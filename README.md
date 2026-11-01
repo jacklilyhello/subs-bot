@@ -27,7 +27,7 @@
 | GitHub 搜索 | `/g <关键词或链接>` 搜索公开代码 |
 | 内联查询 | `@bot 关键词` 返回当前用户的私有订阅结果 |
 | 私密分享 | `@bot Share [x份数] [id用户ID] [s分钟] 内容` 生成私密提取卡片 |
-| 短链服务 | `/s/{code}` 重定向 |
+| 短链服务 | `/s/{code}` 重定向；可选对接外部短域名服务，失败时回退本地短链 |
 | 临时节点 | 发送 ss:// 等分享链接加入临时列表 |
 
 ## 使用说明
@@ -81,6 +81,7 @@ cd /opt/subs-bot
 cp .env.example .env
 nano .env   # 必填 BOT_TOKEN, ALLOWED_USER_IDS, PUBLIC_BASE_URL
 # 可选：ADMIN_USER_IDS（独立管理员名单）、GITHUB_TOKEN（提高 /g 搜索 API 限额）
+# 可选：SHORTLINK_API_URL、SHORTLINK_TOKEN、SHORTLINK_DOMAIN（外部短链服务，见下方说明）
 
 # 3. 一键部署（venv + systemd）
 ./deploy.sh
@@ -91,6 +92,7 @@ journalctl -u subs-bot -f
 ```
 
 - 默认 HTTP 服务仅绑定 `127.0.0.1:8787`；如需公网访问，应通过反向代理提供 HTTPS，并显式配置 `HTTP_HOST`。订阅和聚合响应使用 `Cache-Control: no-store`，避免缓存敏感节点凭据。
+- 外部短链：配置 `SHORTLINK_API_URL`（须为 HTTPS）、`SHORTLINK_TOKEN`、`SHORTLINK_DOMAIN` 后，生成短链时向该接口发送 `POST {"url": ..., "domain": ...}`（`Authorization: Bearer <token>`），使用返回 JSON 中的 `data.short_url`。Bot 先创建本地 `/s/` 短链，外部服务只收到这条本地短链；未配置、请求失败或返回其他域名时，直接使用本地短链。外部服务能经本地短链访问订阅内容，只应接入可信服务；Token 只写在服务器 `.env`。
 
 ## 迁移数据
 

@@ -47,6 +47,9 @@ from config import (
     MAX_IMPORTED_NODES,
     MAX_IMPORTED_SUBSCRIPTIONS,
     PUBLIC_BASE_URL,
+    SHORTLINK_API_URL,
+    SHORTLINK_DOMAIN,
+    SHORTLINK_TOKEN,
     UPDATE_CONCURRENCY,
     parse_tg_user_id,
 )
@@ -321,6 +324,50 @@ async def cmd_auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def sub_token_url(token: str, kind: str = "clash") -> str:
     return f"{PUBLIC_BASE_URL}/sub/{token}/{kind}"
+
+
+async def external_short_url(target: str) -> str | None:
+    """Ask the configured external shortener to wrap ``target``.
+
+    Returns None when the service is not configured, unreachable, rejects the
+    request, or returns a link outside the configured domain. Callers then use
+    the local link, so the bot never depends on the third party.
+    """
+    if not (SHORTLINK_TOKEN and SHORTLINK_DOMAIN and SHORTLINK_API_URL.startswith("https://")):
+        return None
+    try:
+        session = await get_session()
+        async with session.post(
+            SHORTLINK_API_URL,
+            json={"url": target, "domain": SHORTLINK_DOMAIN},
+            headers={"Authorization": f"Bearer {SHORTLINK_TOKEN}"},
+            timeout=aiohttp.ClientTimeout(total=10),
+            allow_redirects=False,
+        ) as resp:
+            status = resp.status
+            payload = await resp.json(content_type=None) if 200 <= status < 300 else None
+    except Exception as exc:
+        log.warning("external shortener unavailable: %s: %s", type(exc).__name__, exc)
+        return None
+    data = payload.get("data") if isinstance(payload, dict) and payload.get("ok") is True else None
+    short = data.get("short_url") if isinstance(data, dict) else None
+    parsed = urlparse(short) if isinstance(short, str) else None
+    if parsed is None or parsed.scheme != "https" or parsed.hostname != SHORTLINK_DOMAIN:
+        log.warning("external shortener rejected or returned an invalid link: HTTP %s", status)
+        return None
+    return short
+
+
+async def make_short_url(user_id: int, target: str) -> str:
+    """Create a short link for ``target``.
+
+    The local /s/ code is always created first. The external shortener only
+    sees that local link, so deleting the local code also revokes the external
+    link's access to the subscription.
+    """
+    code = await store.create_short(user_id, target)
+    local = f"{PUBLIC_BASE_URL}/s/{code}"
+    return await external_short_url(local) or local
 
 
 def scope_owner(update: Update) -> int:
@@ -1466,9 +1513,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not re.match(r"^https?://", target):
             await update.effective_message.reply_text("短链目标必须是 http/https 链接。")
             return
-        code = await store.create_short(user_id, target)
+        short = await make_short_url(user_id, target)
         await update.effective_message.reply_html(
-            f"✅ 短链已生成\n<code>{html.escape(PUBLIC_BASE_URL + '/s/' + code)}</code>",
+            f"✅ 短链已生成\n<code>{html.escape(short)}</code>",
             reply_markup=MAIN_KB,
         )
         return
@@ -1928,8 +1975,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not nodes_of(sub):
             sub = await refresh_sub(user_id, sub, rename=True)
         target = sub_token_url(sub["token"], kind)
-        code = await store.create_short(user_id, target)
-        short = f"{PUBLIC_BASE_URL}/s/{code}"
+        short = await make_short_url(user_id, target)
         title = {
             "clash": "Clash Meta",
             "singbox": "Sing-box",
@@ -2014,8 +2060,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await q.message.reply_text("订阅不存在")
             return
         target = sub_token_url(sub["token"], "clash")
-        code = await store.create_short(user_id, target)
-        short = f"{PUBLIC_BASE_URL}/s/{code}"
+        short = await make_short_url(user_id, target)
         await q.message.reply_html(
             "🔗 <b>短链生成成功</b>\n"
             f"🏷️ 原始机场名称：{html.escape(sub['name'])}\n"

@@ -75,6 +75,10 @@ if not BOT_TOKEN:
     raise SystemExit("缺少 BOT_TOKEN：请在 .env 填写 BotFather 下发的 token")
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "your_bot_username").lstrip("@")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+# 可选外部短链服务：三项都配置且 API 为 HTTPS 时启用；未配置或调用失败时使用本地 /s/ 短链。
+SHORTLINK_API_URL = os.environ.get("SHORTLINK_API_URL", "").strip()
+SHORTLINK_TOKEN = os.environ.get("SHORTLINK_TOKEN", "").strip()
+SHORTLINK_DOMAIN = os.environ.get("SHORTLINK_DOMAIN", "").strip().lower()
 ALLOWED_USER_IDS = parse_user_id_set(os.environ.get("ALLOWED_USER_IDS", ""))
 # 不把第一个使用者提升为管理员。管理员集合为空时，Bot 内授权管理关闭。
 ADMIN_USER_IDS = resolve_admin_ids(ALLOWED_USER_IDS, os.environ.get("ADMIN_USER_IDS"))
