@@ -1,7 +1,8 @@
 import { getSubscriptionSnapshot, readSnapshotNodes, type SubscriptionSnapshot } from "./storage.ts";
-import { drainTelegramReplies } from "./telegram/delivery.ts";
+import { answerTelegramViewCallback, drainTelegramReplies } from "./telegram/delivery.ts";
 import { decodeTelegramRequest, parseTelegramPolicy } from "./telegram/protocol.ts";
 import { acceptTelegramCommand } from "./telegram/store.ts";
+import { acceptTelegramView, reapTelegramViewTickets } from "./telegram/views.ts";
 
 export interface Env {
   DB: D1Database;
@@ -103,6 +104,14 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
     if (decoded.command) {
       await acceptTelegramCommand(env.DB, policy, decoded.command);
       ctx?.waitUntil(drainTelegramReplies(env.DB, policy, 4, 20_000).catch(() => undefined));
+    } else if (decoded.view) {
+      const outcome = await acceptTelegramView(env.DB, policy, decoded.view);
+      if (decoded.view.kind === "callback") {
+        ctx?.waitUntil(answerTelegramViewCallback(policy, decoded.view.callbackId));
+      }
+      if (outcome === "accepted" || decoded.view.kind !== "callback") {
+        ctx?.waitUntil(drainTelegramReplies(env.DB, policy, 4, 20_000).catch(() => undefined));
+      }
     }
     return new Response(null, { status: decoded.status, headers: HEADERS });
   } catch {
@@ -152,6 +161,7 @@ async function recoverTelegramReplies(_controller: ScheduledController, env: Env
   if (!policy) return;
   try {
     await drainTelegramReplies(env.DB, policy, 10, 45_000);
+    await reapTelegramViewTickets(env.DB);
   } catch {
     throw new Error("Telegram scheduled recovery could not finish.");
   }

@@ -100,8 +100,11 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
     botId: "123456789", botUsername: "fixture_subs_bot", adminId: "1001", memberId: "1002", groupId: "-1003",
     botToken: `123456789:${"a".repeat(35)}`, webhookSecret: "fixture-webhook-secret-00000000000000",
   };
-  const replies: Array<{ chatId: string; messageId: number; replyTo: number; text: string }> = [];
+  const replies: Array<{ chatId: string; messageId: number; replyTo: number; text: string; button?: string }> = [];
   const sentBodies: unknown[] = [];
+  const callbackId = "fixture-page-callback";
+  let acknowledged = 0;
+  let nextTicket: string | undefined;
   const botPath = `/bot${policy.botToken}/sendMessage`;
   const miniflare = new Miniflare({
     modules: true,
@@ -111,21 +114,42 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
     d1Databases: ["DB"],
     r2Buckets: ["NODES"],
     outboundService: async (request: Request) => {
-      assert.equal(request.url, `https://api.telegram.org${botPath}`);
       assert.equal(request.method, "POST");
+      if (request.url === `https://api.telegram.org/bot${policy.botToken}/answerCallbackQuery`) {
+        assert.deepEqual(await request.json(), { callback_query_id: callbackId });
+        acknowledged += 1;
+        return Response.json({ ok: true, result: true });
+      }
+      assert.equal(request.url, `https://api.telegram.org${botPath}`);
       const expected = replies.shift();
       assert.ok(expected, "Unexpected outbound request");
-      const payload = await request.json() as { chat_id: string; text: string; reply_parameters: { message_id: number } };
+      const payload = await request.json() as {
+        chat_id: string;
+        text: string;
+        reply_parameters: { message_id: number };
+        reply_markup?: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
+      };
       const observed = { chatId: payload.chat_id, text: payload.text, replyTo: payload.reply_parameters?.message_id };
       sentBodies.push(observed);
       assert.deepEqual(observed, { chatId: expected.chatId, text: expected.text, replyTo: expected.replyTo });
+      if (expected.button) {
+        const keyboard = payload.reply_markup?.inline_keyboard;
+        assert.equal(keyboard?.length, 1);
+        assert.equal(keyboard?.[0]?.length, 1);
+        const button = keyboard![0][0];
+        assert.equal(button.text, expected.button);
+        assert.match(button.callback_data, /^sbv1_[A-Za-z0-9_-]{22}$/u);
+        if (button.text === "下一页") nextTicket = button.callback_data;
+      } else {
+        assert.equal(payload.reply_markup, undefined);
+      }
       return Response.json({ ok: true, result: { message_id: expected.messageId, chat: { id: Number(expected.chatId) } } });
     },
   });
   try {
     const db = await miniflare.getD1Database("DB");
-    assert.deepEqual(fixture.migrations.slice(0, 3).map(({ name }: { name: string }) => name), [
-      "0001_subscriptions.sql", "0002_telegram.sql", "0003_subscription_lifecycle.sql",
+    assert.deepEqual(fixture.migrations.slice(0, 4).map(({ name }: { name: string }) => name), [
+      "0001_subscriptions.sql", "0002_telegram.sql", "0003_subscription_lifecycle.sql", "0004_telegram_views.sql",
     ]);
     await applyMigrations(db, directory, fixture.migrations.slice(0, 2));
     const url = "https://provider.example.invalid/synthetic";
@@ -144,8 +168,8 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
       chat: { id: Number(policy.groupId), type: "group" },
       entities: [{ type: "bot_command", offset: 0, length: text.length }],
     };
-    function expectSend(chatId: string, messageId: number, replyTo: number, expectedText: string) {
-      replies.push({ chatId, messageId, replyTo, text: expectedText });
+    function expectSend(chatId: string, messageId: number, replyTo: number, expectedText: string, button?: string) {
+      replies.push({ chatId, messageId, replyTo, text: expectedText, button });
       return { chatId, text: expectedText, replyTo };
     }
     const webhook = "https://subs-bot.example/telegram/webhook";
@@ -175,21 +199,38 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
     const outbox = "SELECT state, sent_message_id FROM telegram_outbox ORDER BY receipt_id";
     assert.deepEqual((await db.prepare(outbox).all()).results, [{ state: "sent", sent_message_id: 10 }]);
     assert.deepEqual(sentBodies, [expectedPrivate]);
+    for (let index = 2; index <= 9; index += 1) {
+      await createSubscription(db, { ownerId: policy.memberId, name: `Member fixture ${index}`, sourceUrl: url });
+    }
 
     assert.equal((await post({ update_id: 10, message }, "invalid")).status, 401);
     assert.equal((await post({ update_id: 10, message: { ...message, chat: { ...message.chat, id: -2000 } } })).status, 204);
-    const expectedGroup = expectSend(policy.groupId, 8, 7, "你的订阅\n1. Member fixture");
+    const firstPage = ["你的订阅", "• Member fixture", ...Array.from({ length: 7 }, (_, index) => `• Member fixture ${index + 2}`)].join("\n");
+    const expectedGroup = expectSend(policy.groupId, 8, 7, firstPage, "下一页");
     const update = { update_id: 11, message };
     assert.deepEqual((await Promise.all([post(update), post(update)])).map((result) => result.status), [200, 200]);
 
-    for (let attempt = 0; attempt < 50; attempt += 1) {
-      const rows = await db.prepare(outbox).all();
-      if (rows.results.every((row) => row.state === "sent") && rows.results.length === 2) break;
-      await new Promise((resolve) => setTimeout(resolve, 100));
+    async function waitForReplies(messageIds: number[], acknowledgements = 0) {
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        const rows = await db.prepare(outbox).all();
+        if (rows.results.every((row) => row.state === "sent") && rows.results.length === messageIds.length &&
+            acknowledged === acknowledgements) break;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      assert.deepEqual((await db.prepare(outbox).all()).results,
+        messageIds.map((id) => ({ state: "sent", sent_message_id: id })));
     }
-    const results = await db.prepare(outbox).all();
-    assert.deepEqual(results.results, [{ state: "sent", sent_message_id: 10 }, { state: "sent", sent_message_id: 8 }]);
-    assert.deepEqual(sentBodies, [expectedPrivate, expectedGroup]);
+    await waitForReplies([10, 8]);
+    assert.ok(nextTicket);
+    const expectedNext = expectSend(policy.groupId, 9, 8, "你的订阅\n• Member fixture 9", "第一页");
+    const callback = { update_id: 13, callback_query: {
+      id: callbackId, data: nextTicket, chat_instance: "synthetic-instance", from: message.from,
+      message: { date, message_id: 8, chat: message.chat, from: { id: Number(policy.botId), is_bot: true } },
+    } };
+    assert.deepEqual((await Promise.all([post(callback), post(callback)])).map((result) => result.status), [200, 200]);
+    await waitForReplies([10, 8, 9], 2);
+    assert.equal(acknowledged, 2);
+    assert.deepEqual(sentBodies, [expectedPrivate, expectedGroup, expectedNext]);
     assert.deepEqual(replies, []);
   } finally {
     await miniflare.dispose();

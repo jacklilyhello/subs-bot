@@ -12,7 +12,7 @@ const policy: TelegramPolicy = {
 const lease: TelegramReplyLease = {
   actorId: policy.memberId, chatId: policy.memberId, chatType: "private",
   updateId: 1, messageId: 2, messageDate: 1_785_456_000, threadId: null,
-  command: "list", leaseId: "fixture-lease", attempts: 1,
+  command: "list", receiptId: 1, leaseId: "fixture-lease", attempts: 1, view: null,
 };
 
 test("sends plain text to the approved actor and verifies the Telegram receipt scope", async () => {
