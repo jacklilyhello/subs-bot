@@ -16,7 +16,9 @@ from release_isolation import telegram_release_config
 
 
 MIGRATION = "0004_telegram_views.sql"
+LIFECYCLE_MIGRATION = "0006_telegram_lifecycle.sql"
 ORIGIN = "https://subs-bot-view-fixtures.invalid/"
+LIFECYCLE_ORIGIN = "https://subs-bot-action-fixtures.invalid/"
 FIELDS = "id, owner_id, name, source_url, token, expire_at, created_at, updated_at, generation, node_count"
 PREFIX_MATCH = "substr(source_url, 1, length(?)) = ?"
 
@@ -51,23 +53,46 @@ def rows(api, path, sql, *parameters):
     return query(api, path, statement(sql, *parameters), 1)[0]["results"]
 
 
-def plan(policy, cohort):
+def plan(policy, cohort, purpose="views"):
     if not isinstance(cohort, str) or re.fullmatch(r"[a-z0-9]{16}", cohort) is None:
         raise FixtureError("A 16-character lowercase synthetic cohort key is required.")
-    prefix = f"{ORIGIN}{cohort}/"
+    if purpose == "views":
+        prefix = f"{ORIGIN}{cohort}/"
+        name_prefix = "CFV"
+        counts = (10, 9, 2, 1)
+    elif purpose == "lifecycle":
+        prefix = f"{LIFECYCLE_ORIGIN}{cohort}/"
+        name_prefix = "CFA"
+        counts = (1, 1, 1, 1)
+    else:
+        raise FixtureError("Unknown Telegram acceptance purpose.")
     entries = [
-        Fixture(policy[owner], f"CFV-{cohort[-6:]}-{role}{kind}{index:02}",
+        Fixture(policy[owner], f"{name_prefix}-{cohort[-6:]}-{role}{kind}{index:02}",
                 f"{prefix}{role}{kind}{index:02}", kind == "T", -3600 if index == 1 else 86400)
-        for owner, role, kind, count in (
-            ("adminId", "A", "L", 10), ("adminId", "A", "T", 9),
-            ("memberId", "B", "L", 2), ("memberId", "B", "T", 1),
-        )
+        for (owner, role, kind), count in zip(
+            (("adminId", "A", "L"), ("adminId", "A", "T"), ("memberId", "B", "L"), ("memberId", "B", "T")),
+            counts, strict=True)
         for index in range(1, count + 1)
     ]
     return prefix, {entry.source: entry for entry in entries}
 
 
-def read_cohort(api, path, prefix, expected):
+def lifecycle_state_matches(row, fixture, allow_lifecycle):
+    revision, trash_revision = row.get("revision"), row.get("trash_revision")
+    name, trashed = row.get("name"), row.get("trashed")
+    if (name, trashed, revision, trash_revision) == (
+            fixture.name, int(fixture.trashed), 1 if fixture.trashed else None, 1 if fixture.trashed else None):
+        return True
+    if not allow_lifecycle or type(revision) is not int or not 1 <= revision <= 8:
+        return False
+    if type(trashed) is not int or trashed not in (0, 1) or trash_revision != (revision if trashed else None):
+        return False
+    if revision < int(fixture.trashed) + int(trashed != int(fixture.trashed)) + int(name != fixture.name):
+        return False
+    return name in (fixture.name, fixture.name + "-renamed")
+
+
+def read_cohort(api, path, prefix, expected, allow_lifecycle=False):
     observed = rows(api, path, f"""
         SELECT id, owner_id, name, source_url, generation, node_count, snapshot_id, manifest_sha256, created_at, expire_at,
           (SELECT revision FROM subscription_lifecycle WHERE subscription_id = subscriptions.id) AS revision,
@@ -85,9 +110,7 @@ def read_cohort(api, path, prefix, expected):
         fixture = expected.get(source)
         if (not fixture or source in by_source or type(row.get("id")) is not int
                 or not 0 < row["id"] < 2**53
-                or (row.get("owner_id"), row.get("name"), row.get("trashed"))
-                != (fixture.owner, fixture.name, int(fixture.trashed))
-                or (row.get("revision"), row.get("trash_revision")) != ((1, 1) if fixture.trashed else (None, None))
+                or row.get("owner_id") != fixture.owner or not lifecycle_state_matches(row, fixture, allow_lifecycle)
                 or type(row.get("created_at")) is not int or row.get("expire_at") != row["created_at"] + fixture.expire_offset
                 or (row.get("generation"), row.get("node_count"), row.get("snapshot_id"), row.get("manifest_sha256"))
                 != (0, 0, None, None)):
@@ -130,21 +153,26 @@ def retire_statements(prefix, rows):
     statements = [cohort_count(prefix, len(rows))]
     for row in rows.values():
         table = "subscription_trash" if row["trashed"] else "subscriptions"
-        parameters = (row["id"], row["source_url"], row["owner_id"], row["name"])
+        parameters = (row["id"], row["source_url"], row["owner_id"], row["name"], row["created_at"], row["expire_at"])
         conditions = ("id = CAST(? AS INTEGER) AND source_url = ? AND owner_id = ? AND name = ? "
+                      "AND created_at = CAST(? AS INTEGER) AND expire_at = CAST(? AS INTEGER) "
                       "AND generation = 0 AND node_count = 0 AND snapshot_id IS NULL AND manifest_sha256 IS NULL")
         if row["trashed"]:
-            conditions += " AND lifecycle_revision = 1"
-            statements.append(statement("DELETE FROM subscription_lifecycle WHERE revision = 1 "
-                                        f"AND subscription_id IN (SELECT id FROM {table} WHERE {conditions})", *parameters))
+            conditions += " AND lifecycle_revision = CAST(? AS INTEGER)"
+            parameters += (row["trash_revision"],)
+        if row["revision"] is not None:
+            statements.append(statement("DELETE FROM subscription_lifecycle WHERE revision = CAST(? AS INTEGER) "
+                                        f"AND subscription_id IN (SELECT id FROM {table} WHERE {conditions})",
+                                        row["revision"], *parameters))
         conditions += f" AND NOT EXISTS (SELECT 1 FROM subscription_lifecycle WHERE subscription_id = {table}.id)"
         statements.append(statement(f"DELETE FROM {table} WHERE {conditions}", *parameters))
     statements.append(cohort_count(prefix, 0))
     return statements
 
 
-def manage(api, path, action, prefix, expected):
-    before = read_cohort(api, path, prefix, expected)
+def manage(api, path, action, prefix, expected, purpose="views"):
+    allow_lifecycle = action == "retire" and purpose == "lifecycle" and prefix.startswith(LIFECYCLE_ORIGIN)
+    before = read_cohort(api, path, prefix, expected, allow_lifecycle)
     if action == "seed" and before and set(before) != set(expected):
         raise FixtureError("A partial synthetic cohort must be retired before another seed attempt.")
     statements = (seed_statements(prefix, expected) if action == "seed" and not before else
@@ -155,7 +183,7 @@ def manage(api, path, action, prefix, expected):
             query(api, path, {"batch": statements}, len(statements))
         except (CloudflareError, FixtureError) as error:
             failure = error  # Reconcile an ambiguous API result by verifying the exact cohort.
-    after = read_cohort(api, path, prefix, expected)
+    after = read_cohort(api, path, prefix, expected, allow_lifecycle)
     if set(after) != (set(expected) if action == "seed" else set()):
         reason = str(failure) if failure else "D1 cohort readback differed."
         raise FixtureError(f"The synthetic fixture operation could not be confirmed. {reason}")
@@ -171,7 +199,8 @@ def run():
             or os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch" or os.environ.get("GITHUB_REF") != "refs/heads/main"):
         raise FixtureError("Telegram fixtures require the project's manually dispatched main workflow.")
     raw = telegram_release_config({"migrations": [{"name": "0002_telegram.sql"}]})
-    prefix, expected = plan(json.loads(raw), os.environ.get("SUBS_BOT_TELEGRAM_FIXTURE_COHORT"))
+    purpose = os.environ.get("SUBS_BOT_TELEGRAM_FIXTURE_PURPOSE", "views")
+    prefix, expected = plan(json.loads(raw), os.environ.get("SUBS_BOT_TELEGRAM_FIXTURE_COHORT"), purpose)
     target = json.loads(os.environ.get("SUBS_BOT_CF_ISOLATION_TARGET_JSON", "null"))
     data = os.environ.get("SUBS_BOT_CF_BOOTSTRAP_TOKEN")
     deploy = os.environ.get("SUBS_BOT_CF_DEPLOY_TOKEN")
@@ -188,15 +217,17 @@ def run():
         raise FixtureError("The active Worker and Telegram configuration must match the reviewed isolation release.")
     _verify_health(revision)
     path = f"{scope.account}/d1/database/{target['d1Id']}"
-    digest = sha256((Path(__file__).resolve().parents[1] / "migrations" / MIGRATION).read_bytes()).hexdigest()
-    if rows(data_api, path, "SELECT sha256, mode FROM subs_bot_schema_migrations WHERE name = ?", MIGRATION) != [
-        {"sha256": digest, "mode": "applied"},
-    ]:
-        raise FixtureError("The isolated Telegram view migration does not match the checked-out revision.")
+    migrations = (MIGRATION, LIFECYCLE_MIGRATION) if purpose == "lifecycle" else (MIGRATION,)
+    for migration in migrations:
+        digest = sha256((Path(__file__).resolve().parents[1] / "migrations" / migration).read_bytes()).hexdigest()
+        if rows(data_api, path, "SELECT sha256, mode FROM subs_bot_schema_migrations WHERE name = ?", migration) != [
+            {"sha256": digest, "mode": "applied"},
+        ]:
+            raise FixtureError("The isolated Telegram migration does not match the checked-out revision.")
     require_current_main(revision)
     if scope.active() != active:
         raise FixtureError("The isolation deployment changed before the fixture operation.")
-    print(json.dumps(manage(data_api, path, action, prefix, expected), sort_keys=True))
+    print(json.dumps(manage(data_api, path, action, prefix, expected, purpose), sort_keys=True))
 
 
 if __name__ == "__main__":

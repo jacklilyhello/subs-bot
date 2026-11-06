@@ -29,11 +29,19 @@ export type TelegramViewUpdate = TelegramEventScope & (
   | { kind: "callback"; callbackId: string; ticket: string }
 );
 
-type NormalizedUpdate = { command: TelegramCommand; view?: never } | { view: TelegramViewUpdate; command?: never };
+export type TelegramLifecycleUpdate = TelegramEventScope & (
+  | { kind: "lifecycle-callback"; callbackId: string; ticket: string }
+  | { kind: "rename-reply"; promptMessageId: number; text: string }
+);
+
+type NormalizedUpdate =
+  | { command: TelegramCommand; view?: never; lifecycle?: never }
+  | { view: TelegramViewUpdate; command?: never; lifecycle?: never }
+  | { lifecycle: TelegramLifecycleUpdate; command?: never; view?: never };
 
 type DecodedTelegramRequest =
   | ({ status: 200 } & NormalizedUpdate)
-  | { status: 204 | 400 | 401 | 413 | 415; command?: never; view?: never };
+  | { status: 204 | 400 | 401 | 413 | 415; command?: never; view?: never; lifecycle?: never };
 
 const MAX_UPDATE_BYTES = 64 * 1024;
 const USERNAME = /^[A-Za-z0-9_]{5,32}(?![\s\S])/;
@@ -43,6 +51,8 @@ const JSON_CONTENT_TYPE = /^application\/json(?:\s*;\s*charset\s*=\s*(?:"utf-8"|
 const BOT_COMMAND = /^\/([A-Za-z0-9_]{1,32})(?:@([A-Za-z0-9_]{5,32}))?(?![\s\S])/;
 const CALLBACK_ID = /^[\u0021-\u007e]{1,128}(?![\s\S])/u;
 const VIEW_TICKET = /^sbv1_[A-Za-z0-9_-]{22}(?![\s\S])/;
+const LIFECYCLE_TICKET = /^sba1_[A-Za-z0-9_-]{22}(?![\s\S])/;
+const RENAME_CANCEL = /^(?:\/cancel|cancel|取消|退出)(?![\s\S])/iu;
 const NON_HUMAN_MESSAGE_FIELDS = [
   "sender_chat", "sender_business_bot", "via_bot", "forward_origin", "forward_date",
   "forward_from", "forward_from_chat", "forward_from_message_id", "forward_sender_name", "forward_signature",
@@ -178,6 +188,29 @@ function messageScope(
   return inTelegramScope(policy, scope) ? scope : null;
 }
 
+function ownBotMessage(value: unknown, policy: TelegramPolicy): value is Record<string, unknown> {
+  if (!isRecord(value)) return false;
+  const bot = value.from;
+  return isRecord(bot) && bot.is_bot === true && isPositiveInteger(bot.id) && String(bot.id) === policy.botId;
+}
+
+function renameReply(
+  message: Record<string, unknown>, scope: TelegramEventScope, policy: TelegramPolicy,
+): TelegramLifecycleUpdate | null {
+  const { reply_to_message: repliedTo, text, entities } = message;
+  if (typeof text !== "string" || text.length === 0 || !ownBotMessage(repliedTo, policy)) return null;
+  if (Array.isArray(entities) && entities.some((entity) =>
+    isRecord(entity) && entity.type === "bot_command" && entity.offset === 0) && !RENAME_CANCEL.test(text.trim())) {
+    return null;
+  }
+  const prompt = messageScope(repliedTo, scope.actorId, scope.updateId, policy);
+  if (!prompt || prompt.chatId !== scope.chatId || prompt.chatType !== scope.chatType ||
+      prompt.threadId !== scope.threadId || prompt.messageId >= scope.messageId || prompt.messageDate > scope.messageDate) {
+    return null;
+  }
+  return { ...scope, kind: "rename-reply", promptMessageId: prompt.messageId, text };
+}
+
 function normalizeMessage(
   message: Record<string, unknown>, updateId: number, policy: TelegramPolicy,
 ): NormalizedUpdate | null {
@@ -188,20 +221,24 @@ function normalizeMessage(
   if (!scope) return null;
   const command = messageCommand(message, policy);
   if (command === "list" || command === "expiry" || command === "recycle") return { view: { ...scope, kind: command } };
-  return command ? { command: { ...scope, command } } : null;
+  if (command) return { command: { ...scope, command } };
+  const lifecycle = renameReply(message, scope, policy);
+  return lifecycle ? { lifecycle } : null;
 }
 
 function normalizeCallback(
   callback: Record<string, unknown>, updateId: number, policy: TelegramPolicy,
 ): NormalizedUpdate | null {
   const { id: callbackId, from: actor, message, data: ticket } = callback;
-  if (!matches(callbackId, CALLBACK_ID) || !matches(ticket, VIEW_TICKET) ||
+  if (!matches(callbackId, CALLBACK_ID) || typeof ticket !== "string" ||
       !isRecord(actor) || actor.is_bot !== false || !isPositiveInteger(actor.id) ||
-      !isRecord(message) || "inline_message_id" in callback || "game_short_name" in callback) return null;
-  const bot = message.from;
-  if (!isRecord(bot) || bot.is_bot !== true || !isPositiveInteger(bot.id) || String(bot.id) !== policy.botId) return null;
+      !ownBotMessage(message, policy) || "inline_message_id" in callback || "game_short_name" in callback) return null;
   const scope = messageScope(message, String(actor.id), updateId, policy);
-  return scope ? { view: { ...scope, kind: "callback", callbackId, ticket } } : null;
+  if (!scope) return null;
+  if (VIEW_TICKET.test(ticket)) return { view: { ...scope, kind: "callback", callbackId, ticket } };
+  return LIFECYCLE_TICKET.test(ticket)
+    ? { lifecycle: { ...scope, kind: "lifecycle-callback", callbackId, ticket } }
+    : null;
 }
 
 function normalizeUpdate(
