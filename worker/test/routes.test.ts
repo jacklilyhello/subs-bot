@@ -190,14 +190,17 @@ test("a second-pass R2 failure errors the body after earlier bytes without expos
   assert.equal(reads, 2);
 });
 
-test("canceling a response stops additional snapshot reads", async () => {
+test("canceling a response stops reads beyond the current lookahead window", async () => {
   const first = LINK + "x".repeat(4 * 24 * 1024);
-  const { env, reads } = fixture([[{ share: first }], [{ share: `${LINK}later` }]]);
+  const { env, reads } = fixture([
+    [{ share: first }], ...Array.from({ length: 4 }, (_, index) => [{ share: `${LINK}later${index}` }]),
+  ]);
   const response = await request(`/sub/${TOKEN}/base64`, env);
   assert.equal(response.status, 200);
   const reader = response.body!.getReader();
   assert.equal((await reader.read()).done, false);
   await reader.cancel();
   assert.equal((await reader.read()).done, true);
-  assert.equal(reads.filter((key) => key === `${PREFIX}1.ndjson`).length, 1);
+  const pass = ["manifest.json", "0.ndjson", "1.ndjson", "2.ndjson", "3.ndjson", "4.ndjson"].map((name) => PREFIX + name);
+  assert.deepEqual(reads, [...pass, ...pass.slice(0, -1)]);
 });
