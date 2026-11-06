@@ -592,43 +592,37 @@ class PublicResolver:
         self, host: str, port: int = 0, family: int = socket.AF_UNSPEC
     ) -> list[dict[str, Any]]:
         resolved = await self._resolver.resolve(host, port, family)
-        blocked = next(
-            (
-                item.get("host")
-                for item in resolved
-                if not _is_public_ip(str(item.get("host") or ""))
-            ),
-            None,
-        )
-        if blocked is not None:
-            raise OSError(f"连接目标为内网/保留地址: {blocked}")
+        if any(not _is_public_ip(str(item.get("host") or "")) for item in resolved):
+            raise OSError("连接目标为内网/保留地址")
         return resolved
 
     async def close(self) -> None:
         await self._resolver.close()
 
 
+class _SubscriptionURLRejected(ValueError):
+    """A URL policy error with a fixed message safe to store and display."""
+
+
 async def _check_public_url(url: str) -> None:
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+    except ValueError:
+        raise _SubscriptionURLRejected("订阅 URL 格式无效") from None
     if parsed.scheme.lower() not in {"http", "https"}:
-        raise ValueError("仅支持 http/https URL")
+        raise _SubscriptionURLRejected("仅支持 http/https URL")
     if parsed.username is not None or parsed.password is not None:
-        raise ValueError("URL 不允许携带用户名或密码")
-    host = parsed.hostname or ""
+        raise _SubscriptionURLRejected("URL 不允许携带用户名或密码")
     if not host:
-        raise ValueError("URL 缺少主机名")
+        raise _SubscriptionURLRejected("URL 缺少主机名")
     try:
         infos = await asyncio.to_thread(socket.getaddrinfo, host, None)
-    except socket.gaierror as exc:
-        raise ValueError(f"主机名解析失败: {exc}") from exc
+    except socket.gaierror:
+        raise _SubscriptionURLRejected("主机名解析失败") from None
     addresses = {str(info[4][0]) for info in infos}
-    blocked = next((ip for ip in addresses if not _is_public_ip(ip)), None)
-    if blocked is not None:
-        raise ValueError(f"URL 指向内网/保留地址: {host} -> {blocked}")
-
-
-
-
+    if any(not _is_public_ip(ip) for ip in addresses):
+        raise _SubscriptionURLRejected("URL 指向内网/保留地址")
 
 
 async def fetch_subscription(url: str, timeout: int = 25) -> tuple[list[dict[str, Any]], dict[str, Any], str | None]:
@@ -676,8 +670,16 @@ async def fetch_subscription(url: str, timeout: int = 25) -> tuple[list[dict[str
                         return [], meta, "订阅包含无效或暂不支持的 Hysteria 2 链接，未解析出节点"
                 return nodes, meta, None
         return [], {"traffic_used": None, "traffic_total": None, "expire_at": None, "profile_name": None}, "订阅重定向次数过多"
-    except Exception as e:
-        return [], {"traffic_used": None, "traffic_total": None, "expire_at": None, "profile_name": None}, str(e)
+    except _SubscriptionURLRejected as exc:
+        error = str(exc)
+    except TimeoutError:
+        error = "订阅请求超时"
+    except aiohttp.ClientError:
+        error = "订阅请求失败"
+    except Exception:
+        # HTTP and parsing exceptions can embed provider URLs or response data.
+        error = "订阅处理失败"
+    return [], {"traffic_used": None, "traffic_total": None, "expire_at": None, "profile_name": None}, error
 
 
 def apply_path_maps(nodes: list[dict[str, Any]], maps: dict[str, str]) -> list[dict[str, Any]]:
