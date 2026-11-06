@@ -21,6 +21,7 @@ export interface SubscriptionMetadata {
   createdAt: number;
   updatedAt: number;
   generation: number;
+  lifecycleRevision: number;
   nodeCount: number;
 }
 
@@ -28,6 +29,7 @@ export interface SnapshotPublication {
   id: number;
   ownerId: string;
   expectedGeneration: number;
+  expectedLifecycleRevision: number;
 }
 
 interface ChunkDescriptor {
@@ -50,6 +52,9 @@ const MAX_OWNER_ID = 9223372036854775807n;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{16,128}(?![\s\S])/u;
 const SNAPSHOT_ID_PATTERN = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}(?![\s\S])/u;
 const SHA256_PATTERN = /^[a-f0-9]{64}(?![\s\S])/u;
+export const SUBSCRIPTION_LIFECYCLE_REVISION = `COALESCE((
+  SELECT revision FROM subscription_lifecycle WHERE subscription_id = subscriptions.id
+), 0)`;
 const encoder = new TextEncoder();
 
 export class SnapshotIntegrityError extends Error {
@@ -59,13 +64,13 @@ export class SnapshotIntegrityError extends Error {
   }
 }
 
-function checkOwnerId(ownerId: string): void {
+export function checkOwnerId(ownerId: string): void {
   if (typeof ownerId !== "string" || !/^[1-9][0-9]{0,18}(?![\s\S])/u.test(ownerId) || BigInt(ownerId) > MAX_OWNER_ID) {
     throw new RangeError("Invalid subscription owner.");
   }
 }
 
-function validInteger(value: unknown, minimum: number, maximum = Number.MAX_SAFE_INTEGER): value is number {
+export function validInteger(value: unknown, minimum: number, maximum = Number.MAX_SAFE_INTEGER): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= minimum && value <= maximum;
 }
 
@@ -87,16 +92,16 @@ export async function createSubscription(
   const now = Math.floor(Date.now() / 1000);
   const row = await db.prepare(`
     INSERT INTO subscriptions (owner_id, name, source_url, token, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?)
+    SELECT ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM subscription_trash WHERE token = ?)
     RETURNING id
-  `).bind(input.ownerId, input.name, input.sourceUrl, token, now, now).first<{ id: number }>();
+  `).bind(input.ownerId, input.name, input.sourceUrl, token, now, now, token).first<{ id: number }>();
   if (!row || !validInteger(row.id, 1)) {
     throw new Error("Subscription creation failed.");
   }
   return {
     id: row.id, ownerId: input.ownerId, name: input.name, sourceUrl: input.sourceUrl, token,
     expireAt: null, trafficUsed: null, trafficTotal: null, lastError: null, createdAt: now, updatedAt: now,
-    generation: 0, nodeCount: 0,
+    generation: 0, lifecycleRevision: 0, nodeCount: 0,
   };
 }
 
@@ -112,7 +117,8 @@ export async function getOwnedSubscription(
   return db.prepare(`
     SELECT id, owner_id AS ownerId, name, source_url AS sourceUrl, token, expire_at AS expireAt,
       traffic_used AS trafficUsed, traffic_total AS trafficTotal, last_error AS lastError,
-      created_at AS createdAt, updated_at AS updatedAt, generation, node_count AS nodeCount
+      created_at AS createdAt, updated_at AS updatedAt, generation, ${SUBSCRIPTION_LIFECYCLE_REVISION} AS lifecycleRevision,
+      node_count AS nodeCount
     FROM subscriptions WHERE id = ? AND owner_id = ?
   `).bind(id, ownerId).first<SubscriptionMetadata>();
 }
@@ -161,15 +167,17 @@ export async function publishNodeSnapshot(
   target: SnapshotPublication,
   nodes: Iterable<NodeRecord> | AsyncIterable<NodeRecord>,
 ): Promise<boolean> {
-  const { id, ownerId, expectedGeneration } = target;
+  const { id, ownerId, expectedGeneration, expectedLifecycleRevision } = target;
   checkOwnerId(ownerId);
-  if (!validInteger(id, 1) || !validInteger(expectedGeneration, 0, Number.MAX_SAFE_INTEGER - 1)) {
+  if (!validInteger(id, 1) || !validInteger(expectedGeneration, 0, Number.MAX_SAFE_INTEGER - 1) ||
+      !validInteger(expectedLifecycleRevision, 0)) {
     throw new RangeError("Invalid subscription version.");
   }
   const row = await db.prepare(`
-    SELECT generation FROM subscriptions WHERE id = ? AND owner_id = ?
-  `).bind(id, ownerId).first<{ generation: number }>();
-  if (!row || row.generation !== expectedGeneration) {
+    SELECT id FROM subscriptions
+    WHERE id = ? AND owner_id = ? AND generation = ? AND ${SUBSCRIPTION_LIFECYCLE_REVISION} = ?
+  `).bind(id, ownerId, expectedGeneration, expectedLifecycleRevision).first<{ id: number }>();
+  if (!row) {
     return false;
   }
 
@@ -243,8 +251,9 @@ export async function publishNodeSnapshot(
     UPDATE subscriptions
     SET generation = generation + 1, snapshot_id = ?, manifest_sha256 = ?, node_count = ?,
         last_error = NULL, updated_at = ?
-    WHERE id = ? AND owner_id = ? AND generation = ?
-  `).bind(snapshotId, manifestHash, nodeCount, Math.floor(Date.now() / 1000), id, ownerId, expectedGeneration).run();
+    WHERE id = ? AND owner_id = ? AND generation = ? AND ${SUBSCRIPTION_LIFECYCLE_REVISION} = ?
+  `).bind(snapshotId, manifestHash, nodeCount, Math.floor(Date.now() / 1000), id, ownerId,
+    expectedGeneration, expectedLifecycleRevision).run();
   if (!result.success) {
     throw new Error("Subscription snapshot publication failed.");
   }

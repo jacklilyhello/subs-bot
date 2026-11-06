@@ -1,3 +1,4 @@
+import { listOwnedSubscriptions } from "../subscriptions.ts";
 import type { TelegramPolicy } from "./protocol.ts";
 import {
   beginTelegramReply, claimTelegramReply, isTelegramMemberAllowed,
@@ -112,13 +113,12 @@ async function renderReply(
   const allowed = lease.actorId === policy.adminId || await isTelegramMemberAllowed(db, policy);
   if (!allowed) return { text: "当前账号没有使用权限。", access: "denied" };
   if (lease.command === "list") {
-    const result = await db.prepare("SELECT name FROM subscriptions WHERE owner_id = ? ORDER BY id LIMIT ?")
-      .bind(lease.actorId, LIST_LIMIT + 1).all<{ name: string }>();
-    const names = result.results.slice(0, LIST_LIMIT).map((row, index) => {
+    const page = await listOwnedSubscriptions(db, lease.actorId, { limit: LIST_LIMIT });
+    const names = page.items.map((row, index) => {
       const name = Array.from(row.name.replace(/[\u0000-\u001f\u007f-\u009f]/gu, " ")).slice(0, 80).join("");
       return `${index + 1}. ${name}`;
     });
-    if (result.results.length > LIST_LIMIT) names.push(`仅显示前 ${LIST_LIMIT} 条。`);
+    if (page.nextAfterId !== null) names.push(`仅显示前 ${LIST_LIMIT} 条。`);
     return { text: names.length ? `你的订阅\n${names.join("\n")}` : "你的订阅列表为空。", access: "allowed" };
   }
   const help = "使用 /list 查看你的订阅，/help 查看命令。";
