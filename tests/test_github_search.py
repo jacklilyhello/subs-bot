@@ -12,7 +12,11 @@ from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 with tempfile.TemporaryDirectory(prefix="subs-github-search-") as data_dir:
-    with patch.dict(os.environ, {"BOT_TOKEN": "0:TEST", "DATA_DIR": data_dir}):
+    with patch.dict(os.environ, {
+        "BOT_TOKEN": "0:TEST",
+        "DATA_DIR": data_dir,
+        "DB_PATH": str(Path(data_dir) / "test.db"),
+    }):
         import bot
 
 
