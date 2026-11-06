@@ -1,0 +1,35 @@
+name: Provider Fetch CI
+
+on:
+  pull_request:
+    paths:
+      - 'worker/provider_fetch/**'
+      - '.github/workflows/worker-provider-fetch-ci.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'worker/provider_fetch/**'
+      - '.github/workflows/worker-provider-fetch-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  transport:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+      - name: Install only the pinned transport wheels
+        run: |
+          python -m pip --isolated install --index-url https://pypi.org/simple --only-binary=:all: \
+            --require-hashes -r worker/provider_fetch/requirements.txt
+          python -m pip check
+      - name: Exercise pinned HTTPS, DNS and response limits
+        run: python -m unittest discover -s worker/provider_fetch -p 'test_*.py'
