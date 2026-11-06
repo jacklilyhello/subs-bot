@@ -5,11 +5,12 @@ from copy import deepcopy
 from hashlib import sha256
 from http.client import IncompleteRead
 from io import BytesIO
+import json
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 from urllib.error import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
@@ -41,9 +42,12 @@ SCRIPT = f"{ACCOUNT}/workers/scripts/{cloudflare.WORKER_NAME}"
 WORKER = f"{ACCOUNT}/workers/workers/{TARGET['workerId']}"
 VERSIONS = WORKER + "/versions"
 DEPLOYMENTS = SCRIPT + "/deployments"
+SCHEDULES = SCRIPT + "/schedules"
 DATABASE = f"{ACCOUNT}/d1/database/{TARGET['d1Id']}"
 BUCKET = f"{ACCOUNT}/r2/buckets/{cloudflare.WORKER_NAME}"
 DOMAINS = f"{ACCOUNT}/workers/domains?service={cloudflare.WORKER_NAME}"
+TELEGRAM_CONFIG = '{"fixture":"synthetic-only"}'
+CRON = {"cron": cloudflare.TELEGRAM_CRON}
 
 
 def deployment(deployment_id, version, message=None):
@@ -92,7 +96,7 @@ class FakeCloudflare:
             },
             SCRIPT + "/settings": {"tags": ["subs-bot", "isolation-01"]},
             DOMAINS: [],
-            SCRIPT + "/schedules": {"schedules": []},
+            SCHEDULES: {"schedules": []},
             ACCOUNT + "/workers/subdomain": {"subdomain": cloudflare.NAMESPACE},
         }
         self.data_responses = {
@@ -111,6 +115,11 @@ class FakeCloudflare:
         self.stale = False
         self.stale_after_upload = False
         self.concurrent_after_upload = False
+        self.cron_available = True
+        self.lose_cron_response = False
+        self.health_verified_deployment = None
+        self.telegram_upload = None
+        self.alter_config_digest = False
 
     def worker_api(self, method, path, payload=None):
         self.calls.append((method, path))
@@ -133,6 +142,12 @@ class FakeCloudflare:
             assert payload["modules"][0]["content_base64"] == base64.b64encode(NEW_MODULE).decode("ascii")
             assert payload["bindings"][0]["database_id"] == TARGET["d1Id"]
             self.versions[NEW_VERSION] = {**deepcopy(payload), "id": NEW_VERSION}
+            for row in self.versions[NEW_VERSION]["bindings"]:
+                if row["name"] == cloudflare.TELEGRAM_CONFIG_BINDING:
+                    self.telegram_upload = deepcopy(row)
+                    row.pop("text")
+                if row["name"] == cloudflare.TELEGRAM_DIGEST_BINDING and self.alter_config_digest:
+                    row["text"] = "e" * 64
             if self.stale_after_upload:
                 self.stale = True
             if self.concurrent_after_upload:
@@ -151,6 +166,17 @@ class FakeCloudflare:
             if version_id == NEW_VERSION and self.lose_activation:
                 raise cloudflare.CloudflareError("Activation connection failed.", uncertain=True)
             return deepcopy(self.active)
+        if method == "PUT" and path == SCHEDULES:
+            assert payload == [CRON]
+            assert self.active["id"] == self.health_verified_deployment
+            assert any(row["type"] == "secret_text"
+                       for row in self.versions[self.active["versions"][0]["version_id"]]["bindings"])
+            if not self.cron_available:
+                raise cloudflare.CloudflareError("Cron setup rejected.")
+            self.worker_responses[path] = {"schedules": [{**CRON, "created_on": "2026-07-30T00:00:00Z"}]}
+            if self.lose_cron_response:
+                raise cloudflare.CloudflareError("Cron connection failed.", uncertain=True)
+            return deepcopy(self.worker_responses[path])
         raise AssertionError("Unexpected Worker operation.")
 
     def data_api(self, method, path, payload=None):
@@ -165,6 +191,7 @@ class FakeCloudflare:
                 self.active = deployment(CONCURRENT_DEPLOYMENT, NEW_VERSION, "Another operator")
             return {"ok": False}
         revision = self.versions[version_id]["bindings"][2]["text"]
+        self.health_verified_deployment = self.active["id"]
         return {"ok": True, "service": "subs-bot", "revision": revision}
 
     def guard(self):
@@ -172,7 +199,7 @@ class FakeCloudflare:
         return not self.stale
 
     def writes(self):
-        return [path for method, path in self.calls if method == "POST"]
+        return [path for method, path in self.calls if method in {"POST", "PUT"}]
 
 
 class ReleaseTests(unittest.TestCase):
@@ -191,17 +218,25 @@ class ReleaseTests(unittest.TestCase):
         sleeper.start()
         self.addCleanup(sleeper.stop)
 
-    def release(self):
+    def release(self, telegram_config=None):
         return cloudflare.release_worker(self.api.worker_api, self.api.data_api, TARGET, self.bundle,
-                                         self.manifest, self.api.guard)
+                                         self.manifest, self.api.guard, telegram_config=telegram_config)
+
+    def set_old_telegram_config(self, config=TELEGRAM_CONFIG):
+        self.api.versions[OLD_VERSION]["bindings"].extend([
+            {"type": "secret_text", "name": cloudflare.TELEGRAM_CONFIG_BINDING},
+            {"type": "plain_text", "name": cloudflare.TELEGRAM_DIGEST_BINDING,
+             "text": sha256(config.encode("utf-8")).hexdigest()},
+        ])
 
     def test_read_only_preflight_rejects_wrong_resource_or_domain(self):
         self.assertEqual(cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET),
                          {"deploymentId": OLD_DEPLOYMENT, "versionId": OLD_VERSION, "revision": OLD_REVISION})
         for path, replacement in ((BUCKET + "/domains/managed", {"enabled": True}),
                                   (DATABASE, {"uuid": "wrong"}),
-                                  (DOMAINS, [{"hostname": "unexpected.example"}])):
-            container = self.api.worker_responses if path == DOMAINS else self.api.data_responses
+                                  (DOMAINS, [{"hostname": "unexpected.example"}]),
+                                  (SCHEDULES, {"schedules": [{"cron": "0 0 * * *"}]})):
+            container = self.api.worker_responses if path in (DOMAINS, SCHEDULES) else self.api.data_responses
             previous = container[path]
             with self.subTest(path=path):
                 container[path] = replacement
@@ -231,6 +266,82 @@ class ReleaseTests(unittest.TestCase):
         self.api.versions[NEW_VERSION] = version(NEW_VERSION, NEW_REVISION, NEW_MODULE)
         self.assertEqual(self.release()["versionId"], NEW_VERSION)
         self.assertEqual(self.api.writes(), [DEPLOYMENTS])
+
+    def test_telegram_is_secret_bound_and_cron_is_set_after_healthy_activation(self):
+        result = self.release(TELEGRAM_CONFIG)
+        self.assertEqual(result["versionId"], NEW_VERSION)
+        self.assertNotIn("synthetic-only", json.dumps(result))
+        self.assertNotIn(sha256(TELEGRAM_CONFIG.encode("utf-8")).hexdigest(), json.dumps(result))
+        self.assertEqual(self.api.telegram_upload, {
+            "name": cloudflare.TELEGRAM_CONFIG_BINDING, "type": "secret_text", "text": TELEGRAM_CONFIG,
+        })
+        self.assertEqual(self.api.versions[NEW_VERSION]["bindings"][-1], {
+            "name": cloudflare.TELEGRAM_DIGEST_BINDING, "type": "plain_text",
+            "text": sha256(TELEGRAM_CONFIG.encode("utf-8")).hexdigest(),
+        })
+        self.assertFalse(self.release(TELEGRAM_CONFIG)["changed"])
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS, SCHEDULES])
+        cron_index = self.api.calls.index(("PUT", SCHEDULES))
+        self.assertEqual(self.api.calls[cron_index - 2:cron_index], [("GET", DEPLOYMENTS), ("GUARD", "main")])
+
+    def test_telegram_config_can_change_without_changing_the_git_revision(self):
+        self.api.versions[OLD_VERSION] = version(OLD_VERSION, NEW_REVISION, NEW_MODULE)
+        self.set_old_telegram_config('{"fixture":"old-synthetic-only"}')
+        self.api.worker_responses[SCHEDULES] = {"schedules": [CRON]}
+        self.assertTrue(self.release(TELEGRAM_CONFIG)["changed"])
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
+
+    def test_failed_cron_setup_can_be_retried_without_redeploying(self):
+        self.api.cron_available = False
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "active.*rejected the Cron setup"):
+            self.release(TELEGRAM_CONFIG)
+        self.assertEqual(self.api.active["id"], NEW_DEPLOYMENT)
+        self.assertEqual(self.api.worker_responses[SCHEDULES], {"schedules": []})
+        self.api.cron_available = True
+        self.assertTrue(self.release(TELEGRAM_CONFIG)["changed"])
+        self.assertFalse(self.release(TELEGRAM_CONFIG)["changed"])
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS, SCHEDULES, SCHEDULES])
+
+    def test_lost_cron_response_is_reconciled_by_readback(self):
+        self.api.lose_cron_response = True
+        self.assertTrue(self.release(TELEGRAM_CONFIG)["changed"])
+        self.assertFalse(self.release(TELEGRAM_CONFIG)["changed"])
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS, SCHEDULES])
+
+    def test_rollback_preserves_preexisting_cron_and_config(self):
+        self.set_old_telegram_config()
+        self.api.worker_responses[SCHEDULES] = {"schedules": [CRON]}
+        self.api.health_available = False
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "prior version was restored"):
+            self.release(TELEGRAM_CONFIG)
+        self.assertEqual(self.api.active["versions"][0]["version_id"], OLD_VERSION)
+        self.assertEqual(self.api.worker_responses[SCHEDULES], {"schedules": [CRON]})
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS, DEPLOYMENTS])
+
+    def test_omitting_config_cannot_remove_existing_telegram_bindings(self):
+        self.set_old_telegram_config()
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "required to preserve"):
+            self.release()
+        self.assertEqual(self.api.writes(), [])
+
+    def test_staged_config_digest_must_match_before_activation(self):
+        self.api.alter_config_digest = True
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "differs from the verified artifact"):
+            self.release(TELEGRAM_CONFIG)
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false"])
+
+    def test_active_config_binding_must_be_secret_text(self):
+        self.set_old_telegram_config()
+        self.api.versions[OLD_VERSION]["bindings"][-2]["type"] = "plain_text"
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "Telegram binding mismatch"):
+            self.release(TELEGRAM_CONFIG)
+        self.assertEqual(self.api.writes(), [])
+
+    def test_invalid_config_cannot_trigger_cloudflare_calls(self):
+        for value in ("", "é" * 2501, 1):
+            with self.subTest(value_type=type(value)), self.assertRaises(cloudflare.CloudflareError):
+                self.release(value)
+        self.assertEqual(self.api.calls, [])
 
     def test_ref_and_current_deployment_are_rechecked_before_activation(self):
         for attribute, message in (("stale_after_upload", "main revision changed"),
@@ -320,6 +431,23 @@ class ClientTests(unittest.TestCase):
             client("POST", "/accounts/test", {})
         self.assertTrue(error.exception.uncertain)
         self.assertNotIn("response prefix", str(error.exception))
+
+    def test_client_put_is_limited_to_the_isolated_cron_path_and_body(self):
+        opener = MagicMock()
+        opener.open.return_value.__enter__.return_value.read.return_value = (
+            b'{"success":true,"result":{"schedules":[]}}'
+        )
+        with patch.object(cloudflare, "build_opener", return_value=opener):
+            client = cloudflare.CloudflareClient("synthetic-token")
+        for path, payload in ((DEPLOYMENTS, [CRON]), (SCHEDULES + "?extra=1", [CRON]),
+                              (SCHEDULES, []), (SCHEDULES, [{"cron": "0 0 * * *"}])):
+            with self.subTest(path=path), self.assertRaises(cloudflare.CloudflareError):
+                client("PUT", path, payload)
+        opener.open.assert_not_called()
+        self.assertEqual(client("PUT", SCHEDULES, [CRON]), {"schedules": []})
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.get_method(), "PUT")
+        self.assertEqual(json.loads(request.data), [CRON])
 
 
 if __name__ == "__main__":

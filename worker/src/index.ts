@@ -1,9 +1,13 @@
 import { getSubscriptionSnapshot, readSnapshotNodes, type SubscriptionSnapshot } from "./storage.ts";
+import { drainTelegramReplies } from "./telegram/delivery.ts";
+import { decodeTelegramRequest, parseTelegramPolicy } from "./telegram/protocol.ts";
+import { acceptTelegramCommand } from "./telegram/store.ts";
 
 export interface Env {
   DB: D1Database;
   NODES: R2Bucket;
   BUILD_REVISION?: string;
+  TELEGRAM_ISOLATION_CONFIG?: string;
 }
 
 const MAX_SHARE_BYTES = 16 * 1024 * 1024;
@@ -86,8 +90,30 @@ function base64Body(bucket: R2Bucket, snapshot: SubscriptionSnapshot, shareLengt
   return readable;
 }
 
-async function fetchRequest(request: Request, env: Env): Promise<Response> {
+async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
+  if (request.method !== "POST") {
+    return plain("Method not allowed.", 405, request.method === "HEAD", { Allow: "POST" });
+  }
+  if (new URL(request.url).protocol !== "https:") return plain("Not found.", 404, false);
+  const policy = parseTelegramPolicy(env.TELEGRAM_ISOLATION_CONFIG);
+  if (!policy) return plain("Service unavailable.", 503, false);
+
+  try {
+    const decoded = await decodeTelegramRequest(request, policy);
+    if (decoded.command) {
+      await acceptTelegramCommand(env.DB, policy, decoded.command);
+      ctx?.waitUntil(drainTelegramReplies(env.DB, policy, 4, 20_000).catch(() => undefined));
+    }
+    return new Response(null, { status: decoded.status, headers: HEADERS });
+  } catch {
+    // Telegram can retry delivery if durable admission could not be confirmed.
+    return plain("Service unavailable.", 503, false);
+  }
+}
+
+async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
   const path = new URL(request.url).pathname;
+  if (path === "/telegram/webhook") return telegramWebhook(request, env, ctx);
   const subscription = SUBSCRIPTION_PATH.exec(path);
   const head = request.method === "HEAD";
   if (path !== "/health" && !subscription) return plain("Not found.", 404, head);
@@ -121,4 +147,14 @@ async function fetchRequest(request: Request, env: Env): Promise<Response> {
   }
 }
 
-export default { fetch: fetchRequest } satisfies ExportedHandler<Env>;
+async function recoverTelegramReplies(_controller: ScheduledController, env: Env): Promise<void> {
+  const policy = parseTelegramPolicy(env.TELEGRAM_ISOLATION_CONFIG);
+  if (!policy) return;
+  try {
+    await drainTelegramReplies(env.DB, policy, 10, 45_000);
+  } catch {
+    throw new Error("Telegram scheduled recovery could not finish.");
+  }
+}
+
+export default { fetch: fetchRequest, scheduled: recoverTelegramReplies } satisfies ExportedHandler<Env>;
