@@ -6,6 +6,7 @@ import { test } from "node:test";
 
 import { Miniflare } from "miniflare";
 
+import { createPrivateShare } from "../src/private-shares.ts";
 import { restoreOwnedSubscription, trashOwnedSubscription } from "../src/subscriptions.ts";
 import { createSubscription, publishNodeSnapshot } from "../src/storage.ts";
 import type { TelegramPolicy } from "../src/telegram/protocol.ts";
@@ -187,6 +188,7 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
       "0001_subscriptions.sql", "0002_telegram.sql", "0003_subscription_lifecycle.sql", "0004_telegram_views.sql",
     ]);
     assert.equal(fixture.migrations[5]?.name, "0006_telegram_lifecycle.sql");
+    assert.equal(fixture.migrations[6]?.name, "0007_telegram_private_claims.sql");
     await applyMigrations(db, directory, fixture.migrations.slice(0, 2));
     const url = "https://provider.example.invalid/synthetic";
     await db.prepare(`
@@ -287,7 +289,29 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
       FROM subscriptions JOIN subscription_lifecycle ON id = subscription_id
       WHERE owner_id = ?
     `).bind(policy.memberId).first(), { owner_id: policy.memberId, name: "Renamed in compiled Worker", revision: 1 });
-    assert.deepEqual(sentBodies, [expectedPrivate, expectedGroup, expectedNext, prompt, confirmation]);
+
+    const bucket = await miniflare.getR2Bucket("NODES");
+    const share = await createPrivateShare(db, bucket, {
+      botId: policy.botId, senderId: policy.adminId, senderName: "Synthetic sender", content: "Synthetic private share",
+      maxClaims: 1, targetUserId: policy.memberId, durationMinutes: 10,
+    });
+    await db.prepare("UPDATE telegram_auth SET allowed = 0 WHERE bot_id = ? AND user_id = ?")
+      .bind(policy.botId, policy.memberId).run();
+    const deepLink = `/start claim_${share.code}`;
+    const claimMessage = { ...message, message_id: 21, text: deepLink,
+      entities: [{ type: "bot_command", offset: 0, length: 6 }] };
+    assert.equal((await post({ update_id: 16, message: claimMessage })).status, 204);
+    const claimReply = expectSend(policy.memberId, 22, 21, "私密分享\n来自：Synthetic sender\n领取进度：1/1\n\nSynthetic private share");
+    const privateClaim = { update_id: 17, message: { ...claimMessage, chat: { id: Number(policy.memberId), type: "private" } } };
+    assert.deepEqual((await Promise.all([post(privateClaim), post(privateClaim)])).map((result) => result.status), [200, 200]);
+    await waitForReplies([10, 8, 9, 18, 20, 22], 3);
+    const expectedCodeDigest = digest(Buffer.from(share.code));
+    const claimState = await db.prepare(`
+      SELECT receipt.code_sha256 AS code, (SELECT count(*) FROM private_share_claims) AS portions
+      FROM telegram_private_claim AS receipt
+    `).first();
+    assert.deepEqual(claimState, { code: expectedCodeDigest, portions: 1 });
+    assert.deepEqual(sentBodies, [expectedPrivate, expectedGroup, expectedNext, prompt, confirmation, claimReply]);
     assert.deepEqual(replies, []);
   } finally {
     await miniflare.dispose();

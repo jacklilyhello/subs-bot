@@ -34,14 +34,17 @@ export type TelegramLifecycleUpdate = TelegramEventScope & (
   | { kind: "rename-reply"; promptMessageId: number; text: string }
 );
 
+export type TelegramPrivateClaimUpdate = TelegramEventScope & { kind: "private-claim"; code: string };
+
 type NormalizedUpdate =
-  | { command: TelegramCommand; view?: never; lifecycle?: never }
-  | { view: TelegramViewUpdate; command?: never; lifecycle?: never }
-  | { lifecycle: TelegramLifecycleUpdate; command?: never; view?: never };
+  | { command: TelegramCommand; view?: never; lifecycle?: never; privateClaim?: never }
+  | { view: TelegramViewUpdate; command?: never; lifecycle?: never; privateClaim?: never }
+  | { lifecycle: TelegramLifecycleUpdate; command?: never; view?: never; privateClaim?: never }
+  | { privateClaim: TelegramPrivateClaimUpdate; command?: never; view?: never; lifecycle?: never };
 
 type DecodedTelegramRequest =
   | ({ status: 200 } & NormalizedUpdate)
-  | { status: 204 | 400 | 401 | 413 | 415; command?: never; view?: never; lifecycle?: never };
+  | { status: 204 | 400 | 401 | 413 | 415; command?: never; view?: never; lifecycle?: never; privateClaim?: never };
 
 const MAX_UPDATE_BYTES = 64 * 1024;
 const USERNAME = /^[A-Za-z0-9_]{5,32}(?![\s\S])/;
@@ -53,6 +56,7 @@ const CALLBACK_ID = /^[\u0021-\u007e]{1,128}(?![\s\S])/u;
 const VIEW_TICKET = /^sbv1_[A-Za-z0-9_-]{22}(?![\s\S])/;
 const LIFECYCLE_TICKET = /^sba1_[A-Za-z0-9_-]{22}(?![\s\S])/;
 const RENAME_CANCEL = /^(?:\/cancel|cancel|取消|退出)(?![\s\S])/iu;
+const PRIVATE_CLAIM = /^claim_([A-Za-z0-9_-]{11}|[A-Za-z0-9_-]{22})(?![\s\S])/u;
 const NON_HUMAN_MESSAGE_FIELDS = [
   "sender_chat", "sender_business_bot", "via_bot", "forward_origin", "forward_date",
   "forward_from", "forward_from_chat", "forward_from_message_id", "forward_sender_name", "forward_signature",
@@ -140,7 +144,7 @@ function authCommand(args: string[], reply: unknown, memberId: string): Telegram
 
 function messageCommand(
   message: Record<string, unknown>, policy: TelegramPolicy,
-): TelegramCommand["command"] | TelegramViewKind | null {
+): TelegramCommand["command"] | TelegramViewKind | { code: string } | null {
   const { text, entities } = message;
   if (typeof text !== "string" || !Array.isArray(entities)) return null;
   const commands = entities.filter((entity) => isRecord(entity) && entity.type === "bot_command" && entity.offset === 0);
@@ -155,8 +159,11 @@ function messageCommand(
   if (addressedTo && addressedTo.toLowerCase() !== policy.botUsername.toLowerCase()) return null;
   const args = remainder.trim().split(/\s+/u).filter(Boolean);
   switch (name.toLowerCase()) {
-    case "start":
-      return args[0]?.startsWith("claim_") ? null : "start";
+    case "start": {
+      if (!args[0]?.startsWith("claim_")) return "start";
+      const claim = args.length === 1 ? PRIVATE_CLAIM.exec(args[0]) : null;
+      return claim ? { code: claim[1] } : null;
+    }
     case "help":
       return "help";
     case "list":
@@ -220,6 +227,10 @@ function normalizeMessage(
   const scope = messageScope(message, actorId, updateId, policy);
   if (!scope) return null;
   const command = messageCommand(message, policy);
+  if (command && typeof command === "object") {
+    return scope.chatType === "private" && scope.threadId === null
+      ? { privateClaim: { ...scope, kind: "private-claim", code: command.code } } : null;
+  }
   if (command === "list" || command === "expiry" || command === "recycle") return { view: { ...scope, kind: command } };
   if (command) return { command: { ...scope, command } };
   const lifecycle = renameReply(message, scope, policy);

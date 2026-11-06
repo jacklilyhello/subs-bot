@@ -26,10 +26,11 @@ export interface PrivateShareClaimInput {
 }
 
 type DeniedKind = "expired" | "target" | "exhausted";
+type UnavailableShare = { kind: "unavailable" | DeniedKind };
 
 export type PrivateShareClaimResult =
   | { kind: "claimed" | "repeated"; content: string; senderName: string; claimCount: number; maxClaims: number; expireAt: number }
-  | { kind: "unavailable" | DeniedKind };
+  | UnavailableShare;
 
 interface ShareRow {
   id: number;
@@ -45,6 +46,20 @@ interface ShareRow {
   claimCount: number;
 }
 
+interface PrivateShareClaimKey {
+  botId: string;
+  actorId: string;
+  codeSha256: string;
+}
+
+interface VerifiedShareClaim extends PrivateShareClaimKey {
+  kind: "verified";
+  candidate: ShareRow;
+  content: string;
+}
+
+export type PreparedPrivateShareClaim = VerifiedShareClaim | (PrivateShareClaimKey & UnavailableShare);
+
 function checkedText(text: unknown, limit: number): Uint8Array<ArrayBuffer> {
   if (typeof text !== "string" || text.length === 0 || text.length > limit || /[\ud800-\udfff]/u.test(text)) {
     throw new RangeError("Invalid private share text.");
@@ -56,6 +71,11 @@ function checkedText(text: unknown, limit: number): Uint8Array<ArrayBuffer> {
 
 function digestHex(digest: ArrayBuffer): string {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+export async function privateShareCodeDigest(code: string): Promise<string | null> {
+  if (typeof code !== "string" || !SHARE_CODE.test(code)) return null;
+  return digestHex(await crypto.subtle.digest("SHA-256", encoder.encode(code)));
 }
 
 function payloadKey(id: string): string {
@@ -154,70 +174,101 @@ async function readVerifiedPayload(bucket: R2Bucket, row: ShareRow): Promise<str
   }
 }
 
+function shareLookup(db: D1Database, { botId, actorId, codeSha256 }: PrivateShareClaimKey): D1PreparedStatement {
+  return db.prepare(`
+    SELECT share.id, share.sender_name AS senderName, share.payload_id AS payloadId,
+      share.payload_sha256 AS payloadSha256, share.payload_bytes AS payloadBytes,
+      share.max_claims AS maxClaims, share.expire_at AS expireAt, share.expire_at >= unixepoch() AS active,
+      (share.target_user_id IS NULL OR share.target_user_id = ?) AS targetAllowed,
+      EXISTS (SELECT 1 FROM private_share_claims WHERE share_id = share.id AND actor_id = ?) AS alreadyClaimed,
+      (SELECT count(*) FROM private_share_claims WHERE share_id = share.id) AS claimCount
+    FROM private_shares AS share WHERE share.bot_id = ? AND share.code_sha256 = ?
+  `).bind(actorId, actorId, botId, codeSha256);
+}
+
+export async function preparePrivateShareClaim(
+  db: D1Database,
+  bucket: R2Bucket,
+  key: PrivateShareClaimKey,
+): Promise<PreparedPrivateShareClaim> {
+  if (!SHA256.test(key.codeSha256)) return { ...key, kind: "unavailable" };
+  try {
+    checkOwnerId(key.botId);
+    checkOwnerId(key.actorId);
+  } catch {
+    return { ...key, kind: "unavailable" };
+  }
+
+  try {
+    const candidate = await shareLookup(db, key).first<ShareRow>();
+    if (!candidate) return { ...key, kind: "unavailable" };
+    const denied = denial(candidate);
+    if (denied) return { ...key, kind: denied };
+
+    const content = await readVerifiedPayload(bucket, candidate);
+    return content === null ? { ...key, kind: "unavailable" } : { ...key, kind: "verified", candidate, content };
+  } catch {
+    throw new Error("Private share claim could not be confirmed.");
+  }
+}
+
+export function privateShareClaimStatements(
+  db: D1Database,
+  prepared: VerifiedShareClaim,
+  guard?: { sql: string; bindings: readonly (string | number | null)[] },
+): [D1PreparedStatement, D1PreparedStatement] {
+  const { botId, actorId, codeSha256, candidate } = prepared;
+  // The verified pointer, access, cutoff, remaining count and unique actor are checked on the write.
+  return [db.prepare(`
+    INSERT INTO private_share_claims (share_id, actor_id, claimed_at)
+    SELECT share.id, ?, unixepoch() FROM private_shares AS share
+    WHERE share.id = ? AND share.bot_id = ? AND share.code_sha256 = ?
+      AND share.payload_id = ? AND share.payload_sha256 = ? AND share.payload_bytes = ?
+      AND share.expire_at >= unixepoch() AND (share.target_user_id IS NULL OR share.target_user_id = ?)
+      AND (SELECT count(*) FROM private_share_claims WHERE share_id = share.id) < share.max_claims
+      ${guard ? `AND (${guard.sql})` : ""}
+    ON CONFLICT (share_id, actor_id) DO NOTHING
+  `).bind(actorId, candidate.id, botId, codeSha256, candidate.payloadId, candidate.payloadSha256,
+    candidate.payloadBytes, actorId, ...(guard?.bindings ?? [])), shareLookup(db, prepared)];
+}
+
+export function readPrivateShareClaimResult(
+  { candidate, content }: VerifiedShareClaim,
+  write: Pick<D1Result, "success" | "meta"> | undefined,
+  read: { success: boolean; results: readonly unknown[] } | undefined,
+): PrivateShareClaimResult {
+  if (!write?.success || !read?.success || read.results.length > 1
+    || !validInteger(write.meta.changes, 0, 1)) throw new Error("Private share claim could not be confirmed.");
+  const confirmed = read.results[0] as ShareRow | undefined;
+  if (!confirmed || confirmed.id !== candidate.id || confirmed.payloadId !== candidate.payloadId
+    || confirmed.payloadSha256 !== candidate.payloadSha256 || confirmed.payloadBytes !== candidate.payloadBytes) {
+    if (write.meta.changes === 0) return { kind: "unavailable" };
+    throw new Error("Private share claim could not be confirmed.");
+  }
+  const inserted = write.meta.changes === 1;
+  if (!inserted) {
+    const denied = denial(confirmed);
+    if (denied) return { kind: denied };
+  }
+  if (confirmed.alreadyClaimed !== 1 || confirmed.targetAllowed !== 1
+    || !validInteger(confirmed.claimCount, 1, confirmed.maxClaims)) throw new Error("Private share claim could not be confirmed.");
+  // The insertion established eligibility even if the clock ticked before readback.
+  return { kind: inserted ? "claimed" : "repeated", content, senderName: confirmed.senderName,
+    claimCount: confirmed.claimCount, maxClaims: confirmed.maxClaims, expireAt: confirmed.expireAt };
+}
+
 export async function claimPrivateShare(
   db: D1Database,
   bucket: R2Bucket,
   { botId, actorId, code }: PrivateShareClaimInput,
 ): Promise<PrivateShareClaimResult> {
-  if (typeof code !== "string" || !SHARE_CODE.test(code)) return { kind: "unavailable" };
   try {
-    checkOwnerId(botId);
-    checkOwnerId(actorId);
-  } catch {
-    return { kind: "unavailable" };
-  }
-
-  try {
-    const codeHash = digestHex(await crypto.subtle.digest("SHA-256", encoder.encode(code)));
-    const lookup = db.prepare(`
-      SELECT share.id, share.sender_name AS senderName, share.payload_id AS payloadId,
-        share.payload_sha256 AS payloadSha256, share.payload_bytes AS payloadBytes,
-        share.max_claims AS maxClaims, share.expire_at AS expireAt, share.expire_at >= unixepoch() AS active,
-        (share.target_user_id IS NULL OR share.target_user_id = ?) AS targetAllowed,
-        EXISTS (SELECT 1 FROM private_share_claims WHERE share_id = share.id AND actor_id = ?) AS alreadyClaimed,
-        (SELECT count(*) FROM private_share_claims WHERE share_id = share.id) AS claimCount
-      FROM private_shares AS share WHERE share.bot_id = ? AND share.code_sha256 = ?
-    `).bind(actorId, actorId, botId, codeHash);
-    const candidate = await lookup.first<ShareRow>();
-    if (!candidate) return { kind: "unavailable" };
-    const denied = denial(candidate);
-    if (denied) return { kind: denied };
-
-    const content = await readVerifiedPayload(bucket, candidate);
-    if (content === null) return { kind: "unavailable" };
-
-    // The verified pointer, access, cutoff, remaining count and unique actor are checked on the write.
-    const [write, read] = await db.batch<ShareRow>([
-      db.prepare(`
-        INSERT INTO private_share_claims (share_id, actor_id, claimed_at)
-        SELECT share.id, ?, unixepoch() FROM private_shares AS share
-        WHERE share.id = ? AND share.bot_id = ? AND share.code_sha256 = ?
-          AND share.payload_id = ? AND share.payload_sha256 = ? AND share.payload_bytes = ?
-          AND share.expire_at >= unixepoch() AND (share.target_user_id IS NULL OR share.target_user_id = ?)
-          AND (SELECT count(*) FROM private_share_claims WHERE share_id = share.id) < share.max_claims
-        ON CONFLICT (share_id, actor_id) DO NOTHING
-      `).bind(actorId, candidate.id, botId, codeHash, candidate.payloadId, candidate.payloadSha256,
-        candidate.payloadBytes, actorId),
-      lookup,
-    ]);
-    if (!write?.success || !read?.success || read.results.length > 1
-      || !validInteger(write.meta.changes, 0, 1)) throw new Error("Private share claim batch failed.");
-    const confirmed = read.results[0];
-    if (!confirmed || confirmed.id !== candidate.id || confirmed.payloadId !== candidate.payloadId
-      || confirmed.payloadSha256 !== candidate.payloadSha256 || confirmed.payloadBytes !== candidate.payloadBytes) {
-      if (write.meta.changes === 0) return { kind: "unavailable" };
-      throw new Error("Private share claim batch failed.");
-    }
-    const inserted = write.meta.changes === 1;
-    if (!inserted) {
-      const nowDenied = denial(confirmed);
-      if (nowDenied) return { kind: nowDenied };
-    }
-    if (confirmed.alreadyClaimed !== 1 || confirmed.targetAllowed !== 1
-      || !validInteger(confirmed.claimCount, 1, confirmed.maxClaims)) throw new Error("Private share claim batch failed.");
-    // The successful insertion established eligibility even if the clock ticked before the readback.
-    return { kind: inserted ? "claimed" : "repeated", content, senderName: confirmed.senderName,
-      claimCount: confirmed.claimCount, maxClaims: confirmed.maxClaims, expireAt: confirmed.expireAt };
+    const codeSha256 = await privateShareCodeDigest(code);
+    if (codeSha256 === null) return { kind: "unavailable" };
+    const prepared = await preparePrivateShareClaim(db, bucket, { botId, actorId, codeSha256 });
+    if (prepared.kind !== "verified") return { kind: prepared.kind };
+    const [write, read] = await db.batch(privateShareClaimStatements(db, prepared));
+    return readPrivateShareClaimResult(prepared, write, read);
   } catch {
     throw new Error("Private share claim could not be confirmed.");
   }
