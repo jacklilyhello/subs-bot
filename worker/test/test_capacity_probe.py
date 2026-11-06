@@ -62,7 +62,7 @@ class CapacityProbeTests(unittest.TestCase):
         self.last_revision = REVISION
 
     @contextmanager
-    def network(self, method, path, deadline):
+    def network(self, method, path, deadline, _label="probe"):
         self.assertGreater(deadline, probe.monotonic())
         with self.lock:
             if path == "/health":
@@ -193,14 +193,14 @@ class CapacityProbeTests(unittest.TestCase):
         connection.getresponse.side_effect = BadStatusLine(path)
         with (patch.object(probe, "HTTPSConnection", return_value=connection) as connect,
               patch.object(probe, "Timer") as timer):
-            with self.assertRaisesRegex(probe.ProbeError, "HTTPS request failed") as failure:
-                with probe._request("GET", path, probe.monotonic() + 10):
+            with self.assertRaisesRegex(probe.ProbeError, "response headers for HEAD at-limits") as failure:
+                with probe._request("HEAD", path, probe.monotonic() + 10, "at-limits"):
                     self.fail("Unexpected response")
         self.assertNotIn(token, str(failure.exception))
         self.assertEqual(connect.call_args.args, (probe.HOST,))
         self.assertGreater(connect.call_args.kwargs["timeout"], 0)
         connection.request.assert_called_once_with(
-            "GET", path, headers={"Accept-Encoding": "identity", "Connection": "close", "User-Agent": "subs-bot-isolation-release/1.0"},
+            "HEAD", path, headers={"Accept-Encoding": "identity", "Connection": "close", "User-Agent": "subs-bot-isolation-release/1.0"},
         )
         connection.close.assert_called_once()
         timer.return_value.cancel.assert_called_once()
