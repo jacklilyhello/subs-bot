@@ -35,11 +35,13 @@
 
 | 阶段 | 依赖、变更和验收 |
 | --- | --- |
-| 现有缺陷修复 | 在 Python 服务上独立修复凭据作用域和导出。由 GitHub 托管 runner 复现并验证，迁移以合并后的代码及样例为基准。 |
+| 现有缺陷修复 | 在 Python 服务上独立修复凭据作用域、结构化导出和 Hysteria 2 文本导入。由 GitHub 托管 runner 复现并验证，迁移以合并后的代码及样例为基准。 |
 | 隔离 HTTP 与存储 | 将首个切片单独提交。GitHub 构建和测试后，将对应提交的不可变产物部署至项目隔离 Worker。用真实绑定验证提交 SHA、成功导出、内容完整性、错误状态和能力边界。 |
+| 隔离发布与迁移基线 | 在 GitHub 托管 runner 上复核合并产物的来源和摘要。先识别已有 D1 结构和迁移历史，再登记或增量升级。重复触发同一版本应得到相同结果。 |
 | Telegram 与权限 | 在已验收的存储模型上加入 Webhook、持久收件箱和发件箱、用户和会话隔离、管理员授权、私密领取，以及对应的并发和故障测试。用明确归属的测试 Bot 和测试会话验收。 |
 | 导出、导入和刷新 | 补齐聚合、短链、临时节点、回收站、路径规则、流量与到期、内联与格式转换。加入可恢复的批量刷新。真实提供方必须通过隔离环境出网测试，再开启远程订阅拉取。 |
-| 数据迁移与生产切换 | 先对备份进行隔离恢复和端到端验收，再审核切换窗口、旧服务写入边界、域名、Telegram 和回滚步骤。获得生产切换决定后执行。 |
+| 容量与数据迁移 | 比较旧 SQLite 正文与转换后快照和分享原文的实际字节数。先用云端合成样本验证容量边界、并发与失败，再对获准的真实备份做隔离恢复、数据对账和双账号验收。 |
+| 生产切换 | 核对切换窗口、旧服务写入边界、域名、Telegram 和回滚步骤。获得生产切换决定后执行。 |
 
 ### Telegram 收件、发件与权限验收
 
@@ -56,6 +58,17 @@
 - 测试包括实际提供方的鉴权、重定向、编码、流量头、IPv4/IPv6、阻断行为与限速。输出只记录分类结果和耗时。覆盖 DNS 重绑定、跨来源重定向、压缩超限和异常 YAML，并核对失败不会改变旧快照。真实联调使用获准的测试订阅和会话。
 
 ## 部署、数据迁移和回滚
+
+### 隔离环境发布
+
+1. 在 GitHub 建立仅允许 `main` 的 `subs-bot-isolation` Environment。将核对过的资源标识保存为此环境的 Secret `SUBS_BOT_CF_ISOLATION_TARGET_JSON`，包含 `accountId`、`workerId`、`workerCreatedOn`、`d1Id`、`d1CreatedAt`、`r2CreatedOn` 和 `namespace`。把数据和 Worker 部署凭据分别保存在此环境的 `SUBS_BOT_CF_BOOTSTRAP_TOKEN`、`SUBS_BOT_CF_DEPLOY_TOKEN`。普通 PR CI 和构建产物不使用这些凭据。 [GitHub Environment 保护规则](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)
+2. 查找当前 `main` 的成功 `Worker CI` 运行。若该提交只改动旧 Python 服务，先手动对 `main` 运行 `Worker CI` 生成同一 SHA 的产物。以该运行 ID 启动 `gh workflow run worker-isolation-deploy.yml --ref main -f source_run_id=<run-id>`。
+3. 发布流程重新核对运行、提交、ZIP 摘要、包内文件清单及独立摘要，验证已登记的资源身份。D1 只接管结构完全一致且已清理合成数据的 `0001` 基线，使用 `subs_bot_schema_migrations` 记录已核对的摘要。后续通过同一流程应用增量建表和建索引。涉及现有数据或表结构变更时单独审查迁移和恢复步骤。 [D1 迁移](https://developers.cloudflare.com/d1/reference/migrations/)
+4. Worker 的候选版本通过内容与绑定回读后才启用。记录实际版本、部署及 `/health` 中的提交。遇到不明确的写入结果，先读取实际状态；Worker 回滚仅恢复此前验证的版本，D1 和 R2 状态独立处理。 [Cloudflare Worker 回滚](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/)
+
+域级 Worker 路由核对使用单独的只读凭据。发布任务内使用项目专用凭据核对 Worker 的 Custom Domain、预览、日志、Cron 及实际数据绑定。 [Cloudflare Worker 路由 API](https://developers.cloudflare.com/api/resources/workers/subresources/routes/)
+
+### 数据与切换
 
 1. 先只读核对 Cloudflare 目标账户、Zone、`subs-bot.lilyya.top` 的 DNS、Worker 路由和 Custom Domain 绑定。新资源记录账号、环境及资源 ID，隔离与生产分别使用各自的 Worker、D1、R2 和队列。现有配置冲突须在改动前报告。目标主机名可用且切换获准后，仅增加所需的 Custom Domain 绑定。 [Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)
 2. `Worker CI` 在 GitHub 托管 runner 上安装依赖、检查类型、构建和测试。构建产物标记准确提交与摘要，由授权的部署步骤核对并上传至隔离 Worker。普通 PR CI 使用只读权限和合成数据。部署 Token 通过独立的受控步骤使用。云端 smoke 显式指定隔离环境和提交，核对 `/health` 与提交、已知测试快照的输出和负面用例。分别记录测试、构建、部署和真实运行结果。

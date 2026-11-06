@@ -2,10 +2,10 @@ name: Worker CI
 
 on:
   pull_request:
-    paths: ['worker/**', '.github/workflows/worker-ci.yml']
+    paths: ['worker/**', '.github/workflows/worker-ci.yml', '.github/workflows/worker-isolation-deploy.yml']
   push:
     branches: [main]
-    paths: ['worker/**', '.github/workflows/worker-ci.yml']
+    paths: ['worker/**', '.github/workflows/worker-ci.yml', '.github/workflows/worker-isolation-deploy.yml']
   workflow_dispatch:
 
 permissions:
@@ -40,11 +40,16 @@ jobs:
         run: npm run build
       - name: Test Worker
         run: npm test
+      - name: Test release tooling
+        run: python3 -m unittest discover -s test -p 'test_*.py'
       - name: Package exact revision and synthetic fixture
         run: |
           mkdir -p "$RUNNER_TEMP/subs-bot-worker"
           cp dist/index.js "$RUNNER_TEMP/subs-bot-worker/index.js"
-          cp migrations/0001_subscriptions.sql "$RUNNER_TEMP/subs-bot-worker/0001_subscriptions.sql"
+          git ls-files -z -- migrations | while IFS= read -r -d '' migration; do
+            [[ "$migration" =~ ^migrations/[0-9]{4}_[a-z][a-z0-9_]*\.sql$ && -f "$migration" && ! -L "$migration" ]]
+            cp -- "$migration" "$RUNNER_TEMP/subs-bot-worker/"
+          done
           node tools/isolation-fixture.mjs "$RUNNER_TEMP/subs-bot-worker"
       - name: Test emitted bundle with D1 and R2 bindings
         env:
