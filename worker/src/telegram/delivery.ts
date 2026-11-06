@@ -1,23 +1,20 @@
 import { listOwnedSubscriptions } from "../subscriptions.ts";
-import type { TelegramPolicy } from "./protocol.ts";
+import { inTelegramScope, type TelegramPolicy } from "./protocol.ts";
 import {
   beginTelegramReply, claimTelegramReply, isTelegramMemberAllowed,
   reapExpiredTelegramReplies, settleTelegramReply,
   type TelegramReplyLease, type TelegramReplyOutcome,
 } from "./store.ts";
+import { prepareTelegramViewTickets, renderTelegramView, type TelegramViewButton } from "./views.ts";
 
 const BOT_API = "https://api.telegram.org";
 const MAX_RESPONSE_BYTES = 64 * 1024;
 const SEND_TIMEOUT_MS = 10_000;
+const CALLBACK_TIMEOUT_MS = 3_000;
 const LIST_LIMIT = 20;
 
 type ReplyAccess = "allowed" | "denied" | "none";
-
-function isReplyDestination(policy: TelegramPolicy, lease: TelegramReplyLease): boolean {
-  if (lease.actorId !== policy.adminId && lease.actorId !== policy.memberId) return false;
-  if (lease.chatType === "private") return lease.chatId === lease.actorId;
-  return (lease.chatType === "group" || lease.chatType === "supergroup") && lease.chatId === policy.groupId;
-}
+type InlineKeyboard = { text: string; callback_data: string }[][];
 
 async function readBotReply(response: Response): Promise<unknown> {
   if (!response.body) return null;
@@ -57,8 +54,9 @@ export async function sendTelegramReply(
   text: string,
   timeoutMs: number,
   request: typeof fetch = fetch,
+  keyboard?: InlineKeyboard,
 ): Promise<TelegramReplyOutcome> {
-  if (!isReplyDestination(policy, lease)) return { kind: "failed" };
+  if (!inTelegramScope(policy, lease)) return { kind: "failed" };
   try {
     const response = await request(`${BOT_API}/bot${policy.botToken}/sendMessage`, {
       method: "POST",
@@ -70,6 +68,7 @@ export async function sendTelegramReply(
         ...(lease.threadId === null ? {} : { message_thread_id: lease.threadId }),
         reply_parameters: { message_id: lease.messageId, allow_sending_without_reply: true },
         link_preview_options: { is_disabled: true },
+        ...(keyboard?.length ? { reply_markup: { inline_keyboard: keyboard } } : {}),
         text,
       }),
     });
@@ -95,11 +94,26 @@ export async function sendTelegramReply(
   return { kind: "uncertain" };
 }
 
+export async function answerTelegramViewCallback(policy: TelegramPolicy, callbackId: string): Promise<void> {
+  try {
+    const response = await fetch(`${BOT_API}/bot${policy.botToken}/answerCallbackQuery`, {
+      method: "POST",
+      redirect: "manual",
+      signal: AbortSignal.timeout(CALLBACK_TIMEOUT_MS),
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ callback_query_id: callbackId }),
+    });
+    await response.body?.cancel();
+  } catch {
+    // Acknowledgement is best effort. The callback's durable admission decides whether it has effects.
+  }
+}
+
 async function renderReply(
   db: D1Database,
   policy: TelegramPolicy,
   lease: TelegramReplyLease,
-): Promise<{ text: string; access: ReplyAccess }> {
+): Promise<{ text: string; access: ReplyAccess; buttons?: TelegramViewButton[] }> {
   if (lease.command.startsWith("auth-")) {
     if (lease.actorId !== policy.adminId) return { text: "只有管理员可以管理授权。", access: "none" };
     if (lease.chatType !== "private") return { text: "请在私聊中管理授权。", access: "none" };
@@ -112,6 +126,7 @@ async function renderReply(
   }
   const allowed = lease.actorId === policy.adminId || await isTelegramMemberAllowed(db, policy);
   if (!allowed) return { text: "当前账号没有使用权限。", access: "denied" };
+  if (lease.view) return { ...await renderTelegramView(db, lease.actorId, lease.view), access: "allowed" };
   if (lease.command === "list") {
     const page = await listOwnedSubscriptions(db, lease.actorId, { limit: LIST_LIMIT });
     const names = page.items.map((row, index) => {
@@ -121,7 +136,7 @@ async function renderReply(
     if (page.nextAfterId !== null) names.push(`仅显示前 ${LIST_LIMIT} 条。`);
     return { text: names.length ? `你的订阅\n${names.join("\n")}` : "你的订阅列表为空。", access: "allowed" };
   }
-  const help = "使用 /list 查看你的订阅，/help 查看命令。";
+  const help = "使用 /list 查看你的订阅，/expire 查看临期，/recycle 查看回收站，/help 查看命令。";
   return { text: lease.command === "start" ? `欢迎使用 subs-bot。\n${help}` : help, access: "allowed" };
 }
 
@@ -137,10 +152,12 @@ export async function drainTelegramReplies(
   for (let processed = 0; processed < limit && Date.now() < deadline; processed += 1) {
     const lease = await claimTelegramReply(db, policy.botId);
     if (!lease) return;
-    if (!isReplyDestination(policy, lease)) continue;
+    if (!inTelegramScope(policy, lease)) continue;
     const reply = await renderReply(db, policy, lease);
-    if (Date.now() >= deadline || !await beginTelegramReply(db, policy, lease, reply.access)) continue;
-    const outcome = await sendTelegramReply(policy, lease, reply.text, Math.max(1, deadline - Date.now()), request);
+    const view = reply.buttons?.length ? await prepareTelegramViewTickets(reply.buttons) : undefined;
+    if (Date.now() >= deadline || !await beginTelegramReply(db, policy, lease, reply.access, view?.tickets)) continue;
+    const outcome = await sendTelegramReply(policy, lease, reply.text, Math.max(1, deadline - Date.now()), request,
+      view?.keyboard);
     await settleTelegramReply(db, policy, lease, outcome);
   }
 }

@@ -8,7 +8,7 @@ export interface TelegramPolicy {
   botToken: string;
 }
 
-export interface TelegramCommand {
+export interface TelegramEventScope {
   updateId: number;
   actorId: string;
   chatId: string;
@@ -16,12 +16,24 @@ export interface TelegramCommand {
   messageId: number;
   messageDate: number;
   threadId: number | null;
+}
+
+export interface TelegramCommand extends TelegramEventScope {
   command: "start" | "help" | "list" | "auth-list" | "auth-add" | "auth-remove" | "auth-usage";
 }
 
+export type TelegramViewKind = "list" | "expiry" | "recycle";
+
+export type TelegramViewUpdate = TelegramEventScope & (
+  | { kind: TelegramViewKind }
+  | { kind: "callback"; callbackId: string; ticket: string }
+);
+
+type NormalizedUpdate = { command: TelegramCommand; view?: never } | { view: TelegramViewUpdate; command?: never };
+
 type DecodedTelegramRequest =
-  | { status: 200; command: TelegramCommand }
-  | { status: 204 | 400 | 401 | 413 | 415; command?: never };
+  | ({ status: 200 } & NormalizedUpdate)
+  | { status: 204 | 400 | 401 | 413 | 415; command?: never; view?: never };
 
 const MAX_UPDATE_BYTES = 64 * 1024;
 const USERNAME = /^[A-Za-z0-9_]{5,32}(?![\s\S])/;
@@ -29,6 +41,8 @@ const WEBHOOK_SECRET = /^[A-Za-z0-9_-]{1,256}(?![\s\S])/;
 const BOT_TOKEN = /^[1-9][0-9]*:[A-Za-z0-9_-]{1,128}(?![\s\S])/;
 const JSON_CONTENT_TYPE = /^application\/json(?:\s*;\s*charset\s*=\s*(?:"utf-8"|utf-8))?$/i;
 const BOT_COMMAND = /^\/([A-Za-z0-9_]{1,32})(?:@([A-Za-z0-9_]{5,32}))?(?![\s\S])/;
+const CALLBACK_ID = /^[\u0021-\u007e]{1,128}(?![\s\S])/u;
+const VIEW_TICKET = /^sbv1_[A-Za-z0-9_-]{22}(?![\s\S])/;
 const NON_HUMAN_MESSAGE_FIELDS = [
   "sender_chat", "sender_business_bot", "via_bot", "forward_origin", "forward_date",
   "forward_from", "forward_from_chat", "forward_from_message_id", "forward_sender_name", "forward_signature",
@@ -70,6 +84,12 @@ export function parseTelegramPolicy(input: unknown): TelegramPolicy | null {
   return { botId, botUsername, adminId, memberId, groupId, webhookSecret, botToken };
 }
 
+export function inTelegramScope(policy: TelegramPolicy, event: Pick<TelegramEventScope, "actorId" | "chatId" | "chatType">): boolean {
+  if (event.actorId !== policy.adminId && event.actorId !== policy.memberId) return false;
+  if (event.chatType === "private") return event.chatId === event.actorId;
+  return (event.chatType === "group" || event.chatType === "supergroup") && event.chatId === policy.groupId;
+}
+
 async function verifyWebhookSecret(header: string | null, secret: string): Promise<boolean> {
   if (!matches(header, WEBHOOK_SECRET)) return false;
   const encoder = new TextEncoder();
@@ -108,7 +128,9 @@ function authCommand(args: string[], reply: unknown, memberId: string): Telegram
   }
 }
 
-function messageCommand(message: Record<string, unknown>, policy: TelegramPolicy): TelegramCommand["command"] | null {
+function messageCommand(
+  message: Record<string, unknown>, policy: TelegramPolicy,
+): TelegramCommand["command"] | TelegramViewKind | null {
   const { text, entities } = message;
   if (typeof text !== "string" || !Array.isArray(entities)) return null;
   const commands = entities.filter((entity) => isRecord(entity) && entity.type === "bot_command" && entity.offset === 0);
@@ -129,6 +151,10 @@ function messageCommand(message: Record<string, unknown>, policy: TelegramPolicy
       return "help";
     case "list":
       return "list";
+    case "expire":
+      return "expiry";
+    case "recycle":
+      return "recycle";
     case "auth":
       return authCommand(args, message.reply_to_message, policy.memberId);
     default:
@@ -136,15 +162,9 @@ function messageCommand(message: Record<string, unknown>, policy: TelegramPolicy
   }
 }
 
-function normalizeUpdate(
-  update: Record<string, unknown>, updateId: number, policy: TelegramPolicy,
-): TelegramCommand | null {
-  const message = update.message;
-  // An Update contains at most one event. This intake accepts new messages only.
-  if (Object.keys(update).length !== 2 || !isRecord(message) || "edit_date" in message) return null;
-  const actorId = humanSender(message);
-  if (actorId === null || (actorId !== policy.adminId && actorId !== policy.memberId)) return null;
-
+function messageScope(
+  message: Record<string, unknown>, actorId: string, updateId: number, policy: TelegramPolicy,
+): TelegramEventScope | null {
   const { chat, message_id: messageId, date: messageDate, message_thread_id: threadId } = message;
   if (
     !isRecord(chat) || typeof chat.id !== "number" || !Number.isSafeInteger(chat.id)
@@ -153,14 +173,44 @@ function normalizeUpdate(
   ) return null;
   const chatId = String(chat.id);
   const chatType = chat.type;
-  if (chatType === "private") {
-    if (chatId !== actorId) return null;
-  } else if ((chatType !== "group" && chatType !== "supergroup") || chatId !== policy.groupId) {
-    return null;
-  }
+  if (chatType !== "private" && chatType !== "group" && chatType !== "supergroup") return null;
+  const scope: TelegramEventScope = { updateId, actorId, chatId, chatType, messageId, messageDate, threadId: threadId ?? null };
+  return inTelegramScope(policy, scope) ? scope : null;
+}
 
+function normalizeMessage(
+  message: Record<string, unknown>, updateId: number, policy: TelegramPolicy,
+): NormalizedUpdate | null {
+  if ("edit_date" in message) return null;
+  const actorId = humanSender(message);
+  if (actorId === null) return null;
+  const scope = messageScope(message, actorId, updateId, policy);
+  if (!scope) return null;
   const command = messageCommand(message, policy);
-  return command ? { updateId, actorId, chatId, chatType, messageId, messageDate, threadId: threadId ?? null, command } : null;
+  if (command === "list" || command === "expiry" || command === "recycle") return { view: { ...scope, kind: command } };
+  return command ? { command: { ...scope, command } } : null;
+}
+
+function normalizeCallback(
+  callback: Record<string, unknown>, updateId: number, policy: TelegramPolicy,
+): NormalizedUpdate | null {
+  const { id: callbackId, from: actor, message, data: ticket } = callback;
+  if (!matches(callbackId, CALLBACK_ID) || !matches(ticket, VIEW_TICKET) ||
+      !isRecord(actor) || actor.is_bot !== false || !isPositiveInteger(actor.id) ||
+      !isRecord(message) || "inline_message_id" in callback || "game_short_name" in callback) return null;
+  const bot = message.from;
+  if (!isRecord(bot) || bot.is_bot !== true || !isPositiveInteger(bot.id) || String(bot.id) !== policy.botId) return null;
+  const scope = messageScope(message, String(actor.id), updateId, policy);
+  return scope ? { view: { ...scope, kind: "callback", callbackId, ticket } } : null;
+}
+
+function normalizeUpdate(
+  update: Record<string, unknown>, updateId: number, policy: TelegramPolicy,
+): NormalizedUpdate | null {
+  // An Update contains at most one event.
+  if (Object.keys(update).length !== 2) return null;
+  if (isRecord(update.message)) return normalizeMessage(update.message, updateId, policy);
+  return isRecord(update.callback_query) ? normalizeCallback(update.callback_query, updateId, policy) : null;
 }
 
 export async function decodeTelegramRequest(
@@ -196,8 +246,8 @@ export async function decodeTelegramRequest(
     const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes.subarray(0, size));
     const update: unknown = JSON.parse(text);
     if (!isRecord(update) || !isPositiveInteger(update.update_id)) return { status: 400 };
-    const command = normalizeUpdate(update, update.update_id, policy);
-    return command ? { status: 200, command } : { status: 204 };
+    const event = normalizeUpdate(update, update.update_id, policy);
+    return event ? { status: 200, ...event } : { status: 204 };
   } catch {
     return { status: 400 };
   } finally {
