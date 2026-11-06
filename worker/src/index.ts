@@ -3,7 +3,8 @@ import { isValidStoredShare } from "./stored-share.ts";
 import { serializeStructuredShare } from "./structured-share.ts";
 import { SingBoxContentError } from "./singbox-export.ts";
 import { planSingBox, singBoxChunks } from "./singbox-response.ts";
-import { answerTelegramViewCallback, drainTelegramReplies } from "./telegram/delivery.ts";
+import { answerTelegramCallback, drainTelegramReplies } from "./telegram/delivery.ts";
+import { acceptTelegramLifecycle, reapTelegramLifecycle } from "./telegram/lifecycle-actions.ts";
 import { decodeTelegramRequest, parseTelegramPolicy } from "./telegram/protocol.ts";
 import { acceptTelegramCommand } from "./telegram/store.ts";
 import { acceptTelegramView, reapTelegramViewTickets } from "./telegram/views.ts";
@@ -126,9 +127,17 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
     } else if (decoded.view) {
       const outcome = await acceptTelegramView(env.DB, policy, decoded.view);
       if (decoded.view.kind === "callback") {
-        ctx?.waitUntil(answerTelegramViewCallback(policy, decoded.view.callbackId));
+        ctx?.waitUntil(answerTelegramCallback(policy, decoded.view.callbackId));
       }
       if (outcome === "accepted" || decoded.view.kind !== "callback") {
+        ctx?.waitUntil(drainTelegramReplies(env.DB, policy, 4, 20_000).catch(() => undefined));
+      }
+    } else if (decoded.lifecycle) {
+      const outcome = await acceptTelegramLifecycle(env.DB, policy, decoded.lifecycle);
+      if (decoded.lifecycle.kind === "lifecycle-callback") {
+        ctx?.waitUntil(answerTelegramCallback(policy, decoded.lifecycle.callbackId));
+      }
+      if (outcome === "accepted") {
         ctx?.waitUntil(drainTelegramReplies(env.DB, policy, 4, 20_000).catch(() => undefined));
       }
     }
@@ -194,6 +203,7 @@ async function recoverTelegramReplies(_controller: ScheduledController, env: Env
   try {
     await drainTelegramReplies(env.DB, policy, 10, 45_000);
     await reapTelegramViewTickets(env.DB);
+    await reapTelegramLifecycle(env.DB);
   } catch {
     throw new Error("Telegram scheduled recovery could not finish.");
   }

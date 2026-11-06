@@ -53,8 +53,8 @@ class FixtureTests(unittest.TestCase):
             raise CloudflareError("Synthetic response lost after commit.", uncertain=True)
         return results
 
-    def manage(self, action, cohort=COHORT):
-        return manage(self.api, PATH, action, *plan(POLICY, cohort))
+    def manage(self, action, cohort=COHORT, purpose="views"):
+        return manage(self.api, PATH, action, *plan(POLICY, cohort, purpose), purpose)
 
     def test_seed_and_retire_are_scoped_and_idempotent(self):
         prefix, expected = plan(POLICY, COHORT)
@@ -113,3 +113,42 @@ class FixtureTests(unittest.TestCase):
         for sql in self.observed_queries:
             for value in (prefix, COHORT, POLICY["adminId"], POLICY["memberId"], "CFV-"):
                 self.assertNotIn(value, sql)
+
+    def test_lifecycle_retire_accepts_only_expected_changes_and_preserves_the_view_cohort(self):
+        self.assertEqual(self.manage("seed", purpose="lifecycle"), {"active": 2, "trashed": 2, "removed": 0})
+        self.manage("seed")
+        prefix, expected = plan(POLICY, COHORT, "lifecycle")
+        initial = read_cohort(self.api, PATH, prefix, expected)
+        renamed = initial[prefix + "AL01"]
+        moved = initial[prefix + "BL01"]
+        self.db.execute("UPDATE subscriptions SET name = name || '-renamed' WHERE id = ?", (renamed["id"],))
+        self.db.executemany("INSERT INTO subscription_lifecycle (subscription_id,revision) VALUES (?,1)",
+                            [(renamed["id"],), (moved["id"],)])
+        self.db.execute("""
+            INSERT INTO subscription_trash
+                (id, owner_id, name, source_url, token, expire_at, created_at, updated_at, generation, node_count,
+                 deleted_at, lifecycle_revision)
+            SELECT id, owner_id, name, source_url, token, expire_at, created_at, updated_at, generation, node_count,
+                 unixepoch(), 1 FROM subscriptions WHERE id = ?
+        """, (moved["id"],))
+        self.db.execute("DELETE FROM subscriptions WHERE id = ?", (moved["id"],))
+        with self.assertRaisesRegex(FixtureError, "ambiguous"):
+            self.manage("seed", purpose="lifecycle")
+        self.assertEqual(self.manage("retire", purpose="lifecycle"), {"active": 0, "trashed": 0, "removed": 4})
+        self.assertEqual(len(read_cohort(self.api, PATH, *plan(POLICY, COHORT))), 22)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM subscription_lifecycle").fetchone()[0], 10)
+
+    def test_lifecycle_retire_refuses_unknown_name_or_published_fixture(self):
+        self.manage("seed", purpose="lifecycle")
+        prefix, expected = plan(POLICY, COHORT, "lifecycle")
+        row = read_cohort(self.api, PATH, prefix, expected)[prefix + "AL01"]
+        self.db.execute("UPDATE subscriptions SET name = 'Unknown title' WHERE id = ?", (row["id"],))
+        with self.assertRaisesRegex(FixtureError, "ambiguous"):
+            self.manage("retire", purpose="lifecycle")
+        self.db.execute("""
+            UPDATE subscriptions SET name = ?, generation = 1, node_count = 1, snapshot_id = ?, manifest_sha256 = ?
+            WHERE id = ?
+        """, (row["name"], "11111111-1111-4111-8111-111111111111", "a" * 64, row["id"]))
+        with self.assertRaisesRegex(FixtureError, "ambiguous"):
+            self.manage("retire", purpose="lifecycle")
+        self.assertEqual(self.write_calls, 1)

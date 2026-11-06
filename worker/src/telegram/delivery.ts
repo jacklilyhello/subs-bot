@@ -1,4 +1,7 @@
 import { listOwnedSubscriptions } from "../subscriptions.ts";
+import {
+  prepareTelegramLifecycleTickets, renderTelegramLifecycle, type TelegramLifecycleButton,
+} from "./lifecycle-actions.ts";
 import { inTelegramScope, type TelegramPolicy } from "./protocol.ts";
 import {
   beginTelegramReply, claimTelegramReply, isTelegramMemberAllowed,
@@ -55,6 +58,7 @@ export async function sendTelegramReply(
   timeoutMs: number,
   request: typeof fetch = fetch,
   keyboard?: InlineKeyboard,
+  forceReply = false,
 ): Promise<TelegramReplyOutcome> {
   if (!inTelegramScope(policy, lease)) return { kind: "failed" };
   try {
@@ -68,7 +72,8 @@ export async function sendTelegramReply(
         ...(lease.threadId === null ? {} : { message_thread_id: lease.threadId }),
         reply_parameters: { message_id: lease.messageId, allow_sending_without_reply: true },
         link_preview_options: { is_disabled: true },
-        ...(keyboard?.length ? { reply_markup: { inline_keyboard: keyboard } } : {}),
+        ...(keyboard?.length ? { reply_markup: { inline_keyboard: keyboard } }
+          : forceReply && lease.chatType === "private" ? { reply_markup: { force_reply: true } } : {}),
         text,
       }),
     });
@@ -94,7 +99,7 @@ export async function sendTelegramReply(
   return { kind: "uncertain" };
 }
 
-export async function answerTelegramViewCallback(policy: TelegramPolicy, callbackId: string): Promise<void> {
+export async function answerTelegramCallback(policy: TelegramPolicy, callbackId: string): Promise<void> {
   try {
     const response = await fetch(`${BOT_API}/bot${policy.botToken}/answerCallbackQuery`, {
       method: "POST",
@@ -113,7 +118,13 @@ async function renderReply(
   db: D1Database,
   policy: TelegramPolicy,
   lease: TelegramReplyLease,
-): Promise<{ text: string; access: ReplyAccess; buttons?: TelegramViewButton[] }> {
+): Promise<{
+  text: string;
+  access: ReplyAccess;
+  buttons?: TelegramViewButton[];
+  lifecycleButtons?: TelegramLifecycleButton[];
+  forceReply?: boolean;
+}> {
   if (lease.command.startsWith("auth-")) {
     if (lease.actorId !== policy.adminId) return { text: "只有管理员可以管理授权。", access: "none" };
     if (lease.chatType !== "private") return { text: "请在私聊中管理授权。", access: "none" };
@@ -126,6 +137,10 @@ async function renderReply(
   }
   const allowed = lease.actorId === policy.adminId || await isTelegramMemberAllowed(db, policy);
   if (!allowed) return { text: "当前账号没有使用权限。", access: "denied" };
+  if (lease.lifecycle) {
+    const { text, buttons, forceReply } = renderTelegramLifecycle(lease.lifecycle);
+    return { text, lifecycleButtons: buttons, forceReply, access: "allowed" };
+  }
   if (lease.view) return { ...await renderTelegramView(db, lease.actorId, lease.view), access: "allowed" };
   if (lease.command === "list") {
     const page = await listOwnedSubscriptions(db, lease.actorId, { limit: LIST_LIMIT });
@@ -154,10 +169,15 @@ export async function drainTelegramReplies(
     if (!lease) return;
     if (!inTelegramScope(policy, lease)) continue;
     const reply = await renderReply(db, policy, lease);
-    const view = reply.buttons?.length ? await prepareTelegramViewTickets(reply.buttons) : undefined;
-    if (Date.now() >= deadline || !await beginTelegramReply(db, policy, lease, reply.access, view?.tickets)) continue;
+    const [view, lifecycle] = await Promise.all([
+      reply.buttons?.length ? prepareTelegramViewTickets(reply.buttons) : undefined,
+      reply.lifecycleButtons?.length ? prepareTelegramLifecycleTickets(reply.lifecycleButtons) : undefined,
+    ]);
+    if (Date.now() >= deadline ||
+      !await beginTelegramReply(db, policy, lease, reply.access, view?.tickets, lifecycle?.tickets)) continue;
+    const keyboard = [...(view?.keyboard ?? []), ...(lifecycle?.keyboard ?? [])];
     const outcome = await sendTelegramReply(policy, lease, reply.text, Math.max(1, deadline - Date.now()), request,
-      view?.keyboard);
+      keyboard, reply.forceReply);
     await settleTelegramReply(db, policy, lease, outcome);
   }
 }

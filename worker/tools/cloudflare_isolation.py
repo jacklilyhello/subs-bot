@@ -39,9 +39,10 @@ READBACK_DELAYS = (0, 1, 2, 4)
 
 
 class CloudflareError(RuntimeError):
-    def __init__(self, message, *, uncertain=False):
+    def __init__(self, message, *, uncertain=False, http_status=None):
         super().__init__(message)
         self.uncertain = uncertain
+        self.http_status = http_status
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -97,7 +98,7 @@ class CloudflareClient:
             error.close()
             uncertain = method != "GET" and (error.code == 408 or error.code >= 500)
             raise CloudflareError(f"Cloudflare API rejected the request (HTTP {error.code}).",
-                                  uncertain=uncertain) from None
+                                  uncertain=uncertain, http_status=error.code) from None
         except (OSError, ValueError, HTTPException):
             raise CloudflareError("Cloudflare API connection failed.", uncertain=method != "GET") from None
         try:
@@ -287,6 +288,22 @@ class _Isolation:
         return _Version(rev["text"], sha256(body).hexdigest(), version["compatibility_date"],
                         annotations.get("workers/tag"), telegram_digest)
 
+    def verify_candidate(self, candidate, desired):
+        # A version can be visible in its creation response or listing before its module is readable.
+        for delay in READBACK_DELAYS:
+            if delay:
+                sleep(delay)
+            try:
+                actual = self.version(candidate)
+            except CloudflareError as error:
+                if error.http_status != 404:
+                    raise
+                continue
+            _require(actual == desired, "Isolated candidate Worker version differs from the verified artifact.")
+            return candidate
+        raise CloudflareError("Isolated candidate Worker version readback could not be confirmed (HTTP 404).",
+                              uncertain=True, http_status=404)
+
     def staged(self, desired):
         rows = self.worker_api("GET", self.versions + "?page=1&per_page=100")
         _require(isinstance(rows, list), "Invalid Cloudflare Worker version list.")
@@ -299,9 +316,7 @@ class _Isolation:
         _require(len(candidates) <= 1, "More than one isolated Worker version claims the target revision.")
         if not candidates:
             return None
-        candidate = candidates[0]
-        _require(self.version(candidate) == desired, "Staged isolated Worker version differs from the verified artifact.")
-        return candidate
+        return self.verify_candidate(candidates[0], desired)
 
     def upload(self, module, desired, telegram_config):
         bindings = [
@@ -329,12 +344,13 @@ class _Isolation:
             })
         except CloudflareError as error:
             if not error.uncertain:
+                if error.http_status is not None:
+                    raise CloudflareError(f"Isolated Worker version upload was rejected (HTTP {error.http_status}).",
+                                          http_status=error.http_status) from None
                 raise
             result = None
         if isinstance(result, dict) and _matches(UUID, result.get("id")):
-            candidate = result["id"]
-            _require(self.version(candidate) == desired, "Uploaded isolated Worker version differs from the verified artifact.")
-            return candidate
+            return self.verify_candidate(result["id"], desired)
         for delay in READBACK_DELAYS:
             if delay:
                 sleep(delay)
@@ -352,6 +368,9 @@ class _Isolation:
             })
         except CloudflareError as error:
             if not error.uncertain:
+                if error.http_status is not None:
+                    raise CloudflareError(f"Isolated Worker activation was rejected (HTTP {error.http_status}).",
+                                          http_status=error.http_status) from None
                 raise
             result = None
         ack = result.get("id") if isinstance(result, dict) else None

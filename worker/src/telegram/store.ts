@@ -2,12 +2,17 @@ import { inTelegramScope, type TelegramCommand, type TelegramPolicy } from "./pr
 import {
   insertTelegramViewTickets, TELEGRAM_VIEW_MARKER, type TelegramView, type TelegramViewTicket,
 } from "./views.ts";
+import {
+  insertTelegramLifecycleTickets, TELEGRAM_LIFECYCLE_MARKER,
+  type TelegramLifecycleReply, type TelegramLifecycleTicket,
+} from "./lifecycle-actions.ts";
 
 export interface TelegramReplyLease extends TelegramCommand {
   receiptId: number;
   leaseId: string;
   attempts: number;
   view: TelegramView | null;
+  lifecycle?: TelegramLifecycleReply;
 }
 
 export type TelegramReplyOutcome =
@@ -20,15 +25,20 @@ const MAX_REPLY_AGE_SECONDS = 15 * 60;
 const MAX_ATTEMPTS = 4;
 const REAP_LIMIT = 40;
 
-type ReplyRow = Omit<TelegramReplyLease, "view"> & {
+type ReplyRow = Omit<TelegramReplyLease, "view" | "lifecycle"> & {
   viewKind: TelegramView["kind"] | null;
   afterId: number | null;
   afterEpoch: number | null;
+  lifecycleKind: TelegramLifecycleReply["kind"] | null;
+  lifecycleSubscriptionId: number | null;
+  lifecycleExpectedRevision: number | null;
 };
 
 function supportedReceipt(alias: "inbox" | "earlier"): string {
   return `(${alias}.receipt_nonce IS NULL OR (${alias}.receipt_nonce = '${TELEGRAM_VIEW_MARKER}'
-    AND EXISTS (SELECT 1 FROM telegram_view WHERE receipt_id = ${alias}.receipt_id)))`;
+    AND EXISTS (SELECT 1 FROM telegram_view WHERE receipt_id = ${alias}.receipt_id))
+    OR (${alias}.receipt_nonce = '${TELEGRAM_LIFECYCLE_MARKER}'
+    AND EXISTS (SELECT 1 FROM telegram_lifecycle_action WHERE receipt_id = ${alias}.receipt_id)))`;
 }
 
 export async function acceptTelegramCommand(
@@ -115,17 +125,24 @@ export async function claimTelegramReply(db: D1Database, botId: string): Promise
         inbox.chat_id AS chatId, inbox.chat_type AS chatType,
         inbox.message_id AS messageId, inbox.message_date AS messageDate, inbox.thread_id AS threadId,
         inbox.command, reply.lease_id AS leaseId, reply.attempts,
-        page.kind AS viewKind, page.after_id AS afterId, page.after_epoch AS afterEpoch
+        page.kind AS viewKind, page.after_id AS afterId, page.after_epoch AS afterEpoch,
+        action.kind AS lifecycleKind, action.subscription_id AS lifecycleSubscriptionId,
+        action.expected_revision AS lifecycleExpectedRevision
       FROM telegram_outbox AS reply JOIN telegram_inbox AS inbox USING (receipt_id)
       LEFT JOIN telegram_view AS page ON page.receipt_id = inbox.receipt_id AND inbox.receipt_nonce = '${TELEGRAM_VIEW_MARKER}'
+      LEFT JOIN telegram_lifecycle_action AS action ON action.receipt_id = inbox.receipt_id
+        AND inbox.receipt_nonce = '${TELEGRAM_LIFECYCLE_MARKER}'
       WHERE reply.lease_id = ? AND reply.state = 'leased' AND inbox.bot_id = ? AND ${supportedReceipt("inbox")}
     `).bind(leaseId, botId),
   ]);
   if (!write?.success || !read?.success) throw new Error("Telegram reply claim could not be confirmed.");
   const row = read.results[0];
   if (!row) return null;
-  const { viewKind, afterId, afterEpoch, ...lease } = row;
-  return { ...lease, view: viewKind === null ? null : { kind: viewKind, afterId, afterEpoch } };
+  const { viewKind, afterId, afterEpoch, lifecycleKind, lifecycleSubscriptionId, lifecycleExpectedRevision, ...lease } = row;
+  const lifecycle = lifecycleKind === null || lifecycleSubscriptionId === null || lifecycleExpectedRevision === null
+    ? undefined : { kind: lifecycleKind, subscriptionId: lifecycleSubscriptionId, expectedLifecycleRevision: lifecycleExpectedRevision };
+  return { ...lease, view: viewKind === null ? null : { kind: viewKind, afterId, afterEpoch },
+    ...(lifecycle ? { lifecycle } : {}) };
 }
 
 export async function beginTelegramReply(
@@ -134,8 +151,10 @@ export async function beginTelegramReply(
   lease: TelegramReplyLease,
   access: "allowed" | "denied" | "none",
   tickets: readonly TelegramViewTicket[] = [],
+  lifecycleTickets: readonly TelegramLifecycleTicket[] = [],
 ): Promise<boolean> {
-  if (!inTelegramScope(policy, lease) || (tickets.length > 0 && (!lease.view || access !== "allowed"))) return false;
+  if (!inTelegramScope(policy, lease) || (tickets.length > 0 && (!lease.view || access !== "allowed"))
+    || (lifecycleTickets.length > 0 && (!(lease.view || lease.lifecycle) || access !== "allowed"))) return false;
 
   const begin = db.prepare(`
     UPDATE telegram_outbox SET state = 'sending', lease_until = unixepoch() + ${LEASE_SECONDS}
@@ -155,17 +174,27 @@ export async function beginTelegramReply(
     RETURNING receipt_id
   `).bind(lease.leaseId, lease.attempts, policy.botId, lease.updateId, lease.receiptId, lease.actorId, lease.chatId, lease.chatType,
     lease.messageId, lease.messageDate, lease.threadId, lease.command, access, policy.adminId, access);
-  if (tickets.length === 0) return await begin.first() !== null;
+  if (tickets.length === 0 && lifecycleTickets.length === 0) return await begin.first() !== null;
 
-  const [state, ticketWrite] = await db.batch<{ receipt_id: number }>([
-    begin, insertTelegramViewTickets(db, lease.receiptId, lease.attempts, lease.leaseId, tickets),
-  ]);
-  if (!state?.success || !ticketWrite?.success) throw new Error("Telegram view reply could not be confirmed.");
-  if (state.results.length === 0 && ticketWrite.meta.changes === 0) return false;
-  if (state.results.length !== 1 || state.results[0].receipt_id !== lease.receiptId || ticketWrite.meta.changes !== tickets.length) {
-    throw new Error("Telegram view reply could not be confirmed.");
+  const statements = [begin];
+  const ticketCounts: number[] = [];
+  if (tickets.length > 0) {
+    statements.push(insertTelegramViewTickets(db, lease.receiptId, lease.attempts, lease.leaseId, tickets));
+    ticketCounts.push(tickets.length);
   }
-  return true;
+  if (lifecycleTickets.length > 0) {
+    statements.push(insertTelegramLifecycleTickets(db, lease.receiptId, lease.attempts, lease.leaseId,
+      lifecycleTickets, tickets.length || 1));
+    ticketCounts.push(lifecycleTickets.length);
+  }
+  const [state, ...writes] = await db.batch<{ receipt_id: number }>(statements);
+  const changed = state?.results.length;
+  if (!state?.success || (changed !== 0 && changed !== 1) ||
+      (changed === 1 && state.results[0].receipt_id !== lease.receiptId) || writes.length !== ticketCounts.length ||
+      writes.some((write, index) => !write.success || write.meta.changes !== changed * ticketCounts[index])) {
+    throw new Error("Telegram reply tickets could not be confirmed.");
+  }
+  return changed === 1;
 }
 
 export async function settleTelegramReply(
