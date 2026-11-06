@@ -199,3 +199,45 @@ test("honors retry delays, caps attempts, and expires old pending replies", asyn
   assert.equal((await outbox(scope, 51))?.state, "failed");
   assert.equal(await claimTelegramReply(db, scope.botId), null);
 });
+
+test("legacy delivery skips marked receipts without blocking the same actor and chat", async () => {
+  const scope = policy("109");
+  const extended = command(scope, 60, { command: "help" });
+  await acceptTelegramCommand(db, scope, extended);
+  await db.prepare("UPDATE telegram_inbox SET receipt_nonce = ? WHERE bot_id = ? AND update_id = ?")
+    .bind("action:v1", scope.botId, extended.updateId).run();
+  await acceptTelegramCommand(db, scope, command(scope, 61));
+  await acceptTelegramCommand(db, scope, command(scope, 62));
+  await acceptTelegramCommand(db, scope, command(scope, 63, { chatId: scope.groupId, chatType: "supergroup" }));
+
+  const first = await claimTelegramReply(db, scope.botId);
+  const group = await claimTelegramReply(db, scope.botId);
+  assert.ok(first);
+  assert.ok(group);
+  assert.equal(first.updateId, 61);
+  assert.equal(group.updateId, 63);
+  assert.equal(await claimTelegramReply(db, scope.botId), null);
+  assert.equal(await beginTelegramReply(db, scope, first, "allowed"), true);
+  await settleTelegramReply(db, scope, first, { kind: "sent", messageId: 1000 });
+  assert.equal((await claimTelegramReply(db, scope.botId))?.updateId, 62);
+  assert.deepEqual(await outbox(scope, 60), { state: "pending", attempts: 0, leaseId: null, sentMessageId: null });
+
+  const extendedLease = { ...extended, attempts: 1, leaseId: "synthetic-action-lease" };
+  await db.prepare(`
+    UPDATE telegram_outbox SET state = 'leased', attempts = 1, lease_id = ?, lease_until = unixepoch() + 30
+    WHERE receipt_id = (SELECT receipt_id FROM telegram_inbox WHERE bot_id = ? AND update_id = ?)
+  `).bind(extendedLease.leaseId, scope.botId, extended.updateId).run();
+  assert.equal(await beginTelegramReply(db, scope, extendedLease, "allowed"), false);
+  await db.prepare("UPDATE telegram_outbox SET state = 'sending' WHERE lease_id = ?")
+    .bind(extendedLease.leaseId).run();
+  await settleTelegramReply(db, scope, extendedLease, { kind: "sent", messageId: 1001 });
+  assert.equal((await outbox(scope, 60))?.state, "sending");
+
+  await expireLease(extendedLease.leaseId);
+  await expireLease(group.leaseId);
+  await reapExpiredTelegramReplies(db, scope.botId);
+  assert.deepEqual(await outbox(scope, 60), {
+    state: "sending", attempts: 1, leaseId: extendedLease.leaseId, sentMessageId: null,
+  });
+  assert.equal((await outbox(scope, 63))?.state, "pending");
+});
