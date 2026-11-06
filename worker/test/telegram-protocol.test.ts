@@ -239,6 +239,50 @@ test("drops malformed, inaccessible, inline and out-of-scope view callbacks", as
   assert.deepEqual(await decode({ update_id: updateId, callback_query: callback(), message: message() }), { status: 204 });
 });
 
+test("dispatches an action callback only for the scoped bot and fixed token namespace", async () => {
+  const ticket = "sba1_ABCDEFGHIJKLMNOPQRSTUA";
+  const event = callback({ data: ticket });
+  assert.deepEqual(await decode({ update_id: updateId, callback_query: event }), {
+    status: 200,
+    lifecycle: {
+      updateId, actorId: policy.adminId, chatId: policy.adminId, chatType: "private",
+      messageId: 32, messageDate, threadId: null, kind: "lifecycle-callback", callbackId, ticket,
+    },
+  });
+  assert.deepEqual(await decode({ update_id: updateId, callback_query: { ...event, data: ticket + "\n" } }), {
+    status: 204,
+  });
+});
+
+test("normalizes only an explicit reply to an earlier own-bot message in the same group topic", async () => {
+  const chat = { id: Number(policy.groupId), type: "supergroup" };
+  const prompt = callback({}, { chat, message_id: 14, message_thread_id: 212 }).message;
+  const fields = { chat, message_thread_id: 212, entities: [], reply_to_message: prompt };
+  assert.deepEqual(await decodeMessage("新名称", fields), {
+    status: 200,
+    lifecycle: {
+      updateId, actorId: policy.adminId, chatId: policy.groupId, chatType: "supergroup", threadId: 212,
+      messageId: 15, messageDate, kind: "rename-reply", promptMessageId: 14, text: "新名称",
+    },
+  });
+  assert.equal((await decodeMessage("/cancel", {
+    ...fields, entities: [{ type: "bot_command", offset: 0, length: 7 }],
+  })).lifecycle?.kind, "rename-reply");
+  assert.equal((await decodeMessage("/list", {
+    ...fields, entities: [{ type: "bot_command", offset: 0, length: 5 }],
+  })).view?.kind, "list");
+  for (const reply of [
+    undefined, { ...prompt, chat: { ...chat, id: -42 } }, { ...prompt, message_thread_id: 213 },
+    { ...prompt, date: messageDate + 1 }, { ...prompt, message_id: 15 },
+    { ...prompt, from: { id: Number(policy.adminId), is_bot: false } },
+  ]) {
+    assert.deepEqual(await decodeMessage("新名称", { ...fields, reply_to_message: reply }), { status: 204 });
+  }
+  assert.deepEqual(await decodeMessage("/another@Other_Bot", {
+    ...fields, entities: [{ type: "bot_command", offset: 0, length: 18 }],
+  }), { status: 204 });
+});
+
 test("drops unknown actors and chats, channel posts, bots, anonymous, forwarded and edited events", async () => {
   for (const fields of [
     { from: { id: 123, is_bot: false } },

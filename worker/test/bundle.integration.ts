@@ -126,11 +126,12 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
     botId: "123456789", botUsername: "fixture_subs_bot", adminId: "1001", memberId: "1002", groupId: "-1003",
     botToken: `123456789:${"a".repeat(35)}`, webhookSecret: "fixture-webhook-secret-00000000000000",
   };
-  const replies: Array<{ chatId: string; messageId: number; replyTo: number; text: string; button?: string }> = [];
+  const replies: Array<{ chatId: string; messageId: number; replyTo: number; text: string; button?: string; actions?: number }> = [];
   const sentBodies: unknown[] = [];
   const callbackId = "fixture-page-callback";
   let acknowledged = 0;
   let nextTicket: string | undefined;
+  let renameTicket: string | undefined;
   const botPath = `/bot${policy.botToken}/sendMessage`;
   const miniflare = new Miniflare({
     modules: true,
@@ -159,13 +160,16 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
       sentBodies.push(observed);
       assert.deepEqual(observed, { chatId: expected.chatId, text: expected.text, replyTo: expected.replyTo });
       if (expected.button) {
-        const keyboard = payload.reply_markup?.inline_keyboard;
-        assert.equal(keyboard?.length, 1);
-        assert.equal(keyboard?.[0]?.length, 1);
-        const button = keyboard![0][0];
+        const [button, ...actions] = payload.reply_markup?.inline_keyboard.flat() ?? [];
+        assert.ok(button);
         assert.equal(button.text, expected.button);
         assert.match(button.callback_data, /^sbv1_[A-Za-z0-9_-]{22}$/u);
         if (button.text === "下一页") nextTicket = button.callback_data;
+        const expectedLabels = Array.from({ length: expected.actions ?? 0 }, (_, index) =>
+          [`${index + 1} 重命名`, `${index + 1} 删除`]).flat();
+        assert.deepEqual(actions.map(({ text }) => text), expectedLabels);
+        for (const action of actions) assert.match(action.callback_data, /^sba1_[A-Za-z0-9_-]{22}$/u);
+        renameTicket = actions[0]?.callback_data;
       } else {
         assert.equal(payload.reply_markup, undefined);
       }
@@ -177,6 +181,7 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
     assert.deepEqual(fixture.migrations.slice(0, 4).map(({ name }: { name: string }) => name), [
       "0001_subscriptions.sql", "0002_telegram.sql", "0003_subscription_lifecycle.sql", "0004_telegram_views.sql",
     ]);
+    assert.equal(fixture.migrations[5]?.name, "0006_telegram_lifecycle.sql");
     await applyMigrations(db, directory, fixture.migrations.slice(0, 2));
     const url = "https://provider.example.invalid/synthetic";
     await db.prepare(`
@@ -194,8 +199,8 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
       chat: { id: Number(policy.groupId), type: "group" },
       entities: [{ type: "bot_command", offset: 0, length: text.length }],
     };
-    function expectSend(chatId: string, messageId: number, replyTo: number, expectedText: string, button?: string) {
-      replies.push({ chatId, messageId, replyTo, text: expectedText, button });
+    function expectSend(chatId: string, messageId: number, replyTo: number, expectedText: string, button?: string, actions?: number) {
+      replies.push({ chatId, messageId, replyTo, text: expectedText, button, actions });
       return { chatId, text: expectedText, replyTo };
     }
     const webhook = "https://subs-bot.example/telegram/webhook";
@@ -231,8 +236,9 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
 
     assert.equal((await post({ update_id: 10, message }, "invalid")).status, 401);
     assert.equal((await post({ update_id: 10, message: { ...message, chat: { ...message.chat, id: -2000 } } })).status, 204);
-    const firstPage = ["你的订阅", "• Member fixture", ...Array.from({ length: 7 }, (_, index) => `• Member fixture ${index + 2}`)].join("\n");
-    const expectedGroup = expectSend(policy.groupId, 8, 7, firstPage, "下一页");
+    const firstPage = ["你的订阅", "1. Member fixture", ...Array.from({ length: 7 }, (_, index) =>
+      `${index + 2}. Member fixture ${index + 2}`)].join("\n");
+    const expectedGroup = expectSend(policy.groupId, 8, 7, firstPage, "下一页", 8);
     const update = { update_id: 11, message };
     assert.deepEqual((await Promise.all([post(update), post(update)])).map((result) => result.status), [200, 200]);
 
@@ -248,7 +254,7 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
     }
     await waitForReplies([10, 8]);
     assert.ok(nextTicket);
-    const expectedNext = expectSend(policy.groupId, 9, 8, "你的订阅\n• Member fixture 9", "第一页");
+    const expectedNext = expectSend(policy.groupId, 9, 8, "你的订阅\n1. Member fixture 9", "第一页", 1);
     const callback = { update_id: 13, callback_query: {
       id: callbackId, data: nextTicket, chat_instance: "synthetic-instance", from: message.from,
       message: { date, message_id: 8, chat: message.chat, from: { id: Number(policy.botId), is_bot: true } },
@@ -256,7 +262,27 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
     assert.deepEqual((await Promise.all([post(callback), post(callback)])).map((result) => result.status), [200, 200]);
     await waitForReplies([10, 8, 9], 2);
     assert.equal(acknowledged, 2);
-    assert.deepEqual(sentBodies, [expectedPrivate, expectedGroup, expectedNext]);
+
+    assert.ok(renameTicket);
+    const prompt = expectSend(policy.groupId, 18, 9, "请回复这条消息，发送新的订阅名称。发送 /cancel 取消。");
+    const botMessage = { ...callback.callback_query.message, message_id: 9 };
+    assert.equal((await post({ update_id: 14, callback_query: {
+      ...callback.callback_query, data: renameTicket, message: botMessage,
+    } })).status, 200);
+    await waitForReplies([10, 8, 9, 18], 3);
+    const confirmation = expectSend(policy.groupId, 20, 19, "订阅名称已更新。");
+    const rename = { update_id: 15, message: {
+      ...message, message_id: 19, text: "Renamed in compiled Worker", entities: [],
+      reply_to_message: { ...botMessage, message_id: 18 },
+    } };
+    assert.deepEqual((await Promise.all([post(rename), post(rename)])).map((result) => result.status), [200, 200]);
+    await waitForReplies([10, 8, 9, 18, 20], 3);
+    assert.deepEqual(await db.prepare(`
+      SELECT owner_id, name, revision
+      FROM subscriptions JOIN subscription_lifecycle ON id = subscription_id
+      WHERE owner_id = ?
+    `).bind(policy.memberId).first(), { owner_id: policy.memberId, name: "Renamed in compiled Worker", revision: 1 });
+    assert.deepEqual(sentBodies, [expectedPrivate, expectedGroup, expectedNext, prompt, confirmation]);
     assert.deepEqual(replies, []);
   } finally {
     await miniflare.dispose();
