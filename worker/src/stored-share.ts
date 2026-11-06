@@ -17,7 +17,7 @@ const SS_2022_KEY_BYTES = new Map([
 const INVALID_LINE_CHARACTER = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\ud800-\udfff]/u;
 const DOMAIN_LABEL = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?![\s\S])/u;
 const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
-const percentUtf8 = new TextDecoder("utf-8", { ignoreBOM: true });
+const percentUtf8 = new TextDecoder("utf-8", { fatal: false, ignoreBOM: true });
 
 function splitOnce(value: string, separator: string): [string, string | undefined] {
   const index = value.indexOf(separator);
@@ -227,8 +227,12 @@ function vmessJsonText(raw: string): string {
     }
     return decoded;
   }
-  if ((a === 254 && b === 255) || a === 0) return new TextDecoder("utf-16be", { fatal: true }).decode(bytes);
-  if ((a === 255 && b === 254) || b === 0) return new TextDecoder("utf-16le", { fatal: true }).decode(bytes);
+  if ((a === 254 && b === 255) || a === 0) {
+    return new TextDecoder("utf-16be", { fatal: true, ignoreBOM: false }).decode(bytes);
+  }
+  if ((a === 255 && b === 254) || b === 0) {
+    return new TextDecoder("utf-16le", { fatal: true, ignoreBOM: false }).decode(bytes);
+  }
   return utf8.decode(bytes).replace(/^\uFEFF/u, "");
 }
 
