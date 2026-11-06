@@ -169,6 +169,33 @@ test("malformed links and corrupt or missing snapshots fail without partial cred
   }
 });
 
+test("preflights legacy authority and ECH validity for every alias without leaking private content", async () => {
+  const hopping = "hysteria2://fixture:pass@[2001:db8::5]:443,8443-8445/?ech=AAT-DQAA#港 😀";
+  const stored = fixture([[{ share: LINK }, { share: hopping }]]);
+  const response = await request("/sub/" + TOKEN + "/mixed", stored.env);
+  assert.equal(response.status, 200);
+  assertPrivate(response);
+  assert.equal(Buffer.from(await response.text(), "base64").toString("utf8"), LINK + "\n" + hopping);
+
+  const invalidLinks = [
+    "hy2://fixture-secret@proxy.example.invalid?ech=%2Ffixture%2Fsecret-path",
+    "trojan://proxy.example.invalid:443#fixture-secret",
+    "ss://fixture-secret",
+  ];
+  for (const invalid of invalidLinks) {
+    const rejected = fixture([[{ share: LINK }], [{ share: invalid }]]);
+    const result = await request("/sub/" + TOKEN + "/v2ray", rejected.env);
+    assert.equal(result.status, 422);
+    assertPrivate(result);
+    assert.equal(await result.text(), "Subscription content cannot be exported.");
+    assert.deepEqual(rejected.reads, ["manifest.json", "0.ndjson", "1.ndjson"].map((name) => PREFIX + name));
+    const head = await request("/sub/" + TOKEN + "/base64", rejected.env, "HEAD");
+    assert.equal(head.status, 422);
+    assertPrivate(head);
+    assert.equal(head.body, null);
+  }
+});
+
 test("a second-pass R2 failure errors the body after earlier bytes without exposing backend details", async () => {
   const first = LINK + "x".repeat(24 * 1024);
   const { env } = fixture([[{ share: first }], [{ share: `${LINK}later` }]]);

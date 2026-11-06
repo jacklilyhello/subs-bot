@@ -1,4 +1,5 @@
 import { getSubscriptionSnapshot, readSnapshotNodes, type SubscriptionSnapshot } from "./storage.ts";
+import { isValidStoredShare } from "./stored-share.ts";
 import { drainTelegramReplies } from "./telegram/delivery.ts";
 import { decodeTelegramRequest, parseTelegramPolicy } from "./telegram/protocol.ts";
 import { acceptTelegramCommand } from "./telegram/store.ts";
@@ -15,8 +16,6 @@ const MAX_SHARE_BYTES = 16 * 1024 * 1024;
 const SHARE_CHUNK_BYTES = 24 * 1024;
 const EXPORT_KINDS = new Set(["base64", "v2ray", "mixed"]);
 const SUBSCRIPTION_PATH = /^\/sub\/([A-Za-z0-9_-]{16,128})(?:\/([A-Za-z0-9-]{1,32}))?$/;
-const SHARE_LINE = /^(?:ss|ssr|vmess|vless|trojan|hysteria2?|hy2|tuic|snell|wireguard|anytls|socks5(?:-tls)?):\/\/[^\s#]+(?:#[^\r\n\u2028\u2029]*)?$/i;
-const UNSAFE_SHARE_CHARACTER = /[\u0000-\u001f\u007f-\u009f\ud800-\udfff]/u;
 const HEADERS = {
   "Cache-Control": "private, no-store",
   "Referrer-Policy": "no-referrer",
@@ -40,7 +39,7 @@ async function* shareBytes(
 
   for await (const node of readSnapshotNodes(bucket, snapshot, signal)) {
     const share = node.share;
-    if (typeof share !== "string" || UNSAFE_SHARE_CHARACTER.test(share) || !SHARE_LINE.test(share)) {
+    if (!isValidStoredShare(share)) {
       throw new ExportContentError();
     }
     const line = encoder.encode(total === 0 ? share : `\n${share}`);
