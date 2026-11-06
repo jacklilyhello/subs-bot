@@ -193,7 +193,7 @@ export async function decodeTelegramRequest(
       bytes.set(value, size);
       size += value.byteLength;
     }
-    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, size));
+    const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes.subarray(0, size));
     const update: unknown = JSON.parse(text);
     if (!isRecord(update) || !isPositiveInteger(update.update_id)) return { status: 400 };
     const command = normalizeUpdate(update, update.update_id, policy);

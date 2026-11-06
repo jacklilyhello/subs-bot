@@ -21,7 +21,7 @@ function isReplyDestination(policy: TelegramPolicy, lease: TelegramReplyLease): 
 async function readBotReply(response: Response): Promise<unknown> {
   if (!response.body) return null;
   const reader = response.body.getReader();
-  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
   let total = 0;
   let text = "";
   try {
