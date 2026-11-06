@@ -8,7 +8,8 @@
   "scripts": {
     "check": "tsc --noEmit",
     "build": "esbuild src/index.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=dist/index.js",
-    "test": "node --test test/*.test.ts"
+    "test": "node --test test/*.test.ts",
+    "test:bundle": "node --test test/bundle.integration.ts"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20261106.1",

@@ -26,52 +26,64 @@ function plain(text: string, status: number, head: boolean, headers?: HeadersIni
   return new Response(head ? null : text, { status, headers: responseHeaders });
 }
 
-async function collectShares(bucket: R2Bucket, snapshot: SubscriptionSnapshot): Promise<Uint8Array[] | null> {
+class ExportContentError extends Error {}
+
+async function* shareBytes(bucket: R2Bucket, snapshot: SubscriptionSnapshot): AsyncGenerator<Uint8Array> {
   const encoder = new TextEncoder();
-  const chunks: Uint8Array[] = [];
-  let chunk = new Uint8Array(SHARE_CHUNK_BYTES);
-  let offset = 0;
   let total = 0;
 
   for await (const node of readSnapshotNodes(bucket, snapshot)) {
     const share = node.share;
-    if (typeof share !== "string" || UNSAFE_SHARE_CHARACTER.test(share) || !SHARE_LINE.test(share)) return null;
+    if (typeof share !== "string" || UNSAFE_SHARE_CHARACTER.test(share) || !SHARE_LINE.test(share)) {
+      throw new ExportContentError();
+    }
     const line = encoder.encode(total === 0 ? share : `\n${share}`);
     total += line.length;
-    if (total > MAX_SHARE_BYTES) return null;
+    if (total > MAX_SHARE_BYTES) throw new ExportContentError();
+    yield line;
+  }
+}
 
+async function* base64Chunks(bucket: R2Bucket, snapshot: SubscriptionSnapshot): AsyncGenerator<Uint8Array> {
+  const encoder = new TextEncoder();
+  const chunk = new Uint8Array(SHARE_CHUNK_BYTES);
+  let offset = 0;
+
+  for await (const line of shareBytes(bucket, snapshot)) {
     for (let start = 0; start < line.length;) {
       const length = Math.min(line.length - start, chunk.length - offset);
       chunk.set(line.subarray(start, start + length), offset);
       start += length;
       offset += length;
       if (offset === chunk.length) {
-        chunks.push(chunk);
-        chunk = new Uint8Array(SHARE_CHUNK_BYTES);
+        yield encoder.encode(btoa(String.fromCharCode(...chunk)));
         offset = 0;
       }
     }
   }
-  if (offset !== 0) chunks.push(chunk.subarray(0, offset));
-  return chunks;
+  if (offset !== 0) yield encoder.encode(btoa(String.fromCharCode(...chunk.subarray(0, offset))));
 }
 
-function base64Body(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
-  const encoder = new TextEncoder();
-  const pending = chunks.reverse();
-  return new ReadableStream({
-    pull(controller) {
-      const chunk = pending.pop();
-      if (!chunk) {
-        controller.close();
-        return;
+function base64Body(bucket: R2Bucket, snapshot: SubscriptionSnapshot, shareLength: number): ReadableStream {
+  const chunks = base64Chunks(bucket, snapshot);
+  const source = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const chunk = await chunks.next();
+        if (chunk.done) controller.close();
+        else controller.enqueue(chunk.value);
+      } catch {
+        controller.error(new Error("Subscription stream failed."));
       }
-      controller.enqueue(encoder.encode(btoa(String.fromCharCode(...chunk))));
     },
-    cancel() {
-      pending.length = 0;
+    async cancel() {
+      await chunks.return(undefined).catch(() => {});
     },
-  });
+  }, { highWaterMark: 0 });
+  const { readable, writable } = new FixedLengthStream(4 * Math.ceil(shareLength / 3));
+  // A source error aborts the response body. Client cancellation also stops the source.
+  void source.pipeTo(writable).catch(() => {});
+  return readable;
 }
 
 async function fetchRequest(request: Request, env: Env): Promise<Response> {
@@ -96,14 +108,15 @@ async function fetchRequest(request: Request, env: Env): Promise<Response> {
   try {
     const snapshot = await getSubscriptionSnapshot(env.DB, token);
     if (!snapshot) return plain("Not found.", 404, head);
-    // Check all referenced chunks before sending any success bytes.
-    const chunks = await collectShares(env.NODES, snapshot);
-    if (!chunks) return plain("Subscription content cannot be exported.", 422, head);
-    if (chunks.length === 0) return plain("Subscription temporarily unavailable.", 503, head);
-    return new Response(head ? null : base64Body(chunks), {
+    // Measure and verify the immutable snapshot before returning success, without retaining its content.
+    let shareLength = 0;
+    for await (const line of shareBytes(env.NODES, snapshot)) shareLength += line.byteLength;
+    if (shareLength === 0) return plain("Subscription temporarily unavailable.", 503, head);
+    return new Response(head ? null : base64Body(env.NODES, snapshot, shareLength), {
       headers: { ...HEADERS, "Content-Type": "text/plain; charset=utf-8" },
     });
-  } catch {
+  } catch (error) {
+    if (error instanceof ExportContentError) return plain("Subscription content cannot be exported.", 422, head);
     return plain("Subscription temporarily unavailable.", 503, head);
   }
 }

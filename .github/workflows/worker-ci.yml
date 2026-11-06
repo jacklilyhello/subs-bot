@@ -46,6 +46,10 @@ jobs:
           cp dist/index.js "$RUNNER_TEMP/subs-bot-worker/index.js"
           cp migrations/0001_subscriptions.sql "$RUNNER_TEMP/subs-bot-worker/0001_subscriptions.sql"
           node tools/isolation-fixture.mjs "$RUNNER_TEMP/subs-bot-worker"
+      - name: Test emitted bundle with D1 and R2 bindings
+        env:
+          WORKER_TEST_BUNDLE_DIR: ${{ runner.temp }}/subs-bot-worker
+        run: npm run test:bundle
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: subs-bot-worker-${{ env.BUILD_REVISION }}-${{ github.run_attempt }}

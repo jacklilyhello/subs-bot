@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import worker, { type Env } from "../src/index.ts";
 
 const TOKEN = "synthetic-sub-token-01";
@@ -8,6 +8,36 @@ const REVISION = "a".repeat(40);
 const SNAPSHOT_ID = "00000000-0000-4000-8000-000000000001";
 const PREFIX = `subscriptions/42/${SNAPSHOT_ID}/`;
 const LINK = "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.12:8388#";
+
+// Node lacks the Worker constructor. Check byte-count and cancellation behavior here;
+// the emitted Worker integration test checks actual workerd response framing.
+class FixedLengthStreamShim {
+  readonly readable: ReadableStream<Uint8Array>;
+  readonly writable: WritableStream<Uint8Array>;
+
+  constructor(length: number) {
+    let written = 0;
+    const stream = new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        written += chunk.byteLength;
+        if (written > length) throw new Error("Too many response bytes.");
+        controller.enqueue(chunk);
+      },
+      flush() {
+        if (written !== length) throw new Error("Response byte count mismatch.");
+      },
+    });
+    this.readable = stream.readable;
+    this.writable = stream.writable;
+  }
+}
+
+const originalFixedLengthStream = Object.getOwnPropertyDescriptor(globalThis, "FixedLengthStream");
+Object.defineProperty(globalThis, "FixedLengthStream", { value: FixedLengthStreamShim, configurable: true });
+after(() => {
+  if (originalFixedLengthStream) Object.defineProperty(globalThis, "FixedLengthStream", originalFixedLengthStream);
+  else Reflect.deleteProperty(globalThis, "FixedLengthStream");
+});
 
 function fixture(groups: Array<Array<Record<string, unknown>>>) {
   const objects = new Map<string, Buffer>();
@@ -80,20 +110,25 @@ test("health exposes only the exact build revision and rejects invalid configura
 test("subscription aliases stream identical Base64 across UTF-8 and R2 chunk boundaries", async () => {
   const first = LINK + "x".repeat(24 * 1024 - LINK.length - 1) + "香港";
   const links = [first, `${LINK}第二条`, `${LINK}third`];
-  const { env } = fixture([[{ share: links[0] }], [{ share: links[1] }, { share: links[2] }]]);
+  const { env, reads } = fixture([[{ share: links[0] }], [{ share: links[1] }, { share: links[2] }]]);
   const expected = Buffer.from(links.join("\n")).toString("base64");
+  const pass = ["manifest.json", "0.ndjson", "1.ndjson"].map((name) => PREFIX + name);
   for (const kind of ["base64", "mixed", "V2Ray"]) {
+    const before = reads.length;
     const response = await request(`/sub/${TOKEN}/${kind}`, env);
     assert.equal(response.status, 200);
     assertPrivate(response);
     assert.equal(response.headers.get("content-type"), "text/plain; charset=utf-8");
     assert.equal(await response.text(), expected);
+    assert.deepEqual(reads.slice(before), [...pass, ...pass]);
   }
 
+  const beforeHead = reads.length;
   const head = await request(`/sub/${TOKEN}/base64`, env, "HEAD");
   assert.equal(head.status, 200);
   assertPrivate(head);
   assert.equal(head.body, null);
+  assert.deepEqual(reads.slice(beforeHead), pass);
 });
 
 test("wrong capabilities and unavailable formats never read private objects", async () => {
@@ -132,4 +167,37 @@ test("malformed links and corrupt or missing snapshots fail without partial cred
     assertPrivate(unavailable);
     assert.equal(await unavailable.text(), "Subscription temporarily unavailable.");
   }
+});
+
+test("a second-pass R2 failure errors the body after earlier bytes without exposing backend details", async () => {
+  const first = LINK + "x".repeat(24 * 1024);
+  const { env } = fixture([[{ share: first }], [{ share: `${LINK}later` }]]);
+  const get = env.NODES.get.bind(env.NODES);
+  let reads = 0;
+  env.NODES.get = async (key: string) => {
+    if (key === `${PREFIX}1.ndjson` && ++reads === 2) throw new Error("synthetic backend credential");
+    return get(key);
+  };
+
+  const response = await request(`/sub/${TOKEN}/base64`, env);
+  assert.equal(response.status, 200);
+  assertPrivate(response);
+  const reader = response.body!.getReader();
+  const chunk = await reader.read();
+  assert.equal(chunk.done, false);
+  assert.equal(Buffer.from(chunk.value!).toString(), Buffer.from(first).subarray(0, 24 * 1024).toString("base64"));
+  await assert.rejects(reader.read(), { message: "Subscription stream failed." });
+  assert.equal(reads, 2);
+});
+
+test("canceling a response stops additional snapshot reads", async () => {
+  const first = LINK + "x".repeat(4 * 24 * 1024);
+  const { env, reads } = fixture([[{ share: first }], [{ share: `${LINK}later` }]]);
+  const response = await request(`/sub/${TOKEN}/base64`, env);
+  assert.equal(response.status, 200);
+  const reader = response.body!.getReader();
+  assert.equal((await reader.read()).done, false);
+  await reader.cancel();
+  assert.equal((await reader.read()).done, true);
+  assert.equal(reads.filter((key) => key === `${PREFIX}1.ndjson`).length, 1);
 });

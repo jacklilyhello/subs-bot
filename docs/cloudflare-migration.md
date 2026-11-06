@@ -11,7 +11,9 @@
 | `GET` 或 `HEAD /health` | 返回部署的 40 位 Git commit SHA，供部署验收核对 |
 | `GET` 或 `HEAD /sub/{token}/{format}` | 读取当前已发布快照并导出已有 URI，支持 `base64`、`v2ray` 和 `mixed` |
 
-能力链接视同凭据。成功与失败响应均使用 `Cache-Control: no-store, private`、`Referrer-Policy: no-referrer` 和 `X-Content-Type-Options: nosniff`。`HEAD` 保留 `GET` 的状态和响应头，响应体为空。未知能力链接返回 `404`，未支持的导出格式返回 `406`，节点缺少可导出的分享 URI 或分享文本超过 16 MiB 返回 `422`，已引用的快照不可用或完整性校验失败返回 `503`。处理在发送 `200` 之前校验快照，按块编码 Base64，避免生成一个完整的编码后字符串。
+能力链接视同凭据。成功与失败响应均使用 `Cache-Control: no-store, private`、`Referrer-Policy: no-referrer` 和 `X-Content-Type-Options: nosniff`。`HEAD` 执行同样的预检并返回相同状态，响应体为空。未知能力链接返回 `404`，未支持的导出格式返回 `406`，节点缺少可导出的分享 URI 或分享文本超过 16 MiB 返回 `422`。若预检时发现已引用的快照不可用或校验失败，返回 `503`。
+
+`GET` 在预检时逐块验证已选定的快照并计算编码长度。通过后再读取同一个不可变快照，按下游读取速度逐块编码，通过 `FixedLengthStream` 发送。导出无需在内存中拼接完整的原文或 Base64。若第二遍读取在成功响应头发出后失败，响应流会中止，客户端应把读取错误或未读满声明长度视为失败。客户端取消后停止后续读取，已发出的存储请求可能仍会完成。 [Workers FixedLengthStream](https://developers.cloudflare.com/workers/runtime-apis/streams/transformstream/#fixedlengthstream) · [Workers Content-Length](https://developers.cloudflare.com/workers/runtime-apis/response/#set-the-content-length-header)
 
 聚合、结构化节点生成分享 URI、其他导出格式、数据导入界面、Telegram Webhook、订阅拉取和生产域名属于后续阶段。
 
@@ -63,7 +65,8 @@
 
 ## 限额、成本和凭据
 
-- Workers Paid 的 Worker 内存为每 isolate 128 MB，HTTP CPU 默认 30 秒，可配置至 5 分钟，每次调用默认最多 10,000 个子请求。D1 单个字符串、BLOB 或数据行上限 2,000,000 字节，Paid 单库上限 10 GB。Queues 单条消息上限 128 KB。上线前用最坏体积和并发样例验证 CPU、内存超限计数、延时和实际子请求量。 [Workers 限制](https://developers.cloudflare.com/workers/platform/limits/) · [D1 限制](https://developers.cloudflare.com/d1/platform/limits/) · [Queues 限制](https://developers.cloudflare.com/queues/platform/limits/)
+- Workers Paid 的 Worker 内存为每 isolate 128 MB，由同一 isolate 中的并发请求共享。HTTP CPU 默认 30 秒，可配置至 5 分钟，每次调用默认最多 10,000 个子请求，R2 和 D1 绑定请求也计入。D1 单个字符串、BLOB 或数据行上限 2,000,000 字节，Paid 单库上限 10 GB。Queues 单条消息上限 128 KB。 [Workers 限制](https://developers.cloudflare.com/workers/platform/limits/) · [D1 限制](https://developers.cloudflare.com/d1/platform/limits/) · [Queues 限制](https://developers.cloudflare.com/queues/platform/limits/)
+- 一个有 `N` 个数据块的快照，每遍读取包含一次清单读取和 `N` 次数据块读取。完整 `GET` 执行 `2 × (N + 1)` 次 R2 Class B 读取，并重复校验和解码。`HEAD` 只进行预检。隔离环境的正确性 smoke 完成后，仍需以接近快照与导出上限的样本，在代表性的并发量、慢客户端和中途取消条件下测量首字节与完整响应耗时、吞吐、CPU、内存超限计数及实际 R2 子请求数。用实测操作数与请求分布估算成本，再决定是否调整块大小或请求限额。 [R2 Class B 定价](https://developers.cloudflare.com/r2/pricing/#class-b-operations)
 - 成本按实测请求数与 CPU、D1 读写行数、R2 容量及对象读写、队列投递与重试计算。若启用 Container，再核对实例运行时间、内存和磁盘配额、活动 CPU、区域出网及关联 Durable Objects 用量。隔离验收以按需启动和可睡眠为前提。显著新增费用或需要常驻时先提交估算和影响。 [Workers 定价](https://developers.cloudflare.com/workers/platform/pricing/) · [R2 定价](https://developers.cloudflare.com/r2/pricing/) · [Queues 定价](https://developers.cloudflare.com/queues/platform/pricing/) · [Containers 定价](https://developers.cloudflare.com/containers/platform/pricing/)
 - 资源管理分开使用只读核查、派生 Token 创建和项目部署权限。新 Token 按目标账户、所需操作和有效期收窄。平台权限无法限定到单个资源时，执行步骤须核对项目专用资源 ID。应用通过绑定和 Secrets 使用运行所需权限。高权限管理凭据留在受控管理位置。 [Cloudflare API Token](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/) · [Workers Secrets](https://developers.cloudflare.com/workers/configuration/secrets/)
 - Worker、反代及其他链路避免记录能力路径、查询参数、Telegram 更新、订阅内容、鉴权头或上游异常正文。Cloudflare 自动 invocation 日志可能包含带凭据的 URL，发布前禁用或验证脱敏，并核对追踪、异常和外部转发的字段。允许的运行信号限于路由类别、状态、计数、耗时和内部操作 ID。私密数据和密钥不得出现在公共缓存、Git、构建产物或测试日志。 [Workers Logs](https://developers.cloudflare.com/workers/observability/logs/workers-logs/)
