@@ -196,6 +196,34 @@ test("preflights legacy authority and ECH validity for every alias without leaki
   }
 });
 
+test("preserves allowed Shadowsocks plugins and rejects a legacy plugin concealed by a fragment", async () => {
+  const user = "aes-256-gcm:fixture:p@ss@proxy.example.invalid:8388";
+  const legacy = (plugin: string) => "ss://" + Buffer.from(
+    `${user}/?plugin=${plugin}#@display.example.invalid:8388`,
+  ).toString("base64url") + "#港 节点";
+  const permitted = legacy("obfs-local%3Bobfs%3Dhttp");
+  const permittedSnapshot = fixture([[{ share: LINK }, { share: permitted }]]);
+  const response = await request(`/sub/${TOKEN}/mixed`, permittedSnapshot.env);
+  assert.equal(response.status, 200);
+  assertPrivate(response);
+  assert.equal(Buffer.from(await response.text(), "base64").toString("utf8"), LINK + "\n" + permitted);
+
+  for (const denied of [
+    legacy("v2ray-plugin%3Btls%3Bcert%3D%2Fpath%2Fsynthetic-cert"),
+    "ss://" + Buffer.from("aes-256-gcm:fixture:p@ss/字#?@192.0.2.40:443").toString("base64url"),
+  ]) {
+    const deniedSnapshot = fixture([[{ share: LINK }], [{ share: denied }]]);
+    const get = await request(`/sub/${TOKEN}/v2ray`, deniedSnapshot.env);
+    assert.equal(get.status, 422);
+    assertPrivate(get);
+    assert.equal(await get.text(), "Subscription content cannot be exported.");
+    const head = await request(`/sub/${TOKEN}/base64`, deniedSnapshot.env, "HEAD");
+    assert.equal(head.status, 422);
+    assertPrivate(head);
+    assert.equal(head.body, null);
+  }
+});
+
 test("a second-pass R2 failure errors the body after earlier bytes without exposing backend details", async () => {
   const first = LINK + "x".repeat(24 * 1024);
   const { env } = fixture([[{ share: first }], [{ share: `${LINK}later` }]]);
