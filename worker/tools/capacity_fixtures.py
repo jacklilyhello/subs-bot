@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import sys
 import uuid
 
 
@@ -18,6 +19,11 @@ SHARE_BYTES = 16 * 1024 * 1024
 NODE_COUNT = 100_000
 LINE_OVERHEAD = len(b'{"share":"","pad":""}\n')
 SHARE_PREFIX = b"ss://YWVzLTI1Ni1nY206Zml4dHVyZS1vbmx5@203.0.113.10:8388#"
+CAPACITY_STATUS = {"at-limits": 200, "share-over": 422, "snapshot-over": 503}
+STRUCTURED_SMOKE = "structured-smoke"
+FIXTURE_PROFILES = {"capacity": CAPACITY_STATUS, STRUCTURED_SMOKE: {"structured-mixed": 200, "structured-unsupported": 422}}
+SMOKE_CHUNK_COUNT = 2
+SMOKE_OBJECT_LIMIT = 4096
 
 
 def _write_private(path: Path, body: bytes | bytearray) -> str:
@@ -133,16 +139,65 @@ def _write_over_snapshot(root: Path) -> dict:
     return _fixture_metadata(root, label, 503, [], descriptors, 0, None)
 
 
-def generate_capacity_fixtures(directory: Path, revision: str) -> dict:
+def structured_smoke_fixture(label: str) -> tuple[list[bytes], int, bytes]:
+    # The Python serializer is independent of the deployed Worker's implementation.
+    root = str(Path(__file__).resolve().parents[2])
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from export_errors import ExportError
+    from share_export import to_share_links
+
+    structured = {
+        "type": "ss", "server": "203.0.113.10", "port": 8388,
+        "name": "港 + 字", "cipher": "aes-256-gcm", "password": "fixture-only",
+    }
+    stored = {"share": "vless://synthetic-client@bücher.example:443#原始标签 😀"}
+    if label == "structured-mixed":
+        nodes = [structured, stored]
+        raw = "\n".join(to_share_links(nodes)).encode("utf-8")
+    elif label == "structured-unsupported":
+        # Put a valid stored share first to check rejection before a partial response.
+        nodes = [stored, {**structured, "plugin": "v2ray-plugin", "plugin_opts": "tls;cert=/path/to/synthetic-fixture"}]
+        try:
+            to_share_links(nodes)
+        except ExportError:
+            raw = b""
+        else:
+            raise ValueError("The Python oracle accepted the unsupported synthetic fixture.")
+    else:
+        raise ValueError("Unknown structured smoke fixture.")
+    return [_json_bytes(node) + b"\n" for node in nodes], len(raw), base64.b64encode(raw)
+
+
+def _write_smoke_fixture(root: Path, label: str, status: int) -> dict:
+    (root / label).mkdir(mode=0o700)
+    bodies, share_bytes, export = structured_smoke_fixture(label)
+    descriptors, chunks = [], []
+    for index, body in enumerate(bodies):
+        file = f"{label}/{index}.ndjson"
+        descriptor = {"bytes": len(body), "sha256": _write_private(root / file, body), "count": 1}
+        descriptors.append(descriptor)
+        chunks.append({"file": file, **descriptor})
+    return _fixture_metadata(
+        root, label, status, chunks, descriptors, share_bytes, hashlib.sha256(export).hexdigest() if export else None,
+    )
+
+
+def generate_capacity_fixtures(directory: Path, revision: str, *, profile: str = "capacity") -> dict:
     """Create a new fixture directory and write its metadata last."""
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise ValueError("A full lowercase Git revision is required.")
+    if profile not in FIXTURE_PROFILES:
+        raise ValueError("Unknown synthetic fixture profile.")
     directory.mkdir(mode=0o700)
-    fixtures = [
-        _write_data_fixture(directory, "at-limits", 200, _at_limits_layout()),
-        _write_data_fixture(directory, "share-over", 422, _share_over_layout()),
-        _write_over_snapshot(directory),
-    ]
+    if profile == STRUCTURED_SMOKE:
+        fixtures = [_write_smoke_fixture(directory, label, status) for label, status in FIXTURE_PROFILES[profile].items()]
+    else:
+        fixtures = [
+            _write_data_fixture(directory, "at-limits", 200, _at_limits_layout()),
+            _write_data_fixture(directory, "share-over", 422, _share_over_layout()),
+            _write_over_snapshot(directory),
+        ]
     metadata = {"version": 1, "revision": revision, "fixtures": fixtures}
     _write_private(directory / "capacity.json", _json_bytes(metadata) + b"\n")
     return metadata
@@ -152,9 +207,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output_dir", type=Path)
     parser.add_argument("revision")
+    parser.add_argument("--profile", choices=FIXTURE_PROFILES, default="capacity")
     args = parser.parse_args()
     try:
-        generate_capacity_fixtures(args.output_dir, args.revision)
+        generate_capacity_fixtures(args.output_dir, args.revision, profile=args.profile)
     except ValueError as exc:
         parser.exit(1, f"{exc}\n")
     except OSError:

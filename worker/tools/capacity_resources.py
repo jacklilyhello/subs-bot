@@ -15,7 +15,10 @@ from time import sleep
 from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request, build_opener
 
-from capacity_fixtures import CHUNK_BYTES, NODE_COUNT, SHARE_BYTES, SHARE_PREFIX, SNAPSHOT_BYTES
+from capacity_fixtures import (
+    CAPACITY_STATUS as STATUS, CHUNK_BYTES, FIXTURE_PROFILES, NODE_COUNT, SHARE_BYTES, SHARE_PREFIX,
+    SMOKE_CHUNK_COUNT, SMOKE_OBJECT_LIMIT, SNAPSHOT_BYTES, STRUCTURED_SMOKE, structured_smoke_fixture,
+)
 from cloudflare_isolation import (
     API_ORIGIN, DIGEST, HEX_ID, NAMESPACE, REVISION, TIMESTAMP, UUID, WORKER_NAME,
     CloudflareClient, CloudflareError, _NoRedirect, _verify_health, verify_worker_target,
@@ -31,7 +34,6 @@ MAX_MANIFEST = 64 * 1024
 MAX_CHUNKS = 256
 TOKEN = re.compile(r"subsbot-synthetic-capacity-[A-Za-z0-9_-]{32}")
 RUN_ID = re.compile(r"[1-9][0-9]{0,19}")
-STATUS = {"at-limits": 200, "share-over": 422, "snapshot-over": 503}
 UNCERTAIN_READBACK_DELAYS = (1, 2, 4)
 SYNTHETIC_LINE = re.compile(rb'\{"share":"(' + re.escape(SHARE_PREFIX)
                             + rb'capacity-[0-9]{6}-x*)","pad":"p*"\}\n')
@@ -95,21 +97,64 @@ def read_object_file(directory, label, index, objects):
     return body
 
 
-def read_fixtures(directory, revision):
+def check_raw_fixture(directory, fixture, node_count, node_bytes, objects):
+    label = fixture["label"]
+    total_shares = total_records = 0
+    for index, chunk in enumerate(fixture["chunks"]):
+        body = read_object_file(directory, label, index, objects)
+        position = record_count = 0
+        while position < len(body):
+            record = SYNTHETIC_LINE.match(body, position)
+            require(record is not None, "Capacity node data is not the expected synthetic format.")
+            total_shares += len(record[1])
+            record_count += 1
+            position = record.end()
+        require(record_count == chunk["count"], "Capacity chunk node count does not match.")
+        total_records += record_count
+    total_shares += max(0, total_records - 1)
+    require(fixture.get("shareBytes") == total_shares, "Capacity share size does not match.")
+    if label == "at-limits":
+        require((node_count, node_bytes, total_shares) == (NODE_COUNT, SNAPSHOT_BYTES, SHARE_BYTES)
+                and fixture.get("exportBytes") == 4 * ((SHARE_BYTES + 2) // 3)
+                and matches(DIGEST, fixture.get("exportSha256")), "Capacity boundary fixture is invalid.")
+    else:
+        require(fixture.get("exportBytes") == 0 and fixture.get("exportSha256") is None
+                and ((label == "snapshot-over" and node_bytes == SNAPSHOT_BYTES + 1)
+                     or (label == "share-over" and node_bytes <= SNAPSHOT_BYTES and total_shares == SHARE_BYTES + 1)),
+                "Capacity over-limit fixture is invalid.")
+
+
+def check_structured_smoke_fixture(directory, fixture, snapshot_manifest, objects):
+    label = fixture["label"]
+    bodies, share_bytes, export = structured_smoke_fixture(label)
+    descriptors = [{"bytes": len(body), "sha256": digest(body), "count": 1} for body in bodies]
+    require(snapshot_manifest == {"version": 1, "chunks": descriptors}
+            and all(row["bytes"] <= SMOKE_OBJECT_LIMIT for row in objects)
+            and fixture.get("shareBytes") == share_bytes and fixture.get("exportBytes") == len(export)
+            and fixture.get("exportSha256") == (digest(export) if export else None),
+            "Structured smoke fixture differs from the fixed synthetic plan.")
+    for index, body in enumerate(bodies):
+        require(read_object_file(directory, label, index, objects) == body,
+                "Structured smoke fixture records differ from the fixed synthetic plan.")
+
+
+def read_fixtures(directory, revision, *, profile="capacity"):
+    require(profile in FIXTURE_PROFILES, "Unknown synthetic fixture profile.")
+    statuses = FIXTURE_PROFILES[profile]
     metadata = json_body(read_private(directory / "capacity.json", MAX_JSON))
     fixtures = metadata.get("fixtures")
     require(metadata.get("version") == 1 and metadata.get("revision") == revision
-            and isinstance(fixtures, list) and len(fixtures) == len(STATUS),
+            and isinstance(fixtures, list) and len(fixtures) == len(statuses),
             "Capacity manifest does not match the requested revision.")
     require(all(isinstance(fixture, dict) for fixture in fixtures)
-            and [fixture.get("label") for fixture in fixtures] == list(STATUS),
+            and [fixture.get("label") for fixture in fixtures] == list(statuses),
             "Unexpected capacity fixture inventory.")
     entries = []
     for fixture in fixtures:
         label = fixture["label"]
         token, snapshot = fixture.get("token"), fixture.get("snapshotId")
         require(matches(TOKEN, token) and matches(UUID, snapshot)
-                and fixture.get("status") == STATUS[label] and fixture.get("manifestFile") == f"{label}/manifest.json",
+                and fixture.get("status") == statuses[label] and fixture.get("manifestFile") == f"{label}/manifest.json",
                 "Invalid capacity fixture identity.")
         chunk_files = fixture.get("chunks")
         require(isinstance(chunk_files, list) and len(chunk_files) <= MAX_CHUNKS,
@@ -134,34 +179,15 @@ def read_fixtures(directory, revision):
         require(chunk_files == expected_chunks, "Capacity chunk files do not match their manifest.")
         objects = [{key: row[key] for key in ("bytes", "sha256")} for row in chunk_files]
         objects.append({"bytes": len(manifest), "sha256": digest(manifest)})
-        total_shares = total_records = 0
-        for index, chunk in enumerate(chunk_files):
-            body = read_object_file(directory, label, index, objects)
-            position = record_count = 0
-            while position < len(body):
-                record = SYNTHETIC_LINE.match(body, position)
-                require(record is not None, "Capacity node data is not the expected synthetic format.")
-                total_shares += len(record[1])
-                record_count += 1
-                position = record.end()
-            require(record_count == chunk["count"], "Capacity chunk node count does not match.")
-            total_records += record_count
-        total_shares += max(0, total_records - 1)
-        require(fixture.get("shareBytes") == total_shares, "Capacity share size does not match.")
-        if label == "at-limits":
-            require((node_count, node_bytes, total_shares) == (NODE_COUNT, SNAPSHOT_BYTES, SHARE_BYTES)
-                    and fixture.get("exportBytes") == 4 * ((SHARE_BYTES + 2) // 3)
-                    and matches(DIGEST, fixture.get("exportSha256")), "Capacity boundary fixture is invalid.")
+        if profile == STRUCTURED_SMOKE:
+            check_structured_smoke_fixture(directory, fixture, snapshot_manifest, objects)
         else:
-            require(fixture.get("exportBytes") == 0 and fixture.get("exportSha256") is None
-                    and ((label == "snapshot-over" and node_bytes == SNAPSHOT_BYTES + 1)
-                         or (label == "share-over" and node_bytes <= SNAPSHOT_BYTES and total_shares == SHARE_BYTES + 1)),
-                    "Capacity over-limit fixture is invalid.")
+            check_raw_fixture(directory, fixture, node_count, node_bytes, objects)
         entries.append({"label": label, "snapshotId": snapshot, "nodeCount": node_count,
                         "tokenSha256": digest(token.encode("ascii")), "objects": objects,
                         "rowId": None, "armed": [], "reservePending": False, "putPending": []})
-    require(len({entry["snapshotId"] for entry in entries}) == len(STATUS)
-            and len({entry["tokenSha256"] for entry in entries}) == len(STATUS),
+    require(len({entry["snapshotId"] for entry in entries}) == len(statuses)
+            and len({entry["tokenSha256"] for entry in entries}) == len(statuses),
             "Duplicate capacity fixture identity.")
     return fixtures, entries
 
@@ -197,7 +223,9 @@ def save_ledger(directory, ledger):
     save_private_json(directory / LEDGER_FILE, ledger)
 
 
-def load_ledger(directory, scope_hash):
+def load_ledger(directory, scope_hash, *, profile="capacity"):
+    require(profile in FIXTURE_PROFILES, "Unknown synthetic fixture profile.")
+    statuses = FIXTURE_PROFILES[profile]
     path = directory / LEDGER_FILE
     if not path.exists() and not path.is_symlink():
         return None
@@ -207,8 +235,8 @@ def load_ledger(directory, scope_hash):
             and ledger["version"] == 1 and ledger["scopeSha256"] == scope_hash
             and matches(REVISION, ledger["revision"]) and matches(RUN_ID, ledger["runId"])
             and ledger["phase"] in ("seed", "cleanup", "retired") and isinstance(entries, list)
-            and len(entries) == len(STATUS) and all(isinstance(entry, dict) for entry in entries)
-            and [entry.get("label") for entry in entries] == list(STATUS), "Invalid capacity cleanup ledger.")
+            and len(entries) == len(statuses) and all(isinstance(entry, dict) for entry in entries)
+            and [entry.get("label") for entry in entries] == list(statuses), "Invalid capacity cleanup ledger.")
     for entry in entries:
         require(set(entry) == {"label", "snapshotId", "nodeCount", "tokenSha256", "objects", "rowId", "armed",
                                "reservePending", "putPending"}
@@ -225,17 +253,20 @@ def load_ledger(directory, scope_hash):
                 and all(integer(index, 0, len(entry["armed"]) - 1) for index in entry["putPending"])
                 and len(set(entry["putPending"])) == len(entry["putPending"])
                 and (ledger["phase"] != "retired" or not (entry["reservePending"] or entry["putPending"]))
-                and (entry["label"] != "snapshot-over" or len(entry["objects"]) == 1),
+                and (entry["label"] != "snapshot-over" or len(entry["objects"]) == 1)
+                and (profile != STRUCTURED_SMOKE or (entry["nodeCount"] == SMOKE_CHUNK_COUNT
+                                                     and len(entry["objects"]) == SMOKE_CHUNK_COUNT + 1)),
                 "Invalid capacity cleanup ledger entry.")
         for index, obj in enumerate(entry["objects"]):
-            limit = MAX_MANIFEST if index == len(entry["objects"]) - 1 else CHUNK_BYTES
+            limit = (SMOKE_OBJECT_LIMIT if profile == STRUCTURED_SMOKE else
+                     MAX_MANIFEST if index == len(entry["objects"]) - 1 else CHUNK_BYTES)
             require(isinstance(obj, dict) and set(obj) == {"bytes", "sha256"}
                     and integer(obj["bytes"], 1, limit) and matches(DIGEST, obj["sha256"]),
                     "Invalid capacity cleanup object record.")
     assigned = [entry["rowId"] for entry in entries if entry["rowId"] is not None]
     require(len(set(assigned)) == len(assigned)
-            and len({entry["snapshotId"] for entry in entries}) == len(STATUS)
-            and len({entry["tokenSha256"] for entry in entries}) == len(STATUS),
+            and len({entry["snapshotId"] for entry in entries}) == len(statuses)
+            and len({entry["tokenSha256"] for entry in entries}) == len(statuses),
             "Duplicate capacity cleanup ledger identity.")
     return ledger
 
@@ -436,12 +467,12 @@ def confirm_object(directory, ledger, entry, index):
         save_ledger(directory, ledger)
 
 
-def seed(directory, resources, revision, run_id, guard):
+def seed(directory, resources, revision, run_id, guard, *, profile="capacity"):
     require(matches(REVISION, revision) and matches(RUN_ID, run_id), "A full revision and hosted run ID are required.")
-    fixtures, entries = read_fixtures(directory, revision)
+    fixtures, entries = read_fixtures(directory, revision, profile=profile)
     resources.verify()
     guard(revision)
-    ledger = load_ledger(directory, resources.scope_hash)
+    ledger = load_ledger(directory, resources.scope_hash, profile=profile)
     if ledger is None:
         ledger = {"version": 1, "scopeSha256": resources.scope_hash, "revision": revision,
                   "runId": run_id, "phase": "seed", "fixtures": entries}
@@ -487,8 +518,8 @@ def seed(directory, resources, revision, run_id, guard):
         resources.publish(ledger, entry)
 
 
-def cleanup(directory, resources):
-    ledger = load_ledger(directory, resources.scope_hash)
+def cleanup(directory, resources, *, profile="capacity"):
+    ledger = load_ledger(directory, resources.scope_hash, profile=profile)
     if ledger is None:
         return
     resources.verify()
@@ -549,6 +580,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("seed", "cleanup", "verify-worker-before", "verify-worker-after"))
     parser.add_argument("directory", type=Path)
+    parser.add_argument("--profile", choices=FIXTURE_PROFILES, default="capacity")
     args = parser.parse_args()
     try:
         target = json_body(os.environ.get("SUBS_BOT_CF_ISOLATION_TARGET_JSON", "null"))
@@ -557,10 +589,13 @@ def main():
         with locked_directory(args.directory):
             if args.action == "seed":
                 seed(args.directory, resources, os.environ.get("GITHUB_SHA"), os.environ.get("GITHUB_RUN_ID"),
-                     verify_release)
-                print("Published three verified isolated capacity fixtures.")
+                     verify_release, profile=args.profile)
+                if args.profile == STRUCTURED_SMOKE:
+                    print("Published two verified isolated structured export fixtures.")
+                else:
+                    print("Published three verified isolated capacity fixtures.")
             elif args.action == "cleanup":
-                cleanup(args.directory, resources)
+                cleanup(args.directory, resources, profile=args.profile)
                 print("Isolated capacity fixture cleanup verified.")
             else:
                 deploy_token = os.environ.get("SUBS_BOT_CF_DEPLOY_TOKEN")
