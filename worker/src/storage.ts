@@ -46,6 +46,7 @@ interface SnapshotManifest {
 export const MAX_CHUNK_BYTES = 512 * 1024;
 export const MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024;
 export const MAX_SNAPSHOT_NODES = 100_000;
+const CHUNK_READ_AHEAD = 4;
 const MAX_CHUNKS = 256;
 const MAX_MANIFEST_BYTES = 64 * 1024;
 const MAX_OWNER_ID = 9223372036854775807n;
@@ -305,18 +306,38 @@ function readManifest(raw: string, nodeCount: number): SnapshotManifest {
   return { version: 1, chunks };
 }
 
-export async function* readSnapshotNodes(bucket: R2Bucket, snapshot: SubscriptionSnapshot): AsyncGenerator<NodeRecord> {
+export async function* readSnapshotNodes(
+  bucket: R2Bucket,
+  snapshot: SubscriptionSnapshot,
+  signal?: AbortSignal,
+): AsyncGenerator<NodeRecord> {
+  if (signal?.aborted) return;
   if (!validInteger(snapshot.id, 1) || !validInteger(snapshot.generation, 1) ||
       !SNAPSHOT_ID_PATTERN.test(snapshot.snapshotId) || !SHA256_PATTERN.test(snapshot.manifestSha256) ||
       !validInteger(snapshot.nodeCount, 1, MAX_SNAPSHOT_NODES)) {
     throw new SnapshotIntegrityError();
   }
   const prefix = snapshotPrefix(snapshot.id, snapshot.snapshotId);
+  const pending: Array<Promise<string | null>> = [];
   try {
     const rawManifest = await loadObject(bucket, `${prefix}manifest.json`, snapshot.manifestSha256, MAX_MANIFEST_BYTES);
+    if (signal?.aborted) return;
     const manifest = readManifest(rawManifest, snapshot.nodeCount);
+
+    function preload(index: number): void {
+      const { sha256, bytes } = manifest.chunks[index];
+      // Handle failures immediately even when an earlier chunk is still being consumed.
+      pending.push(loadObject(bucket, `${prefix}${index}.ndjson`, sha256, MAX_CHUNK_BYTES, bytes).catch(() => null));
+    }
+
+    for (let index = 0; index < Math.min(CHUNK_READ_AHEAD, manifest.chunks.length); index += 1) {
+      if (signal?.aborted) return;
+      preload(index);
+    }
     for (const [index, chunk] of manifest.chunks.entries()) {
-      const text = await loadObject(bucket, `${prefix}${index}.ndjson`, chunk.sha256, MAX_CHUNK_BYTES, chunk.bytes);
+      const text = await pending[0];
+      if (signal?.aborted) return;
+      if (text === null) throw new SnapshotIntegrityError();
       let offset = 0;
       for (let record = 0; record < chunk.count; record += 1) {
         const end = text.indexOf("\n", offset);
@@ -328,13 +349,20 @@ export async function* readSnapshotNodes(bucket: R2Bucket, snapshot: Subscriptio
           throw new SnapshotIntegrityError();
         }
         yield value;
+        if (signal?.aborted) return;
         offset = end + 1;
       }
       if (offset !== text.length) {
         throw new SnapshotIntegrityError();
       }
+      pending.shift();
+      const next = index + CHUNK_READ_AHEAD;
+      if (next < manifest.chunks.length) preload(next);
     }
   } catch {
     throw new SnapshotIntegrityError();
+  } finally {
+    // A return or failure leaves at most four started reads. Do not start replacements.
+    await Promise.all(pending);
   }
 }

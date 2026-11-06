@@ -201,3 +201,120 @@ test("rejects a manifest one byte over the snapshot limit before requesting any 
   await assert.rejects(async () => readSnapshotNodes(syntheticBucket, snapshot).next(), SnapshotIntegrityError);
   assert.deepEqual(reads, [manifestKey]);
 });
+
+function delayedSnapshot() {
+  const bodies = Array.from({ length: 8 }, (_, index) => new TextEncoder().encode(`{"name":"Node ${index}"}\n`));
+  const hash = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+  const manifest = new TextEncoder().encode(JSON.stringify({
+    version: 1, chunks: bodies.map((bytes) => ({ bytes: bytes.byteLength, sha256: hash(bytes), count: 1 })),
+  }));
+  const snapshot: SubscriptionSnapshot = {
+    id: 123, generation: 1, snapshotId: "11111111-1111-4111-8111-111111111111",
+    manifestSha256: hash(manifest), nodeCount: bodies.length,
+  };
+  const prefix = `subscriptions/${snapshot.id}/${snapshot.snapshotId}/`;
+  const firstStarted = Promise.withResolvers<void>();
+  const gates = bodies.map(() => Promise.withResolvers<boolean>());
+  const finished = bodies.map(() => Promise.withResolvers<void>());
+  const reads: number[] = [];
+  let active = 0;
+  let peak = 0;
+  const delayedBucket = {
+    async get(key: string) {
+      if (key === `${prefix}manifest.json`) {
+        return { size: manifest.byteLength, arrayBuffer: async () => manifest.buffer };
+      }
+      assert.ok(key.startsWith(prefix) && key.endsWith(".ndjson"));
+      const index = Number(key.slice(prefix.length, -".ndjson".length));
+      const bytes = bodies[index];
+      assert.ok(bytes);
+      reads.push(index);
+      if (reads.length === 1) firstStarted.resolve();
+      active += 1;
+      peak = Math.max(peak, active);
+      return {
+        size: bytes.byteLength,
+        async arrayBuffer() {
+          try {
+            if (await gates[index].promise) throw new Error("Synthetic read failure");
+            return bytes.buffer;
+          } finally {
+            active -= 1;
+            finished[index].resolve();
+          }
+        },
+      };
+    },
+  } as unknown as R2Bucket;
+  return {
+    snapshot, delayedBucket, firstStarted, gates, finished, reads,
+    get active() { return active; },
+    get peak() { return peak; },
+  };
+}
+
+test("reads ahead four chunks and refills in order despite out-of-order reads", async () => {
+  const fixture = delayedSnapshot();
+  const nodes = readSnapshotNodes(fixture.delayedBucket, fixture.snapshot);
+  const first = nodes.next();
+  try {
+    await fixture.firstStarted.promise;
+    assert.deepEqual(fixture.reads, [0, 1, 2, 3]);
+    assert.equal(fixture.active, 4);
+
+    for (const index of [3, 2, 1]) {
+      fixture.gates[index].resolve(false);
+      await fixture.finished[index].promise;
+    }
+    assert.deepEqual(fixture.reads, [0, 1, 2, 3]);
+    assert.equal(fixture.active, 1);
+    fixture.gates[0].resolve(false);
+    assert.deepEqual(await first, { done: false, value: { name: "Node 0" } });
+    assert.deepEqual(fixture.reads, [0, 1, 2, 3]);
+    assert.deepEqual(await nodes.next(), { done: false, value: { name: "Node 1" } });
+    assert.deepEqual(fixture.reads, [0, 1, 2, 3, 4]);
+
+    for (const gate of fixture.gates) gate.resolve(false);
+    const remaining = [];
+    for await (const node of nodes) remaining.push(node.name);
+    assert.deepEqual(remaining, ["Node 2", "Node 3", "Node 4", "Node 5", "Node 6", "Node 7"]);
+    assert.equal(fixture.peak, 4);
+    assert.equal(fixture.active, 0);
+  } finally {
+    for (const gate of fixture.gates) gate.resolve(false);
+    await first.catch(() => {});
+    await nodes.return(undefined);
+  }
+});
+
+test("aborting a snapshot drains read-ahead failures without scheduling another chunk", async () => {
+  const fixture = delayedSnapshot();
+  const cancellation = new AbortController();
+  const nodes = readSnapshotNodes(fixture.delayedBucket, fixture.snapshot, cancellation.signal);
+  const first = nodes.next();
+  try {
+    await fixture.firstStarted.promise;
+    assert.deepEqual(fixture.reads, [0, 1, 2, 3]);
+    fixture.gates[0].resolve(false);
+    assert.deepEqual(await first, { done: false, value: { name: "Node 0" } });
+    cancellation.abort();
+    let stopped = false;
+    const closing = nodes.next().then((result) => {
+      stopped = true;
+      return result;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(stopped, false);
+
+    fixture.gates[3].resolve(true);
+    fixture.gates[2].resolve(false);
+    fixture.gates[1].resolve(false);
+    assert.deepEqual(await closing, { done: true, value: undefined });
+    assert.deepEqual(fixture.reads, [0, 1, 2, 3]);
+    assert.equal(fixture.active, 0);
+  } finally {
+    for (const gate of fixture.gates) gate.resolve(false);
+    await first.catch(() => {});
+    await nodes.return(undefined);
+  }
+});
