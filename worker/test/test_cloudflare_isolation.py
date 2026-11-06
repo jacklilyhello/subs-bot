@@ -120,6 +120,8 @@ class FakeCloudflare:
         self.health_verified_deployment = None
         self.telegram_upload = None
         self.alter_config_digest = False
+        self.candidate_readback_errors = []
+        self.upload_error = None
 
     def worker_api(self, method, path, payload=None):
         self.calls.append((method, path))
@@ -133,12 +135,18 @@ class FakeCloudflare:
                 return [{"id": row["id"], "annotations": deepcopy(row["annotations"])}
                         for row in self.versions.values()]
             if path.startswith(VERSIONS + "/") and path.endswith("?include=modules"):
-                return deepcopy(self.versions[path.split("/")[-1].split("?")[0]])
+                version_id = path.split("/")[-1].split("?")[0]
+                if version_id == NEW_VERSION and self.candidate_readback_errors:
+                    status = self.candidate_readback_errors.pop(0)
+                    raise cloudflare.CloudflareError("Synthetic version readback error.", http_status=status)
+                return deepcopy(self.versions[version_id])
             if path == SCRIPT + "/settings":
                 # This endpoint changes on upload even while the old version serves traffic.
                 return {**self.worker_responses[path], "bindings": self.versions[list(self.versions)[-1]]["bindings"]}
             return deepcopy(self.worker_responses[path])
         if method == "POST" and path == VERSIONS + "?deploy=false":
+            if self.upload_error:
+                raise cloudflare.CloudflareError("Synthetic upload error.", http_status=self.upload_error)
             assert payload["modules"][0]["content_base64"] == base64.b64encode(NEW_MODULE).decode("ascii")
             assert payload["bindings"][0]["database_id"] == TARGET["d1Id"]
             self.versions[NEW_VERSION] = {**deepcopy(payload), "id": NEW_VERSION}
@@ -266,6 +274,40 @@ class ReleaseTests(unittest.TestCase):
         self.api.versions[NEW_VERSION] = version(NEW_VERSION, NEW_REVISION, NEW_MODULE)
         self.assertEqual(self.release()["versionId"], NEW_VERSION)
         self.assertEqual(self.api.writes(), [DEPLOYMENTS])
+
+    def test_recently_uploaded_version_is_read_back_without_duplicate_upload(self):
+        self.api.candidate_readback_errors = [404, 404]
+        self.assertEqual(self.release()["versionId"], NEW_VERSION)
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
+        self.assertEqual(self.api.calls.count(("GET", f"{VERSIONS}/{NEW_VERSION}?include=modules")), 4)
+
+    def test_recently_listed_version_is_read_back_without_upload(self):
+        self.api.versions[NEW_VERSION] = version(NEW_VERSION, NEW_REVISION, NEW_MODULE)
+        self.api.candidate_readback_errors = [404]
+        self.assertEqual(self.release()["versionId"], NEW_VERSION)
+        self.assertEqual(self.api.writes(), [DEPLOYMENTS])
+
+    def test_unreadable_candidate_stops_before_activation(self):
+        self.api.candidate_readback_errors = [404] * len(cloudflare.READBACK_DELAYS)
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "candidate.*HTTP 404"):
+            self.release()
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false"])
+        self.assertEqual(self.api.active["id"], OLD_DEPLOYMENT)
+        self.assertEqual(self.release()["versionId"], NEW_VERSION)
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
+
+    def test_candidate_permission_error_and_upload_404_fail_without_retry(self):
+        self.api.candidate_readback_errors = [403, 404]
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "Synthetic version readback error"):
+            self.release()
+        self.assertEqual(self.api.candidate_readback_errors, [404])
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false"])
+        del self.api.versions[NEW_VERSION]
+        self.api.calls.clear()
+        self.api.upload_error = 404
+        with self.assertRaisesRegex(cloudflare.CloudflareError, r"upload was rejected \(HTTP 404\)"):
+            self.release()
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false"])
 
     def test_telegram_is_secret_bound_and_cron_is_set_after_healthy_activation(self):
         result = self.release(TELEGRAM_CONFIG)
@@ -418,6 +460,7 @@ class ClientTests(unittest.TestCase):
             client("GET", "/accounts/test")
         self.assertEqual(str(error.exception), "Cloudflare API rejected the request (HTTP 403).")
         self.assertFalse(error.exception.uncertain)
+        self.assertEqual(error.exception.http_status, 403)
         request = opener.open.call_args.args[0]
         self.assertEqual(request.full_url, cloudflare.API_ORIGIN + "/accounts/test")
         self.assertEqual(request.get_header("Authorization"), "Bearer synthetic-token")
