@@ -53,6 +53,12 @@
 - 仅包含 HTTP 订阅 URL 的 TXT 文件仍逐条导入远程订阅；直接发送节点链接仍加入临时列表。
 - 远程订阅按流式响应读取到 EOF 后解析，避免分段传输截断 TXT/YAML；解压后的正文超过 10 MB 会明确拒绝，公网地址和重定向安全校验仍然生效。
 
+### 格式导出
+
+- Base64 保留已有分享 URI，也可以从受支持的 Shadowsocks、VMess、VLESS、Trojan、Hysteria 2、TUIC v5 和 AnyTLS 结构化节点生成分享 URI。Clash 的 `udp` 开关属于客户端本地转发设置，需要在目标客户端单独配置。
+- Sing-box 导出把协议、认证、TLS 和传输选项映射到出站配置。合成样例在 CI 中通过固定版本的官方 `sing-box check` 验证。
+- 某个节点或连接选项无法转换时，Base64 或 Sing-box HTTP 导出会返回 `422`。Telegram 会提示格式不可用，聚合导出仍可提供 Clash 链接。
+
 ### 授权管理
 
 管理员在与 Bot 的私聊中使用：

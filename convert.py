@@ -17,10 +17,10 @@ MAX_SUBSCRIPTION_BYTES = 10 * 1024 * 1024
 import aiohttp
 import yaml
 
-PROTO_RE = re.compile(
-    r"^(?:ss|ssr|vmess|vless|trojan|hysteria2?|hy2|tuic|snell|wireguard|anytls|socks5(?:-tls)?)://\S+",
-    re.I,
-)
+from share_export import SHARE_SCHEMES, to_share_links
+from singbox_export import to_singbox as _to_singbox
+
+PROTO_RE = re.compile(rf"^(?:{'|'.join(sorted(SHARE_SCHEMES))})://\S+", re.I)
 
 # ── 共享 HTTP 会话 ────────────────────────────────────────────────────────────
 # 旧实现每抓一条订阅就新建一个 ClientSession，等于每条都重做 TLS 握手、
@@ -288,8 +288,11 @@ def _parse_share_link(url: str) -> dict[str, Any] | None:
         if not _fill_ss_fields(url, node, username, password):
             return None
     elif scheme == "hysteria2":
+        auth = (
+            f"{username}:{password}" if u.password is not None else username or qs.get("auth") or ""
+        )
         node.update({
-            "password": username or password or qs.get("auth") or "",
+            "password": auth,
             "sni": qs.get("sni") or "",
             "skip-cert-verify": qs.get("insecure") in ("1", "true", "True"),
         })
@@ -319,11 +322,11 @@ def _fill_ss_fields(url: str, node: dict[str, Any], username: str, password: str
     elif username and password:
         method, pwd = username, password
         parsed = bool(node.get("server"))
-    elif "@" not in url:
+    elif "@" not in url.split("#", 1)[0]:
         body = url.split("://", 1)[1].split("#", 1)[0]
         decoded = _b64decode(body)
         if decoded and b"@" in decoded:
-            method_pass, hostport = decoded.decode("utf-8", "ignore").split("@", 1)
+            method_pass, hostport = decoded.decode("utf-8").rsplit("@", 1)
             method, pwd = method_pass.split(":", 1)
             if ":" in hostport:
                 host, port_s = hostport.rsplit(":", 1)
@@ -659,15 +662,6 @@ def apply_path_maps(nodes: list[dict[str, Any]], maps: dict[str, str]) -> list[d
     return out
 
 
-def to_share_links(nodes: list[dict[str, Any]]) -> list[str]:
-    links = []
-    for n in nodes:
-        share = n.get("share")
-        if share:
-            links.append(str(share))
-    return links
-
-
 def to_base64_sub(nodes: list[dict[str, Any]]) -> str:
     links = to_share_links(nodes)
     raw = "\n".join(links).encode("utf-8")
@@ -757,27 +751,7 @@ def to_qx(nodes: list[dict[str, Any]]) -> str:
 
 
 def to_singbox(nodes: list[dict[str, Any]]) -> str:
-    outbounds = []
-    tags = []
-    for n in nodes:
-        tag = str(n.get("name") or "node")
-        typ = n.get("type") or "unknown"
-        ob: dict[str, Any] = {"tag": tag, "type": typ}
-        for k in ("server", "server_port", "port", "uuid", "password", "flow", "tls", "transport"):
-            if k in n:
-                ob[k if k != "port" else "server_port"] = n[k]
-        if "port" in n and "server_port" not in ob:
-            ob["server_port"] = n["port"]
-        outbounds.append(ob)
-        tags.append(tag)
-    data = {
-        "outbounds": [
-            {"type": "selector", "tag": "proxy", "outbounds": tags or ["direct"]},
-            {"type": "direct", "tag": "direct"},
-            *outbounds,
-        ]
-    }
-    return json.dumps(data, ensure_ascii=False, indent=2)
+    return _to_singbox(nodes, parse_share_link=parse_share_link)
 
 
 def format_bytes_gb(val: float | None) -> str:

@@ -152,16 +152,16 @@ async def _fetch(body: bytes, charset: str | None):
 class SubscriptionFormatTests(unittest.TestCase):
     def test_plain_uri_txt_keeps_node_fields_and_share(self):
         sip = base64.urlsafe_b64encode(b"aes-256-gcm:sip-secret").decode("ascii").rstrip("=")
-        legacy = base64.b64encode(b"aes-256-gcm:legacy-secret@8.8.8.8:8388").decode("ascii")
+        legacy = base64.b64encode(b"aes-256-gcm:legacy@secret@8.8.8.8:8388").decode("ascii")
         text = "\n".join([
             VLESS,
             f"ss://{sip}@8.8.4.4:8388#SIP",
-            f"ss://{legacy}#Legacy",
+            f"ss://{legacy}#Legacy@Edge",
             "hy2://secret@hy.example:443?sni=hy.example&insecure=1#HY",
             "trojan://pass@tj.example:8443?sni=tj.example&allowInsecure=0#TJ",
         ])
         nodes = parse_nodes_from_text(text)
-        self.assertEqual([node["name"] for node in nodes], ["中文节点", "SIP", "Legacy", "HY", "TJ"])
+        self.assertEqual([node["name"] for node in nodes], ["中文节点", "SIP", "Legacy@Edge", "HY", "TJ"])
 
         vless, sip_node, legacy_node, hy_node, trojan = nodes
         self.assertEqual(vless["type"], "vless")
@@ -182,7 +182,7 @@ class SubscriptionFormatTests(unittest.TestCase):
         self.assertEqual(legacy_node["server"], "8.8.8.8")
         self.assertEqual(legacy_node["port"], 8388)
         self.assertEqual(legacy_node["cipher"], "aes-256-gcm")
-        self.assertEqual(legacy_node["password"], "legacy-secret")
+        self.assertEqual(legacy_node["password"], "legacy@secret")
 
         self.assertEqual(hy_node["type"], "hysteria2")
         self.assertEqual(hy_node["server"], "hy.example")

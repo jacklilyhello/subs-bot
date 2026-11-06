@@ -74,6 +74,7 @@ from convert import (
     _check_public_url,
 )
 from db import Store, nodes_of
+from export_errors import ExportError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 # httpx/httpcore 在 INFO 级会把每次请求的完整 URL 打进日志，而 Telegram 的 URL
@@ -96,6 +97,9 @@ def get_bot_username(bot: Any = None) -> str:
 
 
 ALLOWED_DOCUMENT_SUFFIXES = frozenset({".txt", ".log", ".yaml", ".yml", ".json"})
+_BASE64_KINDS = frozenset({"base64", "v2ray", "mixed"})
+_SINGBOX_KINDS = frozenset({"singbox", "sing-box"})
+_EXPORT_UNSUPPORTED = "部分节点或连接设置无法转换为此格式。"
 
 
 def _document_suffix(filename: str) -> str:
@@ -955,11 +959,17 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     code = await store.create_short(user_id, "aggregate://all")
     clash_url = f"{PUBLIC_BASE_URL}/agg/{code}/clash"
-    base64_url = f"{PUBLIC_BASE_URL}/agg/{code}/base64"
+    try:
+        to_share_links(all_nodes)
+    except ExportError:
+        base64_section = f"Base64：{_EXPORT_UNSUPPORTED}\n\n"
+    else:
+        base64_url = f"{PUBLIC_BASE_URL}/agg/{code}/base64"
+        base64_section = f"Base64:\n<code>{html.escape(base64_url)}</code>\n\n"
     await update.effective_message.reply_html(
-        f"📦 <b>导出完成</b>\n节点数: {len(all_nodes)}\n\n"
+        f"📦 <b>导出链接</b>\n节点数: {len(all_nodes)}\n\n"
         f"Clash:\n<code>{html.escape(clash_url)}</code>\n"
-        f"Base64:\n<code>{html.escape(base64_url)}</code>\n\n"
+        f"{base64_section}"
         f"短链码: <code>{html.escape(code)}</code>",
         reply_markup=MAIN_KB,
         disable_web_page_preview=True,
@@ -1972,8 +1982,24 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not sub:
             await q.message.reply_text("订阅不存在")
             return
-        if not nodes_of(sub):
+        nodes = nodes_of(sub)
+        if not nodes:
             sub = await refresh_sub(user_id, sub, rename=True)
+            nodes = nodes_of(sub)
+        if kind in _BASE64_KINDS or kind in _SINGBOX_KINDS:
+            if not nodes:
+                await q.message.reply_text("没有可导出的节点。")
+                return
+            maps = {m["node_name"]: m["remark"] for m in await store.list_path_maps(user_id)}
+            nodes = apply_path_maps(nodes, maps)
+            try:
+                if kind in _BASE64_KINDS:
+                    to_share_links(nodes)
+                else:
+                    to_singbox(nodes)
+            except ExportError:
+                await q.message.reply_text(_EXPORT_UNSUPPORTED)
+                return
         target = sub_token_url(sub["token"], kind)
         short = await make_short_url(user_id, target)
         title = {
@@ -2079,9 +2105,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         maps = {m["node_name"]: m["remark"] for m in await store.list_path_maps(user_id)}
         nodes = apply_path_maps(nodes_of(sub), maps)
-        links = to_share_links(nodes)
+        try:
+            links = to_share_links(nodes)
+        except ExportError:
+            await q.message.reply_text(_EXPORT_UNSUPPORTED)
+            return
         if not links:
-            await q.message.reply_text("没有可导出的分享链接（可能来自 YAML 订阅）。")
+            await q.message.reply_text("没有可导出的节点。")
             return
         content = "\n".join(links)
         doc = InputFile(content.encode("utf-8"), filename="Base64.txt")
@@ -2109,6 +2139,26 @@ async def mapped_nodes_for_user(user_id: int, sub_ids: list[int] | None = None) 
 
 
 
+def _subscription_export_response(nodes: list[dict[str, Any]], kind: str) -> web.Response:
+    no_store = {"Cache-Control": "no-store, private"}
+    try:
+        if kind in _BASE64_KINDS:
+            return web.Response(text=to_base64_sub(nodes), content_type="text/plain", headers=no_store)
+        if kind in _SINGBOX_KINDS:
+            return web.Response(text=to_singbox(nodes), content_type="application/json", headers=no_store)
+    except ExportError:
+        return web.Response(
+            status=422,
+            text="Some nodes or connection settings are unsupported by this export format.",
+            headers=no_store,
+        )
+    if kind == "surge":
+        return web.Response(text=to_surge(nodes), content_type="text/plain", headers=no_store)
+    if kind in ("qx", "quantumult", "quantumultx"):
+        return web.Response(text=to_qx(nodes), content_type="text/plain", headers=no_store)
+    return web.Response(text=to_clash(nodes), content_type="text/yaml", headers=no_store)
+
+
 async def http_sub(request: web.Request) -> web.Response:
     token = request.match_info["token"]
     kind = request.match_info.get("kind", "clash").lower()
@@ -2117,16 +2167,7 @@ async def http_sub(request: web.Request) -> web.Response:
         return web.Response(status=404, text="not found")
     maps = {m["node_name"]: m["remark"] for m in await store.list_path_maps(int(sub["user_id"]))}
     nodes = apply_path_maps(nodes_of(sub), maps)
-    no_store = {"Cache-Control": "no-store, private"}
-    if kind in ("base64", "v2ray", "mixed"):
-        return web.Response(text=to_base64_sub(nodes), content_type="text/plain", headers=no_store)
-    if kind in ("singbox", "sing-box"):
-        return web.Response(text=to_singbox(nodes), content_type="application/json", headers=no_store)
-    if kind == "surge":
-        return web.Response(text=to_surge(nodes), content_type="text/plain", headers=no_store)
-    if kind in ("qx", "quantumult", "quantumultx"):
-        return web.Response(text=to_qx(nodes), content_type="text/plain", headers=no_store)
-    return web.Response(text=to_clash(nodes), content_type="text/yaml", headers=no_store)
+    return _subscription_export_response(nodes, kind)
 
 
 async def http_agg(request: web.Request) -> web.Response:
@@ -2150,16 +2191,7 @@ async def http_agg(request: web.Request) -> web.Response:
     else:
         return web.Response(status=404, text="not found")
     kind = request.match_info.get("kind", "clash").lower()
-    no_store = {"Cache-Control": "no-store, private"}
-    if kind in ("base64", "v2ray", "mixed"):
-        return web.Response(text=to_base64_sub(nodes), content_type="text/plain", headers=no_store)
-    if kind in ("singbox", "sing-box"):
-        return web.Response(text=to_singbox(nodes), content_type="application/json", headers=no_store)
-    if kind == "surge":
-        return web.Response(text=to_surge(nodes), content_type="text/plain", headers=no_store)
-    if kind in ("qx", "quantumult", "quantumultx"):
-        return web.Response(text=to_qx(nodes), content_type="text/plain", headers=no_store)
-    return web.Response(text=to_clash(nodes), content_type="text/yaml", headers=no_store)
+    return _subscription_export_response(nodes, kind)
 
 
 
@@ -2189,7 +2221,8 @@ async def start_http(app: Application) -> web.AppRunner:
     api.router.add_get("/sub/{token}", http_sub)
     api.router.add_get("/agg/{code}/{kind}", http_agg)
     api.router.add_get("/s/{code}", http_short)
-    runner = web.AppRunner(api)
+    # Subscription tokens and short codes are embedded in request paths.
+    runner = web.AppRunner(api, access_log_format="status=%s bytes=%b time=%Tf")
     await runner.setup()
     site = web.TCPSite(runner, HTTP_HOST, HTTP_PORT)
     await site.start()
