@@ -6,6 +6,7 @@ import { test } from "node:test";
 
 import { Miniflare } from "miniflare";
 
+import { restoreOwnedSubscription, trashOwnedSubscription } from "../src/subscriptions.ts";
 import { createSubscription } from "../src/storage.ts";
 import type { TelegramPolicy } from "../src/telegram/protocol.ts";
 import { acceptTelegramCommand } from "../src/telegram/store.ts";
@@ -65,8 +66,25 @@ test("the hosted deployment artifact exports small and large snapshots in worker
       ).run();
     }
 
-    await verifyIsolation(fixture, process.env.BUILD_REVISION,
-      (path, init) => miniflare.dispatchFetch("https://subs-bot.example" + path, init));
+    const request = (path: string, init?: RequestInit) => miniflare.dispatchFetch("https://subs-bot.example" + path, init);
+    await verifyIsolation(fixture, process.env.BUILD_REVISION, request);
+
+    const snapshot = fixture.snapshots[0];
+    const path = `/sub/${snapshot.token}/base64`;
+    const target = { id: snapshot.id, ownerId: "900000001", expectedLifecycleRevision: 0 };
+    const original = await request(path);
+    assert.equal(original.status, 200);
+    const originalDigest = digest(Buffer.from(await original.arrayBuffer()));
+    assert.equal(await trashOwnedSubscription(db, target), true);
+    for (const method of ["GET", "HEAD"]) {
+      const hidden = await request(path, { method });
+      assert.equal(hidden.status, 404);
+      assert.equal(hidden.headers.get("cache-control"), "private, no-store");
+    }
+    assert.equal(await restoreOwnedSubscription(db, { ...target, expectedLifecycleRevision: 1 }), true);
+    const restored = await request(path);
+    assert.equal(restored.status, 200);
+    assert.equal(digest(Buffer.from(await restored.arrayBuffer())), originalDigest);
   } finally {
     await miniflare.dispose();
   }
@@ -106,10 +124,19 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
   });
   try {
     const db = await miniflare.getD1Database("DB");
-    await applyMigrations(db, directory, fixture.migrations);
+    assert.deepEqual(fixture.migrations.slice(0, 3).map(({ name }: { name: string }) => name), [
+      "0001_subscriptions.sql", "0002_telegram.sql", "0003_subscription_lifecycle.sql",
+    ]);
+    await applyMigrations(db, directory, fixture.migrations.slice(0, 2));
     const url = "https://provider.example.invalid/synthetic";
-    await createSubscription(db, { ownerId: policy.adminId, name: "Admin fixture", sourceUrl: url });
-    await createSubscription(db, { ownerId: policy.memberId, name: "Member fixture", sourceUrl: url });
+    await db.prepare(`
+      INSERT INTO subscriptions (owner_id, name, source_url, token, created_at, updated_at)
+      VALUES (?, 'Member fixture', ?, 'legacy-member-fixture-token', unixepoch(), unixepoch())
+    `).bind(policy.memberId, url).run();
+    await db.prepare(`
+      INSERT INTO telegram_auth (bot_id, user_id, allowed, message_date, message_id)
+      VALUES (?, ?, 1, unixepoch(), 1)
+    `).bind(policy.botId, policy.memberId).run();
     const date = Math.floor(Date.now() / 1000);
     const text = `/list@${policy.botUsername}`;
     const message = {
@@ -131,6 +158,17 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
       updateId: 12, actorId: policy.memberId, chatId: policy.memberId, chatType: "private",
       messageId: 9, messageDate: date, threadId: null, command: "list",
     });
+    const tables = ["subscriptions", "telegram_auth", "telegram_inbox", "telegram_outbox"];
+    const readExistingRows = () => Promise.all(tables.map(async (table) =>
+      (await db.prepare(`SELECT * FROM ${table}`).all()).results));
+    const existingRows = await readExistingRows();
+    await applyMigrations(db, directory, fixture.migrations.slice(2));
+    assert.deepEqual(await readExistingRows(), existingRows);
+    await createSubscription(db, { ownerId: policy.adminId, name: "Admin fixture", sourceUrl: url });
+    const trashed = await createSubscription(db, { ownerId: policy.memberId, name: "Trashed fixture", sourceUrl: url });
+    assert.equal(await trashOwnedSubscription(db, {
+      id: trashed.id, ownerId: policy.memberId, expectedLifecycleRevision: 0,
+    }), true);
     const expectedPrivate = expectSend(policy.memberId, 10, 9, "你的订阅\n1. Member fixture");
     const worker = await miniflare.getWorker();
     assert.equal((await worker.scheduled({ cron: "* * * * *" })).outcome, "ok");
