@@ -10,7 +10,7 @@ import secrets
 import sys
 
 from cloudflare_isolation import CloudflareClient, CloudflareError, REVISION, _Isolation, _verify_health
-from d1_migrations import MigrationError, _assert_sql, _literal, _results, _rows
+from d1_migrations import _assert_sql
 from prepare_isolation_artifact import ArtifactError, require_current_main
 from release_isolation import telegram_release_config
 
@@ -18,6 +18,7 @@ from release_isolation import telegram_release_config
 MIGRATION = "0004_telegram_views.sql"
 ORIGIN = "https://subs-bot-view-fixtures.invalid/"
 FIELDS = "id, owner_id, name, source_url, token, expire_at, created_at, updated_at, generation, node_count"
+PREFIX_MATCH = "substr(source_url, 1, length(?)) = ?"
 
 
 class FixtureError(RuntimeError):
@@ -31,6 +32,23 @@ class Fixture:
     source: str
     trashed: bool
     expire_offset: int
+
+
+def statement(sql, *parameters):
+    return {"sql": sql, "params": [str(value) for value in parameters]}
+
+
+def query(api, path, payload, result_count):
+    results = api("POST", path + "/query", payload)
+    if (not isinstance(results, list) or len(results) != result_count
+            or not all(isinstance(result, dict) and result.get("success") is True
+                       and isinstance(result.get("results"), list) for result in results)):
+        raise FixtureError("D1 fixture query results could not be verified.")
+    return results
+
+
+def rows(api, path, sql, *parameters):
+    return query(api, path, statement(sql, *parameters), 1)[0]["results"]
 
 
 def plan(policy, cohort):
@@ -50,20 +68,19 @@ def plan(policy, cohort):
 
 
 def read_cohort(api, path, prefix, expected):
-    match = f"source_url GLOB {_literal(prefix + '*')}"
-    rows = _rows(api, path, f"""
+    observed = rows(api, path, f"""
         SELECT id, owner_id, name, source_url, generation, node_count, snapshot_id, manifest_sha256, created_at, expire_at,
           (SELECT revision FROM subscription_lifecycle WHERE subscription_id = subscriptions.id) AS revision,
           NULL AS trash_revision, 0 AS trashed
-        FROM subscriptions WHERE {match}
+        FROM subscriptions WHERE {PREFIX_MATCH}
         UNION ALL
         SELECT id, owner_id, name, source_url, generation, node_count, snapshot_id, manifest_sha256, created_at, expire_at,
           (SELECT revision FROM subscription_lifecycle WHERE subscription_id = subscription_trash.id), lifecycle_revision, 1
-        FROM subscription_trash WHERE {match}
+        FROM subscription_trash WHERE {PREFIX_MATCH}
         LIMIT {len(expected) + 1}
-    """)
+    """, prefix, prefix, prefix, prefix)
     by_source = {}
-    for row in rows:
+    for row in observed:
         source = row.get("source_url")
         fixture = expected.get(source)
         if (not fixture or source in by_source or type(row.get("id")) is not int
@@ -80,42 +97,49 @@ def read_cohort(api, path, prefix, expected):
 
 
 def cohort_count(prefix, count):
-    where = f"source_url GLOB {_literal(prefix + '*')}"
-    return f"((SELECT count(*) FROM subscriptions WHERE {where}) + (SELECT count(*) FROM subscription_trash WHERE {where})) = {count}"
+    # A fixture prefix can exceed D1's LIKE/GLOB pattern limit.
+    return statement(_assert_sql(
+        f"((SELECT count(*) FROM subscriptions WHERE {PREFIX_MATCH}) + "
+        f"(SELECT count(*) FROM subscription_trash WHERE {PREFIX_MATCH})) = CAST(? AS INTEGER)"
+    ), prefix, prefix, prefix, prefix, count)
 
 
 def seed_statements(prefix, expected):
     values = ",\n".join(
-        f"({_literal(entry.owner)}, {_literal(entry.name)}, {_literal(entry.source)}, "
-        f"{_literal(secrets.token_urlsafe(24))}, unixepoch() + ({entry.expire_offset}), unixepoch(), unixepoch())"
+        f"(?, ?, ?, ?, unixepoch() + ({entry.expire_offset}), unixepoch(), unixepoch())"
         for entry in expected.values()
     )
-    trash = "source_url IN (" + ",".join(_literal(entry.source) for entry in expected.values() if entry.trashed) + ")"
+    values_parameters = [value for entry in expected.values()
+                         for value in (entry.owner, entry.name, entry.source, secrets.token_urlsafe(24))]
+    trash_parameters = [entry.source for entry in expected.values() if entry.trashed]
+    trash = "source_url IN (" + ",".join("?" for _ in trash_parameters) + ")"
     return [
-        _assert_sql(cohort_count(prefix, 0)),
-        "INSERT INTO subscriptions (owner_id,name,source_url,token,expire_at,created_at,updated_at) VALUES\n" + values,
-        f"INSERT INTO subscription_trash ({FIELDS}, deleted_at, lifecycle_revision) "
-        f"SELECT {FIELDS}, unixepoch() - 3600, 1 FROM subscriptions WHERE {trash}",
-        f"INSERT INTO subscription_lifecycle (subscription_id,revision) SELECT id,1 FROM subscription_trash WHERE {trash}",
-        f"DELETE FROM subscriptions WHERE {trash}",
-        _assert_sql(cohort_count(prefix, len(expected))),
+        cohort_count(prefix, 0),
+        statement("INSERT INTO subscriptions (owner_id,name,source_url,token,expire_at,created_at,updated_at) VALUES\n" + values,
+                  *values_parameters),
+        statement(f"INSERT INTO subscription_trash ({FIELDS}, deleted_at, lifecycle_revision) "
+                  f"SELECT {FIELDS}, unixepoch() - 3600, 1 FROM subscriptions WHERE {trash}", *trash_parameters),
+        statement(f"INSERT INTO subscription_lifecycle (subscription_id,revision) "
+                  f"SELECT id,1 FROM subscription_trash WHERE {trash}", *trash_parameters),
+        statement(f"DELETE FROM subscriptions WHERE {trash}", *trash_parameters),
+        cohort_count(prefix, len(expected)),
     ]
 
 
 def retire_statements(prefix, rows):
-    statements = [_assert_sql(cohort_count(prefix, len(rows)))]
+    statements = [cohort_count(prefix, len(rows))]
     for row in rows.values():
         table = "subscription_trash" if row["trashed"] else "subscriptions"
-        conditions = (f"id = {row['id']} AND source_url = {_literal(row['source_url'])} "
-                      f"AND owner_id = {_literal(row['owner_id'])} AND name = {_literal(row['name'])} "
+        parameters = (row["id"], row["source_url"], row["owner_id"], row["name"])
+        conditions = ("id = CAST(? AS INTEGER) AND source_url = ? AND owner_id = ? AND name = ? "
                       "AND generation = 0 AND node_count = 0 AND snapshot_id IS NULL AND manifest_sha256 IS NULL")
         if row["trashed"]:
             conditions += " AND lifecycle_revision = 1"
-            statements.append("DELETE FROM subscription_lifecycle WHERE revision = 1 "
-                              f"AND subscription_id IN (SELECT id FROM {table} WHERE {conditions})")
+            statements.append(statement("DELETE FROM subscription_lifecycle WHERE revision = 1 "
+                                        f"AND subscription_id IN (SELECT id FROM {table} WHERE {conditions})", *parameters))
         conditions += f" AND NOT EXISTS (SELECT 1 FROM subscription_lifecycle WHERE subscription_id = {table}.id)"
-        statements.append(f"DELETE FROM {table} WHERE {conditions}")
-    statements.append(_assert_sql(cohort_count(prefix, 0)))
+        statements.append(statement(f"DELETE FROM {table} WHERE {conditions}", *parameters))
+    statements.append(cohort_count(prefix, 0))
     return statements
 
 
@@ -125,14 +149,16 @@ def manage(api, path, action, prefix, expected):
         raise FixtureError("A partial synthetic cohort must be retired before another seed attempt.")
     statements = (seed_statements(prefix, expected) if action == "seed" and not before else
                   retire_statements(prefix, before) if action == "retire" and before else [])
+    failure = None
     if statements:
         try:
-            _results(api, path, ";\n".join(statements) + ";")
-        except (CloudflareError, MigrationError):
-            pass  # Reconcile an ambiguous API result by verifying the exact cohort.
+            query(api, path, {"batch": statements}, len(statements))
+        except (CloudflareError, FixtureError) as error:
+            failure = error  # Reconcile an ambiguous API result by verifying the exact cohort.
     after = read_cohort(api, path, prefix, expected)
     if set(after) != (set(expected) if action == "seed" else set()):
-        raise FixtureError("The synthetic fixture operation could not be confirmed.")
+        reason = str(failure) if failure else "D1 cohort readback differed."
+        raise FixtureError(f"The synthetic fixture operation could not be confirmed. {reason}")
     return {"active": sum(not row["trashed"] for row in after.values()),
             "trashed": sum(row["trashed"] for row in after.values()), "removed": len(before) if action == "retire" else 0}
 
@@ -163,7 +189,7 @@ def run():
     _verify_health(revision)
     path = f"{scope.account}/d1/database/{target['d1Id']}"
     digest = sha256((Path(__file__).resolve().parents[1] / "migrations" / MIGRATION).read_bytes()).hexdigest()
-    if _rows(data_api, path, f"SELECT sha256, mode FROM subs_bot_schema_migrations WHERE name = {_literal(MIGRATION)}") != [
+    if rows(data_api, path, "SELECT sha256, mode FROM subs_bot_schema_migrations WHERE name = ?", MIGRATION) != [
         {"sha256": digest, "mode": "applied"},
     ]:
         raise FixtureError("The isolated Telegram view migration does not match the checked-out revision.")
@@ -176,7 +202,7 @@ def run():
 if __name__ == "__main__":
     try:
         run()
-    except (ArtifactError, CloudflareError, FixtureError, MigrationError) as error:
+    except (ArtifactError, CloudflareError, FixtureError) as error:
         sys.exit(str(error))
     except Exception:
         sys.exit("The isolated Telegram fixture operation could not be verified.")

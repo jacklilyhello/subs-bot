@@ -26,15 +26,24 @@ class FixtureTests(unittest.TestCase):
             self.db.executescript(migration.read_text(encoding="utf-8"))
         self.lost_response = False
         self.write_calls = 0
+        self.observed_queries = []
 
     def api(self, method, path, payload):
         self.assertEqual((method, path), ("POST", PATH + "/query"))
-        sql = payload["sql"]
-        if not sql.startswith("SELECT CASE WHEN"):
-            return [{"success": True, "results": [dict(row) for row in self.db.execute(sql)]}]
+        def execute(query):
+            sql, parameters = query["sql"], query["params"]
+            self.observed_queries.append(sql)
+            self.assertLessEqual(len(parameters), 100)
+            self.assertNotRegex(sql, r"\b(?:LIKE|GLOB)\b")
+            return {"success": True, "results": [dict(row) for row in self.db.execute(sql, parameters)]}
+
+        if "batch" not in payload:
+            return [execute(payload)]
         self.write_calls += 1
         try:
-            self.db.executescript("BEGIN;\n" + sql + "\nCOMMIT;")
+            self.db.execute("BEGIN")
+            results = [execute(query) for query in payload["batch"]]
+            self.db.commit()
         except sqlite3.DatabaseError:
             if self.db.in_transaction:
                 self.db.rollback()
@@ -42,7 +51,7 @@ class FixtureTests(unittest.TestCase):
         if self.lost_response:
             self.lost_response = False
             raise CloudflareError("Synthetic response lost after commit.", uncertain=True)
-        return [{"success": True, "results": []}]
+        return results
 
     def manage(self, action, cohort=COHORT):
         return manage(self.api, PATH, action, *plan(POLICY, cohort))
@@ -89,3 +98,18 @@ class FixtureTests(unittest.TestCase):
             with self.assertRaisesRegex(FixtureError, "cohort key"):
                 self.manage("seed", cohort)
         self.assertEqual(self.write_calls, 0)
+
+    def test_long_prefix_is_exact_and_fixture_values_are_bound(self):
+        prefix, _ = plan(POLICY, COHORT)
+        self.assertGreater(len(prefix), 50)
+        neighbor = prefix.removesuffix("/") + "extra/AL01"
+        self.db.execute("""
+            INSERT INTO subscriptions (owner_id,name,source_url,token,created_at,updated_at)
+            VALUES ('1001','Synthetic neighbor',?,'synthetic-neighbor-token',unixepoch(),unixepoch())
+        """, (neighbor,))
+        self.assertEqual(self.manage("seed")["active"], 12)
+        self.assertEqual(self.manage("retire")["removed"], 22)
+        self.assertEqual(self.db.execute("SELECT source_url FROM subscriptions").fetchone()[0], neighbor)
+        for sql in self.observed_queries:
+            for value in (prefix, COHORT, POLICY["adminId"], POLICY["memberId"], "CFV-"):
+                self.assertNotIn(value, sql)
