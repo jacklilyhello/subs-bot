@@ -58,7 +58,19 @@ export async function verifyIsolation(fixture, revision, fetchRequest) {
     && config.outbounds[1]?.type === "direct" && config.outbounds[1]?.tag === "direct"
     && config.outbounds.slice(2).every((outbound) => outbound?.type === "shadowsocks" && outbound?.server === "203.0.113.10"),
   "Unexpected synthetic Sing-box configuration");
-  const unsupported = await request(`/sub/${fixture.snapshots[0].token}/clash`);
+  const defaultClash = await request(`/sub/${fixture.snapshots[0].token}`);
+  const explicitClash = await request(`/sub/${fixture.snapshots[0].token}/clash`);
+  for (const variant of [defaultClash, explicitClash]) {
+    assert.equal(variant.status, 200, "Synthetic Clash export failed");
+    assert.equal(variant.headers.get("content-type"), "text/yaml; charset=utf-8");
+  }
+  const clash = await defaultClash.text();
+  assert.equal(defaultClash.headers.get("content-length"), String(Buffer.byteLength(clash)));
+  assert.equal(explicitClash.headers.get("content-length"), String(Buffer.byteLength(clash)));
+  const explicitClashText = await explicitClash.text();
+  assert(clash === explicitClashText && clash.startsWith("proxies:\n") && clash.includes("\nproxy-groups:\n")
+    && clash.endsWith('rules:\n  - "MATCH,🚀 节点选择"\n'), "Unexpected synthetic Clash configuration");
+  const unsupported = await request(`/sub/${fixture.snapshots[0].token}/unsupported`);
   assert.equal(unsupported.status, 406);
   await unsupported.body?.cancel();
 }

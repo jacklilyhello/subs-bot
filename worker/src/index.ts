@@ -1,6 +1,8 @@
 import { getSubscriptionSnapshot, readSnapshotNodes, type NodeRecord, type SubscriptionSnapshot } from "./storage.ts";
 import { isValidStoredShare } from "./stored-share.ts";
 import { serializeStructuredShare } from "./structured-share.ts";
+import { ClashContentError } from "./clash-export.ts";
+import { clashChunks, planClash } from "./clash-response.ts";
 import { SingBoxContentError } from "./singbox-export.ts";
 import { planSingBox, singBoxChunks } from "./singbox-response.ts";
 import { answerTelegramCallback, drainTelegramReplies } from "./telegram/delivery.ts";
@@ -19,7 +21,7 @@ export interface Env {
 const MAX_SHARE_BYTES = 16 * 1024 * 1024;
 // Every complete chunk ends on a Base64 group boundary.
 const SHARE_CHUNK_BYTES = 24 * 1024;
-const EXPORT_KINDS = new Set(["base64", "v2ray", "mixed", "singbox", "sing-box"]);
+const EXPORT_KINDS = new Set(["base64", "v2ray", "mixed", "singbox", "sing-box", "clash"]);
 const SUBSCRIPTION_PATH = /^\/sub\/([A-Za-z0-9_-]{16,128})(?:\/([A-Za-z0-9-]{1,32}))?$/;
 const HEADERS = {
   "Cache-Control": "private, no-store",
@@ -165,13 +167,20 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
     return new Response(body, { headers: { ...HEADERS, "Content-Type": "application/json" } });
   }
 
-  const [, token, kind = ""] = subscription;
+  const [, token, kind = "clash"] = subscription;
   const format = kind.toLowerCase();
   if (!EXPORT_KINDS.has(format)) return plain("Export format unavailable.", 406, head);
 
   try {
     const snapshot = await getSubscriptionSnapshot(env.DB, token);
     if (!snapshot) return plain("Not found.", 404, head);
+    if (format === "clash") {
+      const plan = await planClash(env.NODES, snapshot);
+      return new Response(
+        head ? null : fixedLengthBody((signal) => clashChunks(env.NODES, snapshot, plan, signal), plan.bytes),
+        { headers: { ...HEADERS, "Content-Type": "text/yaml; charset=utf-8" } },
+      );
+    }
     if (format === "singbox" || format === "sing-box") {
       const plan = await planSingBox(env.NODES, snapshot);
       return new Response(
@@ -190,7 +199,7 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
       headers: { ...HEADERS, "Content-Type": "text/plain; charset=utf-8" },
     });
   } catch (error) {
-    if (error instanceof ExportContentError || error instanceof SingBoxContentError) {
+    if (error instanceof ExportContentError || error instanceof SingBoxContentError || error instanceof ClashContentError) {
       return plain("Subscription content cannot be exported.", 422, head);
     }
     return plain("Subscription temporarily unavailable.", 503, head);

@@ -161,6 +161,60 @@ test("the hosted deployment artifact exports small and large snapshots in worker
     } finally {
       await rm(scratch, { recursive: true, force: true });
     }
+
+    const clashCorpus = JSON.parse(await readFile(new URL("./clash-corpus.json", import.meta.url), "utf8"));
+    const clashSub = await createSubscription(db, {
+      ownerId, name: "Synthetic Clash configuration", sourceUrl: "https://provider.example.invalid/synthetic",
+    });
+    const clashNodes = clashCorpus.map(({ node, vmess }: { node: Record<string, unknown>; vmess?: Record<string, unknown> }) =>
+      vmess ? { ...node, share: "vmess://" + Buffer.from(JSON.stringify(vmess)).toString("base64") } : node);
+    assert.equal(await publishNodeSnapshot(db, bucket, {
+      id: clashSub.id, ownerId, expectedGeneration: 0, expectedLifecycleRevision: 0,
+    }, clashNodes), true);
+    const defaultPath = "/sub/" + clashSub.token;
+    const explicitPath = defaultPath + "/Clash";
+    const defaultHead = await request(defaultPath, { method: "HEAD", headers });
+    assert.equal(defaultHead.status, 200);
+    assert.equal(defaultHead.body, null);
+    const defaultExport = await request(defaultPath, { headers });
+    const explicitExport = await request(explicitPath, { headers });
+    for (const variant of [defaultExport, explicitExport]) {
+      assert.equal(variant.status, 200);
+      assert.equal(variant.headers.get("content-type"), "text/yaml; charset=utf-8");
+      assert.equal(variant.headers.get("cache-control"), "private, no-store");
+    }
+    const clashBytes = Buffer.from(await defaultExport.arrayBuffer());
+    assert.equal(defaultExport.headers.get("content-length"), String(clashBytes.length));
+    assert.equal(explicitExport.headers.get("content-length"), String(clashBytes.length));
+    assert.deepEqual(Buffer.from(await explicitExport.arrayBuffer()), clashBytes);
+    const [proxies, groups, rules] = clashBytes.toString("utf8").split(/(?:proxy-groups|rules):\n/u);
+    const entries = (value: string) => value.split("\n").filter((line) => line.startsWith("  - "))
+      .map((line) => JSON.parse(line.slice(4)));
+    const names = ['港 "字" 🌐', "DIRECT (2)", "VMess", "VMess (3)", "VMess (2)", "GLOBAL (2)", "Trojan",
+      "Hysteria", "🚀 节点选择 (2)", "港", "TUIC", "AnyTLS", "SOCKS", "HTTPS", "Gecko"];
+    assert(proxies.startsWith("proxies:\n"));
+    assert.deepEqual(entries(proxies), clashCorpus.map(({ proxy }: { proxy: Record<string, unknown> }, index: number) => ({
+      name: names[index], ...proxy,
+    })));
+    assert.deepEqual(entries(groups), [
+      { name: "🚀 节点选择", type: "select", proxies: names },
+      { name: "♻️ 自动选择", type: "url-test", proxies: names, url: "http://www.gstatic.com/generate_204", interval: 300 },
+    ]);
+    assert.deepEqual(entries(rules), ["MATCH,🚀 节点选择"]);
+
+    const mihomo = process.env.MIHOMO_TEST_BINARY;
+    assert(mihomo, "Missing checksum-verified Mihomo binary");
+    const clashScratch = await mkdtemp(join(tmpdir(), "subs-bot-mihomo-"));
+    try {
+      const config = join(clashScratch, "synthetic.yaml");
+      await writeFile(config, clashBytes, { mode: 0o600 });
+      const check = spawnSync(mihomo, ["-t", "-d", clashScratch, "-f", config], {
+        timeout: 15_000, encoding: "utf8", env: { HOME: clashScratch },
+      });
+      assert.equal(check.status, 0, check.stderr || check.stdout || check.error?.message || "Mihomo config check failed");
+    } finally {
+      await rm(clashScratch, { recursive: true, force: true });
+    }
   } finally {
     await miniflare.dispose();
   }
