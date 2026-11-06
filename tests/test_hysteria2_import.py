@@ -138,6 +138,13 @@ class Hysteria2ImportTests(unittest.TestCase):
             with self.assertRaises(ExportError):
                 to_base64_sub([{"type": "hysteria2", "share": bad}])
 
+    def test_scoped_ipv6_share_is_retained_and_clash_conversion_is_explicit(self):
+        share = "hy2://[fe80::1%25testzone]:443,8443#Scoped"
+        nodes = parse_nodes_from_text(share)
+        self.assertEqual(base64.b64decode(to_base64_sub(nodes), validate=True).decode(), share)
+        with self.assertRaises(ExportError):
+            to_clash(nodes)
+
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["--emit-singbox"]:

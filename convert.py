@@ -319,7 +319,7 @@ def _parse_hysteria2_link(url: str) -> dict[str, Any]:
     if at and (not userinfo or "@" in userinfo):
         raise ValueError("Invalid Hysteria 2 authentication field")
 
-    params = parse_qs(parsed.query, keep_blank_values=True, errors="strict")
+    params = parse_qs(parsed.query, keep_blank_values=True, errors="strict", max_num_fields=100)
     if params.keys() - HYSTERIA2_OPTIONS or any(len(values) != 1 for values in params.values()):
         raise ValueError("Unsupported or repeated Hysteria 2 URI option")
     options = {key: values[0] for key, values in params.items()}
@@ -727,7 +727,7 @@ def to_clash(nodes: list[dict[str, Any]]) -> str:
         if isinstance(share, str) and is_hysteria2_link(share):
             parsed = parse_share_link(share)
             # Mihomo's fingerprint changes the trust policy and can match a non-leaf certificate.
-            if not parsed or "fingerprint" in parsed:
+            if not parsed or "fingerprint" in parsed or "%" in parsed["server"]:
                 raise ExportError("The Hysteria 2 link cannot be converted to Clash without losing settings.")
             # Cached nodes from earlier versions may be missing required URI options.
             n = {**parsed, "name": n.get("name", parsed["name"])}

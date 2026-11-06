@@ -529,7 +529,7 @@ def _valid_authority_share(share: str, scheme: str) -> bool:
     if scheme in ("vmess", "vless", "tuic") and not parsed.username:
         return False
     if scheme in ("hysteria2", "hy2"):
-        ech = parse_qs(parsed.query, keep_blank_values=True).get("ech", [""])
+        ech = parse_qs(parsed.query, keep_blank_values=True, max_num_fields=100).get("ech", [""])
         if len(ech) != 1:
             return False
         if ech[0]:
