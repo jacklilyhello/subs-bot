@@ -131,6 +131,55 @@ test("subscription aliases stream identical Base64 across UTF-8 and R2 chunk bou
   assert.deepEqual(reads.slice(beforeHead), pass);
 });
 
+test("streams structured fallback and preserves a valid stored share in the same snapshot", async () => {
+  const structured = { type: "ss", server: "203.0.113.10", port: 8388, name: "港 + 字", cipher: "aes-256-gcm", password: "fixture-only" };
+  const stored = "vless://synthetic-client@bücher.example:443#原始标签 😀";
+  const generated = "ss://YWVzLTI1Ni1nY206Zml4dHVyZS1vbmx5@203.0.113.10:8388#%E6%B8%AF%20%2B%20%E5%AD%97";
+  const { env } = fixture([
+    [structured, { ...structured, share: null }],
+    [{ ...structured, type: "unknown", share: stored }, { ...structured, share: "" }],
+  ]);
+  const response = await request(`/sub/${TOKEN}/mixed`, env);
+  assert.equal(response.status, 200);
+  assertPrivate(response);
+  assert.equal(await response.text(), Buffer.from([generated, generated, stored, generated].join("\n")).toString("base64"));
+  const head = await request(`/sub/${TOKEN}/v2ray`, env, "HEAD");
+  assert.equal(head.status, 200);
+  assertPrivate(head);
+  assert.equal(head.body, null);
+
+  for (const invalid of [
+    { ...structured, share: "ss://malformed-fixture" },
+    { ...structured, share: false },
+    { ...structured, server: "faß.example" },
+    { ...structured, plugin: "v2ray-plugin", plugin_opts: "tls;cert=/path/to/synthetic-fixture" },
+  ]) {
+    const rejected = fixture([[{ share: stored }], [invalid]]);
+    const response = await request(`/sub/${TOKEN}/base64`, rejected.env);
+    assert.equal(response.status, 422);
+    assertPrivate(response);
+    assert.equal(await response.text(), "Subscription content cannot be exported.");
+  }
+});
+
+test("applies the 16 MiB limit to serialized URI bytes and separators", async () => {
+  const maximum = 16 * 1024 * 1024;
+  const base = { type: "ss", server: "203.0.113.10", port: 8388, cipher: "aes-256-gcm", password: "fixture-only" };
+  const prefixBytes = "ss://YWVzLTI1Ni1nY206Zml4dHVyZS1vbmx5@203.0.113.10:8388#".length;
+  const fullName = "字".repeat(170_000);
+  const fullShareBytes = prefixBytes + 9 * fullName.length;
+  const remaining = maximum - (10 * (fullShareBytes + 1)) - prefixBytes;
+  const finalName = "字".repeat(Math.floor(remaining / 9)) + "x".repeat(remaining % 9);
+  const groups = Array.from({ length: 10 }, () => [{ ...base, name: fullName }]);
+  for (const over of [false, true]) {
+    const { env } = fixture([...groups, [{ ...base, name: over ? finalName + "x" : finalName }]]);
+    const response = await request(`/sub/${TOKEN}/base64`, env, "HEAD");
+    assert.equal(response.status, over ? 422 : 200);
+    assertPrivate(response);
+    assert.equal(response.body, null);
+  }
+});
+
 test("wrong capabilities and unavailable formats never read private objects", async () => {
   const { env, lookups, reads } = fixture([[{ share: LINK }]]);
   const wrongToken = "other-sub-token-000000";
