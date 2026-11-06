@@ -28,9 +28,11 @@ const sourceUrl = "https://provider.example.invalid/subscription";
 before(async () => {
   db = await miniflare.getD1Database("DB");
   bucket = await miniflare.getR2Bucket("NODES");
-  const sql = await readFile(new URL("../migrations/0001_subscriptions.sql", import.meta.url), "utf8");
-  const statements = sql.trim().split(/;\s*/u).filter(Boolean);
-  await db.batch(statements.map((statement) => db.prepare(statement)));
+  for (const migration of ["0001_subscriptions.sql", "0003_subscription_lifecycle.sql"]) {
+    const sql = await readFile(new URL(`../migrations/${migration}`, import.meta.url), "utf8");
+    const statements = sql.trim().split(/;\s*/u).filter(Boolean);
+    await db.batch(statements.map((statement) => db.prepare(statement)));
+  }
 });
 
 after(() => miniflare.dispose());
@@ -60,7 +62,7 @@ test("uses exact owner IDs and hides unpublished or invalid capabilities", async
   assert.equal(await getSubscriptionSnapshot(db, subscription.token), null);
   assert.equal(await getSubscriptionSnapshot(db, `${subscription.token}\n`), null);
   assert.equal(await publishNodeSnapshot(db, bucket, {
-    id: subscription.id, ownerId: otherOwner, expectedGeneration: 0,
+    id: subscription.id, ownerId: otherOwner, expectedGeneration: 0, expectedLifecycleRevision: 0,
   }, [{ name: "Unauthorized" }]), false);
   for (const ownerId of ["012", "0", "1\n", "9223372036854775808"]) {
     await assert.rejects(createSubscription(db, { ownerId, name: "Invalid", sourceUrl }), /Invalid subscription owner/u);
@@ -70,7 +72,8 @@ test("uses exact owner IDs and hides unpublished or invalid capabilities", async
 test("provider expiry is metadata and does not revoke a published capability", async () => {
   const { id, token } = await create();
   const node = { name: "Published" };
-  assert.equal(await publishNodeSnapshot(db, bucket, { id, ownerId: owner, expectedGeneration: 0 }, [node]), true);
+  const target = { id, ownerId: owner, expectedGeneration: 0, expectedLifecycleRevision: 0 };
+  assert.equal(await publishNodeSnapshot(db, bucket, target, [node]), true);
   const snapshot = await loadPublished(token);
   const now = Math.floor(Date.now() / 1000);
   for (const expiry of [now - 3600, now, now + 3600, null]) {
@@ -89,7 +92,8 @@ test("publishes and reads more than 2 MB as bounded R2 chunks", async () => {
       yield { name: `Node ${index}`, options: item };
     }
   }
-  assert.equal(await publishNodeSnapshot(db, bucket, { id, ownerId: owner, expectedGeneration: 0 }, nodes()), true);
+  const target = { id, ownerId: owner, expectedGeneration: 0, expectedLifecycleRevision: 0 };
+  assert.equal(await publishNodeSnapshot(db, bucket, target, nodes()), true);
   const snapshot = await loadPublished(token);
   assert.equal(snapshot.generation, 1);
   assert.equal(snapshot.nodeCount, 8);
@@ -112,9 +116,10 @@ test("publishes and reads more than 2 MB as bounded R2 chunks", async () => {
 test("preserves the current snapshot when a refresh is empty, oversized, or fails in R2", async () => {
   const { id, token } = await create();
   const previous = { name: "Previous" };
-  assert.equal(await publishNodeSnapshot(db, bucket, { id, ownerId: owner, expectedGeneration: 0 }, [previous]), true);
+  const initial = { id, ownerId: owner, expectedGeneration: 0, expectedLifecycleRevision: 0 };
+  assert.equal(await publishNodeSnapshot(db, bucket, initial, [previous]), true);
   const current = await loadPublished(token);
-  const target = { id, ownerId: owner, expectedGeneration: 1 };
+  const target = { ...initial, expectedGeneration: 1 };
   await assert.rejects(publishNodeSnapshot(db, bucket, target, []), /empty subscription snapshot/u);
   await assert.rejects(publishNodeSnapshot(db, bucket, target, [{ name: "x".repeat(MAX_CHUNK_BYTES) }]), /exceeds storage limits/u);
   const failedManifest = {
@@ -134,7 +139,8 @@ test("preserves the current snapshot when a refresh is empty, oversized, or fail
 
 test("concurrent publishers use a single D1 CAS winner and keep the previous immutable version", { timeout: 20_000 }, async () => {
   const { id, token } = await create();
-  assert.equal(await publishNodeSnapshot(db, bucket, { id, ownerId: owner, expectedGeneration: 0 }, [{ name: "Previous" }]), true);
+  const initial = { id, ownerId: owner, expectedGeneration: 0, expectedLifecycleRevision: 0 };
+  assert.equal(await publishNodeSnapshot(db, bucket, initial, [{ name: "Previous" }]), true);
   const previous = await loadPublished(token);
   const { promise, resolve } = Promise.withResolvers<void>();
   let waiting = 0;
@@ -149,7 +155,7 @@ test("concurrent publishers use a single D1 CAS winner and keep the previous imm
     },
     delete: (keys: string[]) => bucket.delete(keys),
   } as R2Bucket;
-  const target = { id, ownerId: owner, expectedGeneration: 1 };
+  const target = { ...initial, expectedGeneration: 1 };
   const names = ["First", "Second"];
   const results = await Promise.all(names.map((name) => publishNodeSnapshot(db, racingBucket, target, [{ name }])));
   assert.equal(results.filter(Boolean).length, 1);
@@ -163,7 +169,7 @@ test("concurrent publishers use a single D1 CAS winner and keep the previous imm
 test("rejects missing and same-size corrupted published objects", async () => {
   const { id, token } = await create();
   assert.equal(await publishNodeSnapshot(db, bucket, {
-    id, ownerId: owner, expectedGeneration: 0,
+    id, ownerId: owner, expectedGeneration: 0, expectedLifecycleRevision: 0,
   }, [{ name: "original" }]), true);
   const snapshot = await loadPublished(token);
   const prefix = `subscriptions/${id}/${snapshot.snapshotId}/`;
