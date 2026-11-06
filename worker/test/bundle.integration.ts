@@ -91,9 +91,13 @@ test("the hosted deployment artifact exports small and large snapshots in worker
     const idna = "vless://synthetic-client@bücher.example:443#Früh 😀";
     const hopping = "hy2://fixture@[2001:db8::5]:443,8443-8445/?ech=AAT-DQAA#港";
     const invalidEch = "hy2://fixture@proxy.example.invalid?ech=%2Fpath%2Fto%2Fsynthetic-fixture";
+    const sip002 = "ss://aes-256-gcm:fixture@proxy.example.invalid:8388/?plugin=v2ray-plugin%3Btls%3Bhost%3Dtls.example.invalid#港";
+    const unsafeInner = "aes-256-gcm:fixture@proxy.example.invalid:8388/?plugin=%2Fpath%2Fsynthetic-program#@shadow.example.invalid:8388";
+    const unsafePlugin = "ss://" + Buffer.from(unsafeInner).toString("base64url");
     for (const { links, status } of [
-      { links: [vmess, idna, hopping], status: 200 },
+      { links: [vmess, idna, hopping, sip002], status: 200 },
       { links: [vmess, invalidEch], status: 422 },
+      { links: [vmess, unsafePlugin], status: 422 },
     ]) {
       const ownerId = "900000003";
       const subscription = await createSubscription(db, {
