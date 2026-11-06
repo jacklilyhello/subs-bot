@@ -16,6 +16,8 @@ class WorkerSingBoxOracleTests(unittest.TestCase):
     def test_shared_expected_outbounds_match_python(self):
         cases = json.loads((ROOT / "worker" / "test" / "singbox-corpus.json").read_text(encoding="utf-8"))
         for case in cases:
+            if case.get("workerOnly"):
+                continue
             with self.subTest(label=case["label"]):
                 node = case["node"]
                 if "vmess" in case:

@@ -130,10 +130,12 @@ test("the hosted deployment artifact exports small and large snapshots in worker
       id: subscription.id, ownerId, expectedGeneration: 0, expectedLifecycleRevision: 0,
     }, nodes), true);
     const singboxPath = "/sub/" + subscription.token + "/sing-box";
-    const head = await request(singboxPath, { method: "HEAD" });
+    // Match the isolation smoke probe: dynamic compression may omit Content-Length.
+    const headers = { "Accept-Encoding": "identity" };
+    const head = await request(singboxPath, { method: "HEAD", headers });
     assert.equal(head.status, 200);
     assert.equal(head.body, null);
-    const response = await request(singboxPath);
+    const response = await request(singboxPath, { headers });
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("content-type"), "application/json");
     assert.equal(response.headers.get("cache-control"), "private, no-store");
@@ -141,7 +143,7 @@ test("the hosted deployment artifact exports small and large snapshots in worker
     assert.equal(response.headers.get("content-length"), String(emitted.length));
     const { outbounds } = JSON.parse(emitted.toString("utf8"));
     const tags = ['港 "字" 🌐', "proxy (2)", "VMess", "VMess (3)", "VMess (2)", "Reality", "direct (2)",
-      "Hysteria", "港", "TUIC", "AnyTLS", "SOCKS", "HTTPS"];
+      "Hysteria", "港", "TUIC", "AnyTLS", "SOCKS", "HTTPS", "Hysteria peer", "Gecko"];
     assert.deepEqual(outbounds, [
       { type: "selector", tag: "proxy", outbounds: tags }, { type: "direct", tag: "direct" },
       ...corpus.map(({ outbound }: { outbound: Record<string, unknown> }, index: number) => ({

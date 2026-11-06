@@ -19,6 +19,8 @@
 
 Sing-box 返回含选择器、直连项和代理出站的 JSON。支持 Shadowsocks、VMess、VLESS、Trojan、Hysteria 1 和 2、TUIC、AnyTLS、SOCKS 和 HTTP(S) 的已支持选项。HTTP(S) 使用结构化节点，VMess 的分享 URI 使用 Base64 JSON。引用其他出站或本地文件、执行外部插件、未支持的旧式协议，以及无法保持语义的 Hysteria 2 URI 证书钉扎和 ECH，都会使该订阅的 Sing-box 导出返回 `422`。Sing-box JSON 独立限制为 16 MiB 和 25,000 个代理出站。每个原始节点名的 JSON 编码最多 1 KiB，所有原始节点名合计最多 2 MiB。GitHub 托管 runner 使用校验过 SHA-256 的 Sing-box 1.14.4 检查实际 Worker 响应。 [Sing-box 1.14.4](https://github.com/SagerNet/sing-box/releases/tag/v1.14.4) · [Sing-box 出站](https://sing-box.sagernet.org/configuration/outbound/)
 
+Hysteria 1 分享 URI 的 `peer` 映射到 TLS SNI，上传和下载速率必须达到客户端最小值。Hysteria 2 的 Gecko 包大小沿用客户端默认值与 2,048 字节上限。Hysteria 1 和 2 客户端加载配置时会逐项展开跳跃端口。Worker 在每个出站限制 65,535 项，每份配置限制 1,048,576 项。端口范围的首尾均计入，重复和重叠项分别计数。这是客户端内存保护限额。 [Hysteria 1 URI](https://v1.hysteria.network/docs/uri-scheme/) · [Sing-box 1.14.4 所用端口展开代码](https://github.com/SagerNet/sing-quic/blob/7e0a5869a5f4/hysteria/client.go#L111-L139) · [Hysteria 2 Gecko 与端口展开](https://github.com/SagerNet/sing-quic/blob/7e0a5869a5f4/hysteria2/client.go#L115-L140)
+
 聚合、其他导出格式、数据导入界面、订阅拉取和生产域名属于后续阶段。
 
 ## 组件边界

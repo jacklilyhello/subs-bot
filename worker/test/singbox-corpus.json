@@ -64,5 +64,16 @@
     "label": "Clash HTTPS",
     "node": {"name":"HTTPS","type":"https","server":"http.example.invalid","port":443,"username":"fixture","password":"fixture-only","sni":"front.example.invalid"},
     "outbound": {"type":"http","server":"http.example.invalid","server_port":443,"username":"fixture","password":"fixture-only","tls":{"enabled":true,"server_name":"front.example.invalid"}}
+  },
+  {
+    "label": "Official Hysteria v1 peer option",
+    "workerOnly": true,
+    "node": {"name":"Hysteria peer","type":"hysteria","share":"hysteria://hy1.example.invalid:443?peer=front.example.invalid&upmbps=10&downmbps=20"},
+    "outbound": {"type":"hysteria","server":"hy1.example.invalid","server_port":443,"up_mbps":10,"down_mbps":20,"tls":{"enabled":true,"server_name":"front.example.invalid"}}
+  },
+  {
+    "label": "Native Hysteria2 Gecko packet bounds",
+    "node": {"name":"Gecko","type":"hysteria2","server":"hy2.example.invalid","server_port":443,"password":"fixture-only","tls":{"enabled":true},"obfs":{"type":"gecko","password":"fixture-gecko","min_packet_size":0,"max_packet_size":2048}},
+    "outbound": {"type":"hysteria2","server":"hy2.example.invalid","server_port":443,"password":"fixture-only","tls":{"enabled":true},"obfs":{"type":"gecko","password":"fixture-gecko","min_packet_size":0,"max_packet_size":2048}}
   }
 ]

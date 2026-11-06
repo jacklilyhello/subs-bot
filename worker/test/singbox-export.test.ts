@@ -14,7 +14,7 @@ interface Case {
 const corpus: Case[] = JSON.parse(await readFile(new URL("./singbox-corpus.json", import.meta.url), "utf8"));
 const base = corpus[0].node;
 
-test("converts the same verified protocol fields as the legacy Python oracle", () => {
+test("converts the shared Python oracle and explicit Worker extension cases", () => {
   for (const { label, node, vmess, outbound } of corpus) {
     const input = vmess ? { ...node, share: "vmess://" + Buffer.from(JSON.stringify(vmess)).toString("base64") } : node;
     const snapshot = structuredClone(input);
@@ -22,6 +22,45 @@ test("converts the same verified protocol fields as the legacy Python oracle", (
     assert.equal(result.name, input.name, label);
     assert.deepEqual(JSON.parse(result.json), outbound, label);
     assert.deepEqual(input, snapshot, label);
+  }
+});
+
+test("requires usable Hysteria v1 rates and preserves a matching peer/SNI", () => {
+  const node = { type: "hysteria", server: "hy1.example.invalid", server_port: 443,
+    tls: { enabled: true }, up: "16384 Bps", down: "1 Mbps" };
+  assert.equal(JSON.parse(serializeSingBoxOutbound(node).json).up, "16384 Bps");
+  assert.throws(() => serializeSingBoxOutbound({ ...node, up: "16383 Bps" }), SingBoxContentError);
+  const share = "hysteria://hy1.example.invalid:443?peer=front.example.invalid&upmbps=10";
+  assert.throws(() => serializeSingBoxOutbound({ share }), SingBoxContentError);
+  assert.throws(() => serializeSingBoxOutbound({ share: share + "&downmbps=0" }), SingBoxContentError);
+  assert.throws(() => serializeSingBoxOutbound({
+    share: share + "&downmbps=20&sni=other.example.invalid",
+  }), SingBoxContentError);
+  assert.equal(JSON.parse(serializeSingBoxOutbound({
+    share: share + "&downmbps=20&sni=front.example.invalid",
+  }).json).tls.server_name, "front.example.invalid");
+});
+
+test("counts each expanded Hysteria hopping entry, including duplicates and overlaps", () => {
+  const share = "hy2://fixture@hy2.example.invalid:443,5000-6000";
+  assert.equal(serializeSingBoxOutbound({ share }).hoppingPorts, 1002);
+  const node = { type: "hysteria2", server: "hy2.example.invalid", tls: { enabled: true } };
+  const server_ports = ["1:65532", "1:2", "2:2"];
+  assert.equal(serializeSingBoxOutbound({ ...node, server_ports }).hoppingPorts, 65535);
+  assert.throws(() => serializeSingBoxOutbound({ ...node, server_ports: [...server_ports, "2:2"] }),
+    SingBoxContentError);
+});
+
+test("checks effective Gecko bounds without rewriting explicit or omitted defaults", () => {
+  const node = { type: "hysteria2", server: "hy2.example.invalid", server_port: 443, tls: { enabled: true } };
+  const baseObfs = { type: "gecko", password: "fixture-gecko" };
+  for (const limits of [{ min_packet_size: 1200 }, { min_packet_size: 0, max_packet_size: 512 }]) {
+    const obfs = { ...baseObfs, ...limits };
+    assert.deepEqual(JSON.parse(serializeSingBoxOutbound({ ...node, obfs }).json).obfs, obfs);
+  }
+  for (const limits of [{ min_packet_size: 1201 }, { min_packet_size: 0, max_packet_size: 511 },
+    { max_packet_size: 2049 }, { min_packet_size: 700, max_packet_size: 699 }]) {
+    assert.throws(() => serializeSingBoxOutbound({ ...node, obfs: { ...baseObfs, ...limits } }), SingBoxContentError);
   }
 });
 

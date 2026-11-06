@@ -24,6 +24,12 @@ const SURROGATE = /[\ud800-\udfff]/u;
 const LEGACY_METADATA = new Set(["name", "tag", "type", "share", "raw"]);
 const MAX_UINT32 = 2 ** 32 - 1;
 const MAX_INT32 = 2 ** 31 - 1;
+const MAX_HOPPING_PORTS_PER_OUTBOUND = 65535;
+const MIN_HYSTERIA1_BYTES_PER_SECOND = 16384n;
+const MAX_UINT64 = 2n ** 64n - 1n;
+const GECKO_DEFAULT_MIN_PACKET_SIZE = 512;
+const GECKO_DEFAULT_MAX_PACKET_SIZE = 1200;
+const GECKO_MAX_PACKET_SIZE = 2048;
 
 export class SingBoxContentError extends Error {}
 
@@ -141,13 +147,31 @@ function ports(value: unknown): string[] {
   });
 }
 
-const nativeRanges = (value: unknown): boolean => (!Array.isArray(value) || value.length > 0)
-  && listable((item: unknown) => {
-    const match = typeof item === "string" && /^([0-9]{1,5}):([0-9]{1,5})(?![\s\S])/u.exec(item);
-    if (!match) return false;
-    const start = numberInRange(match[1], 1, 65535);
-    return start !== null && numberInRange(match[2], start, 65535) !== null;
-  })(value);
+function expandedHoppingPorts(value: unknown): number {
+  const ranges: unknown[] = Array.isArray(value) ? value : [value];
+  if (ranges.length === 0) unsupported();
+  let total = 0;
+  for (const range of ranges) {
+    const match = typeof range === "string" && /^([0-9]{1,5}):([0-9]{1,5})(?![\s\S])/u.exec(range);
+    if (!match) return unsupported();
+    const start = integer(match[1], 1, 65535);
+    const end = integer(match[2], start, 65535);
+    // The client expands each range, including duplicates and overlaps.
+    total += end - start + 1;
+    if (total > MAX_HOPPING_PORTS_PER_OUTBOUND) unsupported();
+  }
+  return total;
+}
+
+function validHysteria1Bandwidth(value: unknown, mbps: unknown): boolean {
+  if (value === undefined) return typeof mbps === "number" && mbps > 0;
+  if (!isString(value)) return false;
+  const match = /^([0-9]{1,20}) *([KMGT]?)([bB])ps(?![\s\S])/u.exec(value);
+  if (!match) return false;
+  const exponent = match[2] ? "KMGT".indexOf(match[2]) + 1 : 0;
+  const count = BigInt(match[1]) * 1000n ** BigInt(exponent);
+  return count <= MAX_UINT64 && count / (match[3] === "b" ? 8n : 1n) >= MIN_HYSTERIA1_BYTES_PER_SECOND;
+}
 
 function inlineEch(value: unknown): boolean {
   if (!strings(value)) return false;
@@ -198,7 +222,10 @@ const QUIC: Schema = {
   connection_receive_window: isUint, max_concurrent_streams: isInt,
   initial_packet_size: isInt, disable_path_mtu_discovery: isBool,
 };
-const HYSTERIA: Schema = { ...QUIC, server_ports: nativeRanges, hop_interval: duration, up_mbps: isInt, down_mbps: isInt };
+const HYSTERIA: Schema = {
+  ...QUIC, server_ports: (value) => typeof value === "string" || Array.isArray(value),
+  hop_interval: duration, up_mbps: isInt, down_mbps: isInt,
+};
 const TRANSPORT: Schema = { transport: isTransport, tls: (value) => matches(value, TLS_SCHEMA), multiplex };
 const NATIVE_SCHEMAS = new Map<string, Schema>([
   ["shadowsocks", { method: (value) => isString(value) && SS_METHODS.has(value),
@@ -231,7 +258,7 @@ const COMMON: Schema = {
   tcp_keep_alive: duration, tcp_keep_alive_interval: duration, udp_fragment: isBool, reuse_addr: isBool,
 };
 
-function validate(protocol: string, output: Fields): void {
+function validate(protocol: string, output: Fields): number {
   const schema = NATIVE_SCHEMAS.get(protocol);
   const network: Schema = NETWORK_PROTOCOLS.has(protocol) ? { network: listable(oneOf("tcp", "udp")) } : {};
   if (!schema || !matches(output, { type: isString, ...COMMON, ...network, ...schema })) unsupported();
@@ -246,16 +273,23 @@ function validate(protocol: string, output: Fields): void {
   if (["vmess", "vless", "tuic"].includes(protocol) && !output.uuid) unsupported();
   if (["trojan", "anytls"].includes(protocol) && !output.password) unsupported();
   if (protocol === "tuic" && output.udp_over_stream && output.udp_relay_mode) unsupported();
-  if (protocol === "hysteria" && output.auth && output.auth_str) unsupported();
+  if (protocol === "hysteria" && ((output.auth && output.auth_str)
+    || !validHysteria1Bandwidth(output.up, output.up_mbps)
+    || !validHysteria1Bandwidth(output.down, output.down_mbps))) unsupported();
   if (protocol === "hysteria2" && isRecord(output.obfs)) {
     const { type, password, min_packet_size: min, max_packet_size: max } = output.obfs;
-    if (!type || !password || (type !== "gecko" && (min !== undefined || max !== undefined))
-      || (typeof min === "number" && typeof max === "number" && max !== 0 && min > max)) unsupported();
+    if (!type || !password) unsupported();
+    if (type === "gecko") {
+      const effectiveMin = typeof min === "number" && min !== 0 ? min : GECKO_DEFAULT_MIN_PACKET_SIZE;
+      const effectiveMax = typeof max === "number" && max !== 0 ? max : GECKO_DEFAULT_MAX_PACKET_SIZE;
+      if (effectiveMin > effectiveMax || effectiveMax > GECKO_MAX_PACKET_SIZE) unsupported();
+    } else if (min !== undefined || max !== undefined) unsupported();
   }
   const tls = isRecord(output.tls) ? output.tls : {};
   if (TLS_REQUIRED.has(protocol) && tls.enabled !== true) unsupported();
   if (isRecord(tls.reality) && tls.reality.enabled === true
     && (!tls.reality.public_key || !isRecord(tls.utls) || tls.utls.enabled !== true || tls.insecure)) unsupported();
+  return output.server_ports === undefined ? 0 : expandedHoppingPorts(output.server_ports);
 }
 
 function native(source: Fields, protocol: string): Fields {
@@ -591,6 +625,11 @@ function uriSource(share: string, scheme: string, protocol: string, address: str
     source.ports = port;
   } else source.port = port ?? (TLS_REQUIRED.has(protocol) || protocol === "trojan" ? 443 : undefined);
   if (TRANSPORT_PROTOCOLS.has(protocol)) uriTransport(source, options, string(take(options, "type", "tcp"), true));
+  if (protocol === "hysteria") {
+    // The Hysteria v1 URI uses peer for TLS SNI.
+    const sni = scalarAlias(options, ["sni", "peer"]);
+    if (sni !== undefined) options.sni = sni;
+  }
   if (TLS_REQUIRED.has(protocol) || TRANSPORT_PROTOCOLS.has(protocol)) uriTls(source, options, protocol);
 
   const [rawUser, rawPassword] = splitOnce(auth ?? "", ":");
@@ -624,7 +663,7 @@ function uriSource(share: string, scheme: string, protocol: string, address: str
   return source;
 }
 
-export function serializeSingBoxOutbound(node: NodeRecord): { name: string; json: string } {
+export function serializeSingBoxOutbound(node: NodeRecord): { name: string; json: string; hoppingPorts: number } {
   try {
     const name = node.name === undefined || node.name === null || node.name === "" ? "node" : string(node.name, true);
     if (CONTROL.test(name)) unsupported();
@@ -650,8 +689,8 @@ export function serializeSingBoxOutbound(node: NodeRecord): { name: string; json
     if (protocol === undefined || !NATIVE_SCHEMAS.has(protocol)) return unsupported();
     const output = type === protocol && (Object.hasOwn(source, "server_port") || Object.hasOwn(source, "server_ports"))
       ? native(source, protocol) : clash(source, protocol, type === "https");
-    validate(protocol, output);
-    return { name, json: JSON.stringify(output) };
+    const hoppingPorts = validate(protocol, output);
+    return { name, json: JSON.stringify(output), hoppingPorts };
   } catch {
     // URI/JSON parsers may include input values in their errors.
     return unsupported();

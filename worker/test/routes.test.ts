@@ -362,6 +362,18 @@ test("Sing-box aborts a late corrupted body without returning complete JSON", as
   assert.equal(reads, 2);
 });
 
+test("Sing-box caps expanded Hysteria hopping entries across the whole response", async () => {
+  const node = { type: "hysteria2", server: "hy2.example.invalid", tls: { enabled: true } };
+  const full = Array.from({ length: 16 }, () => ({ ...node, server_ports: ["1:65535"] }));
+  // 16 full ranges and 16 entries reach 1,048,576; the next entry is rejected.
+  for (const [range, status] of [["443:458", 200], ["443:459", 422]]) {
+    const { env } = fixture([[...full, { ...node, server_ports: [range] }]]);
+    const response = await request("/sub/" + TOKEN + "/singbox", env, "HEAD");
+    assert.equal(response.status, status);
+    assert.equal(response.body, null);
+  }
+});
+
 test("canceling a response stops reads beyond the current lookahead window", async () => {
   const first = LINK + "x".repeat(4 * 24 * 1024);
   const { env, reads } = fixture([
