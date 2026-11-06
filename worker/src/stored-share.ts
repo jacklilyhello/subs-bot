@@ -19,7 +19,7 @@ const DOMAIN_LABEL = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?![\s\S])/u
 const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const percentUtf8 = new TextDecoder("utf-8", { fatal: false, ignoreBOM: true });
 
-function splitOnce(value: string, separator: string): [string, string | undefined] {
+export function splitOnce(value: string, separator: string): [string, string | undefined] {
   const index = value.indexOf(separator);
   return index === -1 ? [value, undefined] : [value.slice(0, index), value.slice(index + separator.length)];
 }
@@ -51,7 +51,7 @@ function decodeBase64(value: string, requireStandardPadding = false): string | n
   return atob(encoded.replaceAll("-", "+").replaceAll("_", "/"));
 }
 
-function validIpv6(value: string): boolean {
+export function validIpv6(value: string): boolean {
   if (!value.includes(":") || /[^0-9a-f:.]/iu.test(value)) return false;
   try {
     return new URL("https://[" + value + "]/").hostname.startsWith("[");
@@ -60,7 +60,7 @@ function validIpv6(value: string): boolean {
   }
 }
 
-function validServer(value: unknown): boolean {
+export function validServer(value: unknown): boolean {
   if (typeof value !== "string" || !value) return false;
   if (value.startsWith("[") && value.endsWith("]")) return validIpv6(value.slice(1, -1));
   if (value.includes(":")) return validIpv6(value);
@@ -75,7 +75,7 @@ function validServer(value: unknown): boolean {
   return domain.length <= 253 && domain.split(".").every((label) => DOMAIN_LABEL.test(label));
 }
 
-function numberInRange(value: unknown, minimum: number, maximum: number): number | null {
+export function numberInRange(value: unknown, minimum: number, maximum: number): number | null {
   const number = typeof value === "string" && /^[0-9]{1,10}(?![\s\S])/u.test(value) ? Number(value) : value;
   return typeof number === "number" && Number.isSafeInteger(number) && number >= minimum && number <= maximum
     ? number : null;
@@ -168,7 +168,7 @@ function isPluginParameter(field: string): boolean {
   return key.toLowerCase() === "plugin";
 }
 
-function validShadowsocksPlugin(value: string): boolean {
+export function validShadowsocksPlugin(value: string): boolean {
   const [plugin, options = ""] = splitOnce(value, ";");
   if (INVALID_LINE_CHARACTER.test(value) || (plugin !== "obfs-local" && plugin !== "v2ray-plugin")) return false;
   if (!options) return true;
@@ -244,6 +244,10 @@ function validShadowsocks(address: string): boolean {
   }
   if (password === undefined || (!password && method !== "none") || !/^[A-Za-z0-9_-]+(?![\s\S])/u.test(method)
       || !safeAuthority(endpoint) || !validEndpoint(endpoint, "ss") || !validShadowsocksQuery(address)) return false;
+  return validShadowsocks2022Keys(method, password);
+}
+
+export function validShadowsocks2022Keys(method: string, password: string): boolean {
   const keyBytes = SS_2022_KEY_BYTES.get(method);
   return keyBytes === undefined || password.split(":").every((key) => decodeBase64(key, true)?.length === keyBytes);
 }

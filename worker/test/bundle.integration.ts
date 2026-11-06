@@ -94,21 +94,26 @@ test("the hosted deployment artifact exports small and large snapshots in worker
     const sip002 = "ss://aes-256-gcm:fixture@proxy.example.invalid:8388/?plugin=v2ray-plugin%3Btls%3Bhost%3Dtls.example.invalid#港";
     const unsafeInner = "aes-256-gcm:fixture@proxy.example.invalid:8388/?plugin=%2Fpath%2Fsynthetic-program#@shadow.example.invalid:8388";
     const unsafePlugin = "ss://" + Buffer.from(unsafeInner).toString("base64url");
-    for (const { links, status } of [
-      { links: [vmess, idna, hopping, sip002], status: 200 },
-      { links: [vmess, invalidEch], status: 422 },
-      { links: [vmess, unsafePlugin], status: 422 },
+    const structured = { type: "ss", name: "港 字", server: "203.0.113.10", port: 8388, cipher: "aes-256-gcm", password: "fixture-only" };
+    const generated = "ss://YWVzLTI1Ni1nY206Zml4dHVyZS1vbmx5@203.0.113.10:8388#%E6%B8%AF%20%E5%AD%97";
+    const valid = [vmess, idna, hopping, sip002];
+    for (const { nodes, expectedShares, status } of [
+      { nodes: [...valid.map((share) => ({ share })), structured], expectedShares: [...valid, generated], status: 200 },
+      { nodes: [{ share: vmess }, { share: invalidEch }], expectedShares: [], status: 422 },
+      { nodes: [{ share: vmess }, { share: unsafePlugin }], expectedShares: [], status: 422 },
+      { nodes: [{ share: vmess }, { ...structured, share: "ss://malformed-fixture" }], expectedShares: [], status: 422 },
+      { nodes: [{ share: vmess }, { ...structured, unsupported: true }], expectedShares: [], status: 422 },
     ]) {
       const ownerId = "900000003";
       const subscription = await createSubscription(db, {
         ownerId, name: "Stored share validation", sourceUrl: "https://provider.example.invalid/synthetic",
       });
       const publication = { id: subscription.id, ownerId, expectedGeneration: 0, expectedLifecycleRevision: 0 };
-      assert.equal(await publishNodeSnapshot(db, bucket, publication, links.map((share) => ({ share }))), true);
+      assert.equal(await publishNodeSnapshot(db, bucket, publication, nodes), true);
       const exportResult = await request(`/sub/${subscription.token}/base64`);
       assert.equal(exportResult.status, status);
       const expected = status === 200
-        ? Buffer.from(links.join("\n")).toString("base64") : "Subscription content cannot be exported.";
+        ? Buffer.from(expectedShares.join("\n")).toString("base64") : "Subscription content cannot be exported.";
       assert.equal(await exportResult.text(), expected);
     }
   } finally {
