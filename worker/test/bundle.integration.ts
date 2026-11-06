@@ -12,15 +12,15 @@ test("the hosted deployment artifact exports small and large snapshots in worker
   const directory = process.env.WORKER_TEST_BUNDLE_DIR;
   assert(directory, "Missing hosted artifact directory");
   const fixture = JSON.parse(await readFile(join(directory, "isolation.json"), "utf8"));
-  const scriptPath = join(directory, "index.js");
+  const bundle = await readFile(join(directory, "index.js"));
   const digest = (body: Buffer) => createHash("sha256").update(body).digest("hex");
-  assert.equal(digest(await readFile(scriptPath)), fixture.bundleSha256);
+  assert.equal(digest(bundle), fixture.bundleSha256);
   const migration = await readFile(join(directory, "0001_subscriptions.sql"));
   assert.equal(digest(migration), fixture.migrationSha256);
 
   const miniflare = new Miniflare({
     modules: true,
-    scriptPath,
+    script: bundle.toString("utf8"),
     compatibilityDate: fixture.compatibilityDate,
     bindings: { BUILD_REVISION: fixture.revision },
     d1Databases: ["DB"],
