@@ -20,7 +20,10 @@ let db: D1Database;
 
 before(async () => {
   db = await miniflare.getD1Database("DB");
-  for (const file of ["0001_subscriptions.sql", "0002_telegram.sql", "0003_subscription_lifecycle.sql", "0004_telegram_views.sql"]) {
+  for (const file of [
+    "0001_subscriptions.sql", "0002_telegram.sql", "0003_subscription_lifecycle.sql", "0004_telegram_views.sql",
+    "0005_private_shares.sql", "0006_telegram_lifecycle.sql",
+  ]) {
     const sql = await readFile(new URL(`../migrations/${file}`, import.meta.url), "utf8");
     await db.batch(sql.trim().split(/;\s*/u).filter(Boolean).map((statement) => db.prepare(statement)));
   }

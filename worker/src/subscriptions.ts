@@ -25,6 +25,20 @@ export interface SubscriptionLifecycleTarget {
   expectedLifecycleRevision: number;
 }
 
+export type SubscriptionMutation = { kind: "rename"; name: string } | { kind: "trash" | "restore" };
+
+interface SubscriptionMutationGuard {
+  // Only an internal SQL predicate belongs here. Values must be bound.
+  sql: string;
+  bindings: readonly (string | number | null)[];
+}
+
+interface PreparedSubscriptionMutation {
+  first: D1PreparedStatement;
+  followups: D1PreparedStatement[];
+  writes: number;
+}
+
 const MAX_PAGE_SIZE = 50;
 const TRASH_SECONDS = 30 * 24 * 60 * 60;
 const LIST_FIELDS = "id, name, expire_at AS expireAt, traffic_used AS trafficUsed, traffic_total AS trafficTotal, node_count AS nodeCount";
@@ -114,84 +128,114 @@ function guardExclusiveRow(db: D1Database, id: number, ownerId: string): D1Prepa
   `).bind(id, id, ownerId, id);
 }
 
-export async function renameOwnedSubscription(
-  db: D1Database,
-  target: SubscriptionLifecycleTarget,
-  name: string,
-): Promise<boolean> {
-  checkTarget(target);
+export function normalizeSubscriptionName(name: string): string {
   const normalizedName = typeof name === "string" ? name.trim() : "";
   if (!normalizedName || Array.from(normalizedName).length > 64
     || /[\u0000-\u001f\u007f-\u009f\ud800-\udfff]/u.test(normalizedName)) {
     throw new RangeError("Invalid subscription name.");
   }
-  const { id, ownerId, expectedLifecycleRevision } = target;
-  const eligible = `id = ? AND owner_id = ? AND ${SUBSCRIPTION_LIFECYCLE_REVISION} = ?
-    AND NOT EXISTS (SELECT 1 FROM subscription_trash WHERE id = subscriptions.id)`;
-  return mutate(db, [
-    db.prepare(`UPDATE subscriptions SET name = ?, updated_at = unixepoch() WHERE ${eligible}`)
-      .bind(normalizedName, id, ownerId, expectedLifecycleRevision),
-    db.prepare(`
-      INSERT INTO subscription_lifecycle (subscription_id, revision)
-      SELECT id, ? FROM subscriptions WHERE ${eligible}
-      ON CONFLICT (subscription_id) DO UPDATE SET revision = excluded.revision
-    `).bind(expectedLifecycleRevision + 1, id, ownerId, expectedLifecycleRevision),
-  ], 2);
+  return normalizedName;
 }
 
-export async function trashOwnedSubscription(db: D1Database, target: SubscriptionLifecycleTarget): Promise<boolean> {
+// The first statement determines whether the operation started. If a caller
+// records that result before the followups, its write must preserve changes().
+export function prepareOwnedSubscriptionMutation(
+  db: D1Database,
+  target: SubscriptionLifecycleTarget,
+  mutation: SubscriptionMutation,
+  guard?: SubscriptionMutationGuard,
+): PreparedSubscriptionMutation {
   checkTarget(target);
   const { id, ownerId, expectedLifecycleRevision } = target;
   const nextRevision = expectedLifecycleRevision + 1;
-  return mutate(db, [
-    db.prepare(`
-      INSERT INTO subscription_trash (${STORED_FIELDS}, deleted_at, lifecycle_revision)
-      SELECT ${STORED_FIELDS}, unixepoch(), ? FROM subscriptions
-      WHERE id = ? AND owner_id = ? AND ${SUBSCRIPTION_LIFECYCLE_REVISION} = ?
-    `).bind(nextRevision, id, ownerId, expectedLifecycleRevision),
-    db.prepare(`
-      INSERT INTO subscription_lifecycle (subscription_id, revision)
-      SELECT id, lifecycle_revision FROM subscription_trash
-      WHERE id = ? AND owner_id = ? AND lifecycle_revision = ? AND changes() = 1
-      ON CONFLICT (subscription_id) DO UPDATE SET revision = excluded.revision
-      WHERE subscription_lifecycle.revision = ?
-    `).bind(id, ownerId, nextRevision, expectedLifecycleRevision),
-    db.prepare(`
-      DELETE FROM subscriptions WHERE id = ? AND owner_id = ? AND changes() = 1
-        AND ${SUBSCRIPTION_LIFECYCLE_REVISION} = ?
-        AND EXISTS (SELECT 1 FROM subscription_trash WHERE id = subscriptions.id
-          AND owner_id = subscriptions.owner_id AND lifecycle_revision = ?)
-    `).bind(id, ownerId, nextRevision, nextRevision),
-    guardExclusiveRow(db, id, ownerId),
-  ], 3);
-}
+  const condition = guard ? `AND (${guard.sql})` : "";
+  const bindings = guard?.bindings ?? [];
+  const active = `id = ? AND owner_id = ? AND ${SUBSCRIPTION_LIFECYCLE_REVISION} = ?`;
 
-export async function restoreOwnedSubscription(db: D1Database, target: SubscriptionLifecycleTarget): Promise<boolean> {
-  checkTarget(target);
-  const { id, ownerId, expectedLifecycleRevision } = target;
-  const nextRevision = expectedLifecycleRevision + 1;
-  return mutate(db, [
-    db.prepare(`
+  if (mutation.kind === "rename") {
+    const name = normalizeSubscriptionName(mutation.name);
+    const eligible = `${active} AND NOT EXISTS (SELECT 1 FROM subscription_trash WHERE id = subscriptions.id)`;
+    return {
+      first: db.prepare(`UPDATE subscriptions SET name = ?, updated_at = unixepoch() WHERE ${eligible} ${condition}`)
+        .bind(name, id, ownerId, expectedLifecycleRevision, ...bindings),
+      followups: [db.prepare(`
+        INSERT INTO subscription_lifecycle (subscription_id, revision)
+        SELECT id, ? FROM subscriptions WHERE changes() = 1 AND ${eligible}
+        ON CONFLICT (subscription_id) DO UPDATE SET revision = excluded.revision
+      `).bind(nextRevision, id, ownerId, expectedLifecycleRevision)],
+      writes: 2,
+    };
+  }
+  if (mutation.kind === "trash") {
+    return {
+      first: db.prepare(`
+        INSERT INTO subscription_trash (${STORED_FIELDS}, deleted_at, lifecycle_revision)
+        SELECT ${STORED_FIELDS}, unixepoch(), ? FROM subscriptions WHERE ${active} ${condition}
+      `).bind(nextRevision, id, ownerId, expectedLifecycleRevision, ...bindings),
+      followups: [
+        db.prepare(`
+          INSERT INTO subscription_lifecycle (subscription_id, revision)
+          SELECT id, lifecycle_revision FROM subscription_trash
+          WHERE id = ? AND owner_id = ? AND lifecycle_revision = ? AND changes() = 1
+          ON CONFLICT (subscription_id) DO UPDATE SET revision = excluded.revision
+          WHERE subscription_lifecycle.revision = ?
+        `).bind(id, ownerId, nextRevision, expectedLifecycleRevision),
+        db.prepare(`
+          DELETE FROM subscriptions WHERE id = ? AND owner_id = ? AND changes() = 1
+            AND ${SUBSCRIPTION_LIFECYCLE_REVISION} = ?
+            AND EXISTS (SELECT 1 FROM subscription_trash WHERE id = subscriptions.id
+              AND owner_id = subscriptions.owner_id AND lifecycle_revision = ?)
+        `).bind(id, ownerId, nextRevision, nextRevision),
+        guardExclusiveRow(db, id, ownerId),
+      ],
+      writes: 3,
+    };
+  }
+  return {
+    first: db.prepare(`
       INSERT INTO subscriptions (${STORED_FIELDS})
       SELECT ${RECORD_FIELDS}, unixepoch(), ${SNAPSHOT_FIELDS} FROM subscription_trash
       WHERE id = ? AND owner_id = ? AND lifecycle_revision = ?
         AND deleted_at >= unixepoch() - ${TRASH_SECONDS}
         AND EXISTS (SELECT 1 FROM subscription_lifecycle
           WHERE subscription_id = subscription_trash.id AND revision = subscription_trash.lifecycle_revision)
-    `).bind(id, ownerId, expectedLifecycleRevision),
-    db.prepare(`
-      UPDATE subscription_lifecycle SET revision = ?
-      WHERE subscription_id = ? AND revision = ? AND changes() = 1
-        AND EXISTS (SELECT 1 FROM subscription_trash WHERE id = ? AND owner_id = ? AND lifecycle_revision = ?)
-    `).bind(nextRevision, id, expectedLifecycleRevision, id, ownerId, expectedLifecycleRevision),
-    db.prepare(`
-      DELETE FROM subscription_trash WHERE id = ? AND owner_id = ? AND lifecycle_revision = ?
-        AND changes() = 1
-        AND EXISTS (SELECT 1 FROM subscription_lifecycle
-          WHERE subscription_id = subscription_trash.id AND revision = ?)
-        AND EXISTS (SELECT 1 FROM subscriptions WHERE id = subscription_trash.id
-          AND owner_id = subscription_trash.owner_id AND token = subscription_trash.token)
-    `).bind(id, ownerId, expectedLifecycleRevision, nextRevision),
-    guardExclusiveRow(db, id, ownerId),
-  ], 3);
+        ${condition}
+    `).bind(id, ownerId, expectedLifecycleRevision, ...bindings),
+    followups: [
+      db.prepare(`
+        UPDATE subscription_lifecycle SET revision = ?
+        WHERE subscription_id = ? AND revision = ? AND changes() = 1
+          AND EXISTS (SELECT 1 FROM subscription_trash WHERE id = ? AND owner_id = ? AND lifecycle_revision = ?)
+      `).bind(nextRevision, id, expectedLifecycleRevision, id, ownerId, expectedLifecycleRevision),
+      db.prepare(`
+        DELETE FROM subscription_trash WHERE id = ? AND owner_id = ? AND lifecycle_revision = ?
+          AND changes() = 1
+          AND EXISTS (SELECT 1 FROM subscription_lifecycle
+            WHERE subscription_id = subscription_trash.id AND revision = ?)
+          AND EXISTS (SELECT 1 FROM subscriptions WHERE id = subscription_trash.id
+            AND owner_id = subscription_trash.owner_id AND token = subscription_trash.token)
+      `).bind(id, ownerId, expectedLifecycleRevision, nextRevision),
+      guardExclusiveRow(db, id, ownerId),
+    ],
+    writes: 3,
+  };
+}
+
+function performMutation(db: D1Database, target: SubscriptionLifecycleTarget, mutation: SubscriptionMutation) {
+  const { first, followups, writes } = prepareOwnedSubscriptionMutation(db, target, mutation);
+  return mutate(db, [first, ...followups], writes);
+}
+
+export async function renameOwnedSubscription(
+  db: D1Database, target: SubscriptionLifecycleTarget, name: string,
+): Promise<boolean> {
+  return performMutation(db, target, { kind: "rename", name });
+}
+
+export async function trashOwnedSubscription(db: D1Database, target: SubscriptionLifecycleTarget): Promise<boolean> {
+  return performMutation(db, target, { kind: "trash" });
+}
+
+export async function restoreOwnedSubscription(db: D1Database, target: SubscriptionLifecycleTarget): Promise<boolean> {
+  return performMutation(db, target, { kind: "restore" });
 }

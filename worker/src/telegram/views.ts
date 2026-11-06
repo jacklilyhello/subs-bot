@@ -1,5 +1,6 @@
-import { checkOwnerId, validInteger } from "../storage.ts";
+import { checkOwnerId, SUBSCRIPTION_LIFECYCLE_REVISION, validInteger } from "../storage.ts";
 import { listDeletedSubscriptions, listOwnedSubscriptions } from "../subscriptions.ts";
+import type { TelegramLifecycleButton } from "./lifecycle-actions.ts";
 import { inTelegramScope, type TelegramPolicy, type TelegramViewKind, type TelegramViewUpdate } from "./protocol.ts";
 
 export const TELEGRAM_VIEW_MARKER = "view:v1";
@@ -135,12 +136,12 @@ async function expiryPage(db: D1Database, ownerId: string, view: TelegramView) {
   checkOwnerId(ownerId);
   try {
     const result = await db.prepare(`
-      SELECT id, name, expire_at AS epoch FROM subscriptions
+      SELECT id, name, expire_at AS epoch, ${SUBSCRIPTION_LIFECYCLE_REVISION} AS lifecycleRevision FROM subscriptions
       WHERE owner_id = ? AND expire_at BETWEEN unixepoch() AND unixepoch() + ${EXPIRY_SECONDS}
         ${view.afterId === null ? "" : "AND (expire_at, id) > (?, ?)"}
       ORDER BY expire_at, id LIMIT ?
     `).bind(ownerId, ...(view.afterId === null ? [] : [view.afterEpoch, view.afterId]), PAGE_SIZE + 1)
-      .all<{ id: number; name: string; epoch: number }>();
+      .all<{ id: number; name: string; epoch: number; lifecycleRevision: number }>();
     if (result.success) return result.results;
   } catch {
     // Avoid exposing private parameters in a D1 error.
@@ -152,7 +153,7 @@ export async function renderTelegramView(
   db: D1Database,
   ownerId: string,
   view: TelegramView,
-): Promise<{ text: string; buttons: TelegramViewButton[] }> {
+): Promise<{ text: string; buttons: TelegramViewButton[]; lifecycleButtons: TelegramLifecycleButton[] }> {
   if ((view.afterId !== null && !validInteger(view.afterId, 1))
     || (view.afterEpoch !== null && !validInteger(view.afterEpoch, 1))
     || (view.afterEpoch !== null) !== (view.kind !== "list" && view.afterId !== null)) {
@@ -160,7 +161,7 @@ export async function renderTelegramView(
   }
 
   let title: string;
-  let items: { name: string; epoch?: number }[];
+  let items: { id: number; name: string; epoch?: number; lifecycleRevision: number }[];
   let next: ViewCursor | null = null;
   switch (view.kind) {
     case "list": {
@@ -185,18 +186,25 @@ export async function renderTelegramView(
       const after = view.afterId === null || view.afterEpoch === null
         ? undefined : { id: view.afterId, deletedAt: view.afterEpoch };
       const page = await listDeletedSubscriptions(db, ownerId, { limit: PAGE_SIZE, after });
-      items = page.items.map((row) => ({ name: row.name, epoch: row.deletedAt }));
+      items = page.items.map((row) => ({ ...row, epoch: row.deletedAt }));
       if (page.nextCursor) next = { afterId: page.nextCursor.id, afterEpoch: page.nextCursor.deletedAt };
       break;
     }
   }
 
-  const lines = items.map((item) => item.epoch === undefined
-    ? `• ${displayName(item.name)}` : `• ${displayName(item.name)} · ${displayDate(item.epoch)}`);
+  const lines = items.map((item, index) => `${index + 1}. ${displayName(item.name)}` +
+    (item.epoch === undefined ? "" : ` · ${displayDate(item.epoch)}`));
+  const lifecycleButtons = items.flatMap<TelegramLifecycleButton>(({ id, lifecycleRevision }, index) => {
+    const target = { subscriptionId: id, expectedLifecycleRevision: lifecycleRevision };
+    return view.kind === "recycle"
+      ? [{ ...target, text: `${index + 1} 恢复`, action: "restore" }]
+      : [{ ...target, text: `${index + 1} 重命名`, action: "rename" },
+        { ...target, text: `${index + 1} 删除`, action: "trash-prompt" }];
+  });
   const buttons: TelegramViewButton[] = [];
   if (next) buttons.push({ text: "下一页", ...next });
   if (view.afterId !== null) buttons.push({ text: "第一页", afterId: null, afterEpoch: null });
-  return { text: [title, ...(lines.length ? lines : ["当前没有记录。"])].join("\n"), buttons };
+  return { text: [title, ...(lines.length ? lines : ["当前没有记录。"])].join("\n"), buttons, lifecycleButtons };
 }
 
 export async function prepareTelegramViewTickets(buttons: readonly TelegramViewButton[]): Promise<{

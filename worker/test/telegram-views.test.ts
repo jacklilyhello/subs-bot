@@ -30,6 +30,7 @@ before(async () => {
   db = await miniflare.getD1Database("DB");
   for (const name of [
     "0001_subscriptions.sql", "0002_telegram.sql", "0003_subscription_lifecycle.sql", "0004_telegram_views.sql",
+    "0005_private_shares.sql", "0006_telegram_lifecycle.sql",
   ]) {
     const sql = await readFile(new URL(`../migrations/${name}`, import.meta.url), "utf8");
     await db.batch(sql.trim().split(/;\s*/u).filter(Boolean).map((statement) => db.prepare(statement)));
@@ -82,6 +83,9 @@ test("list views use bounded owner-keyset pages and redact sensitive or unsafe f
   assert.deepEqual(first.buttons.map(({ afterId, afterEpoch }) => ({ afterId, afterEpoch })), [
     { afterId: rows[7].id, afterEpoch: null },
   ]);
+  assert.deepEqual(first.lifecycleButtons.map(({ action, subscriptionId, expectedLifecycleRevision }) =>
+    ({ action, subscriptionId, expectedLifecycleRevision })), rows.slice(0, 8).flatMap(({ id: subscriptionId }) =>
+    ["rename", "trash-prompt"].map((action) => ({ action, subscriptionId, expectedLifecycleRevision: 0 }))));
 
   const second = await renderTelegramView(db, owner, { ...firstPage("list"), ...first.buttons[0] });
   assertNameOrder(second.text, [rows[8].name, rows[9].name, "Clean", "title"]);
@@ -154,6 +158,9 @@ test("recycle views paginate tied deletion times in reverse order and enforce th
   assert.deepEqual(first.buttons.map(({ afterId, afterEpoch }) => ({ afterId, afterEpoch })), [
     { afterId: rows[1].id, afterEpoch: tie },
   ]);
+  assert.deepEqual(first.lifecycleButtons.map(({ action, subscriptionId, expectedLifecycleRevision }) =>
+    ({ action, subscriptionId, expectedLifecycleRevision })), rows.slice(1).reverse().map(({ id: subscriptionId }) =>
+    ({ action: "restore", subscriptionId, expectedLifecycleRevision: 1 })));
   const second = await renderTelegramView(db, owner, { ...firstPage("recycle"), ...first.buttons[0] });
   assert.match(second.text, /Recycle tie 1/u);
   assert.equal(second.text.includes(rows[1].name), false);

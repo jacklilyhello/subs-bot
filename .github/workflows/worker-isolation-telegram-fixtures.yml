@@ -1,4 +1,4 @@
-name: Stage Telegram view fixtures
+name: Stage Telegram acceptance fixtures
 
 on:
   workflow_dispatch:
@@ -12,6 +12,12 @@ on:
         description: Unique 16-character lowercase alphanumeric cohort key
         required: true
         type: string
+      purpose:
+        description: Read-only views or subscription lifecycle actions
+        required: true
+        type: choice
+        options: [views, lifecycle]
+        default: views
 
 permissions:
   contents: read
@@ -40,6 +46,7 @@ jobs:
           SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
           SUBS_BOT_TELEGRAM_FIXTURE_ACTION: ${{ inputs.action }}
           SUBS_BOT_TELEGRAM_FIXTURE_COHORT: ${{ inputs.cohort }}
+          SUBS_BOT_TELEGRAM_FIXTURE_PURPOSE: ${{ inputs.purpose }}
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           python3 -B worker/tools/telegram_view_fixtures.py
