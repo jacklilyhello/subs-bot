@@ -1,11 +1,15 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 const directory = process.argv[2];
 const revision = process.env.BUILD_REVISION;
-if (!directory || !/^[a-f0-9]{40}$/.test(revision ?? "")) {
-  throw new Error("The hosted artifact directory and a full Git revision are required");
+const ref = process.env.GITHUB_REF;
+const runId = process.env.GITHUB_RUN_ID;
+const runAttempt = process.env.GITHUB_RUN_ATTEMPT;
+if (!directory || !/^[a-f0-9]{40}$/.test(revision ?? "") || !ref?.startsWith("refs/")
+    || !/^[1-9][0-9]*$/.test(runId ?? "") || !/^[1-9][0-9]*$/.test(runAttempt ?? "")) {
+  throw new Error("The hosted artifact directory and exact GitHub build provenance are required");
 }
 
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
@@ -63,12 +67,25 @@ async function snapshot(id, snapshotId, token, count) {
   };
 }
 
+const migrations = [];
+const migrationNames = (await readdir(directory)).filter((name) => name.endsWith(".sql")).sort();
+if (migrationNames[0] !== "0001_subscriptions.sql") throw new Error("Missing baseline migration");
+for (const [index, name] of migrationNames.entries()) {
+  if (!/^[0-9]{4}_[a-z][a-z0-9_]*\.sql$/.test(name) || Number(name.slice(0, 4)) !== index + 1) {
+    throw new Error("Invalid migration filename or order");
+  }
+  migrations.push({ name, sha256: digest(await readFile(join(directory, name))) });
+}
+
 await writeFile(join(directory, "isolation.json"), JSON.stringify({
-  version: 1,
+  version: 2,
+  ref,
+  runId,
+  runAttempt,
   revision,
   compatibilityDate,
   bundleSha256: digest(await readFile(join(directory, "index.js"))),
-  migrationSha256: digest(await readFile(join(directory, "0001_subscriptions.sql"))),
+  migrations,
   snapshots: [
     await snapshot(1, "11111111-1111-4111-8111-111111111111", "subsbot-synthetic-small-01", 3),
     await snapshot(2, "22222222-2222-4222-8222-222222222222", "subsbot-synthetic-large-01", 9000),

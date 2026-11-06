@@ -66,6 +66,20 @@ test("uses exact owner IDs and hides unpublished or invalid capabilities", async
   }
 });
 
+test("provider expiry is metadata and does not revoke a published capability", async () => {
+  const { id, token } = await create();
+  const node = { name: "Published" };
+  assert.equal(await publishNodeSnapshot(db, bucket, { id, ownerId: owner, expectedGeneration: 0 }, [node]), true);
+  const snapshot = await loadPublished(token);
+  const now = Math.floor(Date.now() / 1000);
+  for (const expiry of [now - 3600, now, now + 3600, null]) {
+    await db.prepare("UPDATE subscriptions SET expire_at = ? WHERE id = ?").bind(expiry, id).run();
+    assert.equal((await getOwnedSubscription(db, owner, id))?.expireAt, expiry);
+    assert.deepEqual(await loadPublished(token), snapshot);
+  }
+  assert.deepEqual(await collect(snapshot), [node]);
+});
+
 test("publishes and reads more than 2 MB as bounded R2 chunks", async () => {
   const { id, token } = await create();
   const item = "测".repeat(100_000);

@@ -15,8 +15,11 @@ test("the hosted deployment artifact exports small and large snapshots in worker
   const bundle = await readFile(join(directory, "index.js"));
   const digest = (body: Buffer) => createHash("sha256").update(body).digest("hex");
   assert.equal(digest(bundle), fixture.bundleSha256);
-  const migration = await readFile(join(directory, "0001_subscriptions.sql"));
-  assert.equal(digest(migration), fixture.migrationSha256);
+  assert.equal(fixture.version, 2);
+  assert.equal(fixture.ref, process.env.GITHUB_REF);
+  assert.equal(fixture.runId, process.env.GITHUB_RUN_ID);
+  assert.equal(fixture.runAttempt, process.env.GITHUB_RUN_ATTEMPT);
+  assert.equal(fixture.migrations[0].name, "0001_subscriptions.sql");
 
   const miniflare = new Miniflare({
     modules: true,
@@ -29,8 +32,12 @@ test("the hosted deployment artifact exports small and large snapshots in worker
   try {
     const db = await miniflare.getD1Database("DB");
     const bucket = await miniflare.getR2Bucket("NODES");
-    const statements = migration.toString("utf8").trim().split(/;\s*/u).filter(Boolean);
-    await db.batch(statements.map((statement) => db.prepare(statement)));
+    for (const { name, sha256 } of fixture.migrations) {
+      const migration = await readFile(join(directory, name));
+      assert.equal(digest(migration), sha256);
+      const statements = migration.toString("utf8").trim().split(/;\s*/u).filter(Boolean);
+      await db.batch(statements.map((statement) => db.prepare(statement)));
+    }
 
     for (const snapshot of fixture.snapshots) {
       for (const item of snapshot.objects) {
