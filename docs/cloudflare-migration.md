@@ -91,6 +91,7 @@
 6. 发布含 `0004_telegram_views.sql` 的版本前，先确认已发布并记录支持回执标记的回滚版本。激活新版并核对实际版本后，只为同一隔离测试 Bot 将 `allowed_updates` 扩为 `message` 与 `callback_query`。保持已核对的 URL、Webhook 密钥和连接上限，设置 `drop_pending_updates: false`，用 `getWebhookInfo` 核对结果。回滚视图时先恢复只接收 `message`，保留增量表和待处理更新。 [Telegram Webhook 配置](https://core.telegram.org/bots/api#setwebhook) · [Telegram Webhook 回读](https://core.telegram.org/bots/api#getwebhookinfo)
 7. 真人视图验收前，用 `gh workflow run worker-isolation-telegram-fixtures.yml --ref main -f action=seed -f cohort=<16位小写字母数字>` 生成指定两名测试用户的合成订阅和回收站记录。流程校验实际 Worker、D1、Telegram 配置摘要和迁移，并只写隔离 D1。真人消息及按钮只在内置浏览器验证。结束后以同一个 `cohort` 和 `action=retire` 删除本组记录，核对输出计数。
 8. 订阅操作验收使用同一工作流，增加 `-f purpose=lifecycle`。专用批次只允许匹配的两个账号及预定义合成来源，测试重命名使用原名后接 `-renamed`。退役流程核对归属、名称、版本、删除状态和未发布快照条件，核对不一致时整批保留。
+9. 私密领取验收使用 `worker-isolation-telegram-claims.yml`，通过 `action`、`cohort` 和 `digests` 手动运行。生成四个随机合成分享码，仅将 `targeted`、`race`、`expired` 和 `document` 对应的 SHA-256 摘要提交给工作流。测试人员在指定 Telegram Web 私聊中使用原码。用相同摘要映射退役，核对合成分享、领取与私有 R2 对象均已清除，保留收件和发送回执。
 
 域级 Worker 路由核对使用单独的只读凭据。发布任务内使用项目专用凭据核对 Worker 的 Custom Domain、预览、日志、Cron 及实际数据绑定。 [Cloudflare Worker 路由 API](https://developers.cloudflare.com/api/resources/workers/subresources/routes/)
 
