@@ -49,7 +49,16 @@ export async function verifyIsolation(fixture, revision, fetchRequest) {
   const missing = await request("/sub/subsbot-synthetic-missing-01/base64");
   assert.equal(missing.status, 404);
   await missing.body?.cancel();
-  const unsupported = await request(`/sub/${fixture.snapshots[0].token}/singbox`);
+  const singBox = await request(`/sub/${fixture.snapshots[0].token}/singbox`);
+  assert.equal(singBox.status, 200, "Synthetic Sing-box export failed");
+  assert.equal(singBox.headers.get("content-type"), "application/json");
+  const config = await singBox.json();
+  assert(Array.isArray(config.outbounds) && config.outbounds.length === fixture.snapshots[0].nodeCount + 2
+    && config.outbounds[0]?.type === "selector" && config.outbounds[0]?.tag === "proxy"
+    && config.outbounds[1]?.type === "direct" && config.outbounds[1]?.tag === "direct"
+    && config.outbounds.slice(2).every((outbound) => outbound?.type === "shadowsocks" && outbound?.server === "203.0.113.10"),
+  "Unexpected synthetic Sing-box configuration");
+  const unsupported = await request(`/sub/${fixture.snapshots[0].token}/clash`);
   assert.equal(unsupported.status, 406);
   await unsupported.body?.cancel();
 }

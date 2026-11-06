@@ -1,6 +1,8 @@
 import { getSubscriptionSnapshot, readSnapshotNodes, type NodeRecord, type SubscriptionSnapshot } from "./storage.ts";
 import { isValidStoredShare } from "./stored-share.ts";
 import { serializeStructuredShare } from "./structured-share.ts";
+import { SingBoxContentError } from "./singbox-export.ts";
+import { planSingBox, singBoxChunks } from "./singbox-response.ts";
 import { answerTelegramCallback, drainTelegramReplies } from "./telegram/delivery.ts";
 import { acceptTelegramLifecycle, reapTelegramLifecycle } from "./telegram/lifecycle-actions.ts";
 import { acceptTelegramPrivateClaim } from "./telegram/private-claims.ts";
@@ -18,7 +20,7 @@ export interface Env {
 const MAX_SHARE_BYTES = 16 * 1024 * 1024;
 // Every complete chunk ends on a Base64 group boundary.
 const SHARE_CHUNK_BYTES = 24 * 1024;
-const EXPORT_KINDS = new Set(["base64", "v2ray", "mixed"]);
+const EXPORT_KINDS = new Set(["base64", "v2ray", "mixed", "singbox", "sing-box"]);
 const SUBSCRIPTION_PATH = /^\/sub\/([A-Za-z0-9_-]{16,128})(?:\/([A-Za-z0-9-]{1,32}))?$/;
 const HEADERS = {
   "Cache-Control": "private, no-store",
@@ -83,9 +85,11 @@ async function* base64Chunks(
   if (offset !== 0) yield encoder.encode(btoa(String.fromCharCode(...chunk.subarray(0, offset))));
 }
 
-function base64Body(bucket: R2Bucket, snapshot: SubscriptionSnapshot, shareLength: number): ReadableStream {
+function fixedLengthBody(
+  generate: (signal: AbortSignal) => AsyncGenerator<Uint8Array>, byteLength: number,
+): ReadableStream {
   const abort = new AbortController();
-  const chunks = base64Chunks(bucket, snapshot, abort.signal);
+  const chunks = generate(abort.signal);
   const source = new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
@@ -102,7 +106,7 @@ function base64Body(bucket: R2Bucket, snapshot: SubscriptionSnapshot, shareLengt
       await chunks.return(undefined).catch(() => {});
     },
   }, { highWaterMark: 0 });
-  const { readable, writable } = new FixedLengthStream(4 * Math.ceil(shareLength / 3));
+  const { readable, writable } = new FixedLengthStream(byteLength);
   // A source error aborts the response body. Client cancellation also stops the source.
   void source.pipeTo(writable).catch(() => {});
   return readable;
@@ -168,20 +172,33 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
   }
 
   const [, token, kind = ""] = subscription;
-  if (!EXPORT_KINDS.has(kind.toLowerCase())) return plain("Export format unavailable.", 406, head);
+  const format = kind.toLowerCase();
+  if (!EXPORT_KINDS.has(format)) return plain("Export format unavailable.", 406, head);
 
   try {
     const snapshot = await getSubscriptionSnapshot(env.DB, token);
     if (!snapshot) return plain("Not found.", 404, head);
+    if (format === "singbox" || format === "sing-box") {
+      const plan = await planSingBox(env.NODES, snapshot);
+      return new Response(
+        head ? null : fixedLengthBody((signal) => singBoxChunks(env.NODES, snapshot, plan, signal), plan.bytes),
+        { headers: { ...HEADERS, "Content-Type": "application/json" } },
+      );
+    }
     // Measure and verify the immutable snapshot before returning success, without retaining its content.
     let shareLength = 0;
     for await (const line of shareBytes(env.NODES, snapshot)) shareLength += line.byteLength;
     if (shareLength === 0) return plain("Subscription temporarily unavailable.", 503, head);
-    return new Response(head ? null : base64Body(env.NODES, snapshot, shareLength), {
+    const body = head ? null : fixedLengthBody(
+      (signal) => base64Chunks(env.NODES, snapshot, signal), 4 * Math.ceil(shareLength / 3),
+    );
+    return new Response(body, {
       headers: { ...HEADERS, "Content-Type": "text/plain; charset=utf-8" },
     });
   } catch (error) {
-    if (error instanceof ExportContentError) return plain("Subscription content cannot be exported.", 422, head);
+    if (error instanceof ExportContentError || error instanceof SingBoxContentError) {
+      return plain("Subscription content cannot be exported.", 422, head);
+    }
     return plain("Subscription temporarily unavailable.", 503, head);
   }
 }

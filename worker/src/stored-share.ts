@@ -112,7 +112,7 @@ function safeAuthority(value: string): boolean {
   return !/[/#?@:]/u.test(plain.normalize("NFKC")) && value.includes("[") === value.includes("]");
 }
 
-function validInlineEch(value: string): boolean {
+export function validInlineEch(value: string): boolean {
   if (value.length > 87384) return false;
   const raw = decodeBase64(value);
   if (raw === null || raw.length < 6) return false;
@@ -216,35 +216,39 @@ function validShadowsocksQuery(address: string): boolean {
   return true;
 }
 
-function validShadowsocks(address: string): boolean {
+export function parseStoredShadowsocks(address: string, strictEscapes = false): {
+  method: string; password: string; endpoint: string; address: string;
+} | null {
   let netloc = authority(address);
+  const decode = strictEscapes ? decodeURIComponent : unquote;
   const legacy = !netloc.includes("@");
   if (legacy) {
     const decoded = decodeBase64(address);
-    if (decoded === null) return false;
+    if (decoded === null) return null;
     address = utf8.decode(binaryBytes(decoded));
     // Some URL parsers strip CR, LF and tabs before interpreting the query.
-    if (INVALID_LINE_CHARACTER.test(address)) return false;
+    if (INVALID_LINE_CHARACTER.test(address)) return null;
     netloc = authority(address);
   }
   const at = legacy ? netloc.lastIndexOf("@") : netloc.indexOf("@");
-  if (at < 0) return false;
+  if (at < 0) return null;
   const userinfo = netloc.slice(0, at);
   const endpoint = netloc.slice(at + 1);
   let [method, password] = splitOnce(userinfo, ":");
   if (!legacy) {
     if (password === undefined) {
-      const decoded = decodeBase64(unquote(userinfo));
-      if (decoded === null) return false;
+      const decoded = decodeBase64(decode(userinfo));
+      if (decoded === null) return null;
       [method, password] = splitOnce(utf8.decode(binaryBytes(decoded)), ":");
     } else {
-      method = unquote(method);
-      password = unquote(password);
+      method = decode(method);
+      password = decode(password);
     }
   }
   if (password === undefined || (!password && method !== "none") || !/^[A-Za-z0-9_-]+(?![\s\S])/u.test(method)
-      || !safeAuthority(endpoint) || !validEndpoint(endpoint, "ss") || !validShadowsocksQuery(address)) return false;
-  return validShadowsocks2022Keys(method, password);
+      || !safeAuthority(endpoint) || !validEndpoint(endpoint, "ss") || !validShadowsocksQuery(address)
+      || !validShadowsocks2022Keys(method, password)) return null;
+  return { method, password, endpoint, address };
 }
 
 export function validShadowsocks2022Keys(method: string, password: string): boolean {
@@ -307,17 +311,18 @@ function vmessJsonText(raw: string): string {
   return utf8.decode(bytes).replace(/^\uFEFF/u, "");
 }
 
-function validVmessJson(address: string): boolean {
+export function parseStoredVmessJson(address: string): Record<string, unknown> | null {
   const raw = decodeBase64(address);
-  if (raw === null) return false;
+  if (raw === null) return null;
   const text = vmessJsonText(raw);
   const integerPort = inspectVmessJson(text);
-  if (integerPort === null) return false;
+  if (integerPort === null) return null;
   const data: unknown = JSON.parse(text);
-  if (typeof data !== "object" || data === null || Array.isArray(data)) return false;
-  const { add, id, port } = data as Record<string, unknown>;
+  if (typeof data !== "object" || data === null || Array.isArray(data)) return null;
+  const fields = data as Record<string, unknown>;
+  const { add, id, port } = fields;
   return validServer(add) && typeof id === "string" && id.length > 0 && numberInRange(port, 1, 65535) !== null
-    && (typeof port !== "number" || integerPort);
+    && (typeof port !== "number" || integerPort) ? fields : null;
 }
 
 export function isValidStoredShare(value: unknown): value is string {
@@ -329,8 +334,8 @@ export function isValidStoredShare(value: unknown): value is string {
   if (!address || /\p{White_Space}/u.test(address)) return false;
 
   try {
-    if (scheme === "ss") return validShadowsocks(address);
-    if (scheme === "vmess" && !address.includes("@")) return validVmessJson(address);
+    if (scheme === "ss") return parseStoredShadowsocks(address) !== null;
+    if (scheme === "vmess" && !address.includes("@")) return parseStoredVmessJson(address) !== null;
     if (scheme === "vmess" || AUTHORITY_SCHEMES.has(scheme)) return validAuthorityShare(address, scheme);
     // Legacy opaque schemes are only checked for the outer single-line format.
     return true;
