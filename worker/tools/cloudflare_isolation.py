@@ -17,6 +17,10 @@ from uuid import uuid4
 
 WORKER_NAME = "subs-bot-cf-dev-01"
 NAMESPACE = "lilyya"
+TELEGRAM_CONFIG_BINDING = "TELEGRAM_ISOLATION_CONFIG"
+TELEGRAM_DIGEST_BINDING = "TELEGRAM_CONFIG_SHA256"
+TELEGRAM_CRON = "* * * * *"
+TELEGRAM_BINDINGS = {TELEGRAM_CONFIG_BINDING, TELEGRAM_DIGEST_BINDING}
 ORIGIN = f"https://{WORKER_NAME}.{NAMESPACE}.workers.dev"
 HEALTH_URL = ORIGIN + "/health"
 API_ORIGIN = "https://api.cloudflare.com/client/v4"
@@ -27,8 +31,10 @@ DIGEST = re.compile(r"[0-9a-f]{64}")
 DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z")
 SAFE_PATH = re.compile(r"/[A-Za-z0-9/_.%?=&,~-]+")
+SCHEDULE_PATH = re.compile(rf"/accounts/{HEX_ID.pattern}/workers/scripts/{WORKER_NAME}/schedules")
 MAX_MODULE_BYTES = 1024 * 1024
 MAX_API_BYTES = 8 * 1024 * 1024
+MAX_TELEGRAM_CONFIG_BYTES = 5000
 READBACK_DELAYS = (0, 1, 2, 4)
 
 
@@ -66,15 +72,18 @@ class CloudflareClient:
         self._opener = build_opener(ProxyHandler({}), _NoRedirect())
 
     def __call__(self, method, path, payload=None):
-        _require(method in {"GET", "POST"} and _matches(SAFE_PATH, path) and not path.startswith("//"),
+        _require(method in {"GET", "POST", "PUT"} and _matches(SAFE_PATH, path) and not path.startswith("//"),
                  "Invalid Cloudflare API request.")
         route = path.partition("?")[0]
         _require("%" not in route and not any(part in {".", ".."} for part in route.split("/")),
                  "Invalid Cloudflare API request.")
+        if method == "PUT":
+            _require(_matches(SCHEDULE_PATH, path) and payload == [{"cron": TELEGRAM_CRON}],
+                     "Invalid isolated Cloudflare schedule update.")
         headers = {"Authorization": "Bearer " + self._token, "Accept": "application/json"}
         data = None
         if payload is not None:
-            _require(method == "POST", "Cloudflare GET cannot carry a payload.")
+            _require(method != "GET", "Cloudflare GET cannot carry a payload.")
             try:
                 data = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode()
             except (TypeError, ValueError):
@@ -86,11 +95,11 @@ class CloudflareClient:
                 raw = response.read(MAX_API_BYTES + 1)
         except HTTPError as error:
             error.close()
-            uncertain = method == "POST" and (error.code == 408 or error.code >= 500)
+            uncertain = method != "GET" and (error.code == 408 or error.code >= 500)
             raise CloudflareError(f"Cloudflare API rejected the request (HTTP {error.code}).",
                                   uncertain=uncertain) from None
         except (OSError, ValueError, HTTPException):
-            raise CloudflareError("Cloudflare API connection failed.", uncertain=method == "POST") from None
+            raise CloudflareError("Cloudflare API connection failed.", uncertain=method != "GET") from None
         try:
             if len(raw) > MAX_API_BYTES:
                 raise ValueError()
@@ -99,10 +108,10 @@ class CloudflareClient:
                 raise ValueError()
         except (ValueError, RecursionError):
             raise CloudflareError("Cloudflare API returned an invalid response.",
-                                  uncertain=method == "POST") from None
+                                  uncertain=method != "GET") from None
         _require(envelope["success"], "Cloudflare API rejected the request.")
         if "result" not in envelope:
-            raise CloudflareError("Cloudflare API response is missing its result.", uncertain=method == "POST")
+            raise CloudflareError("Cloudflare API response is missing its result.", uncertain=method != "GET")
         return envelope["result"]
 
 
@@ -119,6 +128,7 @@ class _Version:
     digest: str
     compatibility: str
     tag: str | None
+    telegram_config_sha256: str | None = None
 
 
 class _Isolation:
@@ -138,6 +148,7 @@ class _Isolation:
         self.script = f"{self.account}/workers/scripts/{WORKER_NAME}"
         self.deployments = self.script + "/deployments"
         self.versions = self.worker + "/versions"
+        self.schedules = self.script + "/schedules"
 
     def worker_config(self):
         worker = _object(self.worker_api("GET", self.worker), "Worker")
@@ -162,9 +173,41 @@ class _Isolation:
                  "Isolated Worker ownership tags do not match.")
         _require(self.worker_api("GET", f"{self.account}/workers/domains?service={WORKER_NAME}") == [],
                  "Isolated Worker custom domains are present or could not be verified.")
-        _require(self.worker_api("GET", self.script + "/schedules") == {"schedules": []},
-                 "Isolated Worker schedules are present or could not be verified.")
         return subdomain, observability
+
+    def cron_enabled(self):
+        result = _object(self.worker_api("GET", self.schedules), "Worker schedules")
+        schedules = result.get("schedules")
+        if schedules == []:
+            return False
+        _require(isinstance(schedules, list) and len(schedules) == 1 and isinstance(schedules[0], dict)
+                 and schedules[0].get("cron") == TELEGRAM_CRON,
+                 "Isolated Worker has an unexpected schedule or its schedules could not be verified.")
+        return True
+
+    def ensure_cron(self, deployment, config, guard):
+        _require(self.worker_config() == config, "Isolated Worker configuration changed before Cron setup.")
+        enabled = self.cron_enabled()
+        _require(self.active() == deployment, "Active isolated Worker deployment changed before Cron setup.")
+        _guard_current(guard)
+        if enabled:
+            return False
+        try:
+            self.worker_api("PUT", self.schedules, [{"cron": TELEGRAM_CRON}])
+        except CloudflareError as error:
+            if not error.uncertain:
+                raise CloudflareError("The isolated Worker is active. Cloudflare rejected the Cron setup.") from None
+        for delay in READBACK_DELAYS:
+            if delay:
+                sleep(delay)
+            try:
+                enabled = self.cron_enabled()
+            except CloudflareError:
+                continue
+            if enabled:
+                _require(self.active() == deployment, "Active isolated Worker deployment changed during Cron setup.")
+                return True
+        raise CloudflareError("The isolated Worker is active. Cron setup could not be confirmed.", uncertain=True)
 
     def verify_resources(self):
         namespace = _object(self.worker_api("GET", self.account + "/workers/subdomain"), "account namespace")
@@ -207,10 +250,13 @@ class _Isolation:
                                                      {"enabled": False, "cross_version_cache": False}),
                  "Isolated Worker version runtime settings differ from the supported configuration.")
         rows = version.get("bindings")
-        _require(isinstance(rows, list) and len(rows) == 3 and all(isinstance(row, dict) for row in rows),
+        _require(isinstance(rows, list) and len(rows) in {3, 5}
+                 and all(isinstance(row, dict) and isinstance(row.get("name"), str) for row in rows),
                  "Unexpected isolated Worker binding inventory.")
-        bindings = {row.get("name"): row for row in rows if isinstance(row.get("name"), str)}
-        _require(set(bindings) == {"DB", "NODES", "BUILD_REVISION"}, "Unexpected isolated Worker binding names.")
+        bindings = {row["name"]: row for row in rows}
+        base_bindings = {"DB", "NODES", "BUILD_REVISION"}
+        _require(len(bindings) == len(rows) and set(bindings) in (base_bindings, base_bindings | TELEGRAM_BINDINGS),
+                 "Unexpected isolated Worker binding names.")
         db, r2, rev = (bindings[name] for name in ("DB", "NODES", "BUILD_REVISION"))
         database_ids = [db[key] for key in ("database_id", "id") if db.get(key) is not None]
         _require(db.get("type") == "d1" and database_ids
@@ -219,6 +265,12 @@ class _Isolation:
                  and r2.get("jurisdiction") in (None, "default")
                  and rev.get("type") == "plain_text" and _matches(REVISION, rev.get("text")),
                  "Isolated Worker data or revision binding mismatch.")
+        telegram_digest = None
+        if TELEGRAM_CONFIG_BINDING in bindings:
+            secret, digest = (bindings[name] for name in (TELEGRAM_CONFIG_BINDING, TELEGRAM_DIGEST_BINDING))
+            _require(secret.get("type") == "secret_text" and digest.get("type") == "plain_text"
+                     and _matches(DIGEST, digest.get("text")), "Isolated Worker Telegram binding mismatch.")
+            telegram_digest = digest["text"]
         modules = version.get("modules")
         _require(isinstance(modules, list) and len(modules) == 1, "Unexpected isolated Worker module inventory.")
         module = _object(modules[0], "Worker module")
@@ -233,7 +285,7 @@ class _Isolation:
         _require(0 < len(body) <= MAX_MODULE_BYTES, "Cloudflare Worker module size is invalid.")
         annotations = _object(version.get("annotations") or {}, "version annotations")
         return _Version(rev["text"], sha256(body).hexdigest(), version["compatibility_date"],
-                        annotations.get("workers/tag"))
+                        annotations.get("workers/tag"), telegram_digest)
 
     def staged(self, desired):
         rows = self.worker_api("GET", self.versions + "?page=1&per_page=100")
@@ -242,7 +294,7 @@ class _Isolation:
         for row in rows:
             item = _object(row, "listed Worker version")
             annotations = _object(item.get("annotations") or {}, "version annotations")
-            if annotations.get("workers/tag") == desired.revision:
+            if annotations.get("workers/tag") == desired.tag:
                 candidates.append(item.get("id"))
         _require(len(candidates) <= 1, "More than one isolated Worker version claims the target revision.")
         if not candidates:
@@ -251,7 +303,17 @@ class _Isolation:
         _require(self.version(candidate) == desired, "Staged isolated Worker version differs from the verified artifact.")
         return candidate
 
-    def upload(self, module, desired):
+    def upload(self, module, desired, telegram_config):
+        bindings = [
+            {"type": "d1", "name": "DB", "database_id": self.target["d1Id"]},
+            {"type": "r2_bucket", "name": "NODES", "bucket_name": WORKER_NAME},
+            {"type": "plain_text", "name": "BUILD_REVISION", "text": desired.revision},
+        ]
+        if telegram_config is not None:
+            bindings.extend([
+                {"type": "secret_text", "name": TELEGRAM_CONFIG_BINDING, "text": telegram_config},
+                {"type": "plain_text", "name": TELEGRAM_DIGEST_BINDING, "text": desired.telegram_config_sha256},
+            ])
         try:
             result = self.worker_api("POST", self.versions + "?deploy=false", {
                 "main_module": "index.js",
@@ -262,12 +324,8 @@ class _Isolation:
                     "content_type": "application/javascript+module",
                     "content_base64": base64.b64encode(module).decode("ascii"),
                 }],
-                "bindings": [
-                    {"type": "d1", "name": "DB", "database_id": self.target["d1Id"]},
-                    {"type": "r2_bucket", "name": "NODES", "bucket_name": WORKER_NAME},
-                    {"type": "plain_text", "name": "BUILD_REVISION", "text": desired.revision},
-                ],
-                "annotations": {"workers/tag": desired.revision, "workers/message": "Reviewed isolated Worker release"},
+                "bindings": bindings,
+                "annotations": {"workers/tag": desired.tag, "workers/message": "Reviewed isolated Worker release"},
             })
         except CloudflareError as error:
             if not error.uncertain:
@@ -322,7 +380,7 @@ def _guard_current(guard):
     _require(fresh is not False, "The reviewed GitHub main revision changed.")
 
 
-def _artifact(bundle_dir, manifest):
+def _artifact(bundle_dir, manifest, telegram_config):
     _require(isinstance(manifest, dict) and manifest.get("version") == 2
              and _matches(REVISION, manifest.get("revision")) and _matches(DIGEST, manifest.get("bundleSha256"))
              and _matches(DATE, manifest.get("compatibilityDate")) and isinstance(manifest.get("migrations"), list),
@@ -336,8 +394,22 @@ def _artifact(bundle_dir, manifest):
         raise CloudflareError("Verified Worker module is unavailable.") from None
     _require(0 < len(module) <= MAX_MODULE_BYTES and sha256(module).hexdigest() == manifest["bundleSha256"],
              "Verified Worker module digest mismatch.")
-    return module, _Version(manifest["revision"], manifest["bundleSha256"], manifest["compatibilityDate"],
-                            manifest["revision"])
+    revision = manifest["revision"]
+    telegram_digest = None
+    tag = revision
+    if telegram_config is not None:
+        _require(isinstance(telegram_config, str), "Invalid isolated Telegram configuration.")
+        try:
+            config_bytes = telegram_config.encode("utf-8")
+        except UnicodeError:
+            raise CloudflareError("Invalid isolated Telegram configuration.") from None
+        _require(0 < len(config_bytes) <= MAX_TELEGRAM_CONFIG_BYTES,
+                 "Isolated Telegram configuration size is invalid.")
+        telegram_digest = sha256(config_bytes).hexdigest()
+        # Distinct configuration releases can share a Git revision.
+        tag = "telegram-" + sha256(f"{revision}:{telegram_digest}".encode("ascii")).hexdigest()
+    return module, _Version(revision, manifest["bundleSha256"], manifest["compatibilityDate"],
+                            tag, telegram_digest)
 
 
 def _read_health():
@@ -373,17 +445,20 @@ def verify_worker_target(worker_api, data_api, target):
     """Read ownership, privacy and active binding facts before any release writes."""
     scope = _Isolation(worker_api, data_api, target)
     scope.worker_config()
+    scope.cron_enabled()
     scope.verify_resources()
     active = scope.active()
     version = scope.version(active.version)
     return {"deploymentId": active.id, "versionId": active.version, "revision": version.revision}
 
 
-def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *, expected_active=None):
-    """Stage and activate only the verified Worker module, with guarded code rollback."""
-    module, desired = _artifact(bundle_dir, manifest)
+def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *, expected_active=None,
+                   telegram_config: str | None = None):
+    """Release the verified Worker and optionally configure its isolated Telegram schedule."""
+    module, desired = _artifact(bundle_dir, manifest, telegram_config)
     scope = _Isolation(worker_api, data_api, target)
     config = scope.worker_config()
+    had_cron = scope.cron_enabled()
     scope.verify_resources()
     previous = scope.active()
     old_version = scope.version(previous.version)
@@ -391,27 +466,36 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
         "deploymentId": previous.id, "versionId": previous.version, "revision": old_version.revision,
     }, "Isolated Worker deployment changed while verifying D1.")
     _require(old_version.compatibility == desired.compatibility, "Worker compatibility date change requires separate approval.")
+    _require(telegram_config is not None or (not had_cron and old_version.telegram_config_sha256 is None),
+             "Isolated Telegram configuration is required to preserve the active configuration.")
     _verify_health(old_version.revision)
     if old_version.revision == desired.revision:
         _require(old_version.digest == desired.digest, "Active revision differs from the verified module digest.")
-        _require(scope.active() == previous, "Active isolated Worker deployment changed during verification.")
-        _guard_current(guard)
-        return {"revision": desired.revision, "deploymentId": previous.id, "versionId": previous.version,
-                "previousVersionId": previous.version, "changed": False}
+        if old_version.telegram_config_sha256 == desired.telegram_config_sha256:
+            if telegram_config is None:
+                _require(scope.active() == previous, "Active isolated Worker deployment changed during verification.")
+                _guard_current(guard)
+                changed = False
+            else:
+                changed = scope.ensure_cron(previous, config, guard)
+            return {"revision": desired.revision, "deploymentId": previous.id, "versionId": previous.version,
+                    "previousVersionId": previous.version, "changed": changed}
 
     candidate = scope.staged(desired)
     if candidate is None:
         _require(scope.active() == previous, "Active isolated Worker deployment changed before upload.")
         _guard_current(guard)
-        candidate = scope.upload(module, desired)
+        candidate = scope.upload(module, desired, telegram_config)
 
     _require(scope.worker_config() == config, "Isolated Worker configuration changed before activation.")
+    _require(scope.cron_enabled() == had_cron, "Isolated Worker schedule changed before activation.")
     scope.verify_resources()
     _require(scope.active() == previous, "Active isolated Worker deployment changed before activation.")
     _guard_current(guard)
     activated = scope.activate(previous, candidate, f"Isolated Worker release {desired.revision} {uuid4()}")
     try:
         _require(scope.worker_config() == config, "Isolated Worker configuration changed after activation.")
+        _require(scope.cron_enabled() == had_cron, "Isolated Worker schedule changed during activation.")
         scope.verify_resources()
         _require(scope.version(activated.version) == desired, "Active Worker version differs from the verified artifact.")
         _verify_health(desired.revision)
@@ -419,6 +503,7 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
     except CloudflareError:
         try:
             _require(scope.worker_config() == config, "Isolated Worker configuration changed before rollback.")
+            _require(scope.cron_enabled() == had_cron, "Isolated Worker schedule changed before rollback.")
             scope.verify_resources()
             _require(scope.version(previous.version) == old_version, "Prior Worker version changed before rollback.")
             _require(scope.active() == activated, "Active isolated Worker deployment changed before rollback.")
@@ -430,5 +515,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
             raise CloudflareError("Isolated Worker verification failed and a safe rollback could not be confirmed.") from None
         raise CloudflareError("Isolated Worker verification failed. The prior version was restored.") from None
 
+    # Cron is script-level. A failed update must not restore code that cannot handle a possibly installed trigger.
+    if telegram_config is not None:
+        scope.ensure_cron(activated, config, guard)
     return {"revision": desired.revision, "deploymentId": activated.id, "versionId": activated.version,
             "previousVersionId": previous.version, "changed": True}
