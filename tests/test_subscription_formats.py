@@ -506,5 +506,20 @@ class SubscriptionFormatTests(unittest.TestCase):
                     self.assertEqual(nodes[0]["password"], "密码")
 
 
+    def test_fetch_reports_rejected_hysteria2_without_exposing_the_uri(self):
+        bad = "hy2://secret-marker@host.example.invalid:443,70000"
+        good = "hy2://host.example.invalid:443,5000-5002"
+        nodes, meta, error = asyncio.run(_fetch(base64.b64encode(bad.encode()), None))
+        self.assertEqual(nodes, [])
+        self.assertEqual(meta["rejected_hysteria2"], 1)
+        self.assertIn("Hysteria 2", error)
+        self.assertNotIn("secret-marker", error)
+
+        nodes, meta, error = asyncio.run(_fetch(f"{bad}\n{good}".encode(), None))
+        self.assertEqual([node["share"] for node in nodes], [good])
+        self.assertEqual(meta["rejected_hysteria2"], 1)
+        self.assertIsNone(error)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -7,12 +7,19 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from urllib.parse import quote
 
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from convert import parse_nodes_from_text, to_base64_sub, to_clash, to_singbox  # noqa: E402
+from convert import (  # noqa: E402
+    parse_nodes_from_text,
+    parse_nodes_from_text_with_report,
+    to_base64_sub,
+    to_clash,
+    to_singbox,
+)
 from export_errors import ExportError  # noqa: E402
 
 
@@ -78,18 +85,62 @@ class Hysteria2ImportTests(unittest.TestCase):
             "hy2://proxy.example.invalid:443,5000-65536#Out-of-range",
             "hy2://[2001:db8::5]unexpected:443#Bracket-suffix",
             "hy2://user@#Missing-host",
+            "hy2://",
+            "hy2://auth-fixture@proxy.example.invalid?auth=conflicting-fixture",
+            "hysteria2+realm://token-fixture@realm.example.invalid/name",
         ]
-        nodes = parse_nodes_from_text("\n".join([DEFAULT_PORT, *malformed, LEGACY_AUTH]))
-        self.assertEqual([node["share"] for node in nodes], [DEFAULT_PORT, LEGACY_AUTH])
+        plain = "\n".join([DEFAULT_PORT, *malformed, LEGACY_AUTH])
+        for document in (plain, as_base64(plain)):
+            nodes, rejected = parse_nodes_from_text_with_report(document)
+            self.assertEqual([node["share"] for node in nodes], [DEFAULT_PORT, LEGACY_AUTH])
+            self.assertEqual(rejected, len(malformed))
 
-    def test_whole_certificate_pin_remains_in_base64_and_singbox_fails_explicitly(self):
-        share = f"hy2://fixture-password@pin.example.invalid:443?pinSHA256={'ab' * 32}#Pinned"
+    def test_legacy_mport_keeps_port_range_and_rejects_conflict(self):
+        valid = "hy2://auth-fixture@proxy.example.invalid:8443?mport=5000-5002"
+        invalid = "hy2://auth-fixture@proxy.example.invalid:443,8443?mport=5000-5002"
+        nodes, rejected = parse_nodes_from_text_with_report(f"{valid}\n{invalid}")
+        self.assertEqual(rejected, 1)
+        self.assertEqual(nodes[0]["ports"], "5000-5002")
+        self.assertEqual(json.loads(to_singbox(nodes))["outbounds"][2]["server_ports"], ["5000:5002"])
+
+    def test_whole_certificate_pin_remains_in_base64_and_unsafe_conversions_fail(self):
+        share = f"hy2://fixture-password@pin.example.invalid:443?insecure=1&pinSHA256={'ab' * 32}#Pinned"
         nodes = parse_nodes_from_text(share)
         self.assertEqual(base64.b64decode(to_base64_sub(nodes), validate=True).decode(), share)
-        with self.assertRaises(ExportError) as error:
-            to_singbox(nodes)
-        self.assertNotIn("fixture-password", str(error.exception))
+        cached = {"name": "Pinned (renamed)", "type": "hysteria2", "share": share, "skip-cert-verify": True}
+        for export in (to_clash, to_singbox):
+            for source in (nodes, [cached]):
+                with self.assertRaises(ExportError) as error:
+                    export(source)
+                self.assertNotIn("fixture-password", str(error.exception))
+
+        nodes, rejected = parse_nodes_from_text_with_report(share.replace("ab" * 32, "::"))
+        self.assertEqual(nodes, [])
+        self.assertEqual(rejected, 1)
+
+    def test_clash_recovers_missing_options_from_cached_uri_and_keeps_label(self):
+        cached = {"name": "Cached (renamed)", "type": "hysteria2", "share": PORT_HOPPING}
+        proxy = yaml.safe_load(to_clash([cached]))["proxies"][0]
+        self.assertEqual(proxy["name"], "Cached (renamed)")
+        self.assertEqual(proxy["ports"], "443,5000-5002")
+        self.assertEqual(proxy["obfs-password"], "fixture+;%")
+
+    def test_ech_requires_inline_config_for_new_imports_and_cached_base64_export(self):
+        config = "AEn+DQBFKwAgACABWIHUGj4u+PIggYXcR5JF0gYk3dCRioBW8uJq9H4mKAAIAAEAAQABAANAEnB1YmxpYy50bHMtZWNoLmRldgAA"
+        prefix = "hy2://ech.example.invalid?ech="
+        share = prefix + quote(config, safe="")
+        nodes = parse_nodes_from_text(share)
+        self.assertEqual(base64.b64decode(to_base64_sub(nodes), validate=True).decode(), share)
+        self.assertEqual(yaml.safe_load(to_clash(nodes))["proxies"][0]["ech-opts"], {"enable": True, "config": config})
+        for value in ("%2Fpath%2Fto%2Ffixture", "YWJjZA==", quote(config + "=", safe="")):
+            bad = prefix + value
+            self.assertEqual(parse_nodes_from_text_with_report(bad), ([], 1))
+            with self.assertRaises(ExportError):
+                to_base64_sub([{"type": "hysteria2", "share": bad}])
 
 
 if __name__ == "__main__":
-    unittest.main()
+    if sys.argv[1:] == ["--emit-singbox"]:
+        print(to_singbox(parse_nodes_from_text(as_base64(f"{PORT_HOPPING}\n{DEFAULT_PORT}"))))
+    else:
+        unittest.main()
