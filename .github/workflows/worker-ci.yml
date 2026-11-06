@@ -2,10 +2,18 @@ name: Worker CI
 
 on:
   pull_request:
-    paths: ['worker/**', '.github/workflows/worker-ci.yml', '.github/workflows/worker-isolation-deploy.yml']
+    paths:
+      - 'worker/**'
+      - '.github/workflows/worker-ci.yml'
+      - '.github/workflows/worker-isolation-deploy.yml'
+      - '.github/workflows/worker-isolation-capacity.yml'
   push:
     branches: [main]
-    paths: ['worker/**', '.github/workflows/worker-ci.yml', '.github/workflows/worker-isolation-deploy.yml']
+    paths:
+      - 'worker/**'
+      - '.github/workflows/worker-ci.yml'
+      - '.github/workflows/worker-isolation-deploy.yml'
+      - '.github/workflows/worker-isolation-capacity.yml'
   workflow_dispatch:
 
 permissions:

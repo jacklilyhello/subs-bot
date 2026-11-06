@@ -1,0 +1,79 @@
+name: Check Worker isolation capacity
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: subs-bot-isolation-deploy
+  cancel-in-progress: false
+
+jobs:
+  measure:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
+    environment: subs-bot-isolation
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Generate the bounded synthetic capacity fixtures
+        timeout-minutes: 2
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          CAPACITY_DIR="$RUNNER_TEMP/subs-bot-capacity"
+          printf 'CAPACITY_DIR=%s\n' "$CAPACITY_DIR" >> "$GITHUB_ENV"
+          python3 -B worker/tools/capacity_fixtures.py "$CAPACITY_DIR" "$GITHUB_SHA"
+      - name: Verify the active isolation Worker before staging
+        id: worker_before
+        timeout-minutes: 2
+        env:
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
+          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPLOY_TOKEN }}
+        run: python3 -B worker/tools/capacity_resources.py verify-worker-before "$CAPACITY_DIR"
+      - name: Seed only the recorded isolated D1 and private R2
+        id: seed
+        timeout-minutes: 7
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
+        run: python3 -B worker/tools/capacity_resources.py seed "$CAPACITY_DIR"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.seed.outcome != 'skipped'
+        with:
+          name: isolation-capacity-checkpoint-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/subs-bot-capacity/capacity-cleanup.json
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Check live boundaries, digest and bounded concurrency
+        timeout-minutes: 8
+        run: python3 -B worker/tools/capacity_probe.py "$CAPACITY_DIR"
+      - name: Verify the active isolation Worker after probing
+        if: always() && steps.worker_before.outcome == 'success' && steps.seed.outcome == 'success'
+        timeout-minutes: 2
+        env:
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
+          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPLOY_TOKEN }}
+        run: python3 -B worker/tools/capacity_resources.py verify-worker-after "$CAPACITY_DIR"
+      - name: Retire the recorded synthetic capabilities and objects
+        id: cleanup
+        if: always() && steps.seed.outcome != 'skipped'
+        timeout-minutes: 7
+        env:
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
+        run: python3 -B worker/tools/capacity_resources.py cleanup "$CAPACITY_DIR"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.cleanup.outcome == 'failure'
+        with:
+          name: isolation-capacity-recovery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/subs-bot-capacity/capacity-cleanup.json
+          if-no-files-found: warn
+          retention-days: 7
