@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { after, before, test } from "node:test";
 
 import { Miniflare } from "miniflare";
 
 import {
-  createSubscription, getOwnedSubscription, getSubscriptionSnapshot, MAX_CHUNK_BYTES,
+  createSubscription, getOwnedSubscription, getSubscriptionSnapshot, MAX_CHUNK_BYTES, MAX_SNAPSHOT_BYTES,
   publishNodeSnapshot, readSnapshotNodes, SnapshotIntegrityError,
 } from "../src/storage.ts";
 import type { NodeRecord, SubscriptionSnapshot } from "../src/storage.ts";
@@ -170,4 +171,27 @@ test("rejects missing and same-size corrupted published objects", async () => {
   await assert.rejects(collect(snapshot), SnapshotIntegrityError);
   await bucket.delete(`${prefix}manifest.json`);
   await assert.rejects(collect(snapshot), SnapshotIntegrityError);
+});
+
+test("rejects a manifest one byte over the snapshot limit before requesting any chunk", async () => {
+  const sha256 = "a".repeat(64);
+  const sizes = [...Array<number>(127).fill(MAX_CHUNK_BYTES), MAX_CHUNK_BYTES - 2, 3];
+  assert.equal(sizes.reduce((total, size) => total + size, 0), MAX_SNAPSHOT_BYTES + 1);
+  const manifest = new TextEncoder().encode(JSON.stringify({
+    version: 1, chunks: sizes.map((bytes) => ({ bytes, sha256, count: 1 })),
+  }));
+  const snapshot: SubscriptionSnapshot = {
+    id: 123, generation: 1, snapshotId: "11111111-1111-4111-8111-111111111111",
+    manifestSha256: createHash("sha256").update(manifest).digest("hex"), nodeCount: sizes.length,
+  };
+  const manifestKey = `subscriptions/${snapshot.id}/${snapshot.snapshotId}/manifest.json`;
+  const reads: string[] = [];
+  const syntheticBucket = {
+    get: async (key: string) => {
+      reads.push(key);
+      return key === manifestKey ? { size: manifest.byteLength, arrayBuffer: async () => manifest.buffer } : null;
+    },
+  } as unknown as R2Bucket;
+  await assert.rejects(async () => readSnapshotNodes(syntheticBucket, snapshot).next(), SnapshotIntegrityError);
+  assert.deepEqual(reads, [manifestKey]);
 });
