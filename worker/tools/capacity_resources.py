@@ -17,7 +17,7 @@ from urllib.request import ProxyHandler, Request, build_opener
 
 from capacity_fixtures import (
     CAPACITY_STATUS as STATUS, CHUNK_BYTES, FIXTURE_PROFILES, NODE_COUNT, SHARE_BYTES, SHARE_PREFIX,
-    SMOKE_CHUNK_COUNT, SMOKE_OBJECT_LIMIT, SNAPSHOT_BYTES, STRUCTURED_SMOKE, structured_smoke_fixture,
+    SMOKE_CHUNK_COUNT, SMOKE_OBJECT_LIMIT, SMOKE_PROFILES, SNAPSHOT_BYTES, smoke_fixture,
 )
 from cloudflare_isolation import (
     API_ORIGIN, DIGEST, HEX_ID, NAMESPACE, REVISION, TIMESTAMP, UUID, WORKER_NAME,
@@ -124,19 +124,19 @@ def check_raw_fixture(directory, fixture, node_count, node_bytes, objects):
                 "Capacity over-limit fixture is invalid.")
 
 
-def check_structured_smoke_fixture(directory, fixture, manifest, objects):
+def check_smoke_fixture(directory, profile, fixture, manifest, objects):
     label = fixture["label"]
-    bodies, share_bytes, export = structured_smoke_fixture(label)
+    bodies, share_bytes, export = smoke_fixture(profile, label)
     descriptors = [{"bytes": len(body), "sha256": digest(body), "count": 1} for body in bodies]
     expected_manifest = json.dumps({"version": 1, "chunks": descriptors}, separators=(",", ":")).encode("ascii")
     require(manifest == expected_manifest
             and all(row["bytes"] <= SMOKE_OBJECT_LIMIT for row in objects)
             and fixture.get("shareBytes") == share_bytes and fixture.get("exportBytes") == len(export)
             and fixture.get("exportSha256") == (digest(export) if export else None),
-            "Structured smoke fixture differs from the fixed synthetic plan.")
+            "Export smoke fixture differs from the fixed synthetic plan.")
     for index, body in enumerate(bodies):
         require(read_object_file(directory, label, index, objects) == body,
-                "Structured smoke fixture records differ from the fixed synthetic plan.")
+                "Export smoke fixture records differ from the fixed synthetic plan.")
 
 
 def read_fixtures(directory, revision, *, profile="capacity"):
@@ -180,8 +180,8 @@ def read_fixtures(directory, revision, *, profile="capacity"):
         require(chunk_files == expected_chunks, "Capacity chunk files do not match their manifest.")
         objects = [{key: row[key] for key in ("bytes", "sha256")} for row in chunk_files]
         objects.append({"bytes": len(manifest), "sha256": digest(manifest)})
-        if profile == STRUCTURED_SMOKE:
-            check_structured_smoke_fixture(directory, fixture, manifest, objects)
+        if profile in SMOKE_PROFILES:
+            check_smoke_fixture(directory, profile, fixture, manifest, objects)
         else:
             check_raw_fixture(directory, fixture, node_count, node_bytes, objects)
         entries.append({"label": label, "snapshotId": snapshot, "nodeCount": node_count,
@@ -255,11 +255,11 @@ def load_ledger(directory, scope_hash, *, profile="capacity"):
                 and len(set(entry["putPending"])) == len(entry["putPending"])
                 and (ledger["phase"] != "retired" or not (entry["reservePending"] or entry["putPending"]))
                 and (entry["label"] != "snapshot-over" or len(entry["objects"]) == 1)
-                and (profile != STRUCTURED_SMOKE or (entry["nodeCount"] == SMOKE_CHUNK_COUNT
+                and (profile not in SMOKE_PROFILES or (entry["nodeCount"] == SMOKE_CHUNK_COUNT
                                                      and len(entry["objects"]) == SMOKE_CHUNK_COUNT + 1)),
                 "Invalid capacity cleanup ledger entry.")
         for index, obj in enumerate(entry["objects"]):
-            limit = (SMOKE_OBJECT_LIMIT if profile == STRUCTURED_SMOKE else
+            limit = (SMOKE_OBJECT_LIMIT if profile in SMOKE_PROFILES else
                      MAX_MANIFEST if index == len(entry["objects"]) - 1 else CHUNK_BYTES)
             require(isinstance(obj, dict) and set(obj) == {"bytes", "sha256"}
                     and integer(obj["bytes"], 1, limit) and matches(DIGEST, obj["sha256"]),
@@ -591,8 +591,8 @@ def main():
             if args.action == "seed":
                 seed(args.directory, resources, os.environ.get("GITHUB_SHA"), os.environ.get("GITHUB_RUN_ID"),
                      verify_release, profile=args.profile)
-                if args.profile == STRUCTURED_SMOKE:
-                    print("Published two verified isolated structured export fixtures.")
+                if args.profile in SMOKE_PROFILES:
+                    print("Published two verified isolated export smoke fixtures.")
                 else:
                     print("Published three verified isolated capacity fixtures.")
             elif args.action == "cleanup":
