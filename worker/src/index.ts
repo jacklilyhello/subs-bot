@@ -1,0 +1,124 @@
+import { getSubscriptionSnapshot, readSnapshotNodes, type SubscriptionSnapshot } from "./storage.ts";
+
+export interface Env {
+  DB: D1Database;
+  NODES: R2Bucket;
+  BUILD_REVISION?: string;
+}
+
+const MAX_SHARE_BYTES = 16 * 1024 * 1024;
+// Every complete chunk ends on a Base64 group boundary.
+const SHARE_CHUNK_BYTES = 24 * 1024;
+const EXPORT_KINDS = new Set(["base64", "v2ray", "mixed"]);
+const SUBSCRIPTION_PATH = /^\/sub\/([A-Za-z0-9_-]{16,128})(?:\/([A-Za-z0-9-]{1,32}))?$/;
+const SHARE_LINE = /^(?:ss|ssr|vmess|vless|trojan|hysteria2?|hy2|tuic|snell|wireguard|anytls|socks5(?:-tls)?):\/\/[^\s#]+(?:#[^\r\n\u2028\u2029]*)?$/i;
+const UNSAFE_SHARE_CHARACTER = /[\u0000-\u001f\u007f-\u009f\ud800-\udfff]/u;
+const HEADERS = {
+  "Cache-Control": "private, no-store",
+  "Referrer-Policy": "no-referrer",
+  "X-Content-Type-Options": "nosniff",
+};
+
+function plain(text: string, status: number, head: boolean, headers?: HeadersInit): Response {
+  const responseHeaders = new Headers(headers);
+  for (const [name, value] of Object.entries(HEADERS)) responseHeaders.set(name, value);
+  responseHeaders.set("Content-Type", "text/plain; charset=utf-8");
+  return new Response(head ? null : text, { status, headers: responseHeaders });
+}
+
+class ExportContentError extends Error {}
+
+async function* shareBytes(bucket: R2Bucket, snapshot: SubscriptionSnapshot): AsyncGenerator<Uint8Array> {
+  const encoder = new TextEncoder();
+  let total = 0;
+
+  for await (const node of readSnapshotNodes(bucket, snapshot)) {
+    const share = node.share;
+    if (typeof share !== "string" || UNSAFE_SHARE_CHARACTER.test(share) || !SHARE_LINE.test(share)) {
+      throw new ExportContentError();
+    }
+    const line = encoder.encode(total === 0 ? share : `\n${share}`);
+    total += line.length;
+    if (total > MAX_SHARE_BYTES) throw new ExportContentError();
+    yield line;
+  }
+}
+
+async function* base64Chunks(bucket: R2Bucket, snapshot: SubscriptionSnapshot): AsyncGenerator<Uint8Array> {
+  const encoder = new TextEncoder();
+  const chunk = new Uint8Array(SHARE_CHUNK_BYTES);
+  let offset = 0;
+
+  for await (const line of shareBytes(bucket, snapshot)) {
+    for (let start = 0; start < line.length;) {
+      const length = Math.min(line.length - start, chunk.length - offset);
+      chunk.set(line.subarray(start, start + length), offset);
+      start += length;
+      offset += length;
+      if (offset === chunk.length) {
+        yield encoder.encode(btoa(String.fromCharCode(...chunk)));
+        offset = 0;
+      }
+    }
+  }
+  if (offset !== 0) yield encoder.encode(btoa(String.fromCharCode(...chunk.subarray(0, offset))));
+}
+
+function base64Body(bucket: R2Bucket, snapshot: SubscriptionSnapshot, shareLength: number): ReadableStream {
+  const chunks = base64Chunks(bucket, snapshot);
+  const source = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const chunk = await chunks.next();
+        if (chunk.done) controller.close();
+        else controller.enqueue(chunk.value);
+      } catch {
+        controller.error(new Error("Subscription stream failed."));
+      }
+    },
+    async cancel() {
+      await chunks.return(undefined).catch(() => {});
+    },
+  }, { highWaterMark: 0 });
+  const { readable, writable } = new FixedLengthStream(4 * Math.ceil(shareLength / 3));
+  // A source error aborts the response body. Client cancellation also stops the source.
+  void source.pipeTo(writable).catch(() => {});
+  return readable;
+}
+
+async function fetchRequest(request: Request, env: Env): Promise<Response> {
+  const path = new URL(request.url).pathname;
+  const subscription = SUBSCRIPTION_PATH.exec(path);
+  const head = request.method === "HEAD";
+  if (path !== "/health" && !subscription) return plain("Not found.", 404, head);
+  if (request.method !== "GET" && !head) return plain("Method not allowed.", 405, false, { Allow: "GET, HEAD" });
+
+  if (!subscription) {
+    const revision = env.BUILD_REVISION;
+    if (typeof revision !== "string" || revision.length !== 40 || !/^[0-9a-f]+$/.test(revision)) {
+      return plain("Service unavailable.", 503, head);
+    }
+    const body = head ? null : JSON.stringify({ ok: true, service: "subs-bot", revision });
+    return new Response(body, { headers: { ...HEADERS, "Content-Type": "application/json" } });
+  }
+
+  const [, token, kind = ""] = subscription;
+  if (!EXPORT_KINDS.has(kind.toLowerCase())) return plain("Export format unavailable.", 406, head);
+
+  try {
+    const snapshot = await getSubscriptionSnapshot(env.DB, token);
+    if (!snapshot) return plain("Not found.", 404, head);
+    // Measure and verify the immutable snapshot before returning success, without retaining its content.
+    let shareLength = 0;
+    for await (const line of shareBytes(env.NODES, snapshot)) shareLength += line.byteLength;
+    if (shareLength === 0) return plain("Subscription temporarily unavailable.", 503, head);
+    return new Response(head ? null : base64Body(env.NODES, snapshot, shareLength), {
+      headers: { ...HEADERS, "Content-Type": "text/plain; charset=utf-8" },
+    });
+  } catch (error) {
+    if (error instanceof ExportContentError) return plain("Subscription content cannot be exported.", 422, head);
+    return plain("Subscription temporarily unavailable.", 503, head);
+  }
+}
+
+export default { fetch: fetchRequest } satisfies ExportedHandler<Env>;

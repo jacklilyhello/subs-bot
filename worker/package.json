@@ -1,0 +1,27 @@
+{
+  "name": "subs-bot-worker",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "24.x"
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "build": "esbuild src/index.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=dist/index.js",
+    "test": "node --test test/*.test.ts",
+    "test:bundle": "node --test test/bundle.integration.ts"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20261106.1",
+    "esbuild": "0.28.2",
+    "miniflare": "4.20260730.0",
+    "typescript": "6.0.3"
+  },
+  "overrides": {
+    "miniflare": {
+      "sharp": "0.35.5",
+      "undici": "7.30.2",
+      "ws": "8.22.1"
+    }
+  }
+}
