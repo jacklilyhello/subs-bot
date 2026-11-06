@@ -157,21 +157,82 @@ function validAuthorityShare(address: string, scheme: string): boolean {
     && ((scheme !== "hy2" && scheme !== "hysteria2") || validHysteriaQuery(address));
 }
 
+function formDecode(value: string): string {
+  return decodeURIComponent(value.replaceAll("+", " "));
+}
+
+function isPluginParameter(field: string): boolean {
+  const key = formDecode(splitOnce(field, "=")[0]);
+  // Don't accept an ambiguous name that needs another decode or control stripping.
+  if (INVALID_LINE_CHARACTER.test(key) || key.includes("%")) throw new Error("Invalid Shadowsocks URI query key.");
+  return key.toLowerCase() === "plugin";
+}
+
+function validShadowsocksPlugin(value: string): boolean {
+  const [plugin, options = ""] = splitOnce(value, ";");
+  if (INVALID_LINE_CHARACTER.test(value) || (plugin !== "obfs-local" && plugin !== "v2ray-plugin")) return false;
+  if (!options) return true;
+
+  // Mirror the audited Python SIP003 client allowlist and its escape grammar.
+  const parts = options.match(/(?:\\[:;=\\]|[^\\;])+/gu) ?? [];
+  const normalized = parts.join(";");
+  if (options !== normalized && options !== normalized + ";") return false;
+  const allowed = plugin === "obfs-local" ? ["obfs", "obfs-host"] : ["mode", "host", "path", "tls", "mux"];
+  const seen = new Set<string>();
+  for (const part of parts) {
+    const [key, setting] = splitOnce(part, "=");
+    if (!allowed.includes(key) || seen.has(key) || (key !== "tls" && !setting)) return false;
+    if (key === "obfs" && setting !== "http" && setting !== "tls") return false;
+    if (key === "mode" && setting !== "websocket") return false;
+    if (key === "tls" && setting !== undefined && setting !== "1" && setting !== "true") return false;
+    if (key === "mux" && numberInRange(setting, 0, 65535) === null) return false;
+    seen.add(key);
+  }
+  return parts.length > 0;
+}
+
+function validShadowsocksQuery(address: string): boolean {
+  const start = address.indexOf("?");
+  if (start < 0) return true;
+  const fragment = address.indexOf("#");
+  if (fragment >= 0 && fragment < start) return true;
+  const query = address.slice(start + 1, fragment < 0 ? undefined : fragment);
+  if (!query) return true;
+  const fields = query.split("&", 101);
+  if (fields.length > 100) return false;
+  let seen = false;
+  for (const field of fields) {
+    // Some URI parsers treat raw semicolons as query separators. Keep safe
+    // raw option delimiters, but reject a plugin hidden by that ambiguity.
+    if (field.includes(";")) {
+      const alternate = field.split(";", 101);
+      if (alternate.length > 100 || alternate.slice(1).some(isPluginParameter)) return false;
+    }
+    if (!isPluginParameter(field)) continue;
+    const [, value = ""] = splitOnce(field, "=");
+    if (seen || !validShadowsocksPlugin(formDecode(value))) return false;
+    seen = true;
+  }
+  return true;
+}
+
 function validShadowsocks(address: string): boolean {
-  let [userinfo, endpoint] = splitOnce(address, "@");
-  let method: string;
-  let password: string | undefined;
-  if (endpoint === undefined) {
+  let netloc = authority(address);
+  const legacy = !netloc.includes("@");
+  if (legacy) {
     const decoded = decodeBase64(address);
     if (decoded === null) return false;
-    const legacy = utf8.decode(binaryBytes(decoded));
-    const at = legacy.lastIndexOf("@");
-    if (at < 0) return false;
-    userinfo = legacy.slice(0, at);
-    endpoint = legacy.slice(at + 1);
-    [method, password] = splitOnce(userinfo, ":");
-  } else {
-    [method, password] = splitOnce(userinfo, ":");
+    address = utf8.decode(binaryBytes(decoded));
+    // Some URL parsers strip CR, LF and tabs before interpreting the query.
+    if (INVALID_LINE_CHARACTER.test(address)) return false;
+    netloc = authority(address);
+  }
+  const at = legacy ? netloc.lastIndexOf("@") : netloc.indexOf("@");
+  if (at < 0) return false;
+  const userinfo = netloc.slice(0, at);
+  const endpoint = netloc.slice(at + 1);
+  let [method, password] = splitOnce(userinfo, ":");
+  if (!legacy) {
     if (password === undefined) {
       const decoded = decodeBase64(unquote(userinfo));
       if (decoded === null) return false;
@@ -181,34 +242,40 @@ function validShadowsocks(address: string): boolean {
       password = unquote(password);
     }
   }
-  const netloc = authority(endpoint);
   if (password === undefined || (!password && method !== "none") || !/^[A-Za-z0-9_-]+(?![\s\S])/u.test(method)
-      || !safeAuthority(netloc) || !validEndpoint(netloc, "ss")) return false;
+      || !safeAuthority(endpoint) || !validEndpoint(endpoint, "ss") || !validShadowsocksQuery(address)) return false;
   const keyBytes = SS_2022_KEY_BYTES.get(method);
   return keyBytes === undefined || password.split(":").every((key) => decodeBase64(key, true)?.length === keyBytes);
 }
 
-function validJsonShape(source: string, numericPort: boolean): boolean {
-  // JSON.parse merges JSON integers with floats. Preserve the Python
-  // validator's rejection of decimal/exponential top-level port literals.
+function inspectVmessJson(source: string): boolean | null {
+  // Check depth before allocating the parsed object and remember whether the
+  // last top-level port token was an integer. JSON.parse merges 443 and 443.0.
   let depth = 0;
   let previous = "";
   let checkValue = false;
   let integer = false;
-  const tokens = /"(?:[^"\\]|\\[\s\S])*"|[{}\[\],:]|[^\s{}\[\],:"]+/gu;
-  for (const [token] of source.matchAll(tokens)) {
+  // A sticky lexer stops at malformed strings instead of searching for the
+  // next possible starting quote in an untrusted envelope.
+  const tokens = /[ \t\r\n]+|"(?:[^"\\\u0000-\u001f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"|[{}\[\],:]|[^\s{}\[\],:"]+/uy;
+  while (tokens.lastIndex < source.length) {
+    const match = tokens.exec(source);
+    if (!match) return null;
+    const [token] = match;
+    if (/^[ \t\r\n]/u.test(token)) continue;
     if (depth === 1 && checkValue && previous === ":") {
       integer = /^-?[0-9]+(?![\s\S])/u.test(token);
       checkValue = false;
     }
-    if (numericPort && depth === 1 && (previous === "{" || previous === ",") && token.startsWith('"')) {
-      checkValue = JSON.parse(token) === "port";
+    if (depth === 1 && (previous === "{" || previous === ",") && token.startsWith('"')) {
+      // Each of the four key characters can be written as a six-character escape.
+      checkValue = token.length <= 26 && JSON.parse(token) === "port";
     }
-    if ((token === "{" || token === "[") && ++depth > 256) return false;
-    if (token === "}" || token === "]") depth--;
+    if ((token === "{" || token === "[") && ++depth > 256) return null;
+    if ((token === "}" || token === "]") && --depth < 0) return null;
     previous = token;
   }
-  return !numericPort || integer;
+  return depth === 0 ? integer : null;
 }
 
 function vmessJsonText(raw: string): string {
@@ -240,11 +307,13 @@ function validVmessJson(address: string): boolean {
   const raw = decodeBase64(address);
   if (raw === null) return false;
   const text = vmessJsonText(raw);
+  const integerPort = inspectVmessJson(text);
+  if (integerPort === null) return false;
   const data: unknown = JSON.parse(text);
   if (typeof data !== "object" || data === null || Array.isArray(data)) return false;
   const { add, id, port } = data as Record<string, unknown>;
   return validServer(add) && typeof id === "string" && id.length > 0 && numberInRange(port, 1, 65535) !== null
-    && validJsonShape(text, typeof port === "number");
+    && (typeof port !== "number" || integerPort);
 }
 
 export function isValidStoredShare(value: unknown): value is string {

@@ -95,6 +95,8 @@
 
 容量检查的客户端耗时和吞吐来自这组样本。CPU、内存和平台子请求数量通过隔离 Worker 的聚合指标另行核对。旧 SQLite 的正文体积与转换后的 NDJSON 和分享原文分别测量。真实备份的分布、超限项及可恢复性需要通过获准的数据演练验证。 [Workers 限制](https://developers.cloudflare.com/workers/platform/limits/) · [Workers 指标](https://developers.cloudflare.com/analytics/graphql-api/tutorials/querying-workers-metrics/)
 
+旧库容量盘点在获准的托管环境运行 `python3 -B worker/tools/legacy_inventory.py <封存备份>`。输入须是单独完成、关闭、使用 UTF-8 和 DELETE 日志模式的 SQLite 备份。备份准备在原库之外进行，盘点本身以只读事务运行。报告只包含活动订阅与回收站的聚合计数、原始字节、紧凑 UTF-8 NDJSON 字节、块数、大小限制和旧转换器分享原文估算。无法读取或解析的记录有独立计数。退出码 `0` 表示报告完整，仍需检查超限和无效项。退出码 `2` 表示无法核对备份。容量报告不判定归属映射、旧链接兼容、分享权限或实际 Worker 性能。 [SQLite 增量读取](https://sqlite.org/c3ref/blob_open.html) · [SQLite URI](https://sqlite.org/uri.html)
+
 1. 先只读核对 Cloudflare 目标账户、Zone、`subs-bot.lilyya.top` 的 DNS、Worker 路由和 Custom Domain 绑定。新资源记录账号、环境及资源 ID，隔离与生产分别使用各自的 Worker、D1、R2 和队列。现有配置冲突须在改动前报告。目标主机名可用且切换获准后，仅增加所需的 Custom Domain 绑定。 [Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)
 2. `Worker CI` 在 GitHub 托管 runner 上安装依赖、检查类型、构建和测试。构建产物标记准确提交与摘要，由授权的部署步骤核对并上传至隔离 Worker。普通 PR CI 使用只读权限和合成数据。部署 Token 通过独立的受控步骤使用。云端 smoke 显式指定隔离环境和提交，核对 `/health` 与提交、已知测试快照的输出和负面用例。分别记录测试、构建、部署和真实运行结果。
 3. 对旧 SQLite 执行一致性备份并确认 WAL 已纳入。生成受保护的迁移清单，在隔离环境恢复。校验每类记录数、用户归属、节点数和摘要，以及有效订阅 Token、短码和仍有效的领取记录。分开处理活动订阅、回收站、路径、临时节点、授权覆盖、分享与领取、短链。旧群级数据存在时由维护者确认归属，跨域链接依赖另行核对。
