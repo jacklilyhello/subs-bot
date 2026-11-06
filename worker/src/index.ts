@@ -31,11 +31,13 @@ function plain(text: string, status: number, head: boolean, headers?: HeadersIni
 
 class ExportContentError extends Error {}
 
-async function* shareBytes(bucket: R2Bucket, snapshot: SubscriptionSnapshot): AsyncGenerator<Uint8Array> {
+async function* shareBytes(
+  bucket: R2Bucket, snapshot: SubscriptionSnapshot, signal?: AbortSignal,
+): AsyncGenerator<Uint8Array> {
   const encoder = new TextEncoder();
   let total = 0;
 
-  for await (const node of readSnapshotNodes(bucket, snapshot)) {
+  for await (const node of readSnapshotNodes(bucket, snapshot, signal)) {
     const share = node.share;
     if (!isValidStoredShare(share)) {
       throw new ExportContentError();
@@ -47,12 +49,14 @@ async function* shareBytes(bucket: R2Bucket, snapshot: SubscriptionSnapshot): As
   }
 }
 
-async function* base64Chunks(bucket: R2Bucket, snapshot: SubscriptionSnapshot): AsyncGenerator<Uint8Array> {
+async function* base64Chunks(
+  bucket: R2Bucket, snapshot: SubscriptionSnapshot, signal: AbortSignal,
+): AsyncGenerator<Uint8Array> {
   const encoder = new TextEncoder();
   const chunk = new Uint8Array(SHARE_CHUNK_BYTES);
   let offset = 0;
 
-  for await (const line of shareBytes(bucket, snapshot)) {
+  for await (const line of shareBytes(bucket, snapshot, signal)) {
     for (let start = 0; start < line.length;) {
       const length = Math.min(line.length - start, chunk.length - offset);
       chunk.set(line.subarray(start, start + length), offset);
@@ -68,18 +72,21 @@ async function* base64Chunks(bucket: R2Bucket, snapshot: SubscriptionSnapshot): 
 }
 
 function base64Body(bucket: R2Bucket, snapshot: SubscriptionSnapshot, shareLength: number): ReadableStream {
-  const chunks = base64Chunks(bucket, snapshot);
+  const abort = new AbortController();
+  const chunks = base64Chunks(bucket, snapshot, abort.signal);
   const source = new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
         const chunk = await chunks.next();
+        if (abort.signal.aborted) return;
         if (chunk.done) controller.close();
         else controller.enqueue(chunk.value);
       } catch {
-        controller.error(new Error("Subscription stream failed."));
+        if (!abort.signal.aborted) controller.error(new Error("Subscription stream failed."));
       }
     },
     async cancel() {
+      abort.abort();
       await chunks.return(undefined).catch(() => {});
     },
   }, { highWaterMark: 0 });

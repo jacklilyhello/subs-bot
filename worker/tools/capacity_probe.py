@@ -155,23 +155,26 @@ def _abort_socket(sock):
 
 
 @contextmanager
-def _request(method, path, deadline):
+def _request(method, path, deadline, label="probe"):
     # Direct HTTPS verifies the fixed hostname. No proxy, auth, cookies, or redirect handler.
     connection = HTTPSConnection(HOST, timeout=min(SOCKET_SECONDS, _remaining(deadline)))
     timer = None
+    stage = "connection"
     try:
         connection.connect()
         # A peer making steady partial progress still cannot hold an open request past its deadline.
         timer = Timer(_remaining(deadline), _abort_socket, (connection.sock,))
         timer.daemon = True
         timer.start()
+        stage = "response headers"
         connection.request(method, path, headers={
             "Accept-Encoding": "identity", "Connection": "close", "User-Agent": "subs-bot-isolation-release/1.0",
         })
         with connection.getresponse() as response:
+            stage = "response body"
             yield response
     except (HTTPException, OSError):
-        raise ProbeError("A capacity probe HTTPS request failed or timed out.") from None
+        raise ProbeError(f"HTTPS request failed or timed out during {stage} for {method} {label}.") from None
     finally:
         if timer is not None:
             timer.cancel()
@@ -291,7 +294,7 @@ def run_probe(directory, revision):
             path = f"/sub/{fixture.token}/base64"
             status, label, media_type = fixture.status, fixture.label, "text/plain"
 
-        with _request(method, path, deadline) as response:
+        with _request(method, path, deadline, f"{label} ({mode})") as response:
             _check_headers(response, status, label, media_type)
             if fixture is None:
                 body_bytes = _verify_health(response, revision)
