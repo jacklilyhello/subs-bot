@@ -108,11 +108,19 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
       chat: { id: Number(policy.groupId), type: "group" },
       entities: [{ type: "bot_command", offset: 0, length: text.length }],
     };
+    const sentBodies: unknown[] = [];
     function expectSend(chatId: string, messageId: number, replyTo: number, expectedText: string) {
-      bot.intercept({ method: "POST", path, body: (body) => {
-        const json = JSON.parse(String(body));
-        return json.chat_id === chatId && json.text === expectedText && json.reply_parameters.message_id === replyTo;
-      } }).reply(200, JSON.stringify({ ok: true, result: { message_id: messageId, chat: { id: Number(chatId) } } }));
+      bot.intercept({ method: "POST", path }).reply(200, ({ body }) => {
+        const encoded = typeof body === "string" ? body : body instanceof Uint8Array ? Buffer.from(body).toString("utf8") : "";
+        try {
+          const payload = JSON.parse(encoded);
+          sentBodies.push({ chatId: payload.chat_id, text: payload.text, replyTo: payload.reply_parameters?.message_id });
+        } catch {
+          sentBodies.push(null);
+        }
+        return JSON.stringify({ ok: true, result: { message_id: messageId, chat: { id: Number(chatId) } } });
+      });
+      return { chatId, text: expectedText, replyTo };
     }
     const webhook = "https://subs-bot.example/telegram/webhook";
     const post = (event: unknown, secret = policy.webhookSecret) => miniflare.dispatchFetch(webhook, {
@@ -124,15 +132,16 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
       updateId: 12, actorId: policy.memberId, chatId: policy.memberId, chatType: "private",
       messageId: 9, messageDate: date, threadId: null, command: "list",
     });
-    expectSend(policy.memberId, 10, 9, "你的订阅\n1. Member fixture");
+    const expectedPrivate = expectSend(policy.memberId, 10, 9, "你的订阅\n1. Member fixture");
     const worker = await miniflare.getWorker();
     assert.equal((await worker.scheduled({ cron: "* * * * *" })).outcome, "ok");
     const outbox = "SELECT state, sent_message_id FROM telegram_outbox ORDER BY receipt_id";
     assert.deepEqual((await db.prepare(outbox).all()).results, [{ state: "sent", sent_message_id: 10 }]);
+    assert.deepEqual(sentBodies, [expectedPrivate]);
 
     assert.equal((await post({ update_id: 10, message }, "invalid")).status, 401);
     assert.equal((await post({ update_id: 10, message: { ...message, chat: { ...message.chat, id: -2000 } } })).status, 204);
-    expectSend(policy.groupId, 8, 7, "你的订阅\n1. Member fixture");
+    const expectedGroup = expectSend(policy.groupId, 8, 7, "你的订阅\n1. Member fixture");
     const update = { update_id: 11, message };
     assert.deepEqual((await Promise.all([post(update), post(update)])).map((result) => result.status), [200, 200]);
 
@@ -143,6 +152,7 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
     }
     const results = await db.prepare(outbox).all();
     assert.deepEqual(results.results, [{ state: "sent", sent_message_id: 10 }, { state: "sent", sent_message_id: 8 }]);
+    assert.deepEqual(sentBodies, [expectedPrivate, expectedGroup]);
     fetchMock.assertNoPendingInterceptors();
   } finally {
     await miniflare.dispose();
