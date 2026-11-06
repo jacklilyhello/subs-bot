@@ -7,6 +7,7 @@ on:
       - '.github/workflows/worker-ci.yml'
       - '.github/workflows/worker-isolation-deploy.yml'
       - '.github/workflows/worker-isolation-capacity.yml'
+      - '.github/workflows/worker-isolation-telegram-fixtures.yml'
   push:
     branches: [main]
     paths:
@@ -14,6 +15,7 @@ on:
       - '.github/workflows/worker-ci.yml'
       - '.github/workflows/worker-isolation-deploy.yml'
       - '.github/workflows/worker-isolation-capacity.yml'
+      - '.github/workflows/worker-isolation-telegram-fixtures.yml'
   workflow_dispatch:
 
 permissions:
