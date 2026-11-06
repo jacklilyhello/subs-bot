@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { Miniflare } from "miniflare";
 
 import { restoreOwnedSubscription, trashOwnedSubscription } from "../src/subscriptions.ts";
-import { createSubscription } from "../src/storage.ts";
+import { createSubscription, publishNodeSnapshot } from "../src/storage.ts";
 import type { TelegramPolicy } from "../src/telegram/protocol.ts";
 import { acceptTelegramCommand } from "../src/telegram/store.ts";
 import { verifyIsolation } from "../tools/verify-isolation.mjs";
@@ -85,6 +85,28 @@ test("the hosted deployment artifact exports small and large snapshots in worker
     const restored = await request(path);
     assert.equal(restored.status, 200);
     assert.equal(digest(Buffer.from(await restored.arrayBuffer())), originalDigest);
+
+    const vmessEnvelope = JSON.stringify({ add: "proxy.example.invalid", port: 443, id: "synthetic-client" });
+    const vmess = "vmess://" + Buffer.from(vmessEnvelope, "utf16le").toString("base64");
+    const idna = "vless://synthetic-client@bücher.example:443#Früh 😀";
+    const hopping = "hy2://fixture@[2001:db8::5]:443,8443-8445/?ech=AAT-DQAA#港";
+    const invalidEch = "hy2://fixture@proxy.example.invalid?ech=%2Fpath%2Fto%2Fsynthetic-fixture";
+    for (const { links, status } of [
+      { links: [vmess, idna, hopping], status: 200 },
+      { links: [vmess, invalidEch], status: 422 },
+    ]) {
+      const ownerId = "900000003";
+      const subscription = await createSubscription(db, {
+        ownerId, name: "Stored share validation", sourceUrl: "https://provider.example.invalid/synthetic",
+      });
+      const publication = { id: subscription.id, ownerId, expectedGeneration: 0, expectedLifecycleRevision: 0 };
+      assert.equal(await publishNodeSnapshot(db, bucket, publication, links.map((share) => ({ share }))), true);
+      const exportResult = await request(`/sub/${subscription.token}/base64`);
+      assert.equal(exportResult.status, status);
+      const expected = status === 200
+        ? Buffer.from(links.join("\n")).toString("base64") : "Subscription content cannot be exported.";
+      assert.equal(await exportResult.text(), expected);
+    }
   } finally {
     await miniflare.dispose();
   }
