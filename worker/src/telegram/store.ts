@@ -1,8 +1,13 @@
-import type { TelegramCommand, TelegramPolicy } from "./protocol.ts";
+import { inTelegramScope, type TelegramCommand, type TelegramPolicy } from "./protocol.ts";
+import {
+  insertTelegramViewTickets, TELEGRAM_VIEW_MARKER, type TelegramView, type TelegramViewTicket,
+} from "./views.ts";
 
 export interface TelegramReplyLease extends TelegramCommand {
+  receiptId: number;
   leaseId: string;
   attempts: number;
+  view: TelegramView | null;
 }
 
 export type TelegramReplyOutcome =
@@ -15,10 +20,15 @@ const MAX_REPLY_AGE_SECONDS = 15 * 60;
 const MAX_ATTEMPTS = 4;
 const REAP_LIMIT = 40;
 
-function inScope(policy: TelegramPolicy, command: TelegramCommand): boolean {
-  if (command.actorId !== policy.adminId && command.actorId !== policy.memberId) return false;
-  if (command.chatType === "private") return command.chatId === command.actorId;
-  return (command.chatType === "group" || command.chatType === "supergroup") && command.chatId === policy.groupId;
+type ReplyRow = Omit<TelegramReplyLease, "view"> & {
+  viewKind: TelegramView["kind"] | null;
+  afterId: number | null;
+  afterEpoch: number | null;
+};
+
+function supportedReceipt(alias: "inbox" | "earlier"): string {
+  return `(${alias}.receipt_nonce IS NULL OR (${alias}.receipt_nonce = '${TELEGRAM_VIEW_MARKER}'
+    AND EXISTS (SELECT 1 FROM telegram_view WHERE receipt_id = ${alias}.receipt_id)))`;
 }
 
 export async function acceptTelegramCommand(
@@ -26,7 +36,7 @@ export async function acceptTelegramCommand(
   policy: TelegramPolicy,
   command: TelegramCommand,
 ): Promise<"accepted" | "duplicate"> {
-  if (!inScope(policy, command)) throw new RangeError("Telegram command is outside the isolation scope.");
+  if (!inTelegramScope(policy, command)) throw new RangeError("Telegram command is outside the isolation scope.");
 
   const receipt = crypto.randomUUID();
   const key = [policy.botId, command.updateId, receipt] as const;
@@ -79,38 +89,43 @@ export async function isTelegramMemberAllowed(db: D1Database, policy: TelegramPo
 }
 
 export async function claimTelegramReply(db: D1Database, botId: string): Promise<TelegramReplyLease | null> {
-  // Non-null receipt markers belong to admission in progress or a newer consumer.
   const leaseId = crypto.randomUUID();
-  const [write, read] = await db.batch<TelegramReplyLease>([
+  const [write, read] = await db.batch<ReplyRow>([
     db.prepare(`
       UPDATE telegram_outbox
       SET state = 'leased', attempts = attempts + 1, lease_id = ?, lease_until = unixepoch() + ${LEASE_SECONDS}
       WHERE receipt_id = (
         SELECT inbox.receipt_id FROM telegram_outbox AS reply
         JOIN telegram_inbox AS inbox USING (receipt_id)
-        WHERE inbox.bot_id = ? AND inbox.receipt_nonce IS NULL AND reply.state = 'pending'
+        WHERE inbox.bot_id = ? AND ${supportedReceipt("inbox")} AND reply.state = 'pending'
           AND reply.due_at <= unixepoch() AND reply.attempts < ${MAX_ATTEMPTS}
           AND inbox.received_at + ${MAX_REPLY_AGE_SECONDS} > unixepoch()
           AND NOT EXISTS (
             SELECT 1 FROM telegram_inbox AS earlier
             JOIN telegram_outbox AS earlier_reply USING (receipt_id)
             WHERE earlier.bot_id = inbox.bot_id AND earlier.actor_id = inbox.actor_id AND earlier.chat_id = inbox.chat_id
-              AND earlier.receipt_nonce IS NULL
+              AND ${supportedReceipt("earlier")}
               AND earlier.receipt_id < inbox.receipt_id AND earlier_reply.state IN ('pending', 'leased', 'sending')
           )
         ORDER BY inbox.receipt_id LIMIT 1
       )
     `).bind(leaseId, botId),
     db.prepare(`
-      SELECT inbox.update_id AS updateId, inbox.actor_id AS actorId, inbox.chat_id AS chatId, inbox.chat_type AS chatType,
+      SELECT inbox.receipt_id AS receiptId, inbox.update_id AS updateId, inbox.actor_id AS actorId,
+        inbox.chat_id AS chatId, inbox.chat_type AS chatType,
         inbox.message_id AS messageId, inbox.message_date AS messageDate, inbox.thread_id AS threadId,
-        inbox.command, reply.lease_id AS leaseId, reply.attempts
+        inbox.command, reply.lease_id AS leaseId, reply.attempts,
+        page.kind AS viewKind, page.after_id AS afterId, page.after_epoch AS afterEpoch
       FROM telegram_outbox AS reply JOIN telegram_inbox AS inbox USING (receipt_id)
-      WHERE reply.lease_id = ? AND reply.state = 'leased' AND inbox.bot_id = ? AND inbox.receipt_nonce IS NULL
+      LEFT JOIN telegram_view AS page ON page.receipt_id = inbox.receipt_id AND inbox.receipt_nonce = '${TELEGRAM_VIEW_MARKER}'
+      WHERE reply.lease_id = ? AND reply.state = 'leased' AND inbox.bot_id = ? AND ${supportedReceipt("inbox")}
     `).bind(leaseId, botId),
   ]);
   if (!write?.success || !read?.success) throw new Error("Telegram reply claim could not be confirmed.");
-  return read.results[0] ?? null;
+  const row = read.results[0];
+  if (!row) return null;
+  const { viewKind, afterId, afterEpoch, ...lease } = row;
+  return { ...lease, view: viewKind === null ? null : { kind: viewKind, afterId, afterEpoch } };
 }
 
 export async function beginTelegramReply(
@@ -118,17 +133,18 @@ export async function beginTelegramReply(
   policy: TelegramPolicy,
   lease: TelegramReplyLease,
   access: "allowed" | "denied" | "none",
+  tickets: readonly TelegramViewTicket[] = [],
 ): Promise<boolean> {
-  if (!inScope(policy, lease)) return false;
+  if (!inTelegramScope(policy, lease) || (tickets.length > 0 && (!lease.view || access !== "allowed"))) return false;
 
-  const row = await db.prepare(`
+  const begin = db.prepare(`
     UPDATE telegram_outbox SET state = 'sending', lease_until = unixepoch() + ${LEASE_SECONDS}
     WHERE state = 'leased' AND lease_id = ? AND attempts = ? AND lease_until > unixepoch()
       AND receipt_id = (
         SELECT inbox.receipt_id FROM telegram_inbox AS inbox
-        WHERE inbox.bot_id = ? AND inbox.update_id = ? AND inbox.actor_id = ? AND inbox.chat_id = ?
+        WHERE inbox.bot_id = ? AND inbox.update_id = ? AND inbox.receipt_id = ? AND inbox.actor_id = ? AND inbox.chat_id = ?
           AND inbox.chat_type = ? AND inbox.message_id = ? AND inbox.message_date = ? AND inbox.thread_id IS ?
-          AND inbox.command = ? AND inbox.receipt_nonce IS NULL
+          AND inbox.command = ? AND ${supportedReceipt("inbox")}
           AND inbox.received_at + ${MAX_REPLY_AGE_SECONDS} > unixepoch()
           AND ((? = 'none' AND inbox.command IN ('auth-list', 'auth-add', 'auth-remove', 'auth-usage')) OR (
             CASE WHEN inbox.actor_id = ? THEN 1 ELSE COALESCE((
@@ -137,9 +153,19 @@ export async function beginTelegramReply(
           ))
       )
     RETURNING receipt_id
-  `).bind(lease.leaseId, lease.attempts, policy.botId, lease.updateId, lease.actorId, lease.chatId, lease.chatType,
-    lease.messageId, lease.messageDate, lease.threadId, lease.command, access, policy.adminId, access).first();
-  return row !== null;
+  `).bind(lease.leaseId, lease.attempts, policy.botId, lease.updateId, lease.receiptId, lease.actorId, lease.chatId, lease.chatType,
+    lease.messageId, lease.messageDate, lease.threadId, lease.command, access, policy.adminId, access);
+  if (tickets.length === 0) return await begin.first() !== null;
+
+  const [state, ticketWrite] = await db.batch<{ receipt_id: number }>([
+    begin, insertTelegramViewTickets(db, lease.receiptId, lease.attempts, lease.leaseId, tickets),
+  ]);
+  if (!state?.success || !ticketWrite?.success) throw new Error("Telegram view reply could not be confirmed.");
+  if (state.results.length === 0 && ticketWrite.meta.changes === 0) return false;
+  if (state.results.length !== 1 || state.results[0].receipt_id !== lease.receiptId || ticketWrite.meta.changes !== tickets.length) {
+    throw new Error("Telegram view reply could not be confirmed.");
+  }
+  return true;
 }
 
 export async function settleTelegramReply(
@@ -148,9 +174,10 @@ export async function settleTelegramReply(
   lease: TelegramReplyLease,
   outcome: TelegramReplyOutcome,
 ): Promise<void> {
-  const identity = [lease.leaseId, lease.attempts, policy.botId, lease.updateId] as const;
+  const identity = [lease.leaseId, lease.attempts, policy.botId, lease.updateId, lease.receiptId] as const;
   const sameReply = `lease_id = ? AND attempts = ? AND receipt_id = (
-    SELECT receipt_id FROM telegram_inbox WHERE bot_id = ? AND update_id = ? AND receipt_nonce IS NULL
+    SELECT receipt_id FROM telegram_inbox AS inbox
+    WHERE bot_id = ? AND update_id = ? AND receipt_id = ? AND ${supportedReceipt("inbox")}
   )`;
   if (outcome.kind === "sent") {
     if (!Number.isSafeInteger(outcome.messageId) || outcome.messageId <= 0) {
@@ -196,7 +223,7 @@ export async function reapExpiredTelegramReplies(db: D1Database, botId: string):
       lease_id = CASE WHEN state = 'sending' THEN lease_id ELSE NULL END, lease_until = NULL
     WHERE receipt_id IN (
       SELECT reply.receipt_id FROM telegram_outbox AS reply JOIN telegram_inbox AS inbox USING (receipt_id)
-      WHERE inbox.bot_id = ? AND inbox.receipt_nonce IS NULL AND (
+      WHERE inbox.bot_id = ? AND ${supportedReceipt("inbox")} AND (
         (reply.state IN ('leased', 'sending') AND reply.lease_until <= unixepoch())
         OR (reply.state IN ('pending', 'leased') AND inbox.received_at + ${MAX_REPLY_AGE_SECONDS} <= unixepoch())
       )
