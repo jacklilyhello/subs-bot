@@ -67,7 +67,7 @@
 - 收件记录只保留归属、消息 ID 和已识别的命令。授权变更和回复意图与收件记录在同一 D1 事务提交。同一用户和聊天的回复按入库顺序处理。发送前复核授权，已经发起的外部请求无法撤回。只有明确的 Telegram 限流拒绝可在到期前重试。超时和无法确认的发送标记为 `uncertain`，保留以供核对。 [D1 事务批处理](https://developers.cloudflare.com/d1/worker-api/d1-database/#batch) · [Telegram `ResponseParameters`](https://core.telegram.org/bots/api#responseparameters)
 - 只读视图每页至多八条，按订阅 ID、到期时间或删除时间翻页。按钮只传随机值，D1 仅存摘要，绑定原发起人、聊天、话题、已确认发送的消息和尝试号，十分钟内只能消费一次。回调去重、按钮消费和下一页回复同批提交。回滚至支持回执标记的版本时，普通命令继续处理，视图回执留待新版处理。 [Telegram `CallbackQuery`](https://core.telegram.org/bots/api#callbackquery)
 - 用户数据按 Telegram 用户 ID 归属，私聊和群聊共用其个人数据。重命名、翻页等交互使用 `(user_id, chat_id)`，内联查询以发起人身份授权。管理员、初始白名单和显式授权覆盖沿用现有语义。授权撤销应在下一次检查生效，权限变更和受保护的写入要用数据库条件约束，避免旧授权快照继续写入。
-- 私密领取保留现有的分享能力语义。检查到期、指定用户和剩余份数，使用 `(share_code, user_id)` 唯一约束在同一事务中记录领取及扣减。已成功领取的用户可在有效期内再次查看而无需扣减。并发测试必须覆盖同一人重试和不同用户争抢最后一份。
+- 私密领取保留现有的分享能力语义。`0005` 按 Bot 存储分享码摘要，使用独立的私有 R2 对象保存最多 64 KiB 的私密正文。领取前核对正文长度、摘要和 UTF-8，D1 在同一事务复核到期、指定用户及剩余份数，以 `(share_id, actor_id)` 唯一键记录领取。份数以实际领取记录计数，已成功领取的用户在有效期内可再次查看。此存储阶段的 GitHub 验证覆盖竞争、重复和损坏正文，Telegram 分享入口与真实领取另行接入。
 - 在业务变更的事务内写入待发送动作，用稳定动作 ID 去重。消费者持有租约并跟踪 Telegram 返回的消息 ID，成功后更新发件箱。对网络超时后可能已送达的动作标记结果不明，按动作类型恢复或人工核对。Telegram 发送接口没有通用幂等键，验收须覆盖收到成功响应后写回失败的情形。 [Telegram `sendMessage`](https://core.telegram.org/bots/api#sendmessage)
 
 ### 刷新与出网验收
@@ -96,6 +96,8 @@
 隔离容量检查使用当前 `main` 的已部署版本，手动运行 `gh workflow run worker-isolation-capacity.yml --ref main`。托管 runner 生成合成快照，依次验证恰好达到 64 MiB NDJSON 和 16 MiB 分享原文的有效输出、分享原文超 1 字节的拒绝、快照清单超 1 字节的拒绝。正向测试流式核对 Base64 长度和摘要，覆盖串行、并发 2 和 4、慢读及中途取消。发布和容量检查使用同一并发组，测试结束先撤销 D1 能力，再清理对应的私有 R2 对象。清理失败时，工作流保留不含凭据或原始能力令牌的恢复清单。
 
 容量检查的客户端耗时和吞吐来自这组样本。CPU、内存和平台子请求数量通过隔离 Worker 的聚合指标另行核对。旧 SQLite 的正文体积与转换后的 NDJSON 和分享原文分别测量。真实备份的分布、超限项及可恢复性需要通过获准的数据演练验证。 [Workers 限制](https://developers.cloudflare.com/workers/platform/limits/) · [Workers 指标](https://developers.cloudflare.com/analytics/graphql-api/tutorials/querying-workers-metrics/)
+
+旧库容量盘点在获准的托管环境运行 `python3 -B worker/tools/legacy_inventory.py <封存备份>`。输入须是单独完成、关闭、使用 UTF-8 和 DELETE 日志模式的 SQLite 备份。备份准备在原库之外进行，盘点本身以只读事务运行。报告只包含活动订阅与回收站的聚合计数、原始字节、紧凑 UTF-8 NDJSON 字节、块数、大小限制和旧转换器分享原文估算。无法读取或解析的记录有独立计数。退出码 `0` 表示报告完整，仍需检查超限和无效项。退出码 `2` 表示无法核对备份。容量报告不判定归属映射、旧链接兼容、分享权限或实际 Worker 性能。 [SQLite 增量读取](https://sqlite.org/c3ref/blob_open.html) · [SQLite URI](https://sqlite.org/uri.html)
 
 1. 先只读核对 Cloudflare 目标账户、Zone、`subs-bot.lilyya.top` 的 DNS、Worker 路由和 Custom Domain 绑定。新资源记录账号、环境及资源 ID，隔离与生产分别使用各自的 Worker、D1、R2 和队列。现有配置冲突须在改动前报告。目标主机名可用且切换获准后，仅增加所需的 Custom Domain 绑定。 [Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)
 2. `Worker CI` 在 GitHub 托管 runner 上安装依赖、检查类型、构建和测试。构建产物标记准确提交与摘要，由授权的部署步骤核对并上传至隔离 Worker。普通 PR CI 使用只读权限和合成数据。部署 Token 通过独立的受控步骤使用。云端 smoke 显式指定隔离环境和提交，核对 `/health` 与提交、已知测试快照的输出和负面用例。分别记录测试、构建、部署和真实运行结果。
