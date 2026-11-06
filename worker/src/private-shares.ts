@@ -51,7 +51,7 @@ function checkedText(text: unknown, limit: number): Uint8Array<ArrayBuffer> {
   }
   const bytes = encoder.encode(text);
   if (bytes.length > limit) throw new RangeError("Private share text exceeds its size limit.");
-  return bytes;
+  return Uint8Array.from(bytes);
 }
 
 function digestHex(digest: ArrayBuffer): string {
