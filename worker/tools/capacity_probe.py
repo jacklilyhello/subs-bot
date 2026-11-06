@@ -60,6 +60,8 @@ class Sample:
     status: int
     elapsed_ms: int
     body_bytes: int
+    first_body_byte_ms: int | None = None
+    body_bytes_per_second: int | None = None
 
 
 def _matches(pattern, value):
@@ -214,23 +216,29 @@ def _verify_export(response, fixture, mode, deadline):
     if (response.getheader("Content-Length") != str(fixture.export_bytes)
             or response.getheader("Transfer-Encoding") is not None):
         raise ProbeError("The successful export did not declare its exact length.")
+    first_byte = response.read(1)
+    first_byte_at = monotonic()
     if mode == "cancel":
-        prefix = response.read(CANCEL_BYTES)
-        if len(prefix) != CANCEL_BYTES:
+        if not first_byte or len(response.read(CANCEL_BYTES - 1)) != CANCEL_BYTES - 1:
             raise ProbeError("The cancelled export ended before the controlled prefix was read.")
         # Closing this response and its dedicated socket intentionally abandons the body.
-        return len(prefix)
+        return CANCEL_BYTES, first_byte_at, None
+    if not first_byte:
+        raise ProbeError("The successful export length or digest differs.")
 
-    digest = sha256()
-    total = 0
+    digest = sha256(first_byte)
+    total = len(first_byte)
+    last_byte_at = first_byte_at
     next_pause = SLOW_INTERVAL_BYTES
     while total < fixture.export_bytes:
         _remaining(deadline)
         data = response.read(min(READ_BYTES, fixture.export_bytes - total))
         if not data:
             break
-        digest.update(data)
         total += len(data)
+        if total == fixture.export_bytes:
+            last_byte_at = monotonic()
+        digest.update(data)
         if mode == "slow" and next_pause <= total < fixture.export_bytes:
             if _remaining(deadline) <= SLOW_PAUSE_SECONDS:
                 raise ProbeError("The slow export reached its deadline.")
@@ -238,17 +246,27 @@ def _verify_export(response, fixture, mode, deadline):
             next_pause += SLOW_INTERVAL_BYTES
     if total != fixture.export_bytes or response.read(1) or digest.hexdigest() != fixture.export_sha256:
         raise ProbeError("The successful export length or digest differs.")
-    return total
+    return total, first_byte_at, last_byte_at
+
+
+def _stats(values):
+    return {"min": min(values), "median": round(median(values)), "max": max(values)}
 
 
 def _summary(samples):
-    elapsed = [sample.elapsed_ms for sample in samples]
-    return {
+    result = {
         "status": samples[0].status,
         "samples": len(samples),
         "bodyBytes": samples[0].body_bytes,
-        "elapsedMs": {"min": min(elapsed), "median": round(median(elapsed)), "max": max(elapsed)},
+        "elapsedMs": _stats([sample.elapsed_ms for sample in samples]),
     }
+    first_byte = [sample.first_body_byte_ms for sample in samples if sample.first_body_byte_ms is not None]
+    throughput = [sample.body_bytes_per_second for sample in samples if sample.body_bytes_per_second is not None]
+    if first_byte:
+        result["firstBodyByteMs"] = _stats(first_byte)
+    if throughput:
+        result["bodyBytesPerSecond"] = _stats(throughput)
+    return result
 
 
 def run_probe(directory, revision):
@@ -260,6 +278,7 @@ def run_probe(directory, revision):
     def sample(fixture=None, method="GET", mode="full"):
         nonlocal requests
         start = monotonic()
+        first_body_byte_ms = body_bytes_per_second = None
         deadline = min(start + REQUEST_SECONDS, run_deadline)
         _remaining(deadline)
         with request_lock:
@@ -286,9 +305,17 @@ def run_probe(directory, revision):
                     raise ProbeError(f"The fixed error response differs for {label}.")
                 body_bytes = len(body)
             else:
-                body_bytes = _verify_export(response, fixture, mode, deadline)
+                body_bytes, first_byte_at, last_byte_at = _verify_export(response, fixture, mode, deadline)
+                first_body_byte_ms = round((first_byte_at - start) * 1000)
+                if last_byte_at is not None:
+                    # Measure the body phase alone, including the reader's deliberate slow-mode pauses.
+                    transfer_seconds = last_byte_at - first_byte_at
+                    if transfer_seconds <= 0:
+                        raise ProbeError("The export body transfer timing could not be measured.")
+                    body_bytes_per_second = round(body_bytes / transfer_seconds)
         _remaining(deadline)
-        return Sample(status, round((monotonic() - start) * 1000), body_bytes)
+        return Sample(status, round((monotonic() - start) * 1000), body_bytes,
+                      first_body_byte_ms, body_bytes_per_second)
 
     positive = fixtures["at-limits"]
 

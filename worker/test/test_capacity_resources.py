@@ -90,6 +90,10 @@ class FakeCloud:
         self.lose_upload = False
         self.lose_publish = False
         self.public_bucket = False
+        self.defer_insert = None
+        self.defer_put = None
+        self.pending_insert = None
+        self.pending_put = None
 
     def __call__(self, method, path, payload=None):
         if method == "GET":
@@ -102,9 +106,24 @@ class FakeCloud:
         assert method == "POST" and path == DATABASE + "/query"
         sql = payload["sql"]
         kind = sql.split()[0]
+        if kind == "SELECT" and self.pending_insert is not None:
+            delay, pending_sql, pending_params = self.pending_insert
+            if delay == 0:
+                self.db.execute(pending_sql, pending_params)
+                self.db.commit()
+                self.pending_insert = None
+            elif delay > 0:
+                self.pending_insert = (delay - 1, pending_sql, pending_params)
         if kind != "SELECT":
             assert (self.directory / capacity.LEDGER_FILE).is_file()
             self.writes.append(kind)
+        if kind == "INSERT":
+            ledger = json.loads((self.directory / capacity.LEDGER_FILE).read_bytes())
+            assert any(entry["reservePending"] for entry in ledger["fixtures"])
+            if self.defer_insert is not None:
+                self.pending_insert = (self.defer_insert, sql, payload["params"])
+                self.defer_insert = None
+                raise capacity.CloudflareError("Synthetic delayed insert response.", uncertain=True)
         cursor = self.db.execute(sql, payload["params"])
         rows = [dict(row) for row in cursor] if cursor.description is not None else []
         self.db.commit()
@@ -118,16 +137,27 @@ class FakeCloud:
 
     def request(self, method, key, body=None):
         if method == "GET":
+            if self.pending_put is not None and self.pending_put[1] == key:
+                delay, _, pending_body = self.pending_put
+                if delay == 0:
+                    self.objects[key] = pending_body
+                    self.pending_put = None
+                elif delay > 0:
+                    self.pending_put = (delay - 1, key, pending_body)
             return self.objects.get(key)
         self.writes.append(method)
         if method == "PUT":
             assert key not in self.objects
             ledger = json.loads((self.directory / capacity.LEDGER_FILE).read_bytes())
             assert any(capacity.object_key(entry, index) == key
-                       for entry in ledger["fixtures"] for index in entry["armed"])
+                       for entry in ledger["fixtures"] for index in entry["putPending"])
             assert self.db.execute(
                 "SELECT generation FROM subscriptions WHERE id=?", (int(key.split("/")[1]),),
             ).fetchone()[0] == 0
+            if self.defer_put is not None:
+                self.pending_put = (self.defer_put, key, body)
+                self.defer_put = None
+                raise capacity.CapacityError("Synthetic delayed upload response.")
             self.objects[key] = body
             if self.lose_upload:
                 self.lose_upload = False
@@ -155,6 +185,9 @@ class CapacityTests(unittest.TestCase):
         self.addCleanup(self.cloud.db.close)
         self.resources = capacity.Resources(TARGET, self.cloud, self.cloud)
         self.guard = Mock()
+        wait = patch.object(capacity, "sleep")
+        self.wait = wait.start()
+        self.addCleanup(wait.stop)
 
     def seed(self):
         with capacity.locked_directory(self.directory):
@@ -198,6 +231,51 @@ class CapacityTests(unittest.TestCase):
         self.assertEqual(self.cloud.writes.count("PUT"), 5)
         self.assertEqual(self.cloud.writes.count("UPDATE"), 3)
         self.cleanup()
+
+    def test_cleanup_retires_a_late_committed_reservation(self):
+        self.cloud.defer_insert = 2
+        with self.assertRaisesRegex(capacity.CapacityError, "reservation could not be confirmed"):
+            self.seed()
+        self.assertTrue(self.ledger()["fixtures"][0]["reservePending"])
+        self.cleanup()
+        self.assertEqual(self.cloud.capacity_rows(), [])
+        self.assertFalse(self.ledger()["fixtures"][0]["reservePending"])
+        self.assertEqual(self.ledger()["phase"], "retired")
+        self.wait.assert_called_once()
+
+    def test_missing_unconfirmed_reservation_keeps_recovery_ledger(self):
+        self.cloud.defer_insert = -1
+        with self.assertRaisesRegex(capacity.CapacityError, "reservation could not be confirmed"):
+            self.seed()
+        with self.assertRaisesRegex(capacity.CapacityError, "reservation remains unconfirmed"):
+            self.cleanup()
+        self.assertEqual(self.cloud.capacity_rows(), [])
+        self.assertEqual(self.ledger()["phase"], "cleanup")
+        self.assertTrue(self.ledger()["fixtures"][0]["reservePending"])
+        self.assertEqual(self.wait.call_count, len(capacity.UNCERTAIN_READBACK_DELAYS))
+
+    def test_cleanup_deletes_a_late_committed_upload(self):
+        self.cloud.defer_put = 2
+        with self.assertRaisesRegex(capacity.CapacityError, "upload could not be verified"):
+            self.seed()
+        self.assertEqual(self.ledger()["fixtures"][0]["putPending"], [0])
+        self.cleanup()
+        self.assertEqual(self.cloud.capacity_rows(), [])
+        self.assertEqual(self.cloud.objects, {})
+        self.assertEqual(self.ledger()["fixtures"][0]["putPending"], [])
+        self.assertEqual(self.ledger()["phase"], "retired")
+        self.wait.assert_called_once()
+
+    def test_missing_unconfirmed_upload_keeps_recovery_ledger(self):
+        self.cloud.defer_put = -1
+        with self.assertRaisesRegex(capacity.CapacityError, "upload could not be verified"):
+            self.seed()
+        with self.assertRaisesRegex(capacity.CapacityError, "upload remains unconfirmed"):
+            self.cleanup()
+        self.assertEqual(self.cloud.capacity_rows(), [])
+        self.assertEqual(self.ledger()["phase"], "cleanup")
+        self.assertEqual(self.ledger()["fixtures"][0]["putPending"], [0])
+        self.assertEqual(self.wait.call_count, len(capacity.UNCERTAIN_READBACK_DELAYS))
 
     def test_stale_main_blocks_publication_but_not_retirement(self):
         self.guard.side_effect = [None, capacity.CapacityError("Revision changed.")]
@@ -254,6 +332,22 @@ class CapacityTests(unittest.TestCase):
             self.cleanup()
         self.assertEqual(self.cloud.objects, previous)
         self.assertEqual(self.ledger()["phase"], "cleanup")
+
+    def test_worker_preflight_fingerprint_is_private_and_must_match_afterward(self):
+        deploy_api = Mock()
+        active = {"revision": REVISION, "deploymentId": "synthetic-deployment", "versionId": "synthetic-version"}
+        with patch.object(capacity, "verify_worker_target", return_value=active) as verify, \
+             patch.object(capacity, "_verify_health") as health:
+            capacity.verify_worker_fingerprint(self.directory, self.resources, deploy_api, REVISION, before=True)
+            capacity.verify_worker_fingerprint(self.directory, self.resources, deploy_api, REVISION, before=False)
+            path = self.directory / capacity.FINGERPRINT_FILE
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertNotIn(active["deploymentId"], path.read_text(encoding="ascii"))
+            active["versionId"] = "other-synthetic-version"
+            with self.assertRaisesRegex(capacity.CapacityError, "differs from the preflight fingerprint"):
+                capacity.verify_worker_fingerprint(self.directory, self.resources, deploy_api, REVISION, before=False)
+            verify.assert_called_with(deploy_api, self.resources.api, TARGET)
+            health.assert_called_with(REVISION)
 
 
 if __name__ == "__main__":

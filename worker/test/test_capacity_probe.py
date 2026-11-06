@@ -109,6 +109,16 @@ class CapacityProbeTests(unittest.TestCase):
             {mode: row["samples"] for mode, row in report["export"].items()},
             {"serial": 3, "parallel2": 2, "parallel4": 4, "slow": 1, "cancel": 1},
         )
+        for mode, row in report["export"].items():
+            self.assertGreaterEqual(row["firstBodyByteMs"]["min"], 0)
+            self.assertLessEqual(row["firstBodyByteMs"]["max"], row["elapsedMs"]["max"])
+            if mode == "cancel":
+                self.assertNotIn("bodyBytesPerSecond", row)
+            else:
+                self.assertGreater(row["bodyBytesPerSecond"]["min"], 0)
+        for row in [report["health"], *report["head"].values(), *report["rejectedGet"].values()]:
+            self.assertNotIn("firstBodyByteMs", row)
+            self.assertNotIn("bodyBytesPerSecond", row)
         positive_path = f"/sub/{self.fixtures['at-limits'].token}/base64"
         successful = [response for method, path, response in self.calls if method == "GET" and path == positive_path]
         self.assertEqual(sorted(response.read_bytes for response in successful), [4] + [len(BODY)] * 10)
@@ -117,6 +127,31 @@ class CapacityProbeTests(unittest.TestCase):
         for fixture in self.fixtures.values():
             self.assertNotIn(fixture.token, output)
         self.assertNotIn("/sub/", output)
+
+    def test_slow_body_timing_uses_first_and_last_body_reads_and_includes_pauses(self):
+        response = Response(200, BODY, **{"Content-Length": str(len(BODY))})
+        read = response.read
+        clock = 100.0
+        read_sizes = []
+
+        def read_at_time(size):
+            nonlocal clock
+            clock += 0.5
+            read_sizes.append(size)
+            return read(size)
+
+        def pause(seconds):
+            nonlocal clock
+            clock += seconds
+
+        with (patch.object(response, "read", side_effect=read_at_time),
+              patch.object(probe, "monotonic", side_effect=lambda: clock),
+              patch.object(probe, "sleep", side_effect=pause),
+              patch.object(probe, "READ_BYTES", 4), patch.object(probe, "SLOW_INTERVAL_BYTES", 4)):
+            measured = probe._verify_export(response, self.fixtures["at-limits"], "slow", 110.0)
+        # The final EOF verification happens after the complete-body timestamp.
+        self.assertEqual(read_sizes, [1, 4, 4, 3, 1])
+        self.assertEqual(measured, (len(BODY), 100.5, 102.5))
 
     def test_postflight_requires_exact_same_revision(self):
         self.last_revision = "b" * 40

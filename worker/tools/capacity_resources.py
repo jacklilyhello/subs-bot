@@ -11,25 +11,28 @@ from pathlib import Path
 import re
 import stat
 import tempfile
+from time import sleep
 from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request, build_opener
 
 from capacity_fixtures import CHUNK_BYTES, NODE_COUNT, SHARE_BYTES, SHARE_PREFIX, SNAPSHOT_BYTES
 from cloudflare_isolation import (
     API_ORIGIN, DIGEST, HEX_ID, NAMESPACE, REVISION, TIMESTAMP, UUID, WORKER_NAME,
-    CloudflareClient, CloudflareError, _NoRedirect, _verify_health,
+    CloudflareClient, CloudflareError, _NoRedirect, _verify_health, verify_worker_target,
 )
 from prepare_isolation_artifact import ArtifactError, require_current_main
 
 
 OWNER = "9223372036854775807"  # Outside Telegram's ID range.
 LEDGER_FILE = "capacity-cleanup.json"
+FINGERPRINT_FILE = "capacity-worker-fingerprint.json"
 MAX_JSON = 256 * 1024
 MAX_MANIFEST = 64 * 1024
 MAX_CHUNKS = 256
 TOKEN = re.compile(r"subsbot-synthetic-capacity-[A-Za-z0-9_-]{32}")
 RUN_ID = re.compile(r"[1-9][0-9]{0,19}")
 STATUS = {"at-limits": 200, "share-over": 422, "snapshot-over": 503}
+UNCERTAIN_READBACK_DELAYS = (1, 2, 4)
 SYNTHETIC_LINE = re.compile(rb'\{"share":"(' + re.escape(SHARE_PREFIX)
                             + rb'capacity-[0-9]{6}-x*)","pad":"p*"\}\n')
 TARGET_KEYS = {"accountId", "workerId", "workerCreatedOn", "d1Id", "d1CreatedAt", "r2CreatedOn", "namespace"}
@@ -156,7 +159,7 @@ def read_fixtures(directory, revision):
                     "Capacity over-limit fixture is invalid.")
         entries.append({"label": label, "snapshotId": snapshot, "nodeCount": node_count,
                         "tokenSha256": digest(token.encode("ascii")), "objects": objects,
-                        "rowId": None, "armed": []})
+                        "rowId": None, "armed": [], "reservePending": False, "putPending": []})
     require(len({entry["snapshotId"] for entry in entries}) == len(STATUS)
             and len({entry["tokenSha256"] for entry in entries}) == len(STATUS),
             "Duplicate capacity fixture identity.")
@@ -176,18 +179,22 @@ def locked_directory(directory):
         os.close(fd)
 
 
-def save_ledger(directory, ledger):
-    fd, temporary = tempfile.mkstemp(dir=directory, prefix=".capacity-cleanup-")
+def save_private_json(path, value):
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".capacity-")
     try:
         with os.fdopen(fd, "w", encoding="ascii") as output:
-            json.dump(ledger, output, separators=(",", ":"))
+            json.dump(value, output, separators=(",", ":"))
             output.write("\n")
             output.flush()
             os.fsync(output.fileno())
-        os.replace(temporary, directory / LEDGER_FILE)
+        os.replace(temporary, path)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def save_ledger(directory, ledger):
+    save_private_json(directory / LEDGER_FILE, ledger)
 
 
 def load_ledger(directory, scope_hash):
@@ -203,7 +210,8 @@ def load_ledger(directory, scope_hash):
             and len(entries) == len(STATUS) and all(isinstance(entry, dict) for entry in entries)
             and [entry.get("label") for entry in entries] == list(STATUS), "Invalid capacity cleanup ledger.")
     for entry in entries:
-        require(set(entry) == {"label", "snapshotId", "nodeCount", "tokenSha256", "objects", "rowId", "armed"}
+        require(set(entry) == {"label", "snapshotId", "nodeCount", "tokenSha256", "objects", "rowId", "armed",
+                               "reservePending", "putPending"}
                 and matches(UUID, entry["snapshotId"]) and matches(DIGEST, entry["tokenSha256"])
                 and integer(entry["nodeCount"], 1, NODE_COUNT)
                 and (entry["rowId"] is None or integer(entry["rowId"], 1, 9007199254740991))
@@ -212,6 +220,11 @@ def load_ledger(directory, scope_hash):
                 and all(integer(index, 0, len(entry["objects"]) - 1) for index in entry["armed"])
                 and entry["armed"] == list(range(len(entry["armed"])))
                 and (not entry["armed"] or entry["rowId"] is not None)
+                and type(entry["reservePending"]) is bool and (not entry["reservePending"] or entry["rowId"] is None)
+                and isinstance(entry["putPending"], list)
+                and all(integer(index, 0, len(entry["armed"]) - 1) for index in entry["putPending"])
+                and len(set(entry["putPending"])) == len(entry["putPending"])
+                and (ledger["phase"] != "retired" or not (entry["reservePending"] or entry["putPending"]))
                 and (entry["label"] != "snapshot-over" or len(entry["objects"]) == 1),
                 "Invalid capacity cleanup ledger entry.")
         for index, obj in enumerate(entry["objects"]):
@@ -326,12 +339,16 @@ class Resources:
                 "Capacity subscription state changed outside this run.")
         return row
 
-    def reserve(self, ledger, entry, token):
+    def reserve(self, ledger, entry, token, before_insert):
         row = self.row(ledger, entry)
+        if entry["reservePending"]:
+            row = recheck_absent(row, lambda: self.row(ledger, entry))
+            require(row is not None, "A prior capacity reservation remains unconfirmed.")
         if row is not None:
             return row
         require(entry["rowId"] is None, "Previously reserved capacity subscription disappeared.")
         name, source = marker(ledger, entry)
+        before_insert()
         try:
             self.query(
                 "INSERT INTO subscriptions (owner_id,name,source_url,token,created_at,updated_at) "
@@ -364,8 +381,7 @@ class Resources:
         row = self.row(ledger, entry)
         require(row is not None and row["generation"] == 1, "Capacity snapshot publication could not be confirmed.")
 
-    def retire(self, ledger, entry):
-        row = self.row(ledger, entry)
+    def retire(self, ledger, entry, row):
         if row is None:
             return
         name, source = marker(ledger, entry)
@@ -398,6 +414,28 @@ def matches_object(body, entry, index):
     return isinstance(body, bytes) and len(body) == descriptor["bytes"] and digest(body) == descriptor["sha256"]
 
 
+def recheck_absent(value, read):
+    for delay in UNCERTAIN_READBACK_DELAYS:
+        if value is not None:
+            break
+        sleep(delay)
+        value = read()
+    return value
+
+
+def confirm_row(directory, ledger, entry, row):
+    if entry["rowId"] is None:
+        entry["rowId"] = row["id"]
+        entry["reservePending"] = False
+        save_ledger(directory, ledger)
+
+
+def confirm_object(directory, ledger, entry, index):
+    if index in entry["putPending"]:
+        entry["putPending"].remove(index)
+        save_ledger(directory, ledger)
+
+
 def seed(directory, resources, revision, run_id, guard):
     require(matches(REVISION, revision) and matches(RUN_ID, run_id), "A full revision and hosted run ID are required.")
     fixtures, entries = read_fixtures(directory, revision)
@@ -410,31 +448,39 @@ def seed(directory, resources, revision, run_id, guard):
         save_ledger(directory, ledger)
     else:
         require(ledger["phase"] == "seed" and (ledger["revision"], ledger["runId"]) == (revision, run_id)
-                and [{**entry, "rowId": None, "armed": []} for entry in ledger["fixtures"]] == entries,
+                and [{**entry, "rowId": None, "armed": [], "reservePending": False, "putPending": []}
+                     for entry in ledger["fixtures"]] == entries,
                 "Existing capacity cleanup ledger belongs to another fixture attempt.")
     for fixture, entry in zip(fixtures, ledger["fixtures"]):
-        row = resources.reserve(ledger, entry, fixture["token"])
-        if entry["rowId"] is None:
-            entry["rowId"] = row["id"]
+        def before_insert():
+            entry["reservePending"] = True
             save_ledger(directory, ledger)
+        row = resources.reserve(ledger, entry, fixture["token"], before_insert)
+        confirm_row(directory, ledger, entry, row)
         for index in range(len(entry["objects"])):
             key = object_key(entry, index)
             remote = resources.objects.request("GET", key)
+            if index in entry["putPending"]:
+                remote = recheck_absent(remote, lambda: resources.objects.request("GET", key))
+                require(remote is not None, "A prior capacity object upload remains unconfirmed.")
             if remote is not None:
                 require(index in entry["armed"] and matches_object(remote, entry, index),
                         "Capacity object key is occupied by unverified content.")
+                confirm_object(directory, ledger, entry, index)
                 continue
             require(row["generation"] == 0, "A published capacity object is missing.")
             body = read_object_file(directory, entry["label"], index, entry["objects"])
             if index not in entry["armed"]:
                 entry["armed"].append(index)
-                save_ledger(directory, ledger)
+            entry["putPending"].append(index)
+            save_ledger(directory, ledger)
             try:
                 resources.objects.request("PUT", key, body)
             except CapacityError:
                 pass
             require(matches_object(resources.objects.request("GET", key), entry, index),
                     "Capacity object upload could not be verified.")
+            confirm_object(directory, ledger, entry, index)
     resources.verify()
     guard(revision)
     for entry in ledger["fixtures"]:
@@ -451,14 +497,23 @@ def cleanup(directory, resources):
     ledger["phase"] = "cleanup"
     save_ledger(directory, ledger)
     for entry in ledger["fixtures"]:
-        resources.retire(ledger, entry)
+        row = resources.row(ledger, entry)
+        if entry["reservePending"]:
+            row = recheck_absent(row, lambda: resources.row(ledger, entry))
+            require(row is not None, "Capacity reservation remains unconfirmed. Cleanup ledger retained.")
+            confirm_row(directory, ledger, entry, row)
+        resources.retire(ledger, entry, row)
     for entry in ledger["fixtures"]:
         for index in entry["armed"]:
             key = object_key(entry, index)
             remote = resources.objects.request("GET", key)
+            if index in entry["putPending"]:
+                remote = recheck_absent(remote, lambda: resources.objects.request("GET", key))
+                require(remote is not None, "Capacity object upload remains unconfirmed. Cleanup ledger retained.")
             if remote is None:
                 continue
             require(matches_object(remote, entry, index), "Capacity object changed and was left in R2.")
+            confirm_object(directory, ledger, entry, index)
             try:
                 resources.objects.request("DELETE", key)
             except CapacityError:
@@ -474,9 +529,25 @@ def verify_release(revision):
     require_current_main(revision)
 
 
+def verify_worker_fingerprint(directory, resources, worker_api, revision, *, before):
+    require(matches(REVISION, revision), "A full hosted Worker revision is required.")
+    active = verify_worker_target(worker_api, resources.api, resources.target)
+    require(active["revision"] == revision, "The isolated Worker does not serve the requested revision.")
+    _verify_health(revision)
+    fingerprint = {"version": 1, "revision": revision, "scopeSha256": resources.scope_hash,
+                   "deploymentSha256": digest(json.dumps(active, sort_keys=True, separators=(",", ":")).encode("ascii"))}
+    path = directory / FINGERPRINT_FILE
+    if not path.exists() and not path.is_symlink():
+        require(before, "The isolated Worker preflight fingerprint is missing.")
+        save_private_json(path, fingerprint)
+    else:
+        require(json_body(read_private(path, MAX_JSON)) == fingerprint,
+                "The isolated Worker deployment differs from the preflight fingerprint.")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("seed", "cleanup"))
+    parser.add_argument("action", choices=("seed", "cleanup", "verify-worker-before", "verify-worker-after"))
     parser.add_argument("directory", type=Path)
     args = parser.parse_args()
     try:
@@ -488,9 +559,15 @@ def main():
                 seed(args.directory, resources, os.environ.get("GITHUB_SHA"), os.environ.get("GITHUB_RUN_ID"),
                      verify_release)
                 print("Published three verified isolated capacity fixtures.")
-            else:
+            elif args.action == "cleanup":
                 cleanup(args.directory, resources)
                 print("Isolated capacity fixture cleanup verified.")
+            else:
+                deploy_token = os.environ.get("SUBS_BOT_CF_DEPLOY_TOKEN")
+                require(deploy_token != token, "Separate scoped Worker and data credentials are required.")
+                verify_worker_fingerprint(args.directory, resources, CloudflareClient(deploy_token),
+                                          os.environ.get("GITHUB_SHA"), before=args.action == "verify-worker-before")
+                print("Exact isolated Worker revision, logging settings and scope verified.")
     except (CapacityError, CloudflareError, ArtifactError) as error:
         parser.exit(1, f"{error}\n")
     except (OSError, ValueError, KeyError, TypeError, RecursionError):
