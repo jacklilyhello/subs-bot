@@ -9,13 +9,15 @@
 | 路径 | 首个切片的行为 |
 | --- | --- |
 | `GET` 或 `HEAD /health` | 返回部署的 40 位 Git commit SHA，供部署验收核对 |
-| `GET` 或 `HEAD /sub/{token}/{format}` | 读取当前已发布快照并导出已有 URI，支持 `base64`、`v2ray` 和 `mixed` |
+| `GET` 或 `HEAD /sub/{token}/{format}` | 读取当前已发布快照，保留有效的已有 URI 或从受支持的结构化节点生成 URI，支持 `base64`、`v2ray` 和 `mixed` |
 
 能力链接视同凭据。成功与失败响应均使用 `Cache-Control: no-store, private`、`Referrer-Policy: no-referrer` 和 `X-Content-Type-Options: nosniff`。`HEAD` 执行同样的预检并返回相同状态，响应体为空。未知能力链接返回 `404`，未支持的导出格式返回 `406`，节点缺少可导出的分享 URI 或分享文本超过 16 MiB 返回 `422`。若预检时发现已引用的快照不可用或校验失败，返回 `503`。
 
 `GET` 在预检时验证已选定的快照并计算编码长度。通过后再读取同一个不可变快照，按原有块顺序编码，通过 `FixedLengthStream` 发送。两遍读取各自最多同时预读四个块，下游消费一块后再补下一块。若第二遍读取在成功响应头发出后失败，响应流会中止，客户端应把读取错误或未读满声明长度视为失败。响应流取消后停止补读，已发出的存储请求可能仍会完成。 [Workers FixedLengthStream](https://developers.cloudflare.com/workers/runtime-apis/streams/transformstream/#fixedlengthstream) · [Workers Content-Length](https://developers.cloudflare.com/workers/runtime-apis/response/#set-the-content-length-header)
 
-聚合、结构化节点生成分享 URI、其他导出格式、数据导入界面、Telegram Webhook、订阅拉取和生产域名属于后续阶段。
+结构化导出支持 Shadowsocks、VMess、VLESS、Trojan、Hysteria 2、TUIC v5 和 AnyTLS。生成 URI 时，服务器地址需要使用 IP 或 ASCII 主机名，包括已明确编码的 Punycode。Python 的 IDNA 转换与 Worker 的 URL 转换可能将同一个 Unicode 主机名解析为不同目的地。已有分享 URI 通过校验后按原字节导出。 [Python IDNA](https://docs.python.org/3/library/codecs.html#encodings.idna) · [URL 标准](https://url.spec.whatwg.org/#concept-domain-to-ascii)
+
+聚合、其他导出格式、数据导入界面、Telegram Webhook、订阅拉取和生产域名属于后续阶段。
 
 ## 组件边界
 

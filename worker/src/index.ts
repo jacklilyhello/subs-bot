@@ -1,5 +1,6 @@
-import { getSubscriptionSnapshot, readSnapshotNodes, type SubscriptionSnapshot } from "./storage.ts";
+import { getSubscriptionSnapshot, readSnapshotNodes, type NodeRecord, type SubscriptionSnapshot } from "./storage.ts";
 import { isValidStoredShare } from "./stored-share.ts";
+import { serializeStructuredShare } from "./structured-share.ts";
 import { answerTelegramViewCallback, drainTelegramReplies } from "./telegram/delivery.ts";
 import { decodeTelegramRequest, parseTelegramPolicy } from "./telegram/protocol.ts";
 import { acceptTelegramCommand } from "./telegram/store.ts";
@@ -32,6 +33,17 @@ function plain(text: string, status: number, head: boolean, headers?: HeadersIni
 
 class ExportContentError extends Error {}
 
+function shareLine(node: NodeRecord): string {
+  const stored = node.share;
+  if (stored === undefined || stored === null || stored === "") {
+    const generated = serializeStructuredShare(node);
+    if (generated !== null) return generated;
+  } else if (isValidStoredShare(stored)) {
+    return stored;
+  }
+  throw new ExportContentError();
+}
+
 async function* shareBytes(
   bucket: R2Bucket, snapshot: SubscriptionSnapshot, signal?: AbortSignal,
 ): AsyncGenerator<Uint8Array> {
@@ -39,10 +51,7 @@ async function* shareBytes(
   let total = 0;
 
   for await (const node of readSnapshotNodes(bucket, snapshot, signal)) {
-    const share = node.share;
-    if (!isValidStoredShare(share)) {
-      throw new ExportContentError();
-    }
+    const share = shareLine(node);
     const line = encoder.encode(total === 0 ? share : `\n${share}`);
     total += line.length;
     if (total > MAX_SHARE_BYTES) throw new ExportContentError();
