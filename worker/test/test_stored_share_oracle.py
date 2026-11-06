@@ -19,7 +19,8 @@ def corpus_share(row):
     if "base64Text" not in row:
         return row["share"]
     body = row["base64Text"].encode(ENCODINGS.get(row.get("encoding"), "utf-8"))
-    return f"{row['scheme']}://{base64.b64encode(body).decode('ascii')}{row.get('fragment', '')}"
+    encoded = base64.urlsafe_b64encode(body).rstrip(b"=") if row.get("urlSafe") else base64.b64encode(body)
+    return f"{row['scheme']}://{encoded.decode('ascii')}{row.get('fragment', '')}"
 
 
 class StoredShareOracleTests(unittest.TestCase):

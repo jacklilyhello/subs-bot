@@ -150,12 +150,18 @@ class ShareExportTests(unittest.TestCase):
 
     def test_existing_sip002_and_legacy_ss_shares_are_unchanged(self):
         userinfo = base64.urlsafe_b64encode(f"aes-128-gcm:{TEST_PASSWORD}".encode()).decode().rstrip("=")
-        legacy = base64.b64encode(f"aes-256-gcm:{TEST_PASSWORD}@192.0.2.40:443".encode()).decode()
+        legacy = base64.b64encode(b"aes-256-gcm:fixture:p@ss@192.0.2.40:443").decode()
         links = [
             f"ss://{userinfo}@[2001:db8::5]:443/?plugin=obfs-local%3Bobfs%3Dhttp#港 节点",
             f"ss://{legacy}#Legacy",
         ]
         self.assertEqual(to_share_links([node("ss", share=link) for link in links]), links)
+
+        # A whole-blob password containing unescaped URI delimiters can be
+        # interpreted as a different destination by a SIP002 client.
+        ambiguous = base64.b64encode(f"aes-256-gcm:{TEST_PASSWORD}@192.0.2.40:443".encode()).decode()
+        with self.assertRaises(ExportError):
+            to_share_links([node("ss", share=f"ss://{ambiguous}#Ambiguous")])
 
     def test_raw_authority_accepts_protocol_defaults_and_hysteria2_port_hopping(self):
         links = [

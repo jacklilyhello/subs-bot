@@ -6,7 +6,7 @@ import ipaddress
 import json
 import re
 from typing import Any
-from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
+from urllib.parse import parse_qs, quote, unquote, unquote_plus, urlencode, urlsplit
 from uuid import UUID
 
 from export_errors import ExportError
@@ -18,6 +18,7 @@ SHARE_SCHEMES = frozenset({
 })
 # SIP002 transports the method token without defining which ciphers a client supports.
 _SS_METHOD = re.compile(r"[a-zA-Z0-9_-]+")
+_SS_LINE_CHARACTER = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 _SS_2022_KEY_BYTES = {
     "2022-blake3-aes-128-gcm": 16,
     "2022-blake3-aes-256-gcm": 32,
@@ -537,23 +538,69 @@ def _valid_authority_share(share: str, scheme: str) -> bool:
     return _valid_endpoint(endpoint, scheme)
 
 
+def _ss_form_decode(value: str) -> str:
+    if re.search(r"%(?![0-9A-Fa-f]{2})", value):
+        raise ValueError("Invalid Shadowsocks URI query escape.")
+    return unquote_plus(value, errors="strict")
+
+
+def _ss_plugin_parameter(field: str) -> bool:
+    key = _ss_form_decode(field.partition("=")[0])
+    if _SS_LINE_CHARACTER.search(key) or "%" in key:
+        raise ValueError("Invalid Shadowsocks URI query key.")
+    return key.lower() == "plugin"
+
+
+def _valid_ss_query(address: str) -> bool:
+    query = address.partition("#")[0].partition("?")[2]
+    if not query:
+        return True
+    fields = query.split("&", 100)
+    if len(fields) > 100:
+        return False
+    seen = False
+    for field in fields:
+        # A semicolon may be a query separator in another client. Do not
+        # mistake a second possible plugin parameter for data in another field.
+        if ";" in field:
+            alternate = field.split(";", 100)
+            if len(alternate) > 100 or any(_ss_plugin_parameter(part) for part in alternate[1:]):
+                return False
+        if not _ss_plugin_parameter(field):
+            continue
+        value = _ss_form_decode(field.partition("=")[2])
+        if seen or _SS_LINE_CHARACTER.search(value):
+            return False
+        plugin, _, options = value.partition(";")
+        validate_ss_plugin_options(plugin, options)
+        seen = True
+    return True
+
+
 def _valid_ss_share(address: str) -> bool:
-    userinfo, separator, endpoint = address.partition("@")
-    if not separator:
-        userinfo, separator, endpoint = _decode_base64(address).decode().rpartition("@")
-        if not separator:
+    netloc = re.split(r"[/#?]", address, maxsplit=1)[0]
+    legacy = "@" not in netloc
+    if legacy:
+        address = _decode_base64(address).decode()
+        # Keep the inner query interpretation stable across URL parsers that
+        # would otherwise strip CR, LF or tabs before parsing the address.
+        if _SS_LINE_CHARACTER.search(address):
+            return False
+        netloc = re.split(r"[/#?]", address, maxsplit=1)[0]
+        userinfo, at, endpoint = netloc.rpartition("@")
+        if not at:
             return False
         method, separator, password = userinfo.partition(":")
     else:
+        userinfo, _, endpoint = netloc.partition("@")
         method, separator, password = userinfo.partition(":")
         if separator:
             method, password = unquote(method), unquote(password)
         else:
             method, separator, password = _decode_base64(unquote(userinfo)).decode().partition(":")
-    parsed = urlsplit("//" + endpoint)
     return bool(
         separator and _SS_METHOD.fullmatch(method) and (password or method == "none")
-        and _valid_ss_2022_keys(method, password) and _valid_endpoint(parsed.netloc, "ss")
+        and _valid_ss_2022_keys(method, password) and _valid_endpoint(endpoint, "ss") and _valid_ss_query(address)
     )
 
 
