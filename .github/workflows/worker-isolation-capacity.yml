@@ -2,6 +2,14 @@ name: Check Worker isolation capacity
 
 on:
   workflow_dispatch:
+    inputs:
+      profile:
+        description: Isolated export fixture profile
+        type: choice
+        options:
+          - capacity
+          - structured-smoke
+        default: capacity
 
 permissions:
   contents: read
@@ -15,6 +23,8 @@ jobs:
     if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
     environment: subs-bot-isolation
     runs-on: ubuntu-latest
+    env:
+      FIXTURE_PROFILE: ${{ inputs.profile || 'capacity' }}
     # Preserve cleanup time even if staging or the client probe uses its entire budget.
     timeout-minutes: 45
     steps:
@@ -28,7 +38,7 @@ jobs:
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           CAPACITY_DIR="$RUNNER_TEMP/subs-bot-capacity"
           printf 'CAPACITY_DIR=%s\n' "$CAPACITY_DIR" >> "$GITHUB_ENV"
-          python3 -B worker/tools/capacity_fixtures.py "$CAPACITY_DIR" "$GITHUB_SHA"
+          python3 -B worker/tools/capacity_fixtures.py "$CAPACITY_DIR" "$GITHUB_SHA" --profile "$FIXTURE_PROFILE"
       - name: Verify the active isolation Worker before staging
         id: worker_before
         timeout-minutes: 2
@@ -44,7 +54,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
           SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
-        run: python3 -B worker/tools/capacity_resources.py seed "$CAPACITY_DIR"
+        run: python3 -B worker/tools/capacity_resources.py seed "$CAPACITY_DIR" --profile "$FIXTURE_PROFILE"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always() && steps.seed.outcome != 'skipped'
         with:
@@ -53,8 +63,13 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
       - name: Check live boundaries, digest and bounded concurrency
+        if: env.FIXTURE_PROFILE == 'capacity'
         timeout-minutes: 8
         run: python3 -B worker/tools/capacity_probe.py "$CAPACITY_DIR"
+      - name: Check live structured and mixed Base64 export
+        if: env.FIXTURE_PROFILE == 'structured-smoke'
+        timeout-minutes: 2
+        run: python3 -B worker/tools/capacity_probe.py "$CAPACITY_DIR" --profile structured-smoke
       - name: Verify the active isolation Worker after probing
         if: always() && steps.worker_before.outcome == 'success' && steps.seed.outcome == 'success'
         timeout-minutes: 2
@@ -70,7 +85,7 @@ jobs:
         env:
           SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
           SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
-        run: python3 -B worker/tools/capacity_resources.py cleanup "$CAPACITY_DIR"
+        run: python3 -B worker/tools/capacity_resources.py cleanup "$CAPACITY_DIR" --profile "$FIXTURE_PROFILE"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always() && steps.cleanup.outcome == 'failure'
         with:
