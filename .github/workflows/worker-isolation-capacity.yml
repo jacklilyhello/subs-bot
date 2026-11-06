@@ -15,7 +15,8 @@ jobs:
     if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
     environment: subs-bot-isolation
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    # Preserve cleanup time even if staging or the client probe uses its entire budget.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -38,7 +39,7 @@ jobs:
         run: python3 -B worker/tools/capacity_resources.py verify-worker-before "$CAPACITY_DIR"
       - name: Seed only the recorded isolated D1 and private R2
         id: seed
-        timeout-minutes: 7
+        timeout-minutes: 12
         env:
           GH_TOKEN: ${{ github.token }}
           SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
@@ -65,7 +66,7 @@ jobs:
       - name: Retire the recorded synthetic capabilities and objects
         id: cleanup
         if: always() && steps.seed.outcome != 'skipped'
-        timeout-minutes: 7
+        timeout-minutes: 12
         env:
           SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
           SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
