@@ -124,11 +124,12 @@ def check_raw_fixture(directory, fixture, node_count, node_bytes, objects):
                 "Capacity over-limit fixture is invalid.")
 
 
-def check_structured_smoke_fixture(directory, fixture, snapshot_manifest, objects):
+def check_structured_smoke_fixture(directory, fixture, manifest, objects):
     label = fixture["label"]
     bodies, share_bytes, export = structured_smoke_fixture(label)
     descriptors = [{"bytes": len(body), "sha256": digest(body), "count": 1} for body in bodies]
-    require(snapshot_manifest == {"version": 1, "chunks": descriptors}
+    expected_manifest = json.dumps({"version": 1, "chunks": descriptors}, separators=(",", ":")).encode("ascii")
+    require(manifest == expected_manifest
             and all(row["bytes"] <= SMOKE_OBJECT_LIMIT for row in objects)
             and fixture.get("shareBytes") == share_bytes and fixture.get("exportBytes") == len(export)
             and fixture.get("exportSha256") == (digest(export) if export else None),
@@ -180,7 +181,7 @@ def read_fixtures(directory, revision, *, profile="capacity"):
         objects = [{key: row[key] for key in ("bytes", "sha256")} for row in chunk_files]
         objects.append({"bytes": len(manifest), "sha256": digest(manifest)})
         if profile == STRUCTURED_SMOKE:
-            check_structured_smoke_fixture(directory, fixture, snapshot_manifest, objects)
+            check_structured_smoke_fixture(directory, fixture, manifest, objects)
         else:
             check_raw_fixture(directory, fixture, node_count, node_bytes, objects)
         entries.append({"label": label, "snapshotId": snapshot, "nodeCount": node_count,

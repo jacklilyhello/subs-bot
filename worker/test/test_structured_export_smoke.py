@@ -61,6 +61,20 @@ class StructuredExportSmokeTests(unittest.TestCase):
         with self.assertRaisesRegex(capacity.CapacityError, "fixed synthetic plan"):
             capacity.read_fixtures(self.directory, REVISION, profile=STRUCTURED_SMOKE)
 
+    def test_rehashed_noncanonical_manifest_is_refused_before_cloud_access(self):
+        path = self.directory / "capacity.json"
+        metadata = json.loads(path.read_bytes())
+        fixture = metadata["fixtures"][0]
+        manifest = self.directory / fixture["manifestFile"]
+        modified = b'{"version":0,' + manifest.read_bytes()[1:]
+        manifest.write_bytes(modified)
+        fixture["manifestSha256"] = sha256(modified).hexdigest()
+        path.write_text(json.dumps(metadata), encoding="ascii")
+        resources = Mock()
+        with self.assertRaisesRegex(capacity.CapacityError, "fixed synthetic plan"):
+            capacity.seed(self.directory, resources, REVISION, RUN, Mock(), profile=STRUCTURED_SMOKE)
+        self.assertEqual(resources.mock_calls, [])
+
     @contextmanager
     def request(self, method, path, deadline, label):
         self.assertGreater(deadline, probe.monotonic())
