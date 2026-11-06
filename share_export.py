@@ -6,7 +6,7 @@ import ipaddress
 import json
 import re
 from typing import Any
-from urllib.parse import quote, unquote, urlencode, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 from uuid import UUID
 
 from export_errors import ExportError
@@ -447,30 +447,75 @@ def _valid_ss_2022_keys(method: str, password: str) -> bool:
         return False
 
 
-def _valid_endpoint(endpoint: str, scheme: str) -> bool:
-    # Hysteria 2 also allows comma-separated port ranges, which urlsplit.port rejects.
+def _endpoint_port(endpoint: str) -> str | None:
     pattern = r"\[([^\]]+)\](?::([^:]+))?" if endpoint.startswith("[") else r"([^:\[\]]+)(?::([^:]+))?"
     match = re.fullmatch(pattern, endpoint)
     if match is None:
-        return False
+        raise ExportError("The share link has an invalid server address.")
     host, ports = match.groups()
     if endpoint.startswith("["):
         address, has_zone, zone = host.partition("%25")
         if "%" in address or (has_zone and not re.fullmatch(r"[a-zA-Z0-9_.~-]+", zone)):
-            return False
+            raise ExportError("The share link has an invalid IPv6 address.")
         ipaddress.IPv6Address(address)
     else:
         _server_address(host)
-    if ports is None:
-        return scheme in _DEFAULT_PORT_SCHEMES
-    if scheme not in ("hysteria2", "hy2"):
-        _number(ports, 1, 65535)
-        return True
+    return ports
+
+
+def hysteria2_port_fields(endpoint: str, legacy_ports: str | None = None) -> dict[str, int | str]:
+    """Validate a Hysteria 2 endpoint and retain its complete port specification."""
+    ports = _endpoint_port(endpoint)
+    hopping = ports is not None and ("," in ports or "-" in ports)
+    if not hopping:
+        port = 443 if ports is None else _number(ports, 1, 65535)
+        if legacy_ports is None:
+            return {"port": port}
+        ports = legacy_ports
+    elif legacy_ports is not None:
+        raise ExportError("The Hysteria 2 link contains conflicting port ranges.")
+
     for span in ports.split(","):
         start, has_end, end = span.partition("-")
         first = _number(start, 1, 65535)
         if has_end:
             _number(end, first, 65535)
+    return {"ports": ports}
+
+
+def hysteria2_inline_ech(value: str) -> str:
+    """Normalize an inline ECHConfigList without permitting the client's file fallback."""
+    error = "The Hysteria 2 ECH option must contain an inline ECHConfigList."
+    if len(value) > 87384:
+        raise ExportError(error)
+    try:
+        raw = _decode_base64(value)
+    except ValueError:
+        raise ExportError(error) from None
+    standard = base64.b64encode(raw).decode("ascii")
+    urlsafe = base64.urlsafe_b64encode(raw).decode("ascii")
+    if value not in (standard, standard.rstrip("="), urlsafe, urlsafe.rstrip("=")):
+        raise ExportError(error)
+    if len(raw) < 6 or int.from_bytes(raw[:2], "big") != len(raw) - 2:
+        raise ExportError(error)
+    offset = 2
+    while offset < len(raw):
+        if offset + 4 > len(raw):
+            raise ExportError(error)
+        offset += 4 + int.from_bytes(raw[offset + 2:offset + 4], "big")
+    if offset != len(raw):
+        raise ExportError(error)
+    return standard
+
+
+def _valid_endpoint(endpoint: str, scheme: str) -> bool:
+    if scheme in ("hysteria2", "hy2"):
+        hysteria2_port_fields(endpoint)
+        return True
+    port = _endpoint_port(endpoint)
+    if port is None:
+        return scheme in _DEFAULT_PORT_SCHEMES
+    _number(port, 1, 65535)
     return True
 
 
@@ -483,6 +528,12 @@ def _valid_authority_share(share: str, scheme: str) -> bool:
         return False
     if scheme in ("vmess", "vless", "tuic") and not parsed.username:
         return False
+    if scheme in ("hysteria2", "hy2"):
+        ech = parse_qs(parsed.query, keep_blank_values=True, max_num_fields=100).get("ech", [""])
+        if len(ech) != 1:
+            return False
+        if ech[0]:
+            hysteria2_inline_ech(ech[0])
     return _valid_endpoint(endpoint, scheme)
 
 

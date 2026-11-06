@@ -62,8 +62,11 @@ from convert import (
     format_bytes_gb,
     format_expire,
     get_session,
+    is_hysteria2_link,
     node_name_from_url,
     parse_nodes_from_text,
+    parse_nodes_from_text_with_report,
+    parse_share_link,
     remain_text,
     to_base64_sub,
     to_clash,
@@ -461,6 +464,10 @@ def sub_summary_line(idx: int, sub: dict[str, Any]) -> str:
     )
 
 
+def _hysteria2_warning(rejected: int) -> str:
+    return f"跳过 {rejected} 条无效或暂不支持的 Hysteria 2 节点链接。" if rejected else ""
+
+
 def detail_text(sub: dict[str, Any], idx: int) -> str:
     nodes = nodes_of(sub)
     used = sub.get("traffic_used")
@@ -485,6 +492,8 @@ def detail_text(sub: dict[str, Any], idx: int) -> str:
 
     err = sub.get("last_error")
     err_line = f"\n⚠️ 刷新错误: {html.escape(err)}" if err else ""
+    warning = _hysteria2_warning(sub.get("rejected_hysteria2", 0))
+    warning_line = f"\n⚠️ {warning}" if warning and not err else ""
     return (
         f"配置名称: {html.escape(sub['name'])}\n"
         f"订阅链接: {html.escape(sub['url'])}\n"
@@ -494,7 +503,7 @@ def detail_text(sub: dict[str, Any], idx: int) -> str:
         f"过期时间: {html.escape(format_expire(sub.get('expire_at')))}\n"
         f"剩余时间: {html.escape(remain_text(sub.get('expire_at')))}\n"
         f"📡 节点列表 ({len(nodes)} 个，支持下拉展开):\n<blockquote expandable>{node_preview}</blockquote>"
-        f"{err_line}"
+        f"{err_line}{warning_line}"
     )
 
 
@@ -602,11 +611,12 @@ async def refresh_sub(
         user_id, int(sub["id"]), return_meta=meta_only, **fields
     )
     if updated is None:
-        fallback = dict(sub)
+        updated = dict(sub)
         if "node_count" in fields:
-            fallback["node_count"] = fields["node_count"]
-        fallback["last_error"] = fields["last_error"]
-        return fallback
+            updated["node_count"] = fields["node_count"]
+        updated["last_error"] = fields["last_error"]
+    if rejected := meta.get("rejected_hysteria2"):
+        updated["rejected_hysteria2"] = rejected
     return updated
 
 
@@ -885,6 +895,8 @@ async def run_update_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         doc = InputFile(content.encode("utf-8"), filename=name)
         await context.bot.send_document(chat_id=deliver_to, document=doc)
     stats = f"有效:{len(valid)} | 耗尽:{len(drained)} | 过期:{len(expired)} | 失败:{len(failed)}"
+    if warning := _hysteria2_warning(sum(row.get("rejected_hysteria2", 0) for row in results if row is not None)):
+        stats += f"\n⚠️ {warning}"
     if failed:
         keyboard = InlineKeyboardMarkup([
             [
@@ -1546,7 +1558,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # name|url
     if "|" in text and re.search(r"https?://", text):
         name, url = [x.strip() for x in text.split("|", 1)]
-        if re.match(r"^https?://", url):
+        if re.match(r"^https?://", url) and not any(
+            is_hysteria2_link(line.strip().lstrip("\ufeff")) for line in name.splitlines()
+        ):
             clean_url = url.rstrip("/")
             existing = [s for s in await store.list_subs_meta(user_id) if s["url"].rstrip("/") == clean_url]
             if existing:
@@ -1556,10 +1570,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 sub = await refresh_sub(
                     user_id, sub, rename=not bool(name), meta_only=True
                 )
+                warning = _hysteria2_warning(sub.get("rejected_hysteria2", 0))
+                if warning and sub.get("last_error"):
+                    await update.effective_message.reply_text(f"⚠️ 订阅节点未更新。{warning}", reply_markup=MAIN_KB)
+                    return
                 subs = await store.list_subs_meta(user_id)
                 idx = next((i for i, s in enumerate(subs, 1) if int(s["id"]) == int(sub["id"])), 1)
+                warning_line = f"\n⚠️ {warning}" if warning else ""
                 await update.effective_message.reply_html(
-                    f"🔄 <b>订阅已存在，已为您自动更新！</b>\n\n#{idx} <b>{html.escape(sub['name'])}</b>\n节点数: {sub['node_count']}",
+                    f"🔄 <b>订阅已存在，已为您自动更新！</b>\n\n#{idx} <b>{html.escape(sub['name'])}</b>\n节点数: {sub['node_count']}{warning_line}",
                     reply_markup=MAIN_KB,
                 )
                 return
@@ -1568,17 +1587,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             sub = await refresh_sub(
                 user_id, sub, rename=not bool(name), meta_only=True
             )
+            warning = _hysteria2_warning(sub.get("rejected_hysteria2", 0))
+            if warning and sub.get("last_error"):
+                await update.effective_message.reply_text(f"⚠️ 订阅链接已保存，未导入节点。{warning}", reply_markup=MAIN_KB)
+                return
+            warning_line = f"\n⚠️ {warning}" if warning else ""
             await update.effective_message.reply_html(
-                f"✅ 已添加订阅 <b>{html.escape(sub['name'])}</b>\n节点: {sub['node_count']}",
+                f"✅ 已添加订阅 <b>{html.escape(sub['name'])}</b>\n节点: {sub['node_count']}{warning_line}",
                 reply_markup=MAIN_KB,
             )
             return
 
     # subscription urls
+    links = extract_share_links(text)
     urls = re.findall(r"https?://\S+", text)
-    if urls and not extract_share_links(text):
+    if urls and not links:
         added = []
         updated_list = []
+        rejected = 0
+        failed_hysteria2 = 0
         existing_subs = await store.list_subs_meta(user_id)
         existing_url_map = {s["url"].rstrip("/"): s for s in existing_subs}
 
@@ -1589,11 +1616,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 refreshed = await refresh_sub(
                     user_id, old_sub, rename=True, meta_only=True
                 )
+                count = refreshed.get("rejected_hysteria2", 0)
+                rejected += count
+                if count and refreshed.get("last_error"):
+                    failed_hysteria2 += 1
+                    continue
                 updated_list.append(f"{refreshed['name']} ({refreshed['node_count']} 节点)")
             else:
                 name = urlparse(url).netloc or "订阅"
                 sub = await store.add_sub(user_id, name, url)
                 sub = await refresh_sub(user_id, sub, rename=True, meta_only=True)
+                count = sub.get("rejected_hysteria2", 0)
+                rejected += count
+                if count and sub.get("last_error"):
+                    failed_hysteria2 += 1
+                    continue
                 added.append(f"{sub['name']} ({sub['node_count']} 节点)")
 
         msg_lines = []
@@ -1601,18 +1638,27 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             msg_lines.append("✅ 已添加新增订阅:\n" + "\n".join(added))
         if updated_list:
             msg_lines.append("🔄 检测到重复订阅，已为您自动更新:\n" + "\n".join(updated_list))
+        if failed_hysteria2:
+            msg_lines.append(f"⚠️ {failed_hysteria2} 条订阅未更新节点。")
+        if warning := _hysteria2_warning(rejected):
+            msg_lines.append(warning)
         await update.effective_message.reply_text("\n\n".join(msg_lines), reply_markup=MAIN_KB)
         return
 
     # node share links
-    links = extract_share_links(text)
     if links:
+        added = 0
+        rejected = 0
         for link in links:
+            if is_hysteria2_link(link) and parse_share_link(link) is None:
+                rejected += 1
+                continue
             await store.add_temp(user_id, link, node_name_from_url(link))
-        await update.effective_message.reply_text(
-            f"✅ 已加入临时列表 {len(links)} 条。发送 /temp 查看。",
-            reply_markup=MAIN_KB,
-        )
+            added += 1
+        lines = [f"✅ 已加入临时列表 {added} 条。发送 /temp 查看。"] if added else []
+        if warning := _hysteria2_warning(rejected):
+            lines.append(warning)
+        await update.effective_message.reply_text("\n".join(lines), reply_markup=MAIN_KB)
         return
 
     if is_group and not addressed:
@@ -1651,7 +1697,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     user_id = scope_owner(update)
-    parsed_nodes = parse_nodes_from_text(text)
+    parsed_nodes, rejected_hysteria2 = parse_nodes_from_text_with_report(text)
     created: list[tuple[str, int]] = []
     failures: list[str] = []
     skipped = 0
@@ -1669,7 +1715,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             created.append((str(local["name"]), len(parsed_nodes[:MAX_IMPORTED_NODES])))
     if not parsed_nodes or all(node.get("share") for node in parsed_nodes):
         existing_url_norm = {sub["url"].rstrip("/"): sub for sub in await store.list_subs_meta(user_id)}
-        urls = _unique(value.rstrip(".,;:!?)]}>\"\'") for value in re.findall(r"https?://[^\s<>\"]+", text))
+        url_text = "\n".join(line for line in text.splitlines() if not is_hysteria2_link(line.strip().lstrip("\ufeff")))
+        urls = _unique(value.rstrip(".,;:!?)]}>\"\'") for value in re.findall(r"https?://[^\s<>\"]+", url_text))
         for url in urls[:MAX_IMPORTED_SUBSCRIPTIONS]:
             clean_url = url.rstrip("/")
             if clean_url in existing_url_norm:
@@ -1678,6 +1725,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     updated = await refresh_sub(
                         user_id, old_sub, rename=True, meta_only=True
                     )
+                    count = updated.get("rejected_hysteria2", 0)
+                    rejected_hysteria2 += count
+                    if count and updated.get("last_error"):
+                        failures.append("订阅节点未更新。")
+                        continue
                     created.append((f"{updated['name']} (已更新)", updated['node_count']))
                 except Exception:
                     skipped += 1
@@ -1688,7 +1740,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 updated = await refresh_sub(
                     user_id, sub, rename=True, meta_only=True
                 )
-                if updated.get("last_error"):
+                count = updated.get("rejected_hysteria2", 0)
+                rejected_hysteria2 += count
+                if count and updated.get("last_error"):
+                    failures.append("订阅链接已保存，未导入节点。")
+                elif updated.get("last_error"):
                     failures.append(f"{name}: {updated['last_error']}")
                 else:
                     created.append((str(updated.get("name") or name), updated['node_count']))
@@ -1702,7 +1758,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         lines.append(f"已跳过重复订阅：{skipped} 条")
     if failures:
         lines.append("失败：" + "；".join(html.escape(item) for item in failures[:8]))
-    if not created and not failures and not skipped:
+    if warning := _hysteria2_warning(rejected_hysteria2):
+        lines.append(warning)
+    if not created and not failures and not skipped and not rejected_hysteria2:
         lines.append("未识别到订阅或节点内容。")
     await status.edit_text("\n".join(lines), reply_markup=MAIN_KB, parse_mode=ParseMode.HTML)
 
@@ -2146,17 +2204,17 @@ def _subscription_export_response(nodes: list[dict[str, Any]], kind: str) -> web
             return web.Response(text=to_base64_sub(nodes), content_type="text/plain", headers=no_store)
         if kind in _SINGBOX_KINDS:
             return web.Response(text=to_singbox(nodes), content_type="application/json", headers=no_store)
+        if kind == "surge":
+            return web.Response(text=to_surge(nodes), content_type="text/plain", headers=no_store)
+        if kind in ("qx", "quantumult", "quantumultx"):
+            return web.Response(text=to_qx(nodes), content_type="text/plain", headers=no_store)
+        return web.Response(text=to_clash(nodes), content_type="text/yaml", headers=no_store)
     except ExportError:
         return web.Response(
             status=422,
             text="Some nodes or connection settings are unsupported by this export format.",
             headers=no_store,
         )
-    if kind == "surge":
-        return web.Response(text=to_surge(nodes), content_type="text/plain", headers=no_store)
-    if kind in ("qx", "quantumult", "quantumultx"):
-        return web.Response(text=to_qx(nodes), content_type="text/plain", headers=no_store)
-    return web.Response(text=to_clash(nodes), content_type="text/yaml", headers=no_store)
 
 
 async def http_sub(request: web.Request) -> web.Response:

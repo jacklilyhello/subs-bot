@@ -8,7 +8,7 @@ import re
 import socket
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import parse_qs, unquote, urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse, urlsplit
 
 MAX_SUBSCRIPTION_REDIRECTS = 5
 MAX_SUBSCRIPTION_BYTES = 10 * 1024 * 1024
@@ -17,10 +17,13 @@ MAX_SUBSCRIPTION_BYTES = 10 * 1024 * 1024
 import aiohttp
 import yaml
 
-from share_export import SHARE_SCHEMES, to_share_links
+from export_errors import ExportError
+from share_export import SHARE_SCHEMES, hysteria2_inline_ech, hysteria2_port_fields, to_share_links
 from singbox_export import to_singbox as _to_singbox
 
 PROTO_RE = re.compile(rf"^(?:{'|'.join(sorted(SHARE_SCHEMES))})://\S+", re.I)
+HYSTERIA2_RE = re.compile(r"^(?:hy2|hysteria2(?:\+realm(?:\+http)?)?)://", re.I)
+HYSTERIA2_OPTIONS = frozenset({"auth", "mport", "sni", "insecure", "obfs", "obfs-password", "pinSHA256", "ech"})
 
 # ── 共享 HTTP 会话 ────────────────────────────────────────────────────────────
 # 旧实现每抓一条订阅就新建一个 ClientSession，等于每条都重做 TLS 握手、
@@ -176,13 +179,17 @@ def decode_maybe_base64(text: str) -> str:
     return stripped
 
 
+def is_hysteria2_link(link: str) -> bool:
+    return HYSTERIA2_RE.match(link) is not None
+
+
 def extract_share_links(text: str) -> list[str]:
     links: list[str] = []
     for line in _strip_leading_bom(text).splitlines():
         line = line.strip().lstrip("\ufeff")
         if not line:
             continue
-        if PROTO_RE.match(line):
+        if PROTO_RE.match(line) or is_hysteria2_link(line):
             links.append(line)
             continue
         raw = _b64decode(line)
@@ -193,7 +200,7 @@ def extract_share_links(text: str) -> list[str]:
             continue
         for sub in _strip_leading_bom(decoded).splitlines():
             sub = sub.strip().lstrip("\ufeff")
-            if PROTO_RE.match(sub):
+            if PROTO_RE.match(sub) or is_hysteria2_link(sub):
                 links.append(sub)
     return links
 
@@ -252,13 +259,13 @@ def _parse_share_link(url: str) -> dict[str, Any] | None:
     lower = url.lower()
     if lower.startswith("vmess://"):
         return parse_vmess(url)
+    if is_hysteria2_link(url):
+        return _parse_hysteria2_link(url)
     name = node_name_from_url(url)
     u = urlparse(url.split("#", 1)[0])
     scheme = (u.scheme or "").lower()
     if not scheme:
         return None
-    if scheme == "hy2":
-        scheme = "hysteria2"
     host = u.hostname or ""
     port = u.port or 0
     username = unquote(u.username or "")
@@ -287,15 +294,6 @@ def _parse_share_link(url: str) -> dict[str, Any] | None:
         # 或整段 base64(method:pass@host:port)。解不出服务器就丢弃，不填默认密码。
         if not _fill_ss_fields(url, node, username, password):
             return None
-    elif scheme == "hysteria2":
-        auth = (
-            f"{username}:{password}" if u.password is not None else username or qs.get("auth") or ""
-        )
-        node.update({
-            "password": auth,
-            "sni": qs.get("sni") or "",
-            "skip-cert-verify": qs.get("insecure") in ("1", "true", "True"),
-        })
     elif scheme == "tuic":
         node.update({
             "uuid": username,
@@ -307,6 +305,50 @@ def _parse_share_link(url: str) -> dict[str, Any] | None:
         })
     else:
         node["raw"] = url
+    return node
+
+
+def _parse_hysteria2_link(url: str) -> dict[str, Any]:
+    address = url.split("#", 1)[0]
+    if re.search(r"\s|[\x00-\x1f\x7f-\x9f]|%(?![0-9a-fA-F]{2})", address):
+        raise ValueError("Invalid Hysteria 2 URI encoding")
+    parsed = urlsplit(address)
+    if parsed.scheme not in ("hy2", "hysteria2") or parsed.path not in ("", "/"):
+        raise ValueError("Unsupported Hysteria 2 URI scheme or path")
+    userinfo, at, endpoint = parsed.netloc.rpartition("@")
+    if at and (not userinfo or "@" in userinfo):
+        raise ValueError("Invalid Hysteria 2 authentication field")
+
+    params = parse_qs(parsed.query, keep_blank_values=True, errors="strict", max_num_fields=100)
+    if params.keys() - HYSTERIA2_OPTIONS or any(len(values) != 1 for values in params.values()):
+        raise ValueError("Unsupported or repeated Hysteria 2 URI option")
+    options = {key: values[0] for key, values in params.items()}
+    auth = unquote(userinfo, errors="strict")
+    legacy_auth = options.get("auth", "")
+    if auth and legacy_auth and auth != legacy_auth:
+        raise ValueError("Conflicting Hysteria 2 authentication fields")
+    insecure = options.get("insecure", "0").lower()
+    if insecure not in ("0", "1", "false", "true"):
+        raise ValueError("Invalid Hysteria 2 TLS verification option")
+    node = {
+        "name": node_name_from_url(url), "type": "hysteria2", "server": parsed.hostname, "share": url,
+        **hysteria2_port_fields(endpoint, options.get("mport")),
+        "password": auth or legacy_auth, "sni": options.get("sni", ""),
+        "skip-cert-verify": insecure in ("1", "true"),
+    }
+    obfs = options.get("obfs", "")
+    obfs_password = options.get("obfs-password", "")
+    if obfs or obfs_password:
+        if obfs not in ("salamander", "gecko") or not obfs_password:
+            raise ValueError("Unsupported or incomplete Hysteria 2 obfuscation")
+        node.update({"obfs": obfs, "obfs-password": obfs_password})
+    if pin := options.get("pinSHA256"):
+        pin = pin.replace(":", "")
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", pin):
+            raise ValueError("Invalid Hysteria 2 certificate pin")
+        node["fingerprint"] = pin.lower()
+    if ech := options.get("ech"):
+        node["ech-opts"] = {"enable": True, "config": hysteria2_inline_ech(ech)}
     return node
 
 
@@ -421,36 +463,41 @@ def _structured_nodes(text: str) -> list[dict[str, Any]]:
     return _nodes_from_loaded(loaded)
 
 
-def _nodes_from_shares(text: str) -> list[dict[str, Any]]:
+def _nodes_from_shares(text: str) -> tuple[list[dict[str, Any]], int]:
     nodes: list[dict[str, Any]] = []
+    rejected_hysteria2 = 0
     for link in extract_share_links(text):
-        try:
-            node = parse_share_link(link)
-        except Exception:
-            continue
+        node = parse_share_link(link)
         if node:
             nodes.append(node)
-    return nodes
+        elif is_hysteria2_link(link):
+            rejected_hysteria2 += 1
+    return nodes, rejected_hysteria2
 
 
-def _nodes_from_plain(text: str) -> list[dict[str, Any]]:
+def _nodes_from_plain(text: str) -> tuple[list[dict[str, Any]], int]:
     nodes = _structured_nodes(text)
     if nodes:
-        return nodes
+        return nodes, 0
     return _nodes_from_shares(text)
 
 
-def parse_nodes_from_text(text: str) -> list[dict[str, Any]]:
+def parse_nodes_from_text_with_report(text: str) -> tuple[list[dict[str, Any]], int]:
+    """Parse a subscription and count rejected Hysteria 2 URI candidates without retaining them."""
     text = _strip_leading_bom(text or "").strip()
     if not text:
-        return []
+        return [], 0
     # 整段都是 Base64 时先解码。折行后逐行解会截断 URI，不能抢在完整文档前面。
     decoded = decode_maybe_base64(text)
     if decoded and decoded != text:
-        nodes = _nodes_from_plain(decoded)
-        if nodes:
-            return nodes
+        nodes, rejected = _nodes_from_plain(decoded)
+        if nodes or rejected:
+            return nodes, rejected
     return _nodes_from_plain(text)
+
+
+def parse_nodes_from_text(text: str) -> list[dict[str, Any]]:
+    return parse_nodes_from_text_with_report(text)[0]
 
 
 def _decode_profile_title(raw: str) -> str:
@@ -622,7 +669,11 @@ async def fetch_subscription(url: str, timeout: int = 25) -> tuple[list[dict[str
                 if len(body) > MAX_SUBSCRIPTION_BYTES:
                     return [], meta, "订阅响应过大"
                 text = decode_subscription_bytes(body, resp.charset)
-                nodes = parse_nodes_from_text(text)
+                nodes, rejected = parse_nodes_from_text_with_report(text)
+                if rejected:
+                    meta["rejected_hysteria2"] = rejected
+                    if not nodes:
+                        return [], meta, "订阅包含无效或暂不支持的 Hysteria 2 链接，未解析出节点"
                 return nodes, meta, None
         return [], {"traffic_used": None, "traffic_total": None, "expire_at": None, "profile_name": None}, "订阅重定向次数过多"
     except Exception as e:
@@ -672,6 +723,14 @@ def to_clash(nodes: list[dict[str, Any]]) -> str:
     proxies = []
     names = []
     for n in nodes:
+        share = n.get("share")
+        if isinstance(share, str) and is_hysteria2_link(share):
+            parsed = parse_share_link(share)
+            # Mihomo's fingerprint changes the trust policy and can match a non-leaf certificate.
+            if not parsed or "fingerprint" in parsed or "%" in parsed["server"]:
+                raise ExportError("The Hysteria 2 link cannot be converted to Clash without losing settings.")
+            # Cached nodes from earlier versions may be missing required URI options.
+            n = {**parsed, "name": n.get("name", parsed["name"])}
         item = {k: v for k, v in n.items() if k not in ("share", "raw") and v not in ("", None)}
         if "name" not in item:
             continue

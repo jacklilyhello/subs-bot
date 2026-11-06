@@ -42,6 +42,8 @@ jobs:
           tar -xzf "$archive" -C "$workdir"
           python tests/test_structured_export_regressions.py --emit-singbox > "$workdir/shadowsocks.json"
           python tests/test_singbox_export.py --emit-singbox > "$workdir/protocols.json"
+          python tests/test_hysteria2_import.py --emit-singbox > "$workdir/hysteria2-import.json"
           singbox="$workdir/sing-box-1.14.4-linux-amd64/sing-box"
           "$singbox" check -c "$workdir/shadowsocks.json"
           "$singbox" check -c "$workdir/protocols.json"
+          "$singbox" check -c "$workdir/hysteria2-import.json"
