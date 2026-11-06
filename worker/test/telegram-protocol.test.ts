@@ -31,6 +31,8 @@ const policy: TelegramPolicy = {
 };
 const updateId = 5182026;
 const messageDate = 1794000000;
+const callbackId = "456789012345678901";
+const viewTicket = "sbv1_ABCDEFGHIJKLMNOPQRSTUA";
 
 function message(text = "/list", fields: Record<string, unknown> = {}) {
   return {
@@ -64,6 +66,24 @@ function decode(payload: unknown) {
 
 function decodeMessage(text: string, fields: Record<string, unknown> = {}) {
   return decode({ update_id: updateId, message: message(text, fields) });
+}
+
+function callback(fields: Record<string, unknown> = {}, original: Record<string, unknown> = {}) {
+  return {
+    id: callbackId,
+    from: { id: Number(policy.adminId), is_bot: false },
+    chat_instance: "562789012345678901",
+    data: viewTicket,
+    message: {
+      message_id: 32,
+      date: messageDate,
+      from: { id: Number(policy.botId), is_bot: true },
+      chat: { id: Number(policy.adminId), type: "private" },
+      text: "Synthetic bot reply",
+      ...original,
+    },
+    ...fields,
+  };
 }
 
 test("validates exact secret policy schema and canonical safe identities", () => {
@@ -136,7 +156,7 @@ test("enforces media type, fatal UTF-8 and declared and streamed size limits", a
   assert.equal(cancelled, true);
 });
 
-test("normalizes private and allowed group commands without retaining message text or names", async () => {
+test("normalizes commands and direct views without retaining message text or names", async () => {
   assert.deepEqual(await decodeMessage("/START@subscriptionfixturebot payload-fixture"), {
     status: 200,
     command: {
@@ -144,6 +164,15 @@ test("normalizes private and allowed group commands without retaining message te
       messageId: 15, messageDate, threadId: null, command: "start",
     },
   });
+  for (const [text, kind] of [["/list", "list"], ["/EXPIRE@subscriptionfixturebot", "expiry"], ["/recycle", "recycle"]]) {
+    assert.deepEqual(await decodeMessage(text), {
+      status: 200,
+      view: {
+        updateId, actorId: policy.adminId, chatId: policy.adminId, chatType: "private",
+        messageId: 15, messageDate, threadId: null, kind,
+      },
+    });
+  }
   for (const chatType of ["group", "supergroup"]) {
     assert.deepEqual(await decodeMessage("/list", {
       from: { id: Number(policy.memberId), is_bot: false, username: "hidden-fixture" },
@@ -151,13 +180,63 @@ test("normalizes private and allowed group commands without retaining message te
       message_thread_id: 212,
     }), {
       status: 200,
-      command: {
+      view: {
         updateId, actorId: policy.memberId, chatId: policy.groupId, chatType,
-        messageId: 15, messageDate, threadId: 212, command: "list",
+        messageId: 15, messageDate, threadId: 212, kind: "list",
       },
     });
   }
   assert.equal((await decodeMessage("/help", { message_thread_id: 44 })).command?.threadId, 44);
+});
+
+test("normalizes scoped callbacks from the exact bot message without retaining reply text", async () => {
+  assert.deepEqual(await decode({ update_id: updateId, callback_query: callback() }), {
+    status: 200,
+    view: {
+      updateId, actorId: policy.adminId, chatId: policy.adminId, chatType: "private",
+      messageId: 32, messageDate, threadId: null, kind: "callback", callbackId, ticket: viewTicket,
+    },
+  });
+  assert.deepEqual(await decode({
+    update_id: updateId,
+    callback_query: callback({ from: { id: Number(policy.memberId), is_bot: false } }, {
+      chat: { id: Number(policy.groupId), type: "supergroup" }, message_thread_id: 212,
+    }),
+  }), {
+    status: 200,
+    view: {
+      updateId, actorId: policy.memberId, chatId: policy.groupId, chatType: "supergroup",
+      messageId: 32, messageDate, threadId: 212, kind: "callback", callbackId, ticket: viewTicket,
+    },
+  });
+});
+
+test("drops malformed, inaccessible, inline and out-of-scope view callbacks", async () => {
+  for (const invalid of [
+    callback({ id: "" }),
+    callback({ id: Number(callbackId) }),
+    callback({ id: "bad\ncallback" }),
+    callback({ data: viewTicket.slice(0, -1) }),
+    callback({ data: `${viewTicket}\n` }),
+    callback({ data: "legacy-callback" }),
+    callback({ data: undefined, game_short_name: "fixture" }),
+    callback({ from: { id: Number(policy.adminId), is_bot: true } }),
+    callback({ from: { id: 123, is_bot: false } }),
+    callback({ inline_message_id: "fixture-inline", message: undefined }),
+    callback({ inline_message_id: "fixture-inline" }),
+    callback({}, { from: { id: Number(policy.botId) + 1, is_bot: true } }),
+    callback({}, { from: { id: Number(policy.botId), is_bot: false } }),
+    callback({}, { date: 0 }),
+    callback({}, { message_id: 0 }),
+    callback({}, { message_id: Number.MAX_SAFE_INTEGER + 1 }),
+    callback({}, { message_thread_id: 0 }),
+    callback({}, { chat: { id: Number(policy.memberId), type: "private" } }),
+    callback({}, { chat: { id: -42, type: "group" } }),
+    callback({}, { chat: { id: Number(policy.groupId), type: "channel" } }),
+  ]) {
+    assert.deepEqual(await decode({ update_id: updateId, callback_query: invalid }), { status: 204 });
+  }
+  assert.deepEqual(await decode({ update_id: updateId, callback_query: callback(), message: message() }), { status: 204 });
 });
 
 test("drops unknown actors and chats, channel posts, bots, anonymous, forwarded and edited events", async () => {

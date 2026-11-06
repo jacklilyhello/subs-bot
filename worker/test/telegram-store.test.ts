@@ -20,7 +20,7 @@ let db: D1Database;
 
 before(async () => {
   db = await miniflare.getD1Database("DB");
-  for (const file of ["0001_subscriptions.sql", "0002_telegram.sql"]) {
+  for (const file of ["0001_subscriptions.sql", "0002_telegram.sql", "0003_subscription_lifecycle.sql", "0004_telegram_views.sql"]) {
     const sql = await readFile(new URL(`../migrations/${file}`, import.meta.url), "utf8");
     await db.batch(sql.trim().split(/;\s*/u).filter(Boolean).map((statement) => db.prepare(statement)));
   }
@@ -222,7 +222,7 @@ test("legacy delivery skips marked receipts without blocking the same actor and 
   assert.equal((await claimTelegramReply(db, scope.botId))?.updateId, 62);
   assert.deepEqual(await outbox(scope, 60), { state: "pending", attempts: 0, leaseId: null, sentMessageId: null });
 
-  const extendedLease = { ...extended, attempts: 1, leaseId: "synthetic-action-lease" };
+  const extendedLease = { ...extended, receiptId: 0, attempts: 1, leaseId: "synthetic-action-lease", view: null };
   await db.prepare(`
     UPDATE telegram_outbox SET state = 'leased', attempts = 1, lease_id = ?, lease_until = unixepoch() + 30
     WHERE receipt_id = (SELECT receipt_id FROM telegram_inbox WHERE bot_id = ? AND update_id = ?)
