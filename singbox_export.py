@@ -12,6 +12,7 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 from uuid import UUID
 
 from export_errors import ExportError
+from share_export import validate_ss_plugin_options
 
 
 _ALIASES = {"ss": "shadowsocks", "hy2": "hysteria2", "socks5": "socks", "https": "http"}
@@ -19,7 +20,8 @@ _TRANSPORT_PROTOCOLS = {"vmess", "vless", "trojan"}
 _TLS_REQUIRED = {"hysteria", "hysteria2", "tuic", "anytls"}
 _TLS_DEFAULT = _TLS_REQUIRED | {"trojan"}
 _NETWORK_PROTOCOLS = {"shadowsocks", "vmess", "vless", "trojan", "hysteria", "hysteria2", "tuic", "socks"}
-_SUPPORTED = _NETWORK_PROTOCOLS | {"anytls", "http", "ssh", "shadowtls", "snell", "naive"}
+_NATIVE_ONLY = {"ssh", "shadowtls", "snell", "naive"}
+_SUPPORTED = _NETWORK_PROTOCOLS | _NATIVE_ONLY | {"anytls", "http"}
 _DIAL_FIELDS = set((
     "server server_port bind_interface inet4_bind_address inet6_bind_address bind_address_no_port "
     "routing_mark reuse_addr connect_timeout tcp_fast_open tcp_multi_path disable_tcp_keep_alive "
@@ -248,7 +250,7 @@ def _plugin(source: dict, output: dict) -> None:
     elif raw_settings is not None:
         settings = _object(raw_settings)
         names = {"mode": "obfs", "host": "obfs-host"} if plugin == "obfs-local" else {
-            "mode": "mode", "host": "host", "path": "path", "tls": "tls",
+            "mode": "mode", "host": "host", "path": "path", "tls": "tls", "mux": "mux",
         }
         options = []
         for key, option in names.items():
@@ -258,6 +260,9 @@ def _plugin(source: dict, output: dict) -> None:
             if key == "tls":
                 if _boolean(value):
                     options.append("tls")
+                continue
+            if key == "mux":
+                options.append(f"mux={int(_boolean(value))}")
                 continue
             text = _string(value)
             if any(char in text for char in ";\\\r\n"):
@@ -539,10 +544,17 @@ def _validate(output: dict) -> None:
         if method not in _SS_METHODS:
             raise ExportError("Shadowsocks 加密方式无法转换为 sing-box")
         _string(output.get("password", ""), allow_empty=method == "none")
-        if output.get("plugin") not in (None, "", "obfs-local", "v2ray-plugin"):
-            raise ExportError("Shadowsocks 插件无法转换为 sing-box")
-    if protocol == "vmess" and output.get("security", "auto") not in _VMESS_SECURITY:
-        raise ExportError("VMess 加密方式无法转换为 sing-box")
+        plugin = output.get("plugin")
+        raw_options = output.get("plugin_opts", "")
+        options = _string("" if raw_options is None else raw_options, allow_empty=True)
+        if plugin not in (None, ""):
+            validate_ss_plugin_options(plugin, options)
+        elif options:
+            raise ExportError("缺少 Shadowsocks 插件类型")
+    if protocol == "vmess":
+        security = output.get("security", "")
+        if not isinstance(security, str) or (security and security not in _VMESS_SECURITY):
+            raise ExportError("VMess 加密方式无法转换为 sing-box")
     if protocol == "vless" and output.get("flow", "") not in ("", "xtls-rprx-vision"):
         raise ExportError("VLESS flow 无法转换为 sing-box")
     if protocol in {"vmess", "vless"}:
@@ -617,6 +629,8 @@ def _outbound(node: dict, parse_share_link: Callable[[str], dict | None]) -> dic
     if native:
         output = _native(source, protocol)
     else:
+        if protocol in _NATIVE_ONLY:
+            raise ExportError("此协议需要原生 sing-box 出站配置")
         if original_type == "https":
             source["_https"] = True
         output = _clash(source, protocol)

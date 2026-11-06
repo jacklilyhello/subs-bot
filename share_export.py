@@ -196,7 +196,41 @@ def _transport_query(fields: dict[str, Any], native: bool) -> tuple[str, dict[st
 
 
 def _escape_plugin(value: str) -> str:
+    if any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value):
+        raise ExportError("A Shadowsocks plugin option contains invalid text.")
     return re.sub(r"[:;=\\]", lambda match: "\\" + match[0], value)
+
+
+def validate_ss_plugin_options(plugin: str, options: str) -> None:
+    """Validate the portable SIP003 client options shared by both exporters."""
+    # Native clients interpret a subset of SIP003. Don't turn options for local
+    # files, listeners or server mode into flags for a different client.
+    if plugin not in ("obfs-local", "v2ray-plugin"):
+        raise ExportError("The Shadowsocks plugin has no supported export mapping.")
+    if not options:
+        return
+    parts = re.findall(r"(?:\\[:;=\\]|[^\\;])+", options)
+    normalized = ";".join(parts)
+    error = "The Shadowsocks plugin has options without a supported client share-link mapping."
+    if not parts or options not in (normalized, normalized + ";") or any(
+        ord(char) < 32 or 127 <= ord(char) <= 159 for char in options
+    ):
+        raise ExportError(error)
+    allowed = {"obfs", "obfs-host"} if plugin == "obfs-local" else {"mode", "host", "path", "tls", "mux"}
+    seen: set[str] = set()
+    for part in parts:
+        key, separator, value = part.partition("=")
+        if key not in allowed or key in seen or (key != "tls" and (not separator or not value)):
+            raise ExportError(error)
+        seen.add(key)
+        if key == "obfs" and value not in ("http", "tls"):
+            raise ExportError(error)
+        if key == "mode" and value != "websocket":
+            raise ExportError(error)
+        if key == "tls" and separator and value not in ("1", "true"):
+            raise ExportError(error)
+        if key == "mux":
+            _number(value, 0, 65535)
 
 
 def _ss_plugin(fields: dict[str, Any]) -> str | None:
@@ -210,6 +244,7 @@ def _ss_plugin(fields: dict[str, Any]) -> str | None:
 
     options = _take(fields, "plugin-opts", "plugin_opts", default={})
     if isinstance(options, str):
+        validate_ss_plugin_options(plugin, options)
         return f"{plugin};{options}"
     options = _mapping(options)
     parameters = [plugin]
@@ -421,7 +456,7 @@ def _valid_endpoint(endpoint: str, scheme: str) -> bool:
     host, ports = match.groups()
     if endpoint.startswith("["):
         address, has_zone, zone = host.partition("%25")
-        if has_zone and not re.fullmatch(r"[a-zA-Z0-9_.~-]+", zone):
+        if "%" in address or (has_zone and not re.fullmatch(r"[a-zA-Z0-9_.~-]+", zone)):
             return False
         ipaddress.IPv6Address(address)
     else:

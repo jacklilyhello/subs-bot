@@ -7,6 +7,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -121,6 +122,47 @@ class SingBoxExportTests(unittest.TestCase):
         tags = [node["tag"] for node in outbounds[2:]]
         self.assertEqual(tags, ["proxy (2)", "direct (2)", "HK", "HK (3)", "HK (2)", "HK (4)"])
         self.assertEqual(outbounds[0]["outbounds"], tags)
+
+    def test_native_vmess_preserves_empty_default_security(self):
+        node = {
+            "name": "native-vmess", "type": "vmess", "server": "vm.example", "server_port": 443,
+            "uuid": "named-vmess-user", "security": "",
+        }
+        outbound = json.loads(to_singbox([node]))["outbounds"][2]
+        self.assertEqual(outbound["security"], "")
+        with self.assertRaises(ExportError):
+            to_singbox([dict(node, security=False)])
+
+    def test_native_only_protocols_require_native_shape(self):
+        for protocol in ("ssh", "shadowtls", "snell", "naive"):
+            with self.subTest(protocol=protocol), self.assertRaises(ExportError):
+                to_singbox([{"type": protocol, "server": "proxy.example", "port": 443}])
+
+        node = {
+            "name": "native-ssh", "type": "ssh", "server": "ssh.example", "server_port": 22,
+            "user": "demo", "password": "test-password",
+        }
+        outbound = json.loads(to_singbox([node]))["outbounds"][2]
+        self.assertEqual(outbound, {"tag": "native-ssh", **{key: value for key, value in node.items() if key != "name"}})
+
+    def test_shadowsocks_plugin_options_keep_safe_values_and_reject_files(self):
+        native = {
+            "type": "shadowsocks", "server": "ss.example", "server_port": 443,
+            "method": "aes-256-gcm", "password": "test-password", "plugin": "v2ray-plugin",
+        }
+        options = r"mode=websocket;path=/ws\;suffix;tls;mux=0"
+        share = "ss://aes-256-gcm:test-password@ss.example:443?plugin="
+        encoded = quote(f"v2ray-plugin;{options}", safe="")
+        nodes = [dict(native, plugin_opts=options), {"type": "temp", "share": share + encoded}]
+        outbounds = json.loads(to_singbox(nodes))["outbounds"][2:]
+        self.assertEqual([outbound["plugin_opts"] for outbound in outbounds], [options, options])
+
+        for unsafe in ("tls;cert=/secret-marker", r"tls;c\ert=/secret-marker"):
+            encoded = quote(f"v2ray-plugin;{unsafe}", safe="")
+            for node in (dict(native, plugin_opts=unsafe), {"type": "temp", "share": share + encoded}):
+                with self.subTest(node_type=node["type"]), self.assertRaises(ExportError) as error:
+                    to_singbox([node])
+                self.assertNotIn("secret-marker", str(error.exception))
 
     def test_rejects_lossy_or_invalid_input_without_echo(self):
         for invalid in (

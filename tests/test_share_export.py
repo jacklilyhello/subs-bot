@@ -56,6 +56,20 @@ class ShareExportTests(unittest.TestCase):
             "plugin": [r"v2ray-plugin;mode=websocket;host=tls.example.invalid;path=/a\;b\=x;tls"],
         })
 
+    def test_native_shadowsocks_plugin_options_are_limited_to_client_settings(self):
+        source = {
+            "name": "Native plugin", "type": "shadowsocks", "server": "proxy.example.invalid", "server_port": 443,
+            "method": "aes-256-gcm", "password": TEST_PASSWORD, "plugin": "v2ray-plugin",
+        }
+        allowed = r"mode=websocket;host=tls.example.invalid;tls;mux=1;path=/ws\;label\=node\;"
+        parsed = urlsplit(to_share_links([{**source, "plugin_opts": allowed}])[0])
+        self.assertEqual(parse_qs(parsed.query), {"plugin": [f"v2ray-plugin;{allowed}"]})
+        for option in ("server", "cert=/fixture/cert.pem", "key=/fixture/key.pem", "localAddr=0.0.0.0"):
+            with self.subTest(option=option.split("=", 1)[0]), self.assertRaises(ExportError):
+                to_share_links([{**source, "plugin_opts": f"{allowed};{option}"}])
+        with self.assertRaises(ExportError):
+            to_share_links([{**source, "plugin_opts": "mode=websocket;tls=false"}])
+
     def test_vmess_native_ws_and_tls_export_to_v2rayn_json(self):
         source = {
             "outbounds": [{
