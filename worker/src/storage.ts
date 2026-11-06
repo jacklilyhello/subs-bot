@@ -229,7 +229,7 @@ export async function publishNodeSnapshot(
       throw new RangeError("Cannot publish an empty subscription snapshot.");
     }
     await uploadChunk();
-    const body = encoder.encode(JSON.stringify(manifest));
+    const body = Uint8Array.from(encoder.encode(JSON.stringify(manifest)));
     const key = `${prefix}manifest.json`;
     manifestHash = await putImmutable(bucket, key, body);
     uploaded.push(key);

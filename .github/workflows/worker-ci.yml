@@ -42,6 +42,8 @@ jobs:
           retention-days: 7
       - name: Install locked dependencies
         run: npm ci --ignore-scripts
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
       - name: Check TypeScript
         run: npm run check
       - name: Build Worker module
