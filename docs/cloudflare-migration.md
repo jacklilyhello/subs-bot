@@ -73,7 +73,8 @@ Clash 返回 `text/yaml`，保留旧版的节点选择、自动选择和匹配�
 - 收件记录只保留归属、消息 ID 和已识别的命令。授权变更和回复意图与收件记录在同一 D1 事务提交。同一用户和聊天的回复按入库顺序处理。发送前复核授权，已经发起的外部请求无法撤回。只有明确的 Telegram 限流拒绝可在到期前重试。超时和无法确认的发送标记为 `uncertain`，保留以供核对。 [D1 事务批处理](https://developers.cloudflare.com/d1/worker-api/d1-database/#batch) · [Telegram `ResponseParameters`](https://core.telegram.org/bots/api#responseparameters)
 - 只读视图每页至多八条，按订阅 ID、到期时间或删除时间翻页。按钮只传随机值，D1 仅存摘要，绑定原发起人、聊天、话题、已确认发送的消息和尝试号，十分钟内只能消费一次。回调去重、按钮消费和下一页回复同批提交。回滚至支持回执标记的版本时，普通命令继续处理，视图回执留待新版处理。 [Telegram `CallbackQuery`](https://core.telegram.org/bots/api#callbackquery)
 - 用户数据按 Telegram 用户 ID 归属，私聊和群聊共用其个人数据。重命名、翻页等交互使用 `(user_id, chat_id)`，内联查询以发起人身份授权。管理员、初始白名单和显式授权覆盖沿用现有语义。授权撤销应在下一次检查生效，权限变更和受保护的写入要用数据库条件约束，避免旧授权快照继续写入。
-- 私密领取保留现有的分享能力语义。`0005` 按 Bot 存储分享码摘要，使用独立的私有 R2 对象保存最多 64 KiB 的私密正文。领取前核对正文长度、摘要和 UTF-8，D1 在同一事务复核到期、指定用户及剩余份数，以 `(share_id, actor_id)` 唯一键记录领取。份数以实际领取记录计数，已成功领取的用户在有效期内可再次查看。此存储阶段的 GitHub 验证覆盖竞争、重复和损坏正文，Telegram 分享入口与真实领取另行接入。
+- 私密领取保留现有的分享能力语义。`0005` 按 Bot 存储分享码摘要，使用独立的私有 R2 对象保存最多 64 KiB 的私密正文。`0007` 将指定账号在普通私聊发出的 `/start claim_<code>` 记为持久领取意图，回执只存码的摘要。这个入口沿用单次领取授权，普通订阅操作仍检查白名单。领取前核对正文长度、摘要和 UTF-8，D1 在同一事务复核到期、指定用户及剩余份数，同时将回复切换到发送中。份数以 `(share_id, actor_id)` 唯一领取记录计数，已领取的用户在有效期内可再次查看。
+- 私聊短正文以纯文本送达，超过消息长度或含有不适合直接显示的控制字符时使用一个固定文件名的 UTF-8 附件。发送结果不明时保留回执和领取记录，避免自动重复发送。内联创建和更新群内分享卡片另行接入。 [Telegram `sendMessage`](https://core.telegram.org/bots/api#sendmessage) · [Telegram `sendDocument`](https://core.telegram.org/bots/api#senddocument)
 - 在业务变更的事务内写入待发送动作，用稳定动作 ID 去重。消费者持有租约并跟踪 Telegram 返回的消息 ID，成功后更新发件箱。对网络超时后可能已送达的动作标记结果不明，按动作类型恢复或人工核对。Telegram 发送接口没有通用幂等键，验收须覆盖收到成功响应后写回失败的情形。 [Telegram `sendMessage`](https://core.telegram.org/bots/api#sendmessage)
 - 重命名等待只接受同一用户在同一聊天与话题中回复已经确认送达的 Bot 提示。删除要求点击独立确认按钮。写入时复核所有者、授权、版本和操作票据，在同一 D1 事务完成变更和回复记录。回收站恢复保留订阅 ID、能力链接和已发布快照。
 
@@ -96,6 +97,7 @@ Clash 返回 `text/yaml`，保留旧版的节点选择、自动选择和匹配�
 6. 发布含 `0004_telegram_views.sql` 的版本前，先确认已发布并记录支持回执标记的回滚版本。激活新版并核对实际版本后，只为同一隔离测试 Bot 将 `allowed_updates` 扩为 `message` 与 `callback_query`。保持已核对的 URL、Webhook 密钥和连接上限，设置 `drop_pending_updates: false`，用 `getWebhookInfo` 核对结果。回滚视图时先恢复只接收 `message`，保留增量表和待处理更新。 [Telegram Webhook 配置](https://core.telegram.org/bots/api#setwebhook) · [Telegram Webhook 回读](https://core.telegram.org/bots/api#getwebhookinfo)
 7. 真人视图验收前，用 `gh workflow run worker-isolation-telegram-fixtures.yml --ref main -f action=seed -f cohort=<16位小写字母数字>` 生成指定两名测试用户的合成订阅和回收站记录。流程校验实际 Worker、D1、Telegram 配置摘要和迁移，并只写隔离 D1。真人消息及按钮只在内置浏览器验证。结束后以同一个 `cohort` 和 `action=retire` 删除本组记录，核对输出计数。
 8. 订阅操作验收使用同一工作流，增加 `-f purpose=lifecycle`。专用批次只允许匹配的两个账号及预定义合成来源，测试重命名使用原名后接 `-renamed`。退役流程核对归属、名称、版本、删除状态和未发布快照条件，核对不一致时整批保留。
+9. 私密领取验收使用 `worker-isolation-telegram-claims.yml`，通过 `action`、`cohort` 和 `digests` 手动运行。生成四个随机合成分享码，仅将 `targeted`、`race`、`expired` 和 `document` 对应的 SHA-256 摘要提交给工作流。测试人员在指定 Telegram Web 私聊中使用原码。用相同摘要映射退役，核对合成分享、领取与私有 R2 对象均已清除，保留收件和发送回执。
 
 域级 Worker 路由核对使用单独的只读凭据。发布任务内使用项目专用凭据核对 Worker 的 Custom Domain、预览、日志、Cron 及实际数据绑定。 [Cloudflare Worker 路由 API](https://developers.cloudflare.com/api/resources/workers/subresources/routes/)
 

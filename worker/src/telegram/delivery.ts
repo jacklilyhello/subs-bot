@@ -1,11 +1,13 @@
 import { listOwnedSubscriptions } from "../subscriptions.ts";
+import type { PrivateShareClaimResult } from "../private-shares.ts";
 import {
   prepareTelegramLifecycleTickets, renderTelegramLifecycle, type TelegramLifecycleButton,
 } from "./lifecycle-actions.ts";
 import { inTelegramScope, type TelegramPolicy } from "./protocol.ts";
+import { beginTelegramPrivateClaim, prepareTelegramPrivateClaim } from "./private-claims.ts";
 import {
   beginTelegramReply, claimTelegramReply, isTelegramMemberAllowed,
-  reapExpiredTelegramReplies, settleTelegramReply,
+  prepareTelegramPrivateClaimBegin, reapExpiredTelegramReplies, settleTelegramReply,
   type TelegramReplyLease, type TelegramReplyOutcome,
 } from "./store.ts";
 import { prepareTelegramViewTickets, renderTelegramView, type TelegramViewButton } from "./views.ts";
@@ -51,31 +53,23 @@ function positiveInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
-export async function sendTelegramReply(
+async function sendTelegram(
   policy: TelegramPolicy,
   lease: TelegramReplyLease,
-  text: string,
+  method: "sendMessage" | "sendDocument",
+  body: Record<string, unknown> | FormData,
   timeoutMs: number,
-  request: typeof fetch = fetch,
-  keyboard?: InlineKeyboard,
-  forceReply = false,
+  request: typeof fetch,
 ): Promise<TelegramReplyOutcome> {
   if (!inTelegramScope(policy, lease)) return { kind: "failed" };
   try {
-    const response = await request(`${BOT_API}/bot${policy.botToken}/sendMessage`, {
+    const multipart = body instanceof FormData;
+    const response = await request(`${BOT_API}/bot${policy.botToken}/${method}`, {
       method: "POST",
       redirect: "manual",
       signal: AbortSignal.timeout(Math.min(SEND_TIMEOUT_MS, timeoutMs)),
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: lease.chatId,
-        ...(lease.threadId === null ? {} : { message_thread_id: lease.threadId }),
-        reply_parameters: { message_id: lease.messageId, allow_sending_without_reply: true },
-        link_preview_options: { is_disabled: true },
-        ...(keyboard?.length ? { reply_markup: { inline_keyboard: keyboard } }
-          : forceReply && lease.chatType === "private" ? { reply_markup: { force_reply: true } } : {}),
-        text,
-      }),
+      ...(multipart ? {} : { headers: { "Content-Type": "application/json" } }),
+      body: multipart ? body : JSON.stringify(body),
     });
     const payload = record(await readBotReply(response));
     if (response.ok && payload?.ok === true) {
@@ -97,6 +91,65 @@ export async function sendTelegramReply(
     // A transport or malformed response cannot prove Telegram did not deliver.
   }
   return { kind: "uncertain" };
+}
+
+function replyParameters(lease: TelegramReplyLease) {
+  return { message_id: lease.messageId, allow_sending_without_reply: true };
+}
+
+export async function sendTelegramReply(
+  policy: TelegramPolicy,
+  lease: TelegramReplyLease,
+  text: string,
+  timeoutMs: number,
+  request: typeof fetch = fetch,
+  keyboard?: InlineKeyboard,
+  forceReply = false,
+): Promise<TelegramReplyOutcome> {
+  return sendTelegram(policy, lease, "sendMessage", {
+    chat_id: lease.chatId,
+    ...(lease.threadId === null ? {} : { message_thread_id: lease.threadId }),
+    reply_parameters: replyParameters(lease),
+    link_preview_options: { is_disabled: true },
+    ...(keyboard?.length ? { reply_markup: { inline_keyboard: keyboard } }
+      : forceReply && lease.chatType === "private" ? { reply_markup: { force_reply: true } } : {}),
+    text,
+  }, timeoutMs, request);
+}
+
+export async function sendTelegramPrivateClaimReply(
+  policy: TelegramPolicy,
+  lease: TelegramReplyLease,
+  result: PrivateShareClaimResult,
+  timeoutMs: number,
+  request: typeof fetch = fetch,
+): Promise<TelegramReplyOutcome> {
+  if (!lease.privateClaim || !inTelegramScope(policy, lease) || lease.chatType !== "private" || lease.threadId !== null) {
+    return { kind: "failed" };
+  }
+  if (!("content" in result)) {
+    const reason = {
+      unavailable: "分享不可用。",
+      expired: "分享已过期。",
+      target: "此分享指定了其他领取人。",
+      exhausted: "分享份数已领完。",
+    }[result.kind];
+    return sendTelegramReply(policy, lease, `私密分享领取失败。\n${reason}`, timeoutMs, request);
+  }
+  const sender = result.senderName.replace(/[\p{Cc}\p{Cf}\p{Cs}\u2028\u2029]/gu, " ")
+    .replace(/[a-z][a-z0-9+.-]*:\/\/\S+/giu, "[链接已省略]").trim() || "用户";
+  const caption = `私密分享\n来自：${sender}\n领取进度：${result.claimCount}/${result.maxClaims}`;
+  const text = `${caption}\n\n${result.content}`;
+  if (text.length <= 3800 && !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(result.content)) {
+    return sendTelegramReply(policy, lease, text, timeoutMs, request);
+  }
+
+  const form = new FormData();
+  form.set("chat_id", lease.chatId);
+  form.set("reply_parameters", JSON.stringify(replyParameters(lease)));
+  form.set("caption", caption);
+  form.set("document", new Blob([result.content], { type: "text/plain;charset=utf-8" }), "private-share.txt");
+  return sendTelegram(policy, lease, "sendDocument", form, timeoutMs, request);
 }
 
 export async function answerTelegramCallback(policy: TelegramPolicy, callbackId: string): Promise<void> {
@@ -157,6 +210,7 @@ async function renderReply(
 
 export async function drainTelegramReplies(
   db: D1Database,
+  bucket: R2Bucket,
   policy: TelegramPolicy,
   limit: number,
   budgetMs: number,
@@ -168,6 +222,18 @@ export async function drainTelegramReplies(
     const lease = await claimTelegramReply(db, policy.botId);
     if (!lease) return;
     if (!inTelegramScope(policy, lease)) continue;
+    if (lease.privateClaim) {
+      const begin = prepareTelegramPrivateClaimBegin(db, policy, lease);
+      if (!begin) continue;
+      const prepared = await prepareTelegramPrivateClaim(db, bucket, policy, lease);
+      if (Date.now() >= deadline) continue;
+      const result = await beginTelegramPrivateClaim(db, policy, lease, prepared, begin);
+      if (result === null) continue;
+      const outcome = await sendTelegramPrivateClaimReply(policy, lease, result,
+        Math.max(1, deadline - Date.now()), request);
+      await settleTelegramReply(db, policy, lease, outcome);
+      continue;
+    }
     const reply = await renderReply(db, policy, lease);
     const [view, lifecycle] = await Promise.all([
       reply.buttons?.length ? prepareTelegramViewTickets(reply.buttons) : undefined,

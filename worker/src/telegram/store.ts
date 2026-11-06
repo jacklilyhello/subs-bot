@@ -6,6 +6,7 @@ import {
   insertTelegramLifecycleTickets, TELEGRAM_LIFECYCLE_MARKER,
   type TelegramLifecycleReply, type TelegramLifecycleTicket,
 } from "./lifecycle-actions.ts";
+import { TELEGRAM_PRIVATE_CLAIM_MARKER } from "./private-claims.ts";
 
 export interface TelegramReplyLease extends TelegramCommand {
   receiptId: number;
@@ -13,6 +14,7 @@ export interface TelegramReplyLease extends TelegramCommand {
   attempts: number;
   view: TelegramView | null;
   lifecycle?: TelegramLifecycleReply;
+  privateClaim?: { codeSha256: string };
 }
 
 export type TelegramReplyOutcome =
@@ -25,20 +27,25 @@ const MAX_REPLY_AGE_SECONDS = 15 * 60;
 const MAX_ATTEMPTS = 4;
 const REAP_LIMIT = 40;
 
-type ReplyRow = Omit<TelegramReplyLease, "view" | "lifecycle"> & {
+type ReplyAccess = "allowed" | "denied" | "none";
+
+type ReplyRow = Omit<TelegramReplyLease, "view" | "lifecycle" | "privateClaim"> & {
   viewKind: TelegramView["kind"] | null;
   afterId: number | null;
   afterEpoch: number | null;
   lifecycleKind: TelegramLifecycleReply["kind"] | null;
   lifecycleSubscriptionId: number | null;
   lifecycleExpectedRevision: number | null;
+  privateClaimCodeSha256: string | null;
 };
 
 function supportedReceipt(alias: "inbox" | "earlier"): string {
   return `(${alias}.receipt_nonce IS NULL OR (${alias}.receipt_nonce = '${TELEGRAM_VIEW_MARKER}'
     AND EXISTS (SELECT 1 FROM telegram_view WHERE receipt_id = ${alias}.receipt_id))
     OR (${alias}.receipt_nonce = '${TELEGRAM_LIFECYCLE_MARKER}'
-    AND EXISTS (SELECT 1 FROM telegram_lifecycle_action WHERE receipt_id = ${alias}.receipt_id)))`;
+    AND EXISTS (SELECT 1 FROM telegram_lifecycle_action WHERE receipt_id = ${alias}.receipt_id))
+    OR (${alias}.receipt_nonce = '${TELEGRAM_PRIVATE_CLAIM_MARKER}'
+    AND EXISTS (SELECT 1 FROM telegram_private_claim WHERE receipt_id = ${alias}.receipt_id)))`;
 }
 
 export async function acceptTelegramCommand(
@@ -127,36 +134,35 @@ export async function claimTelegramReply(db: D1Database, botId: string): Promise
         inbox.command, reply.lease_id AS leaseId, reply.attempts,
         page.kind AS viewKind, page.after_id AS afterId, page.after_epoch AS afterEpoch,
         action.kind AS lifecycleKind, action.subscription_id AS lifecycleSubscriptionId,
-        action.expected_revision AS lifecycleExpectedRevision
+        action.expected_revision AS lifecycleExpectedRevision, claim.code_sha256 AS privateClaimCodeSha256
       FROM telegram_outbox AS reply JOIN telegram_inbox AS inbox USING (receipt_id)
       LEFT JOIN telegram_view AS page ON page.receipt_id = inbox.receipt_id AND inbox.receipt_nonce = '${TELEGRAM_VIEW_MARKER}'
       LEFT JOIN telegram_lifecycle_action AS action ON action.receipt_id = inbox.receipt_id
         AND inbox.receipt_nonce = '${TELEGRAM_LIFECYCLE_MARKER}'
+      LEFT JOIN telegram_private_claim AS claim ON claim.receipt_id = inbox.receipt_id
+        AND inbox.receipt_nonce = '${TELEGRAM_PRIVATE_CLAIM_MARKER}'
       WHERE reply.lease_id = ? AND reply.state = 'leased' AND inbox.bot_id = ? AND ${supportedReceipt("inbox")}
     `).bind(leaseId, botId),
   ]);
   if (!write?.success || !read?.success) throw new Error("Telegram reply claim could not be confirmed.");
   const row = read.results[0];
   if (!row) return null;
-  const { viewKind, afterId, afterEpoch, lifecycleKind, lifecycleSubscriptionId, lifecycleExpectedRevision, ...lease } = row;
+  const { viewKind, afterId, afterEpoch, lifecycleKind, lifecycleSubscriptionId, lifecycleExpectedRevision,
+    privateClaimCodeSha256, ...lease } = row;
   const lifecycle = lifecycleKind === null || lifecycleSubscriptionId === null || lifecycleExpectedRevision === null
     ? undefined : { kind: lifecycleKind, subscriptionId: lifecycleSubscriptionId, expectedLifecycleRevision: lifecycleExpectedRevision };
   return { ...lease, view: viewKind === null ? null : { kind: viewKind, afterId, afterEpoch },
-    ...(lifecycle ? { lifecycle } : {}) };
+    ...(lifecycle ? { lifecycle } : {}),
+    ...(privateClaimCodeSha256 === null ? {} : { privateClaim: { codeSha256: privateClaimCodeSha256 } }) };
 }
 
-export async function beginTelegramReply(
+function beginReplyStatement(
   db: D1Database,
   policy: TelegramPolicy,
   lease: TelegramReplyLease,
-  access: "allowed" | "denied" | "none",
-  tickets: readonly TelegramViewTicket[] = [],
-  lifecycleTickets: readonly TelegramLifecycleTicket[] = [],
-): Promise<boolean> {
-  if (!inTelegramScope(policy, lease) || (tickets.length > 0 && (!lease.view || access !== "allowed"))
-    || (lifecycleTickets.length > 0 && (!(lease.view || lease.lifecycle) || access !== "allowed"))) return false;
-
-  const begin = db.prepare(`
+  access: ReplyAccess | "private-claim",
+): D1PreparedStatement {
+  return db.prepare(`
     UPDATE telegram_outbox SET state = 'sending', lease_until = unixepoch() + ${LEASE_SECONDS}
     WHERE state = 'leased' AND lease_id = ? AND attempts = ? AND lease_until > unixepoch()
       AND receipt_id = (
@@ -165,15 +171,48 @@ export async function beginTelegramReply(
           AND inbox.chat_type = ? AND inbox.message_id = ? AND inbox.message_date = ? AND inbox.thread_id IS ?
           AND inbox.command = ? AND ${supportedReceipt("inbox")}
           AND inbox.received_at + ${MAX_REPLY_AGE_SECONDS} > unixepoch()
-          AND ((? = 'none' AND inbox.command IN ('auth-list', 'auth-add', 'auth-remove', 'auth-usage')) OR (
-            CASE WHEN inbox.actor_id = ? THEN 1 ELSE COALESCE((
-              SELECT allowed FROM telegram_auth WHERE bot_id = inbox.bot_id AND user_id = inbox.actor_id
-            ), 1) END = CASE ? WHEN 'allowed' THEN 1 WHEN 'denied' THEN 0 ELSE -1 END
-          ))
+          AND (
+            (? = 'private-claim' AND inbox.receipt_nonce = '${TELEGRAM_PRIVATE_CLAIM_MARKER}'
+              AND inbox.chat_type = 'private' AND inbox.actor_id = inbox.chat_id AND inbox.thread_id IS NULL
+              AND EXISTS (SELECT 1 FROM telegram_private_claim WHERE receipt_id = inbox.receipt_id AND code_sha256 = ?))
+            OR (inbox.receipt_nonce IS NOT '${TELEGRAM_PRIVATE_CLAIM_MARKER}' AND (
+              (? = 'none' AND inbox.command IN ('auth-list', 'auth-add', 'auth-remove', 'auth-usage')) OR (
+                CASE WHEN inbox.actor_id = ? THEN 1 ELSE COALESCE((
+                  SELECT allowed FROM telegram_auth WHERE bot_id = inbox.bot_id AND user_id = inbox.actor_id
+                ), 1) END = CASE ? WHEN 'allowed' THEN 1 WHEN 'denied' THEN 0 ELSE -1 END
+              )
+            ))
+          )
       )
     RETURNING receipt_id
   `).bind(lease.leaseId, lease.attempts, policy.botId, lease.updateId, lease.receiptId, lease.actorId, lease.chatId, lease.chatType,
-    lease.messageId, lease.messageDate, lease.threadId, lease.command, access, policy.adminId, access);
+    lease.messageId, lease.messageDate, lease.threadId, lease.command, access, lease.privateClaim?.codeSha256 ?? null,
+    access, policy.adminId, access);
+}
+
+export function prepareTelegramPrivateClaimBegin(
+  db: D1Database,
+  policy: TelegramPolicy,
+  lease: TelegramReplyLease,
+): D1PreparedStatement | null {
+  if (!inTelegramScope(policy, lease) || lease.chatType !== "private" || lease.threadId !== null || !lease.privateClaim) {
+    return null;
+  }
+  return beginReplyStatement(db, policy, lease, "private-claim");
+}
+
+export async function beginTelegramReply(
+  db: D1Database,
+  policy: TelegramPolicy,
+  lease: TelegramReplyLease,
+  access: ReplyAccess,
+  tickets: readonly TelegramViewTicket[] = [],
+  lifecycleTickets: readonly TelegramLifecycleTicket[] = [],
+): Promise<boolean> {
+  if (!inTelegramScope(policy, lease) || lease.privateClaim || (tickets.length > 0 && (!lease.view || access !== "allowed"))
+    || (lifecycleTickets.length > 0 && (!(lease.view || lease.lifecycle) || access !== "allowed"))) return false;
+
+  const begin = beginReplyStatement(db, policy, lease, access);
   if (tickets.length === 0 && lifecycleTickets.length === 0) return await begin.first() !== null;
 
   const statements = [begin];
