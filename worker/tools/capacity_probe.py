@@ -15,6 +15,8 @@ import sys
 from threading import Barrier, BrokenBarrierError, Lock, Timer
 from time import monotonic, sleep
 
+from capacity_fixtures import STRUCTURED_SMOKE
+
 
 HOST = "subs-bot-cf-dev-01.lilyya.workers.dev"
 MAX_REQUESTS = 18
@@ -360,12 +362,59 @@ def run_probe(directory, revision):
     }
 
 
+def run_structured_smoke(directory, revision):
+    from capacity_resources import read_fixtures
+
+    if not _matches(SHA1, revision):
+        raise ProbeError("A full hosted revision is required for the structured smoke.")
+    fixtures, _ = read_fixtures(Path(directory), revision, profile=STRUCTURED_SMOKE)
+    run_deadline = monotonic() + 60
+
+    def health():
+        deadline = min(monotonic() + 15, run_deadline)
+        with _request("GET", "/health", deadline, "structured smoke health") as response:
+            _check_headers(response, 200, "structured smoke health", "application/json")
+            _verify_health(response, revision)
+        _remaining(deadline)
+
+    health()
+    results = {}
+    for row in fixtures:
+        fixture = Fixture(row["label"], row["token"], row["status"], row["exportBytes"], row["exportSha256"])
+        path = f"/sub/{fixture.token}/base64"
+        result = {}
+        for method in ("GET", "HEAD"):
+            deadline = min(monotonic() + 15, run_deadline)
+            with _request(method, path, deadline, fixture.label) as response:
+                _check_headers(response, fixture.status, fixture.label, "text/plain")
+                if method == "HEAD":
+                    if response.read(1):
+                        raise ProbeError(f"HEAD returned a body for {fixture.label}.")
+                    body_bytes = 0
+                elif fixture.status == 200:
+                    body_bytes, _, _ = _verify_export(response, fixture, "full", deadline)
+                else:
+                    body = _small_body(response)
+                    if body != ERROR_BODY[422]:
+                        raise ProbeError(f"The fixed error response differs for {fixture.label}.")
+                    body_bytes = len(body)
+                result[method] = {"status": fixture.status, "bodyBytes": body_bytes}
+            _remaining(deadline)
+        results[fixture.label] = result
+    health()
+    return {"requests": 2 + 2 * len(fixtures), "exactHealth": 2, "pythonOracleDigestMatched": True, "exports": results}
+
+
 def main(argv=None):
     args = sys.argv[1:] if argv is None else argv
     try:
-        if len(args) != 1:
+        if len(args) == 3 and args[1:] == ["--profile", STRUCTURED_SMOKE]:
+            report = run_structured_smoke(args[0], os.environ.get("GITHUB_SHA"))
+        elif len(args) == 1:
+            report = run_probe(args[0], os.environ.get("GITHUB_SHA"))
+        else:
             raise ProbeError("One capacity artifact directory is required.")
-        print(json.dumps(run_probe(args[0], os.environ.get("GITHUB_SHA")), sort_keys=True))
+        print(json.dumps(report, sort_keys=True))
         return 0
     except ProbeError as error:
         print(str(error), file=sys.stderr)
