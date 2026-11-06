@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { createFetchMock, Miniflare } from "miniflare";
+import { Miniflare } from "miniflare";
 
 import { createSubscription } from "../src/storage.ts";
 import type { TelegramPolicy } from "../src/telegram/protocol.ts";
@@ -82,9 +82,9 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
     botId: "123456789", botUsername: "fixture_subs_bot", adminId: "1001", memberId: "1002", groupId: "-1003",
     botToken: `123456789:${"a".repeat(35)}`, webhookSecret: "fixture-webhook-secret-00000000000000",
   };
-  const fetchMock = createFetchMock();
-  fetchMock.disableNetConnect();
-  const bot = fetchMock.get("https://api.telegram.org");
+  const replies: Array<{ chatId: string; messageId: number; replyTo: number; text: string }> = [];
+  const sentBodies: unknown[] = [];
+  const botPath = `/bot${policy.botToken}/sendMessage`;
   const miniflare = new Miniflare({
     modules: true,
     script: bundle.toString("utf8"),
@@ -92,7 +92,17 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
     bindings: { BUILD_REVISION: fixture.revision, TELEGRAM_ISOLATION_CONFIG: JSON.stringify(policy) },
     d1Databases: ["DB"],
     r2Buckets: ["NODES"],
-    fetchMock,
+    outboundService: async (request: Request) => {
+      assert.equal(request.url, `https://api.telegram.org${botPath}`);
+      assert.equal(request.method, "POST");
+      const expected = replies.shift();
+      assert.ok(expected, "Unexpected outbound request");
+      const payload = await request.json() as { chat_id: string; text: string; reply_parameters: { message_id: number } };
+      const observed = { chatId: payload.chat_id, text: payload.text, replyTo: payload.reply_parameters?.message_id };
+      sentBodies.push(observed);
+      assert.deepEqual(observed, { chatId: expected.chatId, text: expected.text, replyTo: expected.replyTo });
+      return Response.json({ ok: true, result: { message_id: expected.messageId, chat: { id: Number(expected.chatId) } } });
+    },
   });
   try {
     const db = await miniflare.getD1Database("DB");
@@ -101,25 +111,14 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
     await createSubscription(db, { ownerId: policy.adminId, name: "Admin fixture", sourceUrl: url });
     await createSubscription(db, { ownerId: policy.memberId, name: "Member fixture", sourceUrl: url });
     const date = Math.floor(Date.now() / 1000);
-    const path = `/bot${policy.botToken}/sendMessage`;
     const text = `/list@${policy.botUsername}`;
     const message = {
       date, text, message_id: 7, from: { id: Number(policy.memberId), is_bot: false },
       chat: { id: Number(policy.groupId), type: "group" },
       entities: [{ type: "bot_command", offset: 0, length: text.length }],
     };
-    const sentBodies: unknown[] = [];
     function expectSend(chatId: string, messageId: number, replyTo: number, expectedText: string) {
-      bot.intercept({ method: "POST", path }).reply(200, ({ body }) => {
-        const encoded = typeof body === "string" ? body : body instanceof Uint8Array ? Buffer.from(body).toString("utf8") : "";
-        try {
-          const payload = JSON.parse(encoded);
-          sentBodies.push({ chatId: payload.chat_id, text: payload.text, replyTo: payload.reply_parameters?.message_id });
-        } catch {
-          sentBodies.push(null);
-        }
-        return JSON.stringify({ ok: true, result: { message_id: messageId, chat: { id: Number(chatId) } } });
-      });
+      replies.push({ chatId, messageId, replyTo, text: expectedText });
       return { chatId, text: expectedText, replyTo };
     }
     const webhook = "https://subs-bot.example/telegram/webhook";
@@ -153,7 +152,7 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
     const results = await db.prepare(outbox).all();
     assert.deepEqual(results.results, [{ state: "sent", sent_message_id: 10 }, { state: "sent", sent_message_id: 8 }]);
     assert.deepEqual(sentBodies, [expectedPrivate, expectedGroup]);
-    fetchMock.assertNoPendingInterceptors();
+    assert.deepEqual(replies, []);
   } finally {
     await miniflare.dispose();
   }
