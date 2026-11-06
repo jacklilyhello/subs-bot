@@ -189,6 +189,32 @@ test("normalizes commands and direct views without retaining message text or nam
   assert.equal((await decodeMessage("/help", { message_thread_id: 44 })).command?.threadId, 44);
 });
 
+test("accepts private claim deep-link commands from the two scoped actors only", async () => {
+  for (const code of ["legacy_1234", "ABCDEFGHIJKLMNOPQRSTUA"]) {
+    for (const actorId of [policy.adminId, policy.memberId]) {
+      assert.deepEqual(await decodeMessage(`/start@${policy.botUsername} claim_${code}`, {
+        from: { id: Number(actorId), is_bot: false }, chat: { id: Number(actorId), type: "private" },
+      }), {
+        status: 200,
+        privateClaim: { updateId, actorId, chatId: actorId, chatType: "private",
+          messageId: 15, messageDate, threadId: null, kind: "private-claim", code },
+      });
+    }
+  }
+  const claim = "/start claim_ABCDEFGHIJKLMNOPQRSTUA";
+  for (const fields of [
+    { chat: { id: Number(policy.groupId), type: "group" } },
+    { chat: { id: Number(policy.memberId), type: "private" } },
+    { from: { id: 99, is_bot: false }, chat: { id: 99, type: "private" } },
+    { message_thread_id: 1 },
+  ]) {
+    assert.deepEqual(await decodeMessage(claim, fields), { status: 204 });
+  }
+  for (const text of [claim + " trailing", "/start claim_short", "/start claim_%2F1234567", "/start@Other_Bot claim_legacy_1234"]) {
+    assert.deepEqual(await decodeMessage(text), { status: 204 });
+  }
+});
+
 test("normalizes scoped callbacks from the exact bot message without retaining reply text", async () => {
   assert.deepEqual(await decode({ update_id: updateId, callback_query: callback() }), {
     status: 200,
