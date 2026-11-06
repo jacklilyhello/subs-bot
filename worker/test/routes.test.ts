@@ -187,7 +187,7 @@ test("wrong capabilities and unavailable formats never read private objects", as
   assert.equal(notFound.status, 404);
   assertPrivate(notFound);
   assert.equal(await notFound.text(), "Not found.");
-  assert.equal((await request(`/sub/${TOKEN}/singbox`, env)).status, 406);
+  assert.equal((await request(`/sub/${TOKEN}/clash`, env)).status, 406);
   assert.equal((await request(`/sub/${TOKEN}`, env)).status, 406);
   const post = await request(`/sub/${TOKEN}/base64`, env, "POST");
   assert.equal(post.status, 405);
@@ -292,6 +292,86 @@ test("a second-pass R2 failure errors the body after earlier bytes without expos
   assert.equal(Buffer.from(chunk.value!).toString(), Buffer.from(first).subarray(0, 24 * 1024).toString("base64"));
   await assert.rejects(reader.read(), { message: "Subscription stream failed." });
   assert.equal(reads, 2);
+});
+
+test("Sing-box aliases preflight exact names and credentials before streaming JSON", async () => {
+  const node = { type: "ss", server: "203.0.113.12", port: 8388, cipher: "aes-256-gcm", password: "fixture:港🌐" };
+  const { env, reads } = fixture([[{ ...node, name: "proxy" }, { ...node, name: "港" }], [{ ...node, name: "港" }]]);
+  const pass = ["manifest.json", "0.ndjson", "1.ndjson"].map((name) => PREFIX + name);
+  const primary = "/sub/" + TOKEN + "/singbox";
+  const alias = "/sub/" + TOKEN + "/SING-BOX";
+  const head = await request(alias, env, "HEAD");
+  assert.equal(head.status, 200);
+  assert.equal(head.body, null);
+  assertPrivate(head);
+  assert.deepEqual(reads.splice(0), pass);
+
+  const response = await request(primary, env);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "application/json");
+  assertPrivate(response);
+  const body = await response.text();
+  const config = JSON.parse(body);
+  const tags = ["proxy (2)", "港", "港 (2)"];
+  assert.deepEqual(config.outbounds[0], { type: "selector", tag: "proxy", outbounds: tags });
+  assert.deepEqual(config.outbounds[1], { type: "direct", tag: "direct" });
+  assert.deepEqual(config.outbounds.slice(2).map((outbound: { tag: string }) => outbound.tag), tags);
+  assert.deepEqual(config.outbounds.slice(2).map((outbound: { password: string }) => outbound.password),
+    Array(3).fill(node.password));
+  assert.deepEqual(reads, [...pass, ...pass]);
+
+  const rejected = fixture([[node], [{ share: "hy2://fixture@proxy.example.invalid?ech=AAT-DQAA" }]]);
+  for (const method of ["GET", "HEAD"]) {
+    const invalid = await request(alias, rejected.env, method);
+    assert.equal(invalid.status, 422);
+    assertPrivate(invalid);
+    if (method === "HEAD") assert.equal(invalid.body, null);
+    else assert.equal(await invalid.text(), "Subscription content cannot be exported.");
+  }
+});
+
+test("Sing-box enforces format-specific name and response budgets during preflight", async () => {
+  const node = { type: "ss", server: "203.0.113.12", port: 8388, cipher: "aes-256-gcm", password: "fixture-only" };
+  const name = "港".repeat(340) + "xy";
+  const path = "/sub/" + TOKEN + "/singbox";
+  for (const [label, status] of [[name, 200], [name + "z", 422]] as const) {
+    const { env } = fixture([[{ ...node, name: label }]]);
+    assert.equal((await request(path, env, "HEAD")).status, status);
+  }
+  const largeNode = { ...node, password: "x".repeat(500_000) };
+  for (const [count, status] of [[33, 200], [34, 422]]) {
+    const { env } = fixture(Array.from({ length: count }, (_, index) => [{ ...largeNode, name: "node-" + index }]));
+    assert.equal((await request(path, env, "HEAD")).status, status);
+  }
+});
+
+test("Sing-box aborts a late corrupted body without returning complete JSON", async () => {
+  const { env } = fixture([[{ share: LINK }], [{ share: LINK }]]);
+  const get = env.NODES.get.bind(env.NODES);
+  let reads = 0;
+  env.NODES.get = async (key: string) => {
+    if (key === PREFIX + "1.ndjson" && ++reads === 2) throw new Error("synthetic backend credential");
+    return get(key);
+  };
+  const response = await request("/sub/" + TOKEN + "/singbox", env);
+  assert.equal(response.status, 200);
+  const reader = response.body!.getReader();
+  assert.equal((await reader.read()).done, false);
+  assert.equal((await reader.read()).done, false);
+  await assert.rejects(reader.read(), { message: "Subscription stream failed." });
+  assert.equal(reads, 2);
+});
+
+test("Sing-box caps expanded Hysteria hopping entries across the whole response", async () => {
+  const node = { type: "hysteria2", server: "hy2.example.invalid", tls: { enabled: true } };
+  const full = Array.from({ length: 16 }, () => ({ ...node, server_ports: ["1:65535"] }));
+  // 16 full ranges and 16 entries reach 1,048,576; the next entry is rejected.
+  for (const [range, status] of [["443:458", 200], ["443:459", 422]]) {
+    const { env } = fixture([[...full, { ...node, server_ports: [range] }]]);
+    const response = await request("/sub/" + TOKEN + "/singbox", env, "HEAD");
+    assert.equal(response.status, status);
+    assert.equal(response.body, null);
+  }
 });
 
 test("canceling a response stops reads beyond the current lookahead window", async () => {
