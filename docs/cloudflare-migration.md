@@ -6,18 +6,20 @@
 
 首个 Worker 切片只包含 D1 元数据、私有 R2 快照和只读 HTTP 路径。隔离验证使用本项目专用 `workers.dev` 主机名和合成数据。
 
-| 路径 | 首个切片的行为 |
+| 路径 | 隔离 Worker 的行为 |
 | --- | --- |
 | `GET` 或 `HEAD /health` | 返回部署的 40 位 Git commit SHA，供部署验收核对 |
-| `GET` 或 `HEAD /sub/{token}/{format}` | 读取当前已发布快照，保留有效的已有 URI 或从受支持的结构化节点生成 URI，支持 `base64`、`v2ray` 和 `mixed` |
+| `GET` 或 `HEAD /sub/{token}/{format}` | 读取当前已发布快照，支持 `base64`、`v2ray`、`mixed` 以及 `singbox` 和 `sing-box` |
 
-能力链接视同凭据。成功与失败响应均使用 `Cache-Control: no-store, private`、`Referrer-Policy: no-referrer` 和 `X-Content-Type-Options: nosniff`。`HEAD` 执行同样的预检并返回相同状态，响应体为空。未知能力链接返回 `404`，未支持的导出格式返回 `406`，节点缺少可导出的分享 URI 或分享文本超过 16 MiB 返回 `422`。若预检时发现已引用的快照不可用或校验失败，返回 `503`。
+能力链接视同凭据。成功与失败响应均使用 `Cache-Control: no-store, private`、`Referrer-Policy: no-referrer` 和 `X-Content-Type-Options: nosniff`。`HEAD` 执行同样的预检并返回相同状态，响应体为空。未知能力链接返回 `404`，未支持的导出格式返回 `406`，内容无法完整转换或超过格式限制时返回 `422`。若预检时发现已引用的快照不可用或校验失败，返回 `503`。
 
 `GET` 在预检时验证已选定的快照并计算编码长度。通过后再读取同一个不可变快照，按原有块顺序编码，通过 `FixedLengthStream` 发送。两遍读取各自最多同时预读四个块，下游消费一块后再补下一块。若第二遍读取在成功响应头发出后失败，响应流会中止，客户端应把读取错误或未读满声明长度视为失败。响应流取消后停止补读，已发出的存储请求可能仍会完成。 [Workers FixedLengthStream](https://developers.cloudflare.com/workers/runtime-apis/streams/transformstream/#fixedlengthstream) · [Workers Content-Length](https://developers.cloudflare.com/workers/runtime-apis/response/#set-the-content-length-header)
 
 结构化导出支持 Shadowsocks、VMess、VLESS、Trojan、Hysteria 2、TUIC v5 和 AnyTLS。生成 URI 时，服务器地址需要使用 IP 或 ASCII 主机名，包括已明确编码的 Punycode。Python 的 IDNA 转换与 Worker 的 URL 转换可能将同一个 Unicode 主机名解析为不同目的地。已有分享 URI 通过校验后按原字节导出。 [Python IDNA](https://docs.python.org/3/library/codecs.html#encodings.idna) · [URL 标准](https://url.spec.whatwg.org/#concept-domain-to-ascii)
 
-聚合、其他导出格式、数据导入界面、Telegram Webhook、订阅拉取和生产域名属于后续阶段。
+Sing-box 返回含选择器、直连项和代理出站的 JSON。支持 Shadowsocks、VMess、VLESS、Trojan、Hysteria 1 和 2、TUIC、AnyTLS、SOCKS 和 HTTP(S) 的已支持选项。HTTP(S) 使用结构化节点，VMess 的分享 URI 使用 Base64 JSON。引用其他出站或本地文件、执行外部插件、未支持的旧式协议，以及无法保持语义的 Hysteria 2 URI 证书钉扎和 ECH，都会使该订阅的 Sing-box 导出返回 `422`。Sing-box JSON 独立限制为 16 MiB 和 25,000 个代理出站。每个原始节点名的 JSON 编码最多 1 KiB，所有原始节点名合计最多 2 MiB。GitHub 托管 runner 使用校验过 SHA-256 的 Sing-box 1.14.4 检查实际 Worker 响应。 [Sing-box 1.14.4](https://github.com/SagerNet/sing-box/releases/tag/v1.14.4) · [Sing-box 出站](https://sing-box.sagernet.org/configuration/outbound/)
+
+聚合、其他导出格式、数据导入界面、订阅拉取和生产域名属于后续阶段。
 
 ## 组件边界
 
@@ -30,7 +32,7 @@
 
 1. 按订阅 ID 和随机快照 ID 写入一组不可变 NDJSON 对象，再写清单。清单按顺序记录每块的字节数、节点数和 SHA-256。
 2. 所有对象写入成功后，使用订阅 ID、用户归属和上一代编号对 D1 进行条件更新，同时发布新快照 ID、清单摘要、节点计数和元数据。并发请求中只有一个写入能更新同一代。R2 写入失败或条件不匹配时，旧指针仍有效。
-3. 读取时先核对 D1 中的清单摘要，再按顺序读取和校验各块。快照上限为 64 MiB、256 块、100,000 个节点。单块和单条记录分别最多 512 KiB，清单最多 64 KiB。HTTP 导出的 16 MiB 分享文本上限单独生效，并包含行分隔符。部署后用真实分布和并发验证这些上限适用。
+3. 读取时先核对 D1 中的清单摘要，再按顺序读取和校验各块。快照上限为 64 MiB、256 块、100,000 个节点。单块和单条记录分别最多 512 KiB，清单最多 64 KiB。Base64 导出的 16 MiB 分享文本上限包含行分隔符，Sing-box 按实际 JSON 字节数计量。部署后用真实分布和并发验证这些上限适用。
 4. 已发布旧版本和发布结果不明的候选对象先保留。确认发布失败时，可清理本次新写入且尚未发布的对象。启用历史版本回收前，必须确认对象未被活动订阅、回收站、回滚版本或备份引用，并超过约定的恢复期。桶生命周期规则只适用于可证明安全的备份或临时对象前缀。 [R2 生命周期](https://developers.cloudflare.com/r2/buckets/object-lifecycles/)
 
 ## 分阶段交付
@@ -52,7 +54,7 @@
 | 订阅列表、重命名和回收站 | D1 所有者范围内分页和条件写入。Telegram 的 `/list`、`/expire` 和 `/recycle` 支持只读翻页，详情、重命名、删除和恢复交互另行接入。 |
 | 私聊、群聊、内联及授权 | Webhook 和 D1 记录更新与授权。用指定管理员、普通用户和测试群验收；后续增加持久会话状态、按钮与内联更新。 |
 | 私密分享 | 单独迁移有效期、指定用户、份数及领取事务。验证重复领取、争抢最后一份、撤权及过期。 |
-| 导入、格式与链接 | 覆盖 URL、文档、文本与 Base64 导入。补齐旧路径、协议及 Clash、Sing-box、Surge、Quantumult X 格式，再接入聚合、短链、路径映射和临时节点。旧链接和授权由迁移对账验证。 |
+| 导入、格式与链接 | 覆盖 URL、文档、文本与 Base64 导入。补齐旧路径、其余协议及 Clash、Surge、Quantumult X 格式，再接入聚合、短链、路径映射和临时节点。旧链接和授权由迁移对账验证。 |
 | 更新、批量任务与搜索 | 持久任务记录进度、重试和恢复；上游失败保留上一版快照。对照旧 Bot 的搜索和导出入口，用获准的真实提供方验证出网。 |
 | 备份与交接 | 在独立恢复目标核对 D1 元数据、R2 清单、账号归属、旧能力和完整字节，演练版本回滚后再准备切换。 |
 

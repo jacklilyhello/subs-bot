@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -115,6 +117,47 @@ test("the hosted deployment artifact exports small and large snapshots in worker
       const expected = status === 200
         ? Buffer.from(expectedShares.join("\n")).toString("base64") : "Subscription content cannot be exported.";
       assert.equal(await exportResult.text(), expected);
+    }
+
+    const corpus = JSON.parse(await readFile(new URL("./singbox-corpus.json", import.meta.url), "utf8"));
+    const ownerId = "900000004";
+    const subscription = await createSubscription(db, {
+      ownerId, name: "Synthetic Sing-box configuration", sourceUrl: "https://provider.example.invalid/synthetic",
+    });
+    const nodes = corpus.map(({ node, vmess }: { node: Record<string, unknown>; vmess?: Record<string, unknown> }) =>
+      vmess ? { ...node, share: "vmess://" + Buffer.from(JSON.stringify(vmess)).toString("base64") } : node);
+    assert.equal(await publishNodeSnapshot(db, bucket, {
+      id: subscription.id, ownerId, expectedGeneration: 0, expectedLifecycleRevision: 0,
+    }, nodes), true);
+    const singboxPath = "/sub/" + subscription.token + "/sing-box";
+    const head = await request(singboxPath, { method: "HEAD" });
+    assert.equal(head.status, 200);
+    assert.equal(head.body, null);
+    const response = await request(singboxPath);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("content-type"), "application/json");
+    assert.equal(response.headers.get("cache-control"), "private, no-store");
+    const emitted = Buffer.from(await response.arrayBuffer());
+    assert.equal(response.headers.get("content-length"), String(emitted.length));
+    const { outbounds } = JSON.parse(emitted.toString("utf8"));
+    const tags = ['港 "字" 🌐', "proxy (2)", "VMess", "VMess (3)", "VMess (2)", "Reality", "direct (2)",
+      "Hysteria", "港", "TUIC", "AnyTLS", "SOCKS", "HTTPS"];
+    assert.deepEqual(outbounds, [
+      { type: "selector", tag: "proxy", outbounds: tags }, { type: "direct", tag: "direct" },
+      ...corpus.map(({ outbound }: { outbound: Record<string, unknown> }, index: number) => ({
+        tag: tags[index], ...outbound,
+      })),
+    ]);
+    const binary = process.env.SINGBOX_TEST_BINARY;
+    assert(binary, "Missing checksum-verified Sing-box binary");
+    const scratch = await mkdtemp(join(tmpdir(), "subs-bot-singbox-"));
+    try {
+      const config = join(scratch, "synthetic.json");
+      await writeFile(config, emitted, { mode: 0o600 });
+      const check = spawnSync(binary, ["check", "-c", config], { timeout: 15_000, encoding: "utf8" });
+      assert.equal(check.status, 0, check.stderr || check.error?.message || "Sing-box config check failed");
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
     }
   } finally {
     await miniflare.dispose();
