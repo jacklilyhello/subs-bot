@@ -1158,11 +1158,11 @@ async def cmd_github_search(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     headers = {
-        "Accept": "application/vnd.github+json",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     }
+    github_headers = {"Accept": "application/vnd.github+json"}
     if GITHUB_TOKEN:
-        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+        github_headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
 
     repos_results: list[dict[str, Any]] = []
     code_results: list[dict[str, Any]] = []
@@ -1174,12 +1174,12 @@ async def cmd_github_search(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             # 1. 优先搜索高赞开源仓库 (免 Token 100% 可用)
             repo_url = f"https://api.github.com/search/repositories?q={quote_plus(query)}&sort=stars&order=desc&per_page=5"
             try:
-                async with session.get(repo_url) as resp:
+                async with session.get(repo_url, headers=github_headers, allow_redirects=False) as resp:
                     if resp.status == 200:
                         payload = await resp.json(content_type=None)
                         repos_results = payload.get("items") or []
-            except Exception as e:
-                log.warning("GitHub repo search failed: %s", e)
+            except Exception:
+                log.warning("GitHub repo search failed")
 
             # 2. 搜索公开代码 (有 Token 优先，无 Token 带扩展名)
             code_query = query
@@ -1187,12 +1187,12 @@ async def cmd_github_search(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 code_query = f"{query} extension:yaml extension:txt"
             code_url = f"https://api.github.com/search/code?q={quote_plus(code_query)}&per_page=5"
             try:
-                async with session.get(code_url) as resp:
+                async with session.get(code_url, headers=github_headers, allow_redirects=False) as resp:
                     if resp.status == 200:
                         payload = await resp.json(content_type=None)
                         code_results = payload.get("items") or []
-            except Exception as e:
-                log.warning("GitHub code search failed: %s", e)
+            except Exception:
+                log.warning("GitHub code search failed")
 
             # 3. 如果代码为空，尝试备用 grep.app
             if not code_results:
@@ -1209,8 +1209,8 @@ async def cmd_github_search(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 except Exception:
                     pass
 
-    except Exception as exc:
-        log.warning("GitHub multi-search error: %s", exc)
+    except Exception:
+        log.warning("GitHub multi-search failed")
 
     if not repos_results and not code_results:
         # 即使接口完全触发官方限流，依然提供一键直达网页结果的按钮
