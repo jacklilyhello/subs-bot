@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, Mock, patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from aiohttp import StreamReader
+from aiohttp import InvalidURL, StreamReader
 
 from convert import MAX_SUBSCRIPTION_BYTES, fetch_subscription  # noqa: E402
 
@@ -78,6 +78,18 @@ async def test_response_size_is_capped():
             nodes, _meta, error = await fetch_subscription("https://public.example/sub")
     assert nodes == []
     assert error == "订阅响应过大"
+
+
+async def test_fetch_error_does_not_include_the_provider_url():
+    url = "https://public.example/sub?access=synthetic-provider-marker"
+    session = FakeSession([])
+    session.get = Mock(side_effect=InvalidURL(url))
+    with patch("convert.get_session", new=AsyncMock(return_value=session)), patch(
+        "convert._check_public_url", new=AsyncMock()
+    ):
+        nodes, _meta, error = await fetch_subscription(url)
+    assert nodes == []
+    assert error and "synthetic-provider-marker" not in error, "Fetch error exposes request data."
 
 
 async def test_fragmented_response_is_read_to_eof():
