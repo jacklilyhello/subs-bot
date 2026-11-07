@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import sqlite3
 import sys
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 from uuid import UUID
@@ -103,12 +104,12 @@ class SmokeTests(unittest.TestCase):
             (POLICY["botId"], CODES.get(name, "f" * 64), POLICY[smoke.ROLES[creator]], "Synthetic creator", payload,
              sha256(body).hexdigest(), len(body), POLICY[smoke.ROLES[target]] if target else None, created + 60 * duration, created)).lastrowid
 
-    def receipt(self, role, marker, when, *, group_message=None):
+    def receipt(self, role, marker, when, *, group_message=None, group_type="supergroup"):
         self.next_update += 1
         actor = POLICY[smoke.ROLES[role]]
         message = self.next_update if group_message is None else group_message
         chat = actor if group_message is None else POLICY["groupId"]
-        scope = "private" if group_message is None else "supergroup"
+        scope = "private" if group_message is None else group_type
         receipt_id = self.db.execute("""INSERT INTO telegram_inbox (bot_id,update_id,actor_id,chat_id,chat_type,message_id,
             message_date,command,received_at,receipt_nonce) VALUES (?,?,?,?,?,?,?,'help',?,?)""",
             (POLICY["botId"], self.next_update, actor, chat, scope, message, when, when, marker)).lastrowid
@@ -139,7 +140,7 @@ class SmokeTests(unittest.TestCase):
                             (self.case_ids[case][1], POLICY[smoke.ROLES[role]], when))
         return receipt
 
-    def complete(self):
+    def complete(self, *, group_type="supergroup", group_message=OBSERVED["groupControlMessageId"]):
         self.create("expired", self.initial + 1)
         self.create("targeted", self.initial + 4)
         self.claim("targeted", "admin", self.initial + 6)
@@ -149,12 +150,12 @@ class SmokeTests(unittest.TestCase):
         self.claim("race", "member", self.initial + 24)
         self.claim("race", "admin", self.initial + 25, won=True)
         self.expired_receipt = self.claim("expired", "member", self.initial + 63)
-        self.receipt("admin", None, self.initial + 66, group_message=OBSERVED["groupControlMessageId"])
+        self.receipt("admin", None, self.initial + 66, group_message=group_message, group_type=group_type)
         self.now = self.initial + 67
 
     def verify(self, observed=OBSERVED):
         smoke.validate_checkpoint(self.prepared, "verify", COHORT, PIN["revision"], IDENTITY, PIN)
-        return self.cohort.verify(self.prepared, observed)
+        return self.cohort.verify(self.prepared, observed, PIN)
 
     def test_iab_evidence_binds_body_scope_and_natural_expiry(self):
         self.complete()
@@ -176,6 +177,24 @@ class SmokeTests(unittest.TestCase):
         self.db.execute("UPDATE telegram_inbox SET message_date=? WHERE receipt_id=?", (self.initial + 63, self.expired_receipt))
         self.receipt("admin", None, self.initial + 65, group_message=OBSERVED["groupShareMessageId"])
         with self.assertRaisesRegex(smoke.FixtureError, "group receipt"):
+            self.verify()
+
+    def test_basic_group_keeps_actor_local_ids_and_rejects_any_extra_receipt(self):
+        self.receipt("admin", None, self.initial - 1, group_message=3, group_type="group")
+        self.prepared = self.cohort.prepare(IDENTITY, PIN)
+        self.complete(group_type="group", group_message=4)
+        verified = self.verify()
+        proof = verified["groupProof"]
+        self.assertEqual((proof["chatType"], proof["shareMessageId"], proof["controlMessageId"]),
+                         ("group", OBSERVED["groupShareMessageId"], OBSERVED["groupControlMessageId"]))
+        self.assertTrue(smoke.matches(smoke.DIGEST, proof["controlReceiptSha256"]))
+        self.receipt("member", None, self.initial + 67, group_message=5, group_type="group")
+        with self.assertRaisesRegex(smoke.FixtureError, "additional receipts"):
+            self.verify()
+
+    def test_supergroup_still_requires_the_exact_shared_control_id(self):
+        self.complete(group_message=4)
+        with self.assertRaisesRegex(smoke.FixtureError, "group control reply"):
             self.verify()
 
     def test_retirement_waits_reconciles_lost_writes_and_preserves_genuine_history(self):
@@ -227,9 +246,47 @@ class SmokeTests(unittest.TestCase):
         with self.assertRaisesRegex(smoke.FixtureError, "scope"):
             smoke.validate_checkpoint(verified, "retire", COHORT, PIN["revision"], "0" * 64, LATER, allow_drift=True)
 
+    def test_equivalent_verification_keeps_both_release_pins_for_retirement(self):
+        with self.assertRaisesRegex(smoke.FixtureError, "active release changed"):
+            smoke.validate_checkpoint(self.prepared, "verify", COHORT, PIN["revision"], IDENTITY, LATER)
+        for change in ({"moduleSha256": "e" * 64}, {"compatibilityDate": "2026-08-01"}, {"revision": PIN["revision"]}):
+            with self.subTest(change=change), self.assertRaisesRegex(smoke.FixtureError, "active release changed"):
+                smoke.validate_checkpoint(self.prepared, "verify", COHORT, PIN["revision"], IDENTITY, {**LATER, **change}, allow_equivalent=True)
+        smoke.validate_checkpoint(self.prepared, "verify", COHORT, PIN["revision"], IDENTITY, LATER, allow_equivalent=True)
+        self.complete(group_type="group", group_message=4)
+        verified = self.cohort.verify(self.prepared, OBSERVED, LATER)
+        self.assertEqual((verified["releasePin"], verified["verifiedAtReleasePin"]), (PIN, LATER))
+        smoke.validate_checkpoint(verified, "retire", COHORT, LATER["revision"], IDENTITY, LATER)
+        with self.assertRaisesRegex(smoke.FixtureError, "pin differs"):
+            smoke.validate_checkpoint(verified, "retire", COHORT, PIN["revision"], IDENTITY, LATER)
+
+    def test_equivalent_verification_proves_ancestry_and_historic_version_bindings(self):
+        with patch.object(smoke, "_get_json", return_value={"status": "ahead", "merge_base_commit": {"sha": PIN["revision"]}}) as compare:
+            smoke.require_successor(PIN["revision"], LATER["revision"], "synthetic")
+            compare.assert_called_once_with(f"/compare/{PIN['revision']}...{LATER['revision']}", "synthetic")
+        with patch.object(smoke, "_get_json", return_value={"status": "diverged", "merge_base_commit": {"sha": PIN["revision"]}}):
+            with self.assertRaisesRegex(smoke.FixtureError, "not a successor"):
+                smoke.require_successor(PIN["revision"], LATER["revision"], "synthetic")
+        bindings = {"telegram_config_sha256": "1" * 64, "telegram_private_share_key_sha256": "2" * 64,
+                    "telegram_aggregate_key_sha256": "3" * 64}
+        old = SimpleNamespace(revision=PIN["revision"], digest=PIN["moduleSha256"], compatibility=PIN["compatibilityDate"], **bindings)
+        active = SimpleNamespace(**bindings)
+        scope = SimpleNamespace(version=Mock(return_value=old))
+        smoke.verify_historic_release(scope, PIN, active)
+        scope.version.assert_called_once_with(PIN["versionId"])
+        active.telegram_private_share_key_sha256 = "4" * 64
+        with self.assertRaisesRegex(smoke.FixtureError, "historical"):
+            smoke.verify_historic_release(scope, PIN, active)
+
     def test_only_hash_observations_and_exact_retirement_confirmation_are_accepted(self):
         event = {"inputs": {"action": "verify", "cohort": COHORT, "source_run_id": "123", "observations": json.dumps(OBSERVED)}}
         self.assertEqual(smoke.parse_inputs(event), ("verify", COHORT, "123", OBSERVED, False))
+        event["inputs"]["confirm_verify"] = f"verify {COHORT} on equivalent release"
+        self.assertEqual(smoke.parse_inputs(event), ("verify", COHORT, "123", OBSERVED, True))
+        event["inputs"]["confirm_verify"] = "verify wrong cohort on equivalent release"
+        with self.assertRaisesRegex(smoke.FixtureError, "confirmation"):
+            smoke.parse_inputs(event)
+        del event["inputs"]["confirm_verify"]
         changed = deepcopy(OBSERVED)
         changed["codeHashes"]["race"] = "a" * 22
         event["inputs"]["observations"] = json.dumps(changed)
