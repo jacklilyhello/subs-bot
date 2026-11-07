@@ -251,7 +251,7 @@ function normalizeMessage(
   return scope.chatType === "private" && scope.threadId === null && typeof text === "string"
     && text.trim() !== "" && !text.trimStart().startsWith("/")
     && (!Array.isArray(entities) || !entities.some((entity) =>
-      isRecord(entity) && entity.type === "bot_command" && entity.offset === 0))
+      isRecord(entity) && entity.type === "bot_command"))
     ? { temp: { ...scope, kind: "temp-text", text } } : null;
 }
 
