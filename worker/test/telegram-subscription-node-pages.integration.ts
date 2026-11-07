@@ -148,8 +148,8 @@ test("emitted Worker browses pinned private 15-node pages and safely reopens cur
     assert.equal(await acceptTelegramSubscriptionNodePage(db, policy, { actorId: policy.memberId, chatId: policy.memberId,
       chatType: "private", threadId: null, updateId: 15, callbackId: "fixture-late-node-page", messageDate: date,
       messageId: back.id, ticket: token(back, "浏览全部节点") }), "accepted");
-    assert.equal(await claimTelegramReply(db, policy.botId, false, false, true, true), null);
-    const lease = await claimTelegramReply(db, policy.botId, false, false, true, true, true);
+    assert.equal(await claimTelegramReply(db, policy.botId, false, false, true, true, true), null);
+    const lease = await claimTelegramReply(db, policy.botId, false, false, true, true, true, true);
     assert.ok(lease?.subscriptionNodes);
     const prepared = await renderTelegramSubscriptionNodePage(db, bucket, policy, lease, Date.now() + 5_000);
     assert.ok(prepared.readGuard);
