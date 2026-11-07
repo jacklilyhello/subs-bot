@@ -113,6 +113,18 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(len(self.api.mutations), 2)
         self.assertEqual(self.guard_calls, 2)
 
+    def test_repository_migration_chain_applies_and_repeats_without_writes(self):
+        for file in sorted((WORKER / "migrations").glob("*.sql")):
+            if file.name != BASELINE_NAME:
+                self.add_file(file.name, file.read_bytes())
+
+        expected = [{**item, "mode": "applied"} for item in self.manifest["migrations"]]
+        self.assertEqual(self.apply(), expected)
+        self.assertEqual(self.apply(), expected)
+        self.assertEqual(len(self.api.mutations), len(expected))
+        self.assertEqual(self.guard_calls, len(expected))
+        self.assertEqual(self.api.db.execute("PRAGMA foreign_key_check").fetchall(), [])
+
     def test_legacy_adopts_0001_without_replay_or_reset_and_applies_next(self):
         self.api.seed_legacy()
         self.api.insert_subscription()
