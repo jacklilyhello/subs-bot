@@ -32,7 +32,7 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 `0009` 只存聚合码的摘要。一次 D1 批处理固定成员、快照指针和临时节点。Worker 核对并固定 R2 清单后，复用同一组来源进行两遍导出。每个聚合最多 128 份订阅，快照与临时数据共用 64 MiB、100,000 个节点和 256 个 R2 块的预算。各格式的输出上限仍适用。旧链接导入、订阅拉取和生产域名分阶段接入。
 
-普通短链在私聊通过 `短链 URL`、`short URL` 或 `/short URL` 签发，`/short` 显示帮助，`/short revoke <短码或本地短链>` 撤销自己的链接。每位用户最多有 128 条活动普通短链。目标限 2 KiB，拒绝带 URL 用户名或密码、控制字符、反斜杠、已知本地主机名和特殊用途 IP 的地址。项目域名也禁止作为普通目标。Worker 仅检查 URL 和返回重定向，地址的 DNS 解析由客户端执行。 [URL 标准](https://url.spec.whatwg.org/) · [IANA IPv4 地址注册表](https://www.iana.org/assignments/iana-ipv4-special-registry) · [IANA IPv6 地址注册表](https://www.iana.org/assignments/iana-ipv6-special-registry)
+普通短链在私聊通过 `短链 URL`、`short URL` 或 `/short URL` 签发，`/short` 显示帮助，`/short revoke <短码或本地短链>` 撤销自己的链接。每位用户最多有 128 条活动普通短链。目标限 2 KiB，拒绝带 URL 用户名或密码、控制字符、反斜杠、已知本地主机名和本地或受限 IP 字面量的地址。项目域名也禁止作为普通目标。Worker 仅检查 URL 和返回重定向，地址的 DNS 解析由客户端执行。 [URL 标准](https://url.spec.whatwg.org/) · [IANA IPv4 地址注册表](https://www.iana.org/assignments/iana-ipv4-special-registry) · [IANA IPv6 地址注册表](https://www.iana.org/assignments/iana-ipv6-special-registry)
 
 `0019` 在受限 D1 链接行保存规范化目标和短码摘要。确定未送达的重试使用原短码，撤销清除目标并保留摘要。新普通短码和聚合短码使用不同末位，查找同时核对两个表。同一摘要若有两条归属记录，即使其中一条已撤销，普通和聚合路径都返回 `404`。已核对的 12 位旧普通短码可沿用相同路径，旧数据导入另行执行。
 
@@ -200,6 +200,12 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 容量检查的客户端耗时和吞吐来自这组样本。CPU、内存和平台子请求数量通过隔离 Worker 的聚合指标另行核对。旧 SQLite 的正文体积与转换后的 NDJSON 和分享原文分别测量。真实备份的分布、超限项及可恢复性需要通过获准的数据演练验证。 [Workers 限制](https://developers.cloudflare.com/workers/platform/limits/) · [Workers 指标](https://developers.cloudflare.com/analytics/graphql-api/tutorials/querying-workers-metrics/)
 
 旧库容量盘点在获准的托管环境运行 `python3 -B worker/tools/legacy_inventory.py <封存备份>`。输入须是单独完成、关闭、使用 UTF-8 和 DELETE 日志模式的 SQLite 备份。备份准备在原库之外进行，盘点本身以只读事务运行。报告只包含活动订阅与回收站的聚合计数、原始字节、紧凑 UTF-8 NDJSON 字节、块数、大小限制和旧转换器分享原文估算。无法读取或解析的记录有独立计数。退出码 `0` 表示报告完整，仍需检查超限和无效项。退出码 `2` 表示无法核对备份。容量报告不判定归属映射、旧链接兼容、分享权限或实际 Worker 性能。 [SQLite 增量读取](https://sqlite.org/c3ref/blob_open.html) · [SQLite URI](https://sqlite.org/uri.html)
+
+### 普通短链双账号验收
+
+受保护的 `worker-isolation-telegram-short-links-smoke.yml` 对同一活动版本执行 `prepare`、`issued` 和 `retired`。使用同一个 `cohort` 和 Worker CI 运行 ID。后两步引用前一步的成功运行。两名获准用户只在指定内置浏览器私聊分别签发 `https://example.com/subs-bot-normal-short/<cohort>/admin` 和 `https://example.org/subs-bot-normal-short/<cohort>/member`。管理员先尝试撤销普通用户的测试短码，随后各自撤销自己的短链。提交的浏览器证据只包含三项摘要。
+
+验收任务只读取已固定的资源和回执，并对隔离 Worker 的 GET 和 HEAD 检查状态、重定向目标和私有缓存响应头。探针在项目域名收到响应后结束。撤销后保留两条墓碑，原链接返回 `404`。外部 URL 的连接由使用者的客户端处理。
 
 ### 隔离合成旧订阅候选应用
 

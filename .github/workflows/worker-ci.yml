@@ -13,6 +13,7 @@ on:
       - '.github/workflows/worker-isolation-native-restore.yml'
       - '.github/workflows/worker-isolation-legacy-candidate.yml'
       - '.github/workflows/worker-isolation-telegram-selected-smoke.yml'
+      - '.github/workflows/worker-isolation-telegram-short-links-smoke.yml'
   push:
     branches: [main]
     paths:
@@ -26,6 +27,7 @@ on:
       - '.github/workflows/worker-isolation-native-restore.yml'
       - '.github/workflows/worker-isolation-legacy-candidate.yml'
       - '.github/workflows/worker-isolation-telegram-selected-smoke.yml'
+      - '.github/workflows/worker-isolation-telegram-short-links-smoke.yml'
   workflow_dispatch:
 
 permissions:
