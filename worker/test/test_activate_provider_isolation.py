@@ -441,6 +441,12 @@ class APIContractTests(unittest.TestCase):
                 with self.assertRaises(activation.ActivationError):
                     self.api.stopped(NAMESPACE, START, RELEASE["ociManifestSha256"])
 
+    def test_sqlite_actor_identity_is_available_through_the_pinned_container_inventory(self):
+        stopped = {"id": ACTOR, "application_id": NAMESPACE, "image": IMAGE, "status": {"state": "stopped", "updated_at": STOP}}
+        with patch.object(self.api, "actors", return_value=[]), patch.object(
+                self.api, "instances", side_effect=[[stopped], []]), patch.object(self.api, "_request", return_value=envelope(stopped)):
+            self.assertEqual(self.api.stopped(NAMESPACE, START, RELEASE["ociManifestSha256"]), activation._hash(ACTOR))
+
 
 class ProofTests(unittest.TestCase):
     def test_smoke_output_rejects_wrong_revision_digest_auth_or_numeric_booleans(self):
@@ -456,6 +462,12 @@ class ProofTests(unittest.TestCase):
                         {"output": {}}, {"output": '{"ok":true,"ok":true}'}, {"end": CREATED}):
             with self.subTest(changed=changed), self.assertRaises(ValueError):
                 activation._smoke_result({**smoke(), **changed}, RELEASE, WORKFLOW_PIN, ISOLATED, HEALTH_PROOF)
+
+    def test_exact_workflow_output_can_be_a_json_object(self):
+        instance = smoke()
+        output = json.loads(instance["output"])
+        self.assertEqual(activation._smoke_result({**instance, "output": output}, RELEASE, WORKFLOW_PIN,
+                                                  ISOLATED, HEALTH_PROOF), output)
 
     def test_fixed_public_probe_has_no_authorization_and_refuses_redirect_or_live_handler(self):
         for status, headers, body, accepted in ((404, {}, b"Not found", True), (403, {}, b"Denied", True),
