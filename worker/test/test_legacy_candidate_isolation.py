@@ -263,6 +263,77 @@ class CandidateArtifactTests(unittest.TestCase):
         with self.assertRaises(tool.native.RehearsalError):
             self.verify(self.archive(), tool.SHARE_PROFILE)
 
+    def test_typed_profile_rebuilds_the_fixed_source_and_verifies_exact_restore_evidence(self):
+        report = self.build(tool.TYPED_PROFILE)
+        archive = self.archive()
+        for other in (tool.PROFILE, tool.PATH_PROFILE, tool.EMPTY_PROFILE, tool.SHARE_PROFILE):
+            with self.subTest(profile=other), self.assertRaises(tool.native.RehearsalError):
+                self.verify(archive, other)
+        candidate = self.verify(archive, tool.TYPED_PROFILE)
+        pin = candidate.pin()
+        self.assertEqual(report["version"], 4)
+        self.assertEqual(report["manifestSha256"], pin["packageManifestSha256"])
+        self.assertEqual(len(candidate.entries), 4)
+        self.assertEqual(candidate.document["targetSequenceHighWater"], 72)
+        self.assertEqual(pin["pathSequenceHighWater"], 120)
+        self.assertEqual(pin["typedShortMigrationSha256"], tool.package.TYPED_SHORT_MIGRATION_SHA256)
+        self.assertNotIn("legacyBotId", pin)
+        sql = candidate.sql.read_text(encoding="utf-8")
+        self.assertNotIn(tool.TYPED_ORIGIN, sql)
+        self.assertTrue(all(code not in sql for code, _, _ in tool.TYPED_LINK_FIXTURES))
+        with closing(sqlite3.connect(":memory:")) as db:
+            db.executescript(sql)
+            self.assertEqual(db.execute(f"SELECT subscription_id,owner_id,format FROM {tool.package.TYPED_SHORTS} "
+                                        "ORDER BY subscription_id").fetchall(),
+                             [(2, "123", ""), (5, "123", "sing-box"), (71, "456", "v2ray"), (72, "456", "qx")])
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+        release = {"profile": tool.TYPED_PROFILE, "worker": self.release,
+                   "candidate": {**pin, "artifactId": "123", "archiveSha256": tool.native.digest(archive)}}
+        state = {"sourcePin": release, "scopeSha256": "fixture-scope", "importState": {"state": "complete"},
+                 "phase": "verified", "resources": {kind: {"pin": {"name": kind}} for kind in ("database", "objects")}}
+        journal = Mock(value=state)
+        journal.load.return_value = state
+        engine = tool.CandidateRehearsal(Mock(), Mock(scope_sha256="fixture-scope"), journal, candidate)
+        engine.read_restored_summary = Mock(return_value=(candidate.document["summary"], candidate.document))
+        result = tool.run_action("verify-restore", engine, release)
+        self.assertEqual(result["verifiedTypedShortLinkCount"], 4)
+        self.assertEqual(result["typedShortLinksSha256"], pin["typedShortLinksSha256"])
+        self.assertEqual(result["typedShortInventoryManifestSha256"], pin["typedShortInventoryManifestSha256"])
+        self.assertEqual(result["verifiedEmptyExportMarkerCount"], 2)
+        self.assertEqual(result["verifiedPathRuleCount"], 4)
+        self.assertEqual(result["shortLinkCompatibility"], "not-validated")
+        self.assertNotIn(tool.TYPED_BOT, json.dumps(result))
+        journal.claim.assert_not_called()
+
+    def test_typed_profile_rejects_resealed_inventory_pin(self):
+        self.build(tool.TYPED_PROFILE)
+        document = json.loads((self.output / tool.package.MANIFEST).read_bytes())
+        document["source"]["typedShortInventoryManifestSha256"] = "b" * 64
+        self.reseal(document)
+        with self.assertRaises(tool.native.RehearsalError):
+            self.verify(self.archive(), tool.TYPED_PROFILE)
+
+    def test_typed_profile_rejects_resealed_sql_for_other_owner(self):
+        self.build(tool.TYPED_PROFILE)
+        sql = self.output / tool.package.SQL
+        original = sql.read_text(encoding="utf-8")
+        row = next(line for line in original.splitlines()
+                   if line.startswith(f"INSERT INTO {tool.package.TYPED_SHORTS} ") and "'456'" in line)
+        changed = original.replace(row, row.replace("'456'", "'789'", 1), 1)
+        sql.write_bytes(changed.encode("utf-8"))
+        document = json.loads((self.output / tool.package.MANIFEST).read_bytes())
+        document["sql"].update(bytes=sql.stat().st_size, sha256=tool.native.file_hash(sql)[1],
+                               md5=tool.native.file_hash(sql, "md5")[1])
+        with closing(sqlite3.connect(":memory:")) as db:
+            db.executescript(changed)
+            document["summary"] = tool.package.db_summary(db, document["layout"])
+        document["dataSha256"] = document["summary"]["dataSha256"]
+        document["typedShortLinks"]["tableSha256"] = document["summary"]["tableSha256"][tool.package.TYPED_SHORTS]
+        self.reseal(document)
+        with self.assertRaises(tool.native.RehearsalError):
+            self.verify(self.archive(), tool.TYPED_PROFILE)
+
     def test_correct_archive_digest_does_not_admit_extra_member(self):
         self.build()
         with self.assertRaises(tool.native.RehearsalError):
@@ -292,6 +363,7 @@ class CandidateBoundaryTests(unittest.TestCase):
             path = native.RehearsalAPI(native_tests.TARGET, "synthetic-token", cohort, profile=tool.PATH_PROFILE)
             empty = native.RehearsalAPI(native_tests.TARGET, "synthetic-token", cohort, profile=tool.EMPTY_PROFILE)
             share = native.RehearsalAPI(native_tests.TARGET, "synthetic-token", cohort, profile=tool.SHARE_PROFILE)
+            typed = native.RehearsalAPI(native_tests.TARGET, "synthetic-token", cohort, profile=tool.TYPED_PROFILE)
             existing = native.RehearsalAPI(native_tests.TARGET, "synthetic-token", cohort)
         self.assertEqual(candidate.names, {"database": f"subs-bot-cf-legacy-db-{cohort}",
                                            "objects": f"subs-bot-cf-legacy-r2-{cohort}"})
@@ -308,6 +380,11 @@ class CandidateBoundaryTests(unittest.TestCase):
                                        "objects": f"subs-bot-cf-legacy-share-r2-{cohort}"})
         self.assertTrue(set(share.names.values()).isdisjoint({*empty.names.values(), *path.names.values(), *candidate.names.values()}))
         self.assertEqual(share.journal_prefix, f"maintenance/legacy-share-candidate/{cohort}/journal/")
+        self.assertEqual(typed.names, {"database": f"subs-bot-cf-legacy-typed-db-{cohort}",
+                                       "objects": f"subs-bot-cf-legacy-typed-r2-{cohort}"})
+        self.assertTrue(set(typed.names.values()).isdisjoint(
+            value for other_api in (candidate, second, path, empty, share) for value in other_api.names.values()))
+        self.assertEqual(typed.journal_prefix, f"maintenance/legacy-typed-candidate/{cohort}/journal/")
         self.assertEqual(existing.names, {"backup": f"subs-bot-cf-backup-{cohort[:16]}",
                                           "database": f"subs-bot-cf-restore-{cohort[:16]}",
                                           "objects": f"subs-bot-cf-restore-{cohort[:16]}"})
