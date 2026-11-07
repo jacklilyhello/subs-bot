@@ -3,6 +3,7 @@
 import asyncio
 from base64 import b64encode
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from functools import cache
 import ipaddress
@@ -23,6 +24,7 @@ from yarl import URL
 
 TOTAL_SECONDS = 25
 CONNECT_SECONDS = 8
+API_PROBE_SECONDS = 15
 MAX_REDIRECTS = 5
 MAX_ADDRESSES = 16
 MAX_URL_BYTES = 8192
@@ -53,6 +55,12 @@ class BasicCredentials:
 class FetchSuccess:
     body: bytes = field(repr=False)
     headers: dict[str, str] = field(repr=False)
+
+
+@dataclass(frozen=True)
+class ApiProbeSuccess:
+    status: int
+    elapsed_ms: int
 
 
 @dataclass(frozen=True)
@@ -298,6 +306,61 @@ def _metadata(headers):
     return result
 
 
+@asynccontextmanager
+async def _pinned_get(target, addresses, headers, *, no_replay=False):
+    sent = False
+
+    async def once(request, send):
+        nonlocal sent
+        if sent:
+            raise _Rejected("unavailable")
+        sent = True
+        return await send(request)
+
+    resolver = _PinnedResolver(target, addresses)
+    connector = aiohttp.TCPConnector(resolver=resolver, socket_factory=resolver.socket, ssl=_public_tls_context(),
+                                     use_dns_cache=False, force_close=True)
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=CONNECT_SECONDS)
+    async with aiohttp.ClientSession(connector=connector, trust_env=False, cookie_jar=aiohttp.DummyCookieJar(),
+                                     auto_decompress=False, timeout=timeout, read_bufsize=CHUNK_BYTES,
+                                     max_headers=32, middlewares=(once,) if no_replay else ()) as session:
+        async with session.get(target.url, headers=headers, allow_redirects=False, proxy=None,
+                               server_hostname=target.host.removesuffix(".") if target.url.scheme == "https" else None) as response:
+            yield response
+
+
+async def probe_api_status(url: str, key: str) -> ApiProbeSuccess | FetchFailure:
+    """Get the status and latency of one HTTPS API endpoint without reading its response body."""
+    if not isinstance(key, str) or not re.fullmatch(r"[!-~]{1,512}", key):
+        return FetchFailure("invalid-auth")
+    clock = asyncio.get_running_loop().time
+    started = clock()
+    deadline = started + API_PROBE_SECONDS
+    try:
+        async with asyncio.timeout_at(deadline):
+            target = _parse_target(url)
+            if (target.url.scheme != "https" or "?" in url or "#" in url
+                    or not target.url.raw_path.endswith(("/models", "/chat/completions"))):
+                raise _Rejected("invalid-url")
+            addresses = await _checked_addresses(target)
+            _check_deadline(deadline)
+            headers = {"User-Agent": "subs-bot-api-probe/1.0", "Accept": "application/json", "Accept-Encoding": "identity",
+                       "Authorization": f"Bearer {key}", "X-API-Key": key}
+            async with _pinned_get(target, addresses, headers, no_replay=True) as response:
+                _check_deadline(deadline)
+                if 100 <= response.status <= 599:
+                    return ApiProbeSuccess(response.status, int((clock() - started) * 1000))
+                return FetchFailure("unavailable")
+    except _Rejected as error:
+        return FetchFailure(error.code)
+    except TimeoutError:
+        return FetchFailure("timeout")
+    except (aiohttp.ClientSSLError, ssl.SSLError):
+        return FetchFailure("tls-failed")
+    except (aiohttp.ClientError, OSError, ValueError):
+        return FetchFailure("unavailable")
+
+
 async def fetch_provider(
     url: str, *, basic: BasicCredentials | None = None, address_policy: Callable[[tuple[IP, ...]], bool] | None = None,
     follow_redirects: bool = True,
@@ -316,36 +379,28 @@ async def fetch_provider(
                 addresses = await _checked_addresses(target)
                 if address_policy is not None and not address_policy(addresses):
                     raise _Rejected("blocked-address")
-                resolver = _PinnedResolver(target, addresses)
-                connector = aiohttp.TCPConnector(resolver=resolver, socket_factory=resolver.socket,
-                                                 ssl=_public_tls_context(), use_dns_cache=False, force_close=True)
                 headers = {"User-Agent": user_agent, "Accept": "*/*", "Accept-Encoding": "gzip, deflate"}
                 if authorization is not None:
                     headers["Authorization"] = authorization
-                timeout = aiohttp.ClientTimeout(total=None, sock_connect=CONNECT_SECONDS)
-                async with aiohttp.ClientSession(connector=connector, trust_env=False, cookie_jar=aiohttp.DummyCookieJar(),
-                                                 auto_decompress=False, timeout=timeout, read_bufsize=CHUNK_BYTES,
-                                                 max_headers=32) as session:
-                    async with session.get(target.url, headers=headers, allow_redirects=False, proxy=None,
-                                           server_hostname=target.host.removesuffix(".") if target.url.scheme == "https" else None) as response:
+                async with _pinned_get(target, addresses, headers) as response:
+                    _check_deadline(deadline)
+                    if response.status in REDIRECTS:
+                        if not follow_redirects:
+                            raise _Rejected("invalid-redirect")
+                        if hop == MAX_REDIRECTS:
+                            raise _Rejected("redirect-limit")
+                        following = _redirect(target, response.headers)
+                        if following.origin != target.origin:
+                            authorization = None
+                        target = following
+                    elif response.status == 200:
+                        body = await _read_body(response, deadline)
                         _check_deadline(deadline)
-                        if response.status in REDIRECTS:
-                            if not follow_redirects:
-                                raise _Rejected("invalid-redirect")
-                            if hop == MAX_REDIRECTS:
-                                raise _Rejected("redirect-limit")
-                            following = _redirect(target, response.headers)
-                            if following.origin != target.origin:
-                                authorization = None
-                            target = following
-                        elif response.status == 200:
-                            body = await _read_body(response, deadline)
-                            _check_deadline(deadline)
-                            return FetchSuccess(body, _metadata(response.headers))
-                        elif 100 <= response.status <= 599:
-                            return FetchFailure("http-status", response.status)
-                        else:
-                            return FetchFailure("unavailable")
+                        return FetchSuccess(body, _metadata(response.headers))
+                    elif 100 <= response.status <= 599:
+                        return FetchFailure("http-status", response.status)
+                    else:
+                        return FetchFailure("unavailable")
     except _Rejected as error:
         return FetchFailure(error.code)
     except TimeoutError:
