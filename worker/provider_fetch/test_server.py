@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 from aiohttp.test_utils import TestClient, TestServer
 
 import server
-from transport import FetchSuccess
+from transport import FetchFailure, FetchSuccess
 
 
 REVISION = "a" * 40
@@ -80,3 +80,14 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                 finish.set()
                 async with await first as reply:
                     self.assertEqual(reply.status, 200)
+
+    async def test_reports_only_a_valid_numeric_upstream_status_for_http_failures(self):
+        for upstream, expected in (
+            (429, {"error": "http-status", "upstreamStatus": 429}),
+            (503, {"error": "http-status", "upstreamStatus": 503}),
+            (None, {"error": "unavailable"}), (200, {"error": "unavailable"}), (600, {"error": "unavailable"}),
+        ):
+            with patch.object(server, "fetch_provider", new_callable=AsyncMock, return_value=FetchFailure("http-status", upstream)):
+                async with self.client.post("/v1/fetch", headers=HOST, json={"url": "https://fixture.example/"}) as reply:
+                    self.assertEqual(reply.status, 502)
+                    self.assertEqual(await reply.json(), expected)
