@@ -4,20 +4,30 @@ on:
   pull_request:
     paths:
       - 'worker/provider_fetch/**'
+      - 'worker/tools/install_provider_skopeo.sh'
       - 'worker/tools/prepare_provider_artifact.py'
       - 'worker/tools/prepare_isolation_artifact.py'
+      - 'worker/tools/publish_provider_registry.py'
+      - 'worker/tools/verify_provider_skopeo.py'
       - 'worker/test/test_prepare_provider_artifact.py'
+      - 'worker/test/test_publish_provider_registry.py'
       - '.github/workflows/worker-provider-artifact-preflight.yml'
       - '.github/workflows/worker-provider-fetch-ci.yml'
+      - '.github/workflows/worker-provider-registry-publish.yml'
   push:
     branches: [main]
     paths:
       - 'worker/provider_fetch/**'
+      - 'worker/tools/install_provider_skopeo.sh'
       - 'worker/tools/prepare_provider_artifact.py'
       - 'worker/tools/prepare_isolation_artifact.py'
+      - 'worker/tools/publish_provider_registry.py'
+      - 'worker/tools/verify_provider_skopeo.py'
       - 'worker/test/test_prepare_provider_artifact.py'
+      - 'worker/test/test_publish_provider_registry.py'
       - '.github/workflows/worker-provider-artifact-preflight.yml'
       - '.github/workflows/worker-provider-fetch-ci.yml'
+      - '.github/workflows/worker-provider-registry-publish.yml'
   workflow_dispatch:
 
 permissions:
@@ -43,10 +53,12 @@ jobs:
         run: python -m unittest discover -s worker/provider_fetch -p 'test_*.py'
       - name: Test release provenance without network access
         run: python -B -m unittest discover -s worker/test -p 'test_prepare_provider_artifact.py'
+      - name: Test guarded registry publication without network access
+        run: python -B -m unittest discover -s worker/test -p 'test_publish_provider_registry.py'
 
   runtime:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
     env:
       BUILD_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
@@ -93,6 +105,14 @@ jobs:
             (.durable_objects.bindings | length == 1) and (.workflows | length == 1) and
             ((has("d1_databases") or has("r2_buckets") or has("routes") or has("triggers") or has("services")) | not)' \
             "$RUNNER_TEMP/provider-private-config.json" > /dev/null
+      - name: Install the same pinned Skopeo used for publication
+        run: bash worker/tools/install_provider_skopeo.sh
+      - name: Verify the exact OCI archive with Skopeo offline
+        run: |
+          umask 077
+          sudo unshare --net --setgid="$(id -g)" --setuid="$(id -u)" -- \
+            /usr/bin/python3 -B worker/tools/verify_provider_skopeo.py \
+              "$RUNNER_TEMP/subs-bot-provider" "$RUNNER_TEMP"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: subs-bot-provider-${{ env.BUILD_REVISION }}-${{ github.run_attempt }}
