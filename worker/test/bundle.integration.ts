@@ -496,6 +496,27 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
     assert.deepEqual(sentBodies, [expectedPrivate, expectedGroup, expectedNext, prompt, confirmation, claimReply,
       added, summary, cleared]);
     assert.deepEqual(replies, []);
+
+    const ruleArgs = "Straße=合成路径标签";
+    const pathEvent = { update_id: 310, message: {
+      ...memberPrivate, message_id: 311, date: Math.floor(Date.now() / 1000), text: `/path ${ruleArgs}`,
+      from: { id: Number(policy.adminId), is_bot: false }, chat: { id: Number(policy.adminId), type: "private" },
+      entities: [{ type: "bot_command", offset: 0, length: 5 }],
+    } };
+    assert.equal((await post({ ...pathEvent, message: { ...pathEvent.message, chat: message.chat } })).status, 204);
+    const ruleSaved = expectSend(policy.adminId, 312, 311, "已保存路径规则。");
+    assert.deepEqual((await Promise.all([post(pathEvent), post(pathEvent)])).map((response) => response.status), [200, 200]);
+    await waitForReplies([10, 8, 9, 18, 20, 22, 24, 26, 28, 312], 3);
+    const rule = await db.prepare("SELECT id, owner_id, keyword, remark FROM path_rules").first<{
+      id: number; owner_id: string; keyword: string; remark: string;
+    }>();
+    assert.ok(rule);
+    assert.deepEqual(rule, { id: rule.id, owner_id: policy.adminId, keyword: "Straße", remark: "合成路径标签" });
+    const ruleList = expectSend(policy.adminId, 314, 313, `你的路径规则\n#${rule.id} Straße → 合成路径标签`);
+    assert.equal((await post({ update_id: 311, message: { ...pathEvent.message, message_id: 313, text: "/path" } })).status, 200);
+    await waitForReplies([10, 8, 9, 18, 20, 22, 24, 26, 28, 312, 314], 3);
+    assert.deepEqual(sentBodies.slice(-2), [ruleSaved, ruleList]);
+    assert.deepEqual(replies, []);
   } finally {
     await miniflare.dispose();
   }

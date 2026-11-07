@@ -14,6 +14,7 @@ import { runTelegramDocumentIntake } from "./telegram/document-intake.ts";
 import { acceptTelegramDocumentJob } from "./telegram/document-jobs.ts";
 import { reconcileTelegramDocumentJobReplies, retireTelegramDocumentStage } from "./telegram/document-persistence.ts";
 import { acceptTelegramLifecycle, reapTelegramLifecycle } from "./telegram/lifecycle-actions.ts";
+import { acceptTelegramPath } from "./telegram/path-management.ts";
 import { acceptTelegramPrivateClaim } from "./telegram/private-claims.ts";
 import { decodeTelegramRequest, parseTelegramPolicy } from "./telegram/protocol.ts";
 import { acceptTelegramCommand } from "./telegram/store.ts";
@@ -164,6 +165,11 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
       }
     } else if (decoded.temp) {
       const outcome = await acceptTelegramTemp(env.DB, policy, decoded.temp);
+      if (outcome === "accepted") {
+        ctx?.waitUntil(drainTelegramReplies(env.DB, env.NODES, policy, 4, 20_000).catch(() => undefined));
+      }
+    } else if (decoded.path) {
+      const outcome = await acceptTelegramPath(env.DB, policy, decoded.path);
       if (outcome === "accepted") {
         ctx?.waitUntil(drainTelegramReplies(env.DB, env.NODES, policy, 4, 20_000).catch(() => undefined));
       }
