@@ -37,6 +37,16 @@ export interface SnapshotPublication {
   expectedLifecycleRevision: number;
 }
 
+const stagedObjectKeys = Symbol("staged snapshot object keys");
+
+export interface StagedNodeSnapshot {
+  readonly id: number;
+  readonly snapshotId: string;
+  readonly manifestSha256: string;
+  readonly nodeCount: number;
+  readonly [stagedObjectKeys]: string[];
+}
+
 interface ChunkDescriptor {
   bytes: number;
   sha256: string;
@@ -167,24 +177,14 @@ async function discardUnpublished(bucket: R2Bucket, keys: string[]): Promise<voi
   }
 }
 
-export async function publishNodeSnapshot(
-  db: D1Database,
+/** Write an immutable candidate without changing any subscription pointer. */
+export async function stageNodeSnapshot(
   bucket: R2Bucket,
-  target: SnapshotPublication,
+  id: number,
   nodes: Iterable<NodeRecord> | AsyncIterable<NodeRecord>,
-): Promise<boolean> {
-  const { id, ownerId, expectedGeneration, expectedLifecycleRevision } = target;
-  checkOwnerId(ownerId);
-  if (!validInteger(id, 1) || !validInteger(expectedGeneration, 0, Number.MAX_SAFE_INTEGER - 1) ||
-      !validInteger(expectedLifecycleRevision, 0)) {
-    throw new RangeError("Invalid subscription version.");
-  }
-  const row = await db.prepare(`
-    SELECT id FROM subscriptions
-    WHERE id = ? AND owner_id = ? AND generation = ? AND ${SUBSCRIPTION_LIFECYCLE_REVISION} = ?
-  `).bind(id, ownerId, expectedGeneration, expectedLifecycleRevision).first<{ id: number }>();
-  if (!row) {
-    return false;
+): Promise<StagedNodeSnapshot> {
+  if (!validInteger(id, 1)) {
+    throw new RangeError("Invalid subscription ID.");
   }
 
   const snapshotId = crypto.randomUUID();
@@ -211,7 +211,6 @@ export async function publishNodeSnapshot(
     chunkNodes = 0;
   }
 
-  let manifestHash: string;
   try {
     for await (const node of nodes) {
       if (!isRecord(node)) {
@@ -245,26 +244,68 @@ export async function publishNodeSnapshot(
     await uploadChunk();
     const body = Uint8Array.from(encoder.encode(JSON.stringify(manifest)));
     const key = `${prefix}manifest.json`;
-    manifestHash = await putImmutable(bucket, key, body);
+    const manifestSha256 = await putImmutable(bucket, key, body);
     uploaded.push(key);
+    return Object.freeze({ id, snapshotId, manifestSha256, nodeCount, [stagedObjectKeys]: uploaded });
   } catch (error) {
     await discardUnpublished(bucket, uploaded);
     throw error;
   }
+}
 
-  // A failed or ambiguous D1 call may have committed. Only a confirmed CAS miss permits deletion.
-  const result = await db.prepare(`
+function checkPublicationTarget({ id, ownerId, expectedGeneration, expectedLifecycleRevision }: SnapshotPublication): void {
+  checkOwnerId(ownerId);
+  if (!validInteger(id, 1) || !validInteger(expectedGeneration, 0, Number.MAX_SAFE_INTEGER - 1) ||
+      !validInteger(expectedLifecycleRevision, 0)) {
+    throw new RangeError("Invalid subscription version.");
+  }
+}
+
+/** Prepare the pointer CAS for execution alone or as part of a D1 batch. */
+export function prepareNodeSnapshotPublication(
+  db: D1Database,
+  target: SnapshotPublication,
+  staged: StagedNodeSnapshot,
+): D1PreparedStatement {
+  checkPublicationTarget(target);
+  const { id, ownerId, expectedGeneration, expectedLifecycleRevision } = target;
+  if (staged.id !== id) {
+    throw new RangeError("Staged snapshot belongs to a different subscription.");
+  }
+  return db.prepare(`
     UPDATE subscriptions
     SET generation = generation + 1, snapshot_id = ?, manifest_sha256 = ?, node_count = ?,
         last_error = NULL, updated_at = ?
     WHERE id = ? AND owner_id = ? AND generation = ? AND ${SUBSCRIPTION_LIFECYCLE_REVISION} = ?
-  `).bind(snapshotId, manifestHash, nodeCount, Math.floor(Date.now() / 1000), id, ownerId,
-    expectedGeneration, expectedLifecycleRevision).run();
+  `).bind(staged.snapshotId, staged.manifestSha256, staged.nodeCount, Math.floor(Date.now() / 1000), id, ownerId,
+    expectedGeneration, expectedLifecycleRevision);
+}
+
+export async function publishNodeSnapshot(
+  db: D1Database,
+  bucket: R2Bucket,
+  target: SnapshotPublication,
+  nodes: Iterable<NodeRecord> | AsyncIterable<NodeRecord>,
+): Promise<boolean> {
+  const { id, ownerId, expectedGeneration, expectedLifecycleRevision } = target;
+  const version = { id, ownerId, expectedGeneration, expectedLifecycleRevision };
+  checkPublicationTarget(version);
+  const row = await db.prepare(`
+    SELECT id FROM subscriptions
+    WHERE id = ? AND owner_id = ? AND generation = ? AND ${SUBSCRIPTION_LIFECYCLE_REVISION} = ?
+  `).bind(id, ownerId, expectedGeneration, expectedLifecycleRevision).first<{ id: number }>();
+  if (!row) {
+    return false;
+  }
+
+  const staged = await stageNodeSnapshot(bucket, id, nodes);
+  // A failed or ambiguous D1 call may have committed. Only a confirmed CAS miss permits deletion.
+  const result = await prepareNodeSnapshotPublication(db, version, staged).run();
   if (!result.success) {
     throw new Error("Subscription snapshot publication failed.");
   }
   if (result.meta.changes === 0) {
-    await discardUnpublished(bucket, uploaded);
+    await discardUnpublished(bucket, staged[stagedObjectKeys]);
     return false;
   }
   return true;

@@ -7,7 +7,7 @@ import { Miniflare } from "miniflare";
 
 import {
   createSubscription, getOwnedSubscription, getSubscriptionSnapshot, MAX_CHUNK_BYTES, MAX_SNAPSHOT_BYTES,
-  publishNodeSnapshot, readSnapshotNodes, SnapshotIntegrityError,
+  prepareNodeSnapshotPublication, publishNodeSnapshot, readSnapshotNodes, SnapshotIntegrityError, stageNodeSnapshot,
 } from "../src/storage.ts";
 import type { NodeRecord, SubscriptionSnapshot } from "../src/storage.ts";
 
@@ -135,6 +135,72 @@ test("preserves the current snapshot when a refresh is empty, oversized, or fail
   assert.deepEqual(await loadPublished(token), current);
   assert.deepEqual(await collect(current), [previous]);
   assert.equal((await bucket.list({ prefix: `subscriptions/${id}/` })).objects.length, 2);
+});
+
+test("stages an invisible candidate and publishes its pointer inside a D1 batch", async () => {
+  const { id, token } = await create();
+  const initial = { id, ownerId: owner, expectedGeneration: 0, expectedLifecycleRevision: 0 };
+  assert.equal(await publishNodeSnapshot(db, bucket, initial, [{ name: "Previous" }]), true);
+  const previous = await loadPublished(token);
+  const target = { ...initial, expectedGeneration: previous.generation };
+  const node = { name: "Staged" };
+
+  const staged = await stageNodeSnapshot(bucket, id, [node]);
+  assert.equal(staged.nodeCount, 1);
+  assert.equal((await bucket.list({ prefix: `subscriptions/${id}/${staged.snapshotId}/` })).objects.length, 2);
+  assert.deepEqual(await loadPublished(token), previous);
+  assert.throws(() => prepareNodeSnapshotPublication(db, { ...target, id: id + 1 }, staged), /different subscription/u);
+  const wrongOwner = await prepareNodeSnapshotPublication(db, { ...target, ownerId: otherOwner }, staged).run();
+  assert.equal(wrongOwner.meta.changes, 0);
+
+  await assert.rejects(db.batch([
+    prepareNodeSnapshotPublication(db, target, staged),
+    db.prepare("UPDATE subscriptions SET node_count = -1 WHERE id = ?").bind(id),
+  ]));
+  assert.deepEqual(await loadPublished(token), previous);
+
+  const [published, readback] = await db.batch([
+    prepareNodeSnapshotPublication(db, target, staged),
+    db.prepare("SELECT snapshot_id AS snapshotId FROM subscriptions WHERE id = ?").bind(id),
+  ]);
+  assert.equal(published.meta.changes, 1);
+  assert.deepEqual(readback.results, [{ snapshotId: staged.snapshotId }]);
+  const current = await loadPublished(token);
+  assert.equal(current.generation, previous.generation + 1);
+  assert.equal(current.manifestSha256, staged.manifestSha256);
+  assert.deepEqual(await collect(current), [node]);
+  assert.deepEqual(await collect(previous), [{ name: "Previous" }]);
+});
+
+test("keeps staged objects when D1 commits the pointer but loses the acknowledgement", async () => {
+  const { id, token } = await create();
+  const initial = { id, ownerId: owner, expectedGeneration: 0, expectedLifecycleRevision: 0 };
+  assert.equal(await publishNodeSnapshot(db, bucket, initial, [{ name: "Previous" }]), true);
+  const previous = await loadPublished(token);
+  const uncertain = {
+    prepare(sql: string) {
+      const statement = db.prepare(sql);
+      if (!sql.includes("UPDATE subscriptions")) return statement;
+      return {
+        bind(...values: unknown[]) {
+          return {
+            async run() {
+              await statement.bind(...values).run();
+              throw new Error("Synthetic D1 acknowledgement loss");
+            },
+          };
+        },
+      };
+    },
+  } as unknown as D1Database;
+
+  const node = { name: "Committed" };
+  await assert.rejects(publishNodeSnapshot(uncertain, bucket, { ...initial, expectedGeneration: 1 }, [node]),
+    /Synthetic D1 acknowledgement loss/u);
+  const current = await loadPublished(token);
+  assert.equal(current.generation, 2);
+  assert.deepEqual(await collect(current), [node]);
+  assert.deepEqual(await collect(previous), [{ name: "Previous" }]);
 });
 
 test("concurrent publishers use a single D1 CAS winner and keep the previous immutable version", { timeout: 20_000 }, async () => {
