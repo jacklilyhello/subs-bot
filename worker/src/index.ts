@@ -17,6 +17,7 @@ import { runTelegramDocumentIntake } from "./telegram/document-intake.ts";
 import { acceptTelegramDocumentJob } from "./telegram/document-jobs.ts";
 import { reconcileTelegramDocumentJobReplies, retireTelegramDocumentStage } from "./telegram/document-persistence.ts";
 import { acceptTelegramLifecycle, reapTelegramLifecycle } from "./telegram/lifecycle-actions.ts";
+import { acceptTelegramBulkTrash, telegramBulkTrashReady } from "./telegram/bulk-trash.ts";
 import { acceptTelegramInlineSort, telegramInlineSortReady } from "./telegram/inline-sort.ts";
 import { acceptTelegramInlineConsent, telegramInlineSearchReady } from "./telegram/inline-search-consent.ts";
 import { answerTelegramInlineSearch, reapTelegramInlineSearch } from "./telegram/inline-search.ts";
@@ -131,8 +132,9 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
     const subscriptionNodes = subscriptionRead && await telegramSubscriptionNodePagesReady(env.DB);
     const providerEnabled = await telegramProviderUrlReady(env);
     const inlineConsent = inlineSearchEnabled && await telegramInlineSearchReady(env.DB);
+    const bulkTrash = await telegramBulkTrashReady(env.DB);
     const drain = () => ctx?.waitUntil(drainTelegramReplies(env.DB, env.NODES, policy, 4, 20_000, fetch, aggregateKey, privateShare,
-      subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerEnabled, inlineConsent).catch(() => undefined));
+      subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerEnabled, bulkTrash, inlineConsent).catch(() => undefined));
     if (decoded.command) {
       await acceptTelegramCommand(env.DB, policy, decoded.command);
       drain();
@@ -184,6 +186,11 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
     } else if (decoded.inlineSort) {
       if (!inlineSort) return new Response(null, { status: 204, headers: HEADERS });
       if (await acceptTelegramInlineSort(env.DB, policy, decoded.inlineSort) === "accepted") drain();
+    } else if (decoded.bulkTrash) {
+      if (!bulkTrash) return new Response(null, { status: 204, headers: HEADERS });
+      const outcome = await acceptTelegramBulkTrash(env.DB, policy, decoded.bulkTrash);
+      if (decoded.bulkTrash.kind === "confirm") ctx?.waitUntil(answerTelegramCallback(policy, decoded.bulkTrash.callbackId));
+      if (outcome === "accepted") drain();
     } else if (decoded.inlineConsent) {
       if (!inlineConsent) return new Response(null, { status: 204, headers: HEADERS });
       if (await acceptTelegramInlineConsent(env.DB, policy, decoded.inlineConsent) === "accepted") drain();
@@ -306,9 +313,10 @@ async function recoverTelegramWork(env: Env, policy: TelegramPolicy, pin: Provid
   const subscriptionNodes = subscriptionRead && await telegramSubscriptionNodePagesReady(env.DB);
   const inlineSearchSchema = await telegramInlineSearchReady(env.DB);
   const inlineConsent = inlineSearchSchema && env.TELEGRAM_INLINE_SEARCH === "1";
+  const bulkTrash = await telegramBulkTrashReady(env.DB);
   const drain = (limit: number, budget: number) =>
     drainTelegramReplies(env.DB, env.NODES, policy, limit, budget, fetch, aggregateKey, privateShare,
-      subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerEnabled, inlineConsent);
+      subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerEnabled, bulkTrash, inlineConsent);
   const replies = async () => {
     await drain(10, 45_000);
     await reapTelegramViewTickets(env.DB);
