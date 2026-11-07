@@ -62,6 +62,7 @@ export type TelegramSubscriptionNodeUpdate = TelegramEventScope & { callbackId: 
 export type TelegramInlineSortMode = "default" | "traffic" | "expiry" | "name";
 type TelegramInlineSortAction = { kind: "current" | "usage" } | { kind: "set"; mode: TelegramInlineSortMode };
 export type TelegramInlineSortUpdate = TelegramEventScope & TelegramInlineSortAction;
+export type TelegramGitHubSearchUpdate = TelegramEventScope & { args: string };
 
 type ExistingUpdate =
   | { command: TelegramCommand; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; aggregate?: never; path?: never; document?: never; selected?: never }
@@ -83,8 +84,10 @@ type ShortLinkUpdate = (SubscriptionUpdate & { shortLink?: never })
 
 type InlineSortUpdate = (ShortLinkUpdate & { inlineSort?: never })
   | ({ inlineSort: TelegramInlineSortUpdate } & Partial<Record<keyof ShortLinkUpdate, never>>);
-type NormalizedUpdate = (InlineSortUpdate & { subscriptionNodes?: never })
+type SubscriptionNodeUpdate = (InlineSortUpdate & { subscriptionNodes?: never })
   | ({ subscriptionNodes: TelegramSubscriptionNodeUpdate } & Partial<Record<keyof InlineSortUpdate, never>>);
+type NormalizedUpdate = (SubscriptionNodeUpdate & { githubSearch?: never })
+  | ({ githubSearch: TelegramGitHubSearchUpdate } & Partial<Record<keyof SubscriptionNodeUpdate, never>>);
 
 type DecodedTelegramRequest =
   | ({ status: 200 } & NormalizedUpdate)
@@ -196,7 +199,7 @@ function messageCommand(
   message: Record<string, unknown>, policy: TelegramPolicy,
 ): TelegramCommand["command"] | TelegramViewKind | "temp-raw" | "temp-summary" | "temp-clear" | "aggregate-show" | "aggregate-revoke" |
   { code: string } | { args: string } | { shareArgs: string } | { selectedQuery: string } | { subscriptionQuery: string } | { shortArgs: string } |
-  { inlineSort: TelegramInlineSortAction } | null {
+  { inlineSort: TelegramInlineSortAction } | { githubArgs: string } | null {
   const { text, entities } = message;
   if (typeof text !== "string" || !Array.isArray(entities)) return null;
   const commands = entities.filter((entity) => isRecord(entity) && entity.type === "bot_command" && entity.offset === 0);
@@ -216,6 +219,7 @@ function messageCommand(
   if (commandName === "path") return { args: remainder };
   if (commandName === "o") return { selectedQuery: remainder };
   if (commandName === "short") return { shortArgs: remainder };
+  if (commandName === "g") return { githubArgs: remainder };
   if (commandName === "s") return { subscriptionQuery: remainder };
   if (commandName === "share") return remainder.length <= 4096 ? { shareArgs: remainder } : null;
   if (commandName === "i") {
@@ -341,6 +345,7 @@ function normalizeMessage(
     if ("subscriptionQuery" in command) return { subscriptionRead: { ...scope, kind: "search", query: command.subscriptionQuery } };
     if (scope.chatType !== "private" || scope.threadId !== null) return null;
     if ("inlineSort" in command) return { inlineSort: { ...scope, ...command.inlineSort } };
+    if ("githubArgs" in command) return { githubSearch: { ...scope, args: command.githubArgs } };
     if ("shortArgs" in command) return { shortLink: { ...scope, args: command.shortArgs } };
     if ("shareArgs" in command) {
       const sender = isRecord(message.from) ? [message.from.first_name, message.from.last_name]

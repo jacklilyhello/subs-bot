@@ -78,7 +78,8 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 | `/short` 显示帮助，`短链 URL`、`short URL` 及详情按钮签发短链。`/s/{code}` 按已保存目标跳转，可选外部服务包装同一受控本地链接。 | 私聊签发和撤销普通 HTTP(S) 短链，兼容聚合重定向。验收旧短码、归属、撤销、缓存与命名空间冲突。单订阅详情入口和可信外部服务另行接入。 |
 | `/path` 和菜单维护路径对应，支持添加、删除和清空，受限文本入口接受 `关键词=备注`。 | HTTP 导出已应用所有者路径规则，临时节点保留原名。私聊 `/path` 已接入显式添加、删除、清空和分页。验收两账号隔离与迟到操作，菜单、独立自由文本和旧规则导入分别接入。 |
 | `@Bot [关键词]` 搜索并发送订阅及临时节点，`/i` 切换默认、流量、到期和名称排序。`Share` 支持自定义内容或匹配订阅、指定接收人、份数和有效期；选中反馈用于更新原卡。 | 私密创建和领取已接入私聊 `/share`、`/start claim_<code>`。隔离工作流核对实际双账号回执、正文、过期、指定用户、并发与重复领取。`0020` 增加私聊 `/i`，可查看并持久保存四种排序偏好。内联搜索和分享卡片分别接入。Telegram 内联查询只提供聊天类型，无法核对指定群 ID。 [Telegram InlineQuery](https://core.telegram.org/bots/api#inlinequery) |
-| `/g` 查 GitHub 仓库和公开代码，代码无结果时查询 grep.app，必要时提供 GitHub 网页搜索入口。`/ai` 接受 API 地址和 Key，探测 OpenAI 兼容端点的状态和延迟。 | 两项各自接入和验收。GitHub 凭据只发送至 GitHub。`/ai` 按固定范围验证用户提供的地址，禁用重定向，保护 Key 和上游响应。 |
+| `/g` 查 GitHub 仓库和公开代码，代码无结果时查询 grep.app，必要时提供 GitHub 网页搜索入口。 | `0027` 接入指定账号的私聊公开仓库搜索和固定 GitHub 网页代码搜索按钮。服务端代码搜索和 Grep 集成分别验收。 [GitHub 搜索 API](https://docs.github.com/en/rest/search/search) · [Grep 条款](https://grep.app/terms) |
+| `/ai` 接受 API 地址和 Key，探测 OpenAI 兼容端点的状态和延迟。 | 按固定范围验证用户提供的地址，禁用重定向，保护 Key 和上游响应。 |
 | `/health`、单订阅、聚合和短链 HTTP 路由。旧服务默认使用 Clash，支持 Base64、Sing-box、Surge 和 QX 系列。 | 按本页 HTTP 表验收格式、别名、顺序、字节、失败状态及旧能力链接。托管配置校验、真实隔离 HTTP 响应和客户端导入分别记录。 |
 | 旧服务使用长轮询，启动时清理过期分享和旧回收记录，刷新由用户操作触发。 | 已接入 Webhook 和 Telegram 恢复 Cron。订阅批处理和生产数据回收另行验收，回收前核对备份、活动指针及回滚引用。 |
 
@@ -104,6 +105,12 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 - 私聊 `/temp` 查看计数和受理时已有的原始 URI。短回复使用无链接预览的纯文本，较长回复用单个 UTF-8 `temporary-nodes.txt` 附件，顺序与重复项保持原样。回复前重新核对当前授权、清空边界和批次身份。确定未送达的限流重试仍读取原有批次，送达不明时保留回执以防自动重发。新回执只存状态、数量及权限和清空版本。 [Telegram `sendMessage`](https://core.telegram.org/bots/api#sendmessage) · [Telegram `sendDocument`](https://core.telegram.org/bots/api#senddocument)
 - 已授权用户可以在私聊上传 TXT、LOG、YAML 或 JSON 文件导入命名订阅。纯文本支持原始节点和 Base64。每个文件上限 10 MiB 和 500 个节点，超过限制或含无法支持的节点时整批拒绝。订阅提供方 URL 的识别和刷新由独立出网阶段接入。
 - `0011` 的私聊任务在 webhook 内持久入库，由 Cron 每轮最多领取一件。`0012` 在写入 R2 前记录候选快照，按所有者、文件名、较新消息、授权版本、租约和订阅版本复核发布。成功时在同一 D1 事务中更新快照指针并写入完成回执。同名导入保留现有 ID 和访问令牌。失败保留上一份有效快照，文件 ID 及文件名在任务终止时清除。只有已超出 Cron 最长执行窗口且活动表和回收站均未引用的候选可回收。
+
+### 私聊 GitHub 搜索
+
+现有隔离 Telegram 策略与 `0027` 的准确迁移登记共同启用 `/g 关键词`。命令向 GitHub 发送最多 120 个字符和 256 字节的关键词及受支持限定词。每个账号每 15 秒最多发起一次查找，每次固定向 GitHub 发出一条匿名仓库搜索请求，限时 5 秒，关闭重定向。按星标显示至多五个已验证的公开仓库。代码搜索按钮打开固定 GitHub 网页，由用户自己的 GitHub 会话访问。 [GitHub 仓库搜索](https://docs.github.com/en/rest/search/search#search-repositories) · [GitHub 网页代码搜索](https://docs.github.com/en/search-github/github-code-search/using-github-code-search)
+
+查找期间只保留去重回执、短租约和授权版本。关键词只在当前调用中使用。查找结束后保存回复所需的仓库名称及星标，并在定时恢复中清理已送达、已失效或超过回复窗口的结果。中断的查找由 Cron 提供固定网页入口，已接收的其他命令可继续发送。发送前复核当前授权，明确限流后可重试，结果不明时保留回执。托管测试使用合成的 GitHub 和 Bot 响应。真人验收另用两名指定账号和测试 Bot 各执行一次公开关键词查询，并在已批准群确认同一命令不会产生查找。
 
 ### 订阅搜索、详情和格式链接
 
