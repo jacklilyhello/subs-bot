@@ -113,6 +113,18 @@ class SelectedAcceptanceTests(unittest.TestCase):
         self.revoke("admin-first")
         self.capture("capture-independence", {"admin-second": second})
 
+    def test_quiet_checks_only_the_exact_actors_on_the_new_provider_queue(self):
+        ids = [row["id"] for row in self.cohort.subscriptions().values()]
+        for actor in ("881004", POLICY["adminId"]):
+            self.cloud.db.execute("""INSERT INTO telegram_provider_jobs
+                (owner_id,request_key,kind,subscription_id,source_sha256,expected_generation,expected_lifecycle_revision,
+                 state,created_at,due_at,expires_at) VALUES (?,?,'refresh',1,?,0,0,'pending',1,1,10)""",
+                (actor, "a" * 64, "b" * 64))
+            if actor != POLICY["adminId"]:
+                self.cohort.require_quiet(ids)
+        with self.assertRaisesRegex(FixtureError, "unrelated or in-flight"):
+            self.cohort.require_quiet(ids)
+
     def test_complete_cohort_preserves_receipts_and_link_tombstones(self):
         self.independent()
         first = [item for item in self.probed if item[0] == "admin-first" and item[1]]

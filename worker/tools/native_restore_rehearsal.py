@@ -607,8 +607,9 @@ def quiet_expression(tables, observed_at=None):
         "NOT EXISTS(SELECT 1 FROM telegram_aggregate_slots WHERE code_sha256 IS NOT NULL)",
     ]
     waits = ["telegram_rename_wait", "telegram_view_ticket", "telegram_lifecycle_ticket"]
-    if "subscription_provider_jobs" in tables:
-        conditions.append("NOT EXISTS(SELECT 1 FROM subscription_provider_jobs WHERE state IN ('pending','leased'))")
+    for table in ("subscription_provider_jobs", "telegram_provider_jobs"):
+        if table in tables:
+            conditions.append(f"NOT EXISTS(SELECT 1 FROM {table} WHERE state IN ('pending','leased'))")
     if "telegram_private_share_creations" in tables:
         conditions.append("NOT EXISTS(SELECT 1 FROM telegram_private_share_creations WHERE state='reserved' OR (state='abandoned' AND cleaned_at IS NULL))")
     if "telegram_selected_links" in tables:
