@@ -7,6 +7,7 @@ import {
   prepareTelegramLifecycleTickets, renderTelegramLifecycle, type TelegramLifecycleButton,
 } from "./lifecycle-actions.ts";
 import { inTelegramScope, type TelegramPolicy } from "./protocol.ts";
+import { closeUnsentTelegramBulkTrashReply, confirmTelegramBulkTrashSend, renderTelegramBulkTrash } from "./bulk-trash.ts";
 import { renderTelegramPath } from "./path-management.ts";
 import { beginTelegramPrivateClaim, prepareTelegramPrivateClaim } from "./private-claims.ts";
 import { resolveTelegramPrivateShareCreationReply } from "./private-share-creation.ts";
@@ -16,7 +17,7 @@ import {
   type TelegramSubscriptionReadButton,
 } from "./subscription-read.ts";
 import {
-  beginTelegramAggregateLinkReply, beginTelegramPrivateShareCreationReply,
+  beginTelegramAggregateLinkReply, beginTelegramBulkTrashReply, beginTelegramPrivateShareCreationReply,
   beginTelegramSelectedLinkReply, beginTelegramReply, claimTelegramReply, isTelegramMemberAllowed,
   beginTelegramTempRawReply,
   prepareTelegramPrivateClaimBegin, reapExpiredTelegramReplies, settleTelegramReply,
@@ -120,7 +121,8 @@ export async function sendTelegramReply(
   keyboard?: InlineKeyboard,
   forceReply = false,
 ): Promise<TelegramReplyOutcome> {
-  if ((lease.path || lease.privateShareCreation || lease.tempRaw) && (lease.chatType !== "private" || lease.threadId !== null)) {
+  if ((lease.path || lease.privateShareCreation || lease.tempRaw || lease.bulkTrash)
+    && (lease.chatType !== "private" || lease.threadId !== null)) {
     return { kind: "failed" };
   }
   return sendTelegram(policy, lease, "sendMessage", {
@@ -318,14 +320,31 @@ export async function drainTelegramReplies(
   aggregateKey: CryptoKey | null = null,
   privateShareRuntime: TelegramPrivateShareRuntime = PRIVATE_SHARE_DISABLED,
   subscriptionReadEnabled = false,
+  bulkTrashEnabled = false,
 ): Promise<void> {
   const deadline = Date.now() + budgetMs;
   const privateShareEnabled = privateShareRuntime.schemaReady && privateShareRuntime.context !== null;
-  await reapExpiredTelegramReplies(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled);
+  await reapExpiredTelegramReplies(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled, bulkTrashEnabled);
   for (let processed = 0; processed < limit && Date.now() < deadline; processed += 1) {
-    const lease = await claimTelegramReply(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled);
+    const lease = await claimTelegramReply(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled, bulkTrashEnabled);
     if (!lease) return;
     if (!inTelegramScope(policy, lease)) continue;
+    if (lease.bulkTrash) {
+      const prepared = await renderTelegramBulkTrash(db, policy, lease);
+      if (Date.now() >= deadline) continue;
+      if (!prepared || !await beginTelegramBulkTrashReply(db, policy, lease, prepared.guard, prepared.ticket?.sha256)) {
+        await closeUnsentTelegramBulkTrashReply(db, policy, lease);
+        continue;
+      }
+      if (!await confirmTelegramBulkTrashSend(db, policy, lease, prepared.guard, prepared.ticket?.sha256) || Date.now() >= deadline) {
+        await settleTelegramReply(db, policy, lease, { kind: "failed" });
+        continue;
+      }
+      const keyboard = prepared.ticket ? [[{ text: "确认移入回收站", callback_data: prepared.ticket.token }]] : undefined;
+      const outcome = await sendTelegramReply(policy, lease, prepared.text, Math.max(1, deadline - Date.now()), request, keyboard);
+      await settleTelegramReply(db, policy, lease, outcome);
+      continue;
+    }
     if (lease.tempRaw) {
       await deliverTelegramTempRaw(db, policy, lease, deadline, request);
       continue;

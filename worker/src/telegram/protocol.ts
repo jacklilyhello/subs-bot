@@ -56,6 +56,10 @@ export type TelegramSubscriptionReadUpdate = TelegramEventScope & (
   | { kind: "number"; position: number }
   | { kind: "callback"; callbackId: string; ticket: string }
 );
+export type TelegramBulkTrashUpdate = TelegramEventScope & (
+  | { kind: "preview"; query: string }
+  | { kind: "confirm"; callbackId: string; ticket: string }
+);
 
 type ExistingUpdate =
   | { command: TelegramCommand; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; aggregate?: never; path?: never; document?: never; selected?: never }
@@ -71,8 +75,11 @@ type ExistingUpdate =
 type CurrentUpdate = (ExistingUpdate & { privateShareCreation?: never })
   | ({ privateShareCreation: TelegramPrivateShareCreationUpdate } & Partial<Record<keyof ExistingUpdate, never>>);
 
-type NormalizedUpdate = (CurrentUpdate & { subscriptionRead?: never })
+type SubscriptionUpdate = (CurrentUpdate & { subscriptionRead?: never })
   | ({ subscriptionRead: TelegramSubscriptionReadUpdate } & Partial<Record<keyof CurrentUpdate, never>>);
+
+type NormalizedUpdate = (SubscriptionUpdate & { bulkTrash?: never })
+  | ({ bulkTrash: TelegramBulkTrashUpdate } & Partial<Record<keyof SubscriptionUpdate, never>>);
 
 type DecodedTelegramRequest =
   | ({ status: 200 } & NormalizedUpdate)
@@ -91,6 +98,7 @@ const VIEW_TICKET = /^sbv1_[A-Za-z0-9_-]{22}(?![\s\S])/;
 const LIFECYCLE_TICKET = /^sba1_[A-Za-z0-9_-]{22}(?![\s\S])/;
 const SELECTED_TICKET = /^sbo1_[A-Za-z0-9_-]{22}(?![\s\S])/;
 export const SUBSCRIPTION_READ_TICKET = /^sbr1_[A-Za-z0-9_-]{22}(?![\s\S])/;
+export const BULK_TRASH_TICKET = /^sbd1_[A-Za-z0-9_-]{22}(?![\s\S])/;
 const RENAME_CANCEL = /^(?:\/cancel|cancel|取消|退出)(?![\s\S])/iu;
 const PRIVATE_CLAIM = /^claim_([A-Za-z0-9_-]{11}|[A-Za-z0-9_-]{22})(?![\s\S])/u;
 const NON_HUMAN_MESSAGE_FIELDS = [
@@ -181,7 +189,8 @@ function authCommand(args: string[], reply: unknown, memberId: string): Telegram
 function messageCommand(
   message: Record<string, unknown>, policy: TelegramPolicy,
 ): TelegramCommand["command"] | TelegramViewKind | "temp-raw" | "temp-summary" | "temp-clear" | "aggregate-show" | "aggregate-revoke" |
-  { code: string } | { args: string } | { shareArgs: string } | { selectedQuery: string } | { subscriptionQuery: string } | null {
+  { code: string } | { args: string } | { shareArgs: string } | { selectedQuery: string } | { subscriptionQuery: string } |
+  { bulkTrashQuery: string } | null {
   const { text, entities } = message;
   if (typeof text !== "string" || !Array.isArray(entities)) return null;
   const commands = entities.filter((entity) => isRecord(entity) && entity.type === "bot_command" && entity.offset === 0);
@@ -195,12 +204,13 @@ function messageCommand(
   const [, name, addressedTo] = entity;
   if (addressedTo && addressedTo.toLowerCase() !== policy.botUsername.toLowerCase()) return null;
   const commandName = name.toLowerCase();
-  const separator = commandName === "path" || commandName === "o" || commandName === "s" ? PATH_RULE_WHITESPACE_PREFIX
+  const separator = commandName === "path" || commandName === "o" || commandName === "s" || commandName === "d" ? PATH_RULE_WHITESPACE_PREFIX
     : commandName === "share" ? /^[ \t\r\n]/u : /^\s/u;
   if (remainder !== "" && !separator.test(remainder)) return null;
   if (commandName === "path") return { args: remainder };
   if (commandName === "o") return { selectedQuery: remainder };
   if (commandName === "s") return { subscriptionQuery: remainder };
+  if (commandName === "d") return { bulkTrashQuery: remainder };
   if (commandName === "share") return remainder.length <= 4096 ? { shareArgs: remainder } : null;
   const args = remainder.trim().split(/\s+/u).filter(Boolean);
   switch (commandName) {
@@ -314,6 +324,7 @@ function normalizeMessage(
   if (command && typeof command === "object") {
     if ("subscriptionQuery" in command) return { subscriptionRead: { ...scope, kind: "search", query: command.subscriptionQuery } };
     if (scope.chatType !== "private" || scope.threadId !== null) return null;
+    if ("bulkTrashQuery" in command) return { bulkTrash: { ...scope, kind: "preview", query: command.bulkTrashQuery } };
     if ("shareArgs" in command) {
       const sender = isRecord(message.from) ? [message.from.first_name, message.from.last_name]
         .filter((part): part is string => typeof part === "string" && part.length <= 128).join(" ") : "";
@@ -356,6 +367,8 @@ function normalizeCallback(
   const scope = messageScope(message, String(actor.id), updateId, policy);
   if (!scope) return null;
   if (SUBSCRIPTION_READ_TICKET.test(ticket)) return { subscriptionRead: { ...scope, kind: "callback", callbackId, ticket } };
+  if (BULK_TRASH_TICKET.test(ticket)) return scope.chatType === "private" && scope.threadId === null
+    ? { bulkTrash: { ...scope, kind: "confirm", callbackId, ticket } } : null;
   if (SELECTED_TICKET.test(ticket)) return scope.chatType === "private" && scope.threadId === null
     ? { selected: { ...scope, kind: "selected-revoke", callbackId, ticket } } : null;
   if (VIEW_TICKET.test(ticket)) return { view: { ...scope, kind: "callback", callbackId, ticket } };
