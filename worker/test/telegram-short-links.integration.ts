@@ -201,7 +201,7 @@ test("emitted Worker issues, retries and revokes owned short links without overl
         chatType: "private" as const, threadId: null, messageDate: now() };
     };
     assert.equal(await acceptTelegramShortLink(db, policy, intent(destination), importedKey), "accepted");
-    const authLease = await claimTelegramReply(db, policy.botId, false, false, true);
+    const authLease = await claimTelegramReply(db, policy.botId, false, false, false, true);
     assert.ok(authLease?.shortLink);
     const authPrepared = await prepareTelegramShortLinkReply(db, policy, authLease, importedKey);
     assert.equal(authPrepared.kind, "link");
@@ -216,7 +216,7 @@ test("emitted Worker issues, retries and revokes owned short links without overl
     await checkRoute("/s/" + authCode, null);
 
     assert.equal(await acceptTelegramShortLink(db, policy, intent(destination), importedKey), "accepted");
-    const lease = await claimTelegramReply(db, policy.botId, false, false, true);
+    const lease = await claimTelegramReply(db, policy.botId, false, false, false, true);
     assert.ok(lease?.shortLink);
     const prepared = await prepareTelegramShortLinkReply(db, policy, lease, importedKey);
     assert.equal(prepared.kind, "link");

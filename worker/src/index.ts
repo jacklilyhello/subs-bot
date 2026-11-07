@@ -1,9 +1,7 @@
 import { AggregateLimitError, getAggregateNodeSource, hasAggregateLink } from "./aggregate.ts";
 import { normalShortLinksReady, resolveShortLocation } from "./short-links.ts";
-import { SnapshotIntegrityError, type ExportNodeSource, type NodeRecord } from "./storage.ts";
 import { getSubscriptionNodeSource, PathRuleContentError } from "./path-rules.ts";
-import { isValidStoredShare } from "./stored-share.ts";
-import { serializeStructuredShare } from "./structured-share.ts";
+import { base64Chunks, ExportContentError, planBase64 } from "./base64-response.ts";
 import { ClashContentError } from "./clash-export.ts";
 import { clashChunks, planClash } from "./clash-response.ts";
 import { SingBoxContentError } from "./singbox-export.ts";
@@ -29,6 +27,7 @@ import { acceptTelegramCommand } from "./telegram/store.ts";
 import { acceptTelegramTemp } from "./telegram/temp-import.ts";
 import { acceptTelegramView, reapTelegramViewTickets } from "./telegram/views.ts";
 import { acceptTelegramShortLink, reapFailedTelegramShortLinks } from "./telegram/short-link-actions.ts";
+import { acceptTelegramSubscriptionRead, reapTelegramSubscriptionReadTickets, telegramSubscriptionReadReady } from "./telegram/subscription-read.ts";
 
 export interface Env {
   DB: D1Database;
@@ -39,9 +38,6 @@ export interface Env {
   TELEGRAM_PRIVATE_SHARE_CREATION_KEY?: string;
 }
 
-const MAX_SHARE_BYTES = 16 * 1024 * 1024;
-// Every complete chunk ends on a Base64 group boundary.
-const SHARE_CHUNK_BYTES = 24 * 1024;
 const QX_KINDS = new Set(["qx", "quantumult", "quantumultx"]);
 const EXPORT_KINDS = new Set(["base64", "v2ray", "mixed", "singbox", "sing-box", "clash", "surge", ...QX_KINDS]);
 const SUBSCRIPTION_PATH = /^\/sub\/([A-Za-z0-9_-]{16,128})(?:\/([A-Za-z0-9-]{1,32}))?$/;
@@ -58,59 +54,6 @@ function plain(text: string, status: number, head: boolean, headers?: HeadersIni
   for (const [name, value] of Object.entries(HEADERS)) responseHeaders.set(name, value);
   responseHeaders.set("Content-Type", "text/plain; charset=utf-8");
   return new Response(head ? null : text, { status, headers: responseHeaders });
-}
-
-class ExportContentError extends Error {}
-
-function shareLine(node: NodeRecord): string {
-  const stored = node.share;
-  if (stored === undefined || stored === null || stored === "") {
-    const generated = serializeStructuredShare(node);
-    if (generated !== null) return generated;
-  } else if (isValidStoredShare(stored)) {
-    return stored;
-  }
-  throw new ExportContentError();
-}
-
-async function* shareBytes(
-  source: ExportNodeSource, signal?: AbortSignal,
-): AsyncGenerator<Uint8Array> {
-  const encoder = new TextEncoder();
-  let total = 0;
-  let count = 0;
-
-  for await (const node of source.read(signal)) {
-    count += 1;
-    const share = shareLine(node);
-    const line = encoder.encode(total === 0 ? share : `\n${share}`);
-    total += line.length;
-    if (total > MAX_SHARE_BYTES) throw new ExportContentError();
-    yield line;
-  }
-  if (!signal?.aborted && count !== source.nodeCount) throw new SnapshotIntegrityError();
-}
-
-async function* base64Chunks(
-  source: ExportNodeSource, signal: AbortSignal,
-): AsyncGenerator<Uint8Array> {
-  const encoder = new TextEncoder();
-  const chunk = new Uint8Array(SHARE_CHUNK_BYTES);
-  let offset = 0;
-
-  for await (const line of shareBytes(source, signal)) {
-    for (let start = 0; start < line.length;) {
-      const length = Math.min(line.length - start, chunk.length - offset);
-      chunk.set(line.subarray(start, start + length), offset);
-      start += length;
-      offset += length;
-      if (offset === chunk.length) {
-        yield encoder.encode(btoa(String.fromCharCode(...chunk)));
-        offset = 0;
-      }
-    }
-  }
-  if (offset !== 0) yield encoder.encode(btoa(String.fromCharCode(...chunk.subarray(0, offset))));
 }
 
 function fixedLengthBody(
@@ -154,8 +97,9 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
     const aggregateKey = await parseTelegramAggregateKey(env.TELEGRAM_AGGREGATE_KEY);
     const privateShare = await telegramPrivateShareRuntime(env.DB, env.TELEGRAM_PRIVATE_SHARE_CREATION_KEY);
     const shortLinks = await normalShortLinksReady(env.DB);
+    const subscriptionRead = await telegramSubscriptionReadReady(env.DB);
     const drain = () => ctx?.waitUntil(drainTelegramReplies(env.DB, env.NODES, policy, 4, 20_000, fetch, aggregateKey, privateShare,
-      shortLinks).catch(() => undefined));
+      subscriptionRead, shortLinks).catch(() => undefined));
     if (decoded.command) {
       await acceptTelegramCommand(env.DB, policy, decoded.command);
       drain();
@@ -203,6 +147,13 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
     } else if (decoded.shortLink) {
       if (!shortLinks) return new Response(null, { status: 204, headers: HEADERS });
       if (await acceptTelegramShortLink(env.DB, policy, decoded.shortLink, aggregateKey) === "accepted") drain();
+    } else if (decoded.subscriptionRead) {
+      if (!subscriptionRead) return new Response(null, { status: 204, headers: HEADERS });
+      const outcome = await acceptTelegramSubscriptionRead(env.DB, policy, decoded.subscriptionRead);
+      if (decoded.subscriptionRead.kind === "callback") {
+        ctx?.waitUntil(answerTelegramCallback(policy, decoded.subscriptionRead.callbackId));
+      }
+      if (outcome === "accepted") drain();
     } else if (decoded.privateShareCreation) {
       if (!privateShare.context) return new Response(null, { status: 204, headers: HEADERS });
       const input = decoded.privateShareCreation;
@@ -282,12 +233,8 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
       ), { headers: { ...HEADERS, "Content-Type": "text/plain; charset=utf-8" } });
     }
     // Measure and verify the source before returning success, without retaining its content.
-    let shareLength = 0;
-    for await (const line of shareBytes(source)) shareLength += line.byteLength;
-    if (shareLength === 0) return plain("Subscription temporarily unavailable.", 503, head);
-    const body = head ? null : fixedLengthBody(
-      (signal) => base64Chunks(source, signal), 4 * Math.ceil(shareLength / 3),
-    );
+    const length = await planBase64(source);
+    const body = head ? null : fixedLengthBody((signal) => base64Chunks(source, signal), length);
     return new Response(body, {
       headers: { ...HEADERS, "Content-Type": "text/plain; charset=utf-8" },
     });
@@ -306,11 +253,13 @@ async function recoverTelegramWork(_controller: ScheduledController, env: Env): 
   const aggregateKey = await parseTelegramAggregateKey(env.TELEGRAM_AGGREGATE_KEY);
   const privateShare = await telegramPrivateShareRuntime(env.DB, env.TELEGRAM_PRIVATE_SHARE_CREATION_KEY);
   const shortLinks = await normalShortLinksReady(env.DB);
+  const subscriptionRead = await telegramSubscriptionReadReady(env.DB);
   const replies = async () => {
-    await drainTelegramReplies(env.DB, env.NODES, policy, 10, 45_000, fetch, aggregateKey, privateShare, shortLinks);
+    await drainTelegramReplies(env.DB, env.NODES, policy, 10, 45_000, fetch, aggregateKey, privateShare, subscriptionRead, shortLinks);
     await reapTelegramViewTickets(env.DB);
     await reapTelegramLifecycle(env.DB);
     if (aggregateKey) await reapTelegramSelected(env.DB);
+    if (subscriptionRead) await reapTelegramSubscriptionReadTickets(env.DB);
     if (shortLinks) await reapFailedTelegramShortLinks(env.DB, policy.botId);
   };
   const documents = async () => {
@@ -319,12 +268,14 @@ async function recoverTelegramWork(_controller: ScheduledController, env: Env): 
       claimed = await runTelegramDocumentIntake(env.DB, env.NODES, policy);
     } finally {
       const reconciled = await reconcileTelegramDocumentJobReplies(env.DB, policy);
-      if (claimed || reconciled > 0) await drainTelegramReplies(env.DB, env.NODES, policy, 4, 15_000, fetch, aggregateKey, privateShare, shortLinks);
+      if (claimed || reconciled > 0) {
+        await drainTelegramReplies(env.DB, env.NODES, policy, 4, 15_000, fetch, aggregateKey, privateShare, subscriptionRead, shortLinks);
+      }
     }
   };
   const creations = async () => {
     if (privateShare.context && await recoverTelegramPrivateShareCreation(env.DB, env.NODES, policy, privateShare.context) === "published") {
-      await drainTelegramReplies(env.DB, env.NODES, policy, 4, 15_000, fetch, aggregateKey, privateShare, shortLinks);
+      await drainTelegramReplies(env.DB, env.NODES, policy, 4, 15_000, fetch, aggregateKey, privateShare, subscriptionRead, shortLinks);
     }
   };
   const results = await Promise.allSettled([replies(), documents(), creations(), retireTelegramDocumentStage(env.DB, env.NODES, policy),

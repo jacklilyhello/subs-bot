@@ -273,7 +273,8 @@ test("dispatches temporary-node commands and ordinary text only in the approved 
   assert.deepEqual(await decodeMessage(link, { entities: [] }), {
     status: 200, temp: { ...scope, kind: "temp-text", text: link },
   });
-  assert.deepEqual(await decodeMessage("/temp"), { status: 200, temp: { ...scope, kind: "temp-summary" } });
+  assert.deepEqual(await decodeMessage("/temp"), { status: 200, temp: { ...scope, kind: "temp-raw" } });
+  assert.deepEqual(await decodeMessage("/temp SUMMARY"), { status: 200, temp: { ...scope, kind: "temp-summary" } });
   assert.deepEqual(await decodeMessage("/temp CLEAR"), { status: 200, temp: { ...scope, kind: "temp-clear" } });
   for (const overrides of [
     { chat: { id: Number(policy.groupId), type: "group" } },
@@ -281,9 +282,12 @@ test("dispatches temporary-node commands and ordinary text only in the approved 
     { from: { id: 99, is_bot: false }, chat: { id: 99, type: "private" } },
   ]) {
     assert.deepEqual(await decodeMessage(link, { ...overrides, entities: [] }), { status: 204 });
+    assert.deepEqual(await decodeMessage("/temp", overrides), { status: 204 });
+    assert.deepEqual(await decodeMessage("/temp summary", overrides), { status: 204 });
     assert.deepEqual(await decodeMessage("/temp clear", overrides), { status: 204 });
   }
   assert.deepEqual(await decodeMessage("/temp clear extra"), { status: 204 });
+  assert.deepEqual(await decodeMessage("/temp summary extra"), { status: 204 });
   assert.deepEqual(await decodeMessage("/ignored", { entities: [] }), { status: 204 });
 });
 
