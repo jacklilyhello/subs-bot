@@ -2,8 +2,8 @@
   {
     "label": "Clash Shadowsocks quoted Unicode credentials",
     "legacy": true,
-    "node": {"name":"港 \"字\" 🌐","type":"ss","server":"203.0.113.10","port":8388,"cipher":"aes-256-gcm","password":"fixture: \"密@+字\" # !\u0085end","udp":true},
-    "proxy": {"type":"ss","server":"203.0.113.10","port":8388,"cipher":"aes-256-gcm","password":"fixture: \"密@+字\" # !\u0085end","udp":true}
+    "node": {"name":"港 \"字\" 🌐","type":"ss","server":"203.0.113.10","port":8388,"cipher":"aes-256-gcm","password":"fixture: \"密@+字\" # !\u0085next\u2028line\u2029end","udp":true},
+    "proxy": {"type":"ss","server":"203.0.113.10","port":8388,"cipher":"aes-256-gcm","password":"fixture: \"密@+字\" # !\u0085next\u2028line\u2029end","udp":true}
   },
   {
     "label": "SIP002 client plugin",

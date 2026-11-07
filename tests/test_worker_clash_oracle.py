@@ -21,7 +21,9 @@ class WorkerClashOracleTests(unittest.TestCase):
                 continue
             with self.subTest(label=case["label"]):
                 node = case["node"]
-                config = yaml.safe_load(to_clash([node]))
+                payload = to_clash([node])
+                self.assertNotRegex(payload, r"[\x85\u2028\u2029]")
+                config = yaml.safe_load(payload)
                 self.assertEqual(config["proxies"], [{"name": node["name"], **case["proxy"]}])
                 self.assertEqual(config["proxy-groups"], [
                     {"name": "🚀 节点选择", "type": "select", "proxies": [node["name"]]},
