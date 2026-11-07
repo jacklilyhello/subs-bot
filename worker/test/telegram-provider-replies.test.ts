@@ -73,6 +73,35 @@ test("ambiguous terminal enqueue is idempotent and authorization changes fence d
   assert.equal(await db.prepare("SELECT state FROM telegram_outbox WHERE receipt_id=?").bind(provider!.receiptId).first("state"), "failed");
 });
 
+test("provider work and terminal delivery both require the original isolation role", async (t) => {
+  const { db, policy, scope, claim } = await replyFixture(t);
+  const swapped = { ...policy, adminId: policy.memberId, memberId: policy.adminId };
+  await db.prepare("INSERT INTO telegram_auth (bot_id,user_id,allowed,message_date,message_id) VALUES (?,?,0,?,?)")
+    .bind(policy.botId, policy.adminId, scope.messageDate - 1, 100).run();
+  const result = await acceptTelegramProviderRequest(db, policy, {
+    ...scope, actorId: policy.adminId, chatId: policy.adminId, updateId: 1, messageId: 1, kind: "url-import",
+    sourceUrl: "https://provider.example.invalid/source",
+  });
+  assert.equal(result.kind, "queued");
+  assert.equal(await claimProviderJob(db, swapped), null);
+  const job = await claimProviderJob(db, policy);
+  assert.ok(job);
+  assert.equal(job.ownerId, policy.adminId);
+  assert.equal(await settleProviderJob(db, job, { kind: "failed", reason: "fetch-rejected" }), "done");
+
+  // The previous administrator is now an allowed member under the changed policy.
+  await db.prepare("UPDATE telegram_auth SET allowed=1 WHERE bot_id=? AND user_id=?").bind(policy.botId, policy.adminId).run();
+  assert.equal(await reconcileTelegramProviderReplies(db, swapped), 0);
+  assert.equal(await reconcileTelegramProviderReplies(db, policy), 1);
+  assert.equal(await claimTelegramReply(db, policy.botId, false, false, false, false, false, false, swapped), null);
+  const reply = await claim();
+  assert.ok(reply);
+  assert.equal(reply.providerOutcome, "fetch-rejected");
+  assert.equal(await beginTelegramReply(db, swapped, reply, "allowed"), false);
+  assert.equal(await beginTelegramReply(db, policy, reply, "allowed"), true);
+  await settleTelegramReply(db, policy, reply, { kind: "failed" });
+});
+
 test("a delayed provider reply waits for the later same-chat lease and in-flight send", async (t) => {
   const { db, policy, scope, ordinary, claim } = await replyFixture(t);
   assert.equal((await acceptTelegramProviderRequest(db, policy, { ...scope, kind: "url-import", updateId: 1,
