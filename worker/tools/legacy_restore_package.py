@@ -23,6 +23,8 @@ import prepare_isolation_artifact as artifact
 ACTIVE = "subscriptions"
 TRASH = "subscription_trash"
 LIFECYCLE = "subscription_lifecycle"
+PATH_RULES = "path_rules"
+PATH_COLUMNS = ("id", "owner_id", "keyword", "remark")
 COLUMNS = ("id", "owner_id", "name", "source_url", "token", "expire_at", "traffic_used", "traffic_total",
            "last_error", "created_at", "updated_at", "generation", "snapshot_id", "manifest_sha256", "node_count")
 TABLE_COLUMNS = {
@@ -97,24 +99,36 @@ def converter_artifact(root, manifest_sha):
     require(read_pinned(root / MANIFEST, 64 * 1024, manifest_sha) == raw)
     require(read_private(root / MARKER, 65) == manifest_sha.encode("ascii") + b"\n")
     domains = manifest["domains"]
+    handled = {*converter.HANDLED, "meta"}
+    if manifest["version"] == 2:
+        handled.add(converter.PATH_DOMAIN)
     require(all(type(item["rows"]) is int and item["rows"] >= 0 for item in domains.values())
-            and all(domains[name]["rows"] == 0 for name in converter.DOMAINS if name not in (*converter.HANDLED, "meta"))
+            and all(domains[name]["rows"] == 0 for name in converter.DOMAINS if name not in handled)
             and domains["meta"]["unhandledRows"] == 0 and domains["meta"]["rows"] == domains["meta"]["consumedRows"])
     file_index = manifest["files"]
-    require(native.integer(file_index["count"], 2, native.MAX_OBJECTS + 2))
-    index = read_pinned(root / "files.ndjson", (native.MAX_OBJECTS + 2) * converter.MAX_INDEX_LINE_BYTES, file_index["sha256"])
+    metadata = metadata_files(manifest)
+    max_files = native.MAX_OBJECTS + len(metadata)
+    require(native.integer(file_index["count"], len(metadata), max_files))
+    index = read_pinned(root / "files.ndjson", max_files * converter.MAX_INDEX_LINE_BYTES, file_index["sha256"])
     require(len(index) == file_index["bytes"])
     descriptors = {}
     for item in parse_lines(index, converter.MAX_INDEX_LINE_BYTES):
         require(item["path"] not in descriptors)
         descriptors[item["path"]] = item
-    require(len(descriptors) == file_index["count"] and {"active.ndjson", "trash.ndjson"} <= descriptors.keys())
+    require(len(descriptors) == file_index["count"] and metadata <= descriptors.keys())
     mapping = manifest["trashIdMapping"]
     high = mapping["sourceHighWater"]
     require(mapping["kind"] == "source-high-water-plus-ordinal" and native.integer(high)
             and native.integer(mapping["targetSequenceHighWater"], high, native.MAX_SAFE - 1)
             and mapping["targetSequenceHighWater"] == high + domains["deleted_subs"]["rows"])
     return manifest, descriptors
+
+
+def metadata_files(source):
+    files = {"active.ndjson", "trash.ndjson"}
+    if source["version"] == 2:
+        files.add(converter.PATH_FILE)
+    return files
 
 
 def expected_file(root, descriptors, relative, limit):
@@ -189,13 +203,23 @@ def load_rows(db, source_root, source, descriptors, lineage):
     return counts
 
 
+def load_path_rules(db, root, source, descriptors):
+    mapping = source["pathIdMapping"]
+    raw = expected_file(root, descriptors, converter.PATH_FILE, converter.MAX_PATH_FILE_BYTES)
+    records = converter.validate_path_records(converter._read_path_records(io.BytesIO(raw)), mapping)
+    db.executemany("INSERT INTO path_rules (id,owner_id,keyword,remark) VALUES (?,?,?,?)",
+                   (tuple(row[column] for column in PATH_COLUMNS) for row in records))
+    db.execute("DELETE FROM sqlite_sequence WHERE name='path_rules'")
+    db.execute("INSERT INTO sqlite_sequence(name,seq) VALUES ('path_rules',?)", (mapping["sourceHighWater"],))
+
+
 def db_summary(db, layout):
     return native.data_summary(layout, lambda table, definition: db.execute(
         "SELECT " + ",".join(native._identifier(name) for name, _ in definition["columns"])
         + " FROM " + native._identifier(table) + " ORDER BY " + ",".join(map(native._identifier, definition["primary"]))))
 
 
-def write_sql(db, schema, sequence, path):
+def write_sql(db, schema, sequence, path, *, path_sequence=None):
     # Only the reviewed DDL and fixed-column rows are emitted. SQLite quotes
     # values itself. A subsequent independent replay checks exact round-trip.
     size = 0
@@ -210,7 +234,8 @@ def write_sql(db, schema, sequence, path):
         for obj in schema:
             if obj.name != "sqlite_sequence":
                 write(obj.sql)
-        for table, columns in TABLE_COLUMNS.items():
+        tables = TABLE_COLUMNS if path_sequence is None else {**TABLE_COLUMNS, PATH_RULES: PATH_COLUMNS}
+        for table, columns in tables.items():
             fields = ",".join(native._identifier(column) for column in columns)
             literals = ",".join(f"quote({native._identifier(column)})" for column in columns)
             for row in db.execute(f"SELECT {literals} FROM {table} ORDER BY {columns[0]}"):
@@ -218,6 +243,9 @@ def write_sql(db, schema, sequence, path):
         write("DELETE FROM sqlite_sequence WHERE name='subscriptions'")
         if sequence:
             write(f"INSERT INTO sqlite_sequence (name,seq) VALUES ('subscriptions',{sequence})")
+        if path_sequence is not None:
+            write("DELETE FROM sqlite_sequence WHERE name='path_rules'")
+            write(f"INSERT INTO sqlite_sequence (name,seq) VALUES ('path_rules',{path_sequence})")
 
 
 def describe(path):
@@ -234,6 +262,9 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
         require(not output.is_relative_to(conversion) and not output.is_relative_to(worker))
         source, files = converter_artifact(conversion, converter_manifest_sha)
         chain, build = worker_artifact(worker, revision, worker_manifest_sha)
+        path_mapping = source.get("pathIdMapping")
+        if path_mapping is not None:
+            require(len(chain) >= 10 and chain[9].name == "0010_path_rules.sql")
         schema = migrations._objects(chain, len(chain), managed=True)
         replay_source = SimpleNamespace(objects=schema, tables=sorted(obj.name for obj in schema if obj.type == "table"))
         ledger = [{"position": position, "name": item.name, "sha256": item.sha256, "mode": "applied", "applied_at": applied_at}
@@ -256,6 +287,8 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                                (tuple(row[column] for column in TABLE_COLUMNS[migrations.LEDGER]) for row in ledger))
                 with native.private_file(output / LINEAGE) as lineage:
                     counts = load_rows(db, conversion, source, files, lineage)
+                if path_mapping is not None:
+                    load_path_rules(db, conversion, source, files)
                 require(db.execute("""SELECT 1 FROM subscriptions AS active JOIN subscription_trash AS trash
                     ON active.id=trash.id OR active.token=trash.token LIMIT 1""").fetchone() is None)
                 db.execute("DELETE FROM sqlite_sequence WHERE name='subscriptions'")
@@ -263,7 +296,7 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                     db.execute("INSERT INTO sqlite_sequence(name,seq) VALUES ('subscriptions',?)", (sequence,))
                 layout = native.table_layout(db, replay_source.tables)
                 summary = db_summary(db, layout)
-                write_sql(db, schema, sequence, replay_sql)
+                write_sql(db, schema, sequence, replay_sql, path_sequence=path_mapping["sourceHighWater"] if path_mapping is not None else None)
 
             def read_object(key):
                 raw = expected_file(conversion, files, "objects/" + key, native.OBJECT_BYTES)
@@ -281,7 +314,7 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
             with closing(replayed):
                 require(restored_layout == layout and restored_summary == summary)
                 objects = native.object_references(replayed, read_object, copy_object)
-            require({"objects/" + item["key"] for item in objects} == set(files) - {"active.ndjson", "trash.ndjson"})
+            require({"objects/" + item["key"] for item in objects} == set(files) - metadata_files(source))
             replay_sql.rename(sql)
         report = {"version": 1, "scope": "fresh-unbound-d1-r2", "legacyDomains": "active-and-trash-only",
                   "schemaSha256": native._schema_digest(schema),
@@ -289,6 +322,9 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                   "objectBytes": sum(item["bytes"] for item in objects),
                   "sourceHighWater": source["trashIdMapping"]["sourceHighWater"], "targetSequenceHighWater": sequence,
                   "generationZeroHttp": "not-validated", "formatCompatibility": "not-validated"}
+        if path_mapping is not None:
+            report.update(version=2, legacyDomains="active-trash-and-path-rules",
+                          pathIdMapping={**path_mapping, "targetSequenceHighWater": path_mapping["sourceHighWater"]})
         manifest = {**report, "source": {"sqliteSha256": source["sourceSha256"], "ownerMapSha256": source["ownerMapSha256"],
                     "converterManifestSha256": converter_manifest_sha}, "workerArtifact": build,
                     "ledger": ledger, "layout": layout, "summary": summary, "objects": objects,

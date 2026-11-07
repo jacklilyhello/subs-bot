@@ -15,7 +15,7 @@ WORKER = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(WORKER / "tools"))
 import legacy_restore_package as package
 import legacy_snapshot_convert as convert
-from test_legacy_snapshot_convert import NODE, TOKEN, insert, make_table
+from test_legacy_snapshot_convert import NODE, TOKEN, insert, make_path_table, make_table
 
 
 REVISION = "a" * 40
@@ -80,7 +80,7 @@ class LegacyRestorePackageTests(unittest.TestCase):
         put(self.worker / "isolation.json", manifest)
         return digest(manifest), entries
 
-    def make_conversion(self, *, unsupported=False, trash_sequence=70):
+    def make_conversion(self, *, unsupported=False, trash_sequence=70, path_rows=(), path_sequence=None):
         with closing(sqlite3.connect(self.legacy)) as db, db:
             make_table(db, "subscriptions")
             make_table(db, "deleted_subs")
@@ -94,6 +94,14 @@ class LegacyRestorePackageTests(unittest.TestCase):
             if unsupported:
                 db.execute("CREATE TABLE short_links(code TEXT PRIMARY KEY,user_id INTEGER,target_url TEXT,created_at INTEGER)")
                 db.execute("INSERT INTO short_links VALUES ('synthetic001',123,'aggregate://all',1700000000)")
+            if path_rows or path_sequence is not None:
+                make_path_table(db)
+                db.executemany("INSERT INTO path_maps VALUES (?,?,?,?)", path_rows)
+                if not path_rows:
+                    db.execute("INSERT INTO path_maps VALUES (?,456,'deleted','safe')", (path_sequence,))
+                    db.execute("DELETE FROM path_maps")
+                if path_sequence is not None:
+                    db.execute("UPDATE sqlite_sequence SET seq=? WHERE name='path_maps'", (path_sequence,))
         self.legacy.chmod(0o600)
         report = convert.convert_backup(self.legacy, self.conversion, owner_map={"-100123": "456"})
         self.convert_sha = digest((self.conversion / "manifest.json").read_bytes())
@@ -104,7 +112,7 @@ class LegacyRestorePackageTests(unittest.TestCase):
                    "revision": REVISION, "applied_at": APPLIED_AT, **options}
         return package.build_candidate(self.conversion, self.worker, self.output, **options)
 
-    def reseal_row(self, relative, mutate):
+    def reseal_row(self, relative, mutate, *, valid=True):
         path = self.conversion / relative
         rows = [json.loads(line) for line in path.read_bytes().splitlines()]
         mutate(rows[0])
@@ -124,12 +132,15 @@ class LegacyRestorePackageTests(unittest.TestCase):
         manifest_path.write_bytes(raw)
         self.convert_sha = digest(raw)
         (self.conversion / "manifest.sha256").write_text(self.convert_sha + "\n", encoding="ascii")
-        self.assertTrue(convert.verify_bundle(self.conversion)["completeImportable"])
+        if valid:
+            self.assertTrue(convert.verify_bundle(self.conversion)["completeImportable"])
 
     def test_exact_fresh_candidate_preserves_tokens_objects_lineage_and_allocator(self):
         self.assertTrue(self.make_conversion()["completeImportable"])
         source_before = digest(self.legacy.read_bytes())
         result = self.build()
+        self.assertEqual(result["version"], 1)
+        self.assertNotIn("pathIdMapping", result)
         self.assertEqual(result["scope"], "fresh-unbound-d1-r2")
         self.assertEqual(result["legacyDomains"], "active-and-trash-only")
         self.assertEqual(result["counts"], {"activeRows": 2, "trashRows": 1, "generationZeroActiveRows": 1,
@@ -173,6 +184,8 @@ class LegacyRestorePackageTests(unittest.TestCase):
                              [(71, "456", TRASH_TOKEN, 1)])
             self.assertEqual(db.execute("SELECT * FROM subscription_lifecycle").fetchall(), [(71, 1)])
             self.assertEqual(db.execute("SELECT seq FROM sqlite_sequence WHERE name='subscriptions'").fetchone(), (71,))
+            self.assertEqual(db.execute("SELECT * FROM path_rules").fetchall(), [])
+            self.assertIsNone(db.execute("SELECT seq FROM sqlite_sequence WHERE name='path_rules'").fetchone())
             self.assertEqual(db.execute("SELECT position,name,sha256,mode,applied_at FROM subs_bot_schema_migrations ORDER BY position").fetchall(),
                 [(i, item["name"], item["sha256"], "applied", APPLIED_AT) for i, item in enumerate(self.chain, 1)])
             self.assertIn("subscriptions_owner_id", {row[1] for row in db.execute("PRAGMA index_list('subscriptions')")})
@@ -229,6 +242,59 @@ class LegacyRestorePackageTests(unittest.TestCase):
 
     def test_exhausted_safe_id_allocator_does_not_create_candidate(self):
         self.assertTrue(self.make_conversion(trash_sequence=convert.MAX_SAFE_ID - 1)["completeImportable"])
+        with self.assertRaises(package.PackageError):
+            self.build()
+        self.assertFalse(self.output.exists())
+
+    def test_v2_candidate_replays_exact_path_rows_and_independent_allocator(self):
+        rule = "  路径\t '", '  remark " untouched \n  '
+        self.make_conversion(path_rows=[(37, 456, " hk ", "second"), (5, -100123, *rule)], path_sequence=80)
+        result = self.build()
+        self.assertEqual(result["version"], 2)
+        self.assertEqual(result["legacyDomains"], "active-trash-and-path-rules")
+        self.assertEqual(result["pathIdMapping"], {"kind": "identity", "rows": 2, "sourceHighWater": 80, "targetSequenceHighWater": 80})
+        self.assertEqual(result["objectCount"], 4)
+        self.assertEqual(result["targetSequenceHighWater"], 71)
+        manifest = json.loads((self.output / "manifest.json").read_bytes())
+        self.assertEqual(manifest["summary"]["tableCounts"]["path_rules"], 2)
+        self.assertEqual(manifest["pathIdMapping"], result["pathIdMapping"])
+        self.assertFalse((self.output / convert.PATH_FILE).exists())
+        with closing(sqlite3.connect(":memory:")) as db:
+            db.execute("PRAGMA foreign_keys=ON")
+            db.executescript((self.output / "restore.sql").read_text(encoding="utf-8"))
+            self.assertEqual(db.execute("SELECT id,owner_id,keyword,remark FROM path_rules ORDER BY id").fetchall(),
+                             [(5, "456", *rule), (37, "456", " hk ", "second")])
+            self.assertEqual(db.execute("SELECT name,seq FROM sqlite_sequence ORDER BY name").fetchall(),
+                             [("path_rules", 80), ("subscriptions", 71)])
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+            self.assertEqual(db.execute("PRAGMA quick_check").fetchone(), ("ok",))
+            self.assertIn("path_rules_owner_order", {row[1] for row in db.execute("PRAGMA index_list('path_rules')")})
+            new = db.execute("INSERT INTO path_rules(owner_id,keyword,remark) VALUES ('456','new','new')").lastrowid
+            self.assertEqual(new, 81)
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute("INSERT INTO path_rules(owner_id,keyword,remark) VALUES ('456',' hk ','duplicate')")
+
+    def test_v2_deleted_only_path_allocator_does_not_reuse_original_ids(self):
+        report = self.make_conversion(path_sequence=100)
+        self.assertEqual(report["pathIdMapping"], {"kind": "identity", "rows": 0, "sourceHighWater": 100})
+        self.assertEqual((self.conversion / convert.PATH_FILE).read_bytes(), b"")
+        self.assertEqual(self.build()["version"], 2)
+        with closing(sqlite3.connect(":memory:")) as db:
+            db.executescript((self.output / "restore.sql").read_text(encoding="utf-8"))
+            self.assertEqual(db.execute("SELECT count(*) FROM path_rules").fetchone(), (0,))
+            self.assertEqual(db.execute("INSERT INTO path_rules(owner_id,keyword,remark) VALUES ('456','new','new')").lastrowid, 101)
+
+    def test_resealed_path_rows_with_invalid_target_text_fail(self):
+        self.make_conversion(path_rows=[(5, -100123, "keyword", "remark")])
+        self.reseal_row(convert.PATH_FILE, lambda item: item.update(keyword=" \u3000 "), valid=False)
+        with self.assertRaises(package.PackageError):
+            self.build()
+        self.assertFalse(self.output.exists())
+
+    def test_path_support_does_not_admit_other_nonempty_legacy_domains(self):
+        report = self.make_conversion(unsupported=True, path_rows=[(5, -100123, "keyword", "remark")])
+        self.assertEqual(report["version"], 2)
+        self.assertEqual(report["blockers"], {"unhandled:short_links": 1})
         with self.assertRaises(package.PackageError):
             self.build()
         self.assertFalse(self.output.exists())
