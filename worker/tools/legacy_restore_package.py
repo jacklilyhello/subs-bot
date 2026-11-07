@@ -1,6 +1,7 @@
 """Build an unapplied, private D1 SQL and R2 package on a hosted runner."""
 
 from contextlib import closing
+from dataclasses import dataclass
 from hashlib import sha256
 import io
 from itertools import zip_longest
@@ -17,6 +18,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 import d1_migrations as migrations
 import legacy_snapshot_convert as converter
+import legacy_typed_short_inventory as typed_inventory
 import native_restore_rehearsal as native
 import prepare_isolation_artifact as artifact
 
@@ -31,6 +33,12 @@ EMPTY_EXPORT_COLUMNS = ("subscription_id", "owner_id", "token_sha256")
 EMPTY_EXPORT_PROFILE = "legacy-empty-v3"
 EMPTY_EXPORT_MIGRATION = "0026_legacy_empty_subscription_exports.sql"
 EMPTY_EXPORT_MIGRATION_SHA256 = "124eb153b8f8d1fc01165d2ba0db1adee8948cd6bffe8a8ad2465afa62da3976"
+TYPED_SHORT_PROFILE = "legacy-typed-short-v4"
+TYPED_SHORT_MIGRATION = "0029_legacy_subscription_short_links.sql"
+TYPED_SHORT_MIGRATION_SHA256 = "1a0da8aa8aedde095b3e1a4bc71b5e03376587882288c4e276c9a1f9afa1297d"
+TYPED_SHORTS = "legacy_subscription_short_links"
+TYPED_SHORT_COLUMNS = ("code_sha256", "bot_id", "owner_id", "subscription_id", "token_sha256", "format", "created_at", "revoked_at")
+TYPED_SHORT_LINE_BYTES = 1024
 COLUMNS = ("id", "owner_id", "name", "source_url", "token", "expire_at", "traffic_used", "traffic_total",
            "last_error", "created_at", "updated_at", "generation", "snapshot_id", "manifest_sha256", "node_count")
 TABLE_COLUMNS = {
@@ -48,6 +56,14 @@ ERROR = "Private legacy restore package could not be built safely."
 
 class PackageError(RuntimeError):
     """Only fixed errors may leave the package builder."""
+
+
+@dataclass(frozen=True)
+class TypedShortInput:
+    directory: Path
+    manifest_sha256: str
+    old_origin_sha256: str
+    legacy_bot_id: str
 
 
 def require(condition):
@@ -99,15 +115,22 @@ def worker_artifact(root, revision, manifest_sha):
     return chain, {**identity, "manifestSha256": manifest_sha}
 
 
-def converter_artifact(root, manifest_sha):
+def converter_artifact(root, manifest_sha, *, typed_short_domain=None):
     raw = read_pinned(root / MANIFEST, 64 * 1024, manifest_sha)
-    manifest = converter.verify_bundle(root, require_complete=True)
+    manifest = converter.verify_bundle(root, require_complete=typed_short_domain is None)
     require(read_pinned(root / MANIFEST, 64 * 1024, manifest_sha) == raw)
     require(read_private(root / MARKER, 65) == manifest_sha.encode("ascii") + b"\n")
     domains = manifest["domains"]
     handled = {*converter.HANDLED, "meta"}
     if manifest["version"] == 2:
         handled.add(converter.PATH_DOMAIN)
+    if typed_short_domain is not None:
+        # Consume only the exact domain proven by the independently sealed sidecar.
+        short_count = typed_short_domain["rows"]
+        require(type(domains["short_links"]["present"]) is bool and type(domains["short_links"]["rows"]) is int
+                and domains["short_links"] == typed_short_domain
+                and manifest["blockers"] == ({"unhandled:short_links": short_count} if short_count else {}))
+        handled.add("short_links")
     require(all(type(item["rows"]) is int and item["rows"] >= 0 for item in domains.values())
             and all(domains[name]["rows"] == 0 for name in converter.DOMAINS if name not in handled)
             and domains["meta"]["unhandledRows"] == 0 and domains["meta"]["rows"] == domains["meta"]["consumedRows"])
@@ -247,6 +270,79 @@ def load_path_rules(db, root, source, descriptors):
     db.execute("INSERT INTO sqlite_sequence(name,seq) VALUES ('path_rules',?)", (mapping["sourceHighWater"],))
 
 
+def read_typed_short_artifact(pins, source_sha, owner_map_sha):
+    require(isinstance(pins, TypedShortInput) and native.matches(native.DIGEST, pins.old_origin_sha256)
+            and native.matches(converter.OWNER, pins.legacy_bot_id) and int(pins.legacy_bot_id) <= converter.MAX_OWNER)
+    root = private_path(pins.directory, directory=True)
+    names = {typed_inventory.MANIFEST, typed_inventory.SEAL, typed_inventory.ROWS}
+    require(set(os.listdir(root)) == names and all(private_path(root / name).stat().st_nlink == 1 for name in names))
+    raw = read_pinned(root / typed_inventory.MANIFEST, 64 * 1024, pins.manifest_sha256)
+    require(read_private(root / typed_inventory.SEAL, 65) == pins.manifest_sha256.encode("ascii") + b"\n")
+    manifest = native.parsed(raw, 64 * 1024)
+    require(raw == converter._json(manifest) + b"\n"
+            and set(manifest) == {"version", "kind", "sourceSha256", "ownerMapSha256", "oldOriginSha256",
+                                  "legacyBotId", "inventory", "files"}
+            and native.integer(manifest["version"], 1, 1) and manifest["kind"] == "legacy-typed-subscription-short-inventory"
+            and (manifest["sourceSha256"], manifest["ownerMapSha256"], manifest["oldOriginSha256"], manifest["legacyBotId"])
+            == (source_sha, owner_map_sha, pins.old_origin_sha256, pins.legacy_bot_id))
+    domain, entries = manifest["inventory"], manifest["files"]
+    require(isinstance(domain, dict) and set(domain) == {"present", "rows"} and type(domain["present"]) is bool
+            and native.integer(domain["rows"], 0, typed_inventory.MAX_SHORTS) and (domain["present"] or domain["rows"] == 0)
+            and isinstance(entries, list) and len(entries) == 1)
+    entry = entries[0]
+    require(isinstance(entry, dict) and set(entry) == {"file", "bytes", "sha256"} and entry["file"] == typed_inventory.ROWS
+            and native.integer(entry["bytes"], 0, typed_inventory.MAX_METADATA_BYTES))
+    raw_rows = read_pinned(root / typed_inventory.ROWS, typed_inventory.MAX_METADATA_BYTES, entry["sha256"])
+    require(len(raw_rows) == entry["bytes"])
+    prior, rows = "", []
+    for line in io.BytesIO(raw_rows):
+        require(len(line) <= TYPED_SHORT_LINE_BYTES and line.endswith(b"\n") and len(rows) < domain["rows"])
+        row = native.parsed(line[:-1], TYPED_SHORT_LINE_BYTES)
+        require(set(row) == {"codeSha256", "legacyTable", "legacyId", "ownerId", "tokenSha256", "format", "createdAt"}
+                and line == converter._json(row) + b"\n"
+                and native.matches(native.DIGEST, row["codeSha256"]) and row["codeSha256"] > prior
+                and row["legacyTable"] in (ACTIVE, "deleted_subs") and native.integer(row["legacyId"], 1)
+                and native.matches(converter.OWNER, row["ownerId"]) and int(row["ownerId"]) <= converter.MAX_OWNER
+                and native.matches(native.DIGEST, row["tokenSha256"]) and row["format"] in typed_inventory.FORMATS
+                and native.integer(row["createdAt"], 1))
+        rows.append(row)
+        prior = row["codeSha256"]
+    require(len(rows) == domain["rows"])
+    return root, domain, rows
+
+
+def load_typed_short_links(db, lineage_path, rows, bot_id):
+    # Keep active and trash identities distinct even if their old IDs overlap.
+    required = {(row["legacyTable"], row["legacyId"]) for row in rows}
+    lineage = {}
+    for entry in parse_lines(read_private(lineage_path, native.SQL_BYTES), TYPED_SHORT_LINE_BYTES):
+        key = (entry["legacyTable"], entry["legacyId"])
+        if key in required:
+            require(key not in lineage)
+            lineage[key] = entry["targetId"]
+    require(set(lineage) == required)
+    expected, counts = [], {"rows": len(rows), "activeRows": 0, "trashRows": 0}
+    for row in rows:
+        active = row["legacyTable"] == ACTIVE
+        target_table = ACTIVE if active else TRASH
+        target_id = lineage[(row["legacyTable"], row["legacyId"])]
+        target = db.execute(f"SELECT owner_id,token FROM {target_table} WHERE id=?", (target_id,)).fetchone()
+        require(target is not None and target[0] == row["ownerId"]
+                and native.digest(target[1].encode("ascii")) == row["tokenSha256"])
+        expected.append((row["codeSha256"], bot_id, target[0], target_id, row["tokenSha256"], row["format"], row["createdAt"], None))
+        counts["activeRows" if active else "trashRows"] += 1
+    db.executemany(f"INSERT INTO {TYPED_SHORTS} ({','.join(TYPED_SHORT_COLUMNS)}) VALUES (?,?,?,?,?,?,?,?)", expected)
+    return expected, counts
+
+
+def verify_typed_short_links(db, expected):
+    actual = db.execute(f"SELECT {','.join(TYPED_SHORT_COLUMNS)} FROM {TYPED_SHORTS} ORDER BY code_sha256")
+    require(all(row == target for row, target in zip_longest(actual, expected)))
+    require(db.execute(f"""SELECT 1 FROM {TYPED_SHORTS} AS typed
+        WHERE EXISTS (SELECT 1 FROM normal_short_links WHERE code_sha256=typed.code_sha256)
+           OR EXISTS (SELECT 1 FROM aggregate_links WHERE code_sha256=typed.code_sha256) LIMIT 1""").fetchone() is None)
+
+
 def db_summary(db, layout):
     return native.data_summary(layout, lambda table, definition: db.execute(
         "SELECT " + ",".join(native._identifier(name) for name, _ in definition["columns"])
@@ -293,10 +389,12 @@ def describe(path):
 
 
 def build_candidate(conversion, worker, output, *, converter_manifest_sha, worker_manifest_sha, revision, applied_at,
-                    profile=None, source_sqlite_sha=None, owner_map_sha=None):
+                    profile=None, source_sqlite_sha=None, owner_map_sha=None, typed_short=None):
     try:
-        include_empty_exports = profile == EMPTY_EXPORT_PROFILE
+        include_typed_shorts = profile == TYPED_SHORT_PROFILE
+        include_empty_exports = profile in (EMPTY_EXPORT_PROFILE, TYPED_SHORT_PROFILE)
         require(profile is None or include_empty_exports)
+        require((typed_short is not None) == include_typed_shorts)
         if include_empty_exports:
             require(native.matches(native.DIGEST, source_sqlite_sha) and native.matches(native.DIGEST, owner_map_sha))
         else:
@@ -306,12 +404,19 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
         worker = private_path(worker, directory=True)
         output = converter._safe_path(Path(output), existing=False)
         require(not output.is_relative_to(conversion) and not output.is_relative_to(worker))
-        source, files = converter_artifact(conversion, converter_manifest_sha)
+        typed_domain = None
+        if include_typed_shorts:
+            typed_root, typed_domain, typed_rows = read_typed_short_artifact(typed_short, source_sqlite_sha, owner_map_sha)
+            require(not output.is_relative_to(typed_root))
+        source, files = converter_artifact(conversion, converter_manifest_sha, typed_short_domain=typed_domain)
         chain, build = worker_artifact(worker, revision, worker_manifest_sha)
         if include_empty_exports:
             require(source["sourceSha256"] == source_sqlite_sha and source["ownerMapSha256"] == owner_map_sha
                     and len(chain) >= 26 and chain[25].name == EMPTY_EXPORT_MIGRATION
                     and chain[25].sha256 == EMPTY_EXPORT_MIGRATION_SHA256)
+        if include_typed_shorts:
+            require(len(chain) >= 29 and (chain[28].name, chain[28].sha256)
+                    == (TYPED_SHORT_MIGRATION, TYPED_SHORT_MIGRATION_SHA256))
         path_mapping = source.get("pathIdMapping")
         if path_mapping is not None:
             require(len(chain) >= 10 and chain[9].name == "0010_path_rules.sql")
@@ -339,6 +444,8 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                     counts = load_rows(db, conversion, source, files, lineage, include_empty_exports=include_empty_exports)
                 if path_mapping is not None:
                     load_path_rules(db, conversion, source, files)
+                if include_typed_shorts:
+                    typed_expected, typed_counts = load_typed_short_links(db, output / LINEAGE, typed_rows, typed_short.legacy_bot_id)
                 require(db.execute("""SELECT 1 FROM subscriptions AS active JOIN subscription_trash AS trash
                     ON active.id=trash.id OR active.token=trash.token LIMIT 1""").fetchone() is None)
                 db.execute("DELETE FROM sqlite_sequence WHERE name='subscriptions'")
@@ -348,7 +455,8 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                 summary = db_summary(db, layout)
                 write_sql(db, schema, sequence, replay_sql,
                           path_sequence=path_mapping["sourceHighWater"] if path_mapping is not None else None,
-                          include_empty_exports=include_empty_exports)
+                          include_empty_exports=include_empty_exports,
+                          extra_tables={TYPED_SHORTS: TYPED_SHORT_COLUMNS} if include_typed_shorts else None)
 
             def read_object(key):
                 raw = expected_file(conversion, files, "objects/" + key, native.OBJECT_BYTES)
@@ -367,6 +475,8 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                 require(restored_layout == layout and restored_summary == summary)
                 if include_empty_exports:
                     verify_empty_export_markers(replayed)
+                if include_typed_shorts:
+                    verify_typed_short_links(replayed, typed_expected)
                 objects = native.object_references(replayed, read_object, copy_object)
             require({"objects/" + item["key"] for item in objects} == set(files) - metadata_files(source))
             replay_sql.rename(sql)
@@ -387,8 +497,17 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                 "activeRows": active, "trashRows": trash,
                 "migrationSha256": EMPTY_EXPORT_MIGRATION_SHA256, "tableSha256": summary["tableSha256"][EMPTY_EXPORTS],
             })
-        manifest = {**report, "source": {"sqliteSha256": source["sourceSha256"], "ownerMapSha256": source["ownerMapSha256"],
-                    "converterManifestSha256": converter_manifest_sha}, "workerArtifact": build,
+        source_pin = {"sqliteSha256": source["sourceSha256"], "ownerMapSha256": source["ownerMapSha256"],
+                      "converterManifestSha256": converter_manifest_sha}
+        if include_typed_shorts:
+            require(summary["tableCounts"][TYPED_SHORTS] == typed_counts["rows"])
+            report.update(version=4, legacyDomains=report["legacyDomains"] + "-and-typed-single-shorts",
+                          typedShortLinks={**typed_counts, "migrationSha256": TYPED_SHORT_MIGRATION_SHA256,
+                                           "tableSha256": summary["tableSha256"][TYPED_SHORTS]},
+                          shortLinkCompatibility="not-validated")
+            source_pin.update(typedShortInventoryManifestSha256=typed_short.manifest_sha256,
+                              oldOriginSha256=typed_short.old_origin_sha256, legacyBotId=typed_short.legacy_bot_id)
+        manifest = {**report, "source": source_pin, "workerArtifact": build,
                     "ledger": ledger, "layout": layout, "summary": summary, "objects": objects,
                     "lineage": describe(output / LINEAGE), "sql": {**describe(sql), "md5": native.file_hash(sql, "md5")[1]}}
         body = native.canonical(manifest)
@@ -406,17 +525,19 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
 
 def main(args=None):
     args = sys.argv[1:] if args is None else args
-    if (len(args) not in (7, 10) or not re.fullmatch(r"[1-9][0-9]{0,15}", args[6])
-            or (len(args) == 10 and args[7] != EMPTY_EXPORT_PROFILE)):
+    if (len(args) not in (7, 10, 14) or not re.fullmatch(r"[1-9][0-9]{0,15}", args[6])
+            or (len(args) == 10 and args[7] != EMPTY_EXPORT_PROFILE) or (len(args) == 14 and args[7] != TYPED_SHORT_PROFILE)):
         print("Usage: legacy_restore_package.py CONVERTER_DIR WORKER_ARTIFACT_DIR OUTPUT_DIR CONVERTER_MANIFEST_SHA WORKER_MANIFEST_SHA REVISION APPLIED_AT"
-              " [legacy-empty-v3 SOURCE_SQLITE_SHA OWNER_MAP_SHA]",
+              " [legacy-empty-v3 SOURCE_SQLITE_SHA OWNER_MAP_SHA | legacy-typed-short-v4 SOURCE_SQLITE_SHA OWNER_MAP_SHA "
+              "TYPED_SHORT_INVENTORY TYPED_SHORT_MANIFEST_SHA OLD_ORIGIN_SHA LEGACY_BOT_ID]",
               file=sys.stderr)
         return 2
     try:
-        profile, source_sqlite_sha, owner_map_sha = args[7:] if len(args) == 10 else (None, None, None)
+        profile, source_sqlite_sha, owner_map_sha = args[7:10] if len(args) >= 10 else (None, None, None)
+        typed_short = TypedShortInput(Path(args[10]), *args[11:]) if len(args) == 14 else None
         result = build_candidate(*map(Path, args[:3]), converter_manifest_sha=args[3], worker_manifest_sha=args[4],
                                  revision=args[5], applied_at=int(args[6]), profile=profile,
-                                 source_sqlite_sha=source_sqlite_sha, owner_map_sha=owner_map_sha)
+                                 source_sqlite_sha=source_sqlite_sha, owner_map_sha=owner_map_sha, typed_short=typed_short)
         print(json.dumps(result, ensure_ascii=True, sort_keys=True))
         return 0
     except PackageError as error:
