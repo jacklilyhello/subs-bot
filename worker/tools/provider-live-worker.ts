@@ -5,11 +5,16 @@ import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Miniflare } from "miniflare";
 
+import { ClashContentError, serializeClashProxy } from "../src/clash-export.ts";
 import { enqueueProviderUrlImport, providerHost } from "../src/provider-jobs.ts";
+import { serializeSingBoxOutbound, SingBoxContentError } from "../src/singbox-export.ts";
 import {
-  getOwnedSubscription, getSubscriptionSnapshot, planSnapshotRead, readPlannedSnapshotNodes,
+  getOwnedSubscription, getSubscriptionSnapshot, planSnapshotRead, readPlannedSnapshotNodes, type NodeRecord,
 } from "../src/storage.ts";
+import { isValidStoredShare } from "../src/stored-share.ts";
+import { serializeStructuredShare } from "../src/structured-share.ts";
 import { parseSubscriptionDocument } from "../src/subscription-document.ts";
+import { parseTextProxy, TextExportError } from "../src/text-export.ts";
 
 const OWNER = "91001";
 const PROVIDER_REVISION = "a".repeat(40);
@@ -23,6 +28,10 @@ const FORMATS = {
   surge: ["surge"],
   qx: ["qx", "quantumult", "quantumultx"],
 };
+type Format = keyof typeof FORMATS;
+type Counts = Record<string, number>;
+const FORMAT_NAMES = Object.keys(FORMATS) as Format[];
+const FAMILIES = new Set(["ss", "vmess", "vless", "trojan", "hysteria", "hysteria2", "tuic", "anytls", "socks", "http"]);
 const PROVIDER = `
   import { WorkerEntrypoint } from "cloudflare:workers";
   export class ProviderFetch extends WorkerEntrypoint {
@@ -46,6 +55,73 @@ function requireCheck(value: unknown): asserts value {
 
 function sha256(value: Uint8Array): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function family(node: NodeRecord): string {
+  const type = node.type;
+  if (type === "shadowsocks") return "ss";
+  if (type === "hy2") return "hysteria2";
+  if (type === "socks5") return "socks";
+  if (type === "https") return "http";
+  return typeof type === "string" && FAMILIES.has(type) ? type : "other";
+}
+
+function admissible(format: Format, node: NodeRecord): boolean {
+  if (format === "base64") {
+    const stored = node.share;
+    return stored === undefined || stored === null || stored === ""
+      ? serializeStructuredShare(node) !== null : isValidStoredShare(stored);
+  }
+  try {
+    if (format === "clash") serializeClashProxy(node);
+    else if (format === "singbox") serializeSingBoxOutbound(node);
+    else parseTextProxy(node, format);
+    return true;
+  } catch (error) {
+    if (error instanceof ClashContentError || error instanceof SingBoxContentError || error instanceof TextExportError) return false;
+    throw error;
+  }
+}
+
+function object(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function rejectedTraits(node: NodeRecord): string[] {
+  const traits: string[] = [];
+  if (node["client-fingerprint"] === "randomized") traits.push("randomized-fingerprint");
+  if (node["packet-encoding"] === "none" || node.packet_encoding === "none") traits.push("packet-encoding-none");
+  if (object(node.tls)) traits.push("nested-tls");
+  const ws = node["ws-opts"];
+  if (object(ws) && object(ws.headers) && Object.values(ws.headers).some(Array.isArray)) traits.push("ws-header-array");
+  return traits;
+}
+
+function increment(counts: Counts, name: string): void {
+  counts[name] = (counts[name] ?? 0) + 1;
+}
+
+function diagnosticCounter() {
+  const protocols: Counts = {};
+  const formats = Object.fromEntries(FORMAT_NAMES.map((format) => [format, {
+    admitted: {} as Counts, rejected: {} as Counts, rejectedTraits: {} as Counts,
+  }]));
+  return {
+    value: { protocols, formats },
+    add(node: NodeRecord) {
+      const protocol = family(node);
+      increment(protocols, protocol);
+      const traits = rejectedTraits(node);
+      for (const format of FORMAT_NAMES) {
+        const result = formats[format];
+        if (admissible(format, node)) increment(result.admitted, protocol);
+        else {
+          increment(result.rejected, protocol);
+          for (const trait of traits) increment(result.rejectedTraits, trait);
+        }
+      }
+    },
+  };
 }
 
 async function readBody(response: Response, limit: number): Promise<Buffer> {
@@ -156,8 +232,12 @@ async function run(bundle: string, bodyFile: string, output: string, controls: s
     const snapshot = await getSubscriptionSnapshot(db, owned.token);
     requireCheck(snapshot?.nodeCount === owned.nodeCount);
     const plan = await planSnapshotRead(bucket, snapshot);
+    const diagnostics = diagnosticCounter();
     let count = 0;
-    for await (const _node of readPlannedSnapshotNodes(bucket, plan)) count += 1;
+    for await (const node of readPlannedSnapshotNodes(bucket, plan)) {
+      diagnostics.add(node);
+      count += 1;
+    }
     requireCheck(count === document.nodes && count === snapshot.nodeCount);
     const stored = await bucket.list();
     const keys = new Set([plan.prefix + "manifest.json", ...plan.chunks.map((_, index) => `${plan.prefix}${index}.ndjson`)]);
@@ -165,6 +245,7 @@ async function run(bundle: string, bodyFile: string, output: string, controls: s
     return {
       document, job: "saved", chunks: plan.chunks.length, ndjsonBytes: plan.chunks.reduce((sum, chunk) => sum + chunk.bytes, 0),
       metadata: { trafficUsed: owned.trafficUsed, trafficTotal: owned.trafficTotal, expireAt: owned.expireAt },
+      diagnostics: diagnostics.value,
       formats: await readExports(runtime, owned.token, output),
     };
   } finally {

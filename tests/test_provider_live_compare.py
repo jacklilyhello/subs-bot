@@ -41,14 +41,21 @@ class ProviderLiveCompareTests(unittest.TestCase):
             tool.write_private(scratch / "base64.body", exported)
             formats = {name: {"status": 422, "bytes": 0} for name in tool.FORMATS}
             formats["base64"] = {"status": 200, "bytes": len(exported)}
+            diagnostics = {"protocols": {"ss": 1}, "formats": {
+                name: {"admitted": {"ss": 1}, "rejected": {}, "rejectedTraits": {}} for name in tool.FORMATS,
+            }}
             return {"job": "saved", "document": {"nodes": 1}, "chunks": 1, "ndjsonBytes": 180,
-                    "formats": formats, "metadata": {"trafficUsed": 12345 / 2**30, "trafficTotal": 2, "expireAt": None}}
+                    "formats": formats, "diagnostics": diagnostics,
+                    "metadata": {"trafficUsed": 12345 / 2**30, "trafficTotal": 2, "expireAt": None}}
 
         with patch.object(tool, "worker_replay", side_effect=worker_replay):
             report = tool.compare_sample(self.samples, self.root, tool.read_samples(self.samples, 1)[0], SOURCE)
-        self.assertEqual(report["legacy"], {"kind": "parsed", "nodes": 1, "rejectedHysteria2": 0})
+        self.assertEqual(report["legacy"], {"kind": "parsed", "nodes": 1, "rejectedHysteria2": 0, "protocols": {"ss": 1}})
         self.assertEqual(report["formats"]["base64"]["comparison"], "exact")
+        self.assertEqual(report["formats"]["base64"]["workerCoverage"], {"declarations": 1})
+        self.assertEqual(report["formats"]["qx"]["legacyCoverage"], {"declarations": 0, "uriRows": 1, "unrecognizedRows": 0})
         self.assertEqual(report["formats"]["surge"]["workerStatus"], 422)
+        self.assertIsNone(report["formats"]["surge"]["workerCoverage"])
         self.assertEqual(report["worker"]["metadata"], {"trafficUsed": "equal", "trafficTotal": "equal", "expireAt": "different"})
         serialized = json.dumps(report)
         for private in (SOURCE, PASSWORD, BODY.decode(), self.sample["bodySha256"], "12345", "2000000000"):
@@ -63,6 +70,50 @@ class ProviderLiveCompareTests(unittest.TestCase):
         self.assertEqual(tool.sample_urls(manifest.decode(), sha256(manifest).hexdigest()), [SOURCE])
         with self.assertRaises(tool.ComparisonError):
             tool.sample_urls(manifest.decode(), "0" * 64)
+        oversized = json.loads(manifest)
+        oversized["urls"] = [SOURCE + str(i) for i in range(5)]
+        body = tool.compact(oversized)
+        with self.assertRaises(tool.ComparisonError):
+            tool.sample_urls(body.decode(), sha256(body).hexdigest())
+
+    def test_legacy_declaration_counts_distinguish_bytes_from_complete_exports(self):
+        sys.path.insert(0, str(tool.ROOT))
+        import convert
+
+        nodes = convert.parse_nodes_from_text("""
+proxies:
+  - {name: Fixture SS, type: ss, server: 203.0.113.10, port: 8388, cipher: aes-128-gcm, password: synthetic}
+  - {name: Fixture AnyTLS, type: anytls, server: 203.0.113.11, port: 443, password: synthetic, client-fingerprint: randomized}
+""")
+        self.assertEqual(tool.protocol_counts(nodes), {"ss": 1, "anytls": 1})
+        self.assertEqual(tool.emitted_coverage("clash", convert.to_clash(nodes).encode()), {"declarations": 2})
+        self.assertEqual(tool.emitted_coverage("singbox", convert.to_singbox(nodes).encode()), {"declarations": 2})
+        self.assertEqual(tool.emitted_coverage("surge", convert.to_surge(nodes).encode()), {
+            "declarations": 1, "commentRows": 0, "danglingGroupReferences": 1, "unrecognizedRows": 0,
+        })
+        self.assertEqual(tool.emitted_coverage("qx", convert.to_qx(nodes).encode()), {
+            "declarations": 1, "uriRows": 0, "unrecognizedRows": 0,
+        })
+        commented = b"[Proxy]\n# Fixture = ss, ignored\n[Proxy Group]\nProxy = select, Fixture\n[Rule]\nFINAL,Proxy\n"
+        self.assertEqual(tool.emitted_coverage("surge", commented), {
+            "declarations": 0, "commentRows": 1, "danglingGroupReferences": 1, "unrecognizedRows": 0,
+        })
+        self.assertEqual(tool.emitted_coverage("base64", base64.b64encode(BODY + b" label")), {"declarations": 1})
+        with self.assertRaises(convert.ExportError):
+            convert.to_base64_sub(nodes)
+
+    def test_worker_count_dictionaries_are_closed_and_reconcile_each_family(self):
+        value = {"protocols": {"ss": 1}, "formats": {
+            name: {"admitted": {}, "rejected": {"ss": 1}, "rejectedTraits": {}} for name in tool.FORMATS,
+        }}
+        self.assertEqual(tool.verified_diagnostics(value, 1)["protocols"], {"ss": 1})
+        value["formats"]["clash"]["rejectedTraits"] = {PASSWORD: 1}
+        with self.assertRaises(tool.ComparisonError):
+            tool.verified_diagnostics(value, 1)
+        value["formats"]["clash"]["rejectedTraits"] = {}
+        value["formats"]["clash"]["rejected"] = {"vless": 1}
+        with self.assertRaises(tool.ComparisonError):
+            tool.verified_diagnostics(value, 1)
 
     def test_artifact_run_provenance_uses_the_hosted_string_fields(self):
         bundle = self.root / "bundle"
