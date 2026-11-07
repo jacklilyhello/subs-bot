@@ -10,6 +10,7 @@ import { acceptTelegramLifecycle, reapTelegramLifecycle } from "./telegram/lifec
 import { acceptTelegramPrivateClaim } from "./telegram/private-claims.ts";
 import { decodeTelegramRequest, parseTelegramPolicy } from "./telegram/protocol.ts";
 import { acceptTelegramCommand } from "./telegram/store.ts";
+import { acceptTelegramTemp } from "./telegram/temp-import.ts";
 import { acceptTelegramView, reapTelegramViewTickets } from "./telegram/views.ts";
 
 export interface Env {
@@ -145,6 +146,11 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
       }
     } else if (decoded.privateClaim) {
       const outcome = await acceptTelegramPrivateClaim(env.DB, policy, decoded.privateClaim);
+      if (outcome === "accepted") {
+        ctx?.waitUntil(drainTelegramReplies(env.DB, env.NODES, policy, 4, 20_000).catch(() => undefined));
+      }
+    } else if (decoded.temp) {
+      const outcome = await acceptTelegramTemp(env.DB, policy, decoded.temp);
       if (outcome === "accepted") {
         ctx?.waitUntil(drainTelegramReplies(env.DB, env.NODES, policy, 4, 20_000).catch(() => undefined));
       }
