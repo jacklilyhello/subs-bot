@@ -112,6 +112,69 @@ async function applyMigrations(db: D1Database, directory: string, migrations: Ar
   }
 }
 
+test("emitted Sing-box guards raw HTTP request fields", { timeout: 60_000 }, async (t) => {
+  const directory = process.env.WORKER_TEST_BUNDLE_DIR;
+  assert.ok(directory);
+  const fixture = JSON.parse(await readFile(join(directory, "isolation.json"), "utf8"));
+  const script = await readFile(join(directory, "index.js"), "utf8");
+  const runtime = new Miniflare({ modules: true, script, compatibilityDate: fixture.compatibilityDate,
+    d1Databases: ["DB"], r2Buckets: ["NODES"], bindings: { BUILD_REVISION: fixture.revision },
+    outboundService: () => { throw new Error("HTTP field fixture attempted network access."); } });
+  t.after(() => runtime.dispose());
+  const db = await runtime.getD1Database("DB");
+  const bucket = await runtime.getR2Bucket("NODES");
+  await applyMigrations(db, directory, fixture.migrations);
+
+  const node = { type: "vmess", server: "203.0.113.41", server_port: 443, alter_id: 0,
+    uuid: "12345678-1234-4234-8234-123456789012", security: "aes-128-gcm" };
+  const http1 = { ...node, name: "Synthetic HTTP1", transport: { type: "http", method: "PUT",
+    host: ["front.example.invalid:8443", "[2001:db8::41]:8443"], path: "/escaped%2Fpath",
+    headers: { "X-Fixture": ["one", "two"] } } };
+  const http2 = { ...node, name: "Synthetic HTTP2", tls: { enabled: true, server_name: "tls.example.invalid" },
+    transport: { type: "http", method: "", path: "", headers: { "Accept-Encoding": "identity" } } };
+  const ownerId = "94073";
+  const publish = async (nodes: Array<Record<string, unknown>>) => {
+    const sub = await createSubscription(db, { ownerId, name: "HTTP request fields", sourceUrl: "https://provider.example.invalid/synthetic" });
+    assert.equal(await publishNodeSnapshot(db, bucket, { id: sub.id, ownerId, expectedGeneration: 0, expectedLifecycleRevision: 0 }, nodes), true);
+    return `https://fixture.invalid/sub/${sub.token}/singbox`;
+  };
+
+  const headers = { "Accept-Encoding": "identity" };
+  const valid = await runtime.dispatchFetch(await publish([http1, http2]), { headers });
+  assert.equal(valid.status, 200);
+  const body = Buffer.from(await valid.arrayBuffer());
+  assert.deepEqual(JSON.parse(body.toString()).outbounds.slice(2), [http1, http2].map(({ name, ...fields }) => ({ tag: name, ...fields })));
+  const binary = process.env.SINGBOX_TEST_BINARY;
+  assert.ok(binary);
+  const scratch = await mkdtemp(join(tmpdir(), "subs-bot-singbox-http-"));
+  t.after(() => rm(scratch, { recursive: true, force: true }));
+  const config = join(scratch, "synthetic.json");
+  await writeFile(config, body, { mode: 0o600 });
+  const check = spawnSync(binary, ["check", "-c", config], { stdio: "ignore", timeout: 15_000 });
+  assert.equal(check.status, 0, "Pinned Sing-box must accept the safe HTTP transport fields.");
+
+  for (const [label, options] of Object.entries({
+    method: { method: "GET\r\nX-Fixture: marker" },
+    "method-space": { method: "GET /" },
+    host: { host: ["front.example.invalid", "front.example.invalid\r\nX-Fixture: marker"] },
+    path: { path: "/fixture\r\nX-Fixture: marker" },
+    header: { headers: { "X-Fixture": "one\r\nX-Extra: marker" } },
+    "duplicate-host": { headers: { Host: "front.example.invalid", host: "other.example.invalid" } },
+    "multi-value-host": { headers: { Host: ["front.example.invalid", "other.example.invalid"] } },
+    "content-length": { headers: { "Content-Length": "0" } },
+    "transfer-encoding": { headers: { "Transfer-Encoding": "chunked" } },
+  })) {
+    await t.test(label, async () => {
+      const url = await publish([http1, { ...node, name: "Synthetic refused", transport: { type: "http", ...options } }]);
+      for (const method of ["GET", "HEAD"]) {
+        const response = await runtime.dispatchFetch(url, { method, headers });
+        assert.equal(response.status, 422);
+        assert.equal(await response.text(), method === "GET" ? "Subscription content cannot be exported." : "");
+      }
+    });
+  }
+});
+
 test("emitted Worker serves only marked active legacy empty subscriptions", { timeout: 60_000 }, async (t) => {
   const directory = process.env.WORKER_TEST_BUNDLE_DIR;
   assert.ok(directory);
