@@ -12,7 +12,7 @@ from time import monotonic
 from urllib.parse import urlencode
 from zipfile import ZipFile
 
-from capacity_probe import ProbeError, _check_headers, _request, _small_body
+from capacity_probe import MAX_SMALL_BODY_BYTES, ProbeError, _check_headers, _request, _small_body
 from capacity_resources import CapacityError, R2Objects, Resources, integer, matches, save_private_json
 from cloudflare_isolation import CloudflareClient, CloudflareError, DIGEST, REVISION, UUID, _Isolation, _verify_health
 from d1_migrations import _assert_sql
@@ -21,6 +21,7 @@ from prepare_isolation_artifact import (
     require_current_main, select_main_artifact,
 )
 from release_isolation import telegram_release_config
+from telegram_aggregate_smoke import validate_release_pin
 from telegram_view_fixtures import FixtureError, query, rows, statement
 
 
@@ -28,6 +29,7 @@ WORKFLOW = "worker-isolation-telegram-documents.yml"
 ARTIFACT_PREFIX = "subs-bot-telegram-document"
 CHECKPOINT = "telegram-document-checkpoint.json"
 MIGRATIONS = ("0011_telegram_document_jobs.sql", "0012_telegram_document_publication.sql")
+NODE_MIGRATIONS = ("0018_telegram_subscription_reads.sql", "0022_telegram_subscription_node_pages.sql")
 COHORT = re.compile(r"[a-f0-9]{16}")
 DECIMAL = re.compile(r"[1-9][0-9]{0,19}")
 TOKEN = re.compile(r"[a-f0-9]{32}")
@@ -37,8 +39,12 @@ MAX_OBJECT = 16384
 UPLOADED = "uploaded://telegram-document"
 MARKER = "document-job:v1"
 ROLES = {"member": "memberId", "admin": "adminId"}
+DOCUMENT = "document"
+NODE_PAGES = "node-pages"
 VERSIONS = {"member-first": ("member", 1, ("member-first",)), "admin-first": ("admin", 1, ("admin-first",)),
             "member-second": ("member", 2, ("member-second-1", "member-second-2"))}
+NODE_VERSIONS = {"member-first": ("member", 1, ("member-01", "member-02")),
+                 "admin-first": ("admin", 1, tuple(f"admin-{index:02d}" for index in range(1, 33)))}
 PHASES = {"prepare": "prepared", "capture-created": "created", "verify-replaced": "verified", "retire": "retired"}
 PREVIOUS = {"capture-created": {"prepared"}, "verify-replaced": {"created"}, "retire": {"created", "verified"}}
 SNAPSHOTS = {"prepared": (), "created": ("member-first", "admin-first"), "verified": tuple(VERSIONS)}
@@ -55,21 +61,28 @@ def digest(body):
     return sha256(body).hexdigest()
 
 
-def share_lines(cohort, version):
-    return [f"{SHARE}tgdoc-{cohort}-{suffix}" for suffix in VERSIONS[version][2]]
+def fixture_name(cohort, profile):
+    return ("tgdoc-nodes-" if profile == NODE_PAGES else "tgdoc-") + cohort
+
+
+def share_lines(cohort, version, profile=DOCUMENT):
+    versions = NODE_VERSIONS if profile == NODE_PAGES else VERSIONS
+    return [f"{SHARE}{fixture_name(cohort, profile)}-{suffix}" for suffix in versions[version][2]]
 
 
 def parse_inputs(event):
     inputs = event.get("inputs")
-    require(isinstance(inputs, dict) and set(inputs) <= {"action", "cohort", "source_run_id", "negative_message_id", "confirm_retire"},
+    require(isinstance(inputs, dict) and set(inputs) <= {"profile", "action", "cohort", "source_run_id", "negative_message_id", "confirm_retire"},
             "Invalid isolated document workflow inputs.")
+    profile = inputs.get("profile", DOCUMENT)
     action, cohort = inputs.get("action"), inputs.get("cohort")
     source, negative, confirmation = (inputs.get(key, "") for key in ("source_run_id", "negative_message_id", "confirm_retire"))
-    require(isinstance(action, str) and action in PHASES and matches(COHORT, cohort)
+    require(profile in (DOCUMENT, NODE_PAGES) and isinstance(action, str) and action in PHASES and matches(COHORT, cohort)
+            and (profile == DOCUMENT or action != "verify-replaced")
             and (source == "" if action == "prepare" else matches(DECIMAL, source))
             and (negative == "" or (action == "verify-replaced" and matches(DECIMAL, negative) and int(negative) <= MAX_ID))
             and confirmation == (f"retire {cohort}" if action == "retire" else ""), "Invalid document action or confirmation.")
-    return action, cohort, source, int(negative) if negative else None
+    return profile, action, cohort, source, int(negative) if negative else None
 
 
 def read_checkpoint(run_id, revision, token):
@@ -88,24 +101,37 @@ def read_checkpoint(run_id, revision, token):
     return _parse_object(body, "Invalid isolated document checkpoint.")
 
 
-def validate_checkpoint(checkpoint, action, cohort, revision, identity):
-    require(set(checkpoint) == {"version", "phase", "cohort", "revision", "identity", "afterReceiptId", "snapshots",
-                               "receipts", "negativeReceiptBound"} and type(checkpoint["version"]) is int
-            and checkpoint["version"] == 1 and checkpoint["phase"] in PREVIOUS[action]
+def validate_checkpoint(checkpoint, action, cohort, revision, identity, profile=DOCUMENT, release_pin=None):
+    fields = {"version", "phase", "cohort", "revision", "identity", "afterReceiptId", "snapshots", "receipts", "negativeReceiptBound"}
+    node_pages = profile == NODE_PAGES
+    if node_pages:
+        fields |= {"profile", "releasePin"}
+    require(set(checkpoint) == fields and type(checkpoint["version"]) is int
+            and checkpoint["version"] == (2 if node_pages else 1) and checkpoint["phase"] in PREVIOUS[action]
             and (checkpoint["cohort"], checkpoint["revision"], checkpoint["identity"]) == (cohort, revision, identity)
             and integer(checkpoint["afterReceiptId"], 0, MAX_ID) and type(checkpoint["negativeReceiptBound"]) is bool,
             "Document checkpoint does not match the requested phase or environment.")
+    if node_pages:
+        require(checkpoint["profile"] == NODE_PAGES and checkpoint["phase"] in ("prepared", "created")
+                and action in ("capture-created", "retire") and not checkpoint["negativeReceiptBound"],
+                "Node-page document checkpoint phase or profile differs.")
+        original = checkpoint["releasePin"]
+        validate_release_pin(original)
+        validate_release_pin(release_pin)
+        require(original["revision"] == revision and (action == "retire" or original == release_pin),
+                "Node-page document checkpoint release differs.")
+    versions = NODE_VERSIONS if node_pages else VERSIONS
     snapshots, receipts = checkpoint["snapshots"], checkpoint["receipts"]
     require(isinstance(snapshots, dict) and set(snapshots) == set(SNAPSHOTS[checkpoint["phase"]])
             and isinstance(receipts, dict) and set(receipts) == set(ROLES), "Document checkpoint inventory differs.")
     for role, history in receipts.items():
-        expected = sum(VERSIONS[label][0] == role for label in snapshots)
+        expected = sum(versions[label][0] == role for label in snapshots)
         require(isinstance(history, list) and len(history) == expected and all(matches(DIGEST, item) for item in history)
                 and len(set(history)) == len(history), "Document checkpoint receipts differ.")
     for label, item in snapshots.items():
         require(isinstance(item, dict) and set(item) == {"id", "generation", "snapshotId", "manifestSha256", "tokenSha256",
                 "createdAt", "updatedAt", "objects"} and integer(item["id"], 1, MAX_ID)
-                and integer(item["generation"], VERSIONS[label][1], VERSIONS[label][1])
+                and integer(item["generation"], versions[label][1], versions[label][1])
                 and integer(item["createdAt"], 1, MAX_ID) and integer(item["updatedAt"], item["createdAt"], MAX_ID)
                 and matches(UUID, item["snapshotId"]) and matches(DIGEST, item["manifestSha256"])
                 and matches(DIGEST, item["tokenSha256"]), "Document checkpoint pointer identity differs.")
@@ -128,10 +154,12 @@ def verify_replacement(first, second):
 
 
 class Cohort:
-    def __init__(self, resources, policy, cohort):
+    def __init__(self, resources, policy, cohort, profile=DOCUMENT):
         self.resources = resources
         self.policy = policy
-        self.name = "tgdoc-" + cohort
+        self.profile = profile
+        self.versions = NODE_VERSIONS if profile == NODE_PAGES else VERSIONS
+        self.name = fixture_name(cohort, profile)
         self.cohort = cohort
         self.actors = {role: policy[key] for role, key in ROLES.items()}
 
@@ -158,7 +186,8 @@ class Cohort:
                     and row.get("trashed") == row.get("lifecycle") == 0 and integer(row.get("id"), 1, MAX_ID)
                     and matches(TOKEN, row.get("token")) and matches(UUID, row.get("snapshot_id"))
                     and matches(DIGEST, row.get("manifest_sha256")) and integer(row.get("generation"), 1, 2)
-                    and integer(row.get("node_count"), 1, 2) and integer(row.get("created_at"), 1, MAX_ID)
+                    and integer(row.get("node_count"), 1, max(len(entry[2]) for entry in self.versions.values()))
+                    and integer(row.get("created_at"), 1, MAX_ID)
                     and integer(row.get("updated_at"), row["created_at"], MAX_ID), "Document subscription ownership or pointer is ambiguous.")
             by_owner[role] = row
         return by_owner
@@ -171,8 +200,13 @@ class Cohort:
           AND NOT EXISTS(SELECT 1 FROM telegram_document_stages WHERE subscription_id IN (SELECT value FROM json_each(?)))
           AND NOT EXISTS(SELECT 1 FROM subscription_lifecycle WHERE subscription_id IN (SELECT value FROM json_each(?)))
           AND NOT EXISTS(SELECT 1 FROM subscription_trash WHERE name=? OR id IN (SELECT value FROM json_each(?)))"""
-        return statement(_assert_sql(quiet) if assertion else f"SELECT ({quiet}) AS quiet", self.policy["botId"],
-            *self.actors.values(), self.name, known, known, known, self.name, known)
+        params = (self.policy["botId"], *self.actors.values(), self.name, known, known, known, self.name, known)
+        if self.profile == NODE_PAGES:
+            for table in ("telegram_subscription_read", "telegram_subscription_node_page"):
+                quiet += f""" AND NOT EXISTS(SELECT 1 FROM {table} AS feature JOIN telegram_outbox USING(receipt_id)
+                    WHERE feature.subscription_id IN (SELECT value FROM json_each(?)) AND state IN ('pending','leased','sending'))"""
+                params += (known,)
+        return statement(_assert_sql(quiet) if assertion else f"SELECT ({quiet}) AS quiet", *params)
 
     def require_quiet(self, ids):
         data = self.quiet_statement(ids, False)
@@ -189,7 +223,7 @@ class Cohort:
           WHERE i.bot_id=? AND i.actor_id IN (?,?) AND i.receipt_id>CAST(? AS INTEGER) AND s.name_sha256=?
           ORDER BY i.receipt_id LIMIT 4""", MARKER, self.policy["botId"], *self.actors.values(), after, digest(self.name.encode("ascii")))
         result = {role: [] for role in ROLES}
-        wanted = {role: [len(nodes) for label, (actor, _, nodes) in VERSIONS.items()
+        wanted = {role: [len(nodes) for label, (actor, _, nodes) in self.versions.items()
                          if label in snapshots and actor == role] for role in ROLES}
         for row in readback:
             role = next(role for role, actor in self.actors.items() if actor == row.get("actor_id"))
@@ -228,8 +262,8 @@ class Cohort:
         return prefix, result
 
     def snapshot(self, label, row, probe):
-        _, generation, _ = VERSIONS[label]
-        shares = share_lines(self.cohort, label)
+        _, generation, _ = self.versions[label]
+        shares = share_lines(self.cohort, label, self.profile)
         require((row["generation"], row["node_count"]) == (generation, len(shares)), "Document generation or node count differs.")
         pointer = {"id": row["id"], "generation": generation, "snapshotId": row["snapshot_id"],
                    "manifestSha256": row["manifest_sha256"], "tokenSha256": digest(row["token"].encode("ascii")),
@@ -247,8 +281,11 @@ class Cohort:
         chunk = bodies["0.ndjson"]
         lines = chunk.split(b"\n")
         require(len(lines) == len(shares) + 1 and lines[-1] == b"", "Document snapshot lines differ.")
-        require([_parse_object(line.decode("utf-8"), "Invalid synthetic document node.").get("share") for line in lines[:-1]] == shares,
-                "Document snapshot contains unexpected links.")
+        nodes = [_parse_object(line.decode("utf-8"), "Invalid synthetic document node.") for line in lines[:-1]]
+        require([node.get("share") for node in nodes] == shares, "Document snapshot contains unexpected links.")
+        if self.profile == NODE_PAGES:
+            require(nodes == [{"name": share.split("#", 1)[1], "type": "ss", "share": share} for share in shares],
+                    "Node-page document snapshot labels or protocol differ.")
         probe(row["token"], shares)
         return {**pointer, "objects": objects}
 
@@ -270,11 +307,16 @@ class Cohort:
 def probe_export(token, shares):
     deadline = monotonic() + 20
     expected = b64encode("\n".join(shares).encode("ascii"))
+    require(len(expected) <= MAX_OBJECT, "Document Base64 fixture exceeds the probe limit.")
     for method in ("GET", "HEAD"):
         with _request(method, f"/sub/{token}/base64", deadline, "document snapshot") as response:
             _check_headers(response, 200, "document snapshot", "text/plain")
-            require((response.getheader("Content-Length") == str(len(expected)) and _small_body(response) == expected)
-                    if method == "GET" else response.read(1) == b"", "Document Base64 export differs.")
+            if method == "GET":
+                require(response.getheader("Content-Length") == str(len(expected)), "Document Base64 export differs.")
+                body = _small_body(response) if len(expected) <= MAX_SMALL_BODY_BYTES else response.read(len(expected) + 1)
+                require(body == expected, "Document Base64 export differs.")
+            else:
+                require(response.read(1) == b"", "Document Base64 export differs.")
 
 
 def capture(cohort, checkpoint, action, negative, probe):
@@ -284,7 +326,7 @@ def capture(cohort, checkpoint, action, negative, probe):
     require(set(current) == set(ROLES), "Both approved actors must have one matching uploaded subscription.")
     cohort.require_quiet(tuple(row["id"] for row in current.values()))
     if action == "capture-created":
-        snapshots = {label: cohort.snapshot(label, current[VERSIONS[label][0]], probe) for label in SNAPSHOTS["created"]}
+        snapshots = {label: cohort.snapshot(label, current[cohort.versions[label][0]], probe) for label in SNAPSHOTS["created"]}
         require(snapshots["member-first"]["id"] != snapshots["admin-first"]["id"]
                 and snapshots["member-first"]["tokenSha256"] != snapshots["admin-first"]["tokenSha256"],
                 "Document owner identities overlap.")
@@ -320,7 +362,7 @@ def retire(cohort, checkpoint, guard):
             require((row["id"], row["generation"], row["snapshot_id"], row["manifest_sha256"], row["created_at"], row["updated_at"],
                     row["node_count"], digest(row["token"].encode("ascii")))
                     == (pointer["id"], pointer["generation"], pointer["snapshotId"], pointer["manifestSha256"],
-                        pointer["createdAt"], pointer["updatedAt"], len(VERSIONS[label][2]), pointer["tokenSha256"]),
+                        pointer["createdAt"], pointer["updatedAt"], len(cohort.versions[label][2]), pointer["tokenSha256"]),
                     "Current document pointer differs from the retirement checkpoint.")
             checks.append(statement("""DELETE FROM subscriptions WHERE id=? AND owner_id=? AND name=? AND source_url=? AND token=?
               AND generation=? AND snapshot_id=? AND manifest_sha256=? AND node_count=? AND created_at=? AND updated_at=?""",
@@ -354,7 +396,7 @@ def run():
     with Path(os.environ["GITHUB_EVENT_PATH"]).open("rb") as event:
         body = event.read(65537)
     require(len(body) <= 65536, "Document workflow input is too large.")
-    action, cohort_key, source_run, negative = parse_inputs(_parse_object(body, "Invalid document workflow event."))
+    profile, action, cohort_key, source_run, negative = parse_inputs(_parse_object(body, "Invalid document workflow event."))
     require_current_main(revision)
     github_token = os.environ["GH_TOKEN"]
     # A reviewed cleanup can resume after main advances. Acceptance captures stay on one release.
@@ -372,13 +414,15 @@ def run():
     scope.verify_resources()
     active = scope.active()
     version = scope.version(active.version)
+    release_pin = {"revision": version.revision, "versionId": active.version, "moduleSha256": version.digest,
+                   "compatibilityDate": version.compatibility}
     policy_sha = digest(raw_policy.encode("utf-8"))
     require(scope.cron_enabled() and version.revision == revision and version.telegram_config_sha256 == policy_sha,
             "The active Worker or Telegram policy differs from the reviewed isolation release.")
     _verify_health(revision)
     resources = Resources(target, data, R2Objects(target["accountId"], data_token))
     identity = digest(f"{resources.scope_hash}/{policy_sha}".encode("ascii"))
-    for name in MIGRATIONS:
+    for name in MIGRATIONS + (NODE_MIGRATIONS if profile == NODE_PAGES else ()):
         expected = digest((Path(__file__).resolve().parents[1] / "migrations" / name).read_bytes())
         require(rows(data, resources.database, "SELECT position,sha256,mode FROM subs_bot_schema_migrations WHERE name=?", name)
                 == [{"position": int(name[:4]), "sha256": expected, "mode": "applied"}], "Document migration proof differs.")
@@ -386,8 +430,12 @@ def run():
     def guard():
         require_current_main(revision)
         require(scope.active() == active and scope.worker_config() == config, "Isolated Worker changed during document acceptance.")
+        if profile == NODE_PAGES:
+            scope.verify_resources()
+            require(scope.version(active.version) == version and scope.cron_enabled(),
+                    "The node-page Worker version or schedule changed during document acceptance.")
 
-    cohort = Cohort(resources, policy, cohort_key)
+    cohort = Cohort(resources, policy, cohort_key, profile)
     if checkpoint is None:
         require(not cohort.subscriptions(), "The exact synthetic document filename is occupied.")
         cohort.require_quiet(())
@@ -399,15 +447,26 @@ def run():
         checkpoint = {"version": 1, "phase": "prepared", "cohort": cohort_key, "revision": revision, "identity": identity,
                       "afterReceiptId": clock[0]["highWater"], "snapshots": {}, "receipts": {role: [] for role in ROLES},
                       "negativeReceiptBound": False}
+        if profile == NODE_PAGES:
+            validate_release_pin(release_pin)
+            checkpoint.update(version=2, profile=NODE_PAGES, releasePin=release_pin)
     else:
-        validate_checkpoint(checkpoint, action, cohort_key, source_revision, identity)
+        validate_checkpoint(checkpoint, action, cohort_key, source_revision, identity, profile, release_pin)
         checkpoint = retire(cohort, checkpoint, guard) if action == "retire" else capture(cohort, checkpoint, action, negative, probe_export)
+        if action == "retire" and profile == NODE_PAGES:
+            checkpoint["retiredAtReleasePin"] = release_pin
     guard()
     save_private_json(Path(os.environ["RUNNER_TEMP"]) / CHECKPOINT, checkpoint)
-    print(json.dumps({"phase": checkpoint["phase"], "snapshotCount": len(checkpoint["snapshots"]),
-                      "savedReceiptCount": sum(len(items) for items in checkpoint["receipts"].values()),
-                      "negativeReceiptBound": checkpoint["negativeReceiptBound"],
-                      "verifiedAbsentObjectCount": len(checkpoint["snapshots"]) * len(OBJECTS) if action == "retire" else 0}, sort_keys=True))
+    report = {"phase": checkpoint["phase"], "snapshotCount": len(checkpoint["snapshots"]),
+              "savedReceiptCount": sum(len(items) for items in checkpoint["receipts"].values()),
+              "negativeReceiptBound": checkpoint["negativeReceiptBound"],
+              "verifiedAbsentObjectCount": len(checkpoint["snapshots"]) * len(OBJECTS) if action == "retire" else 0}
+    if profile == NODE_PAGES:
+        report["profile"] = NODE_PAGES
+        if action == "capture-created":
+            report["verifiedNodeCounts"] = {role: len(shares) for role, _, shares in NODE_VERSIONS.values()}
+            report["verifiedExportCount"] = len(checkpoint["snapshots"])
+    print(json.dumps(report, sort_keys=True))
 
 
 if __name__ == "__main__":
