@@ -7,7 +7,7 @@ on:
         description: IAB drives commands between these protected checkpoints
         required: true
         type: choice
-        options: [prepare, capture-first-and-extend, capture-independence, retire]
+        options: [prepare, capture-first-and-extend, capture-independence, retire, prepare-abort, abort-retire]
       cohort:
         description: Unique 16-character lowercase hexadecimal cohort
         required: true
@@ -15,11 +15,14 @@ on:
       source_run_id:
         description: Successful predecessor checkpoint run ID (empty for prepare)
         type: string
+      source_revision:
+        description: Exact predecessor main commit for recovery after a release change (abort only)
+        type: string
       browser_hashes:
         description: JSON map of exact IAB capability SHA-256 digests only
         type: string
       confirm_retire:
-        description: For retirement only, enter retire followed by one space and the cohort
+        description: For retirement, enter retire or abort followed by one space and the cohort
         type: string
 
 permissions:

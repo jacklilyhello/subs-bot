@@ -37,7 +37,8 @@ MEMBERS = {
 }
 PREVIOUS = {"capture-first-and-extend": "prepared", "capture-independence": "extended", "retire": "independent"}
 INPUT_LABELS = {"prepare": (), "capture-first-and-extend": ("admin-first", "member-first"),
-                "capture-independence": ("admin-second",), "retire": ()}
+                "capture-independence": ("admin-second",), "retire": (), "prepare-abort": (), "abort-retire": ()}
+ABORT_ACTIONS = {"prepare-abort", "abort-retire"}
 FIRST_ACTIONS = {"admin": (("issued", "admin-first"),), "member": (("issued", "member-first"),)}
 INDEPENDENT_ACTIONS = {**FIRST_ACTIONS, "admin": FIRST_ACTIONS["admin"] + (("issued", "admin-second"), ("revoked", "admin-first"))}
 FINAL_ACTIONS = {"admin": INDEPENDENT_ACTIONS["admin"] + (("revoked", "admin-second"),),
@@ -47,19 +48,22 @@ PHASE_ACTIONS = {"prepared": {role: () for role in ROLES}, "extended": FIRST_ACT
 
 def parse_inputs(event):
     inputs = event.get("inputs")
-    require(isinstance(inputs, dict) and set(inputs) <= {"action", "cohort", "source_run_id", "browser_hashes", "confirm_retire"},
+    require(isinstance(inputs, dict) and set(inputs) <= {"action", "cohort", "source_run_id", "source_revision", "browser_hashes", "confirm_retire"},
             "Selected acceptance workflow inputs differ.")
     action, cohort = inputs.get("action"), inputs.get("cohort")
     source, confirmation = inputs.get("source_run_id", ""), inputs.get("confirm_retire", "")
+    expected_confirmation = f"retire {cohort}" if action == "retire" else f"abort {cohort}" if action == "abort-retire" else ""
     require(action in INPUT_LABELS and matches(COHORT, cohort) and
             (source == "" if action == "prepare" else matches(DECIMAL, source)) and
-            confirmation == (f"retire {cohort}" if action == "retire" else ""), "Selected acceptance action or confirmation differs.")
+            confirmation == expected_confirmation, "Selected acceptance action or confirmation differs.")
+    revision = inputs.get("source_revision", "")
+    require(revision == "" or action in ABORT_ACTIONS and matches(REVISION, revision), "Selected recovery source revision differs.")
     hashes = inputs.get("browser_hashes", "")
     require(isinstance(hashes, str) and len(hashes) <= 256, "Selected browser evidence exceeds its limit.")
     evidence = _parse_object(hashes or "{}", "Selected browser evidence is invalid.")
     require(set(evidence) == set(INPUT_LABELS[action]) and all(matches(DIGEST, value) for value in evidence.values()),
             "Selected browser evidence must contain the exact capability digests for this phase.")
-    return action, cohort, source, evidence
+    return action, cohort, source, evidence, revision
 
 
 def validate_checkpoint(value, action, cohort, revision, identity, release):
@@ -483,8 +487,22 @@ def retire(cohort, checkpoint, guard, probe=probe_fixture_exports):
         guarded_batch(cohort, steps, guard)
     require(not cohort.subscriptions(ids), "Selected D1 retirement could not be confirmed.")
     cohort.require_quiet(ids)
+    retire_objects(cohort, pointers, guard)
+    require(not cohort.subscriptions(ids) and evidence(cohort, checkpoint, {}, FINAL_ACTIONS, retired=True) == facts,
+            "Selected retirement changed receipt evidence.")
+    require(verify_links(cohort, checkpoint, issued, revoked, None)[:2] == (identities, tombstones),
+            "Selected retirement changed link tombstones.")
+    return {**checkpoint, "phase": "retired", "receipts": history, "groupReceipt": group, "tempReceipts": temp,
+            "tombstones": tombstones}, report
+
+
+def retire_objects(cohort, pointers, guard, retained=()):
     for label, pointer in pointers.items():
         prefix = cohort.checked_objects(label, pointer, missing=True)
+        if label in retained:
+            # An unpublished reservation can still have a delayed PUT. Never
+            # certify absence or delete anything on that uncertain prefix.
+            continue
         for name, body in cohort.bodies(label).items():
             key = prefix + name
             guard()
@@ -498,12 +516,197 @@ def retire(cohort, checkpoint, guard, probe=probe_fixture_exports):
                 pass
             require(cohort.resources.objects.request("GET", key) is None, "Selected R2 retirement could not be confirmed.")
         require(not cohort.list_objects(pointer)[1], "Selected retired object inventory differs.")
-    require(not cohort.subscriptions(ids) and evidence(cohort, checkpoint, {}, FINAL_ACTIONS, retired=True) == facts,
-            "Selected retirement changed receipt evidence.")
-    require(verify_links(cohort, checkpoint, issued, revoked, None)[:2] == (identities, tombstones),
-            "Selected retirement changed link tombstones.")
-    return {**checkpoint, "phase": "retired", "receipts": history, "groupReceipt": group, "tempReceipts": temp,
-            "tombstones": tombstones}, report
+
+
+def abort_history(cohort, checkpoint):
+    bot, actors = cohort.policy["botId"], tuple(cohort.actors.values())
+    rows = cohort.read(f"""SELECT {SENT_FIELDS},i.receipt_nonce FROM telegram_inbox AS i
+      LEFT JOIN telegram_outbox AS o USING(receipt_id)
+      WHERE i.bot_id=? AND i.actor_id IN (?,?) AND i.receipt_id>CAST(? AS INTEGER)
+      ORDER BY i.receipt_id LIMIT 17""", bot, *actors, checkpoint["afterReceiptId"])
+    require(len(rows) <= 16 and all(row["state"] in ("sent", "failed", "uncertain") for row in rows),
+            "Selected recovery requires settled cohort replies.")
+    temp = cohort.read(f"""SELECT {SENT_FIELDS},t.kind,t.node_count,t.total_count,t.malformed_count,t.unsupported_count,t.ignored_count
+      FROM telegram_inbox AS i JOIN telegram_temp_reply AS t USING(receipt_id) JOIN telegram_outbox AS o USING(receipt_id)
+      WHERE i.bot_id=? AND i.actor_id IN (?,?) AND i.receipt_id>CAST(? AS INTEGER) AND i.receipt_nonce='temp:v1'
+      ORDER BY i.receipt_id LIMIT 3""", bot, *actors, checkpoint["afterReceiptId"])
+    require([row["kind"] for row in temp] in ([], ["added", "cleared"]),
+            "Clear the exact temporary fixture in IAB before selected recovery.")
+    if temp:
+        for index, row in enumerate(temp):
+            sent(row, checkpoint)
+            require(row["actor_id"] == cohort.actors["admin"] and (row["node_count"], row["total_count"]) == (1, 1 - index)
+                    and (row["malformed_count"], row["unsupported_count"], row["ignored_count"]) == (0, 0, 0),
+                    "Selected recovery temporary receipts differ.")
+        fence = cohort.read("SELECT message_date,message_id FROM telegram_temp_clear_fence WHERE bot_id=? AND actor_id=?", bot, cohort.actors["admin"])
+        require(fence == [{field: temp[-1][field] for field in ("message_date", "message_id")}],
+                "Selected recovery temporary clear fence differs.")
+    temp_hashes = [row_digest(cohort, "temporary-node", row) for row in temp]
+    require(temp_hashes[:len(checkpoint["tempReceipts"])] == checkpoint["tempReceipts"], "Selected recovery temporary history differs.")
+    actions = cohort.read(f"""SELECT {SENT_FIELDS},a.result,a.code_sha256,a.auth_message_date,a.auth_message_id
+      FROM telegram_inbox AS i LEFT JOIN telegram_selected_actions AS a USING(receipt_id)
+      LEFT JOIN telegram_outbox AS o USING(receipt_id) WHERE i.bot_id=? AND i.actor_id IN (?,?)
+      AND i.receipt_id>CAST(? AS INTEGER) AND i.receipt_nonce=? ORDER BY i.receipt_id LIMIT 9""",
+      bot, *actors, checkpoint["afterReceiptId"], MARKER)
+    require(len(actions) <= 8 and all(row["result"] is not None for row in actions), "Selected recovery action inventory differs.")
+    for role, previous in checkpoint["receipts"].items():
+        actual = [row_digest(cohort, "selected-action", row) for row in actions if row["actor_id"] == cohort.actors[role]]
+        require(actual[:len(previous)] == previous, "Selected recovery changed previously verified action evidence.")
+    return row_digest(cohort, "abort-history", {"inbox": rows, "actions": actions, "temp": temp_hashes})
+
+
+LINK_FIELDS = ("code_sha256", "bot_id", "actor_id", "origin_receipt_id", "nonce", "key_version", "generations",
+               "owner_id", "kind", "link_bot_id", "selected_ids", "created_at", "revoked_at")
+
+
+def abort_links(cohort, checkpoint, pointers):
+    rows = cohort.read("""SELECT selected.code_sha256,selected.bot_id,selected.actor_id,selected.origin_receipt_id,
+      selected.nonce,selected.key_version,selected.generations,link.owner_id,link.kind,link.bot_id AS link_bot_id,
+      link.selected_ids,link.created_at,link.revoked_at,i.actor_id AS receipt_actor,i.bot_id AS receipt_bot,
+      i.chat_id,i.chat_type,i.thread_id,i.command,i.receipt_nonce,o.state,a.result,a.code_sha256 AS action_code
+      FROM telegram_selected_links AS selected JOIN aggregate_links AS link USING(code_sha256)
+      JOIN telegram_inbox AS i ON i.receipt_id=selected.origin_receipt_id
+      LEFT JOIN telegram_outbox AS o ON o.receipt_id=i.receipt_id LEFT JOIN telegram_selected_actions AS a ON a.receipt_id=i.receipt_id
+      WHERE selected.bot_id=? AND selected.actor_id IN (?,?) AND selected.origin_receipt_id>CAST(? AS INTEGER)
+      ORDER BY selected.origin_receipt_id LIMIT 4""", cohort.policy["botId"], *cohort.actors.values(), checkpoint["afterReceiptId"])
+    require(len(rows) <= 3, "Selected recovery found extra capabilities.")
+    result = {}
+    for row in rows:
+        matched = []
+        for label, fixtures in MEMBERS.items():
+            if all(fixture in pointers for fixture in fixtures) and row["actor_id"] == cohort.actors[label.split("-", 1)[0]]:
+                ids = [pointers[fixture]["id"] for fixture in fixtures]
+                if row["selected_ids"] == canonical(ids) and row["generations"] == canonical([[item, 1, 0] for item in ids]):
+                    matched.append(label)
+        require(len(matched) == 1 and matched[0] not in result, "Selected recovery capability membership differs.")
+        label = matched[0]
+        require(row["actor_id"] == row["receipt_actor"] == row["owner_id"] == row["chat_id"]
+                and row["bot_id"] == row["receipt_bot"] == cohort.policy["botId"]
+                and (row["kind"], row["link_bot_id"], row["chat_type"], row["thread_id"], row["command"], row["receipt_nonce"], row["key_version"])
+                    == ("selected", None, "private", None, "help", MARKER, 1)
+                and row["state"] in ("sent", "failed", "uncertain") and integer(row["created_at"], 1, MAX_ID)
+                and (row["revoked_at"] is None or integer(row["revoked_at"], row["created_at"], MAX_ID))
+                and ((row["result"] == "issued" and row["action_code"] == row["code_sha256"])
+                     or (row["result"] == "stale" and row["action_code"] is None and row["revoked_at"] is not None)),
+                "Selected recovery capability or origin receipt differs.")
+        code = derive_selected_code(cohort.encoded, cohort.policy, label.split("-", 1)[0], row["nonce"], row["selected_ids"])
+        require(digest(code.encode("ascii")) == row["code_sha256"], "Selected recovery capability digest differs.")
+        facts = {name: row[name] for name in LINK_FIELDS}
+        identity = row_digest(cohort, "selected-link", {name: value for name, value in facts.items() if name != "revoked_at"})
+        tombstone = None if row["revoked_at"] is None else row_digest(cohort, "selected-tombstone", facts)
+        require(checkpoint["linkIdentities"].get(label, identity) == identity
+                and checkpoint["tombstones"].get(label, tombstone) == tombstone, "Selected recovery changed previously verified link evidence.")
+        result[label] = (facts, code, {"sha256": row["code_sha256"], "identity": identity, "tombstone": tombstone})
+    require(set(checkpoint["linkIdentities"]) <= set(result), "Selected recovery lost a verified link.")
+    return result
+
+
+def validate_abort_source(checkpoint, cohort, source_revision):
+    require(isinstance(checkpoint, dict) and checkpoint.get("phase") in PHASE_ACTIONS, "Selected recovery needs a successful normal checkpoint.")
+    release = checkpoint.get("releasePin")
+    validate_release_pin(release)
+    require(release["revision"] == source_revision, "Selected recovery source release differs.")
+    action = next(action for action, phase in PREVIOUS.items() if phase == checkpoint["phase"])
+    validate_checkpoint(checkpoint, action, cohort.cohort, source_revision, cohort.identity, release)
+
+
+def prepare_abort(cohort, checkpoint, source_revision, release):
+    validate_abort_source(checkpoint, cohort, source_revision)
+    original = checkpoint["snapshots"]
+    current = cohort.subscriptions(item["id"] for item in original.values())
+    require(set(current) in (set(original), set(original) | {"admin-late"}), "Selected recovery fixture inventory differs.")
+    cohort.verify_pointers(current, original)
+    pointers = dict(original)
+    retained = []
+    if "admin-late" not in original and "admin-late" in current:
+        row = current["admin-late"]
+        pointers["admin-late"] = cohort.pointer(row, "admin-late")
+        if row["generation"] == 0:
+            retained.append("admin-late")
+        cohort.checked_objects("admin-late", pointers["admin-late"], missing=bool(retained))
+    links = abort_links(cohort, checkpoint, pointers)
+    require(not retained or "admin-second" not in links, "An unpublished selected fixture cannot have an issued capability.")
+    cohort.require_quiet([item["id"] for item in pointers.values()], active=[row["code_sha256"] for row, _, _ in links.values()])
+    return {"version": 1, "phase": "abort-ready", "sourceCheckpoint": checkpoint, "abortPreparedAtReleasePin": release,
+            "snapshots": pointers, "retainedSnapshots": retained, "links": {label: pin for label, (_, _, pin) in links.items()},
+            "receiptEvidence": abort_history(cohort, checkpoint)}
+
+
+def assert_abort_link(row):
+    return statement(_assert_sql("""EXISTS(SELECT 1 FROM aggregate_links AS link JOIN telegram_selected_links AS selected USING(code_sha256)
+      WHERE code_sha256=? AND link.owner_id=? AND link.kind='selected' AND link.bot_id IS NULL AND link.selected_ids=?
+      AND link.created_at=? AND COALESCE(link.revoked_at,0)=CAST(? AS INTEGER) AND selected.bot_id=? AND selected.actor_id=?
+      AND selected.origin_receipt_id=? AND selected.nonce=? AND selected.key_version=1 AND selected.generations=?)"""),
+      row["code_sha256"], row["owner_id"], row["selected_ids"], row["created_at"], row["revoked_at"] or 0,
+      row["bot_id"], row["actor_id"], row["origin_receipt_id"], row["nonce"], row["generations"])
+
+
+def abort_retire(cohort, ready, source_revision, release, guard, probe=probe_fixture_exports):
+    require(isinstance(ready, dict) and set(ready) == {"version", "phase", "sourceCheckpoint", "abortPreparedAtReleasePin",
+            "snapshots", "retainedSnapshots", "links", "receiptEvidence"} and (ready["version"], ready["phase"]) == (1, "abort-ready"),
+            "Selected recovery requires a successful abort preparation checkpoint.")
+    validate_release_pin(ready["abortPreparedAtReleasePin"])
+    require(ready["abortPreparedAtReleasePin"]["revision"] == source_revision, "Selected abort checkpoint release differs.")
+    checkpoint = ready["sourceCheckpoint"]
+    validate_abort_source(checkpoint, cohort, checkpoint["revision"])
+    pointers, retained = ready["snapshots"], ready["retainedSnapshots"]
+    original = checkpoint["snapshots"]
+    require(isinstance(pointers, dict) and set(pointers) in (set(original), set(original) | {"admin-late"})
+            and all(pointers[label] == item for label, item in original.items()) and retained in ([], ["admin-late"])
+            and (not retained or "admin-late" in pointers and "admin-late" not in original), "Selected abort checkpoint pointers differ.")
+    for label, pointer in pointers.items():
+        token, snapshot = cohort.seed_identity(label)
+        require(isinstance(pointer, dict) and set(pointer) == {"id", "snapshotId", "manifestSha256", "tokenSha256", "createdAt"}
+                and integer(pointer["id"], 1, MAX_ID) and integer(pointer["createdAt"], 1, MAX_ID)
+                and pointer["snapshotId"] == snapshot and pointer["tokenSha256"] == digest(token.encode("ascii"))
+                and pointer["manifestSha256"] == digest(cohort.bodies(label)["manifest.json"]), "Selected abort checkpoint identity differs.")
+    ids = [item["id"] for item in pointers.values()]
+    require(len(set(ids)) == len(ids), "Selected abort checkpoint IDs overlap.")
+    require(abort_history(cohort, checkpoint) == ready["receiptEvidence"], "Selected recovery receipt evidence changed.")
+    links = abort_links(cohort, checkpoint, pointers)
+    pins = ready["links"]
+    require(isinstance(pins, dict) and set(pins) == set(links), "Selected abort checkpoint link inventory differs.")
+    for label, (_, _, pin) in links.items():
+        require(isinstance(pins[label], dict) and set(pins[label]) == set(pin)
+                and pins[label]["sha256"] == pin["sha256"] and pins[label]["identity"] == pin["identity"]
+                and pins[label]["tombstone"] in (None, pin["tombstone"]), "Selected abort checkpoint link identity differs.")
+    active = [row["code_sha256"] for row, _, _ in links.values() if row["revoked_at"] is None]
+    current = cohort.subscriptions(ids)
+    require(not current or set(current) == set(pointers), "Selected recovery found a partial D1 cohort.")
+    cohort.require_quiet(ids, active=active)
+    for label, pointer in pointers.items():
+        if current:
+            row = current[label]
+            require(cohort.pointer(row, label) == pointer and row["generation"] == (0 if label in retained else 1),
+                    "Selected recovery fixture pointer changed.")
+        cohort.checked_objects(label, pointer, missing=not current or label in retained)
+    if current:
+        steps = [cohort.quiet(ids, active=active, assertion=True), statement(_assert_sql("""NOT EXISTS(SELECT 1
+          FROM telegram_inbox AS i LEFT JOIN telegram_outbox AS o USING(receipt_id)
+          WHERE i.bot_id=? AND i.actor_id IN (?,?) AND i.receipt_id>CAST(? AS INTEGER)
+          AND (o.state IS NULL OR o.state NOT IN ('sent','failed','uncertain')))"""),
+          cohort.policy["botId"], *cohort.actors.values(), checkpoint["afterReceiptId"])]
+        steps.extend(exact_row(row) for row in current.values())
+        steps.extend(assert_abort_link(row) for row, _, _ in links.values())
+        steps.append(statement("UPDATE aggregate_links SET revoked_at=MAX(created_at,unixepoch()) WHERE revoked_at IS NULL AND code_sha256 IN (SELECT value FROM json_each(?))", canonical(active)))
+        steps.append(statement("DELETE FROM subscriptions WHERE id IN (SELECT value FROM json_each(?))", canonical(ids)))
+        guarded_batch(cohort, steps, guard)
+    require(not cohort.subscriptions(ids), "Selected recovery D1 retirement could not be confirmed.")
+    cohort.require_quiet(ids)
+    after = abort_links(cohort, checkpoint, pointers)
+    require(set(after) == set(links), "Selected recovery link inventory changed.")
+    report = {}
+    for label, (_, code, pin) in after.items():
+        before = links[label][2]
+        require(pin["identity"] == before["identity"] and pin["tombstone"] is not None
+                and before["tombstone"] in (None, pin["tombstone"]), "Selected recovery revocation could not be confirmed.")
+        exports = expected_fixture_exports([cohort.node(fixture) for fixture in MEMBERS[label]])
+        report[label] = probe(code, pin["sha256"], exports, label, active=False)
+    retire_objects(cohort, pointers, guard, retained)
+    require(not cohort.subscriptions(ids) and abort_history(cohort, checkpoint) == ready["receiptEvidence"]
+            and abort_links(cohort, checkpoint, pointers) == after, "Selected recovery changed retained evidence.")
+    return {**ready, "phase": "aborted", "retiredAtReleasePin": release,
+            "tombstones": {label: pin["tombstone"] for label, (_, _, pin) in after.items()}}, report
 
 
 def run():
@@ -514,9 +717,10 @@ def run():
     with Path(os.environ["GITHUB_EVENT_PATH"]).open("rb") as event:
         body = event.read(65537)
     require(len(body) <= 65536, "Selected workflow event exceeds the limit.")
-    action, key, source_run, hashes = parse_inputs(_parse_object(body, "Selected workflow event differs."))
+    action, key, source_run, hashes, source_revision = parse_inputs(_parse_object(body, "Selected workflow event differs."))
     require_current_main(revision)
-    previous = read_checkpoint(source_run, revision, os.environ["GH_TOKEN"], workflow_file=WORKFLOW,
+    source_revision = source_revision or revision
+    previous = read_checkpoint(source_run, source_revision, os.environ["GH_TOKEN"], workflow_file=WORKFLOW,
                                artifact_prefix=ARTIFACT_PREFIX, checkpoint_file=CHECKPOINT) if source_run else None
     raw_policy = telegram_release_config({"migrations": [{"name": "0002_telegram.sql"}]})
     policy = json.loads(raw_policy)
@@ -545,14 +749,20 @@ def run():
             == [{"position": 17, "sha256": expected, "mode": "applied"}], "Selected migration proof differs.")
 
     def guard():
-        require_current_main(revision)
         require(scope.active() == active and scope.worker_config() == config and scope.version(active.version) == version
                 and scope.cron_enabled(), "Isolation release changed during selected acceptance.")
+        if action in ABORT_ACTIONS:
+            scope.verify_resources()
+        require_current_main(revision)
 
     cohort = SelectedCohort(resources, policy, key, encoded, identity)
     report = {}
     if previous is None:
         checkpoint = prepare(cohort, revision, release, guard)
+    elif action == "prepare-abort":
+        checkpoint = prepare_abort(cohort, previous, source_revision, release)
+    elif action == "abort-retire":
+        checkpoint, report = abort_retire(cohort, previous, source_revision, release, guard)
     else:
         validate_checkpoint(previous, action, key, revision, identity, release)
         if action == "retire":
@@ -563,10 +773,15 @@ def run():
     scope.verify_resources()
     _verify_health(revision)
     save_private_json(Path(os.environ["RUNNER_TEMP"]) / CHECKPOINT, checkpoint)
-    print(json.dumps({"phase": checkpoint["phase"], "snapshotCount": len(checkpoint["snapshots"]),
-        "sentSelectedReceiptCount": sum(len(items) for items in checkpoint["receipts"].values()),
-        "capabilityCount": len(checkpoint["browserHashes"]), "exportEvidence": report,
-        "verifiedAbsentObjectCount": 10 if action == "retire" else 0}, sort_keys=True))
+    result = {"phase": checkpoint["phase"], "snapshotCount": len(checkpoint["snapshots"]), "exportEvidence": report}
+    if action in ABORT_ACTIONS:
+        retained = len(checkpoint["retainedSnapshots"])
+        result.update(capabilityCount=len(checkpoint["links"]), unresolvedSnapshotCount=retained,
+                      verifiedAbsentObjectCount=2 * (len(checkpoint["snapshots"]) - retained) if action == "abort-retire" else 0)
+    else:
+        result.update(sentSelectedReceiptCount=sum(len(items) for items in checkpoint["receipts"].values()),
+                      capabilityCount=len(checkpoint["browserHashes"]), verifiedAbsentObjectCount=10 if action == "retire" else 0)
+    print(json.dumps(result, sort_keys=True))
 
 
 if __name__ == "__main__":

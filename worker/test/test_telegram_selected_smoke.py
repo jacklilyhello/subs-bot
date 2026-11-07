@@ -172,6 +172,65 @@ class SelectedAcceptanceTests(unittest.TestCase):
             smoke.validate_checkpoint(deepcopy(self.checkpoint), "capture-independence", COHORT, REVISION, IDENTITY, changed)
         self.assertEqual(self.cloud.deleted, [])
 
+    def test_abort_expired_tickets_preserves_real_receipts_and_retries_exact_cleanup(self):
+        self.first()
+        self.clear()
+        self.cloud.db.execute("DELETE FROM telegram_selected_revoke_ticket")
+        self.cloud.db.commit()
+        later = {**RELEASE_PIN, "revision": "f" * 40, "moduleSha256": "e" * 64}
+        ready = smoke.prepare_abort(self.cohort, self.checkpoint, REVISION, later)
+        self.assertEqual(ready["sourceCheckpoint"]["releasePin"], RELEASE_PIN)
+        self.assertEqual(set(ready["links"]), {"admin-first", "member-first"})
+        self.assertEqual(self.cloud.deleted, [])
+        receipts = list(self.cloud.db.execute("SELECT * FROM telegram_inbox ORDER BY receipt_id"))
+        actions = list(self.cloud.db.execute("SELECT * FROM telegram_selected_actions ORDER BY receipt_id"))
+        self.cloud.fail_delete = 2
+        with self.assertRaisesRegex(FixtureError, "R2 retirement"):
+            smoke.abort_retire(self.cohort, ready, later["revision"], later, lambda: None, self.probe)
+        self.assertFalse(self.cohort.subscriptions())
+        self.cloud.fail_delete = None
+        result, report = smoke.abort_retire(self.cohort, ready, later["revision"], later, lambda: None, self.probe)
+        self.assertEqual(result["phase"], "aborted")
+        self.assertEqual(result["retiredAtReleasePin"], later)
+        self.assertEqual(set(result["tombstones"]), set(ready["links"]))
+        self.assertEqual(report, {label: {"status": 404} for label in ready["links"]})
+        self.assertEqual(len(set(self.cloud.deleted)), 10)
+        self.assertFalse(self.cloud.data)
+        self.assertEqual(list(self.cloud.db.execute("SELECT * FROM telegram_inbox ORDER BY receipt_id")), receipts)
+        self.assertEqual(list(self.cloud.db.execute("SELECT * FROM telegram_selected_actions ORDER BY receipt_id")), actions)
+        self.assertEqual(self.cloud.db.execute("SELECT count(*) FROM aggregate_links WHERE revoked_at IS NOT NULL").fetchone()[0], 2)
+
+    def test_abort_records_unpublished_late_prefix_before_deleting_exact_rows(self):
+        owner, name, source, token = self.cohort.fixture("admin-late")
+        late, = self.cloud.db.execute("""INSERT INTO subscriptions(owner_id,name,source_url,token,created_at,updated_at)
+          VALUES (?,?,?,?,unixepoch(),unixepoch()) RETURNING id""", (owner, name, source, token)).fetchone()
+        self.cloud.db.commit()
+        snapshot = self.cohort.seed_identity("admin-late")[1]
+        key = f"subscriptions/{late}/{snapshot}/0.ndjson"
+        body = self.cohort.bodies("admin-late")["0.ndjson"]
+        self.cloud.data[key] = body
+        ready = smoke.prepare_abort(self.cohort, self.checkpoint, REVISION, RELEASE_PIN)
+        self.assertEqual(ready["retainedSnapshots"], ["admin-late"])
+        self.assertEqual(ready["snapshots"]["admin-late"]["id"], late)
+        result, _ = smoke.abort_retire(self.cohort, ready, REVISION, RELEASE_PIN, lambda: None, self.probe)
+        self.assertEqual(result["retainedSnapshots"], ["admin-late"])
+        self.assertEqual(len(set(self.cloud.deleted)), 8)
+        self.assertEqual(self.cloud.data, {key: body})
+        self.assertFalse(self.cohort.subscriptions())
+
+    def test_abort_refuses_foreign_membership_and_unsettled_temporary_fixture(self):
+        self.paste()
+        self.issue("admin-first")
+        with self.assertRaisesRegex(FixtureError, "unrelated or in-flight|Clear the exact"):
+            smoke.prepare_abort(self.cohort, self.checkpoint, REVISION, RELEASE_PIN)
+        self.clear()
+        self.cloud.db.execute("UPDATE aggregate_links SET selected_ids='[123456]' WHERE kind='selected'")
+        self.cloud.db.commit()
+        with self.assertRaisesRegex(FixtureError, "capability membership differs"):
+            smoke.prepare_abort(self.cohort, self.checkpoint, REVISION, RELEASE_PIN)
+        self.assertEqual(self.cloud.deleted, [])
+        self.assertEqual(self.cloud.db.execute("SELECT count(*) FROM aggregate_links WHERE revoked_at IS NULL").fetchone()[0], 1)
+
     def test_only_digest_inputs_and_exact_owned_fixture_rows_are_accepted(self):
         query = f"{COHORT}-STRAẞE-Aς".lower()
         matches = [label for label in smoke.SEEDS
