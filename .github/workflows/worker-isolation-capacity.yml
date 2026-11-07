@@ -9,6 +9,7 @@ on:
         options:
           - capacity
           - structured-smoke
+          - singbox-smoke
         default: capacity
 
 permissions:
@@ -66,10 +67,10 @@ jobs:
         if: env.FIXTURE_PROFILE == 'capacity'
         timeout-minutes: 8
         run: python3 -B worker/tools/capacity_probe.py "$CAPACITY_DIR"
-      - name: Check live structured and mixed Base64 export
-        if: env.FIXTURE_PROFILE == 'structured-smoke'
+      - name: Check live structured export against the Python oracle
+        if: env.FIXTURE_PROFILE == 'structured-smoke' || env.FIXTURE_PROFILE == 'singbox-smoke'
         timeout-minutes: 2
-        run: python3 -B worker/tools/capacity_probe.py "$CAPACITY_DIR" --profile structured-smoke
+        run: python3 -B worker/tools/capacity_probe.py "$CAPACITY_DIR" --profile "$FIXTURE_PROFILE"
       - name: Verify the active isolation Worker after probing
         if: always() && steps.worker_before.outcome == 'success' && steps.seed.outcome == 'success'
         timeout-minutes: 2
