@@ -481,6 +481,15 @@ class ProofTests(unittest.TestCase):
         with patch.object(activation.publication, "_response", side_effect=edge):
             self.assertEqual(activation._public(activation.HEALTH_URL, ISOLATED), HEALTH_PROOF)
 
+    def test_fixed_application_health_redacts_rejected_bodies_and_checks_revision(self):
+        with patch.object(activation.publication, "_response", return_value=(403, {}, b"synthetic-secret")):
+            with self.assertRaisesRegex(activation.ActivationError, "HTTP 403") as error:
+                activation._public(activation.HEALTH_URL, ISOLATED)
+        self.assertNotIn("synthetic-secret", str(error.exception))
+        with patch.object(activation.publication, "_response", return_value=(200, {}, HEALTH)):
+            with self.assertRaisesRegex(activation.ActivationError, "exact app revision"):
+                activation._public(activation.HEALTH_URL, REVISION)
+
     def test_private_worker_metadata_keeps_disabled_defaults_and_rejects_drift(self):
         value = worker()
         activation._private_profile(value, IDENTITY, False)
