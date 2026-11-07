@@ -11,6 +11,7 @@ from cloudflare_isolation import (
 )
 from d1_migrations import MigrationError, apply_migrations
 from prepare_isolation_artifact import ArtifactError, require_current_main
+from provider_binding_gate import CONFIG_ENV, load_provider_gate
 
 
 def telegram_release_config(manifest):
@@ -77,12 +78,18 @@ def release():
     data_api = CloudflareClient(data_token)
     worker_api = CloudflareClient(deploy_token)
     guard()
-    starting = verify_worker_target(worker_api, data_api, target, aggregate_key=aggregate_key, private_share_key=private_share_key)
+    provider_gate = load_provider_gate(os.environ.get(CONFIG_ENV, ""), target, deploy_token)
+    provider_binding = provider_gate.binding if provider_gate is not None else None
+    starting = verify_worker_target(worker_api, data_api, target, aggregate_key=aggregate_key, private_share_key=private_share_key,
+                                    provider_binding=provider_binding, release_revision=revision)
+    if provider_gate is not None:
+        provider_gate.verify()
     migrations = apply_migrations(data_api, target, bundle, manifest, guard)
     print(f"Verified {len(migrations)} isolated D1 migration records.", flush=True)
     result = release_worker(worker_api, data_api, target, bundle, manifest, guard,
                             expected_active=starting, telegram_config=telegram_config, aggregate_key=aggregate_key,
-                            private_share_key=private_share_key)
+                            private_share_key=private_share_key, provider_binding=provider_binding,
+                            provider_guard=provider_gate.verify if provider_gate is not None else None)
     guard()
     print(json.dumps(result, sort_keys=True), flush=True)
 

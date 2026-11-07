@@ -172,6 +172,12 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 域级 Worker 路由核对使用单独的只读凭据。发布任务内使用项目专用凭据核对 Worker 的 Custom Domain、预览、日志、Cron 及实际数据绑定。 [Cloudflare Worker 路由 API](https://developers.cloudflare.com/api/resources/workers/subresources/routes/)
 
+#### 隔离提供方绑定
+
+默认发布不配置提供方绑定。首次启用时，先为同一个 `main` 提交构建应用和提供方，完成私有提供方的隔离激活和停机证明，再在 `subs-bot-isolation` Environment 配置 `SUBS_BOT_CF_PROVIDER_BINDING_JSON`。配置使用版本 `1`。`proof` 提供 `revision`、`runId`、`runAttempt`、`artifactId`、`archiveSha256`，`worker` 提供 `workerId`、`workerCreatedOn`，`activation` 提供 `versionId`、`deploymentId`、`namespaceId`。运行及产物编号使用十进制字符串。资源标识只存于受控配置，发布步骤使用现有 Worker 凭据发起核对。
+
+发布核对受保护的激活运行、精确 ZIP 摘要、应用与提供方的同账户归属，并回读提供方的活动版本、模块、镜像、SQLite 命名空间和私有设置。先单独核对没有匹配到提供方的域级路由。应用版本只绑定 `subs-bot-provider-fetch-dev-01` 的 `ProviderFetch` 入口和版本、镜像摘要；新版本写入后回读绑定，激活后再核对提供方。校验失败时仅按既有守卫恢复先前的应用版本。绑定后的发布需要继续提供同一资源身份和有效证明。证明过期、删除或配置漂移会阻止发布，须先复核续证或单独审查轮换。 [服务绑定](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/rpc/#named-entrypoints) · [提供方激活与证明](../worker/provider_fetch/README.md)
+
 ### 数据与切换
 
 隔离容量检查使用当前 `main` 的已部署版本，手动运行 `gh workflow run worker-isolation-capacity.yml --ref main`。托管 runner 生成合成快照，依次验证恰好达到 64 MiB NDJSON 和 16 MiB 分享原文的有效输出、分享原文超 1 字节的拒绝、快照清单超 1 字节的拒绝。正向测试流式核对 Base64 长度和摘要，覆盖串行、并发 2 和 4、慢读及中途取消。发布和容量检查使用同一并发组，测试结束先撤销 D1 能力，再清理对应的私有 R2 对象。清理失败时，工作流保留不含凭据或原始能力令牌的恢复清单。

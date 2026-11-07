@@ -93,7 +93,7 @@ def _page(envelope, rows, maximum, *, cursor=False):
     return rows
 
 
-def _private_profile(worker, identity, active):
+def _private_profile(worker, identity, active, caller=None):
     _require(bootstrap._identity(worker) == identity)
     subdomain = worker.get("subdomain")
     _require(worker.get("tags") == [bootstrap.OWNERSHIP_TAG] and isinstance(subdomain, dict)
@@ -104,7 +104,8 @@ def _private_profile(worker, identity, active):
         _require(worker.get("deployed_on") is None)
     references = worker.get("references")
     _require(isinstance(references, dict)
-             and all(references.get(key) == [] for key in bootstrap.REFERENCE_FIELDS if key != "durable_objects")
+             and all(references.get(key) == [] for key in bootstrap.REFERENCE_FIELDS if key not in {"durable_objects", "workers"})
+             and (references.get("workers") == [] or (caller is not None and references.get("workers") == [caller]))
              and all(key in bootstrap.REFERENCE_FIELDS or not value for key, value in references.items()))
     bootstrap._logging_off(worker)
     preview = worker.get("previews_base_config")
@@ -124,10 +125,14 @@ def _references(worker, identity, namespace):
 class ProviderAPI:
     """Fixed project operations with at most one attempted mutation per process."""
 
-    def __init__(self, account, worker_token, container_token, identity):
+    def __init__(self, account, worker_token, container_token, identity, *, worker_reads_only=False):
         self.worker = bootstrap.WorkerAPI(account, worker_token)
-        _require(publication.API_TOKEN.fullmatch(container_token),
-                 "The dedicated Containers credential is required for the provider resource inventory.")
+        if worker_reads_only:
+            _require(container_token == "")
+        else:
+            _require(isinstance(container_token, str) and publication.API_TOKEN.fullmatch(container_token),
+                     "The dedicated Containers credential is required for the provider resource inventory.")
+        self._worker_reads_only = worker_reads_only
         self.account = account
         self.identity = identity
         self.base = f"{publication.API_ORIGIN}/accounts/{account}"
@@ -140,6 +145,7 @@ class ProviderAPI:
         self._writes = 0
 
     def _request(self, path, *, container=False, method="GET", body=None, absent=None, limit=publication.HTTP_LIMIT):
+        _require(not self._worker_reads_only or (method == "GET" and not container and path.startswith("/workers/")))
         token = self._container_token if container else self._worker_token
         _require(publication.API_TOKEN.fullmatch(token), "The dedicated provider credential required for this phase is missing.")
         _require(path.startswith("/containers/" if container else ("/workers/", "/workflows/")))

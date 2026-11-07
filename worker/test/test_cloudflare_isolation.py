@@ -52,6 +52,7 @@ TELEGRAM_CONFIG = '{"fixture":"synthetic-only"}'
 AGGREGATE_KEY = base64.urlsafe_b64encode(b"\x17" * 32).decode("ascii").rstrip("=")
 PRIVATE_SHARE_KEY = base64.urlsafe_b64encode(b"\x18" * 32).decode("ascii").rstrip("=")
 CRON = {"cron": cloudflare.TELEGRAM_CRON}
+PROVIDER_BINDING = cloudflare.ProviderBinding(NEW_REVISION, "a" * 64, "b" * 64)
 
 
 def deployment(deployment_id, version, message=None):
@@ -238,10 +239,10 @@ class ReleaseTests(unittest.TestCase):
         sleeper.start()
         self.addCleanup(sleeper.stop)
 
-    def release(self, telegram_config=None, aggregate_key=None, private_share_key=None):
+    def release(self, telegram_config=None, aggregate_key=None, private_share_key=None, **options):
         return cloudflare.release_worker(self.api.worker_api, self.api.data_api, TARGET, self.bundle,
                                          self.manifest, self.api.guard, telegram_config=telegram_config,
-                                         aggregate_key=aggregate_key, private_share_key=private_share_key)
+                                         aggregate_key=aggregate_key, private_share_key=private_share_key, **options)
 
     def set_old_telegram_config(self, config=TELEGRAM_CONFIG):
         self.api.versions[OLD_VERSION]["bindings"].extend([
@@ -415,6 +416,27 @@ class ReleaseTests(unittest.TestCase):
             migrate.assert_not_called()
             deploy.assert_not_called()
 
+    def test_protected_entry_rejects_provider_drift_before_any_migration(self):
+        directory = self.bundle / "subs-bot-verified"
+        directory.mkdir()
+        (directory / "isolation.json").write_text(json.dumps(self.manifest), encoding="utf-8")
+        environment = {"GITHUB_SHA": NEW_REVISION, "GITHUB_REPOSITORY": "jacklilyhello/subs-bot",
+            "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/main", "RUNNER_TEMP": str(self.bundle),
+            "SUBS_BOT_CF_ISOLATION_TARGET_JSON": json.dumps(TARGET), "SUBS_BOT_CF_BOOTSTRAP_TOKEN": "synthetic-data",
+            "SUBS_BOT_CF_DEPLOY_TOKEN": "synthetic-deploy", release_entry.CONFIG_ENV: "fixture-provider-pin"}
+        provider = Mock(binding=PROVIDER_BINDING)
+        provider.verify.side_effect = cloudflare.CloudflareError("Provider drift.")
+        with patch.dict(os.environ, environment, clear=True), patch.object(release_entry, "CloudflareClient"), \
+             patch.object(release_entry, "require_current_main"), patch.object(release_entry, "verify_worker_target") as verify, \
+             patch.object(release_entry, "load_provider_gate", return_value=provider), \
+             patch.object(release_entry, "apply_migrations") as migrate, patch.object(release_entry, "release_worker") as deploy:
+            with self.assertRaisesRegex(cloudflare.CloudflareError, "Provider drift"):
+                release_entry.release()
+            self.assertEqual(verify.call_args.kwargs["provider_binding"], PROVIDER_BINDING)
+            self.assertEqual(verify.call_args.kwargs["release_revision"], NEW_REVISION)
+            migrate.assert_not_called()
+            deploy.assert_not_called()
+
     def test_failed_cron_setup_can_be_retried_without_redeploying(self):
         self.api.cron_available = False
         with self.assertRaisesRegex(cloudflare.CloudflareError, "active.*rejected the Cron setup"):
@@ -494,6 +516,59 @@ class ReleaseTests(unittest.TestCase):
             self.release()
         self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
         self.assertEqual(self.api.active["id"], OLD_DEPLOYMENT)
+
+    def test_provider_binding_exact_named_entrypoint_and_repeated_release(self):
+        guard = Mock()
+        self.assertTrue(self.release(provider_binding=PROVIDER_BINDING, provider_guard=guard)["changed"])
+        self.assertEqual(guard.call_count, 3)
+        uploaded = self.api.versions[NEW_VERSION]
+        self.assertEqual(uploaded["bindings"][-3:], [
+            {"type": "service", "name": "PROVIDER_FETCH", "service": "subs-bot-provider-fetch-dev-01", "entrypoint": "ProviderFetch"},
+            {"type": "plain_text", "name": "PROVIDER_REVISION", "text": NEW_REVISION},
+            {"type": "plain_text", "name": "PROVIDER_IMAGE_SHA256", "text": PROVIDER_BINDING.image_sha256},
+        ])
+        self.assertEqual(uploaded["annotations"]["workers/message"], cloudflare.PROVIDER_MESSAGE + PROVIDER_BINDING.identity_sha256)
+        self.assertFalse(self.release(provider_binding=PROVIDER_BINDING, provider_guard=guard)["changed"])
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
+
+    def test_provider_drop_rotation_and_partial_binding_are_refused(self):
+        self.release(provider_binding=PROVIDER_BINDING, provider_guard=Mock())
+        writes = self.api.writes()
+        for different in (None, cloudflare.ProviderBinding(NEW_REVISION, PROVIDER_BINDING.image_sha256, "c" * 64)):
+            with self.subTest(different=different), self.assertRaisesRegex(cloudflare.CloudflareError, "separate rotation release"):
+                cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET, provider_binding=different,
+                                                release_revision=NEW_REVISION)
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "separate rotation release"):
+            self.release()
+        self.api.versions[NEW_VERSION]["bindings"].pop()
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "binding names"):
+            self.release(provider_binding=PROVIDER_BINDING, provider_guard=Mock())
+        self.assertEqual(self.api.writes(), writes)
+
+    def test_first_provider_binding_requires_current_contract_revision_and_guard(self):
+        stale = cloudflare.ProviderBinding(OLD_REVISION, PROVIDER_BINDING.image_sha256, PROVIDER_BINDING.identity_sha256)
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "verified dependency guard"):
+            self.release(provider_binding=PROVIDER_BINDING)
+        guard = Mock()
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "same main revision"):
+            self.release(provider_binding=stale, provider_guard=guard)
+        guard.assert_not_called()
+        self.assertEqual(self.api.writes(), [])
+
+    def test_provider_drift_after_staging_blocks_activation(self):
+        guard = Mock(side_effect=[None, cloudflare.CloudflareError("Provider drift.")])
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "Provider drift"):
+            self.release(provider_binding=PROVIDER_BINDING, provider_guard=guard)
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false"])
+        self.assertEqual(self.api.active["id"], OLD_DEPLOYMENT)
+
+    def test_provider_drift_after_activation_rolls_back_without_provider_read(self):
+        guard = Mock(side_effect=[None, None, cloudflare.CloudflareError("Provider drift.")])
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "prior version was restored"):
+            self.release(provider_binding=PROVIDER_BINDING, provider_guard=guard)
+        self.assertEqual(guard.call_count, 3)
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS, DEPLOYMENTS])
+        self.assertEqual(self.api.active["versions"][0]["version_id"], OLD_VERSION)
 
     def test_health_failure_restores_verified_previous_version(self):
         self.api.health_available = False

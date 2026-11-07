@@ -27,8 +27,13 @@ TELEGRAM_CRON = "* * * * *"
 TELEGRAM_BINDINGS = {TELEGRAM_CONFIG_BINDING, TELEGRAM_DIGEST_BINDING}
 AGGREGATE_BINDINGS = {AGGREGATE_KEY_BINDING, AGGREGATE_DIGEST_BINDING}
 PRIVATE_SHARE_BINDINGS = {PRIVATE_SHARE_KEY_BINDING, PRIVATE_SHARE_DIGEST_BINDING}
+PROVIDER_SERVICE = "subs-bot-provider-fetch-dev-01"
+PROVIDER_ENTRYPOINT = "ProviderFetch"
+PROVIDER_BINDINGS = {"PROVIDER_FETCH", "PROVIDER_REVISION", "PROVIDER_IMAGE_SHA256"}
+PROVIDER_MESSAGE = "Reviewed isolated Worker release provider "
 _UNSPECIFIED_AGGREGATE_KEY = object()
 _UNSPECIFIED_PRIVATE_SHARE_KEY = object()
+_UNSPECIFIED_PROVIDER_BINDING = object()
 ORIGIN = f"https://{WORKER_NAME}.{NAMESPACE}.workers.dev"
 HEALTH_URL = ORIGIN + "/health"
 API_ORIGIN = "https://api.cloudflare.com/client/v4"
@@ -132,6 +137,17 @@ class _Deployment:
 
 
 @dataclass(frozen=True)
+class ProviderBinding:
+    revision: str
+    image_sha256: str
+    identity_sha256: str
+
+    def __post_init__(self):
+        _require(_matches(REVISION, self.revision) and _matches(DIGEST, self.image_sha256)
+                 and _matches(DIGEST, self.identity_sha256), "Invalid isolated provider binding identity.")
+
+
+@dataclass(frozen=True)
 class _Version:
     revision: str
     digest: str
@@ -140,6 +156,7 @@ class _Version:
     telegram_config_sha256: str | None = None
     telegram_aggregate_key_sha256: str | None = None
     telegram_private_share_key_sha256: str | None = None
+    provider_binding: ProviderBinding | None = None
 
 
 class _Isolation:
@@ -261,15 +278,18 @@ class _Isolation:
                                                      {"enabled": False, "cross_version_cache": False}),
                  "Isolated Worker version runtime settings differ from the supported configuration.")
         rows = version.get("bindings")
-        _require(isinstance(rows, list) and len(rows) in {3, 5, 7, 9}
+        _require(isinstance(rows, list) and 3 <= len(rows) <= 12
                  and all(isinstance(row, dict) and isinstance(row.get("name"), str) for row in rows),
                  "Unexpected isolated Worker binding inventory.")
         bindings = {row["name"]: row for row in rows}
         base_bindings = {"DB", "NODES", "BUILD_REVISION"}
         telegram_bindings = base_bindings | TELEGRAM_BINDINGS
-        _require(len(bindings) == len(rows) and set(bindings) in (base_bindings, telegram_bindings,
+        has_provider = bool(PROVIDER_BINDINGS & bindings.keys())
+        binding_names = set(bindings) - PROVIDER_BINDINGS
+        _require(len(bindings) == len(rows) and binding_names in (base_bindings, telegram_bindings,
             telegram_bindings | AGGREGATE_BINDINGS, telegram_bindings | PRIVATE_SHARE_BINDINGS,
-            telegram_bindings | AGGREGATE_BINDINGS | PRIVATE_SHARE_BINDINGS),
+            telegram_bindings | AGGREGATE_BINDINGS | PRIVATE_SHARE_BINDINGS)
+            and (not has_provider or PROVIDER_BINDINGS <= bindings.keys()),
                  "Unexpected isolated Worker binding names.")
         db, r2, rev = (bindings[name] for name in ("DB", "NODES", "BUILD_REVISION"))
         database_ids = [db[key] for key in ("database_id", "id") if db.get(key) is not None]
@@ -310,8 +330,22 @@ class _Isolation:
             raise CloudflareError("Cloudflare Worker module encoding is invalid.") from None
         _require(0 < len(body) <= MAX_MODULE_BYTES, "Cloudflare Worker module size is invalid.")
         annotations = _object(version.get("annotations") or {}, "version annotations")
+        provider_binding = None
+        message = annotations.get("workers/message")
+        tagged_provider = isinstance(message, str) and message.startswith(PROVIDER_MESSAGE)
+        _require(has_provider == tagged_provider, "Isolated provider binding identity is incomplete.")
+        if has_provider:
+            service = bindings["PROVIDER_FETCH"]
+            revision_pin, image_pin = (bindings[name] for name in ("PROVIDER_REVISION", "PROVIDER_IMAGE_SHA256"))
+            _require(set(service) <= {"name", "type", "service", "entrypoint", "environment"}
+                     and service.get("type") == "service" and service.get("service") == PROVIDER_SERVICE
+                     and service.get("entrypoint") == PROVIDER_ENTRYPOINT and service.get("environment") in (None, "production")
+                     and all(set(pin) == {"name", "type", "text"} and pin["type"] == "plain_text"
+                             for pin in (revision_pin, image_pin)),
+                     "Isolated provider binding target differs from the reviewed service.")
+            provider_binding = ProviderBinding(revision_pin.get("text"), image_pin.get("text"), message[len(PROVIDER_MESSAGE):])
         return _Version(rev["text"], sha256(body).hexdigest(), version["compatibility_date"],
-                        annotations.get("workers/tag"), telegram_digest, aggregate_digest, private_share_digest)
+                        annotations.get("workers/tag"), telegram_digest, aggregate_digest, private_share_digest, provider_binding)
 
     def verify_candidate(self, candidate, desired):
         # A version can be visible in its creation response or listing before its module is readable.
@@ -364,6 +398,15 @@ class _Isolation:
                 {"type": "secret_text", "name": PRIVATE_SHARE_KEY_BINDING, "text": private_share_key},
                 {"type": "plain_text", "name": PRIVATE_SHARE_DIGEST_BINDING, "text": desired.telegram_private_share_key_sha256},
             ])
+        message = "Reviewed isolated Worker release"
+        if desired.provider_binding is not None:
+            binding = desired.provider_binding
+            bindings.extend([
+                {"type": "service", "name": "PROVIDER_FETCH", "service": PROVIDER_SERVICE, "entrypoint": PROVIDER_ENTRYPOINT},
+                {"type": "plain_text", "name": "PROVIDER_REVISION", "text": binding.revision},
+                {"type": "plain_text", "name": "PROVIDER_IMAGE_SHA256", "text": binding.image_sha256},
+            ])
+            message = PROVIDER_MESSAGE + binding.identity_sha256
         try:
             result = self.worker_api("POST", self.versions + "?deploy=false", {
                 "main_module": "index.js",
@@ -375,7 +418,7 @@ class _Isolation:
                     "content_base64": base64.b64encode(module).decode("ascii"),
                 }],
                 "bindings": bindings,
-                "annotations": {"workers/tag": desired.tag, "workers/message": "Reviewed isolated Worker release"},
+                "annotations": {"workers/tag": desired.tag, "workers/message": message},
             })
         except CloudflareError as error:
             if not error.uncertain:
@@ -450,7 +493,7 @@ def validate_private_share_key(raw):
              "The isolated private share key must be a canonical Base64URL encoding of 32 bytes.")
 
 
-def _artifact(bundle_dir, manifest, telegram_config, aggregate_key=None, private_share_key=None):
+def _artifact(bundle_dir, manifest, telegram_config, aggregate_key=None, private_share_key=None, provider_binding=None):
     _require(isinstance(manifest, dict) and manifest.get("version") == 2
              and _matches(REVISION, manifest.get("revision")) and _matches(DIGEST, manifest.get("bundleSha256"))
              and _matches(DATE, manifest.get("compatibilityDate")) and isinstance(manifest.get("migrations"), list),
@@ -491,8 +534,11 @@ def _artifact(bundle_dir, manifest, telegram_config, aggregate_key=None, private
         _require(private_share_key != aggregate_key, "The isolated private share key must be distinct from the aggregate key.")
         private_share_digest = sha256(private_share_key.encode("ascii")).hexdigest()
         tag = "telegram-" + sha256(f"{revision}:{telegram_digest}:{aggregate_digest}:{private_share_digest}".encode("ascii")).hexdigest()
+    if provider_binding is not None:
+        _require(isinstance(provider_binding, ProviderBinding), "Invalid isolated provider binding identity.")
+        tag = "provider-" + sha256(f"{tag}:{provider_binding.identity_sha256}".encode("ascii")).hexdigest()
     return module, _Version(revision, manifest["bundleSha256"], manifest["compatibilityDate"],
-                            tag, telegram_digest, aggregate_digest, private_share_digest)
+                            tag, telegram_digest, aggregate_digest, private_share_digest, provider_binding)
 
 
 def _read_health():
@@ -524,8 +570,19 @@ def _verify_health(revision):
     raise CloudflareError("Isolated Worker health could not verify the expected revision.")
 
 
+def _require_provider_continuity(active, desired):
+    _require(active is None or active == desired,
+             "Changing or dropping the isolated provider binding requires a separate rotation release.")
+
+
+def _require_provider_revision(active, desired, revision):
+    _require(active is not None or desired is None or desired.revision == revision,
+             "First provider binding requires proof of the same main revision as the application release.")
+
+
 def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECIFIED_AGGREGATE_KEY,
-                         private_share_key=_UNSPECIFIED_PRIVATE_SHARE_KEY):
+                         private_share_key=_UNSPECIFIED_PRIVATE_SHARE_KEY, provider_binding=_UNSPECIFIED_PROVIDER_BINDING,
+                         release_revision=None):
     """Read ownership, privacy and active binding facts before any release writes."""
     scope = _Isolation(worker_api, data_api, target)
     scope.worker_config()
@@ -542,13 +599,19 @@ def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECI
         validate_private_share_key(private_share_key)
         _require(version.telegram_private_share_key_sha256 == sha256(private_share_key.encode("ascii")).hexdigest(),
                  "Changing the isolated private share key requires a separate rotation release.")
+    if provider_binding is not _UNSPECIFIED_PROVIDER_BINDING:
+        _require_provider_continuity(version.provider_binding, provider_binding)
+        _require_provider_revision(version.provider_binding, provider_binding, release_revision)
     return {"deploymentId": active.id, "versionId": active.version, "revision": version.revision}
 
 
 def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *, expected_active=None,
-                   telegram_config: str | None = None, aggregate_key: str | None = None, private_share_key: str | None = None):
+                   telegram_config: str | None = None, aggregate_key: str | None = None, private_share_key: str | None = None,
+                   provider_binding: ProviderBinding | None = None, provider_guard=None):
     """Release the verified Worker and optionally configure its isolated Telegram schedule."""
-    module, desired = _artifact(bundle_dir, manifest, telegram_config, aggregate_key, private_share_key)
+    _require((provider_binding is None and provider_guard is None) or (provider_binding is not None and callable(provider_guard)),
+             "An isolated provider release requires a verified dependency guard.")
+    module, desired = _artifact(bundle_dir, manifest, telegram_config, aggregate_key, private_share_key, provider_binding)
     scope = _Isolation(worker_api, data_api, target)
     config = scope.worker_config()
     had_cron = scope.cron_enabled()
@@ -567,11 +630,17 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
     _require(old_version.telegram_private_share_key_sha256 is None
              or old_version.telegram_private_share_key_sha256 == desired.telegram_private_share_key_sha256,
              "Changing or dropping the isolated private share key requires a separate rotation release.")
+    _require_provider_continuity(old_version.provider_binding, desired.provider_binding)
+    _require_provider_revision(old_version.provider_binding, desired.provider_binding, desired.revision)
     _verify_health(old_version.revision)
+    if provider_guard is not None:
+        provider_guard()
     if old_version.revision == desired.revision:
         _require(old_version.digest == desired.digest, "Active revision differs from the verified module digest.")
-        if (old_version.telegram_config_sha256, old_version.telegram_aggregate_key_sha256, old_version.telegram_private_share_key_sha256) == (
-                desired.telegram_config_sha256, desired.telegram_aggregate_key_sha256, desired.telegram_private_share_key_sha256):
+        if (old_version.telegram_config_sha256, old_version.telegram_aggregate_key_sha256,
+                old_version.telegram_private_share_key_sha256, old_version.provider_binding) == (
+                desired.telegram_config_sha256, desired.telegram_aggregate_key_sha256,
+                desired.telegram_private_share_key_sha256, desired.provider_binding):
             if telegram_config is None:
                 _require(scope.active() == previous, "Active isolated Worker deployment changed during verification.")
                 _guard_current(guard)
@@ -590,6 +659,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
     _require(scope.worker_config() == config, "Isolated Worker configuration changed before activation.")
     _require(scope.cron_enabled() == had_cron, "Isolated Worker schedule changed before activation.")
     scope.verify_resources()
+    if provider_guard is not None:
+        provider_guard()
     _require(scope.active() == previous, "Active isolated Worker deployment changed before activation.")
     _guard_current(guard)
     activated = scope.activate(previous, candidate, f"Isolated Worker release {desired.revision} {uuid4()}")
@@ -599,6 +670,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
         scope.verify_resources()
         _require(scope.version(activated.version) == desired, "Active Worker version differs from the verified artifact.")
         _verify_health(desired.revision)
+        if provider_guard is not None:
+            provider_guard()
         _require(scope.active() == activated, "Active isolated Worker deployment changed during verification.")
     except CloudflareError:
         try:
