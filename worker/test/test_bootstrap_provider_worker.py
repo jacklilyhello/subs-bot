@@ -44,7 +44,7 @@ class WorkerAPITests(unittest.TestCase):
         with patch.object(bootstrap, "_response", side_effect=[
             envelope(404, success=False, errors=[{"code": 10007}]),
             envelope(201, worker()), envelope(200, worker()),
-            envelope(200, [], result_info={"count": 0, "total_count": 0, "page": 1}),
+            envelope(200, [], result_info={"count": 0, "total_count": 0, "page": 1, "per_page": 1}),
         ]) as read:
             self.assertIsNone(self.api.by_name(absent=True))
             self.assertEqual(self.api.create(), worker())
@@ -100,6 +100,12 @@ class WorkerAPITests(unittest.TestCase):
             with self.subTest(payload=payload), patch.object(bootstrap, "_response", return_value=payload):
                 with self.assertRaisesRegex(bootstrap.BootstrapError, "private, empty settings"):
                     self.api.require_no_versions(IDENTITY)
+
+    def test_successful_real_empty_page_can_return_null_errors(self):
+        result = {"success": True, "errors": None, "result": [],
+                  "result_info": {"count": 0, "total_count": 0, "page": 1, "per_page": 1}}
+        with patch.object(bootstrap, "_response", return_value=(200, {}, json.dumps(result).encode())):
+            self.api.require_no_versions(IDENTITY)
 
     def test_wrong_account_or_missing_worker_token_fails_before_network(self):
         with self.assertRaisesRegex(bootstrap.BootstrapError, "account does not match"):
@@ -182,6 +188,19 @@ class BootstrapTests(unittest.TestCase):
         unsafe["observability"]["logs"]["invocation_logs"] = True
         with self.assertRaises(bootstrap.BootstrapError):
             bootstrap._verify_profile(unsafe, IDENTITY)
+
+    def test_disabled_real_readback_defaults_do_not_admit_a_enabled_log_stream(self):
+        live = worker()
+        live["observability"]["logs"].update(invocation_logs=True, persist=True)
+        live["observability"]["traces"]["persist"] = True
+        del live["previews_base_config"]["tail_consumers"]
+        bootstrap._verify_profile(live, IDENTITY)
+        for stream in ("logs", "traces"):
+            with self.subTest(stream=stream):
+                unsafe = deepcopy(live)
+                unsafe["observability"][stream]["enabled"] = True
+                with self.assertRaises(bootstrap.BootstrapError):
+                    bootstrap._verify_profile(unsafe, IDENTITY)
 
     def test_final_name_readback_must_still_match_the_immutable_id(self):
         self.api.by_name.side_effect = [None, None, {**worker(), "id": "d" * 32}]
