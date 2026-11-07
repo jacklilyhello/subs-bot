@@ -22,11 +22,14 @@ import {
 } from "./subscription-read.ts";
 import { prepareTelegramNodePageTickets, renderTelegramSubscriptionNodePage, type TelegramNodePageButton } from "./subscription-node-pages.ts";
 import { renderTelegramGitHubReply } from "./github-search.ts";
+import { confirmTelegramSubscriptionRawFileSend, prepareTelegramRawFileButton, prepareTelegramSubscriptionRawFile,
+  type TelegramRawFileTarget } from "./subscription-raw-file.ts";
 import {
   beginTelegramAggregateLinkReply, beginTelegramBulkTrashReply, beginTelegramInlineConsentReply, beginTelegramInlineSortReply,
   beginTelegramPrivateShareCreationReply,
   beginTelegramSelectedLinkReply, beginTelegramShortLinkReply, beginTelegramReply, claimTelegramReply, isTelegramMemberAllowed,
   beginTelegramGitHubSearchReply, beginTelegramTempRawReply,
+  beginTelegramSubscriptionRawFileReply, failLeasedTelegramSubscriptionRawFileReply,
   prepareTelegramPrivateClaimBegin, reapExpiredTelegramReplies, settleTelegramReply,
   type TelegramReplyLease, type TelegramReplyOutcome,
 } from "./store.ts";
@@ -130,7 +133,7 @@ export async function sendTelegramReply(
   keyboard?: InlineKeyboard,
   forceReply = false,
 ): Promise<TelegramReplyOutcome> {
-  if ((lease.path || lease.privateShareCreation || lease.tempRaw || lease.shortLink || lease.subscriptionNodes
+  if ((lease.path || lease.privateShareCreation || lease.tempRaw || lease.shortLink || lease.subscriptionNodes || lease.subscriptionRawFile
     || lease.providerOutcome !== undefined || lease.bulkTrash || lease.githubSearch)
     && (lease.chatType !== "private" || lease.threadId !== null)) {
     return { kind: "failed" };
@@ -225,6 +228,7 @@ async function renderReply(
   subscriptionReadEnabled = false,
   subscriptionNodesEnabled = false,
   providerRefreshEnabled = false,
+  subscriptionRawFileEnabled = false,
 ): Promise<{
   text: string;
   access: ReplyAccess;
@@ -233,6 +237,7 @@ async function renderReply(
   readButtons?: TelegramSubscriptionReadButton[];
   nodeButtons?: TelegramNodePageButton[];
   refreshTarget?: TelegramProviderRefreshTarget;
+  rawFileTarget?: TelegramRawFileTarget;
   readGuard?: { sql: string; bindings: readonly (string | number | null)[] };
   forceReply?: boolean;
 }> {
@@ -249,7 +254,7 @@ async function renderReply(
   const allowed = lease.actorId === policy.adminId || await isTelegramMemberAllowed(db, policy);
   if (!allowed) return { text: "当前账号没有使用权限。", access: "denied" };
   if (lease.subscriptionRead) return { ...await renderTelegramSubscriptionRead(db, bucket, policy, lease, deadline,
-    subscriptionNodesEnabled, providerRefreshEnabled), access: "allowed" };
+    subscriptionNodesEnabled, providerRefreshEnabled, subscriptionRawFileEnabled), access: "allowed" };
   if (lease.subscriptionNodes) {
     const { backId, ...page } = await renderTelegramSubscriptionNodePage(db, bucket, policy, lease, deadline);
     return { ...page, access: "allowed", ...(backId === undefined ? {} : {
@@ -376,6 +381,37 @@ async function deliverTelegramTempRaw(
   await settleTelegramReply(db, policy, lease, outcome);
 }
 
+async function deliverTelegramSubscriptionRawFile(
+  db: D1Database, bucket: R2Bucket, policy: TelegramPolicy, lease: TelegramReplyLease, deadline: number, request: typeof fetch,
+): Promise<void> {
+  const prepared = await prepareTelegramSubscriptionRawFile(db, bucket, policy, lease, deadline);
+  if (Date.now() >= deadline) return;
+  if (!prepared) {
+    await failLeasedTelegramSubscriptionRawFileReply(db, policy, lease);
+    return;
+  }
+  let send: (timeout: number) => Promise<TelegramReplyOutcome>;
+  if (prepared.kind === "document") {
+    const form = new FormData();
+    form.set("chat_id", lease.chatId);
+    form.set("reply_parameters", JSON.stringify({ message_id: lease.messageId, allow_sending_without_reply: false }));
+    form.set("caption", "📦 节点导出完成");
+    form.set("document", prepared.file, "Base64.txt");
+    send = (timeout) => sendTelegram(policy, lease, "sendDocument", form, timeout, request);
+  } else {
+    send = (timeout) => sendTelegramReply(policy, lease, prepared.text, timeout, request);
+  }
+  if (!await beginTelegramSubscriptionRawFileReply(db, policy, lease, prepared.guard)) {
+    await failLeasedTelegramSubscriptionRawFileReply(db, policy, lease);
+    return;
+  }
+  if (!await confirmTelegramSubscriptionRawFileSend(db, policy, lease, prepared.guard) || Date.now() >= deadline) {
+    await settleTelegramReply(db, policy, lease, { kind: "failed" });
+    return;
+  }
+  await settleTelegramReply(db, policy, lease, await send(Math.max(1, deadline - Date.now())));
+}
+
 export async function drainTelegramReplies(
   db: D1Database,
   bucket: R2Bucket,
@@ -394,17 +430,20 @@ export async function drainTelegramReplies(
   inlineConsentEnabled = false,
   gitHubSearchReadiness: boolean | "unavailable" = false,
   providerRefreshEnabled = false,
+  subscriptionRawFileReadiness: boolean | "unavailable" = false,
 ): Promise<void> {
   const deadline = Date.now() + budgetMs;
   const privateShareEnabled = privateShareRuntime.schemaReady && privateShareRuntime.context !== null;
   const gitHubSearchEnabled = gitHubSearchReadiness === true;
   const gitHubSearch = gitHubSearchEnabled ? policy : gitHubSearchReadiness === "unavailable" ? "unavailable" : undefined;
+  const subscriptionRawFileEnabled = subscriptionRawFileReadiness === true;
   await reapExpiredTelegramReplies(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled,
-    shortLinksEnabled, inlineSortEnabled, subscriptionNodesEnabled, providerEnabled, bulkTrashEnabled, inlineConsentEnabled, gitHubSearchEnabled);
+    shortLinksEnabled, inlineSortEnabled, subscriptionNodesEnabled, providerEnabled, bulkTrashEnabled, inlineConsentEnabled,
+    gitHubSearchEnabled, subscriptionRawFileEnabled);
   for (let processed = 0; processed < limit && Date.now() < deadline; processed += 1) {
     const lease = await claimTelegramReply(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled,
       shortLinksEnabled, inlineSortEnabled, subscriptionNodesEnabled, providerEnabled ? policy : undefined,
-      bulkTrashEnabled, inlineConsentEnabled, gitHubSearch);
+      bulkTrashEnabled, inlineConsentEnabled, gitHubSearch, subscriptionRawFileReadiness);
     if (!lease) return;
     if (!inTelegramScope(policy, lease)) continue;
     if (lease.providerOutcome !== undefined) {
@@ -433,6 +472,10 @@ export async function drainTelegramReplies(
     }
     if (lease.tempRaw) {
       await deliverTelegramTempRaw(db, policy, lease, deadline, request);
+      continue;
+    }
+    if (lease.subscriptionRawFile) {
+      await deliverTelegramSubscriptionRawFile(db, bucket, policy, lease, deadline, request);
       continue;
     }
     if (lease.shortLink) {
@@ -524,17 +567,18 @@ export async function drainTelegramReplies(
       continue;
     }
     const reply = await renderReply(db, bucket, policy, lease, deadline, privateShareEnabled, subscriptionReadEnabled,
-      subscriptionNodesEnabled, providerRefreshEnabled);
-    const [view, lifecycle, read, nodes, refresh] = await Promise.all([
+      subscriptionNodesEnabled, providerRefreshEnabled, subscriptionRawFileEnabled);
+    const [view, lifecycle, read, nodes, refresh, rawFile] = await Promise.all([
       reply.buttons?.length ? prepareTelegramViewTickets(reply.buttons) : undefined,
       reply.lifecycleButtons?.length ? prepareTelegramLifecycleTickets(reply.lifecycleButtons) : undefined,
       reply.readButtons?.length ? prepareTelegramSubscriptionReadTickets(reply.readButtons) : undefined,
       reply.nodeButtons?.length ? prepareTelegramNodePageTickets(reply.nodeButtons) : undefined,
       reply.refreshTarget ? prepareTelegramProviderRefreshButton(reply.refreshTarget) : undefined,
+      reply.rawFileTarget ? prepareTelegramRawFileButton(reply.rawFileTarget) : undefined,
     ]);
     if (Date.now() >= deadline ||
       !await beginTelegramReply(db, policy, lease, reply.access, view?.tickets, lifecycle?.tickets, read?.tickets, reply.readGuard,
-        nodes?.tickets, refresh?.ticket)) continue;
+        nodes?.tickets, refresh?.ticket, rawFile?.ticket)) continue;
     if (reply.readGuard) {
       const confirmed = await confirmTelegramSubscriptionReadSend(db, policy, lease, reply.readGuard).catch(() => false);
       if (!confirmed || Date.now() >= deadline) {
@@ -543,7 +587,7 @@ export async function drainTelegramReplies(
       }
     }
     const keyboard = [...(view?.keyboard ?? []), ...(lifecycle?.keyboard ?? []), ...(nodes?.keyboard ?? []), ...(read?.keyboard ?? []),
-      ...(refresh ? [[refresh.button]] : [])];
+      ...(refresh ? [[refresh.button]] : []), ...(rawFile ? [[rawFile.button]] : [])];
     const outcome = await sendTelegramReply(policy, lease, reply.text, Math.max(1, deadline - Date.now()), request,
       keyboard, reply.forceReply);
     await settleTelegramReply(db, policy, lease, outcome);
