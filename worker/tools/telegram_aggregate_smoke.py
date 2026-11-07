@@ -132,19 +132,20 @@ def parse_inputs(event):
     return action, cohort, source
 
 
-def read_checkpoint(run_id, revision, token):
-    path = f".github/workflows/{WORKFLOW}"
-    workflow = _get_json(f"/actions/workflows/{WORKFLOW}", token)
+def read_checkpoint(run_id, revision, token, *, workflow_file=WORKFLOW, artifact_prefix=ARTIFACT_PREFIX,
+                    checkpoint_file=CHECKPOINT):
+    path = f".github/workflows/{workflow_file}"
+    workflow = _get_json(f"/actions/workflows/{workflow_file}", token)
     require(integer(workflow.get("id"), 1, MAX_ID) and workflow.get("path") == path, "Aggregate workflow identity differs.")
     _, artifact_id, archive_sha = select_main_artifact(run_id, revision, token, workflow_id=workflow["id"],
-        workflow_path=path, artifact_prefix=ARTIFACT_PREFIX, workflow_label="Telegram aggregate checkpoint")
+        workflow_path=path, artifact_prefix=artifact_prefix, workflow_label="Telegram export checkpoint")
     raw = _download(artifact_id, token)
     require(len(raw) <= MAX_CHECKPOINT and digest(raw) == archive_sha, "Aggregate checkpoint archive differs.")
     with ZipFile(BytesIO(raw)) as archive:
         members = _zip_members(archive)
-        require(set(members) == {CHECKPOINT} and members[CHECKPOINT].file_size <= MAX_CHECKPOINT,
+        require(set(members) == {checkpoint_file} and members[checkpoint_file].file_size <= MAX_CHECKPOINT,
                 "Aggregate checkpoint inventory differs.")
-        return _parse_object(archive.read(members[CHECKPOINT]), "Aggregate checkpoint JSON differs.")
+        return _parse_object(archive.read(members[checkpoint_file]), "Aggregate checkpoint JSON differs.")
 
 
 def validate_release_pin(pin):
@@ -430,28 +431,36 @@ def capability(cohort, role, slot):
 
 
 def expected_exports(cohort, role):
-    node = cohort.node(role)
-    proxy = {"name": node["name"], "type": "ss", "server": node["server"], "port": 8388,
-             "cipher": "aes-256-gcm", "password": node["password"]}
-    label = canonical(node["name"])
-    # Independent, fixed one-node oracle for the documented emitted Clash framing.
-    clash = ("proxies:\n  - " + canonical(proxy) + "\nproxy-groups:\n"
-        '  - {"name":"🚀 节点选择","type":"select","proxies":[' + label + "]}\n"
-        '  - {"name":"♻️ 自动选择","type":"url-test","proxies":[' + label
+    return expected_fixture_exports([cohort.node(role)])
+
+
+def expected_fixture_exports(nodes):
+    # Independent fixed Shadowsocks oracle for the emitted Clash framing.
+    proxies = [{"name": node["name"], "type": "ss", "server": node["server"], "port": 8388,
+                "cipher": "aes-256-gcm", "password": node["password"]} for node in nodes]
+    labels = ",".join(canonical(node["name"]) for node in nodes)
+    entries = "".join("  - " + canonical(proxy) + "\n" for proxy in proxies)
+    clash = ("proxies:\n" + entries + "proxy-groups:\n"
+        '  - {"name":"🚀 节点选择","type":"select","proxies":[' + labels + "]}\n"
+        '  - {"name":"♻️ 自动选择","type":"url-test","proxies":[' + labels
         + '],"url":"http://www.gstatic.com/generate_204","interval":300}\nrules:\n  - "MATCH,🚀 节点选择"\n').encode("utf-8")
-    return {"clash": clash, "base64": b64encode(node["share"].encode("ascii"))}
+    return {"clash": clash, "base64": b64encode("\n".join(node["share"] for node in nodes).encode("ascii"))}
 
 
 def probe_capability(cohort, role, recovery, *, active):
     require(recovery["keyVersion"] == 1 and canonical_nonce(recovery["nonce"]), "Aggregate recovery metadata differs.")
     code = derive_code(cohort.encoded, cohort.policy, role, recovery["nonce"])
     require(digest(code.encode()) == recovery["sha256"], "Aggregate recovery digest differs.")
+    return probe_fixture_exports(code, recovery["sha256"], expected_exports(cohort, role), role, active=active)
+
+
+def probe_fixture_exports(code, code_sha256, exports, label, *, active):
     deadline = monotonic() + 60
     report = {}
-    for format_name, body in expected_exports(cohort, role).items():
+    for format_name, body in exports.items():
         for method in ("GET", "HEAD"):
-            with _request(method, f"/agg/{code}/{format_name}", deadline, "aggregate " + role) as response:
-                _check_headers(response, 200 if active else 404, "aggregate " + role,
+            with _request(method, f"/agg/{code}/{format_name}", deadline, "aggregate " + label) as response:
+                _check_headers(response, 200 if active else 404, "aggregate " + label,
                                "text/yaml" if active and format_name == "clash" else "text/plain")
                 expected = body if active else b"Not found."
                 if method == "HEAD":
@@ -460,11 +469,11 @@ def probe_capability(cohort, role, recovery, *, active):
                     require(_small_body(response) == expected and response.getheader("Transfer-Encoding") is None
                             and response.getheader("Content-Length") == str(len(expected)), "Aggregate export bytes or length differ.")
         report[format_name] = {"status": 200 if active else 404, "bytes": len(body) if active else 0,
-                               "sha256": digest(body) if active else recovery["sha256"]}
+                               "sha256": digest(body) if active else code_sha256}
     for method in ("GET", "HEAD"):
-        with _request(method, f"/s/{code}", deadline, "aggregate alias " + role) as response:
+        with _request(method, f"/s/{code}", deadline, "aggregate alias " + label) as response:
             if not active:
-                _check_headers(response, 404, "aggregate alias " + role, "text/plain")
+                _check_headers(response, 404, "aggregate alias " + label, "text/plain")
                 require((response.read(1) == b"") if method == "HEAD" else _small_body(response) == b"Not found.",
                         "Revoked aggregate alias denial differs.")
             else:

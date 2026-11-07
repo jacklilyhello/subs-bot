@@ -16,6 +16,8 @@ import { acceptTelegramCommand } from "../src/telegram/store.ts";
 import { verifyIsolation } from "../tools/verify-isolation.mjs";
 import "./backup-rehearsal.integration.ts";
 import "./telegram-private-share-command.integration.ts";
+import "./telegram-subscription-read.integration.ts";
+import "./telegram-temp-raw.integration.ts";
 
 test("emitted Worker /o freezes owned subscription membership and excludes temporary nodes", { timeout: 60_000 }, async () => {
   const directory = process.env.WORKER_TEST_BUNDLE_DIR;
