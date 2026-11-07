@@ -279,6 +279,8 @@ PY
 
 默认的 `synthetic-legacy` 沿用版本 1 合成包。路径规则演练显式选择 `synthetic-legacy-path`，全程保持同一选项。该选项使用单独的版本 2 产物、目标资源名称及操作记录前缀。固定样例核对映射归属、精确规则文字及编号顺序，并保留已删除规则的编号上界。最终读回输出规则数量、编号上界和数据摘要。候选保持未绑定状态。
 
+选择 `synthetic-legacy-empty` 演练版本 3。它使用独立的产物、D1、R2 和操作记录前缀。预检从固定合成样例重建源 SQLite 与转换包并核对摘要，再验证两个活动订阅、两个回收站订阅、路径规则、原始令牌对应的两个空导出标记、0026 迁移、编号序列及四个 R2 对象。构建与预检须使用能产生同一 SQLite 文件的托管工具链，摘要不符时停止。恢复读回包含标记数量与表摘要。目标保持未绑定，空导出 HTTP 行为另行验收。
+
 1. 依次运行 `verify`、`prepare`、`create-restore-db`、`create-restore-bucket`，每步核对结果后再继续。创建响应不明时先运行只读 `verify`，根据创建意图、时间和实际资源身份独立确认归属，再用 `pin-resource` 提交 `resource` 和 `identity_sha256`。无法确认归属时保留该资源，停止本组后续写入。
 2. 运行 `restore-objects` 核对专用私有 R2 的对象闭包，再运行 `start-import` 向已核对且仍为空的专用 D1 导入。若已有确认的轮询书签，可用同一 `start-import` 继续轮询。响应不明时保留目标和私有操作记录，通过 `verify-restore` 核对完整结果。导入请求未确认、上传链接或产物已失效，或固定版本已变更时，禁止重发首次导入、重置或删除原目标。保留现场核查，后续演练使用新的 `cohort` 和专用资源。 [D1 原生导入](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/import/)
 3. 用 `verify-restore` 验证完整 `PRAGMA quick_check`、外键、结构、迁移记录、编号序列、逐表摘要和 R2 对象。检查失败即保留目标和证据。此结果覆盖合成候选恢复，旧链接、真实数据和 HTTP 导出分别验收。 [D1 完整性检查](https://developers.cloudflare.com/d1/sql-api/sql-statements/#pragma-quick_check)
