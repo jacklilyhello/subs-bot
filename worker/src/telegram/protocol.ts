@@ -36,15 +36,21 @@ export type TelegramLifecycleUpdate = TelegramEventScope & (
 
 export type TelegramPrivateClaimUpdate = TelegramEventScope & { kind: "private-claim"; code: string };
 
+export type TelegramTempUpdate = TelegramEventScope & (
+  | { kind: "temp-text"; text: string }
+  | { kind: "temp-summary" | "temp-clear" }
+);
+
 type NormalizedUpdate =
-  | { command: TelegramCommand; view?: never; lifecycle?: never; privateClaim?: never }
-  | { view: TelegramViewUpdate; command?: never; lifecycle?: never; privateClaim?: never }
-  | { lifecycle: TelegramLifecycleUpdate; command?: never; view?: never; privateClaim?: never }
-  | { privateClaim: TelegramPrivateClaimUpdate; command?: never; view?: never; lifecycle?: never };
+  | { command: TelegramCommand; view?: never; lifecycle?: never; privateClaim?: never; temp?: never }
+  | { view: TelegramViewUpdate; command?: never; lifecycle?: never; privateClaim?: never; temp?: never }
+  | { lifecycle: TelegramLifecycleUpdate; command?: never; view?: never; privateClaim?: never; temp?: never }
+  | { privateClaim: TelegramPrivateClaimUpdate; command?: never; view?: never; lifecycle?: never; temp?: never }
+  | { temp: TelegramTempUpdate; command?: never; view?: never; lifecycle?: never; privateClaim?: never };
 
 type DecodedTelegramRequest =
   | ({ status: 200 } & NormalizedUpdate)
-  | { status: 204 | 400 | 401 | 413 | 415; command?: never; view?: never; lifecycle?: never; privateClaim?: never };
+  | { status: 204 | 400 | 401 | 413 | 415; command?: never; view?: never; lifecycle?: never; privateClaim?: never; temp?: never };
 
 const MAX_UPDATE_BYTES = 64 * 1024;
 const USERNAME = /^[A-Za-z0-9_]{5,32}(?![\s\S])/;
@@ -144,7 +150,7 @@ function authCommand(args: string[], reply: unknown, memberId: string): Telegram
 
 function messageCommand(
   message: Record<string, unknown>, policy: TelegramPolicy,
-): TelegramCommand["command"] | TelegramViewKind | { code: string } | null {
+): TelegramCommand["command"] | TelegramViewKind | "temp-summary" | "temp-clear" | { code: string } | null {
   const { text, entities } = message;
   if (typeof text !== "string" || !Array.isArray(entities)) return null;
   const commands = entities.filter((entity) => isRecord(entity) && entity.type === "bot_command" && entity.offset === 0);
@@ -172,6 +178,9 @@ function messageCommand(
       return "expiry";
     case "recycle":
       return "recycle";
+    case "temp":
+      if (args.length === 0) return "temp-summary";
+      return args.length === 1 && args[0].toLowerCase() === "clear" ? "temp-clear" : null;
     case "auth":
       return authCommand(args, message.reply_to_message, policy.memberId);
     default:
@@ -231,10 +240,19 @@ function normalizeMessage(
     return scope.chatType === "private" && scope.threadId === null
       ? { privateClaim: { ...scope, kind: "private-claim", code: command.code } } : null;
   }
+  if (command === "temp-summary" || command === "temp-clear") {
+    return scope.chatType === "private" && scope.threadId === null ? { temp: { ...scope, kind: command } } : null;
+  }
   if (command === "list" || command === "expiry" || command === "recycle") return { view: { ...scope, kind: command } };
   if (command) return { command: { ...scope, command } };
   const lifecycle = renameReply(message, scope, policy);
-  return lifecycle ? { lifecycle } : null;
+  if (lifecycle) return { lifecycle };
+  const { text, entities } = message;
+  return scope.chatType === "private" && scope.threadId === null && typeof text === "string"
+    && text.trim() !== "" && !text.trimStart().startsWith("/")
+    && (!Array.isArray(entities) || !entities.some((entity) =>
+      isRecord(entity) && entity.type === "bot_command" && entity.offset === 0))
+    ? { temp: { ...scope, kind: "temp-text", text } } : null;
 }
 
 function normalizeCallback(

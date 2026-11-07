@@ -7,6 +7,7 @@ import {
   type TelegramLifecycleReply, type TelegramLifecycleTicket,
 } from "./lifecycle-actions.ts";
 import { TELEGRAM_PRIVATE_CLAIM_MARKER } from "./private-claims.ts";
+import { TELEGRAM_TEMP_MARKER, type TelegramTempReply } from "./temp-import.ts";
 
 export interface TelegramReplyLease extends TelegramCommand {
   receiptId: number;
@@ -15,6 +16,7 @@ export interface TelegramReplyLease extends TelegramCommand {
   view: TelegramView | null;
   lifecycle?: TelegramLifecycleReply;
   privateClaim?: { codeSha256: string };
+  temp?: TelegramTempReply;
 }
 
 export type TelegramReplyOutcome =
@@ -29,7 +31,7 @@ const REAP_LIMIT = 40;
 
 type ReplyAccess = "allowed" | "denied" | "none";
 
-type ReplyRow = Omit<TelegramReplyLease, "view" | "lifecycle" | "privateClaim"> & {
+type ReplyRow = Omit<TelegramReplyLease, "view" | "lifecycle" | "privateClaim" | "temp"> & {
   viewKind: TelegramView["kind"] | null;
   afterId: number | null;
   afterEpoch: number | null;
@@ -37,6 +39,12 @@ type ReplyRow = Omit<TelegramReplyLease, "view" | "lifecycle" | "privateClaim"> 
   lifecycleSubscriptionId: number | null;
   lifecycleExpectedRevision: number | null;
   privateClaimCodeSha256: string | null;
+  tempKind: TelegramTempReply["kind"] | null;
+  tempNodeCount: number | null;
+  tempTotalCount: number | null;
+  tempMalformedCount: number | null;
+  tempUnsupportedCount: number | null;
+  tempIgnoredCount: number | null;
 };
 
 function supportedReceipt(alias: "inbox" | "earlier"): string {
@@ -45,7 +53,9 @@ function supportedReceipt(alias: "inbox" | "earlier"): string {
     OR (${alias}.receipt_nonce = '${TELEGRAM_LIFECYCLE_MARKER}'
     AND EXISTS (SELECT 1 FROM telegram_lifecycle_action WHERE receipt_id = ${alias}.receipt_id))
     OR (${alias}.receipt_nonce = '${TELEGRAM_PRIVATE_CLAIM_MARKER}'
-    AND EXISTS (SELECT 1 FROM telegram_private_claim WHERE receipt_id = ${alias}.receipt_id)))`;
+    AND EXISTS (SELECT 1 FROM telegram_private_claim WHERE receipt_id = ${alias}.receipt_id))
+    OR (${alias}.receipt_nonce = '${TELEGRAM_TEMP_MARKER}'
+    AND EXISTS (SELECT 1 FROM telegram_temp_reply WHERE receipt_id = ${alias}.receipt_id)))`;
 }
 
 export async function acceptTelegramCommand(
@@ -134,13 +144,18 @@ export async function claimTelegramReply(db: D1Database, botId: string): Promise
         inbox.command, reply.lease_id AS leaseId, reply.attempts,
         page.kind AS viewKind, page.after_id AS afterId, page.after_epoch AS afterEpoch,
         action.kind AS lifecycleKind, action.subscription_id AS lifecycleSubscriptionId,
-        action.expected_revision AS lifecycleExpectedRevision, claim.code_sha256 AS privateClaimCodeSha256
+        action.expected_revision AS lifecycleExpectedRevision, claim.code_sha256 AS privateClaimCodeSha256,
+        temp.kind AS tempKind, temp.node_count AS tempNodeCount, temp.total_count AS tempTotalCount,
+        temp.malformed_count AS tempMalformedCount, temp.unsupported_count AS tempUnsupportedCount,
+        temp.ignored_count AS tempIgnoredCount
       FROM telegram_outbox AS reply JOIN telegram_inbox AS inbox USING (receipt_id)
       LEFT JOIN telegram_view AS page ON page.receipt_id = inbox.receipt_id AND inbox.receipt_nonce = '${TELEGRAM_VIEW_MARKER}'
       LEFT JOIN telegram_lifecycle_action AS action ON action.receipt_id = inbox.receipt_id
         AND inbox.receipt_nonce = '${TELEGRAM_LIFECYCLE_MARKER}'
       LEFT JOIN telegram_private_claim AS claim ON claim.receipt_id = inbox.receipt_id
         AND inbox.receipt_nonce = '${TELEGRAM_PRIVATE_CLAIM_MARKER}'
+      LEFT JOIN telegram_temp_reply AS temp ON temp.receipt_id = inbox.receipt_id
+        AND inbox.receipt_nonce = '${TELEGRAM_TEMP_MARKER}'
       WHERE reply.lease_id = ? AND reply.state = 'leased' AND inbox.bot_id = ? AND ${supportedReceipt("inbox")}
     `).bind(leaseId, botId),
   ]);
@@ -148,11 +163,16 @@ export async function claimTelegramReply(db: D1Database, botId: string): Promise
   const row = read.results[0];
   if (!row) return null;
   const { viewKind, afterId, afterEpoch, lifecycleKind, lifecycleSubscriptionId, lifecycleExpectedRevision,
-    privateClaimCodeSha256, ...lease } = row;
+    privateClaimCodeSha256, tempKind, tempNodeCount, tempTotalCount, tempMalformedCount,
+    tempUnsupportedCount, tempIgnoredCount, ...lease } = row;
   const lifecycle = lifecycleKind === null || lifecycleSubscriptionId === null || lifecycleExpectedRevision === null
     ? undefined : { kind: lifecycleKind, subscriptionId: lifecycleSubscriptionId, expectedLifecycleRevision: lifecycleExpectedRevision };
+  // The joined temp companion declares every count NOT NULL when its kind is present.
+  const temp = tempKind === null ? undefined : { kind: tempKind, nodeCount: tempNodeCount!, totalCount: tempTotalCount!,
+    malformedCount: tempMalformedCount!, unsupportedCount: tempUnsupportedCount!, ignoredCount: tempIgnoredCount! };
   return { ...lease, view: viewKind === null ? null : { kind: viewKind, afterId, afterEpoch },
     ...(lifecycle ? { lifecycle } : {}),
+    ...(temp ? { temp } : {}),
     ...(privateClaimCodeSha256 === null ? {} : { privateClaim: { codeSha256: privateClaimCodeSha256 } }) };
 }
 
