@@ -37,7 +37,7 @@ test("emitted Worker admits private provider URLs only after opt-in and delivers
       return Response.json({ ok: true, result: { message_id: message.id, chat: { id: Number(message.chat) } } });
     },
   };
-  const bindings = { BUILD_REVISION: manifest.revision, TELEGRAM_ISOLATION_CONFIG: JSON.stringify(policy),
+  const bindings = { BUILD_REVISION: manifest.revision, TELEGRAM_ISOLATION_CONFIG: JSON.stringify(policy), TELEGRAM_INLINE_SEARCH: "1",
     PROVIDER_REVISION: providerRevision, PROVIDER_IMAGE_SHA256: imageSha256 };
   const runtime = new Miniflare({ workers: [
     { ...common, name: "app", bindings: { ...bindings, TELEGRAM_PROVIDER_URL_IMPORT: "1" } },
@@ -128,10 +128,13 @@ test("emitted Worker admits private provider URLs only after opt-in and delivers
   assert.equal(await originCount(), 2);
   assert.equal(await scopedCount(), 2);
   assert.equal(await calls(), 1, "webhook does not invoke the provider");
+  assert.equal((await post(message(sourceUrl), disabled)).status, 200);
+  assert.equal(await originCount(), 2, "switching off admission does not create another provider origin");
+  assert.equal(await scopedCount(), 2, "switching off admission preserves already-queued jobs");
   await db.prepare("UPDATE telegram_inbox SET received_at=unixepoch()-901 WHERE update_id=?").bind(admin.update_id).run();
-  await cron();
+  await cron(disabled);
   await expectSent(admin.update_id, policy.adminId, "远程订阅已导入。发送 /list 查看。");
-  await cron();
+  await cron(disabled);
   await expectSent(member.update_id, policy.memberId, "远程订阅已导入。发送 /list 查看。");
   assert.equal(await calls(), 3);
   const sub = await db.prepare("SELECT source_url AS source,name,token FROM subscriptions WHERE owner_id=?")

@@ -441,6 +441,39 @@ class APIContractTests(unittest.TestCase):
                 with self.assertRaises(activation.ActivationError):
                     self.api.stopped(NAMESPACE, START, RELEASE["ociManifestSha256"])
 
+    def test_sqlite_actor_inventory_verifies_one_stored_actor_and_the_empty_final_page(self):
+        stopped = {"id": ACTOR, "application_id": NAMESPACE, "image": IMAGE, "status": {"state": "stopped", "updated_at": STOP}}
+        actor = {"id": ACTOR, "hasStoredData": True}
+        first = envelope([actor], result_info={"cursor": "synthetic+/cursor=", "count": 1})
+        last = envelope([], result_info={"count": 0})
+        objects = f"/workers/durable_objects/namespaces/{NAMESPACE}/objects"
+        with patch.object(self.api, "instances", side_effect=[[stopped], []]), patch.object(
+                self.api, "_request", side_effect=[first, last, envelope(stopped)]) as read:
+            self.assertEqual(self.api.stopped(NAMESPACE, START, RELEASE["ociManifestSha256"]), activation._hash(ACTOR))
+            self.assertEqual(read.call_args_list[:2], [call(objects + "?limit=10"),
+                            call(objects + "?limit=10&cursor=synthetic%2B%2Fcursor%3D")])
+        for pages in ([first, first], [first, envelope([actor])], [first, envelope([], result_info={"count": 1})],
+                      [envelope([], result_info={"cursor": "synthetic"})],
+                      [envelope([actor], result_info={"cursor": "x" * 513})],
+                      [envelope([actor], result_info={"cursor": "synthetic", "cursors": {"after": "different"}})]):
+            with self.subTest(pages=pages), patch.object(self.api, "_request", side_effect=pages) as read:
+                with self.assertRaises(activation.ActivationError):
+                    self.api.actors(NAMESPACE)
+                self.assertLessEqual(read.call_count, 2)
+        for rows, actors, active in (
+            ([{**stopped, "status": {"state": "stopping", "updated_at": STOP}}], [actor], []),
+            ([{**stopped, "application_id": "f" * 32}], [actor], []),
+            ([stopped, stopped], [actor], []),
+            ([stopped], [], []),
+            ([stopped], [{"id": "f" * 64, "hasStoredData": True}], []),
+            ([stopped], [{"id": ACTOR, "hasStoredData": False}], []),
+            ([stopped], [actor], [stopped]),
+        ):
+            with self.subTest(rows=rows, actors=actors, active=active), patch.object(self.api, "actors", return_value=actors), patch.object(
+                    self.api, "instances", side_effect=[rows, active]), patch.object(self.api, "_request", return_value=envelope(stopped)):
+                with self.assertRaises(activation.ActivationError):
+                    self.api.stopped(NAMESPACE, START, RELEASE["ociManifestSha256"])
+
 
 class ProofTests(unittest.TestCase):
     def test_smoke_output_rejects_wrong_revision_digest_auth_or_numeric_booleans(self):
@@ -457,6 +490,16 @@ class ProofTests(unittest.TestCase):
             with self.subTest(changed=changed), self.assertRaises(ValueError):
                 activation._smoke_result({**smoke(), **changed}, RELEASE, WORKFLOW_PIN, ISOLATED, HEALTH_PROOF)
 
+    def test_exact_workflow_output_can_be_a_json_object(self):
+        instance = smoke()
+        output = json.loads(instance["output"])
+        self.assertEqual(activation._smoke_result({**instance, "output": output}, RELEASE, WORKFLOW_PIN,
+                                                  ISOLATED, HEALTH_PROOF), output)
+        for changed in (None, 7, [output], {**output, "approvedDnsFamilies": [4.0, 6]}, {**output, "extra": "synthetic-secret"}):
+            with self.subTest(changed=changed), self.assertRaises(activation.ActivationError) as error:
+                activation._smoke_result({**instance, "output": changed}, RELEASE, WORKFLOW_PIN, ISOLATED, HEALTH_PROOF)
+            self.assertNotIn("synthetic-secret", str(error.exception))
+
     def test_fixed_public_probe_has_no_authorization_and_refuses_redirect_or_live_handler(self):
         for status, headers, body, accepted in ((404, {}, b"Not found", True), (403, {}, b"Denied", True),
                                                (302, {"Location": "https://example.invalid"}, b"", False), (200, {}, b"ok", False)):
@@ -469,6 +512,26 @@ class ProofTests(unittest.TestCase):
                 request = send.call_args.args[0]
                 self.assertIsNone(request.get_header("Authorization"))
                 self.assertEqual(request.full_url, activation.PROVIDER_URL)
+
+    def test_fixed_application_health_uses_the_isolation_release_user_agent(self):
+        def edge(request, _opener, _error, **kwargs):
+            self.assertEqual(request.full_url, activation.HEALTH_URL)
+            self.assertIsNone(request.get_header("Authorization"))
+            if request.get_header("User-agent") != "subs-bot-isolation-release/1.0":
+                return 403, {}, b'{"error":"denied"}'
+            return 200, {}, HEALTH
+
+        with patch.object(activation.publication, "_response", side_effect=edge):
+            self.assertEqual(activation._public(activation.HEALTH_URL, ISOLATED), HEALTH_PROOF)
+
+    def test_fixed_application_health_redacts_rejected_bodies_and_checks_revision(self):
+        with patch.object(activation.publication, "_response", return_value=(403, {}, b"synthetic-secret")):
+            with self.assertRaisesRegex(activation.ActivationError, "HTTP 403") as error:
+                activation._public(activation.HEALTH_URL, ISOLATED)
+        self.assertNotIn("synthetic-secret", str(error.exception))
+        with patch.object(activation.publication, "_response", return_value=(200, {}, HEALTH)):
+            with self.assertRaisesRegex(activation.ActivationError, "exact app revision"):
+                activation._public(activation.HEALTH_URL, REVISION)
 
     def test_private_worker_metadata_keeps_disabled_defaults_and_rejects_drift(self):
         value = worker()

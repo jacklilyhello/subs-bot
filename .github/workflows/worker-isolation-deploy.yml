@@ -20,6 +20,16 @@ on:
         description: Exact isolation confirmation for enable or disable
         required: false
         type: string
+      provider_url_import:
+        description: Preserve, enable, or disable new private Telegram provider URL imports
+        required: true
+        default: preserve
+        type: choice
+        options: [preserve, enable, disable]
+      provider_url_import_confirmation:
+        description: Exact isolation confirmation for provider URL import enable or disable
+        required: false
+        type: string
 
 permissions:
   actions: read
@@ -52,6 +62,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SUBS_BOT_INLINE_SEARCH_MODE: ${{ inputs.inline_search }}
           SUBS_BOT_INLINE_SEARCH_CONFIRMATION: ${{ inputs.inline_search_confirmation }}
+          SUBS_BOT_PROVIDER_URL_IMPORT_MODE: ${{ inputs.provider_url_import }}
+          SUBS_BOT_PROVIDER_URL_IMPORT_CONFIRMATION: ${{ inputs.provider_url_import_confirmation }}
           SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
           SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
           SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPLOY_TOKEN }}

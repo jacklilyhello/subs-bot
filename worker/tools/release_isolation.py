@@ -48,6 +48,16 @@ def inline_search_release_mode():
     raise CloudflareError("The isolated inline search release mode or confirmation is invalid.")
 
 
+def provider_url_import_release_mode():
+    mode = os.environ.get("SUBS_BOT_PROVIDER_URL_IMPORT_MODE", "preserve")
+    confirmation = os.environ.get("SUBS_BOT_PROVIDER_URL_IMPORT_CONFIRMATION", "")
+    if mode == "preserve" and confirmation == "":
+        return None
+    if mode in ("enable", "disable") and confirmation == f"{mode} provider URL import for {WORKER_NAME}":
+        return mode == "enable"
+    raise CloudflareError("The isolated provider URL import release mode or confirmation is invalid.")
+
+
 def release():
     revision = os.environ.get("GITHUB_SHA", "")
     if (os.environ.get("GITHUB_REPOSITORY") != "jacklilyhello/subs-bot"
@@ -57,6 +67,7 @@ def release():
         raise ValueError("The isolation workflow must run for the project's main branch.")
 
     inline_search = inline_search_release_mode()
+    provider_url_import = provider_url_import_release_mode()
     bundle = Path(os.environ["RUNNER_TEMP"]) / "subs-bot-verified"
     manifest = json.loads((bundle / "isolation.json").read_text(encoding="utf-8"))
     if manifest.get("version") != 2 or manifest.get("revision") != revision:
@@ -98,7 +109,7 @@ def release():
                                     provider_binding=provider_binding, release_revision=revision,
                                     provider_first_binding_guard=first_provider_proof,
                                     historical_application_revision=historical_application_revision, release_manifest=manifest,
-                                    telegram_config=telegram_config, inline_search=inline_search)
+                                    telegram_config=telegram_config, inline_search=inline_search, provider_url_import=provider_url_import)
     if provider_gate is not None:
         provider_gate.verify()
     migrations = apply_migrations(data_api, target, bundle, manifest, guard)
@@ -108,7 +119,8 @@ def release():
                             private_share_key=private_share_key, provider_binding=provider_binding,
                             provider_guard=provider_gate.verify if provider_gate is not None else None,
                             provider_first_binding_guard=first_provider_proof,
-                            historical_application_revision=historical_application_revision, inline_search=inline_search)
+                            historical_application_revision=historical_application_revision, inline_search=inline_search,
+                            provider_url_import=provider_url_import)
     guard()
     print(json.dumps(result, sort_keys=True), flush=True)
 
