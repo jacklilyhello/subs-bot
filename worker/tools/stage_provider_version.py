@@ -26,6 +26,10 @@ PREPARE_SECONDS = 15 * 60
 VERSION_ERROR = "The staged provider Worker version did not match the exact private release."
 UPLOAD_ERROR = "The provider version upload was not confirmed. Use verification to reconcile the exact candidate before another stage."
 PREPARE_ERROR = "The pinned provider image was not ready for Cloudflare Workers."
+MAX_UPLOAD_ERRORS = 8
+UPLOAD_FIELDS = frozenset((
+    "metadata", "main_module", "compatibility_date", "annotations", "bindings", "containers", "exports", "files", "migrations",
+))
 
 
 class StageError(ValueError):
@@ -73,17 +77,47 @@ def _multipart(metadata, module):
     return f"multipart/form-data; boundary={boundary}", body
 
 
-def _json_request(url, opener, token, error, *, content_type=None, body=None,
-                  statuses=(200,), limit=publication.HTTP_LIMIT):
+def _request(url, opener, token, error, *, content_type=None, body=None, limit=publication.HTTP_LIMIT):
     headers = {"Authorization": "Bearer " + token, "Accept": "application/json", "Cache-Control": "no-cache"}
     if body is not None:
         headers["Content-Type"] = content_type
     request = Request(url, data=body, headers=headers, method="GET" if body is None else "POST")
-    status, _, raw = publication._response(request, opener, error, limit=limit)
+    return publication._response(request, opener, error, limit=limit)
+
+
+def _json_request(url, opener, token, error, *, content_type=None, body=None,
+                  statuses=(200,), limit=publication.HTTP_LIMIT):
+    status, _, raw = _request(url, opener, token, error, content_type=content_type, body=body, limit=limit)
     envelope = github._parse_object(raw, error)
     _require(status in statuses and envelope.get("success") is True and envelope.get("errors") in (None, [])
              and "result" in envelope, error)
     return status, envelope
+
+
+def _upload_error(status, envelope):
+    diagnostic = {}
+    if type(status) is int and 100 <= status <= 599:
+        diagnostic["httpStatus"] = status
+    errors = envelope.get("errors") if envelope is not None else None
+    codes, fields = set(), set()
+    if isinstance(errors, list):
+        for entry in errors[:MAX_UPLOAD_ERRORS]:
+            code = entry.get("code") if isinstance(entry, dict) else None
+            if type(code) is not int or not 1000 <= code <= 999999:
+                continue
+            codes.add(code)
+            source = entry.get("source")
+            pointer = source.get("pointer") if isinstance(source, dict) else None
+            if isinstance(pointer, str) and re.fullmatch(r"/[A-Za-z0-9_/-]{1,127}", pointer):
+                path = pointer.removeprefix("/metadata") if pointer.startswith("/metadata/") else pointer
+                field = path.split("/", 2)[1]
+                if field in UPLOAD_FIELDS:
+                    fields.add(field)
+    if codes:
+        diagnostic["cloudflareCodes"] = sorted(codes)
+    if fields:
+        diagnostic["validationFields"] = sorted(fields)
+    return f"{UPLOAD_ERROR} Upload diagnostic {json.dumps(diagnostic, separators=(',', ':'))}." if diagnostic else UPLOAD_ERROR
 
 
 def _version_id(value):
@@ -134,15 +168,17 @@ class WorkerVersions:
 
     def upload(self, metadata, module):
         content_type, body = _multipart(metadata, module)
+        status = envelope = None
         try:
-            _, envelope = _json_request(f"{self._base}{self._legacy}/versions?bindings_inherit=strict",
-                                        self._opener, self._token, UPLOAD_ERROR, content_type=content_type,
-                                        body=body, statuses=(200, 201))
-            result = envelope["result"]
-            _require(isinstance(result, dict), UPLOAD_ERROR)
+            status, _, raw = _request(f"{self._base}{self._legacy}/versions?bindings_inherit=strict",
+                                      self._opener, self._token, UPLOAD_ERROR, content_type=content_type, body=body)
+            envelope = github._parse_object(raw, UPLOAD_ERROR)
+            result = envelope.get("result")
+            _require(status in (200, 201) and envelope.get("success") is True and envelope.get("errors") in (None, [])
+                     and isinstance(result, dict), UPLOAD_ERROR)
             return _version_id(result.get("id"))
         except (StageError, publication.PublicationError, github.ArtifactError):
-            raise StageError(UPLOAD_ERROR) from None
+            raise StageError(_upload_error(status, envelope)) from None
 
     def verify(self, candidate, metadata, module_sha256):
         candidate = _version_id(candidate)
