@@ -4,6 +4,7 @@ import {
   prepareTelegramLifecycleTickets, renderTelegramLifecycle, type TelegramLifecycleButton,
 } from "./lifecycle-actions.ts";
 import { inTelegramScope, type TelegramPolicy } from "./protocol.ts";
+import { renderTelegramPath } from "./path-management.ts";
 import { beginTelegramPrivateClaim, prepareTelegramPrivateClaim } from "./private-claims.ts";
 import {
   beginTelegramReply, claimTelegramReply, isTelegramMemberAllowed,
@@ -107,6 +108,7 @@ export async function sendTelegramReply(
   keyboard?: InlineKeyboard,
   forceReply = false,
 ): Promise<TelegramReplyOutcome> {
+  if (lease.path && (lease.chatType !== "private" || lease.threadId !== null)) return { kind: "failed" };
   return sendTelegram(policy, lease, "sendMessage", {
     chat_id: lease.chatId,
     ...(lease.threadId === null ? {} : { message_thread_id: lease.threadId }),
@@ -197,6 +199,9 @@ async function renderReply(
   }
   if (lease.view) return { ...await renderTelegramView(db, lease.actorId, lease.view), access: "allowed" };
   if (lease.temp) return { text: renderTelegramTemp(lease.temp), access: "allowed" };
+  if (lease.path && lease.chatType === "private" && lease.threadId === null) {
+    return { text: await renderTelegramPath(db, lease.actorId, lease.path), access: "allowed" };
+  }
   if (lease.command === "list") {
     const page = await listOwnedSubscriptions(db, lease.actorId, { limit: LIST_LIMIT });
     const names = page.items.map((row, index) => {
@@ -206,7 +211,7 @@ async function renderReply(
     if (page.nextAfterId !== null) names.push(`仅显示前 ${LIST_LIMIT} 条。`);
     return { text: names.length ? `你的订阅\n${names.join("\n")}` : "你的订阅列表为空。", access: "allowed" };
   }
-  const help = "使用 /list 查看你的订阅，/expire 查看临期，/recycle 查看回收站，/temp 查看临时节点，/help 查看命令。";
+  const help = "使用 /list 查看你的订阅，/expire 查看临期，/recycle 查看回收站，/temp 查看临时节点，私聊 /path 管理路径规则。";
   return { text: lease.command === "start" ? `欢迎使用 subs-bot。\n${help}` : help, access: "allowed" };
 }
 

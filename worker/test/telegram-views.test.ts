@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { after, before, test } from "node:test";
 
 import { Miniflare } from "miniflare";
@@ -28,12 +28,9 @@ const thirtyDays = 30 * 24 * 60 * 60;
 
 before(async () => {
   db = await miniflare.getD1Database("DB");
-  for (const name of [
-    "0001_subscriptions.sql", "0002_telegram.sql", "0003_subscription_lifecycle.sql", "0004_telegram_views.sql",
-    "0005_private_shares.sql", "0006_telegram_lifecycle.sql", "0007_telegram_private_claims.sql",
-    "0008_telegram_temp_nodes.sql",
-  ]) {
-    const sql = await readFile(new URL(`../migrations/${name}`, import.meta.url), "utf8");
+  const migrations = new URL("../migrations/", import.meta.url);
+  for (const name of (await readdir(migrations)).filter((file) => file.endsWith(".sql")).sort()) {
+    const sql = await readFile(new URL(name, migrations), "utf8");
     await db.batch(sql.trim().split(/;\s*/u).filter(Boolean).map((statement) => db.prepare(statement)));
   }
 });
