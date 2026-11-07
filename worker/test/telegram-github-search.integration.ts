@@ -7,7 +7,7 @@ import { Miniflare } from "miniflare";
 import { TELEGRAM_GITHUB_SEARCH_MIGRATION, TELEGRAM_GITHUB_SEARCH_SCHEMA_SHA256 } from "../src/telegram/github-search.ts";
 import type { TelegramPolicy } from "../src/telegram/protocol.ts";
 
-test("emitted Worker searches GitHub privately and preserves the outbox through a delayed lookup and send ambiguity",
+test("emitted Worker preserves private GitHub search and ordinary delivery across lookup, send and readiness faults",
   { timeout: 60_000 }, async () => {
     const directory = process.env.WORKER_TEST_BUNDLE_DIR;
     assert.ok(directory);
@@ -21,6 +21,7 @@ test("emitted Worker searches GitHub privately and preserves the outbox through 
     };
     const releaseLookup = Promise.withResolvers<void>();
     const releaseHelp = Promise.withResolvers<void>();
+    const releaseGitHubReply = Promise.withResolvers<void>();
     const upstreamUrls: URL[] = [];
     type Sent = {
       chat_id: string; text: string; reply_parameters: { message_id: number };
@@ -28,8 +29,34 @@ test("emitted Worker searches GitHub privately and preserves the outbox through 
     };
     const sent: Sent[] = [];
     let fallbackAttempts = 0;
+    let heldReplyAttempts = 0;
     const runtime = new Miniflare({
-      modules: true, script: script.toString("utf8"), compatibilityDate: manifest.compatibilityDate,
+      modules: [
+        { type: "ESModule", path: "fixture.js", contents: `
+          import worker from './index.js';
+          function withReadinessFault(env) {
+            const db = env.DB;
+            return {...env, DB: {
+              prepare(sql) {
+                const statement = db.prepare(sql);
+                if (!sql.includes('sqlite_schema') || !sql.includes('telegram_github_search_expiring')) return statement;
+                return {async first() {
+                  const fail = await db.prepare('SELECT fail FROM github_readiness_fixture').first('fail');
+                  if (fail === 1) throw new Error('Synthetic GitHub readiness failure.');
+                  return statement.first();
+                }};
+              },
+              batch(statements) { return db.batch(statements); },
+            }};
+          }
+          export default {
+            fetch(request, env, ctx) { return worker.fetch(request, withReadinessFault(env), ctx); },
+            scheduled(controller, env, ctx) { return worker.scheduled(controller, withReadinessFault(env), ctx); },
+          };
+        ` },
+        { type: "ESModule", path: "index.js", contents: script.toString("utf8") },
+      ],
+      compatibilityDate: manifest.compatibilityDate,
       d1Databases: ["DB"], r2Buckets: ["NODES"],
       bindings: { BUILD_REVISION: manifest.revision, TELEGRAM_ISOLATION_CONFIG: JSON.stringify(policy) },
       outboundService: async (request: Request) => {
@@ -59,6 +86,10 @@ test("emitted Worker searches GitHub privately and preserves the outbox through 
         sent.push(body);
         const replyId = body.reply_parameters.message_id;
         if (replyId === 5) await releaseHelp.promise;
+        if (replyId === 9 && ++heldReplyAttempts === 1) {
+          await releaseGitHubReply.promise;
+          return Response.json({ ok: false, error_code: 429, parameters: { retry_after: 60 } }, { status: 429 });
+        }
         if (replyId === 8) {
           fallbackAttempts++;
           if (fallbackAttempts === 1) {
@@ -80,7 +111,11 @@ test("emitted Worker searches GitHub privately and preserves the outbox through 
         assert.equal(sha256(bytes), migration.sha256);
         await db.batch(bytes.toString("utf8").trim().split(/;\s*/u).filter(Boolean).map((sql) => db.prepare(sql)));
       }
-      await db.prepare("CREATE TABLE subs_bot_schema_migrations (position INTEGER, name TEXT PRIMARY KEY, sha256 TEXT, mode TEXT)").run();
+      await db.batch([
+        db.prepare("CREATE TABLE subs_bot_schema_migrations (position INTEGER, name TEXT PRIMARY KEY, sha256 TEXT, mode TEXT)"),
+        db.prepare("CREATE TABLE github_readiness_fixture (fail INTEGER NOT NULL)"),
+        db.prepare("INSERT INTO github_readiness_fixture VALUES (0)"),
+      ]);
       const now = await db.prepare("SELECT unixepoch() AS now").first<number>("now");
       assert.ok(now);
       const date = now - 5;
@@ -150,9 +185,43 @@ test("emitted Worker searches GitHub privately and preserves the outbox through 
       assert.ok(fallback.every((item) => item.reply_markup?.inline_keyboard[0][0].url === "https://github.com/search?type=code"));
       const stored = JSON.stringify((await db.prepare("SELECT * FROM telegram_github_search").all()).results);
       assert.doesNotMatch(stored, /private-fixture-argument|with-credential|redirect-demo|excluded|Hello-World/u);
+
+      assert.equal((await post(9, "/g")).status, 200);
+      await waitFor(() => heldReplyAttempts === 1);
+      assert.equal(await state(9), "sending");
+      await db.prepare("UPDATE github_readiness_fixture SET fail=1").run();
+      const unavailable = await post(10, publicQuery, policy.adminId);
+      assert.equal(unavailable.status, 503);
+      assert.equal(await unavailable.text(), "Service unavailable.");
+      assert.equal(await db.prepare("SELECT count(*) AS n FROM telegram_inbox WHERE update_id=10").first("n"), 0);
+
+      assert.equal((await post(11, "/help")).status, 200);
+      assert.equal((await post(12, "/help", policy.adminId)).status, 200);
+      assert.equal((await post(13, "/help")).status, 200);
+      assert.equal((await worker.scheduled({ cron: "* * * * *" })).outcome, "ok");
+      await waitFor(async () => await state(12) === "sent");
+      assert.equal(await state(11), "pending", "an active GitHub send must still hold the same chat");
+      assert.equal(await state(13), "pending");
+
+      releaseGitHubReply.resolve();
+      await waitFor(async () => await state(9) === "pending");
+      assert.equal((await worker.scheduled({ cron: "* * * * *" })).outcome, "ok");
+      await waitFor(async () => await state(11) === "sent" && await state(13) === "sent");
+      assert.deepEqual(sent.map(({ reply_parameters }) => reply_parameters.message_id).filter((id) => id === 11 || id === 13), [11, 13]);
+
+      await db.prepare("UPDATE telegram_outbox SET due_at=unixepoch() WHERE receipt_id=(SELECT receipt_id FROM telegram_inbox WHERE update_id=9)").run();
+      assert.equal((await worker.scheduled({ cron: "* * * * *" })).outcome, "ok");
+      assert.equal(await state(9), "pending", "a failed readiness probe cannot claim an existing GitHub reply");
+      assert.equal(heldReplyAttempts, 1);
+      await db.prepare("UPDATE github_readiness_fixture SET fail=0").run();
+      assert.equal((await worker.scheduled({ cron: "* * * * *" })).outcome, "ok");
+      assert.equal(await state(9), "sent");
+      assert.equal(heldReplyAttempts, 2);
+      assert.equal(upstreamUrls.length, 2, "readiness failures and existing reply recovery never replay lookup egress");
     } finally {
       releaseLookup.resolve();
       releaseHelp.resolve();
+      releaseGitHubReply.resolve();
       await runtime.dispose();
     }
   });

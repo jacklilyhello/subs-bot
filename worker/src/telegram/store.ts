@@ -225,7 +225,8 @@ export async function isTelegramMemberAllowed(db: D1Database, policy: TelegramPo
 export async function claimTelegramReply(db: D1Database, botId: string, includeAggregate = false,
   includePrivateShareCreation = false, includeSubscriptionRead = false, includeShortLinks = false, includeInlineSort = false,
   includeSubscriptionNodes = false, providerPolicy?: TelegramPolicy, includeBulkTrash = false, includeInlineConsent = false,
-  gitHubSearchPolicy?: TelegramPolicy): Promise<TelegramReplyLease | null> {
+  gitHubSearch?: TelegramPolicy | "unavailable"): Promise<TelegramReplyLease | null> {
+  const gitHubSearchPolicy = gitHubSearch === "unavailable" ? undefined : gitHubSearch;
   if (providerPolicy && providerPolicy.botId !== botId) throw new Error("Telegram provider reply scope differs.");
   if (gitHubSearchPolicy && gitHubSearchPolicy.botId !== botId) throw new Error("Telegram GitHub search reply scope differs.");
   const leaseId = crypto.randomUUID();
@@ -252,6 +253,13 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
       OR (earlier.receipt_id < inbox.receipt_id AND earlier_reply.state = 'pending'
         AND earlier_reply.attempts < ${MAX_ATTEMPTS} AND earlier.received_at + ${MAX_REPLY_AGE_SECONDS} > unixepoch()
         AND ${earlierGithubCurrent.sql}))))` : earlierActive;
+  // A ready invocation can still own a GitHub send when a later probe fails.
+  // Preserve that same-chat lease without reading the optional companion table.
+  const activeGitHubLease = gitHubSearch === "unavailable" ? `OR (
+    earlier.receipt_nonce = '${TELEGRAM_GITHUB_SEARCH_MARKER}' AND earlier.command = 'help'
+    AND earlier.chat_type = 'private' AND earlier.chat_id = earlier.actor_id AND earlier.thread_id IS NULL
+    AND earlier_reply.state IN ('leased', 'sending') AND earlier_reply.lease_until > unixepoch()
+  )` : "";
   const aggregateColumns = includeAggregate ? `aggregate.result AS aggregateResult,
     aggregate.revision AS aggregateRevision, aggregate.code_sha256 AS aggregateCodeSha256,
     selected.result AS selectedResult, selected.code_sha256 AS selectedCodeSha256`
@@ -273,9 +281,9 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
             SELECT 1 FROM telegram_inbox AS earlier
             JOIN telegram_outbox AS earlier_reply USING (receipt_id)
             WHERE earlier.bot_id = inbox.bot_id AND earlier.actor_id = inbox.actor_id AND earlier.chat_id = inbox.chat_id
-              AND ${supportedReceipt("earlier", includeAggregate, includePrivateShareCreation, includeSubscriptionRead,
+              AND ((${supportedReceipt("earlier", includeAggregate, includePrivateShareCreation, includeSubscriptionRead,
                 includeShortLinks, includeInlineSort, includeSubscriptionNodes, includeProvider, includeBulkTrash, includeInlineConsent, includeGitHubSearch)}
-              AND ${sameChatBlocker}
+                AND ${sameChatBlocker}) ${activeGitHubLease})
           )
         ORDER BY inbox.receipt_id LIMIT 1
       )
