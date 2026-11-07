@@ -314,6 +314,12 @@ PY
 
 在原命令末尾显式附加 `legacy-empty-v3 SOURCE_SQLITE_SHA OWNER_MAP_SHA` 可构建版本 3。新增参数分别固定已封存 SQLite 与已核准归属映射的 SHA-256，Worker 产物必须包含摘要吻合的 0026 迁移。已验证的旧空节点数组按目标订阅编号、归属与原令牌摘要写入标记表，包含活动和回收站记录。回收站的标记在同一订阅恢复后才可用于导出。SQL 重放核对完整标记集及迁移记录，清单另记活动和回收站标记数、迁移和表摘要。包的验证范围限于候选数据，原生导入和空导出 HTTP 行为需分别验收。
 
+### 隔离旧空订阅 HTTP 验收
+
+在当前 `main` 的确切产物已发布且迁移 `0026` 已核对后，运行 `gh workflow run worker-isolation-legacy-empty-smoke.yml --ref main -f action=verify -f cohort=<16位小写十六进制>`。流程只在既有隔离 D1 准备一个带精确标记的空订阅和一个无标记的对照。依次检查默认路径、各格式别名的 GET 与 HEAD、响应类型、空内容、私有缓存策略及无标记 404，然后按同一批次的精确身份退役两条记录和标记。响应中使用的合成能力令牌不出现在日志中。
+
+若流程中断，可在确认当前隔离版本后，以同一批次执行 `action=retire` 并在 `confirm_retire` 填写 `retire <cohort>`。遇到所有者、版本、指针或标记不符时保留记录并停止。此流程验证实际 Worker HTTP 和 D1 读取，与 V3 独立原生恢复的对象完整性核对分别记录。
+
 ### 真实数据与生产切换门槛
 
 1. 先只读核对 Cloudflare 目标账户、Zone、`subs-bot.lilyya.top` 的 DNS、Worker 路由和 Custom Domain 绑定。新资源记录账号、环境及资源 ID，隔离与生产分别使用各自的 Worker、D1、R2 和队列。现有配置冲突须在改动前报告。目标主机名可用且切换获准后，仅增加所需的 Custom Domain 绑定。 [Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)
