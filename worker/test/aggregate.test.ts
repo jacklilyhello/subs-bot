@@ -7,6 +7,7 @@ import { Miniflare } from "miniflare";
 
 import { getAggregateNodeSource } from "../src/aggregate.ts";
 import worker from "../src/index.ts";
+import { MAX_PATH_RULES } from "../src/path-rules.ts";
 import { createSubscription, MAX_CHUNK_BYTES, publishNodeSnapshot, type ExportNodeSource,
   type SubscriptionMetadata } from "../src/storage.ts";
 import { restoreOwnedSubscription, trashOwnedSubscription } from "../src/subscriptions.ts";
@@ -142,6 +143,94 @@ test("a replayable source pins publication and temp values across concurrent cha
   await temp(config, 2);
   assert.deepEqual(await sourceShares(captured), before);
   assert.deepEqual(await encodedShares(code), [share("after-refresh")]);
+});
+
+test("maps only owned subscription nodes and pins rules across selected and all replays", async () => {
+  const config = policy("98013", "88013");
+  const all = "SyntheticMap";
+  const selected = "SyntheticSel";
+  const first = await subscription(config.memberId, "First mapped subscription", ["Raw"]);
+  const second = await subscription(config.memberId, "Second mapped subscription");
+  const structured = { name: "Straße", type: "ss", server: "203.0.113.10", port: 8388,
+    cipher: "aes-256-gcm", password: "fixture" };
+  assert.equal(await publishNodeSnapshot(db, bucket, {
+    id: second.id, ownerId: second.ownerId, expectedGeneration: 0, expectedLifecycleRevision: 0,
+  }, [structured]), true);
+  await link(all, config);
+  await link(selected, config, [second.id, first.id]);
+  await temp(config, 1, "temporary");
+  const insert = "INSERT INTO path_rules (owner_id, keyword, remark) VALUES (?, ?, ?)";
+  await db.batch([
+    db.prepare(insert).bind(config.adminId, "STRASSE", "foreign"),
+    db.prepare(insert).bind(config.memberId, "STRASSE", "mapped"),
+    db.prepare(insert).bind(config.memberId, "#raw", "stored"),
+    db.prepare(insert).bind(config.memberId, "temporary", "excluded"),
+  ]);
+
+  const singbox = await request(`/sub/${second.token}/singbox`);
+  assert.equal(singbox.status, 200);
+  const { outbounds } = await singbox.json() as { outbounds: { tag: string }[] };
+  assert.equal(outbounds[2].tag, "Straße → mapped");
+  const raw = await request(`/sub/${first.token}/mixed`);
+  assert.equal(raw.status, 200);
+  assert.equal(Buffer.from(await raw.text(), "base64").toString("utf8"), share("Raw"));
+
+  const generated = "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.10:8388#Stra%C3%9Fe%20%E2%86%92%20mapped";
+  assert.deepEqual(await encodedShares(all), [share("Raw"), generated, share("temporary")]);
+  assert.deepEqual(await encodedShares(selected), [generated, share("Raw")]);
+  const selectedClash = await request(`/agg/${selected}/clash`);
+  assert.equal(selectedClash.status, 200);
+  const clashText = await selectedClash.text();
+  assert.match(clashText, /"name":"Straße → mapped"[^\n]+\n  - \{"name":"Raw → stored"/u);
+  assert.doesNotMatch(clashText, /temporary|foreign/u);
+  const allClash = await request(`/agg/${all}/clash`);
+  assert.equal(allClash.status, 200);
+  const allText = await allClash.text();
+  assert.match(allText, /"name":"Raw → stored"[^\n]+\n  - \{"name":"Straße → mapped"[^\n]+\n  - \{"name":"temporary"/u);
+  assert.doesNotMatch(allText, /excluded|foreign/u);
+
+  const capture = await getAggregateNodeSource(db, bucket, selected);
+  assert.ok(capture);
+  await db.prepare("UPDATE path_rules SET remark = 'later' WHERE owner_id = ? AND keyword = 'STRASSE'")
+    .bind(config.memberId).run();
+  for (const _pass of [1, 2]) {
+    const names = [];
+    for await (const { name } of capture.read()) names.push(name);
+    assert.deepEqual(names, ["Straße → mapped", "Raw → stored"]);
+  }
+  const fresh = await request(`/agg/${selected}/clash`);
+  assert.equal(fresh.status, 200);
+  assert.match(await fresh.text(), /Straße → later/u);
+});
+
+test("rejects excess and corrupt owned rules before GET or HEAD export succeeds", async () => {
+  const config = policy("98014", "88014");
+  const selected = "SyntheticCapRulesCodeA";
+  const owned = await subscription(config.memberId, "Owned", ["owned"]);
+  const foreign = await subscription(config.adminId, "Foreign", ["foreign"]);
+  await link(selected, config, [owned.id]);
+  await db.prepare(`WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM seq WHERE n < ?)
+    INSERT INTO path_rules (owner_id, keyword, remark) SELECT ?, 'rule-' || n, 'fixture' FROM seq`)
+    .bind(MAX_PATH_RULES + 1, config.memberId).run();
+
+  for (const path of [`/sub/${owned.token}/clash`, `/agg/${selected}/base64`]) {
+    const get = await request(path);
+    assert.equal(get.status, 422);
+    assert.equal(await get.text(), "Subscription content cannot be exported.");
+    const head = await request(path, "HEAD");
+    assert.equal(head.status, 422);
+    assert.equal(await head.text(), "");
+  }
+  const other = await request(`/sub/${foreign.token}/base64`);
+  assert.equal(other.status, 200);
+  assert.equal(Buffer.from(await other.text(), "base64").toString("utf8"), share("foreign"));
+
+  await db.prepare("DELETE FROM path_rules WHERE owner_id = ?").bind(config.memberId).run();
+  await db.prepare("INSERT INTO path_rules (owner_id, keyword, remark) VALUES (?, ?, ?)")
+    .bind(config.memberId, "\u0085", "fixture").run();
+  const corrupt = await request(`/sub/${owned.token}/base64`);
+  assert.equal(corrupt.status, 503);
+  assert.equal(await corrupt.text(), "Subscription temporarily unavailable.");
 });
 
 test("uses the existing format planners and fixed private redirect for an active aggregate", async () => {
