@@ -39,6 +39,10 @@ export type TelegramLifecycleUpdate = TelegramEventScope & (
 
 export type TelegramPrivateClaimUpdate = TelegramEventScope & { kind: "private-claim"; code: string };
 export type TelegramAggregateUpdate = TelegramEventScope & { kind: "show" | "revoke" };
+export type TelegramSelectedUpdate = TelegramEventScope & (
+  | { kind: "selected"; query: string }
+  | { kind: "selected-revoke"; callbackId: string; ticket: string }
+);
 
 export type TelegramTempUpdate = TelegramEventScope & (
   | { kind: "temp-text"; text: string }
@@ -48,14 +52,15 @@ export type TelegramTempUpdate = TelegramEventScope & (
 export type TelegramPathUpdate = TelegramEventScope & { kind: "path"; args: string };
 
 type NormalizedUpdate =
-  | { command: TelegramCommand; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; aggregate?: never; path?: never; document?: never }
-  | { view: TelegramViewUpdate; command?: never; lifecycle?: never; privateClaim?: never; temp?: never; aggregate?: never; path?: never; document?: never }
-  | { lifecycle: TelegramLifecycleUpdate; command?: never; view?: never; privateClaim?: never; temp?: never; aggregate?: never; path?: never; document?: never }
-  | { privateClaim: TelegramPrivateClaimUpdate; command?: never; view?: never; lifecycle?: never; temp?: never; aggregate?: never; path?: never; document?: never }
-  | { temp: TelegramTempUpdate; command?: never; view?: never; lifecycle?: never; privateClaim?: never; aggregate?: never; path?: never; document?: never }
-  | { aggregate: TelegramAggregateUpdate; command?: never; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; path?: never; document?: never }
-  | { path: TelegramPathUpdate; command?: never; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; aggregate?: never; document?: never }
-  | { document: TelegramDocumentJobInput; command?: never; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; aggregate?: never; path?: never };
+  | { command: TelegramCommand; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; aggregate?: never; path?: never; document?: never; selected?: never }
+  | { view: TelegramViewUpdate; command?: never; lifecycle?: never; privateClaim?: never; temp?: never; aggregate?: never; path?: never; document?: never; selected?: never }
+  | { lifecycle: TelegramLifecycleUpdate; command?: never; view?: never; privateClaim?: never; temp?: never; aggregate?: never; path?: never; document?: never; selected?: never }
+  | { privateClaim: TelegramPrivateClaimUpdate; command?: never; view?: never; lifecycle?: never; temp?: never; aggregate?: never; path?: never; document?: never; selected?: never }
+  | { temp: TelegramTempUpdate; command?: never; view?: never; lifecycle?: never; privateClaim?: never; aggregate?: never; path?: never; document?: never; selected?: never }
+  | { aggregate: TelegramAggregateUpdate; command?: never; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; path?: never; document?: never; selected?: never }
+  | { path: TelegramPathUpdate; command?: never; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; aggregate?: never; document?: never; selected?: never }
+  | { document: TelegramDocumentJobInput; command?: never; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; aggregate?: never; path?: never; selected?: never }
+  | { selected: TelegramSelectedUpdate; command?: never; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; aggregate?: never; path?: never; document?: never };
 
 type DecodedTelegramRequest =
   | ({ status: 200 } & NormalizedUpdate)
@@ -72,6 +77,7 @@ const DOCUMENT_FILE_ID = /^[!-~]{1,512}(?![\s\S])/u;
 const MAX_DOCUMENT_FILENAME = 1024;
 const VIEW_TICKET = /^sbv1_[A-Za-z0-9_-]{22}(?![\s\S])/;
 const LIFECYCLE_TICKET = /^sba1_[A-Za-z0-9_-]{22}(?![\s\S])/;
+const SELECTED_TICKET = /^sbo1_[A-Za-z0-9_-]{22}(?![\s\S])/;
 const RENAME_CANCEL = /^(?:\/cancel|cancel|取消|退出)(?![\s\S])/iu;
 const PRIVATE_CLAIM = /^claim_([A-Za-z0-9_-]{11}|[A-Za-z0-9_-]{22})(?![\s\S])/u;
 const NON_HUMAN_MESSAGE_FIELDS = [
@@ -162,7 +168,7 @@ function authCommand(args: string[], reply: unknown, memberId: string): Telegram
 function messageCommand(
   message: Record<string, unknown>, policy: TelegramPolicy,
 ): TelegramCommand["command"] | TelegramViewKind | "temp-summary" | "temp-clear" | "aggregate-show" | "aggregate-revoke" |
-  { code: string } | { args: string } | null {
+  { code: string } | { args: string } | { selectedQuery: string } | null {
   const { text, entities } = message;
   if (typeof text !== "string" || !Array.isArray(entities)) return null;
   const commands = entities.filter((entity) => isRecord(entity) && entity.type === "bot_command" && entity.offset === 0);
@@ -176,9 +182,10 @@ function messageCommand(
   const [, name, addressedTo] = entity;
   if (addressedTo && addressedTo.toLowerCase() !== policy.botUsername.toLowerCase()) return null;
   const commandName = name.toLowerCase();
-  const separator = commandName === "path" ? PATH_RULE_WHITESPACE_PREFIX : /^\s/u;
+  const separator = commandName === "path" || commandName === "o" ? PATH_RULE_WHITESPACE_PREFIX : /^\s/u;
   if (remainder !== "" && !separator.test(remainder)) return null;
   if (commandName === "path") return { args: remainder };
+  if (commandName === "o") return { selectedQuery: remainder };
   const args = remainder.trim().split(/\s+/u).filter(Boolean);
   switch (commandName) {
     case "start": {
@@ -269,7 +276,8 @@ function normalizeMessage(
   const command = messageCommand(message, policy);
   if (command && typeof command === "object") {
     if (scope.chatType !== "private" || scope.threadId !== null) return null;
-    return "code" in command ? { privateClaim: { ...scope, kind: "private-claim", code: command.code } }
+    if ("code" in command) return { privateClaim: { ...scope, kind: "private-claim", code: command.code } };
+    return "selectedQuery" in command ? { selected: { ...scope, kind: "selected", query: command.selectedQuery } }
       : { path: { ...scope, kind: "path", args: command.args } };
   }
   if (command === "temp-summary" || command === "temp-clear") {
@@ -300,6 +308,8 @@ function normalizeCallback(
       !ownBotMessage(message, policy) || "inline_message_id" in callback || "game_short_name" in callback) return null;
   const scope = messageScope(message, String(actor.id), updateId, policy);
   if (!scope) return null;
+  if (SELECTED_TICKET.test(ticket)) return scope.chatType === "private" && scope.threadId === null
+    ? { selected: { ...scope, kind: "selected-revoke", callbackId, ticket } } : null;
   if (VIEW_TICKET.test(ticket)) return { view: { ...scope, kind: "callback", callbackId, ticket } };
   return LIFECYCLE_TICKET.test(ticket)
     ? { lifecycle: { ...scope, kind: "lifecycle-callback", callbackId, ticket } }

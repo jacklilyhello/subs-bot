@@ -10,6 +10,7 @@ import { planSingBox, singBoxChunks } from "./singbox-response.ts";
 import { TextExportError } from "./text-export.ts";
 import { planTextExport, textExportChunks } from "./text-export-response.ts";
 import { acceptTelegramAggregate, parseTelegramAggregateKey } from "./telegram/aggregate-actions.ts";
+import { acceptTelegramSelected, reapTelegramSelected } from "./telegram/selected-export.ts";
 import { answerTelegramCallback, drainTelegramReplies } from "./telegram/delivery.ts";
 import { runTelegramDocumentIntake } from "./telegram/document-intake.ts";
 import { acceptTelegramDocumentJob } from "./telegram/document-jobs.ts";
@@ -173,6 +174,11 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
       if (outcome === "accepted") {
         drain();
       }
+    } else if (decoded.selected) {
+      if (!aggregateKey) return new Response(null, { status: 204, headers: HEADERS });
+      const outcome = await acceptTelegramSelected(env.DB, policy, decoded.selected, aggregateKey);
+      if (decoded.selected.kind === "selected-revoke") ctx?.waitUntil(answerTelegramCallback(policy, decoded.selected.callbackId));
+      if (outcome === "accepted") drain();
     } else if (decoded.aggregate) {
       if (!aggregateKey) return new Response(null, { status: 204, headers: HEADERS });
       if (await acceptTelegramAggregate(env.DB, policy, decoded.aggregate, aggregateKey) === "accepted") drain();
@@ -276,6 +282,7 @@ async function recoverTelegramWork(_controller: ScheduledController, env: Env): 
     await drainTelegramReplies(env.DB, env.NODES, policy, 10, 45_000, fetch, aggregateKey);
     await reapTelegramViewTickets(env.DB);
     await reapTelegramLifecycle(env.DB);
+    if (aggregateKey) await reapTelegramSelected(env.DB);
   };
   const documents = async () => {
     let claimed = false;
