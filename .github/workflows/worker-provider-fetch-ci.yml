@@ -6,18 +6,24 @@ on:
       - 'worker/provider_fetch/**'
       - 'worker/tools/prepare_provider_artifact.py'
       - 'worker/tools/prepare_isolation_artifact.py'
+      - 'worker/tools/publish_provider_registry.py'
       - 'worker/test/test_prepare_provider_artifact.py'
+      - 'worker/test/test_publish_provider_registry.py'
       - '.github/workflows/worker-provider-artifact-preflight.yml'
       - '.github/workflows/worker-provider-fetch-ci.yml'
+      - '.github/workflows/worker-provider-registry-publish.yml'
   push:
     branches: [main]
     paths:
       - 'worker/provider_fetch/**'
       - 'worker/tools/prepare_provider_artifact.py'
       - 'worker/tools/prepare_isolation_artifact.py'
+      - 'worker/tools/publish_provider_registry.py'
       - 'worker/test/test_prepare_provider_artifact.py'
+      - 'worker/test/test_publish_provider_registry.py'
       - '.github/workflows/worker-provider-artifact-preflight.yml'
       - '.github/workflows/worker-provider-fetch-ci.yml'
+      - '.github/workflows/worker-provider-registry-publish.yml'
   workflow_dispatch:
 
 permissions:
@@ -43,6 +49,8 @@ jobs:
         run: python -m unittest discover -s worker/provider_fetch -p 'test_*.py'
       - name: Test release provenance without network access
         run: python -B -m unittest discover -s worker/test -p 'test_prepare_provider_artifact.py'
+      - name: Test guarded registry publication without network access
+        run: python -B -m unittest discover -s worker/test -p 'test_publish_provider_registry.py'
 
   runtime:
     runs-on: ubuntu-latest
