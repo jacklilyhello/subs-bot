@@ -83,7 +83,9 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 - 私聊短正文以纯文本送达，超过消息长度或含有不适合直接显示的控制字符时使用一个固定文件名的 UTF-8 附件。发送结果不明时保留回执和领取记录，避免自动重复发送。内联创建和更新群内分享卡片另行接入。 [Telegram `sendMessage`](https://core.telegram.org/bots/api#sendmessage) · [Telegram `sendDocument`](https://core.telegram.org/bots/api#senddocument)
 - 在业务变更的事务内写入待发送动作，用稳定动作 ID 去重。消费者持有租约并跟踪 Telegram 返回的消息 ID，成功后更新发件箱。对网络超时后可能已送达的动作标记结果不明，按动作类型恢复或人工核对。Telegram 发送接口没有通用幂等键，验收须覆盖收到成功响应后写回失败的情形。 [Telegram `sendMessage`](https://core.telegram.org/bots/api#sendmessage)
 - 重命名等待只接受同一用户在同一聊天与话题中回复已经确认送达的 Bot 提示。删除要求点击独立确认按钮。写入时复核所有者、授权、版本和操作票据，在同一 D1 事务完成变更和回复记录。回收站恢复保留订阅 ID、能力链接和已发布快照。
-- 临时节点先支持私聊粘贴节点链接或 Base64 列表。导入保留原始 URI、顺序及重复项。格式错误或暂不支持的节点按数量报告，并整批保留原状态。`0008` 将不超过 256 KiB 的有界数据批次、当前授权与回复意图放在同一 D1 事务。每个用户最多 5,000 个节点和 4 MiB。群聊不会接收临时节点正文。`/temp` 查看个人计数，`/temp clear` 清除当前清空操作之前的条目，较新的导入不会被迟到的清空误删。文档、URL 及聚合另行接入。
+- 临时节点先支持私聊粘贴节点链接或 Base64 列表。导入保留原始 URI、顺序及重复项。格式错误或暂不支持的节点按数量报告，并整批保留原状态。`0008` 将不超过 256 KiB 的有界数据批次、当前授权与回复意图放在同一 D1 事务。每个用户最多 5,000 个节点和 4 MiB。群聊不会接收临时节点正文。`/temp` 查看个人计数，`/temp clear` 清除当前清空操作之前的条目，较新的导入不会被迟到的清空误删。临时文件、URL 及聚合交互另行接入。
+- 已授权用户可以在私聊上传 TXT、LOG、YAML 或 JSON 文件导入命名订阅。纯文本支持原始节点和 Base64。每个文件上限 10 MiB 和 500 个节点，超过限制或含无法支持的节点时整批拒绝。订阅提供方 URL 的识别和刷新由独立出网阶段接入。
+- `0011` 的私聊任务在 webhook 内持久入库，由 Cron 每轮最多领取一件。`0012` 在写入 R2 前记录候选快照，按所有者、文件名、较新消息、授权版本、租约和订阅版本复核发布。成功时在同一 D1 事务中更新快照指针并写入完成回执。同名导入保留现有 ID 和访问令牌。失败保留上一份有效快照，文件 ID 及文件名在任务终止时清除。只有已超出 Cron 最长执行窗口且活动表和回收站均未引用的候选可回收。
 
 ### 刷新与出网验收
 
@@ -119,6 +121,14 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 `profile=clash-smoke` 检查旧能力路径和 `/clash` 两种入口。两者的 GET 字节必须一致，HEAD 均为空。探针对照固定代理、分组、规则和凭据，验证不支持的依赖返回 422。它使用同名清理参数。
 
 `profile=text-export-smoke` 暂存四份合成快照，检查 `/surge`、`/qx`、`/quantumult` 和 `/quantumultx`。成功的 GET 必须声明准确长度，原始 UTF-8 响应的摘要须与固定样本相同。HEAD 均为空，不兼容的协议组合返回固定的 `422`。探针共发送 18 次请求，包括前后两次版本检查。它使用同名清理参数。原生客户端导入和代理连接另行验证。
+
+`profile=aggregate-smoke` 还验证路径规则。探针为专用合成所有者暂存规则，核对单份、全量、指定顺序聚合以及另一所有者的 Sing-box GET 和 HEAD。配置必须保留连接参数并按预期应用 Unicode 折叠、最长关键词和同长规则顺序。临时节点保留原名，聚合 Base64 原始输出字节保持一致。清理事务先核对并移除合成聚合码、规则和临时数据，再由原流程撤销合成订阅并清理 R2。工作流只报告状态、字节数和摘要。
+
+隔离文档验收使用 `worker-isolation-telegram-documents.yml`。选择未使用的 16 位小写十六进制 `cohort` 并先运行 `prepare`。两名获准测试者分别在浏览器中私聊同一个隔离 Bot，上传名为 `tgdoc-<cohort>.txt` 的纯文本文件。每行以 `ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.10:8388#tgdoc-<cohort>-` 开头，成员首版以 `member-first` 结尾，管理员首版以 `admin-first` 结尾。填写成功的 `prepare` 运行 ID 执行 `capture-created`，确认两份首版都已核对后再继续。
+
+成员用相同文件名上传两行替换内容，分别以 `member-second-1` 和 `member-second-2` 结尾，再上传一个同名、只有普通文本的无效文件。以 `capture-created` 运行 ID 执行 `verify-replaced`。该步骤核对成员的稳定订阅 ID、能力令牌摘要和新版本、管理员的原版本、合成导出的 GET 和 HEAD，以及成功回执。能从浏览器确认无效文件的准确消息 ID 时，可填入 `negative_message_id` 核对对应终态，否则保留浏览器观察和未发生额外发布的证据。
+
+关闭本组上传后选择 `retire`，提供成功的 `verify-replaced` 运行 ID，并在确认字段填写 `retire <cohort>`。若在替换前结束，也可使用 `capture-created` 的检查点。清理先在 D1 中核对并撤销本组两个订阅指针，再删除并核对检查点记录的私有 R2 对象。实际 Telegram 的终态回执继续保留，以防重投重新创建订阅。检查点只包含本组合成对象标识、计数和摘要。验收工作流通过 Cloudflare 核对状态，实际上传和可见回复在浏览器中确认。
 
 容量检查的客户端耗时和吞吐来自这组样本。CPU、内存和平台子请求数量通过隔离 Worker 的聚合指标另行核对。旧 SQLite 的正文体积与转换后的 NDJSON 和分享原文分别测量。真实备份的分布、超限项及可恢复性需要通过获准的数据演练验证。 [Workers 限制](https://developers.cloudflare.com/workers/platform/limits/) · [Workers 指标](https://developers.cloudflare.com/analytics/graphql-api/tutorials/querying-workers-metrics/)
 

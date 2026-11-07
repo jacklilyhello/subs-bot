@@ -500,3 +500,181 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
     await miniflare.dispose();
   }
 });
+
+test("the deployed bundle imports private documents through Cron without blocking ordinary replies", { timeout: 60_000 }, async () => {
+  const directory = process.env.WORKER_TEST_BUNDLE_DIR;
+  assert(directory, "Missing hosted artifact directory");
+  const fixture = JSON.parse(await readFile(join(directory, "isolation.json"), "utf8"));
+  const bundle = await readFile(join(directory, "index.js"));
+  assert.equal(digest(bundle), fixture.bundleSha256);
+
+  const policy: TelegramPolicy = {
+    botId: "123456788", botUsername: "fixture_document_bot", adminId: "1001", memberId: "1002", groupId: "-1003",
+    botToken: `123456788:${"a".repeat(35)}`, webhookSecret: "fixture-document-webhook-secret",
+  };
+  const filename = "Synthetic private filename";
+  const uri = "ss://YWVzLTI1Ni1nY206Zml4dHVyZS1vbmx5@203.0.113.10:8388";
+  const oldLink = `${uri}#old`;
+  const newLink = `${uri}#new`;
+  const files = new Map([
+    ["fixture-old", Buffer.from(`${oldLink}\n`)],
+    ["fixture-bad", Buffer.from(`${newLink}\nss://wrong\n`)],
+    ["fixture-new", Buffer.from(`${newLink}\n`)],
+  ]);
+  const fileCalls: string[] = [];
+  const replies: Array<{ text: string; replyTo: number }> = [];
+  const downloadStarted = Promise.withResolvers<void>();
+  const releaseDownload = Promise.withResolvers<void>();
+  const ordinaryReply = Promise.withResolvers<void>();
+  const miniflare = new Miniflare({
+    modules: true, script: bundle.toString("utf8"), compatibilityDate: fixture.compatibilityDate,
+    bindings: { BUILD_REVISION: fixture.revision, TELEGRAM_ISOLATION_CONFIG: JSON.stringify(policy) },
+    d1Databases: ["DB"], r2Buckets: ["NODES"],
+    outboundService: async (request: Request) => {
+      const url = new URL(request.url);
+      assert.equal(url.origin, "https://api.telegram.org");
+      assert.equal(url.search, "");
+      if (url.pathname === `/bot${policy.botToken}/getFile`) {
+        assert.equal(request.method, "POST");
+        const { file_id: fileId } = await request.json() as { file_id: string };
+        const body = files.get(fileId);
+        assert.ok(body, "Unexpected file lookup");
+        fileCalls.push(`lookup:${fileId}`);
+        if (fileId === "fixture-old") {
+          downloadStarted.resolve();
+          await releaseDownload.promise;
+        }
+        return Response.json({ ok: true, result: { file_path: `documents/${fileId}.txt`, file_size: body.length } });
+      }
+      const filePath = `/file/bot${policy.botToken}/documents/`;
+      if (url.pathname.startsWith(filePath)) {
+        assert.equal(request.method, "GET");
+        assert.ok(url.pathname.endsWith(".txt"));
+        const fileId = url.pathname.slice(filePath.length, -4);
+        const body = files.get(fileId);
+        assert.ok(body, "Unexpected file download");
+        fileCalls.push(`read:${fileId}`);
+        return new Response(body, { headers: { "Content-Length": String(body.length) } });
+      }
+      assert.equal(url.pathname, `/bot${policy.botToken}/sendMessage`);
+      assert.equal(request.method, "POST");
+      const payload = await request.json() as { chat_id: string; text: string; reply_parameters: { message_id: number } };
+      assert.equal(payload.chat_id, policy.memberId);
+      const replyTo = payload.reply_parameters.message_id;
+      replies.push({ text: payload.text, replyTo });
+      if (replyTo === 21) ordinaryReply.resolve();
+      else assert.doesNotMatch(payload.text, /Synthetic private filename|fixture-|203\.0\.113\.10|ss:\/\//u);
+      return Response.json({ ok: true, result: { message_id: 100 + replyTo, chat: { id: Number(payload.chat_id) } } });
+    },
+  });
+  try {
+    const db = await miniflare.getD1Database("DB");
+    const bucket = await miniflare.getR2Bucket("NODES");
+    await applyMigrations(db, directory, fixture.migrations);
+    const worker = await miniflare.getWorker();
+    const date = Math.floor(Date.now() / 1_000);
+    const actor = { id: Number(policy.memberId), is_bot: false };
+    const chat = { id: actor.id, type: "private" };
+    const post = (update: unknown, secret = policy.webhookSecret) => miniflare.dispatchFetch("https://subs-bot.example/telegram/webhook", {
+      method: "POST", headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": secret },
+      body: JSON.stringify(update),
+    });
+    const upload = (id: number, fileId: string, extension = "txt") => ({ update_id: id, message: {
+      date, from: actor, chat, message_id: 19 + id, caption: "/auth remove ignored",
+      document: { file_id: fileId, file_name: `${filename}.${extension}`, file_size: files.get(fileId)?.length ?? 0 },
+    } });
+    const job = (id: number) => db.prepare(`
+      SELECT job.state, job.result_code, job.file_id, job.name, job.expected_size, reply.state AS reply_state
+      FROM telegram_inbox AS inbox JOIN telegram_document_jobs AS job USING (receipt_id)
+      LEFT JOIN telegram_outbox AS reply USING (receipt_id) WHERE inbox.bot_id = ? AND inbox.update_id = ?
+    `).bind(policy.botId, id).first();
+    const subscription = () => db.prepare(`
+      SELECT id, token, generation, snapshot_id, source_url FROM subscriptions WHERE owner_id = ? AND name = ?
+    `).bind(policy.memberId, filename).first<{ id: number; token: string; generation: number; snapshot_id: string; source_url: string }>();
+    const exportBase64 = async (token: string) => {
+      const response = await miniflare.dispatchFetch(`https://subs-bot.example/sub/${token}/base64`);
+      assert.equal(response.status, 200);
+      return await response.text();
+    };
+    const terminal = (result: string) => ({ state: "done", result_code: result, file_id: null, name: null,
+      expected_size: null, reply_state: "sent" });
+
+    const first = upload(1, "fixture-old");
+    assert.equal((await post(first, "wrong")).status, 401);
+    assert.equal((await post({ ...first, message: { ...first.message, chat: { id: Number(policy.groupId), type: "group" } } })).status, 204);
+    assert.deepEqual((await Promise.all([post(first), post(first)])).map(({ status }) => status), [200, 200]);
+    assert.deepEqual(await job(1), { state: "pending", result_code: null, file_id: "fixture-old", name: filename,
+      expected_size: files.get("fixture-old")?.length, reply_state: null });
+    assert.deepEqual(fileCalls, []);
+    assert.equal(await subscription(), null);
+
+    await acceptTelegramCommand(db, policy, { updateId: 2, actorId: policy.memberId, chatId: policy.memberId,
+      chatType: "private", messageId: 21, messageDate: date, threadId: null, command: "list" });
+    const tick = worker.scheduled({ cron: "* * * * *" });
+    const wait = Promise.withResolvers<never>();
+    const timer = setTimeout(() => wait.reject(new Error("Scheduled document blocked an ordinary reply.")), 10_000);
+    try {
+      await Promise.race([Promise.all([downloadStarted.promise, ordinaryReply.promise]), wait.promise,
+        tick.then(() => { throw new Error("Scheduled work ended before observing both paths."); })]);
+      assert.deepEqual(replies, [{ replyTo: 21, text: "你的订阅列表为空。" }]);
+      assert.equal(await subscription(), null);
+    } finally {
+      clearTimeout(timer);
+      releaseDownload.resolve();
+    }
+    assert.equal((await tick).outcome, "ok");
+    assert.deepEqual(await job(1), terminal("saved"));
+    const original = await subscription();
+    assert.ok(original);
+    assert.equal(original.generation, 1);
+    assert.match(original.source_url, /^uploaded:\/\//u);
+    assert.equal(await exportBase64(original.token), Buffer.from(oldLink).toString("base64"));
+
+    assert.equal((await post(upload(3, "fixture-bad"))).status, 200);
+    assert.equal((await worker.scheduled({ cron: "* * * * *" })).outcome, "ok");
+    assert.deepEqual(await job(3), terminal("invalid-document"));
+    assert.deepEqual(await subscription(), original);
+    assert.equal(await exportBase64(original.token), Buffer.from(oldLink).toString("base64"));
+
+    assert.equal((await post(upload(4, "fixture-new"))).status, 200);
+    assert.equal((await worker.scheduled({ cron: "* * * * *" })).outcome, "ok");
+    assert.deepEqual(await job(4), terminal("saved"));
+    const replacement = await subscription();
+    assert.ok(replacement);
+    assert.equal(replacement.id, original.id);
+    assert.equal(replacement.token, original.token);
+    assert.equal(replacement.generation, 2);
+    assert.notEqual(replacement.snapshot_id, original.snapshot_id);
+    assert.ok(await bucket.head(`subscriptions/${original.id}/${original.snapshot_id}/manifest.json`));
+    assert.equal(await exportBase64(original.token), Buffer.from(newLink).toString("base64"));
+
+    assert.equal((await post(upload(5, "fixture-invalid-type", "exe"))).status, 200);
+    const longName = upload(6, "fixture-invalid-name");
+    longName.message.document.file_name = `${"x".repeat(1025)}.txt`;
+    assert.equal((await post(longName)).status, 200);
+    assert.equal((await post(upload(7, "fixture-new"))).status, 200);
+    await db.prepare("INSERT INTO telegram_auth (bot_id, user_id, allowed, message_date, message_id) VALUES (?, ?, 0, ?, 1)")
+      .bind(policy.botId, policy.memberId, date).run();
+    await db.prepare("UPDATE telegram_auth SET allowed = 1, message_id = 2 WHERE bot_id = ? AND user_id = ?")
+      .bind(policy.botId, policy.memberId).run();
+    assert.equal((await worker.scheduled({ cron: "* * * * *" })).outcome, "ok");
+    assert.deepEqual(await job(5), terminal("invalid-document"));
+    assert.deepEqual(await job(6), terminal("invalid-document"));
+    assert.deepEqual(await job(7), terminal("access-changed"));
+    assert.deepEqual(await subscription(), replacement);
+    assert.equal((await post(first)).status, 200);
+    assert.equal((await worker.scheduled({ cron: "* * * * *" })).outcome, "ok");
+    assert.deepEqual(fileCalls, ["lookup:fixture-old", "read:fixture-old", "lookup:fixture-bad", "read:fixture-bad",
+      "lookup:fixture-new", "read:fixture-new"]);
+    const saved = "文件已导入，共 1 个节点。";
+    const invalid = "文件未导入。请检查文件类型、大小和节点格式。已有订阅保持原样。";
+    assert.deepEqual(replies, [
+      { replyTo: 21, text: "你的订阅列表为空。" }, { replyTo: 20, text: saved }, { replyTo: 22, text: invalid },
+      { replyTo: 23, text: saved }, { replyTo: 24, text: invalid }, { replyTo: 25, text: invalid },
+      { replyTo: 26, text: "授权状态已变更，文件未导入。" },
+    ]);
+  } finally {
+    releaseDownload.resolve();
+    await miniflare.dispose();
+  }
+});

@@ -98,18 +98,23 @@ def _identity(worker):
     return identity
 
 
-def _logging_off(settings):
+def _logging_off(settings, *, preview=False):
     observability = settings.get("observability")
-    _require(settings.get("logpush") is False and settings.get("tail_consumers") == []
+    tail_consumers = settings.get("tail_consumers", [] if preview else None)
+    _require(settings.get("logpush") is False and tail_consumers == []
              and isinstance(observability, dict) and observability.get("enabled") is False, PROFILE_ERROR)
     issues = observability.get("issues")
     _require(issues is None or (isinstance(issues, dict) and issues.get("enabled") is False), PROFILE_ERROR)
     for field in ("logs", "traces"):
         stream = observability.get(field)
         _require(isinstance(stream, dict) and stream.get("enabled") is False
-                 and stream.get("destinations", []) == [] and stream.get("persist", False) is False,
-                 PROFILE_ERROR)
-    _require(observability["logs"].get("invocation_logs", False) is False, PROFILE_ERROR)
+                 and stream.get("destinations", []) == [], PROFILE_ERROR)
+    latent_flags = (observability["logs"].get("invocation_logs", False), observability["logs"].get("persist", False),
+                    observability["traces"].get("persist", False))
+    explicitly_disabled = all(flag is False for flag in latent_flags)
+    # Cloudflare returns these dormant defaults on the main Worker even when both streams are disabled.
+    inactive_main_defaults = not preview and all(flag is True for flag in latent_flags)
+    _require(explicitly_disabled or inactive_main_defaults, PROFILE_ERROR)
 
 
 def _verify_profile(worker, expected):
@@ -124,7 +129,7 @@ def _verify_profile(worker, expected):
     preview = worker.get("previews_base_config")
     if preview is not None:
         _require(isinstance(preview, dict) and preview.get("env", {}) == {}, PROFILE_ERROR)
-        _logging_off(preview)
+        _logging_off(preview, preview=True)
 
 
 class WorkerAPI:
@@ -156,7 +161,7 @@ class WorkerAPI:
                      and type(errors[0].get("code")) is int and errors[0]["code"] == 10007, error)
             return None
         _require(status in ({200, 201} if create else {200}) and envelope.get("success") is True
-                 and envelope.get("errors", []) == [] and "result" in envelope, error)
+                 and envelope.get("errors") in (None, []) and "result" in envelope, error)
         return envelope
 
     def by_name(self, *, absent=False):
@@ -176,8 +181,8 @@ class WorkerAPI:
         result = self._request(f"{self._workers}/{identity.worker_id}/versions?page=1&per_page=1")
         pagination = result.get("result_info", {})
         _require(result["result"] == [] and isinstance(pagination, dict)
-                 and all(type(pagination.get(key, expected)) is int and pagination.get(key, expected) == expected
-                         for key, expected in (("count", 0), ("total_count", 0), ("page", 1))), PROFILE_ERROR)
+                 and all(type(pagination.get(key)) is int and pagination[key] == expected
+                         for key, expected in (("count", 0), ("total_count", 0), ("page", 1), ("per_page", 1))), PROFILE_ERROR)
 
 
 def _bootstrap(api, action, pin, guard):
