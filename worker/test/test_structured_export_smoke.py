@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 
 from test_capacity_probe import Response, probe
 from test_capacity_resources import FakeCloud, REVISION, RUN, TARGET, capacity
-from capacity_fixtures import SINGBOX_SMOKE, STRUCTURED_SMOKE, generate_capacity_fixtures, smoke_fixture
+from capacity_fixtures import CLASH_SMOKE, SINGBOX_SMOKE, STRUCTURED_SMOKE, generate_capacity_fixtures, smoke_fixture
 
 
 class StructuredExportSmokeTests(unittest.TestCase):
@@ -151,3 +151,56 @@ class SingBoxExportSmokeTests(StructuredExportSmokeTests):
         self.positive_body = duplicate.ljust(len(self.export), b" ")
         with patch.object(probe, "_request", self.request), self.assertRaisesRegex(probe.ProbeError, "invalid JSON"):
             probe.run_structured_smoke(self.directory, REVISION, profile=self.profile)
+
+
+class ClashExportSmokeTests(unittest.TestCase):
+    def setUp(self):
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.directory = Path(directory.name) / "fixtures"
+        self.fixtures = generate_capacity_fixtures(self.directory, REVISION, profile=CLASH_SMOKE)["fixtures"]
+        oracle = json.loads(smoke_fixture(CLASH_SMOKE, "clash-mixed")[2])
+        self.sections = [(key, oracle[key]) for key in ("proxies", "proxy-groups", "rules")]
+        self.calls = []
+        self.drift = False
+
+    def yaml_body(self, explicit):
+        separators = (", ", ":") if self.drift and explicit else (",", ":")
+        return "".join(key + ":\n" + "".join("  - " + json.dumps(value, separators=separators) + "\n"
+                                               for value in values) for key, values in self.sections).encode("ascii")
+
+    @contextmanager
+    def request(self, method, path, deadline, label):
+        self.calls.append((method, path))
+        if path == "/health":
+            result = Response(200, json.dumps({"ok": True, "service": "subs-bot", "revision": REVISION}).encode("ascii"),
+                              **{"Content-Type": "application/json"})
+        else:
+            fixture = next(row for row in self.fixtures if path in {f"/sub/{row['token']}", f"/sub/{row['token']}/clash"})
+            status = fixture["status"]
+            data = b"" if method == "HEAD" else self.yaml_body(path.endswith("/clash")) if status == 200 else probe.ERROR_BODY[422]
+            result = Response(status, data, **{"Content-Length": str(len(data)),
+                                               "Content-Type": "text/yaml" if status == 200 else "text/plain"})
+        try:
+            yield result
+        finally:
+            result.close()
+
+    def test_checks_both_legacy_paths_and_exact_bytes(self):
+        with patch.object(probe, "_request", self.request):
+            report = probe.run_structured_smoke(self.directory, REVISION, profile=CLASH_SMOKE)
+            self.assertTrue(report["fixedClashFixtureDigestMatched"])
+            self.assertEqual(report["requests"], 10)
+            self.assertEqual(report["exports"]["clash-mixed:default"], report["exports"]["clash-mixed:clash"])
+            self.assertEqual(report["exports"]["clash-unsupported:default"]["HEAD"], {"status": 422, "bodyBytes": 0})
+            self.drift = True
+            with self.assertRaisesRegex(probe.ProbeError, "aliases returned different bytes"):
+                probe.run_structured_smoke(self.directory, REVISION, profile=CLASH_SMOKE)
+
+    def test_literal_yaml_line_separator_is_rejected(self):
+        fixture = self.fixtures[0]
+        bad = self.yaml_body(False).replace(b"\\u0085", "\u0085".encode("utf-8"))
+        result = Response(200, bad, **{"Content-Length": str(len(bad))})
+        with self.assertRaisesRegex(probe.ProbeError, "invalid YAML"):
+            probe._verify_native_config(result, probe.Fixture(fixture["label"], fixture["token"], 200,
+                                                               fixture["exportBytes"], fixture["exportSha256"]), clash=True)
