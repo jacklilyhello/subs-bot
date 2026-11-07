@@ -1,9 +1,10 @@
-import { copy, empty, fields, requireConsumed, string, take, unsupported, type Fields } from "./proxy-input.ts";
+import { copy, empty, fields, isRecord, requireConsumed, string, take, unsupported, type Fields } from "./proxy-input.ts";
 import { validatedNativeSingBox } from "./singbox-export.ts";
+import { portableVmessH2Options, requireVmessH2Connection } from "./vmess-h2.ts";
 
 const UDP_TOGGLE = new Set(["shadowsocks", "vmess", "vless", "trojan", "socks", "anytls"]);
 
-export function portableNativeSource(input: Fields, protocol: string): Fields {
+export function portableNativeSource(input: Fields, protocol: string, target: "clash" | "surge" | "qx"): Fields {
   const { output } = validatedNativeSingBox(input, protocol);
   const source = fields(output);
   const result: Fields = { server: take(source, "server"), port: take(source, "server_port") };
@@ -35,6 +36,13 @@ export function portableNativeSource(input: Fields, protocol: string): Fields {
     if (opts.enabled === true) result["udp-over-tcp-version"] = opts.version === undefined || opts.version === 0 ? 2 : opts.version;
   }
   const tls = take(source, "tls");
+  const transport = take(source, "transport");
+  const vmessH2 = target === "clash" && protocol === "vmess" && isRecord(transport) && transport.type === "http";
+  if (vmessH2) {
+    // Sing-box's omitted or empty network enables both TCP and UDP.
+    if (result.udp !== false || !empty(packetEncoding)) unsupported();
+    requireVmessH2Connection(tls, result.cipher, result.alterId);
+  }
   if (!empty(tls)) {
     const opts = fields(tls);
     result.tls = take(opts, "enabled", false);
@@ -57,8 +65,12 @@ export function portableNativeSource(input: Fields, protocol: string): Fields {
     }
     requireConsumed(opts);
   }
-  const transport = take(source, "transport");
-  if (!empty(transport)) {
+  if (vmessH2) {
+    const opts = fields(transport);
+    take(opts, "type");
+    result.network = "h2";
+    result["h2-opts"] = portableVmessH2Options(opts, "singbox");
+  } else if (!empty(transport)) {
     const opts = fields(transport);
     const kind = take(opts, "type");
     if (kind !== "ws" && kind !== "grpc") unsupported();
