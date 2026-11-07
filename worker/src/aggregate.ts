@@ -7,7 +7,7 @@ import { MAX_TEMP_BATCH_BYTES, MAX_TEMP_OWNER_BYTES, MAX_TEMP_OWNER_NODES } from
 import { compilePathRules, MAX_PATH_RULES, pathRuleMapper, type PathRuleRow } from "./path-rules.ts";
 
 const CODE = /^(?:[A-Za-z0-9_-]{12}|[A-Za-z0-9_-]{22})(?![\s\S])/u;
-const MAX_MEMBERS = 128;
+export const MAX_AGGREGATE_MEMBERS = 128;
 const encoder = new TextEncoder();
 const activeLink = "FROM aggregate_links WHERE code_sha256 = ? AND revoked_at IS NULL";
 const ownerTemp = `FROM link JOIN telegram_temp_batch AS temp
@@ -39,7 +39,7 @@ function validSelection(selection: string | null): boolean {
   if (selection === null) return false;
   try {
     const ids: unknown = JSON.parse(selection);
-    return Array.isArray(ids) && ids.length > 0 && ids.length <= MAX_MEMBERS && ids.every((id) => validInteger(id, 1));
+    return Array.isArray(ids) && ids.length > 0 && ids.length <= MAX_AGGREGATE_MEMBERS && ids.every((id) => validInteger(id, 1));
   } catch {
     return false;
   }
@@ -89,13 +89,13 @@ export async function getAggregateNodeSource(db: D1Database, bucket: R2Bucket, c
     db.prepare(`${withLink}
       SELECT ${pointerColumns} FROM link JOIN subscriptions AS sub ON sub.owner_id = link.owner_id
       WHERE link.kind = 'all' AND sub.generation > 0 ORDER BY sub.id LIMIT ?
-    `).bind(digest, MAX_MEMBERS + 1),
+    `).bind(digest, MAX_AGGREGATE_MEMBERS + 1),
     db.prepare(`${withLink}
       SELECT ${pointerColumns} FROM link JOIN json_each(link.selected_ids) AS member
       JOIN subscriptions AS sub ON sub.owner_id = link.owner_id AND sub.id = member.value
       WHERE link.kind = 'selected' AND member.type = 'integer' AND sub.generation > 0
       ORDER BY CAST(member.key AS INTEGER) LIMIT ?
-    `).bind(digest, MAX_MEMBERS + 1),
+    `).bind(digest, MAX_AGGREGATE_MEMBERS + 1),
     db.prepare(`${withLink} ${tempTotals}`).bind(digest),
     db.prepare(`${withLink}, totals AS (${tempTotals})
       SELECT temp.nodes_json AS json, temp.node_count AS nodeCount, temp.payload_bytes AS bytes
@@ -123,7 +123,7 @@ export async function getAggregateNodeSource(db: D1Database, bucket: R2Bucket, c
   if (!totals) throw new SnapshotIntegrityError();
   verifyTemp(totals, temp);
 
-  if (snapshots.length > MAX_MEMBERS) throw new AggregateLimitError();
+  if (snapshots.length > MAX_AGGREGATE_MEMBERS) throw new AggregateLimitError();
   let nodeCount = totals.nodeCount;
   for (const snapshot of snapshots) {
     if (!validInteger(snapshot.nodeCount, 1, MAX_SNAPSHOT_NODES)) throw new SnapshotIntegrityError();
