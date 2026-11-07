@@ -11,7 +11,7 @@ import re
 
 from aiohttp import web
 
-from transport import FetchFailure, fetch_provider
+from transport import FetchFailure, fetch_provider, probe_api_status
 
 
 PORT = 8080
@@ -68,7 +68,7 @@ def application(revision):
             return problem("not-found", 404)
         if (request.method, request.raw_path) == ("GET", "/ready"):
             return web.json_response({"ok": True, "revision": revision}, headers=HEADERS)
-        if request.method != "POST" or request.raw_path not in {"/v1/fetch", "/v1/edge-proof"}:
+        if request.method != "POST" or request.raw_path not in {"/v1/fetch", "/v1/edge-proof", "/v1/api-status"}:
             return problem("not-found", 404)
         if (request.headers.getall("Content-Type", []) != ["application/json"]
                 or request.headers.getall("Content-Encoding", [])):
@@ -86,6 +86,13 @@ def application(revision):
             body = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
             if request.raw_path == "/v1/fetch" and isinstance(body, dict) and set(body) == {"url"} and isinstance(body["url"], str):
                 return reply(await fetch_provider(body["url"]))
+            if request.raw_path == "/v1/api-status" and isinstance(body, dict) and set(body) == {"url", "key"}:
+                if not isinstance(body["url"], str) or not isinstance(body["key"], str):
+                    return problem("invalid-request", 400)
+                status = await probe_api_status(body["url"], body["key"])
+                if isinstance(status, FetchFailure):
+                    return reply(status)
+                return web.json_response({"status": status.status, "elapsedMs": status.elapsed_ms}, headers=HEADERS)
             if request.raw_path == "/v1/edge-proof" and body == {}:
                 families = set()
 
