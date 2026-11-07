@@ -235,4 +235,12 @@ test("emitted VMess configurations tunnel through a verified loopback TLS H2 rel
   await t.test("native Sing-box TLS HTTP preserves the tunneled bytes and request envelope", async () => {
     await probe("singbox", await singboxSource.singbox());
   });
+  await t.test("Clash TLS H2 exported to Sing-box preserves the tunneled bytes and identity encoding", async () => {
+    await probe("singbox", await clashSource.singbox());
+  });
+  await t.test("Sing-box TLS HTTP with identity encoding exports as working Clash H2", async () => {
+    const outbound = await singboxSource.clash();
+    assert.equal(outbound.network, "h2");
+    await probe("clash", outbound);
+  });
 });
