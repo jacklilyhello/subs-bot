@@ -624,6 +624,8 @@ def quiet_expression(tables, observed_at=None):
     waits = ["telegram_rename_wait", "telegram_view_ticket", "telegram_lifecycle_ticket"]
     if "subscription_provider_jobs" in tables:
         conditions.append("NOT EXISTS(SELECT 1 FROM subscription_provider_jobs WHERE state IN ('pending','leased'))")
+    if "telegram_inline_search_receipts" in tables:
+        conditions.append(f"NOT EXISTS(SELECT 1 FROM telegram_inline_search_receipts WHERE state IN ('preflight','sending') AND lease_until > {epoch})")
     if "telegram_private_share_creations" in tables:
         conditions.append("NOT EXISTS(SELECT 1 FROM telegram_private_share_creations WHERE state='reserved' OR (state='abandoned' AND cleaned_at IS NULL))")
     if "telegram_selected_links" in tables:

@@ -607,6 +607,25 @@ class SnapshotTests(unittest.TestCase):
         path.write_text("\n".join(self.db.iterdump()), "utf-8")
         return path
 
+    def test_quiet_checks_only_unexpired_inline_work_on_the_new_schema(self):
+        self.db.execute("""INSERT INTO telegram_inbox
+            (receipt_id,bot_id,update_id,actor_id,chat_id,chat_type,message_id,message_date,command,receipt_nonce)
+            VALUES (1,'881000',1,'881001','881001','private',1,1,'help','inline-consent:v1')""")
+        self.db.execute("""INSERT INTO telegram_inline_search_consent
+            (receipt_id,bot_id,actor_id,kind,message_date,update_id,expires_at,actor_role,auth_message_date,auth_message_id)
+            VALUES (1,'881000','881001','on',1,1,100,'admin',0,0)""")
+        self.db.execute("""INSERT INTO telegram_inline_search_receipts
+            (bot_id,update_id,actor_id,query_id_sha256,consent_receipt_id,sort_mode,sort_update_id,received_at,lease_until,state)
+            VALUES ('881000',2,'881001',?,1,'default',0,2,10,'preflight')""", ("a" * 64,))
+        active = native.quiet_expression(self.source.tables, 9)
+        expired = native.quiet_expression(self.source.tables, 10)
+        older = native.quiet_expression(set(self.source.tables) - {"telegram_inline_search_receipts"}, 9)
+        self.assertEqual(self.db.execute("SELECT " + active).fetchone(), (0,))
+        self.db.execute("UPDATE telegram_inline_search_receipts SET state='sending'")
+        self.assertEqual(self.db.execute("SELECT " + active).fetchone(), (0,))
+        self.assertEqual(self.db.execute("SELECT " + expired).fetchone(), (1,))
+        self.assertEqual(self.db.execute("SELECT " + older).fetchone(), (1,))
+
     def test_full_schema_large_temp_text_and_r2_closure_roundtrip(self):
         self.snapshot()
         self.db.execute("INSERT INTO subscription_lifecycle VALUES (2,1)")

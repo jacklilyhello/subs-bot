@@ -8,6 +8,8 @@ import {
 } from "./lifecycle-actions.ts";
 import { inTelegramScope, type TelegramPolicy } from "./protocol.ts";
 import { renderTelegramInlineSort } from "./inline-sort.ts";
+import { renderTelegramInlineConsent } from "./inline-search-consent.ts";
+import type { InlineSearchArticle, InlineSearchOutcome } from "./inline-search.ts";
 import { renderTelegramPath } from "./path-management.ts";
 import { beginTelegramPrivateClaim, prepareTelegramPrivateClaim } from "./private-claims.ts";
 import { resolveTelegramPrivateShareCreationReply } from "./private-share-creation.ts";
@@ -18,7 +20,7 @@ import {
   type TelegramSubscriptionReadButton,
 } from "./subscription-read.ts";
 import {
-  beginTelegramAggregateLinkReply, beginTelegramInlineSortReply, beginTelegramPrivateShareCreationReply,
+  beginTelegramAggregateLinkReply, beginTelegramInlineConsentReply, beginTelegramInlineSortReply, beginTelegramPrivateShareCreationReply,
   beginTelegramSelectedLinkReply, beginTelegramShortLinkReply, beginTelegramReply, claimTelegramReply, isTelegramMemberAllowed,
   beginTelegramTempRawReply,
   prepareTelegramPrivateClaimBegin, reapExpiredTelegramReplies, settleTelegramReply,
@@ -186,6 +188,25 @@ export async function answerTelegramCallback(policy: TelegramPolicy, callbackId:
   }
 }
 
+export async function sendTelegramInlineAnswer(
+  policy: TelegramPolicy, queryId: string, results: readonly InlineSearchArticle[], timeoutMs: number,
+): Promise<InlineSearchOutcome> {
+  try {
+    const response = await fetch(`${BOT_API}/bot${policy.botToken}/answerInlineQuery`, {
+      method: "POST", redirect: "manual", signal: AbortSignal.timeout(timeoutMs),
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ inline_query_id: queryId, results, is_personal: true, cache_time: 0, next_offset: "" }),
+    });
+    const payload = record(await readBotReply(response));
+    if (response.ok && payload?.ok === true && payload.result === true) return "sent";
+    if (response.status >= 400 && response.status < 500 && response.status !== 408
+      && payload?.ok === false && payload.error_code === response.status) return "failed";
+  } catch {
+    // Transport and malformed outcomes cannot prove whether Telegram displayed a result.
+  }
+  return "uncertain";
+}
+
 async function renderReply(
   db: D1Database,
   bucket: R2Bucket,
@@ -348,12 +369,15 @@ export async function drainTelegramReplies(
   subscriptionReadEnabled = false,
   shortLinksEnabled = false,
   inlineSortEnabled = false,
+  inlineConsentEnabled = false,
 ): Promise<void> {
   const deadline = Date.now() + budgetMs;
   const privateShareEnabled = privateShareRuntime.schemaReady && privateShareRuntime.context !== null;
-  await reapExpiredTelegramReplies(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled, shortLinksEnabled, inlineSortEnabled);
+  await reapExpiredTelegramReplies(db, policy.botId, aggregateKey !== null, privateShareEnabled,
+    subscriptionReadEnabled, shortLinksEnabled, inlineSortEnabled, inlineConsentEnabled);
   for (let processed = 0; processed < limit && Date.now() < deadline; processed += 1) {
-    const lease = await claimTelegramReply(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled, shortLinksEnabled, inlineSortEnabled);
+    const lease = await claimTelegramReply(db, policy.botId, aggregateKey !== null, privateShareEnabled,
+      subscriptionReadEnabled, shortLinksEnabled, inlineSortEnabled, inlineConsentEnabled);
     if (!lease) return;
     if (!inTelegramScope(policy, lease)) continue;
     if (lease.tempRaw) {
@@ -367,6 +391,14 @@ export async function drainTelegramReplies(
     if (lease.inlineSort) {
       if (Date.now() < deadline && await beginTelegramInlineSortReply(db, policy, lease)) {
         const outcome = await sendTelegramReply(policy, lease, renderTelegramInlineSort(lease.inlineSort),
+          Math.max(1, deadline - Date.now()), request);
+        await settleTelegramReply(db, policy, lease, outcome);
+      }
+      continue;
+    }
+    if (lease.inlineConsent) {
+      if (Date.now() < deadline && await beginTelegramInlineConsentReply(db, policy, lease)) {
+        const outcome = await sendTelegramReply(policy, lease, renderTelegramInlineConsent(lease.inlineConsent),
           Math.max(1, deadline - Date.now()), request);
         await settleTelegramReply(db, policy, lease, outcome);
       }
