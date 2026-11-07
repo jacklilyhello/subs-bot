@@ -110,22 +110,22 @@ def require_current_main(revision: str) -> None:
         raise ArtifactError("The requested revision is no longer current on main.")
 
 
-def _select_artifact(run_id, revision, token):
+def select_main_artifact(run_id, revision, token, *, workflow_id, workflow_path, artifact_prefix, workflow_label):
     run = _get_json(f"/actions/runs/{run_id}", token)
     repositories = (run.get("repository"), run.get("head_repository"))
     attempt = run.get("run_attempt")
     if (
         str(run.get("id")) != run_id
-        or run.get("workflow_id") != WORKFLOW_ID
-        or run.get("path") not in (WORKFLOW_PATH, f"{WORKFLOW_PATH}@main", f"{WORKFLOW_PATH}@{MAIN_REF}")
+        or run.get("workflow_id") != workflow_id
+        or run.get("path") not in (workflow_path, f"{workflow_path}@main", f"{workflow_path}@{MAIN_REF}")
         or run.get("event") not in ("push", "workflow_dispatch")
         or (run.get("status"), run.get("conclusion")) != ("completed", "success")
         or (run.get("head_branch"), run.get("head_sha")) != ("main", revision)
         or any(not isinstance(repo, dict) or repo.get("id") != REPOSITORY_ID for repo in repositories)
         or type(attempt) is not int or not _DECIMAL.fullmatch(str(attempt))
     ):
-        raise ArtifactError("The selected run is not a successful Worker CI build of current main.")
-    name = f"subs-bot-worker-{revision}-{attempt}"
+        raise ArtifactError(f"The selected run is not a successful {workflow_label} build of current main.")
+    name = f"{artifact_prefix}-{revision}-{attempt}"
     query = urlencode({"name": name, "per_page": 2})
     listing = _get_json(f"/actions/runs/{run_id}/artifacts?{query}", token)
     artifacts = listing.get("artifacts")
@@ -149,7 +149,12 @@ def _select_artifact(run_id, revision, token):
     return str(attempt), str(artifact_id), digest[7:]
 
 
-def _download(artifact_id, token):
+def _select_artifact(run_id, revision, token):
+    return select_main_artifact(run_id, revision, token, workflow_id=WORKFLOW_ID, workflow_path=WORKFLOW_PATH,
+                                artifact_prefix="subs-bot-worker", workflow_label="Worker CI")
+
+
+def artifact_storage_request(artifact_id, token):
     error = "Could not download the selected GitHub artifact."
     try:
         with _OPENER.open(_api_request(f"/actions/artifacts/{artifact_id}/zip", token), timeout=20):
@@ -160,16 +165,24 @@ def _download(artifact_id, token):
     except (URLError, OSError, HTTPException):
         raise ArtifactError(error) from None
     try:
+        if not re.fullmatch(r"[!-~]{1,8192}", location) or "\\" in location:
+            raise ArtifactError(error)
         url = urlsplit(location)
         if (url.scheme != "https" or not url.hostname or url.username is not None
                 or url.password is not None or url.fragment or url.port not in (None, 443)):
             raise ArtifactError(error)
         # Construct a fresh request with no GitHub headers. Signed storage URLs must stay private.
-        request = Request(location, headers={"Accept-Encoding": "identity"})
-        with _OPENER.open(request, timeout=60) as response:
-            return _bounded_read(response, _MAX_ZIP)
-    except (URLError, OSError, HTTPException, ValueError):
+        return Request(location, headers={"Accept-Encoding": "identity"})
+    except ValueError:
         raise ArtifactError(error) from None
+
+
+def _download(artifact_id, token):
+    try:
+        with _OPENER.open(artifact_storage_request(artifact_id, token), timeout=60) as response:
+            return _bounded_read(response, _MAX_ZIP)
+    except (URLError, OSError, HTTPException):
+        raise ArtifactError("Could not download the selected GitHub artifact.") from None
 
 
 def _sha256(body):
