@@ -37,6 +37,12 @@ export interface SnapshotPublication {
   expectedLifecycleRevision: number;
 }
 
+export interface SnapshotMetadataUpdate {
+  trafficUsed?: number;
+  trafficTotal?: number;
+  expireAt?: number;
+}
+
 const stagedObjectKeys = Symbol("staged snapshot object keys");
 
 export interface StagedNodeSnapshot {
@@ -177,6 +183,11 @@ async function discardUnpublished(bucket: R2Bucket, keys: string[]): Promise<voi
   }
 }
 
+/** Use only after a confirmed publication miss for this exact candidate. */
+export function discardStagedNodeSnapshot(bucket: R2Bucket, staged: StagedNodeSnapshot): Promise<void> {
+  return discardUnpublished(bucket, staged[stagedObjectKeys]);
+}
+
 /** Write an immutable candidate without changing any subscription pointer. */
 export async function stageNodeSnapshot(
   bucket: R2Bucket,
@@ -268,19 +279,31 @@ export function prepareNodeSnapshotPublication(
   target: SnapshotPublication,
   staged: StagedNodeSnapshot,
   guard?: { sql: string; bindings: readonly (number | string)[] },
+  metadata?: SnapshotMetadataUpdate,
 ): D1PreparedStatement {
   checkPublicationTarget(target);
   const { id, ownerId, expectedGeneration, expectedLifecycleRevision } = target;
   if (staged.id !== id) {
     throw new RangeError("Staged snapshot belongs to a different subscription.");
   }
+  const metadataFields = [];
+  const metadataValues = [];
+  for (const [column, value] of [["traffic_used", metadata?.trafficUsed], ["traffic_total", metadata?.trafficTotal],
+    ["expire_at", metadata?.expireAt]] as const) {
+    if (value === undefined) continue;
+    if (!Number.isFinite(value) || value < 0 || (column === "expire_at" && !validInteger(value, 1))) {
+      throw new RangeError("Invalid subscription snapshot metadata.");
+    }
+    metadataFields.push(`, ${column} = ?`);
+    metadataValues.push(value);
+  }
   return db.prepare(`
     UPDATE subscriptions
     SET generation = generation + 1, snapshot_id = ?, manifest_sha256 = ?, node_count = ?,
-        last_error = NULL, updated_at = ?
+        last_error = NULL, updated_at = ?${metadataFields.join("")}
     WHERE id = ? AND owner_id = ? AND generation = ? AND ${SUBSCRIPTION_LIFECYCLE_REVISION} = ?
       ${guard ? `AND (${guard.sql})` : ""}
-  `).bind(staged.snapshotId, staged.manifestSha256, staged.nodeCount, Math.floor(Date.now() / 1000), id, ownerId,
+  `).bind(staged.snapshotId, staged.manifestSha256, staged.nodeCount, Math.floor(Date.now() / 1000), ...metadataValues, id, ownerId,
     expectedGeneration, expectedLifecycleRevision, ...(guard?.bindings ?? []));
 }
 
@@ -308,7 +331,7 @@ export async function publishNodeSnapshot(
     throw new Error("Subscription snapshot publication failed.");
   }
   if (result.meta.changes === 0) {
-    await discardUnpublished(bucket, staged[stagedObjectKeys]);
+    await discardStagedNodeSnapshot(bucket, staged);
     return false;
   }
   return true;

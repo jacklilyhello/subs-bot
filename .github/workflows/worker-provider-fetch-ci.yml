@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'worker/provider_fetch/**'
+      - 'worker/src/provider-fetch-contract.ts'
       - 'worker/tools/bootstrap_provider_worker.py'
       - 'worker/tools/activate_provider_isolation.py'
       - 'worker/tools/install_provider_skopeo.sh'
@@ -27,6 +28,7 @@ on:
     branches: [main]
     paths:
       - 'worker/provider_fetch/**'
+      - 'worker/src/provider-fetch-contract.ts'
       - 'worker/tools/bootstrap_provider_worker.py'
       - 'worker/tools/activate_provider_isolation.py'
       - 'worker/tools/install_provider_skopeo.sh'

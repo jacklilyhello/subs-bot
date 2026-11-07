@@ -1,6 +1,12 @@
+import {
+  PROVIDER_MAX_BODY_BYTES as MAX_BODY_BYTES, PROVIDER_MAX_METADATA_BYTES as MAX_METADATA_BYTES,
+  PROVIDER_METADATA_FIELDS as metadataKeys, PROVIDER_REVISION as REVISION, PROVIDER_SHA256 as SHA256,
+  type ProviderFailureCode, type ProviderFetchInput, type ProviderFetchResult, type ProviderMetadata,
+} from "../src/provider-fetch-contract.ts";
+
 export const SERVICE = "subs-bot-provider-fetch-dev-01";
 export const SINGLETON = "provider-fetch-v1";
-export const REVISION = /^[0-9a-f]{40}(?![\s\S])/u;
+export { REVISION };
 const IMAGE = /^registry\.cloudflare\.com\/[0-9a-f]{32}\/subs-bot-provider-fetch-dev-01@sha256:[0-9a-f]{64}(?![\s\S])/u;
 const IDLE_MS = 30_000;
 const START_MS = 30_000;
@@ -11,25 +17,16 @@ const ORIGIN = "http://container";
 const BLOCKED = ["http://127.0.0.1/", "http://[::1]/", "http://169.254.169.254/"];
 const MAX_URL_BYTES = 8192;
 const MAX_REQUEST_BYTES = 12 * 1024;
-const MAX_BODY_BYTES = 10 * 1024 * 1024;
-const MAX_METADATA_BYTES = 3072;
-const SHA256 = /^[a-f0-9]{64}(?![\s\S])/u;
 const encoder = new TextEncoder();
-const metadataKeys = ["content-type", "content-disposition", "profile-title", "subscription-userinfo"] as const;
 const failureStatuses = {
   "invalid-request": [400, 413], "invalid-url": [422], "blocked-address": [422], "busy": [429],
   "invalid-auth": [502], "dns-failed": [502], "tls-failed": [502], "unavailable": [502, 503],
   "timeout": [504], "invalid-redirect": [502], "redirect-limit": [502], "http-status": [502],
   "body-too-large": [502], "invalid-body": [502],
-} as const;
+} as const satisfies Record<ProviderFailureCode, readonly number[]>;
 
-export interface ProviderFetchInput { url: string }
-type ProviderMetadata = Partial<Record<typeof metadataKeys[number], string>>;
-type FailureCode = keyof typeof failureStatuses;
-type ProviderFailure = { ok: false; code: FailureCode; retryable: boolean; upstreamStatus?: number };
-export type ProviderFetchResult =
-  | { ok: true; body: ArrayBuffer; bodySha256: string; metadata?: ProviderMetadata }
-  | ProviderFailure;
+type FailureCode = ProviderFailureCode;
+type ProviderFailure = Extract<ProviderFetchResult, { ok: false }>;
 
 export function providerFailure(code: FailureCode, upstreamStatus?: number): ProviderFailure {
   const retryable = code === "busy" || code === "timeout" || code === "dns-failed" || code === "unavailable"
@@ -45,6 +42,16 @@ export function providerPayload(input: unknown): string | null {
       || encoder.encode(url).byteLength > MAX_URL_BYTES) return null;
   const payload = JSON.stringify({ url });
   return encoder.encode(payload).byteLength <= MAX_REQUEST_BYTES ? payload : null;
+}
+
+export function providerRequest(input: unknown): ProviderFetchInput | null {
+  if (!isRecord(input) || Object.keys(input).length !== 3 || !Object.hasOwn(input, "url")
+      || !Object.hasOwn(input, "providerRevision") || !Object.hasOwn(input, "imageSha256")) return null;
+  const { url, providerRevision, imageSha256 } = input;
+  if (typeof url !== "string" || providerPayload({ url }) === null
+      || typeof providerRevision !== "string" || !REVISION.test(providerRevision)
+      || typeof imageSha256 !== "string" || !SHA256.test(imageSha256)) return null;
+  return { url, providerRevision, imageSha256 };
 }
 
 type ProbeStage = "configuration" | "start" | "readiness" | "image" | "edge" | "address-policy" | "stop";
@@ -151,7 +158,7 @@ function post(port: Fetcher, path: "/v1/edge-proof" | "/v1/fetch", body: string,
 }
 
 async function withPinnedContainer<T>(
-  container: Container, revision: string, use: (port: Fetcher, image: string) => Promise<T>,
+  container: Container, revision: string, use: (port: Fetcher, image: string) => Promise<T>, expectedImageSha256?: string,
 ): Promise<T> {
   let stage: ProbeStage = "configuration";
   let started = false;
@@ -159,6 +166,8 @@ async function withPinnedContainer<T>(
     const image = container.images.provider;
     requireResult(REVISION.test(revision) && typeof image === "string" && IMAGE.test(image) && !container.running,
       "The provider container image or stopped state differs.");
+    requireResult(expectedImageSha256 === undefined || image.endsWith(`@sha256:${expectedImageSha256}`),
+      "The provider container image does not match the caller's pin.");
     const deadline = Date.now() + START_MS;
     const startup = AbortSignal.timeout(START_MS);
     stage = "start";
@@ -249,9 +258,10 @@ async function fetchPort(port: Fetcher, payload: string): Promise<ProviderFetchR
   }
 }
 
-export async function fetchPinnedProvider(container: Container, revision: string, payload: string): Promise<ProviderFetchResult> {
+export async function fetchPinnedProvider(container: Container, revision: string, payload: string, imageSha256: string): Promise<ProviderFetchResult> {
   try {
-    return await withPinnedContainer(container, revision, (port) => fetchPort(port, payload));
+    if (typeof imageSha256 !== "string" || !SHA256.test(imageSha256)) return providerFailure("invalid-request");
+    return await withPinnedContainer(container, revision, (port) => fetchPort(port, payload), imageSha256);
   } catch {
     return providerFailure("unavailable");
   }

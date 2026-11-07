@@ -9,6 +9,8 @@ import { SingBoxContentError } from "./singbox-export.ts";
 import { planSingBox, singBoxChunks } from "./singbox-response.ts";
 import { TextExportError } from "./text-export.ts";
 import { planTextExport, textExportChunks } from "./text-export-response.ts";
+import type { ProviderFetcher } from "./provider-fetch-contract.ts";
+import { runOneProviderJob } from "./provider-job-consumer.ts";
 import { acceptTelegramAggregate, parseTelegramAggregateKey } from "./telegram/aggregate-actions.ts";
 import { acceptTelegramSelected, reapTelegramSelected } from "./telegram/selected-export.ts";
 import { answerTelegramCallback, drainTelegramReplies } from "./telegram/delivery.ts";
@@ -35,6 +37,9 @@ export interface Env {
   TELEGRAM_ISOLATION_CONFIG?: string;
   TELEGRAM_AGGREGATE_KEY?: string;
   TELEGRAM_PRIVATE_SHARE_CREATION_KEY?: string;
+  PROVIDER_FETCH?: ProviderFetcher;
+  PROVIDER_REVISION?: string;
+  PROVIDER_IMAGE_SHA256?: string;
 }
 
 const MAX_SHARE_BYTES = 16 * 1024 * 1024;
@@ -323,4 +328,14 @@ async function recoverTelegramWork(_controller: ScheduledController, env: Env): 
   }
 }
 
-export default { fetch: fetchRequest, scheduled: recoverTelegramWork } satisfies ExportedHandler<Env>;
+async function scheduled(controller: ScheduledController, env: Env): Promise<void> {
+  try {
+    await recoverTelegramWork(controller, env);
+  } finally {
+    await runOneProviderJob(env.DB, env.NODES, env.PROVIDER_FETCH, {
+      providerRevision: env.PROVIDER_REVISION ?? "", imageSha256: env.PROVIDER_IMAGE_SHA256 ?? "",
+    });
+  }
+}
+
+export default { fetch: fetchRequest, scheduled } satisfies ExportedHandler<Env>;
