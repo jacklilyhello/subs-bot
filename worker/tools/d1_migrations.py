@@ -152,9 +152,11 @@ def _schema_condition(objects: tuple[SchemaObject, ...]) -> str:
         f" AND name = {_literal(obj.name)} AND tbl_name = {_literal(obj.table)} AND sql = {_literal(obj.sql)})"
         for obj in objects
     )
+    # D1 limits GLOB patterns to 50 bytes. Match the table-name prefix literally.
     parts.append("""NOT EXISTS (SELECT 1 FROM sqlite_schema AS i
         WHERE i.tbl_name <> '_cf_KV' AND i.sql IS NULL
-        AND NOT (i.type = 'index' AND i.name GLOB ('sqlite_autoindex_' || i.tbl_name || '_[0-9]*')
+        AND NOT (i.type = 'index' AND instr(i.name, 'sqlite_autoindex_' || i.tbl_name || '_') = 1
+          AND substr(i.name, length('sqlite_autoindex_' || i.tbl_name || '_') + 1) GLOB '[0-9]*'
           AND EXISTS (SELECT 1 FROM sqlite_schema AS t WHERE t.type = 'table' AND t.name = i.tbl_name AND t.sql IS NOT NULL)))""")
     if objects:
         parts.append("""EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'index' AND tbl_name = 'subscriptions'
