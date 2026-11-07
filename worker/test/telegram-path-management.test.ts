@@ -76,11 +76,25 @@ test("normalizes legacy forms and validates exact destructive commands and scala
   }
 });
 
-test("deduplicates writes, keeps stable IDs and fences older changes and clear resurrection", async () => {
+test("deduplicates writes, keeps stable IDs and fences older changes and clear resurrection", async (t) => {
   const config = policy(1);
   const epoch = (await now()) - 5;
   const original = event(config, 1, epoch, "Straße=synthetic-private-remark", { messageId: 10 });
-  assert.deepEqual((await Promise.all([acceptTelegramPath(db, config, original), acceptTelegramPath(db, config, original)])).sort(),
+  const diagnosticDb = new Proxy(db, {
+    get(target, property) {
+      if (property === "batch") return async (statements: D1PreparedStatement[]) => {
+        try {
+          return await target.batch(statements);
+        } catch (error) {
+          t.diagnostic(error instanceof Error ? error.message : "Synthetic D1 batch rejected.");
+          throw error;
+        }
+      };
+      const value = Reflect.get(target, property) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  assert.deepEqual((await Promise.all([acceptTelegramPath(diagnosticDb, config, original), acceptTelegramPath(db, config, original)])).sort(),
     ["accepted", "ignored"]);
   const [first] = await rules(config.memberId);
   const saved = await reply(config, 1);
