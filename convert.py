@@ -721,6 +721,16 @@ def to_base64_sub(nodes: list[dict[str, Any]]) -> str:
     return base64.b64encode(raw).decode("ascii")
 
 
+class _ClashSafeDumper(yaml.SafeDumper):
+    def represent_clash_string(self, value: str) -> yaml.nodes.ScalarNode:
+        # YAML readers can fold literal Unicode line breaks inside scalars.
+        style = '"' if re.search(r"[\x85\u2028\u2029]", value) else None
+        return self.represent_scalar("tag:yaml.org,2002:str", value, style=style)
+
+
+_ClashSafeDumper.add_representer(str, _ClashSafeDumper.represent_clash_string)
+
+
 def to_clash(nodes: list[dict[str, Any]]) -> str:
     proxies = []
     names = []
@@ -749,7 +759,7 @@ def to_clash(nodes: list[dict[str, Any]]) -> str:
         ],
         "rules": ["MATCH,🚀 节点选择"],
     }
-    return yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
+    return yaml.dump(data, Dumper=_ClashSafeDumper, allow_unicode=True, sort_keys=False)
 
 
 def to_surge(nodes: list[dict[str, Any]]) -> str:
