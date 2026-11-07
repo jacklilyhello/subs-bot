@@ -77,8 +77,9 @@ class ProofGateTests(unittest.TestCase):
             return self.workflow
         if path == f"/actions/runs/{RUN}":
             return self.run
-        self.assertEqual(path, f"/actions/runs/{RUN}/artifacts?name={gate.PROOF_PREFIX}-{RELEASE['revision']}-{ATTEMPT}&per_page=2")
-        return {"total_count": 1, "artifacts": [{"id": int(ARTIFACT), "name": f"{gate.PROOF_PREFIX}-{RELEASE['revision']}-{ATTEMPT}",
+        artifact_name = f"{gate.PROOF_PREFIX}-{RELEASE['revision']}-{self.run['run_attempt']}"
+        self.assertEqual(path, f"/actions/runs/{RUN}/artifacts?name={artifact_name}&per_page=2")
+        return {"total_count": 1, "artifacts": [{"id": int(ARTIFACT), "name": artifact_name,
                 "expired": False, "digest": "sha256:" + self.pin["proof"]["archiveSha256"], "workflow_run": self.origin}]}
 
     def load(self):
