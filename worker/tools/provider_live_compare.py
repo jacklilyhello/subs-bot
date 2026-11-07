@@ -28,6 +28,12 @@ FORMATS = ("base64", "clash", "singbox", "surge", "qx")
 FAMILIES = frozenset(("ss", "vmess", "vless", "trojan", "hysteria", "hysteria2", "tuic", "anytls", "socks", "http", "other"))
 FAMILY_ALIASES = {"shadowsocks": "ss", "hy2": "hysteria2", "socks5": "socks", "https": "http"}
 REJECTED_TRAITS = frozenset(("randomized-fingerprint", "packet-encoding-none", "nested-tls", "ws-header-array"))
+VMESS_BASE64_TRAITS = frozenset((
+    "vmess-alpn-csv", "vmess-boolean-spelling", "vmess-empty-extra", "vmess-packet-encoding", "vmess-security-flags",
+    "vmess-dial-flags", "vmess-ws-extra-header", "vmess-ws-early-data", "vmess-reality", "vmess-http-transport",
+))
+VMESS_TEXT_TRAITS = frozenset(("vmess-cipher-auto-or-default", "vmess-non-aead-alter-id"))
+VMESS_TRAITS_BY_FORMAT = {"base64": VMESS_BASE64_TRAITS, "surge": VMESS_TEXT_TRAITS, "qx": VMESS_TEXT_TRAITS}
 SINGBOX_CONTROLS = frozenset(("selector", "direct", "block", "dns", "urltest"))
 SURGE_DECLARATION = re.compile(r"^(.+) = (?:ss|vmess|vless|trojan|anytls|socks5(?:-tls)?|https?|hysteria2|tuic-v5),")
 QX_DECLARATION = re.compile(r"^(?:shadowsocks|vmess|vless|trojan|anytls|socks5|http)=")
@@ -193,12 +199,15 @@ def verified_diagnostics(value, count):
     protocols, formats = value["protocols"], value["formats"]
     require(counter(protocols, FAMILIES, count) and sum(protocols.values()) == count
             and isinstance(formats, dict) and set(formats) == set(FORMATS))
-    for row in formats.values():
+    for name, row in formats.items():
         require(isinstance(row, dict) and set(row) == {"admitted", "rejected", "rejectedTraits"})
         admitted, rejected = row["admitted"], row["rejected"]
+        traits = row["rejectedTraits"]
+        vmess_traits = VMESS_TRAITS_BY_FORMAT.get(name, frozenset())
         require(counter(admitted, FAMILIES, count) and counter(rejected, FAMILIES, count)
                 and all(admitted.get(family, 0) + rejected.get(family, 0) == protocols.get(family, 0) for family in FAMILIES)
-                and counter(row["rejectedTraits"], REJECTED_TRAITS, sum(rejected.values())))
+                and counter(traits, REJECTED_TRAITS | vmess_traits, sum(rejected.values()))
+                and all(traits.get(trait, 0) <= rejected.get("vmess", 0) for trait in vmess_traits))
     return {"runtime": "node24-source-serializers", "protocols": protocols, "formats": formats}
 
 
