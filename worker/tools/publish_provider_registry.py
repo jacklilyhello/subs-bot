@@ -93,7 +93,7 @@ def _guard_main(evidence):
     github.require_current_main(revision)
 
 
-def _response(request, opener, error):
+def _response(request, opener, error, *, limit=HTTP_LIMIT):
     try:
         try:
             response = opener.open(request, timeout=15)
@@ -105,11 +105,11 @@ def _response(request, opener, error):
             data = bytearray()
             _require(response.headers.get("Content-Encoding", "identity").lower() == "identity", error)
             while monotonic() < deadline:
-                chunk = response.read1(min(8192, HTTP_LIMIT + 1 - len(data)))
+                chunk = response.read1(min(8192, limit + 1 - len(data)))
                 if not chunk:
                     return response.code, response.headers, bytes(data)
                 data.extend(chunk)
-                _require(len(data) <= HTTP_LIMIT, error)
+                _require(len(data) <= limit, error)
             raise PublicationError(error)
     except (OSError, ValueError, HTTPException):
         raise PublicationError(error) from None
