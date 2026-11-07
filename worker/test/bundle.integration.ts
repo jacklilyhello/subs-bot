@@ -15,6 +15,77 @@ import type { TelegramPolicy } from "../src/telegram/protocol.ts";
 import { acceptTelegramCommand } from "../src/telegram/store.ts";
 import { verifyIsolation } from "../tools/verify-isolation.mjs";
 import "./backup-rehearsal.integration.ts";
+import "./telegram-private-share-command.integration.ts";
+
+test("emitted Worker /o freezes owned subscription membership and excludes temporary nodes", { timeout: 60_000 }, async () => {
+  const directory = process.env.WORKER_TEST_BUNDLE_DIR;
+  assert.ok(directory);
+  const fixture = JSON.parse(await readFile(join(directory, "isolation.json"), "utf8"));
+  const bundle = await readFile(join(directory, "index.js"), "utf8");
+  const policy: TelegramPolicy = {
+    botId: "94001", adminId: "94101", memberId: "94201", groupId: "-1001234567890",
+    botUsername: "ArtifactSelectedBot", botToken: "94001:synthetic-selected-token", webhookSecret: "synthetic-selected-artifact-secret",
+  };
+  const date = Math.floor(Date.now() / 1000) - 5;
+  const sent: Array<{ text: string; reply_markup?: { inline_keyboard: Array<Array<{ callback_data: string }>> } }> = [];
+  const worker = new Miniflare({
+    modules: true, script: bundle, compatibilityDate: fixture.compatibilityDate, d1Databases: ["DB"], r2Buckets: ["NODES"],
+    bindings: { BUILD_REVISION: fixture.revision, TELEGRAM_ISOLATION_CONFIG: JSON.stringify(policy),
+      TELEGRAM_AGGREGATE_KEY: Buffer.alloc(32, 0x19).toString("base64url") },
+    outboundService: async (request: Request) => {
+      if (request.url.endsWith("/answerCallbackQuery")) return Response.json({ ok: true, result: true });
+      assert.equal(request.url, `https://api.telegram.org/bot${policy.botToken}/sendMessage`);
+      const body = await request.json() as { text: string; chat_id: string };
+      assert.equal(body.chat_id, policy.memberId);
+      sent.push(body);
+      return Response.json({ ok: true, result: { message_id: 1000 + sent.length, chat: { id: Number(policy.memberId) } } });
+    },
+  });
+  try {
+    const db = await worker.getD1Database("DB");
+    const bucket = await worker.getR2Bucket("NODES");
+    await applyMigrations(db, directory, fixture.migrations);
+    const stored = "ss://YWVzLTI1Ni1nY206Zml4dHVyZS1vbmx5@203.0.113.10:8388#stored";
+    const temporary = stored.replace("#stored", "#temporary");
+    const sub = await createSubscription(db, { ownerId: policy.memberId, name: "Selected artifact", sourceUrl: "https://example.invalid/private" });
+    assert.equal(await publishNodeSnapshot(db, bucket, { id: sub.id, ownerId: policy.memberId,
+      expectedGeneration: 0, expectedLifecycleRevision: 0 }, [{ share: stored }]), true);
+    const post = (updateId: number, text: string) => worker.dispatchFetch("https://fixture.invalid/telegram/webhook", {
+      method: "POST", headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": policy.webhookSecret },
+      body: JSON.stringify({ update_id: updateId, message: { message_id: updateId + 10, date, text,
+        from: { id: Number(policy.memberId), is_bot: false }, chat: { id: Number(policy.memberId), type: "private" },
+        entities: text.startsWith("/") ? [{ type: "bot_command", offset: 0, length: 2 }] : [] } }),
+    });
+    const waitForSent = async (count: number) => {
+      for (let attempt = 0; attempt < 100 && sent.length < count; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      assert.equal(sent.length, count);
+    };
+    assert.equal((await post(1, temporary)).status, 200);
+    await waitForSent(1);
+    assert.equal((await post(2, "/o")).status, 200);
+    await waitForSent(2);
+    const url = sent[1].text.match(/https:\/\/[^\s]+\/clash/u)?.[0];
+    assert.ok(url);
+    const response = await worker.dispatchFetch(url.replace(/clash$/u, "base64"));
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), Buffer.from(stored).toString("base64"));
+    assert.equal(response.headers.get("Cache-Control"), "private, no-store");
+    const token = sent[1].reply_markup?.inline_keyboard[0][0].callback_data;
+    assert.match(token!, /^sbo1_[A-Za-z0-9_-]{22}$/u);
+    const result = await worker.dispatchFetch("https://fixture.invalid/telegram/webhook", {
+      method: "POST", headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": policy.webhookSecret },
+      body: JSON.stringify({ update_id: 3, callback_query: { id: "artifact-revoke", data: token,
+        from: { id: Number(policy.memberId), is_bot: false }, message: { message_id: 1002, date,
+          from: { id: Number(policy.botId), is_bot: true }, chat: { id: Number(policy.memberId), type: "private" } } } }),
+    });
+    assert.equal(result.status, 200);
+    assert.equal((await worker.dispatchFetch(url, { method: "HEAD" })).status, 404);
+  } finally {
+    await worker.dispose();
+  }
+});
 
 const digest = (body: Buffer) => createHash("sha256").update(body).digest("hex");
 
@@ -470,7 +541,17 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
     await db.prepare("UPDATE telegram_auth SET allowed = 1 WHERE bot_id = ? AND user_id = ?")
       .bind(policy.botId, policy.memberId).run();
     const importedShare = "hy2://user:fixture@[2001:db8::5]:443,5000-6000/?sni=proxy.example.invalid#Fixture";
-    const memberPrivate = { ...claimMessage, chat: { id: Number(policy.memberId), type: "private" } };
+    const grantDate = await db.prepare("SELECT message_date FROM telegram_auth WHERE bot_id = ? AND user_id = ?")
+      .bind(policy.botId, policy.memberId).first<number>("message_date");
+    assert.ok(grantDate !== null);
+    const memberPrivate = { ...claimMessage, date: grantDate + 1,
+      chat: { id: Number(policy.memberId), type: "private" } };
+    const delayed = { update_id: 1800, message: { ...memberPrivate, date: grantDate, message_id: 2300,
+      text: Buffer.from(importedShare).toString("base64"), entities: [] } };
+    assert.equal((await post(delayed)).status, 200);
+    assert.equal(await db.prepare("SELECT 1 FROM telegram_inbox WHERE bot_id = ? AND update_id = ?")
+      .bind(policy.botId, delayed.update_id).first(), null);
+    assert.deepEqual(await db.prepare("SELECT count(*) AS total FROM telegram_temp_batch").first(), { total: 0 });
     const tempEvent = { update_id: 18, message: { ...memberPrivate, message_id: 23,
       text: Buffer.from(importedShare).toString("base64"), entities: [] } };
     const added = expectSend(policy.memberId, 24, 23, "已加入临时列表 1 条节点，当前共有 1 条。");

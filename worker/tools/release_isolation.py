@@ -6,7 +6,9 @@ import re
 import sys
 from pathlib import Path
 
-from cloudflare_isolation import CloudflareClient, CloudflareError, release_worker, validate_aggregate_key, verify_worker_target
+from cloudflare_isolation import (
+    CloudflareClient, CloudflareError, release_worker, validate_aggregate_key, validate_private_share_key, verify_worker_target,
+)
 from d1_migrations import MigrationError, apply_migrations
 from prepare_isolation_artifact import ArtifactError, require_current_main
 
@@ -51,6 +53,14 @@ def release():
     if any(item["name"] == "0014_telegram_aggregate_issuance.sql" for item in manifest["migrations"]):
         aggregate_key = os.environ.get("SUBS_BOT_TELEGRAM_AGGREGATE_KEY", "")
         validate_aggregate_key(aggregate_key)
+    private_share_key = None
+    # Optional until first activation; thereafter the active digest below prevents dropping or rotating it.
+    if any(item["name"] == "0016_telegram_private_share_creation.sql" for item in manifest["migrations"]):
+        private_share_key = os.environ.get("SUBS_BOT_TELEGRAM_PRIVATE_SHARE_CREATION_KEY") or None
+        if private_share_key is not None:
+            validate_private_share_key(private_share_key)
+            if private_share_key == aggregate_key:
+                raise CloudflareError("The isolated private share key must be distinct from the aggregate key.")
     target = json.loads(os.environ.get("SUBS_BOT_CF_ISOLATION_TARGET_JSON", "null"))
     if not isinstance(target, dict) or set(target) != {
         "accountId", "workerId", "workerCreatedOn", "d1Id", "d1CreatedAt", "r2CreatedOn", "namespace",
@@ -67,11 +77,12 @@ def release():
     data_api = CloudflareClient(data_token)
     worker_api = CloudflareClient(deploy_token)
     guard()
-    starting = verify_worker_target(worker_api, data_api, target, aggregate_key=aggregate_key)
+    starting = verify_worker_target(worker_api, data_api, target, aggregate_key=aggregate_key, private_share_key=private_share_key)
     migrations = apply_migrations(data_api, target, bundle, manifest, guard)
     print(f"Verified {len(migrations)} isolated D1 migration records.", flush=True)
     result = release_worker(worker_api, data_api, target, bundle, manifest, guard,
-                            expected_active=starting, telegram_config=telegram_config, aggregate_key=aggregate_key)
+                            expected_active=starting, telegram_config=telegram_config, aggregate_key=aggregate_key,
+                            private_share_key=private_share_key)
     guard()
     print(json.dumps(result, sort_keys=True), flush=True)
 
