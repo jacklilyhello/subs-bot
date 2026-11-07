@@ -80,7 +80,7 @@ class LegacyRestorePackageTests(unittest.TestCase):
         put(self.worker / "isolation.json", manifest)
         return digest(manifest), entries
 
-    def make_conversion(self, *, unsupported=False):
+    def make_conversion(self, *, unsupported=False, trash_sequence=70):
         with closing(sqlite3.connect(self.legacy)) as db, db:
             make_table(db, "subscriptions")
             make_table(db, "deleted_subs")
@@ -90,7 +90,7 @@ class LegacyRestorePackageTests(unittest.TestCase):
             db.execute("UPDATE subscriptions SET name=?,url=?,expire_at=?,traffic_used=?,traffic_total=?,last_error=? WHERE id=2",
                        (QUOTE_NAME, UPLOAD_URL, 1_700_002_000, 1.25, 9.75, "fixture-private-provider-error"))
             db.execute("UPDATE sqlite_sequence SET seq=50 WHERE name='subscriptions'")
-            db.execute("UPDATE sqlite_sequence SET seq=70 WHERE name='deleted_subs'")
+            db.execute("UPDATE sqlite_sequence SET seq=? WHERE name='deleted_subs'", (trash_sequence,))
             if unsupported:
                 db.execute("CREATE TABLE short_links(code TEXT PRIMARY KEY,user_id INTEGER,target_url TEXT,created_at INTEGER)")
                 db.execute("INSERT INTO short_links VALUES ('synthetic001',123,'aggregate://all',1700000000)")
@@ -223,6 +223,12 @@ class LegacyRestorePackageTests(unittest.TestCase):
     def test_nonempty_unhandled_legacy_domain_never_seals(self):
         report = self.make_conversion(unsupported=True)
         self.assertEqual(report["blockers"], {"unhandled:short_links": 1})
+        with self.assertRaises(package.PackageError):
+            self.build()
+        self.assertFalse(self.output.exists())
+
+    def test_exhausted_safe_id_allocator_does_not_create_candidate(self):
+        self.assertTrue(self.make_conversion(trash_sequence=convert.MAX_SAFE_ID - 1)["completeImportable"])
         with self.assertRaises(package.PackageError):
             self.build()
         self.assertFalse(self.output.exists())

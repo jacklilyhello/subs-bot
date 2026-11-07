@@ -85,7 +85,8 @@ def worker_artifact(root, revision, manifest_sha):
         total += len(body)
         require(total <= artifact._MAX_EXPANDED)
     chain = migrations._load_migrations(root, manifest)
-    require(len(chain) >= 3 and chain[2].name == "0003_subscription_lifecycle.sql")
+    require(len(chain) >= 5 and chain[2].name == "0003_subscription_lifecycle.sql"
+            and chain[4].name == "0005_private_shares.sql")
     identity = {key: manifest[key] for key in ("revision", "runId", "runAttempt", "bundleSha256", "compatibilityDate", "migrations")}
     return chain, {**identity, "manifestSha256": manifest_sha}
 
@@ -111,7 +112,7 @@ def converter_artifact(root, manifest_sha):
     mapping = manifest["trashIdMapping"]
     high = mapping["sourceHighWater"]
     require(mapping["kind"] == "source-high-water-plus-ordinal" and native.integer(high)
-            and native.integer(mapping["targetSequenceHighWater"], high)
+            and native.integer(mapping["targetSequenceHighWater"], high, native.MAX_SAFE - 1)
             and mapping["targetSequenceHighWater"] == high + domains["deleted_subs"]["rows"])
     return manifest, descriptors
 
