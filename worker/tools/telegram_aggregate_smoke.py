@@ -25,7 +25,7 @@ from zipfile import ZipFile
 from capacity_probe import ProbeError, _check_headers, _request, _small_body
 from capacity_resources import CapacityError, R2Objects, Resources, integer, matches, save_private_json
 from cloudflare_isolation import (
-    CloudflareClient, CloudflareError, DIGEST, REVISION, UUID, _Isolation, _verify_health,
+    CloudflareClient, CloudflareError, DATE, DIGEST, REVISION, UUID, _Isolation, _verify_health,
 )
 from d1_migrations import _assert_sql
 from prepare_isolation_artifact import (
@@ -147,12 +147,29 @@ def read_checkpoint(run_id, revision, token):
         return _parse_object(archive.read(members[CHECKPOINT]), "Aggregate checkpoint JSON differs.")
 
 
-def validate_checkpoint(value, action, cohort, revision, identity):
+def validate_release_pin(pin):
+    require(isinstance(pin, dict) and set(pin) == {"revision", "versionId", "moduleSha256", "compatibilityDate"}
+            and matches(REVISION, pin["revision"]) and matches(UUID, pin["versionId"])
+            and matches(DIGEST, pin["moduleSha256"]) and matches(DATE, pin["compatibilityDate"]),
+            "Aggregate active release pin differs.")
+
+
+def verify_checkpoint_release(checkpoint, release_pin, *, retiring=False):
+    original = checkpoint.get("releasePin")
+    validate_release_pin(original)
+    validate_release_pin(release_pin)
+    require(original["revision"] == checkpoint["revision"], "Aggregate checkpoint release revision differs.")
+    # Cleanup can run on a later reviewed main, but never continues the original acceptance proof.
+    require(retiring or original == release_pin, "Aggregate checkpoint active release changed.")
+
+
+def validate_checkpoint(value, action, cohort, revision, identity, release_pin):
     require(isinstance(value, dict) and set(value) == {"version", "phase", "cohort", "revision", "identity", "afterReceiptId",
-            "snapshots", "startingRevisions", "authEpoch", "receipts", "capabilities"} and value["version"] == 1
+            "releasePin", "snapshots", "startingRevisions", "authEpoch", "receipts", "capabilities"} and value["version"] == 1
             and type(value["version"]) is int and value["phase"] in PREVIOUS[action]
             and (value["cohort"], value["revision"], value["identity"]) == (cohort, revision, identity)
             and integer(value["afterReceiptId"], 0, MAX_ID), "Aggregate checkpoint scope or phase differs.")
+    verify_checkpoint_release(value, release_pin, retiring=action == "retire")
     require(set(value["snapshots"]) == set(value["startingRevisions"]) == set(value["receipts"]) == set(ROLES)
             and matches(DIGEST, value["authEpoch"]), "Aggregate checkpoint owner inventory differs.")
     for role in ROLES:
@@ -309,7 +326,9 @@ class Cohort:
         self.require_quiet([item["id"] for item in pointers.values()])
 
 
-def prepare(cohort, revision, guard):
+def prepare(cohort, revision, guard, release_pin):
+    validate_release_pin(release_pin)
+    require(release_pin["revision"] == revision, "Aggregate preparation release revision differs.")
     current = cohort.subscriptions()
     require(not current or set(current) == set(ROLES), "Aggregate preparation found a partial D1 reservation.")
     cohort.require_quiet([row["id"] for row in current.values()])
@@ -364,6 +383,7 @@ def prepare(cohort, revision, guard):
     except (CloudflareError, FixtureError):
         pass
     checkpoint = {"version": 1, "phase": "prepared", "cohort": cohort.cohort, "revision": revision, "identity": cohort.identity,
+        "releasePin": dict(release_pin),
         "afterReceiptId": watermark[0]["highWater"], "snapshots": pointers,
         "startingRevisions": {role: slots.get(role, {}).get("revision", 0) for role in ROLES},
         "authEpoch": auth, "receipts": {role: [] for role in ROLES}, "capabilities": {}}
@@ -459,7 +479,8 @@ def probe_capability(cohort, role, recovery, *, active):
     return report
 
 
-def capture(cohort, checkpoint, action, probe=probe_capability):
+def capture(cohort, checkpoint, action, probe=probe_capability, *, release_pin):
+    verify_checkpoint_release(checkpoint, release_pin, retiring=action == "retire")
     phase = PHASES[action]
     ids = [item["id"] for item in checkpoint["snapshots"].values()]
     current = cohort.subscriptions(ids)
@@ -512,9 +533,9 @@ def capture(cohort, checkpoint, action, probe=probe_capability):
     return {**checkpoint, "phase": phase, "receipts": history, "capabilities": caps}, report
 
 
-def retire(cohort, checkpoint, guard, probe=probe_capability):
+def retire(cohort, checkpoint, guard, probe=probe_capability, *, release_pin):
     # Validate new real revocation receipts before retiring synthetic data. Keep every receipt and link tombstone.
-    verified, report = capture(cohort, checkpoint, "retire", probe)
+    verified, report = capture(cohort, checkpoint, "retire", probe, release_pin=release_pin)
     pointers = checkpoint["snapshots"]
     ids = tuple(item["id"] for item in pointers.values())
     current = cohort.subscriptions(ids)
@@ -545,7 +566,8 @@ def retire(cohort, checkpoint, guard, probe=probe_capability):
                 "Aggregate synthetic R2 retirement could not be confirmed.")
     require(not cohort.subscriptions(ids) and receipt_history(cohort, checkpoint, "retired")[0] == verified["receipts"],
             "Aggregate retirement changed receipt evidence.")
-    return verified, report
+    # Preserve the original acceptance pin and separately disclose the release that performed cleanup.
+    return {**verified, "retiredAtReleasePin": dict(release_pin)}, report
 
 
 def run():
@@ -573,6 +595,9 @@ def run():
     scope.verify_resources()
     active = scope.active()
     version = scope.version(active.version)
+    release_pin = {"revision": version.revision, "versionId": active.version,
+                   "moduleSha256": version.digest, "compatibilityDate": version.compatibility}
+    validate_release_pin(release_pin)
     policy_sha = digest(raw_policy.encode("utf-8"))
     require(scope.cron_enabled() and version.revision == revision and version.telegram_config_sha256 == policy_sha
             and getattr(version, "telegram_aggregate_key_sha256", None) == digest(encoded.encode("ascii")),
@@ -592,10 +617,11 @@ def run():
     cohort = Cohort(resources, policy, cohort_key, encoded, identity)
     report = {}
     if checkpoint is None:
-        checkpoint = prepare(cohort, revision, guard)
+        checkpoint = prepare(cohort, revision, guard, release_pin)
     else:
-        validate_checkpoint(checkpoint, action, cohort_key, source_revision, identity)
-        checkpoint, report = retire(cohort, checkpoint, guard) if action == "retire" else capture(cohort, checkpoint, action)
+        validate_checkpoint(checkpoint, action, cohort_key, source_revision, identity, release_pin)
+        checkpoint, report = (retire(cohort, checkpoint, guard, release_pin=release_pin) if action == "retire"
+                              else capture(cohort, checkpoint, action, release_pin=release_pin))
     guard()
     _verify_health(revision)
     save_private_json(Path(os.environ["RUNNER_TEMP"]) / CHECKPOINT, checkpoint)

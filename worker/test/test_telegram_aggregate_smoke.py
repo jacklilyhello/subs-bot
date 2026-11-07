@@ -24,6 +24,8 @@ from telegram_view_fixtures import FixtureError
 
 
 COHORT, REVISION, IDENTITY = "0123456789abcdef", "a" * 40, "b" * 64
+RELEASE_PIN = {"revision": REVISION, "versionId": "00000000-0000-4000-8000-000000000001",
+               "moduleSha256": "c" * 64, "compatibilityDate": "2026-07-30"}
 KEY = urlsafe_b64encode(b"\x17" * 32).decode().rstrip("=")
 POLICY = {"botId": "881001", "memberId": "881002", "adminId": "881003"}
 STAMP = 1_800_000_000
@@ -92,7 +94,7 @@ class AggregateAcceptanceTests(unittest.TestCase):
         self.cohort = smoke.Cohort(self.cloud, POLICY, COHORT, KEY, IDENTITY)
         self.sequence = 0
         self.probed = []
-        self.checkpoint = smoke.prepare(self.cohort, REVISION, lambda: None)
+        self.checkpoint = smoke.prepare(self.cohort, REVISION, lambda: None, RELEASE_PIN)
 
     def probe(self, cohort, role, recovery, *, active):
         code = smoke.derive_code(KEY, POLICY, role, recovery["nonce"])
@@ -135,8 +137,8 @@ class AggregateAcceptanceTests(unittest.TestCase):
         self.cloud.db.commit()
 
     def capture(self, action):
-        smoke.validate_checkpoint(self.checkpoint, action, COHORT, REVISION, IDENTITY)
-        self.checkpoint, _ = smoke.capture(self.cohort, self.checkpoint, action, self.probe)
+        smoke.validate_checkpoint(self.checkpoint, action, COHORT, REVISION, IDENTITY, RELEASE_PIN)
+        self.checkpoint, _ = smoke.capture(self.cohort, self.checkpoint, action, self.probe, release_pin=RELEASE_PIN)
         return self.checkpoint
 
     def initial(self):
@@ -180,13 +182,13 @@ class AggregateAcceptanceTests(unittest.TestCase):
         self.cohort = smoke.Cohort(self.cloud, POLICY, COHORT, KEY, IDENTITY)
         self.cloud.failure, self.cloud.fail_put = "committed", 1
         with self.assertRaisesRegex(FixtureError, "R2 upload"):
-            smoke.prepare(self.cohort, REVISION, lambda: None)
+            smoke.prepare(self.cohort, REVISION, lambda: None, RELEASE_PIN)
         self.assertEqual(len(self.cloud.puts), 1)
         self.assertEqual(len(self.cohort.subscriptions()), 2)
         self.cloud.fail_put = None
-        checkpoint = smoke.prepare(self.cohort, REVISION, lambda: None)
+        checkpoint = smoke.prepare(self.cohort, REVISION, lambda: None, RELEASE_PIN)
         self.assertEqual(len(self.cloud.puts), 4)
-        self.assertEqual(smoke.prepare(self.cohort, REVISION, lambda: None), checkpoint)
+        self.assertEqual(smoke.prepare(self.cohort, REVISION, lambda: None, RELEASE_PIN), checkpoint)
         self.assertEqual(len(self.cloud.puts), 4)
 
     def test_unknown_object_or_same_basename_is_not_adopted(self):
@@ -194,30 +196,30 @@ class AggregateAcceptanceTests(unittest.TestCase):
         prefix, _ = self.cohort.list_objects(pointer)
         self.cloud.data[prefix + "unrelated"] = b"untouched"
         with self.assertRaisesRegex(FixtureError, "inventory|unknown"):
-            smoke.prepare(self.cohort, REVISION, lambda: None)
+            smoke.prepare(self.cohort, REVISION, lambda: None, RELEASE_PIN)
         self.assertEqual(len(self.cloud.puts), 4)
         self.cloud.data.pop(prefix + "unrelated")
         self.cloud.db.execute("""INSERT INTO subscriptions(owner_id,name,source_url,token,created_at,updated_at)
           VALUES ('999',?,'https://example.invalid/','unrelated-fixture-token',1,1)""", (self.cohort.name,))
         self.cloud.db.commit()
         with self.assertRaisesRegex(FixtureError, "identity|pointer"):
-            smoke.prepare(self.cohort, REVISION, lambda: None)
+            smoke.prepare(self.cohort, REVISION, lambda: None, RELEASE_PIN)
         self.assertEqual(self.cloud.deleted, [])
 
     def test_retirement_requires_both_real_revocations_and_preserves_tombstones(self):
         self.rotated()
         with self.assertRaisesRegex(FixtureError, "command count"):
-            smoke.retire(self.cohort, self.checkpoint, lambda: None, self.probe)
+            smoke.retire(self.cohort, self.checkpoint, lambda: None, self.probe, release_pin=RELEASE_PIN)
         self.assertEqual(len(self.cohort.subscriptions()), 2)
         for role in smoke.ROLES:
             self.receipt(role, "revoked")
         self.cloud.failure = "committed"
         self.cloud.fail_delete = 1
         with self.assertRaisesRegex(CapacityError, "DELETE"):
-            smoke.retire(self.cohort, self.checkpoint, lambda: None, self.probe)
+            smoke.retire(self.cohort, self.checkpoint, lambda: None, self.probe, release_pin=RELEASE_PIN)
         self.assertEqual(self.cohort.subscriptions(), {})
         self.cloud.fail_delete = None
-        retired, _ = smoke.retire(self.cohort, self.checkpoint, lambda: None, self.probe)
+        retired, _ = smoke.retire(self.cohort, self.checkpoint, lambda: None, self.probe, release_pin=RELEASE_PIN)
         self.assertEqual(retired["phase"], "retired")
         self.assertEqual(self.cloud.data, {})
         self.assertEqual(len(set(self.cloud.deleted)), 4)
@@ -230,13 +232,51 @@ class AggregateAcceptanceTests(unittest.TestCase):
         changed = deepcopy(checkpoint)
         changed["capabilities"]["member-initial"]["nonce"] = "A" * 21 + "B"
         with self.assertRaisesRegex(FixtureError, "recovery"):
-            smoke.validate_checkpoint(changed, "verify-member-revoked", COHORT, REVISION, IDENTITY)
+            smoke.validate_checkpoint(changed, "verify-member-revoked", COHORT, REVISION, IDENTITY, RELEASE_PIN)
         self.cloud.db.execute("INSERT INTO telegram_auth VALUES (?,?,1,1,1)", (POLICY["botId"], POLICY["memberId"]))
         self.cloud.db.commit()
         self.receipt("member", "revoked")
         with self.assertRaisesRegex(FixtureError, "epoch"):
             self.capture("verify-member-revoked")
         self.assertEqual(len(self.cloud.data), 4)
+
+    def test_checkpoint_rejects_replaced_active_version_or_module_at_the_same_revision(self):
+        # BUILD_REVISION alone cannot prove that later captures use the same immutable module.
+        changed_pins = [
+            {**RELEASE_PIN, "versionId": "00000000-0000-4000-8000-000000000002"},
+            {**RELEASE_PIN, "moduleSha256": "d" * 64},
+            {**RELEASE_PIN, "compatibilityDate": "2026-08-01"},
+        ]
+        smoke.validate_checkpoint(self.checkpoint, "capture-initial", COHORT, REVISION, IDENTITY, RELEASE_PIN)
+        for changed in changed_pins:
+            with self.subTest(field=next(name for name in changed if changed[name] != RELEASE_PIN[name])):
+                self.assertEqual(changed["revision"], REVISION)
+                with self.assertRaisesRegex(FixtureError, "active release changed"):
+                    smoke.validate_checkpoint(self.checkpoint, "capture-initial", COHORT, REVISION, IDENTITY, changed)
+                with self.assertRaisesRegex(FixtureError, "active release changed"):
+                    smoke.capture(self.cohort, self.checkpoint, "capture-initial", self.probe, release_pin=changed)
+        self.assertEqual(self.probed, [])
+        self.assertEqual(len(self.cloud.data), 4)
+        self.assertEqual(self.cloud.deleted, [])
+        self.assertEqual(self.checkpoint["releasePin"], RELEASE_PIN)
+
+    def test_retire_on_a_later_release_preserves_original_seed_identity_and_acceptance_pin(self):
+        self.revoked()
+        original = deepcopy(self.checkpoint)
+        identities = {role: self.cohort.seed_identity(role) for role in smoke.ROLES}
+        cleanup_pin = {"revision": "e" * 40, "versionId": "00000000-0000-4000-8000-000000000002",
+                       "moduleSha256": "d" * 64, "compatibilityDate": "2026-08-01"}
+        smoke.validate_checkpoint(self.checkpoint, "retire", COHORT, REVISION, IDENTITY, cleanup_pin)
+        retired, _ = smoke.retire(self.cohort, self.checkpoint, lambda: None, self.probe, release_pin=cleanup_pin)
+        self.assertEqual(self.checkpoint, original)
+        self.assertEqual(retired["identity"], IDENTITY)
+        self.assertEqual(retired["revision"], REVISION)
+        self.assertEqual(retired["releasePin"], RELEASE_PIN)
+        self.assertEqual(retired["retiredAtReleasePin"], cleanup_pin)
+        self.assertEqual({role: self.cohort.seed_identity(role) for role in smoke.ROLES}, identities)
+        self.assertEqual(self.cohort.subscriptions(), {})
+        self.assertEqual(self.cloud.data, {})
+        self.assertEqual(len(set(self.cloud.deleted)), 4)
 
     def test_literal_confirmation_and_checkpoint_provenance_are_required(self):
         event = {"inputs": {"action": "retire", "cohort": COHORT, "source_run_id": "123", "confirm_retire": f"retire {COHORT}"}}

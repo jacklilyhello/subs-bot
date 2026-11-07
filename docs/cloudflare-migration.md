@@ -95,11 +95,11 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 `worker-isolation-telegram-aggregate-smoke.yml` 只在受保护的 `main` 与 `subs-bot-isolation` 环境运行，和部署共用锁。它核对实际活动版本、精确 D1/R2 归属、Telegram 配置摘要、聚合密钥摘要和 `0014` 校验和。`prepare` 为两个指定账号各保留一份不同的合成 Shadowsocks 快照；已有同名、同来源但身份不同的记录、其他活动订阅、临时节点、路径规则或正在处理的文件任务都会阻止操作。
 
-真人命令全部从指定的 IAB 账号发送，工具不调用 Bot API，也不创建 Telegram 回执。先让两个账号分别私聊发送 `/export` 两次，再运行 `capture-initial`；成员发送 `/export revoke` 后运行 `verify-member-revoked`；成员重新发送一次 `/export` 后运行 `verify-rotated`；最后两个账号都撤销，再运行带完整确认语句的 `retire`。每一步提供上一成功步骤的 `source_run_id`，并核对同一提交、工作流、run attempt 和产物摘要。
+真人命令全部从指定的 IAB 账号发送，工具不调用 Bot API，也不创建 Telegram 回执。先让两个账号分别私聊发送 `/export` 两次，再运行 `capture-initial`；成员发送 `/export revoke` 后运行 `verify-member-revoked`；成员重新发送一次 `/export` 后运行 `verify-rotated`；最后两个账号都撤销，再运行带完整确认语句的 `retire`。每一步提供上一成功步骤的 `source_run_id`，并核对同一提交、工作流、run attempt 和产物摘要。`prepare` 另将实际活动 Worker 的版本 UUID、模块 SHA-256、兼容日期和提交固定为独立的 `releasePin`；所有捕获和验证步骤要求完全相同，即使 `BUILD_REVISION` 未变，替换版本或模块也会拒绝。该固定值不参与合成 Token 或对象身份派生。
 
 每次检查固定内容的 Clash/Base64 GET 与 HEAD、私有缓存响应头和 `/s/` 同源相对跳转，确认重复签发稳定、旧码撤销后返回 `404`、成员轮换得到新码且管理员码不变。检查点保存能力摘要与规范的 16 字节派生 nonce、密钥版本，以及合成快照的安全数字/UUID 身份与对象摘要；nonce 是非能力恢复元数据，只有另行保护的 HMAC 密钥才能推导 bearer。检查点不保存真实账号 ID、密钥、订阅 Token、原始能力链接或节点正文，日志只报告计数、状态和摘要。
 
-合成订阅 Token 使用独立域的 HMAC 派生，R2 键使用独立派生的 UUIDv8；重试中只采纳完全一致的保留记录与对象，PUT 带 `If-None-Match: *`。发布中断可用同一 cohort 重新 `prepare`，不覆盖已发布或异内容对象。退休先确认两个托管槽已撤销且没有临时节点，以精确快照指针比较并删除两个合成 D1 行，再删除四个固定 R2 键；API 结果不明时先读回，部分对象删除可从上一 `rotated` 检查点重试。实际收件、发件、签发槽和撤销链接作为重放/顺序墓碑保留。此工具是隔离验收准备，只有托管运行结果与真人 IAB 操作共同完成后才能视为实际验收。
+合成订阅 Token 使用独立域的 HMAC 派生，R2 键使用独立派生的 UUIDv8；重试中只采纳完全一致的保留记录与对象，PUT 带 `If-None-Match: *`。发布中断可用同一 cohort 重新 `prepare`，不覆盖已发布或异内容对象。退休先确认两个托管槽已撤销且没有临时节点，以精确快照指针比较并删除两个合成 D1 行，再删除四个固定 R2 键；API 结果不明时先读回，部分对象删除可从上一 `rotated` 检查点重试。只有清理允许在后续已核对的 `main` 发布上继续：资源、配置、密钥及原始派生身份仍须相同，原 `releasePin` 保留，并在最终检查点另记实际清理发布 `retiredAtReleasePin`，不将它计为原验收的延续。实际收件、发件、签发槽和撤销链接作为重放/顺序墓碑保留。此工具是隔离验收准备，只有托管运行结果与真人 IAB 操作共同完成后才能视为实际验收。
 
 ### 刷新与出网验收
 
