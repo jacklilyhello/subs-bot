@@ -189,7 +189,7 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 2. 查找当前 `main` 的成功 `Worker CI` 运行。若该提交只改动旧 Python 服务，先手动对 `main` 运行 `Worker CI` 生成同一 SHA 的产物。以该运行 ID 启动 `gh workflow run worker-isolation-deploy.yml --ref main -f source_run_id=<run-id>`。
 3. 发布流程重新核对运行、提交、ZIP 摘要、包内文件清单及独立摘要，验证已登记的资源身份。D1 只接管结构完全一致且已清理合成数据的 `0001` 基线，使用 `subs_bot_schema_migrations` 记录已核对的摘要。后续通过同一流程应用增量建表和建索引。涉及现有数据或表结构变更时单独审查迁移和恢复步骤。 [D1 迁移](https://developers.cloudflare.com/d1/reference/migrations/)
 4. Worker 的候选版本通过内容与绑定回读后才启用。记录实际版本、部署及 `/health` 中的提交。遇到不明确的写入结果，先读取实际状态；Worker 回滚仅恢复此前验证的版本，D1 和 R2 状态独立处理。 [Cloudflare Worker 回滚](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/)
-5. 含 `0002_telegram.sql` 的隔离版本从同一 Environment 的 `SUBS_BOT_TELEGRAM_TEST_CONFIG` 注入加密配置。配置包含已核对的测试 Bot、两个账号、测试群和 Webhook 密钥。Worker 就绪后配置每分钟 Cron，用于恢复持久回复。测试 Bot 的 Webhook 首次设置前，核对 Bot 身份和现有 Webhook；仅在目标是该隔离地址时接收 `message` 更新并保留待处理更新。真实账号的消息验收在内置浏览器执行。 [Workers Cron](https://developers.cloudflare.com/workers/configuration/cron-triggers/) · [Telegram Webhook](https://core.telegram.org/bots/api#setwebhook)
+5. 含 `0002_telegram.sql` 的隔离版本从同一 Environment 的 `SUBS_BOT_TELEGRAM_TEST_CONFIG` 注入加密配置。配置包含已核对的测试 Bot、两个账号、测试群和 Webhook 密钥。普通隔离发布在迁移和上传前核对已部署的完整配置摘要，首次绑定后变更或轮换须经过单独的受控发布。Worker 就绪后配置每分钟 Cron，用于恢复持久回复。测试 Bot 的 Webhook 首次设置前，核对 Bot 身份和现有 Webhook；仅在目标是该隔离地址时接收 `message` 更新并保留待处理更新。真实账号的消息验收在内置浏览器执行。 [Workers Cron](https://developers.cloudflare.com/workers/configuration/cron-triggers/) · [Telegram Webhook](https://core.telegram.org/bots/api#setwebhook)
 6. 发布含 `0004_telegram_views.sql` 的版本前，先确认已发布并记录支持回执标记的回滚版本。激活新版并核对实际版本后，只为同一隔离测试 Bot 将 `allowed_updates` 扩为 `message` 与 `callback_query`。保持已核对的 URL、Webhook 密钥和连接上限，设置 `drop_pending_updates: false`，用 `getWebhookInfo` 核对结果。回滚视图时先恢复只接收 `message`，保留增量表和待处理更新。 [Telegram Webhook 配置](https://core.telegram.org/bots/api#setwebhook) · [Telegram Webhook 回读](https://core.telegram.org/bots/api#getwebhookinfo)
 7. 真人视图验收前，用 `gh workflow run worker-isolation-telegram-fixtures.yml --ref main -f action=seed -f cohort=<16位小写字母数字>` 生成指定两名测试用户的合成订阅和回收站记录。流程校验实际 Worker、D1、Telegram 配置摘要和迁移，并只写隔离 D1。真人消息及按钮只在内置浏览器验证。结束后以同一个 `cohort` 和 `action=retire` 删除本组记录，核对输出计数。
 8. 订阅操作验收使用同一工作流，增加 `-f purpose=lifecycle`。专用批次只允许匹配的两个账号及预定义合成来源，测试重命名使用原名后接 `-renamed`。退役流程核对归属、名称、版本、删除状态和未发布快照条件，核对不一致时整批保留。
@@ -290,6 +290,8 @@ PY
 
 选择 `synthetic-legacy-empty` 演练版本 3。它使用独立的产物、D1、R2 和操作记录前缀。预检从固定合成样例重建源 SQLite 与转换包并核对摘要，再验证两个活动订阅、两个回收站订阅、路径规则、原始令牌对应的两个空导出标记、0026 迁移、编号序列及四个 R2 对象。构建与预检须使用能产生同一 SQLite 文件的托管工具链，摘要不符时停止。恢复读回包含标记数量与表摘要。目标保持未绑定，空导出 HTTP 行为另行验收。
 
+选择 `synthetic-legacy-private-shares` 可原生恢复 `legacy-private-shares-v1` 的固定合成候选。Worker CI 只打包预置样例。预检在取得 Cloudflare 凭据前从固定旧 SQLite 样例重新构建，逐文件比对 SQL、清单、封印与正文。按下方相同步骤在本组专用 D1 和私有 R2 恢复，目标保持未绑定。最终读回应为三个分享、三条历史领取、分享编号上界 3 和三个正文对象，含指定领取人、已到期记录及恰在到期秒的领取。旧内联标识仅计数。核对完整结构、逐表摘要、对象字节和元数据，检查点只上传计数及摘要。旧 Bot 链接和内联卡片连续性另行验收。
+
 1. 依次运行 `verify`、`prepare`、`create-restore-db`、`create-restore-bucket`，每步核对结果后再继续。创建响应不明时先运行只读 `verify`，根据创建意图、时间和实际资源身份独立确认归属，再用 `pin-resource` 提交 `resource` 和 `identity_sha256`。无法确认归属时保留该资源，停止本组后续写入。
 2. 运行 `restore-objects` 核对专用私有 R2 的对象闭包，再运行 `start-import` 向已核对且仍为空的专用 D1 导入。若已有确认的轮询书签，可用同一 `start-import` 继续轮询。响应不明时保留目标和私有操作记录，通过 `verify-restore` 核对完整结果。导入请求未确认、上传链接或产物已失效，或固定版本已变更时，禁止重发首次导入、重置或删除原目标。保留现场核查，后续演练使用新的 `cohort` 和专用资源。 [D1 原生导入](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/import/)
 3. 用 `verify-restore` 验证完整 `PRAGMA quick_check`、外键、结构、迁移记录、编号序列、逐表摘要和 R2 对象。检查失败即保留目标和证据。此结果覆盖合成候选恢复，旧链接、真实数据和 HTTP 导出分别验收。 [D1 完整性检查](https://developers.cloudflare.com/d1/sql-api/sql-statements/#pragma-quick_check)
@@ -321,6 +323,20 @@ PY
 在当前 `main` 的确切产物已发布且迁移 `0026` 已核对后，运行 `gh workflow run worker-isolation-legacy-empty-smoke.yml --ref main -f action=verify -f cohort=<16位小写十六进制>`。流程只在既有隔离 D1 准备一个带精确标记的空订阅和一个无标记的对照。依次检查默认路径、各格式别名的 GET 与 HEAD、响应类型、空内容、私有缓存策略及无标记 404，然后按同一批次的精确身份退役两条记录和标记。响应中使用的合成能力令牌不出现在日志中。
 
 若流程中断，可在确认当前隔离版本后，以同一批次执行 `action=retire` 并在 `confirm_retire` 填写 `retire <cohort>`。遇到所有者、版本、指针或标记不符时保留记录并停止。此流程验证实际 Worker HTTP 和 D1 读取，与 V3 独立原生恢复的对象完整性核对分别记录。
+
+### 旧私密分享与领取盘点
+
+真实盘点在单独获准的受保护托管运行中使用核对过的源码提交。将关闭的 UTF-8、DELETE 日志模式备份放入仅供当前账号访问的目录，确认普通文件归当前账号所有、没有其他硬链接或 SQLite 伴随文件。准备尚未存在的私有输出目录路径。关闭命令跟踪，运行 `python3 -B worker/tools/legacy_private_share_inventory.py BACKUP OUTPUT EXPECTED_SOURCE_SHA256 LEGACY_BOT_ID LEGACY_BOT_USERNAME`。源 SHA-256 须取自独立的备份交接记录。旧 Bot 的正十进制 ID 和小写用户名须取自单独核对过的身份记录，用户名省略 `@`。程序在不可变只读事务前后核对同一文件及 SHA-256。 [SQLite URI](https://sqlite.org/uri.html)
+
+清单绑定源摘要、旧 Bot 身份、表与可选内联消息 ID 列是否存在、记录数以及三个数据文件的字节数和摘要。`shares.ndjson` 按旧分享码的 SHA-256 排序，保存发送者、可选接收者、份数和有效期。`claims.ndjson` 按原领取记录编号排序，保存领取者和原时间。ID 使用十进制字符串。每条分享记录标记原始正文在 `payloads.bin` 中的偏移、长度和 SHA-256。程序验证领取者唯一性、关联分享、指定用户、时间范围和已领取份数，并保留已过期记录。旧内联消息 ID 只作为私有来源证据。
+
+最多保留 20,000 条分享、20,000 条领取、单份正文 64 KiB、正文合计 64 MiB 及分享索引 32 MiB。超限或有不一致时整包失败。只有退出码 `0`、最后写入的 `manifest.sha256` 与清单相符，且清单和三个数据文件的闭包完整时才接收。能力字段只保存摘要。正文按原字节保存，可能已含敏感文字、URL 或旧分享码。整个包只在获准的私有渠道流转，禁止进入 PR、日志、普通 Actions 产物或缓存。普通 CI 只使用合成样本。该盘点不导入 Worker 或变更 Telegram 权限，旧链接连续性另行验收。
+
+### 旧私密分享候选恢复包
+
+在获准的托管 runner 上，运行 `worker/tools/legacy_private_share_candidate.py INVENTORY_DIR WORKER_ARTIFACT_DIR OUTPUT_DIR INVENTORY_MANIFEST_SHA WORKER_MANIFEST_SHA REVISION APPLIED_AT SOURCE_SQLITE_SHA LEGACY_BOT_ID LEGACY_BOT_USERNAME`。使用已核对的封存清单、原 SQLite 摘要和旧 Bot 身份作为独立输入。输出目录须尚未存在，封存盘点目录、Worker 产物目录和输出父目录仅供当前账号访问。
+
+`legacy-private-shares-v1` 仅填充准确的 0005 分享和领取表。封存程序逐行复核领取人与指定对象、份数和原时间，保留已到期记录的原到期秒，并逐对象核对原 UTF-8 正文的字节和摘要。私有正文存于 `objects/private-shares/`。内联消息标识留在封存盘点中，候选仅记录其数量。SQL 重放核对完整结构、外键、编号序列和对象闭包。每包最多 512 个正文对象，每个最多 64 KiB，SQL 重放上限为 4 MiB，所有数据库行仍受原生恢复上限约束。候选保持未绑定，旧 Bot 链接与内联卡片连续性需另行验收。
 
 ### 真实数据与生产切换门槛
 

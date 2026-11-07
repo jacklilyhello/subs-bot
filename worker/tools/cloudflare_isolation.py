@@ -34,6 +34,7 @@ PROVIDER_SERVICE = "subs-bot-provider-fetch-dev-01"
 PROVIDER_ENTRYPOINT = "ProviderFetch"
 PROVIDER_BINDINGS = {"PROVIDER_FETCH", "PROVIDER_REVISION", "PROVIDER_IMAGE_SHA256"}
 PROVIDER_MESSAGE = "Reviewed isolated Worker release provider "
+_UNSPECIFIED_TELEGRAM_CONFIG = object()
 _UNSPECIFIED_AGGREGATE_KEY = object()
 _UNSPECIFIED_PRIVATE_SHARE_KEY = object()
 _UNSPECIFIED_PROVIDER_BINDING = object()
@@ -660,10 +661,15 @@ def _inline_search_target(active, requested, manifest, telegram_config):
     return enabled, bot_id
 
 
+def _require_telegram_config_continuity(active, desired_digest):
+    _require(active.telegram_config_sha256 is None or active.telegram_config_sha256 == desired_digest,
+             "Changing or dropping the isolated Telegram configuration requires a separate scoped release.")
+
+
 def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECIFIED_AGGREGATE_KEY,
                          private_share_key=_UNSPECIFIED_PRIVATE_SHARE_KEY, provider_binding=_UNSPECIFIED_PROVIDER_BINDING,
                          release_revision=None, provider_first_binding_guard=None, release_manifest=None,
-                         telegram_config=None, inline_search=None):
+                         telegram_config=_UNSPECIFIED_TELEGRAM_CONFIG, inline_search=None):
     """Read ownership, privacy and active binding facts before any release writes."""
     scope = _Isolation(worker_api, data_api, target)
     scope.worker_config()
@@ -671,7 +677,12 @@ def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECI
     scope.verify_resources()
     active = scope.active()
     version = scope.version(active.version)
-    # Read-only fixture guards need only binding identities. Releases explicitly pass their expected key.
+    # Read-only fixtures can inspect the live binding without the secret.
+    if telegram_config is not _UNSPECIFIED_TELEGRAM_CONFIG:
+        _require(telegram_config is None or isinstance(telegram_config, str), "The isolated Telegram configuration is invalid.")
+        desired_digest = sha256(telegram_config.encode("utf-8")).hexdigest() if telegram_config is not None else None
+        _require_telegram_config_continuity(version, desired_digest)
+    # Releases explicitly pass their expected keys.
     if aggregate_key is not _UNSPECIFIED_AGGREGATE_KEY and version.telegram_aggregate_key_sha256 is not None:
         validate_aggregate_key(aggregate_key)
         _require(version.telegram_aggregate_key_sha256 == sha256(aggregate_key.encode("ascii")).hexdigest(),
@@ -715,6 +726,7 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
         "deploymentId": previous.id, "versionId": previous.version, "revision": old_version.revision,
     }, "Isolated Worker deployment changed while verifying D1.")
     _require(old_version.compatibility == desired.compatibility, "Worker compatibility date change requires separate approval.")
+    _require_telegram_config_continuity(old_version, desired.telegram_config_sha256)
     _require(telegram_config is not None or (not had_cron and old_version.telegram_config_sha256 is None),
              "Isolated Telegram configuration is required to preserve the active configuration.")
     _require(old_version.telegram_aggregate_key_sha256 is None

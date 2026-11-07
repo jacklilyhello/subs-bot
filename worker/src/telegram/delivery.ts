@@ -389,16 +389,18 @@ export async function drainTelegramReplies(
   providerEnabled = false,
   bulkTrashEnabled = false,
   inlineConsentEnabled = false,
-  gitHubSearchEnabled = false,
+  gitHubSearchReadiness: boolean | "unavailable" = false,
 ): Promise<void> {
   const deadline = Date.now() + budgetMs;
   const privateShareEnabled = privateShareRuntime.schemaReady && privateShareRuntime.context !== null;
+  const gitHubSearchEnabled = gitHubSearchReadiness === true;
+  const gitHubSearch = gitHubSearchEnabled ? policy : gitHubSearchReadiness === "unavailable" ? "unavailable" : undefined;
   await reapExpiredTelegramReplies(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled,
     shortLinksEnabled, inlineSortEnabled, subscriptionNodesEnabled, providerEnabled, bulkTrashEnabled, inlineConsentEnabled, gitHubSearchEnabled);
   for (let processed = 0; processed < limit && Date.now() < deadline; processed += 1) {
     const lease = await claimTelegramReply(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled,
       shortLinksEnabled, inlineSortEnabled, subscriptionNodesEnabled, providerEnabled ? policy : undefined,
-      bulkTrashEnabled, inlineConsentEnabled, gitHubSearchEnabled ? policy : undefined);
+      bulkTrashEnabled, inlineConsentEnabled, gitHubSearch);
     if (!lease) return;
     if (!inTelegramScope(policy, lease)) continue;
     if (lease.providerOutcome !== undefined) {
