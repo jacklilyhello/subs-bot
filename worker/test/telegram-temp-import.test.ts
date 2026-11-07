@@ -7,8 +7,10 @@ import { Miniflare } from "miniflare";
 import type { TelegramPolicy, TelegramTempUpdate } from "../src/telegram/protocol.ts";
 import {
   acceptTelegramTemp, MAX_TEMP_BATCH_BYTES, MAX_TEMP_OWNER_BYTES, MAX_TEMP_OWNER_NODES, renderTelegramTemp,
-  TELEGRAM_TEMP_MARKER, type TelegramTempReply,
+  TELEGRAM_TEMP_MARKER, TELEGRAM_TEMP_RAW_PREFIX, type TelegramTempReply,
 } from "../src/telegram/temp-import.ts";
+import { beginTelegramReply, beginTelegramTempRawReply, claimTelegramReply, settleTelegramReply } from "../src/telegram/store.ts";
+import { confirmTelegramTempRawSend, prepareTelegramTempRawReply } from "../src/telegram/temp-raw.ts";
 
 const miniflare = new Miniflare({
   modules: true,
@@ -66,6 +68,89 @@ async function totals(config: TelegramPolicy, actorId = config.memberId) {
     FROM telegram_temp_batch WHERE bot_id = ? AND actor_id = ?
   `).bind(config.botId, actorId).first<{ batches: number; nodes: number; bytes: number }>();
 }
+
+test("keeps a raw retry on the admitted batches and refuses final delivery after a clear", async () => {
+  const config = policy("97011");
+  const now = Math.floor(Date.now() / 1000);
+  const current = (updateId: number, messageId = updateId) => ({ ...event(config, updateId, messageId), messageDate: now });
+  assert.equal(await submit(config, { ...current(1), kind: "temp-text", text: firstShare }), "accepted");
+  const added = await claimTelegramReply(db, config.botId);
+  assert.ok(added);
+  assert.equal(await beginTelegramReply(db, config, added, "allowed"), true);
+  await settleTelegramReply(db, config, added, { kind: "sent", messageId: 101 });
+  const raw = { ...current(2), kind: "temp-raw" as const };
+  assert.deepEqual((await Promise.all([submit(config, raw), submit(config, raw)])).sort(), ["accepted", "ignored"]);
+  const durable = await storedReply(config, 2);
+  assert.equal(durable?.marker, TELEGRAM_TEMP_RAW_PREFIX + "[0,0]:[0,0]");
+  assert.equal(durable?.totalCount, 1);
+  const lease = await claimTelegramReply(db, config.botId);
+  assert.ok(lease?.tempRaw);
+  const prepared = await prepareTelegramTempRawReply(db, config, lease, Date.now() + 5_000);
+  assert.equal(prepared.kind, "text");
+  if (prepared.kind !== "text") return;
+  assert.match(prepared.text, /synthetic-first$/u);
+  assert.equal(await beginTelegramTempRawReply(db, config, lease, prepared.guard), true);
+  assert.equal(await confirmTelegramTempRawSend(db, config, lease, prepared.guard), true);
+  await settleTelegramReply(db, config, lease, { kind: "retry", delaySeconds: 1 });
+
+  assert.equal(await submit(config, { ...current(3), kind: "temp-text", text: secondShare }), "accepted");
+  await db.prepare("UPDATE telegram_outbox SET due_at=unixepoch() WHERE receipt_id=?").bind(lease.receiptId).run();
+  const retry = await claimTelegramReply(db, config.botId);
+  assert.ok(retry?.tempRaw);
+  assert.equal(retry.receiptId, lease.receiptId);
+  assert.equal(retry.attempts, 2);
+  const repeated = await prepareTelegramTempRawReply(db, config, retry, Date.now() + 5_000);
+  assert.equal(repeated.kind, "text");
+  if (repeated.kind !== "text") return;
+  assert.equal(repeated.text, prepared.text);
+  assert.equal(await confirmTelegramTempRawSend(db, config, lease, prepared.guard), false);
+  assert.equal(await beginTelegramTempRawReply(db, config, retry, repeated.guard), true);
+  assert.equal(await submit(config, { ...current(4), kind: "temp-clear" }), "accepted");
+  assert.equal(await confirmTelegramTempRawSend(db, config, retry, repeated.guard), false);
+  await settleTelegramReply(db, config, retry, { kind: "failed" });
+  assert.equal(await submit(config, { ...current(5, 3), kind: "temp-raw" }), "ignored");
+  assert.equal(await storedReply(config, 5), null);
+  assert.deepEqual(await totals(config), { batches: 0, nodes: 0, bytes: 0 });
+});
+
+test("rejects a changed grant even if the account is allowed again before the request timestamp", async () => {
+  const config = policy("97012");
+  const now = Math.floor(Date.now() / 1000);
+  await db.prepare("INSERT INTO telegram_auth VALUES (?,?,1,?,?)").bind(config.botId, config.memberId, now - 60, 1).run();
+  assert.equal(await submit(config, { ...event(config, 1), messageDate: now, kind: "temp-text", text: firstShare }), "accepted");
+  const added = await claimTelegramReply(db, config.botId);
+  assert.ok(added);
+  assert.equal(await beginTelegramReply(db, config, added, "allowed"), true);
+  await settleTelegramReply(db, config, added, { kind: "sent", messageId: 101 });
+  assert.equal(await submit(config, { ...event(config, 2), messageDate: now, kind: "temp-raw" }), "accepted");
+  const lease = await claimTelegramReply(db, config.botId);
+  assert.ok(lease?.tempRaw);
+  const prepared = await prepareTelegramTempRawReply(db, config, lease, Date.now() + 5_000);
+  assert.equal(prepared.kind, "text");
+  if (prepared.kind !== "text") return;
+  await db.prepare("UPDATE telegram_auth SET message_date=?,message_id=? WHERE bot_id=? AND user_id=?")
+    .bind(now - 30, 3, config.botId, config.memberId).run();
+  assert.equal(await beginTelegramTempRawReply(db, config, lease, prepared.guard), false);
+  assert.deepEqual(await prepareTelegramTempRawReply(db, config, lease, Date.now() + 5_000), { kind: "stale" });
+});
+
+test("refuses a whole raw reply when a stored batch contains an invalid share", async () => {
+  const config = policy("97013");
+  const now = Math.floor(Date.now() / 1000);
+  assert.equal(await submit(config, { ...event(config, 1), messageDate: now, kind: "temp-text",
+    text: firstShare + "\n" + secondShare }), "accepted");
+  const added = await claimTelegramReply(db, config.botId);
+  assert.ok(added);
+  assert.equal(await beginTelegramReply(db, config, added, "allowed"), true);
+  await settleTelegramReply(db, config, added, { kind: "sent", messageId: 101 });
+  const corrupt = JSON.stringify([{ share: firstShare }, { share: "ss://invalid" }]);
+  await db.prepare("UPDATE telegram_temp_batch SET nodes_json=?,payload_bytes=? WHERE receipt_id=?")
+    .bind(corrupt, Buffer.byteLength(corrupt), added.receiptId).run();
+  assert.equal(await submit(config, { ...event(config, 2), messageDate: now, kind: "temp-raw" }), "accepted");
+  const lease = await claimTelegramReply(db, config.botId);
+  assert.ok(lease?.tempRaw);
+  assert.deepEqual(await prepareTelegramTempRawReply(db, config, lease, Date.now() + 5_000), { kind: "unavailable" });
+});
 
 test("stores whole authorized batches and emits only durable aggregate replies across replay", async () => {
   const config = policy("97001");

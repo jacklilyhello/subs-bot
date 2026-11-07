@@ -2,6 +2,7 @@ import { parseNodeText } from "../text-import.ts";
 import { inTelegramScope, type TelegramPolicy, type TelegramTempUpdate } from "./protocol.ts";
 
 export const TELEGRAM_TEMP_MARKER = "temp:v1";
+export const TELEGRAM_TEMP_RAW_PREFIX = "temp-raw:v1:";
 export const MAX_TEMP_BATCH_BYTES = 256 * 1024;
 export const MAX_TEMP_OWNER_NODES = 5_000;
 export const MAX_TEMP_OWNER_BYTES = 4 * 1024 * 1024;
@@ -45,6 +46,22 @@ const currentClear = `EXISTS (
     AND (fence.message_date, fence.message_id) = (incoming.message_date, incoming.message_id)
 )`;
 const encoder = new TextEncoder();
+
+// The original receipt schema has space for a versioned marker. Store only
+// the grant and clear epochs here. The receipt ID bounds the raw read.
+export function tempRawStamp(alias: "incoming" | "inbox"): string {
+  return `'${TELEGRAM_TEMP_RAW_PREFIX}' || (CASE WHEN ${alias}.actor_id=? THEN '[0,0]' ELSE COALESCE((
+    SELECT json_array(auth.message_date,auth.message_id) FROM telegram_auth AS auth
+    WHERE auth.bot_id=${alias}.bot_id AND auth.user_id=${alias}.actor_id
+  ),'[0,0]') END) || ':' || COALESCE((
+    SELECT json_array(fence.message_date,fence.message_id) FROM telegram_temp_clear_fence AS fence
+    WHERE fence.bot_id=${alias}.bot_id AND fence.actor_id=${alias}.actor_id
+  ),'[0,0]')`;
+}
+
+export function tempRawMarker(alias: "inbox" | "earlier"): string {
+  return `substr(${alias}.receipt_nonce,1,${TELEGRAM_TEMP_RAW_PREFIX.length})='${TELEGRAM_TEMP_RAW_PREFIX}'`;
+}
 
 function planText(text: string): TextPlan {
   const parsed = parseNodeText(text, { maxInputBytes: MAX_TEMP_TEXT_BYTES, maxNodes: MAX_TEMP_BATCH_NODES });
@@ -128,17 +145,22 @@ export async function acceptTelegramTemp(
   if (event.chatType !== "private" || event.threadId !== null || !inTelegramScope(policy, event)) return "ignored";
 
   try {
+    const raw = event.kind === "temp-raw";
     const nonce = crypto.randomUUID();
     const key = [policy.botId, event.updateId, nonce] as const;
     const steps = [db.prepare(`
       INSERT INTO telegram_inbox
         (bot_id, update_id, actor_id, chat_id, chat_type, message_id, message_date, thread_id, command, receipt_nonce)
       SELECT ?, ?, ?, ?, 'private', ?, ?, NULL, 'help', ?
-      WHERE ? = ? OR COALESCE((SELECT allowed = 1 AND message_date < ?
-        FROM telegram_auth WHERE bot_id = ? AND user_id = ?), 1)
+      WHERE (? = ? OR COALESCE((SELECT allowed = 1 AND message_date < ?
+        FROM telegram_auth WHERE bot_id = ? AND user_id = ?), 1))
+      ${raw ? `AND ? BETWEEN unixepoch()-900 AND unixepoch()+30
+        AND NOT EXISTS (SELECT 1 FROM telegram_temp_clear_fence
+          WHERE bot_id=? AND actor_id=? AND (message_date,message_id)>=(?,?))` : ""}
       ON CONFLICT (bot_id, update_id) DO NOTHING
     `).bind(policy.botId, event.updateId, event.actorId, event.chatId, event.messageId, event.messageDate, nonce,
-      event.actorId, policy.adminId, event.messageDate, policy.botId, event.actorId)];
+      event.actorId, policy.adminId, event.messageDate, policy.botId, event.actorId,
+      ...(raw ? [event.messageDate, policy.botId, event.actorId, event.messageDate, event.messageId] : []))];
     if (event.kind === "temp-text") {
       steps.push(...textSteps(db, key, planText(event.text)));
     } else if (event.kind === "temp-clear") {
@@ -160,7 +182,7 @@ export async function acceptTelegramTemp(
       `).bind(...key),
       // Missing companions or an incomplete write make command NULL and abort the batch.
       db.prepare(`
-        UPDATE telegram_inbox AS incoming SET receipt_nonce = ?, command = CASE WHEN EXISTS (
+        UPDATE telegram_inbox AS incoming SET receipt_nonce = ${raw ? tempRawStamp("incoming") : "?"}, command = CASE WHEN EXISTS (
           SELECT 1 FROM telegram_temp_reply AS reply JOIN telegram_outbox USING (receipt_id)
           WHERE reply.receipt_id = incoming.receipt_id AND reply.total_count = (${ownerTotal})
             AND (reply.kind <> 'added' OR EXISTS (
@@ -173,7 +195,7 @@ export async function acceptTelegramTemp(
         ) THEN command END
         WHERE ${freshReceipt}
         RETURNING receipt_id
-      `).bind(TELEGRAM_TEMP_MARKER, ...key),
+      `).bind(raw ? policy.adminId : TELEGRAM_TEMP_MARKER, ...key),
     );
     const results = await db.batch(steps);
     const receipt = results.at(-1);

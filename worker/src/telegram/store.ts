@@ -7,7 +7,8 @@ import {
   type TelegramLifecycleReply, type TelegramLifecycleTicket,
 } from "./lifecycle-actions.ts";
 import { TELEGRAM_PRIVATE_CLAIM_MARKER } from "./private-claims.ts";
-import { TELEGRAM_TEMP_MARKER, type TelegramTempReply } from "./temp-import.ts";
+import { TELEGRAM_TEMP_MARKER, tempRawMarker, type TelegramTempReply } from "./temp-import.ts";
+import type { TelegramTempRawGuard } from "./temp-raw.ts";
 import { aggregateLinkDeliveryGuard, TELEGRAM_AGGREGATE_MARKER, type TelegramAggregateReply } from "./aggregate-actions.ts";
 import { TELEGRAM_PATH_MARKER, type TelegramPathReply } from "./path-management.ts";
 import { TELEGRAM_DOCUMENT_JOB_MARKER, type TelegramDocumentJobResult } from "./document-jobs.ts";
@@ -23,6 +24,7 @@ export interface TelegramReplyLease extends TelegramCommand {
   lifecycle?: TelegramLifecycleReply;
   privateClaim?: { codeSha256: string };
   temp?: TelegramTempReply;
+  tempRaw?: true;
   aggregate?: TelegramAggregateReply;
   selected?: TelegramSelectedReply;
   path?: TelegramPathReply;
@@ -42,7 +44,7 @@ const REAP_LIMIT = 40;
 
 type ReplyAccess = "allowed" | "denied" | "none";
 
-type ReplyRow = Omit<TelegramReplyLease, "view" | "lifecycle" | "privateClaim" | "temp" | "aggregate" | "selected" | "path" | "document" | "privateShareCreation"> & {
+type ReplyRow = Omit<TelegramReplyLease, "view" | "lifecycle" | "privateClaim" | "temp" | "tempRaw" | "aggregate" | "selected" | "path" | "document" | "privateShareCreation"> & {
   viewKind: TelegramView["kind"] | null;
   afterId: number | null;
   afterEpoch: number | null;
@@ -56,6 +58,7 @@ type ReplyRow = Omit<TelegramReplyLease, "view" | "lifecycle" | "privateClaim" |
   tempMalformedCount: number | null;
   tempUnsupportedCount: number | null;
   tempIgnoredCount: number | null;
+  tempRawMarker: number;
   aggregateResult: TelegramAggregateReply["result"] | null;
   aggregateRevision: number | null;
   aggregateCodeSha256: string | null;
@@ -78,6 +81,9 @@ function supportedReceipt(alias: "inbox" | "earlier", includeAggregate = false, 
     AND EXISTS (SELECT 1 FROM telegram_private_claim WHERE receipt_id = ${alias}.receipt_id))
     OR (${alias}.receipt_nonce = '${TELEGRAM_TEMP_MARKER}'
     AND EXISTS (SELECT 1 FROM telegram_temp_reply WHERE receipt_id = ${alias}.receipt_id))
+    OR (${tempRawMarker(alias)} AND ${alias}.chat_type='private' AND ${alias}.actor_id=${alias}.chat_id
+      AND ${alias}.thread_id IS NULL AND EXISTS (SELECT 1 FROM telegram_temp_reply
+        WHERE receipt_id=${alias}.receipt_id AND kind='summary'))
     OR (${alias}.receipt_nonce = '${TELEGRAM_PATH_MARKER}' AND ${alias}.chat_type = 'private'
     AND ${alias}.actor_id = ${alias}.chat_id AND ${alias}.thread_id IS NULL
     AND EXISTS (SELECT 1 FROM telegram_path_reply WHERE receipt_id = ${alias}.receipt_id))
@@ -193,7 +199,8 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
         action.expected_revision AS lifecycleExpectedRevision, claim.code_sha256 AS privateClaimCodeSha256,
         temp.kind AS tempKind, temp.node_count AS tempNodeCount, temp.total_count AS tempTotalCount,
         temp.malformed_count AS tempMalformedCount, temp.unsupported_count AS tempUnsupportedCount,
-        temp.ignored_count AS tempIgnoredCount, ${aggregateColumns},
+        temp.ignored_count AS tempIgnoredCount,
+        CASE WHEN ${tempRawMarker("inbox")} THEN 1 ELSE 0 END AS tempRawMarker, ${aggregateColumns},
         path.kind AS pathKind, path.after_id AS pathAfterId, path.affected_count AS pathAffectedCount,
         document.result_code AS documentKind, saved.node_count AS documentNodeCount,
         ${includePrivateShareCreation ? "creation.receipt_id" : "NULL"} AS privateShareCreationReceipt
@@ -204,7 +211,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
       LEFT JOIN telegram_private_claim AS claim ON claim.receipt_id = inbox.receipt_id
         AND inbox.receipt_nonce = '${TELEGRAM_PRIVATE_CLAIM_MARKER}'
       LEFT JOIN telegram_temp_reply AS temp ON temp.receipt_id = inbox.receipt_id
-        AND inbox.receipt_nonce = '${TELEGRAM_TEMP_MARKER}'
+        AND (inbox.receipt_nonce = '${TELEGRAM_TEMP_MARKER}' OR ${tempRawMarker("inbox")})
       ${includeAggregate ? `LEFT JOIN telegram_aggregate_actions AS aggregate ON aggregate.receipt_id = inbox.receipt_id
         AND inbox.receipt_nonce = '${TELEGRAM_AGGREGATE_MARKER}'
       LEFT JOIN telegram_selected_actions AS selected ON selected.receipt_id = inbox.receipt_id
@@ -224,7 +231,8 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
   if (!row) return null;
   const { viewKind, afterId, afterEpoch, lifecycleKind, lifecycleSubscriptionId, lifecycleExpectedRevision,
     privateClaimCodeSha256, tempKind, tempNodeCount, tempTotalCount, tempMalformedCount,
-    tempUnsupportedCount, tempIgnoredCount, aggregateResult, aggregateRevision, aggregateCodeSha256, selectedResult, selectedCodeSha256,
+    tempUnsupportedCount, tempIgnoredCount, tempRawMarker: rawMarker, aggregateResult, aggregateRevision, aggregateCodeSha256,
+    selectedResult, selectedCodeSha256,
     pathKind, pathAfterId, pathAffectedCount,
     documentKind, documentNodeCount, privateShareCreationReceipt, ...lease } = row;
   const lifecycle = lifecycleKind === null || lifecycleSubscriptionId === null || lifecycleExpectedRevision === null
@@ -235,6 +243,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
   return { ...lease, view: viewKind === null ? null : { kind: viewKind, afterId, afterEpoch },
     ...(lifecycle ? { lifecycle } : {}),
     ...(temp ? { temp } : {}),
+    ...(rawMarker === 1 ? { tempRaw: true as const } : {}),
     ...(aggregateResult === null ? {} : { aggregate: { result: aggregateResult, revision: aggregateRevision,
       codeSha256: aggregateCodeSha256 } }),
     ...(selectedResult === null ? {} : { selected: { result: selectedResult, codeSha256: selectedCodeSha256 } }),
@@ -306,6 +315,14 @@ export async function beginTelegramAggregateLinkReply(db: D1Database, policy: Te
   return guard !== null && await beginReplyStatement(db, policy, lease, "allowed", guard).first() !== null;
 }
 
+export async function beginTelegramTempRawReply(
+  db: D1Database, policy: TelegramPolicy, lease: TelegramReplyLease, guard: TelegramTempRawGuard,
+): Promise<boolean> {
+  if (!lease.tempRaw || lease.temp?.kind !== "summary" || lease.chatType !== "private" || lease.threadId !== null
+    || !inTelegramScope(policy, lease)) return false;
+  return await beginReplyStatement(db, policy, lease, "allowed", guard).first() !== null;
+}
+
 export async function beginTelegramPrivateShareCreationReply(
   db: D1Database, policy: TelegramPolicy, lease: TelegramReplyLease, reply: TelegramPrivateShareCreationReply,
 ): Promise<boolean> {
@@ -354,7 +371,8 @@ export async function beginTelegramReply(
   tickets: readonly TelegramViewTicket[] = [],
   lifecycleTickets: readonly TelegramLifecycleTicket[] = [],
 ): Promise<boolean> {
-  if (!inTelegramScope(policy, lease) || lease.privateClaim || ((lease.aggregate || lease.selected || lease.path || lease.privateShareCreation) && (lease.chatType !== "private" || lease.threadId !== null))
+  if (!inTelegramScope(policy, lease) || lease.privateClaim || ((lease.aggregate || lease.selected || lease.path || lease.privateShareCreation
+    || lease.tempRaw) && (lease.chatType !== "private" || lease.threadId !== null))
     || (tickets.length > 0 && (!lease.view || access !== "allowed"))
     || (lifecycleTickets.length > 0 && (!(lease.view || lease.lifecycle) || access !== "allowed"))) return false;
 

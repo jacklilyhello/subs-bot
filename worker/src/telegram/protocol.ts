@@ -46,7 +46,7 @@ export type TelegramSelectedUpdate = TelegramEventScope & (
 
 export type TelegramTempUpdate = TelegramEventScope & (
   | { kind: "temp-text"; text: string }
-  | { kind: "temp-summary" | "temp-clear" }
+  | { kind: "temp-raw" | "temp-summary" | "temp-clear" }
 );
 
 export type TelegramPathUpdate = TelegramEventScope & { kind: "path"; args: string };
@@ -171,7 +171,7 @@ function authCommand(args: string[], reply: unknown, memberId: string): Telegram
 
 function messageCommand(
   message: Record<string, unknown>, policy: TelegramPolicy,
-): TelegramCommand["command"] | TelegramViewKind | "temp-summary" | "temp-clear" | "aggregate-show" | "aggregate-revoke" |
+): TelegramCommand["command"] | TelegramViewKind | "temp-raw" | "temp-summary" | "temp-clear" | "aggregate-show" | "aggregate-revoke" |
   { code: string } | { args: string } | { shareArgs: string } | { selectedQuery: string } | null {
   const { text, entities } = message;
   if (typeof text !== "string" || !Array.isArray(entities)) return null;
@@ -208,8 +208,10 @@ function messageCommand(
     case "recycle":
       return "recycle";
     case "temp":
-      if (args.length === 0) return "temp-summary";
-      return args.length === 1 && args[0].toLowerCase() === "clear" ? "temp-clear" : null;
+      if (args.length === 0) return "temp-raw";
+      if (args.length !== 1) return null;
+      if (args[0].toLowerCase() === "summary") return "temp-summary";
+      return args[0].toLowerCase() === "clear" ? "temp-clear" : null;
     case "export":
       if (args.length === 0) return "aggregate-show";
       return args.length === 1 && args[0].toLowerCase() === "revoke" ? "aggregate-revoke" : null;
@@ -291,7 +293,7 @@ function normalizeMessage(
     return "selectedQuery" in command ? { selected: { ...scope, kind: "selected", query: command.selectedQuery } }
       : { path: { ...scope, kind: "path", args: command.args } };
   }
-  if (command === "temp-summary" || command === "temp-clear") {
+  if (command === "temp-raw" || command === "temp-summary" || command === "temp-clear") {
     return scope.chatType === "private" && scope.threadId === null ? { temp: { ...scope, kind: command } } : null;
   }
   if (command === "aggregate-show" || command === "aggregate-revoke") {
