@@ -26,11 +26,15 @@ export function collapsePathRuleWhitespace(value: string): string {
   return value.replace(pythonRuns, " ").replace(/^ +| +$/gu, "");
 }
 
+export function trimPathRuleWhitespace(value: string): string {
+  return value.replace(pythonTrim, "");
+}
+
 export function pathRuleText(value: unknown): string | null {
   if (typeof value !== "string" || nonScalar.test(value) || Array.from(value).length > MAX_RULE_SCALARS) {
     return null;
   }
-  return value.replace(pythonTrim, "") || null;
+  return trimPathRuleWhitespace(value) || null;
 }
 
 export function compilePathRules(rows: readonly PathRuleRow[]): readonly PathRule[] {

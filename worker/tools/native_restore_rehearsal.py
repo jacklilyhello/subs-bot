@@ -63,6 +63,8 @@ ACTIONS = {"verify", "prepare", "create-backup-bucket", "create-restore-db", "cr
            "pin-resource", "capture", "poll-export", "restore-objects", "start-import", "verify-restore"}
 RESOURCES = ("backup", "database", "objects")
 LEGACY_CANDIDATE_PROFILE = "synthetic-legacy"
+LEGACY_PATH_CANDIDATE_PROFILE = "synthetic-legacy-path"
+LEGACY_CANDIDATE_NAMES = {LEGACY_CANDIDATE_PROFILE: "legacy", LEGACY_PATH_CANDIDATE_PROFILE: "legacy-path"}
 ACCOUNT_SHA256 = "ffdbf3dd5d042c6edb68d7f628998a69a22320b0199775bfda9f97593136e508"
 
 
@@ -203,7 +205,7 @@ class RehearsalAPI:
         require(isinstance(target, dict) and matches(HEX_ID, target.get("accountId")) and matches(UUID, target.get("d1Id")))
         require(digest(target["accountId"].encode("ascii")) == ACCOUNT_SHA256)
         require(matches(re.compile(r"[A-Za-z0-9_.-]{1,4096}"), token))
-        require(profile in {"native", LEGACY_CANDIDATE_PROFILE} and matches(COHORT, cohort))
+        require((profile == "native" or profile in LEGACY_CANDIDATE_NAMES) and matches(COHORT, cohort))
         self.target, self.token, self.cohort = target, token, cohort
         self.profile = profile
         self.account_id = target["accountId"]
@@ -212,9 +214,10 @@ class RehearsalAPI:
         self.source = self.root + "/d1/database/" + target["d1Id"]
         self.journal_prefix = f"maintenance/native-restore/{cohort}/journal/"
         self.archive_prefix = f"rehearsals/{cohort}/"
-        if profile == LEGACY_CANDIDATE_PROFILE:
-            self.names = {"database": f"subs-bot-cf-legacy-db-{cohort}", "objects": f"subs-bot-cf-legacy-r2-{cohort}"}
-            self.journal_prefix = f"maintenance/legacy-candidate/{cohort}/journal/"
+        if profile in LEGACY_CANDIDATE_NAMES:
+            label = LEGACY_CANDIDATE_NAMES[profile]
+            self.names = {"database": f"subs-bot-cf-{label}-db-{cohort}", "objects": f"subs-bot-cf-{label}-r2-{cohort}"}
+            self.journal_prefix = f"maintenance/{label}-candidate/{cohort}/journal/"
         self.buckets = {WORKER_NAME, *(self.names[kind] for kind in self.names if kind != "database")}
         self.databases = {target["d1Id"]}
         self.restore_id = None
@@ -277,7 +280,7 @@ class RehearsalAPI:
             allowed = allowed or any(route in {self.root + f"/r2/buckets/{bucket}" + suffix for suffix in
                 ("", "/domains/managed", "/domains/custom", "/objects")} for bucket in self.buckets)
             require(allowed and payload is None)
-            if self.profile == LEGACY_CANDIDATE_PROFILE and route == self.root + f"/r2/buckets/{WORKER_NAME}/objects":
+            if self.profile in LEGACY_CANDIDATE_NAMES and route == self.root + f"/r2/buckets/{WORKER_NAME}/objects":
                 query = parse_qs(urlsplit(path).query, max_num_fields=3)
                 prefix = query.get("prefix", [])
                 require(len(prefix) == 1 and re.fullmatch(re.escape(self.journal_prefix) + r"(?:[0-9]{6}-)?", prefix[0]))
@@ -625,6 +628,8 @@ def quiet_expression(tables, observed_at=None):
     for table in ("subscription_provider_jobs", "telegram_provider_jobs"):
         if table in tables:
             conditions.append(f"NOT EXISTS(SELECT 1 FROM {table} WHERE state IN ('pending','leased'))")
+    if "telegram_inline_search_receipts" in tables:
+        conditions.append(f"NOT EXISTS(SELECT 1 FROM telegram_inline_search_receipts WHERE state IN ('preflight','sending') AND lease_until > {epoch})")
     if "telegram_private_share_creations" in tables:
         conditions.append("NOT EXISTS(SELECT 1 FROM telegram_private_share_creations WHERE state='reserved' OR (state='abandoned' AND cleaned_at IS NULL))")
     if "telegram_selected_links" in tables:

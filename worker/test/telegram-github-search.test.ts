@@ -37,8 +37,8 @@ function event(updateId: number, messageDate: number, actorId = policy.memberId)
     args: " 合成查询 user:octocat in:name" };
 }
 
-function claim(db: D1Database) {
-  return claimTelegramReply(db, policy.botId, false, false, false, false, false, false, policy);
+function claim(db: D1Database, providerPolicy?: TelegramPolicy) {
+  return claimTelegramReply(db, policy.botId, false, false, false, false, false, false, providerPolicy, false, false, policy);
 }
 
 test("GitHub search accepts bounded keywords and known qualifiers and rejects external or private syntax", () => {
@@ -81,7 +81,7 @@ test("GitHub lookup is deduplicated, bounded, anonymous, and keeps only explicit
     assert.equal(calls, 1);
     assert.equal(await runTelegramGitHubSearch(db, policy, admitted, async () => assert.fail("lookup replay made a request")), false);
     assert.equal(await claimTelegramReply(db, policy.botId), null, "an older Worker must skip the marked carrier");
-    const reply = await claim(db);
+    const reply = await claim(db, policy);
     assert.ok(reply?.githubSearch);
     assert.deepEqual(renderTelegramGitHubReply(reply.githubSearch), {
       text: "GitHub 公开仓库\noctocat/Hello-World · ★ 12",
@@ -118,7 +118,7 @@ test("abandoned lookups are recovered only while authorized and expired pending 
     assert.equal(await runTelegramGitHubSearch(db, policy, admin, async () => assert.fail("abandoned lookup was replayed")), false);
     await db.prepare("UPDATE telegram_inbox SET received_at = unixepoch() - 901 WHERE receipt_id=?").bind(admin.receiptId).run();
     await acceptTelegramCommand(db, policy, { ...event(3, now, policy.adminId), command: "help" });
-    const reply = await claim(db);
+    const reply = await claim(db, policy);
     assert.equal(reply?.updateId, 3);
     assert.equal(reply?.githubSearch, undefined);
   });
