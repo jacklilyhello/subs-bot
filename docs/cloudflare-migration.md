@@ -233,6 +233,12 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 两名获准测试者分别在内置浏览器中通过隔离 Bot 私聊提交单条 HTTP(S) 订阅链接，可使用 `名称 | URL` 指定名称。群组、未获准的账号和多行消息均不会创建远程导入任务。发布参数默认为 `preserve`。停止接收新链接时使用 `provider_url_import=disable` 及 `provider_url_import_confirmation=disable provider URL import for subs-bot-cf-dev-01`。关闭后 Cron 继续处理已接受的任务和回执。启用校验失败时，已有回滚守卫可恢复使用同一应用产物的关闭版本。 [Worker 回滚](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/)
 
+#### 隔离私聊远程订阅刷新
+
+先保留默认参数发布当前 `main` 的已核对产物，使已绑定提供方的隔离 Worker 在刷新关闭时运行包含刷新队列恢复的版本。D1 必须已应用确切的 `0018`、`0021`、`0023` 和 `0028` 迁移。使用同一产物，在受保护的 `worker-isolation-deploy.yml` 指定 `provider_refresh=enable` 和 `provider_refresh_confirmation=enable provider refresh for subs-bot-cf-dev-01`。通过发布结果 `providerRefreshEnabled` 和活动版本的 `TELEGRAM_PROVIDER_REFRESH=1` 绑定核对。
+
+刷新入口独立于 URL 导入。关闭入口时指定 `provider_refresh=disable` 和 `provider_refresh_confirmation=disable provider refresh for subs-bot-cf-dev-01`。Cron 继续处理已接受的任务和回执，并清理过期的刷新按钮。已发出的按钮会按原期限过期，期间重新启用时仍受所有权和订阅版本校验约束。
+
 ### 数据与切换
 
 隔离容量检查使用当前 `main` 的已部署版本，手动运行 `gh workflow run worker-isolation-capacity.yml --ref main`。托管 runner 生成合成快照，依次验证恰好达到 64 MiB NDJSON 和 16 MiB 分享原文的有效输出、分享原文超 1 字节的拒绝、快照清单超 1 字节的拒绝。正向测试流式核对 Base64 长度和摘要，覆盖串行、并发 2 和 4、慢读及中途取消。发布和容量检查使用同一并发组，测试结束先撤销 D1 能力，再清理对应的私有 R2 对象。清理失败时，工作流保留不含凭据或原始能力令牌的恢复清单。
