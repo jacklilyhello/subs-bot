@@ -1,6 +1,7 @@
 import { AggregateLimitError, getAggregateNodeSource, hasAggregateLink } from "./aggregate.ts";
 import { normalShortLinksReady, resolveShortLocation } from "./short-links.ts";
 import { getSubscriptionNodeSource, PathRuleContentError } from "./path-rules.ts";
+import { legacyEmptyExportResponse, legacyEmptyExportState } from "./legacy-empty-export.ts";
 import { base64Chunks, ExportContentError, planBase64 } from "./base64-response.ts";
 import { ClashContentError } from "./clash-export.ts";
 import { clashChunks, planClash } from "./clash-response.ts";
@@ -218,8 +219,14 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
   if (!EXPORT_KINDS.has(format)) return plain("Export format unavailable.", 406, head);
 
   try {
-    const source = aggregate ? await getAggregateNodeSource(env.DB, env.NODES, token, await normalShortLinksReady(env.DB))
+    let source = aggregate ? await getAggregateNodeSource(env.DB, env.NODES, token, await normalShortLinksReady(env.DB))
       : await getSubscriptionNodeSource(env.DB, env.NODES, token);
+    if (subscription && !source) {
+      const state = await legacyEmptyExportState(env.DB, token);
+      if (state === "empty") return legacyEmptyExportResponse(format, head, HEADERS);
+      // A refresh may have published between the initial lookup and the legacy check.
+      if (state === "published") source = await getSubscriptionNodeSource(env.DB, env.NODES, token);
+    }
     if (!source) return plain("Not found.", 404, head);
     if (format === "clash") {
       const plan = await planClash(source);
