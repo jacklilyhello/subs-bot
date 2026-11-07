@@ -41,17 +41,18 @@ export type TelegramDocumentJobResult = "saved" | "invalid-document" | "download
 type JobGuard = { sql: string; bindings: readonly (string | number)[] };
 const freshReceipt = "incoming.bot_id = ? AND incoming.update_id = ? AND incoming.receipt_nonce = ?";
 
-// The member's current access and the authorization version at admission must both match.
+// The member's current epoch must match, and the original message must postdate that grant.
 const eligibleJob = `(
   EXISTS (
     SELECT 1 FROM telegram_inbox AS inbox WHERE inbox.receipt_id = job.receipt_id AND inbox.bot_id = job.bot_id
       AND inbox.actor_id = job.actor_id AND inbox.chat_id = job.actor_id AND inbox.chat_type = 'private'
       AND inbox.thread_id IS NULL AND inbox.command = 'help' AND inbox.receipt_nonce = '${TELEGRAM_DOCUMENT_JOB_MARKER}'
-  ) AND (
-    job.actor_id = ? OR (job.actor_id = ? AND COALESCE((
-      SELECT allowed = 1 AND message_date = job.auth_message_date AND message_id = job.auth_message_id
-      FROM telegram_auth WHERE bot_id = job.bot_id AND user_id = job.actor_id
-    ), job.auth_message_date = 0 AND job.auth_message_id = 0))
+      AND (
+        job.actor_id = ? OR (job.actor_id = ? AND inbox.message_date > job.auth_message_date AND COALESCE((
+          SELECT allowed = 1 AND message_date = job.auth_message_date AND message_id = job.auth_message_id
+          FROM telegram_auth WHERE bot_id = job.bot_id AND user_id = job.actor_id
+        ), job.auth_message_date = 0 AND job.auth_message_id = 0))
+      )
   )
 )`;
 
@@ -90,10 +91,11 @@ export async function acceptTelegramDocumentJob(
         INSERT INTO telegram_inbox
           (bot_id, update_id, actor_id, chat_id, chat_type, message_id, message_date, thread_id, command, receipt_nonce)
         SELECT ?, ?, ?, ?, 'private', ?, ?, NULL, 'help', ?
-        WHERE ? = ? OR COALESCE((SELECT allowed FROM telegram_auth WHERE bot_id = ? AND user_id = ?), 1) = 1
+        WHERE ? = ? OR COALESCE((SELECT allowed = 1 AND message_date < ?
+          FROM telegram_auth WHERE bot_id = ? AND user_id = ?), 1)
         ON CONFLICT (bot_id, update_id) DO NOTHING
       `).bind(policy.botId, event.updateId, event.actorId, event.chatId, event.messageId, event.messageDate, nonce,
-        event.actorId, policy.adminId, policy.botId, event.actorId),
+        event.actorId, policy.adminId, event.messageDate, policy.botId, event.actorId),
       db.prepare(`
         WITH candidate AS (
           SELECT incoming.receipt_id, incoming.bot_id, incoming.actor_id, incoming.received_at,
