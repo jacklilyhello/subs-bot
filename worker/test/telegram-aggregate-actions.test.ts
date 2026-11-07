@@ -319,7 +319,7 @@ test("the bundled Worker gates private issuance by the optional key and pins the
       const response = await worker.dispatchFetch(base64);
       assert.equal(response.status, 200);
       assert.equal(response.headers.get("Cache-Control"), "private, no-store");
-      assert.equal(await response.text(), Buffer.from(`${share}\n`).toString("base64"));
+      assert.equal(await response.text(), Buffer.from(share).toString("base64"));
 
       assert.equal((await post(4, "/export revoke")).status, 200);
       assert.equal((await worker.dispatchFetch(base64, { method: "HEAD" })).status, 404);

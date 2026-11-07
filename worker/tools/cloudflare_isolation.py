@@ -24,6 +24,7 @@ AGGREGATE_DIGEST_BINDING = "TELEGRAM_AGGREGATE_KEY_SHA256"
 TELEGRAM_CRON = "* * * * *"
 TELEGRAM_BINDINGS = {TELEGRAM_CONFIG_BINDING, TELEGRAM_DIGEST_BINDING}
 AGGREGATE_BINDINGS = {AGGREGATE_KEY_BINDING, AGGREGATE_DIGEST_BINDING}
+_UNSPECIFIED_AGGREGATE_KEY = object()
 ORIGIN = f"https://{WORKER_NAME}.{NAMESPACE}.workers.dev"
 HEALTH_URL = ORIGIN + "/health"
 API_ORIGIN = "https://api.cloudflare.com/client/v4"
@@ -491,7 +492,7 @@ def _verify_health(revision):
     raise CloudflareError("Isolated Worker health could not verify the expected revision.")
 
 
-def verify_worker_target(worker_api, data_api, target, *, aggregate_key=None):
+def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECIFIED_AGGREGATE_KEY):
     """Read ownership, privacy and active binding facts before any release writes."""
     scope = _Isolation(worker_api, data_api, target)
     scope.worker_config()
@@ -499,7 +500,8 @@ def verify_worker_target(worker_api, data_api, target, *, aggregate_key=None):
     scope.verify_resources()
     active = scope.active()
     version = scope.version(active.version)
-    if version.telegram_aggregate_key_sha256 is not None:
+    # Read-only fixture guards need only binding identities. Releases explicitly pass their expected key.
+    if aggregate_key is not _UNSPECIFIED_AGGREGATE_KEY and version.telegram_aggregate_key_sha256 is not None:
         validate_aggregate_key(aggregate_key)
         _require(version.telegram_aggregate_key_sha256 == sha256(aggregate_key.encode("ascii")).hexdigest(),
                  "Changing the isolated aggregate key requires a separate rotation release.")

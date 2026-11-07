@@ -346,6 +346,8 @@ class ReleaseTests(unittest.TestCase):
                                                    "text": AGGREGATE_KEY})
         self.assertNotIn(AGGREGATE_KEY, json.dumps(result))
         self.assertFalse(self.release(TELEGRAM_CONFIG, AGGREGATE_KEY)["changed"])
+        self.assertEqual(cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET),
+                         {"deploymentId": NEW_DEPLOYMENT, "versionId": NEW_VERSION, "revision": NEW_REVISION})
         writes = self.api.writes()
         for different in (None, "A" * 43):
             with self.subTest(key_absent=different is None):
