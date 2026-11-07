@@ -58,6 +58,16 @@ def provider_url_import_release_mode():
     raise CloudflareError("The isolated provider URL import release mode or confirmation is invalid.")
 
 
+def provider_refresh_release_mode():
+    mode = os.environ.get("SUBS_BOT_PROVIDER_REFRESH_MODE", "preserve")
+    confirmation = os.environ.get("SUBS_BOT_PROVIDER_REFRESH_CONFIRMATION", "")
+    if mode == "preserve" and confirmation == "":
+        return None
+    if mode in ("enable", "disable") and confirmation == f"{mode} provider refresh for {WORKER_NAME}":
+        return mode == "enable"
+    raise CloudflareError("The isolated provider refresh release mode or confirmation is invalid.")
+
+
 def release():
     revision = os.environ.get("GITHUB_SHA", "")
     if (os.environ.get("GITHUB_REPOSITORY") != "jacklilyhello/subs-bot"
@@ -68,6 +78,7 @@ def release():
 
     inline_search = inline_search_release_mode()
     provider_url_import = provider_url_import_release_mode()
+    provider_refresh = provider_refresh_release_mode()
     bundle = Path(os.environ["RUNNER_TEMP"]) / "subs-bot-verified"
     manifest = json.loads((bundle / "isolation.json").read_text(encoding="utf-8"))
     if manifest.get("version") != 2 or manifest.get("revision") != revision:
@@ -109,7 +120,8 @@ def release():
                                     provider_binding=provider_binding, release_revision=revision,
                                     provider_first_binding_guard=first_provider_proof,
                                     historical_application_revision=historical_application_revision, release_manifest=manifest,
-                                    telegram_config=telegram_config, inline_search=inline_search, provider_url_import=provider_url_import)
+                                    telegram_config=telegram_config, inline_search=inline_search,
+                                    provider_url_import=provider_url_import, provider_refresh=provider_refresh)
     if provider_gate is not None:
         provider_gate.verify()
     migrations = apply_migrations(data_api, target, bundle, manifest, guard)
@@ -120,7 +132,7 @@ def release():
                             provider_guard=provider_gate.verify if provider_gate is not None else None,
                             provider_first_binding_guard=first_provider_proof,
                             historical_application_revision=historical_application_revision, inline_search=inline_search,
-                            provider_url_import=provider_url_import)
+                            provider_url_import=provider_url_import, provider_refresh=provider_refresh)
     guard()
     print(json.dumps(result, sort_keys=True), flush=True)
 

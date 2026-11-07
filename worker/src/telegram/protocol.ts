@@ -62,6 +62,7 @@ export type TelegramBulkTrashUpdate = TelegramEventScope & (
   | { kind: "confirm"; callbackId: string; ticket: string }
 );
 export type TelegramSubscriptionNodeUpdate = TelegramEventScope & { callbackId: string; ticket: string };
+export type TelegramProviderRefreshUpdate = TelegramEventScope & { callbackId: string; ticket: string };
 
 export type TelegramInlineSortMode = "default" | "traffic" | "expiry" | "name";
 type TelegramInlineSortAction = { kind: "current" | "usage" } | { kind: "set"; mode: TelegramInlineSortMode };
@@ -98,8 +99,10 @@ type InlineConsentUpdate = (BulkTrashUpdate & { inlineConsent?: never })
   | ({ inlineConsent: TelegramInlineConsentUpdate } & Partial<Record<keyof BulkTrashUpdate, never>>);
 type InlineQueryUpdate = (InlineConsentUpdate & { inlineQuery?: never })
   | ({ inlineQuery: TelegramInlineQuery } & Partial<Record<keyof InlineConsentUpdate, never>>);
-type NormalizedUpdate = (InlineQueryUpdate & { githubSearch?: never })
+type GitHubSearchUpdate = (InlineQueryUpdate & { githubSearch?: never })
   | ({ githubSearch: TelegramGitHubSearchUpdate } & Partial<Record<keyof InlineQueryUpdate, never>>);
+type NormalizedUpdate = (GitHubSearchUpdate & { providerRefresh?: never })
+  | ({ providerRefresh: TelegramProviderRefreshUpdate } & Partial<Record<keyof GitHubSearchUpdate, never>>);
 
 type DecodedTelegramRequest =
   | ({ status: 200 } & NormalizedUpdate)
@@ -121,6 +124,7 @@ export const SUBSCRIPTION_READ_TICKET = /^sbr1_[A-Za-z0-9_-]{22}(?![\s\S])/;
 export const BULK_TRASH_TICKET = /^sbd1_[A-Za-z0-9_-]{22}(?![\s\S])/;
 export const SUBSCRIPTION_READ_RECEIPT_MARKER = "subread:v1";
 export const SUBSCRIPTION_NODE_TICKET = /^sbn1_[A-Za-z0-9_-]{22}(?![\s\S])/;
+export const PROVIDER_REFRESH_TICKET = /^sbpr1_[A-Za-z0-9_-]{21}[AQgw](?![\s\S])/;
 const RENAME_CANCEL = /^(?:\/cancel|cancel|取消|退出)(?![\s\S])/iu;
 const PRIVATE_CLAIM = /^claim_([A-Za-z0-9_-]{11}|[A-Za-z0-9_-]{22})(?![\s\S])/u;
 const NON_HUMAN_MESSAGE_FIELDS = [
@@ -417,6 +421,8 @@ function normalizeCallback(
     ? { bulkTrash: { ...scope, kind: "confirm", callbackId, ticket } } : null;
   if (SUBSCRIPTION_NODE_TICKET.test(ticket)) return scope.chatType === "private" && scope.threadId === null
     ? { subscriptionNodes: { ...scope, callbackId, ticket } } : null;
+  if (PROVIDER_REFRESH_TICKET.test(ticket)) return scope.chatType === "private" && scope.threadId === null
+    ? { providerRefresh: { ...scope, callbackId, ticket } } : null;
   if (SELECTED_TICKET.test(ticket)) return scope.chatType === "private" && scope.threadId === null
     ? { selected: { ...scope, kind: "selected-revoke", callbackId, ticket } } : null;
   if (VIEW_TICKET.test(ticket)) return { view: { ...scope, kind: "callback", callbackId, ticket } };

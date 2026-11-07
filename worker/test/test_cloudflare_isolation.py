@@ -55,6 +55,7 @@ INLINE_CONFIG = json.dumps({"botId": INLINE_BOT, "fixture": "synthetic-only"})
 INLINE_BINDING = {"name": cloudflare.INLINE_SEARCH_BINDING, "type": "plain_text", "text": "1"}
 INLINE_MIGRATION = {"name": cloudflare.INLINE_SEARCH_MIGRATION, "sha256": cloudflare.INLINE_SEARCH_MIGRATION_SHA256}
 PROVIDER_URL_BINDING = {"name": cloudflare.PROVIDER_URL_IMPORT_BINDING, "type": "plain_text", "text": "1"}
+PROVIDER_REFRESH_BINDING = {"name": cloudflare.PROVIDER_REFRESH_BINDING, "type": "plain_text", "text": "1"}
 AGGREGATE_KEY = base64.urlsafe_b64encode(b"\x17" * 32).decode("ascii").rstrip("=")
 PRIVATE_SHARE_KEY = base64.urlsafe_b64encode(b"\x18" * 32).decode("ascii").rstrip("=")
 CRON = {"cron": cloudflare.TELEGRAM_CRON}
@@ -140,6 +141,8 @@ class FakeCloudflare:
         self.inline_ledger_drift = set()
         self.provider_url_checks = []
         self.provider_url_ledger_drift = set()
+        self.provider_refresh_checks = []
+        self.provider_refresh_ledger_drift = {}
 
     def worker_api(self, method, path, payload=None):
         self.calls.append((method, path))
@@ -213,6 +216,13 @@ class FakeCloudflare:
 
     def data_api(self, method, path, payload=None):
         if method == "POST" and path == DATABASE + "/query":
+            if "AS refreshIndex" in payload["sql"]:
+                assert set(payload) == {"sql"} and payload["sql"].strip().startswith("SELECT ")
+                self.provider_refresh_checks.append(self.active["versions"][0]["version_id"])
+                rows = [{"position": position, "name": name, "sha256": digest, "mode": "applied",
+                         "refreshTables": 5, "refreshIndex": 1} for position, name, digest in cloudflare.PROVIDER_REFRESH_MIGRATIONS]
+                rows[-1].update(self.provider_refresh_ledger_drift.get(len(self.provider_refresh_checks), {}))
+                return [{"success": True, "results": rows}]
             if payload["sql"].strip().startswith("SELECT position, name, sha256, mode,"):
                 assert set(payload) == {"sql"}
                 self.provider_url_checks.append(self.active["versions"][0]["version_id"])
@@ -310,6 +320,18 @@ class ReleaseTests(unittest.TestCase):
             off["bindings"].append(PROVIDER_URL_BINDING)
         return off
 
+    def set_provider_refresh_baseline(self, *, enabled=False, url=False, same_artifact=True, inline=False):
+        active = self.set_provider_url_baseline(enabled=url, same_artifact=same_artifact, inline=inline)
+        self.manifest["migrations"].extend({"name": f"{position:04d}_fixture.sql", "sha256": "a" * 64}
+                                          for position in range(26, 29))
+        for position, name, digest in cloudflare.PROVIDER_REFRESH_MIGRATIONS:
+            self.manifest["migrations"][position - 1] = {"name": name, "sha256": digest}
+        if enabled:
+            active["bindings"].append(PROVIDER_REFRESH_BINDING)
+            active["annotations"]["workers/tag"] = cloudflare._telegram_feature_tag(
+                active["annotations"]["workers/tag"], False, False, True)
+        return active
+
     def test_read_only_preflight_rejects_wrong_resource_or_domain(self):
         self.assertEqual(cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET),
                          {"deploymentId": OLD_DEPLOYMENT, "versionId": OLD_VERSION, "revision": OLD_REVISION})
@@ -330,7 +352,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(self.release(), {
             "revision": NEW_REVISION, "versionId": NEW_VERSION, "deploymentId": NEW_DEPLOYMENT,
             "previousVersionId": OLD_VERSION, "changed": True, "inlineSearchEnabled": False,
-            "providerUrlImportEnabled": False,
+            "providerUrlImportEnabled": False, "providerRefreshEnabled": False,
         })
         self.assertFalse(self.release()["changed"])
         self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
@@ -570,6 +592,114 @@ class ReleaseTests(unittest.TestCase):
                     "SUBS_BOT_PROVIDER_URL_IMPORT_MODE": mode, "SUBS_BOT_PROVIDER_URL_IMPORT_CONFIRMATION": confirmation}, clear=True), \
                  self.assertRaisesRegex(cloudflare.CloudflareError, "mode or confirmation"):
                 release_entry.provider_url_import_release_mode()
+
+    def test_refresh_toggle_preserves_provider_and_other_flags(self):
+        off = self.set_provider_refresh_baseline(url=True, inline=True)
+        options = {"provider_binding": PROVIDER_BINDING, "provider_guard": Mock(),
+                   "provider_first_binding_guard": Mock(side_effect=AssertionError("Provider already bound."))}
+        self.assertFalse(self.release(INLINE_CONFIG, **options)["providerRefreshEnabled"])
+        self.assertEqual(self.api.provider_refresh_checks, [])
+        self.assertEqual(self.api.writes(), [])
+
+        enabled = self.release(INLINE_CONFIG, provider_refresh=True, **options)
+        self.assertTrue(enabled["providerRefreshEnabled"])
+        self.assertTrue(enabled["providerUrlImportEnabled"])
+        self.assertTrue(enabled["inlineSearchEnabled"])
+        on = self.api.versions[NEW_VERSION]
+        self.assertNotEqual(on["annotations"]["workers/tag"], off["annotations"]["workers/tag"])
+        self.assertEqual({row["name"]: row for row in on["bindings"]},
+                         {row["name"]: row for row in [*off["bindings"], PROVIDER_REFRESH_BINDING]})
+        self.assertEqual(self.api.provider_refresh_checks, [OLD_VERSION, OLD_VERSION, NEW_VERSION])
+        self.assertFalse(self.release(INLINE_CONFIG, **options)["changed"])
+
+        disabled = self.release(INLINE_CONFIG, provider_refresh=False, **options)
+        self.assertFalse(disabled["providerRefreshEnabled"])
+        self.assertTrue(disabled["providerUrlImportEnabled"])
+        self.assertTrue(disabled["inlineSearchEnabled"])
+        self.assertEqual(disabled["versionId"], OLD_VERSION)
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS, DEPLOYMENTS])
+
+    def test_new_revision_preserves_refresh_independently_of_url_import(self):
+        self.set_provider_refresh_baseline(enabled=True, same_artifact=False)
+        result = self.release(INLINE_CONFIG, provider_binding=PROVIDER_BINDING, provider_guard=Mock())
+        self.assertTrue(result["changed"])
+        self.assertTrue(result["providerRefreshEnabled"])
+        self.assertFalse(result["providerUrlImportEnabled"])
+        self.assertIn(PROVIDER_REFRESH_BINDING, self.api.versions[NEW_VERSION]["bindings"])
+        self.assertEqual(self.api.provider_refresh_checks, [OLD_VERSION, OLD_VERSION, NEW_VERSION])
+        self.assertEqual(self.api.provider_url_checks, [])
+
+    def test_refresh_enable_requires_existing_provider_cron_artifact_and_migrations(self):
+        options = {"provider_binding": PROVIDER_BINDING, "provider_guard": Mock(), "provider_refresh": True}
+        self.set_provider_refresh_baseline(same_artifact=False)
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "same Worker artifact"):
+            self.release(INLINE_CONFIG, **options)
+        self.set_provider_refresh_baseline()
+        self.manifest["migrations"][27]["sha256"] = "0" * 64
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "exact 0018, 0021, 0023 and 0028"):
+            self.release(INLINE_CONFIG, **options)
+        self.set_inline_baseline()
+        proof = Mock()
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "same active provider"):
+            self.release(INLINE_CONFIG, provider_first_binding_guard=proof, **options)
+        proof.assert_not_called()
+        self.set_provider_refresh_baseline()
+        different = cloudflare.ProviderBinding(OLD_REVISION, PROVIDER_BINDING.image_sha256,
+                                                PROVIDER_BINDING.identity_sha256)
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "separate rotation release"):
+            self.release(INLINE_CONFIG, **{**options, "provider_binding": different})
+        self.api.worker_responses[SCHEDULES] = {"schedules": []}
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "same active provider"):
+            self.release(INLINE_CONFIG, **options)
+        self.assertEqual(self.api.writes(), [])
+
+    def test_refresh_schema_is_checked_before_migrations_activation_and_after_activation(self):
+        self.set_provider_refresh_baseline()
+        self.api.provider_refresh_ledger_drift = {1: {"sha256": "0" * 64}, 3: {"refreshIndex": 0}, 6: {"refreshTables": 4}}
+        options = {"provider_binding": PROVIDER_BINDING, "provider_refresh": True}
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "provider refresh migrations could not be verified"):
+            cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET,
+                                           telegram_config=INLINE_CONFIG, release_manifest=self.manifest, **options)
+        self.assertEqual(self.api.writes(), [])
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "provider refresh migrations could not be verified"):
+            self.release(INLINE_CONFIG, provider_guard=Mock(), **options)
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false"])
+        self.assertEqual(self.api.active["versions"][0]["version_id"], OLD_VERSION)
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "prior version was restored"):
+            self.release(INLINE_CONFIG, provider_guard=Mock(), **options)
+        self.assertEqual(self.api.provider_refresh_checks, [OLD_VERSION] * 5 + [NEW_VERSION])
+        self.assertEqual(self.api.active["versions"][0]["version_id"], OLD_VERSION)
+        self.assertNotIn(PROVIDER_REFRESH_BINDING, self.api.versions[OLD_VERSION]["bindings"])
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS, DEPLOYMENTS])
+
+    def test_refresh_binding_readback_rejects_wrong_value_missing_flag_and_other_flag_drift(self):
+        active = self.set_provider_refresh_baseline(enabled=True, url=True)
+        active["bindings"][-1] = {**PROVIDER_REFRESH_BINDING, "text": "0"}
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "provider refresh binding"):
+            cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET)
+        active["bindings"].pop()
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "provider refresh release tag"):
+            cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET)
+        active["bindings"].remove(PROVIDER_URL_BINDING)
+        active["bindings"].append(PROVIDER_REFRESH_BINDING)
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "provider refresh release tag"):
+            cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET)
+        self.assertEqual(self.api.writes(), [])
+
+    def test_refresh_operator_modes_require_literal_isolation_confirmation(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(release_entry.provider_refresh_release_mode())
+        for mode, desired in (("enable", True), ("disable", False)):
+            with self.subTest(mode=mode), patch.dict(os.environ, {
+                    "SUBS_BOT_PROVIDER_REFRESH_MODE": mode,
+                    "SUBS_BOT_PROVIDER_REFRESH_CONFIRMATION": f"{mode} provider refresh for {cloudflare.WORKER_NAME}"}, clear=True):
+                self.assertIs(release_entry.provider_refresh_release_mode(), desired)
+        for mode, confirmation in (("enable", ""), ("disable", "enable provider refresh for subs-bot-cf-dev-01"),
+                                   ("preserve", "unused"), ("enabled", "")):
+            with self.subTest(mode=mode), patch.dict(os.environ, {
+                    "SUBS_BOT_PROVIDER_REFRESH_MODE": mode, "SUBS_BOT_PROVIDER_REFRESH_CONFIRMATION": confirmation}, clear=True), \
+                 self.assertRaisesRegex(cloudflare.CloudflareError, "mode or confirmation"):
+                release_entry.provider_refresh_release_mode()
 
     def test_inline_consent_read_is_exact_bot_order_and_expiry(self):
         db = sqlite3.connect(":memory:")
