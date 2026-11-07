@@ -8,6 +8,7 @@ from io import BytesIO
 import json
 import os
 from pathlib import Path
+import sqlite3
 import sys
 from tempfile import TemporaryDirectory
 import unittest
@@ -49,6 +50,10 @@ DATABASE = f"{ACCOUNT}/d1/database/{TARGET['d1Id']}"
 BUCKET = f"{ACCOUNT}/r2/buckets/{cloudflare.WORKER_NAME}"
 DOMAINS = f"{ACCOUNT}/workers/domains?service={cloudflare.WORKER_NAME}"
 TELEGRAM_CONFIG = '{"fixture":"synthetic-only"}'
+INLINE_BOT = "97001"
+INLINE_CONFIG = json.dumps({"botId": INLINE_BOT, "fixture": "synthetic-only"})
+INLINE_BINDING = {"name": cloudflare.INLINE_SEARCH_BINDING, "type": "plain_text", "text": "1"}
+INLINE_MIGRATION = {"name": cloudflare.INLINE_SEARCH_MIGRATION, "sha256": cloudflare.INLINE_SEARCH_MIGRATION_SHA256}
 AGGREGATE_KEY = base64.urlsafe_b64encode(b"\x17" * 32).decode("ascii").rstrip("=")
 PRIVATE_SHARE_KEY = base64.urlsafe_b64encode(b"\x18" * 32).decode("ascii").rstrip("=")
 CRON = {"cron": cloudflare.TELEGRAM_CRON}
@@ -129,6 +134,9 @@ class FakeCloudflare:
         self.alter_config_digest = False
         self.candidate_readback_errors = []
         self.upload_error = None
+        self.inline_checks = []
+        self.inline_consents = 0
+        self.inline_ledger_drift = set()
 
     def worker_api(self, method, path, payload=None):
         self.calls.append((method, path))
@@ -201,6 +209,15 @@ class FakeCloudflare:
         raise AssertionError("Unexpected Worker operation.")
 
     def data_api(self, method, path, payload=None):
+        if method == "POST" and path == DATABASE + "/query":
+            assert payload["sql"].strip().startswith("SELECT name, sha256, mode,")
+            fresh, bot_id = payload["params"]
+            assert fresh in ("0", "1") and bot_id == INLINE_BOT
+            self.inline_checks.append((self.active["versions"][0]["version_id"], fresh))
+            row = {**INLINE_MIGRATION, "mode": "applied", "activeConsent": self.inline_consents if fresh == "1" else 0}
+            if len(self.inline_checks) in self.inline_ledger_drift:
+                row["sha256"] = "0" * 64
+            return [{"success": True, "results": [row]}]
         if method != "GET" or payload is not None:
             raise AssertionError("Release attempted to write data.")
         return deepcopy(self.data_responses[path])
@@ -251,6 +268,14 @@ class ReleaseTests(unittest.TestCase):
              "text": sha256(config.encode("utf-8")).hexdigest()},
         ])
 
+    def set_inline_baseline(self):
+        self.manifest["migrations"] = [{"name": f"{position:04d}_fixture.sql", "sha256": "a" * 64}
+                                       for position in range(1, 25)] + [INLINE_MIGRATION.copy()]
+        self.api.versions[OLD_VERSION] = version(OLD_VERSION, NEW_REVISION, NEW_MODULE)
+        self.set_old_telegram_config(INLINE_CONFIG)
+        self.api.worker_responses[SCHEDULES] = {"schedules": [CRON]}
+        return self.api.versions[OLD_VERSION]
+
     def test_read_only_preflight_rejects_wrong_resource_or_domain(self):
         self.assertEqual(cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET),
                          {"deploymentId": OLD_DEPLOYMENT, "versionId": OLD_VERSION, "revision": OLD_REVISION})
@@ -270,7 +295,7 @@ class ReleaseTests(unittest.TestCase):
     def test_upload_activate_and_same_revision_retry_are_idempotent(self):
         self.assertEqual(self.release(), {
             "revision": NEW_REVISION, "versionId": NEW_VERSION, "deploymentId": NEW_DEPLOYMENT,
-            "previousVersionId": OLD_VERSION, "changed": True,
+            "previousVersionId": OLD_VERSION, "changed": True, "inlineSearchEnabled": False,
         })
         self.assertFalse(self.release()["changed"])
         self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
@@ -283,6 +308,157 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(cloudflare.CloudflareError, "digest"):
             self.release()
         self.assertEqual(self.api.writes(), [])
+
+    def test_same_artifact_inline_flag_changes_preserve_provider_and_keys(self):
+        off = self.set_inline_baseline()
+        _, previous = cloudflare._artifact(self.bundle, self.manifest, INLINE_CONFIG, AGGREGATE_KEY, PRIVATE_SHARE_KEY, PROVIDER_BINDING)
+        off["annotations"] = {"workers/tag": previous.tag,
+                              "workers/message": cloudflare.PROVIDER_MESSAGE + PROVIDER_BINDING.identity_sha256}
+        off["bindings"].extend([
+            {"type": "secret_text", "name": cloudflare.AGGREGATE_KEY_BINDING},
+            {"type": "plain_text", "name": cloudflare.AGGREGATE_DIGEST_BINDING, "text": previous.telegram_aggregate_key_sha256},
+            {"type": "secret_text", "name": cloudflare.PRIVATE_SHARE_KEY_BINDING},
+            {"type": "plain_text", "name": cloudflare.PRIVATE_SHARE_DIGEST_BINDING, "text": previous.telegram_private_share_key_sha256},
+            {"type": "service", "name": "PROVIDER_FETCH", "service": cloudflare.PROVIDER_SERVICE, "entrypoint": cloudflare.PROVIDER_ENTRYPOINT},
+            {"type": "plain_text", "name": "PROVIDER_REVISION", "text": PROVIDER_BINDING.revision},
+            {"type": "plain_text", "name": "PROVIDER_IMAGE_SHA256", "text": PROVIDER_BINDING.image_sha256},
+        ])
+        proof = Mock(side_effect=cloudflare.CloudflareError("Synthetic unavailable activation proof."))
+        options = {"provider_binding": PROVIDER_BINDING, "provider_guard": Mock(), "provider_first_binding_guard": proof}
+        enabled = self.release(INLINE_CONFIG, AGGREGATE_KEY, PRIVATE_SHARE_KEY, inline_search=True, **options)
+        self.assertTrue(enabled["changed"])
+        self.assertTrue(enabled["inlineSearchEnabled"])
+        self.assertEqual(enabled["previousVersionId"], OLD_VERSION)
+        on = self.api.versions[NEW_VERSION]
+        self.assertNotEqual(on["annotations"]["workers/tag"], previous.tag)
+        self.assertEqual({row["name"]: row for row in on["bindings"]},
+                         {row["name"]: row for row in [*off["bindings"], INLINE_BINDING]})
+        self.assertEqual(self.api.inline_checks, [(OLD_VERSION, "1"), (OLD_VERSION, "1"), (NEW_VERSION, "0")])
+
+        self.api.inline_consents = 1
+        repeated = self.release(INLINE_CONFIG, AGGREGATE_KEY, PRIVATE_SHARE_KEY, **options)
+        self.assertFalse(repeated["changed"])
+        self.assertTrue(repeated["inlineSearchEnabled"])
+        disabled = self.release(INLINE_CONFIG, AGGREGATE_KEY, PRIVATE_SHARE_KEY, inline_search=False, **options)
+        self.assertTrue(disabled["changed"])
+        self.assertFalse(disabled["inlineSearchEnabled"])
+        self.assertEqual(disabled["versionId"], OLD_VERSION)
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS, DEPLOYMENTS])
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "consent must end"):
+            self.release(INLINE_CONFIG, AGGREGATE_KEY, PRIVATE_SHARE_KEY, inline_search=True, **options)
+        self.assertEqual(self.api.active["versions"][0]["version_id"], OLD_VERSION)
+        proof.assert_not_called()
+
+    def test_inline_binding_is_exact_and_requires_existing_telegram_config(self):
+        self.api.versions[OLD_VERSION]["bindings"].append(INLINE_BINDING)
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "inline search binding"):
+            cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET)
+        self.set_old_telegram_config(INLINE_CONFIG)
+        rows = self.api.versions[OLD_VERSION]["bindings"]
+        for malformed in ({**INLINE_BINDING, "text": "0"}, {**INLINE_BINDING, "type": "secret_text"},
+                          {**INLINE_BINDING, "text": True}, {**INLINE_BINDING, "extra": "fixture"}):
+            with self.subTest(malformed=malformed), self.assertRaisesRegex(cloudflare.CloudflareError, "inline search binding"):
+                rows[3] = malformed
+                cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET)
+        rows[3] = INLINE_BINDING
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "inline search release tag"):
+            cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET)
+        tag = cloudflare._release_tag(OLD_REVISION, sha256(INLINE_CONFIG.encode()).hexdigest(), None, None, None)
+        self.api.versions[OLD_VERSION]["annotations"]["workers/tag"] = cloudflare._inline_search_tag(tag)
+        self.assertEqual(cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET)["versionId"], OLD_VERSION)
+        self.assertEqual(self.api.inline_checks, [])
+        self.assertEqual(self.api.writes(), [])
+
+    def test_inline_enable_requires_exact_off_artifact_and_migration(self):
+        active = self.set_inline_baseline()
+        active["bindings"][2]["text"] = OLD_REVISION
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "same Worker artifact"):
+            self.release(INLINE_CONFIG, inline_search=True)
+        active["bindings"][2]["text"] = NEW_REVISION
+        self.manifest["migrations"][24]["sha256"] = "0" * 64
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "exact 0025 migration artifact"):
+            self.release(INLINE_CONFIG, inline_search=True)
+        self.manifest["migrations"][24] = INLINE_MIGRATION
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "same verified Telegram configuration"):
+            self.release(INLINE_CONFIG + " ", inline_search=True)
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "same keys and provider binding"):
+            self.release(INLINE_CONFIG, AGGREGATE_KEY, inline_search=True)
+        self.api.worker_responses[SCHEDULES] = {"schedules": []}
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "existing Cron"):
+            self.release(INLINE_CONFIG, inline_search=True)
+        self.assertEqual(self.api.writes(), [])
+
+    def test_inline_activation_verifies_post_release_ledger_and_rolls_back_to_off(self):
+        self.set_inline_baseline()
+        self.api.inline_ledger_drift = {3}
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "prior version was restored"):
+            self.release(INLINE_CONFIG, inline_search=True)
+        self.assertEqual(self.api.inline_checks, [(OLD_VERSION, "1"), (OLD_VERSION, "1"), (NEW_VERSION, "0")])
+        self.assertEqual(self.api.active["versions"][0]["version_id"], OLD_VERSION)
+        self.assertNotIn(INLINE_BINDING, self.api.versions[OLD_VERSION]["bindings"])
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS, DEPLOYMENTS])
+
+    def test_protected_inline_entry_checks_ledger_before_migrations(self):
+        self.set_inline_baseline()
+        directory = self.bundle / "subs-bot-verified"
+        directory.mkdir()
+        (directory / "isolation.json").write_text(json.dumps(self.manifest), encoding="utf-8")
+        environment = {"GITHUB_SHA": NEW_REVISION, "GITHUB_REPOSITORY": "jacklilyhello/subs-bot",
+            "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/main", "RUNNER_TEMP": str(self.bundle),
+            "SUBS_BOT_CF_ISOLATION_TARGET_JSON": json.dumps(TARGET), "SUBS_BOT_CF_BOOTSTRAP_TOKEN": "synthetic-data",
+            "SUBS_BOT_CF_DEPLOY_TOKEN": "synthetic-deploy", "SUBS_BOT_INLINE_SEARCH_MODE": "enable",
+            "SUBS_BOT_INLINE_SEARCH_CONFIRMATION": f"enable inline search for {cloudflare.WORKER_NAME}"}
+        self.api.inline_ledger_drift = {1}
+        with patch.dict(os.environ, environment, clear=True), \
+             patch.object(release_entry, "telegram_release_config", return_value=INLINE_CONFIG), \
+             patch.object(release_entry, "CloudflareClient", side_effect=[self.api.data_api, self.api.worker_api]), \
+             patch.object(release_entry, "require_current_main"), patch.object(release_entry, "apply_migrations") as migrate:
+            with self.assertRaisesRegex(cloudflare.CloudflareError, "migration could not be verified"):
+                release_entry.release()
+            migrate.assert_not_called()
+        self.assertEqual(self.api.inline_checks, [(OLD_VERSION, "1")])
+        self.assertEqual(self.api.writes(), [])
+
+    def test_inline_operator_modes_require_literal_isolation_confirmation(self):
+        for mode, confirmation, desired in (("preserve", "", None),
+                                            ("enable", f"enable inline search for {cloudflare.WORKER_NAME}", True),
+                                            ("disable", f"disable inline search for {cloudflare.WORKER_NAME}", False)):
+            with self.subTest(mode=mode), patch.dict(os.environ, {
+                    "SUBS_BOT_INLINE_SEARCH_MODE": mode, "SUBS_BOT_INLINE_SEARCH_CONFIRMATION": confirmation}, clear=True):
+                self.assertIs(release_entry.inline_search_release_mode(), desired)
+        for mode, confirmation in (("enable", ""), ("disable", "enable inline search for subs-bot-cf-dev-01"),
+                                   ("preserve", "unused"), ("enabled", "")):
+            with self.subTest(mode=mode), patch.dict(os.environ, {
+                    "SUBS_BOT_INLINE_SEARCH_MODE": mode, "SUBS_BOT_INLINE_SEARCH_CONFIRMATION": confirmation}, clear=True), \
+                 self.assertRaisesRegex(cloudflare.CloudflareError, "mode or confirmation"):
+                release_entry.inline_search_release_mode()
+
+    def test_inline_consent_read_is_exact_bot_order_and_expiry(self):
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.row_factory = sqlite3.Row
+        db.executescript("""
+            CREATE TABLE subs_bot_schema_migrations(position INTEGER PRIMARY KEY,name TEXT,sha256 TEXT,mode TEXT);
+            CREATE TABLE telegram_inline_search_consent(receipt_id INTEGER PRIMARY KEY,bot_id TEXT,actor_id TEXT,
+              kind TEXT,message_date INTEGER,update_id INTEGER,expires_at INTEGER);
+        """)
+        db.execute("INSERT INTO subs_bot_schema_migrations VALUES (25, ?, ?, 'applied')",
+                   (INLINE_MIGRATION["name"], INLINE_MIGRATION["sha256"]))
+        db.executemany("INSERT INTO telegram_inline_search_consent VALUES (?, ?, ?, ?, ?, ?, unixepoch() + ?)", [
+            (1, INLINE_BOT, "97002", "on", 1, 1, 100), (2, INLINE_BOT, "97002", "off", 1, 2, 0),
+            (3, INLINE_BOT, "97003", "on", 1, 3, -1), (4, "97009", "97002", "on", 1, 4, 100),
+        ])
+
+        def select(method, path, payload):
+            self.assertEqual((method, path), ("POST", DATABASE + "/query"))
+            return [{"success": True, "results": [dict(row) for row in db.execute(payload["sql"], payload["params"])]}]
+
+        scope = cloudflare._Isolation(self.api.worker_api, select, TARGET)
+        scope.verify_inline_search(INLINE_BOT, require_fresh=True)
+        db.execute("DELETE FROM telegram_inline_search_consent WHERE receipt_id=2")
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "consent must end"):
+            scope.verify_inline_search(INLINE_BOT, require_fresh=True)
+        scope.verify_inline_search(INLINE_BOT)
 
     def test_verified_staged_version_is_reused(self):
         self.api.versions[NEW_VERSION] = version(NEW_VERSION, NEW_REVISION, NEW_MODULE)
