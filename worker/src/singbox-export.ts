@@ -305,7 +305,9 @@ function clash(source: Fields, protocol: string, https: boolean, fromUri: boolea
   }
   if (NETWORK_PROTOCOLS.has(protocol)) {
     const udp = take(source, "udp");
-    if (udp === undefined ? vmessH2 : !flag(udp)) output.network = "tcp";
+    const udpEnabled = udp === undefined ? !vmessH2 : flag(udp);
+    if (vmessH2 && udpEnabled) unsupported();
+    if (!udpEnabled) output.network = "tcp";
   }
   for (const [from, to] of [["tfo", "tcp_fast_open"], ["mptcp", "tcp_multi_path"]]) {
     if (Object.hasOwn(source, from)) output[to] = flag(take(source, from));
@@ -338,6 +340,7 @@ function clash(source: Fields, protocol: string, https: boolean, fromUri: boolea
   if (protocol === "vmess" || protocol === "vless") {
     const encoding = scalarAlias(source, ["packet-encoding", "packet_encoding"]);
     if (encoding !== undefined && encoding !== null) {
+      if (vmessH2 && encoding !== "" && encoding !== "none") unsupported();
       output.packet_encoding = encoding === "packet" ? "packetaddr" : encoding === "none" ? "" : encoding;
     }
   }

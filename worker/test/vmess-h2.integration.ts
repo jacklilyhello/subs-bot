@@ -23,6 +23,7 @@ const proxyName = "vmess-h2-fixture";
 const requestText = "fixture tunnel request";
 const replyText = "fixture tunnel reply";
 const expectedWire = { alpn: "h2", sni, authority, path, method: "PUT", encoding: "identity" };
+const defaultWire = { ...expectedWire, authority: "www.example.com", path: "/" };
 const sha256 = (body: Buffer) => createHash("sha256").update(body).digest("hex");
 
 function command(binary: string, args: string[], scratch: string, label: string): Promise<string> {
@@ -173,7 +174,9 @@ test("emitted VMess configurations tunnel through a verified loopback TLS H2 rel
   relay.on("stream", (stream, headers) => {
     wire.push({ alpn: stream.session?.alpnProtocol, sni: stream.session?.socket.servername,
       authority: headers[":authority"], path: headers[":path"], method: headers[":method"], encoding: headers["accept-encoding"] });
-    if (headers[":method"] !== "PUT" || headers[":authority"] !== authority || headers[":path"] !== path) {
+    const admittedTarget = [expectedWire, defaultWire].some((target) =>
+      headers[":authority"] === target.authority && headers[":path"] === target.path);
+    if (headers[":method"] !== "PUT" || !admittedTarget) {
       stream.respond({ ":status": 400 });
       stream.end();
       return;
@@ -202,7 +205,7 @@ test("emitted VMess configurations tunnel through a verified loopback TLS H2 rel
   const clashSource = await replay(directory, scratch, "clash", { proxies: [clashNode] });
   const singboxSource = await replay(directory, scratch, "singbox", { outbounds: [singboxNode] });
 
-  async function probe(engine: "clash" | "singbox", outbound: Record<string, unknown>) {
+  async function probe(engine: "clash" | "singbox", outbound: Record<string, unknown>, expected = expectedWire) {
     const config = join(scratch, `client-${engine}.json`);
     const clientConfig = engine === "clash"
       ? { "mixed-port": ports.socks, "bind-address": loopback, "allow-lan": false, "log-level": "silent",
@@ -222,8 +225,8 @@ test("emitted VMess configurations tunnel through a verified loopback TLS H2 rel
       assert.ok(response === replyText, "The exact application bytes must traverse the tunnel.");
       assert.equal(wire.length - offset, 1);
       const observed = wire[offset] as Record<string, unknown>;
-      for (const [field, expected] of Object.entries(expectedWire)) {
-        assert.ok(observed[field] === expected, `Unexpected TLS H2 fixture ${field}.`);
+      for (const [field, value] of Object.entries(expected)) {
+        assert.ok(observed[field] === value, `Unexpected TLS H2 fixture ${field}.`);
       }
     } finally {
       await client.stop();
@@ -244,16 +247,20 @@ test("emitted VMess configurations tunnel through a verified loopback TLS H2 rel
     assert.equal(outbound.network, "h2");
     await probe("clash", outbound);
   });
-  await t.test("both cross-exports tunnel with explicit ChaCha20-Poly1305", async () => {
+  await t.test("both ChaCha20-Poly1305 cross-exports retain the default H2 authority and path", async () => {
     const cipher = "chacha20-poly1305";
-    const clash = await replay(directory, scratch, "clash-chacha", { proxies: [{ ...clashNode, cipher }] });
-    const sing = await replay(directory, scratch, "singbox-chacha", { outbounds: [{ ...singboxNode, security: cipher }] });
+    const clash = await replay(directory, scratch, "clash-chacha", {
+      proxies: [{ ...clashNode, cipher, "h2-opts": {} }],
+    });
+    const sing = await replay(directory, scratch, "singbox-chacha", {
+      outbounds: [{ ...singboxNode, security: cipher, transport: { type: "http", headers: singboxNode.transport.headers } }],
+    });
     const outbound = await clash.singbox();
     assert.equal(outbound.security, cipher);
-    await probe("singbox", outbound);
+    await probe("singbox", outbound, defaultWire);
     const proxy = await sing.clash();
     assert.equal(proxy.cipher, cipher);
-    await probe("clash", proxy);
+    await probe("clash", proxy, defaultWire);
   });
   await t.test("out-of-subset inputs preserve their native route and refuse the cross-export", async () => {
     const cleartext = await replay(directory, scratch, "clash-cleartext", {
@@ -264,5 +271,14 @@ test("emitted VMess configurations tunnel through a verified loopback TLS H2 rel
       outbounds: [{ ...singboxNode, transport: { type: "http", host: [authority], path } }],
     });
     assert.deepEqual(autoCompression.status, { clash: 422, singbox: 200 });
+  });
+  await t.test("UDP-enabled profiles preserve their native route and refuse the TCP-only cross-export", async () => {
+    const udp = await replay(directory, scratch, "clash-udp", { proxies: [{ ...clashNode, udp: true }] });
+    assert.deepEqual(udp.status, { clash: 200, singbox: 422 });
+    assert.equal((await udp.clash()).udp, true);
+    const { network: _tcp, ...defaultNetwork } = singboxNode;
+    const both = await replay(directory, scratch, "singbox-default-network", { outbounds: [defaultNetwork] });
+    assert.deepEqual(both.status, { clash: 422, singbox: 200 });
+    assert.equal((await both.singbox()).network, undefined);
   });
 });

@@ -10,7 +10,7 @@ const clash = { ...endpoint, port: 443, tls: true, network: "h2", cipher: "aes-1
 const tls = { enabled: true };
 const headers = { "aCcEpT-EnCoDiNg": ["identity"] };
 const transport = { type: "http", method: "PUT", headers };
-const singbox = { ...endpoint, server_port: 443, security: "aes-128-gcm", tls, transport };
+const singbox = { ...endpoint, server_port: 443, security: "aes-128-gcm", network: "tcp", tls, transport };
 
 const toSingBox = (node: NodeRecord) => JSON.parse(serializeSingBoxOutbound(node).json);
 const toClash = (node: NodeRecord) => serializeClashProxy(node).proxy;
@@ -21,12 +21,12 @@ test("cross-export retains checked H2 defaults and authority bytes", () => {
   assert.deepEqual(defaultForward.transport, { type: "http", headers: { "Accept-Encoding": "identity" } });
   const hosts = ["front.example.invalid:443", "[2001:db8::1]"];
   const path = "/a/~b_1.2";
-  const forward = toSingBox({ ...clash, alpn: ["h2"], "h2-opts": { host: hosts, path }, udp: true });
-  assert.equal(forward.network, undefined);
+  const forward = toSingBox({ ...clash, alpn: ["h2"], "h2-opts": { host: hosts, path }, udp: false });
+  assert.equal(forward.network, "tcp");
   assert.deepEqual(forward.transport, { type: "http", host: hosts, path, headers: { "Accept-Encoding": "identity" } });
-  const reverse = toClash({ ...singbox, tls: { ...tls, alpn: "h2" }, transport: { ...transport, host: hosts, path } });
+  const reverse = toClash({ ...singbox, network: ["tcp"], tls: { ...tls, alpn: "h2" }, transport: { ...transport, host: hosts, path } });
   assert.equal(reverse.network, "h2");
-  assert.equal(reverse.udp, true);
+  assert.equal(reverse.udp, false);
   assert.deepEqual(JSON.parse(JSON.stringify(reverse["h2-opts"])), { host: hosts, path });
 });
 
@@ -34,6 +34,9 @@ test("Clash H2 refuses cross-export when its request or TLS would differ", () =>
   for (const node of [
     { ...clash, cipher: "auto" },
     { ...clash, alterId: 1 },
+    { ...clash, udp: true },
+    { ...clash, udp: false, "packet-encoding": "packet" },
+    { ...clash, udp: false, "packet-encoding": "xudp" },
     { ...clash, alpn: ["h2", "http/1.1"] },
     { ...clash, "client-fingerprint": "chrome" },
     { ...clash, "h2-opts": { path: "/escaped%2Fsegment" } },
@@ -47,18 +50,29 @@ test("Clash H2 refuses cross-export when its request or TLS would differ", () =>
 });
 
 test("native Sing-box HTTP is portable only with the exact TLS-H2 request semantics", () => {
+  const { network: _tcp, ...defaultNetwork } = singbox;
   for (const node of [
     { ...singbox, tls: { enabled: false } },
     { ...singbox, tls: { ...tls, alpn: ["http/1.1"] } },
     { ...singbox, tls: { ...tls, min_version: "1.3" } },
     { ...singbox, security: "auto" },
+    defaultNetwork,
+    { ...singbox, network: [] },
+    { ...singbox, network: ["tcp", "udp"] },
+    { ...singbox, network: "udp" },
+    { ...singbox, packet_encoding: "packetaddr" },
+    { ...singbox, packet_encoding: "xudp" },
+    { ...singbox, multiplex: { enabled: true, protocol: "smux" } },
     { ...singbox, transport: { ...transport, method: "GET" } },
     { ...singbox, transport: { ...transport, path: "/escaped%2Fsegment" } },
     { ...singbox, transport: { ...transport, headers: { "Accept-Encoding": "gzip" } } },
     { ...singbox, transport: { ...transport, headers: { ...headers, "X-Fixture": "one" } } },
     { ...singbox, transport: { ...transport, idle_timeout: "1s" } },
   ]) {
-    assert.deepEqual(toSingBox(node).transport, node.transport);
+    const native = toSingBox(node);
+    for (const key of ["transport", "network", "packet_encoding", "multiplex"]) {
+      assert.deepEqual(native[key], (node as NodeRecord)[key]);
+    }
     assert.throws(() => toClash(node), ClashContentError);
   }
 });

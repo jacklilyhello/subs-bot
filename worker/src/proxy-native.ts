@@ -38,7 +38,11 @@ export function portableNativeSource(input: Fields, protocol: string, target: "c
   const tls = take(source, "tls");
   const transport = take(source, "transport");
   const vmessH2 = target === "clash" && protocol === "vmess" && isRecord(transport) && transport.type === "http";
-  if (vmessH2) requireVmessH2Connection(tls, result.cipher, result.alterId);
+  if (vmessH2) {
+    // Sing-box's omitted or empty network enables both TCP and UDP.
+    if (result.udp !== false || !empty(packetEncoding)) unsupported();
+    requireVmessH2Connection(tls, result.cipher, result.alterId);
+  }
   if (!empty(tls)) {
     const opts = fields(tls);
     result.tls = take(opts, "enabled", false);
