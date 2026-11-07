@@ -5,9 +5,17 @@ on:
   workflow_dispatch:
     inputs:
       provider_ci_run_id:
-        description: Successful Provider Fetch CI run for this exact main revision
+        description: Successful Provider Fetch CI run for the selected exact release
         required: true
         type: string
+      release:
+        description: Select current main or resume the already-active c0a73ce release
+        required: true
+        type: choice
+        options:
+          - current
+          - resume-c0a73ce
+        default: current
       operation:
         description: Verify read-only or perform exactly one pinned provider operation
         required: true
@@ -47,15 +55,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           SUBS_BOT_PROVIDER_CI_RUN_ID: ${{ inputs.provider_ci_run_id }}
+          SUBS_BOT_PROVIDER_RELEASE_SELECTION: ${{ inputs.release }}
+          SUBS_BOT_PROVIDER_ACTIVATION_OPERATION: ${{ inputs.operation }}
+          SUBS_BOT_PROVIDER_ISOLATED_REVISION: ${{ inputs.isolated_revision }}
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           umask 077
-          python3 -B worker/tools/prepare_provider_artifact.py > "$RUNNER_TEMP/provider-provenance.json"
+          python3 -B worker/tools/activate_provider_isolation.py --prepare > "$RUNNER_TEMP/provider-provenance.json"
       - name: Verify or perform one private provider operation
         id: provider-activation
         env:
           GH_TOKEN: ${{ github.token }}
           SUBS_BOT_PROVIDER_CI_RUN_ID: ${{ inputs.provider_ci_run_id }}
+          SUBS_BOT_PROVIDER_RELEASE_SELECTION: ${{ inputs.release }}
           SUBS_BOT_PROVIDER_ACTIVATION_OPERATION: ${{ inputs.operation }}
           SUBS_BOT_PROVIDER_ISOLATED_REVISION: ${{ inputs.isolated_revision }}
           SUBS_BOT_CF_PROVIDER_ACCOUNT_ID: ${{ vars.SUBS_BOT_CF_PROVIDER_ACCOUNT_ID }}

@@ -4,10 +4,11 @@ import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { Miniflare } from "miniflare";
+import { parse } from "yaml";
 
 import { enqueueOwnedProviderRefresh, enqueueProviderUrlImport, type ProviderAdmission } from "../src/provider-jobs.ts";
 import { getOwnedSubscription } from "../src/storage.ts";
@@ -149,34 +150,150 @@ test("emitted Worker leaves queued work untouched when the provider pin is missi
   assert.equal(await db.prepare("SELECT calls FROM provider_fixture_state").first("calls"), 0);
 });
 
-test("protected comparator replays the exact named provider body through the emitted Worker", { timeout: 60_000 }, async () => {
+async function protectedReplay(t: TestContext, body: Buffer) {
   const bundle = process.env.WORKER_TEST_BUNDLE_DIR;
   assert.ok(bundle);
   const scratch = await mkdtemp(join(tmpdir(), "synthetic-provider-replay-"));
-  try {
-    const body = Buffer.from(firstShare);
-    const input = join(scratch, "sample-01.body");
-    const controls = join(scratch, "request.json");
-    await writeFile(input, body, { mode: 0o600 });
-    await writeFile(controls, JSON.stringify({
-      source, decodedBytes: body.length, bodySha256: createHash("sha256").update(body).digest("hex"),
-      rpcMetadata: { "subscription-userinfo": "upload=1073741824; download=1073741824; total=4294967296; expire=2000000000" },
-    }), { mode: 0o600 });
-    const script = fileURLToPath(new URL("../tools/provider-live-worker.ts", import.meta.url));
-    const check = spawnSync(process.execPath, [script, bundle, input, scratch, controls], {
-      stdio: "ignore", env: { PATH: process.env.PATH, HOME: scratch, TMPDIR: scratch }, timeout: 50_000,
-    });
-    assert.equal(check.status, 0, "The protected comparator could not complete its synthetic replay.");
-    const report = JSON.parse(await readFile(join(scratch, "worker.json"), "utf8"));
-    assert.equal(report.job, "saved");
-    assert.deepEqual(report.document, {
-      kind: "parsed", format: "text", envelope: "plain", nodes: 1, malformed: 0, unsupported: 0, ignored: 0,
-    });
-    assert.deepEqual(report.metadata, { trafficUsed: 2, trafficTotal: 4, expireAt: 2_000_000_000 });
-    assert.equal(report.chunks, 1);
-    assert.deepEqual(Object.values(report.formats).map((format) => (format as { status: number }).status), [200, 200, 200, 200, 200]);
-    assert.equal(await readFile(join(scratch, "base64.body"), "ascii"), body.toString("base64"));
-  } finally {
-    await rm(scratch, { recursive: true, force: true });
+  t.after(() => rm(scratch, { recursive: true, force: true }));
+  const input = join(scratch, "sample-01.body");
+  const controls = join(scratch, "request.json");
+  await writeFile(input, body, { mode: 0o600 });
+  await writeFile(controls, JSON.stringify({
+    source, decodedBytes: body.length, bodySha256: createHash("sha256").update(body).digest("hex"),
+    rpcMetadata: { "subscription-userinfo": "upload=1073741824; download=1073741824; total=4294967296; expire=2000000000" },
+  }), { mode: 0o600 });
+  const script = fileURLToPath(new URL("../tools/provider-live-worker.ts", import.meta.url));
+  const check = spawnSync(process.execPath, [script, bundle, input, scratch, controls], {
+    stdio: "ignore", env: { PATH: process.env.PATH, HOME: scratch, TMPDIR: scratch }, timeout: 50_000,
+  });
+  assert.equal(check.status, 0, "The protected comparator could not complete its synthetic replay.");
+  return { scratch, report: JSON.parse(await readFile(join(scratch, "worker.json"), "utf8")) };
+}
+
+test("protected comparator replays the exact named provider body through the emitted Worker", { timeout: 60_000 }, async (t) => {
+  const body = Buffer.from(firstShare);
+  const { report, scratch } = await protectedReplay(t, body);
+  assert.equal(report.job, "saved");
+  assert.deepEqual(report.document, {
+    kind: "parsed", format: "text", envelope: "plain", nodes: 1, malformed: 0, unsupported: 0, ignored: 0,
+  });
+  assert.deepEqual(report.metadata, { trafficUsed: 2, trafficTotal: 4, expireAt: 2_000_000_000 });
+  assert.equal(report.chunks, 1);
+  assert.deepEqual(Object.values(report.formats).map((format) => (format as { status: number }).status), [200, 200, 200, 200, 200]);
+  assert.deepEqual(report.diagnostics.protocols, { ss: 1 });
+  for (const format of Object.values(report.diagnostics.formats)) {
+    assert.deepEqual(format, { admitted: { ss: 1 }, rejected: {}, rejectedTraits: {} });
   }
+  assert.equal(await readFile(join(scratch, "base64.body"), "ascii"), body.toString("base64"));
+});
+
+test("protected comparator distinguishes per-node refusal from a stored document", { timeout: 60_000 }, async (t) => {
+  const body = Buffer.from(JSON.stringify({ proxies: [
+    { name: "Synthetic SS", type: "ss", server: "203.0.113.10", port: 8388, cipher: "aes-128-gcm", password: "fixture-only" },
+    { name: "Synthetic AnyTLS", type: "anytls", server: "203.0.113.11", port: 443,
+      password: "fixture-only", "client-fingerprint": "randomized" },
+    { name: "Synthetic VMess", type: "vmess", server: "203.0.113.12", port: 443,
+      uuid: "12345678-1234-4234-8234-123456789012", cipher: "aes-128-gcm", "packet-encoding": "none" },
+  ] }));
+  const { report, scratch } = await protectedReplay(t, body);
+  assert.equal(report.job, "saved");
+  assert.equal(report.document.nodes, 3);
+  assert.deepEqual(report.diagnostics.protocols, { ss: 1, anytls: 1, vmess: 1 });
+  for (const format of ["base64", "surge", "qx"]) {
+    assert.equal(report.formats[format].status, 422);
+    assert.deepEqual(report.diagnostics.formats[format], {
+      admitted: { ss: 1 }, rejected: { anytls: 1, vmess: 1 },
+      rejectedTraits: { "randomized-fingerprint": 1, "packet-encoding-none": 1 },
+    });
+  }
+  assert.equal(report.formats.clash.status, 422);
+  assert.equal(report.diagnostics.formats.clash.rejected.vmess, 1);
+  assert.equal(report.diagnostics.formats.clash.rejectedTraits["packet-encoding-none"], 1);
+  assert.equal(report.formats.singbox.status, 200);
+  assert.deepEqual(report.diagnostics.formats.singbox, {
+    admitted: { ss: 1, anytls: 1, vmess: 1 }, rejected: {}, rejectedTraits: {},
+  });
+  const binary = process.env.SINGBOX_TEST_BINARY;
+  assert.ok(binary);
+  const check = spawnSync(binary, ["check", "-c", join(scratch, "singbox.body")], {
+    stdio: "ignore", timeout: 15_000,
+  });
+  assert.equal(check.status, 0, "The synthetic replay must be accepted by the pinned Sing-box checker.");
+});
+
+const hysteria2 = {
+  name: "Synthetic Hysteria 2", type: "hysteria2", server: "203.0.113.20", port: 443, password: "fixture-only",
+};
+
+test("structured Hysteria 2 cannot disable UDP in a Clash export", { timeout: 60_000 }, async (t) => {
+  const body = Buffer.from(JSON.stringify({ proxies: [{ ...hysteria2, udp: false }] }));
+  const { report } = await protectedReplay(t, body);
+  assert.equal(report.job, "saved");
+  assert.equal(report.document.format, "clash");
+  assert.equal(report.formats.clash.status, 422);
+});
+
+test("structured Hysteria 2 can retain native UDP behavior in a Clash export", { timeout: 60_000 }, async (t) => {
+  const body = Buffer.from(JSON.stringify({ proxies: [{ ...hysteria2, udp: true }] }));
+  const { report, scratch } = await protectedReplay(t, body);
+  assert.equal(report.job, "saved");
+  assert.equal(report.document.format, "clash");
+  for (const format of ["base64", "surge", "singbox"]) {
+    assert.equal(report.formats[format].status, 200);
+  }
+  assert.equal(report.formats.clash.status, 200, "Redundant Hysteria 2 UDP enablement must remain exportable to Mihomo.");
+  const output = await readFile(join(scratch, "clash.body"), "utf8");
+  assert.deepEqual(parse(output).proxies, [hysteria2]);
+  const config = join(scratch, "synthetic-hysteria2.yaml");
+  await writeFile(config, output, { mode: 0o600 });
+  const binary = process.env.MIHOMO_TEST_BINARY;
+  assert.ok(binary);
+  const check = spawnSync(binary, ["-t", "-d", scratch, "-f", config], {
+    stdio: "ignore", env: { HOME: scratch }, timeout: 15_000,
+  });
+  assert.equal(check.status, 0, "The exact synthetic output must be accepted by the pinned Mihomo checker.");
+});
+
+test("protected comparator counts only closed traits on rejected structured VMess", { timeout: 60_000 }, async (t) => {
+  const options = [
+    { tls: true, alpn: "h2,http/1.1" },
+    { tls: "TRUE", "skip-cert-verify": 0 },
+    { "fixture-unused-field": [] },
+    { network: "ws", "ws-opts": { path: "/fixture", "fixture-unused-nested-field": {} } },
+    { "packet-encoding": "xudp" },
+    { "global-padding": false, "authenticated-length": true },
+    { tfo: false, mptcp: true },
+    { network: "ws", "ws-opts": { headers: { "X-Fixture-Header": "synthetic-header-value" } } },
+    { network: "ws", "ws-opts": { "max-early-data": 1024, "early-data-header-name": "Sec-WebSocket-Protocol" } },
+    { tls: true, "client-fingerprint": "chrome", "reality-opts": { "public-key": "A".repeat(43), "short-id": "0123" } },
+    { network: "h2", "h2-opts": { path: "/fixture" } },
+    { cipher: "auto" },
+    { cipher: undefined },
+    { alterId: "4" },
+    { network: "ws", "ws-opts": { headers: {} } },
+  ];
+  const body = Buffer.from(JSON.stringify({ proxies: options.map((option, index) => ({
+    name: `Synthetic VMess ${index}`, type: "vmess", server: "203.0.113.40", port: 443,
+    uuid: "12345678-1234-4234-8234-123456789012", cipher: "aes-128-gcm", ...option,
+  })) }));
+  const { report } = await protectedReplay(t, body);
+  assert.equal(report.job, "saved");
+  assert.equal(report.document.nodes, 15);
+  assert.deepEqual(report.diagnostics.protocols, { vmess: 15 });
+  assert.equal(report.formats.base64.status, 422);
+  assert.deepEqual(report.diagnostics.formats.base64, {
+    admitted: { vmess: 4 }, rejected: { vmess: 11 }, rejectedTraits: {
+      "vmess-alpn-csv": 1, "vmess-boolean-spelling": 1, "vmess-empty-extra": 2,
+      "vmess-packet-encoding": 1, "vmess-security-flags": 1, "vmess-dial-flags": 1,
+      "vmess-ws-extra-header": 1, "vmess-ws-early-data": 1, "vmess-reality": 1, "vmess-http-transport": 1,
+    },
+  });
+  for (const format of ["surge", "qx"]) {
+    assert.equal(report.formats[format].status, 422);
+    assert.deepEqual(report.diagnostics.formats[format].rejectedTraits, {
+      "vmess-cipher-auto-or-default": 2, "vmess-non-aead-alter-id": 1,
+    });
+  }
+  assert.deepEqual(report.diagnostics.formats.clash.rejectedTraits, {});
+  assert.deepEqual(report.diagnostics.formats.singbox.rejectedTraits, {});
 });

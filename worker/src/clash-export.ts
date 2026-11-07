@@ -275,7 +275,12 @@ export function serializeClashProxy(node: NodeRecord): { name: string; proxy: Fi
       }
     }
     if (hoppingPorts === 0) output.port = integer(port, 1, 65535);
-    if (UDP_TOGGLE.has(protocol)) option(source, output, "udp", flag);
+    if (UDP_TOGGLE.has(protocol)) {
+      option(source, output, "udp", flag);
+    } else if (protocol === "hysteria2" && !fromUri && source.udp === true) {
+      // Mihomo Hysteria 2 already enables UDP and has no UDP toggle.
+      take(source, "udp");
+    }
     if (protocol !== "hysteria" && protocol !== "hysteria2" && protocol !== "tuic") {
       option(source, output, "tfo", flag);
       option(source, output, "mptcp", flag);

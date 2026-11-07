@@ -1,12 +1,23 @@
 import { DurableObject, WorkerEntrypoint, WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
-import type { ProviderFetchInput, ProviderFetchResult } from "../src/provider-fetch-contract.ts";
+import type {
+  ProviderApiStatusInput, ProviderApiStatusProber, ProviderApiStatusResult, ProviderFetchInput, ProviderFetchResult,
+} from "../src/provider-fetch-contract.ts";
 import {
-  exercise, fetchPinnedProvider, providerFailure, providerPayload, providerRequest, ProviderProbeError, REVISION, SERVICE, SINGLETON,
+  apiStatusFailure, exercise, fetchPinnedProvider, probePinnedProviderApiStatus, providerApiStatusRequest, providerApiStatusResult,
+  providerFailure, providerPayload, providerRequest, ProviderProbeError, REVISION, SERVICE, SINGLETON,
 } from "./controller.ts";
 
 interface Env {
   BUILD_REVISION: string;
-  PROVIDER_CONTAINER: DurableObjectNamespace<ProviderContainer>;
+}
+
+declare global {
+  namespace Cloudflare {
+    interface GlobalProps {
+      mainModule: typeof import("./worker.ts");
+      durableNamespaces: "ProviderContainer";
+    }
+  }
 }
 
 interface Probe {
@@ -31,7 +42,7 @@ export class ProviderContainer extends DurableObject<Env> {
       if (request.providerRevision !== revision) return providerFailure("unavailable");
       const payload = providerPayload({ url: request.url });
       if (payload === null) return providerFailure("invalid-request");
-      const singleton = this.env.PROVIDER_CONTAINER.idFromName(SINGLETON);
+      const singleton = this.ctx.exports.ProviderContainer.idFromName(SINGLETON);
       const container = this.ctx.container;
       if (!this.ctx.id.equals(singleton) || !container || typeof revision !== "string" || !REVISION.test(revision)) {
         return providerFailure("unavailable");
@@ -48,9 +59,30 @@ export class ProviderContainer extends DurableObject<Env> {
     }
   }
 
+  async probeApiStatus(input: ProviderApiStatusInput): Promise<ProviderApiStatusResult> {
+    try {
+      const request = providerApiStatusRequest(input);
+      if (request === null) return apiStatusFailure("invalid-request");
+      const revision = this.env.BUILD_REVISION;
+      if (request.providerRevision !== revision) return apiStatusFailure("unavailable");
+      const singleton = this.ctx.exports.ProviderContainer.idFromName(SINGLETON);
+      const container = this.ctx.container;
+      if (!this.ctx.id.equals(singleton) || !container) return apiStatusFailure("unavailable");
+      if (this.busy) return apiStatusFailure("busy");
+      this.busy = true;
+      try {
+        return await probePinnedProviderApiStatus(container, request);
+      } finally {
+        this.busy = false;
+      }
+    } catch {
+      return apiStatusFailure("unavailable");
+    }
+  }
+
   async prove(probe: Probe) {
     const revision = this.env.BUILD_REVISION;
-    const singleton = this.env.PROVIDER_CONTAINER.idFromName(SINGLETON);
+    const singleton = this.ctx.exports.ProviderContainer.idFromName(SINGLETON);
     if (!this.ctx.id.equals(singleton) || !validProbe(probe, revision) || this.busy || !this.ctx.container) {
       throw new Error("Provider smoke admission rejected.");
     }
@@ -69,15 +101,27 @@ export class ProviderContainer extends DurableObject<Env> {
   }
 }
 
-export class ProviderFetch extends WorkerEntrypoint<Env> {
+export class ProviderFetch extends WorkerEntrypoint<Env> implements ProviderApiStatusProber {
   async fetchSubscription(input: ProviderFetchInput): Promise<ProviderFetchResult> {
     try {
       const request = providerRequest(input);
       if (request === null) return providerFailure("invalid-request");
       if (request.providerRevision !== this.env.BUILD_REVISION) return providerFailure("unavailable");
-      return await this.env.PROVIDER_CONTAINER.getByName(SINGLETON).fetchSubscription(request);
+      return await this.ctx.exports.ProviderContainer.getByName(SINGLETON).fetchSubscription(request);
     } catch {
       return providerFailure("unavailable");
+    }
+  }
+
+  async probeApiStatus(input: ProviderApiStatusInput): Promise<ProviderApiStatusResult> {
+    try {
+      const request = providerApiStatusRequest(input);
+      if (request === null) return apiStatusFailure("invalid-request");
+      if (request.providerRevision !== this.env.BUILD_REVISION) return apiStatusFailure("unavailable");
+      const container = this.ctx.exports.ProviderContainer.getByName(SINGLETON);
+      return providerApiStatusResult(await container.probeApiStatus(request));
+    } catch {
+      return apiStatusFailure("unavailable");
     }
   }
 }
@@ -91,7 +135,7 @@ export class ProviderSmoke extends WorkflowEntrypoint<Env, Probe> {
     }
     return step.do("verify fixed provider egress", { retries: { limit: 0, delay: "1 second" }, timeout: "75 seconds" }, async () => {
       try {
-        const container = this.env.PROVIDER_CONTAINER.getByName(SINGLETON);
+        const container = this.ctx.exports.ProviderContainer.getByName(SINGLETON);
         return await container.prove(event.payload);
       } catch {
         throw new Error("Provider container smoke failed.");

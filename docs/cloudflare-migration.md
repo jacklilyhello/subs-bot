@@ -177,7 +177,7 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 - 刷新任务保存订阅、发起人、期望版本、尝试次数和错误类别。租约带过期时间及递增凭据，过期消费者的写入由条件检查拒绝。队列消息重复投递时复用同一任务。重试按错误类别退避并遵守提供方限速，耗尽后进入死信或可审计的失败状态。用 Cron 补发已入库但未成功入队的任务。拉取或解析失败只记录错误状态，上一份有效快照继续服务。 [Queues 重试与死信](https://developers.cloudflare.com/queues/configuration/batching-retries/)
 - 任意用户 URL 开放前，验证 HTTP(S) URL、允许端口和重定向策略。每一跳重新解析 A/AAAA，拒绝私有、环回、保留及混合公网和私网结果，并确保实际连接到通过检查的 IP，同时保持原 Host、TLS SNI 和证书校验。带凭据的请求禁止将凭据转发至新来源。延续现有解压后 10 MiB 上限，并对上传、重定向次数、总耗时、节点数和 YAML 深度或别名设置限额。
 - 抓取组件使用项目专用 Cloudflare Container、固定 DNS 地址的 Python 传输及有界私有 RPC。Cron 只有在私有服务绑定、预期版本和镜像摘要都配置后，才会领取已有任务。RPC 在启动 Container 前核对版本和镜像。托管 CI 使用合成 RPC 验证已构建 Worker 的 D1、R2 与 HTTP 流程。服务绑定启用和真实提供方的 TLS 与兼容性单独验收。 [私有抓取组件](../worker/provider_fetch/README.md) · [Containers 出网](https://developers.cloudflare.com/containers/configuration/outbound-traffic/)
-- 私聊单条导入要求显式开启 `TELEGRAM_PROVIDER_URL_IMPORT=1`，并确认已配置固定抓取绑定和迁移。仅两位隔离账号可提交一条独立 HTTP(S) 链接或 `名称|链接`。群聊、多行内容及回复改名沿用各自的处理路径。每次 Cron 最多领取一项 Telegram 导入任务和一项普通提供方任务。等待抓取期间，同一私聊可以继续接收其他回复。固定结果只发回原私聊，并与已进入发送流程的回复串行。入队任务的发送期限为完成时间与任务过期时间中较早的一项再加 15 分钟，未入队的拒绝回复从收件起算。关闭入口后暂停该队列及回复恢复。刷新按钮和批量输入分别接入及验收。
+- 私聊单条导入要求显式开启 `TELEGRAM_PROVIDER_URL_IMPORT=1`，并确认已配置固定抓取绑定和迁移。仅两位隔离账号可提交一条独立 HTTP(S) 链接或 `名称|链接`。群聊、多行内容及回复改名沿用各自的处理路径。每次 Cron 最多领取一项 Telegram 导入任务和一项普通提供方任务。等待抓取期间，同一私聊可以继续接收其他回复。固定结果只发回原私聊，并与已进入发送流程的回复串行。入队任务的发送期限为完成时间与任务过期时间中较早的一项再加 15 分钟，未入队的拒绝回复从收件起算。关闭入口只停止接收新 URL，固定抓取绑定和迁移就绪时，Cron 继续处理已入队的任务和回执。刷新按钮和批量输入分别接入及验收。
 - 解析拒绝、抓取失败或租约过期时保留上一份快照和流量信息。成功发布在同一个 D1 批次核对所有者、原始 URL、代次、生命周期和租约，再更新快照、有效流量与到期元数据，并完成任务。候选 R2 路径使用本次租约 UUID。确认 CAS 未提交时回收本次候选，结果不明时读回精确任务及包含摘要的快照指针，并保留不能确认的候选。后续清理需在写 R2 前持久记录候选并确认活动区、回收站和备份均未引用，现有任务记录丢失租约后不能凭 R2 前缀自动推定归属。
 - 测试包括实际提供方的鉴权、重定向、编码、流量头、IPv4/IPv6、阻断行为与限速。输出只记录分类结果和耗时。覆盖 DNS 重绑定、跨来源重定向、压缩超限和异常 YAML，并核对失败不会改变旧快照。真实联调使用获准的测试订阅和会话。
 
@@ -212,17 +212,25 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 #### 隔离提供方绑定
 
-默认发布不配置提供方绑定。首次启用时，为同一个 `main` 提交构建应用和提供方，完成私有提供方的隔离激活和停机证明，并单独核对域级路由未指向提供方。将下列精确结构保存到 `subs-bot-isolation` Environment 的受保护配置 `SUBS_BOT_CF_PROVIDER_BINDING_JSON`，并在 GitHub 证明产物到期前运行首次绑定。资源标识和完整配置只存于受控配置。
+默认发布不配置提供方绑定。首次启用通常为同一个 `main` 提交构建应用和提供方。完成私有提供方的隔离激活和停机证明，并单独核对域级路由未指向提供方。将下列精确结构保存到 `subs-bot-isolation` Environment 的受保护配置 `SUBS_BOT_CF_PROVIDER_BINDING_JSON`，并在 GitHub 证明产物到期前运行首次绑定。资源标识和完整配置只存于受控配置。
 
 - `version` 为整数 `2`。
-- `proof` 包含 `revision`、`runId`、`runAttempt`、`artifactId`、`archiveSha256`。运行和产物编号为十进制字符串，摘要为原始 ZIP 字节的 SHA-256。
-- `proofDocument` 为该 ZIP 中 `provider-binding-proof.json` 的完整 JSON 对象。保留证明的所有字段和值，包括证明文档自己的 `version` 值 `1`。
+- `proof` 包含 `revision`、`runId`、`runAttempt`、`artifactId`、`archiveSha256`。`revision` 是生成证明的受保护工作流提交，也是首次绑定的应用提交。运行和产物编号为十进制字符串，摘要为原始 ZIP 字节的 SHA-256。
+- `proofDocument` 为该 ZIP 中 `provider-binding-proof.json` 的完整 JSON 对象。保留证明的所有字段和值，包括证明文档自己的 `version`。同提交证明为 `1`，受控历史提供方延续证明为 `2`。
 - `worker` 包含 `workerId`、`workerCreatedOn`。
 - `activation` 包含 `versionId`、`deploymentId`、`namespaceId`。
 
 首次绑定在 D1 迁移前核对 GitHub 受保护激活运行、精确 ZIP 摘要、规范化证明内容以及应用与提供方的同账户归属。之后保留原始配置。应用当前活动版本的不可变注解和绑定记录必须与配置的证明摘要及资源身份完全一致。满足此条件时，后续应用发布可以使用新的 `main` 提交，原 GitHub 产物过期或不可用时仍可继续。每次发布仍回读提供方的活动版本、模块、镜像、SQLite 命名空间和私有设置。应用绑定目标为 `subs-bot-provider-fetch-dev-01` 的 `ProviderFetch` 入口，并向该入口校验所需的提供方修订和镜像摘要。
 
+历史延续仅接受已固定的 `c0a73ce` 提供方版本。证明的 `providerBuild.revision` 保留该提供方提交，`activation.revision` 必须等于已核对的证明工作流和应用产物提交。首次绑定要求当前未绑定应用仍运行已核对的 `c0a73ce` 版本，并独立核对该历史提交是当前 `main` 的祖先。绑定后的 RPC 继续校验原提供方提交和 OCI 镜像摘要。
+
 写入应用版本后回读绑定，激活后再次核对提供方。校验失败时仅按既有守卫恢复先前的应用版本。绑定配置变化、提供方漂移或尝试移除绑定会阻止常规发布，轮换须单独审查。回滚至未绑定版本后，重新绑定仍须取得符合首次绑定要求的 GitHub 证明。 [服务绑定](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/rpc/#named-entrypoints) · [提供方激活与证明](../worker/provider_fetch/README.md)
+
+#### 隔离私聊远程订阅导入
+
+提供方绑定就绪后，先以默认发布参数发布当前 `main` 的已核对产物，确认活动版本已绑定同一个提供方、保留隔离 Telegram 配置和 Cron，并且没有 `TELEGRAM_PROVIDER_URL_IMPORT` 绑定。D1 必须已应用确切的 `0021`、`0023` 迁移。启用时继续使用同一提交和同一产物，在受保护的 `worker-isolation-deploy.yml` 指定 `provider_url_import=enable` 及 `provider_url_import_confirmation=enable provider URL import for subs-bot-cf-dev-01`。以发布结果中的 `providerUrlImportEnabled` 和活动版本绑定回读确认状态。
+
+两名获准测试者分别在内置浏览器中通过隔离 Bot 私聊提交单条 HTTP(S) 订阅链接，可使用 `名称 | URL` 指定名称。群组、未获准的账号和多行消息均不会创建远程导入任务。发布参数默认为 `preserve`。停止接收新链接时使用 `provider_url_import=disable` 及 `provider_url_import_confirmation=disable provider URL import for subs-bot-cf-dev-01`。关闭后 Cron 继续处理已接受的任务和回执。启用校验失败时，已有回滚守卫可恢复使用同一应用产物的关闭版本。 [Worker 回滚](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/)
 
 ### 数据与切换
 
