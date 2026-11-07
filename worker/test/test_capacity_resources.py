@@ -8,7 +8,8 @@ import sqlite3
 import sys
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
+from urllib.error import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import capacity_resources as capacity
@@ -77,8 +78,9 @@ class FakeCloud:
         self.directory = directory
         self.db = sqlite3.connect(":memory:")
         self.db.row_factory = sqlite3.Row
-        sql = Path(__file__).resolve().parents[1] / "migrations" / "0001_subscriptions.sql"
-        self.db.executescript(sql.read_text(encoding="utf-8"))
+        migrations = Path(__file__).resolve().parents[1] / "migrations"
+        for name in ("0001_subscriptions.sql", "0003_subscription_lifecycle.sql"):
+            self.db.executescript((migrations / name).read_text(encoding="utf-8"))
         self.db.execute(
             "INSERT INTO subscriptions(owner_id,name,source_url,token,created_at,updated_at) "
             "VALUES ('10','Other row','https://example.invalid/other','unrelated-dummy-token',1,1)",
@@ -255,10 +257,12 @@ class CapacityTests(unittest.TestCase):
         self.assertEqual(self.wait.call_count, len(capacity.UNCERTAIN_READBACK_DELAYS))
 
     def test_cleanup_deletes_a_late_committed_upload(self):
-        self.cloud.defer_put = 2
+        self.cloud.defer_put = len(capacity.UNCERTAIN_READBACK_DELAYS) + 2
         with self.assertRaisesRegex(capacity.CapacityError, "upload could not be verified"):
             self.seed()
         self.assertEqual(self.ledger()["fixtures"][0]["putPending"], [0])
+        self.assertEqual(self.wait.call_count, len(capacity.UNCERTAIN_READBACK_DELAYS))
+        self.wait.reset_mock()
         self.cleanup()
         self.assertEqual(self.cloud.capacity_rows(), [])
         self.assertEqual(self.cloud.objects, {})
@@ -266,16 +270,60 @@ class CapacityTests(unittest.TestCase):
         self.assertEqual(self.ledger()["phase"], "retired")
         self.wait.assert_called_once()
 
+    def test_seed_reconciles_a_delayed_upload_without_a_second_put(self):
+        self.cloud.defer_put = 2
+        self.seed()
+        self.assertEqual(self.wait.call_count, 2)
+        self.assertEqual(self.cloud.writes.count("PUT"), 5)
+        self.assertTrue(all(row["generation"] == 1 for row in self.cloud.capacity_rows()))
+        self.assertTrue(all(not entry["putPending"] for entry in self.ledger()["fixtures"]))
+        self.cleanup()
+
     def test_missing_unconfirmed_upload_keeps_recovery_ledger(self):
         self.cloud.defer_put = -1
-        with self.assertRaisesRegex(capacity.CapacityError, "upload could not be verified"):
+        with self.assertRaisesRegex(capacity.CapacityError, "exact key remained absent"):
+            self.seed()
+        with self.assertRaisesRegex(capacity.CapacityError, "prior capacity object upload remains unconfirmed"):
             self.seed()
         with self.assertRaisesRegex(capacity.CapacityError, "upload remains unconfirmed"):
             self.cleanup()
         self.assertEqual(self.cloud.capacity_rows(), [])
         self.assertEqual(self.ledger()["phase"], "cleanup")
         self.assertEqual(self.ledger()["fixtures"][0]["putPending"], [0])
-        self.assertEqual(self.wait.call_count, len(capacity.UNCERTAIN_READBACK_DELAYS))
+        self.assertEqual(self.wait.call_count, 3 * len(capacity.UNCERTAIN_READBACK_DELAYS))
+        self.assertEqual(self.cloud.writes, ["INSERT", "PUT", "DELETE"])
+
+    def test_upload_diagnostics_distinguish_http_transport_envelope_and_readback(self):
+        def response(body):
+            reply = MagicMock()
+            reply.__enter__.return_value.read.return_value = body
+            return reply
+
+        url = "https://private.invalid/unprinted-object-path"
+        private = "unprinted-response-detail"
+        key = "subscriptions/1/11111111-1111-4111-8111-111111111111/0.ndjson"
+        body = b"synthetic"
+        entry = {"objects": [{"bytes": len(body), "sha256": digest(body)}]}
+        retry_count = 1 + len(capacity.UNCERTAIN_READBACK_DELAYS)
+        for put, get, reason, attempts in (
+            (HTTPError(url, 429, private, {}, None), None, "PUT HTTP 429, exact key remained absent", retry_count),
+            (TimeoutError(private), None, "PUT transport failure, exact key remained absent", retry_count),
+            (response(private.encode()), None, "PUT invalid response envelope, exact key remained absent", retry_count),
+            (response(b""), response(b"mismatch"), "PUT acknowledged, readback bytes differ", 1),
+            (TimeoutError(private), HTTPError(url, 503, private, {}, None), "PUT transport failure, GET HTTP 503", 1),
+        ):
+            with self.subTest(reason=reason):
+                reads = [get] if get is not None else [HTTPError(url, 404, private, {}, None) for _ in range(attempts)]
+                objects = capacity.R2Objects(TARGET["accountId"], "synthetic-credential")
+                objects.opener = Mock()
+                objects.opener.open.side_effect = [put, *reads]
+                with self.assertRaisesRegex(capacity.CapacityError, reason) as raised:
+                    capacity.upload_and_verify_object(objects, key, body, entry, 0)
+                message = str(raised.exception)
+                for hidden in (private, key, url, "synthetic-credential"):
+                    self.assertNotIn(hidden, message)
+                self.assertEqual([call.args[0].get_method() for call in objects.opener.open.call_args_list],
+                                 ["PUT", *(["GET"] * attempts)])
 
     def test_stale_main_blocks_publication_but_not_retirement(self):
         self.guard.side_effect = [None, capacity.CapacityError("Revision changed.")]
@@ -331,6 +379,30 @@ class CapacityTests(unittest.TestCase):
         with self.assertRaisesRegex(capacity.CapacityError, "ownership"):
             self.cleanup()
         self.assertEqual(self.cloud.objects, previous)
+        self.assertEqual(self.ledger()["phase"], "cleanup")
+
+    def test_cleanup_preserves_snapshot_referenced_by_trash_or_lifecycle(self):
+        self.seed()
+        first = self.cloud.capacity_rows()[0]["id"]
+        before = dict(self.cloud.objects)
+        ledger = self.ledger()
+        entry = ledger["fixtures"][0]
+        active = self.resources.row(ledger, entry)
+        self.cloud.db.execute("INSERT INTO subscription_lifecycle VALUES (?,1)", (first,))
+        self.cloud.db.commit()
+        with self.assertRaisesRegex(capacity.CapacityError, "lifecycle or trash reference"):
+            self.resources.retire(ledger, entry, active)
+        self.assertEqual(len(self.cloud.capacity_rows()), 3)
+        self.assertEqual(self.cloud.objects, before)
+
+        with self.cloud.db:
+            self.cloud.db.execute("DELETE FROM subscription_lifecycle WHERE subscription_id=?", (first,))
+            self.cloud.db.execute("INSERT INTO subscription_trash SELECT subscriptions.*,1,1 "
+                                  "FROM subscriptions WHERE id=?", (first,))
+            self.cloud.db.execute("DELETE FROM subscriptions WHERE id=?", (first,))
+        with self.assertRaisesRegex(capacity.CapacityError, "lifecycle or trash reference"):
+            self.cleanup()
+        self.assertEqual(self.cloud.objects, before)
         self.assertEqual(self.ledger()["phase"], "cleanup")
 
     def test_worker_preflight_fingerprint_is_private_and_must_match_afterward(self):
