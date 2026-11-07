@@ -7,6 +7,19 @@ on:
         description: Successful Worker CI run for this exact main commit
         required: true
         type: string
+      inline_search:
+        description: Preserve, enable, or disable inline search on the isolated Worker
+        required: true
+        default: preserve
+        type: choice
+        options:
+          - preserve
+          - enable
+          - disable
+      inline_search_confirmation:
+        description: Exact isolation confirmation for enable or disable
+        required: false
+        type: string
 
 permissions:
   actions: read
@@ -37,10 +50,13 @@ jobs:
       - name: Apply isolated D1 migrations and release verified Worker
         env:
           GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_INLINE_SEARCH_MODE: ${{ inputs.inline_search }}
+          SUBS_BOT_INLINE_SEARCH_CONFIRMATION: ${{ inputs.inline_search_confirmation }}
           SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
           SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
           SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPLOY_TOKEN }}
           SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
           SUBS_BOT_TELEGRAM_AGGREGATE_KEY: ${{ secrets.SUBS_BOT_TELEGRAM_AGGREGATE_KEY }}
           SUBS_BOT_TELEGRAM_PRIVATE_SHARE_CREATION_KEY: ${{ secrets.SUBS_BOT_TELEGRAM_PRIVATE_SHARE_CREATION_KEY }}
+          SUBS_BOT_CF_PROVIDER_BINDING_JSON: ${{ secrets.SUBS_BOT_CF_PROVIDER_BINDING_JSON }}
         run: python3 -B worker/tools/release_isolation.py

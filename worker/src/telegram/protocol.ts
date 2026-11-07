@@ -57,12 +57,19 @@ export type TelegramSubscriptionReadUpdate = TelegramEventScope & (
   | { kind: "number"; position: number }
   | { kind: "callback"; callbackId: string; ticket: string }
 );
+export type TelegramBulkTrashUpdate = TelegramEventScope & (
+  | { kind: "preview"; query: string }
+  | { kind: "confirm"; callbackId: string; ticket: string }
+);
 export type TelegramSubscriptionNodeUpdate = TelegramEventScope & { callbackId: string; ticket: string };
 export type TelegramProviderRefreshUpdate = TelegramEventScope & { callbackId: string; ticket: string };
 
 export type TelegramInlineSortMode = "default" | "traffic" | "expiry" | "name";
 type TelegramInlineSortAction = { kind: "current" | "usage" } | { kind: "set"; mode: TelegramInlineSortMode };
 export type TelegramInlineSortUpdate = TelegramEventScope & TelegramInlineSortAction;
+export type TelegramInlineConsentUpdate = TelegramEventScope & { kind: "on" | "off" | "usage" };
+export type TelegramInlineQuery = { updateId: number; actorId: string; chatType: "sender"; queryId: string; query: string };
+export type TelegramGitHubSearchUpdate = TelegramEventScope & { args: string };
 
 type ExistingUpdate =
   | { command: TelegramCommand; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; aggregate?: never; path?: never; document?: never; selected?: never }
@@ -86,8 +93,16 @@ type InlineSortUpdate = (ShortLinkUpdate & { inlineSort?: never })
   | ({ inlineSort: TelegramInlineSortUpdate } & Partial<Record<keyof ShortLinkUpdate, never>>);
 type SubscriptionNodeUpdate = (InlineSortUpdate & { subscriptionNodes?: never })
   | ({ subscriptionNodes: TelegramSubscriptionNodeUpdate } & Partial<Record<keyof InlineSortUpdate, never>>);
-type NormalizedUpdate = (SubscriptionNodeUpdate & { providerRefresh?: never })
-  | ({ providerRefresh: TelegramProviderRefreshUpdate } & Partial<Record<keyof SubscriptionNodeUpdate, never>>);
+type BulkTrashUpdate = (SubscriptionNodeUpdate & { bulkTrash?: never })
+  | ({ bulkTrash: TelegramBulkTrashUpdate } & Partial<Record<keyof SubscriptionNodeUpdate, never>>);
+type InlineConsentUpdate = (BulkTrashUpdate & { inlineConsent?: never })
+  | ({ inlineConsent: TelegramInlineConsentUpdate } & Partial<Record<keyof BulkTrashUpdate, never>>);
+type InlineQueryUpdate = (InlineConsentUpdate & { inlineQuery?: never })
+  | ({ inlineQuery: TelegramInlineQuery } & Partial<Record<keyof InlineConsentUpdate, never>>);
+type GitHubSearchUpdate = (InlineQueryUpdate & { githubSearch?: never })
+  | ({ githubSearch: TelegramGitHubSearchUpdate } & Partial<Record<keyof InlineQueryUpdate, never>>);
+type NormalizedUpdate = (GitHubSearchUpdate & { providerRefresh?: never })
+  | ({ providerRefresh: TelegramProviderRefreshUpdate } & Partial<Record<keyof GitHubSearchUpdate, never>>);
 
 type DecodedTelegramRequest =
   | ({ status: 200 } & NormalizedUpdate)
@@ -106,6 +121,7 @@ const VIEW_TICKET = /^sbv1_[A-Za-z0-9_-]{22}(?![\s\S])/;
 const LIFECYCLE_TICKET = /^sba1_[A-Za-z0-9_-]{22}(?![\s\S])/;
 const SELECTED_TICKET = /^sbo1_[A-Za-z0-9_-]{22}(?![\s\S])/;
 export const SUBSCRIPTION_READ_TICKET = /^sbr1_[A-Za-z0-9_-]{22}(?![\s\S])/;
+export const BULK_TRASH_TICKET = /^sbd1_[A-Za-z0-9_-]{22}(?![\s\S])/;
 export const SUBSCRIPTION_READ_RECEIPT_MARKER = "subread:v1";
 export const SUBSCRIPTION_NODE_TICKET = /^sbn1_[A-Za-z0-9_-]{22}(?![\s\S])/;
 export const PROVIDER_REFRESH_TICKET = /^sbpr1_[A-Za-z0-9_-]{21}[AQgw](?![\s\S])/;
@@ -200,7 +216,8 @@ function messageCommand(
   message: Record<string, unknown>, policy: TelegramPolicy,
 ): TelegramCommand["command"] | TelegramViewKind | "temp-raw" | "temp-summary" | "temp-clear" | "aggregate-show" | "aggregate-revoke" |
   { code: string } | { args: string } | { shareArgs: string } | { selectedQuery: string } | { subscriptionQuery: string } | { shortArgs: string } |
-  { inlineSort: TelegramInlineSortAction } | null {
+  { inlineSort: TelegramInlineSortAction } | { bulkTrashQuery: string } |
+  { inlineConsent: TelegramInlineConsentUpdate["kind"] } | { githubArgs: string } | null {
   const { text, entities } = message;
   if (typeof text !== "string" || !Array.isArray(entities)) return null;
   const commands = entities.filter((entity) => isRecord(entity) && entity.type === "bot_command" && entity.offset === 0);
@@ -214,14 +231,21 @@ function messageCommand(
   const [, name, addressedTo] = entity;
   if (addressedTo && addressedTo.toLowerCase() !== policy.botUsername.toLowerCase()) return null;
   const commandName = name.toLowerCase();
-  const separator = commandName === "path" || commandName === "o" || commandName === "s" || commandName === "i" ? PATH_RULE_WHITESPACE_PREFIX
+  const separator = commandName === "path" || commandName === "o" || commandName === "s" || commandName === "i" || commandName === "d"
+    ? PATH_RULE_WHITESPACE_PREFIX
     : commandName === "share" ? /^[ \t\r\n]/u : /^\s/u;
   if (remainder !== "" && !separator.test(remainder)) return null;
   if (commandName === "path") return { args: remainder };
   if (commandName === "o") return { selectedQuery: remainder };
   if (commandName === "short") return { shortArgs: remainder };
+  if (commandName === "g") return { githubArgs: remainder };
   if (commandName === "s") return { subscriptionQuery: remainder };
+  if (commandName === "d") return { bulkTrashQuery: remainder };
   if (commandName === "share") return remainder.length <= 4096 ? { shareArgs: remainder } : null;
+  if (commandName === "inline") {
+    const mode = remainder.trim().toLowerCase();
+    return { inlineConsent: mode === "on" || mode === "off" ? mode : "usage" };
+  }
   if (commandName === "i") {
     switch (remainder.length <= 4096 ? collapsePathRuleWhitespace(remainder) : null) {
       case "": return { inlineSort: { kind: "current" } };
@@ -344,7 +368,10 @@ function normalizeMessage(
   if (command && typeof command === "object") {
     if ("subscriptionQuery" in command) return { subscriptionRead: { ...scope, kind: "search", query: command.subscriptionQuery } };
     if (scope.chatType !== "private" || scope.threadId !== null) return null;
+    if ("bulkTrashQuery" in command) return { bulkTrash: { ...scope, kind: "preview", query: command.bulkTrashQuery } };
     if ("inlineSort" in command) return { inlineSort: { ...scope, ...command.inlineSort } };
+    if ("inlineConsent" in command) return { inlineConsent: { ...scope, kind: command.inlineConsent } };
+    if ("githubArgs" in command) return { githubSearch: { ...scope, args: command.githubArgs } };
     if ("shortArgs" in command) return { shortLink: { ...scope, args: command.shortArgs } };
     if ("shareArgs" in command) {
       const sender = isRecord(message.from) ? [message.from.first_name, message.from.last_name]
@@ -390,6 +417,8 @@ function normalizeCallback(
   const scope = messageScope(message, String(actor.id), updateId, policy);
   if (!scope) return null;
   if (SUBSCRIPTION_READ_TICKET.test(ticket)) return { subscriptionRead: { ...scope, kind: "callback", callbackId, ticket } };
+  if (BULK_TRASH_TICKET.test(ticket)) return scope.chatType === "private" && scope.threadId === null
+    ? { bulkTrash: { ...scope, kind: "confirm", callbackId, ticket } } : null;
   if (SUBSCRIPTION_NODE_TICKET.test(ticket)) return scope.chatType === "private" && scope.threadId === null
     ? { subscriptionNodes: { ...scope, callbackId, ticket } } : null;
   if (PROVIDER_REFRESH_TICKET.test(ticket)) return scope.chatType === "private" && scope.threadId === null
@@ -402,17 +431,29 @@ function normalizeCallback(
     : null;
 }
 
+function normalizeInlineQuery(value: Record<string, unknown>, updateId: number, policy: TelegramPolicy): NormalizedUpdate | null {
+  const { id, from, chat_type, offset, query } = value;
+  if (chat_type !== "sender" || offset !== "" || !matches(id, CALLBACK_ID)
+    || !isRecord(from) || from.is_bot !== false || !isPositiveInteger(from.id)
+    || typeof query !== "string" || query.length > 512 || /[\u0000\ud800-\udfff]/u.test(query)
+    || Array.from(query).length > 256 || new TextEncoder().encode(query).byteLength > 1024) return null;
+  const actorId = String(from.id);
+  return actorId === policy.adminId || actorId === policy.memberId
+    ? { inlineQuery: { updateId, actorId, chatType: "sender", queryId: id, query } } : null;
+}
+
 function normalizeUpdate(
-  update: Record<string, unknown>, updateId: number, policy: TelegramPolicy,
+  update: Record<string, unknown>, updateId: number, policy: TelegramPolicy, inlineSearchEnabled: boolean,
 ): NormalizedUpdate | null {
   // An Update contains at most one event.
   if (Object.keys(update).length !== 2) return null;
   if (isRecord(update.message)) return normalizeMessage(update.message, updateId, policy);
-  return isRecord(update.callback_query) ? normalizeCallback(update.callback_query, updateId, policy) : null;
+  if (isRecord(update.callback_query)) return normalizeCallback(update.callback_query, updateId, policy);
+  return inlineSearchEnabled && isRecord(update.inline_query) ? normalizeInlineQuery(update.inline_query, updateId, policy) : null;
 }
 
 export async function decodeTelegramRequest(
-  request: Request, policy: TelegramPolicy,
+  request: Request, policy: TelegramPolicy, inlineSearchEnabled = false,
 ): Promise<DecodedTelegramRequest> {
   if (!await verifyWebhookSecret(request.headers.get("X-Telegram-Bot-Api-Secret-Token"), policy.webhookSecret)) {
     return { status: 401 };
@@ -444,7 +485,7 @@ export async function decodeTelegramRequest(
     const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes.subarray(0, size));
     const update: unknown = JSON.parse(text);
     if (!isRecord(update) || !isPositiveInteger(update.update_id)) return { status: 400 };
-    const event = normalizeUpdate(update, update.update_id, policy);
+    const event = normalizeUpdate(update, update.update_id, policy, inlineSearchEnabled);
     return event ? { status: 200, ...event } : { status: 204 };
   } catch {
     return { status: 400 };

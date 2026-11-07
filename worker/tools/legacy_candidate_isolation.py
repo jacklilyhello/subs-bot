@@ -22,7 +22,11 @@ from cloudflare_isolation import CloudflareClient
 
 
 PROFILE = native.LEGACY_CANDIDATE_PROFILE
+PATH_PROFILE = native.LEGACY_PATH_CANDIDATE_PROFILE
+EMPTY_PROFILE = native.LEGACY_EMPTY_CANDIDATE_PROFILE
 ARTIFACT_PREFIX = "subs-bot-legacy-candidate"
+ARTIFACT_PREFIXES = {PROFILE: ARTIFACT_PREFIX, PATH_PROFILE: "subs-bot-legacy-path-candidate",
+                     EMPTY_PROFILE: "subs-bot-legacy-empty-candidate"}
 CANDIDATE_DIRECTORY = "subs-bot-verified-legacy-candidate"
 PROVENANCE = "legacy-candidate-provenance.json"
 EVIDENCE = "legacy-candidate-evidence.json"
@@ -34,6 +38,8 @@ FIXTURE_UPDATED = 1_700_001_000
 APPLIED_AT = 1_700_002_000
 HIGH_WATER = 70
 TARGET_SEQUENCE = 71
+EMPTY_TARGET_SEQUENCE = 72
+PATH_SEQUENCE = 120
 SQL_LIMIT = 128 * 1024
 OBJECT_LIMIT = 2048
 LINEAGE_LIMIT = 4096
@@ -49,8 +55,16 @@ FIXTURES = (
         {"name": "synthetic trash", "share": "ss://YWVzLTEyOC1nY206Zml4dHVyZQ@192.0.2.3:443#synthetic"},
     )),
 )
+EMPTY_TRASH_FIXTURE = ("deleted_subs", 4, EMPTY_TARGET_SEQUENCE, -100123, "empty-trash", "legacy-synthetic-empty-trash-04", ())
+PATH_FIXTURES = (
+    (5, -100123, "  HK\t", "  香港 '优先'  "),
+    (12, -100123, "hk", "same owner and folded keyword"),
+    (29, 456, " Route 日 ", "  第二条\t路径  "),
+    (41, 123, "hk", "separate owner"),
+)
 COUNTS = {"activeRows": 2, "trashRows": 1, "generationZeroActiveRows": 1,
           "generationZeroTrashRows": 0, "nodeCount": 3, "redactedErrorRows": 1}
+EMPTY_COUNTS = {**COUNTS, "trashRows": 2, "generationZeroTrashRows": 1}
 MANIFEST_FIELDS = {"version", "scope", "legacyDomains", "schemaSha256", "dataSha256", "counts", "objectCount", "objectBytes",
                    "sourceHighWater", "targetSequenceHighWater", "generationZeroHttp", "formatCompatibility", "source",
                    "workerArtifact", "ledger", "layout", "summary", "objects", "lineage", "sql"}
@@ -73,7 +87,26 @@ def fixture_source(label):
     return "https://legacy-candidate.invalid/" + label
 
 
-def make_synthetic_source(path):
+def candidate_directory(profile):
+    require(profile in ARTIFACT_PREFIXES)
+    return CANDIDATE_DIRECTORY if profile == PROFILE else "subs-bot-verified-" + ARTIFACT_PREFIXES[profile].removeprefix("subs-bot-")
+
+
+def candidate_version(profile):
+    require(profile in ARTIFACT_PREFIXES)
+    return {PROFILE: 1, PATH_PROFILE: 2, EMPTY_PROFILE: 3}[profile]
+
+
+def path_mapping():
+    return {"kind": "identity", "rows": len(PATH_FIXTURES), "sourceHighWater": PATH_SEQUENCE, "targetSequenceHighWater": PATH_SEQUENCE}
+
+
+def fixture_rows(profile):
+    return (*FIXTURES, EMPTY_TRASH_FIXTURE) if profile == EMPTY_PROFILE else FIXTURES
+
+
+def make_synthetic_source(path, profile=PROFILE):
+    version = candidate_version(profile)
     put(path, b"")
     with closing(sqlite3.connect(path)) as db, db:
         for table, time_field in (("subscriptions", "updated_at"), ("deleted_subs", "deleted_at")):
@@ -81,7 +114,7 @@ def make_synthetic_source(path):
                 user_id INTEGER NOT NULL,name TEXT NOT NULL,url TEXT NOT NULL,token TEXT NOT NULL,
                 expire_at INTEGER,traffic_used REAL,traffic_total REAL,nodes_json TEXT NOT NULL,
                 node_count INTEGER NOT NULL,last_error TEXT,created_at INTEGER NOT NULL,{time_field} INTEGER NOT NULL)""")
-        for table, legacy_id, _, owner, label, token, nodes in FIXTURES:
+        for table, legacy_id, _, owner, label, token, nodes in fixture_rows(profile):
             active = label == "active"
             db.execute(f"INSERT INTO {table} VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (legacy_id, owner, "Synthetic " + label, fixture_source(label), token, None,
@@ -89,22 +122,38 @@ def make_synthetic_source(path):
                  "synthetic historical failure" if active else None, FIXTURE_CREATED, FIXTURE_UPDATED))
         db.execute("UPDATE sqlite_sequence SET seq=50 WHERE name='subscriptions'")
         db.execute("UPDATE sqlite_sequence SET seq=? WHERE name='deleted_subs'", (HIGH_WATER,))
+        if version >= 2:
+            db.execute("""CREATE TABLE path_maps (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+                node_name TEXT NOT NULL, remark TEXT NOT NULL DEFAULT '', UNIQUE(user_id,node_name))""")
+            db.executemany("INSERT INTO path_maps VALUES (?,?,?,?)", PATH_FIXTURES)
+            db.execute("INSERT INTO path_maps VALUES (?,123,'deleted rule','synthetic')", (PATH_SEQUENCE,))
+            db.execute("DELETE FROM path_maps WHERE id=?", (PATH_SEQUENCE,))
 
 
-def build_synthetic_candidate(worker, output, revision, run_id, attempt):
+def convert_synthetic_source(root, profile):
+    source, conversion = root / "synthetic.sqlite", root / "conversion"
+    make_synthetic_source(source, profile)
+    converter.convert_backup(source, conversion, owner_map=OWNER_MAP)
+    pins = {"sqliteSha256": native.file_hash(source)[1], "ownerMapSha256": native.digest(native.canonical(OWNER_MAP)),
+            "converterManifestSha256": native.file_hash(conversion / package.MANIFEST)[1]}
+    return conversion, pins
+
+
+def build_synthetic_candidate(worker, output, revision, run_id, attempt, *, profile=PROFILE):
+    version = candidate_version(profile)
     worker_sha = native.digest(package.read_private(worker / "isolation.json", artifact._MAX_JSON))
     _, worker_pin = package.worker_artifact(worker, revision, worker_sha)
     require((worker_pin["runId"], worker_pin["runAttempt"]) == (run_id, attempt))
     with tempfile.TemporaryDirectory(prefix="legacy-synthetic-", dir=output.parent) as temporary:
-        root = Path(temporary)
-        source = root / "synthetic.sqlite"
-        make_synthetic_source(source)
-        conversion = root / "conversion"
-        converter.convert_backup(source, conversion, owner_map=OWNER_MAP)
-        source_sha = native.file_hash(conversion / package.MANIFEST)[1]
-        report = package.build_candidate(conversion, worker, output, converter_manifest_sha=source_sha,
-                                         worker_manifest_sha=worker_sha, revision=revision, applied_at=APPLIED_AT)
-    require(report["counts"] == COUNTS and report["objectCount"] == 4)
+        conversion, pins = convert_synthetic_source(Path(temporary), profile)
+        options = {} if version != 3 else {"profile": package.EMPTY_EXPORT_PROFILE, "source_sqlite_sha": pins["sqliteSha256"],
+                                          "owner_map_sha": pins["ownerMapSha256"]}
+        report = package.build_candidate(conversion, worker, output, converter_manifest_sha=pins["converterManifestSha256"],
+                                         worker_manifest_sha=worker_sha, revision=revision, applied_at=APPLIED_AT, **options)
+    require(report["counts"] == (EMPTY_COUNTS if version == 3 else COUNTS)
+            and report["objectCount"] == 4 and report["version"] == version)
+    if version >= 2:
+        require(report["pathIdMapping"] == path_mapping())
     return report
 
 
@@ -122,13 +171,14 @@ def package_files(document):
     return files
 
 
-def unpack_candidate(body, archive_sha, destination):
+def unpack_candidate(body, archive_sha, destination, *, profile=PROFILE):
     require(len(body) <= 512 * 1024 and native.digest(body) == archive_sha)
     with ZipFile(io.BytesIO(body)) as archive:
         members = artifact._zip_members(archive)
         manifest = members.get(package.MANIFEST)
         require(manifest is not None and 0 < manifest.file_size <= native.MANIFEST_BYTES)
         document = native.parsed(archive.read(manifest), native.MANIFEST_BYTES)
+        require(type(document.get("version")) is int and document["version"] == candidate_version(profile))
         limits = {package.MANIFEST: native.MANIFEST_BYTES, package.MARKER: 65,
                   package.SQL: SQL_LIMIT, package.LINEAGE: LINEAGE_LIMIT}
         require(set(members) == package_files(document))
@@ -141,12 +191,12 @@ def unpack_candidate(body, archive_sha, destination):
             put(path, archive.read(entry))
 
 
-def fixture_contents(db, document):
+def fixture_contents(db, document, profile=PROFILE):
     """Check every synthetic value, including the original URL tokens and raw nodes."""
     expected_objects, expected_rows, lineage = {}, {package.ACTIVE: [], package.TRASH: []}, []
     source_sha = document["source"]["sqliteSha256"]
-    for legacy_table, legacy_id, target_id, owner, label, token, nodes in FIXTURES:
-        is_trash = label == "trash"
+    for legacy_table, legacy_id, target_id, owner, label, token, nodes in fixture_rows(profile):
+        is_trash = legacy_table == "deleted_subs"
         table = package.TRASH if is_trash else package.ACTIVE
         original = str(owner)
         mapped = OWNER_MAP.get(original, original)
@@ -168,28 +218,53 @@ def fixture_contents(db, document):
     for table, rows in expected_rows.items():
         columns = ",".join(package.TABLE_COLUMNS[table])
         require(db.execute(f"SELECT {columns} FROM {table} ORDER BY id").fetchall() == rows)
-    require(db.execute("SELECT subscription_id,revision FROM subscription_lifecycle").fetchall() == [(TARGET_SEQUENCE, 1)])
-    require(db.execute("SELECT name,seq FROM sqlite_sequence ORDER BY name").fetchall() == [("subscriptions", TARGET_SEQUENCE)])
+    trash_ids = [row[0] for row in expected_rows[package.TRASH]]
+    require(db.execute("SELECT subscription_id,revision FROM subscription_lifecycle ORDER BY subscription_id").fetchall()
+            == [(target_id, 1) for target_id in trash_ids])
+    sequences = [("subscriptions", trash_ids[-1])]
+    if profile in (PATH_PROFILE, EMPTY_PROFILE):
+        expected_paths = [(row_id, OWNER_MAP.get(str(owner), str(owner)), keyword, remark) for row_id, owner, keyword, remark in PATH_FIXTURES]
+        require(db.execute("SELECT id,owner_id,keyword,remark FROM path_rules ORDER BY id").fetchall() == expected_paths)
+        sequences.insert(0, ("path_rules", PATH_SEQUENCE))
+    require(db.execute("SELECT name,seq FROM sqlite_sequence ORDER BY name").fetchall() == sequences)
     return expected_objects, b"".join(native.canonical(row) + b"\n" for row in lineage)
 
 
 class Candidate:
-    def __init__(self, root, source, worker_pin, scratch):
+    def __init__(self, root, source, worker_pin, scratch, *, profile=PROFILE):
+        version = candidate_version(profile)
+        has_paths, has_empty = version >= 2, version == 3
+        counts = EMPTY_COUNTS if has_empty else COUNTS
+        sequence = EMPTY_TARGET_SEQUENCE if has_empty else TARGET_SEQUENCE
+        self.profile = profile
         self.root = package.private_path(root, directory=True)
         raw = package.read_private(root / package.MANIFEST, native.MANIFEST_BYTES)
         self.manifest_sha = native.digest(raw)
         require(package.read_private(root / package.MARKER, 65) == self.manifest_sha.encode("ascii") + b"\n")
         document = native.parsed(raw, native.MANIFEST_BYTES)
-        require(set(document) == MANIFEST_FIELDS and native.canonical(document) == raw
-                and type(document.get("version")) is int and document["version"] == 1
-                and document.get("scope") == "fresh-unbound-d1-r2" and document.get("legacyDomains") == "active-and-trash-only"
+        fields = MANIFEST_FIELDS | {"pathIdMapping"} if has_paths else MANIFEST_FIELDS
+        domains = "active-trash-and-path-rules" if has_paths else "active-and-trash-only"
+        if has_empty:
+            fields |= {"emptyExportMarkers"}
+            domains = "active-trash-path-rules-and-empty-exports"
+        require(set(document) == fields and native.canonical(document) == raw
+                and type(document.get("version")) is int and document["version"] == version
+                and document.get("scope") == "fresh-unbound-d1-r2" and document.get("legacyDomains") == domains
                 and document.get("generationZeroHttp") == document.get("formatCompatibility") == "not-validated"
-                and document.get("counts") == COUNTS and document.get("objectCount") == 4
-                and (document.get("sourceHighWater"), document.get("targetSequenceHighWater")) == (HIGH_WATER, TARGET_SEQUENCE)
+                and document.get("counts") == counts and document.get("objectCount") == 4
+                and (document.get("sourceHighWater"), document.get("targetSequenceHighWater")) == (HIGH_WATER, sequence)
                 and document.get("workerArtifact") == worker_pin and document.get("schemaSha256") == source.schema_sha256)
+        if has_paths:
+            require(document["pathIdMapping"] == path_mapping()
+                    and len(source.migrations) >= 10 and source.migrations[9].name == "0010_path_rules.sql")
         require(set(document["source"]) == {"sqliteSha256", "ownerMapSha256", "converterManifestSha256"}
                 and all(native.matches(native.DIGEST, value) for value in document["source"].values())
                 and document["source"]["ownerMapSha256"] == native.digest(native.canonical(OWNER_MAP)))
+        if has_empty:
+            # Rebuild the fixed source rather than trusting an internally consistent replacement archive.
+            with tempfile.TemporaryDirectory(prefix="candidate-source-", dir=scratch) as temporary:
+                _, expected_source = convert_synthetic_source(Path(temporary), profile)
+            require(document["source"] == expected_source)
         require({path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file() or path.is_symlink()}
                 == package_files(document))
         self.sql = root / package.SQL
@@ -201,7 +276,7 @@ class Candidate:
         with closing(db):
             require(native.canonical(layout) == native.canonical(document["layout"])
                     and summary == document["summary"] and document["dataSha256"] == summary["dataSha256"])
-            objects, lineage = fixture_contents(db, document)
+            objects, lineage = fixture_contents(db, document, profile)
             require(self.read_file(document["lineage"], package.LINEAGE, LINEAGE_LIMIT) == lineage)
             ledger = [{"position": i, "name": entry.name, "sha256": entry.sha256, "mode": "applied", "applied_at": APPLIED_AT}
                       for i, entry in enumerate(source.migrations, 1)]
@@ -209,8 +284,17 @@ class Candidate:
                 "SELECT position,name,sha256,mode,applied_at FROM subs_bot_schema_migrations ORDER BY position").fetchall()
                 == [tuple(entry.values()) for entry in ledger])
             expected_counts = {name: 0 for name in layout}
-            expected_counts.update({package.ACTIVE: 2, package.TRASH: 1, package.LIFECYCLE: 1,
+            expected_counts.update({package.ACTIVE: counts["activeRows"], package.TRASH: counts["trashRows"],
+                                    package.LIFECYCLE: counts["trashRows"],
                                     "sqlite_sequence": 1, migrations.LEDGER: len(ledger)})
+            if has_paths:
+                expected_counts.update(path_rules=len(PATH_FIXTURES), sqlite_sequence=2)
+            if has_empty:
+                package.verify_empty_export_markers(db)
+                expected_counts[package.EMPTY_EXPORTS] = 2
+                require(document["emptyExportMarkers"] == {"activeRows": 1, "trashRows": 1,
+                    "migrationSha256": package.EMPTY_EXPORT_MIGRATION_SHA256,
+                    "tableSha256": summary["tableSha256"][package.EMPTY_EXPORTS]})
             require(summary["tableCounts"] == expected_counts)
             self.entries = {entry["key"]: entry for entry in document["objects"]}
             require(self.entries.keys() == objects.keys() and document["objectBytes"] == sum(map(len, objects.values())))
@@ -218,7 +302,8 @@ class Candidate:
             references = native.object_references(db, lambda key: (self.read_object(self.entries[key]), self.entries[key]["metadata"]))
             require(references == document["objects"])
             canonical_sql = scratch / "canonical.sql"
-            package.write_sql(db, source.objects, TARGET_SEQUENCE, canonical_sql)
+            package.write_sql(db, source.objects, sequence, canonical_sql, path_sequence=PATH_SEQUENCE if has_paths else None,
+                              include_empty_exports=has_empty)
             require(package.read_private(canonical_sql, SQL_LIMIT) == sql)
         self.document = {**document, "sqlMd5": document["sql"]["md5"]}
 
@@ -234,9 +319,15 @@ class Candidate:
         return self.read_file({"path": path, "bytes": entry["bytes"], "sha256": entry["sha256"]}, path, OBJECT_LIMIT)
 
     def pin(self):
-        return {"packageManifestSha256": self.manifest_sha, "schemaSha256": self.document["schemaSha256"],
-                "dataSha256": self.document["dataSha256"], "sqlSha256": self.document["sql"]["sha256"],
-                "sqlMd5": self.document["sqlMd5"]}
+        result = {"packageManifestSha256": self.manifest_sha, "schemaSha256": self.document["schemaSha256"],
+                  "dataSha256": self.document["dataSha256"], "sqlSha256": self.document["sql"]["sha256"],
+                  "sqlMd5": self.document["sqlMd5"]}
+        if self.profile in (PATH_PROFILE, EMPTY_PROFILE):
+            result.update(pathRulesSha256=self.document["summary"]["tableSha256"]["path_rules"], pathSequenceHighWater=PATH_SEQUENCE)
+        if self.profile == EMPTY_PROFILE:
+            result.update(self.document["source"], emptyExportMarkersSha256=self.document["emptyExportMarkers"]["tableSha256"],
+                          emptyExportMigrationSha256=package.EMPTY_EXPORT_MIGRATION_SHA256)
+        return result
 
 
 class CandidateSource(native.Source):
@@ -367,20 +458,35 @@ def run_action(action, engine, pin, *, resource=None, identity_sha=None):
     source.before_write()
     state = journal.value
     pins = {} if state is None else {kind: state["resources"][kind]["pin"] for kind in resources}
-    result = {"profile": PROFILE, "action": action, "phase": "unprepared" if state is None else state["phase"],
+    profile = pin["profile"]
+    result = {"profile": profile, "action": action, "phase": "unprepared" if state is None else state["phase"],
               "packageManifestSha256": pin["candidate"]["packageManifestSha256"], "releasePinSha256": native.digest(native.canonical(pin)),
               "workerArtifact": pin["worker"], "candidateArtifactId": pin["candidate"]["artifactId"],
               "candidateArchiveSha256": pin["candidate"]["archiveSha256"],
               "resourceCount": sum(value is not None for value in pins.values()), "resourcePinsSha256": native.digest(native.canonical(pins)),
               "unconfirmedResourceCount": len(unconfirmed), "candidateIdentitySha256": unconfirmed,
-              "counts": COUNTS, "objectCount": len(engine.candidate.entries), "generationZeroHttp": "not-validated"}
+              "counts": EMPTY_COUNTS if profile == EMPTY_PROFILE else COUNTS,
+              "objectCount": len(engine.candidate.entries), "generationZeroHttp": "not-validated"}
     if observed_summary is not None:
         result.update({"verifiedDataSha256": observed_summary["dataSha256"], "verifiedRowCount": observed_summary["rowCount"],
                        "schemaSha256": pin["candidate"]["schemaSha256"], "foreignKeys": "verified", "r2Closure": "verified"})
+        if profile in (PATH_PROFILE, EMPTY_PROFILE):
+            result.update(verifiedPathRuleCount=observed_summary["tableCounts"]["path_rules"],
+                          verifiedPathSequenceHighWater=PATH_SEQUENCE,
+                          pathRulesSha256=observed_summary["tableSha256"]["path_rules"],
+                          sqliteSequenceSha256=observed_summary["tableSha256"]["sqlite_sequence"])
+        if profile == EMPTY_PROFILE:
+            marker_count = observed_summary["tableCounts"][package.EMPTY_EXPORTS]
+            marker_digest = observed_summary["tableSha256"][package.EMPTY_EXPORTS]
+            require(marker_count == 2 and marker_digest == pin["candidate"]["emptyExportMarkersSha256"])
+            result.update(verifiedEmptyExportMarkerCount=marker_count, emptyExportMarkersSha256=marker_digest,
+                          emptyExportMigrationSha256=pin["candidate"]["emptyExportMigrationSha256"],
+                          verifiedSubscriptionSequenceHighWater=EMPTY_TARGET_SEQUENCE)
     return result
 
 
-def verified_candidate(runner, provenance, scratch):
+def verified_candidate(runner, provenance, scratch, *, profile=PROFILE):
+    require(provenance.get("profile", PROFILE) == profile)
     release = provenance["worker"]
     worker = runner / artifact.VERIFIED_DIRECTORY
     manifest_sha = native.digest(package.read_private(worker / "isolation.json", artifact._MAX_JSON))
@@ -389,18 +495,19 @@ def verified_candidate(runner, provenance, scratch):
     objects = migrations._objects(chain, len(chain), managed=True)
     schema = SimpleNamespace(migrations=chain, objects=objects, schema_sha256=native._schema_digest(objects),
                              tables=sorted(obj.name for obj in objects if obj.type == "table"))
-    return Candidate(runner / CANDIDATE_DIRECTORY, schema, worker_pin, scratch)
+    return Candidate(runner / candidate_directory(profile), schema, worker_pin, scratch, profile=profile)
 
 
-def preflight(runner, revision, run_id):
+def preflight(runner, revision, run_id, *, profile=PROFILE):
     require(os.environ.get("SUBS_BOT_CI_RUN_ID") == run_id)
+    require(profile in ARTIFACT_PREFIXES)
     release = artifact.prepare()
     require((release["revision"], release["runId"]) == (revision, run_id))
     token = artifact._github_token()
 
     def select():
         return artifact.select_main_artifact(run_id, revision, token, workflow_id=artifact.WORKFLOW_ID,
-            workflow_path=artifact.WORKFLOW_PATH, artifact_prefix=ARTIFACT_PREFIX, workflow_label="Worker CI")
+            workflow_path=artifact.WORKFLOW_PATH, artifact_prefix=ARTIFACT_PREFIXES[profile], workflow_label="Worker CI")
 
     selected = select()
     attempt, artifact_id, digest = selected
@@ -408,26 +515,29 @@ def preflight(runner, revision, run_id):
     archive = artifact._download(artifact_id, token)
     require(select() == selected and artifact._select_artifact(run_id, revision, token)
             == (release["runAttempt"], release["artifactId"], release["archiveSha256"]))
-    unpack_candidate(archive, digest, runner / CANDIDATE_DIRECTORY)
+    unpack_candidate(archive, digest, runner / candidate_directory(profile), profile=profile)
     provenance = {"worker": release, "candidate": {"artifactId": artifact_id, "archiveSha256": digest}}
+    if profile != PROFILE:
+        provenance["profile"] = profile
     with tempfile.TemporaryDirectory(prefix="candidate-preflight-", dir=runner) as scratch:
-        candidate = verified_candidate(runner, provenance, Path(scratch))
+        candidate = verified_candidate(runner, provenance, Path(scratch), profile=profile)
         provenance["candidate"].update(candidate.pin())
     artifact.require_current_main(revision)
     put(runner / PROVENANCE, native.canonical(provenance))
 
 
 def apply(runner, revision, inputs):
+    profile = inputs.get("profile", PROFILE)
     provenance = native.parsed(package.read_private(runner / PROVENANCE, 4096), 4096)
     require((provenance["worker"]["revision"], provenance["worker"]["runId"]) == (revision, inputs["source_run_id"]))
     with tempfile.TemporaryDirectory(prefix="candidate-apply-", dir=runner) as scratch:
-        candidate = verified_candidate(runner, provenance, Path(scratch))
+        candidate = verified_candidate(runner, provenance, Path(scratch), profile=profile)
         require(all(provenance["candidate"].get(key) == value for key, value in candidate.pin().items()))
         target = native.parsed(os.environ.get("SUBS_BOT_CF_ISOLATION_TARGET_JSON", "").encode(), 4096)
         token = os.environ.get("SUBS_BOT_CF_BOOTSTRAP_TOKEN", "")
         deploy = os.environ.get("SUBS_BOT_CF_DEPLOY_TOKEN", "")
         require(token and deploy and token != deploy)
-        api = native.RehearsalAPI(target, token, inputs["cohort"], profile=PROFILE)
+        api = native.RehearsalAPI(target, token, inputs["cohort"], profile=profile)
         worker_client = CloudflareClient(deploy)
 
         def read_worker(method, path, payload=None):
@@ -437,7 +547,7 @@ def apply(runner, revision, inputs):
         worker = runner / artifact.VERIFIED_DIRECTORY
         manifest = native.parsed(package.read_private(worker / "isolation.json", artifact._MAX_JSON), artifact._MAX_JSON)
         source = CandidateSource(api, read_worker, target, worker, manifest, lambda: artifact.require_current_main(revision))
-        pin = {**provenance, "profile": PROFILE, "sourceScopeSha256": source.scope_sha256, "protectedLive": source.verify()}
+        pin = {**provenance, "profile": profile, "sourceScopeSha256": source.scope_sha256, "protectedLive": source.verify()}
         run_id, attempt = (os.environ.get(key, "") for key in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"))
         require(all(native.matches(artifact._DECIMAL, value) for value in (run_id, attempt)))
         journal = native.Journal(api, run_id + "/" + attempt, guard=source.before_write)
@@ -453,25 +563,27 @@ def main(args):
     require(native.matches(artifact._REVISION, revision))
     runner = Path(os.environ["RUNNER_TEMP"])
     event_name = os.environ.get("GITHUB_EVENT_NAME")
-    if args == ["build"]:
-        require(event_name in {"push", "workflow_dispatch"})
+    if args and args[0] == "build":
+        require(len(args) in {1, 2} and event_name in {"push", "workflow_dispatch"})
+        profile = args[1] if len(args) == 2 else PROFILE
+        require(profile in ARTIFACT_PREFIXES)
         run_id, attempt = (os.environ.get(key, "") for key in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"))
         require(all(native.matches(artifact._DECIMAL, value) for value in (run_id, attempt)))
-        build_synthetic_candidate(runner / "subs-bot-worker", runner / ARTIFACT_PREFIX, revision, run_id, attempt)
+        build_synthetic_candidate(runner / "subs-bot-worker", runner / ARTIFACT_PREFIXES[profile], revision, run_id, attempt, profile=profile)
         return
     require(args in (["preflight"], ["apply"]) and event_name == "workflow_dispatch")
     with Path(os.environ["GITHUB_EVENT_PATH"]).open("rb") as file:
         event = native.parsed(file.read(65537), 65536)
     inputs = event.get("inputs")
-    require(isinstance(inputs, dict) and set(inputs) <= {"action", "cohort", "source_run_id", "resource", "identity_sha256"}
+    require(isinstance(inputs, dict) and set(inputs) <= {"action", "cohort", "source_run_id", "resource", "identity_sha256", "profile"}
             and inputs.get("action") in ACTIONS and native.matches(native.COHORT, inputs.get("cohort"))
-            and native.matches(artifact._DECIMAL, inputs.get("source_run_id")))
+            and native.matches(artifact._DECIMAL, inputs.get("source_run_id")) and inputs.get("profile", PROFILE) in ARTIFACT_PREFIXES)
     if inputs["action"] == "pin-resource":
         require(inputs.get("resource") in CandidateRehearsal.resource_kinds and native.matches(native.DIGEST, inputs.get("identity_sha256")))
     else:
         require(not inputs.get("identity_sha256"))
     if args == ["preflight"]:
-        preflight(runner, revision, inputs["source_run_id"])
+        preflight(runner, revision, inputs["source_run_id"], profile=inputs.get("profile", PROFILE))
     else:
         apply(runner, revision, inputs)
 

@@ -110,7 +110,8 @@ def require_current_main(revision: str) -> None:
         raise ArtifactError("The requested revision is no longer current on main.")
 
 
-def select_main_artifact(run_id, revision, token, *, workflow_id, workflow_path, artifact_prefix, workflow_label):
+def select_main_artifact(run_id, revision, token, *, workflow_id, workflow_path, artifact_prefix, workflow_label,
+                         events=("push", "workflow_dispatch")):
     run = _get_json(f"/actions/runs/{run_id}", token)
     repositories = (run.get("repository"), run.get("head_repository"))
     attempt = run.get("run_attempt")
@@ -118,7 +119,7 @@ def select_main_artifact(run_id, revision, token, *, workflow_id, workflow_path,
         str(run.get("id")) != run_id
         or run.get("workflow_id") != workflow_id
         or run.get("path") not in (workflow_path, f"{workflow_path}@main", f"{workflow_path}@{MAIN_REF}")
-        or run.get("event") not in ("push", "workflow_dispatch")
+        or run.get("event") not in events
         or (run.get("status"), run.get("conclusion")) != ("completed", "success")
         or (run.get("head_branch"), run.get("head_sha")) != ("main", revision)
         or any(not isinstance(repo, dict) or repo.get("id") != REPOSITORY_ID for repo in repositories)

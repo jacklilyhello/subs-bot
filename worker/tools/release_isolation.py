@@ -7,10 +7,12 @@ import sys
 from pathlib import Path
 
 from cloudflare_isolation import (
-    CloudflareClient, CloudflareError, release_worker, validate_aggregate_key, validate_private_share_key, verify_worker_target,
+    CloudflareClient, CloudflareError, WORKER_NAME, release_worker, validate_aggregate_key, validate_private_share_key,
+    verify_worker_target,
 )
 from d1_migrations import MigrationError, apply_migrations
 from prepare_isolation_artifact import ArtifactError, require_current_main
+from provider_binding_gate import CONFIG_ENV, load_provider_gate
 
 
 def telegram_release_config(manifest):
@@ -36,6 +38,16 @@ def telegram_release_config(manifest):
     return raw
 
 
+def inline_search_release_mode():
+    mode = os.environ.get("SUBS_BOT_INLINE_SEARCH_MODE", "preserve")
+    confirmation = os.environ.get("SUBS_BOT_INLINE_SEARCH_CONFIRMATION", "")
+    if mode == "preserve" and confirmation == "":
+        return None
+    if mode in ("enable", "disable") and confirmation == f"{mode} inline search for {WORKER_NAME}":
+        return mode == "enable"
+    raise CloudflareError("The isolated inline search release mode or confirmation is invalid.")
+
+
 def release():
     revision = os.environ.get("GITHUB_SHA", "")
     if (os.environ.get("GITHUB_REPOSITORY") != "jacklilyhello/subs-bot"
@@ -44,6 +56,7 @@ def release():
             or not re.fullmatch(r"[0-9a-f]{40}", revision)):
         raise ValueError("The isolation workflow must run for the project's main branch.")
 
+    inline_search = inline_search_release_mode()
     bundle = Path(os.environ["RUNNER_TEMP"]) / "subs-bot-verified"
     manifest = json.loads((bundle / "isolation.json").read_text(encoding="utf-8"))
     if manifest.get("version") != 2 or manifest.get("revision") != revision:
@@ -77,12 +90,22 @@ def release():
     data_api = CloudflareClient(data_token)
     worker_api = CloudflareClient(deploy_token)
     guard()
-    starting = verify_worker_target(worker_api, data_api, target, aggregate_key=aggregate_key, private_share_key=private_share_key)
+    provider_gate = load_provider_gate(os.environ.get(CONFIG_ENV, ""), target, deploy_token)
+    provider_binding = provider_gate.binding if provider_gate is not None else None
+    first_provider_proof = provider_gate.verify_first_binding if provider_gate is not None else None
+    starting = verify_worker_target(worker_api, data_api, target, aggregate_key=aggregate_key, private_share_key=private_share_key,
+                                    provider_binding=provider_binding, release_revision=revision,
+                                    provider_first_binding_guard=first_provider_proof, release_manifest=manifest,
+                                    telegram_config=telegram_config, inline_search=inline_search)
+    if provider_gate is not None:
+        provider_gate.verify()
     migrations = apply_migrations(data_api, target, bundle, manifest, guard)
     print(f"Verified {len(migrations)} isolated D1 migration records.", flush=True)
     result = release_worker(worker_api, data_api, target, bundle, manifest, guard,
                             expected_active=starting, telegram_config=telegram_config, aggregate_key=aggregate_key,
-                            private_share_key=private_share_key)
+                            private_share_key=private_share_key, provider_binding=provider_binding,
+                            provider_guard=provider_gate.verify if provider_gate is not None else None,
+                            provider_first_binding_guard=first_provider_proof, inline_search=inline_search)
     guard()
     print(json.dumps(result, sort_keys=True), flush=True)
 

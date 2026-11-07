@@ -7,7 +7,10 @@ import {
   prepareTelegramLifecycleTickets, renderTelegramLifecycle, type TelegramLifecycleButton,
 } from "./lifecycle-actions.ts";
 import { inTelegramScope, type TelegramPolicy } from "./protocol.ts";
+import { closeUnsentTelegramBulkTrashReply, confirmTelegramBulkTrashSend, renderTelegramBulkTrash } from "./bulk-trash.ts";
 import { renderTelegramInlineSort } from "./inline-sort.ts";
+import { renderTelegramInlineConsent } from "./inline-search-consent.ts";
+import type { InlineSearchArticle, InlineSearchOutcome } from "./inline-search.ts";
 import { renderTelegramPath } from "./path-management.ts";
 import { beginTelegramPrivateClaim, prepareTelegramPrivateClaim } from "./private-claims.ts";
 import { resolveTelegramPrivateShareCreationReply } from "./private-share-creation.ts";
@@ -18,10 +21,12 @@ import {
   type TelegramSubscriptionReadButton,
 } from "./subscription-read.ts";
 import { prepareTelegramNodePageTickets, renderTelegramSubscriptionNodePage, type TelegramNodePageButton } from "./subscription-node-pages.ts";
+import { renderTelegramGitHubReply } from "./github-search.ts";
 import {
-  beginTelegramAggregateLinkReply, beginTelegramInlineSortReply, beginTelegramPrivateShareCreationReply,
+  beginTelegramAggregateLinkReply, beginTelegramBulkTrashReply, beginTelegramInlineConsentReply, beginTelegramInlineSortReply,
+  beginTelegramPrivateShareCreationReply,
   beginTelegramSelectedLinkReply, beginTelegramShortLinkReply, beginTelegramReply, claimTelegramReply, isTelegramMemberAllowed,
-  beginTelegramTempRawReply,
+  beginTelegramGitHubSearchReply, beginTelegramTempRawReply,
   prepareTelegramPrivateClaimBegin, reapExpiredTelegramReplies, settleTelegramReply,
   type TelegramReplyLease, type TelegramReplyOutcome,
 } from "./store.ts";
@@ -38,7 +43,7 @@ const CALLBACK_TIMEOUT_MS = 3_000;
 const LIST_LIMIT = 20;
 
 type ReplyAccess = "allowed" | "denied" | "none";
-type InlineKeyboard = { text: string; callback_data: string }[][];
+type InlineKeyboard = ({ text: string; callback_data: string } | { text: string; url: string })[][];
 
 async function readBotReply(response: Response): Promise<unknown> {
   if (!response.body) return null;
@@ -126,7 +131,7 @@ export async function sendTelegramReply(
   forceReply = false,
 ): Promise<TelegramReplyOutcome> {
   if ((lease.path || lease.privateShareCreation || lease.tempRaw || lease.shortLink || lease.subscriptionNodes
-    || lease.providerOutcome !== undefined)
+    || lease.providerOutcome !== undefined || lease.bulkTrash || lease.githubSearch)
     && (lease.chatType !== "private" || lease.threadId !== null)) {
     return { kind: "failed" };
   }
@@ -189,6 +194,25 @@ export async function answerTelegramCallback(policy: TelegramPolicy, callbackId:
   } catch {
     // Acknowledgement is best effort. The callback's durable admission decides whether it has effects.
   }
+}
+
+export async function sendTelegramInlineAnswer(
+  policy: TelegramPolicy, queryId: string, results: readonly InlineSearchArticle[], timeoutMs: number,
+): Promise<InlineSearchOutcome> {
+  try {
+    const response = await fetch(`${BOT_API}/bot${policy.botToken}/answerInlineQuery`, {
+      method: "POST", redirect: "manual", signal: AbortSignal.timeout(timeoutMs),
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ inline_query_id: queryId, results, is_personal: true, cache_time: 0, next_offset: "" }),
+    });
+    const payload = record(await readBotReply(response));
+    if (response.ok && payload?.ok === true && payload.result === true) return "sent";
+    if (response.status >= 400 && response.status < 500 && response.status !== 408
+      && payload?.ok === false && payload.error_code === response.status) return "failed";
+  } catch {
+    // Transport and malformed outcomes cannot prove whether Telegram displayed a result.
+  }
+  return "uncertain";
 }
 
 async function renderReply(
@@ -366,15 +390,19 @@ export async function drainTelegramReplies(
   inlineSortEnabled = false,
   subscriptionNodesEnabled = false,
   providerEnabled = false,
+  bulkTrashEnabled = false,
+  inlineConsentEnabled = false,
+  gitHubSearchEnabled = false,
   providerRefreshEnabled = false,
 ): Promise<void> {
   const deadline = Date.now() + budgetMs;
   const privateShareEnabled = privateShareRuntime.schemaReady && privateShareRuntime.context !== null;
   await reapExpiredTelegramReplies(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled,
-    shortLinksEnabled, inlineSortEnabled, subscriptionNodesEnabled, providerEnabled);
+    shortLinksEnabled, inlineSortEnabled, subscriptionNodesEnabled, providerEnabled, bulkTrashEnabled, inlineConsentEnabled, gitHubSearchEnabled);
   for (let processed = 0; processed < limit && Date.now() < deadline; processed += 1) {
     const lease = await claimTelegramReply(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled,
-      shortLinksEnabled, inlineSortEnabled, subscriptionNodesEnabled, providerEnabled ? policy : undefined);
+      shortLinksEnabled, inlineSortEnabled, subscriptionNodesEnabled, providerEnabled ? policy : undefined,
+      bulkTrashEnabled, inlineConsentEnabled, gitHubSearchEnabled ? policy : undefined);
     if (!lease) return;
     if (!inTelegramScope(policy, lease)) continue;
     if (lease.providerOutcome !== undefined) {
@@ -382,6 +410,22 @@ export async function drainTelegramReplies(
       const text = renderTelegramProviderReply(lease.providerOutcome, lease.providerRequestKind);
       if (Date.now() >= deadline || !await beginTelegramReply(db, policy, lease, "allowed")) continue;
       const outcome = await sendTelegramReply(policy, lease, text, Math.max(1, deadline - Date.now()), request);
+      await settleTelegramReply(db, policy, lease, outcome);
+      continue;
+    }
+    if (lease.bulkTrash) {
+      const prepared = await renderTelegramBulkTrash(db, policy, lease);
+      if (Date.now() >= deadline) continue;
+      if (!prepared || !await beginTelegramBulkTrashReply(db, policy, lease, prepared.guard, prepared.ticket?.sha256)) {
+        await closeUnsentTelegramBulkTrashReply(db, policy, lease);
+        continue;
+      }
+      if (!await confirmTelegramBulkTrashSend(db, policy, lease, prepared.guard, prepared.ticket?.sha256) || Date.now() >= deadline) {
+        await settleTelegramReply(db, policy, lease, { kind: "failed" });
+        continue;
+      }
+      const keyboard = prepared.ticket ? [[{ text: "确认移入回收站", callback_data: prepared.ticket.token }]] : undefined;
+      const outcome = await sendTelegramReply(policy, lease, prepared.text, Math.max(1, deadline - Date.now()), request, keyboard);
       await settleTelegramReply(db, policy, lease, outcome);
       continue;
     }
@@ -397,6 +441,24 @@ export async function drainTelegramReplies(
       if (Date.now() < deadline && await beginTelegramInlineSortReply(db, policy, lease)) {
         const outcome = await sendTelegramReply(policy, lease, renderTelegramInlineSort(lease.inlineSort),
           Math.max(1, deadline - Date.now()), request);
+        await settleTelegramReply(db, policy, lease, outcome);
+      }
+      continue;
+    }
+    if (lease.inlineConsent) {
+      if (Date.now() < deadline && await beginTelegramInlineConsentReply(db, policy, lease)) {
+        const outcome = await sendTelegramReply(policy, lease, renderTelegramInlineConsent(lease.inlineConsent),
+          Math.max(1, deadline - Date.now()), request);
+        await settleTelegramReply(db, policy, lease, outcome);
+      }
+      continue;
+    }
+    if (lease.githubSearch) {
+      const reply = renderTelegramGitHubReply(lease.githubSearch);
+      if (Date.now() < deadline && await beginTelegramGitHubSearchReply(db, policy, lease)) {
+        const outcome = Date.now() < deadline
+          ? await sendTelegramReply(policy, lease, reply.text, Math.max(1, deadline - Date.now()), request, reply.keyboard)
+          : { kind: "failed" as const };
         await settleTelegramReply(db, policy, lease, outcome);
       }
       continue;
