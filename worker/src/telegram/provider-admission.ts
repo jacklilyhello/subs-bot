@@ -3,11 +3,13 @@ import {
 } from "../provider-jobs.ts";
 import { digestHex, validInteger } from "../storage.ts";
 import { normalizeSubscriptionName } from "../subscriptions.ts";
-import { inTelegramScope, type TelegramEventScope, type TelegramPolicy } from "./protocol.ts";
+import { inTelegramScope, type TelegramEventScope, type TelegramPolicy, type TelegramProviderRefreshUpdate } from "./protocol.ts";
+import { readTelegramProviderRefreshAdmission } from "./provider-refresh.ts";
 
 export type TelegramProviderEvent = TelegramEventScope & (
   | { kind: "url-import"; sourceUrl: string; name?: string }
   | { kind: "refresh"; id: number; expectedGeneration: number; expectedLifecycleRevision: number }
+  | ({ kind: "refresh-ticket" } & Pick<TelegramProviderRefreshUpdate, "callbackId" | "ticket">)
 );
 
 type Refusal = "invalid-url" | "unavailable" | "conflict" | "capacity";
@@ -48,11 +50,16 @@ export async function acceptTelegramProviderRequest(
   if (!inTelegramScope(policy, event) || event.chatType !== "private" || event.threadId !== null || event.chatId !== event.actorId ||
       !validInteger(event.updateId, 1) || !validInteger(event.messageId, 1) || !validInteger(event.messageDate, 1)) return { kind: "ignored" };
   try {
+    const kind = event.kind === "refresh-ticket" ? "refresh" : event.kind;
+    const refresh = event.kind === "refresh-ticket" ? await readTelegramProviderRefreshAdmission(db, policy, event) : null;
+    if (event.kind === "refresh-ticket" && refresh === null) return { kind: "ignored" };
     const requestKey = digestHex(await crypto.subtle.digest("SHA-256", encoder.encode(
       `subs-bot:telegram-provider-request:v1\n${policy.botId}\n${event.updateId}`)));
     const nonce = crypto.randomUUID();
     const key = [policy.botId, event.updateId, nonce] as const;
-    const gate = currentAdmission(policy, event);
+    const current = currentAdmission(policy, event);
+    const gate = refresh ? { sql: `(${current.sql}) AND (${refresh.guard.sql})`,
+      bindings: [...current.bindings, ...refresh.guard.bindings] } : current;
     const fence = { sql: freshInbox, bindings: key };
     const input = { ownerId: event.actorId, requestKey };
     let refusal: ProviderSql;
@@ -66,11 +73,15 @@ export async function acceptTelegramProviderRequest(
         admission = plan.statements;
         refusal = plan.refusal;
       }
-    } else if (!validInteger(event.id, 1) || !validInteger(event.expectedGeneration, 0) || !validInteger(event.expectedLifecycleRevision, 0)) {
-      refusal = fixedRefusal("unavailable");
     } else {
-      const prepared = await prepareOwnedProviderRefresh(db, { ...input, id: event.id,
-        expectedGeneration: event.expectedGeneration, expectedLifecycleRevision: event.expectedLifecycleRevision }, fence, gate, policy);
+      const target = event.kind === "refresh-ticket" ? refresh && { id: refresh.id,
+        expectedGeneration: refresh.generation, expectedLifecycleRevision: refresh.lifecycleRevision } : event;
+      const prepared = target && validInteger(target.id, 1) && validInteger(target.expectedGeneration, 0)
+        && validInteger(target.expectedLifecycleRevision, 0) ? await prepareOwnedProviderRefresh(db, {
+          ...input, id: target.id, expectedGeneration: target.expectedGeneration,
+          expectedLifecycleRevision: target.expectedLifecycleRevision,
+        }, fence, gate, policy) : null;
+      if (refresh && prepared?.digest !== refresh.sourceSha256) return { kind: "ignored" };
       admission = prepared?.plan.statements ?? [];
       refusal = prepared?.plan.refusal ?? fixedRefusal("unavailable");
     }
@@ -84,6 +95,9 @@ export async function acceptTelegramProviderRequest(
         THEN 1 ELSE json_extract('provider request key collision', '$') END`)
         .bind(...key, event.actorId, requestKey),
       ...admission,
+      ...(refresh ? [db.prepare(`UPDATE telegram_provider_refresh_tickets AS ticket SET used_by_receipt_id=incoming.receipt_id
+        FROM telegram_inbox AS incoming WHERE ticket.token_sha256=? AND ticket.used_by_receipt_id IS NULL AND ${fresh}`)
+        .bind(refresh.tokenSha256, ...key)] : []),
       db.prepare(`INSERT INTO telegram_provider_requests (receipt_id,job_id,kind,outcome,actor_role,auth_message_date,auth_message_id)
         SELECT incoming.receipt_id,job.job_id,?,CASE WHEN job.job_id IS NULL THEN (${refusal.sql}) ELSE 'admitted' END,?,
           CASE WHEN incoming.actor_id=? THEN 0 ELSE COALESCE(auth.message_date,0) END,
@@ -91,11 +105,13 @@ export async function acceptTelegramProviderRequest(
         FROM telegram_inbox AS incoming
         LEFT JOIN telegram_auth AS auth ON auth.bot_id=incoming.bot_id AND auth.user_id=incoming.actor_id
         LEFT JOIN telegram_provider_jobs AS job ON job.owner_id=incoming.actor_id AND job.request_key=? AND job.kind=?
-        WHERE ${fresh}`).bind(event.kind, ...refusal.bindings, event.actorId === policy.adminId ? "admin" : "member",
-        policy.adminId, policy.adminId, requestKey, event.kind, ...key),
+        WHERE ${fresh}`).bind(kind, ...refusal.bindings, event.actorId === policy.adminId ? "admin" : "member",
+        policy.adminId, policy.adminId, requestKey, kind, ...key),
       db.prepare(`UPDATE telegram_inbox AS incoming SET receipt_nonce=?, command=CASE WHEN EXISTS (
-          SELECT 1 FROM telegram_provider_requests WHERE receipt_id=incoming.receipt_id) THEN command END
-        WHERE ${fresh}`).bind(TELEGRAM_PROVIDER_MARKER, ...key),
+          SELECT 1 FROM telegram_provider_requests WHERE receipt_id=incoming.receipt_id)
+          ${refresh ? `AND EXISTS (SELECT 1 FROM telegram_provider_refresh_tickets
+            WHERE token_sha256=? AND used_by_receipt_id=incoming.receipt_id)` : ""} THEN command END
+        WHERE ${fresh}`).bind(TELEGRAM_PROVIDER_MARKER, ...(refresh ? [refresh.tokenSha256] : []), ...key),
       db.prepare(`SELECT origin.outcome,origin.job_id AS jobId,job.subscription_id AS subscriptionId,job.result_code AS jobResult
         FROM telegram_inbox AS incoming JOIN telegram_provider_requests AS origin USING (receipt_id)
         LEFT JOIN telegram_provider_jobs AS job ON job.job_id=origin.job_id

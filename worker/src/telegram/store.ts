@@ -21,7 +21,8 @@ import { insertTelegramSubscriptionReadTickets, TELEGRAM_SUBSCRIPTION_READ_MARKE
 import { TELEGRAM_INLINE_SORT_MARKER, type TelegramInlineSortReply } from "./inline-sort.ts";
 import { insertTelegramNodePageTickets, TELEGRAM_SUBSCRIPTION_NODE_MARKER, type TelegramNodePageTicket } from "./subscription-node-pages.ts";
 import { telegramProviderReplyClock, telegramProviderReplyEligible, telegramProviderReplyMarker, telegramProviderReplySendGuard,
-  type TelegramProviderReply } from "./provider-replies.ts";
+  type TelegramProviderReply, type TelegramProviderRequestKind } from "./provider-replies.ts";
+import { insertTelegramProviderRefreshTicket, type TelegramProviderRefreshTicket } from "./provider-refresh.ts";
 
 export interface TelegramReplyLease extends TelegramCommand {
   receiptId: number;
@@ -42,6 +43,7 @@ export interface TelegramReplyLease extends TelegramCommand {
   inlineSort?: TelegramInlineSortReply;
   subscriptionNodes?: true;
   providerOutcome?: TelegramProviderReply;
+  providerRequestKind?: TelegramProviderRequestKind;
 }
 
 export type TelegramReplyOutcome =
@@ -58,7 +60,7 @@ type ReplyAccess = "allowed" | "denied" | "none";
 
 type ReplyRow = Omit<TelegramReplyLease,
   "view" | "lifecycle" | "privateClaim" | "temp" | "tempRaw" | "aggregate" | "selected" | "path" | "document" |
-  "privateShareCreation" | "subscriptionRead" | "shortLink" | "inlineSort" | "subscriptionNodes" | "providerOutcome"> & {
+  "privateShareCreation" | "subscriptionRead" | "shortLink" | "inlineSort" | "subscriptionNodes" | "providerOutcome" | "providerRequestKind"> & {
   viewKind: TelegramView["kind"] | null;
   afterId: number | null;
   afterEpoch: number | null;
@@ -90,6 +92,7 @@ type ReplyRow = Omit<TelegramReplyLease,
   inlineSortMode: TelegramInlineSortReply["mode"];
   subscriptionNodeMarker: number;
   providerResult: TelegramProviderReply | null;
+  providerKind: TelegramProviderRequestKind | null;
 };
 
 function supportedReceipt(alias: "inbox" | "earlier", includeAggregate = false, includePrivateShareCreation = false,
@@ -266,7 +269,8 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
         ${includeInlineSort ? "sort.kind" : "NULL"} AS inlineSortKind,
         ${includeInlineSort ? "sort.mode" : "NULL"} AS inlineSortMode,
         CASE WHEN inbox.receipt_nonce='${TELEGRAM_SUBSCRIPTION_NODE_MARKER}' THEN 1 ELSE 0 END AS subscriptionNodeMarker,
-        ${includeProvider ? "provider.outcome" : "NULL"} AS providerResult
+        ${includeProvider ? "provider.outcome" : "NULL"} AS providerResult,
+        ${includeProvider ? "(SELECT kind FROM telegram_provider_requests WHERE receipt_id=provider.receipt_id)" : "NULL"} AS providerKind
       FROM telegram_outbox AS reply JOIN telegram_inbox AS inbox USING (receipt_id)
       LEFT JOIN telegram_view AS page ON page.receipt_id = inbox.receipt_id AND inbox.receipt_nonce = '${TELEGRAM_VIEW_MARKER}'
       LEFT JOIN telegram_lifecycle_action AS action ON action.receipt_id = inbox.receipt_id
@@ -308,7 +312,8 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
     selectedResult, selectedCodeSha256,
     pathKind, pathAfterId, pathAffectedCount,
     documentKind, documentNodeCount, privateShareCreationReceipt, subscriptionReadReceipt, shortLinkReceipt,
-    inlineSortKind, inlineSortMode, subscriptionNodeMarker, providerResult, ...lease } = row;
+    inlineSortKind, inlineSortMode, subscriptionNodeMarker, providerResult, providerKind, ...lease } = row;
+  if ((providerResult === null) !== (providerKind === null)) throw new Error("Telegram provider reply kind could not be confirmed.");
   const lifecycle = lifecycleKind === null || lifecycleSubscriptionId === null || lifecycleExpectedRevision === null
     ? undefined : { kind: lifecycleKind, subscriptionId: lifecycleSubscriptionId, expectedLifecycleRevision: lifecycleExpectedRevision };
   // The joined temp companion declares every count NOT NULL when its kind is present.
@@ -329,7 +334,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
     ...(subscriptionReadReceipt === null ? {} : { subscriptionRead: true as const }),
     ...(inlineSortKind === null ? {} : { inlineSort: { kind: inlineSortKind, mode: inlineSortMode } }),
     ...(subscriptionNodeMarker === 1 ? { subscriptionNodes: true as const } : {}),
-    ...(providerResult === null ? {} : { providerOutcome: providerResult }),
+    ...(providerResult === null || providerKind === null ? {} : { providerOutcome: providerResult, providerRequestKind: providerKind }),
     ...(privateClaimCodeSha256 === null ? {} : { privateClaim: { codeSha256: privateClaimCodeSha256 } }) };
 }
 
@@ -340,7 +345,8 @@ function beginReplyStatement(
   access: ReplyAccess | "private-claim",
   guard?: { sql: string; bindings: readonly (string | number | null)[] },
 ): D1PreparedStatement {
-  const provider = lease.providerOutcome === undefined ? null : telegramProviderReplySendGuard(policy, lease.providerOutcome);
+  const provider = lease.providerOutcome === undefined || lease.providerRequestKind === undefined ? null
+    : telegramProviderReplySendGuard(policy, lease.providerOutcome, lease.providerRequestKind);
   const exactDocumentEpoch = lease.document?.kind === "saved" && access === "allowed" && lease.actorId !== policy.adminId
     ? `AND EXISTS (
       SELECT 1 FROM telegram_document_jobs AS job LEFT JOIN telegram_auth AS auth
@@ -464,6 +470,7 @@ export async function beginTelegramReply(
   readTickets: readonly TelegramSubscriptionReadTicket[] = [],
   readGuard?: { sql: string; bindings: readonly (string | number | null)[] },
   nodeTickets: readonly TelegramNodePageTicket[] = [],
+  refreshTicket?: TelegramProviderRefreshTicket,
 ): Promise<boolean> {
   if (!inTelegramScope(policy, lease) || lease.privateClaim || lease.inlineSort || ((lease.aggregate || lease.selected || lease.path || lease.privateShareCreation
     || lease.tempRaw || lease.shortLink || lease.subscriptionNodes || lease.providerOutcome !== undefined)
@@ -473,10 +480,11 @@ export async function beginTelegramReply(
     || (lifecycleTickets.length > 0 && (!(lease.view || lease.lifecycle) || access !== "allowed"))
     || (readTickets.length > 0 && (!(lease.view || lease.subscriptionRead || lease.subscriptionNodes) || access !== "allowed"))
     || (readGuard && (!(lease.subscriptionRead || lease.subscriptionNodes) || access !== "allowed"))
-    || (nodeTickets.length > 0 && (!readGuard || !(lease.subscriptionRead || lease.subscriptionNodes) || access !== "allowed"))) return false;
+    || (nodeTickets.length > 0 && (!readGuard || !(lease.subscriptionRead || lease.subscriptionNodes) || access !== "allowed"))
+    || (refreshTicket && (!readGuard || !lease.subscriptionRead || access !== "allowed"))) return false;
 
   const begin = beginReplyStatement(db, policy, lease, access, readGuard);
-  if (tickets.length === 0 && lifecycleTickets.length === 0 && readTickets.length === 0 && nodeTickets.length === 0) {
+  if (tickets.length === 0 && lifecycleTickets.length === 0 && readTickets.length === 0 && nodeTickets.length === 0 && !refreshTicket) {
     return await begin.first() !== null;
   }
 
@@ -498,6 +506,10 @@ export async function beginTelegramReply(
   if (nodeTickets.length > 0) {
     statements.push(insertTelegramNodePageTickets(db, lease, nodeTickets, ticketCounts.at(-1) ?? 1));
     ticketCounts.push(nodeTickets.length);
+  }
+  if (refreshTicket) {
+    statements.push(insertTelegramProviderRefreshTicket(db, lease, refreshTicket, ticketCounts.at(-1) ?? 1));
+    ticketCounts.push(1);
   }
   const [state, ...writes] = await db.batch<{ receipt_id: number }>(statements);
   const changed = state?.results.length;

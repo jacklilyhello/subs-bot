@@ -24,6 +24,14 @@ const OUTCOMES = {
 } as const;
 
 export type TelegramProviderReply = keyof typeof OUTCOMES;
+export type TelegramProviderRequestKind = "url-import" | "refresh";
+const REFRESH_OUTCOMES: Partial<Record<TelegramProviderReply, string>> = {
+  unavailable: "这条订阅暂时无法刷新。",
+  saved: "远程订阅已刷新。发送 /list 查看。",
+  "stale-target": "订阅状态已变更，本次刷新未保存。",
+  expired: "订阅刷新已超时，请重新打开详情。",
+  "attempts-exhausted": "订阅刷新未完成，请稍后重试。",
+};
 type UrlInput = Pick<Extract<TelegramProviderEvent, { kind: "url-import" }>, "sourceUrl" | "name">;
 type InboxAlias = "inbox" | "earlier";
 
@@ -39,9 +47,9 @@ export function parseTelegramProviderText(text: string): UrlInput | null {
   return !URI_IN_NAME.test(name) && URL_TOKEN.test(sourceUrl) ? { name, sourceUrl } : null;
 }
 
-export function renderTelegramProviderReply(outcome: TelegramProviderReply): string {
+export function renderTelegramProviderReply(outcome: TelegramProviderReply, kind: TelegramProviderRequestKind): string {
   if (!Object.hasOwn(OUTCOMES, outcome)) throw new Error("Unknown Telegram provider outcome.");
-  return OUTCOMES[outcome];
+  return kind === "refresh" ? REFRESH_OUTCOMES[outcome] ?? OUTCOMES[outcome] : OUTCOMES[outcome];
 }
 
 export async function telegramProviderRepliesReady(db: D1Database): Promise<boolean> {
@@ -71,7 +79,7 @@ export function telegramProviderReplyClock(alias: InboxAlias): string {
 }
 
 function exactProviderEpoch(policy: TelegramPolicy, alias: InboxAlias = "inbox"): ProviderSql {
-  return { sql: `${providerPrivateInbox(alias)} AND origin.kind = 'url-import'
+  return { sql: `${providerPrivateInbox(alias)} AND origin.kind IN ('url-import','refresh')
     AND ((${alias}.actor_id = ? AND origin.actor_role = 'admin' AND origin.auth_message_date = 0 AND origin.auth_message_id = 0)
       OR (${alias}.actor_id = ? AND origin.actor_role = 'member' AND ${alias}.message_date > origin.auth_message_date
         AND COALESCE((SELECT allowed = 1 AND message_date = origin.auth_message_date AND message_id = origin.auth_message_id
@@ -87,12 +95,14 @@ export function telegramProviderReplyEligible(policy: TelegramPolicy | undefined
     bindings: epoch.bindings };
 }
 
-export function telegramProviderReplySendGuard(policy: TelegramPolicy, outcome: TelegramProviderReply): ProviderSql {
+export function telegramProviderReplySendGuard(
+  policy: TelegramPolicy, outcome: TelegramProviderReply, kind: TelegramProviderRequestKind,
+): ProviderSql {
   const epoch = exactProviderEpoch(policy);
   return { sql: `EXISTS (SELECT 1 FROM telegram_provider_replies AS provider
     JOIN telegram_provider_requests AS origin USING (receipt_id)
-    WHERE provider.receipt_id = inbox.receipt_id AND provider.outcome = ? AND ${epoch.sql})`,
-    bindings: [outcome, ...epoch.bindings] };
+    WHERE provider.receipt_id = inbox.receipt_id AND provider.outcome = ? AND origin.kind = ? AND ${epoch.sql})`,
+    bindings: [outcome, kind, ...epoch.bindings] };
 }
 
 /** Repair notification after an ambiguous or delayed terminal commit without making an outbound call. */

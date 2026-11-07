@@ -58,6 +58,7 @@ export type TelegramSubscriptionReadUpdate = TelegramEventScope & (
   | { kind: "callback"; callbackId: string; ticket: string }
 );
 export type TelegramSubscriptionNodeUpdate = TelegramEventScope & { callbackId: string; ticket: string };
+export type TelegramProviderRefreshUpdate = TelegramEventScope & { callbackId: string; ticket: string };
 
 export type TelegramInlineSortMode = "default" | "traffic" | "expiry" | "name";
 type TelegramInlineSortAction = { kind: "current" | "usage" } | { kind: "set"; mode: TelegramInlineSortMode };
@@ -83,8 +84,10 @@ type ShortLinkUpdate = (SubscriptionUpdate & { shortLink?: never })
 
 type InlineSortUpdate = (ShortLinkUpdate & { inlineSort?: never })
   | ({ inlineSort: TelegramInlineSortUpdate } & Partial<Record<keyof ShortLinkUpdate, never>>);
-type NormalizedUpdate = (InlineSortUpdate & { subscriptionNodes?: never })
+type SubscriptionNodeUpdate = (InlineSortUpdate & { subscriptionNodes?: never })
   | ({ subscriptionNodes: TelegramSubscriptionNodeUpdate } & Partial<Record<keyof InlineSortUpdate, never>>);
+type NormalizedUpdate = (SubscriptionNodeUpdate & { providerRefresh?: never })
+  | ({ providerRefresh: TelegramProviderRefreshUpdate } & Partial<Record<keyof SubscriptionNodeUpdate, never>>);
 
 type DecodedTelegramRequest =
   | ({ status: 200 } & NormalizedUpdate)
@@ -105,6 +108,7 @@ const SELECTED_TICKET = /^sbo1_[A-Za-z0-9_-]{22}(?![\s\S])/;
 export const SUBSCRIPTION_READ_TICKET = /^sbr1_[A-Za-z0-9_-]{22}(?![\s\S])/;
 export const SUBSCRIPTION_READ_RECEIPT_MARKER = "subread:v1";
 export const SUBSCRIPTION_NODE_TICKET = /^sbn1_[A-Za-z0-9_-]{22}(?![\s\S])/;
+export const PROVIDER_REFRESH_TICKET = /^sbpr1_[A-Za-z0-9_-]{21}[AQgw](?![\s\S])/;
 const RENAME_CANCEL = /^(?:\/cancel|cancel|取消|退出)(?![\s\S])/iu;
 const PRIVATE_CLAIM = /^claim_([A-Za-z0-9_-]{11}|[A-Za-z0-9_-]{22})(?![\s\S])/u;
 const NON_HUMAN_MESSAGE_FIELDS = [
@@ -388,6 +392,8 @@ function normalizeCallback(
   if (SUBSCRIPTION_READ_TICKET.test(ticket)) return { subscriptionRead: { ...scope, kind: "callback", callbackId, ticket } };
   if (SUBSCRIPTION_NODE_TICKET.test(ticket)) return scope.chatType === "private" && scope.threadId === null
     ? { subscriptionNodes: { ...scope, callbackId, ticket } } : null;
+  if (PROVIDER_REFRESH_TICKET.test(ticket)) return scope.chatType === "private" && scope.threadId === null
+    ? { providerRefresh: { ...scope, callbackId, ticket } } : null;
   if (SELECTED_TICKET.test(ticket)) return scope.chatType === "private" && scope.threadId === null
     ? { selected: { ...scope, kind: "selected-revoke", callbackId, ticket } } : null;
   if (VIEW_TICKET.test(ticket)) return { view: { ...scope, kind: "callback", callbackId, ticket } };
