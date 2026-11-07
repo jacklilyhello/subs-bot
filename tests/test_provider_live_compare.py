@@ -115,6 +115,31 @@ proxies:
         with self.assertRaises(tool.ComparisonError):
             tool.verified_diagnostics(value, 1)
 
+    def test_vmess_traits_are_bounded_by_rejected_family_and_target_format(self):
+        value = {"protocols": {"ss": 1, "vmess": 2}, "formats": {
+            name: {"admitted": {"vmess": 1}, "rejected": {"ss": 1, "vmess": 1}, "rejectedTraits": {}}
+            for name in tool.FORMATS
+        }}
+        base64_traits = value["formats"]["base64"]["rejectedTraits"]
+        base64_traits.update({"vmess-alpn-csv": 1, "vmess-boolean-spelling": 1})
+        value["formats"]["surge"]["rejectedTraits"] = {"vmess-cipher-auto-or-default": 1}
+        value["formats"]["qx"]["rejectedTraits"] = {"vmess-non-aead-alter-id": 1}
+        self.assertEqual(tool.verified_diagnostics(value, 3)["formats"], value["formats"])
+        for format_name, trait, count in (
+            ("base64", "vmess-alpn-csv", 2),
+            ("base64", "vmess-cipher-auto-or-default", 1),
+            ("base64", "vmess-unrecognized", 1),
+            ("surge", "vmess-alpn-csv", 1),
+            ("clash", "vmess-non-aead-alter-id", 1),
+        ):
+            with self.subTest(format=format_name, trait=trait):
+                traits = value["formats"][format_name]["rejectedTraits"]
+                with patch.dict(traits, {trait: count}), self.assertRaises(tool.ComparisonError):
+                    tool.verified_diagnostics(value, 3)
+        value["formats"]["base64"].update(admitted={"vmess": 2}, rejected={"ss": 1})
+        with self.assertRaises(tool.ComparisonError):
+            tool.verified_diagnostics(value, 3)
+
     def test_artifact_run_provenance_uses_the_hosted_string_fields(self):
         bundle = self.root / "bundle"
         bundle.mkdir(mode=0o700)

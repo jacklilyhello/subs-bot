@@ -253,3 +253,47 @@ test("structured Hysteria 2 can retain native UDP behavior in a Clash export", {
   });
   assert.equal(check.status, 0, "The exact synthetic output must be accepted by the pinned Mihomo checker.");
 });
+
+test("protected comparator counts only closed traits on rejected structured VMess", { timeout: 60_000 }, async (t) => {
+  const options = [
+    { tls: true, alpn: "h2,http/1.1" },
+    { tls: "TRUE", "skip-cert-verify": 0 },
+    { "fixture-unused-field": [] },
+    { network: "ws", "ws-opts": { path: "/fixture", "fixture-unused-nested-field": {} } },
+    { "packet-encoding": "xudp" },
+    { "global-padding": false, "authenticated-length": true },
+    { tfo: false, mptcp: true },
+    { network: "ws", "ws-opts": { headers: { "X-Fixture-Header": "synthetic-header-value" } } },
+    { network: "ws", "ws-opts": { "max-early-data": 1024, "early-data-header-name": "Sec-WebSocket-Protocol" } },
+    { tls: true, "client-fingerprint": "chrome", "reality-opts": { "public-key": "A".repeat(43), "short-id": "0123" } },
+    { network: "h2", "h2-opts": { path: "/fixture" } },
+    { cipher: "auto" },
+    { cipher: undefined },
+    { alterId: "4" },
+    { network: "ws", "ws-opts": { headers: {} } },
+  ];
+  const body = Buffer.from(JSON.stringify({ proxies: options.map((option, index) => ({
+    name: `Synthetic VMess ${index}`, type: "vmess", server: "203.0.113.40", port: 443,
+    uuid: "12345678-1234-4234-8234-123456789012", cipher: "aes-128-gcm", ...option,
+  })) }));
+  const { report } = await protectedReplay(t, body);
+  assert.equal(report.job, "saved");
+  assert.equal(report.document.nodes, 15);
+  assert.deepEqual(report.diagnostics.protocols, { vmess: 15 });
+  assert.equal(report.formats.base64.status, 422);
+  assert.deepEqual(report.diagnostics.formats.base64, {
+    admitted: { vmess: 4 }, rejected: { vmess: 11 }, rejectedTraits: {
+      "vmess-alpn-csv": 1, "vmess-boolean-spelling": 1, "vmess-empty-extra": 2,
+      "vmess-packet-encoding": 1, "vmess-security-flags": 1, "vmess-dial-flags": 1,
+      "vmess-ws-extra-header": 1, "vmess-ws-early-data": 1, "vmess-reality": 1, "vmess-http-transport": 1,
+    },
+  });
+  for (const format of ["surge", "qx"]) {
+    assert.equal(report.formats[format].status, 422);
+    assert.deepEqual(report.diagnostics.formats[format].rejectedTraits, {
+      "vmess-cipher-auto-or-default": 2, "vmess-non-aead-alter-id": 1,
+    });
+  }
+  assert.deepEqual(report.diagnostics.formats.clash.rejectedTraits, {});
+  assert.deepEqual(report.diagnostics.formats.singbox.rejectedTraits, {});
+});
