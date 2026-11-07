@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import { Miniflare } from "miniflare";
-import { exercise, ProviderProbeError } from "./controller.ts";
+import { exercise, fetchPinnedProvider, providerPayload, ProviderProbeError } from "./controller.ts";
 
 const revision = "a".repeat(40);
 const isolatedRevision = "b".repeat(40);
@@ -17,7 +17,7 @@ const headers = {
 const body = JSON.stringify({ ok: true, service: "subs-bot", revision: isolatedRevision });
 const digest = createHash("sha256").update(body).digest("hex");
 
-function fake({ runningImage = image, failStop = false, corruptEdge = false } = {}) {
+function fake({ runningImage = image, failStop = false, corruptEdge = false, providerResponse } = {}) {
   const calls = [];
   const container = {
     images: { provider: image },
@@ -44,6 +44,7 @@ function fake({ runningImage = image, failStop = false, corruptEdge = false } = 
           } });
         }
         assert.equal(url, "http://container/v1/fetch");
+        if (providerResponse) return providerResponse(init);
         return Response.json({ error: "blocked-address" }, { headers, status: 422 });
       } };
     },
@@ -65,6 +66,104 @@ test("starts only the pinned image, checks the fixed cases and destroys the inst
     ["http://container/v1/fetch", { url: "http://[::1]/" }],
     ["http://container/v1/fetch", { url: "http://169.254.169.254/" }], ["destroy"],
   ]);
+});
+
+const providerUrl = "https://fixture.example/sub?token=synthetic-private-parameter";
+const metadataHeader = (text) => Buffer.from(text).toString("base64").replaceAll("+", "-").replaceAll("/", "_");
+const success = (extra = {}, bytes = Buffer.from("synthetic subscription bytes")) => new Response(bytes, {
+  headers: { ...headers, "Content-Type": "application/octet-stream", "Content-Length": String(bytes.length),
+    "X-Provider-Body-Sha256": createHash("sha256").update(bytes).digest("hex"), ...extra },
+});
+
+test("admits only a bounded RPC input and posts the exact URL to the verified private container", async () => {
+  for (const input of [null, [], {}, { url: providerUrl, headers: {} }, { url: 100 }, { url: "ftp://fixture.example/" },
+    { url: "https://fixture.example/\ud800" }, { url: "https://fixture.example/\nnext" }, { url: "https://fixture.example/%zz" },
+    { url: "https://fixture.example/" + "😀".repeat(3000) }, { url: "https://fixture.example/" + '"'.repeat(7000) }]) {
+    assert.equal(providerPayload(input), null);
+  }
+  const payload = providerPayload({ url: providerUrl });
+  assert.deepEqual(JSON.parse(payload), { url: providerUrl });
+  const { container, calls } = fake({ providerResponse: () => success({
+    "X-Provider-Metadata": metadataHeader(String.raw`{"profile-title":"\u6e2f \ud83d\ude00","subscription-userinfo":"upload=1; total=9"}`),
+  }) });
+  const result = await fetchPinnedProvider(container, revision, payload);
+  assert.equal(result.ok, true);
+  assert(result.body instanceof ArrayBuffer);
+  assert.equal(Buffer.from(result.body).toString(), "synthetic subscription bytes");
+  assert.equal(result.bodySha256, createHash("sha256").update(Buffer.from(result.body)).digest("hex"));
+  assert.deepEqual(result.metadata, { "profile-title": "港 😀", "subscription-userinfo": "upload=1; total=9" });
+  assert.deepEqual(calls.slice(-2), [["http://container/v1/fetch", { url: providerUrl }], ["destroy"]]);
+
+  const empty = fake({ providerResponse: () => success({}, Buffer.alloc(0)) });
+  const emptyResult = await fetchPinnedProvider(empty.container, revision, payload);
+  assert.equal(emptyResult.ok, true);
+  assert.equal(emptyResult.body.byteLength, 0);
+  assert(!("metadata" in emptyResult));
+
+  const max = Buffer.alloc(10 * 1024 * 1024, 0x41);
+  const full = fake({ providerResponse: () => success({}, max) });
+  const fullResult = await fetchPinnedProvider(full.container, revision, payload);
+  assert.equal(fullResult.ok, true);
+  assert.equal(fullResult.body.byteLength, max.length);
+  assert.equal(fullResult.bodySha256, createHash("sha256").update(max).digest("hex"));
+});
+
+test("rejects incomplete bodies, invalid hashes, foreign headers and malformed metadata before returning bytes", async () => {
+  for (const response of [
+    () => success({ "Content-Length": "1" }), () => success({ "Content-Length": "100" }),
+    () => success({ "Content-Length": "10485761" }), () => success({ "X-Provider-Body-Sha256": "0".repeat(64) }),
+    () => success({ "Content-Encoding": "gzip" }), () => success({ Location: providerUrl }),
+    () => success({ "Set-Cookie": "synthetic" }), () => success({ "X-Provider-Metadata": "====" }),
+    ...[String.raw`{"profile-title":"a","profile-title":"b"}`, String.raw`{"location":"https://fixture.example/"}`,
+      String.raw`{"profile-title":"line\nnext"}`, '{"profile-title":"' + "x".repeat(3072) + '"}']
+      .map((text) => () => success({ "X-Provider-Metadata": metadataHeader(text) })),
+  ]) {
+    const { container, calls } = fake({ providerResponse: response });
+    assert.deepEqual(await fetchPinnedProvider(container, revision, providerPayload({ url: providerUrl })),
+      { ok: false, code: "invalid-body", retryable: false });
+    assert.deepEqual(calls.at(-1), ["destroy"]);
+  }
+});
+
+test("returns only closed failure fields and verifies the stop before releasing a result", async () => {
+  for (const [status, value, expected] of [
+    [502, { error: "http-status", upstreamStatus: 429 }, { code: "http-status", retryable: true, upstreamStatus: 429 }],
+    [502, { error: "http-status", upstreamStatus: 403 }, { code: "http-status", retryable: false, upstreamStatus: 403 }],
+    [502, { error: "http-status", upstreamStatus: 503 }, { code: "http-status", retryable: true, upstreamStatus: 503 }],
+    [502, { error: "http-status", upstreamStatus: "429" }, { code: "invalid-body", retryable: false }],
+    [502, { error: "http-status", upstreamStatus: 429, url: providerUrl }, { code: "invalid-body", retryable: false }],
+    [422, { error: "blocked-address" }, { code: "blocked-address", retryable: false }],
+    [429, { error: "busy" }, { code: "busy", retryable: true }],
+    [504, { error: "timeout" }, { code: "timeout", retryable: true }],
+    [302, { error: "busy" }, { code: "invalid-body", retryable: false }],
+  ]) {
+    const { container } = fake({ providerResponse: () => Response.json(value, { status, headers }) });
+    assert.deepEqual(await fetchPinnedProvider(container, revision, providerPayload({ url: providerUrl })), { ok: false, ...expected });
+  }
+  for (const options of [{ failStop: true, providerResponse: () => success() }, { runningImage: "foreign" },
+    { providerResponse: () => { throw new Error(providerUrl); } }]) {
+    const { container, calls } = fake(options);
+    assert.deepEqual(await fetchPinnedProvider(container, revision, providerPayload({ url: providerUrl })),
+      { ok: false, code: "unavailable", retryable: true });
+    assert.deepEqual(calls.at(-1), ["destroy"]);
+  }
+});
+
+test("bounds a stalled response body and stops the container", async (t) => {
+  const timeout = AbortSignal.timeout.bind(AbortSignal);
+  t.mock.method(AbortSignal, "timeout", (ms) => {
+    if (ms !== 28_000) return timeout(ms);
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 20);
+    return controller.signal;
+  });
+  const { container, calls } = fake({ providerResponse: () => new Response(new ReadableStream({
+    pull: () => new Promise(() => {}),
+  }), { headers: { ...headers, "Content-Type": "application/octet-stream", "Content-Length": "1",
+    "X-Provider-Body-Sha256": "a".repeat(64) } }) });
+  assert.deepEqual(await fetchPinnedProvider(container, revision, providerPayload({ url: providerUrl })),
+    { ok: false, code: "timeout", retryable: true });
+  assert.deepEqual(calls.at(-1), ["destroy"]);
 });
 
 test("refuses a foreign or running image and cleans up owned failed probes", async () => {
@@ -98,6 +197,43 @@ test("the emitted Worker rejects all public fetches without any runtime bindings
       assert.equal(response.status, 404);
       assert.equal(response.headers.get("Cache-Control"), "private, no-store");
       assert.equal(await response.text(), "Not found.");
+    }
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+test("the emitted named service binding admits a private RPC call and returns structured binary data", async () => {
+  assert(process.env.PROVIDER_WORKER_BUNDLE);
+  const script = await readFile(process.env.PROVIDER_WORKER_BUNDLE, "utf8");
+  const runtime = new Miniflare({ workers: [
+    { name: "caller", modules: true, compatibilityDate: "2026-07-30",
+      serviceBindings: { PROVIDER: { name: "provider", entrypoint: "ProviderFetch" } },
+      script: `export default { async fetch(request, env) {
+        const path = new URL(request.url).pathname;
+        const input = path === '/invalid' ? { url: 'file:///synthetic' } : { url: 'https://fixture.example' + path };
+        const result = await env.PROVIDER.fetchSubscription(input);
+        return result.ok ? new Response(result.body, { headers: { 'x-verified': result.bodySha256 } }) : Response.json(result);
+      } };` },
+    { name: "provider", modules: true, compatibilityDate: "2026-07-30", script,
+      durableObjects: { PROVIDER_CONTAINER: { className: "FixtureContainer", scriptName: "fixture" } } },
+    { name: "fixture", modules: true, compatibilityDate: "2026-07-30",
+      script: `import { DurableObject } from 'cloudflare:workers';
+      export class FixtureContainer extends DurableObject {
+        async fetchSubscription(input) {
+          if (input.url !== 'https://fixture.example/accepted') throw new Error('synthetic private RPC failure');
+          return { ok: true, body: new Uint8Array([1, 2, 3]).buffer, bodySha256: '${createHash("sha256").update(Buffer.from([1, 2, 3])).digest("hex")}' };
+        }
+      }
+      export default { fetch() { return new Response(null, { status: 404 }); } };` },
+  ] });
+  try {
+    const accepted = await runtime.dispatchFetch("https://caller.example/accepted");
+    assert.deepEqual(new Uint8Array(await accepted.arrayBuffer()), new Uint8Array([1, 2, 3]));
+    assert.equal(accepted.headers.get("x-verified"), createHash("sha256").update(Buffer.from([1, 2, 3])).digest("hex"));
+    for (const [path, code, retryable] of [["/invalid", "invalid-request", false], ["/fails", "unavailable", true]]) {
+      const result = await runtime.dispatchFetch("https://caller.example" + path);
+      assert.deepEqual(await result.json(), { ok: false, code, retryable });
     }
   } finally {
     await runtime.dispose();

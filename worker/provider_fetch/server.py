@@ -41,6 +41,11 @@ def unique_object(pairs):
 
 def reply(result, families=()):
     if isinstance(result, FetchFailure):
+        if result.code == "http-status":
+            upstream = result.upstream_status
+            if type(upstream) is int and 100 <= upstream <= 599 and upstream != 200:
+                return web.json_response({"error": "http-status", "upstreamStatus": upstream}, status=502, headers=HEADERS)
+            return problem("unavailable", 502)
         status = 504 if result.code == "timeout" else 422 if result.code in {"invalid-url", "blocked-address"} else 502
         return problem(result.code, status)
     headers = {**HEADERS, "X-Provider-Body-Sha256": sha256(result.body).hexdigest()}
