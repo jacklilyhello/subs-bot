@@ -52,6 +52,7 @@ jobs:
           umask 077
           python3 -B worker/tools/prepare_provider_artifact.py > "$RUNNER_TEMP/provider-provenance.json"
       - name: Verify or perform one private provider operation
+        id: provider-activation
         env:
           GH_TOKEN: ${{ github.token }}
           SUBS_BOT_PROVIDER_CI_RUN_ID: ${{ inputs.provider_ci_run_id }}
@@ -68,3 +69,11 @@ jobs:
         run: |
           umask 077
           python3 -B worker/tools/activate_provider_isolation.py
+      - name: Upload the completed private provider binding proof
+        if: steps.provider-activation.outputs.binding_proof == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: subs-bot-provider-binding-proof-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/provider-binding-proof.json
+          if-no-files-found: error
+          retention-days: 30
