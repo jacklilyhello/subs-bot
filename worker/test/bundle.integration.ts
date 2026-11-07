@@ -17,6 +17,7 @@ import { verifyIsolation } from "../tools/verify-isolation.mjs";
 import "./backup-rehearsal.integration.ts";
 import "./telegram-private-share-command.integration.ts";
 import "./telegram-subscription-read.integration.ts";
+import "./telegram-subscription-node-pages.integration.ts";
 import "./telegram-temp-raw.integration.ts";
 import "./telegram-short-links.integration.ts";
 
