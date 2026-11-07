@@ -197,6 +197,20 @@ async function renderReply(
   }
   if (lease.view) return { ...await renderTelegramView(db, lease.actorId, lease.view), access: "allowed" };
   if (lease.temp) return { text: renderTelegramTemp(lease.temp), access: "allowed" };
+  if (lease.document) {
+    const { kind, nodeCount } = lease.document;
+    const text = {
+      saved: `文件已导入，共 ${nodeCount ?? 0} 个节点。`,
+      "invalid-document": "文件未导入。请检查文件类型、大小和节点格式。已有订阅保持原样。",
+      "download-rejected": "无法读取 Telegram 文件。已有订阅保持原样。",
+      coalesced: "已有同名文件已处理或正在处理，请核对后再试。",
+      capacity: "待处理文件已达上限，请稍后重试。",
+      expired: "文件导入已超时。已有订阅保持原样。",
+      "access-changed": "授权状态已变更，文件未导入。",
+      "attempts-exhausted": "文件导入未完成，请重试。已有订阅保持原样。",
+    }[kind];
+    return { text, access: "allowed" };
+  }
   if (lease.command === "list") {
     const page = await listOwnedSubscriptions(db, lease.actorId, { limit: LIST_LIMIT });
     const names = page.items.map((row, index) => {
