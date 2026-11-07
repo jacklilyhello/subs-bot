@@ -412,3 +412,29 @@ test("normalizes the legacy auth aliases and only the configured member target",
     chat: { id: Number(policy.memberId), type: "private" },
   })).command?.command, "auth-list");
 });
+
+test("normalizes only bounded document metadata from direct private human messages", async () => {
+  const actor = { id: Number(policy.memberId), is_bot: false };
+  const chat = { id: actor.id, type: "private" };
+  const document = { file_id: "synthetic-handle", file_name: "Fixture.yaml", file_size: 123,
+    file_unique_id: "discard-this-value", mime_type: "text/plain", file_path: "discard-this-path" };
+  const input = { message_id: 15, date: messageDate, from: actor, chat, document,
+    caption: "/auth remove synthetic", caption_entities: [{ type: "bot_command", offset: 0, length: 5 }] };
+  const decodeDocument = (fields: Record<string, unknown> = {}) => decode({ update_id: updateId, message: { ...input, ...fields } });
+  assert.deepEqual(await decodeDocument(), {
+    status: 200, document: { updateId, actorId: policy.memberId, chatId: policy.memberId, chatType: "private",
+      messageId: 15, messageDate, threadId: null, fileId: document.file_id, fileName: document.file_name, fileSize: 123 },
+  });
+  assert.equal((await decodeDocument({ document: { file_id: document.file_id, file_name: "Unsupported.exe",
+    file_size: 10 * 1024 * 1024 + 1 } })).document?.fileName, "Unsupported.exe");
+  assert.equal((await decodeDocument({ document: { ...document, file_name: `${"x".repeat(1025)}.txt` } })).document?.fileName, ".");
+  assert.equal((await decodeDocument({ document: { file_id: document.file_id, file_size: 0 } })).document?.fileSize, 0);
+  for (const fields of [
+    { chat: { id: Number(policy.groupId), type: "group" } }, { chat: { id: Number(policy.adminId), type: "private" } },
+    { message_thread_id: 9 }, { from: { id: actor.id, is_bot: true } }, { from: { id: 555, is_bot: false } },
+    { forward_origin: { type: "user" } }, { edit_date: messageDate }, { text: "/list" }, { animation: {} },
+    { document: null }, { document: { ...document, file_id: "x\n" } }, { document: { ...document, file_id: "x".repeat(513) } },
+    { document: { ...document, file_name: [] } }, { document: { ...document, file_size: "1" } },
+    { document: { ...document, file_size: -1 } },
+  ]) assert.deepEqual(await decodeDocument(fields), { status: 204 });
+});

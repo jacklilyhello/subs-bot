@@ -20,9 +20,9 @@ let db: D1Database;
 
 before(async () => {
   db = await miniflare.getD1Database("DB");
-  const migrations = new URL("../migrations/", import.meta.url);
-  for (const name of (await readdir(migrations)).filter((file) => file.endsWith(".sql")).sort()) {
-    const sql = await readFile(new URL(name, migrations), "utf8");
+  const directory = new URL("../migrations/", import.meta.url);
+  for (const file of (await readdir(directory)).filter((name) => name.endsWith(".sql")).sort()) {
+    const sql = await readFile(new URL(file, directory), "utf8");
     await db.batch(sql.trim().split(/;\s*/u).filter(Boolean).map((statement) => db.prepare(statement)));
   }
 });

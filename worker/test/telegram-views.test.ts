@@ -28,9 +28,9 @@ const thirtyDays = 30 * 24 * 60 * 60;
 
 before(async () => {
   db = await miniflare.getD1Database("DB");
-  const migrations = new URL("../migrations/", import.meta.url);
-  for (const name of (await readdir(migrations)).filter((file) => file.endsWith(".sql")).sort()) {
-    const sql = await readFile(new URL(name, migrations), "utf8");
+  const directory = new URL("../migrations/", import.meta.url);
+  for (const name of (await readdir(directory)).filter((file) => file.endsWith(".sql")).sort()) {
+    const sql = await readFile(new URL(name, directory), "utf8");
     await db.batch(sql.trim().split(/;\s*/u).filter(Boolean).map((statement) => db.prepare(statement)));
   }
 });

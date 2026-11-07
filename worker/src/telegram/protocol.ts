@@ -1,4 +1,5 @@
 import { PATH_RULE_WHITESPACE_PREFIX } from "../path-rules.ts";
+import type { TelegramDocumentJobInput } from "./document-jobs.ts";
 
 export interface TelegramPolicy {
   botId: string;
@@ -46,16 +47,17 @@ export type TelegramTempUpdate = TelegramEventScope & (
 export type TelegramPathUpdate = TelegramEventScope & { kind: "path"; args: string };
 
 type NormalizedUpdate =
-  | { command: TelegramCommand; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; path?: never }
-  | { view: TelegramViewUpdate; command?: never; lifecycle?: never; privateClaim?: never; temp?: never; path?: never }
-  | { lifecycle: TelegramLifecycleUpdate; command?: never; view?: never; privateClaim?: never; temp?: never; path?: never }
-  | { privateClaim: TelegramPrivateClaimUpdate; command?: never; view?: never; lifecycle?: never; temp?: never; path?: never }
-  | { temp: TelegramTempUpdate; command?: never; view?: never; lifecycle?: never; privateClaim?: never; path?: never }
-  | { path: TelegramPathUpdate; command?: never; view?: never; lifecycle?: never; privateClaim?: never; temp?: never };
+  | { command: TelegramCommand; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; path?: never; document?: never }
+  | { view: TelegramViewUpdate; command?: never; lifecycle?: never; privateClaim?: never; temp?: never; path?: never; document?: never }
+  | { lifecycle: TelegramLifecycleUpdate; command?: never; view?: never; privateClaim?: never; temp?: never; path?: never; document?: never }
+  | { privateClaim: TelegramPrivateClaimUpdate; command?: never; view?: never; lifecycle?: never; temp?: never; path?: never; document?: never }
+  | { temp: TelegramTempUpdate; command?: never; view?: never; lifecycle?: never; privateClaim?: never; path?: never; document?: never }
+  | { path: TelegramPathUpdate; command?: never; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; document?: never }
+  | { document: TelegramDocumentJobInput; command?: never; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; path?: never };
 
 type DecodedTelegramRequest =
   | ({ status: 200 } & NormalizedUpdate)
-  | { status: 204 | 400 | 401 | 413 | 415; command?: never; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; path?: never };
+  | ({ status: 204 | 400 | 401 | 413 | 415 } & Partial<Record<keyof NormalizedUpdate, never>>);
 
 const MAX_UPDATE_BYTES = 64 * 1024;
 const USERNAME = /^[A-Za-z0-9_]{5,32}(?![\s\S])/;
@@ -64,6 +66,8 @@ const BOT_TOKEN = /^[1-9][0-9]*:[A-Za-z0-9_-]{1,128}(?![\s\S])/;
 const JSON_CONTENT_TYPE = /^application\/json(?:\s*;\s*charset\s*=\s*(?:"utf-8"|utf-8))?$/i;
 const BOT_COMMAND = /^\/([A-Za-z0-9_]{1,32})(?:@([A-Za-z0-9_]{5,32}))?(?![\s\S])/;
 const CALLBACK_ID = /^[\u0021-\u007e]{1,128}(?![\s\S])/u;
+const DOCUMENT_FILE_ID = /^[!-~]{1,512}(?![\s\S])/u;
+const MAX_DOCUMENT_FILENAME = 1024;
 const VIEW_TICKET = /^sbv1_[A-Za-z0-9_-]{22}(?![\s\S])/;
 const LIFECYCLE_TICKET = /^sba1_[A-Za-z0-9_-]{22}(?![\s\S])/;
 const RENAME_CANCEL = /^(?:\/cancel|cancel|取消|退出)(?![\s\S])/iu;
@@ -236,6 +240,17 @@ function renameReply(
   return { ...scope, kind: "rename-reply", promptMessageId: prompt.messageId, text };
 }
 
+function normalizeDocument(message: Record<string, unknown>, scope: TelegramEventScope): NormalizedUpdate | null {
+  if (scope.chatType !== "private" || scope.threadId !== null || !isRecord(message.document) ||
+      "text" in message || "entities" in message || "animation" in message) return null;
+  const { file_id: fileId, file_name: reportedName, file_size: fileSize } = message.document;
+  if (!matches(fileId, DOCUMENT_FILE_ID) || (reportedName !== undefined && typeof reportedName !== "string") ||
+      (fileSize !== undefined && fileSize !== 0 && !isPositiveInteger(fileSize))) return null;
+  // Preserve a durable rejection without carrying the unbounded filename into admission.
+  const fileName = reportedName !== undefined && reportedName.length > MAX_DOCUMENT_FILENAME ? "." : reportedName;
+  return { document: { ...scope, fileId, fileName, fileSize } };
+}
+
 function normalizeMessage(
   message: Record<string, unknown>, updateId: number, policy: TelegramPolicy,
 ): NormalizedUpdate | null {
@@ -244,6 +259,7 @@ function normalizeMessage(
   if (actorId === null) return null;
   const scope = messageScope(message, actorId, updateId, policy);
   if (!scope) return null;
+  if ("document" in message) return normalizeDocument(message, scope);
   const command = messageCommand(message, policy);
   if (command && typeof command === "object") {
     if (scope.chatType !== "private" || scope.threadId !== null) return null;

@@ -4,28 +4,34 @@ on:
   pull_request:
     paths:
       - 'worker/provider_fetch/**'
+      - 'worker/tools/bootstrap_provider_worker.py'
       - 'worker/tools/install_provider_skopeo.sh'
       - 'worker/tools/prepare_provider_artifact.py'
       - 'worker/tools/prepare_isolation_artifact.py'
       - 'worker/tools/publish_provider_registry.py'
       - 'worker/tools/verify_provider_skopeo.py'
+      - 'worker/test/test_bootstrap_provider_worker.py'
       - 'worker/test/test_prepare_provider_artifact.py'
       - 'worker/test/test_publish_provider_registry.py'
       - '.github/workflows/worker-provider-artifact-preflight.yml'
+      - '.github/workflows/worker-provider-bootstrap.yml'
       - '.github/workflows/worker-provider-fetch-ci.yml'
       - '.github/workflows/worker-provider-registry-publish.yml'
   push:
     branches: [main]
     paths:
       - 'worker/provider_fetch/**'
+      - 'worker/tools/bootstrap_provider_worker.py'
       - 'worker/tools/install_provider_skopeo.sh'
       - 'worker/tools/prepare_provider_artifact.py'
       - 'worker/tools/prepare_isolation_artifact.py'
       - 'worker/tools/publish_provider_registry.py'
       - 'worker/tools/verify_provider_skopeo.py'
+      - 'worker/test/test_bootstrap_provider_worker.py'
       - 'worker/test/test_prepare_provider_artifact.py'
       - 'worker/test/test_publish_provider_registry.py'
       - '.github/workflows/worker-provider-artifact-preflight.yml'
+      - '.github/workflows/worker-provider-bootstrap.yml'
       - '.github/workflows/worker-provider-fetch-ci.yml'
       - '.github/workflows/worker-provider-registry-publish.yml'
   workflow_dispatch:
@@ -55,6 +61,8 @@ jobs:
         run: python -B -m unittest discover -s worker/test -p 'test_prepare_provider_artifact.py'
       - name: Test guarded registry publication without network access
         run: python -B -m unittest discover -s worker/test -p 'test_publish_provider_registry.py'
+      - name: Test the private Worker bootstrap without network access
+        run: python -B -m unittest discover -s worker/test -p 'test_bootstrap_provider_worker.py'
 
   runtime:
     runs-on: ubuntu-24.04

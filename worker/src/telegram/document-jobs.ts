@@ -32,8 +32,11 @@ export type TelegramDocumentJobLease = DocumentFields & LeaseKey & {
 
 export type TelegramDocumentJobOutcome =
   | { kind: "retry" }
-  | { kind: "failed"; reason: "invalid-document" | "download-rejected" }
+  | { kind: "failed"; reason: "invalid-document" | "download-rejected" | "coalesced" }
   | { kind: "saved" };
+
+export type TelegramDocumentJobResult = "saved" | "invalid-document" | "download-rejected" | "coalesced" |
+  "capacity" | "expired" | "access-changed" | "attempts-exhausted";
 
 type JobGuard = { sql: string; bindings: readonly (string | number)[] };
 const freshReceipt = "incoming.bot_id = ? AND incoming.update_id = ? AND incoming.receipt_nonce = ?";
@@ -74,12 +77,11 @@ export async function acceptTelegramDocumentJob(
   db: D1Database,
   policy: TelegramPolicy,
   event: TelegramDocumentJobInput,
-): Promise<"accepted" | "coalesced" | "capacity" | "ignored"> {
+): Promise<"accepted" | "coalesced" | "capacity" | "invalid-document" | "ignored"> {
   if (!canonicalId(policy.botId) || !canonicalId(event.actorId) || event.chatType !== "private" ||
       event.threadId !== null || !inTelegramScope(policy, event) || !validInteger(event.updateId, 1) ||
       !validInteger(event.messageId, 1) || !validInteger(event.messageDate, 1)) return "ignored";
   const document = documentFields(event);
-  if (!document) return "ignored";
   try {
     const nonce = crypto.randomUUID();
     const key = [policy.botId, event.updateId, nonce] as const;
@@ -98,6 +100,7 @@ export async function acceptTelegramDocumentJob(
             CASE WHEN incoming.actor_id = ? THEN 0 ELSE COALESCE(auth.message_date, 0) END AS auth_date,
             CASE WHEN incoming.actor_id = ? THEN 0 ELSE COALESCE(auth.message_id, 0) END AS auth_id,
             CASE
+              WHEN ? = 1 THEN 'invalid-document'
               WHEN EXISTS (
                 SELECT 1 FROM telegram_document_jobs AS active WHERE active.bot_id = incoming.bot_id
                   AND active.actor_id = incoming.actor_id AND active.name = ? AND active.state IN ('pending', 'leased')
@@ -123,8 +126,13 @@ export async function acceptTelegramDocumentJob(
           CASE WHEN rejected IS NULL THEN ? END, CASE WHEN rejected IS NULL THEN ? END,
           rejected, CASE WHEN rejected IS NOT NULL THEN received_at END
         FROM candidate RETURNING result_code AS resultCode
-      `).bind(policy.adminId, policy.adminId, document.name, ...key,
-        document.fileId, document.name, document.suffix, document.expectedSize),
+      `).bind(policy.adminId, policy.adminId, document === null ? 1 : 0, document?.name ?? null, ...key,
+        document?.fileId ?? null, document?.name ?? null, document?.suffix ?? null, document?.expectedSize ?? null),
+      db.prepare(`
+        INSERT INTO telegram_outbox (receipt_id)
+        SELECT incoming.receipt_id FROM telegram_inbox AS incoming JOIN telegram_document_jobs AS job USING (receipt_id)
+        WHERE ${freshReceipt} AND job.state = 'done'
+      `).bind(...key),
       db.prepare(`
         UPDATE telegram_inbox AS incoming SET receipt_nonce = ?, command = CASE WHEN EXISTS (
           SELECT 1 FROM telegram_document_jobs AS job WHERE job.receipt_id = incoming.receipt_id
@@ -133,12 +141,12 @@ export async function acceptTelegramDocumentJob(
         WHERE ${freshReceipt} RETURNING receipt_id
       `).bind(TELEGRAM_DOCUMENT_JOB_MARKER, ...key),
     ];
-    const results = await db.batch<{ resultCode: "coalesced" | "capacity" | null }>(steps);
+    const results = await db.batch<{ resultCode: "coalesced" | "capacity" | "invalid-document" | null }>(steps);
     if (results.length === steps.length && results.every(({ success }) => success)) {
-      const [, job, receipt] = results;
+      const [, job, , receipt] = results;
       if (receipt.results.length === 1 && job.results.length === 1) {
         const { resultCode } = job.results[0];
-        if (resultCode === "coalesced" || resultCode === "capacity") return resultCode;
+        if (resultCode === "coalesced" || resultCode === "capacity" || resultCode === "invalid-document") return resultCode;
         if (resultCode === null) return "accepted";
       }
       if (receipt.results.length === 0 && job.results.length === 0) return "ignored";
@@ -218,6 +226,7 @@ export function prepareTelegramDocumentJobSettlement(
   policy: TelegramPolicy,
   lease: LeaseKey,
   outcome: TelegramDocumentJobOutcome,
+  requirePublication = false,
 ): D1PreparedStatement {
   const guard = prepareTelegramDocumentJobLeaseGuard(policy, lease);
   const next = "(unixepoch() + CASE attempts WHEN 1 THEN 15 ELSE 45 END)";
@@ -230,7 +239,7 @@ export function prepareTelegramDocumentJobSettlement(
       file_id = CASE WHEN ${retry} THEN file_id END, name = CASE WHEN ${retry} THEN name END,
       suffix = CASE WHEN ${retry} THEN suffix END, expected_size = CASE WHEN ${retry} THEN expected_size END,
       result_code = CASE WHEN NOT ${retry} THEN ${result} END, finished_at = CASE WHEN NOT ${retry} THEN unixepoch() END
-    WHERE receipt_id = ? AND ${guard.sql} RETURNING state
+    WHERE receipt_id = ? AND ${guard.sql} ${requirePublication ? "AND changes() = 1" : ""} RETURNING state
   `).bind(...code, lease.receiptId, ...guard.bindings);
 }
 
