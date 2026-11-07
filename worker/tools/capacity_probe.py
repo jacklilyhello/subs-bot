@@ -15,7 +15,9 @@ import sys
 from threading import Barrier, BrokenBarrierError, Lock, Timer
 from time import monotonic, sleep
 
-from capacity_fixtures import CLASH_SMOKE, SINGBOX_SMOKE, SMOKE_OBJECT_LIMIT, SMOKE_PROFILES, STRUCTURED_SMOKE, canonical_config
+from capacity_fixtures import (
+    CLASH_SMOKE, SINGBOX_SMOKE, SMOKE_OBJECT_LIMIT, SMOKE_PROFILES, STRUCTURED_SMOKE, TEXT_EXPORT_SMOKE, canonical_config,
+)
 
 
 HOST = "subs-bot-cf-dev-01.lilyya.workers.dev"
@@ -41,6 +43,12 @@ FIXTURE_STATUS = {"at-limits": 200, "share-over": 422, "snapshot-over": 503}
 ERROR_BODY = {
     422: b"Subscription content cannot be exported.",
     503: b"Subscription temporarily unavailable.",
+}
+TEXT_EXPORT_ROUTES = {
+    "surge-mixed": ("/surge",),
+    "surge-unsupported": ("/surge",),
+    "qx-mixed": ("/qx", "/quantumult", "/quantumultx"),
+    "qx-unsupported": ("/qx", "/quantumult", "/quantumultx"),
 }
 
 
@@ -419,7 +427,8 @@ def run_structured_smoke(directory, revision, *, profile=STRUCTURED_SMOKE):
     run_deadline = monotonic() + 60
     singbox = profile == SINGBOX_SMOKE
     clash = profile == CLASH_SMOKE
-    routes = ("", "/clash") if clash else (("/sing-box",) if singbox else ("/base64",))
+    text = profile == TEXT_EXPORT_SMOKE
+    standard_routes = ("", "/clash") if clash else (("/sing-box",) if singbox else ("/base64",))
 
     def health():
         deadline = min(monotonic() + 15, run_deadline)
@@ -433,15 +442,18 @@ def run_structured_smoke(directory, revision, *, profile=STRUCTURED_SMOKE):
     for row in fixtures:
         fixture = Fixture(row["label"], row["token"], row["status"], row["exportBytes"], row["exportSha256"])
         wire_digests = set()
+        routes = TEXT_EXPORT_ROUTES[fixture.label] if text else standard_routes
         for route in routes:
             path = f"/sub/{fixture.token}{route}"
-            label = fixture.label + ((":" + (route[1:] or "default")) if clash else "")
+            label = fixture.label + ((":" + (route[1:] or "default")) if clash or text else "")
             result = {}
             for method in ("GET", "HEAD"):
                 deadline = min(monotonic() + 15, run_deadline)
                 with _request(method, path, deadline, label) as response:
                     media = ("text/yaml" if clash else "application/json" if singbox else "text/plain")
                     _check_headers(response, fixture.status, label, media if fixture.status == 200 else "text/plain")
+                    if text and response.getheader("Content-Type", "").lower() != "text/plain; charset=utf-8":
+                        raise ProbeError(f"The text export response charset differs for {label}.")
                     if method == "HEAD":
                         if response.read(1):
                             raise ProbeError(f"HEAD returned a body for {label}.")
@@ -462,8 +474,9 @@ def run_structured_smoke(directory, revision, *, profile=STRUCTURED_SMOKE):
         if len(wire_digests) > 1:
             raise ProbeError("The Clash aliases returned different bytes.")
     health()
-    verified = "fixedClashFixtureDigestMatched" if clash else "pythonOracleDigestMatched"
-    return {"requests": 2 + 2 * len(fixtures) * len(routes), "exactHealth": 2, verified: True, "exports": results}
+    verified = {CLASH_SMOKE: "fixedClashFixtureDigestMatched", TEXT_EXPORT_SMOKE: "fixedTextExportFixtureDigestMatched"}
+    return {"requests": 2 + 2 * len(results), "exactHealth": 2,
+            verified.get(profile, "pythonOracleDigestMatched"): True, "exports": results}
 
 
 def main(argv=None):

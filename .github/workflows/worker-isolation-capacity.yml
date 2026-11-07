@@ -11,6 +11,7 @@ on:
           - structured-smoke
           - singbox-smoke
           - clash-smoke
+          - text-export-smoke
         default: capacity
 
 permissions:
@@ -68,8 +69,8 @@ jobs:
         if: env.FIXTURE_PROFILE == 'capacity'
         timeout-minutes: 8
         run: python3 -B worker/tools/capacity_probe.py "$CAPACITY_DIR"
-      - name: Check live structured export against the reviewed fixture
-        if: env.FIXTURE_PROFILE == 'structured-smoke' || env.FIXTURE_PROFILE == 'singbox-smoke' || env.FIXTURE_PROFILE == 'clash-smoke'
+      - name: Check live export against the reviewed fixture
+        if: env.FIXTURE_PROFILE != 'capacity'
         timeout-minutes: 2
         run: python3 -B worker/tools/capacity_probe.py "$CAPACITY_DIR" --profile "$FIXTURE_PROFILE"
       - name: Verify the active isolation Worker after probing
