@@ -322,6 +322,20 @@ PY
 
 若流程中断，可在确认当前隔离版本后，以同一批次执行 `action=retire` 并在 `confirm_retire` 填写 `retire <cohort>`。遇到所有者、版本、指针或标记不符时保留记录并停止。此流程验证实际 Worker HTTP 和 D1 读取，与 V3 独立原生恢复的对象完整性核对分别记录。
 
+### 旧私密分享与领取盘点
+
+真实盘点在单独获准的受保护托管运行中使用核对过的源码提交。将关闭的 UTF-8、DELETE 日志模式备份放入仅供当前账号访问的目录，确认普通文件归当前账号所有、没有其他硬链接或 SQLite 伴随文件。准备尚未存在的私有输出目录路径。关闭命令跟踪，运行 `python3 -B worker/tools/legacy_private_share_inventory.py BACKUP OUTPUT EXPECTED_SOURCE_SHA256 LEGACY_BOT_ID LEGACY_BOT_USERNAME`。源 SHA-256 须取自独立的备份交接记录。旧 Bot 的正十进制 ID 和小写用户名须取自单独核对过的身份记录，用户名省略 `@`。程序在不可变只读事务前后核对同一文件及 SHA-256。 [SQLite URI](https://sqlite.org/uri.html)
+
+清单绑定源摘要、旧 Bot 身份、表与可选内联消息 ID 列是否存在、记录数以及三个数据文件的字节数和摘要。`shares.ndjson` 按旧分享码的 SHA-256 排序，保存发送者、可选接收者、份数和有效期。`claims.ndjson` 按原领取记录编号排序，保存领取者和原时间。ID 使用十进制字符串。每条分享记录标记原始正文在 `payloads.bin` 中的偏移、长度和 SHA-256。程序验证领取者唯一性、关联分享、指定用户、时间范围和已领取份数，并保留已过期记录。旧内联消息 ID 只作为私有来源证据。
+
+最多保留 20,000 条分享、20,000 条领取、单份正文 64 KiB、正文合计 64 MiB 及分享索引 32 MiB。超限或有不一致时整包失败。只有退出码 `0`、最后写入的 `manifest.sha256` 与清单相符，且清单和三个数据文件的闭包完整时才接收。能力字段只保存摘要。正文按原字节保存，可能已含敏感文字、URL 或旧分享码。整个包只在获准的私有渠道流转，禁止进入 PR、日志、普通 Actions 产物或缓存。普通 CI 只使用合成样本。该盘点不导入 Worker 或变更 Telegram 权限，旧链接连续性另行验收。
+
+### 旧私密分享候选恢复包
+
+在获准的托管 runner 上，运行 `worker/tools/legacy_private_share_candidate.py INVENTORY_DIR WORKER_ARTIFACT_DIR OUTPUT_DIR INVENTORY_MANIFEST_SHA WORKER_MANIFEST_SHA REVISION APPLIED_AT SOURCE_SQLITE_SHA LEGACY_BOT_ID LEGACY_BOT_USERNAME`。使用已核对的封存清单、原 SQLite 摘要和旧 Bot 身份作为独立输入。输出目录须尚未存在，封存盘点目录、Worker 产物目录和输出父目录仅供当前账号访问。
+
+`legacy-private-shares-v1` 仅填充准确的 0005 分享和领取表。封存程序逐行复核领取人与指定对象、份数和原时间，保留已到期记录的原到期秒，并逐对象核对原 UTF-8 正文的字节和摘要。私有正文存于 `objects/private-shares/`。内联消息标识留在封存盘点中，候选仅记录其数量。SQL 重放核对完整结构、外键、编号序列和对象闭包。每包最多 512 个正文对象，每个最多 64 KiB，SQL 重放上限为 4 MiB，所有数据库行仍受原生恢复上限约束。候选保持未绑定，旧 Bot 链接与内联卡片连续性需另行验收。
+
 ### 旧单订阅短链盘点
 
 在获准的受保护托管运行中，对同一份封存 SQLite 使用 `python3 -B worker/tools/legacy_typed_short_inventory.py BACKUP OUTPUT SOURCE_SHA256 OWNER_MAP_JSON OWNER_MAP_SHA256 OLD_HTTPS_ORIGIN LEGACY_BOT_ID`。备份和新输出目录的父目录须仅供当前账号访问。独立核对源文件摘要、规范化归属映射摘要、原 Bot ID 和旧 HTTPS 来源。旧来源使用小写域名，省略端口和尾部斜线。

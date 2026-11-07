@@ -1,0 +1,161 @@
+name: Sample approved provider sources on GitHub
+run-name: Hosted provider source sampling for ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Read source transport only or replay the captured bodies through the Worker
+        type: choice
+        options:
+          - transport
+          - compare
+        default: transport
+      sample_manifest_sha256:
+        description: Independently verified SHA-256 of the exact private sample manifest bytes
+        required: true
+        type: string
+      worker_ci_run_id:
+        description: Successful Worker CI run for this exact main revision, required in compare mode
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: subs-bot-provider-live-samples
+  cancel-in-progress: false
+
+jobs:
+  sample:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && github.run_attempt == '1'
+    environment: subs-bot-provider-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.mode == 'compare' && 18 || 10 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check the selected scope and exact checkout
+        env:
+          SAMPLE_MODE: ${{ inputs.mode }}
+          SUBS_BOT_CI_RUN_ID: ${{ inputs.worker_ci_run_id }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          if [[ "$SAMPLE_MODE" == compare && "$SUBS_BOT_CI_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]; then
+            exit 0
+          fi
+          if [[ "$SAMPLE_MODE" != transport || -n "$SUBS_BOT_CI_RUN_ID" ]]; then
+            echo 'Hosted sample mode or Worker CI run ID is invalid.' >&2
+            exit 2
+          fi
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+      - name: Install only the pinned transport wheels
+        run: |
+          python -m pip --isolated install --index-url https://pypi.org/simple --only-binary=:all: \
+            --require-hashes -r worker/provider_fetch/requirements.txt
+          python -m pip check
+      - name: Prepare the exact Worker CI artifact for comparison
+        if: inputs.mode == 'compare'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CI_RUN_ID: ${{ inputs.worker_ci_run_id }}
+        run: python -B worker/tools/prepare_isolation_artifact.py > /dev/null
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: inputs.mode == 'compare'
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Install locked Worker replay dependencies
+        if: inputs.mode == 'compare'
+        working-directory: worker
+        run: npm ci --ignore-scripts
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        if: inputs.mode == 'compare'
+        id: legacy-python
+        with:
+          python-version: '3.11'
+          update-environment: false
+      - name: Prepare the separate legacy parser environment
+        if: inputs.mode == 'compare'
+        env:
+          LEGACY_PYTHON: ${{ steps.legacy-python.outputs.python-path }}
+        run: |
+          umask 077
+          venv="$RUNNER_TEMP/subs-bot-provider-legacy"
+          "$LEGACY_PYTHON" -m venv "$venv"
+          "$venv/bin/python" -m pip --isolated install --index-url https://pypi.org/simple --only-binary=:all: -r requirements.txt
+          "$venv/bin/python" -m pip check
+      - name: Prepare checksum-pinned client validators
+        if: inputs.mode == 'compare'
+        run: |
+          umask 077
+          clients="$RUNNER_TEMP/subs-bot-provider-clients"
+          mkdir -m 0700 -- "$clients"
+          archive="$clients/sing-box.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 120 \
+            https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-linux-amd64.tar.gz --output "$archive"
+          printf '%s  %s\n' '699a1b510aa4396b2176d32d1181920399ebf1e267835da6f3b598d0f7c24968' "$archive" | sha256sum --check
+          tar -xzf "$archive" -C "$clients"
+          archive="$clients/mihomo.gz"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 120 \
+            https://github.com/MetaCubeX/mihomo/releases/download/v1.19.33/mihomo-linux-amd64-compatible-v1.19.33.gz --output "$archive"
+          printf '%s  %s\n' '386508bfb1c72c43b6a0eda73708ecdce82546581b0ebcb16366c53757c622b6' "$archive" | sha256sum --check
+          gzip -dc "$archive" > "$clients/mihomo"
+          chmod 0700 "$clients/mihomo"
+          test -x "$clients/sing-box-1.14.4-linux-amd64/sing-box"
+          sudo -n unshare --net --setgid="$(id -g)" --setuid="$(id -u)" -- /usr/bin/true
+      - name: Verify the exact current main revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PYTHONPATH=worker/tools python -B - <<'PY'
+          import os
+          from prepare_isolation_artifact import ArtifactError, require_current_main
+
+          try:
+              require_current_main(os.environ['GITHUB_SHA'])
+          except ArtifactError as error:
+              raise SystemExit(str(error)) from None
+          PY
+      - name: Sample approved sources and optionally compare the captured bodies
+        env:
+          SAMPLE_MODE: ${{ inputs.mode }}
+          SUBS_BOT_CI_RUN_ID: ${{ inputs.worker_ci_run_id }}
+          SUBS_BOT_PROVIDER_LIVE_SAMPLE_JSON: ${{ secrets.SUBS_BOT_PROVIDER_LIVE_SAMPLE_JSON }}
+          SUBS_BOT_PROVIDER_LIVE_SAMPLE_SHA256: ${{ inputs.sample_manifest_sha256 }}
+        run: |
+          umask 077
+          runner_temp="$RUNNER_TEMP"
+          workdir="$(mktemp -d "$runner_temp/subs-bot-provider-live-samples.XXXXXXXX")"
+          trap 'rm -rf -- "$workdir"' EXIT
+          trap 'exit 130' INT TERM
+          sample_directory="$workdir/samples"
+          mkdir -m 0700 -- "$sample_directory"
+          export RUNNER_TEMP="$workdir"
+          if [[ "$SAMPLE_MODE" == compare ]]; then
+            python -B -E -s - <<'PY'
+          import os
+          import sys
+          sys.path.insert(0, 'worker/provider_fetch')
+          from live_samples import DIGEST, SECRET, read_manifest
+
+          try:
+              urls = read_manifest(os.environ[SECRET], os.environ[DIGEST])
+              if len(urls) > 4:
+                  raise ValueError()
+          except Exception:
+              raise SystemExit('Hosted comparison requires a verified manifest of at most four sources.') from None
+          PY
+            mv -- "$runner_temp/subs-bot-verified" "$workdir/"
+          fi
+          python -B -E -s worker/provider_fetch/live_samples.py "$sample_directory"
+          if [[ "$SAMPLE_MODE" == compare ]]; then
+            clients="$runner_temp/subs-bot-provider-clients"
+            MIHOMO_TEST_BINARY="$clients/mihomo" SINGBOX_TEST_BINARY="$clients/sing-box-1.14.4-linux-amd64/sing-box" \
+              "$runner_temp/subs-bot-provider-legacy/bin/python" -B -E -s worker/tools/provider_live_compare.py "$sample_directory"
+          fi
