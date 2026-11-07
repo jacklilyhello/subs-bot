@@ -132,12 +132,12 @@ test("emitted Worker searches personal subscriptions and sends only guarded priv
     await seed(policy.adminId, "Admin Straße-AΣ match", "https://provider.example.invalid/unsupported",
       [{ name: "Unsupported fixture", type: "fixture-unsupported" }]);
     await db.prepare("UPDATE subscriptions SET traffic_used=?,traffic_total=?,expire_at=?,last_error=? WHERE id=?")
-      .bind(2 ** 30, 4 * 2 ** 30, now() + 86400, "refresh-secret", ready.id).run();
+      .bind(1.25, 4.5, now() + 86400, "refresh-secret", ready.id).run();
 
     const first = await message(`/s ${needle}`);
     assert.equal(first.response.status, 200);
     const search = await waitForReply(policy.adminId, first.id);
-    assert.match(search.text, /#1 Admin URL match · 剩余 3\.00 GB/u);
+    assert.match(search.text, /#1 Admin URL match · 剩余 3\.25 GB/u);
     assert.match(search.text, /#3 Admin Straße-AΣ match/u);
     assert.doesNotMatch(search.text, /Member-only|decoy/u);
     const groupUpdate = await message(`/s@${policy.botUsername} ${needle}`, policy.memberId, policy.groupId);
@@ -155,6 +155,7 @@ test("emitted Worker searches personal subscriptions and sends only guarded priv
     assert.match(fromList.text, /Admin URL match/u);
     const number = await message("١");
     const detail = await waitForReply(policy.adminId, number.id);
+    assert.match(detail.text, /流量详情：1\.25 GB \/ 4\.50 GB/u);
     assert.match(detail.text, /Synthetic node \[链接已省略\]/u);
     assert.match(detail.text, /上次刷新未成功/u);
     assert.deepEqual(detail.buttons.map(({ text }) => text), Object.keys(expectedFormats));
