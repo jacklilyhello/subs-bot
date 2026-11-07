@@ -40,6 +40,17 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11'
+      - name: Generate Unicode case-folding source
+        run: python3 -B tools/generate_casefold.py > "$RUNNER_TEMP/unicode14-casefold.ts"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unicode14-casefold-${{ env.BUILD_REVISION }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/unicode14-casefold.ts
+          if-no-files-found: error
+          retention-days: 1
       - name: Install locked dependencies
         run: |
           test "$(git rev-parse HEAD)" = "$BUILD_REVISION"
