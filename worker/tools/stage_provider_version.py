@@ -26,6 +26,11 @@ PREPARE_SECONDS = 15 * 60
 VERSION_ERROR = "The staged provider Worker version did not match the exact private release."
 UPLOAD_ERROR = "The provider version upload was not confirmed. Use verification to reconcile the exact candidate before another stage."
 PREPARE_ERROR = "The pinned provider image was not ready for Cloudflare Workers."
+MAX_UPLOAD_ERRORS = 8
+UPLOAD_FIELDS = frozenset((
+    "metadata", "main_module", "compatibility_date", "compatibility_flags", "annotations", "bindings", "containers",
+    "exports", "files", "migrations",
+))
 
 
 class StageError(ValueError):
@@ -43,7 +48,6 @@ def _metadata(evidence, image):
         "compatibility_date": evidence["compatibilityDate"],
         "bindings": [
             {"name": "BUILD_REVISION", "type": "plain_text", "text": evidence["revision"]},
-            {"name": "PROVIDER_CONTAINER", "type": "durable_object_namespace", "class_name": "ProviderContainer"},
             {"name": "PROVIDER_SMOKE", "type": "workflow", "workflow_name": WORKFLOW, "class_name": "ProviderSmoke"},
         ],
         "exports": {
@@ -73,17 +77,47 @@ def _multipart(metadata, module):
     return f"multipart/form-data; boundary={boundary}", body
 
 
-def _json_request(url, opener, token, error, *, content_type=None, body=None,
-                  statuses=(200,), limit=publication.HTTP_LIMIT):
+def _request(url, opener, token, error, *, content_type=None, body=None, limit=publication.HTTP_LIMIT):
     headers = {"Authorization": "Bearer " + token, "Accept": "application/json", "Cache-Control": "no-cache"}
     if body is not None:
         headers["Content-Type"] = content_type
     request = Request(url, data=body, headers=headers, method="GET" if body is None else "POST")
-    status, _, raw = publication._response(request, opener, error, limit=limit)
+    return publication._response(request, opener, error, limit=limit)
+
+
+def _json_request(url, opener, token, error, *, content_type=None, body=None,
+                  statuses=(200,), limit=publication.HTTP_LIMIT):
+    status, _, raw = _request(url, opener, token, error, content_type=content_type, body=body, limit=limit)
     envelope = github._parse_object(raw, error)
     _require(status in statuses and envelope.get("success") is True and envelope.get("errors") in (None, [])
              and "result" in envelope, error)
     return status, envelope
+
+
+def _upload_error(status, envelope):
+    diagnostic = {}
+    if type(status) is int and 100 <= status <= 599:
+        diagnostic["httpStatus"] = status
+    errors = envelope.get("errors") if envelope is not None else None
+    codes, fields = set(), set()
+    if isinstance(errors, list):
+        for entry in errors[:MAX_UPLOAD_ERRORS]:
+            code = entry.get("code") if isinstance(entry, dict) else None
+            if type(code) is not int or not 1000 <= code <= 999999:
+                continue
+            codes.add(code)
+            source = entry.get("source")
+            pointer = source.get("pointer") if isinstance(source, dict) else None
+            if isinstance(pointer, str) and re.fullmatch(r"/[A-Za-z0-9_/-]{1,127}", pointer):
+                path = pointer.removeprefix("/metadata") if pointer.startswith("/metadata/") else pointer
+                field = path.split("/", 2)[1]
+                if field in UPLOAD_FIELDS:
+                    fields.add(field)
+    if codes:
+        diagnostic["cloudflareCodes"] = sorted(codes)
+    if fields:
+        diagnostic["validationFields"] = sorted(fields)
+    return f"{UPLOAD_ERROR} Upload diagnostic {json.dumps(diagnostic, separators=(',', ':'))}." if diagnostic else UPLOAD_ERROR
 
 
 def _version_id(value):
@@ -134,47 +168,66 @@ class WorkerVersions:
 
     def upload(self, metadata, module):
         content_type, body = _multipart(metadata, module)
+        status = envelope = None
         try:
-            _, envelope = _json_request(f"{self._base}{self._legacy}/versions?bindings_inherit=strict",
-                                        self._opener, self._token, UPLOAD_ERROR, content_type=content_type,
-                                        body=body, statuses=(200, 201))
-            result = envelope["result"]
-            _require(isinstance(result, dict), UPLOAD_ERROR)
+            status, _, raw = _request(f"{self._base}{self._legacy}/versions?bindings_inherit=strict",
+                                      self._opener, self._token, UPLOAD_ERROR, content_type=content_type, body=body)
+            envelope = github._parse_object(raw, UPLOAD_ERROR)
+            result = envelope.get("result")
+            _require(status in (200, 201) and envelope.get("success") is True and envelope.get("errors") in (None, [])
+                     and isinstance(result, dict), UPLOAD_ERROR)
             return _version_id(result.get("id"))
         except (StageError, publication.PublicationError, github.ArtifactError):
-            raise StageError(UPLOAD_ERROR) from None
+            raise StageError(_upload_error(status, envelope)) from None
 
     def verify(self, candidate, metadata, module_sha256):
         candidate = _version_id(candidate)
         beta = self._read(f"{self._beta}/{candidate}?include=modules", MAX_VERSION_RESPONSE)["result"]
         _verify_version(beta, candidate, metadata, module_sha256)
         legacy = self._read(f"{self._legacy}/versions/{candidate}")["result"]
-        _require(isinstance(legacy, dict) and legacy.get("id") == candidate, VERSION_ERROR)
-        resources = legacy.get("resources")
-        runtime = resources.get("script_runtime") if isinstance(resources, dict) else None
-        _require(isinstance(runtime, dict) and runtime.get("containers") == metadata["containers"], VERSION_ERROR)
+        _verify_legacy_version(legacy, candidate, metadata)
+
+
+def _verify_legacy_version(version, candidate, metadata):
+    _require(isinstance(version, dict) and version.get("id") == candidate, VERSION_ERROR)
+    resources = version.get("resources")
+    runtime = resources.get("script_runtime") if isinstance(resources, dict) else None
+    _require(isinstance(runtime, dict) and runtime.get("containers") == metadata["containers"], VERSION_ERROR)
+    _verify_compatibility(runtime)
+    # Some legacy responses omit bindings. The Beta version detail always verifies the exact inventory.
+    if resources.get("bindings") not in (None, {}):
+        _verify_bindings(resources["bindings"], metadata["bindings"])
+
+
+def _verify_compatibility(runtime):
+    # The pinned date enables ctx.exports by default (2025-11-17 onward).
+    _require(runtime.get("compatibility_date") in (provider.COMPATIBILITY, provider.COMPATIBILITY + "T00:00:00Z")
+             and runtime.get("compatibility_flags") in (None, []), VERSION_ERROR)
+
+
+def _verify_bindings(bindings, expected):
+    _require(isinstance(bindings, list) and len(bindings) == len(expected)
+             and all(isinstance(row, dict) and isinstance(row.get("name"), str) for row in bindings), VERSION_ERROR)
+    by_name = {row["name"]: row for row in bindings}
+    for binding in expected:
+        row = by_name.get(binding["name"])
+        _require(isinstance(row, dict) and all(row.get(key) == value for key, value in binding.items())
+                 and row.get("script_name") in (None, provider.SERVICE) and row.get("environment") in (None, "production")
+                 and row.get("namespace_id") is None and row.get("dispatch_namespace") is None, VERSION_ERROR)
 
 
 def _verify_version(version, candidate, metadata, module_sha256):
     _require(isinstance(version, dict) and version.get("id") == candidate
              and version.get("main_module") == provider.WORKER and version.get("urls") == []
-             and version.get("compatibility_date") in (metadata["compatibility_date"], metadata["compatibility_date"] + "T00:00:00Z")
              and version.get("usage_model") in (None, "standard")
-             and not any(version.get(key) for key in ("assets", "compatibility_flags", "limits", "migrations", "placement"))
+             and not any(version.get(key) for key in ("assets", "limits", "migrations", "placement"))
              and version.get("cache_options") in (None, {}, {"enabled": False},
                                                  {"enabled": False, "cross_version_cache": False}), VERSION_ERROR)
+    _verify_compatibility(version)
     annotations = version.get("annotations")
     _require(isinstance(annotations, dict)
              and all(annotations.get(key) == expected for key, expected in metadata["annotations"].items()), VERSION_ERROR)
-    bindings = version.get("bindings")
-    _require(isinstance(bindings, list) and len(bindings) == len(metadata["bindings"])
-             and all(isinstance(row, dict) and isinstance(row.get("name"), str) for row in bindings), VERSION_ERROR)
-    by_name = {row["name"]: row for row in bindings}
-    for binding in metadata["bindings"]:
-        row = by_name.get(binding["name"])
-        _require(isinstance(row, dict) and all(row.get(key) == value for key, value in binding.items())
-                 and row.get("script_name") in (None, provider.SERVICE) and row.get("environment") in (None, "production")
-                 and row.get("namespace_id") is None, VERSION_ERROR)
+    _verify_bindings(version.get("bindings"), metadata["bindings"])
     exports = version.get("exports")
     _require(isinstance(exports, dict) and set(exports) - set(metadata["exports"]) <= {"default"}, VERSION_ERROR)
     for name, expected in metadata["exports"].items():

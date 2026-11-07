@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from hashlib import sha256
 import json
 import logging
@@ -21,8 +22,16 @@ import prepare_isolation_artifact as artifact
 MAX_BODY = 10 * 1024**2
 MAX_CONFIG = 16 * 1024**2
 MAX_EXPORT = 4 * ((MAX_CONFIG + 2) // 3)
-MAX_SAMPLES = 12
+MAX_SAMPLES = 4
+MAX_NODES = 5000
 FORMATS = ("base64", "clash", "singbox", "surge", "qx")
+FAMILIES = frozenset(("ss", "vmess", "vless", "trojan", "hysteria", "hysteria2", "tuic", "anytls", "socks", "http", "other"))
+FAMILY_ALIASES = {"shadowsocks": "ss", "hy2": "hysteria2", "socks5": "socks", "https": "http"}
+REJECTED_TRAITS = frozenset(("randomized-fingerprint", "packet-encoding-none", "nested-tls", "ws-header-array"))
+SINGBOX_CONTROLS = frozenset(("selector", "direct", "block", "dns", "urltest"))
+SURGE_DECLARATION = re.compile(r"^(.+) = (?:ss|vmess|vless|trojan|anytls|socks5(?:-tls)?|https?|hysteria2|tuic-v5),")
+QX_DECLARATION = re.compile(r"^(?:shadowsocks|vmess|vless|trojan|anytls|socks5|http)=")
+URI_ROW = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\r\n]+\Z")
 FETCH_FAILURES = frozenset((
     "invalid-url", "invalid-auth", "blocked-address", "dns-failed", "tls-failed", "unavailable", "timeout",
     "invalid-redirect", "redirect-limit", "http-status", "body-too-large", "invalid-body", "skipped-rate-limit",
@@ -165,6 +174,74 @@ def worker_replay(bundle, sample_file, row, source, scratch):
     return replay
 
 
+def protocol_counts(nodes):
+    counts = {}
+    for node in nodes:
+        protocol = node.get("type")
+        protocol = FAMILY_ALIASES.get(protocol, protocol) if isinstance(protocol, str) else "other"
+        family = protocol if protocol in FAMILIES else "other"
+        counts[family] = counts.get(family, 0) + 1
+    return counts
+
+
+def verified_diagnostics(value, count):
+    def counter(mapping, allowed, maximum):
+        return isinstance(mapping, dict) and set(mapping) <= allowed and all(
+            integer(item, 1, maximum) for item in mapping.values())
+
+    require(integer(count, 1, MAX_NODES) and isinstance(value, dict) and set(value) == {"protocols", "formats"})
+    protocols, formats = value["protocols"], value["formats"]
+    require(counter(protocols, FAMILIES, count) and sum(protocols.values()) == count
+            and isinstance(formats, dict) and set(formats) == set(FORMATS))
+    for row in formats.values():
+        require(isinstance(row, dict) and set(row) == {"admitted", "rejected", "rejectedTraits"})
+        admitted, rejected = row["admitted"], row["rejected"]
+        require(counter(admitted, FAMILIES, count) and counter(rejected, FAMILIES, count)
+                and all(admitted.get(family, 0) + rejected.get(family, 0) == protocols.get(family, 0) for family in FAMILIES)
+                and counter(row["rejectedTraits"], REJECTED_TRAITS, sum(rejected.values())))
+    return {"runtime": "node24-source-serializers", "protocols": protocols, "formats": formats}
+
+
+def emitted_coverage(format_name, body):
+    """Count declared output rows. Native-client validation is separate evidence."""
+    try:
+        if format_name == "base64":
+            rows = base64.b64decode(body, validate=True).decode("utf-8").split("\n") if body else []
+            require(all(URI_ROW.fullmatch(line) for line in rows))
+            return {"declarations": len(rows)}
+        if format_name in ("clash", "singbox"):
+            if format_name == "clash":
+                import yaml
+                rows = yaml.safe_load(body)["proxies"]
+            else:
+                rows = json.loads(body)["outbounds"]
+            require(isinstance(rows, list) and all(isinstance(row, dict) for row in rows))
+            return {"declarations": sum(format_name == "clash" or row.get("type") not in SINGBOX_CONTROLS for row in rows)}
+        lines = [line for line in body.decode("utf-8").split("\n") if line]
+        if format_name == "qx":
+            declarations = sum(bool(QX_DECLARATION.match(line)) for line in lines)
+            uris = sum(bool(URI_ROW.fullmatch(line)) for line in lines)
+            return {"declarations": declarations, "uriRows": uris, "unrecognizedRows": len(lines) - declarations - uris}
+        group, rules = lines.index("[Proxy Group]"), lines.index("[Rule]")
+        require(lines[0] == "[Proxy]" and group + 2 == rules and lines[group + 1].startswith("Proxy = select, "))
+        names = set()
+        declarations = comments = 0
+        for line in lines[1:group]:
+            if line.startswith("#"):
+                comments += 1
+                continue
+            match = SURGE_DECLARATION.match(line)
+            if match:
+                declarations += 1
+                names.add(match[1])
+        references = lines[group + 1][len("Proxy = select, "):].split(", ")
+        dangling = sum(reference != "DIRECT" and reference not in names for reference in references)
+        return {"declarations": declarations, "commentRows": comments, "danglingGroupReferences": dangling,
+                "unrecognizedRows": group - 1 - declarations - comments}
+    except Exception:
+        return None
+
+
 def compare_exports(convert, nodes, worker, scratch):
     import yaml
 
@@ -181,7 +258,9 @@ def compare_exports(convert, nodes, worker, scratch):
                 legacy = "rejected"
             except Exception:
                 legacy = "error"
-        result = {"legacy": legacy, "workerStatus": None, "bytes": None, "comparison": "not-comparable", "client": "not-tested"}
+        result = {"legacy": legacy, "workerStatus": None, "bytes": None, "comparison": "not-comparable", "client": "not-tested",
+                  "legacyCoverage": emitted_coverage(format_name, expected) if legacy == "available" else None,
+                  "workerCoverage": None}
         if worker["job"] == "saved":
             response = worker["formats"][format_name]
             status, size = response["status"], response["bytes"]
@@ -191,6 +270,7 @@ def compare_exports(convert, nodes, worker, scratch):
             if status == 200:
                 actual = read_private(scratch / (format_name + ".body"), limit)
                 require(len(actual) == size)
+                result["workerCoverage"] = emitted_coverage(format_name, actual)
                 if legacy == "available":
                     comparison = "exact" if actual == expected else "different"
                     if comparison == "different" and format_name in ("clash", "singbox"):
@@ -224,7 +304,7 @@ def compare_sample(directory, bundle, row, source):
     try:
         charset = aiohttp.helpers.parse_mimetype(legacy_headers.get("content-type", "")).parameters.get("charset")
         nodes, hysteria_rejected = convert.parse_nodes_from_text_with_report(convert.decode_subscription_bytes(body, charset))
-        legacy = "limit" if len(nodes) > 5000 else "parsed" if nodes else "no-nodes"
+        legacy = "limit" if len(nodes) > MAX_NODES else "parsed" if nodes else "no-nodes"
         metadata = convert.parse_subscription_headers(legacy_headers)
     except Exception:
         nodes, hysteria_rejected, legacy, metadata = [], 0, "error", {}
@@ -232,11 +312,13 @@ def compare_sample(directory, bundle, row, source):
         scratch = Path(temp)
         worker = worker_replay(bundle, sample_file, row, source, scratch)
         result = {"case": row["case"], "outcome": "ok", "decodedBytes": len(body),
-                  "legacy": {"kind": legacy, "nodes": len(nodes), "rejectedHysteria2": hysteria_rejected},
-                  "worker": {"job": worker["job"], "document": worker["document"]}}
+                  "legacy": {"kind": legacy, "nodes": len(nodes), "rejectedHysteria2": hysteria_rejected,
+                             "protocols": protocol_counts(nodes) if legacy == "parsed" else {}},
+                  "worker": {"job": worker["job"], "document": worker["document"], "documentRuntime": "node24-source-parser"}}
         if worker["job"] == "saved":
             require(integer(worker.get("chunks"), 1, 256) and integer(worker.get("ndjsonBytes"), 1, 64 * 1024**2)
                     and set(worker["formats"]) == set(FORMATS))
+            result["worker"]["diagnostics"] = verified_diagnostics(worker["diagnostics"], worker["document"]["nodes"])
             match = {}
             for name, old_name in (("trafficUsed", "traffic_used"), ("trafficTotal", "traffic_total"), ("expireAt", "expire_at")):
                 old, new = metadata.get(old_name), worker["metadata"][name]

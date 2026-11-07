@@ -33,6 +33,24 @@ class CandidateArtifactTests(unittest.TestCase):
     def build(self, profile=tool.PROFILE):
         return tool.build_synthetic_candidate(self.worker, self.output, self.release["revision"], "1234", "1", profile=profile)
 
+    def test_share_build_keeps_private_files_under_hosted_runner_temp(self):
+        runner = self.root / "runner-temp"
+        runner.mkdir()
+        runner.chmod(0o755)
+        self.output = runner / tool.ARTIFACT_PREFIXES[tool.SHARE_PROFILE]
+
+        report = self.build(tool.SHARE_PROFILE)
+
+        self.assertEqual(report["objectCount"], 3)
+        self.assertEqual(self.output.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(set(runner.iterdir()), {self.output})
+        manifest = self.output / tool.package.MANIFEST
+        self.assertEqual(manifest.stat().st_mode & 0o777, 0o600)
+        original = manifest.read_bytes()
+        with self.assertRaises(FileExistsError):
+            self.build(tool.SHARE_PROFILE)
+        self.assertEqual(manifest.read_bytes(), original)
+
     def archive(self, *, extra=False):
         file = BytesIO()
         with ZipFile(file, "w") as archive:

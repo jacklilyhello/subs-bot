@@ -42,6 +42,9 @@ def main(revision):
     for url in ("http://127.0.0.1/", "http://[::1]/", "http://169.254.169.254/"):
         require(request("POST", "/v1/fetch", {"url": url}) == (422, {"error": "blocked-address"}))
     require(request("POST", "/v1/edge-proof", {"url": "https://fixture.example/"}) == (400, {"error": "invalid-request"}))
+    for url in ("https://127.0.0.1/v1/models", "https://[::1]/v1/models", "https://169.254.169.254/v1/models"):
+        require(request("POST", "/v1/api-status", {"url": url, "key": "synthetic-probe-key"}) ==
+                (422, {"error": "blocked-address"}))
     print("Hosted nonroot provider image and private port policy verified.")
 
 
