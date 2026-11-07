@@ -6,7 +6,15 @@ import {
 
 interface Env {
   BUILD_REVISION: string;
-  PROVIDER_CONTAINER: DurableObjectNamespace<ProviderContainer>;
+}
+
+declare global {
+  namespace Cloudflare {
+    interface GlobalProps {
+      mainModule: typeof import("./worker.ts");
+      durableNamespaces: "ProviderContainer";
+    }
+  }
 }
 
 interface Probe {
@@ -31,7 +39,7 @@ export class ProviderContainer extends DurableObject<Env> {
       if (request.providerRevision !== revision) return providerFailure("unavailable");
       const payload = providerPayload({ url: request.url });
       if (payload === null) return providerFailure("invalid-request");
-      const singleton = this.env.PROVIDER_CONTAINER.idFromName(SINGLETON);
+      const singleton = this.ctx.exports.ProviderContainer.idFromName(SINGLETON);
       const container = this.ctx.container;
       if (!this.ctx.id.equals(singleton) || !container || typeof revision !== "string" || !REVISION.test(revision)) {
         return providerFailure("unavailable");
@@ -50,7 +58,7 @@ export class ProviderContainer extends DurableObject<Env> {
 
   async prove(probe: Probe) {
     const revision = this.env.BUILD_REVISION;
-    const singleton = this.env.PROVIDER_CONTAINER.idFromName(SINGLETON);
+    const singleton = this.ctx.exports.ProviderContainer.idFromName(SINGLETON);
     if (!this.ctx.id.equals(singleton) || !validProbe(probe, revision) || this.busy || !this.ctx.container) {
       throw new Error("Provider smoke admission rejected.");
     }
@@ -75,7 +83,7 @@ export class ProviderFetch extends WorkerEntrypoint<Env> {
       const request = providerRequest(input);
       if (request === null) return providerFailure("invalid-request");
       if (request.providerRevision !== this.env.BUILD_REVISION) return providerFailure("unavailable");
-      return await this.env.PROVIDER_CONTAINER.getByName(SINGLETON).fetchSubscription(request);
+      return await this.ctx.exports.ProviderContainer.getByName(SINGLETON).fetchSubscription(request);
     } catch {
       return providerFailure("unavailable");
     }
@@ -91,7 +99,7 @@ export class ProviderSmoke extends WorkflowEntrypoint<Env, Probe> {
     }
     return step.do("verify fixed provider egress", { retries: { limit: 0, delay: "1 second" }, timeout: "75 seconds" }, async () => {
       try {
-        const container = this.env.PROVIDER_CONTAINER.getByName(SINGLETON);
+        const container = this.ctx.exports.ProviderContainer.getByName(SINGLETON);
         return await container.prove(event.payload);
       } catch {
         throw new Error("Provider container smoke failed.");

@@ -197,7 +197,6 @@ def config_for(directory, manifest, account):
         "compatibility_date": COMPATIBILITY, "workers_dev": False, "preview_urls": False, "logpush": False,
         "observability": {"enabled": False, "logs": {"enabled": False, "invocation_logs": False}, "traces": {"enabled": False}},
         "vars": {"BUILD_REVISION": manifest["revision"]},
-        "durable_objects": {"bindings": [{"name": "PROVIDER_CONTAINER", "class_name": "ProviderContainer"}]},
         "exports": {"ProviderContainer": {"type": "durable-object", "storage": "sqlite"}},
         "containers": [{"class_name": "ProviderContainer", "scheduling_policy": "durable_object",
                         "images": {"provider": {"image": f"registry.cloudflare.com/{account}/{SERVICE}@sha256:{digest}"}},
