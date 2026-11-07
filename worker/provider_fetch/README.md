@@ -44,6 +44,8 @@ Merge the first activation tooling before staging a release, and retain that exa
 
 Run `worker-provider-isolation-activate.yml` with the exact `provider_ci_run_id`. Its default `verify` performs reads only. The dedicated Workers Scripts Write and Workers Containers Write credentials are both required to inventory the fixed resources. Each explicit operation attempts at most one resource write, and requires a new dispatch on attempt 1. Re-read the observed IDs independently after each operation, compare its identity SHA-256, then set the next protected pin. Identity fingerprints use SHA-256 of the pin's ASCII JSON with sorted keys and compact separators. Raw IDs and API response bodies stay out of public workflow output.
 
+Use `release=resume-c0a73ce` only to continue the pinned `c0a73ce` release from Provider Fetch CI run `42372768064`. It requires an exact current `main` descended from that revision and the original release and activation pins. Begin with `verify` and reconcile any earlier write from the observed state. The continuation permits verification, Container and Workflow provisioning, and smoke. Smoke and its subsequent readback use the original `c0a73ce` isolated app health revision. The resulting v2 proof preserves the running Provider revision and authenticates the current workflow revision separately for first application binding.
+
 | Operation | Required predecessor pins | Protected pin after independent readback |
 | --- | --- | --- |
 | `activate` | Existing Worker identity and exact release | `SUBS_BOT_CF_PROVIDER_ACTIVATION_JSON` with `deploymentId` and `namespaceId` |

@@ -103,6 +103,7 @@ class ProviderGate:
         self._proof_body = activation._proof_bytes(proof)
         self._first_binding_verified = False
         self._release = {**proof["providerBuild"], "versionId": active["versionId"]}
+        self.historical_application_revision = proof["activation"]["revision"] if proof["version"] == 2 else None
         fingerprint = activation._fingerprint({"account": account_sha, "worker": identity.fingerprint(),
             "release": self._release, "activation": deployment, "container": facts["containerIdentitySha256"],
             "workflow": facts["workflowIdentitySha256"], "proofArtifact": proof_pin,
@@ -115,8 +116,12 @@ class ProviderGate:
         if self._first_binding_verified:
             return
         try:
-            proof = _read_proof(self._proof_pin, github._github_token())
+            token = github._github_token()
+            proof = _read_proof(self._proof_pin, token)
             _require(activation._proof_bytes(proof) == self._proof_body, PROOF_ERROR)
+            if self.historical_application_revision is not None:
+                activation.require_historical_provider_ancestor(
+                    self._release["revision"], self.historical_application_revision, token)
         except (ValueError, BadZipFile, RuntimeError, OSError, HTTPException, zlib.error,
                 AttributeError, KeyError, TypeError, EOFError):
             raise CloudflareError(PROOF_ERROR) from None
