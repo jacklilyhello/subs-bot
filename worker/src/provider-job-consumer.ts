@@ -148,7 +148,7 @@ async function publish(
   return await confirmSaved(db, lease, staged) ? "saved" : "uncertain";
 }
 
-/** Run at most one lease on a scheduled invocation. No source URL leaves the named binding. */
+/** Run at most one lease from the selected queue and use the named binding for its source URL. */
 export async function runOneProviderJob(
   db: D1Database, bucket: R2Bucket, provider: ProviderFetcher | undefined, pin: ProviderPin, policy?: ProviderTelegramPolicy,
 ): Promise<ConsumerOutcome> {
