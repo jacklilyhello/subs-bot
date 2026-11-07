@@ -4,6 +4,7 @@ import {
 import type { NodeRecord } from "./storage.ts";
 
 export type Fields = NodeRecord;
+type ProxyExportFormat = "singbox" | "clash" | "surge" | "qx";
 const ALIASES = new Map([["ss", "shadowsocks"], ["hy2", "hysteria2"], ["socks5", "socks"], ["https", "http"]]);
 const RAW_SCHEMES = new Set(["ss", "vmess", "vless", "trojan", "hysteria", "hysteria2", "hy2", "tuic", "anytls", "socks5"]);
 const CLASH_HYSTERIA2_QUERY = new Set(["auth", "mport", "sni", "insecure", "obfs", "obfs-password", "pinSHA256", "ech"]);
@@ -232,7 +233,7 @@ function vmessUri(address: string): Fields {
   return source;
 }
 
-function uriSource(share: string, scheme: string, protocol: string, address: string, format: "singbox" | "clash"): Fields {
+function uriSource(share: string, scheme: string, protocol: string, address: string, format: ProxyExportFormat): Fields {
   if (/[\p{White_Space}\\]/u.test(address)) unsupported();
   if (protocol === "vmess") return vmessUri(address);
   if (protocol === "shadowsocks") {
@@ -268,7 +269,7 @@ function uriSource(share: string, scheme: string, protocol: string, address: str
       || !isValidStoredShare(scheme + "://" + authority + ":443")) unsupported();
   }
   const source: Fields = { server: host };
-  if (protocol === "hysteria2" && format === "clash") {
+  if (protocol === "hysteria2" && format !== "singbox") {
     if (Object.keys(options).some((key) => !CLASH_HYSTERIA2_QUERY.has(key))
       || options.pinSHA256 || (Object.hasOwn(options, "mport") && (hopping || options.mport === ""))) unsupported();
     if (Object.hasOwn(options, "insecure")) flag(options.insecure);
@@ -323,7 +324,7 @@ function uriSource(share: string, scheme: string, protocol: string, address: str
   return source;
 }
 
-export function proxyInput(node: NodeRecord, format: "singbox" | "clash"): {
+export function proxyInput(node: NodeRecord, format: ProxyExportFormat): {
   name: string; type: string | undefined; protocol: string; source: Fields; fromUri: boolean;
 } {
   const name = node.name === undefined || node.name === null || node.name === "" ? "node" : string(node.name, true);
