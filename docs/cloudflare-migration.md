@@ -353,6 +353,10 @@ PY
 
 若流程中断，可在确认当前隔离版本后，以同一批次执行 `action=retire` 并在 `confirm_retire` 填写 `retire <cohort>`。遇到所有者、版本、指针或标记不符时保留记录并停止。此流程验证实际 Worker HTTP 和 D1 读取，与 V3 独立原生恢复的对象完整性核对分别记录。
 
+隔离版本已启用 `LEGACY_SUBSCRIPTION_SHORTS` 后，在相同工作流命令附加 `-f profile=typed-shorts`，使用新的随机 16 位小写十六进制批次。流程核对当前 Worker 版本和 `0029` 表，在既有隔离 D1 写入一个合成的旧空订阅。通过 GET 和 HEAD 核对默认、Surge 与 `mixed` 的相对跳转和目标内容，以及错误归属、令牌摘要不符、已撤销、普通和聚合短码冲突的 404。将订阅移入回收站、恢复并复验后，在一个批次中清理该订阅、标记和短码，再核对 404。流程不写入 R2，也不调用 Telegram。
+
+如需恢复清理，使用相同 `profile=typed-shorts`、同一 `cohort` 和上述 `retire` 参数。流程只清理身份、摘要和生命周期均匹配的完整合成批次。写入状态不明时保留批次标识，先核对运行，再按相同批次恢复，不重复提交原写入。短码与订阅令牌不进入日志或产物。同一 Bot 真实所有者通过 Telegram 撤销短码另行验收。
+
 ### 旧私密分享与领取盘点
 
 真实盘点在单独获准的受保护托管运行中使用核对过的源码提交。将关闭的 UTF-8、DELETE 日志模式备份放入仅供当前账号访问的目录，确认普通文件归当前账号所有、没有其他硬链接或 SQLite 伴随文件。准备尚未存在的私有输出目录路径。关闭命令跟踪，运行 `python3 -B worker/tools/legacy_private_share_inventory.py BACKUP OUTPUT EXPECTED_SOURCE_SHA256 LEGACY_BOT_ID LEGACY_BOT_USERNAME`。源 SHA-256 须取自独立的备份交接记录。旧 Bot 的正十进制 ID 和小写用户名须取自单独核对过的身份记录，用户名省略 `@`。程序在不可变只读事务前后核对同一文件及 SHA-256。 [SQLite URI](https://sqlite.org/uri.html)
