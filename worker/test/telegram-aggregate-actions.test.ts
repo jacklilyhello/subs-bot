@@ -12,6 +12,8 @@ import {
   TELEGRAM_AGGREGATE_MARKER, TELEGRAM_AGGREGATE_ORIGIN,
 } from "../src/telegram/aggregate-actions.ts";
 import { drainTelegramReplies } from "../src/telegram/delivery.ts";
+import { acceptTelegramDocumentJob } from "../src/telegram/document-jobs.ts";
+import { acceptTelegramPath } from "../src/telegram/path-management.ts";
 import { beginTelegramAggregateLinkReply, claimTelegramReply, settleTelegramReply } from "../src/telegram/store.ts";
 import type { TelegramAggregateUpdate, TelegramPolicy } from "../src/telegram/protocol.ts";
 
@@ -236,6 +238,28 @@ test("rolls back issuance and its receipt when the D1 transaction fails", async 
     .bind(config.memberId).first<number>("n"), 0);
   assert.equal(await acceptTelegramAggregate(db, config, input, key), "accepted");
   assert.equal((await action(config, 1))?.result, "issued");
+});
+
+test("path and terminal document replies survive aggregate gating without head-of-line blocking", async () => {
+  for (const enabled of [false, true]) {
+    const config = enabled ? policy("82011", "83101", "83102") : policy("82010", "83001", "83002");
+    await seed(db, bucket, config.memberId, `mixed-replies-${enabled}`);
+    assert.equal(await acceptTelegramAggregate(db, config, event(config, 1, 10), key), "accepted");
+    assert.equal(await acceptTelegramPath(db, config, { ...event(config, 2, 11), kind: "path", args: "" }), "accepted");
+    assert.equal(await acceptTelegramDocumentJob(db, config, { ...event(config, 3, 12),
+      fileId: "synthetic-invalid-document", fileName: "Fixture.exe", fileSize: 1 }), "invalid-document");
+    const { sent, request } = telegramReplies(config);
+    await drainTelegramReplies(db, bucket, config, 3, 10_000, request, enabled ? key : null);
+    assert.equal(sent.length, enabled ? 3 : 2);
+    assert.ok(sent.every(({ chatId }) => chatId === config.memberId));
+    assert.match(sent.at(-1)!.text, /文件未导入/u);
+    assert.equal(sent.filter(({ text }) => text.includes("/agg/")).length, enabled ? 1 : 0);
+    const rows = await db.prepare(`SELECT inbox.update_id AS updateId, reply.state FROM telegram_inbox AS inbox
+      JOIN telegram_outbox AS reply USING (receipt_id) WHERE inbox.bot_id = ? ORDER BY inbox.update_id`)
+      .bind(config.botId).all<{ updateId: number; state: string }>();
+    assert.deepEqual(rows.results, [{ updateId: 1, state: enabled ? "sent" : "pending" },
+      { updateId: 2, state: "sent" }, { updateId: 3, state: "sent" }]);
+  }
 });
 
 test("the bundled Worker gates private issuance by the optional key and pins the link origin", { timeout: 60_000 }, async () => {

@@ -86,6 +86,23 @@ function callback(fields: Record<string, unknown> = {}, original: Record<string,
   };
 }
 
+test("admits explicit path commands only in the approved actor's own private conversation", async () => {
+  const command = `/path@${policy.botUsername}`;
+  const args = "\u0085https://example.invalid/?fixture=key \u3000标签";
+  const entities = [{ type: "bot_command", offset: 0, length: command.length }];
+  const accepted = await decodeMessage(command + args, { entities });
+  assert.equal(accepted.status, 200);
+  assert.deepEqual(accepted.path, { kind: "path", args, updateId, actorId: policy.adminId, chatId: policy.adminId,
+    chatType: "private", messageId: 15, messageDate, threadId: null });
+  assert.equal((await decodeMessage(command + args, { entities,
+    chat: { id: Number(policy.groupId), type: "supergroup" } })).status, 204);
+  assert.equal((await decodeMessage(command + args, { entities, message_thread_id: 1 })).status, 204);
+  assert.equal((await decodeMessage("/path phrase=fixture", { entities: [] })).status, 204);
+  assert.equal((await decodeMessage("/path@UnrelatedFixtureBot clear")).status, 204);
+  assert.equal((await decodeMessage("/pathx clear")).status, 204);
+  assert.equal((await decodeMessage("/path\ufeffclear", { entities: [{ type: "bot_command", offset: 0, length: 5 }] })).status, 204);
+});
+
 test("validates exact secret policy schema and canonical safe identities", () => {
   assert.deepEqual(parseTelegramPolicy(JSON.stringify(policy)), policy);
   for (const invalid of [
@@ -394,4 +411,30 @@ test("normalizes the legacy auth aliases and only the configured member target",
     from: { id: Number(policy.memberId), is_bot: false },
     chat: { id: Number(policy.memberId), type: "private" },
   })).command?.command, "auth-list");
+});
+
+test("normalizes only bounded document metadata from direct private human messages", async () => {
+  const actor = { id: Number(policy.memberId), is_bot: false };
+  const chat = { id: actor.id, type: "private" };
+  const document = { file_id: "synthetic-handle", file_name: "Fixture.yaml", file_size: 123,
+    file_unique_id: "discard-this-value", mime_type: "text/plain", file_path: "discard-this-path" };
+  const input = { message_id: 15, date: messageDate, from: actor, chat, document,
+    caption: "/auth remove synthetic", caption_entities: [{ type: "bot_command", offset: 0, length: 5 }] };
+  const decodeDocument = (fields: Record<string, unknown> = {}) => decode({ update_id: updateId, message: { ...input, ...fields } });
+  assert.deepEqual(await decodeDocument(), {
+    status: 200, document: { updateId, actorId: policy.memberId, chatId: policy.memberId, chatType: "private",
+      messageId: 15, messageDate, threadId: null, fileId: document.file_id, fileName: document.file_name, fileSize: 123 },
+  });
+  assert.equal((await decodeDocument({ document: { file_id: document.file_id, file_name: "Unsupported.exe",
+    file_size: 10 * 1024 * 1024 + 1 } })).document?.fileName, "Unsupported.exe");
+  assert.equal((await decodeDocument({ document: { ...document, file_name: `${"x".repeat(1025)}.txt` } })).document?.fileName, ".");
+  assert.equal((await decodeDocument({ document: { file_id: document.file_id, file_size: 0 } })).document?.fileSize, 0);
+  for (const fields of [
+    { chat: { id: Number(policy.groupId), type: "group" } }, { chat: { id: Number(policy.adminId), type: "private" } },
+    { message_thread_id: 9 }, { from: { id: actor.id, is_bot: true } }, { from: { id: 555, is_bot: false } },
+    { forward_origin: { type: "user" } }, { edit_date: messageDate }, { text: "/list" }, { animation: {} },
+    { document: null }, { document: { ...document, file_id: "x\n" } }, { document: { ...document, file_id: "x".repeat(513) } },
+    { document: { ...document, file_name: [] } }, { document: { ...document, file_size: "1" } },
+    { document: { ...document, file_size: -1 } },
+  ]) assert.deepEqual(await decodeDocument(fields), { status: 204 });
 });

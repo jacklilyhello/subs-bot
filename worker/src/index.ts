@@ -11,7 +11,11 @@ import { TextExportError } from "./text-export.ts";
 import { planTextExport, textExportChunks } from "./text-export-response.ts";
 import { acceptTelegramAggregate, parseTelegramAggregateKey } from "./telegram/aggregate-actions.ts";
 import { answerTelegramCallback, drainTelegramReplies } from "./telegram/delivery.ts";
+import { runTelegramDocumentIntake } from "./telegram/document-intake.ts";
+import { acceptTelegramDocumentJob } from "./telegram/document-jobs.ts";
+import { reconcileTelegramDocumentJobReplies, retireTelegramDocumentStage } from "./telegram/document-persistence.ts";
 import { acceptTelegramLifecycle, reapTelegramLifecycle } from "./telegram/lifecycle-actions.ts";
+import { acceptTelegramPath } from "./telegram/path-management.ts";
 import { acceptTelegramPrivateClaim } from "./telegram/private-claims.ts";
 import { decodeTelegramRequest, parseTelegramPolicy } from "./telegram/protocol.ts";
 import { acceptTelegramCommand } from "./telegram/store.ts";
@@ -172,6 +176,13 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
     } else if (decoded.aggregate) {
       if (!aggregateKey) return new Response(null, { status: 204, headers: HEADERS });
       if (await acceptTelegramAggregate(env.DB, policy, decoded.aggregate, aggregateKey) === "accepted") drain();
+    } else if (decoded.path) {
+      const outcome = await acceptTelegramPath(env.DB, policy, decoded.path);
+      if (outcome === "accepted") {
+        drain();
+      }
+    } else if (decoded.document) {
+      await acceptTelegramDocumentJob(env.DB, policy, decoded.document);
     }
     return new Response(null, { status: decoded.status, headers: HEADERS });
   } catch {
@@ -257,17 +268,28 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
   }
 }
 
-async function recoverTelegramReplies(_controller: ScheduledController, env: Env): Promise<void> {
+async function recoverTelegramWork(_controller: ScheduledController, env: Env): Promise<void> {
   const policy = parseTelegramPolicy(env.TELEGRAM_ISOLATION_CONFIG);
   if (!policy) return;
-  try {
-    const aggregateKey = await parseTelegramAggregateKey(env.TELEGRAM_AGGREGATE_KEY);
+  const aggregateKey = await parseTelegramAggregateKey(env.TELEGRAM_AGGREGATE_KEY);
+  const replies = async () => {
     await drainTelegramReplies(env.DB, env.NODES, policy, 10, 45_000, fetch, aggregateKey);
     await reapTelegramViewTickets(env.DB);
     await reapTelegramLifecycle(env.DB);
-  } catch {
+  };
+  const documents = async () => {
+    let claimed = false;
+    try {
+      claimed = await runTelegramDocumentIntake(env.DB, env.NODES, policy);
+    } finally {
+      const reconciled = await reconcileTelegramDocumentJobReplies(env.DB, policy);
+      if (claimed || reconciled > 0) await drainTelegramReplies(env.DB, env.NODES, policy, 4, 15_000, fetch, aggregateKey);
+    }
+  };
+  const results = await Promise.allSettled([replies(), documents(), retireTelegramDocumentStage(env.DB, env.NODES, policy)]);
+  if (results.some(({ status }) => status === "rejected")) {
     throw new Error("Telegram scheduled recovery could not finish.");
   }
 }
 
-export default { fetch: fetchRequest, scheduled: recoverTelegramReplies } satisfies ExportedHandler<Env>;
+export default { fetch: fetchRequest, scheduled: recoverTelegramWork } satisfies ExportedHandler<Env>;

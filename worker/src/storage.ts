@@ -182,12 +182,13 @@ export async function stageNodeSnapshot(
   bucket: R2Bucket,
   id: number,
   nodes: Iterable<NodeRecord> | AsyncIterable<NodeRecord>,
+  snapshotId = crypto.randomUUID(),
 ): Promise<StagedNodeSnapshot> {
   if (!validInteger(id, 1)) {
     throw new RangeError("Invalid subscription ID.");
   }
 
-  const snapshotId = crypto.randomUUID();
+  if (!SNAPSHOT_ID_PATTERN.test(snapshotId)) throw new RangeError("Invalid subscription snapshot ID.");
   const prefix = snapshotPrefix(id, snapshotId);
   const manifest: SnapshotManifest = { version: 1, chunks: [] };
   const uploaded: string[] = [];
@@ -266,6 +267,7 @@ export function prepareNodeSnapshotPublication(
   db: D1Database,
   target: SnapshotPublication,
   staged: StagedNodeSnapshot,
+  guard?: { sql: string; bindings: readonly (number | string)[] },
 ): D1PreparedStatement {
   checkPublicationTarget(target);
   const { id, ownerId, expectedGeneration, expectedLifecycleRevision } = target;
@@ -277,8 +279,9 @@ export function prepareNodeSnapshotPublication(
     SET generation = generation + 1, snapshot_id = ?, manifest_sha256 = ?, node_count = ?,
         last_error = NULL, updated_at = ?
     WHERE id = ? AND owner_id = ? AND generation = ? AND ${SUBSCRIPTION_LIFECYCLE_REVISION} = ?
+      ${guard ? `AND (${guard.sql})` : ""}
   `).bind(staged.snapshotId, staged.manifestSha256, staged.nodeCount, Math.floor(Date.now() / 1000), id, ownerId,
-    expectedGeneration, expectedLifecycleRevision);
+    expectedGeneration, expectedLifecycleRevision, ...(guard?.bindings ?? []));
 }
 
 export async function publishNodeSnapshot(
