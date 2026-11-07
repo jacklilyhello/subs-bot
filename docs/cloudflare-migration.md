@@ -359,6 +359,12 @@ PY
 
 `legacy-private-shares-v1` 仅填充准确的 0005 分享和领取表。封存程序逐行复核领取人与指定对象、份数和原时间，保留已到期记录的原到期秒，并逐对象核对原 UTF-8 正文的字节和摘要。私有正文存于 `objects/private-shares/`。内联消息标识留在封存盘点中，候选仅记录其数量。SQL 重放核对完整结构、外键、编号序列和对象闭包。每包最多 512 个正文对象，每个最多 64 KiB，SQL 重放上限为 4 MiB，所有数据库行仍受原生恢复上限约束。候选保持未绑定，旧 Bot 链接与内联卡片连续性需另行验收。
 
+### 旧单订阅短链盘点
+
+在获准的受保护托管运行中，对同一份封存 SQLite 使用 `python3 -B worker/tools/legacy_typed_short_inventory.py BACKUP OUTPUT SOURCE_SHA256 OWNER_MAP_JSON OWNER_MAP_SHA256 OLD_HTTPS_ORIGIN LEGACY_BOT_ID`。备份和新输出目录的父目录须仅供当前账号访问。独立核对源文件摘要、规范化归属映射摘要、原 Bot ID 和旧 HTTPS 来源。旧来源使用小写域名，省略端口和尾部斜线。
+
+工具只接收旧来源上可唯一解析的单订阅目标，先核对短链发行者与订阅原归属，再应用归属映射。保存原活动或回收站编号、归属、格式、创建时间及短码和订阅令牌摘要。聚合、外部、递归、归属不一致或多重匹配会阻止整包封存。首版限制为两万条短链、两万个订阅身份、2 GiB 源库和 8 MiB 清单数据。只在获准的私有渠道流转最后写入封印的目录。后续候选封装需要再次核对目标编号、归属及令牌摘要，实际旧链接路由另行验收。
+
 ### 真实数据与生产切换门槛
 
 1. 先只读核对 Cloudflare 目标账户、Zone、`subs-bot.lilyya.top` 的 DNS、Worker 路由和 Custom Domain 绑定。新资源记录账号、环境及资源 ID，隔离与生产分别使用各自的 Worker、D1、R2 和队列。现有配置冲突须在改动前报告。目标主机名可用且切换获准后，仅增加所需的 Custom Domain 绑定。 [Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)
