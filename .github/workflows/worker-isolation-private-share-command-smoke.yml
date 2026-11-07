@@ -18,6 +18,9 @@ on:
       observations:
         description: Verify only. JSON with codeHashes, raceWinner, groupShareMessageId and groupControlMessageId
         type: string
+      confirm_verify:
+        description: Verify only. Use "verify COHORT on equivalent release" to reuse an earlier preparation
+        type: string
       confirm_retire:
         description: Retire only. Use "retire COHORT", or "retire COHORT on current release" for explicit release drift
         type: string

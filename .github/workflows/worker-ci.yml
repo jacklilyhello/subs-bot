@@ -10,6 +10,7 @@ on:
       - '.github/workflows/worker-isolation-telegram-fixtures.yml'
       - '.github/workflows/worker-isolation-telegram-claims.yml'
       - '.github/workflows/worker-isolation-private-share-command-smoke.yml'
+      - '.github/workflows/worker-isolation-native-restore.yml'
   push:
     branches: [main]
     paths:
@@ -20,6 +21,7 @@ on:
       - '.github/workflows/worker-isolation-telegram-fixtures.yml'
       - '.github/workflows/worker-isolation-telegram-claims.yml'
       - '.github/workflows/worker-isolation-private-share-command-smoke.yml'
+      - '.github/workflows/worker-isolation-native-restore.yml'
   workflow_dispatch:
 
 permissions:
