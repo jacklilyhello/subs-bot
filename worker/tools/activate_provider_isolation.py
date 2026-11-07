@@ -12,6 +12,7 @@ from time import monotonic, sleep
 from urllib.request import ProxyHandler, Request, build_opener
 
 import stage_provider_version as stage
+from cloudflare_isolation import HEALTH_URL, ISOLATION_RELEASE_USER_AGENT
 
 
 bootstrap = stage.bootstrap
@@ -23,7 +24,6 @@ ACTIVATION_ENV = "SUBS_BOT_CF_PROVIDER_ACTIVATION_JSON"
 CONTAINER_ENV = "SUBS_BOT_CF_PROVIDER_CONTAINER_IDENTITY_JSON"
 WORKFLOW_ENV = "SUBS_BOT_CF_PROVIDER_WORKFLOW_IDENTITY_JSON"
 PROVIDER_URL = "https://subs-bot-provider-fetch-dev-01.lilyya.workers.dev/health"
-HEALTH_URL = "https://subs-bot-cf-dev-01.lilyya.workers.dev/health"
 ACTOR = re.compile(r"[0-9a-f]{64}")
 ERROR = "The private provider state did not match the pinned release and resource identities."
 WRITE_ERROR = "The provider operation was not confirmed. Use read-only verification and independently pin its observed state before continuing."
@@ -493,14 +493,17 @@ class ProviderAPI:
 
 def _public(url, expected_revision=None):
     request = Request(url, headers={"Accept": "application/json", "Accept-Encoding": "identity",
-                                   "Cache-Control": "no-cache"}, method="GET")
+                                   "Cache-Control": "no-cache", "User-Agent": ISOLATION_RELEASE_USER_AGENT}, method="GET")
     status, headers, raw = publication._response(request, build_opener(ProxyHandler({}), github._NoRedirect()), ERROR, limit=4096)
     _require(not headers.get("Location"))
     if expected_revision is None:
         _require(status in (403, 404), "The fixed provider public endpoint did not deny access.")
     else:
-        _require(status == 200 and github._parse_object(raw, ERROR)
-                 == {"ok": True, "service": "subs-bot", "revision": expected_revision})
+        if type(status) is int and 100 <= status <= 599 and status != 200:
+            raise ActivationError(f"The fixed isolated health endpoint returned HTTP {status}.")
+        health_error = "The fixed isolated health response did not match the exact app revision."
+        _require(status == 200 and github._parse_object(raw, health_error)
+                 == {"ok": True, "service": "subs-bot", "revision": expected_revision}, health_error)
     return {"status": status, "bytes": len(raw), "sha256": sha256(raw).hexdigest()}
 
 
