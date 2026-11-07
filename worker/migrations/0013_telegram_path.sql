@@ -1,7 +1,7 @@
 CREATE TABLE telegram_path_reply (
     receipt_id INTEGER PRIMARY KEY REFERENCES telegram_inbox (receipt_id),
     kind TEXT NOT NULL CHECK (kind IN ('list', 'usage', 'saved', 'deleted', 'cleared', 'missing', 'capacity', 'stale')),
-    after_id INTEGER CHECK (after_id BETWEEN 1 AND 9007199254740991 AND kind = 'list'),
+    after_id INTEGER CHECK (after_id IS NULL OR (after_id BETWEEN 1 AND 9007199254740991 AND kind = 'list')),
     affected_count INTEGER NOT NULL DEFAULT 0 CHECK (
         (kind = 'cleared' AND affected_count BETWEEN 0 AND 64)
         OR (kind IN ('saved', 'deleted') AND affected_count = 1)
