@@ -3,8 +3,9 @@ import {
   type ProviderFetcher, type ProviderFetchResult, type ProviderPin,
 } from "./provider-fetch-contract.ts";
 import {
-  claimProviderJob, prepareProviderJobLeaseGuard, prepareProviderJobSettlement, retireStaleProviderJob, settleProviderJob,
-  type ProviderFailureOutcome, type ProviderJobLease,
+  claimProviderJob, isProviderJobCurrent, prepareProviderJobLeaseGuard, prepareProviderJobSettlement, providerJobLeaseTable,
+  retireStaleProviderJob, settleProviderJob,
+  type ProviderFailureOutcome, type ProviderJobLease, type ProviderTelegramPolicy,
 } from "./provider-jobs.ts";
 import {
   digestHex, discardStagedNodeSnapshot, prepareNodeSnapshotPublication, stageNodeSnapshot,
@@ -107,7 +108,7 @@ async function confirmSaved(db: D1Database, lease: ProviderJobLease, staged: Sta
   const pointer = `id = ? AND owner_id = ? AND generation = ? AND snapshot_id = ? AND manifest_sha256 = ? AND node_count = ?`;
   const snapshot = [lease.id, lease.ownerId, lease.expectedGeneration + 1, staged.snapshotId, staged.manifestSha256, staged.nodeCount];
   try {
-    return await db.prepare(`SELECT CASE WHEN EXISTS (SELECT 1 FROM subscription_provider_jobs
+    return await db.prepare(`SELECT CASE WHEN EXISTS (SELECT 1 FROM ${providerJobLeaseTable(lease)}
         WHERE job_id = ? AND owner_id = ? AND request_key = ? AND subscription_id = ? AND source_sha256 = ?
           AND state = 'done' AND result_code = 'saved' AND attempts = ?)
       AND (EXISTS (SELECT 1 FROM subscriptions WHERE ${pointer}) OR EXISTS (SELECT 1 FROM subscription_trash WHERE ${pointer}))
@@ -149,12 +150,16 @@ async function publish(
 
 /** Run at most one lease on a scheduled invocation. No source URL leaves the named binding. */
 export async function runOneProviderJob(
-  db: D1Database, bucket: R2Bucket, provider: ProviderFetcher | undefined, pin: ProviderPin,
+  db: D1Database, bucket: R2Bucket, provider: ProviderFetcher | undefined, pin: ProviderPin, policy?: ProviderTelegramPolicy,
 ): Promise<ConsumerOutcome> {
   if (!provider || typeof pin.providerRevision !== "string" || !PROVIDER_REVISION.test(pin.providerRevision) ||
       typeof pin.imageSha256 !== "string" || !PROVIDER_SHA256.test(pin.imageSha256)) return "disabled";
-  const lease = await claimProviderJob(db);
+  const lease = await claimProviderJob(db, policy);
   if (lease === null) return "idle";
+  if (lease.scope !== "generic" && !await isProviderJobCurrent(db, lease)) {
+    await retireStaleProviderJob(db, lease);
+    return "stale";
+  }
   if (lease.leaseUntil * 1000 - Date.now() < LEASE_HEADROOM_MS) {
     return settleProviderJob(db, lease, { kind: "retry", reason: "timeout" });
   }
@@ -174,15 +179,7 @@ export async function runOneProviderJob(
   if (parsed.kind !== "parsed" || parsed.nodes.length === 0 || parsed.rejected.malformed || parsed.rejected.unsupported) {
     return settleProviderJob(db, lease, invalidDocument);
   }
-  const guard = prepareProviderJobLeaseGuard(lease);
-  let current: number | null;
-  try {
-    current = await db.prepare(`SELECT CASE WHEN ${guard.sql} THEN 1 ELSE 0 END AS current`)
-      .bind(...guard.bindings).first<number>("current");
-  } catch {
-    throw new Error("Provider publication target could not be verified.");
-  }
-  if (current !== 1) {
+  if (!await isProviderJobCurrent(db, lease)) {
     await retireStaleProviderJob(db, lease);
     return "stale";
   }

@@ -119,6 +119,9 @@ class SelectedCohort(Cohort):
         super().__init__(resources, policy, cohort, encoded, identity)
         self.prefix = f"https://subs-bot-selected-fixtures.invalid/{cohort}/"
         self.name = f"CFSEL-{cohort}"
+        provider_table = self.read("SELECT name FROM sqlite_schema WHERE type='table' AND name='telegram_provider_jobs'")
+        require(provider_table in ([], [{"name": "telegram_provider_jobs"}]), "Selected provider queue schema differs.")
+        self.has_telegram_provider_queue = bool(provider_table)
 
     def seed_identity(self, label):
         material = hmac.new(key_bytes(self.encoded), canonical(["subs-bot/selected-fixture/v1", self.identity,
@@ -183,9 +186,15 @@ class SelectedCohort(Cohort):
           AND NOT EXISTS(SELECT 1 FROM telegram_aggregate_slots WHERE bot_id=? AND actor_id IN (?,?) AND code_sha256 IS NOT NULL)
           AND NOT EXISTS(SELECT 1 FROM aggregate_links WHERE owner_id IN (?,?) AND revoked_at IS NULL
             AND (kind='selected' OR bot_id=?) AND code_sha256 NOT IN (SELECT value FROM json_each(?)))"""
+        provider_params = ()
+        if self.has_telegram_provider_queue:
+            condition += " AND NOT EXISTS(SELECT 1 FROM telegram_provider_jobs WHERE owner_id IN (?,?) AND state IN ('pending','leased'))"
+            provider_params = actors
+        else:
+            condition += " AND NOT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='telegram_provider_jobs')"
         return statement(_assert_sql(condition) if assertion else "SELECT (" + condition + ") AS quiet",
             bot, *actors, temp_id, *actors, *actors, known, known, bot, *actors, known, known, *actors, bot, *actors, *actors, bot,
-            canonical(list(active)))
+            canonical(list(active)), *provider_params)
 
     def require_quiet(self, ids, temp_id=0, active=()):
         check = self.quiet(ids, temp_id, active)
