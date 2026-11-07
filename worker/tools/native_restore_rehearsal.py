@@ -628,6 +628,8 @@ def quiet_expression(tables, observed_at=None):
     for table in ("subscription_provider_jobs", "telegram_provider_jobs"):
         if table in tables:
             conditions.append(f"NOT EXISTS(SELECT 1 FROM {table} WHERE state IN ('pending','leased'))")
+    if "telegram_inline_search_receipts" in tables:
+        conditions.append(f"NOT EXISTS(SELECT 1 FROM telegram_inline_search_receipts WHERE state IN ('preflight','sending') AND lease_until > {epoch})")
     if "telegram_private_share_creations" in tables:
         conditions.append("NOT EXISTS(SELECT 1 FROM telegram_private_share_creations WHERE state='reserved' OR (state='abandoned' AND cleaned_at IS NULL))")
     if "telegram_selected_links" in tables:
