@@ -609,7 +609,7 @@ class ReleaseTests(unittest.TestCase):
             "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/main", "RUNNER_TEMP": str(self.bundle),
             "SUBS_BOT_CF_ISOLATION_TARGET_JSON": json.dumps(TARGET), "SUBS_BOT_CF_BOOTSTRAP_TOKEN": "synthetic-data",
             "SUBS_BOT_CF_DEPLOY_TOKEN": "synthetic-deploy", release_entry.CONFIG_ENV: "fixture-provider-pin"}
-        provider = Mock(binding=PROVIDER_BINDING)
+        provider = Mock(binding=PROVIDER_BINDING, historical_application_revision=None)
         provider.verify.side_effect = cloudflare.CloudflareError("Provider drift.")
         with patch.dict(os.environ, environment, clear=True), patch.object(release_entry, "CloudflareClient"), \
              patch.object(release_entry, "require_current_main"), patch.object(release_entry, "verify_worker_target") as verify, \
@@ -769,6 +769,36 @@ class ReleaseTests(unittest.TestCase):
         guard.assert_not_called()
         self.assertEqual(self.api.writes(), [])
 
+    def test_first_historical_binding_requires_exact_app_artifact_and_keeps_provider_revision(self):
+        binding = cloudflare.ProviderBinding(OLD_REVISION, PROVIDER_BINDING.image_sha256, PROVIDER_BINDING.identity_sha256)
+        proof = Mock()
+        options = {"provider_binding": binding, "provider_first_binding_guard": proof,
+                   "historical_application_revision": NEW_REVISION}
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "same main revision"):
+            cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET,
+                                            release_revision="e" * 40, **options)
+        self.api.versions[OLD_VERSION]["bindings"][2]["text"] = "e" * 40
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "exact active isolated health baseline"):
+            cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET,
+                                            release_revision=NEW_REVISION, **options)
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "exact active isolated health baseline"):
+            self.release(provider_guard=Mock(), **options)
+        proof.assert_not_called()
+        self.assertEqual(self.api.writes(), [])
+        self.api.versions[OLD_VERSION]["bindings"][2]["text"] = OLD_REVISION
+
+        active = cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET,
+                                                 release_revision=NEW_REVISION, **options)
+        released = self.release(expected_active=active, provider_guard=Mock(), **options)
+        self.assertEqual(released["revision"], NEW_REVISION)
+        self.assertEqual(self.api.versions[NEW_VERSION]["bindings"][-2],
+                         {"type": "plain_text", "name": "PROVIDER_REVISION", "text": OLD_REVISION})
+        self.assertEqual(proof.call_count, 2)
+        proof.side_effect = cloudflare.CloudflareError("Synthetic expired historical proof.")
+        self.assertFalse(self.release(provider_guard=Mock(), **options)["changed"])
+        self.assertEqual(proof.call_count, 2)
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
+
     def test_protected_first_binding_requires_live_artifact_before_migrations(self):
         directory = self.bundle / "subs-bot-verified"
         directory.mkdir()
@@ -777,18 +807,20 @@ class ReleaseTests(unittest.TestCase):
             "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/main", "RUNNER_TEMP": str(self.bundle),
             "SUBS_BOT_CF_ISOLATION_TARGET_JSON": json.dumps(TARGET), "SUBS_BOT_CF_BOOTSTRAP_TOKEN": "synthetic-data",
             "SUBS_BOT_CF_DEPLOY_TOKEN": "synthetic-deploy", release_entry.CONFIG_ENV: "fixture-provider-capsule"}
-        provider = Mock(binding=PROVIDER_BINDING)
-        provider.verify_first_binding.side_effect = cloudflare.CloudflareError("Synthetic expired artifact.")
-        with patch.dict(os.environ, environment, clear=True), \
-             patch.object(release_entry, "CloudflareClient", side_effect=[self.api.data_api, self.api.worker_api]), \
-             patch.object(release_entry, "require_current_main"), patch.object(release_entry, "load_provider_gate", return_value=provider), \
-             patch.object(release_entry, "apply_migrations") as migrate, patch.object(release_entry, "release_worker") as deploy:
-            with self.assertRaisesRegex(cloudflare.CloudflareError, "expired artifact"):
-                release_entry.release()
-            provider.verify_first_binding.assert_called_once_with()
-            provider.verify.assert_not_called()
-            migrate.assert_not_called()
-            deploy.assert_not_called()
+        historical = cloudflare.ProviderBinding(OLD_REVISION, PROVIDER_BINDING.image_sha256, PROVIDER_BINDING.identity_sha256)
+        for binding, application_revision in ((PROVIDER_BINDING, None), (historical, NEW_REVISION)):
+            provider = Mock(binding=binding, historical_application_revision=application_revision)
+            provider.verify_first_binding.side_effect = cloudflare.CloudflareError("Synthetic expired artifact.")
+            with self.subTest(historical=application_revision is not None), patch.dict(os.environ, environment, clear=True), \
+                 patch.object(release_entry, "CloudflareClient", side_effect=[self.api.data_api, self.api.worker_api]), \
+                 patch.object(release_entry, "require_current_main"), patch.object(release_entry, "load_provider_gate", return_value=provider), \
+                 patch.object(release_entry, "apply_migrations") as migrate, patch.object(release_entry, "release_worker") as deploy:
+                with self.assertRaisesRegex(cloudflare.CloudflareError, "expired artifact"):
+                    release_entry.release()
+                provider.verify_first_binding.assert_called_once_with()
+                provider.verify.assert_not_called()
+                migrate.assert_not_called()
+                deploy.assert_not_called()
         self.assertEqual(self.api.writes(), [])
 
     def test_provider_drift_after_staging_blocks_activation(self):
