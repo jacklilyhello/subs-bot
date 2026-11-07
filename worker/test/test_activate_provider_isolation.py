@@ -441,18 +441,33 @@ class APIContractTests(unittest.TestCase):
                 with self.assertRaises(activation.ActivationError):
                     self.api.stopped(NAMESPACE, START, RELEASE["ociManifestSha256"])
 
-    def test_sqlite_actor_identity_is_available_through_the_pinned_container_inventory(self):
+    def test_sqlite_actor_inventory_verifies_one_stored_actor_and_the_empty_final_page(self):
         stopped = {"id": ACTOR, "application_id": NAMESPACE, "image": IMAGE, "status": {"state": "stopped", "updated_at": STOP}}
-        with patch.object(self.api, "actors", return_value=[]), patch.object(
-                self.api, "instances", side_effect=[[stopped], []]), patch.object(self.api, "_request", return_value=envelope(stopped)):
+        actor = {"id": ACTOR, "hasStoredData": True}
+        first = envelope([actor], result_info={"cursor": "synthetic+/cursor=", "count": 1})
+        last = envelope([], result_info={"count": 0})
+        objects = f"/workers/durable_objects/namespaces/{NAMESPACE}/objects"
+        with patch.object(self.api, "instances", side_effect=[[stopped], []]), patch.object(
+                self.api, "_request", side_effect=[first, last, envelope(stopped)]) as read:
             self.assertEqual(self.api.stopped(NAMESPACE, START, RELEASE["ociManifestSha256"]), activation._hash(ACTOR))
+            self.assertEqual(read.call_args_list[:2], [call(objects + "?limit=10"),
+                            call(objects + "?limit=10&cursor=synthetic%2B%2Fcursor%3D")])
+        for pages in ([first, first], [first, envelope([actor])], [first, envelope([], result_info={"count": 1})],
+                      [envelope([], result_info={"cursor": "synthetic"})],
+                      [envelope([actor], result_info={"cursor": "x" * 513})],
+                      [envelope([actor], result_info={"cursor": "synthetic", "cursors": {"after": "different"}})]):
+            with self.subTest(pages=pages), patch.object(self.api, "_request", side_effect=pages) as read:
+                with self.assertRaises(activation.ActivationError):
+                    self.api.actors(NAMESPACE)
+                self.assertLessEqual(read.call_count, 2)
         for rows, actors, active in (
-            ([{**stopped, "status": {"state": "stopping", "updated_at": STOP}}], [], []),
-            ([{**stopped, "application_id": "f" * 32}], [], []),
-            ([stopped, stopped], [], []),
+            ([{**stopped, "status": {"state": "stopping", "updated_at": STOP}}], [actor], []),
+            ([{**stopped, "application_id": "f" * 32}], [actor], []),
+            ([stopped, stopped], [actor], []),
+            ([stopped], [], []),
             ([stopped], [{"id": "f" * 64, "hasStoredData": True}], []),
             ([stopped], [{"id": ACTOR, "hasStoredData": False}], []),
-            ([stopped], [], [stopped]),
+            ([stopped], [actor], [stopped]),
         ):
             with self.subTest(rows=rows, actors=actors, active=active), patch.object(self.api, "actors", return_value=actors), patch.object(
                     self.api, "instances", side_effect=[rows, active]), patch.object(self.api, "_request", return_value=envelope(stopped)):

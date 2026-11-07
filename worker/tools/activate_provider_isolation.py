@@ -9,6 +9,7 @@ import re
 import stat
 import sys
 from time import monotonic, sleep
+from urllib.parse import urlencode
 from urllib.request import ProxyHandler, Request, build_opener
 
 import stage_provider_version as stage
@@ -25,6 +26,7 @@ CONTAINER_ENV = "SUBS_BOT_CF_PROVIDER_CONTAINER_IDENTITY_JSON"
 WORKFLOW_ENV = "SUBS_BOT_CF_PROVIDER_WORKFLOW_IDENTITY_JSON"
 PROVIDER_URL = "https://subs-bot-provider-fetch-dev-01.lilyya.workers.dev/health"
 ACTOR = re.compile(r"[0-9a-f]{64}")
+ACTOR_CURSOR = re.compile(r"[!-~]{1,512}")
 ERROR = "The private provider state did not match the pinned release and resource identities."
 WRITE_ERROR = "The provider operation was not confirmed. Use read-only verification and independently pin its observed state before continuing."
 PIN_ERROR = "The protected provider release or resource identity pin is invalid."
@@ -228,6 +230,21 @@ def _page(envelope, rows, maximum, *, cursor=False):
     else:
         stage._one_page(envelope, rows, maximum)
     return rows
+
+
+def _actor_page(envelope):
+    rows, info = envelope.get("result"), envelope.get("result_info", {})
+    _require(isinstance(rows, list) and len(rows) <= 1 and isinstance(info, dict)
+             and info.get("next_page_token") in (None, ""))
+    if "count" in info:
+        _require(type(info["count"]) is int and info["count"] == len(rows))
+    cursors = info.get("cursors")
+    _require(cursors is None or (isinstance(cursors, dict) and set(cursors) <= {"before", "after"}
+                                and cursors.get("before") in (None, "")))
+    direct, nested = info.get("cursor"), (cursors or {}).get("after")
+    _require(all(cursor in (None, "") or _match(ACTOR_CURSOR, cursor) for cursor in (direct, nested))
+             and (not direct or not nested or direct == nested))
+    return rows, direct or nested
 
 
 def _private_profile(worker, identity, active, caller=None):
@@ -463,8 +480,14 @@ class ProviderAPI:
         return value
 
     def actors(self, namespace):
-        envelope = self._request(f"/workers/durable_objects/namespaces/{namespace}/objects?limit=10")
-        return _page(envelope, envelope["result"], 1, cursor=True)
+        path = f"/workers/durable_objects/namespaces/{namespace}/objects"
+        rows, cursor = _actor_page(self._request(path + "?limit=10"))
+        if cursor:
+            _require(len(rows) == 1)
+            query = urlencode({"limit": 10, "cursor": cursor})
+            following, remaining = _actor_page(self._request(path + "?" + query))
+            _require(following == [] and not remaining)
+        return rows
 
     def instances(self, namespace, *, active=False):
         path = f"/containers/applications/{namespace}/instances-v2?per_page=2"
@@ -474,15 +497,13 @@ class ProviderAPI:
         return _page(envelope, envelope["result"], 1, cursor=True)
 
     def stopped(self, namespace, start, manifest):
-        # The Containers API exposes the DO actor ID even when the separate
-        # namespace object inventory does not show the actor.
         rows = self.instances(namespace)
         _require(len(rows) == 1 and isinstance(rows[0], dict) and _match(ACTOR, rows[0].get("id"))
                  and rows[0].get("application_id") == namespace)
         actor = rows[0]["id"]
         actors = self.actors(namespace)
-        _require(actors == [] or (len(actors) == 1 and isinstance(actors[0], dict)
-                 and actors[0].get("id") == actor and actors[0].get("hasStoredData") is True))
+        _require(len(actors) == 1 and isinstance(actors[0], dict)
+                 and actors[0].get("id") == actor and actors[0].get("hasStoredData") is True)
         instance = self._request(f"/containers/applications/{namespace}/instances/{actor}", container=True)["result"]
         _require(isinstance(instance, dict) and instance.get("id") == actor and instance.get("application_id") == namespace)
         expected_image = f"{publication.HOST}/{self.account}/{provider.SERVICE}@sha256:{manifest}"
