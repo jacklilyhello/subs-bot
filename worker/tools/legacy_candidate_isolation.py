@@ -14,6 +14,7 @@ from uuid import NAMESPACE_URL, uuid5
 from zipfile import ZipFile
 
 import d1_migrations as migrations
+import legacy_private_share_fixture as share_fixture
 import legacy_restore_package as package
 import legacy_snapshot_convert as converter
 import native_restore_rehearsal as native
@@ -24,9 +25,10 @@ from cloudflare_isolation import CloudflareClient
 PROFILE = native.LEGACY_CANDIDATE_PROFILE
 PATH_PROFILE = native.LEGACY_PATH_CANDIDATE_PROFILE
 EMPTY_PROFILE = native.LEGACY_EMPTY_CANDIDATE_PROFILE
+SHARE_PROFILE = native.LEGACY_PRIVATE_SHARE_CANDIDATE_PROFILE
 ARTIFACT_PREFIX = "subs-bot-legacy-candidate"
 ARTIFACT_PREFIXES = {PROFILE: ARTIFACT_PREFIX, PATH_PROFILE: "subs-bot-legacy-path-candidate",
-                     EMPTY_PROFILE: "subs-bot-legacy-empty-candidate"}
+                     EMPTY_PROFILE: "subs-bot-legacy-empty-candidate", SHARE_PROFILE: "subs-bot-legacy-private-share-candidate"}
 CANDIDATE_DIRECTORY = "subs-bot-verified-legacy-candidate"
 PROVENANCE = "legacy-candidate-provenance.json"
 EVIDENCE = "legacy-candidate-evidence.json"
@@ -94,7 +96,7 @@ def candidate_directory(profile):
 
 def candidate_version(profile):
     require(profile in ARTIFACT_PREFIXES)
-    return {PROFILE: 1, PATH_PROFILE: 2, EMPTY_PROFILE: 3}[profile]
+    return {PROFILE: 1, PATH_PROFILE: 2, EMPTY_PROFILE: 3, SHARE_PROFILE: 1}[profile]
 
 
 def path_mapping():
@@ -144,6 +146,8 @@ def build_synthetic_candidate(worker, output, revision, run_id, attempt, *, prof
     worker_sha = native.digest(package.read_private(worker / "isolation.json", artifact._MAX_JSON))
     _, worker_pin = package.worker_artifact(worker, revision, worker_sha)
     require((worker_pin["runId"], worker_pin["runAttempt"]) == (run_id, attempt))
+    if profile == SHARE_PROFILE:
+        return share_fixture.build(worker, output, worker_pin, applied_at=APPLIED_AT)
     with tempfile.TemporaryDirectory(prefix="legacy-synthetic-", dir=output.parent) as temporary:
         conversion, pins = convert_synthetic_source(Path(temporary), profile)
         options = {} if version != 3 else {"profile": package.EMPTY_EXPORT_PROFILE, "source_sqlite_sha": pins["sqliteSha256"],
@@ -181,7 +185,8 @@ def unpack_candidate(body, archive_sha, destination, *, profile=PROFILE):
         require(type(document.get("version")) is int and document["version"] == candidate_version(profile))
         limits = {package.MANIFEST: native.MANIFEST_BYTES, package.MARKER: 65,
                   package.SQL: SQL_LIMIT, package.LINEAGE: LINEAGE_LIMIT}
-        require(set(members) == package_files(document))
+        expected_files = share_fixture.files(document, OBJECT_LIMIT) if profile == SHARE_PROFILE else package_files(document)
+        require(set(members) == expected_files)
         require(all(0 < entry.file_size <= limits.get(name, OBJECT_LIMIT) for name, entry in members.items()))
         destination.mkdir(mode=0o700)
         for name, entry in members.items():
@@ -330,6 +335,36 @@ class Candidate:
         return result
 
 
+class ShareCandidate(Candidate):
+    def __init__(self, root, worker, worker_pin, scratch):
+        self.profile = SHARE_PROFILE
+        self.root = package.private_path(root, directory=True)
+        self.sql = self.root / package.SQL
+        raw = package.read_private(self.root / package.MANIFEST, native.MANIFEST_BYTES)
+        self.manifest_sha = native.digest(raw)
+        document = native.parsed(raw, native.MANIFEST_BYTES)
+        paths = share_fixture.files(document, OBJECT_LIMIT)
+        require({path.relative_to(self.root).as_posix() for path in self.root.rglob("*")
+                 if path.is_file() or path.is_symlink()} == paths)
+        expected = scratch / "expected-shares"
+        report = share_fixture.build(worker, expected, worker_pin, applied_at=APPLIED_AT)
+        require(report["manifestSha256"] == self.manifest_sha)
+        # Only bytes reproduced from the fixed source may be used for import.
+        limits = {package.MANIFEST: native.MANIFEST_BYTES, package.MARKER: 65, package.SQL: SQL_LIMIT}
+        for path in paths:
+            limit = limits.get(path, OBJECT_LIMIT)
+            require(package.read_private(self.root / path, limit) == package.read_private(expected / path, limit))
+        self.document = {**document, "sqlMd5": document["sql"]["md5"]}
+        self.entries = {entry["key"]: entry for entry in document["objects"]}
+
+    def pin(self):
+        hashes = self.document["summary"]["tableSha256"]
+        return {**super().pin(), "privateSharesSha256": hashes["private_shares"],
+                "privateShareClaimsSha256": hashes["private_share_claims"],
+                "sqliteSequenceSha256": hashes["sqlite_sequence"],
+                "shareSequenceHighWater": self.document["shareSequenceHighWater"]}
+
+
 class CandidateSource(native.Source):
     """The live Worker is a protected boundary, separate from candidate build provenance."""
 
@@ -465,8 +500,11 @@ def run_action(action, engine, pin, *, resource=None, identity_sha=None):
               "candidateArchiveSha256": pin["candidate"]["archiveSha256"],
               "resourceCount": sum(value is not None for value in pins.values()), "resourcePinsSha256": native.digest(native.canonical(pins)),
               "unconfirmedResourceCount": len(unconfirmed), "candidateIdentitySha256": unconfirmed,
-              "counts": EMPTY_COUNTS if profile == EMPTY_PROFILE else COUNTS,
-              "objectCount": len(engine.candidate.entries), "generationZeroHttp": "not-validated"}
+              "objectCount": len(engine.candidate.entries)}
+    if profile == SHARE_PROFILE:
+        result.update(counts=share_fixture.COUNTS, shareCompatibility="not-validated")
+    else:
+        result.update(counts=EMPTY_COUNTS if profile == EMPTY_PROFILE else COUNTS, generationZeroHttp="not-validated")
     if observed_summary is not None:
         result.update({"verifiedDataSha256": observed_summary["dataSha256"], "verifiedRowCount": observed_summary["rowCount"],
                        "schemaSha256": pin["candidate"]["schemaSha256"], "foreignKeys": "verified", "r2Closure": "verified"})
@@ -482,6 +520,18 @@ def run_action(action, engine, pin, *, resource=None, identity_sha=None):
             result.update(verifiedEmptyExportMarkerCount=marker_count, emptyExportMarkersSha256=marker_digest,
                           emptyExportMigrationSha256=pin["candidate"]["emptyExportMigrationSha256"],
                           verifiedSubscriptionSequenceHighWater=EMPTY_TARGET_SEQUENCE)
+        if profile == SHARE_PROFILE:
+            counts, hashes = observed_summary["tableCounts"], observed_summary["tableSha256"]
+            require(counts["private_shares"] == share_fixture.COUNTS["shares"]
+                    and counts["private_share_claims"] == share_fixture.COUNTS["claims"]
+                    and result["objectCount"] == share_fixture.COUNTS["shares"])
+            share_pin = pin["candidate"]
+            require((hashes["private_shares"], hashes["private_share_claims"], hashes["sqlite_sequence"]) ==
+                    (share_pin["privateSharesSha256"], share_pin["privateShareClaimsSha256"], share_pin["sqliteSequenceSha256"]))
+            result.update(verifiedPrivateShareCount=counts["private_shares"], verifiedPrivateShareClaimCount=counts["private_share_claims"],
+                          privateSharesSha256=hashes["private_shares"], privateShareClaimsSha256=hashes["private_share_claims"],
+                          sqliteSequenceSha256=hashes["sqlite_sequence"], verifiedShareSequenceHighWater=share_pin["shareSequenceHighWater"],
+                          r2Metadata="verified")
     return result
 
 
@@ -492,6 +542,8 @@ def verified_candidate(runner, provenance, scratch, *, profile=PROFILE):
     manifest_sha = native.digest(package.read_private(worker / "isolation.json", artifact._MAX_JSON))
     chain, worker_pin = package.worker_artifact(worker, release["revision"], manifest_sha)
     require((worker_pin["runId"], worker_pin["runAttempt"]) == (release["runId"], release["runAttempt"]))
+    if profile == SHARE_PROFILE:
+        return ShareCandidate(runner / candidate_directory(profile), worker, worker_pin, scratch)
     objects = migrations._objects(chain, len(chain), managed=True)
     schema = SimpleNamespace(migrations=chain, objects=objects, schema_sha256=native._schema_digest(objects),
                              tables=sorted(obj.name for obj in objects if obj.type == "table"))

@@ -159,6 +159,92 @@ class CandidateArtifactTests(unittest.TestCase):
         with self.assertRaises(tool.package.PackageError):
             self.verify(self.archive(), tool.EMPTY_PROFILE)
 
+    def test_share_profile_restores_exact_claim_history_and_rechecks_private_metadata(self):
+        fixture, native = tool.share_fixture, tool.native
+        built = self.build(tool.SHARE_PROFILE)
+        archive = self.archive()
+        for other in (tool.PROFILE, tool.PATH_PROFILE, tool.EMPTY_PROFILE):
+            with self.subTest(profile=other), self.assertRaises(native.RehearsalError):
+                self.verify(archive, other)
+        candidate = self.verify(archive, tool.SHARE_PROFILE)
+        self.assertEqual(built["counts"], {"shares": 3, "claims": 3, "sourceInlineIdRows": 1})
+        self.assertEqual(candidate.pin()["packageManifestSha256"], built["manifestSha256"])
+        self.assertEqual(candidate.document["summary"]["rowCount"], len(candidate.document["workerArtifact"]["migrations"]) + 7)
+        self.assertTrue(all(key.startswith("private-shares/") for key in candidate.entries))
+        self.assertTrue(all(entry["metadata"] == fixture.EMPTY_METADATA for entry in candidate.entries.values()))
+        self.assertNotIn(b"fixture-retired-inline", candidate.sql.read_bytes())
+        self.assertTrue(all(fixture.code(index).encode("ascii") not in candidate.sql.read_bytes() for index in (1, 2, 3)))
+
+        api = native_tests.MemoryAPI()
+        api.names.update(database="synthetic-share-db", objects="synthetic-share-r2")
+        api.journal_prefix = "maintenance/legacy-share-candidate/synthetic/journal/"
+        source = native_tests.fake_source()
+        journal = native.Journal(api, "1/1", guard=source.before_write)
+        engine = tool.CandidateRehearsal(api, source, journal, candidate)
+
+        def observe(kind):
+            if kind not in api.resource:
+                return None
+            identity = native.resource_identity(kind, api.resource[kind], api.names[kind])
+            return {**identity, "storageClass": "Standard"} if kind == "objects" else identity
+
+        engine.observe = Mock(side_effect=observe)
+        pin = {"profile": tool.SHARE_PROFILE, "worker": self.release,
+               "candidate": {**candidate.pin(), "artifactId": "123", "archiveSha256": native.digest(archive)}}
+        for action, resource_count in (("prepare", 0), ("create-restore-db", 1), ("create-restore-bucket", 2)):
+            self.assertEqual(tool.run_action(action, engine, pin)["resourceCount"], resource_count)
+
+        with closing(sqlite3.connect(":memory:")) as db:
+            api.db = db
+
+            def empty_target(_api, path, objects):
+                self.assertEqual(path, api.root + "/d1/database/" + native_tests.RESTORE_ID)
+                self.assertEqual(objects, ())
+                return db.execute("SELECT count(*) FROM sqlite_schema").fetchone() == (0,)
+
+            def import_result(payload):
+                if payload["action"] == "init":
+                    return {"filename": "fixture.sql", "upload_url": "https://fixture.invalid/upload"}
+                self.assertEqual(payload["action"], "ingest")
+                self.assertEqual({key for bucket, key in api.objects if bucket == api.names["objects"]}, set(candidate.entries))
+                db.executescript(candidate.sql.read_text(encoding="utf-8"))
+                return {"success": True, "status": "complete"}
+
+            api.response = import_result
+            with patch.object(tool.migrations, "_matches_schema", side_effect=empty_target), patch.object(native, "signed_transfer") as transfer:
+                self.assertEqual(tool.run_action("restore-objects", engine, pin)["phase"], "objects-restored")
+                self.assertEqual(tool.run_action("start-import", engine, pin)["phase"], "verified")
+                transfer.assert_called_once_with("https://fixture.invalid/upload", upload=candidate.sql, expected_md5=candidate.document["sqlMd5"])
+            exact_claims = [(1, None, 1, fixture.LATER_EXPIRY, fixture.OTHER, fixture.CREATED_AT + 15),
+                            (2, fixture.TARGET, 2, fixture.LATER_EXPIRY, fixture.TARGET, fixture.CREATED_AT),
+                            (3, fixture.TARGET, 1, fixture.EXPIRED_AT, fixture.TARGET, fixture.EXPIRED_AT)]
+            for index, target, maximum, expiry, actor, claimed in exact_claims:
+                result = db.execute("""SELECT bot_id, sender_id, target_user_id, max_claims, expire_at, actor_id, claimed_at
+                    FROM private_shares JOIN private_share_claims ON private_shares.id = private_share_claims.share_id
+                    WHERE code_sha256=?""", (native.digest(fixture.code(index).encode("ascii")),)).fetchone()
+                self.assertEqual(result, (fixture.BOT_ID, str(fixture.SENDER), None if target is None else str(target),
+                                          maximum, expiry, str(actor), claimed))
+            self.assertEqual(db.execute("SELECT name,seq FROM sqlite_sequence").fetchall(), [("private_shares", 3)])
+
+            api.calls.clear()
+            verified = tool.run_action("verify-restore", engine, pin)
+            self.assertEqual((verified["verifiedPrivateShareCount"], verified["verifiedPrivateShareClaimCount"],
+                              verified["verifiedShareSequenceHighWater"], verified["r2Metadata"]), (3, 3, 3, "verified"))
+            self.assertEqual(verified["shareCompatibility"], "not-validated")
+            self.assertEqual(verified["privateSharesSha256"], candidate.pin()["privateSharesSha256"])
+            self.assertNotIn(fixture.BOT_ID, json.dumps(verified))
+            self.assertFalse(any(call[0] in {"POST", "PUT", "S3 PUT"} for call in api.calls))
+            first = api.names["objects"], next(iter(candidate.entries))
+            api.metadata[first]["http_metadata"] = {"contentType": "text/plain"}
+            with self.assertRaisesRegex(native.RehearsalError, "size or metadata"):
+                tool.run_action("verify-restore", engine, pin)
+
+    def test_share_profile_rejects_a_valid_archive_from_altered_synthetic_source(self):
+        with patch.object(tool.share_fixture, "SENDER", tool.share_fixture.SENDER + 10):
+            self.build(tool.SHARE_PROFILE)
+        with self.assertRaises(tool.native.RehearsalError):
+            self.verify(self.archive(), tool.SHARE_PROFILE)
+
     def test_correct_archive_digest_does_not_admit_extra_member(self):
         self.build()
         with self.assertRaises(tool.native.RehearsalError):
@@ -187,6 +273,7 @@ class CandidateBoundaryTests(unittest.TestCase):
             second = native.RehearsalAPI(native_tests.TARGET, "synthetic-token", other, profile=tool.PROFILE)
             path = native.RehearsalAPI(native_tests.TARGET, "synthetic-token", cohort, profile=tool.PATH_PROFILE)
             empty = native.RehearsalAPI(native_tests.TARGET, "synthetic-token", cohort, profile=tool.EMPTY_PROFILE)
+            share = native.RehearsalAPI(native_tests.TARGET, "synthetic-token", cohort, profile=tool.SHARE_PROFILE)
             existing = native.RehearsalAPI(native_tests.TARGET, "synthetic-token", cohort)
         self.assertEqual(candidate.names, {"database": f"subs-bot-cf-legacy-db-{cohort}",
                                            "objects": f"subs-bot-cf-legacy-r2-{cohort}"})
@@ -199,6 +286,10 @@ class CandidateBoundaryTests(unittest.TestCase):
                                        "objects": f"subs-bot-cf-legacy-empty-r2-{cohort}"})
         self.assertTrue(set(empty.names.values()).isdisjoint({*path.names.values(), *candidate.names.values()}))
         self.assertEqual(empty.journal_prefix, f"maintenance/legacy-empty-candidate/{cohort}/journal/")
+        self.assertEqual(share.names, {"database": f"subs-bot-cf-legacy-share-db-{cohort}",
+                                       "objects": f"subs-bot-cf-legacy-share-r2-{cohort}"})
+        self.assertTrue(set(share.names.values()).isdisjoint({*empty.names.values(), *path.names.values(), *candidate.names.values()}))
+        self.assertEqual(share.journal_prefix, f"maintenance/legacy-share-candidate/{cohort}/journal/")
         self.assertEqual(existing.names, {"backup": f"subs-bot-cf-backup-{cohort[:16]}",
                                           "database": f"subs-bot-cf-restore-{cohort[:16]}",
                                           "objects": f"subs-bot-cf-restore-{cohort[:16]}"})
