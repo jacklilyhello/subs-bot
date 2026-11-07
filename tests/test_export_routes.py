@@ -134,6 +134,75 @@ class ExportRouteTests(unittest.IsolatedAsyncioTestCase):
                                 self.assertEqual(node["server_port"], SUPPORTED["port"])
                                 self.assertEqual(node["password"], PASSWORD)
 
+    async def test_imported_native_singbox_http_transport_guards_raw_request_fields(self):
+        node = {
+            "type": "vmess", "server": "203.0.113.41", "server_port": 443, "alter_id": 0,
+            "uuid": "12345678-1234-4234-8234-123456789012", "security": "aes-128-gcm",
+        }
+        http1 = {**node, "tag": "Synthetic HTTP1", "transport": {
+            "type": "http", "method": "PUT", "path": "/escaped%2Fpath",
+            "host": ["front.example.invalid:8443", "[2001:db8::41]:8443"], "headers": {"X-Fixture": ["one", "two"]},
+        }}
+        http2 = {**node, "tag": "Synthetic HTTP2", "tls": {"enabled": True, "server_name": "tls.example.invalid"},
+                 "transport": {"type": "http", "method": "", "path": "", "headers": {"Accept-Encoding": "identity"}}}
+
+        async def upload(name, outbounds):
+            raw = json.dumps({"outbounds": outbounds}).encode("utf-8")
+            update = telegram_update()
+            message = update.effective_message
+            message.document = SimpleNamespace(file_name=f"{name}.json", file_size=len(raw), file_id="fixture")
+            message.reply_text.return_value = SimpleNamespace(edit_text=AsyncMock())
+            file = SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(raw)))
+            context = SimpleNamespace(bot=SimpleNamespace(get_file=AsyncMock(return_value=file)))
+            with patch.object(bot, "fetch_subscription", AsyncMock()) as fetch:
+                await bot.handle_document(update, context)
+                fetch.assert_not_awaited()
+            sub = next(sub for sub in await self.store.list_subs(OWNER) if sub["name"] == name)
+            self.assertEqual(sub["node_count"], len(outbounds))
+            return sub
+
+        bad_fields = {
+            "method": {"method": "GET\r\nX-Fixture: marker"},
+            "method-space": {"method": "GET /"},
+            "host": {"host": ["front.example.invalid", "front.example.invalid\r\nX-Fixture: marker"]},
+            "path": {"path": "/fixture\r\nX-Fixture: marker"},
+            "header-name": {"headers": {"X-Fixture\r\nX-Extra": "marker"}},
+            "header-value": {"headers": {"X-Fixture": "one\r\nX-Extra: marker"}},
+            "duplicate-host": {"headers": {"Host": "front.example.invalid", "host": "other.example.invalid"}},
+            "multi-value-host": {"headers": {"Host": ["front.example.invalid", "other.example.invalid"]}},
+            "content-length": {"headers": {"Content-Length": "0"}},
+            "transfer-encoding": {"headers": {"Transfer-Encoding": "chunked"}},
+        }
+        valid = await upload("safe-http", [http1, http2])
+        invalid = {}
+        for label, fields in bad_fields.items():
+            unsafe = {**node, "tag": "Synthetic refused", "transport": {"type": "http", **fields}}
+            invalid[label] = await upload(f"unsafe-http-{label}", [http1, unsafe])
+
+        async with self.http_session() as (session, origin):
+            async with session.get(f"{origin}/sub/{valid['token']}/singbox") as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual((await response.json())["outbounds"][2:], [http1, http2])
+            for label, sub in invalid.items():
+                for method in ("GET", "HEAD"):
+                    with self.subTest(field=label, method=method):
+                        async with session.request(method, f"{origin}/sub/{sub['token']}/sing-box") as response:
+                            self.assertEqual(response.status, 422)
+                            self.assert_private(response)
+                            self.assertEqual(await response.text(), HTTP_ERROR if method == "GET" else "")
+            for path in (await self.paths(invalid["method"]))[1:]:
+                with self.subTest(route=path.split("/")[1]):
+                    async with session.get(f"{origin}{path}/singbox") as response:
+                        self.assertEqual(response.status, 422)
+                        self.assertEqual(await response.text(), HTTP_ERROR)
+
+        update = telegram_update(f"sub:fmt:{invalid['method']['id']}:singbox")
+        with patch.object(bot, "make_short_url", AsyncMock()) as make_short_url:
+            await bot.on_callback(update, SimpleNamespace())
+        make_short_url.assert_not_awaited()
+        update.effective_message.reply_html.assert_not_awaited()
+        update.effective_message.reply_text.assert_awaited_once_with(bot._EXPORT_UNSUPPORTED)
+
     async def test_access_logs_keep_status_without_capability_urls(self):
         sub = await self.store.add_imported_sub(OWNER, "supported", [SUPPORTED])
         await self.store.add_imported_sub(OWNER, "unsupported", [UNSUPPORTED])
