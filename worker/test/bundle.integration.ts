@@ -321,6 +321,7 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
     ]);
     assert.equal(fixture.migrations[5]?.name, "0006_telegram_lifecycle.sql");
     assert.equal(fixture.migrations[6]?.name, "0007_telegram_private_claims.sql");
+    assert.equal(fixture.migrations[7]?.name, "0008_telegram_temp_nodes.sql");
     await applyMigrations(db, directory, fixture.migrations.slice(0, 2));
     const url = "https://provider.example.invalid/synthetic";
     await db.prepare(`
@@ -443,7 +444,35 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
       FROM telegram_private_claim AS receipt
     `).first();
     assert.deepEqual(claimState, { code: expectedCodeDigest, portions: 1 });
-    assert.deepEqual(sentBodies, [expectedPrivate, expectedGroup, expectedNext, prompt, confirmation, claimReply]);
+
+    await db.prepare("UPDATE telegram_auth SET allowed = 1 WHERE bot_id = ? AND user_id = ?")
+      .bind(policy.botId, policy.memberId).run();
+    const importedShare = "hy2://user:fixture@[2001:db8::5]:443,5000-6000/?sni=proxy.example.invalid#Fixture";
+    const memberPrivate = { ...claimMessage, chat: { id: Number(policy.memberId), type: "private" } };
+    const tempEvent = { update_id: 18, message: { ...memberPrivate, message_id: 23,
+      text: Buffer.from(importedShare).toString("base64"), entities: [] } };
+    const added = expectSend(policy.memberId, 24, 23, "已加入临时列表 1 条节点，当前共有 1 条。");
+    assert.deepEqual((await Promise.all([post(tempEvent), post(tempEvent)])).map((result) => result.status), [200, 200]);
+    await waitForReplies([10, 8, 9, 18, 20, 22, 24], 3);
+    const batch = await db.prepare("SELECT actor_id, node_count, json_extract(nodes_json,'$[0].share') AS share FROM telegram_temp_batch")
+      .first();
+    assert.deepEqual(batch, { actor_id: policy.memberId, node_count: 1, share: importedShare });
+
+    const summary = expectSend(policy.adminId, 26, 25, "临时列表共有 0 条节点。发送 /temp clear 清空。");
+    assert.equal((await post({ update_id: 19, message: {
+      ...memberPrivate, message_id: 25, text: "/temp",
+      from: { id: Number(policy.adminId), is_bot: false }, chat: { id: Number(policy.adminId), type: "private" },
+      entities: [{ type: "bot_command", offset: 0, length: 5 }],
+    } })).status, 200);
+    await waitForReplies([10, 8, 9, 18, 20, 22, 24, 26], 3);
+    const cleared = expectSend(policy.memberId, 28, 27, "已移除 1 条临时节点，当前共有 0 条。");
+    assert.equal((await post({ update_id: 20, message: {
+      ...memberPrivate, message_id: 27, text: "/temp clear", entities: [{ type: "bot_command", offset: 0, length: 5 }],
+    } })).status, 200);
+    await waitForReplies([10, 8, 9, 18, 20, 22, 24, 26, 28], 3);
+    assert.deepEqual(await db.prepare("SELECT count(*) AS total FROM telegram_temp_batch").first(), { total: 0 });
+    assert.deepEqual(sentBodies, [expectedPrivate, expectedGroup, expectedNext, prompt, confirmation, claimReply,
+      added, summary, cleared]);
     assert.deepEqual(replies, []);
   } finally {
     await miniflare.dispose();
