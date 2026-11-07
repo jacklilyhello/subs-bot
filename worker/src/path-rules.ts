@@ -7,6 +7,8 @@ const MAX_PATH_RULE_WORK = 64 * 1024 * 1024;
 const MAX_RULE_SCALARS = 128;
 const pythonWhitespace = "[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]";
 const pythonTrim = new RegExp(`^${pythonWhitespace}+|${pythonWhitespace}+$`, "gu");
+const pythonRuns = new RegExp(`${pythonWhitespace}+`, "gu");
+export const PATH_RULE_WHITESPACE_PREFIX = new RegExp(`^${pythonWhitespace}`, "u");
 const nonScalar = /[\u0000\ud800-\udfff]/u;
 const caseFoldScalars = new RegExp("[" + Object.keys(FULL_CASE_FOLD)
   .map((character) => "\\u{" + character.codePointAt(0)!.toString(16) + "}").join("") + "]", "gu");
@@ -20,13 +22,15 @@ export function foldPathText(value: string): string {
   return value.replace(caseFoldScalars, (character) => FULL_CASE_FOLD[character]);
 }
 
-function ruleText(value: unknown): string {
+export function collapsePathRuleWhitespace(value: string): string {
+  return value.replace(pythonRuns, " ").replace(/^ +| +$/gu, "");
+}
+
+export function pathRuleText(value: unknown): string | null {
   if (typeof value !== "string" || nonScalar.test(value) || Array.from(value).length > MAX_RULE_SCALARS) {
-    throw new SnapshotIntegrityError();
+    return null;
   }
-  const trimmed = value.replace(pythonTrim, "");
-  if (!trimmed) throw new SnapshotIntegrityError();
-  return trimmed;
+  return value.replace(pythonTrim, "") || null;
 }
 
 export function compilePathRules(rows: readonly PathRuleRow[]): readonly PathRule[] {
@@ -35,8 +39,11 @@ export function compilePathRules(rows: readonly PathRuleRow[]): readonly PathRul
   const rules = rows.map(({ id, keyword, remark }) => {
     if (!validInteger(id, lastId + 1)) throw new SnapshotIntegrityError();
     lastId = id;
-    const folded = foldPathText(ruleText(keyword));
-    return { id, keyword: folded, length: Array.from(folded).length, remark: ruleText(remark) };
+    const needle = pathRuleText(keyword);
+    const label = pathRuleText(remark);
+    if (needle === null || label === null) throw new SnapshotIntegrityError();
+    const folded = foldPathText(needle);
+    return { id, keyword: folded, length: Array.from(folded).length, remark: label };
   });
   return rules.sort((left, right) => right.length - left.length || left.id - right.id);
 }
