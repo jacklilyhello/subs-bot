@@ -2,16 +2,19 @@
 
 迁移目标是让 subs-bot 的 Telegram 处理、订阅与分享数据、导出和后台任务都运行在 Cloudflare。Telegram、GitHub、订阅提供方和已配置的可信短链服务仍是业务接口。完成切换后，服务无需维护者管理 VPS、轮询进程或外部数据库。
 
-## 首个隔离环境
+## 隔离环境与 HTTP 接口
 
-首个 Worker 切片只包含 D1 元数据、私有 R2 快照和只读 HTTP 路径。隔离验证使用本项目专用 `workers.dev` 主机名和合成数据。
+隔离 Worker 使用本项目专用 `workers.dev` 主机名、D1 元数据、私有 R2 快照和合成数据。Telegram 收件、回复和文档处理使用同一隔离环境。
 
 | 路径 | 隔离 Worker 的行为 |
 | --- | --- |
 | `GET` 或 `HEAD /health` | 返回部署的 40 位 Git commit SHA，供部署验收核对 |
 | `GET` 或 `HEAD /sub/{token}/{format}` | 读取当前已发布快照，支持 `base64`、`v2ray`、`mixed`、`singbox`、`sing-box`、`clash`、`surge`、`qx`、`quantumult` 和 `quantumultx`。省略格式时使用 `clash` |
+| `GET` 或 `HEAD /agg/{code}/{format}` | 导出全量或指定订阅，使用同一套格式 |
+| `GET` 或 `HEAD /s/{code}` | 对有效聚合码返回同源相对重定向 |
+| `POST /telegram/webhook` | 校验隔离 Bot 的 Webhook 密钥，接收受限消息及回调 |
 
-能力链接视同凭据。成功与失败响应均使用 `Cache-Control: no-store, private`、`Referrer-Policy: no-referrer` 和 `X-Content-Type-Options: nosniff`。`HEAD` 执行同样的预检并返回相同状态，响应体为空。未知能力链接返回 `404`，未支持的导出格式返回 `406`，内容无法完整转换或超过格式限制时返回 `422`。若预检时发现已引用的快照不可用或校验失败，返回 `503`。
+能力链接视同凭据。成功与失败响应均使用 `Cache-Control: no-store, private`、`Referrer-Policy: no-referrer` 和 `X-Content-Type-Options: nosniff`。`HEAD` 执行同样的预检并返回相同状态，响应体为空。未知能力链接返回 `404`，未支持的导出格式返回 `406`，内容无法完整转换或超过格式限制时返回 `422`。若预检时发现已引用的快照不可用或校验失败，返回 `503`。旧服务将未知格式回退到 Clash，迁移前须核对已发链接所用格式。
 
 `GET` 在预检时验证已选定的快照并计算编码长度。通过后再读取同一个不可变快照，按原有块顺序编码，通过 `FixedLengthStream` 发送。两遍读取各自最多同时预读四个块，下游消费一块后再补下一块。若第二遍读取在成功响应头发出后失败，响应流会中止，客户端应把读取错误或未读满声明长度视为失败。响应流取消后停止补读，已发出的存储请求可能仍会完成。 [Workers FixedLengthStream](https://developers.cloudflare.com/workers/runtime-apis/streams/transformstream/#fixedlengthstream) · [Workers Content-Length](https://developers.cloudflare.com/workers/runtime-apis/response/#set-the-content-length-header)
 
@@ -36,7 +39,7 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 - **TypeScript Worker** 处理 HTTP、Telegram Webhook、权限与任务编排，通过平台绑定访问 D1、R2 和未来的 Queues。现有 Python 逻辑及回归样例是迁移对照。Python Workers 使用 Pyodide，依赖与文件系统行为与目前的 CPython 服务不同。单独移植轮询、进程内锁和本地 SQLite 仍需重新设计数据和事件生命周期。 [Python Workers 标准库](https://developers.cloudflare.com/workers/languages/python/stdlib/) · [Python 依赖支持](https://developers.cloudflare.com/workers/languages/python/packages/)
 - **D1** 保存用户归属、授权、订阅元数据、能力链接、操作状态和当前快照指针。列表与权限检查只读取必要列。授权与领取使用数据库约束和有条件写入，关键读从主库获取。 [D1 Binding API](https://developers.cloudflare.com/d1/worker-api/d1-database/) · [D1 读取一致性](https://developers.cloudflare.com/d1/best-practices/read-replication/)
 - **私有 R2** 存储体积较大的节点快照和受控备份。对象通过 Worker 绑定读取。禁用公开访问和边缘缓存。 [R2 一致性](https://developers.cloudflare.com/r2/reference/consistency/) · [R2 限制](https://developers.cloudflare.com/r2/platform/limits/)
-- **Queues 与 Cron** 在引入长任务时启用。Queues 传递短任务 ID，D1 记录实际进度及重试状态。Cron 按 UTC 调度到期刷新、补发和过期清理。需要按会话严格排序或按提供方节流时，先验证 D1 的条件写入和租约。只有在云端验证表明需要额外协调时，再引入 Durable Objects。 [Queues 投递语义](https://developers.cloudflare.com/queues/reference/delivery-guarantees/) · [Cron Triggers](https://developers.cloudflare.com/workers/configuration/cron-triggers/) · [Durable Objects 限制](https://developers.cloudflare.com/durable-objects/platform/limits/)
+- **Cron** 恢复待发 Telegram 回复、回收交互票据、处理文档任务及其废弃候选。提供方任务接入时，D1 记录任务状态与租约。若引入 Queues，只投递任务 ID，并验证重复投递和补发。 [Queues 投递语义](https://developers.cloudflare.com/queues/reference/delivery-guarantees/) · [Cron Triggers](https://developers.cloudflare.com/workers/configuration/cron-triggers/)
 
 ### 快照发布和恢复
 
@@ -45,28 +48,25 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 3. 读取时先核对 D1 中的清单摘要，再按顺序读取和校验各块。快照上限为 64 MiB、256 块、100,000 个节点。单块和单条记录分别最多 512 KiB，清单最多 64 KiB。Base64 导出的 16 MiB 分享文本上限包含行分隔符，Sing-box 按实际 JSON 字节数计量。部署后用真实分布和并发验证这些上限适用。
 4. 已发布旧版本和发布结果不明的候选对象先保留。确认发布失败时，可清理本次新写入且尚未发布的对象。启用历史版本回收前，必须确认对象未被活动订阅、回收站、回滚版本或备份引用，并超过约定的恢复期。桶生命周期规则只适用于可证明安全的备份或临时对象前缀。 [R2 生命周期](https://developers.cloudflare.com/r2/buckets/object-lifecycles/)
 
-## 分阶段交付
+## 功能对照与验收清单
 
-| 阶段 | 依赖、变更和验收 |
+以旧服务实际注册的命令、文本、按钮和 HTTP 路由为准。下表将已接入的隔离入口和可单独验收的后续工作分开。发布时分别核对托管 CI、确切提交的隔离部署、真实资源读回及用户操作。真人操作限获准的两名测试者在内置浏览器使用隔离 Bot 和指定测试群。 [旧 Bot 入口](../bot.py) · [隔离 Worker 入口](../worker/src/index.ts)
+
+| 旧入口与行为 | 隔离 Worker 与独立验收项 |
 | --- | --- |
-| 现有缺陷修复 | 在 Python 服务上独立修复凭据作用域、结构化导出和 Hysteria 2 文本导入。由 GitHub 托管 runner 复现并验证，迁移以合并后的代码及样例为基准。 |
-| 隔离 HTTP 与存储 | 将首个切片单独提交。GitHub 构建和测试后，将对应提交的不可变产物部署至项目隔离 Worker。用真实绑定验证提交 SHA、成功导出、内容完整性、错误状态和能力边界。 |
-| 隔离发布与迁移基线 | 在 GitHub 托管 runner 上复核合并产物的来源和摘要。先识别已有 D1 结构和迁移历史，再登记或增量升级。重复触发同一版本应得到相同结果。 |
-| Telegram 与权限 | 在已验收的存储模型上加入 Webhook、持久收件箱和发件箱、用户和会话隔离、管理员授权、私密领取，以及对应的并发和故障测试。用明确归属的测试 Bot 和测试会话验收。 |
-| 导出、导入和刷新 | 补齐聚合、短链、临时节点、回收站、路径规则、流量与到期、内联与格式转换。加入可恢复的批量刷新。真实提供方必须通过隔离环境出网测试，再开启远程订阅拉取。 |
-| 容量与数据迁移 | 比较旧 SQLite 正文与转换后快照和分享原文的实际字节数。先用云端合成样本验证容量边界、并发与失败，再对获准的真实备份做隔离恢复、数据对账和双账号验收。 |
-| 生产切换 | 核对切换窗口、旧服务写入边界、域名、Telegram 和回滚步骤。获得生产切换决定后执行。 |
-
-### 功能对照与阶段边界
-
-| 功能 | 迁移与验收路径 |
-| --- | --- |
-| 订阅列表、重命名和回收站 | Telegram 的 `/list`、`/expire` 和 `/recycle` 按所有者翻页。编号按钮可发起重命名、确认删除和恢复。订阅详情和批量操作分阶段接入。 |
-| 私聊、群聊、内联及授权 | Webhook 和 D1 记录更新与授权。用指定管理员、普通用户和测试群验收；后续增加持久会话状态、按钮与内联更新。 |
-| 私密分享 | 单独迁移有效期、指定用户、份数及领取事务。验证重复领取、争抢最后一份、撤权及过期。 |
-| 导入、格式与链接 | 覆盖 URL、文档、文本与 Base64 导入。补齐其余协议，再接入聚合、短链、路径映射和临时节点。旧链接和授权由迁移对账验证。 |
-| 更新、批量任务与搜索 | 持久任务记录进度、重试和恢复；上游失败保留上一版快照。对照旧 Bot 的搜索和导出入口，用获准的真实提供方验证出网。 |
-| 备份与交接 | 在独立恢复目标核对 D1 元数据、R2 清单、账号归属、旧能力和完整字节，演练版本回滚后再准备切换。 |
+| `/start`、`/help`、中文回复菜单、`/auth` 列表及增删，支持输入 ID 或回复目标用户。 | 已接入基础欢迎、帮助和私聊管理员授权。核对两账号和测试群的权限隔离、撤权及重投。中文菜单、生产管理员及白名单配置、历史授权覆盖另行核对。 |
+| `/list`、`/expire`、回收站菜单、翻页和跳页。 | `/list`、未来 14 天内到期的 `/expire` 及新增的 `/recycle` 已支持按所有者翻页。核对边界日期、旧票据、跨用户回调和重命名、确认删除、30 天内恢复。菜单、任意页跳转和详情入口分开接入。 |
+| 数字或列表按钮打开详情，浏览节点和流量，单条重命名、刷新、删除、格式链接、短链和节点文件。`/s` 按名称及原始 URL 搜索，`/d` 批量删除匹配项。`/renumber` 只返回当前订阅计数。 | 已有生命周期操作、元数据和快照读取。详情及节点浏览、搜索、批量回收预览和确认、私聊签发各格式链接及原始 URI 附件分别验收。展示编号由列表计算。原始 URL、节点及能力链接限定在私聊。 |
+| 粘贴节点加入临时列表，`/temp` 查看原文，`/temp clear` 清空。 | 已接入私聊原始 URI 和 Base64 批量导入、计数和清空。核对顺序、重复、整批拒绝及迟到清空。私聊查看或导出原文另行验收。 |
+| 上传 `.txt`、`.log`、`.yaml`、`.yml`、`.json`，识别节点或订阅 URL，同名文件更新旧导入。 | 已接入私聊节点文档及同名上传替换。验收同一账号保留订阅 ID 和令牌、另一账号同名文件独立、失败保留旧快照。URL 列表和混合文档随提供方导入接入。 |
+| 发送一个或多个 HTTP(S) URL 或 `名称\|URL`，重复 URL 刷新，按上游标题自动命名。单条刷新、详情或导出的按需刷新、更新所有的确认和进度、有效及失败报告、保留或回收失败项。 | 私有抓取入口、订阅元数据和快照发布为基础。先验收实际提供方出网、URL 导入、单条刷新和流量、到期、标题，再验收可恢复的批量刷新、报告和失败项回收。 |
+| `/export` 动态全量聚合含自己的临时节点，`/o` 按名称和原始 URL 筛选并固定订阅顺序，所选聚合只包含订阅。 | 已接入全量和筛选聚合的 HTTP 读取。分别验收私聊签发与撤销、筛选签发、归属和顺序，以及旧聚合码迁移。 |
+| `/short` 显示帮助，`短链 URL`、`short URL` 及详情按钮签发短链。`/s/{code}` 按已保存目标跳转，可选外部服务包装同一受控本地链接。 | 当前 `/s/{code}` 支持聚合同源重定向。单订阅格式短链、任意 HTTP(S) 目标及可信外部服务回退单独验收。 |
+| `/path` 和菜单维护路径对应，支持添加、删除和清空，受限文本入口接受 `关键词=备注`。 | HTTP 导出已应用所有者路径规则，临时节点保留原名。规则的私聊管理、旧规则导入和两账号隔离分别验收。 |
+| `@Bot [关键词]` 搜索并发送订阅及临时节点，`/i` 切换默认、流量、到期和名称排序。`Share` 支持自定义内容或匹配订阅、指定接收人、份数和有效期；选中反馈用于更新原卡。 | 私密领取已接入私聊 `/start claim_<code>`，核对过期、指定用户、并发、重复领取及撤权后的领取权限。私密创建、内联搜索和排序、卡片编辑分开验收；分享卡片只显示通用信息，正文在私聊交付。 |
+| `/g` 查 GitHub 仓库和公开代码，代码无结果时查询 grep.app，必要时提供 GitHub 网页搜索入口。`/ai` 接受 API 地址和 Key，探测 OpenAI 兼容端点的状态和延迟。 | 两项各自接入和验收。GitHub 凭据只发送至 GitHub。`/ai` 按固定范围验证用户提供的地址，禁用重定向，保护 Key 和上游响应。 |
+| `/health`、单订阅、聚合和短链 HTTP 路由。旧服务默认使用 Clash，支持 Base64、Sing-box、Surge 和 QX 系列。 | 按本页 HTTP 表验收格式、别名、顺序、字节、失败状态及旧能力链接。托管配置校验、真实隔离 HTTP 响应和客户端导入分别记录。 |
+| 旧服务使用长轮询，启动时清理过期分享和旧回收记录，刷新由用户操作触发。 | 已接入 Webhook 和 Telegram 恢复 Cron。订阅批处理和生产数据回收另行验收，回收前核对备份、活动指针及回滚引用。 |
 
 回收操作在同一 D1 事务内将订阅元数据移出活动表。旧 Worker 在回滚时也无法用活动查询读取已回收订阅。恢复保留原 ID、能力令牌、快照指针及到期和流量信息，便于继续使用原链接和 R2 对象。回收站显示和恢复均以 D1 时间为准，保留 30 天的操作窗口。超出窗口的元数据和 R2 对象留待受控清理。已开始的导出可以继续读取原快照，后续请求需要重新查询活动表。
 
@@ -74,14 +74,14 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 ### Telegram 收件、发件与权限验收
 
-- 隔离入口 `/telegram/webhook` 首批接收 `/start`、`/help`、`/list` 和 `/auth`。只接受指定测试 Bot 的两个用户及指定群。管理员在自己的私聊管理另一名测试用户的授权，群消息和普通用户的响应不显示授权详情。群和私聊的订阅读取都使用发起者的用户 ID。
+- 隔离入口 `/telegram/webhook` 处理上表已接入的命令、消息和回调。指定测试 Bot 的两个用户可以操作各自的订阅，群内入口限指定测试群。管理员在自己的私聊管理另一名测试用户的授权。
 - Webhook 仅接收指定路径上的 HTTPS POST，以恒定时间比较核对 `X-Telegram-Bot-Api-Secret-Token`，限制请求大小及允许的 update 类型。用 `(bot_id, update_id)` 唯一键持久记录更新。提交后返回 `2xx`，已持久化的重复更新也返回 `2xx`。暂时无法持久化时返回可重试错误。接受乱序更新，去重保留期覆盖重投窗口。 [Telegram `Update`](https://core.telegram.org/bots/api#update) · [Telegram `setWebhook`](https://core.telegram.org/bots/api#setwebhook)
 - 收件记录只保留归属、消息 ID 和已识别的命令。授权变更和回复意图与收件记录在同一 D1 事务提交。同一用户和聊天的回复按入库顺序处理。发送前复核授权，已经发起的外部请求无法撤回。只有明确的 Telegram 限流拒绝可在到期前重试。超时和无法确认的发送标记为 `uncertain`，保留以供核对。 [D1 事务批处理](https://developers.cloudflare.com/d1/worker-api/d1-database/#batch) · [Telegram `ResponseParameters`](https://core.telegram.org/bots/api#responseparameters)
 - 只读视图每页至多八条，按订阅 ID、到期时间或删除时间翻页。按钮只传随机值，D1 仅存摘要，绑定原发起人、聊天、话题、已确认发送的消息和尝试号，十分钟内只能消费一次。回调去重、按钮消费和下一页回复同批提交。回滚至支持回执标记的版本时，普通命令继续处理，视图回执留待新版处理。 [Telegram `CallbackQuery`](https://core.telegram.org/bots/api#callbackquery)
-- 用户数据按 Telegram 用户 ID 归属，私聊和群聊共用其个人数据。重命名、翻页等交互使用 `(user_id, chat_id)`，内联查询以发起人身份授权。管理员、初始白名单和显式授权覆盖沿用现有语义。授权撤销应在下一次检查生效，权限变更和受保护的写入要用数据库条件约束，避免旧授权快照继续写入。
+- 同一用户的私聊和群聊读取相同的个人数据。重命名和翻页绑定用户、聊天与话题。受保护的写入以 D1 里的当前授权和对象版本为条件。生产授权迁移需要核对管理员、初始白名单及显式允许和拒绝覆盖。
 - 私密领取保留现有的分享能力语义。`0005` 按 Bot 存储分享码摘要，使用独立的私有 R2 对象保存最多 64 KiB 的私密正文。`0007` 将指定账号在普通私聊发出的 `/start claim_<code>` 记为持久领取意图，回执只存码的摘要。这个入口沿用单次领取授权，普通订阅操作仍检查白名单。领取前核对正文长度、摘要和 UTF-8，D1 在同一事务复核到期、指定用户及剩余份数，同时将回复切换到发送中。份数以 `(share_id, actor_id)` 唯一领取记录计数，已领取的用户在有效期内可再次查看。
 - 私聊短正文以纯文本送达，超过消息长度或含有不适合直接显示的控制字符时使用一个固定文件名的 UTF-8 附件。发送结果不明时保留回执和领取记录，避免自动重复发送。内联创建和更新群内分享卡片另行接入。 [Telegram `sendMessage`](https://core.telegram.org/bots/api#sendmessage) · [Telegram `sendDocument`](https://core.telegram.org/bots/api#senddocument)
-- 在业务变更的事务内写入待发送动作，用稳定动作 ID 去重。消费者持有租约并跟踪 Telegram 返回的消息 ID，成功后更新发件箱。对网络超时后可能已送达的动作标记结果不明，按动作类型恢复或人工核对。Telegram 发送接口没有通用幂等键，验收须覆盖收到成功响应后写回失败的情形。 [Telegram `sendMessage`](https://core.telegram.org/bots/api#sendmessage)
+- 验收须覆盖 Telegram 返回成功后写回失败，核对同一发件租约的状态与实际送达。 [Telegram `sendMessage`](https://core.telegram.org/bots/api#sendmessage)
 - 重命名等待只接受同一用户在同一聊天与话题中回复已经确认送达的 Bot 提示。删除要求点击独立确认按钮。写入时复核所有者、授权、版本和操作票据，在同一 D1 事务完成变更和回复记录。回收站恢复保留订阅 ID、能力链接和已发布快照。
 - 临时节点先支持私聊粘贴节点链接或 Base64 列表。导入保留原始 URI、顺序及重复项。格式错误或暂不支持的节点按数量报告，并整批保留原状态。`0008` 将不超过 256 KiB 的有界数据批次、当前授权与回复意图放在同一 D1 事务。每个用户最多 5,000 个节点和 4 MiB。群聊不会接收临时节点正文。`/temp` 查看个人计数，`/temp clear` 清除当前清空操作之前的条目，较新的导入不会被迟到的清空误删。临时文件、URL 及聚合交互另行接入。
 - 已授权用户可以在私聊上传 TXT、LOG、YAML 或 JSON 文件导入命名订阅。纯文本支持原始节点和 Base64。每个文件上限 10 MiB 和 500 个节点，超过限制或含无法支持的节点时整批拒绝。订阅提供方 URL 的识别和刷新由独立出网阶段接入。
@@ -91,7 +91,7 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 - 刷新任务保存订阅、发起人、期望版本、尝试次数和错误类别。租约带过期时间及递增凭据，过期消费者的写入由条件检查拒绝。队列消息重复投递时复用同一任务。重试按错误类别退避并遵守提供方限速，耗尽后进入死信或可审计的失败状态。用 Cron 补发已入库但未成功入队的任务。拉取或解析失败只记录错误状态，上一份有效快照继续服务。 [Queues 重试与死信](https://developers.cloudflare.com/queues/configuration/batching-retries/)
 - 任意用户 URL 开放前，验证 HTTP(S) URL、允许端口和重定向策略。每一跳重新解析 A/AAAA，拒绝私有、环回、保留及混合公网和私网结果，并确保实际连接到通过检查的 IP，同时保持原 Host、TLS SNI 和证书校验。带凭据的请求禁止将凭据转发至新来源。延续现有解压后 10 MiB 上限，并对上传、重定向次数、总耗时、节点数和 YAML 深度或别名设置限额。
-- Worker `fetch()` 的 `resolveOverride` 有同 Zone 限制，预先查询 DNS 后再调用普通 `fetch()` 无法证明连接使用了已审查的 IP。Workers TCP 又限制对 Cloudflare IP 的直接连接。先在隔离环境验证平台支持的安全拨号方案和真实提供方。若无法同时满足地址固定、TLS 校验和兼容性，再使用项目专用 Cloudflare Container 承载受控抓取，并按需复用 Python 解析。Container 通过 Worker 内部入口接收有界任务，使用逐跳地址校验、网络策略和默认拒绝的出网边界。持久数据仍在 D1 和 R2。 [Workers Request](https://developers.cloudflare.com/workers/runtime-apis/request/#the-cf-property-requestinitcfproperties) · [Workers TCP](https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/) · [Containers 出网](https://developers.cloudflare.com/containers/configuration/outbound-traffic/)
+- 抓取组件使用项目专用 Cloudflare Container、固定 DNS 地址的 Python 传输及有界私有 RPC。业务 Worker 的服务绑定、导入和刷新任务需要通过隔离集成验收，确认实际连接、TLS 和 Cloudflare 代理的提供方兼容性。持久数据继续写入 D1 和 R2。 [私有抓取组件](../worker/provider_fetch/README.md) · [Containers 出网](https://developers.cloudflare.com/containers/configuration/outbound-traffic/)
 - 测试包括实际提供方的鉴权、重定向、编码、流量头、IPv4/IPv6、阻断行为与限速。输出只记录分类结果和耗时。覆盖 DNS 重绑定、跨来源重定向、压缩超限和异常 YAML，并核对失败不会改变旧快照。真实联调使用获准的测试订阅和会话。
 
 ## 部署、数据迁移和回滚
@@ -134,11 +134,13 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 旧库容量盘点在获准的托管环境运行 `python3 -B worker/tools/legacy_inventory.py <封存备份>`。输入须是单独完成、关闭、使用 UTF-8 和 DELETE 日志模式的 SQLite 备份。备份准备在原库之外进行，盘点本身以只读事务运行。报告只包含活动订阅与回收站的聚合计数、原始字节、紧凑 UTF-8 NDJSON 字节、块数、大小限制和旧转换器分享原文估算。无法读取或解析的记录有独立计数。退出码 `0` 表示报告完整，仍需检查超限和无效项。退出码 `2` 表示无法核对备份。容量报告不判定归属映射、旧链接兼容、分享权限或实际 Worker 性能。 [SQLite 增量读取](https://sqlite.org/c3ref/blob_open.html) · [SQLite URI](https://sqlite.org/uri.html)
 
+### 真实数据与生产切换门槛
+
 1. 先只读核对 Cloudflare 目标账户、Zone、`subs-bot.lilyya.top` 的 DNS、Worker 路由和 Custom Domain 绑定。新资源记录账号、环境及资源 ID，隔离与生产分别使用各自的 Worker、D1、R2 和队列。现有配置冲突须在改动前报告。目标主机名可用且切换获准后，仅增加所需的 Custom Domain 绑定。 [Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)
 2. `Worker CI` 在 GitHub 托管 runner 上安装依赖、检查类型、构建和测试。构建产物标记准确提交与摘要，由授权的部署步骤核对并上传至隔离 Worker。普通 PR CI 使用只读权限和合成数据。部署 Token 通过独立的受控步骤使用。云端 smoke 显式指定隔离环境和提交，核对 `/health` 与提交、已知测试快照的输出和负面用例。分别记录测试、构建、部署和真实运行结果。
-3. 对旧 SQLite 执行一致性备份并确认 WAL 已纳入。生成受保护的迁移清单，在隔离环境恢复。校验每类记录数、用户归属、节点数和摘要，以及有效订阅 Token、短码和仍有效的领取记录。分开处理活动订阅、回收站、路径、临时节点、授权覆盖、分享与领取、短链。旧群级数据存在时由维护者确认归属，跨域链接依赖另行核对。
-4. 备份须同时保存 D1 元数据和清单引用的 R2 对象。保存 D1 导出或恢复书签、R2 清单及摘要，并在项目专用隔离环境演练还原。Workers Paid 的 D1 Time Travel 可用于最近 30 天的原地恢复，会覆盖目标 D1；它不能还原 R2。恢复前冻结写入并确认 D1 与 R2 指向同一备份代。 [D1 Time Travel](https://developers.cloudflare.com/d1/reference/time-travel/)
-5. 生产切换前冻结旧写入、完成最后一次同步、验证旧链接和授权，再切换 Telegram Webhook 或流量。保留待处理更新，先处理旧轮询目前配置 `drop_pending_updates=True` 的回滚风险。验收失败时先停止新写入，核对是否需要回放迁移后写入，再恢复已审核的旧入口和 Telegram 模式。仅回滚 Worker 版本无法回滚 D1 或 R2。 [Telegram `setWebhook` / `deleteWebhook`](https://core.telegram.org/bots/api#setwebhook) · [Worker 版本与部署](https://developers.cloudflare.com/workers/versions-and-deployments/)
+3. 确认获准的数据来源和使用范围后，对旧 SQLite 执行包含 WAL 的一致性备份。先在项目专用隔离目标做恢复和容量盘点。对账活动订阅、回收站、路径规则、临时节点、授权覆盖、分享及领取、短链的数量和归属。核对节点摘要、有效订阅令牌、旧短码、仍有效的领取状态和跨域链接依赖。旧群级数据须由维护者确认归属。
+4. 合成备份演练验证恢复路径。真实数据验收需保存同一代 D1 导出或恢复书签、R2 清单及摘要，并在独立目标重建实际引用。核对清单、对象摘要、外键、导出和两个账号的权限。Workers Paid 的 D1 Time Travel 可用于最近 30 天的原地恢复，会覆盖目标 D1。R2 对象使用对应的独立备份。 [D1 Time Travel](https://developers.cloudflare.com/d1/reference/time-travel/)
+5. 在功能清单中记录代表性提供方、客户端及双账号的实测结果，并核对容量、失败恢复和旧链接连续性。确认生产切换范围、窗口及回滚方案并取得授权后，冻结旧写入，完成最后一次同步，再切换 Telegram Webhook 或域名流量。保留待处理更新，先处理旧轮询配置 `drop_pending_updates=True` 的回滚风险。验收失败时停止新写入，核对迁移后写入如何回放，再分别恢复 Worker 版本、数据和 Telegram 模式。 [Telegram `setWebhook` / `deleteWebhook`](https://core.telegram.org/bots/api#setwebhook) · [Worker 版本与部署](https://developers.cloudflare.com/workers/versions-and-deployments/)
 
 ## 限额、成本和凭据
 
