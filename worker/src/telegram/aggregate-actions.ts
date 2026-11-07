@@ -1,11 +1,12 @@
 import { MAX_AGGREGATE_MEMBERS } from "../aggregate.ts";
 import { MAX_PATH_RULES } from "../path-rules.ts";
+import { ISOLATION_PUBLIC_ORIGIN } from "../short-links.ts";
 import { digestHex, MAX_SNAPSHOT_NODES, validInteger } from "../storage.ts";
 import { inTelegramScope, type TelegramAggregateUpdate, type TelegramPolicy } from "./protocol.ts";
 import { MAX_TEMP_OWNER_BYTES, MAX_TEMP_OWNER_NODES } from "./temp-import.ts";
 
 export const TELEGRAM_AGGREGATE_MARKER = "aggregate:v1";
-export const TELEGRAM_AGGREGATE_ORIGIN = "https://subs-bot-cf-dev-01.lilyya.workers.dev";
+export const TELEGRAM_AGGREGATE_ORIGIN = ISOLATION_PUBLIC_ORIGIN;
 const KEY_VERSION = 1;
 const MAX_COMMAND_AGE_SECONDS = 900;
 const FUTURE_SKEW_SECONDS = 30;

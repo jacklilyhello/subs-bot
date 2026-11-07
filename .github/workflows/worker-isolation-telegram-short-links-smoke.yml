@@ -1,0 +1,67 @@
+name: Verify isolated Telegram normal short links
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: One read-only checkpoint with IAB actions between checkpoints
+        required: true
+        type: choice
+        options: [prepare, issued, retired]
+      cohort:
+        description: Fresh 16-character lowercase hexadecimal challenge
+        required: true
+        type: string
+      worker_ci_run_id:
+        description: Successful Worker CI run for this exact main release
+        required: true
+        type: string
+      source_run_id:
+        description: Successful previous checkpoint run ID (empty for prepare)
+        type: string
+      browser_hashes:
+        description: Retired phase only, JSON digests admin, member, and foreignTarget observed in IAB
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: subs-bot-isolation-deploy
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
+    environment: subs-bot-isolation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify the exact successful Worker artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CI_RUN_ID: ${{ inputs.worker_ci_run_id }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          python3 -B worker/tools/prepare_isolation_artifact.py > "$RUNNER_TEMP/telegram-short-worker-artifact.json"
+      - name: Read back the selected normal short-link checkpoint
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
+          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPLOY_TOKEN }}
+          SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
+          SUBS_BOT_TELEGRAM_AGGREGATE_KEY: ${{ secrets.SUBS_BOT_TELEGRAM_AGGREGATE_KEY }}
+        run: python3 -B worker/tools/telegram_short_links_smoke.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: subs-bot-telegram-normal-short-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/telegram-normal-short-checkpoint.json
+          if-no-files-found: error
+          retention-days: 7

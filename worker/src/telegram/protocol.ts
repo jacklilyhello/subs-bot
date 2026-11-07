@@ -46,16 +46,18 @@ export type TelegramSelectedUpdate = TelegramEventScope & (
 
 export type TelegramTempUpdate = TelegramEventScope & (
   | { kind: "temp-text"; text: string }
-  | { kind: "temp-summary" | "temp-clear" }
+  | { kind: "temp-raw" | "temp-summary" | "temp-clear" }
 );
 
 export type TelegramPathUpdate = TelegramEventScope & { kind: "path"; args: string };
 export type TelegramPrivateShareCreationUpdate = TelegramEventScope & { args: string; senderName?: string };
+export type TelegramShortLinkUpdate = TelegramEventScope & { args: string };
 export type TelegramSubscriptionReadUpdate = TelegramEventScope & (
   | { kind: "search"; query: string }
   | { kind: "number"; position: number }
   | { kind: "callback"; callbackId: string; ticket: string }
 );
+
 export type TelegramInlineSortMode = "default" | "traffic" | "expiry" | "name";
 type TelegramInlineSortAction = { kind: "current" | "usage" } | { kind: "set"; mode: TelegramInlineSortMode };
 export type TelegramInlineSortUpdate = TelegramEventScope & TelegramInlineSortAction;
@@ -73,12 +75,13 @@ type ExistingUpdate =
 
 type CurrentUpdate = (ExistingUpdate & { privateShareCreation?: never })
   | ({ privateShareCreation: TelegramPrivateShareCreationUpdate } & Partial<Record<keyof ExistingUpdate, never>>);
-
 type SubscriptionUpdate = (CurrentUpdate & { subscriptionRead?: never })
   | ({ subscriptionRead: TelegramSubscriptionReadUpdate } & Partial<Record<keyof CurrentUpdate, never>>);
+type ShortLinkUpdate = (SubscriptionUpdate & { shortLink?: never })
+  | ({ shortLink: TelegramShortLinkUpdate } & Partial<Record<keyof SubscriptionUpdate, never>>);
 
-type NormalizedUpdate = (SubscriptionUpdate & { inlineSort?: never })
-  | ({ inlineSort: TelegramInlineSortUpdate } & Partial<Record<keyof SubscriptionUpdate, never>>);
+type NormalizedUpdate = (ShortLinkUpdate & { inlineSort?: never })
+  | ({ inlineSort: TelegramInlineSortUpdate } & Partial<Record<keyof ShortLinkUpdate, never>>);
 
 type DecodedTelegramRequest =
   | ({ status: 200 } & NormalizedUpdate)
@@ -186,8 +189,8 @@ function authCommand(args: string[], reply: unknown, memberId: string): Telegram
 
 function messageCommand(
   message: Record<string, unknown>, policy: TelegramPolicy,
-): TelegramCommand["command"] | TelegramViewKind | "temp-summary" | "temp-clear" | "aggregate-show" | "aggregate-revoke" |
-  { code: string } | { args: string } | { shareArgs: string } | { selectedQuery: string } | { subscriptionQuery: string } |
+): TelegramCommand["command"] | TelegramViewKind | "temp-raw" | "temp-summary" | "temp-clear" | "aggregate-show" | "aggregate-revoke" |
+  { code: string } | { args: string } | { shareArgs: string } | { selectedQuery: string } | { subscriptionQuery: string } | { shortArgs: string } |
   { inlineSort: TelegramInlineSortAction } | null {
   const { text, entities } = message;
   if (typeof text !== "string" || !Array.isArray(entities)) return null;
@@ -207,6 +210,7 @@ function messageCommand(
   if (remainder !== "" && !separator.test(remainder)) return null;
   if (commandName === "path") return { args: remainder };
   if (commandName === "o") return { selectedQuery: remainder };
+  if (commandName === "short") return { shortArgs: remainder };
   if (commandName === "s") return { subscriptionQuery: remainder };
   if (commandName === "share") return remainder.length <= 4096 ? { shareArgs: remainder } : null;
   if (commandName === "i") {
@@ -235,8 +239,10 @@ function messageCommand(
     case "recycle":
       return "recycle";
     case "temp":
-      if (args.length === 0) return "temp-summary";
-      return args.length === 1 && args[0].toLowerCase() === "clear" ? "temp-clear" : null;
+      if (args.length === 0) return "temp-raw";
+      if (args.length !== 1) return null;
+      if (args[0].toLowerCase() === "summary") return "temp-summary";
+      return args[0].toLowerCase() === "clear" ? "temp-clear" : null;
     case "export":
       if (args.length === 0) return "aggregate-show";
       return args.length === 1 && args[0].toLowerCase() === "revoke" ? "aggregate-revoke" : null;
@@ -330,6 +336,7 @@ function normalizeMessage(
     if ("subscriptionQuery" in command) return { subscriptionRead: { ...scope, kind: "search", query: command.subscriptionQuery } };
     if (scope.chatType !== "private" || scope.threadId !== null) return null;
     if ("inlineSort" in command) return { inlineSort: { ...scope, ...command.inlineSort } };
+    if ("shortArgs" in command) return { shortLink: { ...scope, args: command.shortArgs } };
     if ("shareArgs" in command) {
       const sender = isRecord(message.from) ? [message.from.first_name, message.from.last_name]
         .filter((part): part is string => typeof part === "string" && part.length <= 128).join(" ") : "";
@@ -339,7 +346,7 @@ function normalizeMessage(
     return "selectedQuery" in command ? { selected: { ...scope, kind: "selected", query: command.selectedQuery } }
       : { path: { ...scope, kind: "path", args: command.args } };
   }
-  if (command === "temp-summary" || command === "temp-clear") {
+  if (command === "temp-raw" || command === "temp-summary" || command === "temp-clear") {
     return scope.chatType === "private" && scope.threadId === null ? { temp: { ...scope, kind: command } } : null;
   }
   if (command === "aggregate-show" || command === "aggregate-revoke") {
@@ -355,6 +362,8 @@ function normalizeMessage(
   if (scope.chatType === "private" && scope.threadId === null && typeof text === "string" && !hasCommandEntity) {
     const position = subscriptionPosition(text);
     if (position !== null) return { subscriptionRead: { ...scope, kind: "number", position } };
+    const short = /^(?:短链|short)(?: +([\s\S]*))?(?![\s\S])/iu.exec(text.replace(/^ +| +$/gu, ""));
+    if (short || text === "🔗 短链") return { shortLink: { ...scope, args: short?.[1] ?? "" } };
   }
   return scope.chatType === "private" && scope.threadId === null && typeof text === "string"
     && text.trim() !== "" && !text.trimStart().startsWith("/")

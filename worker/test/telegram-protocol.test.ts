@@ -296,7 +296,8 @@ test("dispatches temporary-node commands and ordinary text only in the approved 
   assert.deepEqual(await decodeMessage(link, { entities: [] }), {
     status: 200, temp: { ...scope, kind: "temp-text", text: link },
   });
-  assert.deepEqual(await decodeMessage("/temp"), { status: 200, temp: { ...scope, kind: "temp-summary" } });
+  assert.deepEqual(await decodeMessage("/temp"), { status: 200, temp: { ...scope, kind: "temp-raw" } });
+  assert.deepEqual(await decodeMessage("/temp SUMMARY"), { status: 200, temp: { ...scope, kind: "temp-summary" } });
   assert.deepEqual(await decodeMessage("/temp CLEAR"), { status: 200, temp: { ...scope, kind: "temp-clear" } });
   for (const overrides of [
     { chat: { id: Number(policy.groupId), type: "group" } },
@@ -304,10 +305,31 @@ test("dispatches temporary-node commands and ordinary text only in the approved 
     { from: { id: 99, is_bot: false }, chat: { id: 99, type: "private" } },
   ]) {
     assert.deepEqual(await decodeMessage(link, { ...overrides, entities: [] }), { status: 204 });
+    assert.deepEqual(await decodeMessage("/temp", overrides), { status: 204 });
+    assert.deepEqual(await decodeMessage("/temp summary", overrides), { status: 204 });
     assert.deepEqual(await decodeMessage("/temp clear", overrides), { status: 204 });
   }
   assert.deepEqual(await decodeMessage("/temp clear extra"), { status: 204 });
+  assert.deepEqual(await decodeMessage("/temp summary extra"), { status: 204 });
   assert.deepEqual(await decodeMessage("/ignored", { entities: [] }), { status: 204 });
+});
+
+test("normalizes private short link commands without routing group URLs into other features", async () => {
+  const url = "https://example.com/fixture?q=synthetic";
+  const scope = { updateId, actorId: policy.adminId, chatId: policy.adminId, chatType: "private",
+    messageId: 15, messageDate, threadId: null };
+  assert.deepEqual(await decodeMessage("/short"), { status: 200, shortLink: { ...scope, args: "" } });
+  assert.deepEqual(await decodeMessage(`/short@${policy.botUsername} ${url}`),
+    { status: 200, shortLink: { ...scope, args: " " + url } });
+  for (const verb of ["短链", "ShOrT"]) {
+    assert.deepEqual(await decodeMessage(`${verb} ${url}`, { entities: [] }),
+      { status: 200, shortLink: { ...scope, args: url } });
+  }
+  assert.deepEqual(await decodeMessage(`/short@Other_Bot ${url}`), { status: 204 });
+  assert.deepEqual(await decodeMessage(`/short ${url}`, { message_thread_id: 3 }), { status: 204 });
+  for (const text of [`/short ${url}`, `短链 ${url}`, `short ${url}`]) {
+    assert.deepEqual(await decodeMessage(text, { chat: { id: Number(policy.groupId), type: "supergroup" } }), { status: 204 });
+  }
 });
 
 test("normalizes scoped callbacks from the exact bot message without retaining reply text", async () => {
