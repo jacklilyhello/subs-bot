@@ -40,6 +40,7 @@ _UNSPECIFIED_PRIVATE_SHARE_KEY = object()
 _UNSPECIFIED_PROVIDER_BINDING = object()
 ORIGIN = f"https://{WORKER_NAME}.{NAMESPACE}.workers.dev"
 HEALTH_URL = ORIGIN + "/health"
+ISOLATION_RELEASE_USER_AGENT = "subs-bot-isolation-release/1.0"
 API_ORIGIN = "https://api.cloudflare.com/client/v4"
 HEX_ID = re.compile(r"[0-9a-f]{32}")
 UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
@@ -598,7 +599,7 @@ def _artifact(bundle_dir, manifest, telegram_config, aggregate_key=None, private
 
 def _read_health():
     request = Request(HEALTH_URL, headers={"Accept": "application/json",
-                                         "User-Agent": "subs-bot-isolation-release/1.0"})
+                                         "User-Agent": ISOLATION_RELEASE_USER_AGENT})
     try:
         with build_opener(ProxyHandler({}), _NoRedirect()).open(request, timeout=10) as response:
             raw = response.read(1025)
