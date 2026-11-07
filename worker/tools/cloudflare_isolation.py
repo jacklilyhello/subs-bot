@@ -19,8 +19,11 @@ WORKER_NAME = "subs-bot-cf-dev-01"
 NAMESPACE = "lilyya"
 TELEGRAM_CONFIG_BINDING = "TELEGRAM_ISOLATION_CONFIG"
 TELEGRAM_DIGEST_BINDING = "TELEGRAM_CONFIG_SHA256"
+AGGREGATE_KEY_BINDING = "TELEGRAM_AGGREGATE_KEY"
+AGGREGATE_DIGEST_BINDING = "TELEGRAM_AGGREGATE_KEY_SHA256"
 TELEGRAM_CRON = "* * * * *"
 TELEGRAM_BINDINGS = {TELEGRAM_CONFIG_BINDING, TELEGRAM_DIGEST_BINDING}
+AGGREGATE_BINDINGS = {AGGREGATE_KEY_BINDING, AGGREGATE_DIGEST_BINDING}
 ORIGIN = f"https://{WORKER_NAME}.{NAMESPACE}.workers.dev"
 HEALTH_URL = ORIGIN + "/health"
 API_ORIGIN = "https://api.cloudflare.com/client/v4"
@@ -130,6 +133,7 @@ class _Version:
     compatibility: str
     tag: str | None
     telegram_config_sha256: str | None = None
+    telegram_aggregate_key_sha256: str | None = None
 
 
 class _Isolation:
@@ -251,12 +255,14 @@ class _Isolation:
                                                      {"enabled": False, "cross_version_cache": False}),
                  "Isolated Worker version runtime settings differ from the supported configuration.")
         rows = version.get("bindings")
-        _require(isinstance(rows, list) and len(rows) in {3, 5}
+        _require(isinstance(rows, list) and len(rows) in {3, 5, 7}
                  and all(isinstance(row, dict) and isinstance(row.get("name"), str) for row in rows),
                  "Unexpected isolated Worker binding inventory.")
         bindings = {row["name"]: row for row in rows}
         base_bindings = {"DB", "NODES", "BUILD_REVISION"}
-        _require(len(bindings) == len(rows) and set(bindings) in (base_bindings, base_bindings | TELEGRAM_BINDINGS),
+        telegram_bindings = base_bindings | TELEGRAM_BINDINGS
+        _require(len(bindings) == len(rows) and set(bindings) in (base_bindings, telegram_bindings,
+                                                                 telegram_bindings | AGGREGATE_BINDINGS),
                  "Unexpected isolated Worker binding names.")
         db, r2, rev = (bindings[name] for name in ("DB", "NODES", "BUILD_REVISION"))
         database_ids = [db[key] for key in ("database_id", "id") if db.get(key) is not None]
@@ -272,6 +278,12 @@ class _Isolation:
             _require(secret.get("type") == "secret_text" and digest.get("type") == "plain_text"
                      and _matches(DIGEST, digest.get("text")), "Isolated Worker Telegram binding mismatch.")
             telegram_digest = digest["text"]
+        aggregate_digest = None
+        if AGGREGATE_KEY_BINDING in bindings:
+            secret, digest = (bindings[name] for name in (AGGREGATE_KEY_BINDING, AGGREGATE_DIGEST_BINDING))
+            _require(secret.get("type") == "secret_text" and digest.get("type") == "plain_text"
+                     and _matches(DIGEST, digest.get("text")), "Isolated Worker aggregate binding mismatch.")
+            aggregate_digest = digest["text"]
         modules = version.get("modules")
         _require(isinstance(modules, list) and len(modules) == 1, "Unexpected isolated Worker module inventory.")
         module = _object(modules[0], "Worker module")
@@ -286,7 +298,7 @@ class _Isolation:
         _require(0 < len(body) <= MAX_MODULE_BYTES, "Cloudflare Worker module size is invalid.")
         annotations = _object(version.get("annotations") or {}, "version annotations")
         return _Version(rev["text"], sha256(body).hexdigest(), version["compatibility_date"],
-                        annotations.get("workers/tag"), telegram_digest)
+                        annotations.get("workers/tag"), telegram_digest, aggregate_digest)
 
     def verify_candidate(self, candidate, desired):
         # A version can be visible in its creation response or listing before its module is readable.
@@ -318,7 +330,7 @@ class _Isolation:
             return None
         return self.verify_candidate(candidates[0], desired)
 
-    def upload(self, module, desired, telegram_config):
+    def upload(self, module, desired, telegram_config, aggregate_key):
         bindings = [
             {"type": "d1", "name": "DB", "database_id": self.target["d1Id"]},
             {"type": "r2_bucket", "name": "NODES", "bucket_name": WORKER_NAME},
@@ -328,6 +340,11 @@ class _Isolation:
             bindings.extend([
                 {"type": "secret_text", "name": TELEGRAM_CONFIG_BINDING, "text": telegram_config},
                 {"type": "plain_text", "name": TELEGRAM_DIGEST_BINDING, "text": desired.telegram_config_sha256},
+            ])
+        if aggregate_key is not None:
+            bindings.extend([
+                {"type": "secret_text", "name": AGGREGATE_KEY_BINDING, "text": aggregate_key},
+                {"type": "plain_text", "name": AGGREGATE_DIGEST_BINDING, "text": desired.telegram_aggregate_key_sha256},
             ])
         try:
             result = self.worker_api("POST", self.versions + "?deploy=false", {
@@ -399,7 +416,15 @@ def _guard_current(guard):
     _require(fresh is not False, "The reviewed GitHub main revision changed.")
 
 
-def _artifact(bundle_dir, manifest, telegram_config):
+def validate_aggregate_key(raw):
+    _require(isinstance(raw, str) and re.fullmatch(r"[A-Za-z0-9_-]{43}", raw),
+             "The isolated aggregate key must be a canonical Base64URL encoding of 32 bytes.")
+    decoded = base64.urlsafe_b64decode(raw + "=")
+    _require(len(decoded) == 32 and base64.urlsafe_b64encode(decoded).decode("ascii").rstrip("=") == raw,
+             "The isolated aggregate key must be a canonical Base64URL encoding of 32 bytes.")
+
+
+def _artifact(bundle_dir, manifest, telegram_config, aggregate_key=None):
     _require(isinstance(manifest, dict) and manifest.get("version") == 2
              and _matches(REVISION, manifest.get("revision")) and _matches(DIGEST, manifest.get("bundleSha256"))
              and _matches(DATE, manifest.get("compatibilityDate")) and isinstance(manifest.get("migrations"), list),
@@ -415,6 +440,7 @@ def _artifact(bundle_dir, manifest, telegram_config):
              "Verified Worker module digest mismatch.")
     revision = manifest["revision"]
     telegram_digest = None
+    aggregate_digest = None
     tag = revision
     if telegram_config is not None:
         _require(isinstance(telegram_config, str), "Invalid isolated Telegram configuration.")
@@ -427,8 +453,13 @@ def _artifact(bundle_dir, manifest, telegram_config):
         telegram_digest = sha256(config_bytes).hexdigest()
         # Distinct configuration releases can share a Git revision.
         tag = "telegram-" + sha256(f"{revision}:{telegram_digest}".encode("ascii")).hexdigest()
+    if aggregate_key is not None:
+        _require(telegram_digest is not None, "An isolated aggregate key requires the approved Telegram configuration.")
+        validate_aggregate_key(aggregate_key)
+        aggregate_digest = sha256(aggregate_key.encode("ascii")).hexdigest()
+        tag = "telegram-" + sha256(f"{revision}:{telegram_digest}:{aggregate_digest}".encode("ascii")).hexdigest()
     return module, _Version(revision, manifest["bundleSha256"], manifest["compatibilityDate"],
-                            tag, telegram_digest)
+                            tag, telegram_digest, aggregate_digest)
 
 
 def _read_health():
@@ -460,7 +491,7 @@ def _verify_health(revision):
     raise CloudflareError("Isolated Worker health could not verify the expected revision.")
 
 
-def verify_worker_target(worker_api, data_api, target):
+def verify_worker_target(worker_api, data_api, target, *, aggregate_key=None):
     """Read ownership, privacy and active binding facts before any release writes."""
     scope = _Isolation(worker_api, data_api, target)
     scope.worker_config()
@@ -468,13 +499,17 @@ def verify_worker_target(worker_api, data_api, target):
     scope.verify_resources()
     active = scope.active()
     version = scope.version(active.version)
+    if version.telegram_aggregate_key_sha256 is not None:
+        validate_aggregate_key(aggregate_key)
+        _require(version.telegram_aggregate_key_sha256 == sha256(aggregate_key.encode("ascii")).hexdigest(),
+                 "Changing the isolated aggregate key requires a separate rotation release.")
     return {"deploymentId": active.id, "versionId": active.version, "revision": version.revision}
 
 
 def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *, expected_active=None,
-                   telegram_config: str | None = None):
+                   telegram_config: str | None = None, aggregate_key: str | None = None):
     """Release the verified Worker and optionally configure its isolated Telegram schedule."""
-    module, desired = _artifact(bundle_dir, manifest, telegram_config)
+    module, desired = _artifact(bundle_dir, manifest, telegram_config, aggregate_key)
     scope = _Isolation(worker_api, data_api, target)
     config = scope.worker_config()
     had_cron = scope.cron_enabled()
@@ -487,10 +522,14 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
     _require(old_version.compatibility == desired.compatibility, "Worker compatibility date change requires separate approval.")
     _require(telegram_config is not None or (not had_cron and old_version.telegram_config_sha256 is None),
              "Isolated Telegram configuration is required to preserve the active configuration.")
+    _require(old_version.telegram_aggregate_key_sha256 is None
+             or old_version.telegram_aggregate_key_sha256 == desired.telegram_aggregate_key_sha256,
+             "Changing or dropping the isolated aggregate key requires a separate rotation release.")
     _verify_health(old_version.revision)
     if old_version.revision == desired.revision:
         _require(old_version.digest == desired.digest, "Active revision differs from the verified module digest.")
-        if old_version.telegram_config_sha256 == desired.telegram_config_sha256:
+        if (old_version.telegram_config_sha256, old_version.telegram_aggregate_key_sha256) == (
+                desired.telegram_config_sha256, desired.telegram_aggregate_key_sha256):
             if telegram_config is None:
                 _require(scope.active() == previous, "Active isolated Worker deployment changed during verification.")
                 _guard_current(guard)
@@ -504,7 +543,7 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
     if candidate is None:
         _require(scope.active() == previous, "Active isolated Worker deployment changed before upload.")
         _guard_current(guard)
-        candidate = scope.upload(module, desired, telegram_config)
+        candidate = scope.upload(module, desired, telegram_config, aggregate_key)
 
     _require(scope.worker_config() == config, "Isolated Worker configuration changed before activation.")
     _require(scope.cron_enabled() == had_cron, "Isolated Worker schedule changed before activation.")

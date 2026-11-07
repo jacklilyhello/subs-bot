@@ -1,4 +1,5 @@
 import { listOwnedSubscriptions } from "../subscriptions.ts";
+import { resolveTelegramAggregateCode, TELEGRAM_AGGREGATE_ORIGIN } from "./aggregate-actions.ts";
 import type { PrivateShareClaimResult } from "../private-shares.ts";
 import {
   prepareTelegramLifecycleTickets, renderTelegramLifecycle, type TelegramLifecycleButton,
@@ -6,7 +7,7 @@ import {
 import { inTelegramScope, type TelegramPolicy } from "./protocol.ts";
 import { beginTelegramPrivateClaim, prepareTelegramPrivateClaim } from "./private-claims.ts";
 import {
-  beginTelegramReply, claimTelegramReply, isTelegramMemberAllowed,
+  beginTelegramAggregateLinkReply, beginTelegramReply, claimTelegramReply, isTelegramMemberAllowed,
   prepareTelegramPrivateClaimBegin, reapExpiredTelegramReplies, settleTelegramReply,
   type TelegramReplyLease, type TelegramReplyOutcome,
 } from "./store.ts";
@@ -191,6 +192,18 @@ async function renderReply(
   }
   const allowed = lease.actorId === policy.adminId || await isTelegramMemberAllowed(db, policy);
   if (!allowed) return { text: "当前账号没有使用权限。", access: "denied" };
+  if (lease.aggregate) {
+    const text = {
+      issued: "聚合链接已变更，请重新发送 /export。",
+      ready: "聚合链接已变更，请重新发送 /export。",
+      empty: "暂无可导出节点。",
+      limit: "聚合内容超过导出上限。",
+      revoked: "聚合导出链接已撤销。",
+      "already-revoked": "没有可撤销的聚合导出链接。",
+      stale: "这条聚合操作已失效。",
+    }[lease.aggregate.result];
+    return { text, access: "allowed" };
+  }
   if (lease.lifecycle) {
     const { text, buttons, forceReply } = renderTelegramLifecycle(lease.lifecycle);
     return { text, lifecycleButtons: buttons, forceReply, access: "allowed" };
@@ -217,13 +230,23 @@ export async function drainTelegramReplies(
   limit: number,
   budgetMs: number,
   request: typeof fetch = fetch,
+  aggregateKey: CryptoKey | null = null,
 ): Promise<void> {
   const deadline = Date.now() + budgetMs;
-  await reapExpiredTelegramReplies(db, policy.botId);
+  await reapExpiredTelegramReplies(db, policy.botId, aggregateKey !== null);
   for (let processed = 0; processed < limit && Date.now() < deadline; processed += 1) {
-    const lease = await claimTelegramReply(db, policy.botId);
+    const lease = await claimTelegramReply(db, policy.botId, aggregateKey !== null);
     if (!lease) return;
     if (!inTelegramScope(policy, lease)) continue;
+    if (lease.aggregate && lease.chatType === "private" && lease.threadId === null) {
+      const code = await resolveTelegramAggregateCode(db, policy, { ...lease, aggregate: lease.aggregate }, aggregateKey);
+      if (code !== null && Date.now() < deadline && await beginTelegramAggregateLinkReply(db, policy, lease)) {
+        const text = `Clash 聚合订阅链接\n${TELEGRAM_AGGREGATE_ORIGIN}/agg/${code}/clash\n发送 /export revoke 可撤销链接。`;
+        const outcome = await sendTelegramReply(policy, lease, text, Math.max(1, deadline - Date.now()), request);
+        await settleTelegramReply(db, policy, lease, outcome);
+        continue;
+      }
+    }
     if (lease.privateClaim) {
       const begin = prepareTelegramPrivateClaimBegin(db, policy, lease);
       if (!begin) continue;
