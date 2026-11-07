@@ -18,12 +18,12 @@ interface SingBoxPlan {
   readonly tags: readonly string[];
 }
 
-export async function planSingBox(source: ExportNodeSource): Promise<SingBoxPlan> {
+export async function planSingBox(source: ExportNodeSource, signal?: AbortSignal): Promise<SingBoxPlan> {
   let namesBytes = 0;
   let bytes = OPEN.length + DIRECT.length + CLOSE.length;
   let expandedPorts = 0;
   const names: string[] = [];
-  for await (const node of source.read()) {
+  for await (const node of source.read(signal)) {
     const { name, json, hoppingPorts } = serializeSingBoxOutbound(node);
     const nameBytes = encoder.encode(JSON.stringify(name)).byteLength;
     namesBytes += nameBytes;
@@ -34,7 +34,7 @@ export async function planSingBox(source: ExportNodeSource): Promise<SingBoxPlan
       || expandedPorts > MAX_EXPANDED_HOPPING_PORTS) throw new SingBoxContentError();
     names.push(name);
   }
-  if (names.length !== source.nodeCount || names.length === 0) throw new SnapshotIntegrityError();
+  if (signal?.aborted || names.length !== source.nodeCount || names.length === 0) throw new SnapshotIntegrityError();
 
   const tags = allocateExportNames(names, ["proxy", "direct"]).map((tag) => {
     const quoted = JSON.stringify(tag);

@@ -1,6 +1,7 @@
 import { checkOwnerId, SUBSCRIPTION_LIFECYCLE_REVISION, validInteger } from "../storage.ts";
 import { listDeletedSubscriptions, listOwnedSubscriptions } from "../subscriptions.ts";
 import type { TelegramLifecycleButton } from "./lifecycle-actions.ts";
+import type { TelegramSubscriptionReadButton } from "./subscription-read.ts";
 import { inTelegramScope, type TelegramPolicy, type TelegramViewKind, type TelegramViewUpdate } from "./protocol.ts";
 
 export const TELEGRAM_VIEW_MARKER = "view:v1";
@@ -120,13 +121,13 @@ export async function acceptTelegramView(
   throw new Error("Telegram view receipt could not be confirmed.");
 }
 
-function displayName(name: string): string {
+export function displayTelegramName(name: string): string {
   const clean = name.replace(/[\p{Cc}\p{Cf}\p{Cs}\u2028\u2029]/gu, " ")
     .replace(/[a-z][a-z0-9+.-]*:\/\/\S+/giu, "[链接已省略]").trim();
   return Array.from(clean).slice(0, 80).join("") || "未命名";
 }
 
-function displayDate(epoch: number): string {
+export function displayTelegramDate(epoch: number): string {
   const date = new Date(epoch * 1000);
   if (!Number.isFinite(date.getTime())) return "日期未知";
   return date.toISOString().replace("T", " ").replace(/:\d{2}\.\d{3}Z$/u, " UTC");
@@ -153,7 +154,9 @@ export async function renderTelegramView(
   db: D1Database,
   ownerId: string,
   view: TelegramView,
-): Promise<{ text: string; buttons: TelegramViewButton[]; lifecycleButtons: TelegramLifecycleButton[] }> {
+  includeReadButtons = false,
+): Promise<{ text: string; buttons: TelegramViewButton[]; lifecycleButtons: TelegramLifecycleButton[];
+  readButtons?: TelegramSubscriptionReadButton[] }> {
   if ((view.afterId !== null && !validInteger(view.afterId, 1))
     || (view.afterEpoch !== null && !validInteger(view.afterEpoch, 1))
     || (view.afterEpoch !== null) !== (view.kind !== "list" && view.afterId !== null)) {
@@ -192,19 +195,31 @@ export async function renderTelegramView(
     }
   }
 
-  const lines = items.map((item, index) => `${index + 1}. ${displayName(item.name)}` +
-    (item.epoch === undefined ? "" : ` · ${displayDate(item.epoch)}`));
+  let preceding = 0;
+  if (includeReadButtons && view.kind === "list" && view.afterId !== null && items.length > 0) {
+    const row = await db.prepare("SELECT count(*) AS preceding FROM subscriptions WHERE owner_id=? AND id<?")
+      .bind(ownerId, items[0].id).first<{ preceding: number }>().catch(() => null);
+    if (!row || !validInteger(row.preceding, 0)) throw new Error("Telegram subscription position could not be read.");
+    preceding = row.preceding;
+  }
+  const ordinal = (index: number) => preceding + index + 1;
+  const lines = items.map((item, index) => `${ordinal(index)}. ${displayTelegramName(item.name)}` +
+    (item.epoch === undefined ? "" : ` · ${displayTelegramDate(item.epoch)}`));
   const lifecycleButtons = items.flatMap<TelegramLifecycleButton>(({ id, lifecycleRevision }, index) => {
     const target = { subscriptionId: id, expectedLifecycleRevision: lifecycleRevision };
     return view.kind === "recycle"
-      ? [{ ...target, text: `${index + 1} 恢复`, action: "restore" }]
-      : [{ ...target, text: `${index + 1} 重命名`, action: "rename" },
-        { ...target, text: `${index + 1} 删除`, action: "trash-prompt" }];
+      ? [{ ...target, text: `${ordinal(index)} 恢复`, action: "restore" }]
+      : [{ ...target, text: `${ordinal(index)} 重命名`, action: "rename" },
+        { ...target, text: `${ordinal(index)} 删除`, action: "trash-prompt" }];
   });
   const buttons: TelegramViewButton[] = [];
   if (next) buttons.push({ text: "下一页", ...next });
   if (view.afterId !== null) buttons.push({ text: "第一页", afterId: null, afterEpoch: null });
-  return { text: [title, ...(lines.length ? lines : ["当前没有记录。"])].join("\n"), buttons, lifecycleButtons };
+  const readButtons = includeReadButtons && view.kind !== "recycle"
+    ? items.map<TelegramSubscriptionReadButton>(({ id }, index) => ({ text: `${ordinal(index)} 详情`, kind: "detail", subscriptionId: id }))
+    : undefined;
+  return { text: [title, ...(lines.length ? lines : ["当前没有记录。"])].join("\n"), buttons, lifecycleButtons,
+    ...(readButtons ? { readButtons } : {}) };
 }
 
 export async function prepareTelegramViewTickets(buttons: readonly TelegramViewButton[]): Promise<{
