@@ -9,6 +9,7 @@ import { SingBoxContentError } from "./singbox-export.ts";
 import { planSingBox, singBoxChunks } from "./singbox-response.ts";
 import { TextExportError } from "./text-export.ts";
 import { planTextExport, textExportChunks } from "./text-export-response.ts";
+import { acceptTelegramAggregate, parseTelegramAggregateKey } from "./telegram/aggregate-actions.ts";
 import { answerTelegramCallback, drainTelegramReplies } from "./telegram/delivery.ts";
 import { runTelegramDocumentIntake } from "./telegram/document-intake.ts";
 import { acceptTelegramDocumentJob } from "./telegram/document-jobs.ts";
@@ -26,6 +27,7 @@ export interface Env {
   NODES: R2Bucket;
   BUILD_REVISION?: string;
   TELEGRAM_ISOLATION_CONFIG?: string;
+  TELEGRAM_AGGREGATE_KEY?: string;
 }
 
 const MAX_SHARE_BYTES = 16 * 1024 * 1024;
@@ -139,16 +141,19 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
 
   try {
     const decoded = await decodeTelegramRequest(request, policy);
+    if (decoded.status !== 200) return new Response(null, { status: decoded.status, headers: HEADERS });
+    const aggregateKey = await parseTelegramAggregateKey(env.TELEGRAM_AGGREGATE_KEY);
+    const drain = () => ctx?.waitUntil(drainTelegramReplies(env.DB, env.NODES, policy, 4, 20_000, fetch, aggregateKey).catch(() => undefined));
     if (decoded.command) {
       await acceptTelegramCommand(env.DB, policy, decoded.command);
-      ctx?.waitUntil(drainTelegramReplies(env.DB, env.NODES, policy, 4, 20_000).catch(() => undefined));
+      drain();
     } else if (decoded.view) {
       const outcome = await acceptTelegramView(env.DB, policy, decoded.view);
       if (decoded.view.kind === "callback") {
         ctx?.waitUntil(answerTelegramCallback(policy, decoded.view.callbackId));
       }
       if (outcome === "accepted" || decoded.view.kind !== "callback") {
-        ctx?.waitUntil(drainTelegramReplies(env.DB, env.NODES, policy, 4, 20_000).catch(() => undefined));
+        drain();
       }
     } else if (decoded.lifecycle) {
       const outcome = await acceptTelegramLifecycle(env.DB, policy, decoded.lifecycle);
@@ -156,22 +161,25 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
         ctx?.waitUntil(answerTelegramCallback(policy, decoded.lifecycle.callbackId));
       }
       if (outcome === "accepted") {
-        ctx?.waitUntil(drainTelegramReplies(env.DB, env.NODES, policy, 4, 20_000).catch(() => undefined));
+        drain();
       }
     } else if (decoded.privateClaim) {
       const outcome = await acceptTelegramPrivateClaim(env.DB, policy, decoded.privateClaim);
       if (outcome === "accepted") {
-        ctx?.waitUntil(drainTelegramReplies(env.DB, env.NODES, policy, 4, 20_000).catch(() => undefined));
+        drain();
       }
     } else if (decoded.temp) {
       const outcome = await acceptTelegramTemp(env.DB, policy, decoded.temp);
       if (outcome === "accepted") {
-        ctx?.waitUntil(drainTelegramReplies(env.DB, env.NODES, policy, 4, 20_000).catch(() => undefined));
+        drain();
       }
+    } else if (decoded.aggregate) {
+      if (!aggregateKey) return new Response(null, { status: 204, headers: HEADERS });
+      if (await acceptTelegramAggregate(env.DB, policy, decoded.aggregate, aggregateKey) === "accepted") drain();
     } else if (decoded.path) {
       const outcome = await acceptTelegramPath(env.DB, policy, decoded.path);
       if (outcome === "accepted") {
-        ctx?.waitUntil(drainTelegramReplies(env.DB, env.NODES, policy, 4, 20_000).catch(() => undefined));
+        drain();
       }
     } else if (decoded.document) {
       await acceptTelegramDocumentJob(env.DB, policy, decoded.document);
@@ -263,8 +271,9 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
 async function recoverTelegramWork(_controller: ScheduledController, env: Env): Promise<void> {
   const policy = parseTelegramPolicy(env.TELEGRAM_ISOLATION_CONFIG);
   if (!policy) return;
+  const aggregateKey = await parseTelegramAggregateKey(env.TELEGRAM_AGGREGATE_KEY);
   const replies = async () => {
-    await drainTelegramReplies(env.DB, env.NODES, policy, 10, 45_000);
+    await drainTelegramReplies(env.DB, env.NODES, policy, 10, 45_000, fetch, aggregateKey);
     await reapTelegramViewTickets(env.DB);
     await reapTelegramLifecycle(env.DB);
   };
@@ -274,7 +283,7 @@ async function recoverTelegramWork(_controller: ScheduledController, env: Env): 
       claimed = await runTelegramDocumentIntake(env.DB, env.NODES, policy);
     } finally {
       const reconciled = await reconcileTelegramDocumentJobReplies(env.DB, policy);
-      if (claimed || reconciled > 0) await drainTelegramReplies(env.DB, env.NODES, policy, 4, 15_000);
+      if (claimed || reconciled > 0) await drainTelegramReplies(env.DB, env.NODES, policy, 4, 15_000, fetch, aggregateKey);
     }
   };
   const results = await Promise.allSettled([replies(), documents(), retireTelegramDocumentStage(env.DB, env.NODES, policy)]);

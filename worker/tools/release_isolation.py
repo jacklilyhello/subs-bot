@@ -6,7 +6,7 @@ import re
 import sys
 from pathlib import Path
 
-from cloudflare_isolation import CloudflareClient, CloudflareError, release_worker, verify_worker_target
+from cloudflare_isolation import CloudflareClient, CloudflareError, release_worker, validate_aggregate_key, verify_worker_target
 from d1_migrations import MigrationError, apply_migrations
 from prepare_isolation_artifact import ArtifactError, require_current_main
 
@@ -47,6 +47,10 @@ def release():
     if manifest.get("version") != 2 or manifest.get("revision") != revision:
         raise ValueError("The verified artifact does not match this release.")
     telegram_config = telegram_release_config(manifest)
+    aggregate_key = None
+    if any(item["name"] == "0014_telegram_aggregate_issuance.sql" for item in manifest["migrations"]):
+        aggregate_key = os.environ.get("SUBS_BOT_TELEGRAM_AGGREGATE_KEY", "")
+        validate_aggregate_key(aggregate_key)
     target = json.loads(os.environ.get("SUBS_BOT_CF_ISOLATION_TARGET_JSON", "null"))
     if not isinstance(target, dict) or set(target) != {
         "accountId", "workerId", "workerCreatedOn", "d1Id", "d1CreatedAt", "r2CreatedOn", "namespace",
@@ -63,11 +67,11 @@ def release():
     data_api = CloudflareClient(data_token)
     worker_api = CloudflareClient(deploy_token)
     guard()
-    starting = verify_worker_target(worker_api, data_api, target)
+    starting = verify_worker_target(worker_api, data_api, target, aggregate_key=aggregate_key)
     migrations = apply_migrations(data_api, target, bundle, manifest, guard)
     print(f"Verified {len(migrations)} isolated D1 migration records.", flush=True)
     result = release_worker(worker_api, data_api, target, bundle, manifest, guard,
-                            expected_active=starting, telegram_config=telegram_config)
+                            expected_active=starting, telegram_config=telegram_config, aggregate_key=aggregate_key)
     guard()
     print(json.dumps(result, sort_keys=True), flush=True)
 
