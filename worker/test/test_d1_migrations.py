@@ -12,7 +12,7 @@ from pathlib import Path
 WORKER = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(WORKER / "tools"))
 
-from d1_migrations import BASELINE_NAME, LEDGER, MigrationError, apply_migrations  # noqa: E402
+from d1_migrations import BASELINE_NAME, LEDGER, MAX_D1_STATEMENT_BYTES, MigrationError, apply_migrations  # noqa: E402
 
 
 TARGET = {
@@ -125,6 +125,12 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(self.apply(), expected)
         self.assertEqual(len(self.api.mutations), len(expected))
         self.assertEqual(self.guard_calls, len(expected))
+        guards = [sql for sql in self.api.executed if sql.lstrip().startswith("SELECT CASE WHEN")]
+        self.assertEqual(len(guards), 2 * len(expected))
+        self.assertLess(max(len(sql.encode("utf-8")) for sql in guards), MAX_D1_STATEMENT_BYTES)
+        read_migration = next(i for i, item in enumerate(expected) if item["name"] == "0018_telegram_subscription_reads.sql")
+        self.assertNotIn("telegram_subscription_read_ticket", guards[2 * read_migration])
+        self.assertIn("telegram_subscription_read_ticket", guards[2 * read_migration + 1])
         self.assertEqual(self.api.db.execute("PRAGMA foreign_key_check").fetchall(), [])
 
     def test_legacy_adopts_0001_without_replay_or_reset_and_applies_next(self):
