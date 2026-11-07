@@ -213,6 +213,12 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 此演练限定 32 MiB SQL、20,000 行及最多 512 个引用对象（合计 256 MiB）。清单保存 D1 指向的应用对象、标准 HTTP 元数据及经发布回执核对的私密分享 `purpose` 和 `receipt`。恢复使用现有隔离数据 Token 派生的 R2 S3 凭据，向已核对的目标对象发起条件写入，并回读字节和元数据。遇到未知元数据或 SSE-C 会停止。桶的无引用对象和 Worker 密钥不在范围内。托管合成测试、Cloudflare 原生恢复、旧 SQLite 归属转换和生产切换分别验收。 [R2 S3 条件写入](https://developers.cloudflare.com/r2/api/s3/api/) · [R2 Token 凭据](https://developers.cloudflare.com/r2/api/tokens/)
 
+### 旧订阅候选恢复包
+
+在获准的托管 runner 上，将完整封存的旧订阅转换包与核对过来源及摘要的 Worker 产物交给 `worker/tools/legacy_restore_package.py CONVERTER_DIR WORKER_ARTIFACT_DIR OUTPUT_DIR CONVERTER_MANIFEST_SHA WORKER_MANIFEST_SHA REVISION APPLIED_AT`。输入目录须仅供当前账号访问，输出目录须尚未存在。时间参数为候选迁移记录使用的 Unix 秒。程序使用完整增量结构构建独立候选数据库，并重新执行生成的 SQL，核对结构、外键、数据指纹、活动和回收站归属、编号序列及 R2 引用。
+
+候选包含原生导入所用的 `restore.sql`、逐行归属记录、精确对象和最后写入的 `manifest.sha256`。保留原始能力令牌和来源，目录及文件按私有数据管理。此工具只生成活动订阅与回收站候选，存在未处理的旧数据域时拒绝封存。实际云端导入、未发布订阅的 HTTP 行为、旧链接连续性和各格式兼容性分别验收。
+
 ### 真实数据与生产切换门槛
 
 1. 先只读核对 Cloudflare 目标账户、Zone、`subs-bot.lilyya.top` 的 DNS、Worker 路由和 Custom Domain 绑定。新资源记录账号、环境及资源 ID，隔离与生产分别使用各自的 Worker、D1、R2 和队列。现有配置冲突须在改动前报告。目标主机名可用且切换获准后，仅增加所需的 Custom Domain 绑定。 [Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)
