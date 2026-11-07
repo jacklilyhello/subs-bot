@@ -48,7 +48,7 @@ async function smallBody(response: Response, limit: number): Promise<Uint8Array<
 
 function json(bytes: Uint8Array<ArrayBuffer>): unknown {
   try {
-    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes));
   } catch {
     throw new Error("Provider response was invalid.");
   }
