@@ -312,3 +312,48 @@ test("terminalizes expired work and retains deduplication without retaining opaq
   assert.equal(await acceptTelegramDocumentJob(db, config, event(config, 1)), "ignored");
   assert.equal(await acceptTelegramDocumentJob(db, config, event(config, 2)), "accepted");
 });
+
+test("first-seen pre-grant documents do not acquire the new epoch after revocation and regrant", async () => {
+  const config = policy("76108");
+  const grantDate = 1_800_000_000;
+  // Preserve the initial member default and its original durable receipt.
+  assert.equal(await acceptTelegramDocumentJob(db, config, event(config, 1,
+    { fileName: "Baseline.txt", messageDate: grantDate - 10 })), "accepted");
+  const baseline = await stored(config, 1);
+  assert.ok(baseline);
+  await db.prepare("INSERT INTO telegram_auth VALUES (?, ?, 0, ?, 49999)")
+    .bind(config.botId, config.memberId, grantDate - 2).run();
+  await db.prepare("UPDATE telegram_auth SET allowed=1,message_date=?,message_id=50000 WHERE bot_id=? AND user_id=?")
+    .bind(grantDate, config.botId, config.memberId).run();
+
+  for (const [updateId, messageDate] of [[2, grantDate - 3], [3, grantDate - 1], [4, grantDate]] as const) {
+    // No cross-chat message-ID comparison can authorize an older or equal-date member event.
+    assert.equal(await acceptTelegramDocumentJob(db, config, event(config, updateId,
+      { fileName: `Delayed ${updateId}.txt`, messageDate, messageId: 100000 + updateId })), "ignored");
+    assert.equal(await stored(config, updateId), null);
+    assert.equal(await db.prepare("SELECT receipt_id FROM telegram_inbox WHERE bot_id=? AND update_id=?")
+      .bind(config.botId, updateId).first(), null);
+    assert.equal(await db.prepare("SELECT count(*) AS n FROM telegram_document_jobs WHERE bot_id=?")
+      .bind(config.botId).first<number>("n"), 1);
+    assert.equal(await db.prepare(`SELECT count(*) AS n FROM telegram_outbox JOIN telegram_inbox USING(receipt_id)
+      WHERE bot_id=?`).bind(config.botId).first<number>("n"), 0);
+    assert.deepEqual(await stored(config, 1), baseline);
+  }
+  assert.equal(await acceptTelegramDocumentJob(db, config, event(config, 5,
+    { fileName: "Fresh.txt", messageDate: grantDate + 1, messageId: 1 })), "accepted");
+  const fresh = await stored(config, 5);
+  assert.ok(fresh);
+  assert.equal(fresh.auth_message_date, grantDate);
+  assert.equal(fresh.auth_message_id, 50000);
+  // The member's auth epoch does not gate the administrator's own private document.
+  assert.equal(await acceptTelegramDocumentJob(db, config,
+    { ...admin(config, 6, "Admin baseline.txt"), messageDate: grantDate - 100 }), "accepted");
+  const administrator = await stored(config, 6);
+  assert.ok(administrator);
+  assert.equal(administrator.auth_message_date, 0);
+  assert.equal(administrator.auth_message_id, 0);
+  const lease = await claimTelegramDocumentJob(db, config);
+  assert.ok(lease);
+  assert.equal(lease.receiptId, fresh.receipt_id);
+  assert.equal(await checkLease(config, lease), 1);
+});

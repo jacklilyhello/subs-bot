@@ -236,3 +236,60 @@ test("a missing reply write rolls back deletion, clear fence, and inbox deduplic
   assert.equal((await storedReply(config, 2))?.kind, "cleared");
   assert.equal((await totals(config))?.nodes, 0);
 });
+
+test("does not admit first-seen pre-grant pastes after revocation and regrant", async () => {
+  const config = policy("97008");
+  const grantDate = 1_800_000_000;
+  const baseline = { ...paste(config, 1), messageDate: grantDate - 10 };
+  // The initial default-authorized member behavior is unchanged.
+  assert.equal(await submit(config, baseline), "accepted");
+  const before = await totals(config);
+  const baselineReply = await storedReply(config, 1);
+  await db.prepare("INSERT INTO telegram_auth VALUES (?, ?, 0, ?, 49999)")
+    .bind(config.botId, config.memberId, grantDate - 2).run();
+  await db.prepare("UPDATE telegram_auth SET allowed=1,message_date=?,message_id=50000 WHERE bot_id=? AND user_id=?")
+    .bind(grantDate, config.botId, config.memberId).run();
+
+  for (const [updateId, messageDate] of [[2, grantDate - 3], [3, grantDate - 1], [4, grantDate]] as const) {
+    // Member and admin message IDs belong to different private chats. A larger member ID grants no authority.
+    assert.equal(await submit(config, { ...paste(config, updateId, secondShare, 100000 + updateId), messageDate }), "ignored");
+    assert.equal(await storedReply(config, updateId), null);
+    assert.equal(await db.prepare("SELECT receipt_id FROM telegram_inbox WHERE bot_id=? AND update_id=?")
+      .bind(config.botId, updateId).first(), null);
+    assert.deepEqual(await totals(config), before);
+    assert.deepEqual(await storedReply(config, 1), baselineReply);
+  }
+  // Conversely, a smaller member message ID is valid once its date is strictly after the grant.
+  assert.equal(await submit(config, { ...paste(config, 5, secondShare, 1), messageDate: grantDate + 1 }), "accepted");
+  assert.equal((await totals(config))?.nodes, 2);
+  assert.equal((await storedReply(config, 5))?.kind, "added");
+  assert.equal(await submit(config, { ...paste(config, 6, firstShare, 1, config.adminId),
+    messageDate: grantDate - 100 }), "accepted");
+  assert.equal((await totals(config, config.adminId))?.nodes, 1);
+});
+
+test("first-seen pre-grant clears cannot delete nodes or advance the clear fence after regrant", async () => {
+  const config = policy("97009");
+  const grantDate = 1_800_000_000;
+  assert.equal(await submit(config, { ...paste(config, 1), messageDate: grantDate - 10 }), "accepted");
+  const before = await totals(config);
+  await db.prepare("INSERT INTO telegram_auth VALUES (?, ?, 0, ?, 49999)")
+    .bind(config.botId, config.memberId, grantDate - 2).run();
+  await db.prepare("UPDATE telegram_auth SET allowed=1,message_date=?,message_id=50000 WHERE bot_id=? AND user_id=?")
+    .bind(grantDate, config.botId, config.memberId).run();
+
+  for (const [updateId, messageDate] of [[2, grantDate - 3], [3, grantDate - 1], [4, grantDate]] as const) {
+    assert.equal(await submit(config, { ...event(config, updateId, 100000 + updateId), kind: "temp-clear", messageDate }), "ignored");
+    assert.equal(await storedReply(config, updateId), null);
+    assert.equal(await db.prepare("SELECT receipt_id FROM telegram_inbox WHERE bot_id=? AND update_id=?")
+      .bind(config.botId, updateId).first(), null);
+    assert.equal(await db.prepare("SELECT message_date,message_id FROM telegram_temp_clear_fence WHERE bot_id=? AND actor_id=?")
+      .bind(config.botId, config.memberId).first(), null);
+    assert.deepEqual(await totals(config), before);
+  }
+  assert.equal(await submit(config, { ...event(config, 5, 1), kind: "temp-clear", messageDate: grantDate + 1 }), "accepted");
+  assert.equal((await totals(config))?.nodes, 0);
+  assert.equal((await storedReply(config, 5))?.kind, "cleared");
+  assert.deepEqual(await db.prepare("SELECT message_date,message_id FROM telegram_temp_clear_fence WHERE bot_id=? AND actor_id=?")
+    .bind(config.botId, config.memberId).first(), { message_date: grantDate + 1, message_id: 1 });
+});
