@@ -1,6 +1,7 @@
 import { AggregateLimitError, getAggregateNodeSource, hasAggregateLink } from "./aggregate.ts";
 import { normalShortLinksReady, resolveShortLocation } from "./short-links.ts";
 import { getSubscriptionNodeSource, PathRuleContentError } from "./path-rules.ts";
+import { legacyEmptyExportResponse, legacyEmptyExportState } from "./legacy-empty-export.ts";
 import { base64Chunks, ExportContentError, planBase64 } from "./base64-response.ts";
 import { ClashContentError } from "./clash-export.ts";
 import { clashChunks, planClash } from "./clash-response.ts";
@@ -12,13 +13,15 @@ import { PROVIDER_REVISION, PROVIDER_SHA256, type ProviderFetcher, type Provider
 import { runOneProviderJob } from "./provider-job-consumer.ts";
 import { acceptTelegramAggregate, parseTelegramAggregateKey } from "./telegram/aggregate-actions.ts";
 import { acceptTelegramSelected, reapTelegramSelected } from "./telegram/selected-export.ts";
-import { answerTelegramCallback, drainTelegramReplies } from "./telegram/delivery.ts";
+import { answerTelegramCallback, drainTelegramReplies, sendTelegramInlineAnswer } from "./telegram/delivery.ts";
 import { runTelegramDocumentIntake } from "./telegram/document-intake.ts";
 import { acceptTelegramDocumentJob } from "./telegram/document-jobs.ts";
 import { reconcileTelegramDocumentJobReplies, retireTelegramDocumentStage } from "./telegram/document-persistence.ts";
 import { acceptTelegramLifecycle, reapTelegramLifecycle } from "./telegram/lifecycle-actions.ts";
 import { acceptTelegramBulkTrash, telegramBulkTrashReady } from "./telegram/bulk-trash.ts";
 import { acceptTelegramInlineSort, telegramInlineSortReady } from "./telegram/inline-sort.ts";
+import { acceptTelegramInlineConsent, telegramInlineSearchReady } from "./telegram/inline-search-consent.ts";
+import { answerTelegramInlineSearch, reapTelegramInlineSearch } from "./telegram/inline-search.ts";
 import { acceptTelegramPath } from "./telegram/path-management.ts";
 import { acceptTelegramPrivateClaim } from "./telegram/private-claims.ts";
 import {
@@ -43,6 +46,7 @@ export interface Env {
   TELEGRAM_ISOLATION_CONFIG?: string;
   TELEGRAM_AGGREGATE_KEY?: string;
   TELEGRAM_PRIVATE_SHARE_CREATION_KEY?: string;
+  TELEGRAM_INLINE_SEARCH?: string;
   PROVIDER_FETCH?: ProviderFetcher;
   PROVIDER_REVISION?: string;
   PROVIDER_IMAGE_SHA256?: string;
@@ -114,8 +118,13 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
   if (!policy) return plain("Service unavailable.", 503, false);
 
   try {
-    const decoded = await decodeTelegramRequest(request, policy);
+    const inlineSearchEnabled = env.TELEGRAM_INLINE_SEARCH === "1";
+    const decoded = await decodeTelegramRequest(request, policy, inlineSearchEnabled);
     if (decoded.status !== 200) return new Response(null, { status: decoded.status, headers: HEADERS });
+    if (decoded.inlineQuery) {
+      if (await telegramInlineSearchReady(env.DB)) await answerTelegramInlineSearch(env.DB, policy, decoded.inlineQuery, sendTelegramInlineAnswer);
+      return new Response(null, { status: 204, headers: HEADERS });
+    }
     const aggregateKey = await parseTelegramAggregateKey(env.TELEGRAM_AGGREGATE_KEY);
     const privateShare = await telegramPrivateShareRuntime(env.DB, env.TELEGRAM_PRIVATE_SHARE_CREATION_KEY);
     const shortLinks = await normalShortLinksReady(env.DB);
@@ -123,9 +132,10 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
     const inlineSort = await telegramInlineSortReady(env.DB);
     const subscriptionNodes = subscriptionRead && await telegramSubscriptionNodePagesReady(env.DB);
     const providerEnabled = await telegramProviderUrlReady(env);
+    const inlineConsent = inlineSearchEnabled && await telegramInlineSearchReady(env.DB);
     const bulkTrash = await telegramBulkTrashReady(env.DB);
     const drain = () => ctx?.waitUntil(drainTelegramReplies(env.DB, env.NODES, policy, 4, 20_000, fetch, aggregateKey, privateShare,
-      subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerEnabled, bulkTrash).catch(() => undefined));
+      subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerEnabled, bulkTrash, inlineConsent).catch(() => undefined));
     if (decoded.command) {
       await acceptTelegramCommand(env.DB, policy, decoded.command);
       drain();
@@ -182,6 +192,9 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
       const outcome = await acceptTelegramBulkTrash(env.DB, policy, decoded.bulkTrash);
       if (decoded.bulkTrash.kind === "confirm") ctx?.waitUntil(answerTelegramCallback(policy, decoded.bulkTrash.callbackId));
       if (outcome === "accepted") drain();
+    } else if (decoded.inlineConsent) {
+      if (!inlineConsent) return new Response(null, { status: 204, headers: HEADERS });
+      if (await acceptTelegramInlineConsent(env.DB, policy, decoded.inlineConsent) === "accepted") drain();
     } else if (decoded.document) {
       await acceptTelegramDocumentJob(env.DB, policy, decoded.document);
     } else if (decoded.shortLink) {
@@ -253,8 +266,14 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
   if (!EXPORT_KINDS.has(format)) return plain("Export format unavailable.", 406, head);
 
   try {
-    const source = aggregate ? await getAggregateNodeSource(env.DB, env.NODES, token, await normalShortLinksReady(env.DB))
+    let source = aggregate ? await getAggregateNodeSource(env.DB, env.NODES, token, await normalShortLinksReady(env.DB))
       : await getSubscriptionNodeSource(env.DB, env.NODES, token);
+    if (subscription && !source) {
+      const state = await legacyEmptyExportState(env.DB, token);
+      if (state === "empty") return legacyEmptyExportResponse(format, head, HEADERS);
+      // A refresh may have published between the initial lookup and the legacy check.
+      if (state === "published") source = await getSubscriptionNodeSource(env.DB, env.NODES, token);
+    }
     if (!source) return plain("Not found.", 404, head);
     if (format === "clash") {
       const plan = await planClash(source);
@@ -299,10 +318,12 @@ async function recoverTelegramWork(env: Env, policy: TelegramPolicy, pin: Provid
   const subscriptionRead = await telegramSubscriptionReadReady(env.DB);
   const inlineSort = await telegramInlineSortReady(env.DB);
   const subscriptionNodes = subscriptionRead && await telegramSubscriptionNodePagesReady(env.DB);
+  const inlineSearchSchema = await telegramInlineSearchReady(env.DB);
+  const inlineConsent = inlineSearchSchema && env.TELEGRAM_INLINE_SEARCH === "1";
   const bulkTrash = await telegramBulkTrashReady(env.DB);
   const drain = (limit: number, budget: number) =>
     drainTelegramReplies(env.DB, env.NODES, policy, limit, budget, fetch, aggregateKey, privateShare,
-      subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerEnabled, bulkTrash);
+      subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerEnabled, bulkTrash, inlineConsent);
   const replies = async () => {
     await drain(10, 45_000);
     await reapTelegramViewTickets(env.DB);
@@ -337,7 +358,8 @@ async function recoverTelegramWork(env: Env, policy: TelegramPolicy, pin: Provid
     }
   };
   const results = await Promise.allSettled([replies(), documents(), creations(), retireTelegramDocumentStage(env.DB, env.NODES, policy),
-    privateShare.schemaReady ? retireAbandonedTelegramPrivateShareCreation(env.DB, env.NODES, policy) : Promise.resolve(), providers()]);
+    privateShare.schemaReady ? retireAbandonedTelegramPrivateShareCreation(env.DB, env.NODES, policy) : Promise.resolve(),
+    providers(), inlineSearchSchema ? reapTelegramInlineSearch(env.DB, policy.botId) : Promise.resolve()]);
   if (results.some(({ status }) => status === "rejected")) {
     throw new Error("Telegram scheduled recovery could not finish.");
   }

@@ -3,6 +3,7 @@
 from contextlib import closing
 from hashlib import sha256
 import io
+from itertools import zip_longest
 import json
 import math
 import os
@@ -25,6 +26,11 @@ TRASH = "subscription_trash"
 LIFECYCLE = "subscription_lifecycle"
 PATH_RULES = "path_rules"
 PATH_COLUMNS = ("id", "owner_id", "keyword", "remark")
+EMPTY_EXPORTS = "legacy_empty_subscription_exports"
+EMPTY_EXPORT_COLUMNS = ("subscription_id", "owner_id", "token_sha256")
+EMPTY_EXPORT_PROFILE = "legacy-empty-v3"
+EMPTY_EXPORT_MIGRATION = "0026_legacy_empty_subscription_exports.sql"
+EMPTY_EXPORT_MIGRATION_SHA256 = "124eb153b8f8d1fc01165d2ba0db1adee8948cd6bffe8a8ad2465afa62da3976"
 COLUMNS = ("id", "owner_id", "name", "source_url", "token", "expire_at", "traffic_used", "traffic_total",
            "last_error", "created_at", "updated_at", "generation", "snapshot_id", "manifest_sha256", "node_count")
 TABLE_COLUMNS = {
@@ -171,7 +177,32 @@ def validate_record(item, source_table, target_table, ordinal, previous, source)
     return row
 
 
-def load_rows(db, source_root, source, descriptors, lineage):
+def empty_export_identity(subscription_id, owner_id, token):
+    require(native.integer(subscription_id, 1)
+            and native.matches(converter.OWNER, owner_id) and int(owner_id) <= converter.MAX_OWNER
+            and native.matches(converter.TOKEN, token))
+    return subscription_id, owner_id, sha256(token.encode("utf-8")).hexdigest()
+
+
+def verify_empty_export_markers(db):
+    # Derive the complete expected set independently from the restored active and
+    # trash rows. A marked trash row can serve only after a subsequent restore.
+    ledger = db.execute(f"SELECT name,sha256,mode FROM {migrations.LEDGER} WHERE position=26").fetchone()
+    require(ledger == (EMPTY_EXPORT_MIGRATION, EMPTY_EXPORT_MIGRATION_SHA256, "applied"))
+    candidates = db.execute(f"""
+        SELECT id,owner_id,token FROM {ACTIVE}
+          WHERE generation=0 AND snapshot_id IS NULL AND manifest_sha256 IS NULL AND node_count=0
+        UNION ALL
+        SELECT id,owner_id,token FROM {TRASH}
+          WHERE generation=0 AND snapshot_id IS NULL AND manifest_sha256 IS NULL AND node_count=0
+        ORDER BY id
+    """)
+    actual = db.execute(f"SELECT {','.join(EMPTY_EXPORT_COLUMNS)} FROM {EMPTY_EXPORTS} ORDER BY subscription_id")
+    expected = (empty_export_identity(*row) for row in candidates)
+    require(all(marker == identity for marker, identity in zip_longest(actual, expected)))
+
+
+def load_rows(db, source_root, source, descriptors, lineage, *, include_empty_exports=False):
     counts = {"activeRows": 0, "trashRows": 0, "generationZeroActiveRows": 0, "generationZeroTrashRows": 0,
               "nodeCount": 0, "redactedErrorRows": 0}
     for file, source_table, target_table, label in (
@@ -188,6 +219,9 @@ def load_rows(db, source_root, source, descriptors, lineage):
             db.execute(insert, tuple(row[column] for column in columns))
             if target_table == TRASH:
                 db.execute("INSERT INTO subscription_lifecycle(subscription_id,revision) VALUES (?,?)", (row["id"], 1))
+            if include_empty_exports and row["generation"] == 0:
+                db.execute(f"INSERT INTO {EMPTY_EXPORTS} ({','.join(EMPTY_EXPORT_COLUMNS)}) VALUES (?,?,?)",
+                           empty_export_identity(row["id"], row["owner_id"], row["token"]))
             counts[f"{label.lower()}Rows"] += 1
             counts[f"generationZero{label}Rows"] += int(row["generation"] == 0)
             counts["nodeCount"] += row["node_count"]
@@ -219,7 +253,7 @@ def db_summary(db, layout):
         + " FROM " + native._identifier(table) + " ORDER BY " + ",".join(map(native._identifier, definition["primary"]))))
 
 
-def write_sql(db, schema, sequence, path, *, path_sequence=None):
+def write_sql(db, schema, sequence, path, *, path_sequence=None, include_empty_exports=False):
     # Only the reviewed DDL and fixed-column rows are emitted. SQLite quotes
     # values itself. A subsequent independent replay checks exact round-trip.
     size = 0
@@ -235,6 +269,8 @@ def write_sql(db, schema, sequence, path, *, path_sequence=None):
             if obj.name != "sqlite_sequence":
                 write(obj.sql)
         tables = TABLE_COLUMNS if path_sequence is None else {**TABLE_COLUMNS, PATH_RULES: PATH_COLUMNS}
+        if include_empty_exports:
+            tables = {**tables, EMPTY_EXPORTS: EMPTY_EXPORT_COLUMNS}
         for table, columns in tables.items():
             fields = ",".join(native._identifier(column) for column in columns)
             literals = ",".join(f"quote({native._identifier(column)})" for column in columns)
@@ -253,8 +289,15 @@ def describe(path):
     return {"path": path.name, "bytes": size, "sha256": digest}
 
 
-def build_candidate(conversion, worker, output, *, converter_manifest_sha, worker_manifest_sha, revision, applied_at):
+def build_candidate(conversion, worker, output, *, converter_manifest_sha, worker_manifest_sha, revision, applied_at,
+                    profile=None, source_sqlite_sha=None, owner_map_sha=None):
     try:
+        include_empty_exports = profile == EMPTY_EXPORT_PROFILE
+        require(profile is None or include_empty_exports)
+        if include_empty_exports:
+            require(native.matches(native.DIGEST, source_sqlite_sha) and native.matches(native.DIGEST, owner_map_sha))
+        else:
+            require(source_sqlite_sha is None and owner_map_sha is None)
         require(native.integer(applied_at, 1))
         conversion = private_path(conversion, directory=True)
         worker = private_path(worker, directory=True)
@@ -262,6 +305,10 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
         require(not output.is_relative_to(conversion) and not output.is_relative_to(worker))
         source, files = converter_artifact(conversion, converter_manifest_sha)
         chain, build = worker_artifact(worker, revision, worker_manifest_sha)
+        if include_empty_exports:
+            require(source["sourceSha256"] == source_sqlite_sha and source["ownerMapSha256"] == owner_map_sha
+                    and len(chain) >= 26 and chain[25].name == EMPTY_EXPORT_MIGRATION
+                    and chain[25].sha256 == EMPTY_EXPORT_MIGRATION_SHA256)
         path_mapping = source.get("pathIdMapping")
         if path_mapping is not None:
             require(len(chain) >= 10 and chain[9].name == "0010_path_rules.sql")
@@ -286,7 +333,7 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                 db.executemany("INSERT INTO subs_bot_schema_migrations(position,name,sha256,mode,applied_at) VALUES (?,?,?,?,?)",
                                (tuple(row[column] for column in TABLE_COLUMNS[migrations.LEDGER]) for row in ledger))
                 with native.private_file(output / LINEAGE) as lineage:
-                    counts = load_rows(db, conversion, source, files, lineage)
+                    counts = load_rows(db, conversion, source, files, lineage, include_empty_exports=include_empty_exports)
                 if path_mapping is not None:
                     load_path_rules(db, conversion, source, files)
                 require(db.execute("""SELECT 1 FROM subscriptions AS active JOIN subscription_trash AS trash
@@ -296,7 +343,9 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                     db.execute("INSERT INTO sqlite_sequence(name,seq) VALUES ('subscriptions',?)", (sequence,))
                 layout = native.table_layout(db, replay_source.tables)
                 summary = db_summary(db, layout)
-                write_sql(db, schema, sequence, replay_sql, path_sequence=path_mapping["sourceHighWater"] if path_mapping is not None else None)
+                write_sql(db, schema, sequence, replay_sql,
+                          path_sequence=path_mapping["sourceHighWater"] if path_mapping is not None else None,
+                          include_empty_exports=include_empty_exports)
 
             def read_object(key):
                 raw = expected_file(conversion, files, "objects/" + key, native.OBJECT_BYTES)
@@ -313,6 +362,8 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
             replayed, restored_layout, restored_summary = native.open_export(replay_sql, replay_source)
             with closing(replayed):
                 require(restored_layout == layout and restored_summary == summary)
+                if include_empty_exports:
+                    verify_empty_export_markers(replayed)
                 objects = native.object_references(replayed, read_object, copy_object)
             require({"objects/" + item["key"] for item in objects} == set(files) - metadata_files(source))
             replay_sql.rename(sql)
@@ -325,6 +376,14 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
         if path_mapping is not None:
             report.update(version=2, legacyDomains="active-trash-and-path-rules",
                           pathIdMapping={**path_mapping, "targetSequenceHighWater": path_mapping["sourceHighWater"]})
+        if include_empty_exports:
+            active, trash = counts["generationZeroActiveRows"], counts["generationZeroTrashRows"]
+            require(summary["tableCounts"][EMPTY_EXPORTS] == active + trash)
+            domains = "active-trash-and-empty-exports" if path_mapping is None else "active-trash-path-rules-and-empty-exports"
+            report.update(version=3, legacyDomains=domains, emptyExportMarkers={
+                "activeRows": active, "trashRows": trash,
+                "migrationSha256": EMPTY_EXPORT_MIGRATION_SHA256, "tableSha256": summary["tableSha256"][EMPTY_EXPORTS],
+            })
         manifest = {**report, "source": {"sqliteSha256": source["sourceSha256"], "ownerMapSha256": source["ownerMapSha256"],
                     "converterManifestSha256": converter_manifest_sha}, "workerArtifact": build,
                     "ledger": ledger, "layout": layout, "summary": summary, "objects": objects,
@@ -344,13 +403,17 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
 
 def main(args=None):
     args = sys.argv[1:] if args is None else args
-    if len(args) != 7 or not re.fullmatch(r"[1-9][0-9]{0,15}", args[6]):
-        print("Usage: legacy_restore_package.py CONVERTER_DIR WORKER_ARTIFACT_DIR OUTPUT_DIR CONVERTER_MANIFEST_SHA WORKER_MANIFEST_SHA REVISION APPLIED_AT",
+    if (len(args) not in (7, 10) or not re.fullmatch(r"[1-9][0-9]{0,15}", args[6])
+            or (len(args) == 10 and args[7] != EMPTY_EXPORT_PROFILE)):
+        print("Usage: legacy_restore_package.py CONVERTER_DIR WORKER_ARTIFACT_DIR OUTPUT_DIR CONVERTER_MANIFEST_SHA WORKER_MANIFEST_SHA REVISION APPLIED_AT"
+              " [legacy-empty-v3 SOURCE_SQLITE_SHA OWNER_MAP_SHA]",
               file=sys.stderr)
         return 2
     try:
+        profile, source_sqlite_sha, owner_map_sha = args[7:] if len(args) == 10 else (None, None, None)
         result = build_candidate(*map(Path, args[:3]), converter_manifest_sha=args[3], worker_manifest_sha=args[4],
-                                 revision=args[5], applied_at=int(args[6]))
+                                 revision=args[5], applied_at=int(args[6]), profile=profile,
+                                 source_sqlite_sha=source_sqlite_sha, owner_map_sha=owner_map_sha)
         print(json.dumps(result, ensure_ascii=True, sort_keys=True))
         return 0
     except PackageError as error:

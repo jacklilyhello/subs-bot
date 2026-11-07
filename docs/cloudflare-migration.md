@@ -77,7 +77,7 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 | `/export` 动态全量聚合含自己的临时节点，`/o` 按名称和原始 URL 筛选并固定订阅顺序，所选聚合只包含订阅。 | 已接入全量和筛选聚合的 HTTP 读取、私聊 `/export` 及 `/o` 签发和撤销。验收 Unicode 匹配、稳定重显、冻结成员、配额回收、并发修改、撤销后的新读取、两账号归属和顺序。旧聚合码迁移单独接入。 |
 | `/short` 显示帮助，`短链 URL`、`short URL` 及详情按钮签发短链。`/s/{code}` 按已保存目标跳转，可选外部服务包装同一受控本地链接。 | 私聊签发和撤销普通 HTTP(S) 短链，兼容聚合重定向。验收旧短码、归属、撤销、缓存与命名空间冲突。单订阅详情入口和可信外部服务另行接入。 |
 | `/path` 和菜单维护路径对应，支持添加、删除和清空，受限文本入口接受 `关键词=备注`。 | HTTP 导出已应用所有者路径规则，临时节点保留原名。私聊 `/path` 已接入显式添加、删除、清空和分页。验收两账号隔离与迟到操作，菜单、独立自由文本和旧规则导入分别接入。 |
-| `@Bot [关键词]` 搜索并发送订阅及临时节点，`/i` 切换默认、流量、到期和名称排序。`Share` 支持自定义内容或匹配订阅、指定接收人、份数和有效期；选中反馈用于更新原卡。 | 私密创建和领取已接入私聊 `/share`、`/start claim_<code>`。隔离工作流核对实际双账号回执、正文、过期、指定用户、并发与重复领取。`0020` 增加私聊 `/i`，可查看并持久保存四种排序偏好。内联搜索和分享卡片分别接入。Telegram 内联查询只提供聊天类型，无法核对指定群 ID。 [Telegram InlineQuery](https://core.telegram.org/bots/api#inlinequery) |
+| `@Bot [关键词]` 搜索并发送订阅及临时节点，`/i` 切换默认、流量、到期和名称排序。`Share` 支持自定义内容或匹配订阅、指定接收人、份数和有效期；选中反馈用于更新原卡。 | 私密创建和领取已接入私聊 `/share`、`/start claim_<code>`。隔离工作流核对实际双账号回执、正文、过期、指定用户、并发与重复领取。`0020` 持久保存私聊 `/i` 排序。`0025` 增加默认关闭的私聊内联订阅搜索，仅处理能确认为当前用户与同一 Bot 私聊的 `sender`。临时节点、选择后的专用操作和群内分享卡片另行接入。Telegram 内联查询只提供聊天类型，无法核对指定群 ID。 [Telegram InlineQuery](https://core.telegram.org/bots/api#inlinequery) |
 | `/g` 查 GitHub 仓库和公开代码，代码无结果时查询 grep.app，必要时提供 GitHub 网页搜索入口。`/ai` 接受 API 地址和 Key，探测 OpenAI 兼容端点的状态和延迟。 | 两项各自接入和验收。GitHub 凭据只发送至 GitHub。`/ai` 按固定范围验证用户提供的地址，禁用重定向，保护 Key 和上游响应。 |
 | `/health`、单订阅、聚合和短链 HTTP 路由。旧服务默认使用 Clash，支持 Base64、Sing-box、Surge 和 QX 系列。 | 按本页 HTTP 表验收格式、别名、顺序、字节、失败状态及旧能力链接。托管配置校验、真实隔离 HTTP 响应和客户端导入分别记录。 |
 | 旧服务使用长轮询，启动时清理过期分享和旧回收记录，刷新由用户操作触发。 | 已接入 Webhook 和 Telegram 恢复 Cron。订阅批处理和生产数据回收另行验收，回收前核对备份、活动指针及回滚引用。 |
@@ -95,7 +95,8 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 - 同一用户的私聊和群聊读取相同的个人数据。重命名和翻页绑定用户、聊天与话题。受保护的写入以 D1 里的当前授权和对象版本为条件。生产授权迁移需要核对管理员、初始白名单及显式允许和拒绝覆盖。
 - 私密领取保留现有的分享能力语义。`0005` 按 Bot 存储分享码摘要，使用独立的私有 R2 对象保存最多 64 KiB 的私密正文。`0007` 将指定账号在普通私聊发出的 `/start claim_<code>` 记为持久领取意图，回执只存码的摘要。这个入口沿用单次领取授权，普通订阅操作仍检查白名单。领取前核对正文长度、摘要和 UTF-8，D1 在同一事务复核到期、指定用户及剩余份数，同时将回复切换到发送中。份数以 `(share_id, actor_id)` 唯一领取记录计数，已领取的用户在有效期内可再次查看。
 - 私聊短正文以纯文本送达，超过消息长度或含有不适合直接显示的控制字符时使用一个固定文件名的 UTF-8 附件。发送结果不明时保留回执和领取记录，避免自动重复发送。内联创建和更新群内分享卡片另行接入。 [Telegram `sendMessage`](https://core.telegram.org/bots/api#sendmessage) · [Telegram `sendDocument`](https://core.telegram.org/bots/api#senddocument)
-- 私聊 `/share [x份数] [id领取人ID] [s分钟] -- 正文` 接入 `0016` 的私密创建。份数默认 1、上限 100，时长默认 10 分钟、上限 10,080 分钟。指定领取人限当前隔离策略的两个账号。命令参数最多 4,096 个 UTF-16 单位，分隔符后的正文保留原空格和换行。此入口在私聊签发领取链接。内联搜索和群内通用分享卡片分阶段接入。
+- 私聊 `/share [x份数] [id领取人ID] [s分钟] -- 正文` 接入 `0016` 的私密创建。份数默认 1、上限 100，时长默认 10 分钟、上限 10,080 分钟。指定领取人限当前隔离策略的两个账号。命令参数最多 4,096 个 UTF-16 单位，分隔符后的正文保留原空格和换行。此入口在私聊签发领取链接。群内通用分享卡片另行接入。
+- 私聊内联搜索需要单独启用 Worker 的 `TELEGRAM_INLINE_SEARCH` 和 Telegram 的内联更新。每位获准用户再通过自己的 Bot 私聊发送 `/inline on` 授权 15 分钟，可用 `/inline off` 关闭。结果按 `/i` 的模式排列，只显示脱敏名称。每次最多返回 50 条。扫描预算为两秒，最多处理 512 条订阅，名称和来源共计最多 8 MiB。超出扫描预算时返回空结果。每位用户每分钟最多接纳 12 次查询，同一时刻只处理一个。Telegram 缓存时间为零。D1 只记录查询 ID 摘要、关联授权、排序版本和结果状态，保留约 25 小时用于去重。发送中断后请重新输入关键词。当前配置留在关闭状态。 [Telegram Inline Bots](https://core.telegram.org/bots/inline) · [Telegram answerInlineQuery](https://core.telegram.org/bots/api#answerinlinequery)
 - 创建需单独的 `TELEGRAM_PRIVATE_SHARE_CREATION_KEY`，使用规范 Base64URL 编码的 32 字节密钥及稳定安装标识 `subs-bot-cf-dev-01`。它与聚合密钥分离。运行时每轮核对 `0016` 的精确迁移登记，再启用对应收件、发件和恢复分支。缺少密钥时普通回复继续独立发送。清理只需 schema 就绪，不依赖该密钥。受保护发布在任何迁移前核对当前密钥摘要，拒绝意外替换或删除。通用只读验收仅核对绑定元数据。
 - 正文在 R2 写入前先登记回执与内容摘要，再以条件 PUT 写入私有对象。未确认正文持久化时 webhook 返回可重试错误。Cron 每轮恢复一份已有正文的候选。发送领取链接前，在同一 D1 更新中同时核对精确发件租约及创建模块返回的私聊、发布、到期和授权版本条件。链接只发给创建者，正文由独立私聊领取。发送结果不明时保留原回执和不确定状态。遗弃候选沿用有归属校验与宽限期的清理，并保留墓碑重新观察迟到对象。托管测试只使用合成更新和 Bot HTTP double，实际双账号验收仍从指定 IAB 执行。
 - 验收须覆盖 Telegram 返回成功后写回失败，核对同一发件租约的状态与实际送达。 [Telegram `sendMessage`](https://core.telegram.org/bots/api#sendmessage)
@@ -190,6 +191,16 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 域级 Worker 路由核对使用单独的只读凭据。发布任务内使用项目专用凭据核对 Worker 的 Custom Domain、预览、日志、Cron 及实际数据绑定。 [Cloudflare Worker 路由 API](https://developers.cloudflare.com/api/resources/workers/subresources/routes/)
 
+#### 隔离私聊内联搜索
+
+先用当前 `main` 的已核对 Worker CI 产物正常发布，确认活动版本没有 `TELEGRAM_INLINE_SEARCH` 绑定且 D1 已记录 `0025`。发布参数 `inline_search` 默认为 `preserve`，沿用活动版本的设置。首次部署和仍关闭的版本均省略该绑定。启用时只接受 Worker 的版本级 `plain_text` 绑定，值为 `1`。
+
+启用前由用户单独为已核对的隔离测试 Bot 确认 BotFather 的 `/setinline`，并确认 Webhook 仍使用原隔离 URL、密钥和连接上限，接收范围精确为 `message`、`callback_query` 和 `inline_query`。变更时保留待处理更新。无需开启所选内联结果反馈。部署工作流只核对 Cloudflare 状态，Telegram 配置由用户独立核对。 [Telegram 内联设置](https://core.telegram.org/bots/inline) · [Webhook 配置](https://core.telegram.org/bots/api#setwebhook) · [Webhook 回读](https://core.telegram.org/bots/api#getwebhookinfo)
+
+确认上述范围后，在受保护的同一发布工作流指定 `inline_search=enable` 和 `inline_search_confirmation=enable inline search for subs-bot-cf-dev-01`。使用当前活动关闭版本对应的同一 `main` 提交和 Worker CI 产物。发布保留已核对的 Telegram 配置、数据绑定、密钥和提供方配置，且在启用前确认该 Bot 没有仍有效的内联同意。记录发布输出中的活动部署、版本及 `inlineSearchEnabled`，并核对完整模块和绑定回读。`/health` 只用于核对提交。
+
+实际验收在内置浏览器中使用两名获准账号与同一测试 Bot 的私聊。各自执行 `/inline on` 后，使用同一合成查询验证只显示自己的订阅名称。在指定测试群查看同一查询无结果。测试结束在各自私聊执行 `/inline off`。紧急停止输入时由用户先将 Webhook 接收范围恢复到已核对的原集合，保留待处理更新。随后可用 `inline_search=disable` 和 `inline_search_confirmation=disable inline search for subs-bot-cf-dev-01` 发布关闭版本。以活动版本回读确认关闭。回滚保留增量 D1 表和既有记录。重新启用前确认旧同意均已关闭或自然到期。 [Telegram 私聊内联类型](https://core.telegram.org/constructor/inlineQueryPeerTypeSameBotPM) · [Worker 回滚](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/)
+
 #### 隔离提供方绑定
 
 默认发布不配置提供方绑定。首次启用时，为同一个 `main` 提交构建应用和提供方，完成私有提供方的隔离激活和停机证明，并单独核对域级路由未指向提供方。将下列精确结构保存到 `subs-bot-isolation` Environment 的受保护配置 `SUBS_BOT_CF_PROVIDER_BINDING_JSON`，并在 GitHub 证明产物到期前运行首次绑定。资源标识和完整配置只存于受控配置。
@@ -268,6 +279,8 @@ PY
 
 默认的 `synthetic-legacy` 沿用版本 1 合成包。路径规则演练显式选择 `synthetic-legacy-path`，全程保持同一选项。该选项使用单独的版本 2 产物、目标资源名称及操作记录前缀。固定样例核对映射归属、精确规则文字及编号顺序，并保留已删除规则的编号上界。最终读回输出规则数量、编号上界和数据摘要。候选保持未绑定状态。
 
+选择 `synthetic-legacy-empty` 演练版本 3。它使用独立的产物、D1、R2 和操作记录前缀。预检从固定合成样例重建源 SQLite 与转换包并核对摘要，再验证两个活动订阅、两个回收站订阅、路径规则、原始令牌对应的两个空导出标记、0026 迁移、编号序列及四个 R2 对象。构建与预检须使用能产生同一 SQLite 文件的托管工具链，摘要不符时停止。恢复读回包含标记数量与表摘要。目标保持未绑定，空导出 HTTP 行为另行验收。
+
 1. 依次运行 `verify`、`prepare`、`create-restore-db`、`create-restore-bucket`，每步核对结果后再继续。创建响应不明时先运行只读 `verify`，根据创建意图、时间和实际资源身份独立确认归属，再用 `pin-resource` 提交 `resource` 和 `identity_sha256`。无法确认归属时保留该资源，停止本组后续写入。
 2. 运行 `restore-objects` 核对专用私有 R2 的对象闭包，再运行 `start-import` 向已核对且仍为空的专用 D1 导入。若已有确认的轮询书签，可用同一 `start-import` 继续轮询。响应不明时保留目标和私有操作记录，通过 `verify-restore` 核对完整结果。导入请求未确认、上传链接或产物已失效，或固定版本已变更时，禁止重发首次导入、重置或删除原目标。保留现场核查，后续演练使用新的 `cohort` 和专用资源。 [D1 原生导入](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/import/)
 3. 用 `verify-restore` 验证完整 `PRAGMA quick_check`、外键、结构、迁移记录、编号序列、逐表摘要和 R2 对象。检查失败即保留目标和证据。此结果覆盖合成候选恢复，旧链接、真实数据和 HTTP 导出分别验收。 [D1 完整性检查](https://developers.cloudflare.com/d1/sql-api/sql-statements/#pragma-quick_check)
@@ -289,6 +302,10 @@ PY
 在获准的托管 runner 上，将完整封存的旧订阅转换包与核对过来源及摘要的 Worker 产物交给 `worker/tools/legacy_restore_package.py CONVERTER_DIR WORKER_ARTIFACT_DIR OUTPUT_DIR CONVERTER_MANIFEST_SHA WORKER_MANIFEST_SHA REVISION APPLIED_AT`。输入目录须仅供当前账号访问，输出目录须尚未存在。时间参数为候选迁移记录使用的 Unix 秒。程序使用完整增量结构构建独立候选数据库，并重新执行生成的 SQL，核对结构、外键、数据指纹、活动和回收站归属、编号序列及 R2 引用。
 
 候选包含原生导入所用的 `restore.sql`、逐行归属记录、精确对象和最后写入的 `manifest.sha256`。保留原始能力令牌和来源，目录及文件按私有数据管理。路径规则和历史编号都为空时沿用版本 1。版本 2 另将旧 `path_maps` 归入 `path_rules`，保留原编号、顺序、关键字、备注以及已删除规则占用过的编号上界。旧群归属使用已核准的映射。归并到同一用户的不同旧归属，其关键字若在去除首尾空白和折叠大小写后重合，则阻止封存。该检查使用与 Worker 相同的 Unicode 14 规则，托管转换使用 CPython 3.11。无效文本和每位用户超过 64 条也会阻止封存。真实备份仍需盘点其他数据域，未处理的数据域有内容时同样会阻止封存。实际云端导入、未发布订阅的 HTTP 行为、旧链接连续性和各格式兼容性分别验收。
+
+增量迁移 `0026` 为旧空订阅提供单独的 HTTP 导出标记。`/sub` 仅在活动记录的编号、归属及原始令牌摘要均匹配，且仍无已发布快照时返回相应格式的空配置。回收期间返回 404，恢复后按原标记导出。失败刷新保留空配置，首次成功刷新改用正常快照。新建的未发布订阅仍返回 404。此迁移只创建空表，版本 1 和版本 2 候选包继续沿用原有封存规则。标记通过单独验证的封存候选流程填充。
+
+在原命令末尾显式附加 `legacy-empty-v3 SOURCE_SQLITE_SHA OWNER_MAP_SHA` 可构建版本 3。新增参数分别固定已封存 SQLite 与已核准归属映射的 SHA-256，Worker 产物必须包含摘要吻合的 0026 迁移。已验证的旧空节点数组按目标订阅编号、归属与原令牌摘要写入标记表，包含活动和回收站记录。回收站的标记在同一订阅恢复后才可用于导出。SQL 重放核对完整标记集及迁移记录，清单另记活动和回收站标记数、迁移和表摘要。包的验证范围限于候选数据，原生导入和空导出 HTTP 行为需分别验收。
 
 ### 真实数据与生产切换门槛
 

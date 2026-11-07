@@ -22,6 +22,8 @@ REVISION = "a" * 40
 APPLIED_AT = 1_800_000_000
 TRASH_TOKEN = "fixture-private-trash-token"
 EMPTY_TOKEN = "fixture-private-empty-token"
+EMPTY_TRASH_TOKEN = "fixture-private-empty-trash-token"
+OWNER_MAP = {"-100123": "456"}
 QUOTE_NAME = "Synthetic '); DROP TABLE subscriptions; -- 名称"
 UPLOAD_URL = "uploaded://fixture-only"
 
@@ -80,13 +82,21 @@ class LegacyRestorePackageTests(unittest.TestCase):
         put(self.worker / "isolation.json", manifest)
         return digest(manifest), entries
 
-    def make_conversion(self, *, unsupported=False, trash_sequence=70, path_rows=(), path_sequence=None):
+    def make_conversion(self, *, unsupported=False, trash_sequence=70, path_rows=(), path_sequence=None,
+                        empty_trash=False, malformed_empty=False):
         with closing(sqlite3.connect(self.legacy)) as db, db:
             make_table(db, "subscriptions")
             make_table(db, "deleted_subs")
             insert(db, row_id=2, nodes=[NODE, NODE])
             insert(db, row_id=5, nodes=[], token=EMPTY_TOKEN)
             insert(db, table="deleted_subs", row_id=2, owner=-100123, token=TRASH_TOKEN)
+            if empty_trash:
+                insert(db, table="deleted_subs", row_id=4, owner=-100123, nodes=[], token=EMPTY_TRASH_TOKEN)
+                db.execute("UPDATE deleted_subs SET nodes_json=?,node_count=99 WHERE id=4", (" [ \n ] ",))
+                db.execute("UPDATE subscriptions SET node_count=17 WHERE id=5")
+                db.execute("UPDATE subscriptions SET node_count=0 WHERE id=2")
+            if malformed_empty:
+                db.execute("UPDATE subscriptions SET nodes_json='[]extra' WHERE id=5")
             db.execute("UPDATE subscriptions SET name=?,url=?,expire_at=?,traffic_used=?,traffic_total=?,last_error=? WHERE id=2",
                        (QUOTE_NAME, UPLOAD_URL, 1_700_002_000, 1.25, 9.75, "fixture-private-provider-error"))
             db.execute("UPDATE sqlite_sequence SET seq=50 WHERE name='subscriptions'")
@@ -103,7 +113,7 @@ class LegacyRestorePackageTests(unittest.TestCase):
                 if path_sequence is not None:
                     db.execute("UPDATE sqlite_sequence SET seq=? WHERE name='path_maps'", (path_sequence,))
         self.legacy.chmod(0o600)
-        report = convert.convert_backup(self.legacy, self.conversion, owner_map={"-100123": "456"})
+        report = convert.convert_backup(self.legacy, self.conversion, owner_map=OWNER_MAP)
         self.convert_sha = digest((self.conversion / "manifest.json").read_bytes())
         return report
 
@@ -111,6 +121,10 @@ class LegacyRestorePackageTests(unittest.TestCase):
         options = {"converter_manifest_sha": self.convert_sha, "worker_manifest_sha": self.worker_sha,
                    "revision": REVISION, "applied_at": APPLIED_AT, **options}
         return package.build_candidate(self.conversion, self.worker, self.output, **options)
+
+    def v3_pins(self):
+        return {"profile": "legacy-empty-v3", "source_sqlite_sha": digest(self.legacy.read_bytes()),
+                "owner_map_sha": digest(body(OWNER_MAP))}
 
     def reseal_row(self, relative, mutate, *, valid=True):
         path = self.conversion / relative
@@ -297,6 +311,122 @@ class LegacyRestorePackageTests(unittest.TestCase):
         self.assertEqual(report["blockers"], {"unhandled:short_links": 1})
         with self.assertRaises(package.PackageError):
             self.build()
+        self.assertFalse(self.output.exists())
+
+    def test_v3_marks_exact_active_and_trash_empty_arrays_and_preserves_default(self):
+        self.assertTrue(self.make_conversion(empty_trash=True)["completeImportable"])
+        default = self.build()
+        self.assertEqual(default["version"], 1)
+        self.assertNotIn("emptyExportMarkers", default)
+        original = self.output
+        self.output = self.root / "explicit-v3"
+        pins = self.v3_pins()
+        result = self.build(**pins)
+        self.assertEqual(result["version"], 3)
+        self.assertEqual(result["legacyDomains"], "active-trash-and-empty-exports")
+        self.assertEqual(result["counts"], {"activeRows": 2, "trashRows": 2, "generationZeroActiveRows": 1,
+                                           "generationZeroTrashRows": 1, "nodeCount": 3, "redactedErrorRows": 1})
+        self.assertEqual((result["targetSequenceHighWater"], result["objectCount"]), (72, 4))
+        self.assertEqual(result["generationZeroHttp"], "not-validated")
+        self.assertEqual(result["formatCompatibility"], "not-validated")
+        raw = (self.output / "manifest.json").read_bytes()
+        manifest = json.loads(raw)
+        self.assertEqual((self.output / "manifest.sha256").read_bytes(), digest(raw).encode("ascii") + b"\n")
+        self.assertEqual(manifest["source"]["sqliteSha256"], pins["source_sqlite_sha"])
+        self.assertEqual(manifest["source"]["ownerMapSha256"], pins["owner_map_sha"])
+        self.assertEqual(result["emptyExportMarkers"], {
+            "activeRows": 1, "trashRows": 1, "migrationSha256": package.EMPTY_EXPORT_MIGRATION_SHA256,
+            "tableSha256": manifest["summary"]["tableSha256"][package.EMPTY_EXPORTS],
+        })
+        self.assertEqual(manifest["summary"]["tableCounts"][package.EMPTY_EXPORTS], 2)
+        self.assertEqual(manifest["objects"], json.loads((original / "manifest.json").read_bytes())["objects"])
+        self.assertEqual((original / "lineage.ndjson").read_bytes(), (self.output / "lineage.ndjson").read_bytes())
+        self.assertEqual(digest(self.legacy.read_bytes()), pins["source_sqlite_sha"])
+        default_sql = (original / "restore.sql").read_text(encoding="utf-8")
+        v3_sql = (self.output / "restore.sql").read_text(encoding="utf-8")
+        self.assertEqual(default_sql, "".join(line for line in v3_sql.splitlines(keepends=True)
+                                              if not line.startswith(f"INSERT INTO {package.EMPTY_EXPORTS} ")))
+        with closing(sqlite3.connect(":memory:")) as db:
+            db.executescript(v3_sql)
+            self.assertEqual(db.execute(f"SELECT * FROM {package.EMPTY_EXPORTS} ORDER BY subscription_id").fetchall(), [
+                (5, "123", digest(EMPTY_TOKEN.encode("utf-8"))),
+                (72, "456", digest(EMPTY_TRASH_TOKEN.encode("utf-8"))),
+            ])
+            self.assertEqual(db.execute("SELECT id,owner_id,token,generation,snapshot_id,manifest_sha256,node_count "
+                                        "FROM subscription_trash WHERE id=72").fetchone(),
+                             (72, "456", EMPTY_TRASH_TOKEN, 0, None, None, 0))
+            self.assertEqual(db.execute("SELECT * FROM subscription_lifecycle ORDER BY subscription_id").fetchall(),
+                             [(71, 1), (72, 1)])
+            package.verify_empty_export_markers(db)
+            for change, bindings in (
+                (f"DELETE FROM {package.EMPTY_EXPORTS} WHERE subscription_id=72", ()),
+                (f"UPDATE {package.EMPTY_EXPORTS} SET owner_id='789' WHERE subscription_id=72", ()),
+                (f"UPDATE {package.EMPTY_EXPORTS} SET token_sha256=? WHERE subscription_id=72", ("b" * 64,)),
+                (f"INSERT INTO {package.EMPTY_EXPORTS} VALUES (2,'123',?)", (digest(TOKEN.encode("utf-8")),)),
+                ("UPDATE subs_bot_schema_migrations SET sha256=? WHERE position=26", ("b" * 64,)),
+            ):
+                with self.subTest(change=change):
+                    db.execute("SAVEPOINT altered_candidate")
+                    try:
+                        db.execute(change, bindings)
+                        with self.assertRaises(package.PackageError):
+                            package.verify_empty_export_markers(db)
+                    finally:
+                        db.execute("ROLLBACK TO altered_candidate")
+                        db.execute("RELEASE altered_candidate")
+
+    def test_v3_cli_preserves_v2_path_rows_and_allocator(self):
+        self.make_conversion(path_rows=[(5, -100123, "keyword", "remark")], path_sequence=100)
+        default = self.build()
+        self.assertEqual(default["version"], 2)
+        self.assertNotIn("emptyExportMarkers", default)
+        self.output = self.root / "explicit-v3-with-paths"
+        pins = self.v3_pins()
+        output, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(output), redirect_stderr(errors):
+            result = package.main([str(self.conversion), str(self.worker), str(self.output), self.convert_sha,
+                                   self.worker_sha, REVISION, str(APPLIED_AT), pins["profile"],
+                                   pins["source_sqlite_sha"], pins["owner_map_sha"]])
+        self.assertEqual((result, errors.getvalue()), (0, ""))
+        report = json.loads(output.getvalue())
+        self.assertEqual(report["version"], 3)
+        self.assertEqual(report["legacyDomains"], "active-trash-path-rules-and-empty-exports")
+        self.assertEqual(report["pathIdMapping"], default["pathIdMapping"])
+        self.assertEqual(report["emptyExportMarkers"]["activeRows"], 1)
+        self.assertEqual(report["emptyExportMarkers"]["trashRows"], 0)
+        for private_value in (EMPTY_TOKEN, "keyword", "remark"):
+            self.assertNotIn(private_value, output.getvalue())
+        with closing(sqlite3.connect(":memory:")) as db:
+            db.executescript((self.output / "restore.sql").read_text(encoding="utf-8"))
+            self.assertEqual(db.execute("SELECT * FROM path_rules").fetchall(), [(5, "456", "keyword", "remark")])
+            self.assertEqual(db.execute("SELECT seq FROM sqlite_sequence WHERE name='path_rules'").fetchone(), (100,))
+
+    def test_v3_requires_independent_source_pins_and_exact_migration(self):
+        self.make_conversion()
+        pins = self.v3_pins()
+        for overrides in ({"source_sqlite_sha": None}, {"source_sqlite_sha": "b" * 64},
+                          {"owner_map_sha": None}, {"owner_map_sha": "b" * 64}, {"profile": "unknown"}):
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(package.PackageError):
+                    self.build(**{**pins, **overrides})
+                self.assertFalse(self.output.exists())
+
+        manifest_path = self.worker / "isolation.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        migration = self.worker / package.EMPTY_EXPORT_MIGRATION
+        altered = migration.read_bytes() + b"\n"
+        migration.write_bytes(altered)
+        manifest["migrations"][25]["sha256"] = digest(altered)
+        manifest_path.write_bytes(body(manifest))
+        self.worker_sha = digest(body(manifest))
+        with self.assertRaises(package.PackageError):
+            self.build(**pins)
+        self.assertFalse(self.output.exists())
+
+    def test_v3_does_not_mark_malformed_legacy_nodes_as_empty(self):
+        self.assertEqual(self.make_conversion(malformed_empty=True)["blockers"], {"invalidNodeRows": 1})
+        with self.assertRaises(package.PackageError):
+            self.build(**self.v3_pins())
         self.assertFalse(self.output.exists())
 
 
