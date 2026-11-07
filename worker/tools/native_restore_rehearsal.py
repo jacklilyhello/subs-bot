@@ -25,7 +25,7 @@ import sys
 import tempfile
 import time
 from urllib.error import HTTPError
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
 
 import d1_migrations as migrations
@@ -62,6 +62,7 @@ READ_ERROR = "Native restore rehearsal could not be verified safely."
 ACTIONS = {"verify", "prepare", "create-backup-bucket", "create-restore-db", "create-restore-bucket",
            "pin-resource", "capture", "poll-export", "restore-objects", "start-import", "verify-restore"}
 RESOURCES = ("backup", "database", "objects")
+LEGACY_CANDIDATE_PROFILE = "synthetic-legacy"
 ACCOUNT_SHA256 = "ffdbf3dd5d042c6edb68d7f628998a69a22320b0199775bfda9f97593136e508"
 
 
@@ -198,17 +199,23 @@ def _response(opener, request, maximum):
 class RehearsalAPI:
     """Fixed account/resource allowlist; no DELETE, reset, Worker write or Time Travel restore."""
 
-    def __init__(self, target, token, cohort):
+    def __init__(self, target, token, cohort, *, profile="native"):
         require(isinstance(target, dict) and matches(HEX_ID, target.get("accountId")) and matches(UUID, target.get("d1Id")))
         require(digest(target["accountId"].encode("ascii")) == ACCOUNT_SHA256)
         require(matches(re.compile(r"[A-Za-z0-9_.-]{1,4096}"), token))
+        require(profile in {"native", LEGACY_CANDIDATE_PROFILE} and matches(COHORT, cohort))
         self.target, self.token, self.cohort = target, token, cohort
+        self.profile = profile
         self.account_id = target["accountId"]
         self.names = names(cohort)
         self.root = "/accounts/" + target["accountId"]
         self.source = self.root + "/d1/database/" + target["d1Id"]
         self.journal_prefix = f"maintenance/native-restore/{cohort}/journal/"
         self.archive_prefix = f"rehearsals/{cohort}/"
+        if profile == LEGACY_CANDIDATE_PROFILE:
+            self.names = {"database": f"subs-bot-cf-legacy-db-{cohort}", "objects": f"subs-bot-cf-legacy-r2-{cohort}"}
+            self.journal_prefix = f"maintenance/legacy-candidate/{cohort}/journal/"
+        self.buckets = {WORKER_NAME, *(self.names[kind] for kind in self.names if kind != "database")}
         self.databases = {target["d1Id"]}
         self.restore_id = None
         self.restore_keys = set()
@@ -234,22 +241,22 @@ class RehearsalAPI:
     def json(self, method, path, payload=None, *, envelope=False):
         require(method in {"GET", "POST"} and path.startswith(self.root + "/") and not any(c in path for c in ("#", "\\", "\n", "\r")))
         route = path.partition("?")[0]
-        buckets = {WORKER_NAME, self.names["backup"], self.names["objects"]}
         if method == "POST":
             if route == self.root + "/d1/database":
                 require(payload == {"name": self.names["database"], "read_replication": {"mode": "disabled"}})
             elif route == self.root + "/r2/buckets":
-                require(payload in ({"name": self.names["backup"], "storageClass": "Standard"},
-                                    {"name": self.names["objects"], "storageClass": "Standard"}))
+                require(any(payload == {"name": self.names[kind], "storageClass": "Standard"}
+                            for kind in self.names if kind != "database"))
             elif route.endswith("/query"):
-                require(route in {self.root + f"/d1/database/{value}/query" for value in self.databases})
+                databases = self.databases if self.profile == "native" else {self.restore_id}
+                require(route in {self.root + f"/d1/database/{value}/query" for value in databases if value is not None})
                 require(isinstance(payload, dict) and set(payload) <= {"sql", "params"} and isinstance(payload.get("sql"), str))
                 params = payload.get("params", [])
                 require(isinstance(params, list) and all(isinstance(value, str) for value in params))
                 sql = payload["sql"].strip()
                 require(readonly_sql(sql))
                 require(len(sql.encode()) <= 100_000)
-            elif route == self.source + "/export":
+            elif route == self.source + "/export" and self.profile == "native":
                 require(isinstance(payload, dict) and set(payload) <= {"output_format", "dump_options", "current_bookmark"}
                         and payload.get("output_format") == "polling" and payload.get("dump_options") == {"compatibility": "d1"})
                 require("current_bookmark" not in payload or matches(BOOKMARK, payload["current_bookmark"]))
@@ -268,8 +275,12 @@ class RehearsalAPI:
             allowed = route in {self.root + "/d1/database", self.root + "/r2/buckets", self.root + "/tokens/verify"}
             allowed = allowed or any(route == self.root + f"/d1/database/{value}" for value in self.databases)
             allowed = allowed or any(route in {self.root + f"/r2/buckets/{bucket}" + suffix for suffix in
-                ("", "/domains/managed", "/domains/custom", "/objects")} for bucket in buckets)
+                ("", "/domains/managed", "/domains/custom", "/objects")} for bucket in self.buckets)
             require(allowed and payload is None)
+            if self.profile == LEGACY_CANDIDATE_PROFILE and route == self.root + f"/r2/buckets/{WORKER_NAME}/objects":
+                query = parse_qs(urlsplit(path).query, max_num_fields=3)
+                prefix = query.get("prefix", [])
+                require(len(prefix) == 1 and re.fullmatch(re.escape(self.journal_prefix) + r"(?:[0-9]{6}-)?", prefix[0]))
         headers = {"Authorization": "Bearer " + self.token, "Accept": "application/json", "Cache-Control": "no-cache",
                    "cf-r2-jurisdiction": "default"}
         body = None if payload is None else canonical(payload)
@@ -285,7 +296,7 @@ class RehearsalAPI:
                                  maximum=MAX_CHECKPOINTS if generation is None else 2)
 
     def list_objects(self, bucket, *, prefix="", maximum):
-        require(bucket in {WORKER_NAME, self.names["backup"], self.names["objects"]})
+        require(bucket in self.buckets)
         base = self.root + f"/r2/buckets/{bucket}/objects?"
         rows, cursors, cursor = [], set(), None
         while True:
@@ -309,10 +320,11 @@ class RehearsalAPI:
             cursors.add(cursor)
 
     def r2(self, method, bucket, key, body=None):
-        require(method in {"GET", "PUT"} and bucket in {WORKER_NAME, self.names["backup"], self.names["objects"]})
+        require(method in {"GET", "PUT"} and bucket in self.buckets)
         if bucket == WORKER_NAME:
-            require(journal_key(self.journal_prefix, key) is not None or method == "GET" and matches(KEY, key))
-        elif bucket == self.names["backup"]:
+            require(journal_key(self.journal_prefix, key) is not None
+                    or self.profile == "native" and method == "GET" and matches(KEY, key))
+        elif bucket == self.names.get("backup"):
             require(key == self.archive_prefix + "manifest.json" or re.fullmatch(re.escape(self.archive_prefix) + r"(?:sql/[0-9]{1,3}\.sql|blobs/[a-f0-9]{64})", key))
         else:
             require(method == "GET" and key in self.restore_keys)
@@ -435,8 +447,9 @@ def journal_key(prefix, key):
 class Journal:
     """Append-only intent log, serialized by the protected workflow concurrency group."""
 
-    def __init__(self, api, owner):
+    def __init__(self, api, owner, *, guard=None):
         self.api, self.owner = api, owner
+        self.guard = guard
         self.value = None
         self.generation = 0
         self.key = self.raw = None
@@ -480,6 +493,8 @@ class Journal:
         key = f"{self.api.journal_prefix}{generation:06d}-{token_hex(16)}.json"
         expected = canonical({"generation": generation, "previous": previous, "value": value})
         require(len(expected) <= JOURNAL_BYTES and self.api.object_or_none(WORKER_NAME, key)[0] is None)
+        if self.guard is not None:
+            self.guard()
         # From this point no subsequent checkpoint is allowed until exact
         # readback. Losing the runner cannot authorize the operation it fenced.
         self.poisoned = True
@@ -839,6 +854,9 @@ def resource_identity(kind, value, expected_name):
 
 
 class Rehearsal:
+    resource_kinds = RESOURCES
+    creation_window_seconds = None
+
     def __init__(self, api, source, journal, directory):
         self.api, self.source, self.journal, self.directory = api, source, journal, directory
 
@@ -858,7 +876,9 @@ class Rehearsal:
             candidate = exact[0].get("uuid")
             require(matches(UUID, candidate) and candidate != self.api.target["d1Id"])
             self.api.databases.add(candidate)
-            return resource_identity(kind, self.api.json("GET", self.api.root + "/d1/database/" + candidate), name)
+            identity = resource_identity(kind, self.api.json("GET", self.api.root + "/d1/database/" + candidate), name)
+            require(identity["id"] == candidate, "D1 inventory and detail identities disagree.")
+            return identity
         path = self.api.root + "/r2/buckets?" + urlencode({"name_contains": name, "per_page": 100})
         envelope = self.api.json("GET", path, envelope=True)
         result = envelope["result"]
@@ -881,7 +901,7 @@ class Rehearsal:
     def verify_resources(self, *, all_required=False):
         require(self.journal.value is not None)
         resources = self.journal.value["resources"]
-        require(set(resources) == set(RESOURCES))
+        require(set(resources) == set(self.resource_kinds))
         for kind, record in resources.items():
             require(isinstance(record, dict) and set(record) == {"pin", "intent"})
             if record["pin"] is not None:
@@ -895,15 +915,15 @@ class Rehearsal:
 
     def prepare(self, pin):
         require(self.journal.value is None, "This rehearsal already has a private journal.")
-        require(all(self.observe(kind) is None for kind in RESOURCES), "A proposed rehearsal resource name is occupied.")
+        require(all(self.observe(kind) is None for kind in self.resource_kinds), "A proposed rehearsal resource name is occupied.")
         self.source.before_write()
         self.journal.save({"version": 1, "cohort": self.api.cohort, "scopeSha256": self.source.scope_sha256,
-            "sourcePin": pin, "resources": {kind: {"pin": None, "intent": None} for kind in RESOURCES},
+            "sourcePin": pin, "resources": {kind: {"pin": None, "intent": None} for kind in self.resource_kinds},
             "phase": "prepared", "export": None, "backup": None, "importState": None,
             "lease": {"owner": self.journal.owner, "until": int(time.time()) + LEASE_SECONDS}})
 
     def create(self, kind):
-        require(kind in RESOURCES)
+        require(kind in self.resource_kinds)
         record = self.journal.value["resources"][kind]
         if record["pin"] is not None:
             require(self.observe(kind) == record["pin"])
@@ -937,7 +957,7 @@ class Rehearsal:
         self.journal.update(resources=resources)
 
     def pin_resource(self, kind, expected_sha256):
-        require(kind in RESOURCES and matches(DIGEST, expected_sha256))
+        require(kind in self.resource_kinds and matches(DIGEST, expected_sha256))
         resources = deepcopy(self.journal.value["resources"])
         record = resources[kind]
         require(record["pin"] is None and isinstance(record["intent"], dict)
@@ -947,6 +967,9 @@ class Rehearsal:
         created = datetime.fromisoformat(candidate["createdAt"]).timestamp()
         require(created >= record["intent"]["at"] - 5,
                 "The observed resource predates the recorded project creation attempt.")
+        if self.creation_window_seconds is not None:
+            require(created <= record["intent"]["at"] + self.creation_window_seconds,
+                    "The observed resource falls outside the recorded project creation window.")
         self.source.before_write()
         record["pin"] = candidate
         record["intent"]["state"] = "confirmed"
@@ -1155,6 +1178,9 @@ class Rehearsal:
         require(len(actual) == len(set(actual)))
         return set(actual)
 
+    def before_target_write(self):
+        self.source.before_write()
+
     def restore_objects(self):
         self.verify_resources(all_required=True)
         document, _ = self.manifest()
@@ -1175,7 +1201,7 @@ class Rehearsal:
         bucket, key = self.api.names["objects"], entry["key"]
         current, _ = self.api.object_or_none(bucket, key)
         if current is None:
-            self.source.before_write()
+            self.before_target_write()
             try:
                 self.api.put_restored_object(key, body, entry["metadata"])
             except RehearsalError as error:
@@ -1229,7 +1255,7 @@ class Rehearsal:
         require(migrations._matches_schema(self.api, path, ()), "Native import requires the new, still empty restore D1.")
         if state is None:
             self.journal.update(importState={"state": "init-started", "etag": document["sqlMd5"]})
-            self.source.before_write()
+            self.before_target_write()
             try:
                 result = self.api.json("POST", path + "/import", {"action": "init", "etag": document["sqlMd5"]})
             except RehearsalError:
@@ -1246,7 +1272,7 @@ class Rehearsal:
             state = {"state": "upload-ready", "filename": result["filename"], "url": result["upload_url"], "etag": document["sqlMd5"]}
             self.journal.update(importState=state)
         require(state.get("state") in {"upload-ready", "upload-unknown"} and state.get("etag") == document["sqlMd5"])
-        self.source.before_write()
+        self.before_target_write()
         try:
             signed_transfer(state["url"], upload=sql, expected_md5=document["sqlMd5"])
         except RehearsalError:
@@ -1254,7 +1280,7 @@ class Rehearsal:
             raise
         require(migrations._matches_schema(self.api, path, ()))
         self.journal.update(importState={"state": "ingest-started", "filename": state["filename"], "etag": state["etag"]})
-        self.source.before_write()
+        self.before_target_write()
         try:
             result = self.api.json("POST", path + "/import", {"action": "ingest", "filename": state["filename"], "etag": state["etag"]})
         except RehearsalError:
@@ -1265,6 +1291,12 @@ class Rehearsal:
         return self.verify_restore(document)
 
     def verify_restore(self, document=None):
+        summary, document = self.read_restored_summary(document)
+        self.journal.update(phase="verified", importState={"state": "verified"}, targetDataSha256=summary["dataSha256"],
+                            targetPublishedShareMetadataCount=published_share_metadata_count(document["objects"]))
+        return summary
+
+    def read_restored_summary(self, document=None):
         self.verify_resources(all_required=True)
         if document is None:
             document, _ = self.manifest()
@@ -1275,9 +1307,7 @@ class Rehearsal:
         summary = remote_summary(self.api, self.api.restore_id, document["layout"])
         require(summary == document["summary"], "The native restored target does not match the captured full data digest.")
         self.verify_object_bytes(document)
-        self.journal.update(phase="verified", importState={"state": "verified"}, targetDataSha256=summary["dataSha256"],
-                            targetPublishedShareMetadataCount=published_share_metadata_count(document["objects"]))
-        return summary
+        return summary, document
 
 
 def report(journal, source):
