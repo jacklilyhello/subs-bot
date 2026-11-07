@@ -36,6 +36,6 @@ CREATE INDEX telegram_private_share_creations_actor_order ON telegram_private_sh
 CREATE INDEX telegram_private_share_creations_reserved ON telegram_private_share_creations (bot_id, next_check_at, receipt_id)
     WHERE state = 'reserved';
 
--- cleaned_at records the last confirmed absence; abandoned tombstones stay due for bounded re-observation.
+-- cleaned_at records confirmed absence. Recheck abandoned rows for late R2 commits.
 CREATE INDEX telegram_private_share_creations_cleanup ON telegram_private_share_creations (bot_id, next_check_at, receipt_id)
     WHERE state = 'abandoned';
