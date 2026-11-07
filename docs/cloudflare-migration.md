@@ -330,6 +330,12 @@ PY
 
 最多保留 20,000 条分享、20,000 条领取、单份正文 64 KiB、正文合计 64 MiB 及分享索引 32 MiB。超限或有不一致时整包失败。只有退出码 `0`、最后写入的 `manifest.sha256` 与清单相符，且清单和三个数据文件的闭包完整时才接收。能力字段只保存摘要。正文按原字节保存，可能已含敏感文字、URL 或旧分享码。整个包只在获准的私有渠道流转，禁止进入 PR、日志、普通 Actions 产物或缓存。普通 CI 只使用合成样本。该盘点不导入 Worker 或变更 Telegram 权限，旧链接连续性另行验收。
 
+### 旧私密分享候选恢复包
+
+在获准的托管 runner 上，运行 `worker/tools/legacy_private_share_candidate.py INVENTORY_DIR WORKER_ARTIFACT_DIR OUTPUT_DIR INVENTORY_MANIFEST_SHA WORKER_MANIFEST_SHA REVISION APPLIED_AT SOURCE_SQLITE_SHA LEGACY_BOT_ID LEGACY_BOT_USERNAME`。使用已核对的封存清单、原 SQLite 摘要和旧 Bot 身份作为独立输入。输出目录须尚未存在，封存盘点目录、Worker 产物目录和输出父目录仅供当前账号访问。
+
+`legacy-private-shares-v1` 仅填充准确的 0005 分享和领取表。封存程序逐行复核领取人与指定对象、份数和原时间，保留已到期记录的原到期秒，并逐对象核对原 UTF-8 正文的字节和摘要。私有正文存于 `objects/private-shares/`。内联消息标识留在封存盘点中，候选仅记录其数量。SQL 重放核对完整结构、外键、编号序列和对象闭包。每包最多 512 个正文对象，每个最多 64 KiB，SQL 重放上限为 4 MiB，所有数据库行仍受原生恢复上限约束。候选保持未绑定，旧 Bot 链接与内联卡片连续性需另行验收。
+
 ### 真实数据与生产切换门槛
 
 1. 先只读核对 Cloudflare 目标账户、Zone、`subs-bot.lilyya.top` 的 DNS、Worker 路由和 Custom Domain 绑定。新资源记录账号、环境及资源 ID，隔离与生产分别使用各自的 Worker、D1、R2 和队列。现有配置冲突须在改动前报告。目标主机名可用且切换获准后，仅增加所需的 Custom Domain 绑定。 [Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)
