@@ -307,6 +307,12 @@ PY
 
 在原命令末尾显式附加 `legacy-empty-v3 SOURCE_SQLITE_SHA OWNER_MAP_SHA` 可构建版本 3。新增参数分别固定已封存 SQLite 与已核准归属映射的 SHA-256，Worker 产物必须包含摘要吻合的 0026 迁移。已验证的旧空节点数组按目标订阅编号、归属与原令牌摘要写入标记表，包含活动和回收站记录。回收站的标记在同一订阅恢复后才可用于导出。SQL 重放核对完整标记集及迁移记录，清单另记活动和回收站标记数、迁移和表摘要。包的验证范围限于候选数据，原生导入和空导出 HTTP 行为需分别验收。
 
+### 旧私密分享候选恢复包
+
+在获准的托管 runner 上，运行 `worker/tools/legacy_private_share_candidate.py INVENTORY_DIR WORKER_ARTIFACT_DIR OUTPUT_DIR INVENTORY_MANIFEST_SHA WORKER_MANIFEST_SHA REVISION APPLIED_AT SOURCE_SQLITE_SHA LEGACY_BOT_ID LEGACY_BOT_USERNAME`。使用已核对的封存清单、原 SQLite 摘要和旧 Bot 身份作为独立输入。输出目录须尚未存在，封存盘点目录、Worker 产物目录和输出父目录仅供当前账号访问。
+
+`legacy-private-shares-v1` 仅填充准确的 0005 分享和领取表。封存程序逐行复核领取人与指定对象、份数和原时间，保留已到期记录的原到期秒，并逐对象核对原 UTF-8 正文的字节和摘要。私有正文存于 `objects/private-shares/`。内联消息标识留在封存盘点中，候选仅记录其数量。SQL 重放核对完整结构、外键、编号序列和对象闭包。每包最多 512 个正文对象，每个最多 64 KiB，SQL 重放上限为 4 MiB，所有数据库行仍受原生恢复上限约束。候选保持未绑定，旧 Bot 链接与内联卡片连续性需另行验收。
+
 ### 旧私密分享与领取盘点
 
 真实盘点在单独获准的受保护托管运行中使用核对过的源码提交。将关闭的 UTF-8、DELETE 日志模式备份放入仅供当前账号访问的目录，确认普通文件归当前账号所有、没有其他硬链接或 SQLite 伴随文件。准备尚未存在的私有输出目录路径。关闭命令跟踪，运行 `python3 -B worker/tools/legacy_private_share_inventory.py BACKUP OUTPUT EXPECTED_SOURCE_SHA256 LEGACY_BOT_ID LEGACY_BOT_USERNAME`。源 SHA-256 须取自独立的备份交接记录。旧 Bot 的正十进制 ID 和小写用户名须取自单独核对过的身份记录，用户名省略 `@`。程序在不可变只读事务前后核对同一文件及 SHA-256。 [SQLite URI](https://sqlite.org/uri.html)
