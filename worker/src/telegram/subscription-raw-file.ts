@@ -203,7 +203,7 @@ export async function prepareTelegramSubscriptionRawFile(
       for await (const node of readPlannedSnapshotNodes(bucket, plan, abort)) yield map(node);
     } };
     for await (const chunk of rawShareBytes(source, signal, MAX_RAW_FILE_BYTES)) {
-      chunks.push(chunk);
+      chunks.push(Uint8Array.from(chunk));
       bytes += chunk.byteLength;
     }
     if (signal.aborted || bytes === 0) return { kind: "text", text: "暂时无法读取订阅节点。", guard };

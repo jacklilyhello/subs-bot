@@ -22,7 +22,7 @@ function shareLine(node: NodeRecord): string {
 
 export async function* rawShareBytes(
   source: ExportNodeSource, signal?: AbortSignal, maxBytes = MAX_SHARE_BYTES,
-): AsyncGenerator<Uint8Array<ArrayBuffer>> {
+): AsyncGenerator<Uint8Array> {
   const encoder = new TextEncoder();
   let total = 0;
   let count = 0;
