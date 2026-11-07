@@ -11,9 +11,10 @@ import { renderTelegramPath } from "./path-management.ts";
 import { beginTelegramPrivateClaim, prepareTelegramPrivateClaim } from "./private-claims.ts";
 import { resolveTelegramPrivateShareCreationReply } from "./private-share-creation.ts";
 import { PRIVATE_SHARE_DISABLED, type TelegramPrivateShareRuntime } from "./private-share-runtime.ts";
+import { confirmTelegramShortLinkSend, prepareTelegramShortLinkReply, retireUnsentTelegramShortLink } from "./short-link-actions.ts";
 import {
   beginTelegramAggregateLinkReply, beginTelegramPrivateShareCreationReply,
-  beginTelegramSelectedLinkReply, beginTelegramReply, claimTelegramReply, isTelegramMemberAllowed,
+  beginTelegramSelectedLinkReply, beginTelegramShortLinkReply, beginTelegramReply, claimTelegramReply, isTelegramMemberAllowed,
   prepareTelegramPrivateClaimBegin, reapExpiredTelegramReplies, settleTelegramReply,
   type TelegramReplyLease, type TelegramReplyOutcome,
 } from "./store.ts";
@@ -114,7 +115,9 @@ export async function sendTelegramReply(
   keyboard?: InlineKeyboard,
   forceReply = false,
 ): Promise<TelegramReplyOutcome> {
-  if ((lease.path || lease.privateShareCreation) && (lease.chatType !== "private" || lease.threadId !== null)) return { kind: "failed" };
+  if ((lease.path || lease.privateShareCreation || lease.shortLink) && (lease.chatType !== "private" || lease.threadId !== null)) {
+    return { kind: "failed" };
+  }
   return sendTelegram(policy, lease, "sendMessage", {
     chat_id: lease.chatId,
     ...(lease.threadId === null ? {} : { message_thread_id: lease.threadId }),
@@ -251,6 +254,32 @@ async function renderReply(
   return { text: lease.command === "start" ? `欢迎使用 subs-bot。\n${help}` : help, access: "allowed" };
 }
 
+async function deliverTelegramShortLink(
+  db: D1Database, policy: TelegramPolicy, lease: TelegramReplyLease, key: CryptoKey | null, deadline: number, request: typeof fetch,
+): Promise<void> {
+  if (lease.chatType !== "private" || lease.threadId !== null || !inTelegramScope(policy, lease)) return;
+  const allowed = lease.actorId === policy.adminId || await isTelegramMemberAllowed(db, policy);
+  const reply = allowed ? await prepareTelegramShortLinkReply(db, policy, lease, key)
+    : { kind: "notice" as const, text: "当前账号没有使用权限。" };
+  if (Date.now() >= deadline) return;
+  if (reply.kind === "link") {
+    if (!await beginTelegramShortLinkReply(db, policy, lease, reply.guard)) return;
+    if (!await confirmTelegramShortLinkSend(db, policy, lease, reply.guard) || Date.now() >= deadline) {
+      await settleTelegramReply(db, policy, lease, { kind: "failed" });
+      return;
+    }
+  } else {
+    await retireUnsentTelegramShortLink(db, policy, lease);
+    if (!await beginTelegramReply(db, policy, lease, allowed ? "allowed" : "denied")) return;
+  }
+  if (Date.now() >= deadline) {
+    await settleTelegramReply(db, policy, lease, { kind: "failed" });
+    return;
+  }
+  const outcome = await sendTelegramReply(policy, lease, reply.text, Math.max(1, deadline - Date.now()), request);
+  await settleTelegramReply(db, policy, lease, outcome);
+}
+
 export async function drainTelegramReplies(
   db: D1Database,
   bucket: R2Bucket,
@@ -260,14 +289,19 @@ export async function drainTelegramReplies(
   request: typeof fetch = fetch,
   aggregateKey: CryptoKey | null = null,
   privateShareRuntime: TelegramPrivateShareRuntime = PRIVATE_SHARE_DISABLED,
+  shortLinksEnabled = false,
 ): Promise<void> {
   const deadline = Date.now() + budgetMs;
   const privateShareEnabled = privateShareRuntime.schemaReady && privateShareRuntime.context !== null;
-  await reapExpiredTelegramReplies(db, policy.botId, aggregateKey !== null, privateShareEnabled);
+  await reapExpiredTelegramReplies(db, policy.botId, aggregateKey !== null, privateShareEnabled, shortLinksEnabled);
   for (let processed = 0; processed < limit && Date.now() < deadline; processed += 1) {
-    const lease = await claimTelegramReply(db, policy.botId, aggregateKey !== null, privateShareEnabled);
+    const lease = await claimTelegramReply(db, policy.botId, aggregateKey !== null, privateShareEnabled, shortLinksEnabled);
     if (!lease) return;
     if (!inTelegramScope(policy, lease)) continue;
+    if (lease.shortLink) {
+      await deliverTelegramShortLink(db, policy, lease, aggregateKey, deadline, request);
+      continue;
+    }
     if (lease.privateShareCreation && privateShareRuntime.context) {
       const reply = await resolveTelegramPrivateShareCreationReply(db, policy, lease, privateShareRuntime.context);
       if (reply && Date.now() < deadline && await beginTelegramPrivateShareCreationReply(db, policy, lease, reply)) {

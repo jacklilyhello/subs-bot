@@ -51,6 +51,7 @@ export type TelegramTempUpdate = TelegramEventScope & (
 
 export type TelegramPathUpdate = TelegramEventScope & { kind: "path"; args: string };
 export type TelegramPrivateShareCreationUpdate = TelegramEventScope & { args: string; senderName?: string };
+export type TelegramShortLinkUpdate = TelegramEventScope & { args: string };
 
 type ExistingUpdate =
   | { command: TelegramCommand; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; aggregate?: never; path?: never; document?: never; selected?: never }
@@ -63,8 +64,10 @@ type ExistingUpdate =
   | { document: TelegramDocumentJobInput; command?: never; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; aggregate?: never; path?: never; selected?: never }
   | { selected: TelegramSelectedUpdate; command?: never; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; aggregate?: never; path?: never; document?: never };
 
-type NormalizedUpdate = (ExistingUpdate & { privateShareCreation?: never })
+type CurrentUpdate = (ExistingUpdate & { privateShareCreation?: never })
   | ({ privateShareCreation: TelegramPrivateShareCreationUpdate } & Partial<Record<keyof ExistingUpdate, never>>);
+type NormalizedUpdate = (CurrentUpdate & { shortLink?: never })
+  | ({ shortLink: TelegramShortLinkUpdate } & Partial<Record<keyof CurrentUpdate, never>>);
 
 type DecodedTelegramRequest =
   | ({ status: 200 } & NormalizedUpdate)
@@ -172,7 +175,7 @@ function authCommand(args: string[], reply: unknown, memberId: string): Telegram
 function messageCommand(
   message: Record<string, unknown>, policy: TelegramPolicy,
 ): TelegramCommand["command"] | TelegramViewKind | "temp-summary" | "temp-clear" | "aggregate-show" | "aggregate-revoke" |
-  { code: string } | { args: string } | { shareArgs: string } | { selectedQuery: string } | null {
+  { code: string } | { args: string } | { shareArgs: string } | { selectedQuery: string } | { shortArgs: string } | null {
   const { text, entities } = message;
   if (typeof text !== "string" || !Array.isArray(entities)) return null;
   const commands = entities.filter((entity) => isRecord(entity) && entity.type === "bot_command" && entity.offset === 0);
@@ -191,6 +194,7 @@ function messageCommand(
   if (remainder !== "" && !separator.test(remainder)) return null;
   if (commandName === "path") return { args: remainder };
   if (commandName === "o") return { selectedQuery: remainder };
+  if (commandName === "short") return { shortArgs: remainder };
   if (commandName === "share") return remainder.length <= 4096 ? { shareArgs: remainder } : null;
   const args = remainder.trim().split(/\s+/u).filter(Boolean);
   switch (commandName) {
@@ -282,6 +286,7 @@ function normalizeMessage(
   const command = messageCommand(message, policy);
   if (command && typeof command === "object") {
     if (scope.chatType !== "private" || scope.threadId !== null) return null;
+    if ("shortArgs" in command) return { shortLink: { ...scope, args: command.shortArgs } };
     if ("shareArgs" in command) {
       const sender = isRecord(message.from) ? [message.from.first_name, message.from.last_name]
         .filter((part): part is string => typeof part === "string" && part.length <= 128).join(" ") : "";
@@ -303,6 +308,11 @@ function normalizeMessage(
   const lifecycle = renameReply(message, scope, policy);
   if (lifecycle) return { lifecycle };
   const { text, entities } = message;
+  if (scope.chatType === "private" && scope.threadId === null && typeof text === "string"
+    && (!Array.isArray(entities) || !entities.some((entity) => isRecord(entity) && entity.type === "bot_command"))) {
+    const short = /^(?:短链|short)(?: +([\s\S]*))?(?![\s\S])/iu.exec(text.replace(/^ +| +$/gu, ""));
+    if (short || text === "🔗 短链") return { shortLink: { ...scope, args: short?.[1] ?? "" } };
+  }
   return scope.chatType === "private" && scope.threadId === null && typeof text === "string"
     && text.trim() !== "" && !text.trimStart().startsWith("/")
     && (!Array.isArray(entities) || !entities.some((entity) =>
