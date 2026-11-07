@@ -221,7 +221,7 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 在获准的托管 runner 上，将完整封存的旧订阅转换包与核对过来源及摘要的 Worker 产物交给 `worker/tools/legacy_restore_package.py CONVERTER_DIR WORKER_ARTIFACT_DIR OUTPUT_DIR CONVERTER_MANIFEST_SHA WORKER_MANIFEST_SHA REVISION APPLIED_AT`。输入目录须仅供当前账号访问，输出目录须尚未存在。时间参数为候选迁移记录使用的 Unix 秒。程序使用完整增量结构构建独立候选数据库，并重新执行生成的 SQL，核对结构、外键、数据指纹、活动和回收站归属、编号序列及 R2 引用。
 
-候选包含原生导入所用的 `restore.sql`、逐行归属记录、精确对象和最后写入的 `manifest.sha256`。保留原始能力令牌和来源，目录及文件按私有数据管理。此工具只生成活动订阅与回收站候选，存在未处理的旧数据域时拒绝封存。实际云端导入、未发布订阅的 HTTP 行为、旧链接连续性和各格式兼容性分别验收。
+候选包含原生导入所用的 `restore.sql`、逐行归属记录、精确对象和最后写入的 `manifest.sha256`。保留原始能力令牌和来源，目录及文件按私有数据管理。路径规则和历史编号都为空时沿用版本 1。版本 2 另将旧 `path_maps` 归入 `path_rules`，保留原编号、顺序、关键字、备注以及已删除规则占用过的编号上界。旧群归属使用已核准的映射。归并到同一用户的不同旧归属，其关键字若在去除首尾空白和折叠大小写后重合，则阻止封存。该检查使用与 Worker 相同的 Unicode 14 规则，托管转换使用 CPython 3.11。无效文本和每位用户超过 64 条也会阻止封存。真实备份仍需盘点其他数据域，未处理的数据域有内容时同样会阻止封存。实际云端导入、未发布订阅的 HTTP 行为、旧链接连续性和各格式兼容性分别验收。
 
 ### 真实数据与生产切换门槛
 
