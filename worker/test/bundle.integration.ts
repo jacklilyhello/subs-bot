@@ -16,6 +16,7 @@ import { acceptTelegramCommand } from "../src/telegram/store.ts";
 import { verifyIsolation } from "../tools/verify-isolation.mjs";
 import "./backup-rehearsal.integration.ts";
 import "./telegram-private-share-command.integration.ts";
+import "./provider-job-consumer.integration.ts";
 import "./telegram-subscription-read.integration.ts";
 import "./telegram-temp-raw.integration.ts";
 

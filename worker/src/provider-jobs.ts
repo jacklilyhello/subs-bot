@@ -39,8 +39,8 @@ export interface ProviderJobLease {
 
 type TerminalFailure = "invalid-document" | "fetch-rejected" | "storage-failed";
 type RetryFailure = "busy" | "timeout" | "dns-failed" | "unavailable" | "upstream-retryable" | "storage-failed";
-type FailureOutcome = { kind: "retry"; reason: RetryFailure } | { kind: "failed"; reason: TerminalFailure };
-type ProviderJobOutcome = FailureOutcome | { kind: "saved"; snapshotId: string };
+export type ProviderFailureOutcome = { kind: "retry"; reason: RetryFailure } | { kind: "failed"; reason: TerminalFailure };
+type ProviderJobOutcome = ProviderFailureOutcome | { kind: "saved"; snapshotId: string };
 type Binding = string | number;
 type Guard = { sql: string; bindings: readonly Binding[] };
 type Receipt = {
@@ -350,7 +350,7 @@ export async function claimProviderJob(db: D1Database): Promise<ProviderJobLease
 
 /** Require both the guarded publication and saved settlement to affect one row in the same D1 batch. */
 export function prepareProviderJobSettlement(
-  db: D1Database, lease: ProviderJobLease, outcome: ProviderJobOutcome,
+  db: D1Database, lease: ProviderJobLease, outcome: ProviderJobOutcome, afterPublication = false,
 ): D1PreparedStatement {
   validateClaim(lease);
   if (!providerHost(lease.sourceUrl)) throw new RangeError("Invalid provider job lease.");
@@ -362,7 +362,7 @@ export function prepareProviderJobSettlement(
     const published = exactTarget(lease, outcome.snapshotId);
     return db.prepare(`UPDATE subscription_provider_jobs SET state = 'done', result_code = 'saved',
       finished_at = unixepoch(), lease_id = NULL, lease_until = NULL, failure_code = NULL
-      WHERE job_id = ? AND ${live.sql} AND ${published.sql}
+      WHERE job_id = ? AND ${live.sql} AND ${published.sql} ${afterPublication ? "AND changes() = 1" : ""}
       RETURNING state, result_code AS resultCode`).bind(lease.jobId, ...live.bindings, ...published.bindings);
   }
   const failure = outcome.kind === "failed" && ["invalid-document", "fetch-rejected", "storage-failed"].includes(outcome.reason);
@@ -389,7 +389,7 @@ export function prepareProviderJobSettlement(
 }
 
 export async function settleProviderJob(
-  db: D1Database, lease: ProviderJobLease, outcome: FailureOutcome,
+  db: D1Database, lease: ProviderJobLease, outcome: ProviderFailureOutcome,
 ): Promise<"retry" | "done" | "stale"> {
   if (outcome.kind !== "failed" && outcome.kind !== "retry") throw new RangeError("Invalid provider job outcome.");
   try {
@@ -397,5 +397,22 @@ export async function settleProviderJob(
     return row === null ? "stale" : row.state === "pending" ? "retry" : "done";
   } catch {
     throw new Error("Provider job settlement could not be confirmed.");
+  }
+}
+
+/** Release a live lease whose owned source or publication version changed. */
+export async function retireStaleProviderJob(db: D1Database, lease: ProviderJobLease): Promise<void> {
+  validateClaim(lease);
+  if (!providerHost(lease.sourceUrl)) throw new RangeError("Invalid provider job lease.");
+  const live = leaseGuard(lease);
+  const target = exactTarget(lease);
+  try {
+    const result = await db.prepare(`UPDATE subscription_provider_jobs SET state = 'done', result_code = 'stale-target',
+      finished_at = unixepoch(), lease_id = NULL, lease_until = NULL, failure_code = NULL
+      WHERE job_id = ? AND ${live.sql} AND NOT ${target.sql}`)
+      .bind(lease.jobId, ...live.bindings, ...target.bindings).run();
+    if (!result.success || ![0, 1].includes(result.meta.changes)) throw new Error();
+  } catch {
+    throw new Error("Stale provider job retirement could not be confirmed.");
   }
 }
