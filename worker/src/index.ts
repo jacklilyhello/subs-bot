@@ -1,6 +1,6 @@
 import { AggregateLimitError, getAggregateNodeSource, hasAggregateLink } from "./aggregate.ts";
-import { getSubscriptionSnapshot, readSnapshotNodes, SnapshotIntegrityError,
-  type ExportNodeSource, type NodeRecord } from "./storage.ts";
+import { SnapshotIntegrityError, type ExportNodeSource, type NodeRecord } from "./storage.ts";
+import { getSubscriptionNodeSource, PathRuleContentError } from "./path-rules.ts";
 import { isValidStoredShare } from "./stored-share.ts";
 import { serializeStructuredShare } from "./structured-share.ts";
 import { ClashContentError } from "./clash-export.ts";
@@ -206,7 +206,8 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
   if (!EXPORT_KINDS.has(format)) return plain("Export format unavailable.", 406, head);
 
   try {
-    const source = aggregate ? await getAggregateNodeSource(env.DB, env.NODES, token) : await subscriptionSource(env, token);
+    const source = aggregate ? await getAggregateNodeSource(env.DB, env.NODES, token)
+      : await getSubscriptionNodeSource(env.DB, env.NODES, token);
     if (!source) return plain("Not found.", 404, head);
     if (format === "clash") {
       const plan = await planClash(source);
@@ -241,16 +242,11 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
     });
   } catch (error) {
     if (error instanceof AggregateLimitError || error instanceof ExportContentError || error instanceof SingBoxContentError
-        || error instanceof ClashContentError || error instanceof TextExportError) {
+        || error instanceof ClashContentError || error instanceof TextExportError || error instanceof PathRuleContentError) {
       return plain("Subscription content cannot be exported.", 422, head);
     }
     return plain("Subscription temporarily unavailable.", 503, head);
   }
-}
-
-async function subscriptionSource(env: Env, token: string): Promise<ExportNodeSource | null> {
-  const snapshot = await getSubscriptionSnapshot(env.DB, token);
-  return snapshot && { nodeCount: snapshot.nodeCount, read: (signal) => readSnapshotNodes(env.NODES, snapshot, signal) };
 }
 
 async function recoverTelegramReplies(_controller: ScheduledController, env: Env): Promise<void> {
