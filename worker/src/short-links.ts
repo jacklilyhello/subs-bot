@@ -3,6 +3,15 @@ import { digestHex } from "./storage.ts";
 export const ISOLATION_PUBLIC_ORIGIN = "https://subs-bot-cf-dev-01.lilyya.workers.dev";
 export const SHORT_CODE = /^(?:[A-Za-z0-9_-]{12}|[A-Za-z0-9_-]{22})(?![\s\S])/u;
 export const NORMAL_CODE_SUFFIX = "s";
+export const LEGACY_SUBSCRIPTION_SHORT_MIGRATION = "0029_legacy_subscription_short_links.sql";
+export const LEGACY_SUBSCRIPTION_SHORT_SHA256 = "1a0da8aa8aedde095b3e1a4bc71b5e03376587882288c4e276c9a1f9afa1297d";
+export const LEGACY_SUBSCRIPTION_SHORT_PIN = `EXISTS (
+  SELECT 1 FROM subs_bot_schema_migrations WHERE position=29 AND mode='applied'
+    AND name='${LEGACY_SUBSCRIPTION_SHORT_MIGRATION}' AND sha256='${LEGACY_SUBSCRIPTION_SHORT_SHA256}'
+)`;
+const LEGACY_SUBSCRIPTION_TOKEN = /^[A-Za-z0-9_-]{16,128}(?![\s\S])/u;
+const LEGACY_SUBSCRIPTION_FORMATS = new Set(["", "clash", "base64", "v2ray", "mixed", "singbox", "sing-box", "surge",
+  "qx", "quantumult", "quantumultx"]);
 const MAX_TARGET_BYTES = 2048;
 const HOST_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
 const LOCAL_SUFFIXES = [".localhost", ".localdomain", ".local", ".internal", ".home.arpa", ".test", ".invalid", ".example",
@@ -64,36 +73,73 @@ export async function shortCodeDigest(code: string): Promise<string> {
   return digestHex(await crypto.subtle.digest("SHA-256", encoder.encode(code)));
 }
 
-export async function normalShortLinksReady(db: D1Database): Promise<boolean> {
+export interface ShortLinkNamespaces {
+  normal: boolean;
+  legacySubscription: boolean;
+  migrationLedger: boolean;
+}
+
+export async function readShortLinkNamespaces(db: D1Database): Promise<ShortLinkNamespaces> {
   try {
-    const row = await db.prepare(`SELECT count(*) AS present FROM sqlite_schema WHERE type='table'
-      AND name IN ('normal_short_links','telegram_short_link_actions')`).first<{ present: number }>();
-    if (row?.present === 0 || row?.present === 2) return row.present === 2;
+    const row = await db.prepare(`SELECT
+      count(CASE WHEN name IN ('normal_short_links','telegram_short_link_actions') THEN 1 END) AS normal,
+      count(CASE WHEN name='legacy_subscription_short_links' THEN 1 END) AS legacySubscription,
+      count(CASE WHEN name='subs_bot_schema_migrations' THEN 1 END) AS migrationLedger
+      FROM sqlite_schema WHERE type='table' AND name IN ('normal_short_links','telegram_short_link_actions',
+        'legacy_subscription_short_links','subs_bot_schema_migrations')`)
+      .first<{ normal: number; legacySubscription: number; migrationLedger: number }>();
+    if (row && (row.normal === 0 || row.normal === 2)) {
+      return { normal: row.normal === 2, legacySubscription: row.legacySubscription === 1,
+        migrationLedger: row.migrationLedger === 1 };
+    }
   } catch {
     // Fail closed when namespace state cannot be read.
   }
   throw new Error("Short link schema could not be confirmed.");
 }
 
+export async function normalShortLinksReady(db: D1Database): Promise<boolean> {
+  return (await readShortLinkNamespaces(db)).normal;
+}
+
 type ShortRow = {
-  kind: "aggregate" | "external";
+  kind: "aggregate" | "external" | "legacy-subscription";
   codeLength: number | null;
   targetUrl: string | null;
   revokedAt: number | null;
+  token: string | null;
+  tokenSha256: string | null;
+  format: string | null;
 };
 
-/** Both namespaces, including tombstones, are read from a single SQLite snapshot. */
-export async function resolveShortLocation(db: D1Database, code: string): Promise<string | null> {
+/** Even a disabled compatibility namespace reserves its digests. */
+export async function resolveShortLocation(db: D1Database, code: string, serveLegacy = false): Promise<string | null> {
   if (!SHORT_CODE.test(code)) return null;
+  const namespaces = await readShortLinkNamespaces(db);
   const digest = await shortCodeDigest(code);
-  const result = await db.prepare(`SELECT 'aggregate' AS kind,NULL AS codeLength,NULL AS targetUrl,revoked_at AS revokedAt
-    FROM aggregate_links WHERE code_sha256=?
-    UNION ALL SELECT 'external',code_length,target_url,revoked_at FROM normal_short_links WHERE code_sha256=?`)
-    .bind(digest, digest).all<ShortRow>();
+  const legacyEnabled = serveLegacy && code.length === 12 && namespaces.normal && namespaces.legacySubscription && namespaces.migrationLedger;
+  const legacyTarget = legacyEnabled ? `sub.token, link.token_sha256, link.format
+    FROM legacy_subscription_short_links AS link
+    LEFT JOIN subscriptions AS sub ON sub.id=link.subscription_id AND sub.owner_id=link.owner_id
+      AND link.revoked_at IS NULL AND ${LEGACY_SUBSCRIPTION_SHORT_PIN}
+      AND NOT EXISTS (SELECT 1 FROM subscription_trash AS trash WHERE trash.id=sub.id OR trash.token=sub.token)
+    WHERE link.code_sha256=?` : "NULL,NULL,NULL FROM legacy_subscription_short_links AS link WHERE link.code_sha256=?";
+  const result = await db.prepare(`SELECT 'aggregate' AS kind,NULL AS codeLength,NULL AS targetUrl,revoked_at AS revokedAt,
+      NULL AS token,NULL AS tokenSha256,NULL AS format FROM aggregate_links WHERE code_sha256=?
+    ${namespaces.normal ? `UNION ALL SELECT 'external',code_length,target_url,revoked_at,NULL,NULL,NULL
+      FROM normal_short_links WHERE code_sha256=?` : ""}
+    ${namespaces.legacySubscription ? `UNION ALL SELECT 'legacy-subscription',12,NULL,link.revoked_at,${legacyTarget}` : ""}`)
+    .bind(digest, ...(namespaces.normal ? [digest] : []), ...(namespaces.legacySubscription ? [digest] : [])).all<ShortRow>();
   if (!result.success) throw new Error("Short link state could not be read.");
   if (result.results.length !== 1 || result.results[0].revokedAt !== null) return null;
   const row = result.results[0];
   if (row.kind === "aggregate") return `/agg/${code}/clash`;
+  if (row.kind === "legacy-subscription") {
+    if (!legacyEnabled || row.token === null || !LEGACY_SUBSCRIPTION_TOKEN.test(row.token)
+      || row.format === null || !LEGACY_SUBSCRIPTION_FORMATS.has(row.format)
+      || await shortCodeDigest(row.token) !== row.tokenSha256) return null;
+    return row.format === "" ? `/sub/${row.token}` : `/sub/${row.token}/${row.format}`;
+  }
   if (row.kind !== "external" || row.codeLength !== code.length || (code.length === 22 && !code.endsWith(NORMAL_CODE_SUFFIX))) return null;
   return canonicalShortDestination(row.targetUrl);
 }

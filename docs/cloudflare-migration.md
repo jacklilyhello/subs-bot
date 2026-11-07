@@ -303,6 +303,14 @@ PY
 
 验收任务只读取已固定的资源和回执，并对隔离 Worker 的 GET 和 HEAD 检查状态、重定向目标和私有缓存响应头。探针在项目域名收到响应后结束。撤销后保留两条墓碑，原链接返回 `404`。外部 URL 的连接由使用者的客户端处理。
 
+### 旧单订阅短链
+
+`0029` 为旧版 12 位短码提供独立的兼容表。记录保存短码摘要、Bot、所有者、订阅 ID、原订阅令牌摘要、格式和时间。兼容表存在时，其中的摘要始终占用短码，和普通或聚合短码冲突的访问一律返回 `404`。 [D1 数据库批处理](https://developers.cloudflare.com/d1/worker-api/d1-database/#batch)
+
+首次启用前，以默认参数发布并回读同一提交和 Worker 产物的关闭版本。隔离发布工作流 `worker-isolation-deploy.yml` 的 `legacy_subscription_shorts` 默认为 `preserve`，初始不配置 `LEGACY_SUBSCRIPTION_SHORTS`。启用需指定 `legacy_subscription_shorts=enable` 和 `legacy_subscription_shorts_confirmation=enable legacy subscription shorts for subs-bot-cf-dev-01`。发布核对 `0029` 迁移、兼容表和主键索引，并回读 `legacySubscriptionShortsEnabled`。关闭使用 `disable` 和 `disable legacy subscription shorts for subs-bot-cf-dev-01`。关闭公开跳转时继续保留摘要占用和同一 Bot 下的所有者撤销。
+
+启用后，`/s/{code}` 只会跳到当前站点上仍由原所有者持有、令牌摘要一致的订阅。支持原格式按钮及现有 Base64、Sing-box、QX 别名，也保留省略格式的形式。目标移入回收站时返回 `404`，恢复同一订阅与令牌后可再次跳转。私聊 `/short revoke 短码` 可在公开跳转关闭时撤销自己的记录。撤销清除目标字段并保留摘要占用。旧库转换、真实旧域名和外部短链包装另行验收。
+
 ### 隔离合成旧订阅候选应用
 
 在受保护的 `main` 运行 `worker-isolation-legacy-candidate.yml`。所有步骤使用同一组全长 32 位小写十六进制 `cohort`、同一次成功的 Worker CI `source_run_id` 和同一已核对的隔离 Worker。开始前确认本轮可在产物保留期内完成，并保持 `main` 和隔离部署稳定。此流程从 CI 的固定合成候选包恢复，目标 D1 和 R2 的名称包含完整 `cohort`。只在源私有 R2 写入本组操作记录。

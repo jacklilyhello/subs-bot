@@ -1,5 +1,5 @@
-import { AggregateLimitError, getAggregateNodeSource, hasAggregateLink } from "./aggregate.ts";
-import { normalShortLinksReady, resolveShortLocation } from "./short-links.ts";
+import { AggregateLimitError, getAggregateNodeSource } from "./aggregate.ts";
+import { normalShortLinksReady, readShortLinkNamespaces, resolveShortLocation } from "./short-links.ts";
 import { getSubscriptionNodeSource, PathRuleContentError } from "./path-rules.ts";
 import { legacyEmptyExportResponse, legacyEmptyExportState } from "./legacy-empty-export.ts";
 import { base64Chunks, ExportContentError, planBase64 } from "./base64-response.ts";
@@ -54,6 +54,7 @@ export interface Env {
   PROVIDER_IMAGE_SHA256?: string;
   TELEGRAM_PROVIDER_URL_IMPORT?: string;
   TELEGRAM_PROVIDER_REFRESH?: string;
+  LEGACY_SUBSCRIPTION_SHORTS?: string;
 }
 
 const QX_KINDS = new Set(["qx", "quantumult", "quantumultx"]);
@@ -135,7 +136,8 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
     }
     const aggregateKey = await parseTelegramAggregateKey(env.TELEGRAM_AGGREGATE_KEY);
     const privateShare = await telegramPrivateShareRuntime(env.DB, env.TELEGRAM_PRIVATE_SHARE_CREATION_KEY);
-    const shortLinks = await normalShortLinksReady(env.DB);
+    const shortLinkNamespaces = await readShortLinkNamespaces(env.DB);
+    const shortLinks = shortLinkNamespaces.normal;
     const subscriptionRead = await telegramSubscriptionReadReady(env.DB);
     const inlineSort = await telegramInlineSortReady(env.DB);
     const subscriptionNodes = subscriptionRead && await telegramSubscriptionNodePagesReady(env.DB);
@@ -225,7 +227,7 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
       await acceptTelegramDocumentJob(env.DB, policy, decoded.document);
     } else if (decoded.shortLink) {
       if (!shortLinks) return new Response(null, { status: 204, headers: HEADERS });
-      if (await acceptTelegramShortLink(env.DB, policy, decoded.shortLink, aggregateKey) === "accepted") drain();
+      if (await acceptTelegramShortLink(env.DB, policy, decoded.shortLink, aggregateKey, shortLinkNamespaces) === "accepted") drain();
     } else if (decoded.subscriptionRead) {
       if (!subscriptionRead) return new Response(null, { status: 204, headers: HEADERS });
       const outcome = await acceptTelegramSubscriptionRead(env.DB, policy, decoded.subscriptionRead, subscriptionNodes);
@@ -286,8 +288,7 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
 
   if (short) {
     try {
-      const location = await normalShortLinksReady(env.DB) ? await resolveShortLocation(env.DB, short[1])
-        : await hasAggregateLink(env.DB, short[1]) ? `/agg/${short[1]}/clash` : null;
+      const location = await resolveShortLocation(env.DB, short[1], env.LEGACY_SUBSCRIPTION_SHORTS === "1");
       return location ? new Response(null, { status: 302, headers: { ...HEADERS, Location: location } })
         : plain("Not found.", 404, head);
     } catch {
@@ -300,7 +301,8 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
   if (!EXPORT_KINDS.has(format)) return plain("Export format unavailable.", 406, head);
 
   try {
-    let source = aggregate ? await getAggregateNodeSource(env.DB, env.NODES, token, await normalShortLinksReady(env.DB))
+    const namespaces = aggregate ? await readShortLinkNamespaces(env.DB) : null;
+    let source = namespaces ? await getAggregateNodeSource(env.DB, env.NODES, token, namespaces.normal, namespaces.legacySubscription)
       : await getSubscriptionNodeSource(env.DB, env.NODES, token);
     if (subscription && !source) {
       const state = await legacyEmptyExportState(env.DB, token);

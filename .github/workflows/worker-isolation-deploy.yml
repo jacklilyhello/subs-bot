@@ -40,6 +40,16 @@ on:
         description: Exact isolation confirmation for provider refresh enable or disable
         required: false
         type: string
+      legacy_subscription_shorts:
+        description: Preserve, enable, or disable isolated typed legacy subscription short links
+        required: true
+        default: preserve
+        type: choice
+        options: [preserve, enable, disable]
+      legacy_subscription_shorts_confirmation:
+        description: Exact isolation confirmation for legacy subscription short-link enable or disable
+        required: false
+        type: string
 
 permissions:
   actions: read
@@ -76,6 +86,8 @@ jobs:
           SUBS_BOT_PROVIDER_URL_IMPORT_CONFIRMATION: ${{ inputs.provider_url_import_confirmation }}
           SUBS_BOT_PROVIDER_REFRESH_MODE: ${{ inputs.provider_refresh }}
           SUBS_BOT_PROVIDER_REFRESH_CONFIRMATION: ${{ inputs.provider_refresh_confirmation }}
+          SUBS_BOT_LEGACY_SUBSCRIPTION_SHORTS_MODE: ${{ inputs.legacy_subscription_shorts }}
+          SUBS_BOT_LEGACY_SUBSCRIPTION_SHORTS_CONFIRMATION: ${{ inputs.legacy_subscription_shorts_confirmation }}
           SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
           SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
           SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPLOY_TOKEN }}

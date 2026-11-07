@@ -35,6 +35,12 @@ PROVIDER_REFRESH_MIGRATIONS = (
     *PROVIDER_URL_IMPORT_MIGRATIONS,
     (28, "0028_telegram_provider_refresh_tickets.sql", "ccbfe6d71864608b9a6d680d955c11af083aa34280b55845edef1296d87dab2e"),
 )
+LEGACY_SUBSCRIPTION_SHORT_BINDING = "LEGACY_SUBSCRIPTION_SHORTS"
+LEGACY_SUBSCRIPTION_SHORT_TAG_PREFIX = "legacy-sl-"
+LEGACY_SUBSCRIPTION_SHORT_MIGRATION = "0029_legacy_subscription_short_links.sql"
+LEGACY_SUBSCRIPTION_SHORT_SHA256 = "1a0da8aa8aedde095b3e1a4bc71b5e03376587882288c4e276c9a1f9afa1297d"
+# SQLite records the exact CREATE statement without the trailing semicolon.
+LEGACY_SUBSCRIPTION_SHORT_TABLE_SHA256 = "7c490869f45c42234b6c01083975a8cb06bfa5fe8d104a89ab69f24d156fc8e2"
 AGGREGATE_KEY_BINDING = "TELEGRAM_AGGREGATE_KEY"
 AGGREGATE_DIGEST_BINDING = "TELEGRAM_AGGREGATE_KEY_SHA256"
 PRIVATE_SHARE_KEY_BINDING = "TELEGRAM_PRIVATE_SHARE_CREATION_KEY"
@@ -178,6 +184,7 @@ class _Version:
     telegram_inline_search: bool = False
     telegram_provider_url_import: bool = False
     telegram_provider_refresh: bool = False
+    legacy_subscription_shorts: bool = False
 
 
 def _release_tag(revision, telegram_digest, aggregate_digest, private_share_digest, provider_binding):
@@ -198,13 +205,15 @@ def _inline_search_tag(tag):
     return "inline-" + sha256(f"{tag}:inline-search:1".encode("ascii")).hexdigest()
 
 
-def _telegram_feature_tag(tag, inline_search, provider_url_import, provider_refresh=False):
+def _telegram_feature_tag(tag, inline_search, provider_url_import, provider_refresh=False, legacy_subscription_shorts=False):
     if inline_search:
         tag = _inline_search_tag(tag)
     if provider_url_import:
         tag = PROVIDER_URL_IMPORT_TAG_PREFIX + sha256(f"{tag}:provider-url-import:1".encode("ascii")).hexdigest()
     if provider_refresh:
         tag = PROVIDER_REFRESH_TAG_PREFIX + sha256(f"{tag}:provider-refresh:1".encode("ascii")).hexdigest()
+    if legacy_subscription_shorts:
+        tag = LEGACY_SUBSCRIPTION_SHORT_TAG_PREFIX + sha256(f"{tag}:legacy-subscription-shorts:1".encode("ascii")).hexdigest()
     return tag
 
 
@@ -364,6 +373,33 @@ class _Isolation:
         except (CloudflareError, AttributeError, TypeError, ValueError):
             raise CloudflareError(error) from None
 
+    def verify_legacy_subscription_shorts(self):
+        path = f"{self.account}/d1/database/{self.target['d1Id']}/query"
+        error = "The isolated legacy subscription short-link schema could not be verified."
+        try:
+            result = self.data_api("POST", path, {"sql": """
+                SELECT name, sha256, mode,
+                  (SELECT sql FROM sqlite_schema WHERE type='table'
+                    AND name='legacy_subscription_short_links' AND tbl_name='legacy_subscription_short_links') AS tableSql,
+                  (SELECT count(*) FROM sqlite_schema WHERE type='index'
+                    AND tbl_name='legacy_subscription_short_links') AS indexCount,
+                  (SELECT count(*) FROM sqlite_schema WHERE type='index' AND tbl_name='legacy_subscription_short_links'
+                    AND name='sqlite_autoindex_legacy_subscription_short_links_1' AND sql IS NULL) AS primaryIndex
+                FROM subs_bot_schema_migrations WHERE position=29
+            """})
+            _require(isinstance(result, list) and len(result) == 1 and result[0].get("success") is True, error)
+            rows = result[0].get("results")
+            _require(isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict), error)
+            row = rows[0]
+            _require(set(row) == {"name", "sha256", "mode", "tableSql", "indexCount", "primaryIndex"}
+                     and row["name"] == LEGACY_SUBSCRIPTION_SHORT_MIGRATION and row["sha256"] == LEGACY_SUBSCRIPTION_SHORT_SHA256
+                     and row["mode"] == "applied" and type(row["indexCount"]) is int and row["indexCount"] == 1
+                     and type(row["primaryIndex"]) is int and row["primaryIndex"] == 1
+                     and isinstance(row["tableSql"], str)
+                     and sha256(row["tableSql"].encode("utf-8")).hexdigest() == LEGACY_SUBSCRIPTION_SHORT_TABLE_SHA256, error)
+        except (CloudflareError, AttributeError, TypeError, ValueError):
+            raise CloudflareError(error) from None
+
     def active(self):
         result = _object(self.worker_api("GET", self.deployments), "deployments").get("deployments")
         _require(isinstance(result, list) and result, "Isolated Worker has no verified active deployment.")
@@ -390,7 +426,7 @@ class _Isolation:
                                                      {"enabled": False, "cross_version_cache": False}),
                  "Isolated Worker version runtime settings differ from the supported configuration.")
         rows = version.get("bindings")
-        _require(isinstance(rows, list) and 3 <= len(rows) <= 15
+        _require(isinstance(rows, list) and 3 <= len(rows) <= 16
                  and all(isinstance(row, dict) and isinstance(row.get("name"), str) for row in rows),
                  "Unexpected isolated Worker binding inventory.")
         bindings = {row["name"]: row for row in rows}
@@ -400,8 +436,9 @@ class _Isolation:
         inline = bindings.get(INLINE_SEARCH_BINDING)
         provider_url = bindings.get(PROVIDER_URL_IMPORT_BINDING)
         refresh = bindings.get(PROVIDER_REFRESH_BINDING)
+        legacy_shorts = bindings.get(LEGACY_SUBSCRIPTION_SHORT_BINDING)
         binding_names = set(bindings) - PROVIDER_BINDINGS - {
-            INLINE_SEARCH_BINDING, PROVIDER_URL_IMPORT_BINDING, PROVIDER_REFRESH_BINDING,
+            INLINE_SEARCH_BINDING, PROVIDER_URL_IMPORT_BINDING, PROVIDER_REFRESH_BINDING, LEGACY_SUBSCRIPTION_SHORT_BINDING,
         }
         _require(len(bindings) == len(rows) and binding_names in (base_bindings, telegram_bindings,
             telegram_bindings | AGGREGATE_BINDINGS, telegram_bindings | PRIVATE_SHARE_BINDINGS,
@@ -417,6 +454,9 @@ class _Isolation:
         _require(refresh is None or (has_provider and TELEGRAM_BINDINGS <= binding_names and refresh == {
             "name": PROVIDER_REFRESH_BINDING, "type": "plain_text", "text": "1",
         }), "Unexpected isolated Worker provider refresh binding.")
+        _require(legacy_shorts is None or legacy_shorts == {
+            "name": LEGACY_SUBSCRIPTION_SHORT_BINDING, "type": "plain_text", "text": "1",
+        }, "Unexpected isolated Worker legacy subscription short-link binding.")
         db, r2, rev = (bindings[name] for name in ("DB", "NODES", "BUILD_REVISION"))
         database_ids = [db[key] for key in ("database_id", "id") if db.get(key) is not None]
         _require(db.get("type") == "d1" and database_ids
@@ -475,19 +515,24 @@ class _Isolation:
                  "Isolated Worker provider URL import release tag differs.")
         _require(refresh is not None or not (isinstance(tag, str) and tag.startswith(PROVIDER_REFRESH_TAG_PREFIX)),
                  "Isolated Worker provider refresh release tag differs.")
-        if inline is not None or provider_url is not None or refresh is not None:
+        _require(legacy_shorts is not None or not (isinstance(tag, str) and tag.startswith(LEGACY_SUBSCRIPTION_SHORT_TAG_PREFIX)),
+                 "Isolated Worker legacy subscription short-link release tag differs.")
+        if inline is not None or provider_url is not None or refresh is not None or legacy_shorts is not None:
             expected = _telegram_feature_tag(_release_tag(rev["text"], telegram_digest, aggregate_digest,
                                                            private_share_digest, provider_binding),
-                                             inline is not None, provider_url is not None, refresh is not None)
+                                             inline is not None, provider_url is not None, refresh is not None,
+                                             legacy_shorts is not None)
             feature = "inline search"
-            if refresh is not None:
+            if legacy_shorts is not None:
+                feature = "legacy subscription short-link"
+            elif refresh is not None:
                 feature = "provider refresh"
             elif provider_url is not None:
                 feature = "provider URL import"
             _require(tag == expected, f"Isolated Worker {feature} release tag differs.")
         return _Version(rev["text"], sha256(body).hexdigest(), version["compatibility_date"],
                         tag, telegram_digest, aggregate_digest, private_share_digest, provider_binding, inline is not None,
-                        provider_url is not None, refresh is not None)
+                        provider_url is not None, refresh is not None, legacy_shorts is not None)
 
     def verify_candidate(self, candidate, desired):
         # A version can be visible in its creation response or listing before its module is readable.
@@ -546,6 +591,8 @@ class _Isolation:
             bindings.append({"type": "plain_text", "name": PROVIDER_URL_IMPORT_BINDING, "text": "1"})
         if desired.telegram_provider_refresh:
             bindings.append({"type": "plain_text", "name": PROVIDER_REFRESH_BINDING, "text": "1"})
+        if desired.legacy_subscription_shorts:
+            bindings.append({"type": "plain_text", "name": LEGACY_SUBSCRIPTION_SHORT_BINDING, "text": "1"})
         message = "Reviewed isolated Worker release"
         if desired.provider_binding is not None:
             binding = desired.provider_binding
@@ -797,6 +844,22 @@ def _provider_refresh_target(active, requested, manifest, telegram_digest, provi
     return enabled
 
 
+def _legacy_subscription_shorts_target(active, requested, manifest):
+    _require(requested is None or type(requested) is bool, "Invalid isolated legacy subscription short-link release mode.")
+    enabled = active.legacy_subscription_shorts if requested is None else requested
+    if not (active.legacy_subscription_shorts or enabled):
+        return enabled
+    entries = manifest.get("migrations") if isinstance(manifest, dict) else None
+    _require(isinstance(entries, list) and len(entries) >= 29 and entries[28] == {
+        "name": LEGACY_SUBSCRIPTION_SHORT_MIGRATION, "sha256": LEGACY_SUBSCRIPTION_SHORT_SHA256,
+    }, "Isolated legacy subscription short links require the exact 0029 migration artifact.")
+    if enabled and not active.legacy_subscription_shorts:
+        _require(active.revision == manifest.get("revision") and active.digest == manifest.get("bundleSha256")
+                 and active.compatibility == manifest.get("compatibilityDate"),
+                 "Enable legacy subscription short links only after verifying the same Worker artifact with compatibility disabled.")
+    return enabled
+
+
 def _require_telegram_config_continuity(active, desired_digest):
     _require(active.telegram_config_sha256 is None or active.telegram_config_sha256 == desired_digest,
              "Changing or dropping the isolated Telegram configuration requires a separate scoped release.")
@@ -807,7 +870,7 @@ def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECI
                          release_revision=None, provider_first_binding_guard=None, historical_application_revision=None,
                          release_manifest=None,
                          telegram_config=_UNSPECIFIED_TELEGRAM_CONFIG, inline_search=None, provider_url_import=None,
-                         provider_refresh=None):
+                         provider_refresh=None, legacy_subscription_shorts=None):
     """Read ownership, privacy and active binding facts before any release writes."""
     scope = _Isolation(worker_api, data_api, target)
     scope.worker_config()
@@ -855,6 +918,10 @@ def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECI
         scope.verify_provider_refresh()
     elif verify_provider_url:
         scope.verify_provider_url_import()
+    if release_manifest is not None or legacy_subscription_shorts is not None:
+        enabled = _legacy_subscription_shorts_target(version, legacy_subscription_shorts, release_manifest)
+        if version.legacy_subscription_shorts or enabled:
+            scope.verify_legacy_subscription_shorts()
     if provider_binding is not _UNSPECIFIED_PROVIDER_BINDING:
         _verify_first_provider_binding(version, provider_binding, release_revision, provider_first_binding_guard,
                                        historical_application_revision)
@@ -869,7 +936,7 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                    provider_binding: ProviderBinding | None = None, provider_guard=None, provider_first_binding_guard=None,
                    historical_application_revision: str | None = None,
                    inline_search: bool | None = None, provider_url_import: bool | None = None,
-                   provider_refresh: bool | None = None):
+                   provider_refresh: bool | None = None, legacy_subscription_shorts: bool | None = None):
     """Release the verified Worker and optionally configure its isolated Telegram schedule."""
     _require((provider_binding is None and provider_guard is None) or (provider_binding is not None and callable(provider_guard)),
              "An isolated provider release requires a verified dependency guard.")
@@ -899,6 +966,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
         desired.telegram_config_sha256, desired.provider_binding, had_cron)
     refresh_enabled = _provider_refresh_target(old_version, provider_refresh, manifest,
         desired.telegram_config_sha256, desired.provider_binding, had_cron)
+    legacy_shorts_enabled = _legacy_subscription_shorts_target(old_version, legacy_subscription_shorts, manifest)
+    verify_legacy_shorts = old_version.legacy_subscription_shorts or legacy_shorts_enabled
     verify_provider_schema = None
     if old_version.telegram_provider_refresh or refresh_enabled:
         verify_provider_schema = scope.verify_provider_refresh
@@ -911,12 +980,14 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                   desired.telegram_private_share_key_sha256, desired.provider_binding),
                  "Change the isolated inline search flag with the existing Cron, same keys and provider binding.")
     desired = replace(desired, telegram_inline_search=enabled, telegram_provider_url_import=provider_url_enabled,
-                      telegram_provider_refresh=refresh_enabled,
-                      tag=_telegram_feature_tag(desired.tag, enabled, provider_url_enabled, refresh_enabled))
+                      telegram_provider_refresh=refresh_enabled, legacy_subscription_shorts=legacy_shorts_enabled,
+                      tag=_telegram_feature_tag(desired.tag, enabled, provider_url_enabled, refresh_enabled, legacy_shorts_enabled))
     if inline_bot is not None:
         scope.verify_inline_search(inline_bot, require_fresh=first_enable)
     if verify_provider_schema is not None:
         verify_provider_schema()
+    if verify_legacy_shorts:
+        scope.verify_legacy_subscription_shorts()
     _verify_first_provider_binding(old_version, desired.provider_binding, desired.revision, provider_first_binding_guard,
                                    historical_application_revision)
     _verify_health(old_version.revision)
@@ -927,10 +998,11 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
         if (old_version.telegram_config_sha256, old_version.telegram_aggregate_key_sha256,
                 old_version.telegram_private_share_key_sha256, old_version.provider_binding,
                 old_version.telegram_inline_search, old_version.telegram_provider_url_import,
-                old_version.telegram_provider_refresh) == (
+                old_version.telegram_provider_refresh, old_version.legacy_subscription_shorts) == (
                 desired.telegram_config_sha256, desired.telegram_aggregate_key_sha256,
                 desired.telegram_private_share_key_sha256, desired.provider_binding,
-                desired.telegram_inline_search, desired.telegram_provider_url_import, desired.telegram_provider_refresh):
+                desired.telegram_inline_search, desired.telegram_provider_url_import, desired.telegram_provider_refresh,
+                desired.legacy_subscription_shorts):
             if telegram_config is None:
                 _require(scope.active() == previous, "Active isolated Worker deployment changed during verification.")
                 _guard_current(guard)
@@ -939,7 +1011,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                 changed = scope.ensure_cron(previous, config, guard)
             return {"revision": desired.revision, "deploymentId": previous.id, "versionId": previous.version,
                     "previousVersionId": previous.version, "changed": changed, "inlineSearchEnabled": enabled,
-                    "providerUrlImportEnabled": provider_url_enabled, "providerRefreshEnabled": refresh_enabled}
+                    "providerUrlImportEnabled": provider_url_enabled, "providerRefreshEnabled": refresh_enabled,
+                    "legacySubscriptionShortsEnabled": legacy_shorts_enabled}
 
     candidate = scope.staged(desired)
     if candidate is None:
@@ -956,6 +1029,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
         scope.verify_inline_search(inline_bot, require_fresh=first_enable)
     if verify_provider_schema is not None:
         verify_provider_schema()
+    if verify_legacy_shorts:
+        scope.verify_legacy_subscription_shorts()
     _require(scope.active() == previous, "Active isolated Worker deployment changed before activation.")
     _guard_current(guard)
     activated = scope.activate(previous, candidate, f"Isolated Worker release {desired.revision} {uuid4()}")
@@ -969,6 +1044,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
             scope.verify_inline_search(inline_bot)
         if verify_provider_schema is not None:
             verify_provider_schema()
+        if verify_legacy_shorts:
+            scope.verify_legacy_subscription_shorts()
         if provider_guard is not None:
             provider_guard()
         _require(scope.active() == activated, "Active isolated Worker deployment changed during verification.")
@@ -982,8 +1059,10 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
             _guard_current(guard)
             restored = scope.activate(activated, previous.version, f"Isolated Worker rollback {uuid4()}")
             _verify_health(old_version.revision)
-            if inline_bot is not None or verify_provider_schema is not None:
+            if inline_bot is not None or verify_provider_schema is not None or verify_legacy_shorts:
                 _require(scope.version(restored.version) == old_version, "Isolated Worker Telegram rollback state differs.")
+            if old_version.legacy_subscription_shorts:
+                scope.verify_legacy_subscription_shorts()
             _require(scope.active() == restored, "Isolated Worker rollback activation changed.")
         except CloudflareError:
             raise CloudflareError("Isolated Worker verification failed and a safe rollback could not be confirmed.") from None
@@ -994,4 +1073,5 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
         scope.ensure_cron(activated, config, guard)
     return {"revision": desired.revision, "deploymentId": activated.id, "versionId": activated.version,
             "previousVersionId": previous.version, "changed": True, "inlineSearchEnabled": enabled,
-            "providerUrlImportEnabled": provider_url_enabled, "providerRefreshEnabled": refresh_enabled}
+            "providerUrlImportEnabled": provider_url_enabled, "providerRefreshEnabled": refresh_enabled,
+            "legacySubscriptionShortsEnabled": legacy_shorts_enabled}
