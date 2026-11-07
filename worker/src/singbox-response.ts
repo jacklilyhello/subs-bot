@@ -1,4 +1,5 @@
 import { serializeSingBoxOutbound, SingBoxContentError } from "./singbox-export.ts";
+import { allocateExportNames } from "./export-names.ts";
 import { readSnapshotNodes, SnapshotIntegrityError, type SubscriptionSnapshot } from "./storage.ts";
 
 const MAX_EXPORT_BYTES = 16 * 1024 * 1024;
@@ -37,20 +38,7 @@ export async function planSingBox(
   }
   if (names.length !== snapshot.nodeCount || names.length === 0) throw new SnapshotIntegrityError();
 
-  // Reserve original names even when a later outbound will use them.
-  const originals = new Set(names);
-  const used = new Set(["proxy", "direct"]);
-  const nextSuffix = new Map<string, number>();
-  const tags = names.map((name) => {
-    let tag = name;
-    if (used.has(tag)) {
-      let suffix = nextSuffix.get(name) ?? 2;
-      do {
-        tag = name + " (" + suffix++ + ")";
-      } while (used.has(tag) || originals.has(tag));
-      nextSuffix.set(name, suffix);
-    }
-    used.add(tag);
+  const tags = allocateExportNames(names, ["proxy", "direct"]).map((tag) => {
     const quoted = JSON.stringify(tag);
     bytes += 2 * encoder.encode(quoted).byteLength;
     return quoted;

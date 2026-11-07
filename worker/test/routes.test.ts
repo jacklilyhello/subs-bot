@@ -187,8 +187,7 @@ test("wrong capabilities and unavailable formats never read private objects", as
   assert.equal(notFound.status, 404);
   assertPrivate(notFound);
   assert.equal(await notFound.text(), "Not found.");
-  assert.equal((await request(`/sub/${TOKEN}/clash`, env)).status, 406);
-  assert.equal((await request(`/sub/${TOKEN}`, env)).status, 406);
+  assert.equal((await request("/sub/" + TOKEN + "/unsupported", env)).status, 406);
   const post = await request(`/sub/${TOKEN}/base64`, env, "POST");
   assert.equal(post.status, 405);
   assert.equal(post.headers.get("allow"), "GET, HEAD");
@@ -371,6 +370,75 @@ test("Sing-box caps expanded Hysteria hopping entries across the whole response"
     const response = await request("/sub/" + TOKEN + "/singbox", env, "HEAD");
     assert.equal(response.status, status);
     assert.equal(response.body, null);
+  }
+});
+
+test("the default and explicit Clash routes stream the same bounded private YAML", async () => {
+  const node = { type: "ss", server: "203.0.113.12", port: 8388, cipher: "aes-256-gcm", password: "fixture:港\u0085🌐" };
+  const { env, reads } = fixture([[{ ...node, name: "DIRECT" }], [{ ...node, name: "DIRECT (2)" }]]);
+  const pass = ["manifest.json", "0.ndjson", "1.ndjson"].map((name) => PREFIX + name);
+  const path = "/sub/" + TOKEN;
+  const alias = path + "/cLaSh";
+  const head = await request(alias, env, "HEAD");
+  assert.equal(head.status, 200);
+  assert.equal(head.body, null);
+  assertPrivate(head);
+  assert.deepEqual(reads.splice(0), pass);
+  const response = await request(path, env);
+  const alternate = await request(alias, env);
+  assert.equal(response.status, 200);
+  assert.equal(alternate.status, 200);
+  assert.equal(response.headers.get("content-type"), "text/yaml; charset=utf-8");
+  assertPrivate(response);
+  const yaml = await response.text();
+  assert.equal(await alternate.text(), yaml);
+  assert.match(yaml, /^proxies:\n/u);
+  assert(yaml.includes('"name":"DIRECT (3)"') && yaml.includes('"name":"DIRECT (2)"'));
+  assert(yaml.includes('"proxies":["DIRECT (3)","DIRECT (2)"]'));
+  assert(yaml.includes("fixture:港\\u0085🌐"));
+  assert.deepEqual(reads, [...pass, ...pass, ...pass, ...pass]);
+});
+
+test("Clash rejects lossy input before success and aborts a failed second snapshot pass", async () => {
+  const path = "/sub/" + TOKEN;
+  const bad = fixture([[{ share: LINK }], [{ share: "hy2://fixture@hy.example.invalid?pinSHA256=" + "ab".repeat(32) }]]);
+  const rejected = await request(path, bad.env);
+  assert.equal(rejected.status, 422);
+  assert.equal(await rejected.text(), "Subscription content cannot be exported.");
+  assertPrivate(rejected);
+
+  const missing = await request("/sub/other-sub-token-000000", bad.env, "HEAD");
+  assert.equal(missing.status, 404);
+  assert.equal(missing.body, null);
+
+  const { env } = fixture([[{ share: LINK }], [{ share: LINK }]]);
+  const get = env.NODES.get.bind(env.NODES);
+  let reads = 0;
+  env.NODES.get = async (key: string) => {
+    if (key === PREFIX + "1.ndjson" && ++reads === 2) throw new Error("synthetic backend credential");
+    return get(key);
+  };
+  const response = await request(path, env);
+  assert.equal(response.status, 200);
+  const reader = response.body!.getReader();
+  assert.equal(new TextDecoder().decode((await reader.read()).value), "proxies:\n");
+  assert.equal((await reader.read()).done, false);
+  await assert.rejects(reader.read(), { message: "Subscription stream failed." });
+  assert.equal(reads, 2);
+});
+
+test("Clash limits serialized names and aggregate hopping expansion during preflight", async () => {
+  const path = "/sub/" + TOKEN;
+  const name = "港".repeat(340) + "xy";
+  for (const [label, status] of [[name, 200], [name + "z", 422]] as const) {
+    const { env } = fixture([[{ name: label, share: LINK }]]);
+    assert.equal((await request(path, env, "HEAD")).status, status);
+  }
+  const node = { type: "hysteria2", server: "hy2.example.invalid" };
+  const full = Array.from({ length: 16 }, () => ({ ...node, ports: "1-65535" }));
+  for (const [ports, status] of [["443-458", 200], ["443-459", 422]]) {
+    const { env } = fixture([[...full, { ...node, ports }]]);
+    assert.equal((await request(path, env, "HEAD")).status, status);
   }
 });
 

@@ -112,20 +112,24 @@ function safeAuthority(value: string): boolean {
   return !/[/#?@:]/u.test(plain.normalize("NFKC")) && value.includes("[") === value.includes("]");
 }
 
-export function validInlineEch(value: string): boolean {
-  if (value.length > 87384) return false;
+export function normalizeInlineEch(value: string): string | null {
+  if (value.length > 87384) return null;
   const raw = decodeBase64(value);
-  if (raw === null || raw.length < 6) return false;
+  if (raw === null || raw.length < 6) return null;
   // Hysteria falls back to treating non-inline values as paths. Match only the
   // four canonical Base64 forms its inline decoder accepts.
   const standard = btoa(raw);
   const urlSafe = standard.replaceAll("+", "-").replaceAll("/", "_");
-  if (![standard, standard.replace(/=+$/u, ""), urlSafe, urlSafe.replace(/=+$/u, "")].includes(value)) return false;
+  if (![standard, standard.replace(/=+$/u, ""), urlSafe, urlSafe.replace(/=+$/u, "")].includes(value)) return null;
   const u16 = (offset: number) => raw.charCodeAt(offset) * 256 + raw.charCodeAt(offset + 1);
-  if (u16(0) !== raw.length - 2) return false;
+  if (u16(0) !== raw.length - 2) return null;
   let offset = 2;
   while (offset + 4 <= raw.length) offset += 4 + u16(offset + 2);
-  return offset === raw.length;
+  return offset === raw.length ? standard : null;
+}
+
+export function validInlineEch(value: string): boolean {
+  return normalizeInlineEch(value) !== null;
 }
 
 function validHysteriaQuery(address: string): boolean {
@@ -168,27 +172,33 @@ function isPluginParameter(field: string): boolean {
   return key.toLowerCase() === "plugin";
 }
 
-export function validShadowsocksPlugin(value: string): boolean {
+export function parseShadowsocksPlugin(value: string): {
+  plugin: "obfs-local" | "v2ray-plugin"; options: Map<string, string | undefined>;
+} | null {
   const [plugin, options = ""] = splitOnce(value, ";");
-  if (INVALID_LINE_CHARACTER.test(value) || (plugin !== "obfs-local" && plugin !== "v2ray-plugin")) return false;
-  if (!options) return true;
+  if (INVALID_LINE_CHARACTER.test(value) || (plugin !== "obfs-local" && plugin !== "v2ray-plugin")) return null;
+  const parsed = new Map<string, string | undefined>();
+  if (!options) return { plugin, options: parsed };
 
   // Mirror the audited Python SIP003 client allowlist and its escape grammar.
   const parts = options.match(/(?:\\[:;=\\]|[^\\;])+/gu) ?? [];
   const normalized = parts.join(";");
-  if (options !== normalized && options !== normalized + ";") return false;
+  if (options !== normalized && options !== normalized + ";") return null;
   const allowed = plugin === "obfs-local" ? ["obfs", "obfs-host"] : ["mode", "host", "path", "tls", "mux"];
-  const seen = new Set<string>();
   for (const part of parts) {
     const [key, setting] = splitOnce(part, "=");
-    if (!allowed.includes(key) || seen.has(key) || (key !== "tls" && !setting)) return false;
-    if (key === "obfs" && setting !== "http" && setting !== "tls") return false;
-    if (key === "mode" && setting !== "websocket") return false;
-    if (key === "tls" && setting !== undefined && setting !== "1" && setting !== "true") return false;
-    if (key === "mux" && numberInRange(setting, 0, 65535) === null) return false;
-    seen.add(key);
+    if (!allowed.includes(key) || parsed.has(key) || (key !== "tls" && !setting)) return null;
+    if (key === "obfs" && setting !== "http" && setting !== "tls") return null;
+    if (key === "mode" && setting !== "websocket") return null;
+    if (key === "tls" && setting !== undefined && setting !== "1" && setting !== "true") return null;
+    if (key === "mux" && numberInRange(setting, 0, 65535) === null) return null;
+    parsed.set(key, setting?.replace(/\\([:;=\\])/gu, "$1"));
   }
-  return parts.length > 0;
+  return parts.length > 0 ? { plugin, options: parsed } : null;
+}
+
+export function validShadowsocksPlugin(value: string): boolean {
+  return parseShadowsocksPlugin(value) !== null;
 }
 
 function validShadowsocksQuery(address: string): boolean {

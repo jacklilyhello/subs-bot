@@ -9,7 +9,7 @@
 | 路径 | 隔离 Worker 的行为 |
 | --- | --- |
 | `GET` 或 `HEAD /health` | 返回部署的 40 位 Git commit SHA，供部署验收核对 |
-| `GET` 或 `HEAD /sub/{token}/{format}` | 读取当前已发布快照，支持 `base64`、`v2ray`、`mixed` 以及 `singbox` 和 `sing-box` |
+| `GET` 或 `HEAD /sub/{token}/{format}` | 读取当前已发布快照，支持 `base64`、`v2ray`、`mixed`、`singbox`、`sing-box` 和 `clash`。省略格式时使用 `clash` |
 
 能力链接视同凭据。成功与失败响应均使用 `Cache-Control: no-store, private`、`Referrer-Policy: no-referrer` 和 `X-Content-Type-Options: nosniff`。`HEAD` 执行同样的预检并返回相同状态，响应体为空。未知能力链接返回 `404`，未支持的导出格式返回 `406`，内容无法完整转换或超过格式限制时返回 `422`。若预检时发现已引用的快照不可用或校验失败，返回 `503`。
 
@@ -20,6 +20,8 @@
 Sing-box 返回含选择器、直连项和代理出站的 JSON。支持 Shadowsocks、VMess、VLESS、Trojan、Hysteria 1 和 2、TUIC、AnyTLS、SOCKS 和 HTTP(S) 的已支持选项。HTTP(S) 使用结构化节点，VMess 的分享 URI 使用 Base64 JSON。引用其他出站或本地文件、执行外部插件、未支持的旧式协议，以及无法保持语义的 Hysteria 2 URI 证书钉扎和 ECH，都会使该订阅的 Sing-box 导出返回 `422`。Sing-box JSON 独立限制为 16 MiB 和 25,000 个代理出站。每个原始节点名的 JSON 编码最多 1 KiB，所有原始节点名合计最多 2 MiB。GitHub 托管 runner 使用校验过 SHA-256 的 Sing-box 1.14.4 检查实际 Worker 响应。 [Sing-box 1.14.4](https://github.com/SagerNet/sing-box/releases/tag/v1.14.4) · [Sing-box 出站](https://sing-box.sagernet.org/configuration/outbound/)
 
 Hysteria 1 分享 URI 的 `peer` 映射到 TLS SNI，上传和下载速率必须达到客户端最小值。Hysteria 2 的 Gecko 包大小沿用客户端默认值与 2,048 字节上限。Hysteria 1 和 2 客户端加载配置时会逐项展开跳跃端口。Worker 在每个出站限制 65,535 项，每份配置限制 1,048,576 项。端口范围的首尾均计入，重复和重叠项分别计数。这是客户端内存保护限额。 [Hysteria 1 URI](https://v1.hysteria.network/docs/uri-scheme/) · [Sing-box 1.14.4 所用端口展开代码](https://github.com/SagerNet/sing-quic/blob/7e0a5869a5f4/hysteria/client.go#L111-L139) · [Hysteria 2 Gecko 与端口展开](https://github.com/SagerNet/sing-quic/blob/7e0a5869a5f4/hysteria2/client.go#L115-L140)
+
+Clash 返回 `text/yaml`，保留旧版的节点选择、自动选择和匹配规则。节点名碰到内建名称、分组名称或其他节点时自动分配后缀，原有不冲突的名称保持原样。支持 Shadowsocks、VMess、VLESS、Trojan、Hysteria 1 和 2、TUIC v5、AnyTLS、SOCKS5 和 HTTP(S) 的可转换设置。支持经过校验的 Hysteria 2 内联 ECH，无法保持语义的 URI 证书钉扎、作用域 IPv6、未支持的协议或本地文件与其他出站依赖返回 `422`。Clash 配置最多 16 MiB 和 25,000 个代理，原始节点名上限与 Sing-box 相同，并使用相同的 Hysteria 跳跃端口计数上限。托管 CI 用校验过 SHA-256 的 Mihomo 1.19.33 读取实际 Worker 响应。 [Mihomo 1.19.33](https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.33) · [Mihomo Hysteria 2](https://wiki.metacubex.one/en/config/proxies/hysteria2/)
 
 聚合、其他导出格式、数据导入界面、订阅拉取和生产域名属于后续阶段。
 
@@ -56,7 +58,7 @@ Hysteria 1 分享 URI 的 `peer` 映射到 TLS SNI，上传和下载速率必须
 | 订阅列表、重命名和回收站 | Telegram 的 `/list`、`/expire` 和 `/recycle` 按所有者翻页。编号按钮可发起重命名、确认删除和恢复。订阅详情和批量操作分阶段接入。 |
 | 私聊、群聊、内联及授权 | Webhook 和 D1 记录更新与授权。用指定管理员、普通用户和测试群验收；后续增加持久会话状态、按钮与内联更新。 |
 | 私密分享 | 单独迁移有效期、指定用户、份数及领取事务。验证重复领取、争抢最后一份、撤权及过期。 |
-| 导入、格式与链接 | 覆盖 URL、文档、文本与 Base64 导入。补齐旧路径、其余协议及 Clash、Surge、Quantumult X 格式，再接入聚合、短链、路径映射和临时节点。旧链接和授权由迁移对账验证。 |
+| 导入、格式与链接 | 覆盖 URL、文档、文本与 Base64 导入。补齐其余协议及 Surge、Quantumult X 格式，再接入聚合、短链、路径映射和临时节点。旧链接和授权由迁移对账验证。 |
 | 更新、批量任务与搜索 | 持久任务记录进度、重试和恢复；上游失败保留上一版快照。对照旧 Bot 的搜索和导出入口，用获准的真实提供方验证出网。 |
 | 备份与交接 | 在独立恢复目标核对 D1 元数据、R2 清单、账号归属、旧能力和完整字节，演练版本回滚后再准备切换。 |
 

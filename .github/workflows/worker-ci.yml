@@ -75,7 +75,15 @@ jobs:
             --output "$archive"
           printf '%s  %s\n' '699a1b510aa4396b2176d32d1181920399ebf1e267835da6f3b598d0f7c24968' "$archive" | sha256sum --check
           tar -xzf "$archive" -C "$workdir"
-          SINGBOX_TEST_BINARY="$workdir/sing-box-1.14.4-linux-amd64/sing-box" npm run test:bundle
+          archive="$workdir/mihomo.gz"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 120 \
+            https://github.com/MetaCubeX/mihomo/releases/download/v1.19.33/mihomo-linux-amd64-compatible-v1.19.33.gz \
+            --output "$archive"
+          printf '%s  %s\n' '386508bfb1c72c43b6a0eda73708ecdce82546581b0ebcb16366c53757c622b6' "$archive" | sha256sum --check
+          gzip -dc "$archive" > "$workdir/mihomo"
+          chmod 0700 "$workdir/mihomo"
+          SINGBOX_TEST_BINARY="$workdir/sing-box-1.14.4-linux-amd64/sing-box" \
+            MIHOMO_TEST_BINARY="$workdir/mihomo" npm run test:bundle
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: subs-bot-worker-${{ env.BUILD_REVISION }}-${{ github.run_attempt }}
