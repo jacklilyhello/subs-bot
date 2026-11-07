@@ -297,3 +297,60 @@ test("protected comparator counts only closed traits on rejected structured VMes
   assert.deepEqual(report.diagnostics.formats.clash.rejectedTraits, {});
   assert.deepEqual(report.diagnostics.formats.singbox.rejectedTraits, {});
 });
+
+const cipherFixture = {
+  type: "vmess", server: "203.0.113.41", uuid: "12345678-1234-4234-8234-123456789012",
+};
+
+test("emitted Sing-box refuses Mihomo VMess auto with TLS without dropping nodes", { timeout: 60_000 }, async (t) => {
+  const choices = [
+    { name: "TLS auto", cipher: "auto", tls: true },
+    { name: "TLS default", tls: true },
+    { name: "Plain auto", cipher: "auto", tls: false },
+    { name: "TLS AES", cipher: "aes-128-gcm", tls: true },
+    { name: "TLS ChaCha20", cipher: "chacha20-poly1305", tls: true },
+  ];
+  const proxies = choices.map((choice) => ({ ...cipherFixture, port: 443, alterId: 0, ...choice }));
+  const { report, scratch } = await protectedReplay(t, Buffer.from(JSON.stringify({ proxies })));
+  assert.equal(report.job, "saved");
+  assert.equal(report.document.format, "clash");
+  assert.equal(report.formats.clash.status, 200);
+  assert.equal(report.formats.singbox.status, 422);
+  assert.deepEqual(report.diagnostics.formats.singbox.admitted, { vmess: 3 });
+  assert.deepEqual(report.diagnostics.formats.singbox.rejected, { vmess: 2 });
+  const emitted = parse(await readFile(join(scratch, "clash.body"), "utf8"));
+  assert.deepEqual(emitted.proxies.map(({ cipher }: { cipher: string }) => cipher),
+    ["auto", "auto", "auto", "aes-128-gcm", "chacha20-poly1305"]);
+});
+
+test("emitted Clash preserves effective Sing-box VMess auto and TLS", { timeout: 60_000 }, async (t) => {
+  const choices = [
+    ["auto", true, "zero"], ["", true, "zero"], [undefined, true, "zero"],
+    ["auto", false, "auto"], [undefined, false, "auto"],
+    ["aes-128-gcm", true, "aes-128-gcm"], ["chacha20-poly1305", true, "chacha20-poly1305"],
+    ["none", true, "none"], ["zero", true, "zero"],
+  ] as const;
+  const outbounds = choices.map(([security, enabled], index) => ({ ...cipherFixture, tag: `VMess ${index}`,
+    server_port: 443, alter_id: 0, security, tls: enabled ? { enabled, server_name: "vm.example.invalid" } : { enabled } }));
+  const { report, scratch } = await protectedReplay(t, Buffer.from(JSON.stringify({ outbounds })));
+  assert.equal(report.job, "saved");
+  assert.equal(report.document.format, "singbox");
+  assert.equal(report.formats.singbox.status, 200);
+  assert.equal(report.formats.clash.status, 200);
+  const clashConfig = join(scratch, "clash.body");
+  const emitted = parse(await readFile(clashConfig, "utf8"));
+  assert.deepEqual(emitted.proxies.map(({ cipher, tls }: { cipher: string; tls?: boolean }) => [cipher, tls === true]),
+    choices.map(([, enabled, cipher]) => [cipher, enabled]));
+  const singboxConfig = join(scratch, "singbox.body");
+  const native = JSON.parse(await readFile(singboxConfig, "utf8"));
+  assert.deepEqual(native.outbounds.slice(2), JSON.parse(JSON.stringify(outbounds)));
+  const mihomo = process.env.MIHOMO_TEST_BINARY;
+  const singbox = process.env.SINGBOX_TEST_BINARY;
+  assert.ok(mihomo && singbox);
+  const clashCheck = spawnSync(mihomo, ["-t", "-d", scratch, "-f", clashConfig], {
+    stdio: "ignore", env: { HOME: scratch }, timeout: 15_000,
+  });
+  assert.equal(clashCheck.status, 0, "Pinned Mihomo must accept the converted VMess ciphers.");
+  const singboxCheck = spawnSync(singbox, ["check", "-c", singboxConfig], { stdio: "ignore", timeout: 15_000 });
+  assert.equal(singboxCheck.status, 0, "Pinned Sing-box must accept the unchanged native VMess ciphers.");
+});
