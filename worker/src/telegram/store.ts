@@ -22,7 +22,8 @@ import { installTelegramBulkTrashTicket, TELEGRAM_BULK_TRASH_MARKER, type BulkTr
 import { TELEGRAM_INLINE_SORT_MARKER, type TelegramInlineSortReply } from "./inline-sort.ts";
 import { insertTelegramNodePageTickets, TELEGRAM_SUBSCRIPTION_NODE_MARKER, type TelegramNodePageTicket } from "./subscription-node-pages.ts";
 import { telegramProviderReplyClock, telegramProviderReplyEligible, telegramProviderReplyMarker, telegramProviderReplySendGuard,
-  type TelegramProviderReply } from "./provider-replies.ts";
+  type TelegramProviderReply, type TelegramProviderRequestKind } from "./provider-replies.ts";
+import { insertTelegramProviderRefreshTicket, type TelegramProviderRefreshTicket } from "./provider-refresh.ts";
 import { TELEGRAM_INLINE_CONSENT_MARKER, type TelegramInlineConsentReply } from "./inline-search-consent.ts";
 import { TELEGRAM_GITHUB_SEARCH_MARKER, telegramGitHubSearchEligible, telegramGitHubSearchMarker, telegramGitHubSendGuard,
   type TelegramGitHubReply } from "./github-search.ts";
@@ -46,6 +47,7 @@ export interface TelegramReplyLease extends TelegramCommand {
   inlineSort?: TelegramInlineSortReply;
   subscriptionNodes?: true;
   providerOutcome?: TelegramProviderReply;
+  providerRequestKind?: TelegramProviderRequestKind;
   bulkTrash?: true;
   inlineConsent?: TelegramInlineConsentReply;
   githubSearch?: TelegramGitHubReply;
@@ -65,7 +67,7 @@ type ReplyAccess = "allowed" | "denied" | "none";
 
 type ReplyRow = Omit<TelegramReplyLease,
   "view" | "lifecycle" | "privateClaim" | "temp" | "tempRaw" | "aggregate" | "selected" | "path" | "document" |
-  "privateShareCreation" | "subscriptionRead" | "shortLink" | "inlineSort" | "subscriptionNodes" | "providerOutcome" |
+  "privateShareCreation" | "subscriptionRead" | "shortLink" | "inlineSort" | "subscriptionNodes" | "providerOutcome" | "providerRequestKind" |
   "bulkTrash" | "inlineConsent" | "githubSearch"> & {
   viewKind: TelegramView["kind"] | null;
   afterId: number | null;
@@ -98,6 +100,7 @@ type ReplyRow = Omit<TelegramReplyLease,
   inlineSortMode: TelegramInlineSortReply["mode"];
   subscriptionNodeMarker: number;
   providerResult: TelegramProviderReply | null;
+  providerKind: TelegramProviderRequestKind | null;
   bulkTrashMarker: number;
   inlineConsentKind: TelegramInlineConsentReply | null;
   githubSearchState: TelegramGitHubReply["state"] | null;
@@ -302,6 +305,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
         ${includeInlineSort ? "sort.mode" : "NULL"} AS inlineSortMode,
         CASE WHEN inbox.receipt_nonce='${TELEGRAM_SUBSCRIPTION_NODE_MARKER}' THEN 1 ELSE 0 END AS subscriptionNodeMarker,
         ${includeProvider ? "provider.outcome" : "NULL"} AS providerResult,
+        ${includeProvider ? "(SELECT kind FROM telegram_provider_requests WHERE receipt_id=provider.receipt_id)" : "NULL"} AS providerKind,
         CASE WHEN inbox.receipt_nonce='${TELEGRAM_BULK_TRASH_MARKER}' THEN 1 ELSE 0 END AS bulkTrashMarker,
         ${includeInlineConsent ? "consent.kind" : "NULL"} AS inlineConsentKind,
         ${includeGitHubSearch ? "github.state" : "NULL"} AS githubSearchState,
@@ -351,8 +355,9 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
     selectedResult, selectedCodeSha256,
     pathKind, pathAfterId, pathAffectedCount,
     documentKind, documentNodeCount, privateShareCreationReceipt, subscriptionReadReceipt, shortLinkReceipt,
-    inlineSortKind, inlineSortMode, subscriptionNodeMarker, providerResult, bulkTrashMarker, inlineConsentKind,
+    inlineSortKind, inlineSortMode, subscriptionNodeMarker, providerResult, providerKind, bulkTrashMarker, inlineConsentKind,
     githubSearchState, githubSearchResults, ...lease } = row;
+  if ((providerResult === null) !== (providerKind === null)) throw new Error("Telegram provider reply kind could not be confirmed.");
   const lifecycle = lifecycleKind === null || lifecycleSubscriptionId === null || lifecycleExpectedRevision === null
     ? undefined : { kind: lifecycleKind, subscriptionId: lifecycleSubscriptionId, expectedLifecycleRevision: lifecycleExpectedRevision };
   // The joined temp companion declares every count NOT NULL when its kind is present.
@@ -373,7 +378,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
     ...(subscriptionReadReceipt === null ? {} : { subscriptionRead: true as const }),
     ...(inlineSortKind === null ? {} : { inlineSort: { kind: inlineSortKind, mode: inlineSortMode } }),
     ...(subscriptionNodeMarker === 1 ? { subscriptionNodes: true as const } : {}),
-    ...(providerResult === null ? {} : { providerOutcome: providerResult }),
+    ...(providerResult === null || providerKind === null ? {} : { providerOutcome: providerResult, providerRequestKind: providerKind }),
     ...(bulkTrashMarker === 1 ? { bulkTrash: true as const } : {}),
     ...(inlineConsentKind === null ? {} : { inlineConsent: inlineConsentKind }),
     ...(githubSearchState === null ? {} : { githubSearch: { state: githubSearchState, publicResults: githubSearchResults } }),
@@ -387,7 +392,8 @@ function beginReplyStatement(
   access: ReplyAccess | "private-claim",
   guard?: { sql: string; bindings: readonly (string | number | null)[] },
 ): D1PreparedStatement {
-  const provider = lease.providerOutcome === undefined ? null : telegramProviderReplySendGuard(policy, lease.providerOutcome);
+  const provider = lease.providerOutcome === undefined || lease.providerRequestKind === undefined ? null
+    : telegramProviderReplySendGuard(policy, lease.providerOutcome, lease.providerRequestKind);
   const exactDocumentEpoch = lease.document?.kind === "saved" && access === "allowed" && lease.actorId !== policy.adminId
     ? `AND EXISTS (
       SELECT 1 FROM telegram_document_jobs AS job LEFT JOIN telegram_auth AS auth
@@ -539,6 +545,7 @@ export async function beginTelegramReply(
   readTickets: readonly TelegramSubscriptionReadTicket[] = [],
   readGuard?: { sql: string; bindings: readonly (string | number | null)[] },
   nodeTickets: readonly TelegramNodePageTicket[] = [],
+  refreshTicket?: TelegramProviderRefreshTicket,
 ): Promise<boolean> {
   if (!inTelegramScope(policy, lease) || lease.privateClaim || lease.inlineSort || lease.bulkTrash || lease.inlineConsent || lease.githubSearch
     || ((lease.aggregate || lease.selected || lease.path || lease.privateShareCreation
@@ -549,10 +556,11 @@ export async function beginTelegramReply(
     || (lifecycleTickets.length > 0 && (!(lease.view || lease.lifecycle) || access !== "allowed"))
     || (readTickets.length > 0 && (!(lease.view || lease.subscriptionRead || lease.subscriptionNodes) || access !== "allowed"))
     || (readGuard && (!(lease.subscriptionRead || lease.subscriptionNodes) || access !== "allowed"))
-    || (nodeTickets.length > 0 && (!readGuard || !(lease.subscriptionRead || lease.subscriptionNodes) || access !== "allowed"))) return false;
+    || (nodeTickets.length > 0 && (!readGuard || !(lease.subscriptionRead || lease.subscriptionNodes) || access !== "allowed"))
+    || (refreshTicket && (!readGuard || !lease.subscriptionRead || access !== "allowed"))) return false;
 
   const begin = beginReplyStatement(db, policy, lease, access, readGuard);
-  if (tickets.length === 0 && lifecycleTickets.length === 0 && readTickets.length === 0 && nodeTickets.length === 0) {
+  if (tickets.length === 0 && lifecycleTickets.length === 0 && readTickets.length === 0 && nodeTickets.length === 0 && !refreshTicket) {
     return await begin.first() !== null;
   }
 
@@ -574,6 +582,10 @@ export async function beginTelegramReply(
   if (nodeTickets.length > 0) {
     statements.push(insertTelegramNodePageTickets(db, lease, nodeTickets, ticketCounts.at(-1) ?? 1));
     ticketCounts.push(nodeTickets.length);
+  }
+  if (refreshTicket) {
+    statements.push(insertTelegramProviderRefreshTicket(db, lease, refreshTicket, ticketCounts.at(-1) ?? 1));
+    ticketCounts.push(1);
   }
   const [state, ...writes] = await db.batch<{ receipt_id: number }>(statements);
   const changed = state?.results.length;
