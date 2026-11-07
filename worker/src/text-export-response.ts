@@ -1,6 +1,6 @@
 import { allocateExportNames } from "./export-names.ts";
 import { parseTextProxy, textProxyLine, TextExportError, type TextExportFormat } from "./text-export.ts";
-import { readSnapshotNodes, SnapshotIntegrityError, type SubscriptionSnapshot } from "./storage.ts";
+import { SnapshotIntegrityError, type ExportNodeSource } from "./storage.ts";
 
 const MAX_BYTES = 16 * 1024 * 1024;
 const MAX_LINE_BYTES = 64 * 1024;
@@ -22,14 +22,14 @@ interface TextExportPlan {
 }
 
 export async function planTextExport(
-  bucket: R2Bucket, snapshot: SubscriptionSnapshot, format: TextExportFormat,
+  source: ExportNodeSource, format: TextExportFormat,
 ): Promise<TextExportPlan> {
   let bytes = 0;
   let namesBytes = 0;
   let expanded = 0;
   const names: string[] = [];
   const lengths: number[] = [];
-  for await (const node of readSnapshotNodes(bucket, snapshot)) {
+  for await (const node of source.read()) {
     const proxy = parseTextProxy(node, format);
     const nameBytes = encoder.encode(proxy.name).byteLength;
     const lineBytes = encoder.encode(textProxyLine(proxy, "", format)).byteLength;
@@ -41,7 +41,7 @@ export async function planTextExport(
     names.push(proxy.name);
     lengths.push(lineBytes);
   }
-  if (names.length === 0 || names.length !== snapshot.nodeCount) throw new SnapshotIntegrityError();
+  if (names.length === 0 || names.length !== source.nodeCount) throw new SnapshotIntegrityError();
 
   const labels = allocateExportNames(names, RESERVED_NAMES, (name) => name.normalize("NFC").toLowerCase());
   let labelsBytes = 0;
@@ -61,11 +61,11 @@ export async function planTextExport(
 }
 
 export async function* textExportChunks(
-  bucket: R2Bucket, snapshot: SubscriptionSnapshot, format: TextExportFormat, plan: TextExportPlan, signal: AbortSignal,
+  source: ExportNodeSource, format: TextExportFormat, plan: TextExportPlan, signal: AbortSignal,
 ): AsyncGenerator<Uint8Array> {
   if (format === "surge") yield encoder.encode(SURGE_PREFIX);
   let index = 0;
-  for await (const node of readSnapshotNodes(bucket, snapshot, signal)) {
+  for await (const node of source.read(signal)) {
     const name = plan.labels[index++];
     if (name === undefined) throw new SnapshotIntegrityError();
     yield encoder.encode(textProxyLine(parseTextProxy(node, format), name, format));

@@ -16,7 +16,7 @@ from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request, build_opener
 
 from capacity_fixtures import (
-    CAPACITY_STATUS as STATUS, CHUNK_BYTES, FIXTURE_PROFILES, NODE_COUNT, SHARE_BYTES, SHARE_PREFIX,
+    AGGREGATE_LABELS, CAPACITY_STATUS as STATUS, CHUNK_BYTES, FIXTURE_PROFILES, NODE_COUNT, SHARE_BYTES, SHARE_PREFIX,
     SMOKE_CHUNK_COUNT, SMOKE_OBJECT_LIMIT, SMOKE_PROFILES, SNAPSHOT_BYTES, smoke_fixture,
 )
 from cloudflare_isolation import (
@@ -27,6 +27,8 @@ from prepare_isolation_artifact import ArtifactError, require_current_main
 
 
 OWNER = "9223372036854775807"  # Outside Telegram's ID range.
+AGGREGATE_OWNER = "9223372036854775806"
+AGGREGATE_FOREIGN_OWNER = "9223372036854775805"
 LEDGER_FILE = "capacity-cleanup.json"
 FINGERPRINT_FILE = "capacity-worker-fingerprint.json"
 MAX_JSON = 256 * 1024
@@ -348,19 +350,27 @@ class Resources:
 
     def row(self, ledger, entry):
         name, source = marker(ledger, entry)
+        owner = fixture_owner(entry)
         by_id = entry["rowId"] is not None
+        if entry["label"] in AGGREGATE_LABELS:
+            archived = self.query(
+                "SELECT 1 FROM subscription_trash WHERE (owner_id=? AND source_url=?)"
+                + (" OR id=? UNION ALL SELECT 1 FROM subscription_lifecycle WHERE subscription_id=?" if by_id else ""),
+                (owner, source, entry["rowId"], entry["rowId"]) if by_id else (owner, source),
+            )
+            require(not archived, "An aggregate fixture has an unexpected lifecycle or trash reference.")
         rows = self.query(
             "SELECT id, owner_id, name, source_url, token, generation, snapshot_id, manifest_sha256, node_count "
             "FROM subscriptions WHERE (owner_id=? AND name=? AND source_url=?)"
             + (" OR id=?" if by_id else "") + " LIMIT 2",
-            (OWNER, name, source, entry["rowId"]) if by_id else (OWNER, name, source),
+            (owner, name, source, entry["rowId"]) if by_id else (owner, name, source),
         )
         if not rows:
             return None
         require(len(rows) == 1 and isinstance(rows[0], dict), "Capacity subscription ownership is ambiguous.")
         row = rows[0]
         token = row.get("token")
-        require((row.get("owner_id"), row.get("name"), row.get("source_url")) == (OWNER, name, source)
+        require((row.get("owner_id"), row.get("name"), row.get("source_url")) == (owner, name, source)
                 and integer(row.get("id"), 1, 9007199254740991)
                 and (not by_id or row["id"] == entry["rowId"])
                 and matches(TOKEN, token) and digest(token.encode("ascii")) == entry["tokenSha256"],
@@ -380,6 +390,7 @@ class Resources:
             return row
         require(entry["rowId"] is None, "Previously reserved capacity subscription disappeared.")
         name, source = marker(ledger, entry)
+        owner = fixture_owner(entry)
         before_insert()
         try:
             self.query(
@@ -387,7 +398,7 @@ class Resources:
                 "SELECT ?,?,?,?,unixepoch(),unixepoch() "
                 "WHERE NOT EXISTS (SELECT 1 FROM subscriptions WHERE owner_id=? AND name=? AND source_url=?) "
                 "ON CONFLICT(token) DO NOTHING",
-                (OWNER, name, source, token, OWNER, name, source),
+                (owner, name, source, token, owner, name, source),
             )
         except (CloudflareError, CapacityError):
             pass  # Read back an uncertain insert by the journaled marker.
@@ -406,7 +417,7 @@ class Resources:
                     "WHERE id=? AND owner_id=? AND name=? AND source_url=? AND token=? AND generation=0 "
                     "AND snapshot_id IS NULL AND manifest_sha256 IS NULL AND node_count=0",
                     (entry["snapshotId"], entry["objects"][-1]["sha256"], entry["nodeCount"],
-                     row["id"], OWNER, name, source, row["token"]),
+                     row["id"], fixture_owner(entry), name, source, row["token"]),
                 )
             except (CloudflareError, CapacityError):
                 pass
@@ -422,12 +433,19 @@ class Resources:
                 "DELETE FROM subscriptions WHERE id=? AND owner_id=? AND name=? AND source_url=? AND token=? "
                 "AND generation=? AND ((generation=0 AND snapshot_id IS NULL AND manifest_sha256 IS NULL AND node_count=0) "
                 "OR (generation=1 AND snapshot_id=? AND manifest_sha256=? AND node_count=?))",
-                (row["id"], OWNER, name, source, row["token"], row["generation"],
+                (row["id"], fixture_owner(entry), name, source, row["token"], row["generation"],
                  entry["snapshotId"], entry["objects"][-1]["sha256"], entry["nodeCount"]),
             )
         except (CloudflareError, CapacityError):
             pass
         require(self.row(ledger, entry) is None, "Capacity subscription retirement could not be confirmed.")
+
+
+def fixture_owner(entry):
+    label = entry["label"]
+    if label == AGGREGATE_LABELS[2]:
+        return AGGREGATE_FOREIGN_OWNER
+    return AGGREGATE_OWNER if label in AGGREGATE_LABELS else OWNER
 
 
 def marker(ledger, entry):
@@ -592,7 +610,7 @@ def main():
                 seed(args.directory, resources, os.environ.get("GITHUB_SHA"), os.environ.get("GITHUB_RUN_ID"),
                      verify_release, profile=args.profile)
                 if args.profile in SMOKE_PROFILES:
-                    print("Published two verified isolated export smoke fixtures.")
+                    print(f"Published {len(SMOKE_PROFILES[args.profile])} verified isolated export smoke fixtures.")
                 else:
                     print("Published three verified isolated capacity fixtures.")
             elif args.action == "cleanup":

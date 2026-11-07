@@ -1,4 +1,6 @@
-import { getSubscriptionSnapshot, readSnapshotNodes, type NodeRecord, type SubscriptionSnapshot } from "./storage.ts";
+import { AggregateLimitError, getAggregateNodeSource, hasAggregateLink } from "./aggregate.ts";
+import { getSubscriptionSnapshot, readSnapshotNodes, SnapshotIntegrityError,
+  type ExportNodeSource, type NodeRecord } from "./storage.ts";
 import { isValidStoredShare } from "./stored-share.ts";
 import { serializeStructuredShare } from "./structured-share.ts";
 import { ClashContentError } from "./clash-export.ts";
@@ -28,6 +30,8 @@ const SHARE_CHUNK_BYTES = 24 * 1024;
 const QX_KINDS = new Set(["qx", "quantumult", "quantumultx"]);
 const EXPORT_KINDS = new Set(["base64", "v2ray", "mixed", "singbox", "sing-box", "clash", "surge", ...QX_KINDS]);
 const SUBSCRIPTION_PATH = /^\/sub\/([A-Za-z0-9_-]{16,128})(?:\/([A-Za-z0-9-]{1,32}))?$/;
+const AGGREGATE_PATH = /^\/agg\/([A-Za-z0-9_-]{12}|[A-Za-z0-9_-]{22})\/([A-Za-z0-9-]{1,32})$/;
+const SHORT_PATH = /^\/s\/([A-Za-z0-9_-]{12}|[A-Za-z0-9_-]{22})$/;
 const HEADERS = {
   "Cache-Control": "private, no-store",
   "Referrer-Policy": "no-referrer",
@@ -55,28 +59,31 @@ function shareLine(node: NodeRecord): string {
 }
 
 async function* shareBytes(
-  bucket: R2Bucket, snapshot: SubscriptionSnapshot, signal?: AbortSignal,
+  source: ExportNodeSource, signal?: AbortSignal,
 ): AsyncGenerator<Uint8Array> {
   const encoder = new TextEncoder();
   let total = 0;
+  let count = 0;
 
-  for await (const node of readSnapshotNodes(bucket, snapshot, signal)) {
+  for await (const node of source.read(signal)) {
+    count += 1;
     const share = shareLine(node);
     const line = encoder.encode(total === 0 ? share : `\n${share}`);
     total += line.length;
     if (total > MAX_SHARE_BYTES) throw new ExportContentError();
     yield line;
   }
+  if (!signal?.aborted && count !== source.nodeCount) throw new SnapshotIntegrityError();
 }
 
 async function* base64Chunks(
-  bucket: R2Bucket, snapshot: SubscriptionSnapshot, signal: AbortSignal,
+  source: ExportNodeSource, signal: AbortSignal,
 ): AsyncGenerator<Uint8Array> {
   const encoder = new TextEncoder();
   const chunk = new Uint8Array(SHARE_CHUNK_BYTES);
   let offset = 0;
 
-  for await (const line of shareBytes(bucket, snapshot, signal)) {
+  for await (const line of shareBytes(source, signal)) {
     for (let start = 0; start < line.length;) {
       const length = Math.min(line.length - start, chunk.length - offset);
       chunk.set(line.subarray(start, start + length), offset);
@@ -169,11 +176,14 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
   const path = new URL(request.url).pathname;
   if (path === "/telegram/webhook") return telegramWebhook(request, env, ctx);
   const subscription = SUBSCRIPTION_PATH.exec(path);
+  const aggregate = AGGREGATE_PATH.exec(path);
+  const short = SHORT_PATH.exec(path);
+  const matchedExport = subscription ?? aggregate;
   const head = request.method === "HEAD";
-  if (path !== "/health" && !subscription) return plain("Not found.", 404, head);
+  if (path !== "/health" && !matchedExport && !short) return plain("Not found.", 404, head);
   if (request.method !== "GET" && !head) return plain("Method not allowed.", 405, false, { Allow: "GET, HEAD" });
 
-  if (!subscription) {
+  if (path === "/health") {
     const revision = env.BUILD_REVISION;
     if (typeof revision !== "string" || revision.length !== 40 || !/^[0-9a-f]+$/.test(revision)) {
       return plain("Service unavailable.", 503, head);
@@ -182,51 +192,65 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
     return new Response(body, { headers: { ...HEADERS, "Content-Type": "application/json" } });
   }
 
-  const [, token, kind = "clash"] = subscription;
+  if (short) {
+    try {
+      if (!await hasAggregateLink(env.DB, short[1])) return plain("Not found.", 404, head);
+      return new Response(null, { status: 302, headers: { ...HEADERS, Location: `/agg/${short[1]}/clash` } });
+    } catch {
+      return plain("Subscription temporarily unavailable.", 503, head);
+    }
+  }
+  if (!matchedExport) return plain("Not found.", 404, head);
+  const [, token, kind = "clash"] = matchedExport;
   const format = kind.toLowerCase();
   if (!EXPORT_KINDS.has(format)) return plain("Export format unavailable.", 406, head);
 
   try {
-    const snapshot = await getSubscriptionSnapshot(env.DB, token);
-    if (!snapshot) return plain("Not found.", 404, head);
+    const source = aggregate ? await getAggregateNodeSource(env.DB, env.NODES, token) : await subscriptionSource(env, token);
+    if (!source) return plain("Not found.", 404, head);
     if (format === "clash") {
-      const plan = await planClash(env.NODES, snapshot);
+      const plan = await planClash(source);
       return new Response(
-        head ? null : fixedLengthBody((signal) => clashChunks(env.NODES, snapshot, plan, signal), plan.bytes),
+        head ? null : fixedLengthBody((signal) => clashChunks(source, plan, signal), plan.bytes),
         { headers: { ...HEADERS, "Content-Type": "text/yaml; charset=utf-8" } },
       );
     }
     if (format === "singbox" || format === "sing-box") {
-      const plan = await planSingBox(env.NODES, snapshot);
+      const plan = await planSingBox(source);
       return new Response(
-        head ? null : fixedLengthBody((signal) => singBoxChunks(env.NODES, snapshot, plan, signal), plan.bytes),
+        head ? null : fixedLengthBody((signal) => singBoxChunks(source, plan, signal), plan.bytes),
         { headers: { ...HEADERS, "Content-Type": "application/json" } },
       );
     }
     if (format === "surge" || QX_KINDS.has(format)) {
       const textFormat = format === "surge" ? "surge" : "qx";
-      const plan = await planTextExport(env.NODES, snapshot, textFormat);
+      const plan = await planTextExport(source, textFormat);
       return new Response(head ? null : fixedLengthBody(
-        (signal) => textExportChunks(env.NODES, snapshot, textFormat, plan, signal), plan.bytes,
+        (signal) => textExportChunks(source, textFormat, plan, signal), plan.bytes,
       ), { headers: { ...HEADERS, "Content-Type": "text/plain; charset=utf-8" } });
     }
-    // Measure and verify the immutable snapshot before returning success, without retaining its content.
+    // Measure and verify the source before returning success, without retaining its content.
     let shareLength = 0;
-    for await (const line of shareBytes(env.NODES, snapshot)) shareLength += line.byteLength;
+    for await (const line of shareBytes(source)) shareLength += line.byteLength;
     if (shareLength === 0) return plain("Subscription temporarily unavailable.", 503, head);
     const body = head ? null : fixedLengthBody(
-      (signal) => base64Chunks(env.NODES, snapshot, signal), 4 * Math.ceil(shareLength / 3),
+      (signal) => base64Chunks(source, signal), 4 * Math.ceil(shareLength / 3),
     );
     return new Response(body, {
       headers: { ...HEADERS, "Content-Type": "text/plain; charset=utf-8" },
     });
   } catch (error) {
-    if (error instanceof ExportContentError || error instanceof SingBoxContentError
-      || error instanceof ClashContentError || error instanceof TextExportError) {
+    if (error instanceof AggregateLimitError || error instanceof ExportContentError || error instanceof SingBoxContentError
+        || error instanceof ClashContentError || error instanceof TextExportError) {
       return plain("Subscription content cannot be exported.", 422, head);
     }
     return plain("Subscription temporarily unavailable.", 503, head);
   }
+}
+
+async function subscriptionSource(env: Env, token: string): Promise<ExportNodeSource | null> {
+  const snapshot = await getSubscriptionSnapshot(env.DB, token);
+  return snapshot && { nodeCount: snapshot.nodeCount, read: (signal) => readSnapshotNodes(env.NODES, snapshot, signal) };
 }
 
 async function recoverTelegramReplies(_controller: ScheduledController, env: Env): Promise<void> {
