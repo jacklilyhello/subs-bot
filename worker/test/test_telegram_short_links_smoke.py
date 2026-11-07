@@ -24,6 +24,7 @@ class EvidenceTests(unittest.TestCase):
         self.links = []
         self.cohort = smoke.Cohort(self.read, POLICY, CHALLENGE, KEY)
         self.calls = []
+        self.link_reads = []
 
     def read(self, sql, *_params):
         self.assertTrue(sql.startswith("SELECT "))
@@ -34,10 +35,22 @@ class EvidenceTests(unittest.TestCase):
         if "FROM telegram_inbox" in sql:
             return deepcopy(self.history)
         if "FROM normal_short_links AS l" in sql:
-            return deepcopy(self.links)
+            self.link_reads.append(_params)
+            retired = "l.target_url IS NULL" in sql
+            self.assertEqual(sql.count("l.code_sha256=? AND l.owner_id=? AND"), 2)
+            self.assertEqual(len(_params), 5 if retired else 7)
+            step = 2 if retired else 3
+            selected = []
+            for offset in range(1, len(_params), step):
+                code_hash, actor = _params[offset:offset + 2]
+                target = None if retired else _params[offset + 2]
+                selected.extend(row for row in self.links if (row["code_sha256"], row["owner_id"], row["target_url"])
+                                == (code_hash, actor, target) and (row["revoked_at"] is not None) == retired)
+            return deepcopy(selected)
         if "FROM normal_short_links" in sql:
             return [{field: row[field] for field in ("code_sha256", "owner_id", "target_url")}
-                    for row in sorted(self.links, key=lambda row: row["code_sha256"]) if row["revoked_at"] is None]
+                    for row in sorted(self.links, key=lambda row: row["code_sha256"])
+                    if row["revoked_at"] is None and row["target_url"] in _params[3:]]
         self.fail("Unexpected query")
 
     def add_action(self, role, kind, code_hash):
@@ -50,13 +63,14 @@ class EvidenceTests(unittest.TestCase):
             "auth_message_id": message, "receipt_nonce": smoke.MARKER})
         return row_id
 
-    def issue(self, prepared):
+    def issue(self, prepared, other_target=False):
         for role, actor in self.cohort.actors.items():
             code = smoke.derive_code(KEY, POLICY["botId"], actor, NONCES[role])
             code_hash = smoke.digest(code.encode("ascii"))
             row_id = self.add_action(role, "issued", code_hash)
             self.links.append({"code_sha256": code_hash, "code_length": 22, "owner_id": actor, "origin_receipt_id": row_id,
-                "nonce": NONCES[role], "key_version": 1, "target_url": self.cohort.targets[role], "created_at": 80,
+                "nonce": NONCES[role], "key_version": 1, "target_url": ("https://unrelated.example/" if other_target
+                    and role == "member" else self.cohort.targets[role]), "created_at": 80,
                 "revoked_at": None, "collision": 0})
         return smoke.run_checkpoint(self.cohort, "issued", "identity", prepared, {}, self.probe)[0]
 
@@ -86,6 +100,13 @@ class EvidenceTests(unittest.TestCase):
             self.assertNotIn(link["nonce"], repr(final))
         with self.assertRaises(smoke.FixtureError):
             smoke.run_checkpoint(self.cohort, "retired", "identity", issued, {**proof, "foreignTarget": hashes["admin"]}, self.probe)
+
+    def test_unrelated_issuance_never_fetches_derivation_metadata(self):
+        prepared = self.cohort.prepare("identity")
+        with self.assertRaisesRegex(smoke.FixtureError, "exact active target inventory differs"):
+            self.issue(prepared, other_target=True)
+        self.assertEqual(self.link_reads, [])
+        self.assertEqual(self.calls, [])
 
     def test_scope_signature_and_exact_reserved_targets(self):
         expected = {"admin": f"https://example.com/subs-bot-normal-short/{CHALLENGE}/admin",

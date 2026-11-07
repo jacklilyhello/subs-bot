@@ -125,7 +125,8 @@ class Cohort:
 
     def active(self):
         return self.read("SELECT code_sha256,owner_id,target_url FROM normal_short_links WHERE bot_id=? AND revoked_at IS NULL "
-                         "AND target_url IN (?,?) ORDER BY code_sha256 LIMIT 3", self.bot, *self.targets.values())
+                         "AND owner_id IN (?,?) AND target_url IN (?,?) ORDER BY code_sha256 LIMIT 3",
+                         self.bot, *self.actors.values(), *self.targets.values())
 
     def history(self, after):
         return self.read("""SELECT i.receipt_id,i.actor_id,i.chat_id,i.chat_type,i.thread_id,i.message_id,i.message_date,
@@ -136,11 +137,18 @@ class Cohort:
             AND (i.receipt_nonce=? OR a.receipt_id IS NOT NULL)
           ORDER BY i.receipt_id LIMIT 6""", self.bot, *self.actors.values(), after, MARKER)
 
-    def links(self, hashes):
-        return self.read("""SELECT l.code_sha256,l.code_length,l.owner_id,l.origin_receipt_id,l.nonce,l.key_version,
+    def links(self, hashes, *, retired):
+        target = "l.target_url IS NULL AND l.revoked_at IS NOT NULL" if retired else "l.target_url=? AND l.revoked_at IS NULL"
+        where = f"(l.code_sha256=? AND l.owner_id=? AND {target})"
+        parameters = []
+        for role in ROLES:
+            parameters.extend((hashes[role], self.actors[role]))
+            if not retired:
+                parameters.append(self.targets[role])
+        return self.read(f"""SELECT l.code_sha256,l.code_length,l.owner_id,l.origin_receipt_id,l.nonce,l.key_version,
           l.target_url,l.created_at,l.revoked_at,EXISTS(SELECT 1 FROM aggregate_links AS a WHERE a.code_sha256=l.code_sha256) AS collision
-          FROM normal_short_links AS l WHERE l.bot_id=? AND l.code_sha256 IN (?,?) ORDER BY l.code_sha256 LIMIT 3""",
-          self.bot, *hashes.values())
+          FROM normal_short_links AS l WHERE l.bot_id=? AND ({where} OR {where}) ORDER BY l.code_sha256 LIMIT 3""",
+          self.bot, *parameters)
 
     def prepare(self, identity):
         require(not self.active(), "An active normal short link already uses an exact challenge target.")
@@ -180,12 +188,15 @@ class Cohort:
                     < min(grouped[role][-1]["receipt_id"] for role in ROLES) and foreign["code_sha256"] is None
                     and all(grouped[role][-1]["code_sha256"] == hashes[role] for role in ROLES),
                     "Normal short link foreign attempt or owner revocations differ.")
-        links = self.links(hashes)
-        require(len(links) == 2 and {row["code_sha256"] for row in links} == set(hashes.values()), "Normal short link inventory differs.")
-        by_hash = {row["code_sha256"]: row for row in links}
+        if retired:
+            require(hashes == checkpoint["codeSha256"], "Normal short link issued digests changed before tombstone lookup.")
         candidates = self.active()
         expected_active = [{"code_sha256": hashes[role], "owner_id": self.actors[role], "target_url": self.targets[role]} for role in ROLES]
         require(candidates == ([] if retired else sorted(expected_active, key=lambda row: row["code_sha256"])), "Normal short link exact active target inventory differs.")
+        # Read derivation metadata only after matching the synthetic targets or the signed issuance checkpoint.
+        links = self.links(hashes, retired=retired)
+        require(len(links) == 2 and {row["code_sha256"] for row in links} == set(hashes.values()), "Normal short link inventory differs.")
+        by_hash = {row["code_sha256"]: row for row in links}
         identities, codes = {}, {}
         for role in ROLES:
             row = by_hash[hashes[role]]
