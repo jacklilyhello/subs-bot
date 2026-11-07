@@ -46,8 +46,9 @@ export type TelegramTempUpdate = TelegramEventScope & (
 );
 
 export type TelegramPathUpdate = TelegramEventScope & { kind: "path"; args: string };
+export type TelegramPrivateShareCreationUpdate = TelegramEventScope & { args: string; senderName?: string };
 
-type NormalizedUpdate =
+type ExistingUpdate =
   | { command: TelegramCommand; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; aggregate?: never; path?: never; document?: never }
   | { view: TelegramViewUpdate; command?: never; lifecycle?: never; privateClaim?: never; temp?: never; aggregate?: never; path?: never; document?: never }
   | { lifecycle: TelegramLifecycleUpdate; command?: never; view?: never; privateClaim?: never; temp?: never; aggregate?: never; path?: never; document?: never }
@@ -56,6 +57,9 @@ type NormalizedUpdate =
   | { aggregate: TelegramAggregateUpdate; command?: never; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; path?: never; document?: never }
   | { path: TelegramPathUpdate; command?: never; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; aggregate?: never; document?: never }
   | { document: TelegramDocumentJobInput; command?: never; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; aggregate?: never; path?: never };
+
+type NormalizedUpdate = (ExistingUpdate & { privateShareCreation?: never })
+  | ({ privateShareCreation: TelegramPrivateShareCreationUpdate } & Partial<Record<keyof ExistingUpdate, never>>);
 
 type DecodedTelegramRequest =
   | ({ status: 200 } & NormalizedUpdate)
@@ -162,7 +166,7 @@ function authCommand(args: string[], reply: unknown, memberId: string): Telegram
 function messageCommand(
   message: Record<string, unknown>, policy: TelegramPolicy,
 ): TelegramCommand["command"] | TelegramViewKind | "temp-summary" | "temp-clear" | "aggregate-show" | "aggregate-revoke" |
-  { code: string } | { args: string } | null {
+  { code: string } | { args: string } | { shareArgs: string } | null {
   const { text, entities } = message;
   if (typeof text !== "string" || !Array.isArray(entities)) return null;
   const commands = entities.filter((entity) => isRecord(entity) && entity.type === "bot_command" && entity.offset === 0);
@@ -176,9 +180,10 @@ function messageCommand(
   const [, name, addressedTo] = entity;
   if (addressedTo && addressedTo.toLowerCase() !== policy.botUsername.toLowerCase()) return null;
   const commandName = name.toLowerCase();
-  const separator = commandName === "path" ? PATH_RULE_WHITESPACE_PREFIX : /^\s/u;
+  const separator = commandName === "path" ? PATH_RULE_WHITESPACE_PREFIX : commandName === "share" ? /^[ \t\r\n]/u : /^\s/u;
   if (remainder !== "" && !separator.test(remainder)) return null;
   if (commandName === "path") return { args: remainder };
+  if (commandName === "share") return remainder.length <= 4096 ? { shareArgs: remainder } : null;
   const args = remainder.trim().split(/\s+/u).filter(Boolean);
   switch (commandName) {
     case "start": {
@@ -269,6 +274,11 @@ function normalizeMessage(
   const command = messageCommand(message, policy);
   if (command && typeof command === "object") {
     if (scope.chatType !== "private" || scope.threadId !== null) return null;
+    if ("shareArgs" in command) {
+      const sender = isRecord(message.from) ? [message.from.first_name, message.from.last_name]
+        .filter((part): part is string => typeof part === "string" && part.length <= 128).join(" ") : "";
+      return { privateShareCreation: { ...scope, args: command.shareArgs, ...(sender ? { senderName: sender } : {}) } };
+    }
     return "code" in command ? { privateClaim: { ...scope, kind: "private-claim", code: command.code } }
       : { path: { ...scope, kind: "path", args: command.args } };
   }

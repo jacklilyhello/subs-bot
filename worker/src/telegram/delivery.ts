@@ -7,8 +7,10 @@ import {
 import { inTelegramScope, type TelegramPolicy } from "./protocol.ts";
 import { renderTelegramPath } from "./path-management.ts";
 import { beginTelegramPrivateClaim, prepareTelegramPrivateClaim } from "./private-claims.ts";
+import { resolveTelegramPrivateShareCreationReply } from "./private-share-creation.ts";
+import { PRIVATE_SHARE_DISABLED, type TelegramPrivateShareRuntime } from "./private-share-runtime.ts";
 import {
-  beginTelegramAggregateLinkReply, beginTelegramReply, claimTelegramReply, isTelegramMemberAllowed,
+  beginTelegramAggregateLinkReply, beginTelegramPrivateShareCreationReply, beginTelegramReply, claimTelegramReply, isTelegramMemberAllowed,
   prepareTelegramPrivateClaimBegin, reapExpiredTelegramReplies, settleTelegramReply,
   type TelegramReplyLease, type TelegramReplyOutcome,
 } from "./store.ts";
@@ -109,7 +111,7 @@ export async function sendTelegramReply(
   keyboard?: InlineKeyboard,
   forceReply = false,
 ): Promise<TelegramReplyOutcome> {
-  if (lease.path && (lease.chatType !== "private" || lease.threadId !== null)) return { kind: "failed" };
+  if ((lease.path || lease.privateShareCreation) && (lease.chatType !== "private" || lease.threadId !== null)) return { kind: "failed" };
   return sendTelegram(policy, lease, "sendMessage", {
     chat_id: lease.chatId,
     ...(lease.threadId === null ? {} : { message_thread_id: lease.threadId }),
@@ -175,6 +177,7 @@ async function renderReply(
   db: D1Database,
   policy: TelegramPolicy,
   lease: TelegramReplyLease,
+  privateShareEnabled = false,
 ): Promise<{
   text: string;
   access: ReplyAccess;
@@ -194,6 +197,7 @@ async function renderReply(
   }
   const allowed = lease.actorId === policy.adminId || await isTelegramMemberAllowed(db, policy);
   if (!allowed) return { text: "当前账号没有使用权限。", access: "denied" };
+  if (lease.privateShareCreation) return { text: "分享链接已失效或授权已变更，请重新创建。", access: "allowed" };
   if (lease.aggregate) {
     const text = {
       issued: "聚合链接已变更，请重新发送 /export。",
@@ -238,7 +242,8 @@ async function renderReply(
     if (page.nextAfterId !== null) names.push(`仅显示前 ${LIST_LIMIT} 条。`);
     return { text: names.length ? `你的订阅\n${names.join("\n")}` : "你的订阅列表为空。", access: "allowed" };
   }
-  const help = "使用 /list 查看你的订阅，/expire 查看临期，/recycle 查看回收站，/temp 查看临时节点，私聊 /path 管理路径规则。";
+  const help = "使用 /list 查看你的订阅，/expire 查看临期，/recycle 查看回收站，/temp 查看临时节点，私聊 /path 管理路径规则。"
+    + (privateShareEnabled ? "\n私聊创建私密分享：/share [x份数] [id领取人ID] [s分钟] -- 正文。" : "");
   return { text: lease.command === "start" ? `欢迎使用 subs-bot。\n${help}` : help, access: "allowed" };
 }
 
@@ -250,13 +255,24 @@ export async function drainTelegramReplies(
   budgetMs: number,
   request: typeof fetch = fetch,
   aggregateKey: CryptoKey | null = null,
+  privateShareRuntime: TelegramPrivateShareRuntime = PRIVATE_SHARE_DISABLED,
 ): Promise<void> {
   const deadline = Date.now() + budgetMs;
-  await reapExpiredTelegramReplies(db, policy.botId, aggregateKey !== null);
+  const privateShareEnabled = privateShareRuntime.schemaReady && privateShareRuntime.context !== null;
+  await reapExpiredTelegramReplies(db, policy.botId, aggregateKey !== null, privateShareEnabled);
   for (let processed = 0; processed < limit && Date.now() < deadline; processed += 1) {
-    const lease = await claimTelegramReply(db, policy.botId, aggregateKey !== null);
+    const lease = await claimTelegramReply(db, policy.botId, aggregateKey !== null, privateShareEnabled);
     if (!lease) return;
     if (!inTelegramScope(policy, lease)) continue;
+    if (lease.privateShareCreation && privateShareRuntime.context) {
+      const reply = await resolveTelegramPrivateShareCreationReply(db, policy, lease, privateShareRuntime.context);
+      if (reply && Date.now() < deadline && await beginTelegramPrivateShareCreationReply(db, policy, lease, reply)) {
+        const text = `私密分享已创建。\nhttps://t.me/${policy.botUsername}?start=claim_${reply.code}\n份数上限：${reply.maxClaims}\n到期时间（UTC）：${new Date(reply.expireAt * 1000).toISOString()}`;
+        const outcome = await sendTelegramReply(policy, lease, text, Math.max(1, deadline - Date.now()), request);
+        await settleTelegramReply(db, policy, lease, outcome);
+        continue;
+      }
+    }
     if (lease.aggregate && lease.chatType === "private" && lease.threadId === null) {
       const code = await resolveTelegramAggregateCode(db, policy, { ...lease, aggregate: lease.aggregate }, aggregateKey);
       if (code !== null && Date.now() < deadline && await beginTelegramAggregateLinkReply(db, policy, lease)) {
@@ -278,7 +294,7 @@ export async function drainTelegramReplies(
       await settleTelegramReply(db, policy, lease, outcome);
       continue;
     }
-    const reply = await renderReply(db, policy, lease);
+    const reply = await renderReply(db, policy, lease, privateShareEnabled);
     const [view, lifecycle] = await Promise.all([
       reply.buttons?.length ? prepareTelegramViewTickets(reply.buttons) : undefined,
       reply.lifecycleButtons?.length ? prepareTelegramLifecycleTickets(reply.lifecycleButtons) : undefined,
