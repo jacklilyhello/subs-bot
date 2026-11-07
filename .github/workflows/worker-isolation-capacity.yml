@@ -12,6 +12,7 @@ on:
           - singbox-smoke
           - clash-smoke
           - text-export-smoke
+          - aggregate-smoke
         default: capacity
 
 permissions:
@@ -58,11 +59,22 @@ jobs:
           SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
           SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
         run: python3 -B worker/tools/capacity_resources.py seed "$CAPACITY_DIR" --profile "$FIXTURE_PROFILE"
+      - name: Seed scoped aggregate capabilities and synthetic temporary records
+        id: aggregate_seed
+        if: env.FIXTURE_PROFILE == 'aggregate-smoke'
+        timeout-minutes: 4
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
+        run: python3 -B worker/tools/aggregate_smoke.py seed "$CAPACITY_DIR"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always() && steps.seed.outcome != 'skipped'
         with:
           name: isolation-capacity-checkpoint-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/subs-bot-capacity/capacity-cleanup.json
+          path: |
+            ${{ runner.temp }}/subs-bot-capacity/capacity-cleanup.json
+            ${{ runner.temp }}/subs-bot-capacity/aggregate-cleanup.json
           if-no-files-found: warn
           retention-days: 7
       - name: Check live boundaries, digest and bounded concurrency
@@ -70,9 +82,25 @@ jobs:
         timeout-minutes: 8
         run: python3 -B worker/tools/capacity_probe.py "$CAPACITY_DIR"
       - name: Check live export against the reviewed fixture
-        if: env.FIXTURE_PROFILE != 'capacity'
+        if: env.FIXTURE_PROFILE != 'capacity' && env.FIXTURE_PROFILE != 'aggregate-smoke'
         timeout-minutes: 2
         run: python3 -B worker/tools/capacity_probe.py "$CAPACITY_DIR" --profile "$FIXTURE_PROFILE"
+      - name: Check live aggregate exports and private redirects
+        if: env.FIXTURE_PROFILE == 'aggregate-smoke'
+        timeout-minutes: 2
+        run: python3 -B worker/tools/aggregate_smoke.py probe "$CAPACITY_DIR"
+      - name: Retire just the matching synthetic temporary batch
+        if: env.FIXTURE_PROFILE == 'aggregate-smoke'
+        timeout-minutes: 3
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
+        run: python3 -B worker/tools/aggregate_smoke.py remove-temp "$CAPACITY_DIR"
+      - name: Check the same links after the scoped change
+        if: env.FIXTURE_PROFILE == 'aggregate-smoke'
+        timeout-minutes: 2
+        run: python3 -B worker/tools/aggregate_smoke.py probe-after "$CAPACITY_DIR"
       - name: Verify the active isolation Worker after probing
         if: always() && steps.worker_before.outcome == 'success' && steps.seed.outcome == 'success'
         timeout-minutes: 2
@@ -81,18 +109,30 @@ jobs:
           SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
           SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPLOY_TOKEN }}
         run: python3 -B worker/tools/capacity_resources.py verify-worker-after "$CAPACITY_DIR"
+      - name: Retire aggregate capabilities and synthetic receipts first
+        id: aggregate_cleanup
+        if: always() && env.FIXTURE_PROFILE == 'aggregate-smoke' && steps.aggregate_seed.outcome != 'skipped'
+        timeout-minutes: 4
+        env:
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
+        run: python3 -B worker/tools/aggregate_smoke.py cleanup "$CAPACITY_DIR"
       - name: Retire the recorded synthetic capabilities and objects
         id: cleanup
-        if: always() && steps.seed.outcome != 'skipped'
+        if: >-
+          always() && steps.seed.outcome != 'skipped' &&
+          (env.FIXTURE_PROFILE != 'aggregate-smoke' || steps.aggregate_seed.outcome == 'skipped' || steps.aggregate_cleanup.outcome == 'success')
         timeout-minutes: 12
         env:
           SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
           SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
         run: python3 -B worker/tools/capacity_resources.py cleanup "$CAPACITY_DIR" --profile "$FIXTURE_PROFILE"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: always() && steps.cleanup.outcome == 'failure'
+        if: always() && (steps.cleanup.outcome == 'failure' || steps.aggregate_cleanup.outcome == 'failure')
         with:
           name: isolation-capacity-recovery-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/subs-bot-capacity/capacity-cleanup.json
+          path: |
+            ${{ runner.temp }}/subs-bot-capacity/capacity-cleanup.json
+            ${{ runner.temp }}/subs-bot-capacity/aggregate-cleanup.json
           if-no-files-found: warn
           retention-days: 7

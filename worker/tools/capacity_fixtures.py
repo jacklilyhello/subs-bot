@@ -24,11 +24,14 @@ STRUCTURED_SMOKE = "structured-smoke"
 SINGBOX_SMOKE = "singbox-smoke"
 CLASH_SMOKE = "clash-smoke"
 TEXT_EXPORT_SMOKE = "text-export-smoke"
+AGGREGATE_SMOKE = "aggregate-smoke"
+AGGREGATE_LABELS = ("aggregate-first", "aggregate-second", "aggregate-foreign")
 SMOKE_PROFILES = {
     STRUCTURED_SMOKE: {"structured-mixed": 200, "structured-unsupported": 422},
     SINGBOX_SMOKE: {"singbox-mixed": 200, "singbox-unsupported": 422},
     CLASH_SMOKE: {"clash-mixed": 200, "clash-unsupported": 422},
     TEXT_EXPORT_SMOKE: {"surge-mixed": 200, "surge-unsupported": 422, "qx-mixed": 200, "qx-unsupported": 422},
+    AGGREGATE_SMOKE: dict.fromkeys(AGGREGATE_LABELS, 200),
 }
 FIXTURE_PROFILES = {"capacity": CAPACITY_STATUS, **SMOKE_PROFILES}
 SMOKE_CHUNK_COUNT = 2
@@ -278,7 +281,23 @@ def text_export_smoke_fixture(label: str) -> tuple[list[bytes], int, bytes]:
     return [_json_bytes(node) + b"\n" for node in nodes], 0, expected.encode("utf-8")
 
 
+def aggregate_shares(label: str) -> tuple[str, ...]:
+    if label not in (*AGGREGATE_LABELS, "aggregate-temp", "aggregate-wrong-owner", "aggregate-wrong-bot"):
+        raise ValueError("Unknown aggregate smoke label.")
+    count = SMOKE_CHUNK_COUNT if label in AGGREGATE_LABELS else 1
+    return tuple(SHARE_PREFIX.decode("ascii") + f"{label}-{index}-港" for index in range(count))
+
+
+def aggregate_smoke_fixture(label: str) -> tuple[list[bytes], int, bytes]:
+    shares = aggregate_shares(label)
+    raw = "\n".join(shares).encode("utf-8")
+    return [_json_bytes({"name": f"{label}-{index}", "share": share}) + b"\n"
+            for index, share in enumerate(shares)], len(raw), base64.b64encode(raw)
+
+
 def smoke_fixture(profile: str, label: str) -> tuple[list[bytes], int, bytes]:
+    if profile == AGGREGATE_SMOKE:
+        return aggregate_smoke_fixture(label)
     return {SINGBOX_SMOKE: singbox_smoke_fixture, CLASH_SMOKE: clash_smoke_fixture,
             STRUCTURED_SMOKE: structured_smoke_fixture, TEXT_EXPORT_SMOKE: text_export_smoke_fixture}[profile](label)
 
