@@ -113,7 +113,9 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 在 IAB 内核对 Bot 显示的 `t.me` 域名、用户名和 `claim_…` 载荷。只在指定私聊的输入框发送 `/start claim_…`，避免点击可能唤起 Telegram 客户端的链接。浏览器负责观察正文、失败原因和真实提交，托管测试另外覆盖重叠的 D1 领取事务。
 
-`verify` 使用成功的 `prepare` 运行号。其 `observations` 接收 `codeHashes`（三个私聊案例的原码 SHA-256 摘要）、`raceWinner`（`admin` 或 `member`）、`groupShareMessageId` 与 `groupControlMessageId`。工作流核对原部署、三个已发送创建回执、六个已发送领取回执、两条领取记录、三个私有 R2 对象的原始字节和归属元数据。检查点保留摘要和必要的合成记录标识。原码、正文、Telegram 账号 ID 和密钥留在各自的授权边界。
+`verify` 使用成功的 `prepare` 运行号。其 `observations` 接收 `codeHashes`（三个私聊案例的原码 SHA-256 摘要）、`raceWinner`（`admin` 或 `member`）、`groupShareMessageId` 与 `groupControlMessageId`。普通群的消息编号按账号分配。工作流保留管理员在 IAB 看到的两个编号，核对水位之后同一 Bot 和群仅有一条已发送的管理员帮助回执，并确认未保存群内合成正文。超级群使用共享的消息编号，继续逐条核对。 [Telegram 消息编号规则](https://core.telegram.org/api/updates)
+
+工作流核对三个已发送创建回执、六个已发送领取回执、两条领取记录、三个私有 R2 对象的原始字节和归属元数据。默认要求准备阶段的活动部署完全相同。若当前已部署的 `main` 是原发布的后继，并且 Worker 模块摘要、兼容日期、隔离资源、Telegram 策略、密钥及必需迁移都相同，可提交 `confirm_verify=verify <cohort> on equivalent release` 重用原观察。流程重新读取历史 Worker 版本，并保留准备和验证两个版本标识。原码、正文、Telegram 账号 ID 和密钥留在各自的授权边界。
 
 `retire` 使用成功的 `verify` 运行号。等到三个分享自然到期并经过预留清理宽限期后，再提交 `confirm_retire=retire <cohort>`。从后来已部署的 `main` 清理时，使用 `retire <cohort> on current release`，仍核对相同资源、策略、密钥摘要和迁移，检查点保留原发布版本。事务只清除已核验的合成创建记录、领取计数和分享记录，保留真实收件、发件和领取意图回执。确认 D1 不再引用对应对象后，逐个清理精确的私有 R2 键。中断后从同一验证检查点重试。未核验的案例保留原记录和对应正文，等待后续单独核对。
 
