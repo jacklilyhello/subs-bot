@@ -290,6 +290,8 @@ PY
 
 候选包含原生导入所用的 `restore.sql`、逐行归属记录、精确对象和最后写入的 `manifest.sha256`。保留原始能力令牌和来源，目录及文件按私有数据管理。路径规则和历史编号都为空时沿用版本 1。版本 2 另将旧 `path_maps` 归入 `path_rules`，保留原编号、顺序、关键字、备注以及已删除规则占用过的编号上界。旧群归属使用已核准的映射。归并到同一用户的不同旧归属，其关键字若在去除首尾空白和折叠大小写后重合，则阻止封存。该检查使用与 Worker 相同的 Unicode 14 规则，托管转换使用 CPython 3.11。无效文本和每位用户超过 64 条也会阻止封存。真实备份仍需盘点其他数据域，未处理的数据域有内容时同样会阻止封存。实际云端导入、未发布订阅的 HTTP 行为、旧链接连续性和各格式兼容性分别验收。
 
+在原命令末尾显式附加 `legacy-empty-v3 SOURCE_SQLITE_SHA OWNER_MAP_SHA` 可构建版本 3。新增参数分别固定已封存 SQLite 与已核准归属映射的 SHA-256，Worker 产物必须包含摘要吻合的 0026 迁移。已验证的旧空节点数组按目标订阅编号、归属与原令牌摘要写入标记表，包含活动和回收站记录。回收站的标记在同一订阅恢复后才可用于导出。SQL 重放核对完整标记集及迁移记录，清单另记活动和回收站标记数、迁移和表摘要。包的验证范围限于候选数据，原生导入和空导出 HTTP 行为需分别验收。
+
 ### 真实数据与生产切换门槛
 
 1. 先只读核对 Cloudflare 目标账户、Zone、`subs-bot.lilyya.top` 的 DNS、Worker 路由和 Custom Domain 绑定。新资源记录账号、环境及资源 ID，隔离与生产分别使用各自的 Worker、D1、R2 和队列。现有配置冲突须在改动前报告。目标主机名可用且切换获准后，仅增加所需的 Custom Domain 绑定。 [Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)
