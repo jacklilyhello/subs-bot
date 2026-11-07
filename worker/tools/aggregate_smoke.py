@@ -1,4 +1,4 @@
-"""Probe aggregate capabilities using only a journaled, isolated synthetic cohort."""
+"""Probe aggregate capabilities and path rules using a journaled synthetic cohort."""
 
 import argparse
 from base64 import b64encode
@@ -10,11 +10,11 @@ import secrets
 from time import monotonic
 
 from capacity_fixtures import AGGREGATE_LABELS, AGGREGATE_SMOKE, aggregate_shares
-from capacity_probe import ProbeError, _check_headers, _request, _small_body, _verify_health
+from capacity_probe import ProbeError, _check_headers, _request, _small_body, _unique_json, _verify_health
 from capacity_resources import (
     AGGREGATE_FOREIGN_OWNER, AGGREGATE_OWNER, DIGEST, MAX_JSON, REVISION, RUN_ID, CapacityError,
     R2Objects, Resources, digest, integer, json_body, load_ledger, locked_directory, matches,
-    read_private, recheck_absent, require, save_private_json, verify_release,
+    read_fixtures, read_private, recheck_absent, require, save_private_json, verify_release,
 )
 from cloudflare_isolation import CloudflareClient, CloudflareError
 from d1_migrations import _assert_sql
@@ -31,6 +31,14 @@ TEMPS = (
     ("aggregate-wrong-owner", BOTS[0], OWNERS[1]),
     ("aggregate-wrong-bot", BOTS[1], OWNERS[0]),
 )
+RULES = (
+    (OWNERS[0], "AGGREGATE", "general"),
+    (OWNERS[0], "AGGREGATE-FIRﬆ", "folded-first"),
+    (OWNERS[0], "aggregate-first", "later-tie"),
+    (OWNERS[0], "#AGGREGATE-FIRST-1-港", "raw"),
+    (OWNERS[1], "AGGREGATE", "foreign"),
+)
+MAX_RULE_CONFIG_BYTES = 4096
 JOURNAL = "aggregate-cleanup.json"
 REQUESTS = "aggregate-requests.json"
 
@@ -44,15 +52,16 @@ def _batch(resources, statements):
     require(isinstance(results, list) and len(results) == len(statements)
             and all(isinstance(row, dict) and row.get("success") is True for row in results),
             "Aggregate fixture transaction could not be confirmed.")
+    return results
 
 
 def _verify_schema(resources):
     directory = Path(__file__).resolve().parents[1] / "migrations"
-    files = ("0008_telegram_temp_nodes.sql", "0009_aggregate_links.sql")
+    files = ("0008_telegram_temp_nodes.sql", "0009_aggregate_links.sql", "0010_path_rules.sql")
     expected = [{"position": int(name[:4]), "name": name, "sha256": digest((directory / name).read_bytes())}
                 for name in files]
     rows = resources.query("SELECT position, name, sha256 FROM subs_bot_schema_migrations "
-                           "WHERE position IN (8,9) AND mode='applied' ORDER BY position", ())
+                           "WHERE position IN (8,9,10) AND mode='applied' ORDER BY position", ())
     require(rows == expected, "Aggregate fixture migrations could not be verified.")
 
 
@@ -63,7 +72,7 @@ def _load(directory, resources, capacity):
     plan = json_body(read_private(path, MAX_JSON))
     hashes = plan.get("digests")
     require(set(plan) == {"version", "scopeSha256", "revision", "runId", "runAttempt", "phase", "digests", "subscriptionIds"}
-            and type(plan["version"]) is int and plan["version"] == 1
+            and type(plan["version"]) is int and plan["version"] in (1, 2)
             and plan["scopeSha256"] == resources.scope_hash and plan["revision"] == capacity["revision"]
             and plan["runId"] == capacity["runId"] and matches(RUN_ID, plan["runAttempt"])
             and plan["phase"] in ("planned", "seeding", "seeded", "removing-temp", "temp-removed", "retiring", "retired")
@@ -100,13 +109,54 @@ def _temps(plan):
     return result
 
 
-def _read(resources, plan):
-    links = _links(plan)
-    rows = resources.query("SELECT code_sha256, owner_id, kind, bot_id, selected_ids, created_at, revoked_at "
-                           "FROM aggregate_links WHERE owner_id IN (?,?) OR code_sha256 IN (?,?,?,?,?) LIMIT 6",
-                           (*OWNERS, *(plan["digests"][label] for label in LINKS)))
-    present = set()
+def _rule_remark(run_id, attempt, name):
+    return f"fixture path {run_id}.{attempt} {name}"
+
+
+def _rules(plan):
+    if plan["version"] == 1:
+        return ()
+    return tuple((owner, keyword, _rule_remark(plan["runId"], plan["runAttempt"], name)) for owner, keyword, name in RULES)
+
+
+def _read_rules(rows, expected):
+    rules = {}
     for row in rows:
+        key = (row.get("owner_id"), row.get("keyword"), row.get("remark"))
+        identifier = row.get("id")
+        require(key in expected and key not in rules and integer(identifier, 1, 9007199254740991),
+                "Path rule fixture ownership or state is ambiguous.")
+        rules[key] = identifier
+    return rules
+
+
+def _read(resources, plan):
+    # One read transaction cannot straddle an in-flight seed or cleanup commit.
+    expected_rules = set(_rules(plan))
+    results = _batch(resources, [
+        _statement("SELECT code_sha256, owner_id, kind, bot_id, selected_ids, created_at, revoked_at "
+                   "FROM aggregate_links WHERE owner_id IN (?,?) OR code_sha256 IN (?,?,?,?,?) LIMIT 6",
+                   *OWNERS, *(plan["digests"][label] for label in LINKS)),
+        _statement("""
+          SELECT i.receipt_id, i.receipt_nonce, i.bot_id, i.update_id, i.actor_id, i.chat_id, i.chat_type,
+            i.message_id, i.message_date, i.thread_id, i.command, t.receipt_id AS temp_id,
+            t.bot_id AS temp_bot, t.actor_id AS temp_actor, t.message_id AS temp_message,
+            t.message_date AS temp_date, t.node_count, t.payload_bytes, t.nodes_json,
+            EXISTS(SELECT 1 FROM telegram_outbox WHERE receipt_id=i.receipt_id) AS outbox,
+            EXISTS(SELECT 1 FROM telegram_temp_reply WHERE receipt_id=i.receipt_id) AS reply
+          FROM telegram_inbox AS i LEFT JOIN telegram_temp_batch AS t USING(receipt_id)
+          WHERE i.bot_id IN (?,?) LIMIT 4
+        """, *BOTS),
+        _statement("SELECT count(*) AS n FROM telegram_temp_batch WHERE bot_id IN (?,?)", *BOTS),
+        _statement("SELECT id, owner_id, keyword, remark FROM path_rules WHERE owner_id IN (?,?) ORDER BY id LIMIT ?",
+                   *OWNERS, len(expected_rules) + 1),
+    ])
+    require(all(isinstance(result.get("results"), list) and all(isinstance(row, dict) for row in result["results"])
+                for result in results), "Aggregate fixture readback could not be confirmed.")
+    link_rows, receipt_rows, counts, rule_rows = (result["results"] for result in results)
+    links = _links(plan)
+    present = set()
+    for row in link_rows:
         code = row.get("code_sha256")
         require(code in links and code not in present and row.get("owner_id") == OWNERS[0] and row.get("created_at") == STAMP
                 and tuple(row.get(key) for key in ("kind", "bot_id", "selected_ids", "revoked_at")) == links[code],
@@ -114,18 +164,8 @@ def _read(resources, plan):
         present.add(code)
 
     planned = _temps(plan)
-    rows = resources.query("""
-      SELECT i.receipt_id, i.receipt_nonce, i.bot_id, i.update_id, i.actor_id, i.chat_id, i.chat_type,
-        i.message_id, i.message_date, i.thread_id, i.command, t.receipt_id AS temp_id,
-        t.bot_id AS temp_bot, t.actor_id AS temp_actor, t.message_id AS temp_message,
-        t.message_date AS temp_date, t.node_count, t.payload_bytes, t.nodes_json,
-        EXISTS(SELECT 1 FROM telegram_outbox WHERE receipt_id=i.receipt_id) AS outbox,
-        EXISTS(SELECT 1 FROM telegram_temp_reply WHERE receipt_id=i.receipt_id) AS reply
-      FROM telegram_inbox AS i LEFT JOIN telegram_temp_batch AS t USING(receipt_id)
-      WHERE i.bot_id IN (?,?) LIMIT 4
-    """, BOTS)
     receipts = {}
-    for row in rows:
+    for row in receipt_rows:
         nonce = row.get("receipt_nonce")
         require(nonce in planned and nonce not in receipts, "Aggregate fixture receipt ownership is ambiguous.")
         _, bot, owner, identifier, payload = planned[nonce]
@@ -141,18 +181,17 @@ def _read(resources, plan):
                 == (receipt, bot, owner, identifier, STAMP, 1, len(payload.encode("utf-8")), payload),
                 "Aggregate fixture temporary payload ownership or bytes differ.")
         receipts[nonce] = (receipt, has_temp)
-    counts = resources.query("SELECT count(*) AS n FROM telegram_temp_batch WHERE bot_id IN (?,?)", BOTS)
     require(counts == [{"n": sum(has_temp for _, has_temp in receipts.values())}],
             "Aggregate fixture has unowned temporary data.")
-    return present, receipts
+    return present, receipts, _read_rules(rule_rows, expected_rules)
 
 
 def _state(resources, plan, *, temp_removed=False):
-    links, receipts = _read(resources, plan)
-    if not links and not receipts:
+    links, receipts, rules = _read(resources, plan)
+    if not links and not receipts and not rules:
         return None
     temps = _temps(plan)
-    require(links == set(_links(plan)) and receipts.keys() == temps.keys()
+    require(links == set(_links(plan)) and receipts.keys() == temps.keys() and tuple(rules) == _rules(plan)
             and all(has_temp == (not temp_removed or temps[nonce][0] != TEMPS[0][0])
                     for nonce, (_, has_temp) in receipts.items()), "Aggregate fixture state is incomplete.")
     return receipts
@@ -162,8 +201,11 @@ def _seed_statements(plan):
     statements = [_statement(_assert_sql(
         "NOT EXISTS (SELECT 1 FROM aggregate_links WHERE owner_id IN (?,?) OR code_sha256 IN (?,?,?,?,?)) "
         "AND NOT EXISTS (SELECT 1 FROM telegram_inbox WHERE bot_id IN (?,?)) "
-        "AND NOT EXISTS (SELECT 1 FROM telegram_temp_batch WHERE bot_id IN (?,?))"),
-        *OWNERS, *(plan["digests"][label] for label in LINKS), *BOTS, *BOTS)]
+        "AND NOT EXISTS (SELECT 1 FROM telegram_temp_batch WHERE bot_id IN (?,?)) "
+        "AND NOT EXISTS (SELECT 1 FROM path_rules WHERE owner_id IN (?,?))"),
+        *OWNERS, *(plan["digests"][label] for label in LINKS), *BOTS, *BOTS, *OWNERS)]
+    for rule in _rules(plan):
+        statements.append(_statement("INSERT INTO path_rules (owner_id,keyword,remark) VALUES (?,?,?)", *rule))
     for nonce, (_, bot, owner, identifier, payload) in _temps(plan).items():
         statements.extend([
             _statement("INSERT INTO telegram_inbox (bot_id,update_id,actor_id,chat_id,chat_type,message_id,message_date,command,receipt_nonce) "
@@ -208,13 +250,13 @@ def seed(directory, resources, capacity, revision, run_id, attempt, guard=verify
     plan = _load(directory, resources, capacity)
     if plan is None:
         codes = {label: secrets.token_urlsafe(9 if label == "all" else 16) for label in LINKS}
-        plan = {"version": 1, "scopeSha256": resources.scope_hash, "revision": revision, "runId": capacity["runId"],
+        plan = {"version": 2, "scopeSha256": resources.scope_hash, "revision": revision, "runId": capacity["runId"],
                 "runAttempt": attempt, "digests": {label: digest(code.encode("ascii")) for label, code in codes.items()},
                 "subscriptionIds": ids}
         require(len(set(plan["digests"].values())) == len(LINKS), "Aggregate fixture codes collide.")
         _save(directory, plan, "planned")
         save_private_json(directory / REQUESTS, {"revision": revision, "codes": codes})
-    require(plan["runAttempt"] == attempt and plan["phase"] in ("planned", "seeding", "seeded"),
+    require(plan["version"] == 2 and plan["runAttempt"] == attempt and plan["phase"] in ("planned", "seeding", "seeded"),
             "Aggregate journal belongs to another stage or attempt.")
     require({label: digest(code.encode("ascii")) for label, code in _request_codes(directory, revision).items()} == plan["digests"],
             "Aggregate probe capabilities do not match their journal.")
@@ -244,10 +286,10 @@ def remove_temp(directory, resources, plan, revision, guard=verify_release):
     require(plan is not None and plan["revision"] == revision and plan["phase"] in ("seeded", "removing-temp", "temp-removed"),
             "Aggregate temporary fixture is outside its removal phase.")
     guard(revision)
-    links, receipts = _read(resources, plan)
+    links, receipts, rules = _read(resources, plan)
     temps = _temps(plan)
     nonce = next(key for key, value in temps.items() if value[0] == TEMPS[0][0])
-    require(links == set(_links(plan)) and receipts.keys() == temps.keys()
+    require(links == set(_links(plan)) and receipts.keys() == temps.keys() and tuple(rules) == _rules(plan)
             and all(has_temp for key, (_, has_temp) in receipts.items() if key != nonce),
             "Aggregate temporary cohort is incomplete.")
     receipt, present = receipts[nonce]
@@ -267,10 +309,10 @@ def cleanup(directory, resources, plan):
     if plan["phase"] == "seeding":
         require(recheck_absent(_state(resources, plan), lambda: _state(resources, plan)) is not None,
                 "Aggregate fixture insertion remains unconfirmed. Cleanup journal retained.")
-    links, receipts = _read(resources, plan)
-    require(plan["phase"] not in ("planned", "retired") or not (links or receipts),
+    links, receipts, rules = _read(resources, plan)
+    require(plan["phase"] not in ("planned", "retired") or not (links or receipts or rules),
             "Aggregate journal phase and owned state differ.")
-    if links or receipts:
+    if links or receipts or rules:
         _save(directory, plan, "retiring")
         statements = []
         for code in sorted(links):
@@ -279,6 +321,9 @@ def cleanup(directory, resources, plan):
                                          "AND bot_id IS NULLIF(?,'') AND selected_ids IS NULLIF(?,'') AND created_at=? "
                                          "AND revoked_at IS CAST(NULLIF(?,'') AS INTEGER)",
                                          code, OWNERS[0], kind, bot or "", selection or "", STAMP, revoked or ""))
+        for (owner, keyword, remark), identifier in rules.items():
+            statements.append(_statement("DELETE FROM path_rules WHERE id=? AND owner_id=? AND keyword=? AND remark=?",
+                                         identifier, owner, keyword, remark))
         temps = _temps(plan)
         for nonce, (receipt, has_temp) in receipts.items():
             _, bot, owner, identifier, _ = temps[nonce]
@@ -289,14 +334,16 @@ def cleanup(directory, resources, plan):
                                          "AND command='help' AND thread_id IS NULL", receipt, nonce, bot, owner, identifier, identifier, STAMP))
         statements.append(_statement(_assert_sql("NOT EXISTS (SELECT 1 FROM aggregate_links WHERE owner_id IN (?,?)) "
                                                 "AND NOT EXISTS (SELECT 1 FROM telegram_inbox WHERE bot_id IN (?,?)) "
-                                                "AND NOT EXISTS (SELECT 1 FROM telegram_temp_batch WHERE bot_id IN (?,?))"),
-                                     *OWNERS, *BOTS, *BOTS))
+                                                "AND NOT EXISTS (SELECT 1 FROM telegram_temp_batch WHERE bot_id IN (?,?)) "
+                                                "AND NOT EXISTS (SELECT 1 FROM path_rules WHERE owner_id IN (?,?))"),
+                                     *OWNERS, *BOTS, *BOTS, *OWNERS))
         try:
             _batch(resources, statements)
         except (CloudflareError, CapacityError):
             pass
-        links, receipts = _read(resources, plan)
-    require(not links and not receipts, "Aggregate fixture retirement could not be confirmed. Cleanup journal retained.")
+        links, receipts, rules = _read(resources, plan)
+    require(not links and not receipts and not rules,
+            "Aggregate fixture retirement could not be confirmed. Cleanup journal retained.")
     _save(directory, plan, "retired")
 
 
@@ -307,7 +354,41 @@ def _expected(after):
             for label, shares in (("all", (*first, *second, *temporary)), ("selected", (*second, *first)))}
 
 
-def probe(directory, revision, *, after=False):
+def _path_configs(directory, revision, codes, run_id, attempt, after):
+    require(matches(RUN_ID, run_id) and matches(RUN_ID, attempt), "Invalid path rule probe run identity.")
+    fixtures, _ = read_fixtures(directory, revision, profile=AGGREGATE_SMOKE)
+
+    def names(label, remarks):
+        return [f"{label}-{index} → {_rule_remark(run_id, attempt, remark)}" for index, remark in enumerate(remarks)]
+
+    first = names(AGGREGATE_LABELS[0], ("folded-first", "raw"))
+    second = names(AGGREGATE_LABELS[1], ("general", "general"))
+    foreign = names(AGGREGATE_LABELS[2], ("foreign", "foreign"))
+    yield "all", f"/agg/{codes['all']}/sing-box", first + second + ([] if after else [TEMPS[0][0]])
+    if not after:
+        yield "selected", f"/agg/{codes['selected']}/singbox", second + first
+        yield "single", f"/sub/{fixtures[0]['token']}/sing-box", first
+        yield "foreign", f"/sub/{fixtures[2]['token']}/sing-box", foreign
+
+
+def _path_config_result(response, tags):
+    body = response.read(MAX_RULE_CONFIG_BYTES + 1)
+    require(0 < len(body) <= MAX_RULE_CONFIG_BYTES and response.getheader("Transfer-Encoding") is None
+            and response.getheader("Content-Length") == str(len(body)), "Path rule export framing differs.")
+    try:
+        document = _unique_json(body.decode("utf-8", errors="strict"))
+    except (UnicodeError, ValueError, RecursionError):
+        raise ProbeError("Path rule export is not valid UTF-8 JSON.") from None
+    proxy = {"type": "shadowsocks", "server": "203.0.113.10", "server_port": 8388,
+             "method": "aes-256-gcm", "password": "fixture-only"}
+    require(document == {"outbounds": [{"type": "selector", "tag": "proxy", "outbounds": tags},
+                                         {"type": "direct", "tag": "direct"},
+                                         *({"tag": tag, **proxy} for tag in tags)]},
+            "Path rule export labels, order, or connection fields differ.")
+    return {"GET": 200, "HEAD": 200, "bytes": len(body), "sha256": digest(body)}
+
+
+def probe(directory, revision, run_id, attempt, *, after=False):
     codes = _request_codes(directory, revision)
     deadline = monotonic() + 75
 
@@ -333,6 +414,14 @@ def probe(directory, revision, *, after=False):
                 else:
                     require(response.read(1) == b"", "Aggregate HEAD returned a body.")
         report[label] = {"GET": 200, "HEAD": 200, "bytes": len(expected), "sha256": digest(expected)}
+    report["pathRules"] = {}
+    for label, path, tags in _path_configs(directory, revision, codes, run_id, attempt, after):
+        with request("HEAD", path, "path rules " + label) as response:
+            _check_headers(response, 200, "path rules " + label, "application/json")
+            require(response.read(1) == b"", "Path rule HEAD returned a body.")
+        with request("GET", path, "path rules " + label) as response:
+            _check_headers(response, 200, "path rules " + label, "application/json")
+            report["pathRules"][label] = _path_config_result(response, tags)
     if not after:
         for method in ("GET", "HEAD"):
             with request(method, f"/s/{codes['all']}", "local aggregate alias") as response:
@@ -366,7 +455,8 @@ def main():
         revision = os.environ.get("GITHUB_SHA")
         with locked_directory(args.directory):
             if args.action in ("probe", "probe-after"):
-                print(json.dumps(probe(args.directory, revision, after=args.action == "probe-after"), sort_keys=True))
+                print(json.dumps(probe(args.directory, revision, os.environ.get("GITHUB_RUN_ID"),
+                                       os.environ.get("GITHUB_RUN_ATTEMPT"), after=args.action == "probe-after"), sort_keys=True))
                 return
             target = json_body(os.environ.get("SUBS_BOT_CF_ISOLATION_TARGET_JSON", "null"))
             token = os.environ.get("SUBS_BOT_CF_BOOTSTRAP_TOKEN")

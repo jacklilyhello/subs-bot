@@ -122,6 +122,8 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 `profile=text-export-smoke` 暂存四份合成快照，检查 `/surge`、`/qx`、`/quantumult` 和 `/quantumultx`。成功的 GET 必须声明准确长度，原始 UTF-8 响应的摘要须与固定样本相同。HEAD 均为空，不兼容的协议组合返回固定的 `422`。探针共发送 18 次请求，包括前后两次版本检查。它使用同名清理参数。原生客户端导入和代理连接另行验证。
 
+`profile=aggregate-smoke` 还验证路径规则。探针为专用合成所有者暂存规则，核对单份、全量、指定顺序聚合以及另一所有者的 Sing-box GET 和 HEAD。配置必须保留连接参数并按预期应用 Unicode 折叠、最长关键词和同长规则顺序。临时节点保留原名，聚合 Base64 原始输出字节保持一致。清理事务先核对并移除合成聚合码、规则和临时数据，再由原流程撤销合成订阅并清理 R2。工作流只报告状态、字节数和摘要。
+
 容量检查的客户端耗时和吞吐来自这组样本。CPU、内存和平台子请求数量通过隔离 Worker 的聚合指标另行核对。旧 SQLite 的正文体积与转换后的 NDJSON 和分享原文分别测量。真实备份的分布、超限项及可恢复性需要通过获准的数据演练验证。 [Workers 限制](https://developers.cloudflare.com/workers/platform/limits/) · [Workers 指标](https://developers.cloudflare.com/analytics/graphql-api/tutorials/querying-workers-metrics/)
 
 旧库容量盘点在获准的托管环境运行 `python3 -B worker/tools/legacy_inventory.py <封存备份>`。输入须是单独完成、关闭、使用 UTF-8 和 DELETE 日志模式的 SQLite 备份。备份准备在原库之外进行，盘点本身以只读事务运行。报告只包含活动订阅与回收站的聚合计数、原始字节、紧凑 UTF-8 NDJSON 字节、块数、大小限制和旧转换器分享原文估算。无法读取或解析的记录有独立计数。退出码 `0` 表示报告完整，仍需检查超限和无效项。退出码 `2` 表示无法核对备份。容量报告不判定归属映射、旧链接兼容、分享权限或实际 Worker 性能。 [SQLite 增量读取](https://sqlite.org/c3ref/blob_open.html) · [SQLite URI](https://sqlite.org/uri.html)
