@@ -198,6 +198,34 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 关闭本组上传后选择 `retire`，提供成功的 `verify-replaced` 运行 ID，并在确认字段填写 `retire <cohort>`。若在替换前结束，也可使用 `capture-created` 的检查点。清理先在 D1 中核对并撤销本组两个订阅指针，再删除并核对检查点记录的私有 R2 对象。实际 Telegram 的终态回执继续保留，以防重投重新创建订阅。检查点只包含本组合成对象标识、计数和摘要。验收工作流通过 Cloudflare 核对状态，实际上传和可见回复在浏览器中确认。
 
+同一工作流的 `profile=node-pages` 使用独立的合成文件名 `tgdoc-nodes-<cohort>.txt`。先执行 `prepare`，然后用下面的配方在新的私有临时目录中生成两份同名文件。将示例 `COHORT` 换成这次 `prepare` 的值。配方只写入使用保留测试地址的合成文本。
+
+```sh
+COHORT=0123456789abcdef python3 - <<'PY'
+import os
+from pathlib import Path
+import re
+from tempfile import mkdtemp
+
+cohort = os.environ["COHORT"]
+if re.fullmatch(r"[0-9a-f]{16}", cohort) is None:
+    raise SystemExit("Expected a 16-character lowercase hexadecimal cohort")
+root = Path(mkdtemp(prefix="subs-bot-node-pages-"))
+name = "tgdoc-nodes-" + cohort
+prefix = "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.10:8388#" + name
+for role, count in (("admin", 32), ("member", 2)):
+    folder = root / role
+    folder.mkdir(mode=0o700)
+    content = "".join(f"{prefix}-{role}-{index:02d}\n" for index in range(1, count + 1))
+    fd = os.open(folder / (name + ".txt"), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as file:
+        file.write(content.encode("ascii"))
+print(root)
+PY
+```
+
+两名获准测试者只在指定内置浏览器的隔离 Bot 私聊中上传各自目录中的文件。用文件名搜索各自的订阅，打开详情和节点浏览。管理员核对按原顺序显示的 15、15、2 个节点以及上一页和下一页按钮。成员核对自己的一页两个节点。随后以 `prepare` 运行 ID 执行 `capture-created`，由工作流核对同一固定版本下两份快照的有序节点、协议和 Base64 GET、HEAD。停止浏览后，以 `capture-created` 运行 ID 和 `retire <cohort>` 执行 `retire`。退役要求相关详情与节点回复已结束，且只撤销已核对的两个订阅和四个 R2 对象。文档、详情和节点浏览回执保留。该模式的流程止于这三步。
+
 容量检查的客户端耗时和吞吐来自这组样本。CPU、内存和平台子请求数量通过隔离 Worker 的聚合指标另行核对。旧 SQLite 的正文体积与转换后的 NDJSON 和分享原文分别测量。真实备份的分布、超限项及可恢复性需要通过获准的数据演练验证。 [Workers 限制](https://developers.cloudflare.com/workers/platform/limits/) · [Workers 指标](https://developers.cloudflare.com/analytics/graphql-api/tutorials/querying-workers-metrics/)
 
 旧库容量盘点在获准的托管环境运行 `python3 -B worker/tools/legacy_inventory.py <封存备份>`。输入须是单独完成、关闭、使用 UTF-8 和 DELETE 日志模式的 SQLite 备份。备份准备在原库之外进行，盘点本身以只读事务运行。报告只包含活动订阅与回收站的聚合计数、原始字节、紧凑 UTF-8 NDJSON 字节、块数、大小限制和旧转换器分享原文估算。无法读取或解析的记录有独立计数。退出码 `0` 表示报告完整，仍需检查超限和无效项。退出码 `2` 表示无法核对备份。容量报告不判定归属映射、旧链接兼容、分享权限或实际 Worker 性能。 [SQLite 增量读取](https://sqlite.org/c3ref/blob_open.html) · [SQLite URI](https://sqlite.org/uri.html)
