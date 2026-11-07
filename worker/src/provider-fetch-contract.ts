@@ -23,3 +23,18 @@ export type ProviderFetchResult =
 export interface ProviderFetcher {
   fetchSubscription(input: ProviderFetchInput): Promise<ProviderFetchResult>;
 }
+
+export const PROVIDER_API_STATUS_MAX_ELAPSED_MS = 15_000;
+
+export interface ProviderApiStatusInput extends ProviderPin { url: string; key: string }
+
+export type ProviderApiStatusFailureCode = Extract<ProviderFailureCode, "invalid-request" | "invalid-url" | "invalid-auth"
+  | "blocked-address" | "busy" | "dns-failed" | "tls-failed" | "unavailable" | "timeout" | "invalid-body">;
+
+export type ProviderApiStatusResult =
+  | { ok: true; status: number; elapsedMs: number }
+  | { ok: false; code: ProviderApiStatusFailureCode };
+
+export interface ProviderApiStatusProber {
+  probeApiStatus(input: ProviderApiStatusInput): Promise<ProviderApiStatusResult>;
+}
