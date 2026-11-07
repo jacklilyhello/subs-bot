@@ -60,7 +60,7 @@ function fixture(groups: Array<Array<Record<string, unknown>>>) {
   const reads: string[] = [];
   const DB = {
     prepare() {
-      return { bind: (token: string) => ({ token }) };
+      return { bind: (token: string) => ({ token, first: async () => null }) };
     },
     async batch([{ token }]: { token: string }[]) {
       lookups.push(token);
