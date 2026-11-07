@@ -44,7 +44,7 @@ class SelectedAcceptanceTests(unittest.TestCase):
         self.cloud.db.execute("INSERT INTO telegram_temp_reply(receipt_id,kind,node_count,total_count) VALUES (?,'added',1,1)", (receipt,))
         node = self.cohort.node("temp")
         raw = smoke.canonical([{key: node[key] for key in ("name", "type", "share")}])
-        self.cloud.db.execute("INSERT INTO telegram_temp_batch VALUES (?,?,?,?,?,?,?)",
+        self.cloud.db.execute("INSERT INTO telegram_temp_batch VALUES (?,?,?,?,?,?,?,?)",
             (receipt, POLICY["botId"], POLICY["adminId"], date, message, raw, 1, len(raw.encode("ascii"))))
         self.cloud.db.commit()
 
