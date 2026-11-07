@@ -15,7 +15,7 @@ import sys
 from threading import Barrier, BrokenBarrierError, Lock, Timer
 from time import monotonic, sleep
 
-from capacity_fixtures import STRUCTURED_SMOKE
+from capacity_fixtures import SINGBOX_SMOKE, SMOKE_OBJECT_LIMIT, SMOKE_PROFILES, STRUCTURED_SMOKE, canonical_singbox
 
 
 HOST = "subs-bot-cf-dev-01.lilyya.workers.dev"
@@ -362,18 +362,41 @@ def run_probe(directory, revision):
     }
 
 
-def run_structured_smoke(directory, revision):
+def _verify_singbox(response, fixture):
+    if (not 0 < fixture.export_bytes <= SMOKE_OBJECT_LIMIT
+            or response.getheader("Content-Length") != str(fixture.export_bytes)
+            or response.getheader("Transfer-Encoding") is not None):
+        raise ProbeError("The Sing-box smoke response length is invalid.")
+    body = response.read(fixture.export_bytes + 1)
+
+    def unique_object(pairs):
+        value = dict(pairs)
+        if len(value) != len(pairs):
+            raise ValueError()
+        return value
+
+    try:
+        normalized = canonical_singbox(json.loads(body.decode("utf-8"), object_pairs_hook=unique_object))
+    except (ValueError, RecursionError):
+        raise ProbeError("The Sing-box smoke response is invalid JSON.") from None
+    if len(body) != fixture.export_bytes or sha256(normalized).hexdigest() != fixture.export_sha256:
+        raise ProbeError("The Sing-box smoke response differs from the Python oracle.")
+    return len(body)
+
+
+def run_structured_smoke(directory, revision, *, profile=STRUCTURED_SMOKE):
     from capacity_resources import read_fixtures
 
-    if not _matches(SHA1, revision):
-        raise ProbeError("A full hosted revision is required for the structured smoke.")
-    fixtures, _ = read_fixtures(Path(directory), revision, profile=STRUCTURED_SMOKE)
+    if not _matches(SHA1, revision) or profile not in SMOKE_PROFILES:
+        raise ProbeError("An exact hosted revision and export smoke profile are required.")
+    fixtures, _ = read_fixtures(Path(directory), revision, profile=profile)
     run_deadline = monotonic() + 60
+    singbox = profile == SINGBOX_SMOKE
 
     def health():
         deadline = min(monotonic() + 15, run_deadline)
-        with _request("GET", "/health", deadline, "structured smoke health") as response:
-            _check_headers(response, 200, "structured smoke health", "application/json")
+        with _request("GET", "/health", deadline, "export smoke health") as response:
+            _check_headers(response, 200, "export smoke health", "application/json")
             _verify_health(response, revision)
         _remaining(deadline)
 
@@ -381,18 +404,22 @@ def run_structured_smoke(directory, revision):
     results = {}
     for row in fixtures:
         fixture = Fixture(row["label"], row["token"], row["status"], row["exportBytes"], row["exportSha256"])
-        path = f"/sub/{fixture.token}/base64"
+        path = f"/sub/{fixture.token}/" + ("sing-box" if singbox else "base64")
         result = {}
         for method in ("GET", "HEAD"):
             deadline = min(monotonic() + 15, run_deadline)
             with _request(method, path, deadline, fixture.label) as response:
-                _check_headers(response, fixture.status, fixture.label, "text/plain")
+                content_type = "application/json" if singbox and fixture.status == 200 else "text/plain"
+                _check_headers(response, fixture.status, fixture.label, content_type)
                 if method == "HEAD":
                     if response.read(1):
                         raise ProbeError(f"HEAD returned a body for {fixture.label}.")
                     body_bytes = 0
                 elif fixture.status == 200:
-                    body_bytes, _, _ = _verify_export(response, fixture, "full", deadline)
+                    if singbox:
+                        body_bytes = _verify_singbox(response, fixture)
+                    else:
+                        body_bytes, _, _ = _verify_export(response, fixture, "full", deadline)
                 else:
                     body = _small_body(response)
                     if body != ERROR_BODY[422]:
@@ -408,8 +435,8 @@ def run_structured_smoke(directory, revision):
 def main(argv=None):
     args = sys.argv[1:] if argv is None else argv
     try:
-        if len(args) == 3 and args[1:] == ["--profile", STRUCTURED_SMOKE]:
-            report = run_structured_smoke(args[0], os.environ.get("GITHUB_SHA"))
+        if len(args) == 3 and args[1] == "--profile" and args[2] in SMOKE_PROFILES:
+            report = run_structured_smoke(args[0], os.environ.get("GITHUB_SHA"), profile=args[2])
         elif len(args) == 1:
             report = run_probe(args[0], os.environ.get("GITHUB_SHA"))
         else:

@@ -21,7 +21,12 @@ LINE_OVERHEAD = len(b'{"share":"","pad":""}\n')
 SHARE_PREFIX = b"ss://YWVzLTI1Ni1nY206Zml4dHVyZS1vbmx5@203.0.113.10:8388#"
 CAPACITY_STATUS = {"at-limits": 200, "share-over": 422, "snapshot-over": 503}
 STRUCTURED_SMOKE = "structured-smoke"
-FIXTURE_PROFILES = {"capacity": CAPACITY_STATUS, STRUCTURED_SMOKE: {"structured-mixed": 200, "structured-unsupported": 422}}
+SINGBOX_SMOKE = "singbox-smoke"
+SMOKE_PROFILES = {
+    STRUCTURED_SMOKE: {"structured-mixed": 200, "structured-unsupported": 422},
+    SINGBOX_SMOKE: {"singbox-mixed": 200, "singbox-unsupported": 422},
+}
+FIXTURE_PROFILES = {"capacity": CAPACITY_STATUS, **SMOKE_PROFILES}
 SMOKE_CHUNK_COUNT = 2
 SMOKE_OBJECT_LIMIT = 4096
 
@@ -169,18 +174,64 @@ def structured_smoke_fixture(label: str) -> tuple[list[bytes], int, bytes]:
     return [_json_bytes(node) + b"\n" for node in nodes], len(raw), base64.b64encode(raw)
 
 
-def _write_smoke_fixture(root: Path, label: str, status: int) -> dict:
+def canonical_singbox(value) -> bytes:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
+def singbox_smoke_fixture(label: str) -> tuple[list[bytes], int, bytes]:
+    root = str(Path(__file__).resolve().parents[2])
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from export_errors import ExportError
+    from singbox_export import to_singbox
+
+    structured = {
+        "type": "ss", "server": "203.0.113.10", "port": 8388,
+        "name": "proxy", "cipher": "aes-256-gcm", "password": "fixture-only",
+    }
+    stored = {
+        "type": "temp", "name": "港 字",
+        "share": "vless://11111111-1111-4111-8111-111111111111@proxy.example.invalid:443?security=tls&type=grpc&serviceName=fixture",
+    }
+    if label == "singbox-mixed":
+        nodes = [structured, stored]
+    elif label == "singbox-unsupported":
+        nodes = [stored, {**structured, "dialer-proxy": "unavailable-dependency"}]
+    else:
+        raise ValueError("Unknown Sing-box smoke fixture.")
+
+    try:
+        # These fixed raw families are fully parsed by singbox_export itself.
+        config = to_singbox(nodes, parse_share_link=lambda _: None)
+    except ExportError:
+        if label != "singbox-unsupported":
+            raise ValueError("The Python oracle rejected the accepted synthetic Sing-box fixture.") from None
+        expected = b""
+    else:
+        if label != "singbox-mixed":
+            raise ValueError("The Python oracle accepted the unsupported synthetic Sing-box fixture.")
+        expected = canonical_singbox(json.loads(config))
+    return [_json_bytes(node) + b"\n" for node in nodes], 0, expected
+
+
+def smoke_fixture(profile: str, label: str) -> tuple[list[bytes], int, bytes]:
+    return singbox_smoke_fixture(label) if profile == SINGBOX_SMOKE else structured_smoke_fixture(label)
+
+
+def _write_smoke_fixture(root: Path, profile: str, label: str, status: int) -> dict:
     (root / label).mkdir(mode=0o700)
-    bodies, share_bytes, export = structured_smoke_fixture(label)
+    bodies, share_bytes, export = smoke_fixture(profile, label)
     descriptors, chunks = [], []
     for index, body in enumerate(bodies):
         file = f"{label}/{index}.ndjson"
         descriptor = {"bytes": len(body), "sha256": _write_private(root / file, body), "count": 1}
         descriptors.append(descriptor)
         chunks.append({"file": file, **descriptor})
-    return _fixture_metadata(
+    metadata = _fixture_metadata(
         root, label, status, chunks, descriptors, share_bytes, hashlib.sha256(export).hexdigest() if export else None,
     )
+    metadata["exportBytes"] = len(export)
+    return metadata
 
 
 def generate_capacity_fixtures(directory: Path, revision: str, *, profile: str = "capacity") -> dict:
@@ -190,8 +241,8 @@ def generate_capacity_fixtures(directory: Path, revision: str, *, profile: str =
     if profile not in FIXTURE_PROFILES:
         raise ValueError("Unknown synthetic fixture profile.")
     directory.mkdir(mode=0o700)
-    if profile == STRUCTURED_SMOKE:
-        fixtures = [_write_smoke_fixture(directory, label, status) for label, status in FIXTURE_PROFILES[profile].items()]
+    if profile in SMOKE_PROFILES:
+        fixtures = [_write_smoke_fixture(directory, profile, label, status) for label, status in SMOKE_PROFILES[profile].items()]
     else:
         fixtures = [
             _write_data_fixture(directory, "at-limits", 200, _at_limits_layout()),
