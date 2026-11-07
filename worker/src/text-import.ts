@@ -60,6 +60,15 @@ function binaryBytes(binary: string): Uint8Array<ArrayBuffer> {
   return bytes;
 }
 
+/** Decode a canonical document envelope, including ASCII whitespace folding. */
+export function decodeCanonicalNodeDocumentBase64(text: string): Uint8Array<ArrayBuffer> | null {
+  if (/[^A-Za-z0-9+/_=\- \t\r\n]/u.test(text)) return null;
+  const compact = text.replace(/[ \t\r\n]/gu, "");
+  if (compact.length < 16 && !compact.endsWith("=")) return null;
+  const binary = base64Binary(compact);
+  return binary === null ? null : binaryBytes(binary);
+}
+
 function decodedText(input: string): string | typeof INVALID_ENCODED_TEXT | null {
   if (input.length < 6) return null;
   let binary: string | null;
@@ -187,6 +196,24 @@ function* documentLines(text: string): Iterable<string> {
     start = match.index + match[0].length;
   }
   yield text.slice(start).trim();
+}
+
+/** Recognize a complete URI list before allowing extraction from an ambiguous document. */
+export function inspectPlainNodeText(text: string): { rows: number; unsupported: number } | null {
+  let rows = 0;
+  let unsupported = 0;
+  for (const line of documentLines(text)) {
+    if (!line || line.startsWith("#")) continue;
+    const [address] = splitOnce(line, "#");
+    // URI-shaped YAML keys can introduce a nested URI or block scalar.
+    if (/\s/u.test(address) || /:\s/u.test(line) || line.endsWith(":")) return null;
+    if (!candidateScheme(line)) {
+      if (!/^[A-Za-z][A-Za-z0-9+.-]{0,31}:\/\//u.test(line)) return null;
+      unsupported++;
+    }
+    rows++;
+  }
+  return { rows, unsupported };
 }
 
 function hasCandidate(text: string): boolean {
