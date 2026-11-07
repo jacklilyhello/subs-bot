@@ -269,13 +269,13 @@ class LocalBoundaryTests(unittest.TestCase):
                 self.assertEqual(options["stderr"], subprocess.DEVNULL)
                 self.assertNotIn("GH_TOKEN", options["env"])
                 self.assertNotIn("SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN", options["env"])
-                (scratch / "pushed-digest").write_text(DIGEST)
+                (scratch / "copied-digest").write_text(DIGEST)
 
             with patch.object(publication.subprocess, "run", side_effect=succeed):
                 publication._copy(scratch, scratch / "image.tar", f"{REPO}:{TAG}", auth_path, DIGEST)
             with patch.object(publication.subprocess, "run", side_effect=subprocess.CalledProcessError(
                     1, ["skopeo"], stderr=b"synthetic-private-provider-error")):
-                with self.assertRaisesRegex(publication.PublicationError, "^The registry copy did not confirm"):
+                with self.assertRaisesRegex(publication.PublicationError, "^Skopeo did not confirm"):
                     publication._copy(scratch, scratch / "image.tar", f"{REPO}:{TAG}", auth_path, DIGEST)
 
     def test_config_digest_is_computed_from_raw_bytes_at_the_immutable_reference(self):

@@ -231,13 +231,17 @@ def _skopeo_env(scratch):
 
 
 def _copy(scratch, archive, tag_reference, authfile, expected):
-    digest_file = scratch / "pushed-digest"
-    error = "The registry copy did not confirm the exact OCI manifest digest."
+    _copy_image(scratch, archive, "docker://" + tag_reference, authfile, expected)
+
+
+def _copy_image(scratch, archive, destination, authfile, expected):
+    digest_file = scratch / "copied-digest"
+    error = "Skopeo did not confirm the exact copied OCI manifest digest."
     try:
         subprocess.run([SKOPEO, "copy", "--quiet", "--preserve-digests", "--retry-times=0",
                         "--dest-tls-verify=true", "--dest-authfile", str(authfile),
                         "--digestfile", str(digest_file), "oci-archive:" + str(archive),
-                        "docker://" + tag_reference],
+                        destination],
                        env=_skopeo_env(scratch), stdin=subprocess.DEVNULL,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=240)
         with digest_file.open("rb") as output:
@@ -246,18 +250,24 @@ def _copy(scratch, archive, tag_reference, authfile, expected):
         raise PublicationError(error) from None
 
 
-def _limit_config_output():
+def _limit_inspect_output():
     resource.setrlimit(resource.RLIMIT_FSIZE, (HTTP_LIMIT, HTTP_LIMIT))
 
 
 def _config(scratch, digest_reference, authfile):
-    error = "The exact OCI config could not be read back from Cloudflare Registry."
+    return _inspect_digest(scratch, "docker://" + digest_reference, authfile, config=True)
+
+
+def _inspect_digest(scratch, image, authfile, *, config=False):
+    error = "Skopeo could not read the exact OCI config." if config else "Skopeo could not read the exact OCI manifest."
+    args = [SKOPEO, "inspect", "--raw", "--tls-verify=true", "--retry-times=0", "--authfile", str(authfile)]
+    if config:
+        args.append("--config")
     try:
         with tempfile.TemporaryFile(dir=scratch) as output:
-            subprocess.run([SKOPEO, "inspect", "--raw", "--config", "--tls-verify=true", "--retry-times=0",
-                            "--authfile", str(authfile), "docker://" + digest_reference],
+            subprocess.run([*args, image],
                            env=_skopeo_env(scratch), stdin=subprocess.DEVNULL, stdout=output,
-                           stderr=subprocess.DEVNULL, check=True, timeout=30, preexec_fn=_limit_config_output)
+                           stderr=subprocess.DEVNULL, check=True, timeout=30, preexec_fn=_limit_inspect_output)
             output.seek(0)
             data = output.read(HTTP_LIMIT + 1)
         _require(0 < len(data) <= HTTP_LIMIT, error)

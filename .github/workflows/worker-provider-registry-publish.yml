@@ -28,12 +28,7 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Install pinned Skopeo from signed Ubuntu repositories
-        run: |
-          test "$(dpkg --print-architecture)" = amd64
-          package_version=1.13.3+ds1-2ubuntu0.24.04.3
-          sudo apt-get update
-          sudo apt-get install --yes --reinstall --no-install-recommends "skopeo=$package_version"
-          test "$(dpkg-query -W -f='${Version}' skopeo)" = "$package_version"
+        run: bash worker/tools/install_provider_skopeo.sh
       - name: Verify exact main-branch Provider Fetch CI artifact
         env:
           GH_TOKEN: ${{ github.token }}
