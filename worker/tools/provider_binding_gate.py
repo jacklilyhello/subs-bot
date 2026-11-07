@@ -18,6 +18,7 @@ bootstrap = activation.bootstrap
 CONFIG_ENV = "SUBS_BOT_CF_PROVIDER_BINDING_JSON"
 PROOF_PREFIX = "subs-bot-provider-binding-proof"
 MAX_ARCHIVE_BYTES = 16 * 1024
+MAX_CAPSULE_BYTES = 8192
 PIN_ERROR = "The isolated provider binding pin is invalid."
 PROOF_ERROR = "The pinned provider activation proof could not be verified."
 LIVE_ERROR = "The private provider no longer matches the verified binding proof."
@@ -33,10 +34,10 @@ def _match(pattern, value):
 
 
 def _read_pin(raw):
-    _require(isinstance(raw, str) and 0 < len(raw) <= 4096, PIN_ERROR)
+    _require(isinstance(raw, str) and raw.isascii() and 0 < len(raw) <= MAX_CAPSULE_BYTES, PIN_ERROR)
     pin = github._parse_object(raw, PIN_ERROR)
-    _require(set(pin) == {"version", "proof", "worker", "activation"}
-             and type(pin["version"]) is int and pin["version"] == 1, PIN_ERROR)
+    _require(set(pin) == {"version", "proof", "proofDocument", "worker", "activation"}
+             and type(pin["version"]) is int and pin["version"] == 2, PIN_ERROR)
     proof, worker, active = pin["proof"], pin["worker"], pin["activation"]
     _require(isinstance(proof, dict) and set(proof) == {"revision", "runId", "runAttempt", "artifactId", "archiveSha256"}
              and _match(provider.REVISION, proof["revision"]) and _match(provider.HEX, proof["archiveSha256"])
@@ -45,7 +46,10 @@ def _read_pin(raw):
              and isinstance(active, dict) and set(active) == {"versionId", "deploymentId", "namespaceId"}
              and all(_match(activation.stage.VERSION_ID, active[key]) for key in ("versionId", "deploymentId"))
              and _match(publication.ACCOUNT, active["namespaceId"]), PIN_ERROR)
-    return proof, bootstrap.Identity(worker["workerId"], worker["workerCreatedOn"]), active
+    _require(isinstance(pin["proofDocument"], dict), PIN_ERROR)
+    document = activation.parse_binding_proof(activation._proof_bytes(pin["proofDocument"]), revision=proof["revision"],
+                                              run_id=proof["runId"], run_attempt=proof["runAttempt"])
+    return proof, document, bootstrap.Identity(worker["workerId"], worker["workerCreatedOn"]), active
 
 
 def _download(artifact_id, token):
@@ -83,7 +87,7 @@ def _read_proof(pin, token):
 
 
 class ProviderGate:
-    def __init__(self, account, caller, deploy_token, identity, active, proof):
+    def __init__(self, account, caller, deploy_token, identity, active, proof_pin, proof):
         account_sha = sha256(account.encode("ascii")).hexdigest()
         facts = proof["verification"]
         deployment = {key: active[key] for key in ("deploymentId", "namespaceId")}
@@ -95,11 +99,28 @@ class ProviderGate:
         self._identity = identity
         self._caller = caller
         self._active = active
+        self._proof_pin = proof_pin
+        self._proof_body = activation._proof_bytes(proof)
+        self._first_binding_verified = False
         self._release = {**proof["providerBuild"], "versionId": active["versionId"]}
         fingerprint = activation._fingerprint({"account": account_sha, "worker": identity.fingerprint(),
             "release": self._release, "activation": deployment, "container": facts["containerIdentitySha256"],
-            "workflow": facts["workflowIdentitySha256"]})
+            "workflow": facts["workflowIdentitySha256"], "proofArtifact": proof_pin,
+            "proofSha256": sha256(self._proof_body).hexdigest()})
         self.binding = ProviderBinding(self._release["revision"], self._release["ociManifestSha256"], fingerprint)
+
+    def verify_first_binding(self):
+        # Only the authenticated GitHub artifact can establish a new binding.
+        # Cache exact proof within this single protected release invocation.
+        if self._first_binding_verified:
+            return
+        try:
+            proof = _read_proof(self._proof_pin, github._github_token())
+            _require(activation._proof_bytes(proof) == self._proof_body, PROOF_ERROR)
+        except (ValueError, BadZipFile, RuntimeError, OSError, HTTPException, zlib.error,
+                AttributeError, KeyError, TypeError, EOFError):
+            raise CloudflareError(PROOF_ERROR) from None
+        self._first_binding_verified = True
 
     def verify(self):
         try:
@@ -121,17 +142,15 @@ def load_provider_gate(raw, target, deploy_token):
     if raw == "":
         return None
     try:
-        proof_pin, identity, active = _read_pin(raw)
+        proof_pin, proof, identity, active = _read_pin(raw)
         account, caller_id = target.get("accountId"), target.get("workerId")
         _require(provider.SERVICE == PROVIDER_SERVICE
                  and _match(publication.ACCOUNT, account) and _match(publication.ACCOUNT, caller_id)
                  and identity.worker_id != caller_id
                  and sha256(account.encode("ascii")).hexdigest() == publication.TARGET_ACCOUNT_SHA256, PIN_ERROR)
-    except (CloudflareError, ValueError, AttributeError, KeyError, TypeError):
+    except (CloudflareError, ValueError, AttributeError, KeyError, TypeError, RecursionError):
         raise CloudflareError(PIN_ERROR) from None
     try:
-        proof = _read_proof(proof_pin, github._github_token())
-        return ProviderGate(account, {"id": caller_id, "name": WORKER_NAME}, deploy_token, identity, active, proof)
-    except (ValueError, BadZipFile, RuntimeError, OSError, HTTPException, zlib.error,
-            AttributeError, KeyError, TypeError, EOFError):
+        return ProviderGate(account, {"id": caller_id, "name": WORKER_NAME}, deploy_token, identity, active, proof_pin, proof)
+    except (ValueError, RuntimeError, AttributeError, KeyError, TypeError):
         raise CloudflareError(PROOF_ERROR) from None

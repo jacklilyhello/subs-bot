@@ -575,14 +575,17 @@ def _require_provider_continuity(active, desired):
              "Changing or dropping the isolated provider binding requires a separate rotation release.")
 
 
-def _require_provider_revision(active, desired, revision):
+def _verify_first_provider_binding(active, desired, revision, proof_guard):
     _require(active is not None or desired is None or desired.revision == revision,
              "First provider binding requires proof of the same main revision as the application release.")
+    if active is None and desired is not None:
+        _require(callable(proof_guard), "First provider binding requires the verified GitHub activation artifact.")
+        proof_guard()
 
 
 def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECIFIED_AGGREGATE_KEY,
                          private_share_key=_UNSPECIFIED_PRIVATE_SHARE_KEY, provider_binding=_UNSPECIFIED_PROVIDER_BINDING,
-                         release_revision=None):
+                         release_revision=None, provider_first_binding_guard=None):
     """Read ownership, privacy and active binding facts before any release writes."""
     scope = _Isolation(worker_api, data_api, target)
     scope.worker_config()
@@ -601,13 +604,13 @@ def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECI
                  "Changing the isolated private share key requires a separate rotation release.")
     if provider_binding is not _UNSPECIFIED_PROVIDER_BINDING:
         _require_provider_continuity(version.provider_binding, provider_binding)
-        _require_provider_revision(version.provider_binding, provider_binding, release_revision)
+        _verify_first_provider_binding(version.provider_binding, provider_binding, release_revision, provider_first_binding_guard)
     return {"deploymentId": active.id, "versionId": active.version, "revision": version.revision}
 
 
 def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *, expected_active=None,
                    telegram_config: str | None = None, aggregate_key: str | None = None, private_share_key: str | None = None,
-                   provider_binding: ProviderBinding | None = None, provider_guard=None):
+                   provider_binding: ProviderBinding | None = None, provider_guard=None, provider_first_binding_guard=None):
     """Release the verified Worker and optionally configure its isolated Telegram schedule."""
     _require((provider_binding is None and provider_guard is None) or (provider_binding is not None and callable(provider_guard)),
              "An isolated provider release requires a verified dependency guard.")
@@ -631,7 +634,7 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
              or old_version.telegram_private_share_key_sha256 == desired.telegram_private_share_key_sha256,
              "Changing or dropping the isolated private share key requires a separate rotation release.")
     _require_provider_continuity(old_version.provider_binding, desired.provider_binding)
-    _require_provider_revision(old_version.provider_binding, desired.provider_binding, desired.revision)
+    _verify_first_provider_binding(old_version.provider_binding, desired.provider_binding, desired.revision, provider_first_binding_guard)
     _verify_health(old_version.revision)
     if provider_guard is not None:
         provider_guard()

@@ -46,8 +46,9 @@ class ProofGateTests(unittest.TestCase):
                 "containerIdentitySha256": "3" * 64, "workflowIdentitySha256": "4" * 64,
             },
         }
-        self.pin = {"version": 1, "proof": {"revision": RELEASE["revision"], "runId": RUN, "runAttempt": ATTEMPT,
+        self.pin = {"version": 2, "proof": {"revision": RELEASE["revision"], "runId": RUN, "runAttempt": ATTEMPT,
                                              "artifactId": ARTIFACT, "archiveSha256": "0" * 64},
+                    "proofDocument": deepcopy(self.proof),
                     "worker": {"workerId": IDENTITY.worker_id, "workerCreatedOn": IDENTITY.created_on},
                     "activation": {**ACTIVATION, "versionId": VERSION}}
         self.use_archive(zipped(self.proof))
@@ -85,6 +86,9 @@ class ProofGateTests(unittest.TestCase):
 
     def test_exact_provenance_and_live_same_account_private_provider(self):
         loaded = self.load()
+        gate._download.assert_not_called()
+        loaded.verify_first_binding()
+        loaded.verify_first_binding()
         gate._download.assert_called_once_with(ARTIFACT, "fixture-github")
         self.assertEqual(loaded.binding.revision, EVIDENCE["revision"])
         self.assertEqual(loaded.binding.image_sha256, EVIDENCE["ociManifestSha256"])
@@ -121,26 +125,53 @@ class ProofGateTests(unittest.TestCase):
                         {"head_repository": {"id": 10}}, {"head_branch": "feature"}):
             with self.subTest(changed=changed), patch.dict(self.run, changed):
                 with self.assertRaisesRegex(gate.CloudflareError, "proof could not be verified"):
-                    self.load()
+                    self.load().verify_first_binding()
         gate._download.assert_not_called()
 
     def test_bad_bytes_wrong_pins_and_extra_entries_fail_before_provider_reads(self):
         with patch.object(gate.activation, "ProviderAPI") as provider:
             self.archive += b"bad"
             with self.assertRaises(gate.CloudflareError):
-                self.load()
+                self.load().verify_first_binding()
             self.use_archive(zipped(self.proof, "unexpected"))
             with self.assertRaises(gate.CloudflareError):
-                self.load()
+                self.load().verify_first_binding()
             changed = deepcopy(self.proof)
             changed["verification"]["versionSha256"] = "0" * 64
-            self.use_archive(zipped(changed))
+            self.pin["proofDocument"] = changed
             with self.assertRaises(gate.CloudflareError):
                 self.load()
-            provider.assert_not_called()
+            provider.return_value.deployment.assert_not_called()
+            provider.return_value.version.assert_not_called()
+
+    def test_first_binding_rejects_an_authentic_archive_for_a_different_capsule(self):
+        changed = deepcopy(self.proof)
+        changed["verification"]["healthBytes"] += 1
+        self.use_archive(zipped(changed))
+        with self.assertRaisesRegex(gate.CloudflareError, "proof could not be verified"):
+            self.load().verify_first_binding()
+
+    def test_capsule_has_no_github_dependency_and_fingerprints_exact_evidence(self):
+        original = self.load().binding
+        self.pin["proofDocument"]["verification"]["healthBytes"] += 1
+        self.assertNotEqual(self.load().binding, original)
+        gate.github._github_token.assert_not_called()
+        gate.github._get_json.assert_not_called()
+        gate._download.assert_not_called()
+
+    def test_expired_or_unavailable_artifact_has_no_first_binding_fallback(self):
+        loaded = self.load()
+        gate.github._get_json.side_effect = gate.github.ArtifactError("Synthetic unavailable artifact.")
+        with self.assertRaisesRegex(gate.CloudflareError, "proof could not be verified"):
+            loaded.verify_first_binding()
+        self.assertFalse(loaded._first_binding_verified)
+        gate._download.assert_not_called()
 
     def test_empty_config_is_unbound_and_partial_or_cross_account_config_fails(self):
         self.assertIsNone(gate.load_provider_gate("", {}, ""))
+        with patch.dict(self.pin, version=1):
+            with self.assertRaisesRegex(gate.CloudflareError, "pin is invalid"):
+                self.load()
         with self.assertRaisesRegex(gate.CloudflareError, "pin is invalid"):
             gate.load_provider_gate(json.dumps(self.pin), {**TARGET, "accountId": "f" * 32}, "fixture-worker")
         del self.pin["activation"]["namespaceId"]

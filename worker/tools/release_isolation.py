@@ -80,8 +80,10 @@ def release():
     guard()
     provider_gate = load_provider_gate(os.environ.get(CONFIG_ENV, ""), target, deploy_token)
     provider_binding = provider_gate.binding if provider_gate is not None else None
+    first_provider_proof = provider_gate.verify_first_binding if provider_gate is not None else None
     starting = verify_worker_target(worker_api, data_api, target, aggregate_key=aggregate_key, private_share_key=private_share_key,
-                                    provider_binding=provider_binding, release_revision=revision)
+                                    provider_binding=provider_binding, release_revision=revision,
+                                    provider_first_binding_guard=first_provider_proof)
     if provider_gate is not None:
         provider_gate.verify()
     migrations = apply_migrations(data_api, target, bundle, manifest, guard)
@@ -89,7 +91,8 @@ def release():
     result = release_worker(worker_api, data_api, target, bundle, manifest, guard,
                             expected_active=starting, telegram_config=telegram_config, aggregate_key=aggregate_key,
                             private_share_key=private_share_key, provider_binding=provider_binding,
-                            provider_guard=provider_gate.verify if provider_gate is not None else None)
+                            provider_guard=provider_gate.verify if provider_gate is not None else None,
+                            provider_first_binding_guard=first_provider_proof)
     guard()
     print(json.dumps(result, sort_keys=True), flush=True)
 
