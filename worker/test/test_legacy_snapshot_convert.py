@@ -37,6 +37,11 @@ def make_table(db, table, stored_count=True):
         {final_time} INTEGER NOT NULL DEFAULT 1700001000 {counter})""")
 
 
+def make_path_table(db):
+    db.execute("""CREATE TABLE path_maps (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+        node_name TEXT NOT NULL, remark TEXT NOT NULL DEFAULT '', UNIQUE(user_id,node_name))""")
+
+
 def insert(db, *, table="subscriptions", row_id=1, owner=123, nodes=None, token=TOKEN, stored_count=True):
     raw = json.dumps([NODE] if nodes is None else nodes, ensure_ascii=False, indent=2)
     columns = "id,user_id,token,nodes_json" + (",node_count" if stored_count else "")
@@ -149,14 +154,77 @@ class LegacySnapshotConversionTests(unittest.TestCase):
         with closing(self.database(trash=False, bookkeeping=False)) as db, db:
             insert(db)
             for name, columns in tool.DOMAINS.items():
-                if name in tool.HANDLED:
+                if name in (*tool.HANDLED, tool.PATH_DOMAIN):
                     continue
                 db.execute(f"CREATE TABLE {name} ({','.join(column + ' TEXT' for column in columns)})")
                 db.execute(f"INSERT INTO {name} VALUES ({','.join('?' for _ in columns)})", ["fixture-private-value"] * len(columns))
         report = tool.convert_backup(self.source, self.output)
         self.assertEqual(set(report["domains"]), set(tool.DOMAINS))
-        self.assertEqual(report["blockers"], {f"unhandled:{name}": 1 for name in tool.DOMAINS if name not in tool.HANDLED})
+        self.assertEqual(report["blockers"], {f"unhandled:{name}": 1 for name in tool.DOMAINS if name not in (*tool.HANDLED, tool.PATH_DOMAIN)})
         self.assertEqual(report["counts"]["convertedRows"], 1)
+        self.assertFalse(tool.verify_bundle(self.output, require_complete=False)["completeImportable"])
+
+    def test_empty_path_table_keeps_existing_v1_shape(self):
+        with closing(self.database(trash=False)) as db, db:
+            make_path_table(db)
+        report = tool.convert_backup(self.source, self.output)
+        self.assertEqual(report["version"], 1)
+        self.assertNotIn("pathIdMapping", tool.verify_bundle(self.output))
+        self.assertFalse((self.output / tool.PATH_FILE).exists())
+
+    def test_path_rules_keep_original_text_and_id_order_under_reviewed_owner_mapping(self):
+        data = [(21, 456, " STRASSE ", "  exact\t remark → 尾  "), (4, -100123, "  香港\t ", "路径"),
+                (20, 456, "Straße", "casefold first")]
+        with closing(self.database(trash=False)) as db, db:
+            make_path_table(db)
+            db.executemany("INSERT INTO path_maps VALUES (?,?,?,?)", data)
+            db.execute("UPDATE sqlite_sequence SET seq=70 WHERE name='path_maps'")
+        report = tool.convert_backup(self.source, self.output, owner_map={"-100123": "456"})
+        self.assertTrue(report["completeImportable"])
+        self.assertEqual(report["version"], 2)
+        mapping = {"kind": "identity", "rows": 3, "sourceHighWater": 70}
+        self.assertEqual(report["pathIdMapping"], mapping)
+        self.assertEqual(tool.verify_bundle(self.output)["pathIdMapping"], mapping)
+        self.assertEqual(self.rows(tool.PATH_FILE), [{"id": row_id, "owner_id": "456", "keyword": keyword, "remark": remark}
+            for row_id, _, keyword, remark in sorted(data)])
+
+    def test_path_rules_block_ambiguous_cross_owner_overlap_even_with_different_raw_keys(self):
+        with closing(self.database(trash=False)) as db, db:
+            make_path_table(db)
+            db.executemany("INSERT INTO path_maps VALUES (?,?,?,?)", [(1, 456, "Straße", "personal"), (2, -100123, " STRASSE ", "group")])
+        report = tool.convert_backup(self.source, self.output, owner_map={"-100123": "456"})
+        self.assertEqual(report["blockers"], {"ambiguousPathOwnerRows": 1})
+        self.assertFalse((self.output / tool.PATH_FILE).exists())
+        self.assertFalse(tool.verify_bundle(self.output, require_complete=False)["completeImportable"])
+
+    def test_path_rules_block_unmapped_owners_and_invalid_text_without_partial_emission(self):
+        with closing(self.database(trash=False)) as db, db:
+            make_path_table(db)
+            db.executemany("INSERT INTO path_maps VALUES (?,?,?,?)", [(1, -100123, "unmapped", "safe"),
+                (2, 456, "empty", " \u3000 "), (3, 456, "nul\0", "safe"), (4, 456, "界" * 129, "safe")])
+            db.execute("INSERT INTO path_maps VALUES (5,456,'malformed',CAST(X'FF' AS TEXT))")
+        report = tool.convert_backup(self.source, self.output)
+        self.assertEqual(report["blockers"], {"unmappedPathOwnerRows": 1, "invalidPathRuleRows": 4})
+        self.assertFalse((self.output / "active.ndjson").exists())
+        with self.assertRaises(tool.ConversionError):
+            tool.verify_bundle(self.output)
+
+    def test_path_rules_cap_applies_after_mapping_owners(self):
+        with closing(self.database(trash=False)) as db, db:
+            make_path_table(db)
+            db.executemany("INSERT INTO path_maps VALUES (?,?,?,?)", [(i, 456 if i % 2 else -100123, f"unique-{i}", "ok")
+                for i in range(1, 66)])
+        report = tool.convert_backup(self.source, self.output, owner_map={"-100123": "456"})
+        self.assertEqual(report["blockers"], {"pathRuleOwnerLimitRows": 1})
+        self.assertFalse((self.output / tool.PATH_FILE).exists())
+
+    def test_exhausted_path_allocator_reports_fixed_blocker(self):
+        with closing(self.database(trash=False)) as db, db:
+            make_path_table(db)
+            db.execute("INSERT INTO path_maps VALUES (1,456,'safe','safe')")
+            db.execute("UPDATE sqlite_sequence SET seq=? WHERE name='path_maps'", (tool.MAX_SAFE_ID,))
+        report = tool.convert_backup(self.source, self.output)
+        self.assertEqual(report["blockers"], {"exhaustedPathAllocator": 1})
         self.assertFalse(tool.verify_bundle(self.output, require_complete=False)["completeImportable"])
 
     def test_token_collision_across_independent_source_tables_is_not_silently_rotated(self):
