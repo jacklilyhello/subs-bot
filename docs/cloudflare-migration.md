@@ -70,14 +70,14 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 | --- | --- |
 | `/start`、`/help`、中文回复菜单、`/auth` 列表及增删，支持输入 ID 或回复目标用户。 | 已接入基础欢迎、帮助和私聊管理员授权。核对两账号和测试群的权限隔离、撤权及重投。中文菜单、生产管理员及白名单配置、历史授权覆盖另行核对。 |
 | `/list`、`/expire`、回收站菜单、翻页和跳页。 | `/list`、未来 14 天内到期的 `/expire` 及新增的 `/recycle` 已支持按所有者翻页。核对边界日期、旧票据、跨用户回调和重命名、确认删除、30 天内恢复。菜单、任意页跳转和详情入口分开接入。 |
-| 数字或列表按钮打开详情，浏览节点和流量，单条重命名、刷新、删除、格式链接、短链和节点文件。`/s` 按名称及原始 URL 搜索，`/d` 批量删除匹配项。`/renumber` 只返回当前订阅计数。 | 已有生命周期操作、元数据和快照读取。详情及节点浏览、搜索、批量回收预览和确认、私聊签发各格式链接及原始 URI 附件分别验收。展示编号由列表计算。原始 URL、节点及能力链接限定在私聊。 |
+| 数字或列表按钮打开详情，浏览节点和流量，单条重命名、刷新、删除、格式链接、短链和节点文件。`/s` 按名称及原始 URL 搜索，`/d` 批量删除匹配项。`/renumber` 只返回当前订阅计数。 | 已有生命周期操作、元数据和快照读取。`0022` 在私聊详情中接入每页 15 条的节点浏览，只展示序号、协议和名称。翻页固定到原快照，返回详情可打开同一订阅的当前版本。`0024` 增加私聊 `/d 关键词或订阅链接`，最多预览 16 条匹配项，使用十分钟内一次性按钮确认。任一目标变更时整批停止，已回收订阅可在 30 天内恢复。详情、搜索、各格式链接及原始 URI 附件分别验收。展示编号由列表计算。原始 URL、节点及能力链接限定在私聊。 |
 | 粘贴节点加入临时列表，`/temp` 查看原文，`/temp clear` 清空。 | 私聊核对导入、计数、原文、TXT 附件和清空。验收包含顺序、重复、整批拒绝、迟到清空和清空后的旧请求。 |
 | 上传 `.txt`、`.log`、`.yaml`、`.yml`、`.json`，识别节点或订阅 URL，同名文件更新旧导入。 | 已接入私聊节点文档及同名上传替换。验收同一账号保留订阅 ID 和令牌、另一账号同名文件独立、失败保留旧快照。URL 列表和混合文档随提供方导入接入。 |
 | 发送一个或多个 HTTP(S) URL 或 `名称\|URL`，重复 URL 刷新，按上游标题自动命名。单条刷新、详情或导出的按需刷新、更新所有的确认和进度、有效及失败报告、保留或回收失败项。 | 私有抓取入口、订阅元数据和快照发布为基础。先验收实际提供方出网、URL 导入、单条刷新和流量、到期、标题，再验收可恢复的批量刷新、报告和失败项回收。 |
 | `/export` 动态全量聚合含自己的临时节点，`/o` 按名称和原始 URL 筛选并固定订阅顺序，所选聚合只包含订阅。 | 已接入全量和筛选聚合的 HTTP 读取、私聊 `/export` 及 `/o` 签发和撤销。验收 Unicode 匹配、稳定重显、冻结成员、配额回收、并发修改、撤销后的新读取、两账号归属和顺序。旧聚合码迁移单独接入。 |
 | `/short` 显示帮助，`短链 URL`、`short URL` 及详情按钮签发短链。`/s/{code}` 按已保存目标跳转，可选外部服务包装同一受控本地链接。 | 私聊签发和撤销普通 HTTP(S) 短链，兼容聚合重定向。验收旧短码、归属、撤销、缓存与命名空间冲突。单订阅详情入口和可信外部服务另行接入。 |
 | `/path` 和菜单维护路径对应，支持添加、删除和清空，受限文本入口接受 `关键词=备注`。 | HTTP 导出已应用所有者路径规则，临时节点保留原名。私聊 `/path` 已接入显式添加、删除、清空和分页。验收两账号隔离与迟到操作，菜单、独立自由文本和旧规则导入分别接入。 |
-| `@Bot [关键词]` 搜索并发送订阅及临时节点，`/i` 切换默认、流量、到期和名称排序。`Share` 支持自定义内容或匹配订阅、指定接收人、份数和有效期；选中反馈用于更新原卡。 | 私密创建和领取已接入私聊 `/share`、`/start claim_<code>`。隔离工作流核对实际双账号回执、正文、过期、指定用户、并发与重复领取。`0020` 增加私聊 `/i`，可查看并持久保存四种排序偏好。内联搜索和分享卡片分别接入。Telegram 内联查询只提供聊天类型，无法核对指定群 ID。 [Telegram InlineQuery](https://core.telegram.org/bots/api#inlinequery) |
+| `@Bot [关键词]` 搜索并发送订阅及临时节点，`/i` 切换默认、流量、到期和名称排序。`Share` 支持自定义内容或匹配订阅、指定接收人、份数和有效期；选中反馈用于更新原卡。 | 私密创建和领取已接入私聊 `/share`、`/start claim_<code>`。隔离工作流核对实际双账号回执、正文、过期、指定用户、并发与重复领取。`0020` 持久保存私聊 `/i` 排序。`0025` 增加默认关闭的私聊内联订阅搜索，仅处理能确认为当前用户与同一 Bot 私聊的 `sender`。临时节点、选择后的专用操作和群内分享卡片另行接入。Telegram 内联查询只提供聊天类型，无法核对指定群 ID。 [Telegram InlineQuery](https://core.telegram.org/bots/api#inlinequery) |
 | `/g` 查 GitHub 仓库和公开代码，代码无结果时查询 grep.app，必要时提供 GitHub 网页搜索入口。`/ai` 接受 API 地址和 Key，探测 OpenAI 兼容端点的状态和延迟。 | 两项各自接入和验收。GitHub 凭据只发送至 GitHub。`/ai` 按固定范围验证用户提供的地址，禁用重定向，保护 Key 和上游响应。 |
 | `/health`、单订阅、聚合和短链 HTTP 路由。旧服务默认使用 Clash，支持 Base64、Sing-box、Surge 和 QX 系列。 | 按本页 HTTP 表验收格式、别名、顺序、字节、失败状态及旧能力链接。托管配置校验、真实隔离 HTTP 响应和客户端导入分别记录。 |
 | 旧服务使用长轮询，启动时清理过期分享和旧回收记录，刷新由用户操作触发。 | 已接入 Webhook 和 Telegram 恢复 Cron。订阅批处理和生产数据回收另行验收，回收前核对备份、活动指针及回滚引用。 |
@@ -95,7 +95,8 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 - 同一用户的私聊和群聊读取相同的个人数据。重命名和翻页绑定用户、聊天与话题。受保护的写入以 D1 里的当前授权和对象版本为条件。生产授权迁移需要核对管理员、初始白名单及显式允许和拒绝覆盖。
 - 私密领取保留现有的分享能力语义。`0005` 按 Bot 存储分享码摘要，使用独立的私有 R2 对象保存最多 64 KiB 的私密正文。`0007` 将指定账号在普通私聊发出的 `/start claim_<code>` 记为持久领取意图，回执只存码的摘要。这个入口沿用单次领取授权，普通订阅操作仍检查白名单。领取前核对正文长度、摘要和 UTF-8，D1 在同一事务复核到期、指定用户及剩余份数，同时将回复切换到发送中。份数以 `(share_id, actor_id)` 唯一领取记录计数，已领取的用户在有效期内可再次查看。
 - 私聊短正文以纯文本送达，超过消息长度或含有不适合直接显示的控制字符时使用一个固定文件名的 UTF-8 附件。发送结果不明时保留回执和领取记录，避免自动重复发送。内联创建和更新群内分享卡片另行接入。 [Telegram `sendMessage`](https://core.telegram.org/bots/api#sendmessage) · [Telegram `sendDocument`](https://core.telegram.org/bots/api#senddocument)
-- 私聊 `/share [x份数] [id领取人ID] [s分钟] -- 正文` 接入 `0016` 的私密创建。份数默认 1、上限 100，时长默认 10 分钟、上限 10,080 分钟。指定领取人限当前隔离策略的两个账号。命令参数最多 4,096 个 UTF-16 单位，分隔符后的正文保留原空格和换行。此入口在私聊签发领取链接。内联搜索和群内通用分享卡片分阶段接入。
+- 私聊 `/share [x份数] [id领取人ID] [s分钟] -- 正文` 接入 `0016` 的私密创建。份数默认 1、上限 100，时长默认 10 分钟、上限 10,080 分钟。指定领取人限当前隔离策略的两个账号。命令参数最多 4,096 个 UTF-16 单位，分隔符后的正文保留原空格和换行。此入口在私聊签发领取链接。群内通用分享卡片另行接入。
+- 私聊内联搜索需要单独启用 Worker 的 `TELEGRAM_INLINE_SEARCH` 和 Telegram 的内联更新。每位获准用户再通过自己的 Bot 私聊发送 `/inline on` 授权 15 分钟，可用 `/inline off` 关闭。结果按 `/i` 的模式排列，只显示脱敏名称。每次最多返回 50 条。扫描预算为两秒，最多处理 512 条订阅，名称和来源共计最多 8 MiB。超出扫描预算时返回空结果。每位用户每分钟最多接纳 12 次查询，同一时刻只处理一个。Telegram 缓存时间为零。D1 只记录查询 ID 摘要、关联授权、排序版本和结果状态，保留约 25 小时用于去重。发送中断后请重新输入关键词。当前配置留在关闭状态。 [Telegram Inline Bots](https://core.telegram.org/bots/inline) · [Telegram answerInlineQuery](https://core.telegram.org/bots/api#answerinlinequery)
 - 创建需单独的 `TELEGRAM_PRIVATE_SHARE_CREATION_KEY`，使用规范 Base64URL 编码的 32 字节密钥及稳定安装标识 `subs-bot-cf-dev-01`。它与聚合密钥分离。运行时每轮核对 `0016` 的精确迁移登记，再启用对应收件、发件和恢复分支。缺少密钥时普通回复继续独立发送。清理只需 schema 就绪，不依赖该密钥。受保护发布在任何迁移前核对当前密钥摘要，拒绝意外替换或删除。通用只读验收仅核对绑定元数据。
 - 正文在 R2 写入前先登记回执与内容摘要，再以条件 PUT 写入私有对象。未确认正文持久化时 webhook 返回可重试错误。Cron 每轮恢复一份已有正文的候选。发送领取链接前，在同一 D1 更新中同时核对精确发件租约及创建模块返回的私聊、发布、到期和授权版本条件。链接只发给创建者，正文由独立私聊领取。发送结果不明时保留原回执和不确定状态。遗弃候选沿用有归属校验与宽限期的清理，并保留墓碑重新观察迟到对象。托管测试只使用合成更新和 Bot HTTP double，实际双账号验收仍从指定 IAB 执行。
 - 验收须覆盖 Telegram 返回成功后写回失败，核对同一发件租约的状态与实际送达。 [Telegram `sendMessage`](https://core.telegram.org/bots/api#sendmessage)
@@ -110,6 +111,17 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 `/s 关键词` 按当前用户的活动订阅搜索名称和来源，沿用旧版的 Unicode 小写子串匹配。每页最多显示 8 项，搜索限于 512 条订阅及 8 MiB 元数据。群聊只显示用户自己的匹配名称和编号。普通私聊可通过搜索结果、`/list`、`/expire` 的详情按钮，或直接发送活动列表顺序编号查看详情。详情显示流量、到期、节点数量及最多 8 个已校验的节点名称。来源 URL、节点凭据和刷新错误原文不进入回复。
 
 `0018` 只持久化查询结果中的订阅 ID 和顺序、操作范围及回执。按钮以 10 分钟单次票据绑定 Bot、用户、聊天、话题、原回复和发送尝试。Clash、Sing-box、Base64、Surge 和 QX 使用原有订阅 Token 的固定同源格式链接，发送前重新检查授权及活动快照版本。Base64 和 Sing-box 共用 HTTP 导出的预检，其他格式在现有 HTTP 导出路由验证兼容性。未发布的订阅显示当前状态，待后续刷新或文件导入发布后可重新查看。链接发出后仍遵循现有 HTTP 能力链接规则，移入回收站时返回 `404`。
+
+#### 私聊批量回收验收
+
+`worker-isolation-telegram-fixtures.yml` 的 `bulk-trash` 仅在受保护的 `main` 与指定隔离环境运行，和部署共用锁。工具核对活动 Worker 的精确版本及模块摘要、D1/R2 归属、Telegram 策略、聚合密钥摘要与 `0024` 迁移。验收期间保留同一活动版本，避免这两位账号并行执行其他命令。
+
+1. 使用从未使用的 16 位小写字母或数字 `cohort` 执行 `seed`。工具确认两个指定账号没有其他活动订阅或未完成的相关任务，再为管理员建立 16 条、成员建立 1 条合成订阅。管理员的最后一条仅匹配来源 URL，其他条目匹配名称。所有订阅均未发布节点快照。
+2. 两位账号分别在 IAB 私聊发送一次 `/d CFB-<cohort>`，确认管理员预览 16 条、成员只预览自己的 1 条。可在指定群用带 Bot 用户名的命令观察没有预览。管理员在十分钟内点击原预览的确认按钮，等待 16 条移入回收站的回复。成员不点击确认按钮。
+3. 用成功的 `seed` 运行号作为 `source_run_id` 执行 `verify`。工作流核对实际发送的两个私聊预览、对应的对象集合，以及绑定管理员原消息与发送尝试的确认回复。D1 必须显示 16 条合成管理员订阅均已按同一确认进入回收站，成员行未变更。群聊未显示预览由 IAB 单独观察。
+4. 等成员未使用的按钮自然到期，再用成功的 `verify` 运行号及其完整提交 SHA 执行 `retire`。确认字段填 `retire <cohort>`。工具要求发件已落定，在同一 D1 事务内复核并删除精确的合成订阅及其版本记录。Telegram 收件、发件和批量回收回执保留。工具不调用 Telegram API，也不创建 R2 对象。
+
+如果操作中断，可用 `seed` 的成功运行号和完整 `source_revision` 执行相同的 `retire`。恢复仅接受合成行全部未变更，或管理员 16 条均有已送达的精确确认且成员未变更。未使用的按钮仍须先到期。部分回收、未知记录、发送未落定或身份不符会停止清理。后续已部署的 `main` 可以清理历史检查点，但须核对同一资源、策略和密钥，保留原发布固定值并另记清理发布。签名检查点仅保存合成数字标识、摘要和回执水位。恢复不计作真实验收完成。
 
 ### 私密创建的隔离验收
 
@@ -157,7 +169,8 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 - 刷新任务保存订阅、发起人、期望版本、尝试次数和错误类别。租约带过期时间及递增凭据，过期消费者的写入由条件检查拒绝。队列消息重复投递时复用同一任务。重试按错误类别退避并遵守提供方限速，耗尽后进入死信或可审计的失败状态。用 Cron 补发已入库但未成功入队的任务。拉取或解析失败只记录错误状态，上一份有效快照继续服务。 [Queues 重试与死信](https://developers.cloudflare.com/queues/configuration/batching-retries/)
 - 任意用户 URL 开放前，验证 HTTP(S) URL、允许端口和重定向策略。每一跳重新解析 A/AAAA，拒绝私有、环回、保留及混合公网和私网结果，并确保实际连接到通过检查的 IP，同时保持原 Host、TLS SNI 和证书校验。带凭据的请求禁止将凭据转发至新来源。延续现有解压后 10 MiB 上限，并对上传、重定向次数、总耗时、节点数和 YAML 深度或别名设置限额。
-- 抓取组件使用项目专用 Cloudflare Container、固定 DNS 地址的 Python 传输及有界私有 RPC。Cron 只有在私有服务绑定、预期版本和镜像摘要都配置后，才会领取一条已有导入或刷新任务。RPC 在启动 Container 前核对版本和镜像。托管 CI 使用合成 RPC 验证已构建 Worker 的 D1、R2 与 HTTP 流程。服务绑定启用、Telegram 单条命令和真实提供方的 TLS 与兼容性分别验收，批量刷新另行接入。 [私有抓取组件](../worker/provider_fetch/README.md) · [Containers 出网](https://developers.cloudflare.com/containers/configuration/outbound-traffic/)
+- 抓取组件使用项目专用 Cloudflare Container、固定 DNS 地址的 Python 传输及有界私有 RPC。Cron 只有在私有服务绑定、预期版本和镜像摘要都配置后，才会领取已有任务。RPC 在启动 Container 前核对版本和镜像。托管 CI 使用合成 RPC 验证已构建 Worker 的 D1、R2 与 HTTP 流程。服务绑定启用和真实提供方的 TLS 与兼容性单独验收。 [私有抓取组件](../worker/provider_fetch/README.md) · [Containers 出网](https://developers.cloudflare.com/containers/configuration/outbound-traffic/)
+- 私聊单条导入要求显式开启 `TELEGRAM_PROVIDER_URL_IMPORT=1`，并确认已配置固定抓取绑定和迁移。仅两位隔离账号可提交一条独立 HTTP(S) 链接或 `名称|链接`。群聊、多行内容及回复改名沿用各自的处理路径。每次 Cron 最多领取一项 Telegram 导入任务和一项普通提供方任务。等待抓取期间，同一私聊可以继续接收其他回复。固定结果只发回原私聊，并与已进入发送流程的回复串行。入队任务的发送期限为完成时间与任务过期时间中较早的一项再加 15 分钟，未入队的拒绝回复从收件起算。关闭入口后暂停该队列及回复恢复。刷新按钮和批量输入分别接入及验收。
 - 解析拒绝、抓取失败或租约过期时保留上一份快照和流量信息。成功发布在同一个 D1 批次核对所有者、原始 URL、代次、生命周期和租约，再更新快照、有效流量与到期元数据，并完成任务。候选 R2 路径使用本次租约 UUID。确认 CAS 未提交时回收本次候选，结果不明时读回精确任务及包含摘要的快照指针，并保留不能确认的候选。后续清理需在写 R2 前持久记录候选并确认活动区、回收站和备份均未引用，现有任务记录丢失租约后不能凭 R2 前缀自动推定归属。
 - 测试包括实际提供方的鉴权、重定向、编码、流量头、IPv4/IPv6、阻断行为与限速。输出只记录分类结果和耗时。覆盖 DNS 重绑定、跨来源重定向、压缩超限和异常 YAML，并核对失败不会改变旧快照。真实联调使用获准的测试订阅和会话。
 
@@ -177,6 +190,20 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 10. 发布含 `0014` 的版本前，在同一受控 Environment 配置 `SUBS_BOT_TELEGRAM_AGGREGATE_KEY`。它是独立随机 32 字节的无填充 Base64URL 编码，注入 Worker 的加密绑定 `TELEGRAM_AGGREGATE_KEY`。发布与回读比较其摘要，重复发布保留原密钥。密钥轮换须单独审查，原始密钥及能力链接始终留在受控凭据和私聊范围内。
 
 域级 Worker 路由核对使用单独的只读凭据。发布任务内使用项目专用凭据核对 Worker 的 Custom Domain、预览、日志、Cron 及实际数据绑定。 [Cloudflare Worker 路由 API](https://developers.cloudflare.com/api/resources/workers/subresources/routes/)
+
+#### 隔离提供方绑定
+
+默认发布不配置提供方绑定。首次启用时，为同一个 `main` 提交构建应用和提供方，完成私有提供方的隔离激活和停机证明，并单独核对域级路由未指向提供方。将下列精确结构保存到 `subs-bot-isolation` Environment 的受保护配置 `SUBS_BOT_CF_PROVIDER_BINDING_JSON`，并在 GitHub 证明产物到期前运行首次绑定。资源标识和完整配置只存于受控配置。
+
+- `version` 为整数 `2`。
+- `proof` 包含 `revision`、`runId`、`runAttempt`、`artifactId`、`archiveSha256`。运行和产物编号为十进制字符串，摘要为原始 ZIP 字节的 SHA-256。
+- `proofDocument` 为该 ZIP 中 `provider-binding-proof.json` 的完整 JSON 对象。保留证明的所有字段和值，包括证明文档自己的 `version` 值 `1`。
+- `worker` 包含 `workerId`、`workerCreatedOn`。
+- `activation` 包含 `versionId`、`deploymentId`、`namespaceId`。
+
+首次绑定在 D1 迁移前核对 GitHub 受保护激活运行、精确 ZIP 摘要、规范化证明内容以及应用与提供方的同账户归属。之后保留原始配置。应用当前活动版本的不可变注解和绑定记录必须与配置的证明摘要及资源身份完全一致。满足此条件时，后续应用发布可以使用新的 `main` 提交，原 GitHub 产物过期或不可用时仍可继续。每次发布仍回读提供方的活动版本、模块、镜像、SQLite 命名空间和私有设置。应用绑定目标为 `subs-bot-provider-fetch-dev-01` 的 `ProviderFetch` 入口，并向该入口校验所需的提供方修订和镜像摘要。
+
+写入应用版本后回读绑定，激活后再次核对提供方。校验失败时仅按既有守卫恢复先前的应用版本。绑定配置变化、提供方漂移或尝试移除绑定会阻止常规发布，轮换须单独审查。回滚至未绑定版本后，重新绑定仍须取得符合首次绑定要求的 GitHub 证明。 [服务绑定](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/rpc/#named-entrypoints) · [提供方激活与证明](../worker/provider_fetch/README.md)
 
 ### 数据与切换
 
@@ -198,6 +225,34 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 关闭本组上传后选择 `retire`，提供成功的 `verify-replaced` 运行 ID，并在确认字段填写 `retire <cohort>`。若在替换前结束，也可使用 `capture-created` 的检查点。清理先在 D1 中核对并撤销本组两个订阅指针，再删除并核对检查点记录的私有 R2 对象。实际 Telegram 的终态回执继续保留，以防重投重新创建订阅。检查点只包含本组合成对象标识、计数和摘要。验收工作流通过 Cloudflare 核对状态，实际上传和可见回复在浏览器中确认。
 
+同一工作流的 `profile=node-pages` 使用独立的合成文件名 `tgdoc-nodes-<cohort>.txt`。先执行 `prepare`，然后用下面的配方在新的私有临时目录中生成两份同名文件。将示例 `COHORT` 换成这次 `prepare` 的值。配方只写入使用保留测试地址的合成文本。
+
+```sh
+COHORT=0123456789abcdef python3 - <<'PY'
+import os
+from pathlib import Path
+import re
+from tempfile import mkdtemp
+
+cohort = os.environ["COHORT"]
+if re.fullmatch(r"[0-9a-f]{16}", cohort) is None:
+    raise SystemExit("Expected a 16-character lowercase hexadecimal cohort")
+root = Path(mkdtemp(prefix="subs-bot-node-pages-"))
+name = "tgdoc-nodes-" + cohort
+prefix = "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.10:8388#" + name
+for role, count in (("admin", 32), ("member", 2)):
+    folder = root / role
+    folder.mkdir(mode=0o700)
+    content = "".join(f"{prefix}-{role}-{index:02d}\n" for index in range(1, count + 1))
+    fd = os.open(folder / (name + ".txt"), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as file:
+        file.write(content.encode("ascii"))
+print(root)
+PY
+```
+
+两名获准测试者只在指定内置浏览器的隔离 Bot 私聊中上传各自目录中的文件。用文件名搜索各自的订阅，打开详情和节点浏览。管理员核对按原顺序显示的 15、15、2 个节点以及上一页和下一页按钮。成员核对自己的一页两个节点。随后以 `prepare` 运行 ID 执行 `capture-created`，由工作流核对同一固定版本下两份快照的有序节点、协议和 Base64 GET、HEAD。停止浏览后，以 `capture-created` 运行 ID 和 `retire <cohort>` 执行 `retire`。退役要求相关详情与节点回复已结束，且只撤销已核对的两个订阅和四个 R2 对象。文档、详情和节点浏览回执保留。该模式的流程止于这三步。
+
 容量检查的客户端耗时和吞吐来自这组样本。CPU、内存和平台子请求数量通过隔离 Worker 的聚合指标另行核对。旧 SQLite 的正文体积与转换后的 NDJSON 和分享原文分别测量。真实备份的分布、超限项及可恢复性需要通过获准的数据演练验证。 [Workers 限制](https://developers.cloudflare.com/workers/platform/limits/) · [Workers 指标](https://developers.cloudflare.com/analytics/graphql-api/tutorials/querying-workers-metrics/)
 
 旧库容量盘点在获准的托管环境运行 `python3 -B worker/tools/legacy_inventory.py <封存备份>`。输入须是单独完成、关闭、使用 UTF-8 和 DELETE 日志模式的 SQLite 备份。备份准备在原库之外进行，盘点本身以只读事务运行。报告只包含活动订阅与回收站的聚合计数、原始字节、紧凑 UTF-8 NDJSON 字节、块数、大小限制和旧转换器分享原文估算。无法读取或解析的记录有独立计数。退出码 `0` 表示报告完整，仍需检查超限和无效项。退出码 `2` 表示无法核对备份。容量报告不判定归属映射、旧链接兼容、分享权限或实际 Worker 性能。 [SQLite 增量读取](https://sqlite.org/c3ref/blob_open.html) · [SQLite URI](https://sqlite.org/uri.html)
@@ -211,6 +266,8 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 ### 隔离合成旧订阅候选应用
 
 在受保护的 `main` 运行 `worker-isolation-legacy-candidate.yml`。所有步骤使用同一组全长 32 位小写十六进制 `cohort`、同一次成功的 Worker CI `source_run_id` 和同一已核对的隔离 Worker。开始前确认本轮可在产物保留期内完成，并保持 `main` 和隔离部署稳定。此流程从 CI 的固定合成候选包恢复，目标 D1 和 R2 的名称包含完整 `cohort`。只在源私有 R2 写入本组操作记录。
+
+默认的 `synthetic-legacy` 沿用版本 1 合成包。路径规则演练显式选择 `synthetic-legacy-path`，全程保持同一选项。该选项使用单独的版本 2 产物、目标资源名称及操作记录前缀。固定样例核对映射归属、精确规则文字及编号顺序，并保留已删除规则的编号上界。最终读回输出规则数量、编号上界和数据摘要。候选保持未绑定状态。
 
 1. 依次运行 `verify`、`prepare`、`create-restore-db`、`create-restore-bucket`，每步核对结果后再继续。创建响应不明时先运行只读 `verify`，根据创建意图、时间和实际资源身份独立确认归属，再用 `pin-resource` 提交 `resource` 和 `identity_sha256`。无法确认归属时保留该资源，停止本组后续写入。
 2. 运行 `restore-objects` 核对专用私有 R2 的对象闭包，再运行 `start-import` 向已核对且仍为空的专用 D1 导入。若已有确认的轮询书签，可用同一 `start-import` 继续轮询。响应不明时保留目标和私有操作记录，通过 `verify-restore` 核对完整结果。导入请求未确认、上传链接或产物已失效，或固定版本已变更时，禁止重发首次导入、重置或删除原目标。保留现场核查，后续演练使用新的 `cohort` 和专用资源。 [D1 原生导入](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/import/)

@@ -3,6 +3,11 @@ name: Verify isolated Telegram document uploads
 on:
   workflow_dispatch:
     inputs:
+      profile:
+        description: Select document replacement or subscription node-page fixtures
+        type: choice
+        options: [document, node-pages]
+        default: document
       action:
         description: Select one checkpoint or retirement phase
         required: true
