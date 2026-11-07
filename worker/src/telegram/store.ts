@@ -107,58 +107,61 @@ type ReplyRow = Omit<TelegramReplyLease,
 function supportedReceipt(alias: "inbox" | "earlier", includeAggregate = false, includePrivateShareCreation = false,
   includeSubscriptionRead = false, includeShortLinks = false, includeInlineSort = false, includeSubscriptionNodes = false,
   includeProvider = false, includeBulkTrash = false, includeInlineConsent = false, includeGitHubSearch = false): string {
-  return `(${alias}.receipt_nonce IS NULL OR (${alias}.receipt_nonce = '${TELEGRAM_VIEW_MARKER}'
-    AND EXISTS (SELECT 1 FROM telegram_view WHERE receipt_id = ${alias}.receipt_id))
-    OR (${alias}.receipt_nonce = '${TELEGRAM_LIFECYCLE_MARKER}'
-    AND EXISTS (SELECT 1 FROM telegram_lifecycle_action WHERE receipt_id = ${alias}.receipt_id))
-    OR (${alias}.receipt_nonce = '${TELEGRAM_PRIVATE_CLAIM_MARKER}'
-    AND EXISTS (SELECT 1 FROM telegram_private_claim WHERE receipt_id = ${alias}.receipt_id))
-    OR (${alias}.receipt_nonce = '${TELEGRAM_TEMP_MARKER}'
-    AND EXISTS (SELECT 1 FROM telegram_temp_reply WHERE receipt_id = ${alias}.receipt_id))
-    OR (${tempRawMarker(alias)} AND ${alias}.chat_type='private' AND ${alias}.actor_id=${alias}.chat_id
+  // Keep feature predicates within D1's expression depth limit in the claim query.
+  return `(CASE WHEN ${alias}.receipt_nonce IS NULL THEN 1
+    WHEN (${alias}.receipt_nonce = '${TELEGRAM_VIEW_MARKER}'
+      AND EXISTS (SELECT 1 FROM telegram_view WHERE receipt_id = ${alias}.receipt_id)) THEN 1
+    WHEN (${alias}.receipt_nonce = '${TELEGRAM_LIFECYCLE_MARKER}'
+      AND EXISTS (SELECT 1 FROM telegram_lifecycle_action WHERE receipt_id = ${alias}.receipt_id)) THEN 1
+    WHEN (${alias}.receipt_nonce = '${TELEGRAM_PRIVATE_CLAIM_MARKER}'
+      AND EXISTS (SELECT 1 FROM telegram_private_claim WHERE receipt_id = ${alias}.receipt_id)) THEN 1
+    WHEN (${alias}.receipt_nonce = '${TELEGRAM_TEMP_MARKER}'
+      AND EXISTS (SELECT 1 FROM telegram_temp_reply WHERE receipt_id = ${alias}.receipt_id)) THEN 1
+    WHEN (${tempRawMarker(alias)} AND ${alias}.chat_type='private' AND ${alias}.actor_id=${alias}.chat_id
       AND ${alias}.thread_id IS NULL AND EXISTS (SELECT 1 FROM telegram_temp_reply
-        WHERE receipt_id=${alias}.receipt_id AND kind='summary'))
-    OR (${alias}.receipt_nonce = '${TELEGRAM_PATH_MARKER}' AND ${alias}.chat_type = 'private'
-    AND ${alias}.actor_id = ${alias}.chat_id AND ${alias}.thread_id IS NULL
-    AND EXISTS (SELECT 1 FROM telegram_path_reply WHERE receipt_id = ${alias}.receipt_id))
-    OR (${alias}.receipt_nonce = '${TELEGRAM_DOCUMENT_JOB_MARKER}' AND ${alias}.chat_type = 'private'
-    AND ${alias}.chat_id = ${alias}.actor_id AND ${alias}.thread_id IS NULL AND EXISTS (
-      SELECT 1 FROM telegram_document_jobs AS job WHERE job.receipt_id = ${alias}.receipt_id
-        AND job.bot_id = ${alias}.bot_id AND job.actor_id = ${alias}.actor_id AND job.state = 'done'
-        AND (job.result_code <> 'saved' OR EXISTS (
-          SELECT 1 FROM telegram_document_saved_counts WHERE receipt_id = job.receipt_id
-        ))))
-    ${includeAggregate ? `OR (${alias}.receipt_nonce = '${TELEGRAM_AGGREGATE_MARKER}'
-    AND EXISTS (SELECT 1 FROM telegram_aggregate_actions WHERE receipt_id = ${alias}.receipt_id))
-    OR (${alias}.receipt_nonce = '${TELEGRAM_SELECTED_MARKER}' AND ${alias}.chat_type = 'private'
-    AND ${alias}.chat_id = ${alias}.actor_id AND ${alias}.thread_id IS NULL
-    AND EXISTS (SELECT 1 FROM telegram_selected_actions WHERE receipt_id = ${alias}.receipt_id))` : ""}
-    ${includePrivateShareCreation ? `OR (${alias}.receipt_nonce = '${TELEGRAM_PRIVATE_SHARE_CREATION_MARKER}'
-    AND ${alias}.chat_type = 'private' AND ${alias}.chat_id = ${alias}.actor_id AND ${alias}.thread_id IS NULL
-    AND EXISTS (SELECT 1 FROM telegram_private_share_creations AS creation WHERE creation.receipt_id = ${alias}.receipt_id
-      AND creation.bot_id = ${alias}.bot_id AND creation.actor_id = ${alias}.actor_id AND creation.state = 'published'))` : ""}
-    ${includeSubscriptionRead ? `OR (${alias}.receipt_nonce = '${TELEGRAM_SUBSCRIPTION_READ_MARKER}' AND EXISTS (
-      SELECT 1 FROM telegram_subscription_read AS detail WHERE detail.receipt_id=${alias}.receipt_id
-        AND (detail.kind NOT IN ('detail','format') OR (${alias}.chat_type='private'
-          AND ${alias}.actor_id=${alias}.chat_id AND ${alias}.thread_id IS NULL))))` : ""}
-    ${includeShortLinks ? `OR (${alias}.receipt_nonce='${TELEGRAM_SHORT_LINK_MARKER}' AND ${alias}.chat_type='private'
+        WHERE receipt_id=${alias}.receipt_id AND kind='summary')) THEN 1
+    WHEN (${alias}.receipt_nonce = '${TELEGRAM_PATH_MARKER}' AND ${alias}.chat_type = 'private'
+      AND ${alias}.actor_id = ${alias}.chat_id AND ${alias}.thread_id IS NULL
+      AND EXISTS (SELECT 1 FROM telegram_path_reply WHERE receipt_id = ${alias}.receipt_id)) THEN 1
+    WHEN (${alias}.receipt_nonce = '${TELEGRAM_DOCUMENT_JOB_MARKER}' AND ${alias}.chat_type = 'private'
+      AND ${alias}.chat_id = ${alias}.actor_id AND ${alias}.thread_id IS NULL AND EXISTS (
+        SELECT 1 FROM telegram_document_jobs AS job WHERE job.receipt_id = ${alias}.receipt_id
+          AND job.bot_id = ${alias}.bot_id AND job.actor_id = ${alias}.actor_id AND job.state = 'done'
+          AND (job.result_code <> 'saved' OR EXISTS (
+            SELECT 1 FROM telegram_document_saved_counts WHERE receipt_id = job.receipt_id
+          )))) THEN 1
+    ${includeAggregate ? `WHEN (${alias}.receipt_nonce = '${TELEGRAM_AGGREGATE_MARKER}'
+      AND EXISTS (SELECT 1 FROM telegram_aggregate_actions WHERE receipt_id = ${alias}.receipt_id)) THEN 1
+    WHEN (${alias}.receipt_nonce = '${TELEGRAM_SELECTED_MARKER}' AND ${alias}.chat_type = 'private'
+      AND ${alias}.chat_id = ${alias}.actor_id AND ${alias}.thread_id IS NULL
+      AND EXISTS (SELECT 1 FROM telegram_selected_actions WHERE receipt_id = ${alias}.receipt_id)) THEN 1` : ""}
+    ${includePrivateShareCreation ? `WHEN (${alias}.receipt_nonce = '${TELEGRAM_PRIVATE_SHARE_CREATION_MARKER}'
+      AND ${alias}.chat_type = 'private' AND ${alias}.chat_id = ${alias}.actor_id AND ${alias}.thread_id IS NULL
+      AND EXISTS (SELECT 1 FROM telegram_private_share_creations AS creation WHERE creation.receipt_id = ${alias}.receipt_id
+        AND creation.bot_id = ${alias}.bot_id AND creation.actor_id = ${alias}.actor_id AND creation.state = 'published')) THEN 1` : ""}
+    ${includeSubscriptionRead ? `WHEN (${alias}.receipt_nonce = '${TELEGRAM_SUBSCRIPTION_READ_MARKER}' AND EXISTS (
+        SELECT 1 FROM telegram_subscription_read AS detail WHERE detail.receipt_id=${alias}.receipt_id
+          AND (detail.kind NOT IN ('detail','format') OR (${alias}.chat_type='private'
+            AND ${alias}.actor_id=${alias}.chat_id AND ${alias}.thread_id IS NULL)))) THEN 1` : ""}
+    ${includeShortLinks ? `WHEN (${alias}.receipt_nonce='${TELEGRAM_SHORT_LINK_MARKER}' AND ${alias}.chat_type='private'
       AND ${alias}.chat_id=${alias}.actor_id AND ${alias}.thread_id IS NULL
-      AND EXISTS (SELECT 1 FROM telegram_short_link_actions WHERE receipt_id=${alias}.receipt_id))` : ""}
-    ${includeInlineSort ? `OR (${alias}.receipt_nonce = '${TELEGRAM_INLINE_SORT_MARKER}' AND ${alias}.command = 'help'
+      AND EXISTS (SELECT 1 FROM telegram_short_link_actions WHERE receipt_id=${alias}.receipt_id)) THEN 1` : ""}
+    ${includeInlineSort ? `WHEN (${alias}.receipt_nonce = '${TELEGRAM_INLINE_SORT_MARKER}' AND ${alias}.command = 'help'
       AND ${alias}.chat_type = 'private' AND ${alias}.actor_id = ${alias}.chat_id AND ${alias}.thread_id IS NULL
-      AND EXISTS (SELECT 1 FROM telegram_inline_sort_reply WHERE receipt_id = ${alias}.receipt_id))` : ""}
-    ${includeSubscriptionNodes ? `OR (${alias}.receipt_nonce='${TELEGRAM_SUBSCRIPTION_NODE_MARKER}' AND ${alias}.command='help'
+      AND EXISTS (SELECT 1 FROM telegram_inline_sort_reply WHERE receipt_id = ${alias}.receipt_id)) THEN 1` : ""}
+    ${includeSubscriptionNodes ? `WHEN (${alias}.receipt_nonce='${TELEGRAM_SUBSCRIPTION_NODE_MARKER}' AND ${alias}.command='help'
       AND ${alias}.chat_type='private' AND ${alias}.chat_id=${alias}.actor_id AND ${alias}.thread_id IS NULL
-      AND EXISTS (SELECT 1 FROM telegram_subscription_node_page WHERE receipt_id=${alias}.receipt_id))` : ""}
-    ${includeProvider ? `OR ${telegramProviderReplyMarker(alias)}` : ""}
-    ${includeBulkTrash ? `OR (${alias}.receipt_nonce='${TELEGRAM_BULK_TRASH_MARKER}' AND ${alias}.command='help'
+      AND EXISTS (SELECT 1 FROM telegram_subscription_node_page WHERE receipt_id=${alias}.receipt_id)) THEN 1` : ""}
+    ${includeProvider ? `WHEN ${telegramProviderReplyMarker(alias)} THEN 1` : ""}
+    ${includeBulkTrash ? `WHEN (${alias}.receipt_nonce='${TELEGRAM_BULK_TRASH_MARKER}' AND ${alias}.command='help'
       AND ${alias}.chat_type='private' AND ${alias}.actor_id=${alias}.chat_id AND ${alias}.thread_id IS NULL
-      AND EXISTS (SELECT 1 FROM telegram_bulk_trash WHERE receipt_id=${alias}.receipt_id))` : ""}
-    ${includeInlineConsent ? `OR (${alias}.receipt_nonce='${TELEGRAM_INLINE_CONSENT_MARKER}' AND ${alias}.command='help'
+      AND EXISTS (SELECT 1 FROM telegram_bulk_trash WHERE receipt_id=${alias}.receipt_id)) THEN 1` : ""}
+    ${includeInlineConsent ? `WHEN (${alias}.receipt_nonce='${TELEGRAM_INLINE_CONSENT_MARKER}' AND ${alias}.command='help'
       AND ${alias}.chat_type='private' AND ${alias}.actor_id=${alias}.chat_id AND ${alias}.thread_id IS NULL
       AND EXISTS (SELECT 1 FROM telegram_inline_search_consent AS consent WHERE consent.receipt_id=${alias}.receipt_id
-        AND consent.bot_id=${alias}.bot_id AND consent.actor_id=${alias}.actor_id))` : ""}
-    ${includeGitHubSearch ? `OR ${telegramGitHubSearchMarker(alias)}` : ""})`;
+        AND consent.bot_id=${alias}.bot_id AND consent.actor_id=${alias}.actor_id)) THEN 1` : ""}
+    ${includeGitHubSearch ? `WHEN ${telegramGitHubSearchMarker(alias)} THEN 1` : ""}
+    ELSE 0 END)`;
 }
 
 function replyClock(includeProvider: boolean, alias: "inbox" | "earlier" = "inbox"): string {
