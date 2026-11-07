@@ -7,6 +7,8 @@ import { ClashContentError } from "./clash-export.ts";
 import { clashChunks, planClash } from "./clash-response.ts";
 import { SingBoxContentError } from "./singbox-export.ts";
 import { planSingBox, singBoxChunks } from "./singbox-response.ts";
+import { TextExportError } from "./text-export.ts";
+import { planTextExport, textExportChunks } from "./text-export-response.ts";
 import { answerTelegramCallback, drainTelegramReplies } from "./telegram/delivery.ts";
 import { acceptTelegramLifecycle, reapTelegramLifecycle } from "./telegram/lifecycle-actions.ts";
 import { acceptTelegramPrivateClaim } from "./telegram/private-claims.ts";
@@ -25,7 +27,8 @@ export interface Env {
 const MAX_SHARE_BYTES = 16 * 1024 * 1024;
 // Every complete chunk ends on a Base64 group boundary.
 const SHARE_CHUNK_BYTES = 24 * 1024;
-const EXPORT_KINDS = new Set(["base64", "v2ray", "mixed", "singbox", "sing-box", "clash"]);
+const QX_KINDS = new Set(["qx", "quantumult", "quantumultx"]);
+const EXPORT_KINDS = new Set(["base64", "v2ray", "mixed", "singbox", "sing-box", "clash", "surge", ...QX_KINDS]);
 const SUBSCRIPTION_PATH = /^\/sub\/([A-Za-z0-9_-]{16,128})(?:\/([A-Za-z0-9-]{1,32}))?$/;
 const AGGREGATE_PATH = /^\/agg\/([A-Za-z0-9_-]{12}|[A-Za-z0-9_-]{22})\/([A-Za-z0-9-]{1,32})$/;
 const SHORT_PATH = /^\/s\/([A-Za-z0-9_-]{12}|[A-Za-z0-9_-]{22})$/;
@@ -219,6 +222,13 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
         { headers: { ...HEADERS, "Content-Type": "application/json" } },
       );
     }
+    if (format === "surge" || QX_KINDS.has(format)) {
+      const textFormat = format === "surge" ? "surge" : "qx";
+      const plan = await planTextExport(source, textFormat);
+      return new Response(head ? null : fixedLengthBody(
+        (signal) => textExportChunks(source, textFormat, plan, signal), plan.bytes,
+      ), { headers: { ...HEADERS, "Content-Type": "text/plain; charset=utf-8" } });
+    }
     // Measure and verify the source before returning success, without retaining its content.
     let shareLength = 0;
     for await (const line of shareBytes(source)) shareLength += line.byteLength;
@@ -230,8 +240,8 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
       headers: { ...HEADERS, "Content-Type": "text/plain; charset=utf-8" },
     });
   } catch (error) {
-    if (error instanceof AggregateLimitError || error instanceof ExportContentError || error instanceof SingBoxContentError ||
-        error instanceof ClashContentError) {
+    if (error instanceof AggregateLimitError || error instanceof ExportContentError || error instanceof SingBoxContentError
+        || error instanceof ClashContentError || error instanceof TextExportError) {
       return plain("Subscription content cannot be exported.", 422, head);
     }
     return plain("Subscription temporarily unavailable.", 503, head);

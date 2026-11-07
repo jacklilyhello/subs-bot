@@ -216,6 +216,39 @@ test("the hosted deployment artifact exports small and large snapshots in worker
     } finally {
       await rm(clashScratch, { recursive: true, force: true });
     }
+
+    type TextFixture = {
+      node: Record<string, unknown>; vmess?: Record<string, unknown>; surge: string | null; qx: string | null;
+    };
+    const textCorpus: TextFixture[] = JSON.parse(await readFile(new URL("./text-export-corpus.json", import.meta.url), "utf8"));
+    for (const format of ["surge", "qx"] as const) {
+      const sub = await createSubscription(db, {
+        ownerId, name: "Synthetic text export", sourceUrl: "https://provider.example.invalid/synthetic",
+      });
+      const selected = textCorpus.filter((item) => item[format] !== null);
+      const nodes = selected.map(({ node, vmess }) => vmess
+        ? { ...node, share: "vmess://" + Buffer.from(JSON.stringify(vmess)).toString("base64") } : node);
+      assert.equal(await publishNodeSnapshot(db, bucket, {
+        id: sub.id, ownerId, expectedGeneration: 0, expectedLifecycleRevision: 0,
+      }, nodes), true);
+      const expected = selected.map((item) => item[format]).join("\n") + "\n";
+      const body = format === "surge"
+        ? "[Proxy]\n" + expected + "\n[Proxy Group]\nProxy = select, " + selected.map((item) => item.node.name).join(", ")
+          + "\n\n[Rule]\nFINAL,Proxy\n"
+        : expected;
+      for (const suffix of format === "surge" ? ["surge"] : ["qx", "quantumult", "quantumultx"]) {
+        const path = "/sub/" + sub.token + "/" + suffix;
+        const response = await request(path, { headers });
+        assert.equal(response.status, 200);
+        assert.equal(response.headers.get("content-type"), "text/plain; charset=utf-8");
+        assert.equal(response.headers.get("cache-control"), "private, no-store");
+        assert.equal(response.headers.get("content-length"), String(Buffer.byteLength(body)));
+        assert.deepEqual(Buffer.from(await response.arrayBuffer()), Buffer.from(body));
+        const head = await request(path, { method: "HEAD", headers });
+        assert.equal(head.status, 200);
+        assert.equal(head.body, null);
+      }
+    }
   } finally {
     await miniflare.dispose();
   }

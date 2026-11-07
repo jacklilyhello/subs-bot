@@ -15,7 +15,7 @@ import sys
 from threading import Barrier, BrokenBarrierError, Lock, Timer
 from time import monotonic, sleep
 
-from capacity_fixtures import SINGBOX_SMOKE, SMOKE_OBJECT_LIMIT, SMOKE_PROFILES, STRUCTURED_SMOKE, canonical_singbox
+from capacity_fixtures import CLASH_SMOKE, SINGBOX_SMOKE, SMOKE_OBJECT_LIMIT, SMOKE_PROFILES, STRUCTURED_SMOKE, canonical_config
 
 
 HOST = "subs-bot-cf-dev-01.lilyya.workers.dev"
@@ -362,26 +362,52 @@ def run_probe(directory, revision):
     }
 
 
-def _verify_singbox(response, fixture):
-    if (not 0 < fixture.export_bytes <= SMOKE_OBJECT_LIMIT
-            or response.getheader("Content-Length") != str(fixture.export_bytes)
-            or response.getheader("Transfer-Encoding") is not None):
-        raise ProbeError("The Sing-box smoke response length is invalid.")
-    body = response.read(fixture.export_bytes + 1)
-
+def _unique_json(text):
     def unique_object(pairs):
         value = dict(pairs)
         if len(value) != len(pairs):
             raise ValueError()
         return value
+    return json.loads(text, object_pairs_hook=unique_object)
 
+
+def _clash_flow_document(text):
+    # The Worker emits three block sequences, each containing JSON flow values.
+    # Parse only that bounded wire format. The hosted Mihomo test covers YAML compatibility.
+    if not text.endswith("\n") or re.search(r"[\x85\u2028\u2029]", text):
+        raise ValueError()
+    expected = ["proxies", "proxy-groups", "rules"]
+    document = {}
+    current = None
+    for line in text[:-1].split("\n"):
+        if line.startswith("  - ") and current is not None:
+            document[current].append(_unique_json(line[4:]))
+        else:
+            if not expected or line != expected[0] + ":":
+                raise ValueError()
+            current = expected.pop(0)
+            document[current] = []
+    if expected:
+        raise ValueError()
+    return document
+
+
+def _verify_native_config(response, fixture, *, clash):
+    length = response.getheader("Content-Length", "")
+    if (not re.fullmatch(r"[1-9][0-9]{0,3}", length) or int(length) > SMOKE_OBJECT_LIMIT
+            or (not clash and int(length) != fixture.export_bytes)
+            or response.getheader("Transfer-Encoding") is not None):
+        raise ProbeError("The native export smoke response length is invalid.")
+    body = response.read(int(length) + 1)
     try:
-        normalized = canonical_singbox(json.loads(body.decode("utf-8"), object_pairs_hook=unique_object))
+        text = body.decode("utf-8")
+        normalized = canonical_config(_clash_flow_document(text) if clash else _unique_json(text))
     except (ValueError, RecursionError):
-        raise ProbeError("The Sing-box smoke response is invalid JSON.") from None
-    if len(body) != fixture.export_bytes or sha256(normalized).hexdigest() != fixture.export_sha256:
-        raise ProbeError("The Sing-box smoke response differs from the Python oracle.")
-    return len(body)
+        raise ProbeError("The native export smoke response has invalid YAML flow entries or invalid JSON.") from None
+    if (len(body) != int(length) or len(normalized) != fixture.export_bytes
+            or sha256(normalized).hexdigest() != fixture.export_sha256):
+        raise ProbeError("The native export smoke response differs from the Python oracle or fixed fixture.")
+    return len(body), sha256(body).hexdigest()
 
 
 def run_structured_smoke(directory, revision, *, profile=STRUCTURED_SMOKE):
@@ -392,6 +418,8 @@ def run_structured_smoke(directory, revision, *, profile=STRUCTURED_SMOKE):
     fixtures, _ = read_fixtures(Path(directory), revision, profile=profile)
     run_deadline = monotonic() + 60
     singbox = profile == SINGBOX_SMOKE
+    clash = profile == CLASH_SMOKE
+    routes = ("", "/clash") if clash else (("/sing-box",) if singbox else ("/base64",))
 
     def health():
         deadline = min(monotonic() + 15, run_deadline)
@@ -404,32 +432,38 @@ def run_structured_smoke(directory, revision, *, profile=STRUCTURED_SMOKE):
     results = {}
     for row in fixtures:
         fixture = Fixture(row["label"], row["token"], row["status"], row["exportBytes"], row["exportSha256"])
-        path = f"/sub/{fixture.token}/" + ("sing-box" if singbox else "base64")
-        result = {}
-        for method in ("GET", "HEAD"):
-            deadline = min(monotonic() + 15, run_deadline)
-            with _request(method, path, deadline, fixture.label) as response:
-                content_type = "application/json" if singbox and fixture.status == 200 else "text/plain"
-                _check_headers(response, fixture.status, fixture.label, content_type)
-                if method == "HEAD":
-                    if response.read(1):
-                        raise ProbeError(f"HEAD returned a body for {fixture.label}.")
-                    body_bytes = 0
-                elif fixture.status == 200:
-                    if singbox:
-                        body_bytes = _verify_singbox(response, fixture)
-                    else:
+        wire_digests = set()
+        for route in routes:
+            path = f"/sub/{fixture.token}{route}"
+            label = fixture.label + ((":" + (route[1:] or "default")) if clash else "")
+            result = {}
+            for method in ("GET", "HEAD"):
+                deadline = min(monotonic() + 15, run_deadline)
+                with _request(method, path, deadline, label) as response:
+                    media = ("text/yaml" if clash else "application/json" if singbox else "text/plain")
+                    _check_headers(response, fixture.status, label, media if fixture.status == 200 else "text/plain")
+                    if method == "HEAD":
+                        if response.read(1):
+                            raise ProbeError(f"HEAD returned a body for {label}.")
+                        body_bytes = 0
+                    elif fixture.status == 200 and (singbox or clash):
+                        body_bytes, wire_digest = _verify_native_config(response, fixture, clash=clash)
+                        wire_digests.add(wire_digest)
+                    elif fixture.status == 200:
                         body_bytes, _, _ = _verify_export(response, fixture, "full", deadline)
-                else:
-                    body = _small_body(response)
-                    if body != ERROR_BODY[422]:
-                        raise ProbeError(f"The fixed error response differs for {fixture.label}.")
-                    body_bytes = len(body)
-                result[method] = {"status": fixture.status, "bodyBytes": body_bytes}
-            _remaining(deadline)
-        results[fixture.label] = result
+                    else:
+                        body = _small_body(response)
+                        if body != ERROR_BODY[422]:
+                            raise ProbeError(f"The fixed error response differs for {label}.")
+                        body_bytes = len(body)
+                    result[method] = {"status": fixture.status, "bodyBytes": body_bytes}
+                _remaining(deadline)
+            results[label] = result
+        if len(wire_digests) > 1:
+            raise ProbeError("The Clash aliases returned different bytes.")
     health()
-    return {"requests": 2 + 2 * len(fixtures), "exactHealth": 2, "pythonOracleDigestMatched": True, "exports": results}
+    verified = "fixedClashFixtureDigestMatched" if clash else "pythonOracleDigestMatched"
+    return {"requests": 2 + 2 * len(fixtures) * len(routes), "exactHealth": 2, verified: True, "exports": results}
 
 
 def main(argv=None):

@@ -183,6 +183,30 @@ test("uses the existing format planners and fixed private redirect for an active
   }
 });
 
+test("exports selected subscriptions through the Surge and Quantumult X renderers", async () => {
+  const config = policy("98006", "88006");
+  const code = "SyntheticTxt";
+  const first = await subscription(config.memberId, "First text subscription");
+  const second = await subscription(config.memberId, "Second text subscription");
+  for (const [sub, name] of [[first, "First proxy"], [second, "Second proxy"]] as const) {
+    assert.equal(await publishNodeSnapshot(db, bucket, {
+      id: sub.id, ownerId: sub.ownerId, expectedGeneration: 0, expectedLifecycleRevision: sub.lifecycleRevision,
+    }, [{ name, type: "ss", server: "203.0.113.10", port: 8388, cipher: "aes-256-gcm", password: "fixture" }]), true);
+  }
+  await link(code, config, [second.id, first.id]);
+  const surge = await request(`/agg/${code}/surge`);
+  assert.equal(surge.status, 200);
+  assert.match(await surge.text(), /^\[Proxy\]\nSecond proxy = ss,[^\n]+\nFirst proxy = ss,/u);
+  for (const format of ["qx", "quantumult", "quantumultx"]) {
+    const response = await request(`/agg/${code}/${format}`);
+    assert.equal(response.status, 200);
+    assert.match(await response.text(), /tag=Second proxy\nshadowsocks=[^\n]+tag=First proxy\n$/u);
+    const head = await request(`/agg/${code}/${format}`, "HEAD");
+    assert.equal(head.status, 200);
+    assert.equal(await head.text(), "");
+  }
+});
+
 test("rejects aggregate-wide storage overflow before reading chunks", async () => {
   const config = policy("98005", "88005");
   const code = "SyntheticCap";
