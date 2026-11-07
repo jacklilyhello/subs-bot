@@ -104,9 +104,11 @@ def release():
     provider_gate = load_provider_gate(os.environ.get(CONFIG_ENV, ""), target, deploy_token)
     provider_binding = provider_gate.binding if provider_gate is not None else None
     first_provider_proof = provider_gate.verify_first_binding if provider_gate is not None else None
+    historical_application_revision = provider_gate.historical_application_revision if provider_gate is not None else None
     starting = verify_worker_target(worker_api, data_api, target, aggregate_key=aggregate_key, private_share_key=private_share_key,
                                     provider_binding=provider_binding, release_revision=revision,
-                                    provider_first_binding_guard=first_provider_proof, release_manifest=manifest,
+                                    provider_first_binding_guard=first_provider_proof,
+                                    historical_application_revision=historical_application_revision, release_manifest=manifest,
                                     telegram_config=telegram_config, inline_search=inline_search, provider_url_import=provider_url_import)
     if provider_gate is not None:
         provider_gate.verify()
@@ -116,7 +118,8 @@ def release():
                             expected_active=starting, telegram_config=telegram_config, aggregate_key=aggregate_key,
                             private_share_key=private_share_key, provider_binding=provider_binding,
                             provider_guard=provider_gate.verify if provider_gate is not None else None,
-                            provider_first_binding_guard=first_provider_proof, inline_search=inline_search,
+                            provider_first_binding_guard=first_provider_proof,
+                            historical_application_revision=historical_application_revision, inline_search=inline_search,
                             provider_url_import=provider_url_import)
     guard()
     print(json.dumps(result, sort_keys=True), flush=True)

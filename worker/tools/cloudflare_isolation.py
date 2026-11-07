@@ -673,12 +673,19 @@ def _require_provider_continuity(active, desired):
              "Changing or dropping the isolated provider binding requires a separate rotation release.")
 
 
-def _verify_first_provider_binding(active, desired, revision, proof_guard):
-    _require(active is not None or desired is None or desired.revision == revision,
+def _verify_first_provider_binding(active, desired, revision, proof_guard, historical_application_revision):
+    if active.provider_binding is not None or desired is None:
+        return
+    expected_revision = desired.revision
+    if historical_application_revision is not None:
+        _require(_matches(REVISION, historical_application_revision) and historical_application_revision != desired.revision
+                 and active.revision == desired.revision,
+                 "First historical provider binding requires the exact active isolated health baseline.")
+        expected_revision = historical_application_revision
+    _require(expected_revision == revision,
              "First provider binding requires proof of the same main revision as the application release.")
-    if active is None and desired is not None:
-        _require(callable(proof_guard), "First provider binding requires the verified GitHub activation artifact.")
-        proof_guard()
+    _require(callable(proof_guard), "First provider binding requires the verified GitHub activation artifact.")
+    proof_guard()
 
 
 def _inline_search_target(active, requested, manifest, telegram_config):
@@ -731,7 +738,8 @@ def _require_telegram_config_continuity(active, desired_digest):
 
 def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECIFIED_AGGREGATE_KEY,
                          private_share_key=_UNSPECIFIED_PRIVATE_SHARE_KEY, provider_binding=_UNSPECIFIED_PROVIDER_BINDING,
-                         release_revision=None, provider_first_binding_guard=None, release_manifest=None,
+                         release_revision=None, provider_first_binding_guard=None, historical_application_revision=None,
+                         release_manifest=None,
                          telegram_config=_UNSPECIFIED_TELEGRAM_CONFIG, inline_search=None, provider_url_import=None):
     """Read ownership, privacy and active binding facts before any release writes."""
     scope = _Isolation(worker_api, data_api, target)
@@ -773,13 +781,18 @@ def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECI
         if version.telegram_provider_url_import or enabled:
             scope.verify_provider_url_import()
     if provider_binding is not _UNSPECIFIED_PROVIDER_BINDING:
-        _verify_first_provider_binding(version.provider_binding, provider_binding, release_revision, provider_first_binding_guard)
+        _verify_first_provider_binding(version, provider_binding, release_revision, provider_first_binding_guard,
+                                       historical_application_revision)
+        if historical_application_revision is not None and version.provider_binding is None and provider_binding is not None:
+            _verify_health(version.revision)
+            _require(scope.active() == active, "Active isolated Worker deployment changed during historical proof verification.")
     return {"deploymentId": active.id, "versionId": active.version, "revision": version.revision}
 
 
 def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *, expected_active=None,
                    telegram_config: str | None = None, aggregate_key: str | None = None, private_share_key: str | None = None,
                    provider_binding: ProviderBinding | None = None, provider_guard=None, provider_first_binding_guard=None,
+                   historical_application_revision: str | None = None,
                    inline_search: bool | None = None, provider_url_import: bool | None = None):
     """Release the verified Worker and optionally configure its isolated Telegram schedule."""
     _require((provider_binding is None and provider_guard is None) or (provider_binding is not None and callable(provider_guard)),
@@ -821,7 +834,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
         scope.verify_inline_search(inline_bot, require_fresh=first_enable)
     if verify_provider_url:
         scope.verify_provider_url_import()
-    _verify_first_provider_binding(old_version.provider_binding, desired.provider_binding, desired.revision, provider_first_binding_guard)
+    _verify_first_provider_binding(old_version, desired.provider_binding, desired.revision, provider_first_binding_guard,
+                                   historical_application_revision)
     _verify_health(old_version.revision)
     if provider_guard is not None:
         provider_guard()

@@ -28,7 +28,8 @@ UPLOAD_ERROR = "The provider version upload was not confirmed. Use verification 
 PREPARE_ERROR = "The pinned provider image was not ready for Cloudflare Workers."
 MAX_UPLOAD_ERRORS = 8
 UPLOAD_FIELDS = frozenset((
-    "metadata", "main_module", "compatibility_date", "annotations", "bindings", "containers", "exports", "files", "migrations",
+    "metadata", "main_module", "compatibility_date", "compatibility_flags", "annotations", "bindings", "containers",
+    "exports", "files", "migrations",
 ))
 
 
@@ -47,7 +48,6 @@ def _metadata(evidence, image):
         "compatibility_date": evidence["compatibilityDate"],
         "bindings": [
             {"name": "BUILD_REVISION", "type": "plain_text", "text": evidence["revision"]},
-            {"name": "PROVIDER_CONTAINER", "type": "durable_object_namespace", "class_name": "ProviderContainer"},
             {"name": "PROVIDER_SMOKE", "type": "workflow", "workflow_name": WORKFLOW, "class_name": "ProviderSmoke"},
         ],
         "exports": {
@@ -185,32 +185,49 @@ class WorkerVersions:
         beta = self._read(f"{self._beta}/{candidate}?include=modules", MAX_VERSION_RESPONSE)["result"]
         _verify_version(beta, candidate, metadata, module_sha256)
         legacy = self._read(f"{self._legacy}/versions/{candidate}")["result"]
-        _require(isinstance(legacy, dict) and legacy.get("id") == candidate, VERSION_ERROR)
-        resources = legacy.get("resources")
-        runtime = resources.get("script_runtime") if isinstance(resources, dict) else None
-        _require(isinstance(runtime, dict) and runtime.get("containers") == metadata["containers"], VERSION_ERROR)
+        _verify_legacy_version(legacy, candidate, metadata)
+
+
+def _verify_legacy_version(version, candidate, metadata):
+    _require(isinstance(version, dict) and version.get("id") == candidate, VERSION_ERROR)
+    resources = version.get("resources")
+    runtime = resources.get("script_runtime") if isinstance(resources, dict) else None
+    _require(isinstance(runtime, dict) and runtime.get("containers") == metadata["containers"], VERSION_ERROR)
+    _verify_compatibility(runtime)
+    # Some legacy responses omit bindings. The Beta version detail always verifies the exact inventory.
+    if resources.get("bindings") not in (None, {}):
+        _verify_bindings(resources["bindings"], metadata["bindings"])
+
+
+def _verify_compatibility(runtime):
+    # The pinned date enables ctx.exports by default (2025-11-17 onward).
+    _require(runtime.get("compatibility_date") in (provider.COMPATIBILITY, provider.COMPATIBILITY + "T00:00:00Z")
+             and runtime.get("compatibility_flags") in (None, []), VERSION_ERROR)
+
+
+def _verify_bindings(bindings, expected):
+    _require(isinstance(bindings, list) and len(bindings) == len(expected)
+             and all(isinstance(row, dict) and isinstance(row.get("name"), str) for row in bindings), VERSION_ERROR)
+    by_name = {row["name"]: row for row in bindings}
+    for binding in expected:
+        row = by_name.get(binding["name"])
+        _require(isinstance(row, dict) and all(row.get(key) == value for key, value in binding.items())
+                 and row.get("script_name") in (None, provider.SERVICE) and row.get("environment") in (None, "production")
+                 and row.get("namespace_id") is None and row.get("dispatch_namespace") is None, VERSION_ERROR)
 
 
 def _verify_version(version, candidate, metadata, module_sha256):
     _require(isinstance(version, dict) and version.get("id") == candidate
              and version.get("main_module") == provider.WORKER and version.get("urls") == []
-             and version.get("compatibility_date") in (metadata["compatibility_date"], metadata["compatibility_date"] + "T00:00:00Z")
              and version.get("usage_model") in (None, "standard")
-             and not any(version.get(key) for key in ("assets", "compatibility_flags", "limits", "migrations", "placement"))
+             and not any(version.get(key) for key in ("assets", "limits", "migrations", "placement"))
              and version.get("cache_options") in (None, {}, {"enabled": False},
                                                  {"enabled": False, "cross_version_cache": False}), VERSION_ERROR)
+    _verify_compatibility(version)
     annotations = version.get("annotations")
     _require(isinstance(annotations, dict)
              and all(annotations.get(key) == expected for key, expected in metadata["annotations"].items()), VERSION_ERROR)
-    bindings = version.get("bindings")
-    _require(isinstance(bindings, list) and len(bindings) == len(metadata["bindings"])
-             and all(isinstance(row, dict) and isinstance(row.get("name"), str) for row in bindings), VERSION_ERROR)
-    by_name = {row["name"]: row for row in bindings}
-    for binding in metadata["bindings"]:
-        row = by_name.get(binding["name"])
-        _require(isinstance(row, dict) and all(row.get(key) == value for key, value in binding.items())
-                 and row.get("script_name") in (None, provider.SERVICE) and row.get("environment") in (None, "production")
-                 and row.get("namespace_id") is None, VERSION_ERROR)
+    _verify_bindings(version.get("bindings"), metadata["bindings"])
     exports = version.get("exports")
     _require(isinstance(exports, dict) and set(exports) - set(metadata["exports"]) <= {"default"}, VERSION_ERROR)
     for name, expected in metadata["exports"].items():

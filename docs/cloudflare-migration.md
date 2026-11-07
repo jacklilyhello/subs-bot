@@ -212,15 +212,17 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 #### 隔离提供方绑定
 
-默认发布不配置提供方绑定。首次启用时，为同一个 `main` 提交构建应用和提供方，完成私有提供方的隔离激活和停机证明，并单独核对域级路由未指向提供方。将下列精确结构保存到 `subs-bot-isolation` Environment 的受保护配置 `SUBS_BOT_CF_PROVIDER_BINDING_JSON`，并在 GitHub 证明产物到期前运行首次绑定。资源标识和完整配置只存于受控配置。
+默认发布不配置提供方绑定。首次启用通常为同一个 `main` 提交构建应用和提供方。完成私有提供方的隔离激活和停机证明，并单独核对域级路由未指向提供方。将下列精确结构保存到 `subs-bot-isolation` Environment 的受保护配置 `SUBS_BOT_CF_PROVIDER_BINDING_JSON`，并在 GitHub 证明产物到期前运行首次绑定。资源标识和完整配置只存于受控配置。
 
 - `version` 为整数 `2`。
-- `proof` 包含 `revision`、`runId`、`runAttempt`、`artifactId`、`archiveSha256`。运行和产物编号为十进制字符串，摘要为原始 ZIP 字节的 SHA-256。
-- `proofDocument` 为该 ZIP 中 `provider-binding-proof.json` 的完整 JSON 对象。保留证明的所有字段和值，包括证明文档自己的 `version` 值 `1`。
+- `proof` 包含 `revision`、`runId`、`runAttempt`、`artifactId`、`archiveSha256`。`revision` 是生成证明的受保护工作流提交，也是首次绑定的应用提交。运行和产物编号为十进制字符串，摘要为原始 ZIP 字节的 SHA-256。
+- `proofDocument` 为该 ZIP 中 `provider-binding-proof.json` 的完整 JSON 对象。保留证明的所有字段和值，包括证明文档自己的 `version`。同提交证明为 `1`，受控历史提供方延续证明为 `2`。
 - `worker` 包含 `workerId`、`workerCreatedOn`。
 - `activation` 包含 `versionId`、`deploymentId`、`namespaceId`。
 
 首次绑定在 D1 迁移前核对 GitHub 受保护激活运行、精确 ZIP 摘要、规范化证明内容以及应用与提供方的同账户归属。之后保留原始配置。应用当前活动版本的不可变注解和绑定记录必须与配置的证明摘要及资源身份完全一致。满足此条件时，后续应用发布可以使用新的 `main` 提交，原 GitHub 产物过期或不可用时仍可继续。每次发布仍回读提供方的活动版本、模块、镜像、SQLite 命名空间和私有设置。应用绑定目标为 `subs-bot-provider-fetch-dev-01` 的 `ProviderFetch` 入口，并向该入口校验所需的提供方修订和镜像摘要。
+
+历史延续仅接受已固定的 `c0a73ce` 提供方版本。证明的 `providerBuild.revision` 保留该提供方提交，`activation.revision` 必须等于已核对的证明工作流和应用产物提交。首次绑定要求当前未绑定应用仍运行已核对的 `c0a73ce` 版本，并独立核对该历史提交是当前 `main` 的祖先。绑定后的 RPC 继续校验原提供方提交和 OCI 镜像摘要。
 
 写入应用版本后回读绑定，激活后再次核对提供方。校验失败时仅按既有守卫恢复先前的应用版本。绑定配置变化、提供方漂移或尝试移除绑定会阻止常规发布，轮换须单独审查。回滚至未绑定版本后，重新绑定仍须取得符合首次绑定要求的 GitHub 证明。 [服务绑定](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/rpc/#named-entrypoints) · [提供方激活与证明](../worker/provider_fetch/README.md)
 

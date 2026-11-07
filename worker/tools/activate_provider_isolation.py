@@ -1,6 +1,5 @@
 """Activate and verify the pinned private provider, one explicit write per dispatch."""
 
-from copy import deepcopy
 from datetime import date
 from hashlib import sha256
 import json
@@ -8,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 from time import monotonic, sleep
 from urllib.request import ProxyHandler, Request, build_opener
 
@@ -29,6 +29,10 @@ ERROR = "The private provider state did not match the pinned release and resourc
 WRITE_ERROR = "The provider operation was not confirmed. Use read-only verification and independently pin its observed state before continuing."
 PIN_ERROR = "The protected provider release or resource identity pin is invalid."
 OPERATIONS = {"verify", "activate", "provision-container", "provision-workflow", "smoke"}
+HISTORICAL_PROVIDER_REVISION = "c0a73ce0c166bb212ec373e1ec932e6d9891d806"
+HISTORICAL_PROVIDER_CI_RUN = "42372768064"
+HISTORICAL_SELECTION = "resume-c0a73ce"
+HISTORICAL_ERROR = "The protected continuation requires the pinned active Provider release and its exact main descendant."
 WORKFLOW_PATH = ".github/workflows/worker-provider-isolation-activate.yml"
 BINDING_PROOF_FILE = "provider-binding-proof.json"
 MAX_BINDING_PROOF = 4096
@@ -75,16 +79,47 @@ def _proof_bytes(value):
     return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
 
 
+def require_historical_provider_ancestor(provider_revision, main_revision, token):
+    _require(provider_revision == HISTORICAL_PROVIDER_REVISION and _match(provider.REVISION, main_revision)
+             and main_revision != provider_revision, HISTORICAL_ERROR)
+    comparison = github._get_json(f"/compare/{provider_revision}...{main_revision}?per_page=1", token)
+    base = comparison.get("base_commit")
+    merge_base = comparison.get("merge_base_commit")
+    ahead, behind = comparison.get("ahead_by"), comparison.get("behind_by")
+    _require(comparison.get("status") == "ahead" and type(ahead) is int and ahead > 0
+             and type(behind) is int and behind == 0
+             and all(isinstance(commit, dict) and commit.get("sha") == provider_revision
+                     for commit in (base, merge_base)), HISTORICAL_ERROR)
+
+
+def _provider_revision(main_revision, run_id, operation, isolated_revision):
+    selection = os.environ.get("SUBS_BOT_PROVIDER_RELEASE_SELECTION", "current")
+    if selection == "current":
+        return main_revision
+    _require(selection == HISTORICAL_SELECTION and run_id == HISTORICAL_PROVIDER_CI_RUN
+             and main_revision != HISTORICAL_PROVIDER_REVISION
+             and operation in OPERATIONS - {"activate"}
+             and (isolated_revision == HISTORICAL_PROVIDER_REVISION
+                  or (operation != "smoke" and isolated_revision == "")), HISTORICAL_ERROR)
+    return HISTORICAL_PROVIDER_REVISION
+
+
 def parse_binding_proof(raw, *, revision, run_id, run_attempt):
     """Verify canonical proof bytes against separately authenticated GitHub run metadata."""
     _require(isinstance(raw, bytes) and 0 < len(raw) <= MAX_BINDING_PROOF, BINDING_PROOF_ERROR)
     proof = github._parse_object(raw, BINDING_PROOF_ERROR)
     _require(set(proof) == {"version", "accountSha256", "providerBuild", "activation", "verification"}
-             and type(proof["version"]) is int and proof["version"] == 1
+             and type(proof["version"]) is int and proof["version"] in (1, 2)
              and proof["accountSha256"] == publication.TARGET_ACCOUNT_SHA256, BINDING_PROOF_ERROR)
     build, activation, verification = proof["providerBuild"], proof["activation"], proof["verification"]
+    historical = proof["version"] == 2
+    expected_build = HISTORICAL_PROVIDER_REVISION if historical else revision
+    activation_fields = {"runId", "runAttempt", "isolatedRevision"}
+    if historical:
+        activation_fields.add("revision")
     _require(isinstance(build, dict) and set(build) == BUILD_FIELDS
-             and _match(provider.REVISION, revision) and build["revision"] == revision
+             and _match(provider.REVISION, revision) and build["revision"] == expected_build
+             and (not historical or (revision != expected_build and build["runId"] == HISTORICAL_PROVIDER_CI_RUN))
              and all(_match(provider.DECIMAL, build[key]) for key in ("runId", "runAttempt", "artifactId"))
              and all(_match(provider.HEX, build[key]) for key in BUILD_FIELDS if key.endswith("Sha256")), BINDING_PROOF_ERROR)
     try:
@@ -92,10 +127,12 @@ def parse_binding_proof(raw, *, revision, run_id, run_attempt):
     except (ValueError, TypeError):
         raise ActivationError(BINDING_PROOF_ERROR) from None
     _require(build["compatibilityDate"] == compatibility and isinstance(activation, dict)
-             and set(activation) == {"runId", "runAttempt", "isolatedRevision"}
+             and set(activation) == activation_fields
              and _match(provider.DECIMAL, run_id) and activation["runId"] == run_id
              and _match(provider.DECIMAL, run_attempt) and activation["runAttempt"] == run_attempt
-             and _match(provider.REVISION, activation["isolatedRevision"]), BINDING_PROOF_ERROR)
+             and _match(provider.REVISION, activation["isolatedRevision"])
+             and (not historical or (activation["revision"] == revision and activation["isolatedRevision"] == expected_build)),
+             BINDING_PROOF_ERROR)
     _require(isinstance(verification, dict) and set(verification) == PROOF_FIELDS
              and verification["status"] == "complete" and verification["publicDenied"] is True
              and verification["stopped"] is True and all(_match(provider.HEX, verification[key]) for key in PROOF_DIGESTS)
@@ -129,12 +166,16 @@ def _write_binding_proof(result, revision, run_id, run_attempt):
         return
     _require(os.environ.get("SUBS_BOT_PROVIDER_ACTIVATION_OPERATION") in {"smoke", "verify"}
              and set(result) == BUILD_FIELDS | PROOF_FIELDS, BINDING_PROOF_ERROR)
+    historical = result["revision"] != revision
+    activation = {"runId": run_id, "runAttempt": run_attempt,
+                  "isolatedRevision": os.environ.get("SUBS_BOT_PROVIDER_ISOLATED_REVISION", "")}
+    if historical:
+        activation["revision"] = revision
     raw = _proof_bytes({
-        "version": 1,
+        "version": 2 if historical else 1,
         "accountSha256": publication.TARGET_ACCOUNT_SHA256,
         "providerBuild": {key: result[key] for key in BUILD_FIELDS},
-        "activation": {"runId": run_id, "runAttempt": run_attempt,
-                       "isolatedRevision": os.environ.get("SUBS_BOT_PROVIDER_ISOLATED_REVISION", "")},
+        "activation": activation,
         "verification": {key: result[key] for key in PROOF_FIELDS},
     })
     parse_binding_proof(raw, revision=revision, run_id=run_id, run_attempt=run_attempt)
@@ -218,6 +259,19 @@ def _references(worker, identity, namespace):
              and rows[0].get("worker_name") == provider.SERVICE))
 
 
+def _write_diagnostic(phase, status=None, envelope=None):
+    diagnostic = {"phase": phase}
+    if type(status) is int and 100 <= status <= 599:
+        diagnostic["httpStatus"] = status
+    errors = envelope.get("errors") if envelope is not None else None
+    if isinstance(errors, list):
+        codes = {item.get("code") for item in errors[:8] if isinstance(item, dict)
+                 and type(item.get("code")) is int and 1 <= item["code"] <= 999999}
+        if codes:
+            diagnostic["cloudflareCodes"] = sorted(codes)
+    return ActivationError(f"{WRITE_ERROR} Diagnostic {json.dumps(diagnostic, separators=(',', ':'))}.")
+
+
 class ProviderAPI:
     """Fixed project operations with at most one attempted mutation per process."""
 
@@ -254,24 +308,33 @@ class ProviderAPI:
             data = json.dumps(body, separators=(",", ":")).encode("ascii")
             headers["Content-Type"] = "application/json"
         request = Request(self.base + path, data=data, headers=headers, method=method)
-        status, _, raw = publication._response(request, self._opener, error, limit=limit)
-        envelope = github._parse_object(raw, error)
+        try:
+            status, _, raw = publication._response(request, self._opener, error, limit=limit)
+        except publication.PublicationError:
+            if method != "GET":
+                raise _write_diagnostic("transport") from None
+            raise
+        try:
+            envelope = github._parse_object(raw, error)
+        except github.ArtifactError:
+            if method != "GET":
+                raise _write_diagnostic("response-json", status) from None
+            raise
         if method == "GET" and absent is not None and status == 404:
             errors = envelope.get("errors")
             _require(envelope.get("success") is False and envelope.get("result") is None
                      and isinstance(errors, list) and len(errors) == 1 and isinstance(errors[0], dict)
                      and type(errors[0].get("code")) is int and errors[0]["code"] == absent)
             return None
-        _require(status in ((200,) if method == "GET" else (200, 201))
-                 and envelope.get("success") is True and envelope.get("errors") in (None, [])
-                 and "result" in envelope, error)
+        valid = (status in ((200,) if method == "GET" else (200, 201))
+                 and envelope.get("success") is True and envelope.get("errors") in (None, []) and "result" in envelope)
+        if not valid and method != "GET":
+            raise _write_diagnostic("response-envelope", status, envelope)
+        _require(valid, error)
         return envelope
 
     def _write(self, path, body, *, container=False, method="POST"):
-        try:
-            return self._request(path, container=container, method=method, body=body)["result"]
-        except (ActivationError, bootstrap.BootstrapError, publication.PublicationError, github.ArtifactError):
-            raise ActivationError(WRITE_ERROR) from None
+        return self._request(path, container=container, method=method, body=body)["result"]
 
     def deploy(self, release):
         return self._write(self.worker_path + "/deployments", {
@@ -283,7 +346,7 @@ class ProviderAPI:
         return self._write("/containers/applications", {
             "name": provider.SERVICE, "scheduling_policy": "durable_object",
             "durable_objects": {"namespace_id": _id(namespace)},
-            "configuration": {"authorized_keys": [], "wrangler_ssh": False},
+            "configuration": {"authorized_keys": [], "wrangler_ssh": {"enabled": False}},
             "observability": {"logs": {"enabled": False}},
         }, container=True)
 
@@ -322,41 +385,20 @@ class ProviderAPI:
         rows = _page(envelope, envelope["result"], 1)
         _require(len(rows) == 1 and isinstance(rows[0], dict) and rows[0].get("id") == release["versionId"])
         legacy = self._request(self.worker_path + "/versions/" + release["versionId"])["result"]
-        resources = legacy.get("resources") if isinstance(legacy, dict) else None
-        _require(isinstance(resources, dict) and legacy.get("id") == release["versionId"])
         image = f"{publication.HOST}/{self.account}/{provider.SERVICE}@sha256:{release['ociManifestSha256']}"
         metadata = stage._metadata(release, image)
-        _require(resources.get("script_runtime", {}).get("containers") == metadata["containers"])
+        stage._verify_legacy_version(legacy, release["versionId"], metadata)
         namespace = None
         if active:
-            bindings = resources.get("bindings")
-            _require(isinstance(bindings, list))
-            found = [row for row in bindings if isinstance(row, dict) and row.get("type") == "durable_object_namespace"]
-            _require(len(found) == 1 and found[0].get("name") == "PROVIDER_CONTAINER"
-                     and found[0].get("class_name") == "ProviderContainer"
-                     and found[0].get("script_name") in (None, provider.SERVICE)
-                     and found[0].get("dispatch_namespace") is None)
-            binding = found[0]
             envelope = self._request("/workers/durable_objects/namespaces?page=1&per_page=1000")
             namespaces = _page(envelope, envelope["result"], 1000)
             found = [row for row in namespaces if isinstance(row, dict) and row.get("script") == provider.SERVICE]
             _require(len(found) == 1 and found[0].get("class") == "ProviderContainer" and found[0].get("use_sqlite") is True
                      and found[0].get("preview") is None and found[0].get("dispatch_namespace") is None)
             namespace = _id(found[0].get("id"))
-            _require(binding.get("namespace_id") in (None, namespace))
         beta = self._request(self.beta_path + "/" + release["versionId"] + "?include=modules",
                              limit=stage.MAX_VERSION_RESPONSE)["result"]
-        # Reuse static byte/metadata checks without weakening staging's undeployed verifier.
-        normalized = deepcopy(beta)
-        if active:
-            _require(isinstance(normalized, dict) and isinstance(normalized.get("bindings"), list))
-            for binding in normalized["bindings"]:
-                _require(isinstance(binding, dict))
-                if binding.get("type") == "durable_object_namespace":
-                    _require(binding.get("namespace_id") in (None, namespace)
-                             and binding.get("dispatch_namespace") is None)
-                    binding.pop("namespace_id", None)
-        stage._verify_version(normalized, release["versionId"], metadata, release["workerSha256"])
+        stage._verify_version(beta, release["versionId"], metadata, release["workerSha256"])
         return namespace
 
     def container(self, namespace):
@@ -379,7 +421,10 @@ class ProviderAPI:
                  and value["observability"]["logs"]["enabled"] is False)
         configuration = value.get("configuration")
         _require(isinstance(configuration, dict) and set(configuration) <= {"authorized_keys", "wrangler_ssh"}
-                 and configuration.get("authorized_keys", []) == [] and configuration.get("wrangler_ssh", False) is False)
+                 and configuration.get("authorized_keys", []) == [])
+        ssh = configuration.get("wrangler_ssh")
+        _require(isinstance(ssh, dict) and set(ssh) <= {"enabled", "port"} and ssh.get("enabled") is False
+                 and ("port" not in ssh or (type(ssh["port"]) is int and 1 <= ssh["port"] <= 65535)))
         bootstrap._timestamp(value.get("created_at"))
         return {"applicationId": namespace, "createdAt": value["created_at"]}
 
@@ -528,10 +573,15 @@ def _run(api, operation, release, pins, isolated_revision, guard):
                      and pins["workflow"] is None and state["container"] is None and state["workflow"] is None)
             _require(api.actors(pins["activation"]["namespaceId"]) == [])
             guard()
-            response = api.create_container(pins["activation"]["namespaceId"])
-            _require(isinstance(response, dict), WRITE_ERROR)
-            created = {"applicationId": _id(response.get("id")), "createdAt": response.get("created_at")}
-            bootstrap._timestamp(created["createdAt"])
+            namespace = pins["activation"]["namespaceId"]
+            response = api.create_container(namespace)
+            if not isinstance(response, dict) or response.get("id") != namespace:
+                raise _write_diagnostic("container-response-identity")
+            created = {"applicationId": namespace, "createdAt": response.get("created_at")}
+            try:
+                bootstrap._timestamp(created["createdAt"])
+            except bootstrap.BootstrapError:
+                raise _write_diagnostic("container-response-timestamp") from None
         elif operation == "provision-workflow":
             _require(pins["activation"] is not None and pins["container"] is not None
                      and pins["workflow"] is None and state["workflow"] is None)
@@ -557,17 +607,22 @@ def _run(api, operation, release, pins, isolated_revision, guard):
         # Read retries never repeat a mutation. A partial state remains private for operator recovery.
         deadline = monotonic() + 150
         while True:
-            state = _observe(api, release)
-            _match_pins(state, pins)
+            try:
+                state = _observe(api, release)
+                _match_pins(state, pins)
+            except (ActivationError, bootstrap.BootstrapError, publication.PublicationError, github.ArtifactError):
+                raise _write_diagnostic("post-write-readback") from None
             if operation != "smoke" or (state["instance"] is not None
                                         and state["instance"].get("status") not in {"queued", "running", "waiting"}):
                 break
             _require(monotonic() < deadline, WRITE_ERROR)
             sleep(4)
         expected = {"activate": "activation", "provision-container": "container", "provision-workflow": "workflow", "smoke": "instance"}
-        _require(state[expected[operation]] is not None, WRITE_ERROR)
+        if state[expected[operation]] is None:
+            raise _write_diagnostic("post-write-absent")
         if created is not None:
-            _require(all(state[expected[operation]].get(key) == value for key, value in created.items()), WRITE_ERROR)
+            if not all(state[expected[operation]].get(key) == value for key, value in created.items()):
+                raise _write_diagnostic("post-write-identity")
     guard()
     result = {"status": "staged", "workerIdentitySha256": api.identity.fingerprint(),
               "versionSha256": _hash(release["versionId"]), "publicDenied": True}
@@ -599,7 +654,7 @@ def _run(api, operation, release, pins, isolated_revision, guard):
     return result
 
 
-def activate():
+def _request_context():
     revision = os.environ.get("GITHUB_SHA", "")
     run_id = os.environ.get("SUBS_BOT_PROVIDER_CI_RUN_ID", "")
     operation = os.environ.get("SUBS_BOT_PROVIDER_ACTIVATION_OPERATION", "")
@@ -615,25 +670,56 @@ def activate():
              "Use a new read-only verification dispatch to reconcile a previous operation.")
     _require(isolated_revision == "" or provider.REVISION.fullmatch(isolated_revision), PIN_ERROR)
     _require(operation != "smoke" or provider.REVISION.fullmatch(isolated_revision), PIN_ERROR)
+    build_revision = _provider_revision(revision, run_id, operation, isolated_revision)
+    return revision, build_revision, run_id, operation, isolated_revision, runner_temp
+
+
+def prepare():
+    main_revision, build_revision, _, _, _, _ = _request_context()
+    if build_revision != main_revision:
+        require_historical_provider_ancestor(build_revision, main_revision, github._github_token())
+    return publication.provenance.prepare(provider_revision=build_revision)
+
+
+def _guard_continuation(evidence, main_revision):
+    token = github._github_token()
+    require_historical_provider_ancestor(evidence["revision"], main_revision, token)
+    actual = publication.provenance._select_artifact(evidence["runId"], evidence["revision"], token)
+    _require(actual == (evidence["runAttempt"], evidence["artifactId"], evidence["archiveSha256"]), HISTORICAL_ERROR)
+    github.require_current_main(main_revision)
+
+
+def activate():
+    main_revision, build_revision, run_id, operation, isolated_revision, runner_temp = _request_context()
+    historical = build_revision != main_revision
     identity = bootstrap._pin(os.environ.get(bootstrap.IDENTITY_ENV, ""))
     _require(identity is not None, PIN_ERROR)
-    _, evidence = publication._verified_input(runner_temp, revision, run_id)
+    _, evidence = publication._verified_input(runner_temp, build_revision, run_id)
     release = _release_pin(os.environ.get(RELEASE_ENV, ""), evidence)
     pins = {
         "activation": _pin(os.environ.get(ACTIVATION_ENV, ""), ("deploymentId", "namespaceId")),
         "container": _pin(os.environ.get(CONTAINER_ENV, ""), ("applicationId", "createdAt")),
         "workflow": _pin(os.environ.get(WORKFLOW_ENV, ""), ("workflowId", "createdOn", "versionId")),
     }
+    if historical:
+        _require(pins["activation"] is not None, HISTORICAL_ERROR)
+        def guard():
+            _guard_continuation(evidence, main_revision)
+    else:
+        def guard():
+            publication._guard_main(evidence)
+    guard()
     api = ProviderAPI(os.environ.get("SUBS_BOT_CF_PROVIDER_ACCOUNT_ID", ""),
                       os.environ.get("SUBS_BOT_CF_PROVIDER_WORKER_TOKEN", ""),
                       os.environ.get("SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN", ""), identity)
-    guard = lambda: publication._guard_main(evidence)
-    guard()
     return {**evidence, **_run(api, operation, release, pins, isolated_revision, guard)}
 
 
 def main():
     context = _binding_proof_context()
+    if sys.argv[1:] == ["--prepare"]:
+        print(json.dumps(prepare(), sort_keys=True))
+        return
     result = activate()
     _write_binding_proof(result, *context)
     print(json.dumps(result, sort_keys=True))
