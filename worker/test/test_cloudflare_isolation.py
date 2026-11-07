@@ -516,12 +516,21 @@ class ReleaseTests(unittest.TestCase):
         cron_index = self.api.calls.index(("PUT", SCHEDULES))
         self.assertEqual(self.api.calls[cron_index - 2:cron_index], [("GET", DEPLOYMENTS), ("GUARD", "main")])
 
-    def test_telegram_config_can_change_without_changing_the_git_revision(self):
+    def test_ordinary_release_preserves_existing_telegram_configuration(self):
         self.api.versions[OLD_VERSION] = version(OLD_VERSION, NEW_REVISION, NEW_MODULE)
-        self.set_old_telegram_config('{"fixture":"old-synthetic-only"}')
+        self.set_old_telegram_config()
         self.api.worker_responses[SCHEDULES] = {"schedules": [CRON]}
-        self.assertTrue(self.release(TELEGRAM_CONFIG)["changed"])
-        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
+        self.assertEqual(cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET)["versionId"], OLD_VERSION)
+        for config in ('{"fixture":"different-synthetic-policy"}', None):
+            with self.subTest(configured=config is not None):
+                with self.assertRaisesRegex(cloudflare.CloudflareError, "separate scoped release"):
+                    cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET, telegram_config=config)
+                with self.assertRaisesRegex(cloudflare.CloudflareError, "separate scoped release"):
+                    self.release(config)
+        self.assertEqual(cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET,
+                                                         telegram_config=TELEGRAM_CONFIG)["versionId"], OLD_VERSION)
+        self.assertFalse(self.release(TELEGRAM_CONFIG)["changed"])
+        self.assertEqual(self.api.writes(), [])
 
     def test_aggregate_key_is_private_idempotent_and_requires_explicit_rotation(self):
         result = self.release(TELEGRAM_CONFIG, AGGREGATE_KEY)
