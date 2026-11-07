@@ -24,6 +24,8 @@ import { insertTelegramNodePageTickets, TELEGRAM_SUBSCRIPTION_NODE_MARKER, type 
 import { telegramProviderReplyClock, telegramProviderReplyEligible, telegramProviderReplyMarker, telegramProviderReplySendGuard,
   type TelegramProviderReply } from "./provider-replies.ts";
 import { TELEGRAM_INLINE_CONSENT_MARKER, type TelegramInlineConsentReply } from "./inline-search-consent.ts";
+import { TELEGRAM_GITHUB_SEARCH_MARKER, telegramGitHubSearchEligible, telegramGitHubSearchMarker, telegramGitHubSendGuard,
+  type TelegramGitHubReply } from "./github-search.ts";
 
 export interface TelegramReplyLease extends TelegramCommand {
   receiptId: number;
@@ -46,6 +48,7 @@ export interface TelegramReplyLease extends TelegramCommand {
   providerOutcome?: TelegramProviderReply;
   bulkTrash?: true;
   inlineConsent?: TelegramInlineConsentReply;
+  githubSearch?: TelegramGitHubReply;
 }
 
 export type TelegramReplyOutcome =
@@ -63,7 +66,7 @@ type ReplyAccess = "allowed" | "denied" | "none";
 type ReplyRow = Omit<TelegramReplyLease,
   "view" | "lifecycle" | "privateClaim" | "temp" | "tempRaw" | "aggregate" | "selected" | "path" | "document" |
   "privateShareCreation" | "subscriptionRead" | "shortLink" | "inlineSort" | "subscriptionNodes" | "providerOutcome" |
-  "bulkTrash" | "inlineConsent"> & {
+  "bulkTrash" | "inlineConsent" | "githubSearch"> & {
   viewKind: TelegramView["kind"] | null;
   afterId: number | null;
   afterEpoch: number | null;
@@ -97,62 +100,68 @@ type ReplyRow = Omit<TelegramReplyLease,
   providerResult: TelegramProviderReply | null;
   bulkTrashMarker: number;
   inlineConsentKind: TelegramInlineConsentReply | null;
+  githubSearchState: TelegramGitHubReply["state"] | null;
+  githubSearchResults: string | null;
 };
 
 function supportedReceipt(alias: "inbox" | "earlier", includeAggregate = false, includePrivateShareCreation = false,
   includeSubscriptionRead = false, includeShortLinks = false, includeInlineSort = false, includeSubscriptionNodes = false,
-  includeProvider = false, includeBulkTrash = false, includeInlineConsent = false): string {
-  return `(${alias}.receipt_nonce IS NULL OR (${alias}.receipt_nonce = '${TELEGRAM_VIEW_MARKER}'
-    AND EXISTS (SELECT 1 FROM telegram_view WHERE receipt_id = ${alias}.receipt_id))
-    OR (${alias}.receipt_nonce = '${TELEGRAM_LIFECYCLE_MARKER}'
-    AND EXISTS (SELECT 1 FROM telegram_lifecycle_action WHERE receipt_id = ${alias}.receipt_id))
-    OR (${alias}.receipt_nonce = '${TELEGRAM_PRIVATE_CLAIM_MARKER}'
-    AND EXISTS (SELECT 1 FROM telegram_private_claim WHERE receipt_id = ${alias}.receipt_id))
-    OR (${alias}.receipt_nonce = '${TELEGRAM_TEMP_MARKER}'
-    AND EXISTS (SELECT 1 FROM telegram_temp_reply WHERE receipt_id = ${alias}.receipt_id))
-    OR (${tempRawMarker(alias)} AND ${alias}.chat_type='private' AND ${alias}.actor_id=${alias}.chat_id
+  includeProvider = false, includeBulkTrash = false, includeInlineConsent = false, includeGitHubSearch = false): string {
+  // Keep feature predicates within D1's expression depth limit in the claim query.
+  return `(CASE WHEN ${alias}.receipt_nonce IS NULL THEN 1
+    WHEN (${alias}.receipt_nonce = '${TELEGRAM_VIEW_MARKER}'
+      AND EXISTS (SELECT 1 FROM telegram_view WHERE receipt_id = ${alias}.receipt_id)) THEN 1
+    WHEN (${alias}.receipt_nonce = '${TELEGRAM_LIFECYCLE_MARKER}'
+      AND EXISTS (SELECT 1 FROM telegram_lifecycle_action WHERE receipt_id = ${alias}.receipt_id)) THEN 1
+    WHEN (${alias}.receipt_nonce = '${TELEGRAM_PRIVATE_CLAIM_MARKER}'
+      AND EXISTS (SELECT 1 FROM telegram_private_claim WHERE receipt_id = ${alias}.receipt_id)) THEN 1
+    WHEN (${alias}.receipt_nonce = '${TELEGRAM_TEMP_MARKER}'
+      AND EXISTS (SELECT 1 FROM telegram_temp_reply WHERE receipt_id = ${alias}.receipt_id)) THEN 1
+    WHEN (${tempRawMarker(alias)} AND ${alias}.chat_type='private' AND ${alias}.actor_id=${alias}.chat_id
       AND ${alias}.thread_id IS NULL AND EXISTS (SELECT 1 FROM telegram_temp_reply
-        WHERE receipt_id=${alias}.receipt_id AND kind='summary'))
-    OR (${alias}.receipt_nonce = '${TELEGRAM_PATH_MARKER}' AND ${alias}.chat_type = 'private'
-    AND ${alias}.actor_id = ${alias}.chat_id AND ${alias}.thread_id IS NULL
-    AND EXISTS (SELECT 1 FROM telegram_path_reply WHERE receipt_id = ${alias}.receipt_id))
-    OR (${alias}.receipt_nonce = '${TELEGRAM_DOCUMENT_JOB_MARKER}' AND ${alias}.chat_type = 'private'
-    AND ${alias}.chat_id = ${alias}.actor_id AND ${alias}.thread_id IS NULL AND EXISTS (
-      SELECT 1 FROM telegram_document_jobs AS job WHERE job.receipt_id = ${alias}.receipt_id
-        AND job.bot_id = ${alias}.bot_id AND job.actor_id = ${alias}.actor_id AND job.state = 'done'
-        AND (job.result_code <> 'saved' OR EXISTS (
-          SELECT 1 FROM telegram_document_saved_counts WHERE receipt_id = job.receipt_id
-        ))))
-    ${includeAggregate ? `OR (${alias}.receipt_nonce = '${TELEGRAM_AGGREGATE_MARKER}'
-    AND EXISTS (SELECT 1 FROM telegram_aggregate_actions WHERE receipt_id = ${alias}.receipt_id))
-    OR (${alias}.receipt_nonce = '${TELEGRAM_SELECTED_MARKER}' AND ${alias}.chat_type = 'private'
-    AND ${alias}.chat_id = ${alias}.actor_id AND ${alias}.thread_id IS NULL
-    AND EXISTS (SELECT 1 FROM telegram_selected_actions WHERE receipt_id = ${alias}.receipt_id))` : ""}
-    ${includePrivateShareCreation ? `OR (${alias}.receipt_nonce = '${TELEGRAM_PRIVATE_SHARE_CREATION_MARKER}'
-    AND ${alias}.chat_type = 'private' AND ${alias}.chat_id = ${alias}.actor_id AND ${alias}.thread_id IS NULL
-    AND EXISTS (SELECT 1 FROM telegram_private_share_creations AS creation WHERE creation.receipt_id = ${alias}.receipt_id
-      AND creation.bot_id = ${alias}.bot_id AND creation.actor_id = ${alias}.actor_id AND creation.state = 'published'))` : ""}
-    ${includeSubscriptionRead ? `OR (${alias}.receipt_nonce = '${TELEGRAM_SUBSCRIPTION_READ_MARKER}' AND EXISTS (
-      SELECT 1 FROM telegram_subscription_read AS detail WHERE detail.receipt_id=${alias}.receipt_id
-        AND (detail.kind NOT IN ('detail','format') OR (${alias}.chat_type='private'
-          AND ${alias}.actor_id=${alias}.chat_id AND ${alias}.thread_id IS NULL))))` : ""}
-    ${includeShortLinks ? `OR (${alias}.receipt_nonce='${TELEGRAM_SHORT_LINK_MARKER}' AND ${alias}.chat_type='private'
+        WHERE receipt_id=${alias}.receipt_id AND kind='summary')) THEN 1
+    WHEN (${alias}.receipt_nonce = '${TELEGRAM_PATH_MARKER}' AND ${alias}.chat_type = 'private'
+      AND ${alias}.actor_id = ${alias}.chat_id AND ${alias}.thread_id IS NULL
+      AND EXISTS (SELECT 1 FROM telegram_path_reply WHERE receipt_id = ${alias}.receipt_id)) THEN 1
+    WHEN (${alias}.receipt_nonce = '${TELEGRAM_DOCUMENT_JOB_MARKER}' AND ${alias}.chat_type = 'private'
+      AND ${alias}.chat_id = ${alias}.actor_id AND ${alias}.thread_id IS NULL AND EXISTS (
+        SELECT 1 FROM telegram_document_jobs AS job WHERE job.receipt_id = ${alias}.receipt_id
+          AND job.bot_id = ${alias}.bot_id AND job.actor_id = ${alias}.actor_id AND job.state = 'done'
+          AND (job.result_code <> 'saved' OR EXISTS (
+            SELECT 1 FROM telegram_document_saved_counts WHERE receipt_id = job.receipt_id
+          )))) THEN 1
+    ${includeAggregate ? `WHEN (${alias}.receipt_nonce = '${TELEGRAM_AGGREGATE_MARKER}'
+      AND EXISTS (SELECT 1 FROM telegram_aggregate_actions WHERE receipt_id = ${alias}.receipt_id)) THEN 1
+    WHEN (${alias}.receipt_nonce = '${TELEGRAM_SELECTED_MARKER}' AND ${alias}.chat_type = 'private'
+      AND ${alias}.chat_id = ${alias}.actor_id AND ${alias}.thread_id IS NULL
+      AND EXISTS (SELECT 1 FROM telegram_selected_actions WHERE receipt_id = ${alias}.receipt_id)) THEN 1` : ""}
+    ${includePrivateShareCreation ? `WHEN (${alias}.receipt_nonce = '${TELEGRAM_PRIVATE_SHARE_CREATION_MARKER}'
+      AND ${alias}.chat_type = 'private' AND ${alias}.chat_id = ${alias}.actor_id AND ${alias}.thread_id IS NULL
+      AND EXISTS (SELECT 1 FROM telegram_private_share_creations AS creation WHERE creation.receipt_id = ${alias}.receipt_id
+        AND creation.bot_id = ${alias}.bot_id AND creation.actor_id = ${alias}.actor_id AND creation.state = 'published')) THEN 1` : ""}
+    ${includeSubscriptionRead ? `WHEN (${alias}.receipt_nonce = '${TELEGRAM_SUBSCRIPTION_READ_MARKER}' AND EXISTS (
+        SELECT 1 FROM telegram_subscription_read AS detail WHERE detail.receipt_id=${alias}.receipt_id
+          AND (detail.kind NOT IN ('detail','format') OR (${alias}.chat_type='private'
+            AND ${alias}.actor_id=${alias}.chat_id AND ${alias}.thread_id IS NULL)))) THEN 1` : ""}
+    ${includeShortLinks ? `WHEN (${alias}.receipt_nonce='${TELEGRAM_SHORT_LINK_MARKER}' AND ${alias}.chat_type='private'
       AND ${alias}.chat_id=${alias}.actor_id AND ${alias}.thread_id IS NULL
-      AND EXISTS (SELECT 1 FROM telegram_short_link_actions WHERE receipt_id=${alias}.receipt_id))` : ""}
-    ${includeInlineSort ? `OR (${alias}.receipt_nonce = '${TELEGRAM_INLINE_SORT_MARKER}' AND ${alias}.command = 'help'
+      AND EXISTS (SELECT 1 FROM telegram_short_link_actions WHERE receipt_id=${alias}.receipt_id)) THEN 1` : ""}
+    ${includeInlineSort ? `WHEN (${alias}.receipt_nonce = '${TELEGRAM_INLINE_SORT_MARKER}' AND ${alias}.command = 'help'
       AND ${alias}.chat_type = 'private' AND ${alias}.actor_id = ${alias}.chat_id AND ${alias}.thread_id IS NULL
-      AND EXISTS (SELECT 1 FROM telegram_inline_sort_reply WHERE receipt_id = ${alias}.receipt_id))` : ""}
-    ${includeSubscriptionNodes ? `OR (${alias}.receipt_nonce='${TELEGRAM_SUBSCRIPTION_NODE_MARKER}' AND ${alias}.command='help'
+      AND EXISTS (SELECT 1 FROM telegram_inline_sort_reply WHERE receipt_id = ${alias}.receipt_id)) THEN 1` : ""}
+    ${includeSubscriptionNodes ? `WHEN (${alias}.receipt_nonce='${TELEGRAM_SUBSCRIPTION_NODE_MARKER}' AND ${alias}.command='help'
       AND ${alias}.chat_type='private' AND ${alias}.chat_id=${alias}.actor_id AND ${alias}.thread_id IS NULL
-      AND EXISTS (SELECT 1 FROM telegram_subscription_node_page WHERE receipt_id=${alias}.receipt_id))` : ""}
-    ${includeProvider ? `OR ${telegramProviderReplyMarker(alias)}` : ""}
-    ${includeBulkTrash ? `OR (${alias}.receipt_nonce='${TELEGRAM_BULK_TRASH_MARKER}' AND ${alias}.command='help'
+      AND EXISTS (SELECT 1 FROM telegram_subscription_node_page WHERE receipt_id=${alias}.receipt_id)) THEN 1` : ""}
+    ${includeProvider ? `WHEN ${telegramProviderReplyMarker(alias)} THEN 1` : ""}
+    ${includeBulkTrash ? `WHEN (${alias}.receipt_nonce='${TELEGRAM_BULK_TRASH_MARKER}' AND ${alias}.command='help'
       AND ${alias}.chat_type='private' AND ${alias}.actor_id=${alias}.chat_id AND ${alias}.thread_id IS NULL
-      AND EXISTS (SELECT 1 FROM telegram_bulk_trash WHERE receipt_id=${alias}.receipt_id))` : ""}
-    ${includeInlineConsent ? `OR (${alias}.receipt_nonce='${TELEGRAM_INLINE_CONSENT_MARKER}' AND ${alias}.command='help'
+      AND EXISTS (SELECT 1 FROM telegram_bulk_trash WHERE receipt_id=${alias}.receipt_id)) THEN 1` : ""}
+    ${includeInlineConsent ? `WHEN (${alias}.receipt_nonce='${TELEGRAM_INLINE_CONSENT_MARKER}' AND ${alias}.command='help'
       AND ${alias}.chat_type='private' AND ${alias}.actor_id=${alias}.chat_id AND ${alias}.thread_id IS NULL
       AND EXISTS (SELECT 1 FROM telegram_inline_search_consent AS consent WHERE consent.receipt_id=${alias}.receipt_id
-        AND consent.bot_id=${alias}.bot_id AND consent.actor_id=${alias}.actor_id))` : ""})`;
+        AND consent.bot_id=${alias}.bot_id AND consent.actor_id=${alias}.actor_id)) THEN 1` : ""}
+    ${includeGitHubSearch ? `WHEN ${telegramGitHubSearchMarker(alias)} THEN 1` : ""}
+    ELSE 0 END)`;
 }
 
 function replyClock(includeProvider: boolean, alias: "inbox" | "earlier" = "inbox"): string {
@@ -218,20 +227,34 @@ export async function isTelegramMemberAllowed(db: D1Database, policy: TelegramPo
 
 export async function claimTelegramReply(db: D1Database, botId: string, includeAggregate = false,
   includePrivateShareCreation = false, includeSubscriptionRead = false, includeShortLinks = false, includeInlineSort = false,
-  includeSubscriptionNodes = false, providerPolicy?: TelegramPolicy, includeBulkTrash = false, includeInlineConsent = false): Promise<TelegramReplyLease | null> {
+  includeSubscriptionNodes = false, providerPolicy?: TelegramPolicy, includeBulkTrash = false, includeInlineConsent = false,
+  gitHubSearchPolicy?: TelegramPolicy): Promise<TelegramReplyLease | null> {
   if (providerPolicy && providerPolicy.botId !== botId) throw new Error("Telegram provider reply scope differs.");
+  if (gitHubSearchPolicy && gitHubSearchPolicy.botId !== botId) throw new Error("Telegram GitHub search reply scope differs.");
   const leaseId = crypto.randomUUID();
   const includeProvider = providerPolicy !== undefined;
+  const includeGitHubSearch = gitHubSearchPolicy !== undefined;
   const providerCurrent = telegramProviderReplyEligible(providerPolicy, "inbox");
   const earlierProviderCurrent = telegramProviderReplyEligible(providerPolicy, "earlier");
-  // A provider reply can enter the outbox after a newer receipt has started delivery.
+  const githubCurrent = telegramGitHubSearchEligible(gitHubSearchPolicy, "inbox");
+  const earlierGithubCurrent = telegramGitHubSearchEligible(gitHubSearchPolicy, "earlier");
+  const earlierActive = "earlier.receipt_id < inbox.receipt_id AND earlier_reply.state IN ('pending', 'leased', 'sending')";
+  // A provider reply or search can become ready after a newer reply has started delivery.
+  const searchPair = `(inbox.receipt_nonce IS '${TELEGRAM_GITHUB_SEARCH_MARKER}' OR
+    earlier.receipt_nonce IS '${TELEGRAM_GITHUB_SEARCH_MARKER}')`;
   const sameChatBlocker = includeProvider ? `(
     (earlier_reply.state = 'sending' AND earlier_reply.lease_until > unixepoch())
-    OR ((${earlierProviderCurrent.sql}) AND ${replyClock(true, "earlier")} + ${MAX_REPLY_AGE_SECONDS} > unixepoch() AND (
-      (earlier_reply.state = 'leased' AND earlier_reply.lease_until > unixepoch())
-      OR (earlier.receipt_id < inbox.receipt_id AND earlier_reply.state = 'pending' AND earlier_reply.attempts < ${MAX_ATTEMPTS})
-    ))
-  )` : "earlier.receipt_id < inbox.receipt_id AND earlier_reply.state IN ('pending', 'leased', 'sending')";
+    OR ((${earlierProviderCurrent.sql}) AND (${earlierGithubCurrent.sql})
+      AND ${replyClock(true, "earlier")} + ${MAX_REPLY_AGE_SECONDS} > unixepoch() AND (
+        (earlier_reply.state = 'leased' AND earlier_reply.lease_until > unixepoch())
+        OR (earlier.receipt_id < inbox.receipt_id AND earlier_reply.state = 'pending' AND earlier_reply.attempts < ${MAX_ATTEMPTS})
+      ))
+  )` : includeGitHubSearch ? `(
+    (NOT ${searchPair} AND ${earlierActive}) OR (${searchPair} AND (
+      (earlier_reply.state IN ('leased', 'sending') AND earlier_reply.lease_until > unixepoch())
+      OR (earlier.receipt_id < inbox.receipt_id AND earlier_reply.state = 'pending'
+        AND earlier_reply.attempts < ${MAX_ATTEMPTS} AND earlier.received_at + ${MAX_REPLY_AGE_SECONDS} > unixepoch()
+        AND ${earlierGithubCurrent.sql}))))` : earlierActive;
   const aggregateColumns = includeAggregate ? `aggregate.result AS aggregateResult,
     aggregate.revision AS aggregateRevision, aggregate.code_sha256 AS aggregateCodeSha256,
     selected.result AS selectedResult, selected.code_sha256 AS selectedCodeSha256`
@@ -244,8 +267,8 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
         SELECT inbox.receipt_id FROM telegram_outbox AS reply
         JOIN telegram_inbox AS inbox USING (receipt_id)
         WHERE inbox.bot_id = ? AND ${supportedReceipt("inbox", includeAggregate, includePrivateShareCreation, includeSubscriptionRead,
-          includeShortLinks, includeInlineSort, includeSubscriptionNodes, includeProvider, includeBulkTrash, includeInlineConsent)}
-          AND ${providerCurrent.sql}
+          includeShortLinks, includeInlineSort, includeSubscriptionNodes, includeProvider, includeBulkTrash, includeInlineConsent, includeGitHubSearch)}
+          AND ${providerCurrent.sql} AND ${githubCurrent.sql}
           AND reply.state = 'pending'
           AND reply.due_at <= unixepoch() AND reply.attempts < ${MAX_ATTEMPTS}
           AND ${replyClock(includeProvider)} + ${MAX_REPLY_AGE_SECONDS} > unixepoch()
@@ -254,12 +277,13 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
             JOIN telegram_outbox AS earlier_reply USING (receipt_id)
             WHERE earlier.bot_id = inbox.bot_id AND earlier.actor_id = inbox.actor_id AND earlier.chat_id = inbox.chat_id
               AND ${supportedReceipt("earlier", includeAggregate, includePrivateShareCreation, includeSubscriptionRead,
-                includeShortLinks, includeInlineSort, includeSubscriptionNodes, includeProvider, includeBulkTrash, includeInlineConsent)}
+                includeShortLinks, includeInlineSort, includeSubscriptionNodes, includeProvider, includeBulkTrash, includeInlineConsent, includeGitHubSearch)}
               AND ${sameChatBlocker}
           )
         ORDER BY inbox.receipt_id LIMIT 1
       )
-    `).bind(leaseId, botId, ...providerCurrent.bindings, ...earlierProviderCurrent.bindings),
+    `).bind(leaseId, botId, ...providerCurrent.bindings, ...githubCurrent.bindings,
+      ...earlierProviderCurrent.bindings, ...earlierGithubCurrent.bindings),
     db.prepare(`
       SELECT inbox.receipt_id AS receiptId, inbox.update_id AS updateId, inbox.actor_id AS actorId,
         inbox.chat_id AS chatId, inbox.chat_type AS chatType,
@@ -282,7 +306,9 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
         CASE WHEN inbox.receipt_nonce='${TELEGRAM_SUBSCRIPTION_NODE_MARKER}' THEN 1 ELSE 0 END AS subscriptionNodeMarker,
         ${includeProvider ? "provider.outcome" : "NULL"} AS providerResult,
         CASE WHEN inbox.receipt_nonce='${TELEGRAM_BULK_TRASH_MARKER}' THEN 1 ELSE 0 END AS bulkTrashMarker,
-        ${includeInlineConsent ? "consent.kind" : "NULL"} AS inlineConsentKind
+        ${includeInlineConsent ? "consent.kind" : "NULL"} AS inlineConsentKind,
+        ${includeGitHubSearch ? "github.state" : "NULL"} AS githubSearchState,
+        ${includeGitHubSearch ? "github.public_results" : "NULL"} AS githubSearchResults
       FROM telegram_outbox AS reply JOIN telegram_inbox AS inbox USING (receipt_id)
       LEFT JOIN telegram_view AS page ON page.receipt_id = inbox.receipt_id AND inbox.receipt_nonce = '${TELEGRAM_VIEW_MARKER}'
       LEFT JOIN telegram_lifecycle_action AS action ON action.receipt_id = inbox.receipt_id
@@ -312,9 +338,11 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
         AND ${telegramProviderReplyMarker("inbox")}` : ""}
       ${includeInlineConsent ? `LEFT JOIN telegram_inline_search_consent AS consent ON consent.receipt_id=inbox.receipt_id
         AND inbox.receipt_nonce='${TELEGRAM_INLINE_CONSENT_MARKER}'` : ""}
+      ${includeGitHubSearch ? `LEFT JOIN telegram_github_search AS github ON github.receipt_id = inbox.receipt_id
+        AND inbox.receipt_nonce = '${TELEGRAM_GITHUB_SEARCH_MARKER}'` : ""}
       WHERE reply.lease_id = ? AND reply.state = 'leased' AND inbox.bot_id = ?
         AND ${supportedReceipt("inbox", includeAggregate, includePrivateShareCreation, includeSubscriptionRead,
-          includeShortLinks, includeInlineSort, includeSubscriptionNodes, includeProvider, includeBulkTrash, includeInlineConsent)}
+          includeShortLinks, includeInlineSort, includeSubscriptionNodes, includeProvider, includeBulkTrash, includeInlineConsent, includeGitHubSearch)}
     `).bind(leaseId, botId),
   ]);
   if (!write?.success || !read?.success) throw new Error("Telegram reply claim could not be confirmed.");
@@ -326,7 +354,8 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
     selectedResult, selectedCodeSha256,
     pathKind, pathAfterId, pathAffectedCount,
     documentKind, documentNodeCount, privateShareCreationReceipt, subscriptionReadReceipt, shortLinkReceipt,
-    inlineSortKind, inlineSortMode, subscriptionNodeMarker, providerResult, bulkTrashMarker, inlineConsentKind, ...lease } = row;
+    inlineSortKind, inlineSortMode, subscriptionNodeMarker, providerResult, bulkTrashMarker, inlineConsentKind,
+    githubSearchState, githubSearchResults, ...lease } = row;
   const lifecycle = lifecycleKind === null || lifecycleSubscriptionId === null || lifecycleExpectedRevision === null
     ? undefined : { kind: lifecycleKind, subscriptionId: lifecycleSubscriptionId, expectedLifecycleRevision: lifecycleExpectedRevision };
   // The joined temp companion declares every count NOT NULL when its kind is present.
@@ -350,6 +379,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
     ...(providerResult === null ? {} : { providerOutcome: providerResult }),
     ...(bulkTrashMarker === 1 ? { bulkTrash: true as const } : {}),
     ...(inlineConsentKind === null ? {} : { inlineConsent: inlineConsentKind }),
+    ...(githubSearchState === null ? {} : { githubSearch: { state: githubSearchState, publicResults: githubSearchResults } }),
     ...(privateClaimCodeSha256 === null ? {} : { privateClaim: { codeSha256: privateClaimCodeSha256 } }) };
 }
 
@@ -377,7 +407,8 @@ function beginReplyStatement(
           AND inbox.chat_type = ? AND inbox.message_id = ? AND inbox.message_date = ? AND inbox.thread_id IS ?
           AND inbox.command = ? AND ${supportedReceipt("inbox", lease.aggregate !== undefined || lease.selected !== undefined,
             lease.privateShareCreation === true, lease.subscriptionRead === true, lease.shortLink === true,
-            lease.inlineSort !== undefined, lease.subscriptionNodes === true, provider !== null, lease.bulkTrash === true, lease.inlineConsent !== undefined)}
+            lease.inlineSort !== undefined, lease.subscriptionNodes === true, provider !== null, lease.bulkTrash === true,
+            lease.inlineConsent !== undefined, lease.githubSearch !== undefined)}
           AND ${replyClock(provider !== null)} + ${MAX_REPLY_AGE_SECONDS} > unixepoch()
           ${provider ? `AND (${provider.sql})` : ""}
           ${guard ? `AND (${guard.sql})` : ""}
@@ -512,7 +543,7 @@ export async function beginTelegramReply(
   readGuard?: { sql: string; bindings: readonly (string | number | null)[] },
   nodeTickets: readonly TelegramNodePageTicket[] = [],
 ): Promise<boolean> {
-  if (!inTelegramScope(policy, lease) || lease.privateClaim || lease.inlineSort || lease.bulkTrash || lease.inlineConsent
+  if (!inTelegramScope(policy, lease) || lease.privateClaim || lease.inlineSort || lease.bulkTrash || lease.inlineConsent || lease.githubSearch
     || ((lease.aggregate || lease.selected || lease.path || lease.privateShareCreation
     || lease.tempRaw || lease.shortLink || lease.subscriptionNodes || lease.providerOutcome !== undefined)
     && (lease.chatType !== "private" || lease.threadId !== null))
@@ -596,6 +627,20 @@ async function beginTelegramInlineReply(
   return false;
 }
 
+export async function beginTelegramGitHubSearchReply(
+  db: D1Database, policy: TelegramPolicy, lease: TelegramReplyLease,
+): Promise<boolean> {
+  if (!lease.githubSearch || !inTelegramScope(policy, lease) || lease.chatType !== "private" || lease.threadId !== null) return false;
+  const guard = telegramGitHubSendGuard(policy, lease.githubSearch);
+  if (await beginReplyStatement(db, policy, lease, "allowed", guard).first() !== null) return true;
+  // The fence failed before a send. Release only this exact lease so later commands can proceed.
+  await db.prepare(`UPDATE telegram_outbox SET state = 'failed', lease_id = NULL, lease_until = NULL
+    WHERE receipt_id = ? AND state = 'leased' AND lease_id = ? AND attempts = ?`).bind(
+    lease.receiptId, lease.leaseId, lease.attempts,
+  ).run();
+  return false;
+}
+
 export async function settleTelegramReply(
   db: D1Database,
   policy: TelegramPolicy,
@@ -608,7 +653,8 @@ export async function settleTelegramReply(
     SELECT receipt_id FROM telegram_inbox AS inbox
     WHERE bot_id = ? AND update_id = ? AND receipt_id = ? AND ${supportedReceipt("inbox", lease.aggregate !== undefined || lease.selected !== undefined,
       lease.privateShareCreation === true, lease.subscriptionRead === true, lease.shortLink === true,
-      lease.inlineSort !== undefined, lease.subscriptionNodes === true, includeProvider, lease.bulkTrash === true, lease.inlineConsent !== undefined)}
+      lease.inlineSort !== undefined, lease.subscriptionNodes === true, includeProvider, lease.bulkTrash === true,
+      lease.inlineConsent !== undefined, lease.githubSearch !== undefined)}
   )`;
   if (outcome.kind === "sent") {
     if (!Number.isSafeInteger(outcome.messageId) || outcome.messageId <= 0) {
@@ -646,7 +692,8 @@ export async function settleTelegramReply(
 
 export async function reapExpiredTelegramReplies(db: D1Database, botId: string, includeAggregate = false,
   includePrivateShareCreation = false, includeSubscriptionRead = false, includeShortLinks = false, includeInlineSort = false,
-  includeSubscriptionNodes = false, includeProvider = false, includeBulkTrash = false, includeInlineConsent = false): Promise<void> {
+  includeSubscriptionNodes = false, includeProvider = false, includeBulkTrash = false, includeInlineConsent = false,
+  includeGitHubSearch = false): Promise<void> {
   await db.prepare(`
     UPDATE telegram_outbox SET state = CASE
       WHEN state = 'sending' THEN 'uncertain'
@@ -657,7 +704,7 @@ export async function reapExpiredTelegramReplies(db: D1Database, botId: string, 
     WHERE receipt_id IN (
       SELECT reply.receipt_id FROM telegram_outbox AS reply JOIN telegram_inbox AS inbox USING (receipt_id)
       WHERE inbox.bot_id = ? AND ${supportedReceipt("inbox", includeAggregate, includePrivateShareCreation, includeSubscriptionRead,
-        includeShortLinks, includeInlineSort, includeSubscriptionNodes, includeProvider, includeBulkTrash, includeInlineConsent)} AND (
+        includeShortLinks, includeInlineSort, includeSubscriptionNodes, includeProvider, includeBulkTrash, includeInlineConsent, includeGitHubSearch)} AND (
         (reply.state IN ('leased', 'sending') AND reply.lease_until <= unixepoch())
         OR (reply.state IN ('pending', 'leased') AND ${replyClock(includeProvider)} + ${MAX_REPLY_AGE_SECONDS} <= unixepoch())
       )
