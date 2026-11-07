@@ -177,12 +177,24 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 旧库容量盘点在获准的托管环境运行 `python3 -B worker/tools/legacy_inventory.py <封存备份>`。输入须是单独完成、关闭、使用 UTF-8 和 DELETE 日志模式的 SQLite 备份。备份准备在原库之外进行，盘点本身以只读事务运行。报告只包含活动订阅与回收站的聚合计数、原始字节、紧凑 UTF-8 NDJSON 字节、块数、大小限制和旧转换器分享原文估算。无法读取或解析的记录有独立计数。退出码 `0` 表示报告完整，仍需检查超限和无效项。退出码 `2` 表示无法核对备份。容量报告不判定归属映射、旧链接兼容、分享权限或实际 Worker 性能。 [SQLite 增量读取](https://sqlite.org/c3ref/blob_open.html) · [SQLite URI](https://sqlite.org/uri.html)
 
+### 隔离环境原生备份与恢复演练
+
+`Rehearse isolated native D1 and R2 restore` 只在受保护的 `main` 环境运行。输入同一组随机 32 位小写十六进制 `cohort` 和当前提交成功的 Worker CI 运行 ID。逐项完成后再开始下一项：
+
+1. `verify` 只读核对当前 Worker、D1、R2 与候选名称。`prepare` 在源私有 R2 的保留前缀建立追加式操作记录。依次运行 `create-backup-bucket`、`create-restore-db`、`create-restore-bucket`，各自只发起一次创建，并核对账号、名称、创建时间及适用的资源 ID。已有同名资源不会被采用。创建未确认时先只读核对；只有独立证据能确认该候选确属该次创建，才以 `pin-resource` 提供资源类别及候选身份摘要继续。
+2. 先结束隔离验收并回收测试能力，待队列、回复、临时交互和待清理对象安定后，安排安静窗口并暂停人工命令与部署，再运行 `capture`。如需验证私密分享的 R2 归属元数据，可保留已验证且自然到期的合成分享及正文，封存后再清理源夹具。Cloudflare 原生导出期间源 D1 **暂时不能查询**；原有 Cron 保留，触发可能暂时失败。只用已记录书签的 `poll-export` 继续查询导出状态，再用 `capture` 保存导出。首次请求响应丢失且没有确认书签时，先等 Cloudflare 自动取消并核对源查询恢复；不要重发首次请求。导出包由原生 SQL、SQL 指向的完整 R2 内容及清单组成。 [D1 原生导出](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/export/)
+3. `restore-objects` 在未绑定应用的专用 R2 重建引用内容，`start-import` 再向仍为空的专用 D1 导入已核对的同一份 SQL。已上传文件可能使 D1 `init` 直接开始导入；导入状态不明时，只用确认的书签继续轮询，或核对目标完整摘要。不要重发 `init`、`ingest` 或清空目标。`verify-restore` 核对完整 schema、迁移记录、序列、外键、逐表内容摘要及 R2 引用和字节。源 D1 永不导入或原地恢复，目标不绑定 Worker，也不会处理 Telegram 更新。 [D1 原生导入](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/import/)
+
+受保护工作流与隔离部署使用同一并发组。仅此流程可写该演练前缀；每次追加核对上一条记录及本次写入，不依赖管理 REST API 未承诺的条件写入。不要同时从 Dashboard 或其他工具修改相关资源。遇到分叉、未确认写入、源版本变更或目标数据不匹配时保留记录和专用资源，不执行覆盖、删除或重置。SQL、源/目标私有身份、签名 URL、令牌、内容与对象键只留在私有 R2 或 runner 临时目录；Actions 证据只上传摘要和计数。
+
+此演练限定 32 MiB SQL、20,000 行及最多 512 个引用对象（合计 256 MiB）。清单保存 D1 指向的应用对象、标准 HTTP 元数据及经发布回执核对的私密分享 `purpose` 和 `receipt`。恢复使用现有隔离数据 Token 派生的 R2 S3 凭据，向已核对的目标对象发起条件写入，并回读字节和元数据。遇到未知元数据或 SSE-C 会停止。桶的无引用对象和 Worker 密钥不在范围内。托管合成测试、Cloudflare 原生恢复、旧 SQLite 归属转换和生产切换分别验收。 [R2 S3 条件写入](https://developers.cloudflare.com/r2/api/s3/api/) · [R2 Token 凭据](https://developers.cloudflare.com/r2/api/tokens/)
+
 ### 真实数据与生产切换门槛
 
 1. 先只读核对 Cloudflare 目标账户、Zone、`subs-bot.lilyya.top` 的 DNS、Worker 路由和 Custom Domain 绑定。新资源记录账号、环境及资源 ID，隔离与生产分别使用各自的 Worker、D1、R2 和队列。现有配置冲突须在改动前报告。目标主机名可用且切换获准后，仅增加所需的 Custom Domain 绑定。 [Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)
 2. `Worker CI` 在 GitHub 托管 runner 上安装依赖、检查类型、构建和测试。构建产物标记准确提交与摘要，由授权的部署步骤核对并上传至隔离 Worker。普通 PR CI 使用只读权限和合成数据。部署 Token 通过独立的受控步骤使用。云端 smoke 显式指定隔离环境和提交，核对 `/health` 与提交、已知测试快照的输出和负面用例。分别记录测试、构建、部署和真实运行结果。
 3. 确认获准的数据来源和使用范围后，对旧 SQLite 执行包含 WAL 的一致性备份。先在项目专用隔离目标做恢复和容量盘点。对账活动订阅、回收站、路径规则、临时节点、授权覆盖、分享及领取、短链的数量和归属。核对节点摘要、有效订阅令牌、旧短码、仍有效的领取状态和跨域链接依赖。旧群级数据须由维护者确认归属。
-4. 合成备份演练验证恢复路径。真实数据验收需保存同一代 D1 导出或恢复书签、R2 清单及摘要，并在独立目标重建实际引用。核对清单、对象摘要、外键、导出和两个账号的权限。Workers Paid 的 D1 Time Travel 可用于最近 30 天的原地恢复，会覆盖目标 D1。R2 对象使用对应的独立备份。 [D1 Time Travel](https://developers.cloudflare.com/d1/reference/time-travel/)
+4. 隔离合成演练和原生恢复用于验证恢复路径。真实数据验收须用获准的数据和独立目标，核对清单、对象摘要、外键、导出和两个账号的权限。Workers Paid 的 D1 Time Travel 可用于最近 30 天的原地恢复，会覆盖目标 D1；R2 对象另行恢复。 [D1 Time Travel](https://developers.cloudflare.com/d1/reference/time-travel/)
 5. 在功能清单中记录代表性提供方、客户端及双账号的实测结果，并核对容量、失败恢复和旧链接连续性。确认生产切换范围、窗口及回滚方案并取得授权后，冻结旧写入，完成最后一次同步，再切换 Telegram Webhook 或域名流量。保留待处理更新，先处理旧轮询配置 `drop_pending_updates=True` 的回滚风险。验收失败时停止新写入，核对迁移后写入如何回放，再分别恢复 Worker 版本、数据和 Telegram 模式。 [Telegram `setWebhook` / `deleteWebhook`](https://core.telegram.org/bots/api#setwebhook) · [Worker 版本与部署](https://developers.cloudflare.com/workers/versions-and-deployments/)
 
 ## 限额、成本和凭据
