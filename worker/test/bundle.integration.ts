@@ -540,7 +540,17 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
     await db.prepare("UPDATE telegram_auth SET allowed = 1 WHERE bot_id = ? AND user_id = ?")
       .bind(policy.botId, policy.memberId).run();
     const importedShare = "hy2://user:fixture@[2001:db8::5]:443,5000-6000/?sni=proxy.example.invalid#Fixture";
-    const memberPrivate = { ...claimMessage, chat: { id: Number(policy.memberId), type: "private" } };
+    const grantDate = await db.prepare("SELECT message_date FROM telegram_auth WHERE bot_id = ? AND user_id = ?")
+      .bind(policy.botId, policy.memberId).first<number>("message_date");
+    assert.ok(grantDate !== null);
+    const memberPrivate = { ...claimMessage, date: grantDate + 1,
+      chat: { id: Number(policy.memberId), type: "private" } };
+    const delayed = { update_id: 1800, message: { ...memberPrivate, date: grantDate, message_id: 2300,
+      text: Buffer.from(importedShare).toString("base64"), entities: [] } };
+    assert.equal((await post(delayed)).status, 200);
+    assert.equal(await db.prepare("SELECT 1 FROM telegram_inbox WHERE bot_id = ? AND update_id = ?")
+      .bind(policy.botId, delayed.update_id).first(), null);
+    assert.deepEqual(await db.prepare("SELECT count(*) AS total FROM telegram_temp_batch").first(), { total: 0 });
     const tempEvent = { update_id: 18, message: { ...memberPrivate, message_id: 23,
       text: Buffer.from(importedShare).toString("base64"), entities: [] } };
     const added = expectSend(policy.memberId, 24, 23, "已加入临时列表 1 条节点，当前共有 1 条。");
