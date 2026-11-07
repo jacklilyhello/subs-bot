@@ -1,5 +1,8 @@
-import { DurableObject, WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
-import { exercise, ProviderProbeError, REVISION, SERVICE, SINGLETON } from "./controller.ts";
+import { DurableObject, WorkerEntrypoint, WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
+import {
+  exercise, fetchPinnedProvider, providerFailure, providerPayload, ProviderProbeError, REVISION, SERVICE, SINGLETON,
+  type ProviderFetchInput, type ProviderFetchResult,
+} from "./controller.ts";
 
 interface Env {
   BUILD_REVISION: string;
@@ -20,6 +23,28 @@ function validProbe(probe: Probe, revision: string): boolean {
 export class ProviderContainer extends DurableObject<Env> {
   private busy = false;
 
+  async fetchSubscription(input: ProviderFetchInput): Promise<ProviderFetchResult> {
+    try {
+      const payload = providerPayload(input);
+      if (payload === null) return providerFailure("invalid-request");
+      const revision = this.env.BUILD_REVISION;
+      const singleton = this.env.PROVIDER_CONTAINER.idFromName(SINGLETON);
+      const container = this.ctx.container;
+      if (!this.ctx.id.equals(singleton) || !container || typeof revision !== "string" || !REVISION.test(revision)) {
+        return providerFailure("unavailable");
+      }
+      if (this.busy) return providerFailure("busy");
+      this.busy = true;
+      try {
+        return await fetchPinnedProvider(container, revision, payload);
+      } finally {
+        this.busy = false;
+      }
+    } catch {
+      return providerFailure("unavailable");
+    }
+  }
+
   async prove(probe: Probe) {
     const revision = this.env.BUILD_REVISION;
     const singleton = this.env.PROVIDER_CONTAINER.idFromName(SINGLETON);
@@ -37,6 +62,17 @@ export class ProviderContainer extends DurableObject<Env> {
       return { ok: false, stage: error instanceof ProviderProbeError ? error.stage : "admission" };
     } finally {
       this.busy = false;
+    }
+  }
+}
+
+export class ProviderFetch extends WorkerEntrypoint<Env> {
+  async fetchSubscription(input: ProviderFetchInput): Promise<ProviderFetchResult> {
+    try {
+      if (providerPayload(input) === null) return providerFailure("invalid-request");
+      return await this.env.PROVIDER_CONTAINER.getByName(SINGLETON).fetchSubscription(input);
+    } catch {
+      return providerFailure("unavailable");
     }
   }
 }
