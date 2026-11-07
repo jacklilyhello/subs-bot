@@ -88,8 +88,7 @@ export async function acceptTelegramShortLink(
           CASE WHEN inbox.actor_id=? THEN 0 ELSE COALESCE(auth.message_id,0) END AS auth_id
         FROM telegram_inbox AS inbox LEFT JOIN telegram_auth AS auth ON auth.bot_id=inbox.bot_id AND auth.user_id=inbox.actor_id
         LEFT JOIN normal_short_links AS owned ON owned.code_sha256=? AND owned.owner_id=inbox.actor_id
-          AND owned.bot_id=inbox.bot_id AND owned.revoked_at IS NULL AND owned.code_length=?
-          AND NOT EXISTS (SELECT 1 FROM aggregate_links WHERE code_sha256=owned.code_sha256) ${noLegacyConflict}
+          AND owned.bot_id=inbox.bot_id AND owned.revoked_at IS NULL AND owned.code_length=? ${noLegacyConflict}
         ${legacyRevoke ? `LEFT JOIN legacy_subscription_short_links AS legacy ON legacy.code_sha256=?
           AND legacy.owner_id=inbox.actor_id AND legacy.bot_id=inbox.bot_id AND legacy.revoked_at IS NULL
           AND ${LEGACY_SUBSCRIPTION_SHORT_PIN}
