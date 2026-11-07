@@ -373,6 +373,8 @@ PY
 
 工具只接收旧来源上可唯一解析的单订阅目标，先核对短链发行者与订阅原归属，再应用归属映射。保存原活动或回收站编号、归属、格式、创建时间及短码和订阅令牌摘要。聚合、外部、递归、归属不一致或多重匹配会阻止整包封存。首版限制为两万条短链、两万个订阅身份、2 GiB 源库和 8 MiB 清单数据。只在获准的私有渠道流转最后写入封印的目录。后续候选封装需要再次核对目标编号、归属及令牌摘要，实际旧链接路由另行验收。
 
+对同一份封存旧库生成订阅转换包及短链盘点，再在 `legacy_restore_package.py` 原有七个参数后附加 `legacy-typed-short-v4 SOURCE_SQLITE_SHA OWNER_MAP_SHA TYPED_SHORT_INVENTORY TYPED_SHORT_MANIFEST_SHA OLD_ORIGIN_SHA LEGACY_BOT_ID`。版本 4 保留版本 3 的空导出标记和可选路径规则。旧库有短链时，订阅转换命令会以退出码 2 保留封存包。此处只接受唯一的 `unhandled:short_links` 阻止项，其数量必须与已核对的盘点一致。封装逐条核对原表与编号、目标编号、映射后归属及令牌摘要，保留原格式、创建时间和旧 Bot 归属。清单与重放 SQL 固定 0026、0029 迁移和短链表摘要。短链记录只含摘要与类型，候选仍为未应用、未绑定的私有包。实际原生恢复及旧短链 HTTP 行为另行验收。
+
 ### 真实数据与生产切换门槛
 
 1. 先只读核对 Cloudflare 目标账户、Zone、`subs-bot.lilyya.top` 的 DNS、Worker 路由和 Custom Domain 绑定。新资源记录账号、环境及资源 ID，隔离与生产分别使用各自的 Worker、D1、R2 和队列。现有配置冲突须在改动前报告。目标主机名可用且切换获准后，仅增加所需的 Custom Domain 绑定。 [Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)
