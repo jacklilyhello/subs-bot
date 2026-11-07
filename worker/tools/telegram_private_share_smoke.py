@@ -95,18 +95,22 @@ def parse_observations(value):
 
 def parse_inputs(event):
     fields = event.get("inputs")
-    require(isinstance(fields, dict) and set(fields) <= {"action", "cohort", "source_run_id", "observations", "confirm_retire"},
+    require(isinstance(fields, dict) and set(fields) <= {"action", "cohort", "source_run_id", "observations",
+                                                        "confirm_verify", "confirm_retire"},
             "Private share workflow input fields differ.")
     action, cohort = fields.get("action"), fields.get("cohort")
     source, raw, confirm = (fields.get(field, "") for field in ("source_run_id", "observations", "confirm_retire"))
     drift = action == "retire" and confirm == f"retire {cohort} on current release"
+    confirm_verify = fields.get("confirm_verify", "")
+    equivalent = action == "verify" and confirm_verify == f"verify {cohort} on equivalent release"
     require(action in ("prepare", "verify", "retire") and matches(COHORT, cohort)
             and (source == "" if action == "prepare" else matches(RUN_ID, source))
             and (drift or confirm == (f"retire {cohort}" if action == "retire" else ""))
+            and (equivalent or confirm_verify == "")
             and (isinstance(raw, str) and 0 < len(raw) <= 1024 if action == "verify" else raw == ""),
             "Private share workflow action or confirmation differs.")
     observed = parse_observations(_parse_object(raw.encode("utf-8"), "Private share observations differ.")) if raw else None
-    return action, cohort, source, observed, drift
+    return action, cohort, source, observed, drift or equivalent
 
 
 def read_checkpoint(run_id, token):
@@ -138,17 +142,47 @@ def valid_release_pin(pin):
         and matches(DIGEST, pin["moduleSha256"]) and matches(DATE, pin["compatibilityDate"])
 
 
-def validate_checkpoint(checkpoint, action, cohort, source_revision, identity, pin, *, allow_drift=False):
-    require(exact(checkpoint, ("version", "phase", "cohort", "identity", "releasePin", "baseline", "cases", "groupProof",
-                               "retiredAtReleasePin"))
-            and type(checkpoint["version"]) is int and checkpoint["version"] == 1
+def same_module(left, right):
+    return (left["moduleSha256"], left["compatibilityDate"]) == (right["moduleSha256"], right["compatibilityDate"])
+
+
+def require_successor(earlier, current, token):
+    compared = _get_json(f"/compare/{earlier}...{current}", token)
+    base = compared.get("merge_base_commit")
+    require(compared.get("status") == "ahead" and isinstance(base, dict) and base.get("sha") == earlier,
+            "Current main is not a successor of the private share checkpoint release.")
+
+
+def verify_historic_release(scope, original, active_version):
+    historic = scope.version(original["versionId"])
+    require((historic.revision, historic.digest, historic.compatibility)
+            == (original["revision"], original["moduleSha256"], original["compatibilityDate"])
+            and (historic.telegram_config_sha256, historic.telegram_private_share_key_sha256, historic.telegram_aggregate_key_sha256)
+            == (active_version.telegram_config_sha256, active_version.telegram_private_share_key_sha256,
+                active_version.telegram_aggregate_key_sha256),
+            "The historical private share Worker version or key bindings differ.")
+
+
+def validate_checkpoint(checkpoint, action, cohort, source_revision, identity, pin, *, allow_drift=False, allow_equivalent=False):
+    fields = {"version", "phase", "cohort", "identity", "releasePin", "baseline", "cases", "groupProof", "retiredAtReleasePin"}
+    require(isinstance(checkpoint, dict) and type(checkpoint.get("version")) is int and checkpoint["version"] in (1, 2),
+            "Private share checkpoint version differs.")
+    newer = checkpoint["version"] == 2
+    if newer:
+        fields.add("verifiedAtReleasePin")
+    require(exact(checkpoint, fields) and (action == "retire" or not newer)
             and (checkpoint["cohort"], checkpoint["identity"]) == (cohort, identity)
             and checkpoint["phase"] == ("prepared" if action == "verify" else "verified")
             and checkpoint["retiredAtReleasePin"] is None, "Private share checkpoint scope or phase differs.")
     original = checkpoint["releasePin"]
-    require(valid_release_pin(original) and original["revision"] == source_revision and valid_release_pin(pin)
-            and (original == pin or (action == "retire" and allow_drift and source_revision != pin["revision"])),
-            "Private share checkpoint active release changed.")
+    predecessor = checkpoint["verifiedAtReleasePin"] if newer else original
+    require(valid_release_pin(original) and valid_release_pin(predecessor) and valid_release_pin(pin)
+            and predecessor["revision"] == source_revision and same_module(original, predecessor),
+            "Private share checkpoint release pin differs.")
+    if predecessor != pin:
+        require(source_revision != pin["revision"] and ((action == "retire" and allow_drift)
+                or (action == "verify" and allow_equivalent and same_module(original, pin))),
+                "Private share checkpoint active release changed.")
     baseline = checkpoint["baseline"]
     require(exact(baseline, ("receiptId", "shareId", "dbTime", "authSha256"))
             and safe_id(baseline["receiptId"], 0) and safe_id(baseline["shareId"], 0)
@@ -157,7 +191,15 @@ def validate_checkpoint(checkpoint, action, cohort, source_revision, identity, p
     if action == "verify":
         require(checkpoint["cases"] == {} and checkpoint["groupProof"] is None, "Prepared private share checkpoint is populated.")
         return
-    require(exact(checkpoint["cases"], CASES) and matches(DIGEST, checkpoint["groupProof"]), "Private share case inventory differs.")
+    group = checkpoint["groupProof"]
+    if newer:
+        require(exact(group, ("chatType", "shareMessageId", "controlMessageId", "controlReceiptSha256"))
+                and group["chatType"] in ("group", "supergroup") and safe_id(group["shareMessageId"])
+                and safe_id(group["controlMessageId"]) and group["shareMessageId"] < group["controlMessageId"]
+                and matches(DIGEST, group["controlReceiptSha256"]), "Private share group evidence differs.")
+    else:
+        require(matches(DIGEST, group), "Private share group evidence differs.")
+    require(exact(checkpoint["cases"], CASES), "Private share case inventory differs.")
     for case in checkpoint["cases"].values():
         require(exact(case, ("receiptId", "shareId", "payloadId", "codeSha256", "expireAt", "cleanupAfter",
                              "rowSha256", "historySha256", "claimCount"))
@@ -283,20 +325,32 @@ class Cohort:
         return self.read("SELECT actor_id,claimed_at FROM private_share_claims WHERE share_id=CAST(? AS INTEGER) ORDER BY actor_id LIMIT 2", share_id)
 
     def group_proof(self, observed, baseline):
+        scope = f"""SELECT {HISTORY_COLUMNS} FROM telegram_inbox AS inbox
+            LEFT JOIN telegram_outbox AS reply USING(receipt_id) WHERE inbox.bot_id=? AND inbox.chat_id=?"""
+        bindings = (self.bot, self.policy["groupId"])
+        recent = self.read(scope + " AND inbox.receipt_id>CAST(? AS INTEGER) ORDER BY inbox.receipt_id LIMIT 2",
+                           *bindings, baseline["receiptId"])
+
         def lookup(message_id):
-            return self.read(f"""SELECT {HISTORY_COLUMNS} FROM telegram_inbox AS inbox
-                LEFT JOIN telegram_outbox AS reply USING(receipt_id) WHERE inbox.bot_id=? AND inbox.chat_id=?
-                    AND inbox.message_id=CAST(? AS INTEGER) LIMIT 2""", self.bot, self.policy["groupId"], message_id)
-        require(lookup(observed["groupShareMessageId"]) == [], "The private share command left a group receipt.")
-        control = lookup(observed["groupControlMessageId"])
+            return self.read(scope + " AND inbox.message_id=CAST(? AS INTEGER) LIMIT 2", *bindings, message_id)
+
+        if any(row["chat_type"] == "group" for row in recent):
+            # Basic groups assign IDs within each account. The sole new scoped
+            # receipt must be the control. IAB keeps both local message IDs.
+            require(len(recent) == 1, "The approved basic group has unexpected additional receipts.")
+            control, chat_type = recent, "group"
+        else:
+            require(lookup(observed["groupShareMessageId"]) == [], "The private share command left a group receipt.")
+            control, chat_type = lookup(observed["groupControlMessageId"]), "supergroup"
         require(len(control) == 1 and control[0]["actor_id"] == self.actor("admin") and control[0]["thread_id"] is None
-                and control[0]["chat_type"] in ("group", "supergroup") and control[0]["command"] == "help"
+                and control[0]["chat_type"] == chat_type and control[0]["command"] == "help"
                 and control[0]["receipt_nonce"] is None and control[0]["reply_state"] == "sent"
                 and safe_id(control[0]["sent_message_id"]) and safe_id(control[0]["receipt_id"], baseline["receiptId"] + 1)
                 and safe_id(control[0]["received_at"], baseline["dbTime"]), "The approved group control reply could not be confirmed.")
         require(not self.read("SELECT 1 FROM telegram_private_share_creations WHERE bot_id=? AND payload_sha256=? LIMIT 1",
                               self.bot, body_sha(self.cohort, "group")), "The private group body was persisted.")
-        return fingerprint(control)
+        return {"chatType": chat_type, "shareMessageId": observed["groupShareMessageId"],
+                "controlMessageId": observed["groupControlMessageId"], "controlReceiptSha256": fingerprint(control)}
 
     def verify_case(self, name, observed, baseline, auth):
         creator, target, duration = CASES[name]
@@ -352,14 +406,14 @@ class Cohort:
                 "codeSha256": code_sha, "expireAt": row["expire_at"], "cleanupAfter": row["cleanup_after"],
                 "rowSha256": fingerprint([row, claims]), "historySha256": fingerprint([receipt, histories]), "claimCount": len(claims)}
 
-    def verify(self, checkpoint, observed):
+    def verify(self, checkpoint, observed, pin):
         baseline = checkpoint["baseline"]
         auth = self.auth()
         require(fingerprint(auth) == baseline["authSha256"], "Private share IAB authorization changed during acceptance.")
         cases = {name: self.verify_case(name, observed, baseline, auth) for name in CASES}
         group = self.group_proof(observed, baseline)
         require(self.auth() == auth, "Private share IAB authorization changed during verification.")
-        return {**checkpoint, "phase": "verified", "cases": cases, "groupProof": group}
+        return {**checkpoint, "version": 2, "phase": "verified", "cases": cases, "groupProof": group, "verifiedAtReleasePin": pin}
 
     def unreferenced(self, item):
         return not self.read("""SELECT 1 FROM private_shares WHERE id=CAST(? AS INTEGER) OR payload_id=? OR (bot_id=? AND code_sha256=?)
@@ -460,7 +514,7 @@ def run():
     with Path(os.environ["GITHUB_EVENT_PATH"]).open("rb") as event:
         raw = event.read(65_537)
     require(len(raw) <= 65_536, "Private share workflow event exceeds the limit.")
-    action, cohort, source, observed, allow_drift = parse_inputs(_parse_object(raw, "Private share workflow event differs."))
+    action, cohort, source, observed, allow_release_change = parse_inputs(_parse_object(raw, "Private share workflow event differs."))
     require_current_main(revision)
     source_revision, checkpoint = read_checkpoint(source, os.environ["GH_TOKEN"]) if source else (None, None)
     raw_policy = telegram_release_config({"migrations": [{"name": "0002_telegram.sql"}]})
@@ -501,13 +555,14 @@ def run():
     if action == "prepare":
         checkpoint = verifier.prepare(identity, pin)
     else:
-        validate_checkpoint(checkpoint, action, cohort, source_revision, identity, pin, allow_drift=allow_drift)
-        if action == "retire" and source_revision != revision:
-            compared = _get_json(f"/compare/{source_revision}...{revision}", os.environ["GH_TOKEN"])
-            base = compared.get("merge_base_commit")
-            require(compared.get("status") == "ahead" and isinstance(base, dict) and base.get("sha") == source_revision,
-                    "Current main is not a successor of the verified private share release.")
-        checkpoint = verifier.verify(checkpoint, observed) if action == "verify" else verifier.retire(checkpoint, guard, pin)
+        validate_checkpoint(checkpoint, action, cohort, source_revision, identity, pin,
+                            allow_drift=action == "retire" and allow_release_change,
+                            allow_equivalent=action == "verify" and allow_release_change)
+        if source_revision != revision:
+            require_successor(source_revision, revision, os.environ["GH_TOKEN"])
+            if action == "verify":
+                verify_historic_release(scope, checkpoint["releasePin"], version)
+        checkpoint = verifier.verify(checkpoint, observed, pin) if action == "verify" else verifier.retire(checkpoint, guard, pin)
     guard()
     _verify_health(revision)
     save_private_json(Path(os.environ["RUNNER_TEMP"]) / CHECKPOINT, checkpoint)
