@@ -78,14 +78,18 @@ function* readTemp({ json, nodeCount }: TempRow): Generator<NodeRecord> {
   }
 }
 
-export async function getAggregateNodeSource(db: D1Database, bucket: R2Bucket, code: string): Promise<ExportNodeSource | null> {
+export async function getAggregateNodeSource(
+  db: D1Database, bucket: R2Bucket, code: string, excludeNormalShortLinks = false,
+): Promise<ExportNodeSource | null> {
   const digest = await codeDigest(code);
   if (digest === null) return null;
-  const withLink = `WITH link AS (SELECT owner_id, kind, bot_id, selected_ids ${activeLink})`;
+  const availableLink = excludeNormalShortLinks ? `${activeLink}
+    AND NOT EXISTS (SELECT 1 FROM normal_short_links AS normal WHERE normal.code_sha256=aggregate_links.code_sha256)` : activeLink;
+  const withLink = `WITH link AS (SELECT owner_id, kind, bot_id, selected_ids ${availableLink})`;
   // All inputs come from one D1 transaction. Each statement starts at the same digest
   // and only the matching owner can contribute a subscription or temporary batch.
   const results = await db.batch<Row>([
-    db.prepare(`SELECT kind, selected_ids AS selectedIds ${activeLink}`).bind(digest),
+    db.prepare(`SELECT kind, selected_ids AS selectedIds ${availableLink}`).bind(digest),
     db.prepare(`${withLink}
       SELECT ${pointerColumns} FROM link JOIN subscriptions AS sub ON sub.owner_id = link.owner_id
       WHERE link.kind = 'all' AND sub.generation > 0 ORDER BY sub.id LIMIT ?

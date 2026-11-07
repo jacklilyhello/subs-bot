@@ -15,7 +15,13 @@ const encoder = new TextEncoder();
 
 type AdmissionKey = { ownerId: string; requestKey: string };
 type UrlImport = AdmissionKey & { sourceUrl: string; name?: string };
-type Refresh = AdmissionKey & { id: number };
+type Refresh = AdmissionKey & { id: number; expectedGeneration?: number; expectedLifecycleRevision?: number };
+
+export const TELEGRAM_PROVIDER_MARKER = "provider-request:v1";
+export type ProviderTelegramPolicy = { readonly botId: string; readonly adminId: string; readonly memberId: string };
+type JobScope = ProviderTelegramPolicy | "generic";
+// Keep Telegram work invisible to older consumers of the generic queue.
+type JobTable = "subscription_provider_jobs" | "telegram_provider_jobs";
 
 export type ProviderAdmission =
   | { kind: "queued" | "coalesced" | "duplicate"; jobId: number; subscriptionId: number }
@@ -35,35 +41,50 @@ export interface ProviderJobLease {
   readonly expiresAt: number;
   readonly attempts: number;
   readonly sourceUrl: string;
+  readonly scope: JobScope;
 }
 
 type TerminalFailure = "invalid-document" | "fetch-rejected" | "storage-failed";
 type RetryFailure = "busy" | "timeout" | "dns-failed" | "unavailable" | "upstream-retryable" | "storage-failed";
-type FailureOutcome = { kind: "retry"; reason: RetryFailure } | { kind: "failed"; reason: TerminalFailure };
-type ProviderJobOutcome = FailureOutcome | { kind: "saved"; snapshotId: string };
+export type ProviderFailureOutcome = { kind: "retry"; reason: RetryFailure } | { kind: "failed"; reason: TerminalFailure };
+type ProviderJobOutcome = ProviderFailureOutcome | { kind: "saved"; snapshotId: string };
 type Binding = string | number;
-type Guard = { sql: string; bindings: readonly Binding[] };
+export type ProviderSql = { sql: string; bindings: readonly Binding[] };
+type Guard = ProviderSql;
 type Receipt = {
   jobId: number; subscriptionId: number; kind: ProviderJobLease["kind"]; sourceSha256: string;
   resultCode: string | null;
 };
 type AdmissionRow = Partial<Receipt> & { refused?: "capacity" | "unavailable" | "conflict" };
-type ClaimedRow = Omit<ProviderJobLease, "sourceUrl">;
+type ClaimedRow = Omit<ProviderJobLease, "sourceUrl" | "scope">;
+type AdmissionPlan = { statements: D1PreparedStatement[]; insertIndex: number; refusal: Guard };
+type SettlementRow = { state: "pending" | "done"; resultCode: string | null };
 
 const receiptFields = `job_id AS jobId, subscription_id AS subscriptionId, kind,
   source_sha256 AS sourceSha256, result_code AS resultCode`;
 const liveState = "state IN ('pending', 'leased')";
-const activeJob = `EXISTS (SELECT 1 FROM subscription_provider_jobs AS active
-  WHERE active.owner_id = target.owner_id AND active.subscription_id = target.id AND active.${liveState})`;
-const sameJob = `EXISTS (SELECT 1 FROM subscription_provider_jobs AS active
-  WHERE active.owner_id = target.owner_id AND active.subscription_id = target.id AND active.${liveState}
-    AND active.source_sha256 = ? AND active.expected_generation = target.generation
-    AND active.expected_lifecycle_revision = target.lifecycle_revision)`;
+function jobTable(scope: JobScope): JobTable {
+  return scope === "generic" ? "subscription_provider_jobs" : "telegram_provider_jobs";
+}
 
-function jobCapacity(owner: string): string {
-  return `NOT EXISTS (SELECT 1 FROM subscription_provider_jobs AS active WHERE active.owner_id = ${owner}
+export function providerJobLeaseTable(lease: ProviderJobLease): JobTable {
+  return jobTable(lease.scope);
+}
+
+function sameJob(scope: JobScope, table: JobTable): Guard {
+  const authorization = scopeAuthorization(scope, "active");
+  return { sql: `EXISTS (SELECT 1 FROM ${table} AS active
+    WHERE active.owner_id = target.owner_id AND active.subscription_id = target.id AND active.${liveState}
+      AND active.source_sha256 = ? AND active.expected_generation = target.generation
+      AND active.expected_lifecycle_revision = target.lifecycle_revision
+      ${scope === "generic" ? "" : `AND active.expires_at > unixepoch() AND (${authorization.sql})`})`,
+    bindings: authorization.bindings };
+}
+
+function jobCapacity(owner: string, table: JobTable): string {
+  return `NOT EXISTS (SELECT 1 FROM ${table} AS active WHERE active.owner_id = ${owner}
     AND active.${liveState} LIMIT 1 OFFSET ${MAX_OWNER_JOBS - 1})
-    AND NOT EXISTS (SELECT 1 FROM subscription_provider_jobs WHERE ${liveState} LIMIT 1 OFFSET ${MAX_GLOBAL_JOBS - 1})`;
+    AND NOT EXISTS (SELECT 1 FROM ${table} WHERE ${liveState} LIMIT 1 OFFSET ${MAX_GLOBAL_JOBS - 1})`;
 }
 
 function validateKey({ ownerId, requestKey }: AdmissionKey): void {
@@ -71,7 +92,7 @@ function validateKey({ ownerId, requestKey }: AdmissionKey): void {
   if (typeof requestKey !== "string" || !SHA256.test(requestKey)) throw new RangeError("Invalid provider job request.");
 }
 
-function providerHost(value: unknown): string | null {
+export function providerHost(value: unknown): string | null {
   if (typeof value !== "string" || value.length > MAX_URL_BYTES ||
       /[\s\\\u0000-\u001f\u007f-\u009f\ud800-\udfff#]/u.test(value) ||
       /%(?![0-9a-f]{2})/iu.test(value) || encoder.encode(value).byteLength > MAX_URL_BYTES) return null;
@@ -107,21 +128,25 @@ function previousAdmission(row: AdmissionRow, kind: ProviderJobLease["kind"], ta
 }
 
 function prepareAdmission(
-  db: D1Database, key: AdmissionKey, kind: ProviderJobLease["kind"], target: Guard, digest: string,
+  db: D1Database, key: AdmissionKey, kind: ProviderJobLease["kind"], target: Guard, digest: string, scope: JobScope,
 ): D1PreparedStatement {
+  const table = jobTable(scope);
+  const same = sameJob(scope, table);
+  const activeJob = `EXISTS (SELECT 1 FROM ${table} AS active
+    WHERE active.owner_id = target.owner_id AND active.subscription_id = target.id AND active.${liveState})`;
   return db.prepare(`
     WITH candidates AS (
       SELECT subscriptions.id, subscriptions.owner_id, subscriptions.generation,
         ${SUBSCRIPTION_LIFECYCLE_REVISION} AS lifecycle_revision
       FROM subscriptions WHERE ${target.sql} LIMIT 2
     ), classified AS (
-      SELECT target.*, ${sameJob} AS coalesced
+      SELECT target.*, ${same.sql} AS coalesced
       FROM candidates AS target WHERE (SELECT count(*) FROM candidates) = 1
         AND target.generation < 9007199254740991
-        AND NOT EXISTS (SELECT 1 FROM subscription_provider_jobs WHERE owner_id = target.owner_id AND request_key = ?)
-        AND (${sameJob} OR (NOT ${activeJob} AND ${jobCapacity("target.owner_id")}))
+        AND NOT EXISTS (SELECT 1 FROM ${table} WHERE owner_id = target.owner_id AND request_key = ?)
+        AND (${same.sql} OR (NOT ${activeJob} AND ${jobCapacity("target.owner_id", table)}))
     )
-    INSERT INTO subscription_provider_jobs
+    INSERT INTO ${table}
       (owner_id, request_key, kind, subscription_id, source_sha256, expected_generation, expected_lifecycle_revision,
        state, created_at, due_at, expires_at, result_code, finished_at)
     SELECT owner_id, ?, ?, id, ?, generation, lifecycle_revision, CASE WHEN coalesced THEN 'done' ELSE 'pending' END,
@@ -129,20 +154,22 @@ function prepareAdmission(
       CASE WHEN coalesced THEN unixepoch() END FROM classified WHERE 1
     ON CONFLICT (owner_id, request_key) DO NOTHING
     RETURNING ${receiptFields}
-  `).bind(...target.bindings, digest, key.requestKey, digest, key.requestKey, kind, digest);
+  `).bind(...target.bindings, digest, ...same.bindings, key.requestKey, digest, ...same.bindings, key.requestKey, kind, digest);
 }
 
-async function admit(
+function prepareAdmissionPlan(
   db: D1Database, key: AdmissionKey, kind: ProviderJobLease["kind"], target: Guard, digest: string,
-  originTarget: number | string, refusal: D1PreparedStatement, create?: { sourceUrl: string; name: string },
-): Promise<ProviderAdmission> {
+  refusal: Guard, create?: { sourceUrl: string; name: string }, fence?: Guard, authorization?: ProviderTelegramPolicy,
+): AdmissionPlan {
   const steps: D1PreparedStatement[] = [];
+  const scope = authorization ?? "generic";
+  const table = jobTable(scope);
   const token = create ? crypto.randomUUID().replaceAll("-", "") : null;
   if (create && token) {
     steps.push(db.prepare(`
       INSERT INTO subscriptions (owner_id, name, source_url, token, created_at, updated_at)
       SELECT ?, ?, ?, ?, unixepoch(), unixepoch()
-      WHERE NOT EXISTS (SELECT 1 FROM subscription_provider_jobs WHERE owner_id = ? AND request_key = ?)
+      WHERE NOT EXISTS (SELECT 1 FROM ${table} WHERE owner_id = ? AND request_key = ?)
         AND NOT EXISTS (SELECT 1 FROM subscriptions WHERE owner_id = ? AND source_url = ?)
         AND NOT EXISTS (SELECT 1 FROM subscription_trash WHERE owner_id = ? AND source_url = ?
           AND deleted_at >= unixepoch() - ${TRASH_SECONDS})
@@ -150,23 +177,32 @@ async function admit(
         AND NOT EXISTS (SELECT 1 FROM subscriptions WHERE owner_id = ?
           AND (lower(substr(source_url, 1, 7)) = 'http://' OR lower(substr(source_url, 1, 8)) = 'https://')
           LIMIT 1 OFFSET ${MAX_OWNER_SOURCES - 1})
-        AND ${jobCapacity("?")}
+        AND ${jobCapacity("?", table)}
+        ${fence ? `AND (${fence.sql})` : ""}
     `).bind(key.ownerId, create.name, create.sourceUrl, token, key.ownerId, key.requestKey,
-      key.ownerId, create.sourceUrl, key.ownerId, create.sourceUrl, token, key.ownerId, key.ownerId));
+      key.ownerId, create.sourceUrl, key.ownerId, create.sourceUrl, token, key.ownerId, key.ownerId, ...(fence?.bindings ?? [])));
   }
   const insertIndex = steps.length;
-  steps.push(prepareAdmission(db, key, kind, target, digest));
+  steps.push(prepareAdmission(db, key, kind, fence ? { sql: `(${target.sql}) AND (${fence.sql})`,
+    bindings: [...target.bindings, ...fence.bindings] } : target, digest, scope));
   if (token) {
     // A new shell and its job must either both commit or both roll back.
     steps.push(db.prepare(`
       SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM subscriptions WHERE token = ?)
-        OR EXISTS (SELECT 1 FROM subscription_provider_jobs AS job JOIN subscriptions AS sub ON sub.id = job.subscription_id
+        OR EXISTS (SELECT 1 FROM ${table} AS job JOIN subscriptions AS sub ON sub.id = job.subscription_id
           WHERE sub.token = ? AND job.owner_id = ? AND job.request_key = ? AND job.state = 'pending')
         THEN 1 ELSE json_extract('provider admission guard failed', '$') END
     `).bind(token, token, key.ownerId, key.requestKey));
   }
-  steps.push(db.prepare(`SELECT ${receiptFields} FROM subscription_provider_jobs WHERE owner_id = ? AND request_key = ?`)
-    .bind(key.ownerId, key.requestKey), refusal);
+  return { statements: steps, insertIndex, refusal };
+}
+
+async function admit(
+  db: D1Database, key: AdmissionKey, kind: ProviderJobLease["kind"], digest: string, originTarget: number | string,
+  { statements, insertIndex, refusal }: AdmissionPlan,
+): Promise<ProviderAdmission> {
+  const steps = [...statements, db.prepare(`SELECT ${receiptFields} FROM subscription_provider_jobs WHERE owner_id = ? AND request_key = ?`)
+    .bind(key.ownerId, key.requestKey), db.prepare(`SELECT ${refusal.sql} AS refused`).bind(...refusal.bindings)];
   const results = await db.batch<AdmissionRow>(steps);
   if (results.length !== steps.length || results.some(({ success }) => !success) ||
       results[insertIndex].results.length > 1 || results.at(-2)!.results.length > 1) {
@@ -190,6 +226,53 @@ async function admit(
   throw new Error("Provider job admission could not be confirmed.");
 }
 
+export async function prepareProviderUrlImport(
+  db: D1Database, input: UrlImport, fence?: Guard, authorization?: ProviderTelegramPolicy,
+): Promise<{ digest: string; plan: AdmissionPlan }> {
+  validateKey(input);
+  const host = providerHost(input.sourceUrl);
+  if (!host) throw new RangeError("Invalid provider source URL.");
+  const name = normalizeSubscriptionName(input.name ?? Array.from(host).slice(0, 64).join(""));
+  const digest = await sourceDigest(input.sourceUrl);
+  const target = { sql: "subscriptions.owner_id = ? AND subscriptions.source_url = ?",
+    bindings: [input.ownerId, input.sourceUrl] };
+  const refusal = {
+    sql: `CASE WHEN (SELECT count(*) FROM (SELECT 1 FROM subscriptions WHERE ${target.sql} LIMIT 2)) > 1
+      THEN 'conflict' WHEN NOT EXISTS (SELECT 1 FROM subscriptions WHERE ${target.sql}) AND EXISTS (
+        SELECT 1 FROM subscription_trash WHERE owner_id = ? AND source_url = ? AND deleted_at >= unixepoch() - ${TRASH_SECONDS}
+      ) THEN 'unavailable' ELSE 'capacity' END`,
+    bindings: [...target.bindings, ...target.bindings, input.ownerId, input.sourceUrl],
+  };
+  return { digest, plan: prepareAdmissionPlan(db, input, "url-import", target, digest, refusal, { sourceUrl: input.sourceUrl, name },
+    fence, authorization) };
+}
+
+export async function prepareOwnedProviderRefresh(
+  db: D1Database, input: Refresh, fence?: Guard, readFence?: Guard, authorization?: ProviderTelegramPolicy,
+): Promise<{ digest: string; plan: AdmissionPlan } | null> {
+  validateKey(input);
+  const { id, expectedGeneration, expectedLifecycleRevision } = input;
+  if (!validInteger(id, 1) || (expectedGeneration === undefined) !== (expectedLifecycleRevision === undefined) ||
+      (expectedGeneration !== undefined && (!validInteger(expectedGeneration, 0) || !validInteger(expectedLifecycleRevision, 0)))) {
+    throw new RangeError("Invalid subscription version.");
+  }
+  const version = expectedGeneration === undefined ? { sql: "", bindings: [] } : {
+    sql: `AND subscriptions.generation = ? AND ${SUBSCRIPTION_LIFECYCLE_REVISION} = ?`,
+    bindings: [expectedGeneration, expectedLifecycleRevision!],
+  };
+  const target = ownedSource(input.ownerId, id);
+  const sourceUrl = await db.prepare(`SELECT source_url FROM subscriptions WHERE ${target.sql} ${version.sql}
+    ${readFence ? `AND (${readFence.sql})` : ""}`).bind(...target.bindings, ...version.bindings, ...(readFence?.bindings ?? []))
+    .first<string>("source_url");
+  if (sourceUrl === null || !providerHost(sourceUrl)) return null;
+  const owned = ownedSource(input.ownerId, id, sourceUrl);
+  const exact = { sql: `${owned.sql} ${version.sql}`, bindings: [...owned.bindings, ...version.bindings] };
+  const refusal = { sql: `CASE WHEN EXISTS (SELECT 1 FROM subscriptions WHERE ${exact.sql})
+    THEN 'capacity' ELSE 'unavailable' END`, bindings: exact.bindings };
+  const digest = await sourceDigest(sourceUrl);
+  return { digest, plan: prepareAdmissionPlan(db, input, "refresh", exact, digest, refusal, undefined, fence, authorization) };
+}
+
 /** Internal admission for an already authorized owner. No network request occurs here. */
 export async function enqueueProviderUrlImport(db: D1Database, input: UrlImport): Promise<ProviderAdmission> {
   validateKey(input);
@@ -197,16 +280,8 @@ export async function enqueueProviderUrlImport(db: D1Database, input: UrlImport)
   if (!host) throw new RangeError("Invalid provider source URL.");
   const name = normalizeSubscriptionName(input.name ?? Array.from(host).slice(0, 64).join(""));
   try {
-    const digest = await sourceDigest(input.sourceUrl);
-    const target = { sql: "subscriptions.owner_id = ? AND subscriptions.source_url = ?",
-      bindings: [input.ownerId, input.sourceUrl] };
-    const refusal = db.prepare(`
-      SELECT CASE WHEN (SELECT count(*) FROM (SELECT 1 FROM subscriptions WHERE ${target.sql} LIMIT 2)) > 1
-        THEN 'conflict' WHEN NOT EXISTS (SELECT 1 FROM subscriptions WHERE ${target.sql}) AND EXISTS (
-          SELECT 1 FROM subscription_trash WHERE owner_id = ? AND source_url = ? AND deleted_at >= unixepoch() - ${TRASH_SECONDS}
-        ) THEN 'unavailable' ELSE 'capacity' END AS refused
-    `).bind(...target.bindings, ...target.bindings, input.ownerId, input.sourceUrl);
-    return await admit(db, input, "url-import", target, digest, digest, refusal, { sourceUrl: input.sourceUrl, name });
+    const { digest, plan } = await prepareProviderUrlImport(db, { ...input, name });
+    return await admit(db, input, "url-import", digest, digest, plan);
   } catch {
     // D1 failures may include bound source values.
     throw new Error("Provider URL import admission could not be confirmed.");
@@ -221,14 +296,9 @@ export async function enqueueOwnedProviderRefresh(db: D1Database, input: Refresh
     const earlier = await db.prepare(`SELECT ${receiptFields} FROM subscription_provider_jobs
       WHERE owner_id = ? AND request_key = ?`).bind(input.ownerId, input.requestKey).first<Receipt>();
     if (earlier) return previousAdmission(earlier, "refresh", input.id);
-    const target = ownedSource(input.ownerId, input.id);
-    const sourceUrl = await db.prepare(`SELECT source_url FROM subscriptions WHERE ${target.sql}`)
-      .bind(...target.bindings).first<string>("source_url");
-    if (sourceUrl === null || !providerHost(sourceUrl)) return { kind: "unavailable" };
-    const exact = ownedSource(input.ownerId, input.id, sourceUrl);
-    const refusal = db.prepare(`SELECT CASE WHEN EXISTS (SELECT 1 FROM subscriptions WHERE ${exact.sql})
-      THEN 'capacity' ELSE 'unavailable' END AS refused`).bind(...exact.bindings);
-    return await admit(db, input, "refresh", exact, await sourceDigest(sourceUrl), input.id, refusal);
+    const prepared = await prepareOwnedProviderRefresh(db, input);
+    if (!prepared) return { kind: "unavailable" };
+    return await admit(db, input, "refresh", prepared.digest, input.id, prepared.plan);
   } catch {
     throw new Error("Provider refresh admission could not be confirmed.");
   }
@@ -239,6 +309,30 @@ const currentTarget = `EXISTS (
     AND subscriptions.generation = job.expected_generation
     AND ${SUBSCRIPTION_LIFECYCLE_REVISION} = job.expected_lifecycle_revision
 )`;
+
+function scopeAuthorization(scope: JobScope, alias: "job" | "active" = "job", forRetirement = false): Guard {
+  if (scope === "generic") return { sql: "1", bindings: [] };
+  return { sql: `EXISTS (SELECT 1 FROM telegram_provider_requests AS origin
+    JOIN telegram_inbox AS inbox USING (receipt_id) WHERE origin.job_id = ${alias}.job_id AND origin.outcome = 'admitted'
+      AND origin.kind = ${alias}.kind AND inbox.bot_id = ? AND inbox.actor_id = ${alias}.owner_id
+      AND inbox.chat_id = inbox.actor_id AND inbox.chat_type = 'private' AND inbox.thread_id IS NULL
+      AND inbox.command = 'help' AND inbox.receipt_nonce = '${TELEGRAM_PROVIDER_MARKER}'
+      AND ((inbox.actor_id = ? AND origin.actor_role = 'admin' AND origin.auth_message_date = 0 AND origin.auth_message_id = 0)
+        OR (inbox.actor_id = ? AND origin.actor_role = 'member' AND inbox.message_date > origin.auth_message_date
+          ${forRetirement ? "" : `AND COALESCE((
+            SELECT allowed = 1 AND message_date = origin.auth_message_date AND message_id = origin.auth_message_id
+            FROM telegram_auth WHERE bot_id = inbox.bot_id AND user_id = inbox.actor_id
+          ), origin.auth_message_date = 0 AND origin.auth_message_id = 0)`})))`,
+    bindings: [scope.botId, scope.adminId, scope.memberId] };
+}
+
+function jobScope(policy?: ProviderTelegramPolicy): JobScope {
+  if (!policy) return "generic";
+  const { botId, adminId, memberId } = policy;
+  [botId, adminId, memberId].forEach(checkOwnerId);
+  if (new Set([botId, adminId, memberId]).size !== 3) throw new Error("Invalid provider authorization policy.");
+  return Object.freeze({ botId, adminId, memberId });
+}
 
 function validateClaim(row: ClaimedRow): void {
   validateKey(row);
@@ -252,17 +346,18 @@ function validateClaim(row: ClaimedRow): void {
       !validInteger(row.attempts, 1, MAX_ATTEMPTS)) throw new RangeError("Invalid provider job lease.");
 }
 
-function leaseGuard(lease: ClaimedRow): Guard {
+function leaseGuard(lease: ClaimedRow, scope: JobScope, forRetirement = false): Guard {
+  const authorization = scopeAuthorization(scope, "job", forRetirement);
   return {
-    sql: `EXISTS (SELECT 1 FROM subscription_provider_jobs AS job
+    sql: `EXISTS (SELECT 1 FROM ${jobTable(scope)} AS job
       WHERE job.job_id = ? AND job.owner_id = ? AND job.request_key = ? AND job.kind = ?
         AND job.subscription_id = ? AND job.source_sha256 = ? AND job.expected_generation = ?
         AND job.expected_lifecycle_revision = ? AND job.state = 'leased'
         AND job.lease_id = ? AND job.attempts = ? AND job.lease_until = ? AND job.expires_at = ?
-        AND job.lease_until > unixepoch() AND job.expires_at > unixepoch())`,
+        AND job.lease_until > unixepoch() AND job.expires_at > unixepoch() AND (${authorization.sql}))`,
     bindings: [lease.jobId, lease.ownerId, lease.requestKey, lease.kind, lease.id, lease.sourceSha256,
       lease.expectedGeneration, lease.expectedLifecycleRevision, lease.leaseId, lease.attempts,
-      lease.leaseUntil, lease.expiresAt],
+      lease.leaseUntil, lease.expiresAt, ...authorization.bindings],
   };
 }
 
@@ -281,46 +376,60 @@ function exactTarget(lease: ProviderJobLease, snapshotId?: string): Guard {
 export function prepareProviderJobLeaseGuard(lease: ProviderJobLease): Guard {
   validateClaim(lease);
   if (!providerHost(lease.sourceUrl)) throw new RangeError("Invalid provider job lease.");
-  const live = leaseGuard(lease);
+  const live = leaseGuard(lease, lease.scope);
   const target = exactTarget(lease);
   return { sql: `${live.sql} AND ${target.sql}`, bindings: [...live.bindings, ...target.bindings] };
 }
 
-/** Claim at most one current job globally and read its exact private source. */
-export async function claimProviderJob(db: D1Database): Promise<ProviderJobLease | null> {
+export async function isProviderJobCurrent(db: D1Database, lease: ProviderJobLease): Promise<boolean> {
+  const guard = prepareProviderJobLeaseGuard(lease);
   try {
+    return await db.prepare(`SELECT CASE WHEN ${guard.sql} THEN 1 ELSE 0 END AS current`)
+      .bind(...guard.bindings).first<number>("current") === 1;
+  } catch {
+    throw new Error("Provider publication target could not be verified.");
+  }
+}
+
+/** Claim at most one current job globally and read its exact private source. */
+export async function claimProviderJob(db: D1Database, policy?: ProviderTelegramPolicy): Promise<ProviderJobLease | null> {
+  try {
+    const scope = jobScope(policy);
+    const table = jobTable(scope);
+    const visible = scopeAuthorization(scope, "job", true);
+    const authorized = scopeAuthorization(scope);
     const leaseId = crypto.randomUUID();
     const steps = [
       db.prepare(`
         WITH terminal AS (
           SELECT job.job_id, CASE
             WHEN job.expires_at <= unixepoch() THEN 'expired'
-            WHEN NOT ${currentTarget} THEN 'stale-target'
+            WHEN NOT (${currentTarget} AND ${authorized.sql}) THEN 'stale-target'
             WHEN job.attempts >= ${MAX_ATTEMPTS} THEN 'attempts-exhausted'
           END AS result_code
-          FROM subscription_provider_jobs AS job WHERE job.${liveState}
+          FROM ${table} AS job WHERE job.${liveState} AND (${visible.sql})
             AND (job.state = 'pending' OR job.lease_until <= unixepoch())
         )
-        UPDATE subscription_provider_jobs SET state = 'done', result_code = terminal.result_code,
+        UPDATE ${table} SET state = 'done', result_code = terminal.result_code,
           finished_at = unixepoch(), lease_id = NULL, lease_until = NULL
-        FROM terminal WHERE subscription_provider_jobs.job_id = terminal.job_id AND terminal.result_code IS NOT NULL
-      `),
+        FROM terminal WHERE ${table}.job_id = terminal.job_id AND terminal.result_code IS NOT NULL
+      `).bind(...authorized.bindings, ...visible.bindings),
       db.prepare(`
-        UPDATE subscription_provider_jobs SET state = 'leased', attempts = attempts + 1, lease_id = ?,
+        UPDATE ${table} SET state = 'leased', attempts = attempts + 1, lease_id = ?,
           lease_until = min(unixepoch() + ${LEASE_SECONDS}, expires_at)
         WHERE job_id = (
-          SELECT job.job_id FROM subscription_provider_jobs AS job
+          SELECT job.job_id FROM ${table} AS job
           WHERE job.expires_at > unixepoch() AND job.attempts < ${MAX_ATTEMPTS}
-            AND ${currentTarget}
+            AND ${currentTarget} AND (${authorized.sql})
             AND ((job.state = 'leased' AND job.lease_until <= unixepoch()) OR
               (job.state = 'pending' AND job.due_at <= unixepoch()
-                AND NOT EXISTS (SELECT 1 FROM subscription_provider_jobs WHERE state = 'leased')))
+                AND NOT EXISTS (SELECT 1 FROM ${table} WHERE state = 'leased')))
           ORDER BY job.due_at, job.job_id LIMIT 1
         )
         RETURNING job_id AS jobId, subscription_id AS id, owner_id AS ownerId, kind, request_key AS requestKey,
           expected_generation AS expectedGeneration, expected_lifecycle_revision AS expectedLifecycleRevision,
           source_sha256 AS sourceSha256, lease_id AS leaseId, lease_until AS leaseUntil, expires_at AS expiresAt, attempts
-      `).bind(leaseId),
+      `).bind(leaseId, ...authorized.bindings),
     ];
     const results = await db.batch<ClaimedRow>(steps);
     if (results.length !== steps.length || results.some(({ success }) => !success) || results[1].results.length > 1) {
@@ -330,17 +439,18 @@ export async function claimProviderJob(db: D1Database): Promise<ProviderJobLease
     if (!lease) return null;
     validateClaim(lease);
     if (lease.leaseId !== leaseId) throw new Error("Provider job claim could not be confirmed.");
-    const live = leaseGuard(lease);
+    const live = leaseGuard(lease, scope);
     const sourceUrl = await db.prepare(`SELECT source_url FROM subscriptions WHERE id = ? AND owner_id = ?
       AND generation = ? AND ${SUBSCRIPTION_LIFECYCLE_REVISION} = ? AND ${live.sql}`)
       .bind(lease.id, lease.ownerId, lease.expectedGeneration, lease.expectedLifecycleRevision, ...live.bindings)
       .first<string>("source_url");
     if (sourceUrl !== null && providerHost(sourceUrl) && await sourceDigest(sourceUrl) === lease.sourceSha256) {
-      return Object.freeze({ ...lease, sourceUrl });
+      return Object.freeze({ ...lease, sourceUrl, scope });
     }
-    const retired = await db.prepare(`UPDATE subscription_provider_jobs SET state = 'done', result_code = 'stale-target',
-      finished_at = unixepoch(), lease_id = NULL, lease_until = NULL WHERE job_id = ? AND ${live.sql}`)
-      .bind(lease.jobId, ...live.bindings).run();
+    const retire = leaseGuard(lease, scope, true);
+    const retired = await db.prepare(`UPDATE ${table} SET state = 'done', result_code = 'stale-target',
+      finished_at = unixepoch(), lease_id = NULL, lease_until = NULL WHERE job_id = ? AND ${retire.sql}`)
+      .bind(lease.jobId, ...retire.bindings).run();
     if (!retired.success) throw new Error("Provider job claim could not be confirmed.");
     return null;
   } catch {
@@ -350,19 +460,20 @@ export async function claimProviderJob(db: D1Database): Promise<ProviderJobLease
 
 /** Require both the guarded publication and saved settlement to affect one row in the same D1 batch. */
 export function prepareProviderJobSettlement(
-  db: D1Database, lease: ProviderJobLease, outcome: ProviderJobOutcome,
+  db: D1Database, lease: ProviderJobLease, outcome: ProviderJobOutcome, afterPublication = false,
 ): D1PreparedStatement {
   validateClaim(lease);
   if (!providerHost(lease.sourceUrl)) throw new RangeError("Invalid provider job lease.");
-  const live = leaseGuard(lease);
+  const table = providerJobLeaseTable(lease);
+  const live = leaseGuard(lease, lease.scope, outcome.kind !== "saved");
   if (outcome.kind === "saved") {
     if (typeof outcome.snapshotId !== "string" || !UUID.test(outcome.snapshotId)) {
       throw new RangeError("Invalid provider snapshot identity.");
     }
     const published = exactTarget(lease, outcome.snapshotId);
-    return db.prepare(`UPDATE subscription_provider_jobs SET state = 'done', result_code = 'saved',
+    return db.prepare(`UPDATE ${table} SET state = 'done', result_code = 'saved',
       finished_at = unixepoch(), lease_id = NULL, lease_until = NULL, failure_code = NULL
-      WHERE job_id = ? AND ${live.sql} AND ${published.sql}
+      WHERE job_id = ? AND ${live.sql} AND ${published.sql} ${afterPublication ? "AND changes() = 1" : ""}
       RETURNING state, result_code AS resultCode`).bind(lease.jobId, ...live.bindings, ...published.bindings);
   }
   const failure = outcome.kind === "failed" && ["invalid-document", "fetch-rejected", "storage-failed"].includes(outcome.reason);
@@ -370,32 +481,69 @@ export function prepareProviderJobSettlement(
     ["busy", "timeout", "dns-failed", "unavailable", "upstream-retryable", "storage-failed"].includes(outcome.reason);
   if (!failure && !retry) throw new RangeError("Invalid provider job outcome.");
   const current = exactTarget(lease);
+  const authorized = scopeAuthorization(lease.scope);
   const nextDue = "(unixepoch() + CASE attempts WHEN 1 THEN 60 ELSE 180 END)";
   const decision = retry
     ? `WHEN attempts >= ${MAX_ATTEMPTS} THEN 'attempts-exhausted' WHEN ${nextDue} >= expires_at THEN 'expired'`
     : "ELSE ?";
   return db.prepare(`
     WITH decision AS (
-      SELECT job_id, ${nextDue} AS next_due, CASE WHEN NOT ${current.sql} THEN 'stale-target' ${decision} END AS code
-      FROM subscription_provider_jobs WHERE job_id = ? AND ${live.sql}
+      SELECT job.job_id, ${nextDue} AS next_due, CASE WHEN NOT (${current.sql} AND ${authorized.sql}) THEN 'stale-target' ${decision} END AS code
+      FROM ${table} AS job WHERE job.job_id = ? AND ${live.sql}
     )
-    UPDATE subscription_provider_jobs SET state = CASE WHEN decision.code IS NULL THEN 'pending' ELSE 'done' END,
+    UPDATE ${table} SET state = CASE WHEN decision.code IS NULL THEN 'pending' ELSE 'done' END,
       due_at = CASE WHEN decision.code IS NULL THEN decision.next_due ELSE due_at END,
       lease_id = NULL, lease_until = NULL, failure_code = ?, result_code = decision.code,
       finished_at = CASE WHEN decision.code IS NOT NULL THEN unixepoch() END
-    FROM decision WHERE subscription_provider_jobs.job_id = decision.job_id
+    FROM decision WHERE ${table}.job_id = decision.job_id
     RETURNING state, result_code AS resultCode
-  `).bind(...current.bindings, ...(retry ? [] : [outcome.reason]), lease.jobId, ...live.bindings, outcome.reason);
+  `).bind(...current.bindings, ...authorized.bindings, ...(retry ? [] : [outcome.reason]), lease.jobId, ...live.bindings, outcome.reason);
 }
 
 export async function settleProviderJob(
-  db: D1Database, lease: ProviderJobLease, outcome: FailureOutcome,
+  db: D1Database, lease: ProviderJobLease, outcome: ProviderFailureOutcome,
 ): Promise<"retry" | "done" | "stale"> {
   if (outcome.kind !== "failed" && outcome.kind !== "retry") throw new RangeError("Invalid provider job outcome.");
   try {
-    const row = await prepareProviderJobSettlement(db, lease, outcome).first<{ state: "pending" | "done" }>();
+    const settlement = prepareProviderJobSettlement(db, lease, outcome);
+    let row: SettlementRow | null;
+    if (lease.scope !== "generic") {
+      const authorized = scopeAuthorization(lease.scope);
+      const [result, metadata] = await db.batch<SettlementRow>([settlement, db.prepare(`
+        UPDATE subscriptions SET last_error = 'provider-refresh-failed'
+        WHERE id = ? AND owner_id = ? AND source_url = ? AND generation = ? AND ${SUBSCRIPTION_LIFECYCLE_REVISION} = ?
+          AND changes() = 1 AND EXISTS (SELECT 1 FROM telegram_provider_jobs AS job
+            WHERE job.job_id = ? AND job.owner_id = subscriptions.owner_id AND job.request_key = ?
+              AND job.state = 'done' AND job.result_code IN ('fetch-rejected','invalid-document','storage-failed','attempts-exhausted')
+              AND (${authorized.sql}))`)
+        .bind(lease.id, lease.ownerId, lease.sourceUrl, lease.expectedGeneration, lease.expectedLifecycleRevision,
+          lease.jobId, lease.requestKey, ...authorized.bindings)]);
+      if (!result?.success || !metadata?.success || result.results.length > 1) throw new Error();
+      row = result.results[0] ?? null;
+    } else {
+      row = await settlement.first<SettlementRow>();
+    }
+    if (row?.resultCode === "stale-target" && lease.scope !== "generic") return "stale";
     return row === null ? "stale" : row.state === "pending" ? "retry" : "done";
   } catch {
     throw new Error("Provider job settlement could not be confirmed.");
+  }
+}
+
+/** Release a live lease whose owned source or publication version changed. */
+export async function retireStaleProviderJob(db: D1Database, lease: ProviderJobLease): Promise<void> {
+  validateClaim(lease);
+  if (!providerHost(lease.sourceUrl)) throw new RangeError("Invalid provider job lease.");
+  const live = leaseGuard(lease, lease.scope, true);
+  const target = exactTarget(lease);
+  const authorized = scopeAuthorization(lease.scope);
+  try {
+    const result = await db.prepare(`UPDATE ${providerJobLeaseTable(lease)} AS job SET state = 'done', result_code = 'stale-target',
+      finished_at = unixepoch(), lease_id = NULL, lease_until = NULL, failure_code = NULL
+      WHERE job.job_id = ? AND ${live.sql} AND NOT (${target.sql} AND ${authorized.sql})`)
+      .bind(lease.jobId, ...live.bindings, ...target.bindings, ...authorized.bindings).run();
+    if (!result.success || ![0, 1].includes(result.meta.changes)) throw new Error();
+  } catch {
+    throw new Error("Stale provider job retirement could not be confirmed.");
   }
 }

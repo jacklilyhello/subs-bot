@@ -19,6 +19,7 @@ import re
 import sqlite3
 import stat
 import sys
+import unicodedata
 from uuid import NAMESPACE_URL, uuid5
 
 import legacy_inventory as inventory
@@ -32,6 +33,14 @@ MAX_SAFE_ID = 2**53 - 1
 MAX_OWNER = 2**63 - 1
 MAX_METADATA_BYTES = 32 * 1024
 MAX_INDEX_LINE_BYTES = 1024
+PATH_DOMAIN = "path_maps"
+PATH_FILE = "path-rules.ndjson"
+MAX_PATH_ROWS = 20_000
+MAX_OWNER_PATH_ROWS = 64
+MAX_PATH_TEXT_SCALARS = 128
+MAX_PATH_TEXT_BYTES = 512
+MAX_PATH_LINE_BYTES = 2048
+MAX_PATH_FILE_BYTES = 32 * 1024 * 1024
 DOMAINS = {
     "subscriptions": ("id", "user_id", "name", "url", "token", "expire_at", "traffic_used", "traffic_total",
                       "nodes_json", "node_count", "last_error", "created_at", "updated_at"),
@@ -156,7 +165,7 @@ def _schema(db: sqlite3.Connection) -> tuple[dict, dict[str, set[str]]]:
         optional = OPTIONAL_COLUMNS.get(name, set())
         _require(set(DOMAINS[name]) - optional <= names <= set(DOMAINS[name]) and all(row[6] == 0 for row in columns)
                  and not {"rowid", "_rowid_", "oid"}.intersection(names))
-        if name in HANDLED:
+        if name in (*HANDLED, PATH_DOMAIN):
             _require(any(row[1] == "id" and row[2].upper() == "INTEGER" and row[5] == 1 for row in columns))
         known[name] = names
     _require("subscriptions" in known)
@@ -210,13 +219,17 @@ def _integer(value: object, minimum: int = -MAX_SAFE_ID) -> bool:
     return type(value) is int and minimum <= value <= MAX_SAFE_ID
 
 
-def _metadata(row: dict, table: str, target_id: int, owners: dict[str, str]) -> dict:
-    owner = row["user_id"]
+def _mapped_owner(owner: object, owners: dict[str, str], invalid: str, unmapped: str) -> str:
     if type(owner) is not int or owner == 0 or not -MAX_OWNER - 1 <= owner <= MAX_OWNER:
-        raise _InvalidRow("invalidMetadataRows")
-    if owner < 0 and str(owner) not in owners:
-        raise _InvalidRow("unmappedOwnerRows")
-    owner = owners.get(str(owner), str(owner))
+        raise _InvalidRow(invalid)
+    original = str(owner)
+    if owner < 0 and original not in owners:
+        raise _InvalidRow(unmapped)
+    return owners.get(original, original)
+
+
+def _metadata(row: dict, table: str, target_id: int, owners: dict[str, str]) -> dict:
+    owner = _mapped_owner(row["user_id"], owners, "invalidMetadataRows", "unmappedOwnerRows")
     name, url, token = (row[key] for key in ("name", "url", "token"))
     error = "legacy-refresh-failed" if row["error_type"] == "text" and row["error_bytes"] > 0 else None
     time_column = "updated_at" if table == "subscriptions" else "deleted_at"
@@ -240,6 +253,112 @@ def _metadata(row: dict, table: str, target_id: int, owners: dict[str, str]) -> 
     if table == "deleted_subs":
         record.update(deleted_at=row["deleted_at"], lifecycle_revision=1)
     return record
+
+
+def _path_text(value: object) -> bool:
+    return (isinstance(value, str) and 1 <= len(value) <= MAX_PATH_TEXT_SCALARS and "\0" not in value
+            and bool(value.strip()) and len(value.encode("utf-8")) <= MAX_PATH_TEXT_BYTES)
+
+
+def _path_plan(db, known, domains, owners):
+    rows = domains[PATH_DOMAIN]["rows"]
+    sequence = db.execute("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='sqlite_sequence'").fetchone()
+    entries = db.execute("SELECT seq FROM sqlite_sequence WHERE name=? LIMIT 2", (PATH_DOMAIN,)).fetchall() if sequence else []
+    high = db.execute("SELECT coalesce(max(id),0) FROM path_maps").fetchone()[0] if PATH_DOMAIN in known else 0
+    mapping = {"kind": "identity", "rows": rows, "sourceHighWater": None}
+    if len(entries) > 1 or (entries and (PATH_DOMAIN not in known or not _integer(entries[0][0], 0))) or not _integer(high, 0):
+        return mapping, [], {"invalidPathSequence": 1}
+    high = max(high, entries[0][0] if entries else 0)
+    mapping["sourceHighWater"] = high
+    if not rows and high == 0:
+        return None, [], {}
+    if high == MAX_SAFE_ID:
+        return mapping, [], {"exhaustedPathAllocator": 1}
+    if rows > MAX_PATH_ROWS:
+        return mapping, [], {"pathRuleCountOverLimit": rows}
+    # The Worker matcher and the reviewed legacy comparison both use Unicode 14.
+    if rows and (sys.implementation.name != "cpython" or sys.version_info[:2] != (3, 11)
+                 or unicodedata.unidata_version != "14.0.0"):
+        return mapping, [], {"unsupportedPathUnicodeVersion": 1}
+
+    query = f"""SELECT id,CASE WHEN typeof(user_id)='integer' THEN user_id END,
+        CASE WHEN typeof(node_name)='text' AND length(CAST(node_name AS BLOB))<={MAX_PATH_TEXT_BYTES} THEN CAST(node_name AS BLOB) END,
+        CASE WHEN typeof(remark)='text' AND length(CAST(remark AS BLOB))<={MAX_PATH_TEXT_BYTES} THEN CAST(remark AS BLOB) END
+        FROM path_maps ORDER BY id"""
+    records, errors, by_owner, owner_matches, exact_keys = [], {}, {}, {}, set()
+    previous, bytes_used = 0, 0
+    for id_value, legacy_owner, keyword_bytes, remark_bytes in db.execute(query):
+        try:
+            try:
+                keyword = keyword_bytes.decode("utf-8") if keyword_bytes is not None else None
+                remark = remark_bytes.decode("utf-8") if remark_bytes is not None else None
+            except UnicodeError:
+                raise _InvalidRow("invalidPathRuleRows") from None
+            if not _integer(id_value, previous + 1) or not _path_text(keyword) or not _path_text(remark):
+                raise _InvalidRow("invalidPathRuleRows")
+            previous = id_value
+            owner = _mapped_owner(legacy_owner, owners, "invalidPathRuleRows", "unmappedPathOwnerRows")
+            match = (owner, keyword.strip().casefold())
+            if match in owner_matches and owner_matches[match] != legacy_owner:
+                raise _InvalidRow("ambiguousPathOwnerRows")
+            owner_matches[match] = legacy_owner
+            exact = (owner, keyword)
+            if exact in exact_keys:
+                raise _InvalidRow("duplicatePathKeywordRows")
+            exact_keys.add(exact)
+            by_owner[owner] = by_owner.get(owner, 0) + 1
+            if by_owner[owner] > MAX_OWNER_PATH_ROWS:
+                raise _InvalidRow("pathRuleOwnerLimitRows")
+            record = {"id": id_value, "owner_id": owner, "keyword": keyword, "remark": remark}
+            size = len(_json(record)) + 1
+            bytes_used += size
+            if size > MAX_PATH_LINE_BYTES or bytes_used > MAX_PATH_FILE_BYTES:
+                raise _InvalidRow("pathRuleByteLimitRows")
+            records.append(record)
+        except _InvalidRow as error:
+            errors[error.args[0]] = errors.get(error.args[0], 0) + 1
+    return mapping, records, errors
+
+
+def validate_path_records(records, mapping):
+    previous, rows = 0, 0
+    by_owner, exact_keys = {}, set()
+    high = mapping["sourceHighWater"]
+    for record in records:
+        rows += 1
+        _require(rows <= mapping["rows"] and isinstance(record, dict) and set(record) == {"id", "owner_id", "keyword", "remark"})
+        id_value, owner, keyword, remark = (record[key] for key in ("id", "owner_id", "keyword", "remark"))
+        _require(_integer(id_value, previous + 1) and id_value <= high and isinstance(owner, str) and OWNER.fullmatch(owner)
+                 and int(owner) <= MAX_OWNER and _path_text(keyword) and _path_text(remark) and (owner, keyword) not in exact_keys)
+        previous = id_value
+        exact_keys.add((owner, keyword))
+        by_owner[owner] = by_owner.get(owner, 0) + 1
+        _require(by_owner[owner] <= MAX_OWNER_PATH_ROWS)
+        yield record
+    _require(rows == mapping["rows"])
+
+
+def _verify_path_mapping(manifest):
+    rows = manifest["domains"][PATH_DOMAIN]["rows"]
+    _require(_integer(rows, 0))
+    if manifest["version"] == 1:
+        _require(not manifest["completeImportable"] or rows == 0)
+        return
+    mapping = manifest["pathIdMapping"]
+    _require(isinstance(mapping, dict) and set(mapping) == {"kind", "rows", "sourceHighWater"}
+             and mapping["kind"] == "identity" and _integer(mapping["rows"], 0) and mapping["rows"] == rows)
+    high = mapping["sourceHighWater"]
+    _require((_integer(high, 0) and (rows > 0 or high > 0)) or (high is None and "invalidPathSequence" in manifest["blockers"]))
+    if manifest["completeImportable"]:
+        _require(rows <= MAX_PATH_ROWS and _integer(high, 1) and high < MAX_SAFE_ID)
+
+
+def _read_path_records(stream):
+    while raw := stream.readline(MAX_PATH_LINE_BYTES + 1):
+        _require(len(raw) <= MAX_PATH_LINE_BYTES and raw.endswith(b"\n"))
+        record = json.loads(raw.decode("utf-8"), object_pairs_hook=inventory._unique_object, parse_constant=inventory._reject_constant)
+        _require(_json(record) + b"\n" == raw)
+        yield record
 
 
 def _node_line(node: dict) -> bytes:
@@ -348,7 +467,9 @@ def _convert(db: sqlite3.Connection, root: Path, source_digest: str, owners: dic
         consumed_bookkeeping = 1 if matching == 1 else 0
     domains["meta"].update(consumedRows=consumed_bookkeeping, unhandledRows=domains["meta"]["rows"] - consumed_bookkeeping)
     blockers = {f"unhandled:{name}": value["rows"] for name, value in domains.items()
-                if name not in (*HANDLED, "meta") and value["rows"]}
+                if name not in (*HANDLED, PATH_DOMAIN, "meta") and value["rows"]}
+    path_mapping, path_records, path_blockers = _path_plan(db, known, domains, owners)
+    blockers.update(path_blockers)
     if domains["meta"]["unhandledRows"]:
         blockers["unhandled:meta"] = domains["meta"]["unhandledRows"]
     problems = dict.fromkeys(PROBLEMS, 0)
@@ -396,7 +517,7 @@ def _convert(db: sqlite3.Connection, root: Path, source_digest: str, owners: dic
         blockers.update({name: count for name, count in problems.items() if count})
         output = _Output(root)
         try:
-            if not any(problems.values()):
+            if not any(problems.values()) and not path_blockers:
                 (root / "objects").mkdir(mode=0o700)
                 (root / "objects" / "subscriptions").mkdir(mode=0o700)
                 for table, filename in (("subscriptions", "active.ndjson"), ("deleted_subs", "trash.ndjson")):
@@ -418,13 +539,18 @@ def _convert(db: sqlite3.Connection, root: Path, source_digest: str, owners: dic
                                 file.write(line)
                                 totals["convertedRows"] += 1
                     output.record(filename)
+                if path_mapping is not None:
+                    with _new_file(root / PATH_FILE) as file:
+                        for record in path_records:
+                            file.write(_json(record) + b"\n")
+                    output.record(PATH_FILE)
         finally:
             output.index.close()
     scratch_path.unlink()
     _require(not any(Path(str(scratch_path) + suffix).exists() for suffix in ("-wal", "-shm", "-journal")))
     size, digest = _file_hash(root / "files.ndjson")
     manifest = {
-        "version": 1, "completeImportable": not blockers, "sourceSha256": source_digest,
+        "version": 2 if path_mapping is not None else 1, "completeImportable": not blockers, "sourceSha256": source_digest,
         "ownerMapSha256": sha256(_json(dict(sorted(owners.items())))).hexdigest(),
         "domains": domains, "blockers": blockers, "counts": totals,
         "limits": {"chunkBytes": CHUNK_BYTES, "snapshotBytes": SNAPSHOT_BYTES, "nodes": MAX_NODES, "chunks": MAX_CHUNKS},
@@ -432,12 +558,17 @@ def _convert(db: sqlite3.Connection, root: Path, source_digest: str, owners: dic
                            "targetSequenceHighWater": high_water + domains["deleted_subs"]["rows"]},
         "exportCompatibility": "not-validated", "files": {"path": "files.ndjson", "bytes": size, "sha256": digest, "count": output.file_count},
     }
+    if path_mapping is not None:
+        manifest["pathIdMapping"] = path_mapping
     body = _json(manifest)
     with _new_file(root / "manifest.json") as file:
         file.write(body)
     with _new_file(root / "manifest.sha256") as file:
         file.write(sha256(body).hexdigest().encode("ascii") + b"\n")
-    return {"version": 1, "completeImportable": not blockers, "domains": domains, "blockers": blockers, "counts": totals}
+    report = {"version": manifest["version"], "completeImportable": not blockers, "domains": domains, "blockers": blockers, "counts": totals}
+    if path_mapping is not None:
+        report["pathIdMapping"] = path_mapping
+    return report
 
 
 def convert_backup(source: Path, output: Path, *, owner_map: dict[str, str] | None = None) -> dict:
@@ -494,15 +625,18 @@ def verify_bundle(directory: Path, *, require_complete: bool = True) -> dict:
         root = _safe_path(directory, existing=True, directory=True)
         _require(root.stat().st_uid == os.getuid() and root.stat().st_mode & 0o077 == 0)
         manifest = _bounded_json(root / "manifest.json", 64 * 1024)
+        _require(isinstance(manifest, dict) and type(manifest.get("version")) is int and manifest["version"] in (1, 2))
+        with_paths = manifest["version"] == 2
+        path_fields = {"pathIdMapping"} if with_paths else set()
         _require(isinstance(manifest, dict) and set(manifest) == {"version", "completeImportable", "sourceSha256",
-                 "ownerMapSha256", "domains", "blockers", "counts", "limits", "trashIdMapping", "exportCompatibility", "files"}
-                 and type(manifest["version"]) is int and manifest["version"] == 1
+                 "ownerMapSha256", "domains", "blockers", "counts", "limits", "trashIdMapping", "exportCompatibility", "files"} | path_fields
                  and type(manifest["completeImportable"]) is bool
                  and isinstance(manifest["blockers"], dict) and manifest["completeImportable"] == (not manifest["blockers"])
                  and (not require_complete or manifest["completeImportable"])
                  and isinstance(manifest["sourceSha256"], str) and HASH.fullmatch(manifest["sourceSha256"])
                  and isinstance(manifest["ownerMapSha256"], str) and HASH.fullmatch(manifest["ownerMapSha256"])
                  and isinstance(manifest["domains"], dict) and set(manifest["domains"]) == set(DOMAINS))
+        _verify_path_mapping(manifest)
         marker = _bounded_bytes(root / "manifest.sha256", 65)
         _require(marker == _file_hash(root / "manifest.json")[1].encode("ascii") + b"\n")
         index = manifest["files"]
@@ -518,6 +652,7 @@ def verify_bundle(directory: Path, *, require_complete: bool = True) -> dict:
         next_chunk = 0
         unfinished = False
         count = 0
+        metadata_files = ("active.ndjson", "trash.ndjson", PATH_FILE) if with_paths else ("active.ndjson", "trash.ndjson")
         descriptor = os.open(root / "files.ndjson", os.O_RDONLY | os.O_NOFOLLOW)
         with os.fdopen(descriptor, "rb") as file:
             while raw := file.readline(MAX_INDEX_LINE_BYTES + 1):
@@ -528,8 +663,9 @@ def verify_bundle(directory: Path, *, require_complete: bool = True) -> dict:
                          and isinstance(item["path"], str) and _integer(item["bytes"], 0)
                          and isinstance(item["sha256"], str) and HASH.fullmatch(item["sha256"]))
                 relative = item["path"]
-                if relative in ("active.ndjson", "trash.ndjson"):
-                    _require(not unfinished and relative == ("active.ndjson" if phase == 0 else "trash.ndjson") and phase < 2)
+                if relative in metadata_files:
+                    _require(not unfinished and phase < len(metadata_files) and relative == metadata_files[phase]
+                             and (relative != PATH_FILE or item["bytes"] <= MAX_PATH_FILE_BYTES))
                     phase += 1
                 else:
                     match = OBJECT_PATH.fullmatch(relative)
@@ -550,9 +686,18 @@ def verify_bundle(directory: Path, *, require_complete: bool = True) -> dict:
                 path = _safe_path(root / relative, existing=True)
                 _require(_file_hash(path) == (item["bytes"], item["sha256"]))
                 count += 1
-        _require(not unfinished and count == index["count"] and (phase == 2 or phase == 0 and count == 0 and not manifest["completeImportable"]))
-        if phase == 2:
+        _require(not unfinished and count == index["count"] and (phase == len(metadata_files)
+                 or phase == 0 and count == 0 and not manifest["completeImportable"]))
+        if phase == len(metadata_files):
             _verify_metadata_closure(root, manifest, count)
+            if with_paths:
+                mapping = manifest["pathIdMapping"]
+                _require(mapping["rows"] <= MAX_PATH_ROWS and _integer(mapping["sourceHighWater"], 1)
+                         and mapping["sourceHighWater"] < MAX_SAFE_ID)
+                descriptor = os.open(root / PATH_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                with os.fdopen(descriptor, "rb") as file:
+                    for _ in validate_path_records(_read_path_records(file), mapping):
+                        pass
 
         def files(path: Path, depth: int = 0) -> int:
             _require(depth <= 5)
@@ -575,7 +720,7 @@ def verify_bundle(directory: Path, *, require_complete: bool = True) -> dict:
 
 
 def _verify_metadata_closure(root: Path, manifest: dict, indexed_files: int) -> None:
-    expected_files = 2
+    expected_files = 3 if manifest["version"] == 2 else 2
     total_rows = 0
     total_nodes = 0
     total_bytes = 0
