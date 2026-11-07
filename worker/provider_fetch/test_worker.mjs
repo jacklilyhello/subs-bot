@@ -245,7 +245,7 @@ test("the emitted RPC and Workflow use the same private loopback Durable Object"
         const result = await env.PROVIDER.fetchSubscription(input);
         return result.ok ? new Response(result.body, { headers: { 'x-verified': result.bodySha256 } }) : Response.json(result);
       } };` },
-    { name: "provider", compatibilityDate: "2026-07-30", compatibilityFlags: ["enable_ctx_exports"],
+    { name: "provider", compatibilityDate: "2026-07-30",
       modules: [
         { type: "ESModule", path: "fixture.mjs", contents: fixture },
         { type: "ESModule", path: "emitted.mjs", contents: script },

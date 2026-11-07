@@ -130,7 +130,7 @@ jobs:
             --account-id aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa > "$RUNNER_TEMP/provider-private-config.json"
           jq -e '.workers_dev == false and .preview_urls == false and .observability.enabled == false and
             .name == "subs-bot-provider-fetch-dev-01" and (.containers | length == 1) and
-            .compatibility_flags == ["enable_ctx_exports"] and
+            .compatibility_date == "2026-11-06" and (has("compatibility_flags") | not) and
             .exports == {"ProviderContainer":{"type":"durable-object","storage":"sqlite"}} and
             (.workflows | length == 1) and
             ((has("durable_objects") or has("d1_databases") or has("r2_buckets") or has("routes") or has("triggers") or has("services")) | not)' \

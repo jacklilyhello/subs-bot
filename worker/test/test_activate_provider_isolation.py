@@ -88,7 +88,8 @@ def version():
 def legacy_version():
     metadata = activation.stage._metadata(RELEASE, IMAGE)
     return {"id": VERSION, "resources": {"bindings": metadata["bindings"],
-            "script_runtime": {"containers": metadata["containers"], "compatibility_flags": ["enable_ctx_exports"]}}}
+            "script_runtime": {"containers": metadata["containers"],
+                               "compatibility_date": metadata["compatibility_date"]}}}
 
 
 class PinTests(unittest.TestCase):

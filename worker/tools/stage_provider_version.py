@@ -28,8 +28,8 @@ UPLOAD_ERROR = "The provider version upload was not confirmed. Use verification 
 PREPARE_ERROR = "The pinned provider image was not ready for Cloudflare Workers."
 MAX_UPLOAD_ERRORS = 8
 UPLOAD_FIELDS = frozenset((
-    "metadata", "main_module", "compatibility_date", "compatibility_flags", "annotations", "bindings", "containers", "exports", "files",
-    "migrations",
+    "metadata", "main_module", "compatibility_date", "compatibility_flags", "annotations", "bindings", "containers",
+    "exports", "files", "migrations",
 ))
 
 
@@ -46,7 +46,6 @@ def _metadata(evidence, image):
     return {
         "main_module": provider.WORKER,
         "compatibility_date": evidence["compatibilityDate"],
-        "compatibility_flags": [provider.LOOPBACK_FLAG],
         "bindings": [
             {"name": "BUILD_REVISION", "type": "plain_text", "text": evidence["revision"]},
             {"name": "PROVIDER_SMOKE", "type": "workflow", "workflow_name": WORKFLOW, "class_name": "ProviderSmoke"},
@@ -193,11 +192,17 @@ def _verify_legacy_version(version, candidate, metadata):
     _require(isinstance(version, dict) and version.get("id") == candidate, VERSION_ERROR)
     resources = version.get("resources")
     runtime = resources.get("script_runtime") if isinstance(resources, dict) else None
-    _require(isinstance(runtime, dict) and runtime.get("containers") == metadata["containers"]
-             and runtime.get("compatibility_flags") == [provider.LOOPBACK_FLAG], VERSION_ERROR)
+    _require(isinstance(runtime, dict) and runtime.get("containers") == metadata["containers"], VERSION_ERROR)
+    _verify_compatibility(runtime)
     # Some legacy responses omit bindings. The Beta version detail always verifies the exact inventory.
     if resources.get("bindings") not in (None, {}):
         _verify_bindings(resources["bindings"], metadata["bindings"])
+
+
+def _verify_compatibility(runtime):
+    # The pinned date enables ctx.exports by default (2025-11-17 onward).
+    _require(runtime.get("compatibility_date") in (provider.COMPATIBILITY, provider.COMPATIBILITY + "T00:00:00Z")
+             and runtime.get("compatibility_flags") in (None, []), VERSION_ERROR)
 
 
 def _verify_bindings(bindings, expected):
@@ -214,12 +219,11 @@ def _verify_bindings(bindings, expected):
 def _verify_version(version, candidate, metadata, module_sha256):
     _require(isinstance(version, dict) and version.get("id") == candidate
              and version.get("main_module") == provider.WORKER and version.get("urls") == []
-             and version.get("compatibility_date") in (metadata["compatibility_date"], metadata["compatibility_date"] + "T00:00:00Z")
              and version.get("usage_model") in (None, "standard")
-             and version.get("compatibility_flags") == [provider.LOOPBACK_FLAG]
              and not any(version.get(key) for key in ("assets", "limits", "migrations", "placement"))
              and version.get("cache_options") in (None, {}, {"enabled": False},
                                                  {"enabled": False, "cross_version_cache": False}), VERSION_ERROR)
+    _verify_compatibility(version)
     annotations = version.get("annotations")
     _require(isinstance(annotations, dict)
              and all(annotations.get(key) == expected for key, expected in metadata["annotations"].items()), VERSION_ERROR)
