@@ -52,12 +52,13 @@ class FixtureDatabase:
         if set(payload) == {"sql", "params"}:
             self.queries.append(payload)
             return [{"success": True, "results": self.query(payload["sql"], payload["params"])}]
+        before = self.db.total_changes
         try:
             with self.db:
                 result = [{"success": True, "results": self.query(row["sql"], row["params"])} for row in payload["batch"]]
         except sqlite3.Error:
             raise smoke.CloudflareError("Synthetic batch was rejected.") from None
-        if self.lose_response:
+        if self.lose_response and self.db.total_changes != before:
             raise smoke.CloudflareError("Synthetic acknowledgement was lost.")
         return result
 
