@@ -197,7 +197,7 @@ class ExportRouteTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(await response.text(), HTTP_ERROR)
 
         update = telegram_update(f"sub:fmt:{invalid['method']['id']}:singbox")
-        with patch.object(bot, "make_short_url", AsyncMock()) as make_short_url:
+        with patch.object(bot, "make_short_url", AsyncMock(return_value="https://example.invalid/s/synthetic")) as make_short_url:
             await bot.on_callback(update, SimpleNamespace())
         make_short_url.assert_not_awaited()
         update.effective_message.reply_html.assert_not_awaited()
