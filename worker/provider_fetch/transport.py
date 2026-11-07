@@ -2,6 +2,7 @@
 
 import asyncio
 from base64 import b64encode
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import cache
 import ipaddress
@@ -297,7 +298,11 @@ def _metadata(headers):
     return result
 
 
-async def fetch_provider(url: str, *, basic: BasicCredentials | None = None) -> FetchSuccess | FetchFailure:
+async def fetch_provider(
+    url: str, *, basic: BasicCredentials | None = None, address_policy: Callable[[tuple[IP, ...]], bool] | None = None,
+    follow_redirects: bool = True,
+    user_agent: Literal["clash-meta/1.18.0", "subs-bot-isolation-release/1.0"] = "clash-meta/1.18.0",
+) -> FetchSuccess | FetchFailure:
     """Fetch one private subscription source. Failure results contain only fixed categories/status."""
     deadline = asyncio.get_running_loop().time() + TOTAL_SECONDS
     try:
@@ -309,10 +314,12 @@ async def fetch_provider(url: str, *, basic: BasicCredentials | None = None) -> 
             for hop in range(MAX_REDIRECTS + 1):
                 _check_deadline(deadline)
                 addresses = await _checked_addresses(target)
+                if address_policy is not None and not address_policy(addresses):
+                    raise _Rejected("blocked-address")
                 resolver = _PinnedResolver(target, addresses)
                 connector = aiohttp.TCPConnector(resolver=resolver, socket_factory=resolver.socket,
                                                  ssl=_public_tls_context(), use_dns_cache=False, force_close=True)
-                headers = {"User-Agent": "clash-meta/1.18.0", "Accept": "*/*", "Accept-Encoding": "gzip, deflate"}
+                headers = {"User-Agent": user_agent, "Accept": "*/*", "Accept-Encoding": "gzip, deflate"}
                 if authorization is not None:
                     headers["Authorization"] = authorization
                 timeout = aiohttp.ClientTimeout(total=None, sock_connect=CONNECT_SECONDS)
@@ -323,6 +330,8 @@ async def fetch_provider(url: str, *, basic: BasicCredentials | None = None) -> 
                                            server_hostname=target.host.removesuffix(".") if target.url.scheme == "https" else None) as response:
                         _check_deadline(deadline)
                         if response.status in REDIRECTS:
+                            if not follow_redirects:
+                                raise _Rejected("invalid-redirect")
                             if hop == MAX_REDIRECTS:
                                 raise _Rejected("redirect-limit")
                             following = _redirect(target, response.headers)

@@ -70,6 +70,18 @@ export async function verifyIsolation(fixture, revision, fetchRequest) {
   const explicitClashText = await explicitClash.text();
   assert(clash === explicitClashText && clash.startsWith("proxies:\n") && clash.includes("\nproxy-groups:\n")
     && clash.endsWith('rules:\n  - "MATCH,🚀 节点选择"\n'), "Unexpected synthetic Clash configuration");
+  for (const kind of ["surge", "qx"]) {
+    const response = await request(`/sub/${fixture.snapshots[0].token}/${kind}`);
+    assert.equal(response.status, 200, "Synthetic text configuration failed");
+    assert.equal(response.headers.get("content-type"), "text/plain; charset=utf-8");
+    const body = await response.text();
+    assert.equal(response.headers.get("content-length"), String(Buffer.byteLength(body)));
+    if (kind === "surge") assert(body.startsWith("[Proxy]\n") && body.endsWith("\n[Rule]\nFINAL,Proxy\n"),
+      "Unexpected synthetic Surge configuration");
+    else assert(body.trimEnd().split("\n").length === fixture.snapshots[0].nodeCount
+      && body.trimEnd().split("\n").every((line) => line.startsWith("shadowsocks=203.0.113.10:8388, ")),
+    "Unexpected synthetic Quantumult X configuration");
+  }
   const unsupported = await request(`/sub/${fixture.snapshots[0].token}/unsupported`);
   assert.equal(unsupported.status, 406);
   await unsupported.body?.cancel();

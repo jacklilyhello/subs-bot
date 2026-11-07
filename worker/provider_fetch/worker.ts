@@ -1,0 +1,68 @@
+import { DurableObject, WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
+import { exercise, ProviderProbeError, REVISION, SERVICE, SINGLETON } from "./controller.ts";
+
+interface Env {
+  BUILD_REVISION: string;
+  PROVIDER_CONTAINER: DurableObjectNamespace<ProviderContainer>;
+}
+
+interface Probe {
+  providerRevision: string;
+  isolatedRevision: string;
+}
+
+function validProbe(probe: Probe, revision: string): boolean {
+  return typeof probe === "object" && probe !== null && Object.keys(probe).length === 2
+    && typeof revision === "string" && REVISION.test(revision) && probe.providerRevision === revision
+    && typeof probe.isolatedRevision === "string" && REVISION.test(probe.isolatedRevision);
+}
+
+export class ProviderContainer extends DurableObject<Env> {
+  private busy = false;
+
+  async prove(probe: Probe) {
+    const revision = this.env.BUILD_REVISION;
+    const singleton = this.env.PROVIDER_CONTAINER.idFromName(SINGLETON);
+    if (!this.ctx.id.equals(singleton) || !validProbe(probe, revision) || this.busy || !this.ctx.container) {
+      throw new Error("Provider smoke admission rejected.");
+    }
+    this.busy = true;
+    try {
+      const key = `smoke:${revision}`;
+      if (await this.ctx.storage.get(key)) throw new Error("Provider smoke was already admitted for this revision.");
+      await this.ctx.storage.put(key, true);
+      return await exercise(this.ctx.container, revision, probe.isolatedRevision);
+    } catch (error) {
+      // Store a fixed stage only, even when a platform error contains request data.
+      return { ok: false, stage: error instanceof ProviderProbeError ? error.stage : "admission" };
+    } finally {
+      this.busy = false;
+    }
+  }
+}
+
+export class ProviderSmoke extends WorkflowEntrypoint<Env, Probe> {
+  async run(event: WorkflowEvent<Probe>, step: WorkflowStep) {
+    const revision = this.env.BUILD_REVISION;
+    if (!validProbe(event.payload, revision) || event.workflowName !== SERVICE + "-smoke"
+        || event.instanceId !== `provider-smoke-${revision}`) {
+      throw new Error("Provider smoke request differs from the pinned release.");
+    }
+    return step.do("verify fixed provider egress", { retries: { limit: 0, delay: "1 second" }, timeout: "75 seconds" }, async () => {
+      try {
+        const container = this.env.PROVIDER_CONTAINER.getByName(SINGLETON);
+        return await container.prove(event.payload);
+      } catch {
+        throw new Error("Provider container smoke failed.");
+      }
+    });
+  }
+}
+
+export default {
+  fetch(): Response {
+    return new Response("Not found.", { status: 404, headers: {
+      "Cache-Control": "private, no-store", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff",
+    } });
+  },
+} satisfies ExportedHandler<Env>;
