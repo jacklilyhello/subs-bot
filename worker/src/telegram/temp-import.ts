@@ -134,10 +134,11 @@ export async function acceptTelegramTemp(
       INSERT INTO telegram_inbox
         (bot_id, update_id, actor_id, chat_id, chat_type, message_id, message_date, thread_id, command, receipt_nonce)
       SELECT ?, ?, ?, ?, 'private', ?, ?, NULL, 'help', ?
-      WHERE ? = ? OR COALESCE((SELECT allowed FROM telegram_auth WHERE bot_id = ? AND user_id = ?), 1) = 1
+      WHERE ? = ? OR COALESCE((SELECT allowed = 1 AND message_date < ?
+        FROM telegram_auth WHERE bot_id = ? AND user_id = ?), 1)
       ON CONFLICT (bot_id, update_id) DO NOTHING
     `).bind(policy.botId, event.updateId, event.actorId, event.chatId, event.messageId, event.messageDate, nonce,
-      event.actorId, policy.adminId, policy.botId, event.actorId)];
+      event.actorId, policy.adminId, event.messageDate, policy.botId, event.actorId)];
     if (event.kind === "temp-text") {
       steps.push(...textSteps(db, key, planText(event.text)));
     } else if (event.kind === "temp-clear") {

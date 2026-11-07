@@ -357,3 +357,25 @@ test("first-seen pre-grant documents do not acquire the new epoch after revocati
   assert.equal(lease.receiptId, fresh.receipt_id);
   assert.equal(await checkLease(config, lease), 1);
 });
+
+test("reaps legacy queued documents that captured a grant newer than their original messages", async () => {
+  const config = policy("76109");
+  const grantDate = 1_800_000_000;
+  for (const [updateId, messageDate] of [[1, grantDate - 1], [2, grantDate]] as const) {
+    assert.equal(await acceptTelegramDocumentJob(db, config, event(config, updateId,
+      { fileName: `Legacy ${updateId}.txt`, messageDate })), "accepted");
+  }
+  const lease = await claimTelegramDocumentJob(db, config);
+  assert.ok(lease);
+  await db.prepare("INSERT INTO telegram_auth VALUES (?, ?, 0, ?, 49999)")
+    .bind(config.botId, config.memberId, grantDate - 2).run();
+  await db.prepare("UPDATE telegram_auth SET allowed=1,message_date=?,message_id=50000 WHERE bot_id=? AND user_id=?")
+    .bind(grantDate, config.botId, config.memberId).run();
+  // Model the prior version's bad first-admission state: current epoch, but a pre/equal-grant message.
+  await db.prepare("UPDATE telegram_document_jobs SET auth_message_date=?,auth_message_id=50000 WHERE bot_id=?")
+    .bind(grantDate, config.botId).run();
+  assert.equal(await checkLease(config, lease), 0);
+  await expireLease(lease);
+  assert.equal(await claimTelegramDocumentJob(db, config), null);
+  for (const updateId of [1, 2]) await assertScrubbed(config, updateId, "access-changed");
+});
