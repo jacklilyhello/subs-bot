@@ -77,7 +77,7 @@ class ProofGateTests(unittest.TestCase):
             return self.workflow
         if path == f"/actions/runs/{RUN}":
             return self.run
-        artifact_name = f"{gate.PROOF_PREFIX}-{RELEASE['revision']}-{self.run['run_attempt']}"
+        artifact_name = f"{gate.PROOF_PREFIX}-{self.pin['proof']['revision']}-{self.run['run_attempt']}"
         self.assertEqual(path, f"/actions/runs/{RUN}/artifacts?name={artifact_name}&per_page=2")
         return {"total_count": 1, "artifacts": [{"id": int(ARTIFACT), "name": artifact_name,
                 "expired": False, "digest": "sha256:" + self.pin["proof"]["archiveSha256"], "workflow_run": self.origin}]}
@@ -85,8 +85,19 @@ class ProofGateTests(unittest.TestCase):
     def load(self):
         return gate.load_provider_gate(json.dumps(self.pin), TARGET, "fixture-worker")
 
+    def historical_proof(self):
+        previous = gate.activation.HISTORICAL_PROVIDER_REVISION
+        application = RELEASE["revision"]
+        self.proof["version"] = 2
+        self.proof["providerBuild"] = {**EVIDENCE, "revision": previous, "runId": "42372768064"}
+        self.proof["activation"].update(revision=application, isolatedRevision=previous)
+        self.pin["proofDocument"] = deepcopy(self.proof)
+        self.use_archive(zipped(self.proof))
+        return previous, application
+
     def test_exact_provenance_and_live_same_account_private_provider(self):
         loaded = self.load()
+        self.assertIsNone(loaded.historical_application_revision)
         gate._download.assert_not_called()
         loaded.verify_first_binding()
         loaded.verify_first_binding()
@@ -120,6 +131,41 @@ class ProofGateTests(unittest.TestCase):
         api.deployment.side_effect = [{"id": ACTIVATION["deploymentId"]}, {"id": "0" * 36}]
         with patch.object(gate.activation, "_public"), self.assertRaisesRegex(gate.CloudflareError, "no longer matches"):
             loaded.verify()
+
+    def test_historical_proof_authenticates_new_main_but_binds_original_provider(self):
+        previous, application = self.historical_proof()
+        loaded = self.load()
+        self.assertEqual(loaded.historical_application_revision, application)
+        self.assertEqual(loaded.binding.revision, previous)
+        self.assertEqual(loaded.binding.image_sha256, EVIDENCE["ociManifestSha256"])
+        self.assertEqual(loaded._release, {**self.proof["providerBuild"], "versionId": VERSION})
+        gate.github._get_json.assert_not_called()
+        with patch.object(gate.activation, "require_historical_provider_ancestor") as ancestry:
+            loaded.verify_first_binding()
+            loaded.verify_first_binding()
+            ancestry.assert_called_once_with(previous, application, "fixture-github")
+        gate._download.assert_called_once_with(ARTIFACT, "fixture-github")
+        self.assertEqual(loaded.binding, self.load().binding)
+
+    def test_historical_proof_refuses_wrong_runtime_build_or_health_baseline(self):
+        self.historical_proof()
+        for section, field, bad in (("providerBuild", "revision", "a" * 40), ("providerBuild", "runId", "42"),
+                                    ("activation", "revision", "a" * 40), ("activation", "isolatedRevision", ISOLATED)):
+            with self.subTest(field=field), patch.dict(self.pin["proofDocument"][section], {field: bad}):
+                with self.assertRaisesRegex(gate.CloudflareError, "pin is invalid"):
+                    self.load()
+        gate._download.assert_not_called()
+        gate.github._get_json.assert_not_called()
+
+    def test_historical_ancestry_failure_does_not_cache_first_binding(self):
+        previous, application = self.historical_proof()
+        loaded = self.load()
+        with patch.object(gate.activation, "require_historical_provider_ancestor",
+                          side_effect=gate.activation.ActivationError("Synthetic diverged ancestry.")) as ancestry:
+            with self.assertRaisesRegex(gate.CloudflareError, "proof could not be verified"):
+                loaded.verify_first_binding()
+            ancestry.assert_called_once_with(previous, application, "fixture-github")
+        self.assertFalse(loaded._first_binding_verified)
 
     def test_wrong_workflow_run_attempt_or_origin_fails_before_download(self):
         for changed in ({"event": "push"}, {"run_attempt": 1}, {"conclusion": "failure"}, {"workflow_id": 10},

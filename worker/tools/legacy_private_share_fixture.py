@@ -1,7 +1,7 @@
 """Fixed synthetic legacy share input for the protected native restore profile."""
 
 from base64 import urlsafe_b64encode
-from contextlib import closing
+from contextlib import closing, suppress
 from pathlib import Path
 import sqlite3
 from tempfile import TemporaryDirectory
@@ -55,17 +55,26 @@ def build(worker, output, worker_pin, *, applied_at):
     with TemporaryDirectory(prefix="legacy-share-source-", dir=output.parent) as temporary:
         scratch = Path(temporary)
         source, sealed = scratch / "source.sqlite", scratch / "inventory"
+        staged = scratch / "candidate"
         make_source(source)
         source_sha = native.file_hash(source)[1]
         inventory.seal_inventory(source, sealed, source_sha, BOT_ID, BOT_USERNAME)
         inventory_sha = native.file_hash(sealed / inventory.MANIFEST)[1]
         report = candidate.build_candidate(
-            sealed, worker, output, inventory_manifest_sha=inventory_sha, worker_manifest_sha=worker_pin["manifestSha256"],
+            sealed, worker, staged, inventory_manifest_sha=inventory_sha, worker_manifest_sha=worker_pin["manifestSha256"],
             revision=worker_pin["revision"], applied_at=applied_at, source_sqlite_sha=source_sha,
             legacy_bot_id=BOT_ID, legacy_bot_username=BOT_USERNAME,
         )
-    native.require(report["version"] == 1 and report["profile"] == candidate.PROFILE and report["counts"] == COUNTS
-                   and report["objectCount"] == report["shareSequenceHighWater"] == COUNTS["shares"])
+        native.require(report["version"] == 1 and report["profile"] == candidate.PROFILE and report["counts"] == COUNTS
+                       and report["objectCount"] == report["shareSequenceHighWater"] == COUNTS["shares"])
+        # The hosted runner owns its temp root, which need not be mode 0700.
+        output.mkdir(mode=0o700)
+        try:
+            staged.rename(output)
+        except BaseException:
+            with suppress(OSError):
+                output.rmdir()
+            raise
     return report
 
 

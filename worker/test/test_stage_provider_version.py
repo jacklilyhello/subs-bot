@@ -159,6 +159,14 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(parts[1].get_content_type(), stage.MODULE_TYPE)
         self.assertEqual(parts[1].get_payload(decode=True), MODULE)
         self.assertEqual(self.metadata["containers"][0]["images"], {"provider": IMAGE})
+        self.assertEqual(self.metadata["compatibility_date"], stage.provider.COMPATIBILITY)
+        self.assertNotIn("compatibility_flags", self.metadata)
+        self.assertEqual(self.metadata["bindings"], [
+            {"name": "BUILD_REVISION", "type": "plain_text", "text": REVISION},
+            {"name": "PROVIDER_SMOKE", "type": "workflow", "workflow_name": stage.WORKFLOW, "class_name": "ProviderSmoke"},
+        ])
+        self.assertEqual(self.metadata["exports"]["ProviderContainer"],
+                         {"type": "durable-object", "storage": "sqlite", "container": stage.provider.SERVICE})
         self.assertNotIn("migrations", self.metadata)
         self.assertNotIn("assets", self.metadata)
 
@@ -169,8 +177,49 @@ class BoundaryTests(unittest.TestCase):
                     self.api.upload(self.metadata, MODULE)
                 send.assert_called_once()
 
+    def test_upload_rejection_reports_only_bounded_status_codes_and_known_fields(self):
+        secret = "synthetic-private-response"
+        errors = [
+            {"code": 10021, "message": secret, "documentation_url": f"https://example.invalid/{secret}",
+             "source": {"pointer": "/metadata/exports/ProviderContainer/storage", "detail": secret}},
+            {"code": 10026, "source": {"pointer": "/containers/0/images/provider"}},
+            {"code": 10021, "source": {"pointer": f"/metadata/exports/ProviderContainer/{secret}"}},
+            {"code": 87654, "source": {"pointer": f"/metadata/bindings/0/type\n{secret}"}},
+            {"code": "10057", "source": {"pointer": "/migrations"}},
+            {"code": True},
+            {"code": 9999999},
+            {"code": 10026},
+            {"code": 10057, "source": {"pointer": "/migrations"}},
+        ]
+        response = json.dumps({"success": False, "errors": errors, "messages": [{"code": 10015, "message": secret}],
+                               "result": {"id": secret}}).encode()
+        with patch.object(stage.publication, "_response", return_value=(400, {"X-Synthetic": secret}, response)) as send:
+            with self.assertRaises(stage.StageError) as failure:
+                self.api.upload(self.metadata, MODULE)
+        self.assertEqual(str(failure.exception), stage.UPLOAD_ERROR + ' Upload diagnostic '
+                         '{"httpStatus":400,"cloudflareCodes":[10021,10026,87654],'
+                         '"validationFields":["containers","exports"]}.')
+        send.assert_called_once()
+
+    def test_upload_reports_status_without_a_usable_json_body(self):
+        with patch.object(stage.publication, "_response", return_value=(502, {}, b"synthetic-private-html")) as send:
+            with self.assertRaises(stage.StageError) as failure:
+                self.api.upload(self.metadata, MODULE)
+        self.assertEqual(str(failure.exception), stage.UPLOAD_ERROR + ' Upload diagnostic {"httpStatus":502}.')
+        send.assert_called_once()
+
+    def test_upload_without_a_bounded_response_keeps_the_fixed_ambiguous_error(self):
+        with patch.object(stage.publication, "_response",
+                          side_effect=stage.publication.PublicationError("synthetic-private-transport")) as send:
+            with self.assertRaises(stage.StageError) as failure:
+                self.api.upload(self.metadata, MODULE)
+        self.assertEqual(str(failure.exception), stage.UPLOAD_ERROR)
+        send.assert_called_once()
+
     def test_beta_module_and_legacy_named_image_are_independent_and_exact(self):
-        runtime = {"id": CANDIDATE, "resources": {"script_runtime": {"containers": self.metadata["containers"]}}}
+        script_runtime = {"containers": self.metadata["containers"],
+                          "compatibility_date": stage.provider.COMPATIBILITY + "T00:00:00Z"}
+        runtime = {"id": CANDIDATE, "resources": {"script_runtime": script_runtime}}
         with patch.object(stage.publication, "_response", side_effect=[envelope(version()), envelope(runtime)]) as read:
             self.api.verify(CANDIDATE, self.metadata, MODULE_SHA)
         requests = [entry.args[0] for entry in read.call_args_list]
@@ -179,9 +228,17 @@ class BoundaryTests(unittest.TestCase):
             f"{self.base}/scripts/{stage.provider.SERVICE}/versions/{CANDIDATE}",
         ])
         for wrong in ({"id": CANDIDATE}, {"id": FOREIGN, **{"resources": runtime["resources"]}},
-                      {"id": CANDIDATE, "resources": {"script_runtime": {"containers": [
+                      {"id": CANDIDATE, "resources": {"script_runtime": {**script_runtime, "containers": [
                           {**self.metadata["containers"][0], "images": {"provider": IMAGE.replace(MANIFEST, CONFIG)}},
-                      ]}}}):
+                      ]}}},
+                      {"id": CANDIDATE, "resources": {"script_runtime": {"containers": self.metadata["containers"]}}},
+                      {"id": CANDIDATE, "resources": {"script_runtime": {
+                          **script_runtime, "compatibility_flags": ["disable_ctx_exports"],
+                      }}},
+                      {"id": CANDIDATE, "resources": {"script_runtime": script_runtime, "bindings": [
+                          *self.metadata["bindings"], {"name": "PROVIDER_CONTAINER", "type": "durable_object_namespace",
+                                                      "class_name": "ProviderContainer"},
+                      ]}}):
             with self.subTest(wrong=wrong), patch.object(
                     stage.publication, "_response", side_effect=[envelope(version()), envelope(wrong)]):
                 with self.assertRaisesRegex(stage.StageError, "did not match"):
@@ -192,6 +249,11 @@ class BoundaryTests(unittest.TestCase):
             {"urls": ["https://example.invalid/"]},
             {"modules": [{**version()["modules"][0], "content_base64": b64encode(MODULE + b" ").decode()}]},
             {"bindings": [*version()["bindings"], {"name": "EXTRA", "type": "secret_text"}]},
+            {"bindings": [*version()["bindings"], {"name": "PROVIDER_CONTAINER", "type": "durable_object_namespace",
+                                                   "class_name": "ProviderContainer"}]},
+            {"compatibility_date": "2025-11-16"},
+            {"compatibility_flags": ["enable_ctx_exports"]},
+            {"compatibility_flags": ["disable_ctx_exports"]},
             {"annotations": {"workers/tag": "some-other-version"}},
             {"exports": {**version()["exports"], "Foreign": {"type": "worker"}}},
         ]

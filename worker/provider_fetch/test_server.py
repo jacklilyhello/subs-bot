@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 from aiohttp.test_utils import TestClient, TestServer
 
 import server
-from transport import FetchFailure, FetchSuccess
+from transport import ApiProbeSuccess, FetchFailure, FetchSuccess
 
 
 REVISION = "a" * 40
@@ -39,6 +39,26 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(reply.status, status)
                     self.assertNotIn("secret", await reply.text())
             fetch.assert_not_called()
+
+    async def test_api_probe_ingress_uses_exact_fields_and_returns_only_status_and_latency(self):
+        with patch.object(server, "probe_api_status", new_callable=AsyncMock,
+                          return_value=ApiProbeSuccess(401, 62)) as probe:
+            for path, headers, raw, status in (
+                ("/v1/api-status", {}, b'{}', 404),
+                ("/v1/api-status?test=1", HOST, b'{}', 404),
+                ("/v1/api-status", HOST, b'{"url":"fixture","key":3}', 400),
+                ("/v1/api-status", HOST, b'{"url":"fixture","key":"x","key":"y"}', 400),
+                ("/v1/api-status", HOST, b'{"url":"fixture","key":"x","extra":true}', 400),
+            ):
+                async with self.client.post(path, headers=headers | {"Content-Type": "application/json"}, data=raw) as response:
+                    self.assertEqual(response.status, status)
+            probe.assert_not_called()
+            url = "https://provider.example/v1/models"
+            async with self.client.post("/v1/api-status", headers=HOST, json={"url": url, "key": "synthetic-key"}) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.headers["Cache-Control"], "private, no-store")
+                self.assertEqual(await response.json(), {"status": 401, "elapsedMs": 62})
+            probe.assert_awaited_once_with(url, "synthetic-key")
 
     async def test_fixed_edge_probe_narrows_addresses_and_refuses_redirects(self):
         async def synthetic(url, **policy):

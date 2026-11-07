@@ -110,15 +110,16 @@ def _unpack(path, staged):
         raise github.ArtifactError(error) from None
 
 
-def prepare():
-    revision = os.environ.get("GITHUB_SHA", "")
+def prepare(*, provider_revision=None):
+    main_revision = os.environ.get("GITHUB_SHA", "")
+    revision = provider_revision if provider_revision is not None else main_revision
     run_id = os.environ.get("SUBS_BOT_PROVIDER_CI_RUN_ID", "")
     runner_temp = os.environ.get("RUNNER_TEMP", "")
     if (os.environ.get("GITHUB_REF") != github.MAIN_REF or not provider.DECIMAL.fullmatch(run_id)
             or not Path(runner_temp).is_absolute()):
         raise github.ArtifactError("Provider artifact verification requires main, a CI run ID and runner temporary storage.")
     token = github._github_token()
-    github.require_current_main(revision)
+    github.require_current_main(main_revision)
     attempt, artifact_id, digest = _select_artifact(run_id, revision, token)
     destination = Path(runner_temp) / VERIFIED_DIRECTORY
     if os.path.lexists(destination):
@@ -136,7 +137,7 @@ def prepare():
             raise github.ArtifactError("The provider release manifest or its exact contents did not verify.") from None
         if _select_artifact(run_id, revision, token) != (attempt, artifact_id, digest):
             raise github.ArtifactError("The trusted provider build artifact changed during verification.")
-        github.require_current_main(revision)
+        github.require_current_main(main_revision)
         if os.path.lexists(destination):
             raise github.ArtifactError("The verified provider artifact directory already exists.")
         staged.rename(destination)
