@@ -8,6 +8,7 @@ import {
 } from "./lifecycle-actions.ts";
 import { TELEGRAM_PRIVATE_CLAIM_MARKER } from "./private-claims.ts";
 import { TELEGRAM_TEMP_MARKER, type TelegramTempReply } from "./temp-import.ts";
+import { TELEGRAM_DOCUMENT_JOB_MARKER, type TelegramDocumentJobResult } from "./document-jobs.ts";
 
 export interface TelegramReplyLease extends TelegramCommand {
   receiptId: number;
@@ -17,6 +18,7 @@ export interface TelegramReplyLease extends TelegramCommand {
   lifecycle?: TelegramLifecycleReply;
   privateClaim?: { codeSha256: string };
   temp?: TelegramTempReply;
+  document?: { kind: TelegramDocumentJobResult; nodeCount: number | null };
 }
 
 export type TelegramReplyOutcome =
@@ -31,7 +33,7 @@ const REAP_LIMIT = 40;
 
 type ReplyAccess = "allowed" | "denied" | "none";
 
-type ReplyRow = Omit<TelegramReplyLease, "view" | "lifecycle" | "privateClaim" | "temp"> & {
+type ReplyRow = Omit<TelegramReplyLease, "view" | "lifecycle" | "privateClaim" | "temp" | "document"> & {
   viewKind: TelegramView["kind"] | null;
   afterId: number | null;
   afterEpoch: number | null;
@@ -45,6 +47,8 @@ type ReplyRow = Omit<TelegramReplyLease, "view" | "lifecycle" | "privateClaim" |
   tempMalformedCount: number | null;
   tempUnsupportedCount: number | null;
   tempIgnoredCount: number | null;
+  documentKind: TelegramDocumentJobResult | null;
+  documentNodeCount: number | null;
 };
 
 function supportedReceipt(alias: "inbox" | "earlier"): string {
@@ -55,7 +59,14 @@ function supportedReceipt(alias: "inbox" | "earlier"): string {
     OR (${alias}.receipt_nonce = '${TELEGRAM_PRIVATE_CLAIM_MARKER}'
     AND EXISTS (SELECT 1 FROM telegram_private_claim WHERE receipt_id = ${alias}.receipt_id))
     OR (${alias}.receipt_nonce = '${TELEGRAM_TEMP_MARKER}'
-    AND EXISTS (SELECT 1 FROM telegram_temp_reply WHERE receipt_id = ${alias}.receipt_id)))`;
+    AND EXISTS (SELECT 1 FROM telegram_temp_reply WHERE receipt_id = ${alias}.receipt_id))
+    OR (${alias}.receipt_nonce = '${TELEGRAM_DOCUMENT_JOB_MARKER}' AND ${alias}.chat_type = 'private'
+    AND ${alias}.chat_id = ${alias}.actor_id AND ${alias}.thread_id IS NULL AND EXISTS (
+      SELECT 1 FROM telegram_document_jobs AS job WHERE job.receipt_id = ${alias}.receipt_id
+        AND job.bot_id = ${alias}.bot_id AND job.actor_id = ${alias}.actor_id AND job.state = 'done'
+        AND (job.result_code <> 'saved' OR EXISTS (
+          SELECT 1 FROM telegram_document_saved_counts WHERE receipt_id = job.receipt_id
+        )))))`;
 }
 
 export async function acceptTelegramCommand(
@@ -147,7 +158,7 @@ export async function claimTelegramReply(db: D1Database, botId: string): Promise
         action.expected_revision AS lifecycleExpectedRevision, claim.code_sha256 AS privateClaimCodeSha256,
         temp.kind AS tempKind, temp.node_count AS tempNodeCount, temp.total_count AS tempTotalCount,
         temp.malformed_count AS tempMalformedCount, temp.unsupported_count AS tempUnsupportedCount,
-        temp.ignored_count AS tempIgnoredCount
+        temp.ignored_count AS tempIgnoredCount, document.result_code AS documentKind, saved.node_count AS documentNodeCount
       FROM telegram_outbox AS reply JOIN telegram_inbox AS inbox USING (receipt_id)
       LEFT JOIN telegram_view AS page ON page.receipt_id = inbox.receipt_id AND inbox.receipt_nonce = '${TELEGRAM_VIEW_MARKER}'
       LEFT JOIN telegram_lifecycle_action AS action ON action.receipt_id = inbox.receipt_id
@@ -156,6 +167,9 @@ export async function claimTelegramReply(db: D1Database, botId: string): Promise
         AND inbox.receipt_nonce = '${TELEGRAM_PRIVATE_CLAIM_MARKER}'
       LEFT JOIN telegram_temp_reply AS temp ON temp.receipt_id = inbox.receipt_id
         AND inbox.receipt_nonce = '${TELEGRAM_TEMP_MARKER}'
+      LEFT JOIN telegram_document_jobs AS document ON document.receipt_id = inbox.receipt_id
+        AND inbox.receipt_nonce = '${TELEGRAM_DOCUMENT_JOB_MARKER}'
+      LEFT JOIN telegram_document_saved_counts AS saved ON saved.receipt_id = document.receipt_id
       WHERE reply.lease_id = ? AND reply.state = 'leased' AND inbox.bot_id = ? AND ${supportedReceipt("inbox")}
     `).bind(leaseId, botId),
   ]);
@@ -164,7 +178,7 @@ export async function claimTelegramReply(db: D1Database, botId: string): Promise
   if (!row) return null;
   const { viewKind, afterId, afterEpoch, lifecycleKind, lifecycleSubscriptionId, lifecycleExpectedRevision,
     privateClaimCodeSha256, tempKind, tempNodeCount, tempTotalCount, tempMalformedCount,
-    tempUnsupportedCount, tempIgnoredCount, ...lease } = row;
+    tempUnsupportedCount, tempIgnoredCount, documentKind, documentNodeCount, ...lease } = row;
   const lifecycle = lifecycleKind === null || lifecycleSubscriptionId === null || lifecycleExpectedRevision === null
     ? undefined : { kind: lifecycleKind, subscriptionId: lifecycleSubscriptionId, expectedLifecycleRevision: lifecycleExpectedRevision };
   // The joined temp companion declares every count NOT NULL when its kind is present.
@@ -173,6 +187,7 @@ export async function claimTelegramReply(db: D1Database, botId: string): Promise
   return { ...lease, view: viewKind === null ? null : { kind: viewKind, afterId, afterEpoch },
     ...(lifecycle ? { lifecycle } : {}),
     ...(temp ? { temp } : {}),
+    ...(documentKind === null ? {} : { document: { kind: documentKind, nodeCount: documentNodeCount } }),
     ...(privateClaimCodeSha256 === null ? {} : { privateClaim: { codeSha256: privateClaimCodeSha256 } }) };
 }
 
@@ -182,6 +197,13 @@ function beginReplyStatement(
   lease: TelegramReplyLease,
   access: ReplyAccess | "private-claim",
 ): D1PreparedStatement {
+  const exactDocumentEpoch = lease.document?.kind === "saved" && access === "allowed" && lease.actorId !== policy.adminId
+    ? `AND EXISTS (
+      SELECT 1 FROM telegram_document_jobs AS job LEFT JOIN telegram_auth AS auth
+        ON auth.bot_id = job.bot_id AND auth.user_id = job.actor_id
+      WHERE job.receipt_id = inbox.receipt_id AND job.result_code = 'saved'
+        AND job.auth_message_date = COALESCE(auth.message_date, 0) AND job.auth_message_id = COALESCE(auth.message_id, 0)
+    )` : "";
   return db.prepare(`
     UPDATE telegram_outbox SET state = 'sending', lease_until = unixepoch() + ${LEASE_SECONDS}
     WHERE state = 'leased' AND lease_id = ? AND attempts = ? AND lease_until > unixepoch()
@@ -191,6 +213,7 @@ function beginReplyStatement(
           AND inbox.chat_type = ? AND inbox.message_id = ? AND inbox.message_date = ? AND inbox.thread_id IS ?
           AND inbox.command = ? AND ${supportedReceipt("inbox")}
           AND inbox.received_at + ${MAX_REPLY_AGE_SECONDS} > unixepoch()
+          ${exactDocumentEpoch}
           AND (
             (? = 'private-claim' AND inbox.receipt_nonce = '${TELEGRAM_PRIVATE_CLAIM_MARKER}'
               AND inbox.chat_type = 'private' AND inbox.actor_id = inbox.chat_id AND inbox.thread_id IS NULL
