@@ -1,5 +1,6 @@
 import { checkOwnerId, digestHex, SUBSCRIPTION_LIFECYCLE_REVISION, validInteger } from "./storage.ts";
 import { normalizeSubscriptionName } from "./subscriptions.ts";
+import { isolatedTelegramRoleEpochSql } from "./telegram/authorization-sql.ts";
 
 export const PROVIDER_JOB_TTL_SECONDS = 3600;
 const LEASE_SECONDS = 120;
@@ -312,18 +313,14 @@ const currentTarget = `EXISTS (
 
 function scopeAuthorization(scope: JobScope, alias: "job" | "active" = "job", forRetirement = false): Guard {
   if (scope === "generic") return { sql: "1", bindings: [] };
+  const epoch = isolatedTelegramRoleEpochSql(scope, "inbox", forRetirement ? "recorded" : "current");
   return { sql: `EXISTS (SELECT 1 FROM telegram_provider_requests AS origin
     JOIN telegram_inbox AS inbox USING (receipt_id) WHERE origin.job_id = ${alias}.job_id AND origin.outcome = 'admitted'
       AND origin.kind = ${alias}.kind AND inbox.bot_id = ? AND inbox.actor_id = ${alias}.owner_id
       AND inbox.chat_id = inbox.actor_id AND inbox.chat_type = 'private' AND inbox.thread_id IS NULL
       AND inbox.command = 'help' AND inbox.receipt_nonce = '${TELEGRAM_PROVIDER_MARKER}'
-      AND ((inbox.actor_id = ? AND origin.actor_role = 'admin' AND origin.auth_message_date = 0 AND origin.auth_message_id = 0)
-        OR (inbox.actor_id = ? AND origin.actor_role = 'member' AND inbox.message_date > origin.auth_message_date
-          ${forRetirement ? "" : `AND COALESCE((
-            SELECT allowed = 1 AND message_date = origin.auth_message_date AND message_id = origin.auth_message_id
-            FROM telegram_auth WHERE bot_id = inbox.bot_id AND user_id = inbox.actor_id
-          ), origin.auth_message_date = 0 AND origin.auth_message_id = 0)`})))`,
-    bindings: [scope.botId, scope.adminId, scope.memberId] };
+      AND ${epoch.sql})`,
+    bindings: [scope.botId, ...epoch.bindings] };
 }
 
 function jobScope(policy?: ProviderTelegramPolicy): JobScope {
