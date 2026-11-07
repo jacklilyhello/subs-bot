@@ -253,6 +253,15 @@ class PinnedTLSIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result, expected)
             self.assertNotIn("fixture-secret", repr(result))
 
+    async def test_fixed_probe_policy_can_only_narrow_addresses_and_disable_redirects(self):
+        self.handlers = {"/start": (302, {"Location": "/never"}, b"")}
+        result = await transport.fetch_provider(self.url(PROVIDER, "/start"), address_policy=lambda _: False)
+        self.assertEqual(result, transport.FetchFailure("blocked-address"))
+        self.assertEqual(self.requests, [])
+        result = await transport.fetch_provider(self.url(PROVIDER, "/start"), follow_redirects=False)
+        self.assertEqual(result, transport.FetchFailure("invalid-redirect"))
+        self.assertEqual([request[1] for request in self.requests], ["/start"])
+
     async def test_two_redirect_hops_do_not_each_get_a_fresh_deadline(self):
         self.handlers = {"/first": (302, {"Location": "/second"}, b""), "/second": (200, {}, b"body")}
         self.header_delays = {"/first": 0.35, "/second": 0.35}
