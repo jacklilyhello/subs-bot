@@ -87,6 +87,21 @@ function decodeMessage(text: string, fields: Record<string, unknown> = {}) {
   return decode({ update_id: updateId, message: message(text, fields) });
 }
 
+test("normalizes private share command arguments without trimming the sensitive body", async () => {
+  const text = `/share@${policy.botUsername} x2 id${policy.memberId} s10 --\r\n  synthetic body x99  `;
+  const result = await decodeMessage(text);
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.privateShareCreation, { updateId, actorId: policy.adminId, chatId: policy.adminId,
+    chatType: "private", messageId: 15, messageDate, threadId: null,
+    args: ` x2 id${policy.memberId} s10 --\r\n  synthetic body x99  ` });
+  for (const fields of [
+    { chat: { id: Number(policy.groupId), type: "group" } }, { message_thread_id: 1 },
+    { forward_origin: { type: "user" } }, { from: { id: 999, is_bot: false }, chat: { id: 999, type: "private" } },
+  ]) assert.equal((await decodeMessage(text, fields)).status, 204);
+  assert.equal((await decodeMessage("/share@UnrelatedFixtureBot -- secret")).status, 204);
+  assert.equal((await decodeMessage("/share -- " + "x".repeat(4097))).status, 204);
+});
+
 function callback(fields: Record<string, unknown> = {}, original: Record<string, unknown> = {}) {
   return {
     id: callbackId,

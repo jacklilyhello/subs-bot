@@ -50,8 +50,9 @@ export type TelegramTempUpdate = TelegramEventScope & (
 );
 
 export type TelegramPathUpdate = TelegramEventScope & { kind: "path"; args: string };
+export type TelegramPrivateShareCreationUpdate = TelegramEventScope & { args: string; senderName?: string };
 
-type NormalizedUpdate =
+type ExistingUpdate =
   | { command: TelegramCommand; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; aggregate?: never; path?: never; document?: never; selected?: never }
   | { view: TelegramViewUpdate; command?: never; lifecycle?: never; privateClaim?: never; temp?: never; aggregate?: never; path?: never; document?: never; selected?: never }
   | { lifecycle: TelegramLifecycleUpdate; command?: never; view?: never; privateClaim?: never; temp?: never; aggregate?: never; path?: never; document?: never; selected?: never }
@@ -61,6 +62,9 @@ type NormalizedUpdate =
   | { path: TelegramPathUpdate; command?: never; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; aggregate?: never; document?: never; selected?: never }
   | { document: TelegramDocumentJobInput; command?: never; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; aggregate?: never; path?: never; selected?: never }
   | { selected: TelegramSelectedUpdate; command?: never; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; aggregate?: never; path?: never; document?: never };
+
+type NormalizedUpdate = (ExistingUpdate & { privateShareCreation?: never })
+  | ({ privateShareCreation: TelegramPrivateShareCreationUpdate } & Partial<Record<keyof ExistingUpdate, never>>);
 
 type DecodedTelegramRequest =
   | ({ status: 200 } & NormalizedUpdate)
@@ -168,7 +172,7 @@ function authCommand(args: string[], reply: unknown, memberId: string): Telegram
 function messageCommand(
   message: Record<string, unknown>, policy: TelegramPolicy,
 ): TelegramCommand["command"] | TelegramViewKind | "temp-summary" | "temp-clear" | "aggregate-show" | "aggregate-revoke" |
-  { code: string } | { args: string } | { selectedQuery: string } | null {
+  { code: string } | { args: string } | { shareArgs: string } | { selectedQuery: string } | null {
   const { text, entities } = message;
   if (typeof text !== "string" || !Array.isArray(entities)) return null;
   const commands = entities.filter((entity) => isRecord(entity) && entity.type === "bot_command" && entity.offset === 0);
@@ -182,10 +186,12 @@ function messageCommand(
   const [, name, addressedTo] = entity;
   if (addressedTo && addressedTo.toLowerCase() !== policy.botUsername.toLowerCase()) return null;
   const commandName = name.toLowerCase();
-  const separator = commandName === "path" || commandName === "o" ? PATH_RULE_WHITESPACE_PREFIX : /^\s/u;
+  const separator = commandName === "path" || commandName === "o" ? PATH_RULE_WHITESPACE_PREFIX
+    : commandName === "share" ? /^[ \t\r\n]/u : /^\s/u;
   if (remainder !== "" && !separator.test(remainder)) return null;
   if (commandName === "path") return { args: remainder };
   if (commandName === "o") return { selectedQuery: remainder };
+  if (commandName === "share") return remainder.length <= 4096 ? { shareArgs: remainder } : null;
   const args = remainder.trim().split(/\s+/u).filter(Boolean);
   switch (commandName) {
     case "start": {
@@ -276,6 +282,11 @@ function normalizeMessage(
   const command = messageCommand(message, policy);
   if (command && typeof command === "object") {
     if (scope.chatType !== "private" || scope.threadId !== null) return null;
+    if ("shareArgs" in command) {
+      const sender = isRecord(message.from) ? [message.from.first_name, message.from.last_name]
+        .filter((part): part is string => typeof part === "string" && part.length <= 128).join(" ") : "";
+      return { privateShareCreation: { ...scope, args: command.shareArgs, ...(sender ? { senderName: sender } : {}) } };
+    }
     if ("code" in command) return { privateClaim: { ...scope, kind: "private-claim", code: command.code } };
     return "selectedQuery" in command ? { selected: { ...scope, kind: "selected", query: command.selectedQuery } }
       : { path: { ...scope, kind: "path", args: command.args } };

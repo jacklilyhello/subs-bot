@@ -6,6 +6,7 @@ from hashlib import sha256
 from http.client import IncompleteRead
 from io import BytesIO
 import json
+import os
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
@@ -15,6 +16,7 @@ from urllib.error import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import cloudflare_isolation as cloudflare
+import release_isolation as release_entry
 
 
 TARGET = {
@@ -48,6 +50,7 @@ BUCKET = f"{ACCOUNT}/r2/buckets/{cloudflare.WORKER_NAME}"
 DOMAINS = f"{ACCOUNT}/workers/domains?service={cloudflare.WORKER_NAME}"
 TELEGRAM_CONFIG = '{"fixture":"synthetic-only"}'
 AGGREGATE_KEY = base64.urlsafe_b64encode(b"\x17" * 32).decode("ascii").rstrip("=")
+PRIVATE_SHARE_KEY = base64.urlsafe_b64encode(b"\x18" * 32).decode("ascii").rstrip("=")
 CRON = {"cron": cloudflare.TELEGRAM_CRON}
 
 
@@ -121,6 +124,7 @@ class FakeCloudflare:
         self.health_verified_deployment = None
         self.telegram_upload = None
         self.aggregate_upload = None
+        self.private_share_upload = None
         self.alter_config_digest = False
         self.candidate_readback_errors = []
         self.upload_error = None
@@ -158,6 +162,9 @@ class FakeCloudflare:
                     row.pop("text")
                 if row["name"] == cloudflare.AGGREGATE_KEY_BINDING:
                     self.aggregate_upload = deepcopy(row)
+                    row.pop("text")
+                if row["name"] == cloudflare.PRIVATE_SHARE_KEY_BINDING:
+                    self.private_share_upload = deepcopy(row)
                     row.pop("text")
                 if row["name"] == cloudflare.TELEGRAM_DIGEST_BINDING and self.alter_config_digest:
                     row["text"] = "e" * 64
@@ -231,10 +238,10 @@ class ReleaseTests(unittest.TestCase):
         sleeper.start()
         self.addCleanup(sleeper.stop)
 
-    def release(self, telegram_config=None, aggregate_key=None):
+    def release(self, telegram_config=None, aggregate_key=None, private_share_key=None):
         return cloudflare.release_worker(self.api.worker_api, self.api.data_api, TARGET, self.bundle,
                                          self.manifest, self.api.guard, telegram_config=telegram_config,
-                                         aggregate_key=aggregate_key)
+                                         aggregate_key=aggregate_key, private_share_key=private_share_key)
 
     def set_old_telegram_config(self, config=TELEGRAM_CONFIG):
         self.api.versions[OLD_VERSION]["bindings"].extend([
@@ -359,6 +366,54 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(cloudflare.CloudflareError, "canonical Base64URL"):
             self.release(TELEGRAM_CONFIG, "A" * 42 + "B")
         self.assertEqual(self.api.calls, [])
+
+    def test_private_share_key_composes_with_aggregate_and_preserves_secret_free_readback(self):
+        result = self.release(TELEGRAM_CONFIG, AGGREGATE_KEY, PRIVATE_SHARE_KEY)
+        self.assertTrue(result["changed"])
+        self.assertEqual(self.api.private_share_upload, {"name": cloudflare.PRIVATE_SHARE_KEY_BINDING,
+            "type": "secret_text", "text": PRIVATE_SHARE_KEY})
+        self.assertNotIn(PRIVATE_SHARE_KEY, json.dumps(result))
+        self.assertFalse(self.release(TELEGRAM_CONFIG, AGGREGATE_KEY, PRIVATE_SHARE_KEY)["changed"])
+        self.assertEqual(cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET),
+                         {"deploymentId": NEW_DEPLOYMENT, "versionId": NEW_VERSION, "revision": NEW_REVISION})
+        writes = self.api.writes()
+        for changed in (None, "A" * 43):
+            with self.subTest(absent=changed is None):
+                with self.assertRaisesRegex(cloudflare.CloudflareError, "separate rotation release"):
+                    self.release(TELEGRAM_CONFIG, AGGREGATE_KEY, changed)
+                with self.assertRaises(cloudflare.CloudflareError):
+                    cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET,
+                                                   aggregate_key=AGGREGATE_KEY, private_share_key=changed)
+        self.assertEqual(self.api.writes(), writes)
+
+    def test_invalid_or_reused_private_share_key_fails_before_cloudflare(self):
+        for bad in ("A" * 42 + "B", AGGREGATE_KEY):
+            with self.subTest(reused=bad == AGGREGATE_KEY):
+                with self.assertRaises(cloudflare.CloudflareError):
+                    self.release(TELEGRAM_CONFIG, AGGREGATE_KEY, bad)
+        self.assertEqual(self.api.calls, [])
+
+    def test_protected_entry_rejects_key_change_before_any_migration(self):
+        directory = self.bundle / "subs-bot-verified"
+        directory.mkdir()
+        manifest = {**self.manifest, "migrations": [{"name": "0014_telegram_aggregate_issuance.sql"},
+                                                   {"name": "0016_telegram_private_share_creation.sql"}]}
+        (directory / "isolation.json").write_text(json.dumps(manifest), encoding="utf-8")
+        environment = {"GITHUB_SHA": NEW_REVISION, "GITHUB_REPOSITORY": "jacklilyhello/subs-bot",
+            "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/main", "RUNNER_TEMP": str(self.bundle),
+            "SUBS_BOT_CF_ISOLATION_TARGET_JSON": json.dumps(TARGET), "SUBS_BOT_CF_BOOTSTRAP_TOKEN": "synthetic-data",
+            "SUBS_BOT_CF_DEPLOY_TOKEN": "synthetic-deploy", "SUBS_BOT_TELEGRAM_AGGREGATE_KEY": AGGREGATE_KEY,
+            "SUBS_BOT_TELEGRAM_PRIVATE_SHARE_CREATION_KEY": PRIVATE_SHARE_KEY}
+        with patch.dict(os.environ, environment, clear=True), \
+             patch.object(release_entry, "telegram_release_config", return_value=TELEGRAM_CONFIG), \
+             patch.object(release_entry, "CloudflareClient"), patch.object(release_entry, "require_current_main"), \
+             patch.object(release_entry, "verify_worker_target", side_effect=cloudflare.CloudflareError("separate rotation release")) as verify, \
+             patch.object(release_entry, "apply_migrations") as migrate, patch.object(release_entry, "release_worker") as deploy:
+            with self.assertRaisesRegex(cloudflare.CloudflareError, "rotation"):
+                release_entry.release()
+            self.assertEqual(verify.call_args.kwargs["private_share_key"], PRIVATE_SHARE_KEY)
+            migrate.assert_not_called()
+            deploy.assert_not_called()
 
     def test_failed_cron_setup_can_be_retried_without_redeploying(self):
         self.api.cron_available = False
