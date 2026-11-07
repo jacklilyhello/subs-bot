@@ -87,6 +87,29 @@ function decodeMessage(text: string, fields: Record<string, unknown> = {}) {
   return decode({ update_id: updateId, message: message(text, fields) });
 }
 
+test("normalizes private /i into an enum without enabling inline events", async () => {
+  for (const [label, mode] of [["默认", "default"], ["流量", "traffic"], ["到期", "expiry"], ["名称", "name"]] as const) {
+    const command = `/i@${policy.botUsername}`;
+    const result = await decodeMessage(`${command}\u0085${label}\u3000`, {
+      entities: [{ type: "bot_command", offset: 0, length: command.length }],
+    });
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.inlineSort, { kind: "set", mode, updateId, actorId: policy.adminId, chatId: policy.adminId,
+      chatType: "private", messageId: 15, messageDate, threadId: null });
+  }
+  assert.equal((await decodeMessage("/i")).inlineSort?.kind, "current");
+  const invalid = await decodeMessage("/i 名称 synthetic-marker");
+  assert.equal(invalid.inlineSort?.kind, "usage");
+  assert.doesNotMatch(JSON.stringify(invalid), /synthetic-marker/u);
+  for (const fields of [
+    { chat: { id: Number(policy.groupId), type: "supergroup" } }, { message_thread_id: 1 },
+    { forward_origin: { type: "user" } }, { edit_date: messageDate }, { entities: [] },
+  ]) assert.equal((await decodeMessage("/i 名称", fields)).status, 204);
+  assert.equal((await decodeMessage("/i@UnrelatedFixtureBot 名称")).status, 204);
+  assert.equal((await decode({ update_id: updateId, inline_query: { id: "fixture", chat_type: "sender",
+    from: { id: Number(policy.adminId), is_bot: false }, query: "", offset: "" } })).status, 204);
+});
+
 test("normalizes private share command arguments without trimming the sensitive body", async () => {
   const text = `/share@${policy.botUsername} x2 id${policy.memberId} s10 --\r\n  synthetic body x99  `;
   const result = await decodeMessage(text);

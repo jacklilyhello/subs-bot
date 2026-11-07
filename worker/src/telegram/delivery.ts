@@ -7,6 +7,7 @@ import {
   prepareTelegramLifecycleTickets, renderTelegramLifecycle, type TelegramLifecycleButton,
 } from "./lifecycle-actions.ts";
 import { inTelegramScope, type TelegramPolicy } from "./protocol.ts";
+import { renderTelegramInlineSort } from "./inline-sort.ts";
 import { renderTelegramPath } from "./path-management.ts";
 import { beginTelegramPrivateClaim, prepareTelegramPrivateClaim } from "./private-claims.ts";
 import { resolveTelegramPrivateShareCreationReply } from "./private-share-creation.ts";
@@ -16,7 +17,7 @@ import {
   type TelegramSubscriptionReadButton,
 } from "./subscription-read.ts";
 import {
-  beginTelegramAggregateLinkReply, beginTelegramPrivateShareCreationReply,
+  beginTelegramAggregateLinkReply, beginTelegramInlineSortReply, beginTelegramPrivateShareCreationReply,
   beginTelegramSelectedLinkReply, beginTelegramReply, claimTelegramReply, isTelegramMemberAllowed,
   prepareTelegramPrivateClaimBegin, reapExpiredTelegramReplies, settleTelegramReply,
   type TelegramReplyLease, type TelegramReplyOutcome,
@@ -275,14 +276,23 @@ export async function drainTelegramReplies(
   aggregateKey: CryptoKey | null = null,
   privateShareRuntime: TelegramPrivateShareRuntime = PRIVATE_SHARE_DISABLED,
   subscriptionReadEnabled = false,
+  inlineSortEnabled = false,
 ): Promise<void> {
   const deadline = Date.now() + budgetMs;
   const privateShareEnabled = privateShareRuntime.schemaReady && privateShareRuntime.context !== null;
-  await reapExpiredTelegramReplies(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled);
+  await reapExpiredTelegramReplies(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled, inlineSortEnabled);
   for (let processed = 0; processed < limit && Date.now() < deadline; processed += 1) {
-    const lease = await claimTelegramReply(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled);
+    const lease = await claimTelegramReply(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled, inlineSortEnabled);
     if (!lease) return;
     if (!inTelegramScope(policy, lease)) continue;
+    if (lease.inlineSort) {
+      if (Date.now() < deadline && await beginTelegramInlineSortReply(db, policy, lease)) {
+        const outcome = await sendTelegramReply(policy, lease, renderTelegramInlineSort(lease.inlineSort),
+          Math.max(1, deadline - Date.now()), request);
+        await settleTelegramReply(db, policy, lease, outcome);
+      }
+      continue;
+    }
     if (lease.privateShareCreation && privateShareRuntime.context) {
       const reply = await resolveTelegramPrivateShareCreationReply(db, policy, lease, privateShareRuntime.context);
       if (reply && Date.now() < deadline && await beginTelegramPrivateShareCreationReply(db, policy, lease, reply)) {

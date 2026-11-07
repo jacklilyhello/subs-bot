@@ -16,6 +16,7 @@ import { insertSelectedRevokeTickets, selectedDeliveryGuard, TELEGRAM_SELECTED_M
   type SelectedRevokeTicket, type TelegramSelectedReply } from "./selected-export.ts";
 import { insertTelegramSubscriptionReadTickets, TELEGRAM_SUBSCRIPTION_READ_MARKER,
   type TelegramSubscriptionReadTicket } from "./subscription-read.ts";
+import { TELEGRAM_INLINE_SORT_MARKER, type TelegramInlineSortReply } from "./inline-sort.ts";
 
 export interface TelegramReplyLease extends TelegramCommand {
   receiptId: number;
@@ -31,6 +32,7 @@ export interface TelegramReplyLease extends TelegramCommand {
   document?: { kind: TelegramDocumentJobResult; nodeCount: number | null };
   privateShareCreation?: true;
   subscriptionRead?: true;
+  inlineSort?: TelegramInlineSortReply;
 }
 
 export type TelegramReplyOutcome =
@@ -45,7 +47,7 @@ const REAP_LIMIT = 40;
 
 type ReplyAccess = "allowed" | "denied" | "none";
 
-type ReplyRow = Omit<TelegramReplyLease, "view" | "lifecycle" | "privateClaim" | "temp" | "aggregate" | "selected" | "path" | "document" | "privateShareCreation" | "subscriptionRead"> & {
+type ReplyRow = Omit<TelegramReplyLease, "view" | "lifecycle" | "privateClaim" | "temp" | "aggregate" | "selected" | "path" | "document" | "privateShareCreation" | "subscriptionRead" | "inlineSort"> & {
   viewKind: TelegramView["kind"] | null;
   afterId: number | null;
   afterEpoch: number | null;
@@ -71,10 +73,12 @@ type ReplyRow = Omit<TelegramReplyLease, "view" | "lifecycle" | "privateClaim" |
   documentNodeCount: number | null;
   privateShareCreationReceipt: number | null;
   subscriptionReadReceipt: number | null;
+  inlineSortKind: TelegramInlineSortReply["kind"] | null;
+  inlineSortMode: TelegramInlineSortReply["mode"];
 };
 
 function supportedReceipt(alias: "inbox" | "earlier", includeAggregate = false, includePrivateShareCreation = false,
-  includeSubscriptionRead = false): string {
+  includeSubscriptionRead = false, includeInlineSort = false): string {
   return `(${alias}.receipt_nonce IS NULL OR (${alias}.receipt_nonce = '${TELEGRAM_VIEW_MARKER}'
     AND EXISTS (SELECT 1 FROM telegram_view WHERE receipt_id = ${alias}.receipt_id))
     OR (${alias}.receipt_nonce = '${TELEGRAM_LIFECYCLE_MARKER}'
@@ -105,7 +109,10 @@ function supportedReceipt(alias: "inbox" | "earlier", includeAggregate = false, 
     ${includeSubscriptionRead ? `OR (${alias}.receipt_nonce = '${TELEGRAM_SUBSCRIPTION_READ_MARKER}' AND EXISTS (
       SELECT 1 FROM telegram_subscription_read AS detail WHERE detail.receipt_id=${alias}.receipt_id
         AND (detail.kind NOT IN ('detail','format') OR (${alias}.chat_type='private'
-          AND ${alias}.actor_id=${alias}.chat_id AND ${alias}.thread_id IS NULL))))` : ""})`;
+          AND ${alias}.actor_id=${alias}.chat_id AND ${alias}.thread_id IS NULL))))` : ""}
+    ${includeInlineSort ? `OR (${alias}.receipt_nonce = '${TELEGRAM_INLINE_SORT_MARKER}' AND ${alias}.command = 'help'
+      AND ${alias}.chat_type = 'private' AND ${alias}.actor_id = ${alias}.chat_id AND ${alias}.thread_id IS NULL
+      AND EXISTS (SELECT 1 FROM telegram_inline_sort_reply WHERE receipt_id = ${alias}.receipt_id))` : ""})`;
 }
 
 export async function acceptTelegramCommand(
@@ -166,7 +173,7 @@ export async function isTelegramMemberAllowed(db: D1Database, policy: TelegramPo
 }
 
 export async function claimTelegramReply(db: D1Database, botId: string, includeAggregate = false,
-  includePrivateShareCreation = false, includeSubscriptionRead = false): Promise<TelegramReplyLease | null> {
+  includePrivateShareCreation = false, includeSubscriptionRead = false, includeInlineSort = false): Promise<TelegramReplyLease | null> {
   const leaseId = crypto.randomUUID();
   const aggregateColumns = includeAggregate ? `aggregate.result AS aggregateResult,
     aggregate.revision AS aggregateRevision, aggregate.code_sha256 AS aggregateCodeSha256,
@@ -179,7 +186,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
       WHERE receipt_id = (
         SELECT inbox.receipt_id FROM telegram_outbox AS reply
         JOIN telegram_inbox AS inbox USING (receipt_id)
-        WHERE inbox.bot_id = ? AND ${supportedReceipt("inbox", includeAggregate, includePrivateShareCreation, includeSubscriptionRead)}
+        WHERE inbox.bot_id = ? AND ${supportedReceipt("inbox", includeAggregate, includePrivateShareCreation, includeSubscriptionRead, includeInlineSort)}
           AND reply.state = 'pending'
           AND reply.due_at <= unixepoch() AND reply.attempts < ${MAX_ATTEMPTS}
           AND inbox.received_at + ${MAX_REPLY_AGE_SECONDS} > unixepoch()
@@ -187,7 +194,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
             SELECT 1 FROM telegram_inbox AS earlier
             JOIN telegram_outbox AS earlier_reply USING (receipt_id)
             WHERE earlier.bot_id = inbox.bot_id AND earlier.actor_id = inbox.actor_id AND earlier.chat_id = inbox.chat_id
-              AND ${supportedReceipt("earlier", includeAggregate, includePrivateShareCreation, includeSubscriptionRead)}
+              AND ${supportedReceipt("earlier", includeAggregate, includePrivateShareCreation, includeSubscriptionRead, includeInlineSort)}
               AND earlier.receipt_id < inbox.receipt_id AND earlier_reply.state IN ('pending', 'leased', 'sending')
           )
         ORDER BY inbox.receipt_id LIMIT 1
@@ -207,7 +214,9 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
         path.kind AS pathKind, path.after_id AS pathAfterId, path.affected_count AS pathAffectedCount,
         document.result_code AS documentKind, saved.node_count AS documentNodeCount,
         ${includePrivateShareCreation ? "creation.receipt_id" : "NULL"} AS privateShareCreationReceipt,
-        ${includeSubscriptionRead ? "detail.receipt_id" : "NULL"} AS subscriptionReadReceipt
+        ${includeSubscriptionRead ? "detail.receipt_id" : "NULL"} AS subscriptionReadReceipt,
+        ${includeInlineSort ? "sort.kind" : "NULL"} AS inlineSortKind,
+        ${includeInlineSort ? "sort.mode" : "NULL"} AS inlineSortMode
       FROM telegram_outbox AS reply JOIN telegram_inbox AS inbox USING (receipt_id)
       LEFT JOIN telegram_view AS page ON page.receipt_id = inbox.receipt_id AND inbox.receipt_nonce = '${TELEGRAM_VIEW_MARKER}'
       LEFT JOIN telegram_lifecycle_action AS action ON action.receipt_id = inbox.receipt_id
@@ -229,8 +238,10 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
         AND inbox.receipt_nonce = '${TELEGRAM_PRIVATE_SHARE_CREATION_MARKER}' AND creation.state = 'published'` : ""}
       ${includeSubscriptionRead ? `LEFT JOIN telegram_subscription_read AS detail ON detail.receipt_id=inbox.receipt_id
         AND inbox.receipt_nonce='${TELEGRAM_SUBSCRIPTION_READ_MARKER}'` : ""}
+      ${includeInlineSort ? `LEFT JOIN telegram_inline_sort_reply AS sort ON sort.receipt_id = inbox.receipt_id
+        AND inbox.receipt_nonce = '${TELEGRAM_INLINE_SORT_MARKER}'` : ""}
       WHERE reply.lease_id = ? AND reply.state = 'leased' AND inbox.bot_id = ?
-        AND ${supportedReceipt("inbox", includeAggregate, includePrivateShareCreation, includeSubscriptionRead)}
+        AND ${supportedReceipt("inbox", includeAggregate, includePrivateShareCreation, includeSubscriptionRead, includeInlineSort)}
     `).bind(leaseId, botId),
   ]);
   if (!write?.success || !read?.success) throw new Error("Telegram reply claim could not be confirmed.");
@@ -240,7 +251,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
     privateClaimCodeSha256, tempKind, tempNodeCount, tempTotalCount, tempMalformedCount,
     tempUnsupportedCount, tempIgnoredCount, aggregateResult, aggregateRevision, aggregateCodeSha256, selectedResult, selectedCodeSha256,
     pathKind, pathAfterId, pathAffectedCount,
-    documentKind, documentNodeCount, privateShareCreationReceipt, subscriptionReadReceipt, ...lease } = row;
+    documentKind, documentNodeCount, privateShareCreationReceipt, subscriptionReadReceipt, inlineSortKind, inlineSortMode, ...lease } = row;
   const lifecycle = lifecycleKind === null || lifecycleSubscriptionId === null || lifecycleExpectedRevision === null
     ? undefined : { kind: lifecycleKind, subscriptionId: lifecycleSubscriptionId, expectedLifecycleRevision: lifecycleExpectedRevision };
   // The joined temp companion declares every count NOT NULL when its kind is present.
@@ -257,6 +268,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
     ...(documentKind === null ? {} : { document: { kind: documentKind, nodeCount: documentNodeCount } }),
     ...(privateShareCreationReceipt === null ? {} : { privateShareCreation: true as const }),
     ...(subscriptionReadReceipt === null ? {} : { subscriptionRead: true as const }),
+    ...(inlineSortKind === null ? {} : { inlineSort: { kind: inlineSortKind, mode: inlineSortMode } }),
     ...(privateClaimCodeSha256 === null ? {} : { privateClaim: { codeSha256: privateClaimCodeSha256 } }) };
 }
 
@@ -282,7 +294,7 @@ function beginReplyStatement(
         WHERE inbox.bot_id = ? AND inbox.update_id = ? AND inbox.receipt_id = ? AND inbox.actor_id = ? AND inbox.chat_id = ?
           AND inbox.chat_type = ? AND inbox.message_id = ? AND inbox.message_date = ? AND inbox.thread_id IS ?
           AND inbox.command = ? AND ${supportedReceipt("inbox", lease.aggregate !== undefined || lease.selected !== undefined,
-            lease.privateShareCreation === true, lease.subscriptionRead === true)}
+            lease.privateShareCreation === true, lease.subscriptionRead === true, lease.inlineSort !== undefined)}
           AND inbox.received_at + ${MAX_REPLY_AGE_SECONDS} > unixepoch()
           ${guard ? `AND (${guard.sql})` : ""}
           ${exactDocumentEpoch}
@@ -372,7 +384,7 @@ export async function beginTelegramReply(
   readTickets: readonly TelegramSubscriptionReadTicket[] = [],
   readGuard?: { sql: string; bindings: readonly (string | number | null)[] },
 ): Promise<boolean> {
-  if (!inTelegramScope(policy, lease) || lease.privateClaim || ((lease.aggregate || lease.selected || lease.path || lease.privateShareCreation) && (lease.chatType !== "private" || lease.threadId !== null))
+  if (!inTelegramScope(policy, lease) || lease.privateClaim || lease.inlineSort || ((lease.aggregate || lease.selected || lease.path || lease.privateShareCreation) && (lease.chatType !== "private" || lease.threadId !== null))
     || (tickets.length > 0 && (!lease.view || access !== "allowed"))
     || (lifecycleTickets.length > 0 && (!(lease.view || lease.lifecycle) || access !== "allowed"))
     || (readTickets.length > 0 && (!(lease.view || lease.subscriptionRead) || access !== "allowed"))
@@ -406,6 +418,28 @@ export async function beginTelegramReply(
   return changed === 1;
 }
 
+export async function beginTelegramInlineSortReply(db: D1Database, policy: TelegramPolicy, lease: TelegramReplyLease): Promise<boolean> {
+  if (!lease.inlineSort || !inTelegramScope(policy, lease) || lease.chatType !== "private" || lease.threadId !== null) return false;
+  const guard = {
+    sql: `inbox.receipt_nonce = '${TELEGRAM_INLINE_SORT_MARKER}' AND EXISTS (
+      SELECT 1 FROM telegram_inline_sort_reply AS sort LEFT JOIN telegram_auth AS auth
+        ON auth.bot_id = inbox.bot_id AND auth.user_id = inbox.actor_id AND inbox.actor_id <> ?
+      WHERE sort.receipt_id = inbox.receipt_id AND sort.kind = ? AND sort.mode IS ?
+        AND sort.auth_message_date = COALESCE(auth.message_date, 0)
+        AND sort.auth_message_id = COALESCE(auth.message_id, 0)
+    )`,
+    bindings: [policy.adminId, lease.inlineSort.kind, lease.inlineSort.mode],
+  };
+  if (await beginReplyStatement(db, policy, lease, "allowed", guard).first() !== null) return true;
+
+  // A rejected pre-send lease never called Telegram and can be closed without blocking newer replies.
+  await db.prepare(`UPDATE telegram_outbox SET state = 'failed', lease_id = NULL, lease_until = NULL
+    WHERE receipt_id = ? AND state = 'leased' AND lease_id = ? AND attempts = ?`).bind(
+    lease.receiptId, lease.leaseId, lease.attempts,
+  ).run();
+  return false;
+}
+
 export async function settleTelegramReply(
   db: D1Database,
   policy: TelegramPolicy,
@@ -416,7 +450,7 @@ export async function settleTelegramReply(
   const sameReply = `lease_id = ? AND attempts = ? AND receipt_id = (
     SELECT receipt_id FROM telegram_inbox AS inbox
     WHERE bot_id = ? AND update_id = ? AND receipt_id = ? AND ${supportedReceipt("inbox", lease.aggregate !== undefined || lease.selected !== undefined,
-      lease.privateShareCreation === true, lease.subscriptionRead === true)}
+      lease.privateShareCreation === true, lease.subscriptionRead === true, lease.inlineSort !== undefined)}
   )`;
   if (outcome.kind === "sent") {
     if (!Number.isSafeInteger(outcome.messageId) || outcome.messageId <= 0) {
@@ -453,7 +487,7 @@ export async function settleTelegramReply(
 }
 
 export async function reapExpiredTelegramReplies(db: D1Database, botId: string, includeAggregate = false,
-  includePrivateShareCreation = false, includeSubscriptionRead = false): Promise<void> {
+  includePrivateShareCreation = false, includeSubscriptionRead = false, includeInlineSort = false): Promise<void> {
   await db.prepare(`
     UPDATE telegram_outbox SET state = CASE
       WHEN state = 'sending' THEN 'uncertain'
@@ -463,7 +497,7 @@ export async function reapExpiredTelegramReplies(db: D1Database, botId: string, 
       lease_id = CASE WHEN state = 'sending' THEN lease_id ELSE NULL END, lease_until = NULL
     WHERE receipt_id IN (
       SELECT reply.receipt_id FROM telegram_outbox AS reply JOIN telegram_inbox AS inbox USING (receipt_id)
-      WHERE inbox.bot_id = ? AND ${supportedReceipt("inbox", includeAggregate, includePrivateShareCreation, includeSubscriptionRead)} AND (
+      WHERE inbox.bot_id = ? AND ${supportedReceipt("inbox", includeAggregate, includePrivateShareCreation, includeSubscriptionRead, includeInlineSort)} AND (
         (reply.state IN ('leased', 'sending') AND reply.lease_until <= unixepoch())
         OR (reply.state IN ('pending', 'leased') AND inbox.received_at + ${MAX_REPLY_AGE_SECONDS} <= unixepoch())
       )
