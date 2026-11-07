@@ -6,6 +6,7 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
+from tempfile import TemporaryDirectory
 import sys
 import unittest
 from unittest.mock import Mock, call, patch
@@ -202,6 +203,7 @@ class OperationTests(unittest.TestCase):
         complete = state(3, smoke())
         result = self.run_operation("smoke", [state(3), state(3), complete, complete], PINS)
         self.assertEqual(result["status"], "complete")
+        self.assertEqual(set(result), activation.PROOF_FIELDS)
         self.api.trigger.assert_called_once_with(RELEASE, ISOLATED)
         self.api.stopped.assert_called_once_with(NAMESPACE, START, RELEASE["ociManifestSha256"])
         self.assert_writes("trigger")
@@ -472,6 +474,88 @@ class ProofTests(unittest.TestCase):
             self.assertEqual(result, {**EVIDENCE, "status": "ready-to-smoke"})
             self.assertEqual(run.call_args.args[:5], (api.return_value, "verify", RELEASE, PINS, ""))
             guard.assert_called_once_with(EVIDENCE)
+
+
+class BindingProofTests(unittest.TestCase):
+    def setUp(self):
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.proof_file = Path(directory.name) / activation.BINDING_PROOF_FILE
+        self.output = Path(directory.name) / "github-output"
+        self.output.write_text("previous=value\n", encoding="ascii")
+        self.env = {"GITHUB_SERVER_URL": "https://github.com", "GITHUB_REPOSITORY": activation.github.REPOSITORY,
+                    "GITHUB_REPOSITORY_ID": str(activation.github.REPOSITORY_ID), "GITHUB_REF": activation.github.MAIN_REF,
+                    "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_SHA": REVISION, "GITHUB_WORKFLOW_SHA": REVISION,
+                    "GITHUB_WORKFLOW_REF": f"{activation.github.REPOSITORY}/{activation.WORKFLOW_PATH}@{activation.github.MAIN_REF}",
+                    "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "2", "GITHUB_OUTPUT": str(self.output),
+                    "RUNNER_TEMP": directory.name, "RUNNER_ENVIRONMENT": "github-hosted",
+                    "SUBS_BOT_PROVIDER_ACTIVATION_OPERATION": "verify", "SUBS_BOT_PROVIDER_ISOLATED_REVISION": ISOLATED}
+        self.verification = {
+            "status": "complete", "publicDenied": True, "stopped": True,
+            "workerIdentitySha256": IDENTITY.fingerprint(), "versionSha256": activation._hash(VERSION),
+            "activationIdentitySha256": activation._fingerprint(ACTIVATION),
+            "containerIdentitySha256": activation._fingerprint(CONTAINER),
+            "workflowIdentitySha256": activation._fingerprint(WORKFLOW_PIN), "actorSha256": activation._hash(ACTOR),
+            "healthSha256": HEALTH_PROOF["sha256"], "healthBytes": len(HEALTH),
+            "approvedDnsFamilies": [4, 6], "blockedPrivateTargets": 3,
+        }
+        self.manifest = {"version": 1, "accountSha256": activation.publication.TARGET_ACCOUNT_SHA256,
+                         "providerBuild": EVIDENCE, "verification": self.verification,
+                         "activation": {"runId": "100", "runAttempt": "2", "isolatedRevision": ISOLATED}}
+
+    def verify(self, raw, **overrides):
+        return activation.parse_binding_proof(raw, **{"revision": REVISION, "run_id": "100", "run_attempt": "2", **overrides})
+
+    def test_completed_verification_writes_only_the_canonical_redacted_proof_and_signal(self):
+        with patch.dict(os.environ, self.env, clear=True), patch.object(
+                activation, "activate", return_value={**EVIDENCE, **self.verification}), patch("builtins.print"):
+            activation.main()
+            with self.assertRaises(FileExistsError):
+                activation.main()
+        raw = self.proof_file.read_bytes()
+        self.assertEqual(self.verify(raw), self.manifest)
+        self.assertEqual(raw, (json.dumps(self.manifest, separators=(",", ":"), sort_keys=True) + "\n").encode("ascii"))
+        self.assertEqual(self.proof_file.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.output.read_bytes(), b"previous=value\nbinding_proof=true\n")
+        for private_value in (ACCOUNT, IDENTITY.worker_id, VERSION, DEPLOYMENT, NAMESPACE, WORKFLOW, ACTOR, "https://"):
+            self.assertNotIn(private_value.encode("ascii"), raw)
+
+    def test_partial_results_never_write_a_proof_and_complete_requires_every_fact(self):
+        with patch.dict(os.environ, self.env, clear=True):
+            context = activation._binding_proof_context()
+            for status in ("staged", "active-awaiting-container", "ready-to-smoke", "smoke-running"):
+                activation._write_binding_proof({**EVIDENCE, "status": status}, *context)
+            for change in ({"publicDenied": False}, {"stopped": 1}, {"actorSha256": None}, {"url": "synthetic-private"}):
+                with self.subTest(change=change), self.assertRaises(activation.ActivationError) as error:
+                    activation._write_binding_proof({**EVIDENCE, **self.verification, **change}, *context)
+                self.assertNotIn("synthetic-private", str(error.exception))
+        self.assertFalse(self.proof_file.exists())
+        self.assertEqual(self.output.read_bytes(), b"previous=value\n")
+
+    def test_invalid_hosted_workflow_provenance_rejects_before_activation(self):
+        for change in ({"GITHUB_WORKFLOW_REF": "other"}, {"GITHUB_WORKFLOW_SHA": ISOLATED}, {"GITHUB_RUN_ID": "01"},
+                       {"GITHUB_REPOSITORY_ID": "42"}, {"GITHUB_EVENT_NAME": "push"}, {"RUNNER_ENVIRONMENT": "self-hosted"}):
+            with self.subTest(change=change), patch.dict(os.environ, {**self.env, **change}, clear=True), patch.object(activation, "activate") as activate:
+                with self.assertRaises(activation.ActivationError):
+                    activation.main()
+                activate.assert_not_called()
+
+    def test_parser_requires_exact_run_metadata_and_a_closed_bounded_schema(self):
+        encode = activation._proof_bytes
+        for override in ({"run_id": "101"}, {"run_attempt": "1"}, {"revision": ISOLATED}):
+            with self.subTest(override=override), self.assertRaises(activation.ActivationError):
+                self.verify(encode(self.manifest), **override)
+        for change in ({"version": True}, {"accountSha256": "a" * 64}, {"versionId": VERSION},
+                       {"providerBuild": {**EVIDENCE, "compatibilityDate": "2026-99-99"}},
+                       {"providerBuild": {**EVIDENCE, "archiveSha256": "synthetic-private"}},
+                       {"verification": {**self.verification, "healthBytes": True}},
+                       {"verification": {**self.verification, "approvedDnsFamilies": [4.0, 6]}},
+                       {"verification": {**self.verification, "approvedDnsFamilies": [6, 4]}}):
+            with self.subTest(change=change), self.assertRaises(activation.ActivationError):
+                self.verify(encode({**self.manifest, **change}))
+        for malformed in (encode(self.manifest)[:-1], b'{"version":1,"version":1}', b" " * (activation.MAX_BINDING_PROOF + 1)):
+            with self.assertRaises(ValueError):
+                self.verify(malformed)
 
 
 if __name__ == "__main__":

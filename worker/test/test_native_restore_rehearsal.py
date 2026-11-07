@@ -607,6 +607,18 @@ class SnapshotTests(unittest.TestCase):
         path.write_text("\n".join(self.db.iterdump()), "utf-8")
         return path
 
+    def test_quiet_blocks_unsettled_telegram_provider_jobs_on_new_schema(self):
+        self.db.execute("""INSERT INTO telegram_provider_jobs
+            (owner_id,request_key,kind,subscription_id,source_sha256,expected_generation,expected_lifecycle_revision,
+             state,created_at,due_at,expires_at) VALUES ('881001',?,'refresh',1,?,0,0,'pending',1,1,10)""",
+            ("a" * 64, "b" * 64))
+        full = native.quiet_expression(self.source.tables, 2)
+        older = native.quiet_expression(set(self.source.tables) - {"telegram_provider_jobs"}, 2)
+        self.assertEqual(self.db.execute("SELECT " + full).fetchone(), (0,))
+        self.assertEqual(self.db.execute("SELECT " + older).fetchone(), (1,))
+        self.db.execute("UPDATE telegram_provider_jobs SET state='done',result_code='expired',finished_at=10")
+        self.assertEqual(self.db.execute("SELECT " + full).fetchone(), (1,))
+
     def test_full_schema_large_temp_text_and_r2_closure_roundtrip(self):
         self.snapshot()
         self.db.execute("INSERT INTO subscription_lifecycle VALUES (2,1)")
