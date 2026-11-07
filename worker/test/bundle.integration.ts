@@ -23,6 +23,7 @@ import "./telegram-subscription-node-pages.integration.ts";
 import "./telegram-temp-raw.integration.ts";
 import "./telegram-short-links.integration.ts";
 import "./telegram-inline-sort.integration.ts";
+import "./telegram-bulk-trash.integration.ts";
 
 test("emitted Worker /o freezes owned subscription membership and excludes temporary nodes", { timeout: 60_000 }, async () => {
   const directory = process.env.WORKER_TEST_BUNDLE_DIR;
