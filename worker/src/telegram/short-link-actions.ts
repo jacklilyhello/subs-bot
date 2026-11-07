@@ -1,5 +1,6 @@
 import {
-  canonicalShortDestination, ISOLATION_PUBLIC_ORIGIN, NORMAL_CODE_SUFFIX, SHORT_CODE, shortCodeDigest,
+  canonicalShortDestination, ISOLATION_PUBLIC_ORIGIN, LEGACY_SUBSCRIPTION_SHORT_PIN, NORMAL_CODE_SUFFIX, readShortLinkNamespaces,
+  SHORT_CODE, shortCodeDigest, type ShortLinkNamespaces,
 } from "../short-links.ts";
 import { validInteger } from "../storage.ts";
 import { inTelegramScope, type TelegramCommand, type TelegramPolicy, type TelegramShortLinkUpdate } from "./protocol.ts";
@@ -54,15 +55,22 @@ async function deriveCode(key: CryptoKey, botId: string, actorId: string, nonce:
 
 export async function acceptTelegramShortLink(
   db: D1Database, policy: TelegramPolicy, event: TelegramShortLinkUpdate, key: CryptoKey | null,
+  namespaces?: ShortLinkNamespaces,
 ): Promise<"accepted" | "ignored"> {
   if (event.chatType !== "private" || event.threadId !== null || !inTelegramScope(policy, event) ||
       !validInteger(event.updateId, 1) || !validInteger(event.messageDate, 1) || !validInteger(event.messageId, 1)) return "ignored";
   try {
     const request = parseRequest(event.args);
+    const schema = namespaces ?? await readShortLinkNamespaces(db);
     const nonce = request.kind === "issue" && key ? base64Url(crypto.getRandomValues(new Uint8Array(16))) : null;
     const candidate = nonce && key ? await shortCodeDigest(await deriveCode(key, policy.botId, event.actorId, nonce)) : null;
     const target = request.kind === "issue" ? request.destination : null;
     const revoke = request.kind === "revoke" ? await shortCodeDigest(request.code) : null;
+    const legacyRevoke = schema.legacySubscription && schema.migrationLedger && request.kind === "revoke" && request.code.length === 12;
+    const noLegacyConflict = schema.legacySubscription ? `AND NOT EXISTS (SELECT 1 FROM legacy_subscription_short_links AS reserved
+      WHERE reserved.code_sha256=owned.code_sha256)` : "";
+    const legacyIssueConflict = schema.legacySubscription
+      ? "OR EXISTS (SELECT 1 FROM legacy_subscription_short_links WHERE code_sha256=?)" : "";
     const receipt = [policy.botId, event.updateId, crypto.randomUUID()] as const;
     const steps = [
       db.prepare(`INSERT INTO telegram_inbox
@@ -74,27 +82,35 @@ export async function acceptTelegramShortLink(
         .bind(policy.botId, event.updateId, event.actorId, event.chatId, event.messageId, event.messageDate, receipt[2],
           event.messageDate, event.actorId, policy.adminId, event.messageDate, policy.botId, event.actorId),
       db.prepare(`WITH scoped AS (
-        SELECT inbox.receipt_id,inbox.bot_id,inbox.actor_id,owned.code_sha256 AS owned_hash,
+        SELECT inbox.receipt_id,inbox.bot_id,inbox.actor_id,
+          ${legacyRevoke ? "COALESCE(owned.code_sha256,legacy.code_sha256)" : "owned.code_sha256"} AS owned_hash,
           CASE WHEN inbox.actor_id=? THEN 0 ELSE COALESCE(auth.message_date,0) END AS auth_date,
           CASE WHEN inbox.actor_id=? THEN 0 ELSE COALESCE(auth.message_id,0) END AS auth_id
         FROM telegram_inbox AS inbox LEFT JOIN telegram_auth AS auth ON auth.bot_id=inbox.bot_id AND auth.user_id=inbox.actor_id
         LEFT JOIN normal_short_links AS owned ON owned.code_sha256=? AND owned.owner_id=inbox.actor_id
           AND owned.bot_id=inbox.bot_id AND owned.revoked_at IS NULL AND owned.code_length=?
+          AND NOT EXISTS (SELECT 1 FROM aggregate_links WHERE code_sha256=owned.code_sha256) ${noLegacyConflict}
+        ${legacyRevoke ? `LEFT JOIN legacy_subscription_short_links AS legacy ON legacy.code_sha256=?
+          AND legacy.owner_id=inbox.actor_id AND legacy.bot_id=inbox.bot_id AND legacy.revoked_at IS NULL
+          AND ${LEGACY_SUBSCRIPTION_SHORT_PIN}
+          AND NOT EXISTS (SELECT 1 FROM normal_short_links WHERE code_sha256=legacy.code_sha256)
+          AND NOT EXISTS (SELECT 1 FROM aggregate_links WHERE code_sha256=legacy.code_sha256)` : ""}
         WHERE ${fresh}
       ), classified AS (
         SELECT scoped.*, CASE
           WHEN ? IN ('help','invalid') THEN ?
           WHEN ?='revoke' THEN CASE WHEN owned_hash IS NULL THEN 'missing' ELSE 'revoked' END
           WHEN ? IS NULL OR EXISTS (SELECT 1 FROM normal_short_links WHERE code_sha256=?)
-            OR EXISTS (SELECT 1 FROM aggregate_links WHERE code_sha256=?) THEN 'unavailable'
+            OR EXISTS (SELECT 1 FROM aggregate_links WHERE code_sha256=?) ${legacyIssueConflict} THEN 'unavailable'
           WHEN EXISTS (SELECT 1 FROM normal_short_links WHERE bot_id=scoped.bot_id AND owner_id=scoped.actor_id
             AND revoked_at IS NULL LIMIT 1 OFFSET ${MAX_ACTIVE_LINKS - 1}) THEN 'limit'
           ELSE 'issued' END AS result FROM scoped
       ) INSERT INTO telegram_short_link_actions (receipt_id,result,code_sha256,auth_message_date,auth_message_id)
       SELECT receipt_id,result,CASE WHEN result='issued' THEN ? WHEN result='revoked' THEN owned_hash END,auth_date,auth_id
       FROM classified`)
-        .bind(policy.adminId, policy.adminId, revoke, request.kind === "revoke" ? request.code.length : null, ...receipt,
-          request.kind, request.kind, request.kind, candidate, candidate, candidate, candidate),
+        .bind(policy.adminId, policy.adminId, revoke, request.kind === "revoke" ? request.code.length : null,
+          ...(legacyRevoke ? [revoke] : []), ...receipt, request.kind, request.kind, request.kind, candidate, candidate, candidate,
+          ...(schema.legacySubscription ? [candidate] : []), candidate),
       db.prepare(`INSERT INTO normal_short_links(code_sha256,code_length,bot_id,owner_id,origin_receipt_id,nonce,key_version,target_url)
         SELECT action.code_sha256,22,inbox.bot_id,inbox.actor_id,inbox.receipt_id,?,1,?
         FROM telegram_inbox AS inbox JOIN telegram_short_link_actions AS action USING(receipt_id)
@@ -103,6 +119,14 @@ export async function acceptTelegramShortLink(
         FROM telegram_inbox AS inbox JOIN telegram_short_link_actions AS action USING(receipt_id)
         WHERE ${fresh} AND action.result='revoked' AND link.code_sha256=action.code_sha256
           AND link.bot_id=inbox.bot_id AND link.owner_id=inbox.actor_id AND link.revoked_at IS NULL`).bind(...receipt),
+      ...(legacyRevoke ? [db.prepare(`UPDATE legacy_subscription_short_links AS link
+        SET revoked_at=max(created_at,unixepoch()),subscription_id=NULL,token_sha256=NULL,format=NULL
+        FROM telegram_inbox AS inbox JOIN telegram_short_link_actions AS action USING(receipt_id)
+        WHERE ${fresh} AND action.result='revoked' AND link.code_sha256=action.code_sha256
+          AND link.bot_id=inbox.bot_id AND link.owner_id=inbox.actor_id AND link.revoked_at IS NULL
+          AND ${LEGACY_SUBSCRIPTION_SHORT_PIN}
+          AND NOT EXISTS (SELECT 1 FROM normal_short_links WHERE code_sha256=link.code_sha256)
+          AND NOT EXISTS (SELECT 1 FROM aggregate_links WHERE code_sha256=link.code_sha256)`).bind(...receipt)] : []),
       db.prepare(`INSERT INTO telegram_outbox(receipt_id) SELECT receipt_id FROM telegram_inbox AS inbox WHERE ${fresh}`).bind(...receipt),
       db.prepare(`UPDATE telegram_inbox AS inbox SET receipt_nonce=?,command=CASE WHEN EXISTS (
         SELECT 1 FROM telegram_short_link_actions AS action JOIN telegram_outbox USING(receipt_id)
@@ -110,7 +134,11 @@ export async function acceptTelegramShortLink(
           AND (action.result NOT IN ('issued','revoked') OR EXISTS (SELECT 1 FROM normal_short_links AS link
             WHERE link.code_sha256=action.code_sha256 AND link.bot_id=inbox.bot_id AND link.owner_id=inbox.actor_id
               AND ((action.result='issued' AND link.origin_receipt_id=inbox.receipt_id AND link.revoked_at IS NULL)
-                OR (action.result='revoked' AND link.revoked_at IS NOT NULL))))
+                OR (action.result='revoked' AND link.revoked_at IS NOT NULL)))
+            ${legacyRevoke ? `OR (action.result='revoked' AND EXISTS (SELECT 1 FROM legacy_subscription_short_links AS legacy
+              WHERE legacy.code_sha256=action.code_sha256 AND legacy.bot_id=inbox.bot_id AND legacy.owner_id=inbox.actor_id
+                AND legacy.revoked_at IS NOT NULL AND legacy.subscription_id IS NULL AND legacy.token_sha256 IS NULL
+                AND legacy.format IS NULL))` : ""})
       ) THEN command END WHERE ${fresh} RETURNING receipt_id`).bind(TELEGRAM_SHORT_LINK_MARKER, ...receipt),
     ];
     const results = await db.batch(steps);

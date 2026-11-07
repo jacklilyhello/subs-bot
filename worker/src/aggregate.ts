@@ -79,12 +79,14 @@ function* readTemp({ json, nodeCount }: TempRow): Generator<NodeRecord> {
 }
 
 export async function getAggregateNodeSource(
-  db: D1Database, bucket: R2Bucket, code: string, excludeNormalShortLinks = false,
+  db: D1Database, bucket: R2Bucket, code: string, excludeNormalShortLinks = false, excludeLegacySubscriptionShorts = false,
 ): Promise<ExportNodeSource | null> {
   const digest = await codeDigest(code);
   if (digest === null) return null;
-  const availableLink = excludeNormalShortLinks ? `${activeLink}
-    AND NOT EXISTS (SELECT 1 FROM normal_short_links AS normal WHERE normal.code_sha256=aggregate_links.code_sha256)` : activeLink;
+  const availableLink = `${activeLink}
+    ${excludeNormalShortLinks ? "AND NOT EXISTS (SELECT 1 FROM normal_short_links AS normal WHERE normal.code_sha256=aggregate_links.code_sha256)" : ""}
+    ${excludeLegacySubscriptionShorts ? `AND NOT EXISTS (SELECT 1 FROM legacy_subscription_short_links AS legacy
+      WHERE legacy.code_sha256=aggregate_links.code_sha256)` : ""}`;
   const withLink = `WITH link AS (SELECT owner_id, kind, bot_id, selected_ids ${availableLink})`;
   // All inputs come from one D1 transaction. Each statement starts at the same digest
   // and only the matching owner can contribute a subscription or temporary batch.
