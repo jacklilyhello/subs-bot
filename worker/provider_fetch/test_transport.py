@@ -44,6 +44,19 @@ class PolicyTests(unittest.IsolatedAsyncioTestCase):
                              transport.FetchFailure("invalid-auth"))
             dns.assert_not_called()
 
+    async def test_api_probe_rejects_insecure_endpoints_and_keys_before_dns(self):
+        with patch.object(transport, "_dns_addresses", new_callable=AsyncMock) as dns:
+            for url in ("http://provider.example/v1/models", "https://provider.example/v1/models?x=1",
+                        "https://provider.example/v1/models#", "https://provider.example/v1/other",
+                        "https://user@provider.example/v1/models"):
+                self.assertEqual(await transport.probe_api_status(url, "synthetic-key"), transport.FetchFailure("invalid-url"))
+            for key in ("", "x" * 513, "synthetic key", "synthetic\r\nX-Test: other", "密钥"):
+                self.assertEqual(await transport.probe_api_status("https://provider.example/v1/models", key),
+                                 transport.FetchFailure("invalid-auth"))
+            self.assertEqual(await transport.probe_api_status("https://[::1]/v1/models", "synthetic-key"),
+                             transport.FetchFailure("blocked-address"))
+            dns.assert_not_called()
+
     async def test_queries_both_absolute_types_and_refuses_mixed_answers(self):
         resolver = SimpleNamespace(resolve=AsyncMock(side_effect=[
             SimpleNamespace(rrset=[SimpleNamespace(address="1.1.1.1")]),
@@ -187,6 +200,8 @@ class PinnedTLSIntegrationTests(unittest.IsolatedAsyncioTestCase):
                            (line.decode("ascii").split(":", 1) for line in raw.split(b"\r\n")[1:-2]))
             self.requests.append((method, path, version, headers, writer.get_extra_info("sockname")[0]))
             status, extra, body = self.handlers[path]
+            if status is None:
+                return
             if path in self.header_delays:
                 await asyncio.sleep(self.header_delays[path])
             response = [f"HTTP/1.1 {status} Fixture", "Connection: close", f"Content-Length: {len(body)}"]
@@ -229,6 +244,32 @@ class PinnedTLSIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([request[3].get("authorization") for request in self.requests], [authorization] * 2 + [None] * 2)
         self.assertTrue(all(request[4] == "127.0.0.1" and "cookie" not in request[3] for request in self.requests))
         self.system_dns.assert_not_called()
+
+    async def test_api_probe_uses_pinned_tls_without_body_or_redirect(self):
+        self.handlers = {
+            "/v1/models": (302, {"Location": self.url(OTHER, "/v1/models"), "Set-Cookie": "fixture=private"},
+                           b"synthetic private body"),
+            "/v1/chat/completions": (401, {}, b"synthetic private response"),
+        }
+        with patch.object(transport, "_read_body", side_effect=AssertionError("Unexpected API probe body read.")):
+            for path, status in (("/v1/models", 302), ("/v1/chat/completions", 401)):
+                observed = await transport.probe_api_status(self.url(PROVIDER, path), "synthetic-key")
+                self.assertIsInstance(observed, transport.ApiProbeSuccess)
+                self.assertEqual(observed.status, status)
+                self.assertTrue(0 <= observed.elapsed_ms < 15000)
+                self.assertNotIn("synthetic", repr(observed))
+        self.assertEqual(self.hosts, [PROVIDER, PROVIDER])
+        self.assertEqual(self.sni, self.hosts)
+        self.assertEqual([(r[0], r[1]) for r in self.requests], [("GET", path) for path in self.handlers])
+        self.assertTrue(all(r[3]["authorization"] == "Bearer synthetic-key" and r[3]["x-api-key"] == "synthetic-key"
+                            and "cookie" not in r[3] for r in self.requests))
+        self.system_dns.assert_not_called()
+
+    async def test_api_probe_does_not_replay_after_disconnect(self):
+        self.handlers = {"/v1/models": (None, {}, b"")}
+        observed = await transport.probe_api_status(self.url(PROVIDER, "/v1/models"), "synthetic-key")
+        self.assertEqual(observed, transport.FetchFailure("unavailable"))
+        self.assertEqual(len(self.requests), 1)
 
     async def test_redirect_reresolves_and_stops_private_mixed_results(self):
         self.handlers = {"/start": (302, {"Location": "/rebound"}, b"")}
