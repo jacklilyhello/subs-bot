@@ -22,9 +22,11 @@ SHARE_PREFIX = b"ss://YWVzLTI1Ni1nY206Zml4dHVyZS1vbmx5@203.0.113.10:8388#"
 CAPACITY_STATUS = {"at-limits": 200, "share-over": 422, "snapshot-over": 503}
 STRUCTURED_SMOKE = "structured-smoke"
 SINGBOX_SMOKE = "singbox-smoke"
+CLASH_SMOKE = "clash-smoke"
 SMOKE_PROFILES = {
     STRUCTURED_SMOKE: {"structured-mixed": 200, "structured-unsupported": 422},
     SINGBOX_SMOKE: {"singbox-mixed": 200, "singbox-unsupported": 422},
+    CLASH_SMOKE: {"clash-mixed": 200, "clash-unsupported": 422},
 }
 FIXTURE_PROFILES = {"capacity": CAPACITY_STATUS, **SMOKE_PROFILES}
 SMOKE_CHUNK_COUNT = 2
@@ -174,7 +176,7 @@ def structured_smoke_fixture(label: str) -> tuple[list[bytes], int, bytes]:
     return [_json_bytes(node) + b"\n" for node in nodes], len(raw), base64.b64encode(raw)
 
 
-def canonical_singbox(value) -> bytes:
+def canonical_config(value) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
 
 
@@ -210,12 +212,38 @@ def singbox_smoke_fixture(label: str) -> tuple[list[bytes], int, bytes]:
     else:
         if label != "singbox-mixed":
             raise ValueError("The Python oracle accepted the unsupported synthetic Sing-box fixture.")
-        expected = canonical_singbox(json.loads(config))
+        expected = canonical_config(json.loads(config))
+    return [_json_bytes(node) + b"\n" for node in nodes], 0, expected
+
+
+def clash_smoke_fixture(label: str) -> tuple[list[bytes], int, bytes]:
+    structured = {"name": '港 "字"', "type": "ss", "server": "203.0.113.10", "port": 8388,
+                  "cipher": "aes-256-gcm", "password": "fixture\u0085next", "udp": True}
+    stored = {"name": "Hopping", "type": "temp",
+              "share": "hy2://user:p%2B%40@[2001:db8::5]:443,5000-6000/?insecure=0&sni=tls.example.invalid"}
+    if label == "clash-mixed":
+        names = [structured["name"], stored["name"]]
+        selected, automatic = "🚀 节点选择", "♻️ 自动选择"
+        nodes = [structured, stored]
+        expected = canonical_config({
+            "proxies": [structured, {"name": "Hopping", "type": "hysteria2", "server": "2001:db8::5",
+                                     "ports": "443,5000-6000", "password": "user:p+@", "skip-cert-verify": False,
+                                     "sni": "tls.example.invalid"}],
+            "proxy-groups": [{"name": selected, "type": "select", "proxies": names},
+                             {"name": automatic, "type": "url-test", "proxies": names,
+                              "url": "http://www.gstatic.com/generate_204", "interval": 300}],
+            "rules": [f"MATCH,{selected}"],
+        })
+    elif label == "clash-unsupported":
+        nodes, expected = [stored, {**structured, "dialer-proxy": "unavailable-dependency"}], b""
+    else:
+        raise ValueError("Unknown Clash smoke fixture.")
     return [_json_bytes(node) + b"\n" for node in nodes], 0, expected
 
 
 def smoke_fixture(profile: str, label: str) -> tuple[list[bytes], int, bytes]:
-    return singbox_smoke_fixture(label) if profile == SINGBOX_SMOKE else structured_smoke_fixture(label)
+    return {SINGBOX_SMOKE: singbox_smoke_fixture, CLASH_SMOKE: clash_smoke_fixture,
+            STRUCTURED_SMOKE: structured_smoke_fixture}[profile](label)
 
 
 def _write_smoke_fixture(root: Path, profile: str, label: str, status: int) -> dict:
