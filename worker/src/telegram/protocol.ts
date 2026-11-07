@@ -1,3 +1,4 @@
+import { PATH_RULE_WHITESPACE_PREFIX } from "../path-rules.ts";
 import type { TelegramDocumentJobInput } from "./document-jobs.ts";
 
 export interface TelegramPolicy {
@@ -43,13 +44,16 @@ export type TelegramTempUpdate = TelegramEventScope & (
   | { kind: "temp-summary" | "temp-clear" }
 );
 
+export type TelegramPathUpdate = TelegramEventScope & { kind: "path"; args: string };
+
 type NormalizedUpdate =
-  | { command: TelegramCommand; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; document?: never }
-  | { view: TelegramViewUpdate; command?: never; lifecycle?: never; privateClaim?: never; temp?: never; document?: never }
-  | { lifecycle: TelegramLifecycleUpdate; command?: never; view?: never; privateClaim?: never; temp?: never; document?: never }
-  | { privateClaim: TelegramPrivateClaimUpdate; command?: never; view?: never; lifecycle?: never; temp?: never; document?: never }
-  | { temp: TelegramTempUpdate; command?: never; view?: never; lifecycle?: never; privateClaim?: never; document?: never }
-  | { document: TelegramDocumentJobInput; command?: never; view?: never; lifecycle?: never; privateClaim?: never; temp?: never };
+  | { command: TelegramCommand; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; path?: never; document?: never }
+  | { view: TelegramViewUpdate; command?: never; lifecycle?: never; privateClaim?: never; temp?: never; path?: never; document?: never }
+  | { lifecycle: TelegramLifecycleUpdate; command?: never; view?: never; privateClaim?: never; temp?: never; path?: never; document?: never }
+  | { privateClaim: TelegramPrivateClaimUpdate; command?: never; view?: never; lifecycle?: never; temp?: never; path?: never; document?: never }
+  | { temp: TelegramTempUpdate; command?: never; view?: never; lifecycle?: never; privateClaim?: never; path?: never; document?: never }
+  | { path: TelegramPathUpdate; command?: never; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; document?: never }
+  | { document: TelegramDocumentJobInput; command?: never; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; path?: never };
 
 type DecodedTelegramRequest =
   | ({ status: 200 } & NormalizedUpdate)
@@ -155,7 +159,7 @@ function authCommand(args: string[], reply: unknown, memberId: string): Telegram
 
 function messageCommand(
   message: Record<string, unknown>, policy: TelegramPolicy,
-): TelegramCommand["command"] | TelegramViewKind | "temp-summary" | "temp-clear" | { code: string } | null {
+): TelegramCommand["command"] | TelegramViewKind | "temp-summary" | "temp-clear" | { code: string } | { args: string } | null {
   const { text, entities } = message;
   if (typeof text !== "string" || !Array.isArray(entities)) return null;
   const commands = entities.filter((entity) => isRecord(entity) && entity.type === "bot_command" && entity.offset === 0);
@@ -165,11 +169,15 @@ function messageCommand(
   // Telegram offsets and JavaScript string slicing both use UTF-16 code units.
   const entity = BOT_COMMAND.exec(text.slice(0, length));
   const remainder = text.slice(length);
-  if (!entity || (remainder !== "" && !/^\s/u.test(remainder))) return null;
+  if (!entity) return null;
   const [, name, addressedTo] = entity;
   if (addressedTo && addressedTo.toLowerCase() !== policy.botUsername.toLowerCase()) return null;
+  const commandName = name.toLowerCase();
+  const separator = commandName === "path" ? PATH_RULE_WHITESPACE_PREFIX : /^\s/u;
+  if (remainder !== "" && !separator.test(remainder)) return null;
+  if (commandName === "path") return { args: remainder };
   const args = remainder.trim().split(/\s+/u).filter(Boolean);
-  switch (name.toLowerCase()) {
+  switch (commandName) {
     case "start": {
       if (!args[0]?.startsWith("claim_")) return "start";
       const claim = args.length === 1 ? PRIVATE_CLAIM.exec(args[0]) : null;
@@ -254,8 +262,9 @@ function normalizeMessage(
   if ("document" in message) return normalizeDocument(message, scope);
   const command = messageCommand(message, policy);
   if (command && typeof command === "object") {
-    return scope.chatType === "private" && scope.threadId === null
-      ? { privateClaim: { ...scope, kind: "private-claim", code: command.code } } : null;
+    if (scope.chatType !== "private" || scope.threadId !== null) return null;
+    return "code" in command ? { privateClaim: { ...scope, kind: "private-claim", code: command.code } }
+      : { path: { ...scope, kind: "path", args: command.args } };
   }
   if (command === "temp-summary" || command === "temp-clear") {
     return scope.chatType === "private" && scope.threadId === null ? { temp: { ...scope, kind: command } } : null;

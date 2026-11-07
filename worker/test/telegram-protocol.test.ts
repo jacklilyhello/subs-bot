@@ -86,6 +86,23 @@ function callback(fields: Record<string, unknown> = {}, original: Record<string,
   };
 }
 
+test("admits explicit path commands only in the approved actor's own private conversation", async () => {
+  const command = `/path@${policy.botUsername}`;
+  const args = "\u0085https://example.invalid/?fixture=key \u3000标签";
+  const entities = [{ type: "bot_command", offset: 0, length: command.length }];
+  const accepted = await decodeMessage(command + args, { entities });
+  assert.equal(accepted.status, 200);
+  assert.deepEqual(accepted.path, { kind: "path", args, updateId, actorId: policy.adminId, chatId: policy.adminId,
+    chatType: "private", messageId: 15, messageDate, threadId: null });
+  assert.equal((await decodeMessage(command + args, { entities,
+    chat: { id: Number(policy.groupId), type: "supergroup" } })).status, 204);
+  assert.equal((await decodeMessage(command + args, { entities, message_thread_id: 1 })).status, 204);
+  assert.equal((await decodeMessage("/path phrase=fixture", { entities: [] })).status, 204);
+  assert.equal((await decodeMessage("/path@UnrelatedFixtureBot clear")).status, 204);
+  assert.equal((await decodeMessage("/pathx clear")).status, 204);
+  assert.equal((await decodeMessage("/path\ufeffclear", { entities: [{ type: "bot_command", offset: 0, length: 5 }] })).status, 204);
+});
+
 test("validates exact secret policy schema and canonical safe identities", () => {
   assert.deepEqual(parseTelegramPolicy(JSON.stringify(policy)), policy);
   for (const invalid of [
