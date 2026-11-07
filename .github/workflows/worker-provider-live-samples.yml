@@ -1,0 +1,61 @@
+name: Sample approved provider sources on GitHub
+run-name: Hosted provider source sampling for ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      sample_manifest_sha256:
+        description: Independently verified SHA-256 of the exact private sample manifest bytes
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: subs-bot-provider-live-samples
+  cancel-in-progress: false
+
+jobs:
+  sample:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && github.run_attempt == '1'
+    environment: subs-bot-provider-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+      - name: Install only the pinned transport wheels
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python -m pip --isolated install --index-url https://pypi.org/simple --only-binary=:all: \
+            --require-hashes -r worker/provider_fetch/requirements.txt
+          python -m pip check
+      - name: Verify the exact current main revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PYTHONPATH=worker/tools python -B - <<'PY'
+          import os
+          from prepare_isolation_artifact import ArtifactError, require_current_main
+
+          try:
+              require_current_main(os.environ['GITHUB_SHA'])
+          except ArtifactError as error:
+              raise SystemExit(str(error)) from None
+          PY
+      - name: Read the approved sample once per selected source
+        env:
+          SUBS_BOT_PROVIDER_LIVE_SAMPLE_JSON: ${{ secrets.SUBS_BOT_PROVIDER_LIVE_SAMPLE_JSON }}
+          SUBS_BOT_PROVIDER_LIVE_SAMPLE_SHA256: ${{ inputs.sample_manifest_sha256 }}
+        run: |
+          umask 077
+          sample_directory="$(mktemp -d "$RUNNER_TEMP/subs-bot-provider-live-samples.XXXXXXXX")"
+          trap 'rm -rf -- "$sample_directory"' EXIT
+          trap 'exit 130' INT TERM
+          python -B -E -s worker/provider_fetch/live_samples.py "$sample_directory"
