@@ -3,6 +3,12 @@ name: Verify isolated legacy empty exports
 on:
   workflow_dispatch:
     inputs:
+      profile:
+        description: Exercise empty exports or typed legacy subscription redirects
+        required: true
+        default: legacy-empty
+        type: choice
+        options: [legacy-empty, typed-shorts]
       action:
         description: Verify a new synthetic cohort or retire the exact cohort after interruption
         required: true
