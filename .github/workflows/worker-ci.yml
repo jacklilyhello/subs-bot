@@ -11,6 +11,8 @@ on:
       - '.github/workflows/worker-isolation-telegram-claims.yml'
       - '.github/workflows/worker-isolation-private-share-command-smoke.yml'
       - '.github/workflows/worker-isolation-native-restore.yml'
+      - '.github/workflows/worker-isolation-legacy-candidate.yml'
+      - '.github/workflows/worker-isolation-telegram-selected-smoke.yml'
   push:
     branches: [main]
     paths:
@@ -22,6 +24,8 @@ on:
       - '.github/workflows/worker-isolation-telegram-claims.yml'
       - '.github/workflows/worker-isolation-private-share-command-smoke.yml'
       - '.github/workflows/worker-isolation-native-restore.yml'
+      - '.github/workflows/worker-isolation-legacy-candidate.yml'
+      - '.github/workflows/worker-isolation-telegram-selected-smoke.yml'
   workflow_dispatch:
 
 permissions:
@@ -78,6 +82,7 @@ jobs:
         run: python3 -m unittest discover -s test -p 'test_*.py'
       - name: Package exact revision and synthetic fixture
         run: |
+          umask 077
           mkdir -p "$RUNNER_TEMP/subs-bot-worker"
           cp dist/index.js "$RUNNER_TEMP/subs-bot-worker/index.js"
           git ls-files -z -- migrations | while IFS= read -r -d '' migration; do
@@ -110,6 +115,16 @@ jobs:
         with:
           name: subs-bot-worker-${{ env.BUILD_REVISION }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/subs-bot-worker/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Build the fixed synthetic legacy candidate
+        if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: python3 -B tools/legacy_candidate_isolation.py build
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        with:
+          name: subs-bot-legacy-candidate-${{ env.BUILD_REVISION }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/subs-bot-legacy-candidate/
           if-no-files-found: error
           retention-days: 7
       - name: Check isolated Cloudflare deployment

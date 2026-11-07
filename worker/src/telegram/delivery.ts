@@ -12,13 +12,19 @@ import { beginTelegramPrivateClaim, prepareTelegramPrivateClaim } from "./privat
 import { resolveTelegramPrivateShareCreationReply } from "./private-share-creation.ts";
 import { PRIVATE_SHARE_DISABLED, type TelegramPrivateShareRuntime } from "./private-share-runtime.ts";
 import {
+  confirmTelegramSubscriptionReadSend, prepareTelegramSubscriptionReadTickets, renderTelegramSubscriptionRead,
+  type TelegramSubscriptionReadButton,
+} from "./subscription-read.ts";
+import {
   beginTelegramAggregateLinkReply, beginTelegramPrivateShareCreationReply,
   beginTelegramSelectedLinkReply, beginTelegramReply, claimTelegramReply, isTelegramMemberAllowed,
+  beginTelegramTempRawReply,
   prepareTelegramPrivateClaimBegin, reapExpiredTelegramReplies, settleTelegramReply,
   type TelegramReplyLease, type TelegramReplyOutcome,
 } from "./store.ts";
 import { prepareTelegramViewTickets, renderTelegramView, type TelegramViewButton } from "./views.ts";
 import { renderTelegramTemp } from "./temp-import.ts";
+import { confirmTelegramTempRawSend, prepareTelegramTempRawReply } from "./temp-raw.ts";
 
 const BOT_API = "https://api.telegram.org";
 const MAX_RESPONSE_BYTES = 64 * 1024;
@@ -114,7 +120,9 @@ export async function sendTelegramReply(
   keyboard?: InlineKeyboard,
   forceReply = false,
 ): Promise<TelegramReplyOutcome> {
-  if ((lease.path || lease.privateShareCreation) && (lease.chatType !== "private" || lease.threadId !== null)) return { kind: "failed" };
+  if ((lease.path || lease.privateShareCreation || lease.tempRaw) && (lease.chatType !== "private" || lease.threadId !== null)) {
+    return { kind: "failed" };
+  }
   return sendTelegram(policy, lease, "sendMessage", {
     chat_id: lease.chatId,
     ...(lease.threadId === null ? {} : { message_thread_id: lease.threadId }),
@@ -178,14 +186,19 @@ export async function answerTelegramCallback(policy: TelegramPolicy, callbackId:
 
 async function renderReply(
   db: D1Database,
+  bucket: R2Bucket,
   policy: TelegramPolicy,
   lease: TelegramReplyLease,
+  deadline: number,
   privateShareEnabled = false,
+  subscriptionReadEnabled = false,
 ): Promise<{
   text: string;
   access: ReplyAccess;
   buttons?: TelegramViewButton[];
   lifecycleButtons?: TelegramLifecycleButton[];
+  readButtons?: TelegramSubscriptionReadButton[];
+  readGuard?: { sql: string; bindings: readonly (string | number | null)[] };
   forceReply?: boolean;
 }> {
   if (lease.command.startsWith("auth-")) {
@@ -200,6 +213,7 @@ async function renderReply(
   }
   const allowed = lease.actorId === policy.adminId || await isTelegramMemberAllowed(db, policy);
   if (!allowed) return { text: "当前账号没有使用权限。", access: "denied" };
+  if (lease.subscriptionRead) return { ...await renderTelegramSubscriptionRead(db, bucket, policy, lease, deadline), access: "allowed" };
   if (lease.privateShareCreation) return { text: "分享链接已失效或授权已变更，请重新创建。", access: "allowed" };
   if (lease.aggregate) {
     const text = {
@@ -217,7 +231,10 @@ async function renderReply(
     const { text, buttons, forceReply } = renderTelegramLifecycle(lease.lifecycle);
     return { text, lifecycleButtons: buttons, forceReply, access: "allowed" };
   }
-  if (lease.view) return { ...await renderTelegramView(db, lease.actorId, lease.view), access: "allowed" };
+  if (lease.view) {
+    const privateDetails = subscriptionReadEnabled && lease.chatType === "private" && lease.threadId === null;
+    return { ...await renderTelegramView(db, lease.actorId, lease.view, privateDetails), access: "allowed" };
+  }
   if (lease.temp) return { text: renderTelegramTemp(lease.temp), access: "allowed" };
   if (lease.path && lease.chatType === "private" && lease.threadId === null) {
     return { text: await renderTelegramPath(db, lease.actorId, lease.path), access: "allowed" };
@@ -247,8 +264,48 @@ async function renderReply(
     return { text: names.length ? `你的订阅\n${names.join("\n")}` : "你的订阅列表为空。", access: "allowed" };
   }
   const help = "使用 /list 查看你的订阅，/expire 查看临期，/recycle 查看回收站，/temp 查看临时节点，私聊 /path 管理路径规则，/o 关键词导出所选订阅。"
+    + (subscriptionReadEnabled ? "\n/s 关键词搜索订阅，私聊发送列表编号可查看订阅详情。" : "")
     + (privateShareEnabled ? "\n私聊创建私密分享：/share [x份数] [id领取人ID] [s分钟] -- 正文。" : "");
   return { text: lease.command === "start" ? `欢迎使用 subs-bot。\n${help}` : help, access: "allowed" };
+}
+
+async function deliverTelegramTempRaw(
+  db: D1Database, policy: TelegramPolicy, lease: TelegramReplyLease, deadline: number, request: typeof fetch,
+): Promise<void> {
+  if (lease.chatType !== "private" || lease.threadId !== null || !inTelegramScope(policy, lease)) return;
+  const allowed = lease.actorId === policy.adminId || await isTelegramMemberAllowed(db, policy);
+  const prepared = allowed ? await prepareTelegramTempRawReply(db, policy, lease, deadline) : { kind: "stale" as const };
+  if (Date.now() >= deadline) return;
+  if (prepared.kind === "text" || prepared.kind === "document") {
+    let send: (timeout: number) => Promise<TelegramReplyOutcome>;
+    if (prepared.kind === "document") {
+      const form = new FormData();
+      form.set("chat_id", lease.chatId);
+      form.set("reply_parameters", JSON.stringify(replyParameters(lease)));
+      form.set("caption", prepared.caption);
+      form.set("document", prepared.file, "temporary-nodes.txt");
+      send = (timeout) => sendTelegram(policy, lease, "sendDocument", form, timeout, request);
+    } else {
+      send = (timeout) => sendTelegramReply(policy, lease, prepared.text, timeout, request);
+    }
+    if (!await beginTelegramTempRawReply(db, policy, lease, prepared.guard)) return;
+    if (!await confirmTelegramTempRawSend(db, policy, lease, prepared.guard) || Date.now() >= deadline) {
+      await settleTelegramReply(db, policy, lease, { kind: "failed" });
+      return;
+    }
+    const outcome = await send(Math.max(1, deadline - Date.now()));
+    await settleTelegramReply(db, policy, lease, outcome);
+    return;
+  }
+  const text = !allowed ? "当前账号没有使用权限。"
+    : prepared.kind === "stale" ? "临时列表或授权已变更，请重新发送 /temp。" : "暂时无法读取临时节点，请稍后重试。";
+  if (!await beginTelegramReply(db, policy, lease, allowed ? "allowed" : "denied")) return;
+  if (Date.now() >= deadline) {
+    await settleTelegramReply(db, policy, lease, { kind: "failed" });
+    return;
+  }
+  const outcome = await sendTelegramReply(policy, lease, text, Math.max(1, deadline - Date.now()), request);
+  await settleTelegramReply(db, policy, lease, outcome);
 }
 
 export async function drainTelegramReplies(
@@ -260,14 +317,19 @@ export async function drainTelegramReplies(
   request: typeof fetch = fetch,
   aggregateKey: CryptoKey | null = null,
   privateShareRuntime: TelegramPrivateShareRuntime = PRIVATE_SHARE_DISABLED,
+  subscriptionReadEnabled = false,
 ): Promise<void> {
   const deadline = Date.now() + budgetMs;
   const privateShareEnabled = privateShareRuntime.schemaReady && privateShareRuntime.context !== null;
-  await reapExpiredTelegramReplies(db, policy.botId, aggregateKey !== null, privateShareEnabled);
+  await reapExpiredTelegramReplies(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled);
   for (let processed = 0; processed < limit && Date.now() < deadline; processed += 1) {
-    const lease = await claimTelegramReply(db, policy.botId, aggregateKey !== null, privateShareEnabled);
+    const lease = await claimTelegramReply(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled);
     if (!lease) return;
     if (!inTelegramScope(policy, lease)) continue;
+    if (lease.tempRaw) {
+      await deliverTelegramTempRaw(db, policy, lease, deadline, request);
+      continue;
+    }
     if (lease.privateShareCreation && privateShareRuntime.context) {
       const reply = await resolveTelegramPrivateShareCreationReply(db, policy, lease, privateShareRuntime.context);
       if (reply && Date.now() < deadline && await beginTelegramPrivateShareCreationReply(db, policy, lease, reply)) {
@@ -326,14 +388,22 @@ export async function drainTelegramReplies(
       await settleTelegramReply(db, policy, lease, outcome);
       continue;
     }
-    const reply = await renderReply(db, policy, lease, privateShareEnabled);
-    const [view, lifecycle] = await Promise.all([
+    const reply = await renderReply(db, bucket, policy, lease, deadline, privateShareEnabled, subscriptionReadEnabled);
+    const [view, lifecycle, read] = await Promise.all([
       reply.buttons?.length ? prepareTelegramViewTickets(reply.buttons) : undefined,
       reply.lifecycleButtons?.length ? prepareTelegramLifecycleTickets(reply.lifecycleButtons) : undefined,
+      reply.readButtons?.length ? prepareTelegramSubscriptionReadTickets(reply.readButtons) : undefined,
     ]);
     if (Date.now() >= deadline ||
-      !await beginTelegramReply(db, policy, lease, reply.access, view?.tickets, lifecycle?.tickets)) continue;
-    const keyboard = [...(view?.keyboard ?? []), ...(lifecycle?.keyboard ?? [])];
+      !await beginTelegramReply(db, policy, lease, reply.access, view?.tickets, lifecycle?.tickets, read?.tickets, reply.readGuard)) continue;
+    if (reply.readGuard) {
+      const confirmed = await confirmTelegramSubscriptionReadSend(db, policy, lease, reply.readGuard).catch(() => false);
+      if (!confirmed || Date.now() >= deadline) {
+        await settleTelegramReply(db, policy, lease, { kind: "failed" });
+        continue;
+      }
+    }
+    const keyboard = [...(view?.keyboard ?? []), ...(lifecycle?.keyboard ?? []), ...(read?.keyboard ?? [])];
     const outcome = await sendTelegramReply(policy, lease, reply.text, Math.max(1, deadline - Date.now()), request,
       keyboard, reply.forceReply);
     await settleTelegramReply(db, policy, lease, outcome);
