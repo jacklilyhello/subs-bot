@@ -14,6 +14,7 @@ import { createSubscription, publishNodeSnapshot } from "../src/storage.ts";
 import type { TelegramPolicy } from "../src/telegram/protocol.ts";
 import { acceptTelegramCommand } from "../src/telegram/store.ts";
 import { verifyIsolation } from "../tools/verify-isolation.mjs";
+import "./backup-rehearsal.integration.ts";
 
 const digest = (body: Buffer) => createHash("sha256").update(body).digest("hex");
 
@@ -88,6 +89,27 @@ test("the hosted deployment artifact exports small and large snapshots in worker
     const restored = await request(path);
     assert.equal(restored.status, 200);
     assert.equal(digest(Buffer.from(await restored.arrayBuffer())), originalDigest);
+
+    const mappedOwner = "900000041";
+    const mapped = await createSubscription(db, {
+      ownerId: mappedOwner, name: "Synthetic mapped export", sourceUrl: "uploaded://mapped-fixture",
+    });
+    const mappedShare = "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.10:8388#Stored";
+    assert.equal(await publishNodeSnapshot(db, bucket, {
+      id: mapped.id, ownerId: mappedOwner, expectedGeneration: 0, expectedLifecycleRevision: 0,
+    }, [{ type: "ss", name: "Straße", share: mappedShare }]), true);
+    await db.prepare("INSERT INTO path_rules (owner_id, keyword, remark) VALUES (?, ?, ?)")
+      .bind(mappedOwner, "STRASSE", "fixture").run();
+    const mappedPath = `/sub/${mapped.token}`;
+    const mappedHead = await request(mappedPath, { method: "HEAD" });
+    assert.equal(mappedHead.status, 200);
+    assert.equal(mappedHead.body, null);
+    const mappedClash = await request(mappedPath);
+    assert.equal(mappedClash.status, 200);
+    assert.match(await mappedClash.text(), /"name":"Straße → fixture"/u);
+    const mappedBase64 = await request(mappedPath + "/base64");
+    assert.equal(mappedBase64.status, 200);
+    assert.equal(Buffer.from(await mappedBase64.text(), "base64").toString("utf8"), mappedShare);
 
     const vmessEnvelope = JSON.stringify({ add: "proxy.example.invalid", port: 443, id: "synthetic-client" });
     const vmess = "vmess://" + Buffer.from(vmessEnvelope, "utf16le").toString("base64");

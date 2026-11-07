@@ -60,12 +60,11 @@ function fixture(groups: Array<Array<Record<string, unknown>>>) {
   const reads: string[] = [];
   const DB = {
     prepare() {
-      return { bind: (token: string) => ({
-        first: async () => {
-          lookups.push(token);
-          return token === TOKEN ? snapshot : null;
-        },
-      }) };
+      return { bind: (token: string) => ({ token }) };
+    },
+    async batch([{ token }]: { token: string }[]) {
+      lookups.push(token);
+      return [{ success: true, results: token === TOKEN ? [snapshot] : [] }, { success: true, results: [] }];
     },
   } as unknown as Env["DB"];
   const NODES = {
