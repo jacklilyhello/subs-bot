@@ -7,10 +7,13 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import { Miniflare } from "miniflare";
+import { parse as parseYaml } from "yaml";
 
 import { createPrivateShare } from "../src/private-shares.ts";
+import { runOneProviderJob } from "../src/provider-job-consumer.ts";
+import { enqueueOwnedProviderRefresh } from "../src/provider-jobs.ts";
 import { restoreOwnedSubscription, trashOwnedSubscription } from "../src/subscriptions.ts";
-import { createSubscription, publishNodeSnapshot } from "../src/storage.ts";
+import { createSubscription, getOwnedSubscription, publishNodeSnapshot } from "../src/storage.ts";
 import type { TelegramPolicy } from "../src/telegram/protocol.ts";
 import { acceptTelegramCommand } from "../src/telegram/store.ts";
 import { verifyIsolation } from "../tools/verify-isolation.mjs";
@@ -24,6 +27,7 @@ import "./telegram-temp-raw.integration.ts";
 import "./telegram-short-links.integration.ts";
 import "./telegram-inline-sort.integration.ts";
 import "./telegram-bulk-trash.integration.ts";
+import "./telegram-personal-inline.integration.ts";
 
 test("emitted Worker /o freezes owned subscription membership and excludes temporary nodes", { timeout: 60_000 }, async () => {
   const directory = process.env.WORKER_TEST_BUNDLE_DIR;
@@ -105,6 +109,129 @@ async function applyMigrations(db: D1Database, directory: string, migrations: Ar
     await db.batch(statements.map((statement) => db.prepare(statement)));
   }
 }
+
+test("emitted Worker serves only marked active legacy empty subscriptions", { timeout: 60_000 }, async (t) => {
+  const directory = process.env.WORKER_TEST_BUNDLE_DIR;
+  assert.ok(directory);
+  const fixture = JSON.parse(await readFile(join(directory, "isolation.json"), "utf8"));
+  const script = await readFile(join(directory, "index.js"));
+  assert.equal(digest(script), fixture.bundleSha256);
+  const migration = fixture.migrations[25];
+  assert.equal(migration?.name, "0026_legacy_empty_subscription_exports.sql");
+  const runtime = new Miniflare({ modules: true, script: script.toString("utf8"),
+    compatibilityDate: fixture.compatibilityDate, d1Databases: ["DB"], r2Buckets: ["NODES"],
+    bindings: { BUILD_REVISION: fixture.revision } });
+  t.after(() => runtime.dispose());
+  const db = await runtime.getD1Database("DB");
+  const bucket = await runtime.getR2Bucket("NODES");
+  await applyMigrations(db, directory, fixture.migrations.slice(0, 25));
+
+  const ownerId = "94071";
+  const sourceUrl = "https://provider.example.invalid/empty-legacy-fixture";
+  const legacy = await createSubscription(db, { ownerId, name: "Legacy empty", sourceUrl });
+  const shell = await createSubscription(db, { ownerId, name: "Provider shell", sourceUrl });
+  const read = (suffix: string, method = "GET", token = legacy.token) =>
+    runtime.dispatchFetch(`https://fixture.invalid/sub/${token}${suffix}`, { method });
+  const checkPrivate = (response: Response) => {
+    assert.equal(response.headers.get("Cache-Control"), "private, no-store");
+    assert.equal(response.headers.get("Referrer-Policy"), "no-referrer");
+    assert.equal(response.headers.get("X-Content-Type-Options"), "nosniff");
+  };
+  const unavailable = async (token = legacy.token) => {
+    for (const method of ["GET", "HEAD"]) {
+      const response = await read("/base64", method, token);
+      assert.equal(response.status, 404);
+      checkPrivate(response);
+      assert.equal(await response.text(), method === "HEAD" ? "" : "Not found.");
+    }
+  };
+  await unavailable();
+  await applyMigrations(db, directory, [migration]);
+  const tokenSha = digest(Buffer.from(legacy.token));
+  await db.prepare("INSERT INTO legacy_empty_subscription_exports VALUES (?, ?, ?)")
+    .bind(legacy.id, ownerId, tokenSha).run();
+  await unavailable();
+  // The emitted artifact test applies SQL directly. The protected release supplies the actual ledger.
+  await db.batch([
+    db.prepare("CREATE TABLE subs_bot_schema_migrations (position INTEGER PRIMARY KEY, name TEXT, sha256 TEXT, mode TEXT) STRICT"),
+    db.prepare("INSERT INTO subs_bot_schema_migrations VALUES (26, ?, ?, 'applied')").bind(migration.name, "0".repeat(64)),
+  ]);
+  await unavailable();
+  await db.prepare("UPDATE subs_bot_schema_migrations SET sha256 = ? WHERE position = 26").bind(migration.sha256).run();
+  const setMarkerId = (id: number) => db.prepare("UPDATE legacy_empty_subscription_exports SET subscription_id = ? WHERE token_sha256 = ?")
+    .bind(id, tokenSha).run();
+  await setMarkerId(legacy.id + 1000);
+  await unavailable();
+  await setMarkerId(legacy.id);
+  const setMarker = (markerOwner: string, markerDigest: string) => db.prepare(
+    "UPDATE legacy_empty_subscription_exports SET owner_id = ?, token_sha256 = ? WHERE subscription_id = ?",
+  ).bind(markerOwner, markerDigest, legacy.id).run();
+  await setMarker("94072", tokenSha);
+  await unavailable();
+  await setMarker(ownerId, digest(Buffer.from(shell.token)));
+  await unavailable();
+  await unavailable(shell.token);
+  await setMarker(ownerId, tokenSha);
+  await unavailable("wrong-legacy-empty-token");
+  await unavailable(shell.token);
+
+  const clash = { proxies: [], "proxy-groups": [
+    { name: "🚀 节点选择", type: "select", proxies: ["DIRECT"] },
+    { name: "♻️ 自动选择", type: "url-test", proxies: ["DIRECT"], url: "http://www.gstatic.com/generate_204", interval: 300 },
+  ], rules: ["MATCH,🚀 节点选择"] };
+  const singbox = { outbounds: [
+    { type: "selector", tag: "proxy", outbounds: ["direct"] }, { type: "direct", tag: "direct" },
+  ] };
+  for (const suffix of ["", "/clash", "/base64", "/v2ray", "/mixed", "/singbox", "/sing-box",
+    "/surge", "/qx", "/quantumult", "/quantumultx"]) {
+    const response = await read(suffix);
+    const head = await read(suffix, "HEAD");
+    const type = !suffix || suffix === "/clash" ? "text/yaml; charset=utf-8"
+      : suffix.startsWith("/sing") ? "application/json" : "text/plain; charset=utf-8";
+    for (const result of [response, head]) {
+      assert.equal(result.status, 200);
+      assert.equal(result.headers.get("Content-Type"), type);
+      checkPrivate(result);
+    }
+    assert.equal(await head.text(), "");
+    const body = await response.text();
+    if (type.startsWith("text/yaml")) assert.deepEqual(parseYaml(body), clash);
+    else if (type === "application/json") assert.deepEqual(JSON.parse(body), singbox);
+    else assert.equal(body, suffix === "/surge" ? "[Proxy]\n\n[Proxy Group]\nProxy = select, DIRECT\n\n[Rule]\nFINAL,Proxy\n" : "");
+  }
+  assert.equal((await read("/unsupported")).status, 406);
+  assert.equal((await bucket.list()).objects.length, 0);
+  const target = { id: legacy.id, ownerId, expectedLifecycleRevision: 0 };
+  assert.equal(await trashOwnedSubscription(db, target), true);
+  await unavailable();
+  assert.equal(await restoreOwnedSubscription(db, { ...target, expectedLifecycleRevision: 1 }), true);
+
+  const stored = "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.10:8388#legacy-refresh";
+  const refresh = async (key: string, text: string) => {
+    const admission = await enqueueOwnedProviderRefresh(db, { id: legacy.id, ownerId, requestKey: key.repeat(64) });
+    assert.equal(admission.kind, "queued");
+    const body = new TextEncoder().encode(text).buffer;
+    return runOneProviderJob(db, bucket, {
+      async fetchSubscription() { return { ok: true, body, bodySha256: digest(Buffer.from(body)) }; },
+    }, { providerRevision: "c".repeat(40), imageSha256: "d".repeat(64) });
+  };
+  assert.equal(await refresh("a", " \n"), "done");
+  const stillEmpty = await read("/base64");
+  assert.equal(stillEmpty.status, 200);
+  assert.equal(await stillEmpty.text(), "");
+  assert.equal((await getOwnedSubscription(db, ownerId, legacy.id))?.generation, 0);
+  assert.equal(await refresh("b", stored), "saved");
+  const published = await read("/base64");
+  assert.equal(published.status, 200);
+  assert.equal(await published.text(), Buffer.from(stored).toString("base64"));
+  const manifest = (await bucket.list({ prefix: `subscriptions/${legacy.id}/` })).objects.find(({ key }) => key.endsWith("/manifest.json"));
+  assert.ok(manifest);
+  await bucket.delete(manifest.key);
+  const corrupted = await read("/base64");
+  assert.equal(corrupted.status, 503);
+  assert.equal(await corrupted.text(), "Subscription temporarily unavailable.");
+  checkPrivate(corrupted);
+});
 
 test("the hosted deployment artifact exports small and large snapshots in workerd", { timeout: 60_000 }, async () => {
   const directory = process.env.WORKER_TEST_BUNDLE_DIR;
