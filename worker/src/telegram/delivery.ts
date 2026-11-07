@@ -34,6 +34,7 @@ import { prepareTelegramViewTickets, renderTelegramView, type TelegramViewButton
 import { renderTelegramTemp } from "./temp-import.ts";
 import { confirmTelegramTempRawSend, prepareTelegramTempRawReply } from "./temp-raw.ts";
 import { renderTelegramProviderReply } from "./provider-replies.ts";
+import { prepareTelegramProviderRefreshButton, type TelegramProviderRefreshTarget } from "./provider-refresh.ts";
 
 const BOT_API = "https://api.telegram.org";
 const MAX_RESPONSE_BYTES = 64 * 1024;
@@ -223,6 +224,7 @@ async function renderReply(
   privateShareEnabled = false,
   subscriptionReadEnabled = false,
   subscriptionNodesEnabled = false,
+  providerRefreshEnabled = false,
 ): Promise<{
   text: string;
   access: ReplyAccess;
@@ -230,6 +232,7 @@ async function renderReply(
   lifecycleButtons?: TelegramLifecycleButton[];
   readButtons?: TelegramSubscriptionReadButton[];
   nodeButtons?: TelegramNodePageButton[];
+  refreshTarget?: TelegramProviderRefreshTarget;
   readGuard?: { sql: string; bindings: readonly (string | number | null)[] };
   forceReply?: boolean;
 }> {
@@ -246,7 +249,7 @@ async function renderReply(
   const allowed = lease.actorId === policy.adminId || await isTelegramMemberAllowed(db, policy);
   if (!allowed) return { text: "当前账号没有使用权限。", access: "denied" };
   if (lease.subscriptionRead) return { ...await renderTelegramSubscriptionRead(db, bucket, policy, lease, deadline,
-    subscriptionNodesEnabled), access: "allowed" };
+    subscriptionNodesEnabled, providerRefreshEnabled), access: "allowed" };
   if (lease.subscriptionNodes) {
     const { backId, ...page } = await renderTelegramSubscriptionNodePage(db, bucket, policy, lease, deadline);
     return { ...page, access: "allowed", ...(backId === undefined ? {} : {
@@ -390,6 +393,7 @@ export async function drainTelegramReplies(
   bulkTrashEnabled = false,
   inlineConsentEnabled = false,
   gitHubSearchReadiness: boolean | "unavailable" = false,
+  providerRefreshEnabled = false,
 ): Promise<void> {
   const deadline = Date.now() + budgetMs;
   const privateShareEnabled = privateShareRuntime.schemaReady && privateShareRuntime.context !== null;
@@ -404,7 +408,8 @@ export async function drainTelegramReplies(
     if (!lease) return;
     if (!inTelegramScope(policy, lease)) continue;
     if (lease.providerOutcome !== undefined) {
-      const text = renderTelegramProviderReply(lease.providerOutcome);
+      if (lease.providerRequestKind === undefined) continue;
+      const text = renderTelegramProviderReply(lease.providerOutcome, lease.providerRequestKind);
       if (Date.now() >= deadline || !await beginTelegramReply(db, policy, lease, "allowed")) continue;
       const outcome = await sendTelegramReply(policy, lease, text, Math.max(1, deadline - Date.now()), request);
       await settleTelegramReply(db, policy, lease, outcome);
@@ -518,16 +523,18 @@ export async function drainTelegramReplies(
       await settleTelegramReply(db, policy, lease, outcome);
       continue;
     }
-    const reply = await renderReply(db, bucket, policy, lease, deadline, privateShareEnabled, subscriptionReadEnabled, subscriptionNodesEnabled);
-    const [view, lifecycle, read, nodes] = await Promise.all([
+    const reply = await renderReply(db, bucket, policy, lease, deadline, privateShareEnabled, subscriptionReadEnabled,
+      subscriptionNodesEnabled, providerRefreshEnabled);
+    const [view, lifecycle, read, nodes, refresh] = await Promise.all([
       reply.buttons?.length ? prepareTelegramViewTickets(reply.buttons) : undefined,
       reply.lifecycleButtons?.length ? prepareTelegramLifecycleTickets(reply.lifecycleButtons) : undefined,
       reply.readButtons?.length ? prepareTelegramSubscriptionReadTickets(reply.readButtons) : undefined,
       reply.nodeButtons?.length ? prepareTelegramNodePageTickets(reply.nodeButtons) : undefined,
+      reply.refreshTarget ? prepareTelegramProviderRefreshButton(reply.refreshTarget) : undefined,
     ]);
     if (Date.now() >= deadline ||
       !await beginTelegramReply(db, policy, lease, reply.access, view?.tickets, lifecycle?.tickets, read?.tickets, reply.readGuard,
-        nodes?.tickets)) continue;
+        nodes?.tickets, refresh?.ticket)) continue;
     if (reply.readGuard) {
       const confirmed = await confirmTelegramSubscriptionReadSend(db, policy, lease, reply.readGuard).catch(() => false);
       if (!confirmed || Date.now() >= deadline) {
@@ -535,7 +542,8 @@ export async function drainTelegramReplies(
         continue;
       }
     }
-    const keyboard = [...(view?.keyboard ?? []), ...(lifecycle?.keyboard ?? []), ...(nodes?.keyboard ?? []), ...(read?.keyboard ?? [])];
+    const keyboard = [...(view?.keyboard ?? []), ...(lifecycle?.keyboard ?? []), ...(nodes?.keyboard ?? []), ...(read?.keyboard ?? []),
+      ...(refresh ? [[refresh.button]] : [])];
     const outcome = await sendTelegramReply(policy, lease, reply.text, Math.max(1, deadline - Date.now()), request,
       keyboard, reply.forceReply);
     await settleTelegramReply(db, policy, lease, outcome);
