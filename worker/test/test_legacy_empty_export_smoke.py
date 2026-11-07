@@ -115,7 +115,9 @@ class EmptyExportSmokeTests(unittest.TestCase):
     def test_recovery_requires_explicit_exact_confirmation(self):
         cohort = "1" * 16
         self.assertEqual(smoke.parse_inputs({"inputs": {"action": "retire", "cohort": cohort, "confirm_retire": "retire " + cohort}}),
-                         ("retire", cohort))
+                         ("retire", cohort, "legacy-empty"))
+        self.assertEqual(smoke.parse_inputs({"inputs": {"action": "verify", "cohort": cohort, "profile": "typed-shorts"}}),
+                         ("verify", cohort, "typed-shorts"))
         with self.assertRaises(FixtureError):
             smoke.parse_inputs({"inputs": {"action": "retire", "cohort": cohort}})
 
