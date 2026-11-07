@@ -275,7 +275,7 @@ export function parseTextProxy(node: NodeRecord, format: TextExportFormat): Text
     const { name, type, protocol, source: input, fromUri } = proxyInput(node, format);
     if (!COMMON_PROTOCOLS.has(protocol) && !(format === "surge" ? SURGE_ONLY.has(protocol) : protocol === "vless")) unsupported();
     const source = !fromUri && type === protocol && (Object.hasOwn(input, "server_port") || Object.hasOwn(input, "server_ports"))
-      ? portableNativeSource(input, protocol) : input;
+      ? portableNativeSource(input, protocol, format) : input;
     const host = server(take(source, "server"));
     const options: string[] = [];
     const portValue = take(source, "port");
