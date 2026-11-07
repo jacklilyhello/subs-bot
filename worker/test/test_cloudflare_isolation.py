@@ -379,7 +379,7 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(cloudflare.CloudflareError, "exact 0025 migration artifact"):
             self.release(INLINE_CONFIG, inline_search=True)
         self.manifest["migrations"][24] = INLINE_MIGRATION
-        with self.assertRaisesRegex(cloudflare.CloudflareError, "same verified Telegram configuration"):
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "separate scoped release"):
             self.release(INLINE_CONFIG + " ", inline_search=True)
         with self.assertRaisesRegex(cloudflare.CloudflareError, "same keys and provider binding"):
             self.release(INLINE_CONFIG, AGGREGATE_KEY, inline_search=True)
@@ -652,7 +652,7 @@ class ReleaseTests(unittest.TestCase):
 
     def test_omitting_config_cannot_remove_existing_telegram_bindings(self):
         self.set_old_telegram_config()
-        with self.assertRaisesRegex(cloudflare.CloudflareError, "required to preserve"):
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "separate scoped release"):
             self.release()
         self.assertEqual(self.api.writes(), [])
 
