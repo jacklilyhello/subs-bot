@@ -1,0 +1,83 @@
+[
+  {
+    "label": "legacy Shadowsocks with Unicode",
+    "legacy": ["surge", "qx"],
+    "node": {"name":"香港 🌐","type":"ss","server":"203.0.113.10","port":8388,"cipher":"aes-256-gcm","password":"fixture:密@+字"},
+    "surge": "香港 🌐 = ss, 203.0.113.10, 8388, encrypt-method=aes-256-gcm, password=fixture:密@+字",
+    "qx": "shadowsocks=203.0.113.10:8388, method=aes-256-gcm, password=fixture:密@+字, tag=香港 🌐"
+  },
+  {
+    "label": "legacy Trojan with SNI",
+    "legacy": ["surge"],
+    "node": {"name":"Trojan","type":"trojan","server":"tr.example.invalid","port":443,"password":"fixture-only","sni":"tls.example.invalid"},
+    "surge": "Trojan = trojan, tr.example.invalid, 443, password=fixture-only, sni=tls.example.invalid",
+    "qx": "trojan=tr.example.invalid:443, password=fixture-only, over-tls=true, tls-host=tls.example.invalid, tls-verification=true, tag=Trojan"
+  },
+  {
+    "label": "VMess AEAD WebSocket with ALPN and literal TLS settings",
+    "node": {"name":"VMess","type":"temp"},
+    "vmess": {"v":"2","add":"vm.example.invalid","port":"443","id":"11111111-1111-4111-8111-111111111111","aid":"0","scy":"aes-128-gcm","net":"ws","type":"none","host":"front.example.invalid","path":"/ws","tls":"tls","sni":"front.example.invalid","alpn":"h2,http/1.1","insecure":"0"},
+    "surge": "VMess = vmess, vm.example.invalid, 443, username=11111111-1111-4111-8111-111111111111, encrypt-method=aes-128-gcm, vmess-aead=true, ws=true, ws-path=/ws, ws-headers=Host:front.example.invalid, tls=true, sni=front.example.invalid, skip-cert-verify=false, alpn=\"h2,http/1.1\"",
+    "qx": "vmess=vm.example.invalid:443, password=11111111-1111-4111-8111-111111111111, method=aes-128-gcm, aead=true, obfs=wss, obfs-uri=/ws, obfs-host=front.example.invalid, tls-verification=true, tls-alpn=02683208687474702f312e31, tag=VMess"
+  },
+  {
+    "label": "Quantumult X VLESS TLS WebSocket",
+    "node": {"name":"VLESS","type":"vless","share":"vless://11111111-1111-4111-8111-111111111111@vless.example.invalid:443?encryption=none&security=tls&sni=front.example.invalid&type=ws&host=front.example.invalid&path=%2Fws"},
+    "surge": null,
+    "qx": "vless=vless.example.invalid:443, method=none, password=11111111-1111-4111-8111-111111111111, obfs=wss, obfs-uri=/ws, obfs-host=front.example.invalid, tls-verification=true, tag=VLESS"
+  },
+  {
+    "label": "Surge Hysteria2 port hopping",
+    "node": {"name":"Hysteria","type":"hysteria2","share":"hy2://user:p%2B%40@[2001:db8::5]:443,5000-5002/?sni=tls.example.invalid&insecure=0&obfs=salamander&obfs-password=fixture%2Bsecret"},
+    "surge": "Hysteria = hysteria2, 2001:db8::5, 443, port-hopping=443;5000-5002, password=user:p+@, salamander-password=fixture+secret, sni=tls.example.invalid, skip-cert-verify=false",
+    "qx": null
+  },
+  {
+    "label": "Surge TUIC v5 UUID and password",
+    "node": {"name":"TUIC","type":"temp","share":"tuic://11111111-1111-4111-8111-111111111111:fixture%3Akey@tuic.example.invalid:443?sni=tls.example.invalid&alpn=h3"},
+    "surge": "TUIC = tuic-v5, tuic.example.invalid, 443, uuid=11111111-1111-4111-8111-111111111111, password=fixture:key, sni=tls.example.invalid, alpn=h3",
+    "qx": null
+  },
+  {
+    "label": "AnyTLS default port",
+    "node": {"name":"AnyTLS","type":"anytls","share":"anytls://fixture%2Bsecret@tls.example.invalid?sni=front.example.invalid"},
+    "surge": "AnyTLS = anytls, tls.example.invalid, 443, password=fixture+secret, sni=front.example.invalid",
+    "qx": "anytls=tls.example.invalid:443, password=fixture+secret, over-tls=true, tls-host=front.example.invalid, tls-verification=true, tag=AnyTLS"
+  },
+  {
+    "label": "Native SOCKS v5 with IPv6 and UDP",
+    "node": {"name":"SOCKS","type":"socks","server":"2001:db8::5","server_port":1080,"version":"5","username":"fixture","password":"fixture-only","network":["tcp","udp"]},
+    "surge": "SOCKS = socks5, 2001:db8::5, 1080, username=fixture, password=fixture-only, udp-relay=true",
+    "qx": "socks5=[2001:db8::5]:1080, username=fixture, password=fixture-only, udp-relay=true, tag=SOCKS"
+  },
+  {
+    "label": "TLS HTTP with explicit verification",
+    "node": {"name":"HTTPS","type":"http","server":"http.example.invalid","port":443,"username":"fixture","password":"fixture-only","tls":true,"sni":"front.example.invalid","skip-cert-verify":false},
+    "surge": "HTTPS = https, http.example.invalid, 443, username=fixture, password=fixture-only, always-use-connect=true, sni=front.example.invalid, skip-cert-verify=false",
+    "qx": "http=http.example.invalid:443, username=fixture, password=fixture-only, over-tls=true, tls-host=front.example.invalid, tls-verification=true, tag=HTTPS"
+  },
+  {
+    "label": "SIP002 explicit simple-obfs options",
+    "node": {"name":"SS obfs","type":"temp","share":"ss://aes-256-gcm:fixture%2B%40@ss.example.invalid:8388/?plugin=obfs-local%3Bobfs%3Dhttp%3Bobfs-host%3Dfront.example.invalid"},
+    "surge": "SS obfs = ss, ss.example.invalid, 8388, encrypt-method=aes-256-gcm, password=fixture+@, obfs=http, obfs-host=front.example.invalid",
+    "qx": "shadowsocks=ss.example.invalid:8388, method=aes-256-gcm, password=fixture+@, obfs=http, obfs-host=front.example.invalid, tag=SS obfs"
+  },
+  {
+    "label": "Quantumult X WebSocket SS with multiplex disabled",
+    "node": {"name":"SS WebSocket","type":"temp","share":"ss://aes-256-gcm:fixture%2B%40@ss.example.invalid:8388/?plugin=v2ray-plugin%3Bmode%3Dwebsocket%3Bhost%3Dfront.example.invalid%3Bpath%3D%2Fws%3Btls%3Bmux%3D0"},
+    "surge": null,
+    "qx": "shadowsocks=ss.example.invalid:8388, method=aes-256-gcm, password=fixture+@, obfs=wss, obfs-host=front.example.invalid, obfs-uri=/ws, tls-verification=true, tag=SS WebSocket"
+  },
+  {
+    "label": "Shadowsocks AEAD-2022 padded key",
+    "node": {"name":"SS 2022","type":"ss","server":"ss.example.invalid","port":8388,"cipher":"2022-blake3-aes-128-gcm","password":"AAAAAAAAAAAAAAAAAAAAAA==","udp":true},
+    "surge": "SS 2022 = ss, ss.example.invalid, 8388, encrypt-method=2022-blake3-aes-128-gcm, password=AAAAAAAAAAAAAAAAAAAAAA==, udp-relay=true",
+    "qx": "shadowsocks=ss.example.invalid:8388, method=2022-blake3-aes-128-gcm, password=AAAAAAAAAAAAAAAAAAAAAA==, udp-relay=true, tag=SS 2022"
+  },
+  {
+    "label": "Surge quoted comma in a credential",
+    "node": {"name":"Surge comma","type":"ss","server":"ss.example.invalid","port":8388,"cipher":"aes-256-gcm","password":"fixture,comma"},
+    "surge": "Surge comma = ss, ss.example.invalid, 8388, encrypt-method=aes-256-gcm, password=\"fixture,comma\"",
+    "qx": null
+  }
+]
