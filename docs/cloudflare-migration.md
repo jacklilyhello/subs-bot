@@ -255,6 +255,8 @@ PY
 
 在受保护的 `main` 运行 `worker-isolation-legacy-candidate.yml`。所有步骤使用同一组全长 32 位小写十六进制 `cohort`、同一次成功的 Worker CI `source_run_id` 和同一已核对的隔离 Worker。开始前确认本轮可在产物保留期内完成，并保持 `main` 和隔离部署稳定。此流程从 CI 的固定合成候选包恢复，目标 D1 和 R2 的名称包含完整 `cohort`。只在源私有 R2 写入本组操作记录。
 
+默认的 `synthetic-legacy` 沿用版本 1 合成包。路径规则演练显式选择 `synthetic-legacy-path`，全程保持同一选项。该选项使用单独的版本 2 产物、目标资源名称及操作记录前缀。固定样例核对映射归属、精确规则文字及编号顺序，并保留已删除规则的编号上界。最终读回输出规则数量、编号上界和数据摘要。候选保持未绑定状态。
+
 1. 依次运行 `verify`、`prepare`、`create-restore-db`、`create-restore-bucket`，每步核对结果后再继续。创建响应不明时先运行只读 `verify`，根据创建意图、时间和实际资源身份独立确认归属，再用 `pin-resource` 提交 `resource` 和 `identity_sha256`。无法确认归属时保留该资源，停止本组后续写入。
 2. 运行 `restore-objects` 核对专用私有 R2 的对象闭包，再运行 `start-import` 向已核对且仍为空的专用 D1 导入。若已有确认的轮询书签，可用同一 `start-import` 继续轮询。响应不明时保留目标和私有操作记录，通过 `verify-restore` 核对完整结果。导入请求未确认、上传链接或产物已失效，或固定版本已变更时，禁止重发首次导入、重置或删除原目标。保留现场核查，后续演练使用新的 `cohort` 和专用资源。 [D1 原生导入](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/import/)
 3. 用 `verify-restore` 验证完整 `PRAGMA quick_check`、外键、结构、迁移记录、编号序列、逐表摘要和 R2 对象。检查失败即保留目标和证据。此结果覆盖合成候选恢复，旧链接、真实数据和 HTTP 导出分别验收。 [D1 完整性检查](https://developers.cloudflare.com/d1/sql-api/sql-statements/#pragma-quick_check)
