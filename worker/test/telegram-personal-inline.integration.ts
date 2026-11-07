@@ -8,6 +8,65 @@ import { createSubscription } from "../src/storage.ts";
 import type { InlineSearchArticle } from "../src/telegram/inline-search.ts";
 import type { TelegramPolicy } from "../src/telegram/protocol.ts";
 
+// Wrap the verified bundle only in this fixture. The diagnostic rows contain
+// fixed stages and classes, never SQL, bindings, payloads or raw exceptions.
+const queueDiagnosticsModule = `
+  import worker from './index.js';
+  const tables = ['telegram_aggregate_actions', 'telegram_private_share_creations',
+    'telegram_inline_search_consent', 'telegram_github_search'];
+  function errorClass(error) {
+    const message = String(error?.message ?? '') + ' ' + String(error?.cause?.message ?? '');
+    if (/parser stack overflow|expression tree is too large/i.test(message)) return 'sql-depth';
+    if (/too many SQL variables|wrong number of.*bind/i.test(message)) return 'sql-bind';
+    if (/no such (table|column)|ambiguous column/i.test(message)) return 'sql-schema';
+    if (/SQLITE_ERROR|syntax error/i.test(message)) return 'sql-other';
+    return 'other';
+  }
+  function instrument(env) {
+    const db = env.DB;
+    const claims = new WeakSet();
+    const record = (stage, outcome) => db.prepare('INSERT OR IGNORE INTO fixture_queue_diagnostics VALUES (?,?)')
+      .bind(stage, outcome).run();
+    async function observe(stage, execute, outcome) {
+      let result;
+      try {
+        result = await execute();
+      } catch (error) {
+        await record(stage, errorClass(error)).catch(() => {});
+        throw error;
+      }
+      await record(stage, outcome(result));
+      return result;
+    }
+    return {...env, DB: {
+      prepare(sql) {
+        const query = db.prepare(sql);
+        const matrix = tables.every(table => sql.includes(table)) && !sql.includes('telegram_provider_replies');
+        const reaper = sql.includes('UPDATE telegram_outbox SET state = CASE');
+        const claim = sql.includes("SET state = 'leased', attempts = attempts + 1");
+        if (!matrix || (!reaper && !claim)) return query;
+        return {bind(...bindings) {
+          const statement = query.bind(...bindings);
+          if (claim) {
+            claims.add(statement);
+            return statement;
+          }
+          return {run: () => observe('reap', () => statement.run(), result => result.success ? 'ok' : 'other')};
+        }};
+      },
+      batch(statements) {
+        if (!statements.some(statement => claims.has(statement))) return db.batch(statements);
+        return observe('claim', () => db.batch(statements), results =>
+          results.every(result => result.success) ? (results[1]?.results?.length ? 'claimed' : 'empty') : 'other');
+      },
+    }};
+  }
+  export default {
+    fetch(request, env, ctx) { return worker.fetch(request, instrument(env), ctx); },
+    scheduled(controller, env, ctx) { return worker.scheduled(controller, instrument(env), ctx); },
+  };
+`;
+
 test("emitted Worker answers opted-in sender queries using the owner's durable sort and safe metadata", { timeout: 90_000 }, async () => {
   const directory = process.env.WORKER_TEST_BUNDLE_DIR;
   assert.ok(directory);
@@ -20,14 +79,29 @@ test("emitted Worker answers opted-in sender queries using the owner's durable s
     botToken: "79801:synthetic-token", webhookSecret: "synthetic-inline-search-secret",
   };
   const sent: { id: number; text: string; origin: number }[] = [];
+  let githubRequests = 0;
   type Answer = { inline_query_id: string; results: InlineSearchArticle[]; is_personal: boolean; cache_time: number; next_offset: string };
   const answers: Answer[] = [];
   const started = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
   const common = {
-    modules: true, script: script.toString("utf8"), compatibilityDate: manifest.compatibilityDate,
+    modules: [
+      { type: "ESModule" as const, path: "fixture.js", contents: queueDiagnosticsModule },
+      { type: "ESModule" as const, path: "index.js", contents: script.toString("utf8") },
+    ],
+    compatibilityDate: manifest.compatibilityDate,
     d1Databases: { DB: "personal-inline-fixture" }, r2Buckets: { NODES: "personal-inline-fixture" },
     outboundService: async (request: Request) => {
+      const target = new URL(request.url);
+      if (target.origin === "https://api.github.com") {
+        githubRequests++;
+        assert.equal(request.method, "GET");
+        assert.equal(target.pathname, "/search/repositories");
+        assert.equal(target.searchParams.get("q"), "inline-matrix-fixture is:public");
+        assert.equal(request.headers.get("Authorization"), null);
+        return Response.json({ items: [{ full_name: "octocat/Hello-World", private: false,
+          visibility: "public", stargazers_count: 1, html_url: "https://github.com/octocat/Hello-World" }] });
+      }
       assert.equal(request.method, "POST");
       const url = `https://api.telegram.org/bot${policy.botToken}`;
       if (request.url === url + "/answerInlineQuery") {
@@ -59,7 +133,9 @@ test("emitted Worker answers opted-in sender queries using the owner's durable s
       return Response.json({ ok: true, result: { message_id: id, chat: { id: Number(body.chat_id) } } });
     },
   };
-  const bindings = { BUILD_REVISION: manifest.revision, TELEGRAM_ISOLATION_CONFIG: JSON.stringify(policy) };
+  const bindings = { BUILD_REVISION: manifest.revision, TELEGRAM_ISOLATION_CONFIG: JSON.stringify(policy),
+    TELEGRAM_AGGREGATE_KEY: Buffer.alloc(32, 41).toString("base64url"),
+    TELEGRAM_PRIVATE_SHARE_CREATION_KEY: Buffer.alloc(32, 42).toString("base64url") };
   const swapped = { ...policy, adminId: policy.memberId, memberId: policy.adminId };
   const runtime = new Miniflare({ workers: [
     { ...common, name: "app", bindings: { ...bindings, TELEGRAM_INLINE_SEARCH: "1" } },
@@ -80,6 +156,9 @@ test("emitted Worker answers opted-in sender queries using the owner's durable s
       await db.batch(bytes.toString("utf8").trim().split(/;\s*/u).filter(Boolean).map((sql) => db.prepare(sql)));
     }
     for (const migration of migrations) if (migration !== inline) await applyMigration(migration);
+    await db.prepare(`CREATE TABLE fixture_queue_diagnostics (
+      stage TEXT NOT NULL, outcome TEXT NOT NULL, PRIMARY KEY (stage,outcome)
+    ) STRICT`).run();
     const post = (update: unknown, worker = app) => worker.fetch("https://fixture.invalid/telegram/webhook", {
       method: "POST", headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": policy.webhookSecret },
       body: JSON.stringify(update),
@@ -88,18 +167,20 @@ test("emitted Worker answers opted-in sender queries using the owner's durable s
       { actorId = policy.memberId, date = Math.floor(Date.now() / 1000) } = {}) => post({ update_id: updateId, message: {
       message_id: updateId, date, text,
       from: { id: Number(actorId), is_bot: false }, chat: { id: Number(actorId), type: "private" },
-      entities: [{ type: "bot_command", offset: 0, length: text.indexOf(" ") }],
+      entities: [{ type: "bot_command", offset: 0, length: text.split(/\s/u, 1)[0].length }],
     } }, worker);
     const query = (updateId: number, text = "", fields: Record<string, unknown> = {}, worker = app) => post({ update_id: updateId,
       inline_query: { id: `fixture-inline-${updateId}`, from: { id: Number(policy.memberId), is_bot: false },
         chat_type: "sender", offset: "", query: text, ...fields } }, worker);
     const receipt = (updateId: number) => db.prepare(`SELECT state,sort_mode,result_count,query_id_sha256 FROM telegram_inline_search_receipts
       WHERE bot_id=? AND update_id=?`).bind(policy.botId, updateId).first();
+    const diagnostics = async () => (await db.prepare("SELECT stage,outcome FROM fixture_queue_diagnostics ORDER BY stage,outcome LIMIT 20").all()).results;
     async function expectCommand(id: number, pattern: RegExp) {
       for (let attempt = 0; attempt < 60; attempt++) {
-        const row = await db.prepare(`SELECT state FROM telegram_inbox JOIN telegram_outbox USING (receipt_id)
-          WHERE bot_id=? AND update_id=?`).bind(policy.botId, id).first("state");
-        if (row === "sent") {
+        const row = await db.prepare(`SELECT state,attempts FROM telegram_inbox JOIN telegram_outbox USING (receipt_id)
+          WHERE bot_id=? AND update_id=?`).bind(policy.botId, id).first<{ state: string; attempts: number }>();
+        if (row?.state === "sent") {
+          assert.equal(row.attempts, 1);
           const message = sent.find(({ origin }) => origin === id);
           assert.ok(message);
           assert.match(message.text, pattern);
@@ -107,7 +188,7 @@ test("emitted Worker answers opted-in sender queries using the owner's durable s
         }
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
-      assert.fail("Expected inline preference or consent reply did not settle.");
+      assert.fail(`Expected fixture reply did not settle. Queue stages ${JSON.stringify(await diagnostics())}`);
     }
     const titles = () => answers.at(-1)?.results.map(({ title }) => title);
     async function setSort(id: number, label: string) {
@@ -118,6 +199,20 @@ test("emitted Worker answers opted-in sender queries using the owner's durable s
     assert.equal((await command(1, "/inline on")).status, 204);
     assert.equal((await query(2)).status, 204);
     await applyMigration(inline);
+    // Match the protected D1 migration ledger, including the adopted baseline.
+    await db.prepare(`CREATE TABLE subs_bot_schema_migrations (
+      position INTEGER PRIMARY KEY CHECK (position >= 1),
+      name TEXT NOT NULL UNIQUE,
+      sha256 TEXT NOT NULL CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+      mode TEXT NOT NULL CHECK (mode = 'applied' OR (position = 1 AND mode = 'adopted')),
+      applied_at INTEGER NOT NULL DEFAULT (unixepoch()) CHECK (applied_at > 0)
+    ) STRICT`).run();
+    await db.batch(migrations.map(({ name, sha256: digest }, index) => {
+      const position = index + 1;
+      assert.ok(name.startsWith(`${String(position).padStart(4, "0")}_`));
+      return db.prepare("INSERT INTO subs_bot_schema_migrations (position,name,sha256,mode) VALUES (?,?,?,?)")
+        .bind(position, name, digest, position === 1 ? "adopted" : "applied");
+    }));
     assert.equal((await command(3, "/inline on", disabled)).status, 204);
     assert.equal((await query(4)).status, 204);
     assert.equal(await receipt(4), null);
@@ -125,6 +220,14 @@ test("emitted Worker answers opted-in sender queries using the owner's durable s
     assert.equal((await command(6, "/inline on", app, { actorId: policy.adminId })).status, 200);
     await expectCommand(5, /已开启私聊内联搜索/u);
     await expectCommand(6, /已开启私聊内联搜索/u);
+    const stages = await diagnostics();
+    assert.ok(stages.some(({ stage, outcome }) => stage === "reap" && outcome === "ok"));
+    assert.ok(stages.some(({ stage, outcome }) => stage === "claim" && outcome === "claimed"));
+    assert.equal((await command(101, "/help")).status, 200);
+    await expectCommand(101, /订阅/u);
+    assert.equal((await command(102, "/g inline-matrix-fixture", app, { actorId: policy.adminId })).status, 200);
+    await expectCommand(102, /octocat\/Hello-World/u);
+    assert.equal(githubRequests, 1);
     for (const [id, actor] of [[7, policy.memberId], [8, policy.adminId]] as const) {
       assert.equal((await query(id, "", { from: { id: Number(actor), is_bot: false } }, changedRoles)).status, 204);
       assert.equal(await receipt(id), null, "a role change invalidates old consent in either direction");
