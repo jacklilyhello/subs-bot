@@ -31,6 +31,7 @@ import { acceptTelegramTemp } from "./telegram/temp-import.ts";
 import { acceptTelegramView, reapTelegramViewTickets } from "./telegram/views.ts";
 import { acceptTelegramShortLink, reapFailedTelegramShortLinks } from "./telegram/short-link-actions.ts";
 import { acceptTelegramSubscriptionRead, reapTelegramSubscriptionReadTickets, telegramSubscriptionReadReady } from "./telegram/subscription-read.ts";
+import { acceptTelegramSubscriptionNodePage, reapTelegramSubscriptionNodeTickets, telegramSubscriptionNodePagesReady } from "./telegram/subscription-node-pages.ts";
 
 export interface Env {
   DB: D1Database;
@@ -105,8 +106,9 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
     const shortLinks = await normalShortLinksReady(env.DB);
     const subscriptionRead = await telegramSubscriptionReadReady(env.DB);
     const inlineSort = await telegramInlineSortReady(env.DB);
+    const subscriptionNodes = subscriptionRead && await telegramSubscriptionNodePagesReady(env.DB);
     const drain = () => ctx?.waitUntil(drainTelegramReplies(env.DB, env.NODES, policy, 4, 20_000, fetch, aggregateKey, privateShare,
-      subscriptionRead, shortLinks, inlineSort).catch(() => undefined));
+      subscriptionRead, shortLinks, inlineSort, subscriptionNodes).catch(() => undefined));
     if (decoded.command) {
       await acceptTelegramCommand(env.DB, policy, decoded.command);
       drain();
@@ -159,10 +161,15 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
       if (await acceptTelegramShortLink(env.DB, policy, decoded.shortLink, aggregateKey) === "accepted") drain();
     } else if (decoded.subscriptionRead) {
       if (!subscriptionRead) return new Response(null, { status: 204, headers: HEADERS });
-      const outcome = await acceptTelegramSubscriptionRead(env.DB, policy, decoded.subscriptionRead);
+      const outcome = await acceptTelegramSubscriptionRead(env.DB, policy, decoded.subscriptionRead, subscriptionNodes);
       if (decoded.subscriptionRead.kind === "callback") {
         ctx?.waitUntil(answerTelegramCallback(policy, decoded.subscriptionRead.callbackId));
       }
+      if (outcome === "accepted") drain();
+    } else if (decoded.subscriptionNodes) {
+      if (!subscriptionNodes) return new Response(null, { status: 204, headers: HEADERS });
+      const outcome = await acceptTelegramSubscriptionNodePage(env.DB, policy, decoded.subscriptionNodes);
+      ctx?.waitUntil(answerTelegramCallback(policy, decoded.subscriptionNodes.callbackId));
       if (outcome === "accepted") drain();
     } else if (decoded.privateShareCreation) {
       if (!privateShare.context) return new Response(null, { status: 204, headers: HEADERS });
@@ -265,12 +272,15 @@ async function recoverTelegramWork(_controller: ScheduledController, env: Env): 
   const shortLinks = await normalShortLinksReady(env.DB);
   const subscriptionRead = await telegramSubscriptionReadReady(env.DB);
   const inlineSort = await telegramInlineSortReady(env.DB);
+  const subscriptionNodes = subscriptionRead && await telegramSubscriptionNodePagesReady(env.DB);
   const replies = async () => {
-    await drainTelegramReplies(env.DB, env.NODES, policy, 10, 45_000, fetch, aggregateKey, privateShare, subscriptionRead, shortLinks, inlineSort);
+    await drainTelegramReplies(env.DB, env.NODES, policy, 10, 45_000, fetch, aggregateKey, privateShare,
+      subscriptionRead, shortLinks, inlineSort, subscriptionNodes);
     await reapTelegramViewTickets(env.DB);
     await reapTelegramLifecycle(env.DB);
     if (aggregateKey) await reapTelegramSelected(env.DB);
     if (subscriptionRead) await reapTelegramSubscriptionReadTickets(env.DB);
+    if (subscriptionNodes) await reapTelegramSubscriptionNodeTickets(env.DB);
     if (shortLinks) await reapFailedTelegramShortLinks(env.DB, policy.botId);
   };
   const documents = async () => {
@@ -280,13 +290,15 @@ async function recoverTelegramWork(_controller: ScheduledController, env: Env): 
     } finally {
       const reconciled = await reconcileTelegramDocumentJobReplies(env.DB, policy);
       if (claimed || reconciled > 0) {
-        await drainTelegramReplies(env.DB, env.NODES, policy, 4, 15_000, fetch, aggregateKey, privateShare, subscriptionRead, shortLinks, inlineSort);
+        await drainTelegramReplies(env.DB, env.NODES, policy, 4, 15_000, fetch, aggregateKey, privateShare,
+          subscriptionRead, shortLinks, inlineSort, subscriptionNodes);
       }
     }
   };
   const creations = async () => {
     if (privateShare.context && await recoverTelegramPrivateShareCreation(env.DB, env.NODES, policy, privateShare.context) === "published") {
-      await drainTelegramReplies(env.DB, env.NODES, policy, 4, 15_000, fetch, aggregateKey, privateShare, subscriptionRead, shortLinks, inlineSort);
+      await drainTelegramReplies(env.DB, env.NODES, policy, 4, 15_000, fetch, aggregateKey, privateShare,
+        subscriptionRead, shortLinks, inlineSort, subscriptionNodes);
     }
   };
   const results = await Promise.allSettled([replies(), documents(), creations(), retireTelegramDocumentStage(env.DB, env.NODES, policy),
