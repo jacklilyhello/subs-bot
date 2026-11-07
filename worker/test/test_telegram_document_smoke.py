@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from io import BytesIO
 import json
 from pathlib import Path
@@ -23,6 +24,8 @@ IDENTITY = "b" * 64
 POLICY = {"botId": "881001", "memberId": "881002", "adminId": "881003"}
 TOKEN = {"member": "1" * 32, "admin": "2" * 32}
 STAMP = 1_800_000_000
+RELEASE_PIN = {"revision": REVISION, "versionId": "01234567-89ab-4cde-8f01-23456789abcd",
+               "moduleSha256": "c" * 64, "compatibilityDate": "2026-07-30"}
 
 
 class FakeResources:
@@ -102,11 +105,13 @@ class DocumentSmokeTests(unittest.TestCase):
         self.cloud.db.commit()
 
     def publish(self, version, message):
-        role, generation, _ = smoke.VERSIONS[version]
+        role, generation, _ = self.cohort.versions[version]
         identifier = 1 if role == "member" else 2
-        shares = smoke.share_lines(COHORT, version)
+        shares = smoke.share_lines(COHORT, version, self.cohort.profile)
         snapshot_id = str(uuid4())
-        chunk = "".join(json.dumps({"share": share}) + "\n" for share in shares).encode()
+        nodes = [{"name": share.split("#", 1)[1], "type": "ss", "share": share} if self.cohort.profile == smoke.NODE_PAGES
+                 else {"share": share} for share in shares]
+        chunk = "".join(json.dumps(node) + "\n" for node in nodes).encode()
         manifest = json.dumps({"version": 1, "chunks": [{"bytes": len(chunk), "sha256": smoke.digest(chunk),
                                                         "count": len(shares)}]}).encode()
         prefix = f"subscriptions/{identifier}/{snapshot_id}/"
@@ -122,7 +127,8 @@ class DocumentSmokeTests(unittest.TestCase):
         return prefix
 
     def capture(self, action, negative=None):
-        smoke.validate_checkpoint(self.checkpoint, action, COHORT, REVISION, IDENTITY)
+        smoke.validate_checkpoint(self.checkpoint, action, COHORT, REVISION, IDENTITY,
+                                  self.cohort.profile, self.checkpoint.get("releasePin"))
         self.checkpoint = smoke.capture(self.cohort, self.checkpoint, action, negative,
                                         lambda token, shares: self.probed.append((token, shares)))
         return self.checkpoint
@@ -207,7 +213,7 @@ class DocumentSmokeTests(unittest.TestCase):
 
     def test_requires_literal_confirmation_and_rejects_checkpoint_archive_drift(self):
         inputs = {"action": "retire", "cohort": COHORT, "source_run_id": "123", "confirm_retire": f"retire {COHORT}"}
-        self.assertEqual(smoke.parse_inputs({"inputs": inputs}), ("retire", COHORT, "123", None))
+        self.assertEqual(smoke.parse_inputs({"inputs": inputs}), (smoke.DOCUMENT, "retire", COHORT, "123", None))
         with self.assertRaises(FixtureError):
             smoke.parse_inputs({"inputs": {**inputs, "confirm_retire": "yes"}})
         raw = BytesIO()
@@ -223,6 +229,76 @@ class DocumentSmokeTests(unittest.TestCase):
             download.return_value = raw.getvalue() + b"unexpected"
             with self.assertRaisesRegex(FixtureError, "archive digest"):
                 smoke.read_checkpoint("123", REVISION, "fixture")
+
+    def test_node_pages_reuses_exact_publication_and_retirement_with_its_own_profile(self):
+        with self.assertRaises(FixtureError):
+            smoke.parse_inputs({"inputs": {"profile": smoke.NODE_PAGES, "action": "verify-replaced", "cohort": COHORT,
+                                          "source_run_id": "123"}})
+        self.cohort = smoke.Cohort(self.cloud, POLICY, COHORT, smoke.NODE_PAGES)
+        self.assertEqual(self.cohort.name, "tgdoc-nodes-" + COHORT)
+        self.checkpoint.update(version=2, profile=smoke.NODE_PAGES, releasePin=RELEASE_PIN)
+        with self.assertRaisesRegex(FixtureError, "release differs"):
+            smoke.validate_checkpoint(self.checkpoint, "capture-created", COHORT, REVISION, IDENTITY,
+                                      smoke.NODE_PAGES, {**RELEASE_PIN, "moduleSha256": "d" * 64})
+        with self.assertRaises(FixtureError):
+            smoke.validate_checkpoint(self.checkpoint, "capture-created", COHORT, REVISION, IDENTITY)
+        checkpoint = self.created()
+        self.assertEqual([len(shares) for _, shares in self.probed], [2, 32])
+        self.assertEqual([[line.split("#", 1)[1] for line in shares] for _, shares in self.probed],
+                         [[f"{self.cohort.name}-{role}-{index:02d}" for index in range(1, count + 1)]
+                          for role, count in (("member", 2), ("admin", 32))])
+        self.assertNotIn("ss://", json.dumps(checkpoint))
+        self.assertTrue(all(token not in json.dumps(checkpoint) for token in TOKEN.values()))
+        smoke.validate_checkpoint(checkpoint, "retire", COHORT, REVISION, IDENTITY,
+                                  smoke.NODE_PAGES, {**RELEASE_PIN, "revision": "e" * 40})
+
+        owner = POLICY["adminId"]
+        pointer = checkpoint["snapshots"]["admin-first"]
+        receipt, = self.cloud.db.execute("""INSERT INTO telegram_inbox
+            (bot_id,update_id,actor_id,chat_id,chat_type,message_id,message_date,command,receipt_nonce)
+            VALUES (?,3,?,?,'private',3,?,'help','subnodes:v1') RETURNING receipt_id""",
+            (POLICY["botId"], owner, owner, STAMP)).fetchone()
+        self.cloud.db.execute("""INSERT INTO telegram_subscription_node_page VALUES (?, ?, 1, 0, ?, ?, 32, 0, 0, 0)""",
+                              (receipt, pointer["id"], pointer["snapshotId"], pointer["manifestSha256"]))
+        self.cloud.db.execute("INSERT INTO telegram_outbox (receipt_id) VALUES (?)", (receipt,))
+        self.cloud.db.commit()
+        with self.assertRaisesRegex(FixtureError, "live job or a protected reference"):
+            smoke.retire(self.cohort, checkpoint, lambda: None)
+        self.assertEqual(self.cloud.deleted, [])
+        self.cloud.db.execute("UPDATE telegram_outbox SET state='sent',sent_message_id=103 WHERE receipt_id=?", (receipt,))
+        self.cloud.db.commit()
+        self.assertEqual(smoke.retire(self.cohort, checkpoint, lambda: None)["phase"], "retired")
+        self.assertEqual(len(self.cloud.deleted), 4)
+        self.assertFalse(self.cloud.data)
+        self.assertEqual(self.cloud.db.execute("SELECT count(*) FROM telegram_subscription_node_page").fetchone()[0], 1)
+
+    def test_node_pages_probe_reads_only_exact_larger_export_and_empty_head(self):
+        shares = smoke.share_lines(COHORT, "admin-first", smoke.NODE_PAGES)
+        expected = smoke.b64encode("\n".join(shares).encode("ascii"))
+        self.assertGreater(len(expected), smoke.MAX_SMALL_BODY_BYTES)
+        calls = []
+        extra = b""
+
+        @contextmanager
+        def request(method, _path, _deadline, _label):
+            body = BytesIO(expected + extra if method == "GET" else b"")
+
+            class Response:
+                def getheader(self, name):
+                    return str(len(expected)) if name == "Content-Length" else None
+
+                def read(self, count):
+                    calls.append((method, count))
+                    return body.read(count)
+
+            yield Response()
+
+        with patch.object(smoke, "_request", request), patch.object(smoke, "_check_headers"):
+            smoke.probe_export(TOKEN["admin"], shares)
+            self.assertEqual(calls, [("GET", len(expected) + 1), ("HEAD", 1)])
+            extra = b"!"
+            with self.assertRaisesRegex(FixtureError, "Base64 export differs"):
+                smoke.probe_export(TOKEN["admin"], shares)
 
 
 if __name__ == "__main__":

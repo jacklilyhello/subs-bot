@@ -1,4 +1,5 @@
 import { AggregateLimitError, getAggregateNodeSource, hasAggregateLink } from "./aggregate.ts";
+import { normalShortLinksReady, resolveShortLocation } from "./short-links.ts";
 import { getSubscriptionNodeSource, PathRuleContentError } from "./path-rules.ts";
 import { base64Chunks, ExportContentError, planBase64 } from "./base64-response.ts";
 import { ClashContentError } from "./clash-export.ts";
@@ -16,6 +17,7 @@ import { runTelegramDocumentIntake } from "./telegram/document-intake.ts";
 import { acceptTelegramDocumentJob } from "./telegram/document-jobs.ts";
 import { reconcileTelegramDocumentJobReplies, retireTelegramDocumentStage } from "./telegram/document-persistence.ts";
 import { acceptTelegramLifecycle, reapTelegramLifecycle } from "./telegram/lifecycle-actions.ts";
+import { acceptTelegramInlineSort, telegramInlineSortReady } from "./telegram/inline-sort.ts";
 import { acceptTelegramPath } from "./telegram/path-management.ts";
 import { acceptTelegramPrivateClaim } from "./telegram/private-claims.ts";
 import {
@@ -29,7 +31,9 @@ import { parseTelegramProviderText, reconcileTelegramProviderReplies, telegramPr
 import { acceptTelegramCommand } from "./telegram/store.ts";
 import { acceptTelegramTemp } from "./telegram/temp-import.ts";
 import { acceptTelegramView, reapTelegramViewTickets } from "./telegram/views.ts";
+import { acceptTelegramShortLink, reapFailedTelegramShortLinks } from "./telegram/short-link-actions.ts";
 import { acceptTelegramSubscriptionRead, reapTelegramSubscriptionReadTickets, telegramSubscriptionReadReady } from "./telegram/subscription-read.ts";
+import { acceptTelegramSubscriptionNodePage, reapTelegramSubscriptionNodeTickets, telegramSubscriptionNodePagesReady } from "./telegram/subscription-node-pages.ts";
 
 export interface Env {
   DB: D1Database;
@@ -113,10 +117,13 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
     if (decoded.status !== 200) return new Response(null, { status: decoded.status, headers: HEADERS });
     const aggregateKey = await parseTelegramAggregateKey(env.TELEGRAM_AGGREGATE_KEY);
     const privateShare = await telegramPrivateShareRuntime(env.DB, env.TELEGRAM_PRIVATE_SHARE_CREATION_KEY);
+    const shortLinks = await normalShortLinksReady(env.DB);
     const subscriptionRead = await telegramSubscriptionReadReady(env.DB);
+    const inlineSort = await telegramInlineSortReady(env.DB);
+    const subscriptionNodes = subscriptionRead && await telegramSubscriptionNodePagesReady(env.DB);
     const providerEnabled = await telegramProviderUrlReady(env);
     const drain = () => ctx?.waitUntil(drainTelegramReplies(env.DB, env.NODES, policy, 4, 20_000, fetch, aggregateKey, privateShare,
-      subscriptionRead, providerEnabled).catch(() => undefined));
+      subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerEnabled).catch(() => undefined));
     if (decoded.command) {
       await acceptTelegramCommand(env.DB, policy, decoded.command);
       drain();
@@ -165,14 +172,25 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
       if (outcome === "accepted") {
         drain();
       }
+    } else if (decoded.inlineSort) {
+      if (!inlineSort) return new Response(null, { status: 204, headers: HEADERS });
+      if (await acceptTelegramInlineSort(env.DB, policy, decoded.inlineSort) === "accepted") drain();
     } else if (decoded.document) {
       await acceptTelegramDocumentJob(env.DB, policy, decoded.document);
+    } else if (decoded.shortLink) {
+      if (!shortLinks) return new Response(null, { status: 204, headers: HEADERS });
+      if (await acceptTelegramShortLink(env.DB, policy, decoded.shortLink, aggregateKey) === "accepted") drain();
     } else if (decoded.subscriptionRead) {
       if (!subscriptionRead) return new Response(null, { status: 204, headers: HEADERS });
-      const outcome = await acceptTelegramSubscriptionRead(env.DB, policy, decoded.subscriptionRead);
+      const outcome = await acceptTelegramSubscriptionRead(env.DB, policy, decoded.subscriptionRead, subscriptionNodes);
       if (decoded.subscriptionRead.kind === "callback") {
         ctx?.waitUntil(answerTelegramCallback(policy, decoded.subscriptionRead.callbackId));
       }
+      if (outcome === "accepted") drain();
+    } else if (decoded.subscriptionNodes) {
+      if (!subscriptionNodes) return new Response(null, { status: 204, headers: HEADERS });
+      const outcome = await acceptTelegramSubscriptionNodePage(env.DB, policy, decoded.subscriptionNodes);
+      ctx?.waitUntil(answerTelegramCallback(policy, decoded.subscriptionNodes.callbackId));
       if (outcome === "accepted") drain();
     } else if (decoded.privateShareCreation) {
       if (!privateShare.context) return new Response(null, { status: 204, headers: HEADERS });
@@ -214,8 +232,10 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
 
   if (short) {
     try {
-      if (!await hasAggregateLink(env.DB, short[1])) return plain("Not found.", 404, head);
-      return new Response(null, { status: 302, headers: { ...HEADERS, Location: `/agg/${short[1]}/clash` } });
+      const location = await normalShortLinksReady(env.DB) ? await resolveShortLocation(env.DB, short[1])
+        : await hasAggregateLink(env.DB, short[1]) ? `/agg/${short[1]}/clash` : null;
+      return location ? new Response(null, { status: 302, headers: { ...HEADERS, Location: location } })
+        : plain("Not found.", 404, head);
     } catch {
       return plain("Subscription temporarily unavailable.", 503, head);
     }
@@ -226,7 +246,7 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
   if (!EXPORT_KINDS.has(format)) return plain("Export format unavailable.", 406, head);
 
   try {
-    const source = aggregate ? await getAggregateNodeSource(env.DB, env.NODES, token)
+    const source = aggregate ? await getAggregateNodeSource(env.DB, env.NODES, token, await normalShortLinksReady(env.DB))
       : await getSubscriptionNodeSource(env.DB, env.NODES, token);
     if (!source) return plain("Not found.", 404, head);
     if (format === "clash") {
@@ -268,15 +288,21 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
 async function recoverTelegramWork(env: Env, policy: TelegramPolicy, pin: ProviderPin, providerEnabled: boolean): Promise<void> {
   const aggregateKey = await parseTelegramAggregateKey(env.TELEGRAM_AGGREGATE_KEY);
   const privateShare = await telegramPrivateShareRuntime(env.DB, env.TELEGRAM_PRIVATE_SHARE_CREATION_KEY);
+  const shortLinks = await normalShortLinksReady(env.DB);
   const subscriptionRead = await telegramSubscriptionReadReady(env.DB);
+  const inlineSort = await telegramInlineSortReady(env.DB);
+  const subscriptionNodes = subscriptionRead && await telegramSubscriptionNodePagesReady(env.DB);
   const drain = (limit: number, budget: number) =>
-    drainTelegramReplies(env.DB, env.NODES, policy, limit, budget, fetch, aggregateKey, privateShare, subscriptionRead, providerEnabled);
+    drainTelegramReplies(env.DB, env.NODES, policy, limit, budget, fetch, aggregateKey, privateShare,
+      subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerEnabled);
   const replies = async () => {
     await drain(10, 45_000);
     await reapTelegramViewTickets(env.DB);
     await reapTelegramLifecycle(env.DB);
     if (aggregateKey) await reapTelegramSelected(env.DB);
     if (subscriptionRead) await reapTelegramSubscriptionReadTickets(env.DB);
+    if (subscriptionNodes) await reapTelegramSubscriptionNodeTickets(env.DB);
+    if (shortLinks) await reapFailedTelegramShortLinks(env.DB, policy.botId);
   };
   const documents = async () => {
     let claimed = false;

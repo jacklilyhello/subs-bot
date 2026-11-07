@@ -35,7 +35,7 @@ async function replyFixture(t: TestContext) {
   const scope = { actorId: policy.memberId, chatId: policy.memberId, chatType: "private" as const, threadId: null,
     messageDate: Math.floor(Date.now() / 1000) };
   const ordinary = (id: number) => acceptTelegramCommand(db, policy, { ...scope, updateId: id, messageId: id, command: "help" });
-  const claim = () => claimTelegramReply(db, policy.botId, false, false, false, policy);
+  const claim = () => claimTelegramReply(db, policy.botId, false, false, false, false, false, false, policy);
   return { db, policy, scope, ordinary, claim };
 }
 
@@ -69,7 +69,7 @@ test("ambiguous terminal enqueue is idempotent and authorization changes fence d
   assert.equal((await claim())?.updateId, 3, "an ineligible earlier provider receipt does not block later normal replies");
 
   await db.prepare("UPDATE telegram_provider_replies SET ready_at=unixepoch()-901").run();
-  await reapExpiredTelegramReplies(db, policy.botId, false, false, false, true);
+  await reapExpiredTelegramReplies(db, policy.botId, false, false, false, false, false, false, true);
   assert.equal(await db.prepare("SELECT state FROM telegram_outbox WHERE receipt_id=?").bind(provider!.receiptId).first("state"), "failed");
 });
 
