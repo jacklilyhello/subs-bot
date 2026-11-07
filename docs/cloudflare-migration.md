@@ -157,7 +157,8 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 - 刷新任务保存订阅、发起人、期望版本、尝试次数和错误类别。租约带过期时间及递增凭据，过期消费者的写入由条件检查拒绝。队列消息重复投递时复用同一任务。重试按错误类别退避并遵守提供方限速，耗尽后进入死信或可审计的失败状态。用 Cron 补发已入库但未成功入队的任务。拉取或解析失败只记录错误状态，上一份有效快照继续服务。 [Queues 重试与死信](https://developers.cloudflare.com/queues/configuration/batching-retries/)
 - 任意用户 URL 开放前，验证 HTTP(S) URL、允许端口和重定向策略。每一跳重新解析 A/AAAA，拒绝私有、环回、保留及混合公网和私网结果，并确保实际连接到通过检查的 IP，同时保持原 Host、TLS SNI 和证书校验。带凭据的请求禁止将凭据转发至新来源。延续现有解压后 10 MiB 上限，并对上传、重定向次数、总耗时、节点数和 YAML 深度或别名设置限额。
-- 抓取组件使用项目专用 Cloudflare Container、固定 DNS 地址的 Python 传输及有界私有 RPC。业务 Worker 的服务绑定、导入和刷新任务需要通过隔离集成验收，确认实际连接、TLS 和 Cloudflare 代理的提供方兼容性。持久数据继续写入 D1 和 R2。 [私有抓取组件](../worker/provider_fetch/README.md) · [Containers 出网](https://developers.cloudflare.com/containers/configuration/outbound-traffic/)
+- 抓取组件使用项目专用 Cloudflare Container、固定 DNS 地址的 Python 传输及有界私有 RPC。Cron 只有在私有服务绑定、预期版本和镜像摘要都配置后，才会领取一条已有导入或刷新任务。RPC 在启动 Container 前核对版本和镜像。托管 CI 使用合成 RPC 验证已构建 Worker 的 D1、R2 与 HTTP 流程。服务绑定启用、Telegram 单条命令和真实提供方的 TLS 与兼容性分别验收，批量刷新另行接入。 [私有抓取组件](../worker/provider_fetch/README.md) · [Containers 出网](https://developers.cloudflare.com/containers/configuration/outbound-traffic/)
+- 解析拒绝、抓取失败或租约过期时保留上一份快照和流量信息。成功发布在同一个 D1 批次核对所有者、原始 URL、代次、生命周期和租约，再更新快照、有效流量与到期元数据，并完成任务。候选 R2 路径使用本次租约 UUID。确认 CAS 未提交时回收本次候选，结果不明时读回精确任务及包含摘要的快照指针，并保留不能确认的候选。后续清理需在写 R2 前持久记录候选并确认活动区、回收站和备份均未引用，现有任务记录丢失租约后不能凭 R2 前缀自动推定归属。
 - 测试包括实际提供方的鉴权、重定向、编码、流量头、IPv4/IPv6、阻断行为与限速。输出只记录分类结果和耗时。覆盖 DNS 重绑定、跨来源重定向、压缩超限和异常 YAML，并核对失败不会改变旧快照。真实联调使用获准的测试订阅和会话。
 
 ## 部署、数据迁移和回滚
