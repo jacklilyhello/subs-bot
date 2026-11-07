@@ -250,7 +250,8 @@ function subscriptionGuard(guard: Guard, row: Metadata, token?: string): Guard {
 }
 
 function gb(value: number | null): string {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? `${(value / 2 ** 30).toFixed(2)} GB` : "未知";
+  // Legacy storage and the provider publisher already use GiB.
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? `${value.toFixed(2)} GB` : "未知";
 }
 
 function remaining(used: number | null, total: number | null): string {
