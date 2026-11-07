@@ -36,6 +36,8 @@ EVIDENCE = {
     "ociManifestSha256": "1" * 64, "ociConfigSha256": "2" * 64,
 }
 RELEASE = {**EVIDENCE, "versionId": VERSION}
+HISTORICAL = {**EVIDENCE, "revision": activation.HISTORICAL_PROVIDER_REVISION,
+              "runId": activation.HISTORICAL_PROVIDER_CI_RUN}
 IDENTITY = activation.bootstrap.Identity("3" * 32, CREATED)
 ACTIVATION = {"deploymentId": DEPLOYMENT, "namespaceId": NAMESPACE}
 CONTAINER = {"applicationId": NAMESPACE, "createdAt": CREATED}
@@ -83,6 +85,13 @@ def version():
         {"name": activation.provider.WORKER, "content_type": activation.stage.MODULE_TYPE,
          "content_base64": b64encode(MODULE).decode("ascii")},
     ]}
+
+
+def legacy_version():
+    metadata = activation.stage._metadata(RELEASE, IMAGE)
+    return {"id": VERSION, "resources": {"bindings": metadata["bindings"],
+            "script_runtime": {"containers": metadata["containers"],
+                               "compatibility_date": metadata["compatibility_date"]}}}
 
 
 class PinTests(unittest.TestCase):
@@ -257,7 +266,7 @@ class APIContractTests(unittest.TestCase):
                 elif method == "create_container":
                     self.assertEqual(body, {"name": activation.provider.SERVICE, "scheduling_policy": "durable_object",
                                            "durable_objects": {"namespace_id": NAMESPACE},
-                                           "configuration": {"authorized_keys": [], "wrangler_ssh": False},
+                                           "configuration": {"authorized_keys": [], "wrangler_ssh": {"enabled": False}},
                                            "observability": {"logs": {"enabled": False}}})
                 elif method == "create_workflow":
                     self.assertEqual(body["schedules"], [])
@@ -279,19 +288,38 @@ class APIContractTests(unittest.TestCase):
         with patch.object(activation.publication, "_response", return_value=missing):
             self.assertIsNone(self.api.workflow())
 
+    def test_managed_container_sends_and_verifies_the_documented_disabled_ssh_object(self):
+        expected = {"authorized_keys": [], "wrangler_ssh": {"enabled": False}}
+        value = {"id": NAMESPACE, "account_id": ACCOUNT, "name": activation.provider.SERVICE,
+                 "scheduling_policy": "durable_object", "durable_objects": {"namespace_id": NAMESPACE},
+                 "created_at": CREATED, "configuration": expected, "observability": {"logs": {"enabled": False}}}
+        with patch.object(activation.publication, "_response", return_value=response(value)) as send:
+            self.api.create_container(NAMESPACE)
+            self.assertEqual(json.loads(send.call_args.args[0].data)["configuration"], expected)
+        with patch.object(self.api, "_request", side_effect=[envelope([value]), envelope(value)]):
+            self.assertEqual(self.api.container(NAMESPACE), CONTAINER)
+
     def test_ambiguous_mutation_failure_consumes_write_allowance_and_redacts_body(self):
-        failed = (503, {}, b'{"success":false,"errors":[{"message":"synthetic-secret"}]}')
+        failed = (503, {}, b'{"success":false,"errors":[{"code":4101,"message":"synthetic-secret"},'
+                  b'{"code":true},{"code":"4102"},{"code":99999999}]}')
         with patch.object(activation.publication, "_response", return_value=failed) as send:
-            for unused in range(2):
-                with self.assertRaisesRegex(activation.ActivationError, "not confirmed") as error:
-                    self.api.create_workflow()
-                self.assertNotIn("synthetic-secret", str(error.exception))
+            with self.assertRaisesRegex(activation.ActivationError, r'"httpStatus":503,"cloudflareCodes":\[4101\]') as error:
+                self.api.create_workflow()
+            self.assertNotIn("synthetic-secret", str(error.exception))
+            with self.assertRaisesRegex(activation.ActivationError, "not confirmed"):
+                self.api.create_workflow()
             send.assert_called_once()
+
+    def test_unparseable_mutation_reports_status_but_not_response(self):
+        with patch.object(activation.publication, "_response", return_value=(422, {}, b"synthetic-secret")):
+            with self.assertRaisesRegex(activation.ActivationError, '"phase":"response-json","httpStatus":422') as error:
+                self.api.create_container(NAMESPACE)
+        self.assertNotIn("synthetic-secret", str(error.exception))
 
     def test_container_requires_complete_inventory_exact_id_privacy_and_timestamp(self):
         value = {"id": NAMESPACE, "account_id": ACCOUNT, "name": activation.provider.SERVICE,
                  "scheduling_policy": "durable_object", "durable_objects": {"namespace_id": NAMESPACE},
-                 "created_at": CREATED, "configuration": {"authorized_keys": [], "wrangler_ssh": False},
+                 "created_at": CREATED, "configuration": {"authorized_keys": [], "wrangler_ssh": {"enabled": False, "port": 22}},
                  "observability": {"logs": {"enabled": False}}}
         with patch.object(self.api, "_request", side_effect=[envelope([value]), envelope(value)]) as read:
             self.assertEqual(self.api.container(NAMESPACE), CONTAINER)
@@ -302,6 +330,9 @@ class APIContractTests(unittest.TestCase):
         for changed in ({"account_id": "f" * 32}, {"durable_objects": {"namespace_id": "f" * 32}},
                         {"scheduling_policy": "default"}, {"observability": {"logs": {"enabled": True}}},
                         {"configuration": {"authorized_keys": [{"public_key": "synthetic-key"}]}},
+                        {"configuration": {}}, {"configuration": {"wrangler_ssh": False}},
+                        {"configuration": {"wrangler_ssh": {"enabled": True}}},
+                        {"configuration": {"wrangler_ssh": {"enabled": False, "port": True}}},
                         {"created_at": "unknown"}):
             with self.subTest(changed=changed), patch.object(self.api, "_request", side_effect=[envelope([value]), envelope({**value, **changed})]):
                 with self.assertRaises(ValueError):
@@ -312,19 +343,14 @@ class APIContractTests(unittest.TestCase):
                 with self.assertRaises(activation.ActivationError):
                     self.api.container(namespace)
 
-    def test_active_version_reuses_exact_bytes_and_cross_checks_optional_resolved_id(self):
-        metadata = activation.stage._metadata(RELEASE, IMAGE)
-        bindings = [{"name": "PROVIDER_CONTAINER", "type": "durable_object_namespace", "class_name": "ProviderContainer"}]
+    def test_active_version_reuses_exact_bytes_and_requires_independent_sqlite_namespace(self):
+        legacy = legacy_version()
         namespace = {"id": NAMESPACE, "script": activation.provider.SERVICE, "class": "ProviderContainer", "use_sqlite": True}
-        for resolved in (None, NAMESPACE):
-            beta = version()
-            if resolved:
-                beta["bindings"][1]["namespace_id"] = resolved
-            legacy = {"id": VERSION, "resources": {"bindings": bindings, "script_runtime": {"containers": metadata["containers"]}}}
-            replies = [envelope([{"id": VERSION}]), envelope(legacy), envelope([namespace]), envelope(beta)]
-            with self.subTest(resolved=resolved), patch.object(self.api, "_request", side_effect=replies):
-                self.assertEqual(self.api.version(RELEASE, True), NAMESPACE)
-        for changed in ({"use_sqlite": False}, {"script": "other"}, {"preview": {"id": "foreign"}}):
+        replies = [envelope([{"id": VERSION}]), envelope(legacy), envelope([namespace]), envelope(version())]
+        with patch.object(self.api, "_request", side_effect=replies):
+            self.assertEqual(self.api.version(RELEASE, True), NAMESPACE)
+        for changed in ({"use_sqlite": False}, {"script": "other"}, {"class": "Foreign"},
+                        {"preview": {"id": "foreign"}}, {"dispatch_namespace": "foreign"}):
             with self.subTest(changed=changed), patch.object(self.api, "_request", side_effect=[
                     envelope([{"id": VERSION}]), envelope(legacy), envelope([{**namespace, **changed}])]):
                 with self.assertRaises(activation.ActivationError):
@@ -334,15 +360,24 @@ class APIContractTests(unittest.TestCase):
         with patch.object(self.api, "_request", side_effect=[envelope([{"id": VERSION}]), envelope(legacy), envelope([namespace]), envelope(bad)]):
             with self.assertRaises(activation.stage.StageError):
                 self.api.version(RELEASE, True)
+        for bindings in (legacy["resources"]["bindings"], version()["bindings"]):
+            bindings.append({"name": "PROVIDER_CONTAINER", "type": "durable_object_namespace",
+                             "class_name": "ProviderContainer", "namespace_id": NAMESPACE})
+            beta = {**version(), "bindings": bindings}
+            with patch.object(self.api, "_request", side_effect=[
+                    envelope([{"id": VERSION}]), envelope(legacy), envelope([namespace]), envelope(beta)]):
+                with self.assertRaises(activation.stage.StageError):
+                    self.api.version(RELEASE, True)
+            bindings.pop()
 
     def test_full_default_verification_observes_real_module_and_separate_resource_versions(self):
-        metadata = activation.stage._metadata(RELEASE, IMAGE)
         deployment = {"id": DEPLOYMENT, "strategy": "percentage", "created_on": START,
                       "versions": [{"version_id": VERSION, "percentage": 100}],
                       "annotations": {"workers/message": f"provider-activate/{REVISION}/{EVIDENCE['artifactId']}"}}
         container = {"id": NAMESPACE, "account_id": ACCOUNT, "name": activation.provider.SERVICE,
                      "scheduling_policy": "durable_object", "durable_objects": {"namespace_id": NAMESPACE},
-                     "created_at": CREATED, "configuration": {}, "observability": {"logs": {"enabled": False}}}
+                     "created_at": CREATED, "configuration": {"wrangler_ssh": {"enabled": False}},
+                     "observability": {"logs": {"enabled": False}}}
         workflow = {"id": WORKFLOW, "created_on": CREATED, "name": activation.stage.WORKFLOW,
                     "class_name": "ProviderSmoke", "script_name": activation.provider.SERVICE}
         workflow_version = {"id": WORKFLOW_VERSION, "workflow_id": WORKFLOW, "class_name": "ProviderSmoke",
@@ -355,9 +390,7 @@ class APIContractTests(unittest.TestCase):
                 self.api.worker_path + "/deployments/" + DEPLOYMENT: envelope(deployment),
                 self.api.beta_path + "?page=1&per_page=2": envelope([{"id": VERSION}]),
                 self.api.beta_path + "/" + VERSION + "?include=modules": envelope(version()),
-                self.api.worker_path + "/versions/" + VERSION: envelope({"id": VERSION, "resources": {
-                    "bindings": [{"name": "PROVIDER_CONTAINER", "type": "durable_object_namespace", "class_name": "ProviderContainer"}],
-                    "script_runtime": {"containers": metadata["containers"]}}}),
+                self.api.worker_path + "/versions/" + VERSION: envelope(legacy_version()),
                 "/workers/durable_objects/namespaces?page=1&per_page=1000": envelope([
                     {"id": NAMESPACE, "script": activation.provider.SERVICE, "class": "ProviderContainer", "use_sqlite": True}]),
                 "/containers/applications?per_page=500": envelope([container] if active else []),
@@ -556,6 +589,88 @@ class BindingProofTests(unittest.TestCase):
         for malformed in (encode(self.manifest)[:-1], b'{"version":1,"version":1}', b" " * (activation.MAX_BINDING_PROOF + 1)):
             with self.assertRaises(ValueError):
                 self.verify(malformed)
+
+    def test_continuation_proof_authenticates_current_run_and_unchanged_historical_release(self):
+        env = {**self.env, "SUBS_BOT_PROVIDER_ISOLATED_REVISION": HISTORICAL["revision"]}
+        with patch.dict(os.environ, env, clear=True):
+            activation._write_binding_proof({**HISTORICAL, **self.verification}, *activation._binding_proof_context())
+        actual = self.verify(self.proof_file.read_bytes())
+        self.assertEqual(actual, {**self.manifest, "version": 2, "providerBuild": HISTORICAL,
+                                 "activation": {**self.manifest["activation"], "revision": REVISION,
+                                                "isolatedRevision": HISTORICAL["revision"]}})
+        for field, value in (("revision", ISOLATED), ("isolatedRevision", ISOLATED)):
+            invalid = {**actual, "activation": {**actual["activation"], field: value}}
+            with self.subTest(field=field), self.assertRaises(activation.ActivationError):
+                self.verify(activation._proof_bytes(invalid))
+        for field, value in (("revision", REVISION), ("runId", "13")):
+            invalid = {**actual, "providerBuild": {**HISTORICAL, field: value}}
+            with self.subTest(field=field), self.assertRaises(activation.ActivationError):
+                self.verify(activation._proof_bytes(invalid))
+
+
+class ContinuationTests(unittest.TestCase):
+    def setUp(self):
+        self.env = {"GITHUB_REPOSITORY": activation.github.REPOSITORY, "GITHUB_REF": activation.github.MAIN_REF,
+                    "GITHUB_SHA": REVISION, "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_RUN_ATTEMPT": "1",
+                    "SUBS_BOT_PROVIDER_CI_RUN_ID": HISTORICAL["runId"], "RUNNER_TEMP": "/tmp", "GH_TOKEN": "synthetic-token",
+                    "SUBS_BOT_PROVIDER_RELEASE_SELECTION": activation.HISTORICAL_SELECTION,
+                    "SUBS_BOT_PROVIDER_ACTIVATION_OPERATION": "provision-container",
+                    activation.bootstrap.IDENTITY_ENV: json.dumps({"workerId": IDENTITY.worker_id, "workerCreatedOn": CREATED}),
+                    activation.RELEASE_ENV: json.dumps({**HISTORICAL, "versionId": VERSION}),
+                    activation.ACTIVATION_ENV: json.dumps(ACTIVATION)}
+        self.compare = {"status": "ahead", "ahead_by": 1, "behind_by": 0,
+                        "base_commit": {"sha": HISTORICAL["revision"]}, "merge_base_commit": {"sha": HISTORICAL["revision"]}}
+
+    def test_fixed_github_compare_requires_an_exact_ancestor(self):
+        check = activation.require_historical_provider_ancestor
+        with patch.object(activation.github, "_get_json", return_value=self.compare) as compare:
+            check(HISTORICAL["revision"], REVISION, "synthetic-token")
+            compare.assert_called_once_with(f"/compare/{HISTORICAL['revision']}...{REVISION}?per_page=1", "synthetic-token")
+            for key, value in (("status", "diverged"), ("ahead_by", True), ("behind_by", False), ("behind_by", 1),
+                               ("merge_base_commit", {"sha": ISOLATED}), ("base_commit", None)):
+                compare.return_value = {**self.compare, key: value}
+                with self.subTest(key=key, value=value), self.assertRaises(activation.ActivationError):
+                    check(HISTORICAL["revision"], REVISION, "synthetic-token")
+
+    def test_historical_selection_cannot_activate_or_select_another_build_or_smoke_target(self):
+        for change in ({"SUBS_BOT_PROVIDER_ACTIVATION_OPERATION": "activate"}, {"SUBS_BOT_PROVIDER_CI_RUN_ID": "11"},
+                       {"SUBS_BOT_PROVIDER_RELEASE_SELECTION": "foreign"}, {"GITHUB_SHA": HISTORICAL["revision"]},
+                       {"SUBS_BOT_PROVIDER_ISOLATED_REVISION": ISOLATED}, {"GITHUB_RUN_ATTEMPT": "2"}):
+            with self.subTest(change=change), patch.dict(os.environ, {**self.env, **change}, clear=True), patch.object(
+                    activation.github, "_get_json") as request:
+                with self.assertRaises(activation.ActivationError):
+                    activation.prepare()
+                with self.assertRaises(activation.ActivationError):
+                    activation.activate()
+                request.assert_not_called()
+
+    def test_continuation_guard_uses_historical_artifact_and_current_main(self):
+        provenance = activation.publication.provenance
+        artifact = (HISTORICAL["runAttempt"], HISTORICAL["artifactId"], HISTORICAL["archiveSha256"])
+        with patch.dict(os.environ, self.env, clear=True), patch.object(
+                activation.github, "_get_json", return_value=self.compare), patch.object(
+                activation.github, "require_current_main") as current, patch.object(
+                provenance, "_select_artifact", return_value=artifact) as select, patch.object(
+                provenance, "prepare", return_value=HISTORICAL) as prepare, patch.object(
+                activation.publication, "_verified_input", return_value=(Path("unused"), HISTORICAL)) as read, patch.object(
+                activation, "ProviderAPI") as api, patch.object(
+                activation, "_run", return_value={"status": "container-awaiting-workflow"}) as run:
+            self.assertEqual(activation.prepare(), HISTORICAL)
+            prepare.assert_called_once_with(provider_revision=HISTORICAL["revision"])
+            self.assertEqual(activation.activate()["revision"], HISTORICAL["revision"])
+            read.assert_called_once_with(Path("/tmp"), HISTORICAL["revision"], HISTORICAL["runId"])
+            select.assert_called_once_with(HISTORICAL["runId"], HISTORICAL["revision"], "synthetic-token")
+            current.assert_called_once_with(REVISION)
+            self.assertEqual(run.call_args.args[:5], (api.return_value, "provision-container",
+                             {**HISTORICAL, "versionId": VERSION}, {**NO_PINS, "activation": ACTIVATION}, ""))
+            api.reset_mock()
+            with patch.dict(os.environ, {activation.ACTIVATION_ENV: ""}), self.assertRaises(activation.ActivationError):
+                activation.activate()
+            api.assert_not_called()
+            select.return_value = ("2", *artifact[1:])
+            with self.assertRaises(activation.ActivationError):
+                activation.activate()
+            api.assert_not_called()
 
 
 if __name__ == "__main__":
