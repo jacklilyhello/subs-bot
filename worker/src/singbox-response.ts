@@ -1,6 +1,6 @@
 import { serializeSingBoxOutbound, SingBoxContentError } from "./singbox-export.ts";
 import { allocateExportNames } from "./export-names.ts";
-import { readSnapshotNodes, SnapshotIntegrityError, type SubscriptionSnapshot } from "./storage.ts";
+import { SnapshotIntegrityError, type ExportNodeSource } from "./storage.ts";
 
 const MAX_EXPORT_BYTES = 16 * 1024 * 1024;
 const MAX_NAME_BYTES = 1024;
@@ -18,14 +18,12 @@ interface SingBoxPlan {
   readonly tags: readonly string[];
 }
 
-export async function planSingBox(
-  bucket: R2Bucket, snapshot: SubscriptionSnapshot,
-): Promise<SingBoxPlan> {
+export async function planSingBox(source: ExportNodeSource): Promise<SingBoxPlan> {
   let namesBytes = 0;
   let bytes = OPEN.length + DIRECT.length + CLOSE.length;
   let expandedPorts = 0;
   const names: string[] = [];
-  for await (const node of readSnapshotNodes(bucket, snapshot)) {
+  for await (const node of source.read()) {
     const { name, json, hoppingPorts } = serializeSingBoxOutbound(node);
     const nameBytes = encoder.encode(JSON.stringify(name)).byteLength;
     namesBytes += nameBytes;
@@ -36,7 +34,7 @@ export async function planSingBox(
       || expandedPorts > MAX_EXPANDED_HOPPING_PORTS) throw new SingBoxContentError();
     names.push(name);
   }
-  if (names.length !== snapshot.nodeCount || names.length === 0) throw new SnapshotIntegrityError();
+  if (names.length !== source.nodeCount || names.length === 0) throw new SnapshotIntegrityError();
 
   const tags = allocateExportNames(names, ["proxy", "direct"]).map((tag) => {
     const quoted = JSON.stringify(tag);
@@ -49,11 +47,11 @@ export async function planSingBox(
 }
 
 export async function* singBoxChunks(
-  bucket: R2Bucket, snapshot: SubscriptionSnapshot, plan: SingBoxPlan, signal: AbortSignal,
+  source: ExportNodeSource, plan: SingBoxPlan, signal: AbortSignal,
 ): AsyncGenerator<Uint8Array> {
   yield encoder.encode(OPEN + plan.tags.join(",") + DIRECT);
   let index = 0;
-  for await (const node of readSnapshotNodes(bucket, snapshot, signal)) {
+  for await (const node of source.read(signal)) {
     const tag = plan.tags[index++];
     if (tag === undefined) throw new SnapshotIntegrityError();
     const { json } = serializeSingBoxOutbound(node);
