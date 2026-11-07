@@ -1,6 +1,8 @@
 import {
+  PROVIDER_API_STATUS_MAX_ELAPSED_MS as API_STATUS_MAX_ELAPSED_MS,
   PROVIDER_MAX_BODY_BYTES as MAX_BODY_BYTES, PROVIDER_MAX_METADATA_BYTES as MAX_METADATA_BYTES,
   PROVIDER_METADATA_FIELDS as metadataKeys, PROVIDER_REVISION as REVISION, PROVIDER_SHA256 as SHA256,
+  type ProviderApiStatusFailureCode, type ProviderApiStatusInput, type ProviderApiStatusResult,
   type ProviderFailureCode, type ProviderFetchInput, type ProviderFetchResult, type ProviderMetadata,
 } from "../src/provider-fetch-contract.ts";
 
@@ -11,12 +13,14 @@ const IMAGE = /^registry\.cloudflare\.com\/[0-9a-f]{32}\/subs-bot-provider-fetch
 const IDLE_MS = 30_000;
 const START_MS = 30_000;
 const FETCH_MS = 28_000;
+const API_STATUS_MS = 20_000;
 const STOP_MS = 10_000;
 const PORT = 8080;
 const ORIGIN = "http://container";
 const BLOCKED = ["http://127.0.0.1/", "http://[::1]/", "http://169.254.169.254/"];
 const MAX_URL_BYTES = 8192;
 const MAX_REQUEST_BYTES = 12 * 1024;
+const API_AUTHORITY = /^(?:\[[^\[\]]+\]|[^:\[\]]+)(?::[0-9]{1,5})?$/u;
 const encoder = new TextEncoder();
 const failureStatuses = {
   "invalid-request": [400, 413], "invalid-url": [422], "blocked-address": [422], "busy": [429],
@@ -24,6 +28,17 @@ const failureStatuses = {
   "timeout": [504], "invalid-redirect": [502], "redirect-limit": [502], "http-status": [502],
   "body-too-large": [502], "invalid-body": [502],
 } as const satisfies Record<ProviderFailureCode, readonly number[]>;
+const apiStatusFailureStatuses = {
+  "invalid-request": failureStatuses["invalid-request"],
+  "invalid-url": failureStatuses["invalid-url"],
+  "invalid-auth": failureStatuses["invalid-auth"],
+  "blocked-address": failureStatuses["blocked-address"],
+  "busy": failureStatuses.busy,
+  "dns-failed": failureStatuses["dns-failed"],
+  "tls-failed": failureStatuses["tls-failed"],
+  "unavailable": failureStatuses.unavailable,
+  "timeout": failureStatuses.timeout,
+} as const satisfies Record<Exclude<ProviderApiStatusFailureCode, "invalid-body">, readonly number[]>;
 
 type FailureCode = ProviderFailureCode;
 type ProviderFailure = Extract<ProviderFetchResult, { ok: false }>;
@@ -52,6 +67,47 @@ export function providerRequest(input: unknown): ProviderFetchInput | null {
       || typeof providerRevision !== "string" || !REVISION.test(providerRevision)
       || typeof imageSha256 !== "string" || !SHA256.test(imageSha256)) return null;
   return { url, providerRevision, imageSha256 };
+}
+
+export function providerApiStatusRequest(input: unknown): ProviderApiStatusInput | null {
+  if (!isRecord(input) || Object.keys(input).length !== 4
+    || !["url", "key", "providerRevision", "imageSha256"].every((field) => Object.hasOwn(input, field))) return null;
+  const { url, key, providerRevision, imageSha256 } = input;
+  const pinned = providerRequest({ url, providerRevision, imageSha256 });
+  if (!pinned || typeof key !== "string" || !/^[!-~]{1,512}(?![\s\S])/u.test(key)) return null;
+  const endpoint = /^https:\/\/([^/?#]+)(\/[^?#]*)(?![\s\S])/iu.exec(pinned.url);
+  if (!endpoint || /[@%]/u.test(endpoint[1]) || !API_AUTHORITY.test(endpoint[1])
+    || !(endpoint[2].endsWith("/models") || endpoint[2].endsWith("/chat/completions"))) return null;
+  try {
+    // The Container independently validates DNS, public addresses and the socket.
+    if (new URL(pinned.url).port !== "") return null;
+  } catch {
+    return null;
+  }
+  return encoder.encode(JSON.stringify({ url: pinned.url, key })).byteLength <= MAX_REQUEST_BYTES ? { ...pinned, key } : null;
+}
+
+export function apiStatusFailure(code: ProviderApiStatusFailureCode): Extract<ProviderApiStatusResult, { ok: false }> {
+  return { ok: false, code };
+}
+
+function apiStatusSuccess(status: unknown, elapsedMs: unknown): Extract<ProviderApiStatusResult, { ok: true }> | null {
+  if (typeof status !== "number" || !Number.isInteger(status) || status < 100 || status > 599
+    || typeof elapsedMs !== "number" || !Number.isInteger(elapsedMs) || elapsedMs < 0 || elapsedMs > API_STATUS_MAX_ELAPSED_MS) return null;
+  return { ok: true, status, elapsedMs };
+}
+
+export function providerApiStatusResult(value: unknown): ProviderApiStatusResult {
+  if (isRecord(value)) {
+    const fields = Object.keys(value).length;
+    if (value.ok === true && fields === 3 && Object.hasOwn(value, "ok") && Object.hasOwn(value, "status")
+      && Object.hasOwn(value, "elapsedMs")) return apiStatusSuccess(value.status, value.elapsedMs) ?? apiStatusFailure("invalid-body");
+    if (value.ok === false && fields === 2 && Object.hasOwn(value, "ok") && Object.hasOwn(value, "code")
+      && typeof value.code === "string" && (value.code === "invalid-body" || Object.hasOwn(apiStatusFailureStatuses, value.code))) {
+      return apiStatusFailure(value.code as ProviderApiStatusFailureCode);
+    }
+  }
+  return apiStatusFailure("invalid-body");
 }
 
 type ProbeStage = "configuration" | "start" | "readiness" | "image" | "edge" | "address-policy" | "stop";
@@ -104,9 +160,13 @@ async function smallBody(response: Response, limit: number, signal: AbortSignal)
   }
 }
 
-function json(bytes: Uint8Array<ArrayBuffer>): unknown {
+function json(bytes: Uint8Array<ArrayBuffer>, exact = false): unknown {
   try {
-    return JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes));
+    const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+    const value: unknown = JSON.parse(text);
+    // This protocol has only fixed ASCII names, integer values and closed error codes.
+    if (exact && text.replace(/[ \t\r\n]/gu, "") !== JSON.stringify(value)) throw new Error();
+    return value;
   } catch {
     throw new Error("Provider response was invalid.");
   }
@@ -151,7 +211,7 @@ async function ready(port: Fetcher, revision: string, deadline: number): Promise
   throw new Error("Provider container did not become ready.");
 }
 
-function post(port: Fetcher, path: "/v1/edge-proof" | "/v1/fetch", body: string, signal: AbortSignal) {
+function post(port: Fetcher, path: "/v1/edge-proof" | "/v1/fetch" | "/v1/api-status", body: string, signal: AbortSignal) {
   return within(port.fetch(ORIGIN + path, {
     method: "POST", headers: { "Content-Type": "application/json" }, body, redirect: "manual", signal,
   }), signal);
@@ -264,6 +324,47 @@ export async function fetchPinnedProvider(container: Container, revision: string
     return await withPinnedContainer(container, revision, (port) => fetchPort(port, payload), imageSha256);
   } catch {
     return providerFailure("unavailable");
+  }
+}
+
+async function apiStatusPort(port: Fetcher, url: string, key: string): Promise<ProviderApiStatusResult> {
+  const signal = AbortSignal.timeout(API_STATUS_MS);
+  let response: Response;
+  try {
+    // A request carrying a key is submitted once, even if the outcome is unknown.
+    response = await post(port, "/v1/api-status", JSON.stringify({ url, key }), signal);
+  } catch {
+    return apiStatusFailure(signal.aborted ? "timeout" : "unavailable");
+  }
+  try {
+    requireResult(privateResponse(response, response.status, "application/json") && cleanResponse(response),
+      "Provider API status response headers differ.");
+    const value = json(await smallBody(response, 256, signal), true);
+    requireResult(isRecord(value), "Provider API status response is invalid.");
+    const fields = Object.keys(value).length;
+    if (response.status === 200 && fields === 2 && Object.hasOwn(value, "status") && Object.hasOwn(value, "elapsedMs")) {
+      const result = apiStatusSuccess(value.status, value.elapsedMs);
+      if (result) return result;
+    } else if (response.status !== 200 && fields === 1 && Object.hasOwn(value, "error")
+      && typeof value.error === "string" && Object.hasOwn(apiStatusFailureStatuses, value.error)) {
+      const code = value.error as keyof typeof apiStatusFailureStatuses;
+      if ((apiStatusFailureStatuses[code] as readonly number[]).includes(response.status)) return apiStatusFailure(code);
+    }
+    return apiStatusFailure("invalid-body");
+  } catch {
+    if (!response.bodyUsed) void response.body?.cancel().catch(() => {});
+    return apiStatusFailure(signal.aborted ? "timeout" : "invalid-body");
+  }
+}
+
+export async function probePinnedProviderApiStatus(container: Container, input: ProviderApiStatusInput): Promise<ProviderApiStatusResult> {
+  try {
+    const request = providerApiStatusRequest(input);
+    if (!request) return apiStatusFailure("invalid-request");
+    return await withPinnedContainer(container, request.providerRevision, (port) => apiStatusPort(port, request.url, request.key),
+      request.imageSha256);
+  } catch {
+    return apiStatusFailure("unavailable");
   }
 }
 
