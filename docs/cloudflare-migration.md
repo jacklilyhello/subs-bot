@@ -322,6 +322,12 @@ PY
 
 若流程中断，可在确认当前隔离版本后，以同一批次执行 `action=retire` 并在 `confirm_retire` 填写 `retire <cohort>`。遇到所有者、版本、指针或标记不符时保留记录并停止。此流程验证实际 Worker HTTP 和 D1 读取，与 V3 独立原生恢复的对象完整性核对分别记录。
 
+### 旧单订阅短链盘点
+
+在获准的受保护托管运行中，对同一份封存 SQLite 使用 `python3 -B worker/tools/legacy_typed_short_inventory.py BACKUP OUTPUT SOURCE_SHA256 OWNER_MAP_JSON OWNER_MAP_SHA256 OLD_HTTPS_ORIGIN LEGACY_BOT_ID`。备份和新输出目录的父目录须仅供当前账号访问。独立核对源文件摘要、规范化归属映射摘要、原 Bot ID 和旧 HTTPS 来源。旧来源使用小写域名，省略端口和尾部斜线。
+
+工具只接收旧来源上可唯一解析的单订阅目标，先核对短链发行者与订阅原归属，再应用归属映射。保存原活动或回收站编号、归属、格式、创建时间及短码和订阅令牌摘要。聚合、外部、递归、归属不一致或多重匹配会阻止整包封存。首版限制为两万条短链、两万个订阅身份、2 GiB 源库和 8 MiB 清单数据。只在获准的私有渠道流转最后写入封印的目录。后续候选封装需要再次核对目标编号、归属及令牌摘要，实际旧链接路由另行验收。
+
 ### 真实数据与生产切换门槛
 
 1. 先只读核对 Cloudflare 目标账户、Zone、`subs-bot.lilyya.top` 的 DNS、Worker 路由和 Custom Domain 绑定。新资源记录账号、环境及资源 ID，隔离与生产分别使用各自的 Worker、D1、R2 和队列。现有配置冲突须在改动前报告。目标主机名可用且切换获准后，仅增加所需的 Custom Domain 绑定。 [Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)
