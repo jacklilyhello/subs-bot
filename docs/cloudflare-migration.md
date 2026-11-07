@@ -298,6 +298,8 @@ PY
 
 选择 `synthetic-legacy-empty` 演练版本 3。它使用独立的产物、D1、R2 和操作记录前缀。预检从固定合成样例重建源 SQLite 与转换包并核对摘要，再验证两个活动订阅、两个回收站订阅、路径规则、原始令牌对应的两个空导出标记、0026 迁移、编号序列及四个 R2 对象。构建与预检须使用能产生同一 SQLite 文件的托管工具链，摘要不符时停止。恢复读回包含标记数量与表摘要。目标保持未绑定，空导出 HTTP 行为另行验收。
 
+选择 `synthetic-legacy-private-shares` 可原生恢复 `legacy-private-shares-v1` 的固定合成候选。Worker CI 只打包预置样例。预检在取得 Cloudflare 凭据前从固定旧 SQLite 样例重新构建，逐文件比对 SQL、清单、封印与正文。按下方相同步骤在本组专用 D1 和私有 R2 恢复，目标保持未绑定。最终读回应为三个分享、三条历史领取、分享编号上界 3 和三个正文对象，含指定领取人、已到期记录及恰在到期秒的领取。旧内联标识仅计数。核对完整结构、逐表摘要、对象字节和元数据，检查点只上传计数及摘要。旧 Bot 链接和内联卡片连续性另行验收。
+
 1. 依次运行 `verify`、`prepare`、`create-restore-db`、`create-restore-bucket`，每步核对结果后再继续。创建响应不明时先运行只读 `verify`，根据创建意图、时间和实际资源身份独立确认归属，再用 `pin-resource` 提交 `resource` 和 `identity_sha256`。无法确认归属时保留该资源，停止本组后续写入。
 2. 运行 `restore-objects` 核对专用私有 R2 的对象闭包，再运行 `start-import` 向已核对且仍为空的专用 D1 导入。若已有确认的轮询书签，可用同一 `start-import` 继续轮询。响应不明时保留目标和私有操作记录，通过 `verify-restore` 核对完整结果。导入请求未确认、上传链接或产物已失效，或固定版本已变更时，禁止重发首次导入、重置或删除原目标。保留现场核查，后续演练使用新的 `cohort` 和专用资源。 [D1 原生导入](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/import/)
 3. 用 `verify-restore` 验证完整 `PRAGMA quick_check`、外键、结构、迁移记录、编号序列、逐表摘要和 R2 对象。检查失败即保留目标和证据。此结果覆盖合成候选恢复，旧链接、真实数据和 HTTP 导出分别验收。 [D1 完整性检查](https://developers.cloudflare.com/d1/sql-api/sql-statements/#pragma-quick_check)
