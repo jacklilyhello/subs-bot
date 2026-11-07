@@ -243,6 +243,8 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 隔离容量检查使用当前 `main` 的已部署版本，手动运行 `gh workflow run worker-isolation-capacity.yml --ref main`。托管 runner 生成合成快照，依次验证恰好达到 64 MiB NDJSON 和 16 MiB 分享原文的有效输出、分享原文超 1 字节的拒绝、快照清单超 1 字节的拒绝。正向测试流式核对 Base64 长度和摘要，覆盖串行、并发 2 和 4、慢读及中途取消。发布和容量检查使用同一并发组，测试结束先撤销 D1 能力，再清理对应的私有 R2 对象。清理失败时，工作流保留不含凭据或原始能力令牌的恢复清单。
 
+上传结果未确认时，在产物过期前私下保留原运行的恢复清单。仅使用原清单和对应的隔离资源继续核对清理。待确认对象仍读不到时保留记录，直到核实其内容并确认删除。重新运行容量检查会使用新的合成数据。
+
 运行 `gh workflow run worker-isolation-capacity.yml --ref main -f profile=structured-smoke` 可单独检查混合 Base64 导出。该模式在同一个隔离环境暂存两份小快照，用旧版 Python 序列化器的结果校验混合导出的长度和摘要，并检查不支持的结构化节点返回固定的 422 响应。两份快照都检查 GET 和 HEAD，前后各检查一次运行版本。该模式的恢复清单对应 `capacity_resources.py cleanup` 的 `--profile structured-smoke` 参数。
 
 同一工作流的 `profile=singbox-smoke` 针对 `/sing-box` 检查两份专用快照。成功响应必须声明精确字节数，规范化 JSON 摘要与 Python 对照一致。包含外部出站依赖的快照须返回固定的 422。该模式使用同名清理参数。
