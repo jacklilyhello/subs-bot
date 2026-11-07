@@ -21,10 +21,10 @@ test("matches the folded raw fields, ranks scalar length and breaks ties by orig
   ]));
   assert.equal(map({ name: "😀 SS" }).name, "😀 SS → first tie");
   assert.equal(map({ name: "Other", server: "HOST", share: "ss://opaque" }).name, "Other → crosses fields");
-  assert.equal(map({ name: "Other", share: "vless://fixture@host#%2fpath" }).name, "Other → encoded");
-  const untouched = { name: "Other", raw: "vless://fixture@host#%2fpath", transport: { path: "%2FPath" } };
+  assert.equal(map({ name: "Other", share: "trojan://fixture@host#%2fpath" }).name, "Other → encoded");
+  const untouched = { name: "Other", raw: "trojan://fixture@host#%2fpath", transport: { path: "%2FPath" } };
   assert.equal(map(untouched), untouched);
-  assert.equal(map({ name: "Other", share: "vless://fixture@host#/path" }).name, "Other");
+  assert.equal(map({ name: "Other", share: "trojan://fixture@host#/path" }).name, "Other");
   const native = { name: "SS", tag: "SS", password: "fixture", server: "host" };
   assert.deepEqual(map(native), { ...native, name: "SS → first tie", tag: "SS → first tie" });
   assert.equal(native.name, "SS");
