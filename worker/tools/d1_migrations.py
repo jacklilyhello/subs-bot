@@ -143,6 +143,15 @@ def _objects(migrations: list[Migration], position: int, *, managed: bool) -> tu
     return objects + (LEDGER_OBJECT,) if managed else objects
 
 
+def _all_conditions(parts: list[str]) -> str:
+    # D1 bounds expression depth. Balance the exact predicates so the guard
+    # grows logarithmically in depth as schema and ledger entries accumulate.
+    if len(parts) <= 2:
+        return "\nAND ".join(parts)
+    middle = len(parts) // 2
+    return f"({_all_conditions(parts[:middle])})\nAND ({_all_conditions(parts[middle:])})"
+
+
 def _schema_condition(objects: tuple[SchemaObject, ...]) -> str:
     # Ignore only D1's reserved storage table and SQLite's generated indexes.
     # The full CREATE TABLE SQL pins inline UNIQUE/PK/CHECK constraints.
@@ -162,7 +171,7 @@ def _schema_condition(objects: tuple[SchemaObject, ...]) -> str:
     if objects:
         parts.append("""EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'index' AND tbl_name = 'subscriptions'
             AND name = 'sqlite_autoindex_subscriptions_1' AND sql IS NULL)""")
-    return "\nAND ".join(parts)
+    return _all_conditions(parts)
 
 
 def _validate_indexes(api, path: str, objects: tuple[SchemaObject, ...]) -> None:
@@ -225,7 +234,7 @@ def _history_condition(history: list[dict]) -> str:
         f" AND name = {_literal(row['name'])} AND sha256 = {_literal(row['sha256'])} AND mode = {_literal(row['mode'])})"
         for row in history
     )
-    return "\nAND ".join(parts)
+    return _all_conditions(parts)
 
 
 def _assert_sql(condition: str) -> str:
