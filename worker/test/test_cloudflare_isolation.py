@@ -47,6 +47,7 @@ DATABASE = f"{ACCOUNT}/d1/database/{TARGET['d1Id']}"
 BUCKET = f"{ACCOUNT}/r2/buckets/{cloudflare.WORKER_NAME}"
 DOMAINS = f"{ACCOUNT}/workers/domains?service={cloudflare.WORKER_NAME}"
 TELEGRAM_CONFIG = '{"fixture":"synthetic-only"}'
+AGGREGATE_KEY = base64.urlsafe_b64encode(b"\x17" * 32).decode("ascii").rstrip("=")
 CRON = {"cron": cloudflare.TELEGRAM_CRON}
 
 
@@ -119,6 +120,7 @@ class FakeCloudflare:
         self.lose_cron_response = False
         self.health_verified_deployment = None
         self.telegram_upload = None
+        self.aggregate_upload = None
         self.alter_config_digest = False
         self.candidate_readback_errors = []
         self.upload_error = None
@@ -153,6 +155,9 @@ class FakeCloudflare:
             for row in self.versions[NEW_VERSION]["bindings"]:
                 if row["name"] == cloudflare.TELEGRAM_CONFIG_BINDING:
                     self.telegram_upload = deepcopy(row)
+                    row.pop("text")
+                if row["name"] == cloudflare.AGGREGATE_KEY_BINDING:
+                    self.aggregate_upload = deepcopy(row)
                     row.pop("text")
                 if row["name"] == cloudflare.TELEGRAM_DIGEST_BINDING and self.alter_config_digest:
                     row["text"] = "e" * 64
@@ -226,9 +231,10 @@ class ReleaseTests(unittest.TestCase):
         sleeper.start()
         self.addCleanup(sleeper.stop)
 
-    def release(self, telegram_config=None):
+    def release(self, telegram_config=None, aggregate_key=None):
         return cloudflare.release_worker(self.api.worker_api, self.api.data_api, TARGET, self.bundle,
-                                         self.manifest, self.api.guard, telegram_config=telegram_config)
+                                         self.manifest, self.api.guard, telegram_config=telegram_config,
+                                         aggregate_key=aggregate_key)
 
     def set_old_telegram_config(self, config=TELEGRAM_CONFIG):
         self.api.versions[OLD_VERSION]["bindings"].extend([
@@ -332,6 +338,27 @@ class ReleaseTests(unittest.TestCase):
         self.api.worker_responses[SCHEDULES] = {"schedules": [CRON]}
         self.assertTrue(self.release(TELEGRAM_CONFIG)["changed"])
         self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
+
+    def test_aggregate_key_is_private_idempotent_and_requires_explicit_rotation(self):
+        result = self.release(TELEGRAM_CONFIG, AGGREGATE_KEY)
+        self.assertTrue(result["changed"])
+        self.assertEqual(self.api.aggregate_upload, {"name": cloudflare.AGGREGATE_KEY_BINDING, "type": "secret_text",
+                                                   "text": AGGREGATE_KEY})
+        self.assertNotIn(AGGREGATE_KEY, json.dumps(result))
+        self.assertFalse(self.release(TELEGRAM_CONFIG, AGGREGATE_KEY)["changed"])
+        self.assertEqual(cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET),
+                         {"deploymentId": NEW_DEPLOYMENT, "versionId": NEW_VERSION, "revision": NEW_REVISION})
+        writes = self.api.writes()
+        for different in (None, "A" * 43):
+            with self.subTest(key_absent=different is None):
+                with self.assertRaisesRegex(cloudflare.CloudflareError, "separate rotation release"):
+                    self.release(TELEGRAM_CONFIG, different)
+        self.assertEqual(self.api.writes(), writes)
+
+    def test_invalid_aggregate_key_fails_before_cloudflare(self):
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "canonical Base64URL"):
+            self.release(TELEGRAM_CONFIG, "A" * 42 + "B")
+        self.assertEqual(self.api.calls, [])
 
     def test_failed_cron_setup_can_be_retried_without_redeploying(self):
         self.api.cron_available = False
