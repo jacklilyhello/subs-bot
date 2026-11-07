@@ -3,6 +3,7 @@ import { getSubscriptionNodeSource, PathRuleContentError } from "../path-rules.t
 import { SingBoxContentError } from "../singbox-export.ts";
 import { planSingBox } from "../singbox-response.ts";
 import { digestHex, readSnapshotNodes, SUBSCRIPTION_LIFECYCLE_REVISION, validInteger, type SubscriptionSnapshot } from "../storage.ts";
+import { providerRefreshTarget, type TelegramProviderRefreshTarget } from "./provider-refresh.ts";
 import { TELEGRAM_AGGREGATE_ORIGIN } from "./aggregate-actions.ts";
 import { inTelegramScope, SUBSCRIPTION_READ_RECEIPT_MARKER, SUBSCRIPTION_READ_TICKET,
   type TelegramPolicy, type TelegramSubscriptionReadUpdate } from "./protocol.ts";
@@ -48,6 +49,7 @@ interface RenderedRead {
   readButtons?: TelegramSubscriptionReadButton[];
   readGuard?: Guard;
   nodeButtons?: TelegramNodePageButton[];
+  refreshTarget?: TelegramProviderRefreshTarget;
 }
 
 const privateScope = (event: Pick<ReadLease, "actorId" | "chatId" | "chatType" | "threadId">): boolean =>
@@ -250,14 +252,16 @@ type Metadata = {
   snapshotId: string | null;
   manifestSha256: string | null;
   token: string | null;
+  sourceUrl: string | null;
 };
 
-function subscriptionGuard(guard: Guard, row: Metadata, token?: string): Guard {
+function subscriptionGuard(guard: Guard, row: Metadata, token?: string, refreshSource?: string | null): Guard {
   return { sql: `(${guard.sql}) AND EXISTS (SELECT 1 FROM subscriptions
     WHERE id=? AND owner_id=inbox.actor_id AND generation=? AND ${SUBSCRIPTION_LIFECYCLE_REVISION}=?
-      AND snapshot_id IS ? AND manifest_sha256 IS ? AND node_count=? ${token ? "AND token=?" : ""})`,
+      AND snapshot_id IS ? AND manifest_sha256 IS ? AND node_count=? ${token ? "AND token=?" : ""}
+      ${refreshSource ? "AND source_url=?" : ""})`,
     bindings: [...guard.bindings, row.id, row.generation, row.lifecycleRevision, row.snapshotId, row.manifestSha256, row.nodeCount,
-      ...(token ? [token] : [])] };
+      ...(token ? [token] : []), ...(refreshSource ? [refreshSource] : [])] };
 }
 
 function gb(value: number | null): string {
@@ -339,7 +343,9 @@ async function renderDetail(bucket: R2Bucket, row: Metadata, guard: Guard, deadl
   } else {
     lines.push("当前没有已发布的节点。");
   }
-  return { text: lines.join("\n"), readButtons, readGuard: subscriptionGuard(guard, row),
+  const refreshTarget = await providerRefreshTarget(row, row.sourceUrl);
+  return { text: lines.join("\n"), readButtons, refreshTarget,
+    readGuard: subscriptionGuard(guard, row, undefined, refreshTarget ? row.sourceUrl : null),
     ...(nodeButtons.length ? { nodeButtons } : {}) };
 }
 
@@ -367,6 +373,7 @@ async function renderFormat(db: D1Database, bucket: R2Bucket, row: Metadata, for
 
 export async function renderTelegramSubscriptionRead(
   db: D1Database, bucket: R2Bucket, policy: TelegramPolicy, lease: ReadLease, deadline: number, nodePagesEnabled = false,
+  providerRefreshEnabled = false,
 ): Promise<RenderedRead> {
   const guard = receiptGuard(policy);
   try {
@@ -385,7 +392,8 @@ export async function renderTelegramSubscriptionRead(
     const row = await db.prepare(`SELECT id,name,expire_at AS expireAt,traffic_used AS trafficUsed,traffic_total AS trafficTotal,
       (last_error IS NOT NULL) AS refreshFailed,generation,${SUBSCRIPTION_LIFECYCLE_REVISION} AS lifecycleRevision,
       node_count AS nodeCount,snapshot_id AS snapshotId,manifest_sha256 AS manifestSha256,
-      ${receipt.kind === "format" ? "token" : "NULL"} AS token
+      ${receipt.kind === "format" ? "token" : "NULL"} AS token,
+      ${providerRefreshEnabled && receipt.kind === "detail" ? "source_url" : "NULL"} AS sourceUrl
       FROM subscriptions WHERE id=? AND owner_id=?`).bind(receipt.subscriptionId, lease.actorId).first<Metadata>();
     if (!row) return { text: "订阅不存在或已被删除。", readGuard: guard };
     if (receipt.kind === "detail") return await renderDetail(bucket, row, guard, deadline, nodePagesEnabled);
