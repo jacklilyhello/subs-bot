@@ -202,7 +202,9 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 先用当前 `main` 的已核对 Worker CI 产物正常发布，确认活动版本没有 `TELEGRAM_INLINE_SEARCH` 绑定且 D1 已记录 `0025`。发布参数 `inline_search` 默认为 `preserve`，沿用活动版本的设置。首次部署和仍关闭的版本均省略该绑定。启用时只接受 Worker 的版本级 `plain_text` 绑定，值为 `1`。
 
-启用前由用户单独为已核对的隔离测试 Bot 确认 BotFather 的 `/setinline`，并确认 Webhook 仍使用原隔离 URL、密钥和连接上限，接收范围精确为 `message`、`callback_query` 和 `inline_query`。变更时保留待处理更新。无需开启所选内联结果反馈。部署工作流只核对 Cloudflare 状态，Telegram 配置由用户独立核对。 [Telegram 内联设置](https://core.telegram.org/bots/inline) · [Webhook 配置](https://core.telegram.org/bots/api#setwebhook) · [Webhook 回读](https://core.telegram.org/bots/api#getwebhookinfo)
+启用前由用户单独为已核对的隔离测试 Bot 确认 BotFather 的 `/setinline`。无需开启所选内联结果反馈。在受保护的 `main` 运行 `worker-isolation-telegram-inline-webhook.yml`，先用 `inspect` 核对 Bot 身份、内联模式、隔离 Worker、加密配置摘要与现有 Webhook。现有接收范围须为 `message`、`callback_query`，或已包含 `inline_query` 的精确集合。连接上限须为 4，且使用默认 TLS 验证。
+
+只有原 DNS 设置记录仍适用时，使用 `append` 并填写 `append inline_query for @test_cfsubs_bot using verified DNS webhook`。工具将原已核对的 Worker 版本中的配置摘要与当前活动配置逐字节摘要匹配，然后在原集合中追加 `inline_query`，保持相同 URL、密钥和连接上限，并传入 `drop_pending_updates: false`。Webhook 回读的 IP 只是当前投递地址，原设置记录证明 DNS 模式。原配置来源无法核实时使用 `inspect`。已订阅时只读核对。写入响应不确定时只做有界回读，以同一作用域和精确接收集合确认结果。工作流仅输出状态、计数和提交。 [Telegram 内联设置](https://core.telegram.org/bots/inline) · [Webhook 配置](https://core.telegram.org/bots/api#setwebhook) · [Webhook 回读](https://core.telegram.org/bots/api#getwebhookinfo)
 
 确认上述范围后，在受保护的同一发布工作流指定 `inline_search=enable` 和 `inline_search_confirmation=enable inline search for subs-bot-cf-dev-01`。使用当前活动关闭版本对应的同一 `main` 提交和 Worker CI 产物。发布保留已核对的 Telegram 配置、数据绑定、密钥和提供方配置，且在启用前确认该 Bot 没有仍有效的内联同意。记录发布输出中的活动部署、版本及 `inlineSearchEnabled`，并核对完整模块和绑定回读。`/health` 只用于核对提交。
 

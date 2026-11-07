@@ -1,5 +1,6 @@
 """Check exact synthetic legacy empty exports on the live isolation Worker."""
 
+from contextlib import contextmanager
 from hashlib import sha256
 import hmac
 import json
@@ -11,11 +12,11 @@ from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request, build_opener
 
 from capacity_resources import Resources, integer
-from cloudflare_isolation import CloudflareClient, CloudflareError, REVISION, _Isolation, _NoRedirect, _verify_health
+from cloudflare_isolation import CloudflareClient, CloudflareError, ORIGIN, REVISION, _Isolation, _NoRedirect, _verify_health
 from d1_migrations import _assert_sql
 from prepare_isolation_artifact import MAIN_REF, REPOSITORY, _parse_object, require_current_main
 from release_isolation import telegram_release_config
-from telegram_aggregate_smoke import MAX_ID, ORIGIN, SUBSCRIPTION_FIELDS, canonical, digest, key_bytes, require
+from telegram_aggregate_smoke import MAX_ID, SUBSCRIPTION_FIELDS, canonical, digest, key_bytes, require
 from telegram_bulk_trash_smoke import snapshot_assert
 from telegram_view_fixtures import FixtureError, query, statement
 
@@ -29,6 +30,18 @@ EXPECTED_SINGBOX = {"outbounds": [{"type": "selector", "tag": "proxy", "outbound
                                   {"type": "direct", "tag": "direct"}]}
 EXPECTED_SURGE = b"[Proxy]\n\n[Proxy Group]\nProxy = select, DIRECT\n\n[Rule]\nFINAL,Proxy\n"
 ERROR = "The isolated legacy empty export smoke could not be verified."
+
+
+class SmokePhaseError(RuntimeError):
+    """Expose only a fixed operation phase in hosted smoke diagnostics."""
+
+
+@contextmanager
+def phase(label):
+    try:
+        yield
+    except Exception:
+        raise SmokePhaseError(f"{ERROR} Failed phase {label}.") from None
 
 
 def parse_inputs(event):
@@ -134,7 +147,9 @@ class EmptyFixtures:
 
 def request_export(opener, token, suffix, method):
     path = f"{ORIGIN}/sub/{token}" + (f"/{suffix}" if suffix else "")
-    request = Request(path, method=method, headers={"Cache-Control": "no-cache"})
+    request = Request(path, method=method, headers={
+        "Cache-Control": "no-cache", "Accept-Encoding": "identity", "User-Agent": "subs-bot-isolation-release/1.0",
+    })
     try:
         response = opener.open(request, timeout=8)
     except HTTPError as error:
@@ -145,7 +160,8 @@ def request_export(opener, token, suffix, method):
         require(len(body) <= 4096 and headers.get("Cache-Control") == "private, no-store"
                 and headers.get("Referrer-Policy") == "no-referrer" and headers.get("X-Content-Type-Options") == "nosniff"
                 and headers.get("Location") is None and (method != "HEAD" or not body), ERROR)
-        return response.status, headers.get_content_type(), body
+        media = headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        return response.status, media, body
 
 
 def verify_formats(fixtures, request):
@@ -175,55 +191,66 @@ def verify_unavailable(token, request):
 
 
 def run():
-    revision = os.environ.get("GITHUB_SHA", "")
-    require(REVISION.fullmatch(revision) and os.environ.get("GITHUB_REPOSITORY") == REPOSITORY
-            and os.environ.get("GITHUB_REF") == MAIN_REF and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch", ERROR)
-    with Path(os.environ["GITHUB_EVENT_PATH"]).open("rb") as event:
-        payload = event.read(65537)
-    require(len(payload) <= 65536, ERROR)
-    action, cohort = parse_inputs(_parse_object(payload, ERROR))
-    require_current_main(revision)
-    raw_policy = telegram_release_config({"migrations": [{"name": "0002_telegram.sql"}]})
-    encoded = os.environ["SUBS_BOT_TELEGRAM_AGGREGATE_KEY"]
-    target = _parse_object(os.environ["SUBS_BOT_CF_ISOLATION_TARGET_JSON"], ERROR)
-    data_token, deploy_token = (os.environ.get(name) for name in ("SUBS_BOT_CF_BOOTSTRAP_TOKEN", "SUBS_BOT_CF_DEPLOY_TOKEN"))
-    require(data_token and deploy_token and data_token != deploy_token, ERROR)
-    data = CloudflareClient(data_token)
-    scope = _Isolation(CloudflareClient(deploy_token), data, target)
-    config = scope.worker_config()
-    scope.verify_resources()
-    active = scope.active()
-    version = scope.version(active.version)
-    require(version.revision == revision and version.telegram_config_sha256 == digest(raw_policy.encode("utf-8"))
-            and version.telegram_aggregate_key_sha256 == digest(encoded.encode("ascii")), ERROR)
-    _verify_health(revision)
-    resources = Resources(target, data, None)
-    require(resources.query("SELECT name,sha256,mode FROM subs_bot_schema_migrations WHERE position=26")
-            == [{"name": MIGRATION, "sha256": MIGRATION_SHA256, "mode": "applied"}], ERROR)
+    with phase("workflow inputs"):
+        revision = os.environ.get("GITHUB_SHA", "")
+        require(REVISION.fullmatch(revision) and os.environ.get("GITHUB_REPOSITORY") == REPOSITORY
+                and os.environ.get("GITHUB_REF") == MAIN_REF and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch", ERROR)
+        with Path(os.environ["GITHUB_EVENT_PATH"]).open("rb") as event:
+            payload = event.read(65537)
+        require(len(payload) <= 65536, ERROR)
+        action, cohort = parse_inputs(_parse_object(payload, ERROR))
+        require_current_main(revision)
+        raw_policy = telegram_release_config({"migrations": [{"name": "0002_telegram.sql"}]})
+        encoded = os.environ["SUBS_BOT_TELEGRAM_AGGREGATE_KEY"]
+        target = _parse_object(os.environ["SUBS_BOT_CF_ISOLATION_TARGET_JSON"], ERROR)
+        data_token, deploy_token = (os.environ.get(name) for name in ("SUBS_BOT_CF_BOOTSTRAP_TOKEN", "SUBS_BOT_CF_DEPLOY_TOKEN"))
+        require(data_token and deploy_token and data_token != deploy_token, ERROR)
+
+    with phase("isolated release preflight"):
+        data = CloudflareClient(data_token)
+        scope = _Isolation(CloudflareClient(deploy_token), data, target)
+        config = scope.worker_config()
+        scope.verify_resources()
+        active = scope.active()
+        version = scope.version(active.version)
+        require(version.revision == revision and version.telegram_config_sha256 == digest(raw_policy.encode("utf-8"))
+                and version.telegram_aggregate_key_sha256 == digest(encoded.encode("ascii")), ERROR)
+        _verify_health(revision)
+        resources = Resources(target, data, None)
+    with phase("migration ledger"):
+        require(resources.query("SELECT name,sha256,mode FROM subs_bot_schema_migrations WHERE position=26", ())
+                == [{"name": MIGRATION, "sha256": MIGRATION_SHA256, "mode": "applied"}], ERROR)
 
     def guard():
         require_current_main(revision)
         require(scope.active() == active and scope.worker_config() == config and scope.version(active.version) == version, ERROR)
 
-    fixtures = EmptyFixtures(resources, json.loads(raw_policy), key_bytes(encoded), cohort)
-    opener = build_opener(ProxyHandler({}), _NoRedirect())
+    with phase("fixture setup"):
+        fixtures = EmptyFixtures(resources, json.loads(raw_policy), key_bytes(encoded), cohort)
+        opener = build_opener(ProxyHandler({}), _NoRedirect())
 
     def request(token, suffix, method):
         return request_export(opener, token, suffix, method)
 
     if action == "verify":
-        fixtures.seed(guard)
+        with phase("fixture seed"):
+            fixtures.seed(guard)
         try:
-            verify_formats(fixtures, request)
+            with phase("format probes"):
+                verify_formats(fixtures, request)
         finally:
-            removed = fixtures.retire(guard)
-        require(removed == 2, ERROR)
+            with phase("fixture retirement"):
+                removed = fixtures.retire(guard)
+                require(removed == 2, ERROR)
     else:
-        removed = fixtures.retire(guard)
-    for fixture in fixtures.targets.values():
-        verify_unavailable(fixture["token"], request)
-    guard()
-    _verify_health(revision)
+        with phase("fixture retirement"):
+            removed = fixtures.retire(guard)
+    with phase("retired capability probes"):
+        for fixture in fixtures.targets.values():
+            verify_unavailable(fixture["token"], request)
+    with phase("isolated release readback"):
+        guard()
+        _verify_health(revision)
     print(json.dumps({"action": action, "verifiedFormats": len(SUFFIXES) if action == "verify" else 0,
                       "syntheticRowsRemoved": removed, "privateNoStore": True, "activeVersion": active.version}, sort_keys=True))
 
@@ -231,6 +258,8 @@ def run():
 if __name__ == "__main__":
     try:
         run()
+    except SmokePhaseError as error:
+        sys.exit(str(error))
     except Exception:
         # HTTP and database errors may include synthetic capability values.
         sys.exit(ERROR)
