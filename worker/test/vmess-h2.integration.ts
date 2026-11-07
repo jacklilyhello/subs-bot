@@ -89,6 +89,7 @@ async function replay(directory: string, scratch: string, name: string, document
   assert.equal(report.document.unsupported, 0);
   assert.equal(report.formats.base64.status, 422);
   return {
+    status: { clash: report.formats.clash.status, singbox: report.formats.singbox.status },
     async clash() {
       assert.equal(report.formats.clash.status, 200);
       const { proxies } = parseYaml(await readFile(join(output, "clash.body"), "utf8"));
@@ -107,7 +108,7 @@ async function replay(directory: string, scratch: string, name: string, document
   };
 }
 
-test("emitted VMess configurations tunnel through a verified loopback TLS H2 relay", { timeout: 100_000 }, async (t) => {
+test("emitted VMess configurations tunnel through a verified loopback TLS H2 relay", { timeout: 120_000 }, async (t) => {
   const interfaces = networkInterfaces();
   assert.deepEqual(Object.keys(interfaces), ["lo"], "The fixture requires a loopback-only Linux network namespace.");
   assert.ok(interfaces.lo?.some(({ address, internal }) => address === loopback && internal));
@@ -192,14 +193,14 @@ test("emitted VMess configurations tunnel through a verified loopback TLS H2 rel
     return new Promise<void>((resolve) => relay.close(() => resolve()));
   });
 
-  const clashInput = { proxies: [{ name: proxyName, type: "vmess", server: loopback, port: ports.relay, uuid,
+  const clashNode = { name: proxyName, type: "vmess", server: loopback, port: ports.relay, uuid,
     alterId: 0, cipher: "aes-128-gcm", udp: false, tls: true, servername: sni, network: "h2",
-    "h2-opts": { host: [authority], path } }] };
-  const singboxInput = { outbounds: [{ tag: proxyName, type: "vmess", server: loopback, server_port: ports.relay, uuid,
+    "h2-opts": { host: [authority], path } };
+  const singboxNode = { tag: proxyName, type: "vmess", server: loopback, server_port: ports.relay, uuid,
     alter_id: 0, security: "aes-128-gcm", network: "tcp", tls: { enabled: true, server_name: sni },
-    transport: { type: "http", host: [authority], path, headers: { "Accept-Encoding": "identity" } } }] };
-  const clashSource = await replay(directory, scratch, "clash", clashInput);
-  const singboxSource = await replay(directory, scratch, "singbox", singboxInput);
+    transport: { type: "http", host: [authority], path, headers: { "Accept-Encoding": "identity" } } };
+  const clashSource = await replay(directory, scratch, "clash", { proxies: [clashNode] });
+  const singboxSource = await replay(directory, scratch, "singbox", { outbounds: [singboxNode] });
 
   async function probe(engine: "clash" | "singbox", outbound: Record<string, unknown>) {
     const config = join(scratch, `client-${engine}.json`);
@@ -242,5 +243,26 @@ test("emitted VMess configurations tunnel through a verified loopback TLS H2 rel
     const outbound = await singboxSource.clash();
     assert.equal(outbound.network, "h2");
     await probe("clash", outbound);
+  });
+  await t.test("both cross-exports tunnel with explicit ChaCha20-Poly1305", async () => {
+    const cipher = "chacha20-poly1305";
+    const clash = await replay(directory, scratch, "clash-chacha", { proxies: [{ ...clashNode, cipher }] });
+    const sing = await replay(directory, scratch, "singbox-chacha", { outbounds: [{ ...singboxNode, security: cipher }] });
+    const outbound = await clash.singbox();
+    assert.equal(outbound.security, cipher);
+    await probe("singbox", outbound);
+    const proxy = await sing.clash();
+    assert.equal(proxy.cipher, cipher);
+    await probe("clash", proxy);
+  });
+  await t.test("out-of-subset inputs preserve their native route and refuse the cross-export", async () => {
+    const cleartext = await replay(directory, scratch, "clash-cleartext", {
+      proxies: [{ ...clashNode, tls: false, servername: "" }],
+    });
+    assert.deepEqual(cleartext.status, { clash: 200, singbox: 422 });
+    const autoCompression = await replay(directory, scratch, "singbox-compression", {
+      outbounds: [{ ...singboxNode, transport: { type: "http", host: [authority], path } }],
+    });
+    assert.deepEqual(autoCompression.status, { clash: 422, singbox: 200 });
   });
 });

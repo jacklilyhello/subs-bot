@@ -5,6 +5,7 @@ import {
   TRANSPORT_PROTOCOLS, validHysteria1Bandwidth, type Fields,
 } from "./proxy-input.ts";
 import type { NodeRecord } from "./storage.ts";
+import { portableVmessH2Options, requireVmessH2Connection } from "./vmess-h2.ts";
 
 type Rule = (value: unknown) => boolean;
 type Schema = Record<string, Rule>;
@@ -214,13 +215,18 @@ function clashTls(source: Fields, protocol: string, https: boolean): Fields | nu
   return null;
 }
 
-function clashTransport(source: Fields): Fields | null {
+function clashTransport(source: Fields, vmessH2: boolean): Fields | null {
   const network = take(source, "network");
   if (Object.hasOwn(source, "transport")) {
     if (!empty(network)) unsupported();
     return fields(take(source, "transport"));
   }
   if (empty(network) || network === "tcp" || network === "raw") return null;
+  if (vmessH2) {
+    const options = portableVmessH2Options(take(source, "h2-opts", {}), "clash");
+    // Mihomo's H2 client explicitly opts out of compression. Sing-box otherwise offers gzip.
+    return { type: "http", ...options, headers: { "Accept-Encoding": "identity" } };
+  }
   const kind = network === "h2" ? "http" : string(network);
   if (!TRANSPORT_SCHEMAS.has(kind)) unsupported();
   const output: Fields = { type: kind };
@@ -278,7 +284,8 @@ function clashPlugin(source: Fields, output: Fields): void {
   }
 }
 
-function clash(source: Fields, protocol: string, https: boolean): Fields {
+function clash(source: Fields, protocol: string, https: boolean, fromUri: boolean): Fields {
+  const vmessH2 = !fromUri && protocol === "vmess" && source.network === "h2";
   const output: Fields = { type: protocol, server: server(take(source, "server")) };
   const port = take(source, "port");
   const range = protocol === "hysteria" || protocol === "hysteria2" ? take(source, "ports") : undefined;
@@ -289,7 +296,7 @@ function clash(source: Fields, protocol: string, https: boolean): Fields {
   } else output.server_port = integer(port, 1, 65535);
 
   if (TRANSPORT_PROTOCOLS.has(protocol)) {
-    const transport = clashTransport(source);
+    const transport = clashTransport(source, vmessH2);
     if (transport) output.transport = transport;
   }
   if (TLS_REQUIRED.has(protocol) || TRANSPORT_PROTOCOLS.has(protocol) || protocol === "http") {
@@ -298,7 +305,7 @@ function clash(source: Fields, protocol: string, https: boolean): Fields {
   }
   if (NETWORK_PROTOCOLS.has(protocol)) {
     const udp = take(source, "udp");
-    if (udp !== undefined && !flag(udp)) output.network = "tcp";
+    if (udp === undefined ? vmessH2 : !flag(udp)) output.network = "tcp";
   }
   for (const [from, to] of [["tfo", "tcp_fast_open"], ["mptcp", "tcp_multi_path"]]) {
     if (Object.hasOwn(source, from)) output[to] = flag(take(source, from));
@@ -314,6 +321,7 @@ function clash(source: Fields, protocol: string, https: boolean): Fields {
   if (protocol === "vmess") {
     output.security = scalarAlias(source, ["cipher", "security"], "auto");
     output.alter_id = integer(scalarAlias(source, ["alterId", "alter_id"], 0), 0, 65535);
+    if (vmessH2) requireVmessH2Connection(output.tls, output.security, output.alter_id);
     for (const key of ["global-padding", "authenticated-length"]) {
       if (Object.hasOwn(source, key)) output[key.replace("-", "_")] = flag(take(source, key));
     }
@@ -373,10 +381,10 @@ export function validatedNativeSingBox(source: Fields, protocol: string): { outp
 
 export function serializeSingBoxOutbound(node: NodeRecord): { name: string; json: string; hoppingPorts: number } {
   try {
-    const { name, type, protocol, source } = proxyInput(node, "singbox");
+    const { name, type, protocol, source, fromUri } = proxyInput(node, "singbox");
     if (!NATIVE_SCHEMAS.has(protocol)) return unsupported();
     const output = type === protocol && (Object.hasOwn(source, "server_port") || Object.hasOwn(source, "server_ports"))
-      ? native(source, protocol) : clash(source, protocol, type === "https");
+      ? native(source, protocol) : clash(source, protocol, type === "https", fromUri);
     const hoppingPorts = validate(protocol, output);
     return { name, json: JSON.stringify(output), hoppingPorts };
   } catch {

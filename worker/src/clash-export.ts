@@ -257,7 +257,7 @@ export function serializeClashProxy(node: NodeRecord): { name: string; proxy: Fi
     const clashType = CLASH_TYPES.get(protocol);
     if (!clashType) return unsupported();
     const source = !fromUri && type === protocol && (Object.hasOwn(original, "server_port") || Object.hasOwn(original, "server_ports"))
-      ? portableNativeSource(original, protocol) : original;
+      ? portableNativeSource(original, protocol, "clash") : original;
     const output: Fields = { type: clashType, server: server(take(source, "server")) };
     const port = take(source, "port");
     let hoppingPorts = 0;
