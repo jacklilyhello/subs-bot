@@ -25,6 +25,7 @@ import {
 import { prepareTelegramViewTickets, renderTelegramView, type TelegramViewButton } from "./views.ts";
 import { renderTelegramTemp } from "./temp-import.ts";
 import { confirmTelegramTempRawSend, prepareTelegramTempRawReply } from "./temp-raw.ts";
+import { renderTelegramProviderReply } from "./provider-replies.ts";
 
 const BOT_API = "https://api.telegram.org";
 const MAX_RESPONSE_BYTES = 64 * 1024;
@@ -120,7 +121,8 @@ export async function sendTelegramReply(
   keyboard?: InlineKeyboard,
   forceReply = false,
 ): Promise<TelegramReplyOutcome> {
-  if ((lease.path || lease.privateShareCreation || lease.tempRaw) && (lease.chatType !== "private" || lease.threadId !== null)) {
+  if ((lease.path || lease.privateShareCreation || lease.tempRaw || lease.providerOutcome !== undefined)
+      && (lease.chatType !== "private" || lease.threadId !== null)) {
     return { kind: "failed" };
   }
   return sendTelegram(policy, lease, "sendMessage", {
@@ -318,14 +320,23 @@ export async function drainTelegramReplies(
   aggregateKey: CryptoKey | null = null,
   privateShareRuntime: TelegramPrivateShareRuntime = PRIVATE_SHARE_DISABLED,
   subscriptionReadEnabled = false,
+  providerEnabled = false,
 ): Promise<void> {
   const deadline = Date.now() + budgetMs;
   const privateShareEnabled = privateShareRuntime.schemaReady && privateShareRuntime.context !== null;
-  await reapExpiredTelegramReplies(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled);
+  await reapExpiredTelegramReplies(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled, providerEnabled);
   for (let processed = 0; processed < limit && Date.now() < deadline; processed += 1) {
-    const lease = await claimTelegramReply(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled);
+    const lease = await claimTelegramReply(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled,
+      providerEnabled ? policy : undefined);
     if (!lease) return;
     if (!inTelegramScope(policy, lease)) continue;
+    if (lease.providerOutcome !== undefined) {
+      const text = renderTelegramProviderReply(lease.providerOutcome);
+      if (Date.now() >= deadline || !await beginTelegramReply(db, policy, lease, "allowed")) continue;
+      const outcome = await sendTelegramReply(policy, lease, text, Math.max(1, deadline - Date.now()), request);
+      await settleTelegramReply(db, policy, lease, outcome);
+      continue;
+    }
     if (lease.tempRaw) {
       await deliverTelegramTempRaw(db, policy, lease, deadline, request);
       continue;

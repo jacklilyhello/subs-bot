@@ -1,7 +1,7 @@
 import { checkOwnerId, digestHex, SUBSCRIPTION_LIFECYCLE_REVISION, validInteger } from "./storage.ts";
 import { normalizeSubscriptionName } from "./subscriptions.ts";
 
-const TTL_SECONDS = 3600;
+export const PROVIDER_JOB_TTL_SECONDS = 3600;
 const LEASE_SECONDS = 120;
 const MAX_ATTEMPTS = 3;
 const MAX_OWNER_JOBS = 4;
@@ -150,7 +150,7 @@ function prepareAdmission(
       (owner_id, request_key, kind, subscription_id, source_sha256, expected_generation, expected_lifecycle_revision,
        state, created_at, due_at, expires_at, result_code, finished_at)
     SELECT owner_id, ?, ?, id, ?, generation, lifecycle_revision, CASE WHEN coalesced THEN 'done' ELSE 'pending' END,
-      unixepoch(), unixepoch(), unixepoch() + ${TTL_SECONDS}, CASE WHEN coalesced THEN 'coalesced' END,
+      unixepoch(), unixepoch(), unixepoch() + ${PROVIDER_JOB_TTL_SECONDS}, CASE WHEN coalesced THEN 'coalesced' END,
       CASE WHEN coalesced THEN unixepoch() END FROM classified WHERE 1
     ON CONFLICT (owner_id, request_key) DO NOTHING
     RETURNING ${receiptFields}

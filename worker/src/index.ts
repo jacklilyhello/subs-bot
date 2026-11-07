@@ -7,7 +7,7 @@ import { SingBoxContentError } from "./singbox-export.ts";
 import { planSingBox, singBoxChunks } from "./singbox-response.ts";
 import { TextExportError } from "./text-export.ts";
 import { planTextExport, textExportChunks } from "./text-export-response.ts";
-import type { ProviderFetcher } from "./provider-fetch-contract.ts";
+import { PROVIDER_REVISION, PROVIDER_SHA256, type ProviderFetcher, type ProviderPin } from "./provider-fetch-contract.ts";
 import { runOneProviderJob } from "./provider-job-consumer.ts";
 import { acceptTelegramAggregate, parseTelegramAggregateKey } from "./telegram/aggregate-actions.ts";
 import { acceptTelegramSelected, reapTelegramSelected } from "./telegram/selected-export.ts";
@@ -23,7 +23,9 @@ import {
   recoverTelegramPrivateShareCreation, retireAbandonedTelegramPrivateShareCreation,
 } from "./telegram/private-share-creation.ts";
 import { telegramPrivateShareRuntime } from "./telegram/private-share-runtime.ts";
-import { decodeTelegramRequest, parseTelegramPolicy } from "./telegram/protocol.ts";
+import { decodeTelegramRequest, parseTelegramPolicy, type TelegramPolicy } from "./telegram/protocol.ts";
+import { acceptTelegramProviderRequest } from "./telegram/provider-admission.ts";
+import { parseTelegramProviderText, reconcileTelegramProviderReplies, telegramProviderRepliesReady } from "./telegram/provider-replies.ts";
 import { acceptTelegramCommand } from "./telegram/store.ts";
 import { acceptTelegramTemp } from "./telegram/temp-import.ts";
 import { acceptTelegramView, reapTelegramViewTickets } from "./telegram/views.ts";
@@ -39,6 +41,7 @@ export interface Env {
   PROVIDER_FETCH?: ProviderFetcher;
   PROVIDER_REVISION?: string;
   PROVIDER_IMAGE_SHA256?: string;
+  TELEGRAM_PROVIDER_URL_IMPORT?: string;
 }
 
 const QX_KINDS = new Set(["qx", "quantumult", "quantumultx"]);
@@ -86,6 +89,17 @@ function fixedLengthBody(
   return readable;
 }
 
+function providerPin(env: Env): ProviderPin {
+  return { providerRevision: env.PROVIDER_REVISION ?? "", imageSha256: env.PROVIDER_IMAGE_SHA256 ?? "" };
+}
+
+async function telegramProviderUrlReady(env: Env, pin = providerPin(env)): Promise<boolean> {
+  return env.TELEGRAM_PROVIDER_URL_IMPORT === "1" && typeof env.PROVIDER_FETCH?.fetchSubscription === "function"
+    && typeof pin.providerRevision === "string" && PROVIDER_REVISION.test(pin.providerRevision)
+    && typeof pin.imageSha256 === "string" && PROVIDER_SHA256.test(pin.imageSha256)
+    && await telegramProviderRepliesReady(env.DB);
+}
+
 async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
   if (request.method !== "POST") {
     return plain("Method not allowed.", 405, request.method === "HEAD", { Allow: "POST" });
@@ -100,8 +114,9 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
     const aggregateKey = await parseTelegramAggregateKey(env.TELEGRAM_AGGREGATE_KEY);
     const privateShare = await telegramPrivateShareRuntime(env.DB, env.TELEGRAM_PRIVATE_SHARE_CREATION_KEY);
     const subscriptionRead = await telegramSubscriptionReadReady(env.DB);
+    const providerEnabled = await telegramProviderUrlReady(env);
     const drain = () => ctx?.waitUntil(drainTelegramReplies(env.DB, env.NODES, policy, 4, 20_000, fetch, aggregateKey, privateShare,
-      subscriptionRead).catch(() => undefined));
+      subscriptionRead, providerEnabled).catch(() => undefined));
     if (decoded.command) {
       await acceptTelegramCommand(env.DB, policy, decoded.command);
       drain();
@@ -127,8 +142,14 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
         drain();
       }
     } else if (decoded.temp) {
-      const outcome = await acceptTelegramTemp(env.DB, policy, decoded.temp);
-      if (outcome === "accepted") {
+      const candidate = providerEnabled && decoded.temp.kind === "temp-text" ? parseTelegramProviderText(decoded.temp.text) : null;
+      if (candidate) {
+        const outcome = await acceptTelegramProviderRequest(env.DB, policy, { ...decoded.temp, ...candidate, kind: "url-import" });
+        if (outcome.kind !== "queued" && outcome.kind !== "ignored") {
+          await reconcileTelegramProviderReplies(env.DB, policy);
+          drain();
+        }
+      } else if (await acceptTelegramTemp(env.DB, policy, decoded.temp) === "accepted") {
         drain();
       }
     } else if (decoded.selected) {
@@ -244,14 +265,14 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
   }
 }
 
-async function recoverTelegramWork(_controller: ScheduledController, env: Env): Promise<void> {
-  const policy = parseTelegramPolicy(env.TELEGRAM_ISOLATION_CONFIG);
-  if (!policy) return;
+async function recoverTelegramWork(env: Env, policy: TelegramPolicy, pin: ProviderPin, providerEnabled: boolean): Promise<void> {
   const aggregateKey = await parseTelegramAggregateKey(env.TELEGRAM_AGGREGATE_KEY);
   const privateShare = await telegramPrivateShareRuntime(env.DB, env.TELEGRAM_PRIVATE_SHARE_CREATION_KEY);
   const subscriptionRead = await telegramSubscriptionReadReady(env.DB);
+  const drain = (limit: number, budget: number) =>
+    drainTelegramReplies(env.DB, env.NODES, policy, limit, budget, fetch, aggregateKey, privateShare, subscriptionRead, providerEnabled);
   const replies = async () => {
-    await drainTelegramReplies(env.DB, env.NODES, policy, 10, 45_000, fetch, aggregateKey, privateShare, subscriptionRead);
+    await drain(10, 45_000);
     await reapTelegramViewTickets(env.DB);
     await reapTelegramLifecycle(env.DB);
     if (aggregateKey) await reapTelegramSelected(env.DB);
@@ -264,29 +285,37 @@ async function recoverTelegramWork(_controller: ScheduledController, env: Env): 
     } finally {
       const reconciled = await reconcileTelegramDocumentJobReplies(env.DB, policy);
       if (claimed || reconciled > 0) {
-        await drainTelegramReplies(env.DB, env.NODES, policy, 4, 15_000, fetch, aggregateKey, privateShare, subscriptionRead);
+        await drain(4, 15_000);
       }
     }
   };
   const creations = async () => {
     if (privateShare.context && await recoverTelegramPrivateShareCreation(env.DB, env.NODES, policy, privateShare.context) === "published") {
-      await drainTelegramReplies(env.DB, env.NODES, policy, 4, 15_000, fetch, aggregateKey, privateShare, subscriptionRead);
+      await drain(4, 15_000);
+    }
+  };
+  const providers = async () => {
+    if (!providerEnabled) return;
+    try {
+      await runOneProviderJob(env.DB, env.NODES, env.PROVIDER_FETCH, pin, policy);
+    } finally {
+      if (await reconcileTelegramProviderReplies(env.DB, policy) > 0) await drain(4, 15_000);
     }
   };
   const results = await Promise.allSettled([replies(), documents(), creations(), retireTelegramDocumentStage(env.DB, env.NODES, policy),
-    privateShare.schemaReady ? retireAbandonedTelegramPrivateShareCreation(env.DB, env.NODES, policy) : Promise.resolve()]);
+    privateShare.schemaReady ? retireAbandonedTelegramPrivateShareCreation(env.DB, env.NODES, policy) : Promise.resolve(), providers()]);
   if (results.some(({ status }) => status === "rejected")) {
     throw new Error("Telegram scheduled recovery could not finish.");
   }
 }
 
-async function scheduled(controller: ScheduledController, env: Env): Promise<void> {
+async function scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+  const pin = providerPin(env);
   try {
-    await recoverTelegramWork(controller, env);
+    const policy = parseTelegramPolicy(env.TELEGRAM_ISOLATION_CONFIG);
+    if (policy) await recoverTelegramWork(env, policy, pin, await telegramProviderUrlReady(env, pin));
   } finally {
-    await runOneProviderJob(env.DB, env.NODES, env.PROVIDER_FETCH, {
-      providerRevision: env.PROVIDER_REVISION ?? "", imageSha256: env.PROVIDER_IMAGE_SHA256 ?? "",
-    });
+    await runOneProviderJob(env.DB, env.NODES, env.PROVIDER_FETCH, pin);
   }
 }
 
