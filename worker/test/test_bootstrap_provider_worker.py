@@ -191,6 +191,7 @@ class BootstrapTests(unittest.TestCase):
 
     def test_disabled_real_readback_defaults_do_not_admit_a_enabled_log_stream(self):
         live = worker()
+        live["observability"] = deepcopy(live["observability"])
         live["observability"]["logs"].update(invocation_logs=True, persist=True)
         live["observability"]["traces"]["persist"] = True
         del live["previews_base_config"]["tail_consumers"]
