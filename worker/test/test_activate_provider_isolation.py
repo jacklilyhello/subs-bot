@@ -470,6 +470,17 @@ class ProofTests(unittest.TestCase):
                 self.assertIsNone(request.get_header("Authorization"))
                 self.assertEqual(request.full_url, activation.PROVIDER_URL)
 
+    def test_fixed_application_health_uses_the_isolation_release_user_agent(self):
+        def edge(request, _opener, _error, **kwargs):
+            self.assertEqual(request.full_url, activation.HEALTH_URL)
+            self.assertIsNone(request.get_header("Authorization"))
+            if request.get_header("User-agent") != "subs-bot-isolation-release/1.0":
+                return 403, {}, b'{"error":"denied"}'
+            return 200, {}, HEALTH
+
+        with patch.object(activation.publication, "_response", side_effect=edge):
+            self.assertEqual(activation._public(activation.HEALTH_URL, ISOLATED), HEALTH_PROOF)
+
     def test_private_worker_metadata_keeps_disabled_defaults_and_rejects_drift(self):
         value = worker()
         activation._private_profile(value, IDENTITY, False)
