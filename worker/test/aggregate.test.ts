@@ -184,7 +184,7 @@ test("uses the existing format planners and fixed private redirect for an active
 });
 
 test("exports selected subscriptions through the Surge and Quantumult X renderers", async () => {
-  const config = policy("98006", "88006");
+  const config = policy("98007", "88007");
   const code = "SyntheticTxt";
   const first = await subscription(config.memberId, "First text subscription");
   const second = await subscription(config.memberId, "Second text subscription");
