@@ -276,6 +276,14 @@ PY
 
 旧库容量盘点在获准的托管环境运行 `python3 -B worker/tools/legacy_inventory.py <封存备份>`。输入须是单独完成、关闭、使用 UTF-8 和 DELETE 日志模式的 SQLite 备份。备份准备在原库之外进行，盘点本身以只读事务运行。报告只包含活动订阅与回收站的聚合计数、原始字节、紧凑 UTF-8 NDJSON 字节、块数、大小限制和旧转换器分享原文估算。无法读取或解析的记录有独立计数。退出码 `0` 表示报告完整，仍需检查超限和无效项。退出码 `2` 表示无法核对备份。容量报告不判定归属映射、旧链接兼容、分享权限或实际 Worker 性能。 [SQLite 增量读取](https://sqlite.org/c3ref/blob_open.html) · [SQLite URI](https://sqlite.org/uri.html)
 
+### 旧授权覆盖盘点
+
+普通 Worker CI 只运行合成夹具。真实备份盘点须在单独获准的受保护托管运行中，使用核对过的源码提交和仅供当前账号访问的临时目录。将已经关闭、无 SQLite 伴随文件的 UTF-8、DELETE 日志模式备份放入私有目录，从受信备份交接记录取得独立的 SHA-256。备份须为当前账号拥有的普通文件，使用 `0600` 或 `0400` 权限。输出目录的上级须私有，输出目录须尚未存在。使用无符号链接的实体路径，并在关闭命令跟踪后执行 `python3 -B worker/tools/legacy_authorization_inventory.py BACKUP OUTPUT EXPECTED_SOURCE_SHA256`。程序在不可变只读事务前后核对同一文件的状态及 SHA-256。 [SQLite URI](https://sqlite.org/uri.html)
+
+私有 `auth-overrides.ndjson` 按数值用户 ID 升序保存 `userId`、`allowed`、`createdAt` 和 `updatedAt`。`userId` 使用正有符号 64 位整数的十进制字符串，`allowed` 保留整数 `0` 或 `1`，时间保留有序的正 Unix 秒整数，且不超过 `2^53−1`。最多 20,000 行。缺表与空表分别记录。`manifest.json` 绑定源备份摘要、行数、允许与拒绝的计数、文件长度和文件摘要，`manifest.sha256` 最后写入。只有退出码 `0` 且三个文件的清单闭包和摘要均匹配时才接收盘点包。退出码 `2` 表示无法确认。标准输出仅显示固定完成消息。真实备份和盘点包只在批准的私有交接渠道流转，禁止进入 PR、日志、普通 Actions 产物或缓存。
+
+旧表只保存当前覆盖及时间。实际授权还依赖原管理员配置、允许列表和公开模式，须另行核对。此盘点不写入 Worker、D1 或 Telegram 回执。现有候选仍会拒绝未处理的非空授权覆盖。
+
 ### 普通短链双账号验收
 
 受保护的 `worker-isolation-telegram-short-links-smoke.yml` 对同一活动版本执行 `prepare`、`issued` 和 `retired`。使用同一个 `cohort` 和 Worker CI 运行 ID。后两步引用前一步的成功运行。两名获准用户只在指定内置浏览器私聊分别签发 `https://example.com/subs-bot-normal-short/<cohort>/admin` 和 `https://example.org/subs-bot-normal-short/<cohort>/member`。管理员先尝试撤销普通用户的测试短码，随后各自撤销自己的短链。提交的浏览器证据只包含三项摘要。

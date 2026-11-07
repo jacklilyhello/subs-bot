@@ -1,0 +1,204 @@
+"""Seal only the effective authorization overrides from a closed legacy backup."""
+
+from __future__ import annotations
+
+from contextlib import closing, suppress
+from hashlib import sha256
+import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+import stat
+import sys
+
+
+MAX_ROWS = 20_000
+MAX_USER_ID = 2**63 - 1
+MAX_TIMESTAMP = 2**53 - 1
+SIDECAR = "auth-overrides.ndjson"
+MANIFEST = "manifest.json"
+SEAL = "manifest.sha256"
+USAGE = "Usage: legacy_authorization_inventory.py BACKUP OUTPUT EXPECTED_SOURCE_SHA256"
+SUCCESS = "Legacy authorization inventory sealed."
+FAILURE = "Legacy authorization inventory could not be confirmed safely."
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
+_COLUMNS = (
+    (0, "user_id", "INTEGER", 0, None, 1, 0),
+    (1, "allowed", "INTEGER", 1, None, 0, 0),
+    (2, "created_at", "INTEGER", 1, None, 0, 0),
+    (3, "updated_at", "INTEGER", 1, None, 0, 0),
+)
+
+
+class InventoryError(RuntimeError):
+    """The backup or inventory package could not be verified."""
+
+
+def _require(condition: bool) -> None:
+    if not condition:
+        raise InventoryError(FAILURE)
+
+
+def _private_parent(path: Path) -> Path:
+    _require(path.name not in {"", ".", ".."} and ".." not in path.parts)
+    path = path.absolute()
+    parent = Path(path.anchor)
+    for part in path.parts[1:-1]:
+        parent /= part
+        _require(stat.S_ISDIR(parent.lstat().st_mode))
+    info = parent.lstat()
+    _require(info.st_uid == os.geteuid() and not info.st_mode & 0o077)
+    return path
+
+
+def _file_identity(info: os.stat_result) -> tuple[int, ...]:
+    _require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid()
+             and not info.st_mode & 0o077 and info.st_nlink == 1)
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_mode
+
+
+def _source_state(path: Path) -> tuple[int, ...]:
+    info = path.lstat()
+    for suffix in ("-wal", "-shm", "-journal"):
+        try:
+            path.with_name(path.name + suffix).lstat()
+        except FileNotFoundError:
+            continue
+        raise InventoryError(FAILURE)
+    return _file_identity(info)
+
+
+def _fingerprint(path: Path, identity: tuple[int, ...]) -> str:
+    _require(_source_state(path) == identity)
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    with os.fdopen(os.open(path, flags), "rb") as source:
+        _require(_file_identity(os.fstat(source.fileno())) == identity)
+        header = source.read(20)
+        _require(header.startswith(b"SQLite format 3\x00") and header[18:20] == b"\x01\x01")
+        digest = sha256(header)
+        while block := source.read(64 * 1024):
+            digest.update(block)
+        _require(source.tell() == identity[2] and _file_identity(os.fstat(source.fileno())) == identity)
+    _require(_source_state(path) == identity)
+    return digest.hexdigest()
+
+
+def _canonical_line(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("ascii") + b"\n"
+
+
+def _authorization_rows(db: sqlite3.Connection) -> tuple[bool, bytearray, int, int]:
+    table = db.execute("""
+        SELECT name, type, ncol, wr, strict FROM pragma_table_list
+        WHERE schema = 'main' AND name = 'auth_overrides' COLLATE NOCASE
+    """).fetchone()
+    rows = bytearray()
+    if table is None:
+        return False, rows, 0, 0
+    _require(table == ("auth_overrides", "table", 4, 0, 0)
+             and tuple(db.execute("PRAGMA main.table_xinfo(auth_overrides)")) == _COLUMNS)
+
+    # Project only SQLite INTEGERs. Malformed text/BLOB values fail validation
+    # without loading an arbitrarily large cell into the inventory process.
+    records = db.execute("""
+        SELECT CASE WHEN typeof(user_id) = 'integer' THEN user_id END,
+            CASE WHEN typeof(allowed) = 'integer' THEN allowed END,
+            CASE WHEN typeof(created_at) = 'integer' THEN created_at END,
+            CASE WHEN typeof(updated_at) = 'integer' THEN updated_at END
+        FROM main.auth_overrides ORDER BY user_id LIMIT ?
+    """, (MAX_ROWS + 1,))
+    previous_id = 0
+    count = allowed_count = 0
+    for user_id, allowed, created_at, updated_at in records:
+        _require(count < MAX_ROWS and type(user_id) is int and previous_id < user_id <= MAX_USER_ID
+                 and type(allowed) is int and allowed in (0, 1)
+                 and type(created_at) is int and type(updated_at) is int
+                 and 1 <= created_at <= updated_at <= MAX_TIMESTAMP)
+        rows.extend(_canonical_line({
+            "userId": str(user_id), "allowed": allowed, "createdAt": created_at, "updatedAt": updated_at,
+        }))
+        previous_id = user_id
+        count += 1
+        allowed_count += allowed
+    return True, rows, count, allowed_count
+
+
+def _read_authorization(path: Path) -> tuple[bool, bytearray, int, int]:
+    # immutable is valid only for a completed backup with no concurrent writer.
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro&immutable=1", uri=True, isolation_level=None)) as db:
+        db.execute("PRAGMA trusted_schema = OFF")
+        db.execute("PRAGMA query_only = ON")
+        db.execute("PRAGMA temp_store = MEMORY")
+        db.execute("PRAGMA cache_size = -2048")
+        _require(db.execute("PRAGMA trusted_schema").fetchone() == (0,)
+                 and db.execute("PRAGMA query_only").fetchone() == (1,))
+        db.execute("BEGIN")
+        _require(db.execute("PRAGMA encoding").fetchone() == ("UTF-8",))
+        result = _authorization_rows(db)
+        db.execute("ROLLBACK")
+        return result
+
+
+def _write_private(path: Path, data: bytes | bytearray) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    with os.fdopen(os.open(path, flags, 0o600), "wb") as file:
+        file.write(data)
+        file.flush()
+        os.fsync(file.fileno())
+
+
+def seal_inventory(backup: Path, output: Path, expected_source_sha256: str) -> None:
+    """Write a deterministic private package from an independently pinned source."""
+    _require(_SHA256.fullmatch(expected_source_sha256) is not None)
+    source = _private_parent(backup)
+    destination = _private_parent(output)
+    identity = _source_state(source)
+    _require(_fingerprint(source, identity) == expected_source_sha256)
+    present, rows, count, allowed = _read_authorization(source)
+    _require(_fingerprint(source, identity) == expected_source_sha256)
+
+    manifest = _canonical_line({
+        "version": 1, "kind": "legacy-authorization-inventory", "sourceSha256": expected_source_sha256,
+        "authOverrides": {
+            "present": present, "rows": count, "allowedRows": allowed, "deniedRows": count - allowed,
+            "file": SIDECAR, "bytes": len(rows), "sha256": sha256(rows).hexdigest(),
+        },
+    })
+    destination.mkdir(mode=0o700)
+    try:
+        _write_private(destination / SIDECAR, rows)
+        _write_private(destination / MANIFEST, manifest)
+        _write_private(destination / SEAL, sha256(manifest).hexdigest().encode("ascii") + b"\n")
+    except BaseException:
+        # Only fixed filenames in the newly created private directory are ours.
+        for name in (SEAL, MANIFEST, SIDECAR):
+            with suppress(OSError):
+                (destination / name).unlink()
+        with suppress(OSError):
+            destination.rmdir()
+        raise
+
+
+def main(args: list[str] | None = None) -> int:
+    args = sys.argv[1:] if args is None else args
+    if args in (["-h"], ["--help"]):
+        print(USAGE)
+        return 0
+    if len(args) != 3:
+        print(USAGE, file=sys.stderr)
+        return 2
+    try:
+        seal_inventory(Path(args[0]), Path(args[1]), args[2])
+    except KeyboardInterrupt:
+        print("Legacy authorization inventory was interrupted.", file=sys.stderr)
+        return 130
+    except Exception:
+        print(FAILURE, file=sys.stderr)
+        return 2
+    print(SUCCESS)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
