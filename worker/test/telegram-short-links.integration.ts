@@ -49,7 +49,8 @@ test("emitted Worker issues, retries and revokes owned short links without overl
       const reply = { id: 1000 + sends.length, chat: body.chat_id, replyTo, text: body.text };
       sends.push(reply);
       if (replyTo === retryId && prior === 0) {
-        return Response.json({ ok: false, error_code: 429, parameters: { retry_after: 1 } }, { status: 429 });
+        // The test releases the D1 retry explicitly after observing the pending row.
+        return Response.json({ ok: false, error_code: 429, parameters: { retry_after: 30 } }, { status: 429 });
       }
       if (replyTo === uncertainId) return Response.json({ ok: false, error_code: 500 }, { status: 500 });
       return Response.json({ ok: true, result: { message_id: reply.id, chat: { id: Number(reply.chat) } } });

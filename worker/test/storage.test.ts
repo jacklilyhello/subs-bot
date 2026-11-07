@@ -7,7 +7,7 @@ import { Miniflare } from "miniflare";
 
 import {
   createSubscription, getOwnedSubscription, getSubscriptionSnapshot, MAX_CHUNK_BYTES, MAX_SNAPSHOT_BYTES,
-  prepareNodeSnapshotPublication, publishNodeSnapshot, readSnapshotNodes, SnapshotIntegrityError, stageNodeSnapshot,
+  prepareNodeSnapshotPublication, publishNodeSnapshot, readSnapshotNodeRange, readSnapshotNodes, SnapshotIntegrityError, stageNodeSnapshot,
 } from "../src/storage.ts";
 import type { NodeRecord, SubscriptionSnapshot } from "../src/storage.ts";
 
@@ -266,6 +266,47 @@ test("rejects a manifest one byte over the snapshot limit before requesting any 
   } as unknown as R2Bucket;
   await assert.rejects(async () => readSnapshotNodes(syntheticBucket, snapshot).next(), SnapshotIntegrityError);
   assert.deepEqual(reads, [manifestKey]);
+});
+
+test("a node page reads only intersecting original chunks and validates every record in them", async () => {
+  const encode = (text: string) => new TextEncoder().encode(text);
+  const hash = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+  const prefix = "subscriptions/125/11111111-1111-4111-8111-111111111111/";
+  const records = (first: number, count: number) => Array.from({ length: count }, (_, index) =>
+    `{"name":"Node ${first + index}"}\n`).join("");
+  const first = encode(records(0, 10));
+  const middle = encode(records(10, 10));
+  const last = encode(records(20, 15));
+  const after = encode(records(35, 1));
+  const reads: string[] = [];
+  function fixture(lastChunk: Uint8Array, observedLast: Uint8Array | null = lastChunk) {
+    const manifest = encode(JSON.stringify({ version: 1,
+      chunks: [first, middle, lastChunk, after].map((bytes, i) => ({ bytes: bytes.byteLength,
+        sha256: hash(bytes), count: [10, 10, 15, 1][i] })),
+    }));
+    const snapshot: SubscriptionSnapshot = { id: 125, generation: 1, snapshotId: "11111111-1111-4111-8111-111111111111",
+      manifestSha256: hash(manifest), nodeCount: 36 };
+    const objects = new Map([["manifest.json", manifest], ["1.ndjson", middle], ["2.ndjson", observedLast]]);
+    const bucket = { async get(key: string) {
+      assert.ok(key.startsWith(prefix));
+      const name = key.slice(prefix.length);
+      reads.push(name);
+      const bytes = objects.get(name);
+      return bytes ? { size: bytes.byteLength, arrayBuffer: async () => bytes.buffer } : null;
+    } } as unknown as R2Bucket;
+    return { bucket, snapshot };
+  }
+  const valid = fixture(last);
+  assert.deepEqual((await readSnapshotNodeRange(valid.bucket, valid.snapshot, 15, 15)).map(({ name }) => name),
+    Array.from({ length: 15 }, (_, index) => `Node ${15 + index}`));
+  assert.deepEqual(reads.splice(0), ["manifest.json", "1.ndjson", "2.ndjson"]);
+
+  // Neither missing/digest-invalid content nor malformed or extra trailing NDJSON can yield a partial page.
+  for (const invalid of [fixture(last, null), fixture(last, encode(records(40, 15))),
+    fixture(encode(records(20, 14) + "null\n")), fixture(encode(records(20, 16)))]) {
+    await assert.rejects(readSnapshotNodeRange(invalid.bucket, invalid.snapshot, 15, 15), SnapshotIntegrityError);
+    assert.deepEqual(reads.splice(0), ["manifest.json", "1.ndjson", "2.ndjson"]);
+  }
 });
 
 function delayedSnapshot() {

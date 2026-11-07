@@ -28,8 +28,8 @@ class CandidateArtifactTests(unittest.TestCase):
         self.worker.rename(self.root / tool.artifact.VERIFIED_DIRECTORY)
         self.worker = self.root / tool.artifact.VERIFIED_DIRECTORY
 
-    def build(self):
-        return tool.build_synthetic_candidate(self.worker, self.output, self.release["revision"], "1234", "1")
+    def build(self, profile=tool.PROFILE):
+        return tool.build_synthetic_candidate(self.worker, self.output, self.release["revision"], "1234", "1", profile=profile)
 
     def archive(self, *, extra=False):
         file = BytesIO()
@@ -41,10 +41,13 @@ class CandidateArtifactTests(unittest.TestCase):
                 archive.writestr("unreviewed-scratch.sqlite", b"unexpected")
         return file.getvalue()
 
-    def verify(self, archive):
-        tool.unpack_candidate(archive, tool.native.digest(archive), self.root / tool.CANDIDATE_DIRECTORY)
+    def verify(self, archive, profile=tool.PROFILE):
+        tool.unpack_candidate(archive, tool.native.digest(archive), self.root / tool.candidate_directory(profile), profile=profile)
+        provenance = {"worker": self.release}
+        if profile != tool.PROFILE:
+            provenance["profile"] = profile
         with TemporaryDirectory(dir=self.root) as scratch:
-            return tool.verified_candidate(self.root, {"worker": self.release}, Path(scratch))
+            return tool.verified_candidate(self.root, provenance, Path(scratch), profile=profile)
 
     def test_sealed_synthetic_archive_and_exact_fixture_contents(self):
         report = self.build()
@@ -52,6 +55,37 @@ class CandidateArtifactTests(unittest.TestCase):
         self.assertEqual(candidate.pin()["packageManifestSha256"], report["manifestSha256"])
         self.assertEqual(candidate.document["counts"], tool.COUNTS)
         self.assertEqual(len(candidate.entries), 4)
+        self.assertEqual(report["version"], 1)
+        self.assertNotIn("pathIdMapping", candidate.document)
+        self.assertNotIn("pathRulesSha256", candidate.pin())
+
+    def test_path_profile_replays_exact_v2_artifact_and_rejects_v1_cross_selection(self):
+        report = self.build(tool.PATH_PROFILE)
+        archive = self.archive()
+        with self.assertRaises(tool.native.RehearsalError):
+            self.verify(archive)
+        self.assertFalse((self.root / tool.CANDIDATE_DIRECTORY).exists())
+        candidate = self.verify(archive, tool.PATH_PROFILE)
+        self.assertEqual(candidate.document["version"], 2)
+        self.assertEqual(candidate.document["pathIdMapping"], {"kind": "identity", "rows": 4, "sourceHighWater": 120,
+                                                              "targetSequenceHighWater": 120})
+        self.assertEqual(candidate.document["targetSequenceHighWater"], 71)
+        self.assertEqual(candidate.document["summary"]["tableCounts"]["sqlite_sequence"], 2)
+        self.assertEqual(candidate.pin()["packageManifestSha256"], report["manifestSha256"])
+        self.assertEqual(candidate.pin()["pathRulesSha256"], candidate.document["summary"]["tableSha256"]["path_rules"])
+        self.assertEqual(candidate.pin()["pathSequenceHighWater"], 120)
+
+    def test_path_profile_rejects_a_valid_sealed_package_with_different_path_text(self):
+        row = (*tool.PATH_FIXTURES[0][:3], "other synthetic remark")
+        with patch.object(tool, "PATH_FIXTURES", (row, *tool.PATH_FIXTURES[1:])):
+            self.build(tool.PATH_PROFILE)
+        with self.assertRaises(tool.native.RehearsalError):
+            self.verify(self.archive(), tool.PATH_PROFILE)
+
+    def test_path_profile_rejects_preflight_from_the_other_profile(self):
+        with TemporaryDirectory(dir=self.root) as scratch:
+            with self.assertRaises(tool.native.RehearsalError):
+                tool.verified_candidate(self.root, {"worker": self.release}, Path(scratch), profile=tool.PATH_PROFILE)
 
     def test_correct_archive_digest_does_not_admit_extra_member(self):
         self.build()
@@ -81,10 +115,15 @@ class CandidateBoundaryTests(unittest.TestCase):
         with patch.object(native, "ACCOUNT_SHA256", native.digest(native_tests.ACCOUNT.encode())):
             candidate = native.RehearsalAPI(native_tests.TARGET, "synthetic-token", cohort, profile=tool.PROFILE)
             second = native.RehearsalAPI(native_tests.TARGET, "synthetic-token", other, profile=tool.PROFILE)
+            path = native.RehearsalAPI(native_tests.TARGET, "synthetic-token", cohort, profile=tool.PATH_PROFILE)
             existing = native.RehearsalAPI(native_tests.TARGET, "synthetic-token", cohort)
         self.assertEqual(candidate.names, {"database": f"subs-bot-cf-legacy-db-{cohort}",
                                            "objects": f"subs-bot-cf-legacy-r2-{cohort}"})
         self.assertTrue(set(candidate.names.values()).isdisjoint(second.names.values()))
+        self.assertEqual(path.names, {"database": f"subs-bot-cf-legacy-path-db-{cohort}",
+                                      "objects": f"subs-bot-cf-legacy-path-r2-{cohort}"})
+        self.assertTrue(set(path.names.values()).isdisjoint(candidate.names.values()))
+        self.assertNotEqual(path.journal_prefix, candidate.journal_prefix)
         self.assertEqual(existing.names, {"backup": f"subs-bot-cf-backup-{cohort[:16]}",
                                           "database": f"subs-bot-cf-restore-{cohort[:16]}",
                                           "objects": f"subs-bot-cf-restore-{cohort[:16]}"})
@@ -141,6 +180,17 @@ class CandidateBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(tool.native.RehearsalError, "fixed guard failure"):
             journal.save({"version": 1, "cohort": api.cohort})
         self.assertFalse(any(call[0] == "PUT" for call in api.calls))
+
+    def test_path_profile_cannot_read_another_journal_or_list_live_objects(self):
+        native = tool.native
+        with patch.object(native, "ACCOUNT_SHA256", native.digest(native_tests.ACCOUNT.encode())), patch.object(native, "_response") as response:
+            path = native.RehearsalAPI(native_tests.TARGET, "synthetic-token", native_tests.COHORT, profile=tool.PATH_PROFILE)
+            old = native.RehearsalAPI(native_tests.TARGET, "synthetic-token", native_tests.COHORT, profile=tool.PROFILE)
+            with self.assertRaises(native.RehearsalError):
+                path.r2("GET", native.WORKER_NAME, old.journal_prefix + "000001-" + "a" * 32 + ".json")
+            with self.assertRaises(native.RehearsalError):
+                path.list_objects(native.WORKER_NAME, prefix="subscriptions/", maximum=1)
+            response.assert_not_called()
 
     def test_different_runtime_pin_stops_before_claim(self):
         journal = Mock()
