@@ -51,6 +51,7 @@ export type TelegramTempUpdate = TelegramEventScope & (
 
 export type TelegramPathUpdate = TelegramEventScope & { kind: "path"; args: string };
 export type TelegramPrivateShareCreationUpdate = TelegramEventScope & { args: string; senderName?: string };
+export type TelegramShortLinkUpdate = TelegramEventScope & { args: string };
 export type TelegramSubscriptionReadUpdate = TelegramEventScope & (
   | { kind: "search"; query: string }
   | { kind: "number"; position: number }
@@ -70,9 +71,10 @@ type ExistingUpdate =
 
 type CurrentUpdate = (ExistingUpdate & { privateShareCreation?: never })
   | ({ privateShareCreation: TelegramPrivateShareCreationUpdate } & Partial<Record<keyof ExistingUpdate, never>>);
-
-type NormalizedUpdate = (CurrentUpdate & { subscriptionRead?: never })
+type SubscriptionUpdate = (CurrentUpdate & { subscriptionRead?: never })
   | ({ subscriptionRead: TelegramSubscriptionReadUpdate } & Partial<Record<keyof CurrentUpdate, never>>);
+type NormalizedUpdate = (SubscriptionUpdate & { shortLink?: never })
+  | ({ shortLink: TelegramShortLinkUpdate } & Partial<Record<keyof SubscriptionUpdate, never>>);
 
 type DecodedTelegramRequest =
   | ({ status: 200 } & NormalizedUpdate)
@@ -181,7 +183,7 @@ function authCommand(args: string[], reply: unknown, memberId: string): Telegram
 function messageCommand(
   message: Record<string, unknown>, policy: TelegramPolicy,
 ): TelegramCommand["command"] | TelegramViewKind | "temp-raw" | "temp-summary" | "temp-clear" | "aggregate-show" | "aggregate-revoke" |
-  { code: string } | { args: string } | { shareArgs: string } | { selectedQuery: string } | { subscriptionQuery: string } | null {
+  { code: string } | { args: string } | { shareArgs: string } | { selectedQuery: string } | { subscriptionQuery: string } | { shortArgs: string } | null {
   const { text, entities } = message;
   if (typeof text !== "string" || !Array.isArray(entities)) return null;
   const commands = entities.filter((entity) => isRecord(entity) && entity.type === "bot_command" && entity.offset === 0);
@@ -200,6 +202,7 @@ function messageCommand(
   if (remainder !== "" && !separator.test(remainder)) return null;
   if (commandName === "path") return { args: remainder };
   if (commandName === "o") return { selectedQuery: remainder };
+  if (commandName === "short") return { shortArgs: remainder };
   if (commandName === "s") return { subscriptionQuery: remainder };
   if (commandName === "share") return remainder.length <= 4096 ? { shareArgs: remainder } : null;
   const args = remainder.trim().split(/\s+/u).filter(Boolean);
@@ -314,6 +317,7 @@ function normalizeMessage(
   if (command && typeof command === "object") {
     if ("subscriptionQuery" in command) return { subscriptionRead: { ...scope, kind: "search", query: command.subscriptionQuery } };
     if (scope.chatType !== "private" || scope.threadId !== null) return null;
+    if ("shortArgs" in command) return { shortLink: { ...scope, args: command.shortArgs } };
     if ("shareArgs" in command) {
       const sender = isRecord(message.from) ? [message.from.first_name, message.from.last_name]
         .filter((part): part is string => typeof part === "string" && part.length <= 128).join(" ") : "";
@@ -339,6 +343,8 @@ function normalizeMessage(
   if (scope.chatType === "private" && scope.threadId === null && typeof text === "string" && !hasCommandEntity) {
     const position = subscriptionPosition(text);
     if (position !== null) return { subscriptionRead: { ...scope, kind: "number", position } };
+    const short = /^(?:短链|short)(?: +([\s\S]*))?(?![\s\S])/iu.exec(text.replace(/^ +| +$/gu, ""));
+    if (short || text === "🔗 短链") return { shortLink: { ...scope, args: short?.[1] ?? "" } };
   }
   return scope.chatType === "private" && scope.threadId === null && typeof text === "string"
     && text.trim() !== "" && !text.trimStart().startsWith("/")
