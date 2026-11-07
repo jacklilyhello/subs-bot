@@ -224,6 +224,12 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 写入应用版本后回读绑定，激活后再次核对提供方。校验失败时仅按既有守卫恢复先前的应用版本。绑定配置变化、提供方漂移或尝试移除绑定会阻止常规发布，轮换须单独审查。回滚至未绑定版本后，重新绑定仍须取得符合首次绑定要求的 GitHub 证明。 [服务绑定](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/rpc/#named-entrypoints) · [提供方激活与证明](../worker/provider_fetch/README.md)
 
+#### 隔离私聊远程订阅导入
+
+提供方绑定就绪后，先以默认发布参数发布当前 `main` 的已核对产物，确认活动版本已绑定同一个提供方、保留隔离 Telegram 配置和 Cron，并且没有 `TELEGRAM_PROVIDER_URL_IMPORT` 绑定。D1 必须已应用确切的 `0021`、`0023` 迁移。启用时继续使用同一提交和同一产物，在受保护的 `worker-isolation-deploy.yml` 指定 `provider_url_import=enable` 及 `provider_url_import_confirmation=enable provider URL import for subs-bot-cf-dev-01`。以发布结果中的 `providerUrlImportEnabled` 和活动版本绑定回读确认状态。
+
+两名获准测试者分别在内置浏览器中通过隔离 Bot 私聊提交单条 HTTP(S) 订阅链接，可使用 `名称 | URL` 指定名称。群组、未获准的账号和多行消息均不会创建远程导入任务。发布参数默认为 `preserve`。停止接收新链接时使用 `provider_url_import=disable` 及 `provider_url_import_confirmation=disable provider URL import for subs-bot-cf-dev-01`。关闭后 Cron 继续处理已接受的任务和回执。启用校验失败时，已有回滚守卫可恢复使用同一应用产物的关闭版本。 [Worker 回滚](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/)
+
 ### 数据与切换
 
 隔离容量检查使用当前 `main` 的已部署版本，手动运行 `gh workflow run worker-isolation-capacity.yml --ref main`。托管 runner 生成合成快照，依次验证恰好达到 64 MiB NDJSON 和 16 MiB 分享原文的有效输出、分享原文超 1 字节的拒绝、快照清单超 1 字节的拒绝。正向测试流式核对 Base64 长度和摘要，覆盖串行、并发 2 和 4、慢读及中途取消。发布和容量检查使用同一并发组，测试结束先撤销 D1 能力，再清理对应的私有 R2 对象。清理失败时，工作流保留不含凭据或原始能力令牌的恢复清单。
