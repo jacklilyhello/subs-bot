@@ -37,9 +37,27 @@ const duration = (value: unknown): boolean => isString(value)
 const oneOf = (...options: unknown[]): Rule => (value) => options.includes(value);
 const listable = (rule: Rule): Rule => (value) => Array.isArray(value) ? value.every(rule) : rule(value);
 const strings = listable(isString);
-const safeHeader = (value: unknown): boolean => isString(value) && !CONTROL.test(value);
+const HTTP_TOKEN = /^[!#$%&'*+.^_\x60|~0-9A-Za-z-]+(?![\s\S])/u;
+const safeHeader = (value: unknown): value is string => isString(value) && !CONTROL.test(value);
 const headers = (value: unknown): boolean => isRecord(value) && Object.entries(value).every(([name, item]) =>
-  /^[!#$%&'*+.^_\x60|~0-9A-Za-z-]+(?![\s\S])/u.test(name) && listable(safeHeader)(item));
+  HTTP_TOKEN.test(name) && listable(safeHeader)(item));
+const httpMethod = (value: unknown): boolean => isString(value) && (value === "" || HTTP_TOKEN.test(value));
+const httpHost = (value: unknown): boolean => safeHeader(value) && value !== "" && !/[\/\\?#@,\s]/u.test(value);
+
+function httpHeaders(value: unknown): boolean {
+  if (!isRecord(value) || !headers(value)) return false;
+  const seen = new Set<string>();
+  for (const [name, item] of Object.entries(value)) {
+    if (Array.isArray(item) && item.length === 0) continue;
+    const key = name.toLowerCase();
+    // The cleartext HTTP writer adds raw payload bytes without using these framing headers.
+    if (seen.has(key) || key === "content-length" || key === "transfer-encoding") return false;
+    if (key === "host" && !httpHost(Array.isArray(item) && item.length === 1 ? item[0] : item)) return false;
+    seen.add(key);
+  }
+  return true;
+}
+
 const uuid = (value: unknown): boolean => isString(value)
   && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}(?![\s\S])/iu.test(value);
 
@@ -77,7 +95,8 @@ const TLS_SCHEMA: Schema = {
 const TRANSPORT_SCHEMAS = new Map<string, Schema>([
   ["ws", { path: isString, headers, max_early_data: isUint, early_data_header_name: safeHeader }],
   ["grpc", { service_name: isString, idle_timeout: duration, ping_timeout: duration, permit_without_stream: isBool }],
-  ["http", { host: strings, path: isString, method: isString, headers, idle_timeout: duration, ping_timeout: duration }],
+  ["http", { host: listable(httpHost), path: safeHeader, method: httpMethod, headers: httpHeaders,
+    idle_timeout: duration, ping_timeout: duration }],
   ["httpupgrade", { host: isString, path: isString, headers }],
   ["quic", {}],
 ]);
@@ -386,8 +405,11 @@ export function serializeSingBoxOutbound(node: NodeRecord): { name: string; json
   try {
     const { name, type, protocol, source, fromUri } = proxyInput(node, "singbox");
     if (!NATIVE_SCHEMAS.has(protocol)) return unsupported();
-    const output = type === protocol && (Object.hasOwn(source, "server_port") || Object.hasOwn(source, "server_ports"))
-      ? native(source, protocol) : clash(source, protocol, type === "https", fromUri);
+    const fromNative = type === protocol && (Object.hasOwn(source, "server_port") || Object.hasOwn(source, "server_ports"));
+    const output = fromNative ? native(source, protocol) : clash(source, protocol, type === "https", fromUri);
+    // Mihomo still selects an AEAD cipher under TLS. Sing-box auto would select zero.
+    if (!fromUri && !fromNative && protocol === "vmess" && output.tls !== undefined
+      && (output.security === "auto" || output.security === "")) return unsupported();
     const hoppingPorts = validate(protocol, output);
     return { name, json: JSON.stringify(output), hoppingPorts };
   } catch {

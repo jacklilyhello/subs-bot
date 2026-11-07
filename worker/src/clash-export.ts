@@ -256,8 +256,9 @@ export function serializeClashProxy(node: NodeRecord): { name: string; proxy: Fi
     const { name, type, protocol, source: original, fromUri } = proxyInput(node, "clash");
     const clashType = CLASH_TYPES.get(protocol);
     if (!clashType) return unsupported();
-    const source = !fromUri && type === protocol && (Object.hasOwn(original, "server_port") || Object.hasOwn(original, "server_ports"))
-      ? portableNativeSource(original, protocol, "clash") : original;
+    const fromNative = !fromUri && type === protocol
+      && (Object.hasOwn(original, "server_port") || Object.hasOwn(original, "server_ports"));
+    const source = fromNative ? portableNativeSource(original, protocol, "clash") : original;
     const output: Fields = { type: clashType, server: server(take(source, "server")) };
     const port = take(source, "port");
     let hoppingPorts = 0;
@@ -307,7 +308,8 @@ export function serializeClashProxy(node: NodeRecord): { name: string; proxy: Fi
     if (protocol === "vmess") {
       const cipher = string(scalarAlias(source, ["cipher", "security"], "auto"));
       if (!VMESS_CIPHERS.has(cipher)) unsupported();
-      output.cipher = cipher;
+      // Sing-box uses zero for its default VMess cipher when TLS is enabled.
+      output.cipher = fromNative && output.tls === true && cipher === "auto" ? "zero" : cipher;
       output.alterId = integer(scalarAlias(source, ["alterId", "alter_id"], 0), 0, 65535);
       option(source, output, "global-padding", flag);
       option(source, output, "authenticated-length", flag);
