@@ -23,10 +23,12 @@ CAPACITY_STATUS = {"at-limits": 200, "share-over": 422, "snapshot-over": 503}
 STRUCTURED_SMOKE = "structured-smoke"
 SINGBOX_SMOKE = "singbox-smoke"
 CLASH_SMOKE = "clash-smoke"
+TEXT_EXPORT_SMOKE = "text-export-smoke"
 SMOKE_PROFILES = {
     STRUCTURED_SMOKE: {"structured-mixed": 200, "structured-unsupported": 422},
     SINGBOX_SMOKE: {"singbox-mixed": 200, "singbox-unsupported": 422},
     CLASH_SMOKE: {"clash-mixed": 200, "clash-unsupported": 422},
+    TEXT_EXPORT_SMOKE: {"surge-mixed": 200, "surge-unsupported": 422, "qx-mixed": 200, "qx-unsupported": 422},
 }
 FIXTURE_PROFILES = {"capacity": CAPACITY_STATUS, **SMOKE_PROFILES}
 SMOKE_CHUNK_COUNT = 2
@@ -241,9 +243,44 @@ def clash_smoke_fixture(label: str) -> tuple[list[bytes], int, bytes]:
     return [_json_bytes(node) + b"\n" for node in nodes], 0, expected
 
 
+def text_export_smoke_fixture(label: str) -> tuple[list[bytes], int, bytes]:
+    structured = {"name": "香港 🌐", "type": "ss", "server": "203.0.113.10", "port": 8388,
+                  "cipher": "aes-256-gcm", "password": "fixture:密@+字"}
+    surge_ss = {**structured, "password": "fixture,密@+字"}
+    hysteria = {"name": "Hysteria", "type": "temp",
+                "share": "hy2://user:p%2B%40@[2001:db8::5]:443,5000-5002/"
+                         "?sni=tls.example.invalid&insecure=0&obfs=salamander&obfs-password=fixture%2Bsecret"}
+    vless = {"name": "VLESS", "type": "temp",
+             "share": "vless://11111111-1111-4111-8111-111111111111@vless.example.invalid:443"
+                      "?encryption=none&security=tls&sni=front.example.invalid&type=ws&host=front.example.invalid&path=%2Fws"}
+    if label == "surge-mixed":
+        nodes = [surge_ss, hysteria]
+        expected = (
+            "[Proxy]\n"
+            '香港 🌐 = ss, 203.0.113.10, 8388, encrypt-method=aes-256-gcm, password="fixture,密@+字"\n'
+            "Hysteria = hysteria2, 2001:db8::5, 443, port-hopping=443;5000-5002, password=user:p+@, "
+            "salamander-password=fixture+secret, sni=tls.example.invalid, skip-cert-verify=false\n"
+            "\n[Proxy Group]\nProxy = select, 香港 🌐, Hysteria\n\n[Rule]\nFINAL,Proxy\n"
+        )
+    elif label == "qx-mixed":
+        nodes = [structured, vless]
+        expected = (
+            "shadowsocks=203.0.113.10:8388, method=aes-256-gcm, password=fixture:密@+字, tag=香港 🌐\n"
+            "vless=vless.example.invalid:443, method=none, password=11111111-1111-4111-8111-111111111111, "
+            "obfs=wss, obfs-uri=/ws, obfs-host=front.example.invalid, tls-verification=true, tag=VLESS\n"
+        )
+    elif label == "surge-unsupported":
+        nodes, expected = [surge_ss, vless], ""
+    elif label == "qx-unsupported":
+        nodes, expected = [structured, hysteria], ""
+    else:
+        raise ValueError("Unknown text export smoke fixture.")
+    return [_json_bytes(node) + b"\n" for node in nodes], 0, expected.encode("utf-8")
+
+
 def smoke_fixture(profile: str, label: str) -> tuple[list[bytes], int, bytes]:
     return {SINGBOX_SMOKE: singbox_smoke_fixture, CLASH_SMOKE: clash_smoke_fixture,
-            STRUCTURED_SMOKE: structured_smoke_fixture}[profile](label)
+            STRUCTURED_SMOKE: structured_smoke_fixture, TEXT_EXPORT_SMOKE: text_export_smoke_fixture}[profile](label)
 
 
 def _write_smoke_fixture(root: Path, profile: str, label: str, status: int) -> dict:

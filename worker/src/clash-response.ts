@@ -1,6 +1,6 @@
 import { serializeClashProxy, ClashContentError } from "./clash-export.ts";
 import { allocateExportNames } from "./export-names.ts";
-import { readSnapshotNodes, SnapshotIntegrityError, type SubscriptionSnapshot } from "./storage.ts";
+import { SnapshotIntegrityError, type ExportNodeSource } from "./storage.ts";
 
 const MAX_BYTES = 16 * 1024 * 1024;
 const MAX_NAME_BYTES = 1024;
@@ -30,12 +30,12 @@ interface ClashPlan {
   readonly names: readonly string[];
 }
 
-export async function planClash(bucket: R2Bucket, snapshot: SubscriptionSnapshot): Promise<ClashPlan> {
+export async function planClash(source: ExportNodeSource): Promise<ClashPlan> {
   let bytes = encoder.encode(OPEN + SELECT + AUTO + CLOSE).byteLength;
   let namesBytes = 0;
   let expandedPorts = 0;
   const names: string[] = [];
-  for await (const node of readSnapshotNodes(bucket, snapshot)) {
+  for await (const node of source.read()) {
     const { name, proxy, hoppingPorts } = serializeClashProxy(node);
     const nameBytes = encoder.encode(yamlFlow(name)).byteLength;
     namesBytes += nameBytes;
@@ -45,7 +45,7 @@ export async function planClash(bucket: R2Bucket, snapshot: SubscriptionSnapshot
       || expandedPorts > MAX_HOPPING_PORTS || bytes > MAX_BYTES) throw new ClashContentError();
     names.push(name);
   }
-  if (names.length !== snapshot.nodeCount || names.length === 0) throw new SnapshotIntegrityError();
+  if (names.length !== source.nodeCount || names.length === 0) throw new SnapshotIntegrityError();
   const labels = allocateExportNames(names, RESERVED_NAMES).map((name) => {
     const encoded = yamlFlow(name);
     // The proxy and both groups contain the same label.
@@ -58,11 +58,11 @@ export async function planClash(bucket: R2Bucket, snapshot: SubscriptionSnapshot
 }
 
 export async function* clashChunks(
-  bucket: R2Bucket, snapshot: SubscriptionSnapshot, plan: ClashPlan, signal: AbortSignal,
+  source: ExportNodeSource, plan: ClashPlan, signal: AbortSignal,
 ): AsyncGenerator<Uint8Array> {
   yield encoder.encode(OPEN);
   let index = 0;
-  for await (const node of readSnapshotNodes(bucket, snapshot, signal)) {
+  for await (const node of source.read(signal)) {
     const name = plan.names[index++];
     if (name === undefined) throw new SnapshotIntegrityError();
     const { proxy } = serializeClashProxy(node);

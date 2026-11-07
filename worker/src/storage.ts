@@ -1,5 +1,10 @@
 export type NodeRecord = Record<string, unknown>;
 
+export interface ExportNodeSource {
+  readonly nodeCount: number;
+  read(signal?: AbortSignal): AsyncIterable<NodeRecord>;
+}
+
 export interface SubscriptionSnapshot {
   id: number;
   generation: number;
@@ -46,8 +51,8 @@ interface SnapshotManifest {
 export const MAX_CHUNK_BYTES = 512 * 1024;
 export const MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024;
 export const MAX_SNAPSHOT_NODES = 100_000;
+export const MAX_SNAPSHOT_CHUNKS = 256;
 const CHUNK_READ_AHEAD = 4;
-const MAX_CHUNKS = 256;
 const MAX_MANIFEST_BYTES = 64 * 1024;
 const MAX_OWNER_ID = 9223372036854775807n;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{16,128}(?![\s\S])/u;
@@ -138,7 +143,7 @@ function snapshotPrefix(id: number, snapshotId: string): string {
   return `subscriptions/${id}/${snapshotId}/`;
 }
 
-function digestHex(digest: ArrayBuffer): string {
+export function digestHex(digest: ArrayBuffer): string {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
@@ -194,7 +199,7 @@ export async function publishNodeSnapshot(
   let nodeCount = 0;
 
   async function uploadChunk(): Promise<void> {
-    if (manifest.chunks.length >= MAX_CHUNKS) {
+    if (manifest.chunks.length >= MAX_SNAPSHOT_CHUNKS) {
       throw new RangeError("Subscription snapshot exceeds storage limits.");
     }
     const body = chunk.subarray(0, chunkBytes);
@@ -281,10 +286,10 @@ async function loadObject(bucket: R2Bucket, key: string, hash: string, limit: nu
   return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
 }
 
-function readManifest(raw: string, nodeCount: number): SnapshotManifest {
+function readManifest(raw: string, nodeCount: number): { chunks: ChunkDescriptor[]; bytes: number } {
   const value: unknown = JSON.parse(raw);
   if (!isRecord(value) || value.version !== 1 || !Array.isArray(value.chunks) ||
-      value.chunks.length === 0 || value.chunks.length > MAX_CHUNKS) {
+      value.chunks.length === 0 || value.chunks.length > MAX_SNAPSHOT_CHUNKS) {
     throw new SnapshotIntegrityError();
   }
   const chunks: ChunkDescriptor[] = [];
@@ -303,38 +308,54 @@ function readManifest(raw: string, nodeCount: number): SnapshotManifest {
   if (totalBytes > MAX_SNAPSHOT_BYTES || totalNodes !== nodeCount) {
     throw new SnapshotIntegrityError();
   }
-  return { version: 1, chunks };
+  return { chunks, bytes: totalBytes };
 }
 
-export async function* readSnapshotNodes(
-  bucket: R2Bucket,
-  snapshot: SubscriptionSnapshot,
-  signal?: AbortSignal,
-): AsyncGenerator<NodeRecord> {
-  if (signal?.aborted) return;
+export interface SnapshotReadPlan {
+  readonly prefix: string;
+  readonly bytes: number;
+  readonly chunks: readonly ChunkDescriptor[];
+}
+
+export async function planSnapshotRead(bucket: R2Bucket, snapshot: SubscriptionSnapshot): Promise<SnapshotReadPlan> {
   if (!validInteger(snapshot.id, 1) || !validInteger(snapshot.generation, 1) ||
       !SNAPSHOT_ID_PATTERN.test(snapshot.snapshotId) || !SHA256_PATTERN.test(snapshot.manifestSha256) ||
       !validInteger(snapshot.nodeCount, 1, MAX_SNAPSHOT_NODES)) {
     throw new SnapshotIntegrityError();
   }
   const prefix = snapshotPrefix(snapshot.id, snapshot.snapshotId);
+  try {
+    const raw = await loadObject(bucket, `${prefix}manifest.json`, snapshot.manifestSha256, MAX_MANIFEST_BYTES);
+    return { prefix, ...readManifest(raw, snapshot.nodeCount) };
+  } catch {
+    throw new SnapshotIntegrityError();
+  }
+}
+
+export async function* readSnapshotNodes(
+  bucket: R2Bucket, snapshot: SubscriptionSnapshot, signal?: AbortSignal,
+): AsyncGenerator<NodeRecord> {
+  if (signal?.aborted) return;
+  yield* readPlannedSnapshotNodes(bucket, await planSnapshotRead(bucket, snapshot), signal);
+}
+
+export async function* readPlannedSnapshotNodes(
+  bucket: R2Bucket, { prefix, chunks }: SnapshotReadPlan, signal?: AbortSignal,
+): AsyncGenerator<NodeRecord> {
+  if (signal?.aborted) return;
   const pending: Array<Promise<string | null>> = [];
   try {
-    const rawManifest = await loadObject(bucket, `${prefix}manifest.json`, snapshot.manifestSha256, MAX_MANIFEST_BYTES);
-    if (signal?.aborted) return;
-    const manifest = readManifest(rawManifest, snapshot.nodeCount);
-
     function preload(index: number): void {
-      const { sha256, bytes } = manifest.chunks[index];
+      const { sha256, bytes } = chunks[index];
       // Handle failures immediately even when an earlier chunk is still being consumed.
       pending.push(loadObject(bucket, `${prefix}${index}.ndjson`, sha256, MAX_CHUNK_BYTES, bytes).catch(() => null));
     }
 
-    for (let index = 0; index < Math.min(CHUNK_READ_AHEAD, manifest.chunks.length); index += 1) {
+    for (let index = 0; index < Math.min(CHUNK_READ_AHEAD, chunks.length); index += 1) {
       if (signal?.aborted) return;
       preload(index);
     }
-    for (const [index, chunk] of manifest.chunks.entries()) {
+    for (const [index, chunk] of chunks.entries()) {
       const text = await pending[0];
       if (signal?.aborted) return;
       if (text === null) throw new SnapshotIntegrityError();
@@ -357,7 +378,7 @@ export async function* readSnapshotNodes(
       }
       pending.shift();
       const next = index + CHUNK_READ_AHEAD;
-      if (next < manifest.chunks.length) preload(next);
+      if (next < chunks.length) preload(next);
     }
   } catch {
     throw new SnapshotIntegrityError();

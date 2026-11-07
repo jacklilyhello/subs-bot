@@ -592,7 +592,7 @@ def main():
                 seed(args.directory, resources, os.environ.get("GITHUB_SHA"), os.environ.get("GITHUB_RUN_ID"),
                      verify_release, profile=args.profile)
                 if args.profile in SMOKE_PROFILES:
-                    print("Published two verified isolated export smoke fixtures.")
+                    print(f"Published {len(SMOKE_PROFILES[args.profile])} verified isolated export smoke fixtures.")
                 else:
                     print("Published three verified isolated capacity fixtures.")
             elif args.action == "cleanup":
