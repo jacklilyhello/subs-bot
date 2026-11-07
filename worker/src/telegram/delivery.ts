@@ -21,11 +21,12 @@ import {
   type TelegramSubscriptionReadButton,
 } from "./subscription-read.ts";
 import { prepareTelegramNodePageTickets, renderTelegramSubscriptionNodePage, type TelegramNodePageButton } from "./subscription-node-pages.ts";
+import { renderTelegramGitHubReply } from "./github-search.ts";
 import {
   beginTelegramAggregateLinkReply, beginTelegramBulkTrashReply, beginTelegramInlineConsentReply, beginTelegramInlineSortReply,
   beginTelegramPrivateShareCreationReply,
   beginTelegramSelectedLinkReply, beginTelegramShortLinkReply, beginTelegramReply, claimTelegramReply, isTelegramMemberAllowed,
-  beginTelegramTempRawReply,
+  beginTelegramGitHubSearchReply, beginTelegramTempRawReply,
   prepareTelegramPrivateClaimBegin, reapExpiredTelegramReplies, settleTelegramReply,
   type TelegramReplyLease, type TelegramReplyOutcome,
 } from "./store.ts";
@@ -41,7 +42,7 @@ const CALLBACK_TIMEOUT_MS = 3_000;
 const LIST_LIMIT = 20;
 
 type ReplyAccess = "allowed" | "denied" | "none";
-type InlineKeyboard = { text: string; callback_data: string }[][];
+type InlineKeyboard = ({ text: string; callback_data: string } | { text: string; url: string })[][];
 
 async function readBotReply(response: Response): Promise<unknown> {
   if (!response.body) return null;
@@ -129,7 +130,7 @@ export async function sendTelegramReply(
   forceReply = false,
 ): Promise<TelegramReplyOutcome> {
   if ((lease.path || lease.privateShareCreation || lease.tempRaw || lease.shortLink || lease.subscriptionNodes
-    || lease.providerOutcome !== undefined || lease.bulkTrash)
+    || lease.providerOutcome !== undefined || lease.bulkTrash || lease.githubSearch)
     && (lease.chatType !== "private" || lease.threadId !== null)) {
     return { kind: "failed" };
   }
@@ -388,14 +389,16 @@ export async function drainTelegramReplies(
   providerEnabled = false,
   bulkTrashEnabled = false,
   inlineConsentEnabled = false,
+  gitHubSearchEnabled = false,
 ): Promise<void> {
   const deadline = Date.now() + budgetMs;
   const privateShareEnabled = privateShareRuntime.schemaReady && privateShareRuntime.context !== null;
   await reapExpiredTelegramReplies(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled,
-    shortLinksEnabled, inlineSortEnabled, subscriptionNodesEnabled, providerEnabled, bulkTrashEnabled, inlineConsentEnabled);
+    shortLinksEnabled, inlineSortEnabled, subscriptionNodesEnabled, providerEnabled, bulkTrashEnabled, inlineConsentEnabled, gitHubSearchEnabled);
   for (let processed = 0; processed < limit && Date.now() < deadline; processed += 1) {
     const lease = await claimTelegramReply(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled,
-      shortLinksEnabled, inlineSortEnabled, subscriptionNodesEnabled, providerEnabled ? policy : undefined, bulkTrashEnabled, inlineConsentEnabled);
+      shortLinksEnabled, inlineSortEnabled, subscriptionNodesEnabled, providerEnabled ? policy : undefined,
+      bulkTrashEnabled, inlineConsentEnabled, gitHubSearchEnabled ? policy : undefined);
     if (!lease) return;
     if (!inTelegramScope(policy, lease)) continue;
     if (lease.providerOutcome !== undefined) {
@@ -441,6 +444,16 @@ export async function drainTelegramReplies(
       if (Date.now() < deadline && await beginTelegramInlineConsentReply(db, policy, lease)) {
         const outcome = await sendTelegramReply(policy, lease, renderTelegramInlineConsent(lease.inlineConsent),
           Math.max(1, deadline - Date.now()), request);
+        await settleTelegramReply(db, policy, lease, outcome);
+      }
+      continue;
+    }
+    if (lease.githubSearch) {
+      const reply = renderTelegramGitHubReply(lease.githubSearch);
+      if (Date.now() < deadline && await beginTelegramGitHubSearchReply(db, policy, lease)) {
+        const outcome = Date.now() < deadline
+          ? await sendTelegramReply(policy, lease, reply.text, Math.max(1, deadline - Date.now()), request, reply.keyboard)
+          : { kind: "failed" as const };
         await settleTelegramReply(db, policy, lease, outcome);
       }
       continue;

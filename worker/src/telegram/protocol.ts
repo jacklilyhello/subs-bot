@@ -68,6 +68,7 @@ type TelegramInlineSortAction = { kind: "current" | "usage" } | { kind: "set"; m
 export type TelegramInlineSortUpdate = TelegramEventScope & TelegramInlineSortAction;
 export type TelegramInlineConsentUpdate = TelegramEventScope & { kind: "on" | "off" | "usage" };
 export type TelegramInlineQuery = { updateId: number; actorId: string; chatType: "sender"; queryId: string; query: string };
+export type TelegramGitHubSearchUpdate = TelegramEventScope & { args: string };
 
 type ExistingUpdate =
   | { command: TelegramCommand; view?: never; lifecycle?: never; privateClaim?: never; temp?: never; aggregate?: never; path?: never; document?: never; selected?: never }
@@ -95,8 +96,10 @@ type BulkTrashUpdate = (SubscriptionNodeUpdate & { bulkTrash?: never })
   | ({ bulkTrash: TelegramBulkTrashUpdate } & Partial<Record<keyof SubscriptionNodeUpdate, never>>);
 type InlineConsentUpdate = (BulkTrashUpdate & { inlineConsent?: never })
   | ({ inlineConsent: TelegramInlineConsentUpdate } & Partial<Record<keyof BulkTrashUpdate, never>>);
-type NormalizedUpdate = (InlineConsentUpdate & { inlineQuery?: never })
+type InlineQueryUpdate = (InlineConsentUpdate & { inlineQuery?: never })
   | ({ inlineQuery: TelegramInlineQuery } & Partial<Record<keyof InlineConsentUpdate, never>>);
+type NormalizedUpdate = (InlineQueryUpdate & { githubSearch?: never })
+  | ({ githubSearch: TelegramGitHubSearchUpdate } & Partial<Record<keyof InlineQueryUpdate, never>>);
 
 type DecodedTelegramRequest =
   | ({ status: 200 } & NormalizedUpdate)
@@ -210,7 +213,7 @@ function messageCommand(
 ): TelegramCommand["command"] | TelegramViewKind | "temp-raw" | "temp-summary" | "temp-clear" | "aggregate-show" | "aggregate-revoke" |
   { code: string } | { args: string } | { shareArgs: string } | { selectedQuery: string } | { subscriptionQuery: string } | { shortArgs: string } |
   { inlineSort: TelegramInlineSortAction } | { bulkTrashQuery: string } |
-  { inlineConsent: TelegramInlineConsentUpdate["kind"] } | null {
+  { inlineConsent: TelegramInlineConsentUpdate["kind"] } | { githubArgs: string } | null {
   const { text, entities } = message;
   if (typeof text !== "string" || !Array.isArray(entities)) return null;
   const commands = entities.filter((entity) => isRecord(entity) && entity.type === "bot_command" && entity.offset === 0);
@@ -231,6 +234,7 @@ function messageCommand(
   if (commandName === "path") return { args: remainder };
   if (commandName === "o") return { selectedQuery: remainder };
   if (commandName === "short") return { shortArgs: remainder };
+  if (commandName === "g") return { githubArgs: remainder };
   if (commandName === "s") return { subscriptionQuery: remainder };
   if (commandName === "d") return { bulkTrashQuery: remainder };
   if (commandName === "share") return remainder.length <= 4096 ? { shareArgs: remainder } : null;
@@ -363,6 +367,7 @@ function normalizeMessage(
     if ("bulkTrashQuery" in command) return { bulkTrash: { ...scope, kind: "preview", query: command.bulkTrashQuery } };
     if ("inlineSort" in command) return { inlineSort: { ...scope, ...command.inlineSort } };
     if ("inlineConsent" in command) return { inlineConsent: { ...scope, kind: command.inlineConsent } };
+    if ("githubArgs" in command) return { githubSearch: { ...scope, args: command.githubArgs } };
     if ("shortArgs" in command) return { shortLink: { ...scope, args: command.shortArgs } };
     if ("shareArgs" in command) {
       const sender = isRecord(message.from) ? [message.from.first_name, message.from.last_name]
