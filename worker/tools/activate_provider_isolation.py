@@ -1,6 +1,5 @@
 """Activate and verify the pinned private provider, one explicit write per dispatch."""
 
-from copy import deepcopy
 from datetime import date
 from hashlib import sha256
 import json
@@ -322,41 +321,20 @@ class ProviderAPI:
         rows = _page(envelope, envelope["result"], 1)
         _require(len(rows) == 1 and isinstance(rows[0], dict) and rows[0].get("id") == release["versionId"])
         legacy = self._request(self.worker_path + "/versions/" + release["versionId"])["result"]
-        resources = legacy.get("resources") if isinstance(legacy, dict) else None
-        _require(isinstance(resources, dict) and legacy.get("id") == release["versionId"])
         image = f"{publication.HOST}/{self.account}/{provider.SERVICE}@sha256:{release['ociManifestSha256']}"
         metadata = stage._metadata(release, image)
-        _require(resources.get("script_runtime", {}).get("containers") == metadata["containers"])
+        stage._verify_legacy_version(legacy, release["versionId"], metadata)
         namespace = None
         if active:
-            bindings = resources.get("bindings")
-            _require(isinstance(bindings, list))
-            found = [row for row in bindings if isinstance(row, dict) and row.get("type") == "durable_object_namespace"]
-            _require(len(found) == 1 and found[0].get("name") == "PROVIDER_CONTAINER"
-                     and found[0].get("class_name") == "ProviderContainer"
-                     and found[0].get("script_name") in (None, provider.SERVICE)
-                     and found[0].get("dispatch_namespace") is None)
-            binding = found[0]
             envelope = self._request("/workers/durable_objects/namespaces?page=1&per_page=1000")
             namespaces = _page(envelope, envelope["result"], 1000)
             found = [row for row in namespaces if isinstance(row, dict) and row.get("script") == provider.SERVICE]
             _require(len(found) == 1 and found[0].get("class") == "ProviderContainer" and found[0].get("use_sqlite") is True
                      and found[0].get("preview") is None and found[0].get("dispatch_namespace") is None)
             namespace = _id(found[0].get("id"))
-            _require(binding.get("namespace_id") in (None, namespace))
         beta = self._request(self.beta_path + "/" + release["versionId"] + "?include=modules",
                              limit=stage.MAX_VERSION_RESPONSE)["result"]
-        # Reuse static byte/metadata checks without weakening staging's undeployed verifier.
-        normalized = deepcopy(beta)
-        if active:
-            _require(isinstance(normalized, dict) and isinstance(normalized.get("bindings"), list))
-            for binding in normalized["bindings"]:
-                _require(isinstance(binding, dict))
-                if binding.get("type") == "durable_object_namespace":
-                    _require(binding.get("namespace_id") in (None, namespace)
-                             and binding.get("dispatch_namespace") is None)
-                    binding.pop("namespace_id", None)
-        stage._verify_version(normalized, release["versionId"], metadata, release["workerSha256"])
+        stage._verify_version(beta, release["versionId"], metadata, release["workerSha256"])
         return namespace
 
     def container(self, namespace):

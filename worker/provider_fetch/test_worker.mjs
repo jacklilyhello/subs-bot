@@ -207,9 +207,33 @@ test("the emitted Worker rejects all public fetches without any runtime bindings
   }
 });
 
-test("the emitted named service binding admits a private RPC call and returns structured binary data", async () => {
+test("the emitted RPC and Workflow use the same private loopback Durable Object", { timeout: 20_000 }, async () => {
   assert(process.env.PROVIDER_WORKER_BUNDLE);
   const script = await readFile(process.env.PROVIDER_WORKER_BUNDLE, "utf8");
+  const fixture = `import { DurableObject } from 'cloudflare:workers';
+    export { default, ProviderFetch, ProviderSmoke } from "./emitted.mjs";
+    export class ProviderContainer extends DurableObject {
+      assertSingleton() {
+        const id = this.ctx.exports.ProviderContainer.idFromName('provider-fetch-v1');
+        if (!this.ctx.id.equals(id) || 'PROVIDER_CONTAINER' in this.env) {
+          throw new Error('unexpected fixture namespace');
+        }
+      }
+      async fetchSubscription(input) {
+        this.assertSingleton();
+        if (input.url === 'https://fixture.example/wrong-revision') return { ok: true, body: new ArrayBuffer(0), bodySha256: '${"a".repeat(64)}' };
+        if (input.providerRevision !== '${revision}' || input.imageSha256 !== '${imageDigest}') throw new Error('wrong test pin');
+        if (input.url !== 'https://fixture.example/accepted') throw new Error('synthetic private RPC failure');
+        await this.ctx.storage.put('accepted', true);
+        return { ok: true, body: new Uint8Array([1, 2, 3]).buffer, bodySha256: '${createHash("sha256").update(Buffer.from([1, 2, 3])).digest("hex")}' };
+      }
+      async prove(probe) {
+        this.assertSingleton();
+        if (!(await this.ctx.storage.get('accepted')) || probe.providerRevision !== '${revision}'
+            || probe.isolatedRevision !== '${isolatedRevision}') throw new Error('wrong fixture smoke target');
+        return { ok: true };
+      }
+    }`;
   const runtime = new Miniflare({ workers: [
     { name: "caller", modules: true, compatibilityDate: "2026-07-30",
       serviceBindings: { PROVIDER: { name: "provider", entrypoint: "ProviderFetch" } },
@@ -221,19 +245,14 @@ test("the emitted named service binding admits a private RPC call and returns st
         const result = await env.PROVIDER.fetchSubscription(input);
         return result.ok ? new Response(result.body, { headers: { 'x-verified': result.bodySha256 } }) : Response.json(result);
       } };` },
-    { name: "provider", modules: true, compatibilityDate: "2026-07-30", script, bindings: { BUILD_REVISION: revision },
-      durableObjects: { PROVIDER_CONTAINER: { className: "FixtureContainer", scriptName: "fixture" } } },
-    { name: "fixture", modules: true, compatibilityDate: "2026-07-30",
-      script: `import { DurableObject } from 'cloudflare:workers';
-      export class FixtureContainer extends DurableObject {
-        async fetchSubscription(input) {
-          if (input.url === 'https://fixture.example/wrong-revision') return { ok: true, body: new ArrayBuffer(0), bodySha256: '${"a".repeat(64)}' };
-          if (input.providerRevision !== '${revision}' || input.imageSha256 !== '${imageDigest}') throw new Error('wrong test pin');
-          if (input.url !== 'https://fixture.example/accepted') throw new Error('synthetic private RPC failure');
-          return { ok: true, body: new Uint8Array([1, 2, 3]).buffer, bodySha256: '${createHash("sha256").update(Buffer.from([1, 2, 3])).digest("hex")}' };
-        }
-      }
-      export default { fetch() { return new Response(null, { status: 404 }); } };` },
+    { name: "provider", compatibilityDate: "2026-07-30", compatibilityFlags: ["enable_ctx_exports"],
+      modules: [
+        { type: "ESModule", path: "fixture.mjs", contents: fixture },
+        { type: "ESModule", path: "emitted.mjs", contents: script },
+      ],
+      bindings: { BUILD_REVISION: revision },
+      additionalUnboundDurableObjects: [{ className: "ProviderContainer", useSQLite: true }],
+      workflows: { PROVIDER_SMOKE: { name: "subs-bot-provider-fetch-dev-01-smoke", className: "ProviderSmoke", scriptName: "provider" } } },
   ] });
   try {
     const accepted = await runtime.dispatchFetch("https://caller.example/accepted");
@@ -244,6 +263,17 @@ test("the emitted named service binding admits a private RPC call and returns st
       const result = await runtime.dispatchFetch("https://caller.example" + path);
       assert.deepEqual(await result.json(), { ok: false, code, retryable });
     }
+    const { PROVIDER_SMOKE } = await runtime.getBindings("provider");
+    const smoke = await PROVIDER_SMOKE.create({ id: `provider-smoke-${revision}`,
+      params: { providerRevision: revision, isolatedRevision } });
+    let result;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      result = await smoke.status();
+      if (["complete", "errored", "terminated"].includes(result.status)) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.equal(result?.status, "complete");
+    assert.deepEqual(result.output, { ok: true });
   } finally {
     await runtime.dispose();
   }

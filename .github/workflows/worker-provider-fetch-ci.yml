@@ -130,8 +130,10 @@ jobs:
             --account-id aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa > "$RUNNER_TEMP/provider-private-config.json"
           jq -e '.workers_dev == false and .preview_urls == false and .observability.enabled == false and
             .name == "subs-bot-provider-fetch-dev-01" and (.containers | length == 1) and
-            (.durable_objects.bindings | length == 1) and (.workflows | length == 1) and
-            ((has("d1_databases") or has("r2_buckets") or has("routes") or has("triggers") or has("services")) | not)' \
+            .compatibility_flags == ["enable_ctx_exports"] and
+            .exports == {"ProviderContainer":{"type":"durable-object","storage":"sqlite"}} and
+            (.workflows | length == 1) and
+            ((has("durable_objects") or has("d1_databases") or has("r2_buckets") or has("routes") or has("triggers") or has("services")) | not)' \
             "$RUNNER_TEMP/provider-private-config.json" > /dev/null
       - name: Install the same pinned Skopeo used for publication
         run: bash worker/tools/install_provider_skopeo.sh

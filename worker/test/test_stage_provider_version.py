@@ -159,6 +159,13 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(parts[1].get_content_type(), stage.MODULE_TYPE)
         self.assertEqual(parts[1].get_payload(decode=True), MODULE)
         self.assertEqual(self.metadata["containers"][0]["images"], {"provider": IMAGE})
+        self.assertEqual(self.metadata["compatibility_flags"], ["enable_ctx_exports"])
+        self.assertEqual(self.metadata["bindings"], [
+            {"name": "BUILD_REVISION", "type": "plain_text", "text": REVISION},
+            {"name": "PROVIDER_SMOKE", "type": "workflow", "workflow_name": stage.WORKFLOW, "class_name": "ProviderSmoke"},
+        ])
+        self.assertEqual(self.metadata["exports"]["ProviderContainer"],
+                         {"type": "durable-object", "storage": "sqlite", "container": stage.provider.SERVICE})
         self.assertNotIn("migrations", self.metadata)
         self.assertNotIn("assets", self.metadata)
 
@@ -209,7 +216,8 @@ class BoundaryTests(unittest.TestCase):
         send.assert_called_once()
 
     def test_beta_module_and_legacy_named_image_are_independent_and_exact(self):
-        runtime = {"id": CANDIDATE, "resources": {"script_runtime": {"containers": self.metadata["containers"]}}}
+        script_runtime = {"containers": self.metadata["containers"], "compatibility_flags": ["enable_ctx_exports"]}
+        runtime = {"id": CANDIDATE, "resources": {"script_runtime": script_runtime}}
         with patch.object(stage.publication, "_response", side_effect=[envelope(version()), envelope(runtime)]) as read:
             self.api.verify(CANDIDATE, self.metadata, MODULE_SHA)
         requests = [entry.args[0] for entry in read.call_args_list]
@@ -218,9 +226,14 @@ class BoundaryTests(unittest.TestCase):
             f"{self.base}/scripts/{stage.provider.SERVICE}/versions/{CANDIDATE}",
         ])
         for wrong in ({"id": CANDIDATE}, {"id": FOREIGN, **{"resources": runtime["resources"]}},
-                      {"id": CANDIDATE, "resources": {"script_runtime": {"containers": [
+                      {"id": CANDIDATE, "resources": {"script_runtime": {**script_runtime, "containers": [
                           {**self.metadata["containers"][0], "images": {"provider": IMAGE.replace(MANIFEST, CONFIG)}},
-                      ]}}}):
+                      ]}}},
+                      {"id": CANDIDATE, "resources": {"script_runtime": {"containers": self.metadata["containers"]}}},
+                      {"id": CANDIDATE, "resources": {"script_runtime": script_runtime, "bindings": [
+                          *self.metadata["bindings"], {"name": "PROVIDER_CONTAINER", "type": "durable_object_namespace",
+                                                      "class_name": "ProviderContainer"},
+                      ]}}):
             with self.subTest(wrong=wrong), patch.object(
                     stage.publication, "_response", side_effect=[envelope(version()), envelope(wrong)]):
                 with self.assertRaisesRegex(stage.StageError, "did not match"):
@@ -231,6 +244,10 @@ class BoundaryTests(unittest.TestCase):
             {"urls": ["https://example.invalid/"]},
             {"modules": [{**version()["modules"][0], "content_base64": b64encode(MODULE + b" ").decode()}]},
             {"bindings": [*version()["bindings"], {"name": "EXTRA", "type": "secret_text"}]},
+            {"bindings": [*version()["bindings"], {"name": "PROVIDER_CONTAINER", "type": "durable_object_namespace",
+                                                   "class_name": "ProviderContainer"}]},
+            {"compatibility_flags": []},
+            {"compatibility_flags": ["enable_ctx_exports", "nodejs_compat"]},
             {"annotations": {"workers/tag": "some-other-version"}},
             {"exports": {**version()["exports"], "Foreign": {"type": "worker"}}},
         ]

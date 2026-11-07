@@ -85,6 +85,12 @@ def version():
     ]}
 
 
+def legacy_version():
+    metadata = activation.stage._metadata(RELEASE, IMAGE)
+    return {"id": VERSION, "resources": {"bindings": metadata["bindings"],
+            "script_runtime": {"containers": metadata["containers"], "compatibility_flags": ["enable_ctx_exports"]}}}
+
+
 class PinTests(unittest.TestCase):
     def test_release_requires_exact_artifact_fields_and_version_id(self):
         self.assertEqual(activation._release_pin(json.dumps(RELEASE), EVIDENCE), RELEASE)
@@ -312,19 +318,14 @@ class APIContractTests(unittest.TestCase):
                 with self.assertRaises(activation.ActivationError):
                     self.api.container(namespace)
 
-    def test_active_version_reuses_exact_bytes_and_cross_checks_optional_resolved_id(self):
-        metadata = activation.stage._metadata(RELEASE, IMAGE)
-        bindings = [{"name": "PROVIDER_CONTAINER", "type": "durable_object_namespace", "class_name": "ProviderContainer"}]
+    def test_active_version_reuses_exact_bytes_and_requires_independent_sqlite_namespace(self):
+        legacy = legacy_version()
         namespace = {"id": NAMESPACE, "script": activation.provider.SERVICE, "class": "ProviderContainer", "use_sqlite": True}
-        for resolved in (None, NAMESPACE):
-            beta = version()
-            if resolved:
-                beta["bindings"][1]["namespace_id"] = resolved
-            legacy = {"id": VERSION, "resources": {"bindings": bindings, "script_runtime": {"containers": metadata["containers"]}}}
-            replies = [envelope([{"id": VERSION}]), envelope(legacy), envelope([namespace]), envelope(beta)]
-            with self.subTest(resolved=resolved), patch.object(self.api, "_request", side_effect=replies):
-                self.assertEqual(self.api.version(RELEASE, True), NAMESPACE)
-        for changed in ({"use_sqlite": False}, {"script": "other"}, {"preview": {"id": "foreign"}}):
+        replies = [envelope([{"id": VERSION}]), envelope(legacy), envelope([namespace]), envelope(version())]
+        with patch.object(self.api, "_request", side_effect=replies):
+            self.assertEqual(self.api.version(RELEASE, True), NAMESPACE)
+        for changed in ({"use_sqlite": False}, {"script": "other"}, {"class": "Foreign"},
+                        {"preview": {"id": "foreign"}}, {"dispatch_namespace": "foreign"}):
             with self.subTest(changed=changed), patch.object(self.api, "_request", side_effect=[
                     envelope([{"id": VERSION}]), envelope(legacy), envelope([{**namespace, **changed}])]):
                 with self.assertRaises(activation.ActivationError):
@@ -334,9 +335,17 @@ class APIContractTests(unittest.TestCase):
         with patch.object(self.api, "_request", side_effect=[envelope([{"id": VERSION}]), envelope(legacy), envelope([namespace]), envelope(bad)]):
             with self.assertRaises(activation.stage.StageError):
                 self.api.version(RELEASE, True)
+        for bindings in (legacy["resources"]["bindings"], version()["bindings"]):
+            bindings.append({"name": "PROVIDER_CONTAINER", "type": "durable_object_namespace",
+                             "class_name": "ProviderContainer", "namespace_id": NAMESPACE})
+            beta = {**version(), "bindings": bindings}
+            with patch.object(self.api, "_request", side_effect=[
+                    envelope([{"id": VERSION}]), envelope(legacy), envelope([namespace]), envelope(beta)]):
+                with self.assertRaises(activation.stage.StageError):
+                    self.api.version(RELEASE, True)
+            bindings.pop()
 
     def test_full_default_verification_observes_real_module_and_separate_resource_versions(self):
-        metadata = activation.stage._metadata(RELEASE, IMAGE)
         deployment = {"id": DEPLOYMENT, "strategy": "percentage", "created_on": START,
                       "versions": [{"version_id": VERSION, "percentage": 100}],
                       "annotations": {"workers/message": f"provider-activate/{REVISION}/{EVIDENCE['artifactId']}"}}
@@ -355,9 +364,7 @@ class APIContractTests(unittest.TestCase):
                 self.api.worker_path + "/deployments/" + DEPLOYMENT: envelope(deployment),
                 self.api.beta_path + "?page=1&per_page=2": envelope([{"id": VERSION}]),
                 self.api.beta_path + "/" + VERSION + "?include=modules": envelope(version()),
-                self.api.worker_path + "/versions/" + VERSION: envelope({"id": VERSION, "resources": {
-                    "bindings": [{"name": "PROVIDER_CONTAINER", "type": "durable_object_namespace", "class_name": "ProviderContainer"}],
-                    "script_runtime": {"containers": metadata["containers"]}}}),
+                self.api.worker_path + "/versions/" + VERSION: envelope(legacy_version()),
                 "/workers/durable_objects/namespaces?page=1&per_page=1000": envelope([
                     {"id": NAMESPACE, "script": activation.provider.SERVICE, "class": "ProviderContainer", "use_sqlite": True}]),
                 "/containers/applications?per_page=500": envelope([container] if active else []),
