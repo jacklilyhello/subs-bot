@@ -442,6 +442,64 @@ test("Clash limits serialized names and aggregate hopping expansion during prefl
   }
 });
 
+test("Surge preserves private group references and QX aliases preserve exact native lines", async () => {
+  const node = { type: "ss", server: "203.0.113.12", port: 8388, cipher: "aes-256-gcm", password: "fixture:港🌐" };
+  const { env, reads } = fixture([[{ ...node, name: "direct" }], [{ ...node, name: "DIRECT (2)" }]]);
+  const pass = ["manifest.json", "0.ndjson", "1.ndjson"].map((name) => PREFIX + name);
+  const path = "/sub/" + TOKEN + "/";
+  const head = await request(path + "Surge", env, "HEAD");
+  assert.equal(head.status, 200);
+  assert.equal(head.body, null);
+  assertPrivate(head);
+  assert.deepEqual(reads.splice(0), pass);
+  const surge = await request(path + "Surge", env);
+  assert.equal(surge.status, 200);
+  assertPrivate(surge);
+  assert.equal(await surge.text(), "[Proxy]\n"
+    + "direct (3) = ss, 203.0.113.12, 8388, encrypt-method=aes-256-gcm, password=fixture:港🌐\n"
+    + "DIRECT (2) = ss, 203.0.113.12, 8388, encrypt-method=aes-256-gcm, password=fixture:港🌐\n\n"
+    + "[Proxy Group]\nProxy = select, direct (3), DIRECT (2)\n\n[Rule]\nFINAL,Proxy\n");
+  assert.deepEqual(reads.splice(0), [...pass, ...pass]);
+  const qx = "shadowsocks=203.0.113.12:8388, method=aes-256-gcm, password=fixture:港🌐, tag=direct (3)\n"
+    + "shadowsocks=203.0.113.12:8388, method=aes-256-gcm, password=fixture:港🌐, tag=DIRECT (2)\n";
+  for (const suffix of ["qx", "Quantumult", "QUANTUMULTX"]) {
+    const result = await request(path + suffix, env);
+    assert.equal(result.status, 200);
+    assertPrivate(result);
+    assert.equal(await result.text(), qx);
+  }
+  assert.equal((await request(path + "quantumult-x", env)).status, 406);
+});
+
+test("text exports refuse a mixed unsupported snapshot and a corrupted or oversized response", async () => {
+  const path = "/sub/" + TOKEN + "/";
+  for (const format of ["surge", "qx"]) {
+    const bad = fixture([[{ share: LINK }], [{ share: "ssr://fixture-secret" }]]);
+    const rejected = await request(path + format, bad.env);
+    assert.equal(rejected.status, 422);
+    assert.equal(await rejected.text(), "Subscription content cannot be exported.");
+    assertPrivate(rejected);
+    const head = await request(path + format, bad.env, "HEAD");
+    assert.equal(head.status, 422);
+    assert.equal(head.body, null);
+    const broken = fixture([[{ share: LINK }]]);
+    broken.objects.delete(PREFIX + "0.ndjson");
+    assert.equal((await request(path + format, broken.env)).status, 503);
+  }
+
+  const node = { type: "ss", server: "203.0.113.12", port: 8388, cipher: "aes-256-gcm" };
+  const prefix = "node = ss, 203.0.113.12, 8388, encrypt-method=aes-256-gcm, password=";
+  const size = 64 * 1024 - prefix.length - 1;
+  for (const [bytes, status] of [[size, 200], [size + 1, 422]]) {
+    const { env } = fixture([[{ ...node, name: "node", password: "x".repeat(bytes) }]]);
+    assert.equal((await request(path + "surge", env, "HEAD")).status, status);
+  }
+  const group = Array.from({ length: 100 }, (_, index) => ({ ...node, name: "x".repeat(700) + index, password: "fixture" }));
+  const { env } = fixture([group]);
+  assert.equal((await request(path + "surge", env, "HEAD")).status, 422);
+  assert.equal((await request(path + "qx", env, "HEAD")).status, 200);
+});
+
 test("canceling a response stops reads beyond the current lookahead window", async () => {
   const first = LINK + "x".repeat(4 * 24 * 1024);
   const { env, reads } = fixture([
