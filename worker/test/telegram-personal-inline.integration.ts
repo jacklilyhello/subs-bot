@@ -210,7 +210,7 @@ test("emitted Worker answers opted-in sender queries using the owner's durable s
     async function seedMany(count: number, start: number, title: string) {
       await db.prepare(`WITH RECURSIVE sequence(n) AS (SELECT ? UNION ALL SELECT n+1 FROM sequence WHERE n<?)
         INSERT INTO subscriptions (owner_id,name,source_url,token,created_at,updated_at)
-        SELECT ?,? || printf('%04d',n),'https://example.invalid/cap/' || n,'inline-fixture-' || n,unixepoch(),unixepoch()
+        SELECT ?,? || printf('%04d',n),'https://example.invalid/cap/' || printf('%d',n),'inline-cap-fixture-' || printf('%04d',n),unixepoch(),unixepoch()
         FROM sequence`).bind(start, start + count - 1, policy.memberId, title).run();
     }
     await seedMany(51, 1, "Cap ");
