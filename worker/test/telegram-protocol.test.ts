@@ -291,6 +291,24 @@ test("dispatches temporary-node commands and ordinary text only in the approved 
   assert.deepEqual(await decodeMessage("/ignored", { entities: [] }), { status: 204 });
 });
 
+test("normalizes private short link commands without routing group URLs into other features", async () => {
+  const url = "https://example.com/fixture?q=synthetic";
+  const scope = { updateId, actorId: policy.adminId, chatId: policy.adminId, chatType: "private",
+    messageId: 15, messageDate, threadId: null };
+  assert.deepEqual(await decodeMessage("/short"), { status: 200, shortLink: { ...scope, args: "" } });
+  assert.deepEqual(await decodeMessage(`/short@${policy.botUsername} ${url}`),
+    { status: 200, shortLink: { ...scope, args: " " + url } });
+  for (const verb of ["短链", "ShOrT"]) {
+    assert.deepEqual(await decodeMessage(`${verb} ${url}`, { entities: [] }),
+      { status: 200, shortLink: { ...scope, args: url } });
+  }
+  assert.deepEqual(await decodeMessage(`/short@Other_Bot ${url}`), { status: 204 });
+  assert.deepEqual(await decodeMessage(`/short ${url}`, { message_thread_id: 3 }), { status: 204 });
+  for (const text of [`/short ${url}`, `短链 ${url}`, `short ${url}`]) {
+    assert.deepEqual(await decodeMessage(text, { chat: { id: Number(policy.groupId), type: "supergroup" } }), { status: 204 });
+  }
+});
+
 test("normalizes scoped callbacks from the exact bot message without retaining reply text", async () => {
   assert.deepEqual(await decode({ update_id: updateId, callback_query: callback() }), {
     status: 200,

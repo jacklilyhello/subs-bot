@@ -1,7 +1,7 @@
 import { DurableObject, WorkerEntrypoint, WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
+import type { ProviderFetchInput, ProviderFetchResult } from "../src/provider-fetch-contract.ts";
 import {
-  exercise, fetchPinnedProvider, providerFailure, providerPayload, ProviderProbeError, REVISION, SERVICE, SINGLETON,
-  type ProviderFetchInput, type ProviderFetchResult,
+  exercise, fetchPinnedProvider, providerFailure, providerPayload, providerRequest, ProviderProbeError, REVISION, SERVICE, SINGLETON,
 } from "./controller.ts";
 
 interface Env {
@@ -25,9 +25,12 @@ export class ProviderContainer extends DurableObject<Env> {
 
   async fetchSubscription(input: ProviderFetchInput): Promise<ProviderFetchResult> {
     try {
-      const payload = providerPayload(input);
-      if (payload === null) return providerFailure("invalid-request");
+      const request = providerRequest(input);
+      if (request === null) return providerFailure("invalid-request");
       const revision = this.env.BUILD_REVISION;
+      if (request.providerRevision !== revision) return providerFailure("unavailable");
+      const payload = providerPayload({ url: request.url });
+      if (payload === null) return providerFailure("invalid-request");
       const singleton = this.env.PROVIDER_CONTAINER.idFromName(SINGLETON);
       const container = this.ctx.container;
       if (!this.ctx.id.equals(singleton) || !container || typeof revision !== "string" || !REVISION.test(revision)) {
@@ -36,7 +39,7 @@ export class ProviderContainer extends DurableObject<Env> {
       if (this.busy) return providerFailure("busy");
       this.busy = true;
       try {
-        return await fetchPinnedProvider(container, revision, payload);
+        return await fetchPinnedProvider(container, revision, payload, request.imageSha256);
       } finally {
         this.busy = false;
       }
@@ -69,8 +72,10 @@ export class ProviderContainer extends DurableObject<Env> {
 export class ProviderFetch extends WorkerEntrypoint<Env> {
   async fetchSubscription(input: ProviderFetchInput): Promise<ProviderFetchResult> {
     try {
-      if (providerPayload(input) === null) return providerFailure("invalid-request");
-      return await this.env.PROVIDER_CONTAINER.getByName(SINGLETON).fetchSubscription(input);
+      const request = providerRequest(input);
+      if (request === null) return providerFailure("invalid-request");
+      if (request.providerRevision !== this.env.BUILD_REVISION) return providerFailure("unavailable");
+      return await this.env.PROVIDER_CONTAINER.getByName(SINGLETON).fetchSubscription(request);
     } catch {
       return providerFailure("unavailable");
     }

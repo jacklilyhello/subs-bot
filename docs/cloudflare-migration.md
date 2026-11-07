@@ -11,7 +11,7 @@
 | `GET` 或 `HEAD /health` | 返回部署的 40 位 Git commit SHA，供部署验收核对 |
 | `GET` 或 `HEAD /sub/{token}/{format}` | 读取当前已发布快照，支持 `base64`、`v2ray`、`mixed`、`singbox`、`sing-box`、`clash`、`surge`、`qx`、`quantumult` 和 `quantumultx`。省略格式时使用 `clash` |
 | `GET` 或 `HEAD /agg/{code}/{format}` | 导出全量或指定订阅，使用同一套格式 |
-| `GET` 或 `HEAD /s/{code}` | 对有效聚合码返回同源相对重定向 |
+| `GET` 或 `HEAD /s/{code}` | 对有效聚合码返回同源相对重定向，对普通短码跳转到已验证的外部 HTTP(S) 地址 |
 | `POST /telegram/webhook` | 校验隔离 Bot 的 Webhook 密钥，接收受限消息及回调 |
 
 能力链接视同凭据。成功与失败响应均使用 `Cache-Control: no-store, private`、`Referrer-Policy: no-referrer` 和 `X-Content-Type-Options: nosniff`。`HEAD` 执行同样的预检并返回相同状态，响应体为空。未知能力链接返回 `404`，未支持的导出格式返回 `406`，内容无法完整转换或超过格式限制时返回 `422`。若预检时发现已引用的快照不可用或校验失败，返回 `503`。旧服务将未知格式回退到 Clash，迁移前须核对已发链接所用格式。
@@ -28,9 +28,13 @@ Clash 返回 `text/yaml`，保留旧版的节点选择、自动选择和匹配�
 
 Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks、VMess、Trojan、Hysteria 2、TUIC v5、AnyTLS、SOCKS5 和 HTTP(S) 的可转换设置。Quantumult X 的三个别名返回相同的原生节点资源行，支持 Shadowsocks、VMess、VLESS、Trojan、AnyTLS、SOCKS5 和 HTTP(S)。两个格式都要求每个节点能完整转换。旧版 Surge 生成的 VLESS 声明会返回 `422`。Quantumult X 的已有 URI 先解析再转换。未支持的 URI 或不能等价保留的加密、混淆、证书和传输设置同样返回 `422`。名称和字段内有歧义的分隔符或换行也会拒绝，Surge 中支持厂商语法允许的带引号逗号值。每种输出最多 16 MiB、25,000 个节点和每行 64 KiB，Surge 的选择分组也受单行限制。托管 CI 对照厂商语法和旧版可无损案例，核对实际 Worker 响应的字节。Surge 的配置校验命令随 macOS 应用发布，Quantumult X 提供原生资源示例。两个客户端的实际导入未纳入该 CI。 [Surge 策略](https://manual.nssurge.com/policies/overview.html) · [Surge CLI](https://manual.nssurge.com/tools/cli.html) · [Quantumult X 原生节点示例](https://github.com/crossutility/Quantumult-X/blob/master/server-complete.snippet)
 
-聚合能力链接通过 `GET` 或 `HEAD /agg/{code}/{format}` 使用同一套导出格式。`/s/{code}` 仅对有效的聚合码返回同源相对重定向。全量链接按订阅 ID 读取所有者的活动已发布快照，再读取同一 Bot 和所有者的临时节点。筛选链接按记录顺序读取已选订阅，暂时移除回收中的订阅，恢复后可继续使用原 ID。订阅到期时间仍为上游元数据。
+聚合能力链接通过 `GET` 或 `HEAD /agg/{code}/{format}` 使用同一套导出格式。有效聚合码继续通过 `/s/{code}` 返回同源相对重定向。全量链接按订阅 ID 读取所有者的活动已发布快照，再读取同一 Bot 和所有者的临时节点。筛选链接按记录顺序读取已选订阅，暂时移除回收中的订阅，恢复后可继续使用原 ID。订阅到期时间仍为上游元数据。
 
-`0009` 只存聚合码的摘要。一次 D1 批处理固定成员、快照指针和临时节点。Worker 核对并固定 R2 清单后，复用同一组来源进行两遍导出。每个聚合最多 128 份订阅，快照与临时数据共用 64 MiB、100,000 个节点和 256 个 R2 块的预算。各格式的输出上限仍适用。旧链接导入、其他短链、订阅拉取和生产域名分阶段接入。
+`0009` 只存聚合码的摘要。一次 D1 批处理固定成员、快照指针和临时节点。Worker 核对并固定 R2 清单后，复用同一组来源进行两遍导出。每个聚合最多 128 份订阅，快照与临时数据共用 64 MiB、100,000 个节点和 256 个 R2 块的预算。各格式的输出上限仍适用。旧链接导入、订阅拉取和生产域名分阶段接入。
+
+普通短链在私聊通过 `短链 URL`、`short URL` 或 `/short URL` 签发，`/short` 显示帮助，`/short revoke <短码或本地短链>` 撤销自己的链接。每位用户最多有 128 条活动普通短链。目标限 2 KiB，拒绝带 URL 用户名或密码、控制字符、反斜杠、已知本地主机名和本地或受限 IP 字面量的地址。项目域名也禁止作为普通目标。Worker 仅检查 URL 和返回重定向，地址的 DNS 解析由客户端执行。 [URL 标准](https://url.spec.whatwg.org/) · [IANA IPv4 地址注册表](https://www.iana.org/assignments/iana-ipv4-special-registry) · [IANA IPv6 地址注册表](https://www.iana.org/assignments/iana-ipv6-special-registry)
+
+`0019` 在受限 D1 链接行保存规范化目标和短码摘要。确定未送达的重试使用原短码，撤销清除目标并保留摘要。新普通短码和聚合短码使用不同末位，查找同时核对两个表。同一摘要若有两条归属记录，即使其中一条已撤销，普通和聚合路径都返回 `404`。已核对的 12 位旧普通短码可沿用相同路径，旧数据导入另行执行。
 
 `0014` 允许已授权用户在私聊使用 `/export` 签发或重显个人全量链接，使用 `/export revoke` 撤销当前链接。链接基于独立密钥、随机 nonce、安装来源、Bot 和所有者派生，D1 保存摘要及派生元数据。私聊发送前再次核对授权版本和链接代数。重显保留链接，撤销后的新签发使用新链接。响应显示固定隔离来源的 Clash 链接。其他格式仍由 HTTP 入口逐项验证，Base64 链接需要先确认内容可导出。
 
@@ -71,7 +75,7 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 | 上传 `.txt`、`.log`、`.yaml`、`.yml`、`.json`，识别节点或订阅 URL，同名文件更新旧导入。 | 已接入私聊节点文档及同名上传替换。验收同一账号保留订阅 ID 和令牌、另一账号同名文件独立、失败保留旧快照。URL 列表和混合文档随提供方导入接入。 |
 | 发送一个或多个 HTTP(S) URL 或 `名称\|URL`，重复 URL 刷新，按上游标题自动命名。单条刷新、详情或导出的按需刷新、更新所有的确认和进度、有效及失败报告、保留或回收失败项。 | 私有抓取入口、订阅元数据和快照发布为基础。先验收实际提供方出网、URL 导入、单条刷新和流量、到期、标题，再验收可恢复的批量刷新、报告和失败项回收。 |
 | `/export` 动态全量聚合含自己的临时节点，`/o` 按名称和原始 URL 筛选并固定订阅顺序，所选聚合只包含订阅。 | 已接入全量和筛选聚合的 HTTP 读取、私聊 `/export` 及 `/o` 签发和撤销。验收 Unicode 匹配、稳定重显、冻结成员、配额回收、并发修改、撤销后的新读取、两账号归属和顺序。旧聚合码迁移单独接入。 |
-| `/short` 显示帮助，`短链 URL`、`short URL` 及详情按钮签发短链。`/s/{code}` 按已保存目标跳转，可选外部服务包装同一受控本地链接。 | 当前 `/s/{code}` 支持聚合同源重定向。单订阅格式短链、任意 HTTP(S) 目标及可信外部服务回退单独验收。 |
+| `/short` 显示帮助，`短链 URL`、`short URL` 及详情按钮签发短链。`/s/{code}` 按已保存目标跳转，可选外部服务包装同一受控本地链接。 | 私聊签发和撤销普通 HTTP(S) 短链，兼容聚合重定向。验收旧短码、归属、撤销、缓存与命名空间冲突。单订阅详情入口和可信外部服务另行接入。 |
 | `/path` 和菜单维护路径对应，支持添加、删除和清空，受限文本入口接受 `关键词=备注`。 | HTTP 导出已应用所有者路径规则，临时节点保留原名。私聊 `/path` 已接入显式添加、删除、清空和分页。验收两账号隔离与迟到操作，菜单、独立自由文本和旧规则导入分别接入。 |
 | `@Bot [关键词]` 搜索并发送订阅及临时节点，`/i` 切换默认、流量、到期和名称排序。`Share` 支持自定义内容或匹配订阅、指定接收人、份数和有效期；选中反馈用于更新原卡。 | 私密创建和领取已接入私聊 `/share`、`/start claim_<code>`。隔离工作流核对实际双账号回执、正文、过期、指定用户、并发与重复领取。内联搜索、排序和通用分享卡片分阶段接入。 |
 | `/g` 查 GitHub 仓库和公开代码，代码无结果时查询 grep.app，必要时提供 GitHub 网页搜索入口。`/ai` 接受 API 地址和 Key，探测 OpenAI 兼容端点的状态和延迟。 | 两项各自接入和验收。GitHub 凭据只发送至 GitHub。`/ai` 按固定范围验证用户提供的地址，禁用重定向，保护 Key 和上游响应。 |
@@ -153,7 +157,8 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 - 刷新任务保存订阅、发起人、期望版本、尝试次数和错误类别。租约带过期时间及递增凭据，过期消费者的写入由条件检查拒绝。队列消息重复投递时复用同一任务。重试按错误类别退避并遵守提供方限速，耗尽后进入死信或可审计的失败状态。用 Cron 补发已入库但未成功入队的任务。拉取或解析失败只记录错误状态，上一份有效快照继续服务。 [Queues 重试与死信](https://developers.cloudflare.com/queues/configuration/batching-retries/)
 - 任意用户 URL 开放前，验证 HTTP(S) URL、允许端口和重定向策略。每一跳重新解析 A/AAAA，拒绝私有、环回、保留及混合公网和私网结果，并确保实际连接到通过检查的 IP，同时保持原 Host、TLS SNI 和证书校验。带凭据的请求禁止将凭据转发至新来源。延续现有解压后 10 MiB 上限，并对上传、重定向次数、总耗时、节点数和 YAML 深度或别名设置限额。
-- 抓取组件使用项目专用 Cloudflare Container、固定 DNS 地址的 Python 传输及有界私有 RPC。业务 Worker 的服务绑定、导入和刷新任务需要通过隔离集成验收，确认实际连接、TLS 和 Cloudflare 代理的提供方兼容性。持久数据继续写入 D1 和 R2。 [私有抓取组件](../worker/provider_fetch/README.md) · [Containers 出网](https://developers.cloudflare.com/containers/configuration/outbound-traffic/)
+- 抓取组件使用项目专用 Cloudflare Container、固定 DNS 地址的 Python 传输及有界私有 RPC。Cron 只有在私有服务绑定、预期版本和镜像摘要都配置后，才会领取一条已有导入或刷新任务。RPC 在启动 Container 前核对版本和镜像。托管 CI 使用合成 RPC 验证已构建 Worker 的 D1、R2 与 HTTP 流程。服务绑定启用、Telegram 单条命令和真实提供方的 TLS 与兼容性分别验收，批量刷新另行接入。 [私有抓取组件](../worker/provider_fetch/README.md) · [Containers 出网](https://developers.cloudflare.com/containers/configuration/outbound-traffic/)
+- 解析拒绝、抓取失败或租约过期时保留上一份快照和流量信息。成功发布在同一个 D1 批次核对所有者、原始 URL、代次、生命周期和租约，再更新快照、有效流量与到期元数据，并完成任务。候选 R2 路径使用本次租约 UUID。确认 CAS 未提交时回收本次候选，结果不明时读回精确任务及包含摘要的快照指针，并保留不能确认的候选。后续清理需在写 R2 前持久记录候选并确认活动区、回收站和备份均未引用，现有任务记录丢失租约后不能凭 R2 前缀自动推定归属。
 - 测试包括实际提供方的鉴权、重定向、编码、流量头、IPv4/IPv6、阻断行为与限速。输出只记录分类结果和耗时。覆盖 DNS 重绑定、跨来源重定向、压缩超限和异常 YAML，并核对失败不会改变旧快照。真实联调使用获准的测试订阅和会话。
 
 ## 部署、数据迁移和回滚
@@ -196,6 +201,12 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 容量检查的客户端耗时和吞吐来自这组样本。CPU、内存和平台子请求数量通过隔离 Worker 的聚合指标另行核对。旧 SQLite 的正文体积与转换后的 NDJSON 和分享原文分别测量。真实备份的分布、超限项及可恢复性需要通过获准的数据演练验证。 [Workers 限制](https://developers.cloudflare.com/workers/platform/limits/) · [Workers 指标](https://developers.cloudflare.com/analytics/graphql-api/tutorials/querying-workers-metrics/)
 
 旧库容量盘点在获准的托管环境运行 `python3 -B worker/tools/legacy_inventory.py <封存备份>`。输入须是单独完成、关闭、使用 UTF-8 和 DELETE 日志模式的 SQLite 备份。备份准备在原库之外进行，盘点本身以只读事务运行。报告只包含活动订阅与回收站的聚合计数、原始字节、紧凑 UTF-8 NDJSON 字节、块数、大小限制和旧转换器分享原文估算。无法读取或解析的记录有独立计数。退出码 `0` 表示报告完整，仍需检查超限和无效项。退出码 `2` 表示无法核对备份。容量报告不判定归属映射、旧链接兼容、分享权限或实际 Worker 性能。 [SQLite 增量读取](https://sqlite.org/c3ref/blob_open.html) · [SQLite URI](https://sqlite.org/uri.html)
+
+### 普通短链双账号验收
+
+受保护的 `worker-isolation-telegram-short-links-smoke.yml` 对同一活动版本执行 `prepare`、`issued` 和 `retired`。使用同一个 `cohort` 和 Worker CI 运行 ID。后两步引用前一步的成功运行。两名获准用户只在指定内置浏览器私聊分别签发 `https://example.com/subs-bot-normal-short/<cohort>/admin` 和 `https://example.org/subs-bot-normal-short/<cohort>/member`。管理员先尝试撤销普通用户的测试短码，随后各自撤销自己的短链。提交的浏览器证据只包含三项摘要。
+
+验收任务只读取已固定的资源和回执，并对隔离 Worker 的 GET 和 HEAD 检查状态、重定向目标和私有缓存响应头。探针在项目域名收到响应后结束。撤销后保留两条墓碑，原链接返回 `404`。外部 URL 的连接由使用者的客户端处理。
 
 ### 隔离合成旧订阅候选应用
 
