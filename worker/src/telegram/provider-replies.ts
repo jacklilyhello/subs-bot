@@ -1,4 +1,5 @@
 import { PROVIDER_JOB_TTL_SECONDS, TELEGRAM_PROVIDER_MARKER, type ProviderSql } from "../provider-jobs.ts";
+import { isolatedTelegramRoleEpochSql } from "./authorization-sql.ts";
 import type { TelegramProviderEvent } from "./provider-admission.ts";
 import type { TelegramPolicy } from "./protocol.ts";
 
@@ -71,12 +72,8 @@ export function telegramProviderReplyClock(alias: InboxAlias): string {
 }
 
 function exactProviderEpoch(policy: TelegramPolicy, alias: InboxAlias = "inbox"): ProviderSql {
-  return { sql: `${providerPrivateInbox(alias)} AND origin.kind = 'url-import'
-    AND ((${alias}.actor_id = ? AND origin.actor_role = 'admin' AND origin.auth_message_date = 0 AND origin.auth_message_id = 0)
-      OR (${alias}.actor_id = ? AND origin.actor_role = 'member' AND ${alias}.message_date > origin.auth_message_date
-        AND COALESCE((SELECT allowed = 1 AND message_date = origin.auth_message_date AND message_id = origin.auth_message_id
-          FROM telegram_auth WHERE bot_id = ${alias}.bot_id AND user_id = ${alias}.actor_id),
-          origin.auth_message_date = 0 AND origin.auth_message_id = 0)))`, bindings: [policy.adminId, policy.memberId] };
+  const epoch = isolatedTelegramRoleEpochSql(policy, alias);
+  return { sql: `${providerPrivateInbox(alias)} AND origin.kind = 'url-import' AND ${epoch.sql}`, bindings: epoch.bindings };
 }
 
 export function telegramProviderReplyEligible(policy: TelegramPolicy | undefined, alias: InboxAlias): ProviderSql {
