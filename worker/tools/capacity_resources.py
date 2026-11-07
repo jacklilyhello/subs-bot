@@ -46,6 +46,12 @@ class CapacityError(RuntimeError):
     pass
 
 
+class R2ObjectError(CapacityError):
+    def __init__(self, method, outcome):
+        self.outcome = outcome
+        super().__init__(f"Scoped R2 {method} failed ({outcome}).")
+
+
 def require(condition, message):
     if not condition:
         raise CapacityError(message)
@@ -299,17 +305,22 @@ class R2Objects:
             error.close()
             if error.code == 404 and method in ("GET", "DELETE"):
                 return None
-            raise CapacityError(f"Scoped R2 object request failed (HTTP {error.code}).") from None
+            raise R2ObjectError(method, f"HTTP {error.code}") from None
         except (OSError, ValueError, HTTPException):
-            raise CapacityError("Scoped R2 object request could not be completed.") from None
-        require(len(raw) <= CHUNK_BYTES, "Unexpected scoped R2 object size.")
+            raise R2ObjectError(method, "transport failure") from None
+        if len(raw) > CHUNK_BYTES:
+            raise R2ObjectError(method, "response size exceeds bound")
         if method == "GET":
             return raw
         if raw:
-            response = json_body(raw)
-            result = response.get("result") or {}
-            require(response.get("success") is True and isinstance(result, dict) and result.get("key", key) == key,
-                    "Scoped R2 object write response could not be verified.")
+            try:
+                response = json_body(raw)
+                result = response.get("result")
+                require(response.get("success") is True and
+                        (result is None or isinstance(result, dict) and result.get("key", key) == key),
+                        "Invalid scoped R2 response.")
+            except CapacityError:
+                raise R2ObjectError(method, "invalid response envelope") from None
         return None
 
 
@@ -351,28 +362,31 @@ class Resources:
     def row(self, ledger, entry):
         name, source = marker(ledger, entry)
         owner = fixture_owner(entry)
-        by_id = entry["rowId"] is not None
-        if entry["label"] in AGGREGATE_LABELS:
-            archived = self.query(
-                "SELECT 1 FROM subscription_trash WHERE (owner_id=? AND source_url=?)"
-                + (" OR id=? UNION ALL SELECT 1 FROM subscription_lifecycle WHERE subscription_id=?" if by_id else ""),
-                (owner, source, entry["rowId"], entry["rowId"]) if by_id else (owner, source),
-            )
-            require(not archived, "An aggregate fixture has an unexpected lifecycle or trash reference.")
+        row_id = entry["rowId"]
+        id_check = " OR id=?" if row_id is not None else ""
+        id_params = (row_id,) if row_id is not None else ()
+        lifecycle_check = (" OR EXISTS (SELECT 1 FROM subscription_lifecycle WHERE subscription_id=?)"
+                           if row_id is not None else "")
+        # Read references and the active row together before deciding whether retirement is safe.
         rows = self.query(
-            "SELECT id, owner_id, name, source_url, token, generation, snapshot_id, manifest_sha256, node_count "
-            "FROM subscriptions WHERE (owner_id=? AND name=? AND source_url=?)"
-            + (" OR id=?" if by_id else "") + " LIMIT 2",
-            (owner, name, source, entry["rowId"]) if by_id else (owner, name, source),
+            "SELECT id, owner_id, name, source_url, token, generation, snapshot_id, manifest_sha256, node_count, "
+            "0 AS retained FROM subscriptions WHERE (owner_id=? AND name=? AND source_url=?)" + id_check
+            + " UNION ALL SELECT NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,1 "
+            "WHERE EXISTS (SELECT 1 FROM subscription_trash WHERE (owner_id=? AND source_url=?)" + id_check + ")"
+            + lifecycle_check + " LIMIT 2",
+            (owner, name, source, *id_params, owner, source, *id_params, *id_params),
         )
         if not rows:
             return None
+        require(not any(isinstance(row, dict) and row.get("retained") == 1 for row in rows),
+                "A capacity fixture has an unexpected lifecycle or trash reference.")
         require(len(rows) == 1 and isinstance(rows[0], dict), "Capacity subscription ownership is ambiguous.")
         row = rows[0]
         token = row.get("token")
-        require((row.get("owner_id"), row.get("name"), row.get("source_url")) == (owner, name, source)
+        require(type(row.get("retained")) is int and row["retained"] == 0
+                and (row.get("owner_id"), row.get("name"), row.get("source_url")) == (owner, name, source)
                 and integer(row.get("id"), 1, 9007199254740991)
-                and (not by_id or row["id"] == entry["rowId"])
+                and (row_id is None or row["id"] == row_id)
                 and matches(TOKEN, token) and digest(token.encode("ascii")) == entry["tokenSha256"],
                 "Capacity subscription ownership could not be verified.")
         state = (row.get("generation"), row.get("snapshot_id"), row.get("manifest_sha256"), row.get("node_count"))
@@ -432,7 +446,10 @@ class Resources:
             self.query(
                 "DELETE FROM subscriptions WHERE id=? AND owner_id=? AND name=? AND source_url=? AND token=? "
                 "AND generation=? AND ((generation=0 AND snapshot_id IS NULL AND manifest_sha256 IS NULL AND node_count=0) "
-                "OR (generation=1 AND snapshot_id=? AND manifest_sha256=? AND node_count=?))",
+                "OR (generation=1 AND snapshot_id=? AND manifest_sha256=? AND node_count=?)) "
+                "AND NOT EXISTS (SELECT 1 FROM subscription_trash AS trash WHERE trash.id=subscriptions.id "
+                "OR (trash.owner_id=subscriptions.owner_id AND trash.source_url=subscriptions.source_url)) "
+                "AND NOT EXISTS (SELECT 1 FROM subscription_lifecycle WHERE subscription_id=subscriptions.id)",
                 (row["id"], fixture_owner(entry), name, source, row["token"], row["generation"],
                  entry["snapshotId"], entry["objects"][-1]["sha256"], entry["nodeCount"]),
             )
@@ -486,6 +503,28 @@ def confirm_object(directory, ledger, entry, index):
         save_ledger(directory, ledger)
 
 
+def upload_and_verify_object(objects, key, body, entry, index):
+    def read():
+        return objects.request("GET", key)
+
+    put = "PUT acknowledged"
+    try:
+        objects.request("PUT", key, body)
+    except R2ObjectError as error:
+        put = f"PUT {error.outcome}"
+    except CapacityError:
+        put = "PUT outcome unverified"
+    try:
+        remote = recheck_absent(read(), read)
+    except R2ObjectError as error:
+        raise CapacityError(f"Capacity object upload could not be verified ({put}, GET {error.outcome}).") from None
+    except CapacityError:
+        raise CapacityError(f"Capacity object upload could not be verified ({put}, GET outcome unverified).") from None
+    require(remote is not None, f"Capacity object upload could not be verified ({put}, exact key remained absent).")
+    require(matches_object(remote, entry, index),
+            f"Capacity object upload could not be verified ({put}, readback bytes differ).")
+
+
 def seed(directory, resources, revision, run_id, guard, *, profile="capacity"):
     require(matches(REVISION, revision) and matches(RUN_ID, run_id), "A full revision and hosted run ID are required.")
     fixtures, entries = read_fixtures(directory, revision, profile=profile)
@@ -524,12 +563,7 @@ def seed(directory, resources, revision, run_id, guard, *, profile="capacity"):
                 entry["armed"].append(index)
             entry["putPending"].append(index)
             save_ledger(directory, ledger)
-            try:
-                resources.objects.request("PUT", key, body)
-            except CapacityError:
-                pass
-            require(matches_object(resources.objects.request("GET", key), entry, index),
-                    "Capacity object upload could not be verified.")
+            upload_and_verify_object(resources.objects, key, body, entry, index)
             confirm_object(directory, ledger, entry, index)
     resources.verify()
     guard(revision)
@@ -559,7 +593,8 @@ def cleanup(directory, resources, *, profile="capacity"):
             remote = resources.objects.request("GET", key)
             if index in entry["putPending"]:
                 remote = recheck_absent(remote, lambda: resources.objects.request("GET", key))
-                require(remote is not None, "Capacity object upload remains unconfirmed. Cleanup ledger retained.")
+                require(remote is not None,
+                        "Capacity object upload remains unconfirmed. Exact key was absent. Cleanup ledger retained.")
             if remote is None:
                 continue
             require(matches_object(remote, entry, index), "Capacity object changed and was left in R2.")
