@@ -628,13 +628,13 @@ test("the deployed bundle imports private documents through Cron without blockin
     assert.ok(original);
     assert.equal(original.generation, 1);
     assert.match(original.source_url, /^uploaded:\/\//u);
-    assert.equal(await exportBase64(original.token), Buffer.from(`${oldLink}\n`).toString("base64"));
+    assert.equal(await exportBase64(original.token), Buffer.from(oldLink).toString("base64"));
 
     assert.equal((await post(upload(3, "fixture-bad"))).status, 200);
     assert.equal((await worker.scheduled({ cron: "* * * * *" })).outcome, "ok");
     assert.deepEqual(await job(3), terminal("invalid-document"));
     assert.deepEqual(await subscription(), original);
-    assert.equal(await exportBase64(original.token), Buffer.from(`${oldLink}\n`).toString("base64"));
+    assert.equal(await exportBase64(original.token), Buffer.from(oldLink).toString("base64"));
 
     assert.equal((await post(upload(4, "fixture-new"))).status, 200);
     assert.equal((await worker.scheduled({ cron: "* * * * *" })).outcome, "ok");
@@ -646,7 +646,7 @@ test("the deployed bundle imports private documents through Cron without blockin
     assert.equal(replacement.generation, 2);
     assert.notEqual(replacement.snapshot_id, original.snapshot_id);
     assert.ok(await bucket.head(`subscriptions/${original.id}/${original.snapshot_id}/manifest.json`));
-    assert.equal(await exportBase64(original.token), Buffer.from(`${newLink}\n`).toString("base64"));
+    assert.equal(await exportBase64(original.token), Buffer.from(newLink).toString("base64"));
 
     assert.equal((await post(upload(5, "fixture-invalid-type", "exe"))).status, 200);
     const longName = upload(6, "fixture-invalid-name");
