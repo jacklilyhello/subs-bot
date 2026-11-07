@@ -253,7 +253,7 @@ def db_summary(db, layout):
         + " FROM " + native._identifier(table) + " ORDER BY " + ",".join(map(native._identifier, definition["primary"]))))
 
 
-def write_sql(db, schema, sequence, path, *, path_sequence=None, include_empty_exports=False):
+def write_sql(db, schema, sequence, path, *, path_sequence=None, include_empty_exports=False, extra_tables=None):
     # Only the reviewed DDL and fixed-column rows are emitted. SQLite quotes
     # values itself. A subsequent independent replay checks exact round-trip.
     size = 0
@@ -271,10 +271,13 @@ def write_sql(db, schema, sequence, path, *, path_sequence=None, include_empty_e
         tables = TABLE_COLUMNS if path_sequence is None else {**TABLE_COLUMNS, PATH_RULES: PATH_COLUMNS}
         if include_empty_exports:
             tables = {**tables, EMPTY_EXPORTS: EMPTY_EXPORT_COLUMNS}
+        if extra_tables:
+            tables = {**tables, **extra_tables}
         for table, columns in tables.items():
             fields = ",".join(native._identifier(column) for column in columns)
             literals = ",".join(f"quote({native._identifier(column)})" for column in columns)
-            for row in db.execute(f"SELECT {literals} FROM {table} ORDER BY {columns[0]}"):
+            order = fields if extra_tables and table in extra_tables else columns[0]
+            for row in db.execute(f"SELECT {literals} FROM {table} ORDER BY {order}"):
                 write(f"INSERT INTO {table} ({fields}) VALUES (" + ",".join(row) + ")")
         write("DELETE FROM sqlite_sequence WHERE name='subscriptions'")
         if sequence:
