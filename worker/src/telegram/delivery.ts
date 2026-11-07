@@ -17,6 +17,7 @@ import {
   confirmTelegramSubscriptionReadSend, prepareTelegramSubscriptionReadTickets, renderTelegramSubscriptionRead,
   type TelegramSubscriptionReadButton,
 } from "./subscription-read.ts";
+import { prepareTelegramNodePageTickets, renderTelegramSubscriptionNodePage, type TelegramNodePageButton } from "./subscription-node-pages.ts";
 import {
   beginTelegramAggregateLinkReply, beginTelegramInlineSortReply, beginTelegramPrivateShareCreationReply,
   beginTelegramSelectedLinkReply, beginTelegramShortLinkReply, beginTelegramReply, claimTelegramReply, isTelegramMemberAllowed,
@@ -122,7 +123,8 @@ export async function sendTelegramReply(
   keyboard?: InlineKeyboard,
   forceReply = false,
 ): Promise<TelegramReplyOutcome> {
-  if ((lease.path || lease.privateShareCreation || lease.tempRaw || lease.shortLink) && (lease.chatType !== "private" || lease.threadId !== null)) {
+  if ((lease.path || lease.privateShareCreation || lease.tempRaw || lease.shortLink || lease.subscriptionNodes)
+    && (lease.chatType !== "private" || lease.threadId !== null)) {
     return { kind: "failed" };
   }
   return sendTelegram(policy, lease, "sendMessage", {
@@ -194,12 +196,14 @@ async function renderReply(
   deadline: number,
   privateShareEnabled = false,
   subscriptionReadEnabled = false,
+  subscriptionNodesEnabled = false,
 ): Promise<{
   text: string;
   access: ReplyAccess;
   buttons?: TelegramViewButton[];
   lifecycleButtons?: TelegramLifecycleButton[];
   readButtons?: TelegramSubscriptionReadButton[];
+  nodeButtons?: TelegramNodePageButton[];
   readGuard?: { sql: string; bindings: readonly (string | number | null)[] };
   forceReply?: boolean;
 }> {
@@ -215,7 +219,14 @@ async function renderReply(
   }
   const allowed = lease.actorId === policy.adminId || await isTelegramMemberAllowed(db, policy);
   if (!allowed) return { text: "当前账号没有使用权限。", access: "denied" };
-  if (lease.subscriptionRead) return { ...await renderTelegramSubscriptionRead(db, bucket, policy, lease, deadline), access: "allowed" };
+  if (lease.subscriptionRead) return { ...await renderTelegramSubscriptionRead(db, bucket, policy, lease, deadline,
+    subscriptionNodesEnabled), access: "allowed" };
+  if (lease.subscriptionNodes) {
+    const { backId, ...page } = await renderTelegramSubscriptionNodePage(db, bucket, policy, lease, deadline);
+    return { ...page, access: "allowed", ...(backId === undefined ? {} : {
+      readButtons: [{ text: "返回订阅详情", kind: "detail" as const, subscriptionId: backId }],
+    }) };
+  }
   if (lease.privateShareCreation) return { text: "分享链接已失效或授权已变更，请重新创建。", access: "allowed" };
   if (lease.aggregate) {
     const text = {
@@ -348,12 +359,15 @@ export async function drainTelegramReplies(
   subscriptionReadEnabled = false,
   shortLinksEnabled = false,
   inlineSortEnabled = false,
+  subscriptionNodesEnabled = false,
 ): Promise<void> {
   const deadline = Date.now() + budgetMs;
   const privateShareEnabled = privateShareRuntime.schemaReady && privateShareRuntime.context !== null;
-  await reapExpiredTelegramReplies(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled, shortLinksEnabled, inlineSortEnabled);
+  await reapExpiredTelegramReplies(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled,
+    shortLinksEnabled, inlineSortEnabled, subscriptionNodesEnabled);
   for (let processed = 0; processed < limit && Date.now() < deadline; processed += 1) {
-    const lease = await claimTelegramReply(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled, shortLinksEnabled, inlineSortEnabled);
+    const lease = await claimTelegramReply(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled,
+      shortLinksEnabled, inlineSortEnabled, subscriptionNodesEnabled);
     if (!lease) return;
     if (!inTelegramScope(policy, lease)) continue;
     if (lease.tempRaw) {
@@ -430,14 +444,16 @@ export async function drainTelegramReplies(
       await settleTelegramReply(db, policy, lease, outcome);
       continue;
     }
-    const reply = await renderReply(db, bucket, policy, lease, deadline, privateShareEnabled, subscriptionReadEnabled);
-    const [view, lifecycle, read] = await Promise.all([
+    const reply = await renderReply(db, bucket, policy, lease, deadline, privateShareEnabled, subscriptionReadEnabled, subscriptionNodesEnabled);
+    const [view, lifecycle, read, nodes] = await Promise.all([
       reply.buttons?.length ? prepareTelegramViewTickets(reply.buttons) : undefined,
       reply.lifecycleButtons?.length ? prepareTelegramLifecycleTickets(reply.lifecycleButtons) : undefined,
       reply.readButtons?.length ? prepareTelegramSubscriptionReadTickets(reply.readButtons) : undefined,
+      reply.nodeButtons?.length ? prepareTelegramNodePageTickets(reply.nodeButtons) : undefined,
     ]);
     if (Date.now() >= deadline ||
-      !await beginTelegramReply(db, policy, lease, reply.access, view?.tickets, lifecycle?.tickets, read?.tickets, reply.readGuard)) continue;
+      !await beginTelegramReply(db, policy, lease, reply.access, view?.tickets, lifecycle?.tickets, read?.tickets, reply.readGuard,
+        nodes?.tickets)) continue;
     if (reply.readGuard) {
       const confirmed = await confirmTelegramSubscriptionReadSend(db, policy, lease, reply.readGuard).catch(() => false);
       if (!confirmed || Date.now() >= deadline) {
@@ -445,7 +461,7 @@ export async function drainTelegramReplies(
         continue;
       }
     }
-    const keyboard = [...(view?.keyboard ?? []), ...(lifecycle?.keyboard ?? []), ...(read?.keyboard ?? [])];
+    const keyboard = [...(view?.keyboard ?? []), ...(lifecycle?.keyboard ?? []), ...(nodes?.keyboard ?? []), ...(read?.keyboard ?? [])];
     const outcome = await sendTelegramReply(policy, lease, reply.text, Math.max(1, deadline - Date.now()), request,
       keyboard, reply.forceReply);
     await settleTelegramReply(db, policy, lease, outcome);

@@ -70,7 +70,7 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 | --- | --- |
 | `/start`、`/help`、中文回复菜单、`/auth` 列表及增删，支持输入 ID 或回复目标用户。 | 已接入基础欢迎、帮助和私聊管理员授权。核对两账号和测试群的权限隔离、撤权及重投。中文菜单、生产管理员及白名单配置、历史授权覆盖另行核对。 |
 | `/list`、`/expire`、回收站菜单、翻页和跳页。 | `/list`、未来 14 天内到期的 `/expire` 及新增的 `/recycle` 已支持按所有者翻页。核对边界日期、旧票据、跨用户回调和重命名、确认删除、30 天内恢复。菜单、任意页跳转和详情入口分开接入。 |
-| 数字或列表按钮打开详情，浏览节点和流量，单条重命名、刷新、删除、格式链接、短链和节点文件。`/s` 按名称及原始 URL 搜索，`/d` 批量删除匹配项。`/renumber` 只返回当前订阅计数。 | 已有生命周期操作、元数据和快照读取。详情及节点浏览、搜索、批量回收预览和确认、私聊签发各格式链接及原始 URI 附件分别验收。展示编号由列表计算。原始 URL、节点及能力链接限定在私聊。 |
+| 数字或列表按钮打开详情，浏览节点和流量，单条重命名、刷新、删除、格式链接、短链和节点文件。`/s` 按名称及原始 URL 搜索，`/d` 批量删除匹配项。`/renumber` 只返回当前订阅计数。 | 已有生命周期操作、元数据和快照读取。`0022` 在私聊详情中接入每页 15 条的节点浏览，只展示序号、协议和名称。翻页固定到原快照，返回详情可打开同一订阅的当前版本。详情、搜索、批量回收预览和确认、各格式链接及原始 URI 附件分别验收。展示编号由列表计算。原始 URL、节点及能力链接限定在私聊。 |
 | 粘贴节点加入临时列表，`/temp` 查看原文，`/temp clear` 清空。 | 私聊核对导入、计数、原文、TXT 附件和清空。验收包含顺序、重复、整批拒绝、迟到清空和清空后的旧请求。 |
 | 上传 `.txt`、`.log`、`.yaml`、`.yml`、`.json`，识别节点或订阅 URL，同名文件更新旧导入。 | 已接入私聊节点文档及同名上传替换。验收同一账号保留订阅 ID 和令牌、另一账号同名文件独立、失败保留旧快照。URL 列表和混合文档随提供方导入接入。 |
 | 发送一个或多个 HTTP(S) URL 或 `名称\|URL`，重复 URL 刷新，按上游标题自动命名。单条刷新、详情或导出的按需刷新、更新所有的确认和进度、有效及失败报告、保留或回收失败项。 | 私有抓取入口、订阅元数据和快照发布为基础。先验收实际提供方出网、URL 导入、单条刷新和流量、到期、标题，再验收可恢复的批量刷新、报告和失败项回收。 |
@@ -197,6 +197,34 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 成员用相同文件名上传两行替换内容，分别以 `member-second-1` 和 `member-second-2` 结尾，再上传一个同名、只有普通文本的无效文件。以 `capture-created` 运行 ID 执行 `verify-replaced`。该步骤核对成员的稳定订阅 ID、能力令牌摘要和新版本、管理员的原版本、合成导出的 GET 和 HEAD，以及成功回执。能从浏览器确认无效文件的准确消息 ID 时，可填入 `negative_message_id` 核对对应终态，否则保留浏览器观察和未发生额外发布的证据。
 
 关闭本组上传后选择 `retire`，提供成功的 `verify-replaced` 运行 ID，并在确认字段填写 `retire <cohort>`。若在替换前结束，也可使用 `capture-created` 的检查点。清理先在 D1 中核对并撤销本组两个订阅指针，再删除并核对检查点记录的私有 R2 对象。实际 Telegram 的终态回执继续保留，以防重投重新创建订阅。检查点只包含本组合成对象标识、计数和摘要。验收工作流通过 Cloudflare 核对状态，实际上传和可见回复在浏览器中确认。
+
+同一工作流的 `profile=node-pages` 使用独立的合成文件名 `tgdoc-nodes-<cohort>.txt`。先执行 `prepare`，然后用下面的配方在新的私有临时目录中生成两份同名文件。将示例 `COHORT` 换成这次 `prepare` 的值。配方只写入使用保留测试地址的合成文本。
+
+```sh
+COHORT=0123456789abcdef python3 - <<'PY'
+import os
+from pathlib import Path
+import re
+from tempfile import mkdtemp
+
+cohort = os.environ["COHORT"]
+if re.fullmatch(r"[0-9a-f]{16}", cohort) is None:
+    raise SystemExit("Expected a 16-character lowercase hexadecimal cohort")
+root = Path(mkdtemp(prefix="subs-bot-node-pages-"))
+name = "tgdoc-nodes-" + cohort
+prefix = "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.10:8388#" + name
+for role, count in (("admin", 32), ("member", 2)):
+    folder = root / role
+    folder.mkdir(mode=0o700)
+    content = "".join(f"{prefix}-{role}-{index:02d}\n" for index in range(1, count + 1))
+    fd = os.open(folder / (name + ".txt"), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as file:
+        file.write(content.encode("ascii"))
+print(root)
+PY
+```
+
+两名获准测试者只在指定内置浏览器的隔离 Bot 私聊中上传各自目录中的文件。用文件名搜索各自的订阅，打开详情和节点浏览。管理员核对按原顺序显示的 15、15、2 个节点以及上一页和下一页按钮。成员核对自己的一页两个节点。随后以 `prepare` 运行 ID 执行 `capture-created`，由工作流核对同一固定版本下两份快照的有序节点、协议和 Base64 GET、HEAD。停止浏览后，以 `capture-created` 运行 ID 和 `retire <cohort>` 执行 `retire`。退役要求相关详情与节点回复已结束，且只撤销已核对的两个订阅和四个 R2 对象。文档、详情和节点浏览回执保留。该模式的流程止于这三步。
 
 容量检查的客户端耗时和吞吐来自这组样本。CPU、内存和平台子请求数量通过隔离 Worker 的聚合指标另行核对。旧 SQLite 的正文体积与转换后的 NDJSON 和分享原文分别测量。真实备份的分布、超限项及可恢复性需要通过获准的数据演练验证。 [Workers 限制](https://developers.cloudflare.com/workers/platform/limits/) · [Workers 指标](https://developers.cloudflare.com/analytics/graphql-api/tutorials/querying-workers-metrics/)
 
