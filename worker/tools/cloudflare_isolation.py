@@ -28,6 +28,13 @@ PROVIDER_URL_IMPORT_MIGRATIONS = (
     (21, "0021_telegram_provider_admission.sql", "c0557767395697de2d9c3073b4493759104f0eabd399b7391ba9204b7e6527bc"),
     (23, "0023_telegram_provider_replies.sql", "67b4f625259bdef325fc70ef1042a1b33aa73d8396261ba79c85763c2e1c7c14"),
 )
+PROVIDER_REFRESH_BINDING = "TELEGRAM_PROVIDER_REFRESH"
+PROVIDER_REFRESH_TAG_PREFIX = "provider-rf-"
+PROVIDER_REFRESH_MIGRATIONS = (
+    (18, "0018_telegram_subscription_reads.sql", "382e9e5e7a850e4f38aece8c2a9f0e98fd890203edf7aa83c37212f5ab038e62"),
+    *PROVIDER_URL_IMPORT_MIGRATIONS,
+    (28, "0028_telegram_provider_refresh_tickets.sql", "ccbfe6d71864608b9a6d680d955c11af083aa34280b55845edef1296d87dab2e"),
+)
 AGGREGATE_KEY_BINDING = "TELEGRAM_AGGREGATE_KEY"
 AGGREGATE_DIGEST_BINDING = "TELEGRAM_AGGREGATE_KEY_SHA256"
 PRIVATE_SHARE_KEY_BINDING = "TELEGRAM_PRIVATE_SHARE_CREATION_KEY"
@@ -170,6 +177,7 @@ class _Version:
     provider_binding: ProviderBinding | None = None
     telegram_inline_search: bool = False
     telegram_provider_url_import: bool = False
+    telegram_provider_refresh: bool = False
 
 
 def _release_tag(revision, telegram_digest, aggregate_digest, private_share_digest, provider_binding):
@@ -190,11 +198,13 @@ def _inline_search_tag(tag):
     return "inline-" + sha256(f"{tag}:inline-search:1".encode("ascii")).hexdigest()
 
 
-def _telegram_feature_tag(tag, inline_search, provider_url_import):
+def _telegram_feature_tag(tag, inline_search, provider_url_import, provider_refresh=False):
     if inline_search:
         tag = _inline_search_tag(tag)
     if provider_url_import:
         tag = PROVIDER_URL_IMPORT_TAG_PREFIX + sha256(f"{tag}:provider-url-import:1".encode("ascii")).hexdigest()
+    if provider_refresh:
+        tag = PROVIDER_REFRESH_TAG_PREFIX + sha256(f"{tag}:provider-refresh:1".encode("ascii")).hexdigest()
     return tag
 
 
@@ -333,6 +343,27 @@ class _Isolation:
         except (CloudflareError, AttributeError, TypeError, ValueError):
             raise CloudflareError(error) from None
 
+    def verify_provider_refresh(self):
+        path = f"{self.account}/d1/database/{self.target['d1Id']}/query"
+        error = "The isolated provider refresh migrations could not be verified."
+        try:
+            result = self.data_api("POST", path, {"sql": """
+                SELECT position, name, sha256, mode,
+                  (SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN (
+                    'telegram_subscription_read','telegram_provider_jobs','telegram_provider_requests',
+                    'telegram_provider_replies','telegram_provider_refresh_tickets')) AS refreshTables,
+                  (SELECT count(*) FROM sqlite_schema WHERE type='index'
+                    AND name='telegram_provider_refresh_ticket_expiry'
+                    AND tbl_name='telegram_provider_refresh_tickets') AS refreshIndex
+                FROM subs_bot_schema_migrations WHERE position IN (18, 21, 23, 28) ORDER BY position
+            """})
+            expected = [{"position": position, "name": name, "sha256": digest, "mode": "applied",
+                         "refreshTables": 5, "refreshIndex": 1} for position, name, digest in PROVIDER_REFRESH_MIGRATIONS]
+            _require(isinstance(result, list) and len(result) == 1 and result[0].get("success") is True
+                     and result[0].get("results") == expected, error)
+        except (CloudflareError, AttributeError, TypeError, ValueError):
+            raise CloudflareError(error) from None
+
     def active(self):
         result = _object(self.worker_api("GET", self.deployments), "deployments").get("deployments")
         _require(isinstance(result, list) and result, "Isolated Worker has no verified active deployment.")
@@ -359,7 +390,7 @@ class _Isolation:
                                                      {"enabled": False, "cross_version_cache": False}),
                  "Isolated Worker version runtime settings differ from the supported configuration.")
         rows = version.get("bindings")
-        _require(isinstance(rows, list) and 3 <= len(rows) <= 14
+        _require(isinstance(rows, list) and 3 <= len(rows) <= 15
                  and all(isinstance(row, dict) and isinstance(row.get("name"), str) for row in rows),
                  "Unexpected isolated Worker binding inventory.")
         bindings = {row["name"]: row for row in rows}
@@ -368,7 +399,10 @@ class _Isolation:
         has_provider = bool(PROVIDER_BINDINGS & bindings.keys())
         inline = bindings.get(INLINE_SEARCH_BINDING)
         provider_url = bindings.get(PROVIDER_URL_IMPORT_BINDING)
-        binding_names = set(bindings) - PROVIDER_BINDINGS - {INLINE_SEARCH_BINDING, PROVIDER_URL_IMPORT_BINDING}
+        refresh = bindings.get(PROVIDER_REFRESH_BINDING)
+        binding_names = set(bindings) - PROVIDER_BINDINGS - {
+            INLINE_SEARCH_BINDING, PROVIDER_URL_IMPORT_BINDING, PROVIDER_REFRESH_BINDING,
+        }
         _require(len(bindings) == len(rows) and binding_names in (base_bindings, telegram_bindings,
             telegram_bindings | AGGREGATE_BINDINGS, telegram_bindings | PRIVATE_SHARE_BINDINGS,
             telegram_bindings | AGGREGATE_BINDINGS | PRIVATE_SHARE_BINDINGS)
@@ -380,6 +414,9 @@ class _Isolation:
         _require(provider_url is None or (has_provider and TELEGRAM_BINDINGS <= binding_names and provider_url == {
             "name": PROVIDER_URL_IMPORT_BINDING, "type": "plain_text", "text": "1",
         }), "Unexpected isolated Worker provider URL import binding.")
+        _require(refresh is None or (has_provider and TELEGRAM_BINDINGS <= binding_names and refresh == {
+            "name": PROVIDER_REFRESH_BINDING, "type": "plain_text", "text": "1",
+        }), "Unexpected isolated Worker provider refresh binding.")
         db, r2, rev = (bindings[name] for name in ("DB", "NODES", "BUILD_REVISION"))
         database_ids = [db[key] for key in ("database_id", "id") if db.get(key) is not None]
         _require(db.get("type") == "d1" and database_ids
@@ -436,15 +473,21 @@ class _Isolation:
         tag = annotations.get("workers/tag")
         _require(provider_url is not None or not (isinstance(tag, str) and tag.startswith(PROVIDER_URL_IMPORT_TAG_PREFIX)),
                  "Isolated Worker provider URL import release tag differs.")
-        if inline is not None or provider_url is not None:
+        _require(refresh is not None or not (isinstance(tag, str) and tag.startswith(PROVIDER_REFRESH_TAG_PREFIX)),
+                 "Isolated Worker provider refresh release tag differs.")
+        if inline is not None or provider_url is not None or refresh is not None:
             expected = _telegram_feature_tag(_release_tag(rev["text"], telegram_digest, aggregate_digest,
                                                            private_share_digest, provider_binding),
-                                             inline is not None, provider_url is not None)
-            _require(tag == expected, "Isolated Worker provider URL import release tag differs." if provider_url is not None
-                     else "Isolated Worker inline search release tag differs.")
+                                             inline is not None, provider_url is not None, refresh is not None)
+            feature = "inline search"
+            if refresh is not None:
+                feature = "provider refresh"
+            elif provider_url is not None:
+                feature = "provider URL import"
+            _require(tag == expected, f"Isolated Worker {feature} release tag differs.")
         return _Version(rev["text"], sha256(body).hexdigest(), version["compatibility_date"],
                         tag, telegram_digest, aggregate_digest, private_share_digest, provider_binding, inline is not None,
-                        provider_url is not None)
+                        provider_url is not None, refresh is not None)
 
     def verify_candidate(self, candidate, desired):
         # A version can be visible in its creation response or listing before its module is readable.
@@ -501,6 +544,8 @@ class _Isolation:
             bindings.append({"type": "plain_text", "name": INLINE_SEARCH_BINDING, "text": "1"})
         if desired.telegram_provider_url_import:
             bindings.append({"type": "plain_text", "name": PROVIDER_URL_IMPORT_BINDING, "text": "1"})
+        if desired.telegram_provider_refresh:
+            bindings.append({"type": "plain_text", "name": PROVIDER_REFRESH_BINDING, "text": "1"})
         message = "Reviewed isolated Worker release"
         if desired.provider_binding is not None:
             binding = desired.provider_binding
@@ -732,6 +777,26 @@ def _provider_url_import_target(active, requested, manifest, telegram_digest, pr
     return enabled
 
 
+def _provider_refresh_target(active, requested, manifest, telegram_digest, provider_binding, had_cron):
+    _require(requested is None or type(requested) is bool, "Invalid isolated provider refresh release mode.")
+    enabled = active.telegram_provider_refresh if requested is None else requested
+    if not (active.telegram_provider_refresh or enabled):
+        return enabled
+    _require(had_cron and active.provider_binding is not None and provider_binding == active.provider_binding
+             and telegram_digest is not None and telegram_digest == active.telegram_config_sha256,
+             "Isolated provider refresh requires the same active provider, Telegram policy and Cron.")
+    entries = manifest.get("migrations") if isinstance(manifest, dict) else None
+    _require(isinstance(entries, list) and all(len(entries) >= position and entries[position - 1] == {"name": name, "sha256": digest}
+             for position, name, digest in PROVIDER_REFRESH_MIGRATIONS),
+             "Isolated provider refresh requires the exact 0018, 0021, 0023 and 0028 migration artifacts.")
+    if enabled and not active.telegram_provider_refresh:
+        # The disabled artifact must still drain refresh jobs and reap tickets after a rollback.
+        _require(active.revision == manifest.get("revision") and active.digest == manifest.get("bundleSha256")
+                 and active.compatibility == manifest.get("compatibilityDate"),
+                 "Enable provider refresh only after verifying the same Worker artifact with admission disabled.")
+    return enabled
+
+
 def _require_telegram_config_continuity(active, desired_digest):
     _require(active.telegram_config_sha256 is None or active.telegram_config_sha256 == desired_digest,
              "Changing or dropping the isolated Telegram configuration requires a separate scoped release.")
@@ -741,7 +806,8 @@ def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECI
                          private_share_key=_UNSPECIFIED_PRIVATE_SHARE_KEY, provider_binding=_UNSPECIFIED_PROVIDER_BINDING,
                          release_revision=None, provider_first_binding_guard=None, historical_application_revision=None,
                          release_manifest=None,
-                         telegram_config=_UNSPECIFIED_TELEGRAM_CONFIG, inline_search=None, provider_url_import=None):
+                         telegram_config=_UNSPECIFIED_TELEGRAM_CONFIG, inline_search=None, provider_url_import=None,
+                         provider_refresh=None):
     """Read ownership, privacy and active binding facts before any release writes."""
     scope = _Isolation(worker_api, data_api, target)
     scope.worker_config()
@@ -777,10 +843,18 @@ def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECI
             scope.verify_inline_search(bot_id, require_fresh=enabled and not version.telegram_inline_search)
     if provider_binding is not _UNSPECIFIED_PROVIDER_BINDING:
         _require_provider_continuity(version.provider_binding, provider_binding)
+    verify_provider_url = False
     if release_manifest is not None or provider_url_import is not None:
         enabled = _provider_url_import_target(version, provider_url_import, release_manifest, desired_digest, provider_binding, had_cron)
-        if version.telegram_provider_url_import or enabled:
-            scope.verify_provider_url_import()
+        verify_provider_url = version.telegram_provider_url_import or enabled
+    verify_provider_refresh = False
+    if release_manifest is not None or provider_refresh is not None:
+        enabled = _provider_refresh_target(version, provider_refresh, release_manifest, desired_digest, provider_binding, had_cron)
+        verify_provider_refresh = version.telegram_provider_refresh or enabled
+    if verify_provider_refresh:
+        scope.verify_provider_refresh()
+    elif verify_provider_url:
+        scope.verify_provider_url_import()
     if provider_binding is not _UNSPECIFIED_PROVIDER_BINDING:
         _verify_first_provider_binding(version, provider_binding, release_revision, provider_first_binding_guard,
                                        historical_application_revision)
@@ -794,7 +868,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                    telegram_config: str | None = None, aggregate_key: str | None = None, private_share_key: str | None = None,
                    provider_binding: ProviderBinding | None = None, provider_guard=None, provider_first_binding_guard=None,
                    historical_application_revision: str | None = None,
-                   inline_search: bool | None = None, provider_url_import: bool | None = None):
+                   inline_search: bool | None = None, provider_url_import: bool | None = None,
+                   provider_refresh: bool | None = None):
     """Release the verified Worker and optionally configure its isolated Telegram schedule."""
     _require((provider_binding is None and provider_guard is None) or (provider_binding is not None and callable(provider_guard)),
              "An isolated provider release requires a verified dependency guard.")
@@ -822,7 +897,13 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
     enabled, inline_bot = _inline_search_target(old_version, inline_search, manifest, telegram_config)
     provider_url_enabled = _provider_url_import_target(old_version, provider_url_import, manifest,
         desired.telegram_config_sha256, desired.provider_binding, had_cron)
-    verify_provider_url = old_version.telegram_provider_url_import or provider_url_enabled
+    refresh_enabled = _provider_refresh_target(old_version, provider_refresh, manifest,
+        desired.telegram_config_sha256, desired.provider_binding, had_cron)
+    verify_provider_schema = None
+    if old_version.telegram_provider_refresh or refresh_enabled:
+        verify_provider_schema = scope.verify_provider_refresh
+    elif old_version.telegram_provider_url_import or provider_url_enabled:
+        verify_provider_schema = scope.verify_provider_url_import
     first_enable = enabled and not old_version.telegram_inline_search
     if enabled != old_version.telegram_inline_search:
         _require(had_cron and (old_version.telegram_aggregate_key_sha256, old_version.telegram_private_share_key_sha256,
@@ -830,11 +911,12 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                   desired.telegram_private_share_key_sha256, desired.provider_binding),
                  "Change the isolated inline search flag with the existing Cron, same keys and provider binding.")
     desired = replace(desired, telegram_inline_search=enabled, telegram_provider_url_import=provider_url_enabled,
-                      tag=_telegram_feature_tag(desired.tag, enabled, provider_url_enabled))
+                      telegram_provider_refresh=refresh_enabled,
+                      tag=_telegram_feature_tag(desired.tag, enabled, provider_url_enabled, refresh_enabled))
     if inline_bot is not None:
         scope.verify_inline_search(inline_bot, require_fresh=first_enable)
-    if verify_provider_url:
-        scope.verify_provider_url_import()
+    if verify_provider_schema is not None:
+        verify_provider_schema()
     _verify_first_provider_binding(old_version, desired.provider_binding, desired.revision, provider_first_binding_guard,
                                    historical_application_revision)
     _verify_health(old_version.revision)
@@ -844,10 +926,11 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
         _require(old_version.digest == desired.digest, "Active revision differs from the verified module digest.")
         if (old_version.telegram_config_sha256, old_version.telegram_aggregate_key_sha256,
                 old_version.telegram_private_share_key_sha256, old_version.provider_binding,
-                old_version.telegram_inline_search, old_version.telegram_provider_url_import) == (
+                old_version.telegram_inline_search, old_version.telegram_provider_url_import,
+                old_version.telegram_provider_refresh) == (
                 desired.telegram_config_sha256, desired.telegram_aggregate_key_sha256,
                 desired.telegram_private_share_key_sha256, desired.provider_binding,
-                desired.telegram_inline_search, desired.telegram_provider_url_import):
+                desired.telegram_inline_search, desired.telegram_provider_url_import, desired.telegram_provider_refresh):
             if telegram_config is None:
                 _require(scope.active() == previous, "Active isolated Worker deployment changed during verification.")
                 _guard_current(guard)
@@ -856,7 +939,7 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                 changed = scope.ensure_cron(previous, config, guard)
             return {"revision": desired.revision, "deploymentId": previous.id, "versionId": previous.version,
                     "previousVersionId": previous.version, "changed": changed, "inlineSearchEnabled": enabled,
-                    "providerUrlImportEnabled": provider_url_enabled}
+                    "providerUrlImportEnabled": provider_url_enabled, "providerRefreshEnabled": refresh_enabled}
 
     candidate = scope.staged(desired)
     if candidate is None:
@@ -871,8 +954,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
         provider_guard()
     if inline_bot is not None:
         scope.verify_inline_search(inline_bot, require_fresh=first_enable)
-    if verify_provider_url:
-        scope.verify_provider_url_import()
+    if verify_provider_schema is not None:
+        verify_provider_schema()
     _require(scope.active() == previous, "Active isolated Worker deployment changed before activation.")
     _guard_current(guard)
     activated = scope.activate(previous, candidate, f"Isolated Worker release {desired.revision} {uuid4()}")
@@ -884,8 +967,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
         _verify_health(desired.revision)
         if inline_bot is not None:
             scope.verify_inline_search(inline_bot)
-        if verify_provider_url:
-            scope.verify_provider_url_import()
+        if verify_provider_schema is not None:
+            verify_provider_schema()
         if provider_guard is not None:
             provider_guard()
         _require(scope.active() == activated, "Active isolated Worker deployment changed during verification.")
@@ -899,7 +982,7 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
             _guard_current(guard)
             restored = scope.activate(activated, previous.version, f"Isolated Worker rollback {uuid4()}")
             _verify_health(old_version.revision)
-            if inline_bot is not None or verify_provider_url:
+            if inline_bot is not None or verify_provider_schema is not None:
                 _require(scope.version(restored.version) == old_version, "Isolated Worker Telegram rollback state differs.")
             _require(scope.active() == restored, "Isolated Worker rollback activation changed.")
         except CloudflareError:
@@ -911,4 +994,4 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
         scope.ensure_cron(activated, config, guard)
     return {"revision": desired.revision, "deploymentId": activated.id, "versionId": activated.version,
             "previousVersionId": previous.version, "changed": True, "inlineSearchEnabled": enabled,
-            "providerUrlImportEnabled": provider_url_enabled}
+            "providerUrlImportEnabled": provider_url_enabled, "providerRefreshEnabled": refresh_enabled}
