@@ -33,6 +33,25 @@ const updateId = 5182026;
 const messageDate = 1794000000;
 const callbackId = "456789012345678901";
 const viewTicket = "sbv1_ABCDEFGHIJKLMNOPQRSTUA";
+const selectedTicket = "sbo1_ABCDEFGHIJKLMNOPQRSTUA";
+
+test("normalizes /o queries and private selected revoke callbacks without widening scope", async () => {
+  for (const text of ["/o", "/o revoke", `/o@${policy.botUsername} Straße\u0085 ΟΣ`]) {
+    const decoded = await decodeMessage(text);
+    assert.equal(decoded.status, 200);
+    assert.equal(decoded.selected?.kind, "selected");
+    assert.equal(decoded.selected && "query" in decoded.selected ? decoded.selected.query : null,
+      text.slice(text.indexOf(" ") < 0 ? text.length : text.indexOf(" ")));
+    assert.equal((await decodeMessage(text, { chat: { id: Number(policy.groupId), type: "group" } })).status, 204);
+  }
+  const decoded = await decode({ update_id: updateId, callback_query: callback({ data: selectedTicket }) });
+  assert.equal(decoded.status, 200);
+  assert.equal(decoded.selected?.kind, "selected-revoke");
+  assert.equal((await decode({ update_id: updateId, callback_query: callback({ data: selectedTicket }, {
+    chat: { id: Number(policy.groupId), type: "group" },
+  }) })).status, 204);
+  assert.equal((await decodeMessage("/o@OtherFixtureBot secret")).status, 204);
+});
 
 function message(text = "/list", fields: Record<string, unknown> = {}) {
   return {

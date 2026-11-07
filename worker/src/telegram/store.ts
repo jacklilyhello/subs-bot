@@ -12,6 +12,8 @@ import { aggregateLinkDeliveryGuard, TELEGRAM_AGGREGATE_MARKER, type TelegramAgg
 import { TELEGRAM_PATH_MARKER, type TelegramPathReply } from "./path-management.ts";
 import { TELEGRAM_DOCUMENT_JOB_MARKER, type TelegramDocumentJobResult } from "./document-jobs.ts";
 import { TELEGRAM_PRIVATE_SHARE_CREATION_MARKER, type TelegramPrivateShareCreationReply } from "./private-share-creation.ts";
+import { insertSelectedRevokeTickets, selectedDeliveryGuard, TELEGRAM_SELECTED_MARKER,
+  type SelectedRevokeTicket, type TelegramSelectedReply } from "./selected-export.ts";
 
 export interface TelegramReplyLease extends TelegramCommand {
   receiptId: number;
@@ -22,6 +24,7 @@ export interface TelegramReplyLease extends TelegramCommand {
   privateClaim?: { codeSha256: string };
   temp?: TelegramTempReply;
   aggregate?: TelegramAggregateReply;
+  selected?: TelegramSelectedReply;
   path?: TelegramPathReply;
   document?: { kind: TelegramDocumentJobResult; nodeCount: number | null };
   privateShareCreation?: true;
@@ -39,7 +42,7 @@ const REAP_LIMIT = 40;
 
 type ReplyAccess = "allowed" | "denied" | "none";
 
-type ReplyRow = Omit<TelegramReplyLease, "view" | "lifecycle" | "privateClaim" | "temp" | "aggregate" | "path" | "document" | "privateShareCreation"> & {
+type ReplyRow = Omit<TelegramReplyLease, "view" | "lifecycle" | "privateClaim" | "temp" | "aggregate" | "selected" | "path" | "document" | "privateShareCreation"> & {
   viewKind: TelegramView["kind"] | null;
   afterId: number | null;
   afterEpoch: number | null;
@@ -56,6 +59,8 @@ type ReplyRow = Omit<TelegramReplyLease, "view" | "lifecycle" | "privateClaim" |
   aggregateResult: TelegramAggregateReply["result"] | null;
   aggregateRevision: number | null;
   aggregateCodeSha256: string | null;
+  selectedResult: TelegramSelectedReply["result"] | null;
+  selectedCodeSha256: string | null;
   pathKind: TelegramPathReply["kind"] | null;
   pathAfterId: number | null;
   pathAffectedCount: number | null;
@@ -84,7 +89,10 @@ function supportedReceipt(alias: "inbox" | "earlier", includeAggregate = false, 
           SELECT 1 FROM telegram_document_saved_counts WHERE receipt_id = job.receipt_id
         ))))
     ${includeAggregate ? `OR (${alias}.receipt_nonce = '${TELEGRAM_AGGREGATE_MARKER}'
-    AND EXISTS (SELECT 1 FROM telegram_aggregate_actions WHERE receipt_id = ${alias}.receipt_id))` : ""}
+    AND EXISTS (SELECT 1 FROM telegram_aggregate_actions WHERE receipt_id = ${alias}.receipt_id))
+    OR (${alias}.receipt_nonce = '${TELEGRAM_SELECTED_MARKER}' AND ${alias}.chat_type = 'private'
+    AND ${alias}.chat_id = ${alias}.actor_id AND ${alias}.thread_id IS NULL
+    AND EXISTS (SELECT 1 FROM telegram_selected_actions WHERE receipt_id = ${alias}.receipt_id))` : ""}
     ${includePrivateShareCreation ? `OR (${alias}.receipt_nonce = '${TELEGRAM_PRIVATE_SHARE_CREATION_MARKER}'
     AND ${alias}.chat_type = 'private' AND ${alias}.chat_id = ${alias}.actor_id AND ${alias}.thread_id IS NULL
     AND EXISTS (SELECT 1 FROM telegram_private_share_creations AS creation WHERE creation.receipt_id = ${alias}.receipt_id
@@ -152,8 +160,9 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
   includePrivateShareCreation = false): Promise<TelegramReplyLease | null> {
   const leaseId = crypto.randomUUID();
   const aggregateColumns = includeAggregate ? `aggregate.result AS aggregateResult,
-    aggregate.revision AS aggregateRevision, aggregate.code_sha256 AS aggregateCodeSha256`
-    : "NULL AS aggregateResult, NULL AS aggregateRevision, NULL AS aggregateCodeSha256";
+    aggregate.revision AS aggregateRevision, aggregate.code_sha256 AS aggregateCodeSha256,
+    selected.result AS selectedResult, selected.code_sha256 AS selectedCodeSha256`
+    : "NULL AS aggregateResult, NULL AS aggregateRevision, NULL AS aggregateCodeSha256, NULL AS selectedResult, NULL AS selectedCodeSha256";
   const [write, read] = await db.batch<ReplyRow>([
     db.prepare(`
       UPDATE telegram_outbox
@@ -197,7 +206,9 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
       LEFT JOIN telegram_temp_reply AS temp ON temp.receipt_id = inbox.receipt_id
         AND inbox.receipt_nonce = '${TELEGRAM_TEMP_MARKER}'
       ${includeAggregate ? `LEFT JOIN telegram_aggregate_actions AS aggregate ON aggregate.receipt_id = inbox.receipt_id
-        AND inbox.receipt_nonce = '${TELEGRAM_AGGREGATE_MARKER}'` : ""}
+        AND inbox.receipt_nonce = '${TELEGRAM_AGGREGATE_MARKER}'
+      LEFT JOIN telegram_selected_actions AS selected ON selected.receipt_id = inbox.receipt_id
+        AND inbox.receipt_nonce = '${TELEGRAM_SELECTED_MARKER}'` : ""}
       LEFT JOIN telegram_path_reply AS path ON path.receipt_id = inbox.receipt_id
         AND inbox.receipt_nonce = '${TELEGRAM_PATH_MARKER}'
       LEFT JOIN telegram_document_jobs AS document ON document.receipt_id = inbox.receipt_id
@@ -213,7 +224,8 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
   if (!row) return null;
   const { viewKind, afterId, afterEpoch, lifecycleKind, lifecycleSubscriptionId, lifecycleExpectedRevision,
     privateClaimCodeSha256, tempKind, tempNodeCount, tempTotalCount, tempMalformedCount,
-    tempUnsupportedCount, tempIgnoredCount, aggregateResult, aggregateRevision, aggregateCodeSha256, pathKind, pathAfterId, pathAffectedCount,
+    tempUnsupportedCount, tempIgnoredCount, aggregateResult, aggregateRevision, aggregateCodeSha256, selectedResult, selectedCodeSha256,
+    pathKind, pathAfterId, pathAffectedCount,
     documentKind, documentNodeCount, privateShareCreationReceipt, ...lease } = row;
   const lifecycle = lifecycleKind === null || lifecycleSubscriptionId === null || lifecycleExpectedRevision === null
     ? undefined : { kind: lifecycleKind, subscriptionId: lifecycleSubscriptionId, expectedLifecycleRevision: lifecycleExpectedRevision };
@@ -225,6 +237,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
     ...(temp ? { temp } : {}),
     ...(aggregateResult === null ? {} : { aggregate: { result: aggregateResult, revision: aggregateRevision,
       codeSha256: aggregateCodeSha256 } }),
+    ...(selectedResult === null ? {} : { selected: { result: selectedResult, codeSha256: selectedCodeSha256 } }),
     ...(pathKind === null || pathAffectedCount === null ? {} :
       { path: { kind: pathKind, afterId: pathAfterId, affectedCount: pathAffectedCount } }),
     ...(documentKind === null ? {} : { document: { kind: documentKind, nodeCount: documentNodeCount } }),
@@ -253,7 +266,7 @@ function beginReplyStatement(
         SELECT inbox.receipt_id FROM telegram_inbox AS inbox
         WHERE inbox.bot_id = ? AND inbox.update_id = ? AND inbox.receipt_id = ? AND inbox.actor_id = ? AND inbox.chat_id = ?
           AND inbox.chat_type = ? AND inbox.message_id = ? AND inbox.message_date = ? AND inbox.thread_id IS ?
-          AND inbox.command = ? AND ${supportedReceipt("inbox", lease.aggregate !== undefined, lease.privateShareCreation === true)}
+          AND inbox.command = ? AND ${supportedReceipt("inbox", lease.aggregate !== undefined || lease.selected !== undefined, lease.privateShareCreation === true)}
           AND inbox.received_at + ${MAX_REPLY_AGE_SECONDS} > unixepoch()
           ${guard ? `AND (${guard.sql})` : ""}
           ${exactDocumentEpoch}
@@ -300,6 +313,39 @@ export async function beginTelegramPrivateShareCreationReply(
   return await beginReplyStatement(db, policy, lease, "allowed", reply.guard).first() !== null;
 }
 
+export async function beginTelegramSelectedLinkReply(
+  db: D1Database, policy: TelegramPolicy, lease: TelegramReplyLease, tickets: readonly SelectedRevokeTicket[],
+): Promise<boolean> {
+  if (!inTelegramScope(policy, lease) || lease.chatType !== "private" || lease.threadId !== null || !lease.selected) return false;
+  const guard = selectedDeliveryGuard(policy, lease.selected);
+  if (guard === null || (lease.selected.result === "issued" && tickets.length !== 1)) return false;
+  const insertTickets = insertSelectedRevokeTickets(db, lease.receiptId, lease.attempts, lease.leaseId, tickets);
+  const targets = JSON.stringify(tickets.map(({ codeSha256 }) => codeSha256));
+  const exactTargets = {
+    sql: `(${guard.sql}) AND ? = (
+      SELECT count(*) FROM json_each(?) AS item JOIN telegram_selected_links AS selected ON selected.code_sha256=item.value
+      JOIN aggregate_links AS link USING(code_sha256)
+      JOIN telegram_selected_actions AS action ON action.receipt_id=inbox.receipt_id
+      WHERE selected.bot_id=inbox.bot_id AND selected.actor_id=inbox.actor_id
+        AND link.owner_id=inbox.actor_id AND link.kind='selected' AND link.bot_id IS NULL AND link.revoked_at IS NULL
+        AND (action.result='limit' OR (action.result='issued' AND action.code_sha256=selected.code_sha256))
+    ) ${lease.selected.result === "limit" ? `AND ? = (
+      SELECT count(*) FROM telegram_selected_links AS selected JOIN aggregate_links AS link USING(code_sha256)
+      WHERE selected.bot_id=inbox.bot_id AND selected.actor_id=inbox.actor_id AND link.revoked_at IS NULL
+        AND link.owner_id=inbox.actor_id AND link.kind='selected' AND link.bot_id IS NULL
+    )` : ""}`,
+    bindings: [...guard.bindings, tickets.length, targets, ...(lease.selected.result === "limit" ? [tickets.length] : [])],
+  };
+  const [state, ticket] = await db.batch<{ receipt_id: number }>([
+    beginReplyStatement(db, policy, lease, "allowed", exactTargets),
+    insertTickets,
+  ]);
+  const changed = state?.results.length;
+  if (!state?.success || (changed !== 0 && changed !== 1) || (changed === 1 && state.results[0].receipt_id !== lease.receiptId)
+    || !ticket?.success || ticket.meta.changes !== changed * tickets.length) throw new Error("Selected export reply could not begin.");
+  return changed === 1;
+}
+
 export async function beginTelegramReply(
   db: D1Database,
   policy: TelegramPolicy,
@@ -308,7 +354,7 @@ export async function beginTelegramReply(
   tickets: readonly TelegramViewTicket[] = [],
   lifecycleTickets: readonly TelegramLifecycleTicket[] = [],
 ): Promise<boolean> {
-  if (!inTelegramScope(policy, lease) || lease.privateClaim || ((lease.aggregate || lease.path || lease.privateShareCreation) && (lease.chatType !== "private" || lease.threadId !== null))
+  if (!inTelegramScope(policy, lease) || lease.privateClaim || ((lease.aggregate || lease.selected || lease.path || lease.privateShareCreation) && (lease.chatType !== "private" || lease.threadId !== null))
     || (tickets.length > 0 && (!lease.view || access !== "allowed"))
     || (lifecycleTickets.length > 0 && (!(lease.view || lease.lifecycle) || access !== "allowed"))) return false;
 
@@ -345,7 +391,7 @@ export async function settleTelegramReply(
   const identity = [lease.leaseId, lease.attempts, policy.botId, lease.updateId, lease.receiptId] as const;
   const sameReply = `lease_id = ? AND attempts = ? AND receipt_id = (
     SELECT receipt_id FROM telegram_inbox AS inbox
-    WHERE bot_id = ? AND update_id = ? AND receipt_id = ? AND ${supportedReceipt("inbox", lease.aggregate !== undefined, lease.privateShareCreation === true)}
+    WHERE bot_id = ? AND update_id = ? AND receipt_id = ? AND ${supportedReceipt("inbox", lease.aggregate !== undefined || lease.selected !== undefined, lease.privateShareCreation === true)}
   )`;
   if (outcome.kind === "sent") {
     if (!Number.isSafeInteger(outcome.messageId) || outcome.messageId <= 0) {
