@@ -42,7 +42,7 @@ class ProviderLiveCompareTests(unittest.TestCase):
             formats = {name: {"status": 422, "bytes": 0} for name in tool.FORMATS}
             formats["base64"] = {"status": 200, "bytes": len(exported)}
             diagnostics = {"protocols": {"ss": 1}, "formats": {
-                name: {"admitted": {"ss": 1}, "rejected": {}, "rejectedTraits": {}} for name in tool.FORMATS,
+                name: {"admitted": {"ss": 1}, "rejected": {}, "rejectedTraits": {}} for name in tool.FORMATS
             }}
             return {"job": "saved", "document": {"nodes": 1}, "chunks": 1, "ndjsonBytes": 180,
                     "formats": formats, "diagnostics": diagnostics,
@@ -104,7 +104,7 @@ proxies:
 
     def test_worker_count_dictionaries_are_closed_and_reconcile_each_family(self):
         value = {"protocols": {"ss": 1}, "formats": {
-            name: {"admitted": {}, "rejected": {"ss": 1}, "rejectedTraits": {}} for name in tool.FORMATS,
+            name: {"admitted": {}, "rejected": {"ss": 1}, "rejectedTraits": {}} for name in tool.FORMATS
         }}
         self.assertEqual(tool.verified_diagnostics(value, 1)["protocols"], {"ss": 1})
         value["formats"]["clash"]["rejectedTraits"] = {PASSWORD: 1}
