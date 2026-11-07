@@ -68,6 +68,21 @@ class RegistryTests(unittest.TestCase):
                     with self.assertRaisesRegex(publication.PublicationError, "expected short-lived"):
                         self.registry.mint()
 
+    def test_created_registry_credentials_require_an_exact_account_and_host(self):
+        result = {"account_id": ACCOUNT, "registry_host": publication.HOST, "username": PULL[0], "password": PULL[1]}
+        valid = json.dumps({"success": True, "result": result}).encode()
+        wrong_account = json.dumps({"success": True, "result": {**result, "account_id": "0" * 32}}).encode()
+        with patch.object(publication, "_response", side_effect=[
+            (201, headers(), valid),
+            (201, headers(), wrong_account),
+            (202, headers(), valid),
+        ]):
+            self.assertEqual(self.registry.mint(), PULL)
+            with self.assertRaises(publication.PublicationError):
+                self.registry.mint()
+            with self.assertRaises(publication.PublicationError):
+                self.registry.mint()
+
     def test_authentication_and_authorized_manifest_absence_then_exact_hash(self):
         www = (f'Bearer realm="https://{publication.HOST}/v2/token",service="{publication.HOST}",'
                f'scope="repository:{REPOSITORY}:pull"')

@@ -171,7 +171,7 @@ class Registry:
                           headers={"Authorization": "Bearer " + self._api_token,
                                    "Accept": "application/json", "Content-Type": "application/json"}, method="POST")
         status, _, data = _response(request, self._opener, error)
-        _require(status == 200, error)
+        _require(status in (200, 201), error)
         response = github._parse_object(data, error)
         result = response.get("result")
         _require(response.get("success") is True and isinstance(result, dict)
