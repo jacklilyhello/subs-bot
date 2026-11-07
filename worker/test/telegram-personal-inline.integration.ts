@@ -1,15 +1,17 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { Miniflare } from "miniflare";
 import { createSubscription } from "../src/storage.ts";
 import type { InlineSearchArticle } from "../src/telegram/inline-search.ts";
 import type { TelegramPolicy } from "../src/telegram/protocol.ts";
 
-// Wrap the verified bundle only in this fixture. The diagnostic rows contain
-// fixed stages and classes, never SQL, bindings, payloads or raw exceptions.
+// Wrap the verified bundle only in this fixture. Diagnostics contain fixed
+// stages and classes. The first synthetic claim is passed privately to SQLite.
 const queueDiagnosticsModule = `
   import worker from './index.js';
   const tables = ['telegram_aggregate_actions', 'telegram_private_share_creations',
@@ -24,7 +26,7 @@ const queueDiagnosticsModule = `
   }
   function instrument(env) {
     const db = env.DB;
-    const claims = new WeakSet();
+    const claims = new WeakMap();
     const record = (stage, outcome) => db.prepare('INSERT OR IGNORE INTO fixture_queue_diagnostics VALUES (?,?)')
       .bind(stage, outcome).run();
     async function observe(stage, execute, outcome) {
@@ -48,15 +50,19 @@ const queueDiagnosticsModule = `
         return {bind(...bindings) {
           const statement = query.bind(...bindings);
           if (claim) {
-            claims.add(statement);
+            claims.set(statement, {sql, bindings});
             return statement;
           }
           return {run: () => observe('reap', () => statement.run(), result => result.success ? 'ok' : 'other')};
         }};
       },
       batch(statements) {
-        if (!statements.some(statement => claims.has(statement))) return db.batch(statements);
-        return observe('claim', () => db.batch(statements), results =>
+        const claim = statements.map(statement => claims.get(statement)).find(Boolean);
+        if (!claim) return db.batch(statements);
+        return observe('claim', async () => {
+          await db.prepare('INSERT OR IGNORE INTO fixture_queue_claim VALUES (1,?)').bind(JSON.stringify(claim)).run();
+          return db.batch(statements);
+        }, results =>
           results.every(result => result.success) ? (results[1]?.results?.length ? 'claimed' : 'empty') : 'other');
       },
     }};
@@ -148,17 +154,25 @@ test("emitted Worker answers opted-in sender queries using the owner's durable s
     const changedRoles = await runtime.getWorker("swapped");
     const db = await runtime.getD1Database("DB", "app");
     const migrations = manifest.migrations as { name: string; sha256: string }[];
+    const verifiedMigrationSql = new Map<string, string>();
     const inline = migrations.find(({ name }) => name === "0025_telegram_personal_inline.sql");
     assert.ok(inline);
     async function applyMigration(migration: (typeof migrations)[number]) {
       const bytes = await readFile(join(directory!, migration.name));
       assert.equal(sha256(bytes), migration.sha256);
-      await db.batch(bytes.toString("utf8").trim().split(/;\s*/u).filter(Boolean).map((sql) => db.prepare(sql)));
+      const sql = bytes.toString("utf8");
+      await db.batch(sql.trim().split(/;\s*/u).filter(Boolean).map((statement) => db.prepare(statement)));
+      verifiedMigrationSql.set(migration.name, sql);
     }
     for (const migration of migrations) if (migration !== inline) await applyMigration(migration);
-    await db.prepare(`CREATE TABLE fixture_queue_diagnostics (
-      stage TEXT NOT NULL, outcome TEXT NOT NULL, PRIMARY KEY (stage,outcome)
-    ) STRICT`).run();
+    await db.batch([
+      db.prepare(`CREATE TABLE fixture_queue_diagnostics (
+        stage TEXT NOT NULL, outcome TEXT NOT NULL, PRIMARY KEY (stage,outcome)
+      ) STRICT`),
+      db.prepare(`CREATE TABLE fixture_queue_claim (
+        singleton INTEGER PRIMARY KEY CHECK (singleton=1), body TEXT NOT NULL
+      ) STRICT`),
+    ]);
     const post = (update: unknown, worker = app) => worker.fetch("https://fixture.invalid/telegram/webhook", {
       method: "POST", headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": policy.webhookSecret },
       body: JSON.stringify(update),
@@ -175,6 +189,23 @@ test("emitted Worker answers opted-in sender queries using the owner's durable s
     const receipt = (updateId: number) => db.prepare(`SELECT state,sort_mode,result_count,query_id_sha256 FROM telegram_inline_search_receipts
       WHERE bot_id=? AND update_id=?`).bind(policy.botId, updateId).first();
     const diagnostics = async () => (await db.prepare("SELECT stage,outcome FROM fixture_queue_diagnostics ORDER BY stage,outcome LIMIT 20").all()).results;
+    async function assertD1ClaimExpressionLimit() {
+      for (let attempt = 0; attempt < 60; attempt++) {
+        const body = await db.prepare("SELECT body FROM fixture_queue_claim WHERE singleton=1").first<string>("body");
+        if (body !== null) {
+          const check = spawnSync("python3", ["-B", fileURLToPath(new URL("queue-expression-depth.py", import.meta.url))], {
+            input: JSON.stringify({ claim: JSON.parse(body), migrations: migrations.map(({ name }) => verifiedMigrationSql.get(name)) }),
+            encoding: "utf8", timeout: 5_000, maxBuffer: 4096,
+          });
+          const output = check.stdout?.trim() ?? "";
+          const outcome = ["ok", "expression-depth", "sqlite-error", "invalid-fixture"].includes(output) ? output : "unavailable";
+          assert.equal(check.status === 0 && outcome === "ok", true, `Full queue claim SQLite depth check: ${outcome}.`);
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      assert.fail(`Expected full queue claim was not captured. Queue stages ${JSON.stringify(await diagnostics())}`);
+    }
     async function expectCommand(id: number, pattern: RegExp) {
       for (let attempt = 0; attempt < 60; attempt++) {
         const row = await db.prepare(`SELECT state,attempts FROM telegram_inbox JOIN telegram_outbox USING (receipt_id)
@@ -218,6 +249,7 @@ test("emitted Worker answers opted-in sender queries using the owner's durable s
     assert.equal(await receipt(4), null);
     assert.equal((await command(5, "/inline on")).status, 200);
     assert.equal((await command(6, "/inline on", app, { actorId: policy.adminId })).status, 200);
+    await assertD1ClaimExpressionLimit();
     await expectCommand(5, /已开启私聊内联搜索/u);
     await expectCommand(6, /已开启私聊内联搜索/u);
     const stages = await diagnostics();
