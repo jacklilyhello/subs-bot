@@ -7,11 +7,12 @@ import { Miniflare } from "miniflare";
 
 import { ClashContentError, serializeClashProxy } from "../src/clash-export.ts";
 import { enqueueProviderUrlImport, providerHost } from "../src/provider-jobs.ts";
+import { empty } from "../src/proxy-input.ts";
 import { serializeSingBoxOutbound, SingBoxContentError } from "../src/singbox-export.ts";
 import {
   getOwnedSubscription, getSubscriptionSnapshot, planSnapshotRead, readPlannedSnapshotNodes, type NodeRecord,
 } from "../src/storage.ts";
-import { isValidStoredShare } from "../src/stored-share.ts";
+import { isValidStoredShare, numberInRange } from "../src/stored-share.ts";
 import { serializeStructuredShare } from "../src/structured-share.ts";
 import { parseSubscriptionDocument } from "../src/subscription-document.ts";
 import { parseTextProxy, TextExportError } from "../src/text-export.ts";
@@ -32,6 +33,20 @@ type Format = keyof typeof FORMATS;
 type Counts = Record<string, number>;
 const FORMAT_NAMES = Object.keys(FORMATS) as Format[];
 const FAMILIES = new Set(["ss", "vmess", "vless", "trojan", "hysteria", "hysteria2", "tuic", "anytls", "socks", "http"]);
+const VMESS_SHARE_KEYS = new Set([
+  "type", "name", "tag", "share", "raw", "server", "port", "server_port", "udp", "uuid", "cipher", "security",
+  "alterId", "alter_id", "tls", "sni", "servername", "skip-cert-verify", "alpn", "client-fingerprint", "reality-opts",
+]);
+const VMESS_TLS_KEYS = new Set([
+  "enabled", "sni", "servername", "server_name", "skip-cert-verify", "insecure", "alpn", "client-fingerprint",
+  "utls", "reality", "reality-opts",
+]);
+const VMESS_WS_KEYS = new Set([
+  "path", "host", "headers", "max-early-data", "max_early_data", "early-data-header-name", "early_data_header_name",
+]);
+const VMESS_GRPC_KEYS = new Set(["grpc-service-name", "service_name"]);
+const VMESS_HTTP_KEYS = new Set(["host", "path"]);
+const NO_OPTION_KEYS = new Set<string>();
 const PROVIDER = `
   import { WorkerEntrypoint } from "cloudflare:workers";
   export class ProviderFetch extends WorkerEntrypoint {
@@ -97,6 +112,71 @@ function rejectedTraits(node: NodeRecord): string[] {
   return traits;
 }
 
+function hasEmptyExtra(source: NodeRecord, known: ReadonlySet<string>, ...otherKnown: string[]): boolean {
+  return Object.entries(source).some(([key, value]) => !known.has(key) && !otherKnown.includes(key) && empty(value));
+}
+
+function flagSpelling(value: unknown): boolean {
+  return value === 0 || value === 1 || (typeof value === "string" && /^(?:0|1|true|false)(?![\s\S])/iu.test(value));
+}
+
+// These are overlapping input shapes on an already-rejected node. A count
+// alone does not establish which check rejected the node or justify relaxing it.
+function rejectedStructuredVmessTraits(format: Format, node: NodeRecord): string[] {
+  if ([node.share, node.raw].some((value) => value !== undefined && value !== null && value !== "")) return [];
+  const traits: string[] = [];
+  if (format === "surge" || format === "qx") {
+    if ([node.cipher, node.security].every((value) => value === undefined || value === null || value === "" || value === "auto")) {
+      traits.push("vmess-cipher-auto-or-default");
+    }
+    if ([node.alterId, node.alter_id].some((value) => numberInRange(value, 1, 65535) !== null)) {
+      traits.push("vmess-non-aead-alter-id");
+    }
+    return traits;
+  }
+  if (format !== "base64") return traits;
+
+  const tls = object(node.tls) ? node.tls : {};
+  const utls = object(tls.utls) ? tls.utls : {};
+  const reality = [node["reality-opts"], tls.reality, tls["reality-opts"]];
+  if ([node.alpn, tls.alpn].some((value) => typeof value === "string" && value.includes(","))) traits.push("vmess-alpn-csv");
+  if ([node.tls, node.udp, node["skip-cert-verify"], tls.enabled, tls.insecure, tls["skip-cert-verify"], utls.enabled,
+    ...reality.map((value) => object(value) ? value.enabled : undefined)].some(flagSpelling)) traits.push("vmess-boolean-spelling");
+  if ([node["packet-encoding"], node.packet_encoding].some((value) => !empty(value) && value !== "none")) {
+    traits.push("vmess-packet-encoding");
+  }
+  if ([node["global-padding"], node["authenticated-length"], node.global_padding, node.authenticated_length]
+    .some((value) => !empty(value))) traits.push("vmess-security-flags");
+  if ([node.tfo, node.mptcp, node.tcp_fast_open, node.tcp_multi_path].some((value) => !empty(value))) traits.push("vmess-dial-flags");
+  if (reality.some((value) => object(value) && (value.enabled === true || !empty(value["public-key"]) || !empty(value.public_key)))) {
+    traits.push("vmess-reality");
+  }
+
+  const native = Object.hasOwn(node, "server_port") && !Object.hasOwn(node, "port");
+  const nativeTransport = object(node.transport) ? node.transport : {};
+  const network = native ? nativeTransport.type : node.network;
+  const kind = typeof network === "string" && network !== "" ? network : "tcp";
+  const transportKey = native ? "transport" : `${kind}-opts`;
+  const transportValue = node[transportKey];
+  const transport = object(transportValue) ? transportValue : {};
+  const ws = kind === "ws" || kind === "httpupgrade";
+  const http = kind === "h2" || kind === "http";
+  if (http) traits.push("vmess-http-transport");
+  if (ws) {
+    if (object(transport.headers) && Object.keys(transport.headers).some((key) => key.toLowerCase() !== "host")) {
+      traits.push("vmess-ws-extra-header");
+    }
+    if ([transport["max-early-data"], transport.max_early_data, transport["early-data-header-name"], transport.early_data_header_name]
+      .some((value) => Boolean(value) && !empty(value))) traits.push("vmess-ws-early-data");
+  }
+  const knownOptions = ws ? VMESS_WS_KEYS : http ? VMESS_HTTP_KEYS : kind === "grpc" ? VMESS_GRPC_KEYS : NO_OPTION_KEYS;
+  if (hasEmptyExtra(node, VMESS_SHARE_KEYS, ...(native ? ["transport"] : ["network", transportKey]))
+    || hasEmptyExtra(tls, VMESS_TLS_KEYS) || hasEmptyExtra(transport, knownOptions, ...(native ? ["type"] : []))) {
+    traits.push("vmess-empty-extra");
+  }
+  return traits;
+}
+
 function increment(counts: Counts, name: string): void {
   counts[name] = (counts[name] ?? 0) + 1;
 }
@@ -118,6 +198,9 @@ function diagnosticCounter() {
         else {
           increment(result.rejected, protocol);
           for (const trait of traits) increment(result.rejectedTraits, trait);
+          if (protocol === "vmess") {
+            for (const trait of rejectedStructuredVmessTraits(format, node)) increment(result.rejectedTraits, trait);
+          }
         }
       }
     },
