@@ -474,20 +474,24 @@ class ProviderAPI:
         return _page(envelope, envelope["result"], 1, cursor=True)
 
     def stopped(self, namespace, start, manifest):
-        actors = self.actors(namespace)
-        _require(len(actors) == 1 and isinstance(actors[0], dict) and actors[0].get("hasStoredData") is True
-                 and isinstance(actors[0].get("id"), str) and ACTOR.fullmatch(actors[0]["id"]))
-        actor = actors[0]["id"]
+        # The Containers API exposes the DO actor ID even when the separate
+        # namespace object inventory does not show the actor.
         rows = self.instances(namespace)
-        _require(len(rows) == 1 and isinstance(rows[0], dict) and rows[0].get("id") == actor
+        _require(len(rows) == 1 and isinstance(rows[0], dict) and _match(ACTOR, rows[0].get("id"))
                  and rows[0].get("application_id") == namespace)
+        actor = rows[0]["id"]
+        actors = self.actors(namespace)
+        _require(actors == [] or (len(actors) == 1 and isinstance(actors[0], dict)
+                 and actors[0].get("id") == actor and actors[0].get("hasStoredData") is True))
         instance = self._request(f"/containers/applications/{namespace}/instances/{actor}", container=True)["result"]
         _require(isinstance(instance, dict) and instance.get("id") == actor and instance.get("application_id") == namespace)
-        _require(instance.get("image") in (None, "", f"{publication.HOST}/{self.account}/{provider.SERVICE}@sha256:{manifest}"))
-        status = instance.get("status")
-        _require(isinstance(status, dict) and status.get("state") == "stopped"
-                 and bootstrap._timestamp(status.get("updated_at")) >= bootstrap._timestamp(start)
-                 and self.instances(namespace, active=True) == [])
+        expected_image = f"{publication.HOST}/{self.account}/{provider.SERVICE}@sha256:{manifest}"
+        started = bootstrap._timestamp(start)
+        for observed in (rows[0], instance):
+            status = observed.get("status")
+            _require(observed.get("image") in (None, "", expected_image) and isinstance(status, dict)
+                     and status.get("state") == "stopped" and bootstrap._timestamp(status.get("updated_at")) >= started)
+        _require(self.instances(namespace, active=True) == [])
         return _hash(actor)
 
 
@@ -544,16 +548,18 @@ def _smoke_result(instance, release, workflow, isolated_revision, health):
              and instance.get("schedule") is None)
     bootstrap._timestamp(instance.get("start"))
     _require(bootstrap._timestamp(instance.get("end")) >= bootstrap._timestamp(instance["start"]))
-    raw = instance.get("output")
-    _require(isinstance(raw, str) and len(raw) <= 2048)
-    output = github._parse_object(raw, ERROR)
-    _require(output.get("ok") is True and output.get("stopped") is True
+    output = instance.get("output")
+    if isinstance(output, str):
+        _require(len(output) <= 2048)
+        output = github._parse_object(output, ERROR)
+    _require(isinstance(output, dict) and output.get("ok") is True and output.get("stopped") is True
              and all(type(output.get(key)) is int for key in ("edgeStatus", "bodyBytes", "blockedPrivateTargets"))
              and output == {"ok": True, "revision": release["revision"], "isolatedRevision": isolated_revision,
                        "imageSha256": release["ociManifestSha256"], "edgeStatus": 200,
                        "approvedDnsFamilies": output.get("approvedDnsFamilies"), "bodyBytes": health["bytes"],
                        "bodySha256": health["sha256"], "blockedPrivateTargets": 3, "stopped": True}
-             and output["approvedDnsFamilies"] in ([4], [6], [4, 6]))
+             and output["approvedDnsFamilies"] in ([4], [6], [4, 6])
+             and all(type(family) is int for family in output["approvedDnsFamilies"]))
     return output
 
 

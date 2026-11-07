@@ -446,6 +446,18 @@ class APIContractTests(unittest.TestCase):
         with patch.object(self.api, "actors", return_value=[]), patch.object(
                 self.api, "instances", side_effect=[[stopped], []]), patch.object(self.api, "_request", return_value=envelope(stopped)):
             self.assertEqual(self.api.stopped(NAMESPACE, START, RELEASE["ociManifestSha256"]), activation._hash(ACTOR))
+        for rows, actors, active in (
+            ([{**stopped, "status": {"state": "stopping", "updated_at": STOP}}], [], []),
+            ([{**stopped, "application_id": "f" * 32}], [], []),
+            ([stopped, stopped], [], []),
+            ([stopped], [{"id": "f" * 64, "hasStoredData": True}], []),
+            ([stopped], [{"id": ACTOR, "hasStoredData": False}], []),
+            ([stopped], [], [stopped]),
+        ):
+            with self.subTest(rows=rows, actors=actors, active=active), patch.object(self.api, "actors", return_value=actors), patch.object(
+                    self.api, "instances", side_effect=[rows, active]), patch.object(self.api, "_request", return_value=envelope(stopped)):
+                with self.assertRaises(activation.ActivationError):
+                    self.api.stopped(NAMESPACE, START, RELEASE["ociManifestSha256"])
 
 
 class ProofTests(unittest.TestCase):
@@ -468,6 +480,10 @@ class ProofTests(unittest.TestCase):
         output = json.loads(instance["output"])
         self.assertEqual(activation._smoke_result({**instance, "output": output}, RELEASE, WORKFLOW_PIN,
                                                   ISOLATED, HEALTH_PROOF), output)
+        for changed in (None, 7, [output], {**output, "approvedDnsFamilies": [4.0, 6]}, {**output, "extra": "synthetic-secret"}):
+            with self.subTest(changed=changed), self.assertRaises(activation.ActivationError) as error:
+                activation._smoke_result({**instance, "output": changed}, RELEASE, WORKFLOW_PIN, ISOLATED, HEALTH_PROOF)
+            self.assertNotIn("synthetic-secret", str(error.exception))
 
     def test_fixed_public_probe_has_no_authorization_and_refuses_redirect_or_live_handler(self):
         for status, headers, body, accepted in ((404, {}, b"Not found", True), (403, {}, b"Denied", True),
