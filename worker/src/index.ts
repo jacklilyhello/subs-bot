@@ -18,6 +18,7 @@ import { runTelegramDocumentIntake } from "./telegram/document-intake.ts";
 import { acceptTelegramDocumentJob } from "./telegram/document-jobs.ts";
 import { reconcileTelegramDocumentJobReplies, retireTelegramDocumentStage } from "./telegram/document-persistence.ts";
 import { acceptTelegramLifecycle, reapTelegramLifecycle } from "./telegram/lifecycle-actions.ts";
+import { acceptTelegramGitHubSearch, recoverTelegramGitHubSearch, runTelegramGitHubSearch, telegramGitHubSearchReady } from "./telegram/github-search.ts";
 import { acceptTelegramBulkTrash, telegramBulkTrashReady } from "./telegram/bulk-trash.ts";
 import { acceptTelegramInlineSort, telegramInlineSortReady } from "./telegram/inline-sort.ts";
 import { acceptTelegramInlineConsent, telegramInlineSearchReady } from "./telegram/inline-search-consent.ts";
@@ -109,6 +110,11 @@ async function telegramProviderUrlReady(env: Env, pin = providerPin(env)): Promi
     && await telegramProviderRepliesReady(env.DB);
 }
 
+function telegramGitHubSearchProbe(db: D1Database): () => Promise<boolean> {
+  let readiness: Promise<boolean> | undefined;
+  return () => readiness ??= telegramGitHubSearchReady(db);
+}
+
 async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
   if (request.method !== "POST") {
     return plain("Method not allowed.", 405, request.method === "HEAD", { Allow: "POST" });
@@ -134,8 +140,11 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
     const providerEnabled = await telegramProviderUrlReady(env);
     const inlineConsent = inlineSearchEnabled && await telegramInlineSearchReady(env.DB);
     const bulkTrash = await telegramBulkTrashReady(env.DB);
-    const drain = () => ctx?.waitUntil(drainTelegramReplies(env.DB, env.NODES, policy, 4, 20_000, fetch, aggregateKey, privateShare,
-      subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerEnabled, bulkTrash, inlineConsent).catch(() => undefined));
+    const githubSearch = telegramGitHubSearchProbe(env.DB);
+    const drainReplies = async () => drainTelegramReplies(env.DB, env.NODES, policy, 4, 20_000, fetch, aggregateKey, privateShare,
+      subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerEnabled, bulkTrash, inlineConsent,
+      await githubSearch().catch(() => "unavailable" as const));
+    const drain = () => ctx?.waitUntil(drainReplies().catch(() => undefined));
     if (decoded.command) {
       await acceptTelegramCommand(env.DB, policy, decoded.command);
       drain();
@@ -195,6 +204,18 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
     } else if (decoded.inlineConsent) {
       if (!inlineConsent) return new Response(null, { status: 204, headers: HEADERS });
       if (await acceptTelegramInlineConsent(env.DB, policy, decoded.inlineConsent) === "accepted") drain();
+    } else if (decoded.githubSearch) {
+      if (!await githubSearch()) return new Response(null, { status: 204, headers: HEADERS });
+      const admitted = await acceptTelegramGitHubSearch(env.DB, policy, decoded.githubSearch);
+      if (admitted.kind === "ignored") return new Response(null, { status: 204, headers: HEADERS });
+      if (admitted.kind === "reply") drain();
+      if (admitted.kind === "lookup") {
+        const lookup = async () => {
+          if (await runTelegramGitHubSearch(env.DB, policy, admitted)) await drainReplies();
+        };
+        if (ctx) ctx.waitUntil(lookup().catch(() => undefined));
+        else await lookup();
+      }
     } else if (decoded.document) {
       await acceptTelegramDocumentJob(env.DB, policy, decoded.document);
     } else if (decoded.shortLink) {
@@ -321,9 +342,11 @@ async function recoverTelegramWork(env: Env, policy: TelegramPolicy, pin: Provid
   const inlineSearchSchema = await telegramInlineSearchReady(env.DB);
   const inlineConsent = inlineSearchSchema && env.TELEGRAM_INLINE_SEARCH === "1";
   const bulkTrash = await telegramBulkTrashReady(env.DB);
-  const drain = (limit: number, budget: number) =>
+  const githubSearch = telegramGitHubSearchProbe(env.DB);
+  const drain = async (limit: number, budget: number) =>
     drainTelegramReplies(env.DB, env.NODES, policy, limit, budget, fetch, aggregateKey, privateShare,
-      subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerEnabled, bulkTrash, inlineConsent);
+      subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerEnabled, bulkTrash, inlineConsent,
+      await githubSearch().catch(() => "unavailable" as const));
   const replies = async () => {
     await drain(10, 45_000);
     await reapTelegramViewTickets(env.DB);
@@ -349,6 +372,11 @@ async function recoverTelegramWork(env: Env, policy: TelegramPolicy, pin: Provid
       await drain(4, 15_000);
     }
   };
+  const searches = async () => {
+    if (await githubSearch().catch(() => false) && await recoverTelegramGitHubSearch(env.DB, policy) > 0) {
+      await drain(4, 15_000);
+    }
+  };
   const providers = async () => {
     if (!providerEnabled) return;
     try {
@@ -357,7 +385,7 @@ async function recoverTelegramWork(env: Env, policy: TelegramPolicy, pin: Provid
       if (await reconcileTelegramProviderReplies(env.DB, policy) > 0) await drain(4, 15_000);
     }
   };
-  const results = await Promise.allSettled([replies(), documents(), creations(), retireTelegramDocumentStage(env.DB, env.NODES, policy),
+  const results = await Promise.allSettled([replies(), documents(), creations(), searches(), retireTelegramDocumentStage(env.DB, env.NODES, policy),
     privateShare.schemaReady ? retireAbandonedTelegramPrivateShareCreation(env.DB, env.NODES, policy) : Promise.resolve(),
     providers(), inlineSearchSchema ? reapTelegramInlineSearch(env.DB, policy.botId) : Promise.resolve()]);
   if (results.some(({ status }) => status === "rejected")) {
