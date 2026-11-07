@@ -26,6 +26,10 @@ Hysteria 1 分享 URI 的 `peer` 映射到 TLS SNI，上传和下载速率必须
 
 Clash 返回 `text/yaml`，保留旧版的节点选择、自动选择和匹配规则。节点名碰到内建名称、分组名称或其他节点时自动分配后缀，原有不冲突的名称保持原样。支持 Shadowsocks、VMess、VLESS、Trojan、Hysteria 1 和 2、TUIC v5、AnyTLS、SOCKS5 和 HTTP(S) 的可转换设置。支持经过校验的 Hysteria 2 内联 ECH，无法保持语义的 URI 证书钉扎、作用域 IPv6、未支持的协议或本地文件与其他出站依赖返回 `422`。Clash 配置最多 16 MiB 和 25,000 个代理，原始节点名上限与 Sing-box 相同，并使用相同的 Hysteria 跳跃端口计数上限。托管 CI 用校验过 SHA-256 的 Mihomo 1.19.33 读取实际 Worker 响应。 [Mihomo 1.19.33](https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.33) · [Mihomo Hysteria 2](https://wiki.metacubex.one/en/config/proxies/hysteria2/)
 
+原生 VMess 的 `auto` 在启用 TLS 时有两种含义。Mihomo 仍按客户端架构选择 AES-128-GCM 或 ChaCha20-Poly1305，Sing-box 则使用 `zero`。Worker 将原生 Sing-box 的 TLS `auto`（包括空字符串或省略 `security` 字段）转换成 Clash 的显式 `zero`。将 TLS `auto` 的原生 Clash 节点转为 Sing-box 会使整份导出返回 `422`，因为选定任何单一算法都会丢失按架构选择的行为。旧版 Python 仍会输出这类 Clash 节点的 Sing-box 配置，比较结果可能因此不同。 [Mihomo 1.19.33 出站](https://github.com/MetaCubeX/mihomo/blob/v1.19.33/adapter/outbound/vmess.go#L448-L458) · [Mihomo 自动选密](https://github.com/MetaCubeX/sing-vmess/blob/v0.2.5/protocol.go#L128-L133) · [Sing-box 1.14.4 出站](https://github.com/SagerNet/sing-box/blob/v1.14.4/protocol/vmess/outbound.go#L94-L101)
+
+结构化 VMess 的 Clash H2 与 Sing-box HTTP 跨格式转换要求双方能保留所支持的 TLS H2 请求字段。支持仅 TCP、显式 AES-128-GCM 或 ChaCha20-Poly1305、AEAD Alter ID 0、常规 TLS、默认或单独 `h2` 的 ALPN，以及双方按原样发送的绝对路径和主机列表。Sing-box 输入需要显式限定 `network` 为 TCP，因为省略时同时启用 TCP 和 UDP。Clash 转 Sing-box 会写入 `Accept-Encoding: identity`。反向要求 Sing-box 使用有效的 `PUT` 和单一 `identity` 请求头设置。超出该范围时，目标格式返回 `422`，原生配置仍按各自格式的校验规则导出。托管 CI 使用两种固定版本客户端，在仅开放回环的网络环境中校验合成 TCP 往返。 [Mihomo H2 请求](https://github.com/MetaCubeX/mihomo/blob/v1.19.33/transport/vmess/h2.go#L28-L60) · [Sing-box HTTP 请求](https://github.com/SagerNet/sing-box/blob/v1.14.4/transport/v2rayhttp/client.go#L39-L95)
+
 Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks、VMess、Trojan、Hysteria 2、TUIC v5、AnyTLS、SOCKS5 和 HTTP(S) 的可转换设置。Quantumult X 的三个别名返回相同的原生节点资源行，支持 Shadowsocks、VMess、VLESS、Trojan、AnyTLS、SOCKS5 和 HTTP(S)。两个格式都要求每个节点能完整转换。旧版 Surge 生成的 VLESS 声明会返回 `422`。Quantumult X 的已有 URI 先解析再转换。未支持的 URI 或不能等价保留的加密、混淆、证书和传输设置同样返回 `422`。名称和字段内有歧义的分隔符或换行也会拒绝，Surge 中支持厂商语法允许的带引号逗号值。每种输出最多 16 MiB、25,000 个节点和每行 64 KiB，Surge 的选择分组也受单行限制。托管 CI 对照厂商语法和旧版可无损案例，核对实际 Worker 响应的字节。Surge 的配置校验命令随 macOS 应用发布，Quantumult X 提供原生资源示例。两个客户端的实际导入未纳入该 CI。 [Surge 策略](https://manual.nssurge.com/policies/overview.html) · [Surge CLI](https://manual.nssurge.com/tools/cli.html) · [Quantumult X 原生节点示例](https://github.com/crossutility/Quantumult-X/blob/master/server-complete.snippet)
 
 聚合能力链接通过 `GET` 或 `HEAD /agg/{code}/{format}` 使用同一套导出格式。有效聚合码继续通过 `/s/{code}` 返回同源相对重定向。全量链接按订阅 ID 读取所有者的活动已发布快照，再读取同一 Bot 和所有者的临时节点。筛选链接按记录顺序读取已选订阅，暂时移除回收中的订阅，恢复后可继续使用原 ID。订阅到期时间仍为上游元数据。
@@ -242,6 +246,8 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 ### 数据与切换
 
 隔离容量检查使用当前 `main` 的已部署版本，手动运行 `gh workflow run worker-isolation-capacity.yml --ref main`。托管 runner 生成合成快照，依次验证恰好达到 64 MiB NDJSON 和 16 MiB 分享原文的有效输出、分享原文超 1 字节的拒绝、快照清单超 1 字节的拒绝。正向测试流式核对 Base64 长度和摘要，覆盖串行、并发 2 和 4、慢读及中途取消。发布和容量检查使用同一并发组，测试结束先撤销 D1 能力，再清理对应的私有 R2 对象。清理失败时，工作流保留不含凭据或原始能力令牌的恢复清单。
+
+上传结果未确认时，在产物过期前私下保留原运行的恢复清单。仅使用原清单和对应的隔离资源继续核对清理。待确认对象仍读不到时保留记录，直到核实其内容并确认删除。重新运行容量检查会使用新的合成数据。
 
 运行 `gh workflow run worker-isolation-capacity.yml --ref main -f profile=structured-smoke` 可单独检查混合 Base64 导出。该模式在同一个隔离环境暂存两份小快照，用旧版 Python 序列化器的结果校验混合导出的长度和摘要，并检查不支持的结构化节点返回固定的 422 响应。两份快照都检查 GET 和 HEAD，前后各检查一次运行版本。该模式的恢复清单对应 `capacity_resources.py cleanup` 的 `--profile structured-smoke` 参数。
 

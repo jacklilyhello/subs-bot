@@ -5,6 +5,7 @@ import {
   TRANSPORT_PROTOCOLS, validHysteria1Bandwidth, type Fields,
 } from "./proxy-input.ts";
 import type { NodeRecord } from "./storage.ts";
+import { portableVmessH2Options, requireVmessH2Connection } from "./vmess-h2.ts";
 
 type Rule = (value: unknown) => boolean;
 type Schema = Record<string, Rule>;
@@ -36,9 +37,27 @@ const duration = (value: unknown): boolean => isString(value)
 const oneOf = (...options: unknown[]): Rule => (value) => options.includes(value);
 const listable = (rule: Rule): Rule => (value) => Array.isArray(value) ? value.every(rule) : rule(value);
 const strings = listable(isString);
-const safeHeader = (value: unknown): boolean => isString(value) && !CONTROL.test(value);
+const HTTP_TOKEN = /^[!#$%&'*+.^_\x60|~0-9A-Za-z-]+(?![\s\S])/u;
+const safeHeader = (value: unknown): value is string => isString(value) && !CONTROL.test(value);
 const headers = (value: unknown): boolean => isRecord(value) && Object.entries(value).every(([name, item]) =>
-  /^[!#$%&'*+.^_\x60|~0-9A-Za-z-]+(?![\s\S])/u.test(name) && listable(safeHeader)(item));
+  HTTP_TOKEN.test(name) && listable(safeHeader)(item));
+const httpMethod = (value: unknown): boolean => isString(value) && (value === "" || HTTP_TOKEN.test(value));
+const httpHost = (value: unknown): boolean => safeHeader(value) && value !== "" && !/[\/\\?#@,\s]/u.test(value);
+
+function httpHeaders(value: unknown): boolean {
+  if (!isRecord(value) || !headers(value)) return false;
+  const seen = new Set<string>();
+  for (const [name, item] of Object.entries(value)) {
+    if (Array.isArray(item) && item.length === 0) continue;
+    const key = name.toLowerCase();
+    // The cleartext HTTP writer adds raw payload bytes without using these framing headers.
+    if (seen.has(key) || key === "content-length" || key === "transfer-encoding") return false;
+    if (key === "host" && !httpHost(Array.isArray(item) && item.length === 1 ? item[0] : item)) return false;
+    seen.add(key);
+  }
+  return true;
+}
+
 const uuid = (value: unknown): boolean => isString(value)
   && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}(?![\s\S])/iu.test(value);
 
@@ -76,7 +95,8 @@ const TLS_SCHEMA: Schema = {
 const TRANSPORT_SCHEMAS = new Map<string, Schema>([
   ["ws", { path: isString, headers, max_early_data: isUint, early_data_header_name: safeHeader }],
   ["grpc", { service_name: isString, idle_timeout: duration, ping_timeout: duration, permit_without_stream: isBool }],
-  ["http", { host: strings, path: isString, method: isString, headers, idle_timeout: duration, ping_timeout: duration }],
+  ["http", { host: listable(httpHost), path: safeHeader, method: httpMethod, headers: httpHeaders,
+    idle_timeout: duration, ping_timeout: duration }],
   ["httpupgrade", { host: isString, path: isString, headers }],
   ["quic", {}],
 ]);
@@ -214,13 +234,18 @@ function clashTls(source: Fields, protocol: string, https: boolean): Fields | nu
   return null;
 }
 
-function clashTransport(source: Fields): Fields | null {
+function clashTransport(source: Fields, vmessH2: boolean): Fields | null {
   const network = take(source, "network");
   if (Object.hasOwn(source, "transport")) {
     if (!empty(network)) unsupported();
     return fields(take(source, "transport"));
   }
   if (empty(network) || network === "tcp" || network === "raw") return null;
+  if (vmessH2) {
+    const options = portableVmessH2Options(take(source, "h2-opts", {}), "clash");
+    // Mihomo's H2 client explicitly opts out of compression. Sing-box otherwise offers gzip.
+    return { type: "http", ...options, headers: { "Accept-Encoding": "identity" } };
+  }
   const kind = network === "h2" ? "http" : string(network);
   if (!TRANSPORT_SCHEMAS.has(kind)) unsupported();
   const output: Fields = { type: kind };
@@ -278,7 +303,8 @@ function clashPlugin(source: Fields, output: Fields): void {
   }
 }
 
-function clash(source: Fields, protocol: string, https: boolean): Fields {
+function clash(source: Fields, protocol: string, https: boolean, fromUri: boolean): Fields {
+  const vmessH2 = !fromUri && protocol === "vmess" && source.network === "h2";
   const output: Fields = { type: protocol, server: server(take(source, "server")) };
   const port = take(source, "port");
   const range = protocol === "hysteria" || protocol === "hysteria2" ? take(source, "ports") : undefined;
@@ -289,7 +315,7 @@ function clash(source: Fields, protocol: string, https: boolean): Fields {
   } else output.server_port = integer(port, 1, 65535);
 
   if (TRANSPORT_PROTOCOLS.has(protocol)) {
-    const transport = clashTransport(source);
+    const transport = clashTransport(source, vmessH2);
     if (transport) output.transport = transport;
   }
   if (TLS_REQUIRED.has(protocol) || TRANSPORT_PROTOCOLS.has(protocol) || protocol === "http") {
@@ -298,7 +324,9 @@ function clash(source: Fields, protocol: string, https: boolean): Fields {
   }
   if (NETWORK_PROTOCOLS.has(protocol)) {
     const udp = take(source, "udp");
-    if (udp !== undefined && !flag(udp)) output.network = "tcp";
+    const udpEnabled = udp === undefined ? !vmessH2 : flag(udp);
+    if (vmessH2 && udpEnabled) unsupported();
+    if (!udpEnabled) output.network = "tcp";
   }
   for (const [from, to] of [["tfo", "tcp_fast_open"], ["mptcp", "tcp_multi_path"]]) {
     if (Object.hasOwn(source, from)) output[to] = flag(take(source, from));
@@ -314,6 +342,7 @@ function clash(source: Fields, protocol: string, https: boolean): Fields {
   if (protocol === "vmess") {
     output.security = scalarAlias(source, ["cipher", "security"], "auto");
     output.alter_id = integer(scalarAlias(source, ["alterId", "alter_id"], 0), 0, 65535);
+    if (vmessH2) requireVmessH2Connection(output.tls, output.security, output.alter_id);
     for (const key of ["global-padding", "authenticated-length"]) {
       if (Object.hasOwn(source, key)) output[key.replace("-", "_")] = flag(take(source, key));
     }
@@ -330,6 +359,7 @@ function clash(source: Fields, protocol: string, https: boolean): Fields {
   if (protocol === "vmess" || protocol === "vless") {
     const encoding = scalarAlias(source, ["packet-encoding", "packet_encoding"]);
     if (encoding !== undefined && encoding !== null) {
+      if (vmessH2 && encoding !== "" && encoding !== "none") unsupported();
       output.packet_encoding = encoding === "packet" ? "packetaddr" : encoding === "none" ? "" : encoding;
     }
   }
@@ -373,10 +403,13 @@ export function validatedNativeSingBox(source: Fields, protocol: string): { outp
 
 export function serializeSingBoxOutbound(node: NodeRecord): { name: string; json: string; hoppingPorts: number } {
   try {
-    const { name, type, protocol, source } = proxyInput(node, "singbox");
+    const { name, type, protocol, source, fromUri } = proxyInput(node, "singbox");
     if (!NATIVE_SCHEMAS.has(protocol)) return unsupported();
-    const output = type === protocol && (Object.hasOwn(source, "server_port") || Object.hasOwn(source, "server_ports"))
-      ? native(source, protocol) : clash(source, protocol, type === "https");
+    const fromNative = type === protocol && (Object.hasOwn(source, "server_port") || Object.hasOwn(source, "server_ports"));
+    const output = fromNative ? native(source, protocol) : clash(source, protocol, type === "https", fromUri);
+    // Mihomo still selects an AEAD cipher under TLS. Sing-box auto would select zero.
+    if (!fromUri && !fromNative && protocol === "vmess" && output.tls !== undefined
+      && (output.security === "auto" || output.security === "")) return unsupported();
     const hoppingPorts = validate(protocol, output);
     return { name, json: JSON.stringify(output), hoppingPorts };
   } catch {

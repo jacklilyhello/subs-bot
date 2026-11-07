@@ -69,6 +69,9 @@ _SS_METHODS = {
 _VMESS_SECURITY = {"auto", "none", "zero", "aes-128-cfb", "aes-128-gcm", "chacha20-poly1305"}
 _PORT_RANGE = re.compile(r"([0-9]{1,5})(?:[-:]([0-9]{1,5}))?\Z")
 _DNS_LABEL = re.compile(r"[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?\Z")
+_HTTP_TOKEN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+_HTTP_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\ud800-\udfff]")
+_HTTP_HOST_DELIMITERS = re.compile(r"[/\\?#@,\s\ufeff]")
 
 
 def _take(source: dict, *aliases: str, default: Any = None) -> Any:
@@ -537,6 +540,41 @@ def _native(source: dict, protocol: str) -> dict:
     return {"type": protocol, **source}
 
 
+def _safe_http_text(value: Any) -> bool:
+    return isinstance(value, str) and not _HTTP_CONTROL.search(value)
+
+
+def _safe_http_host(value: Any) -> bool:
+    return _safe_http_text(value) and value != "" and not _HTTP_HOST_DELIMITERS.search(value)
+
+
+def _validate_http_transport(transport: dict) -> None:
+    error = "HTTP 传输设置无效"
+    method = transport.get("method", "")
+    if not isinstance(method, str) or (method and not _HTTP_TOKEN.fullmatch(method)):
+        raise ExportError(error)
+    if not _safe_http_text(transport.get("path", "")):
+        raise ExportError(error)
+    host = transport.get("host", [])
+    if not all(_safe_http_host(value) for value in (host if isinstance(host, list) else [host])):
+        raise ExportError(error)
+
+    seen: set[str] = set()
+    for name, value in _object(transport.get("headers", {})).items():
+        items = value if isinstance(value, list) else [value]
+        if not _HTTP_TOKEN.fullmatch(name) or not all(_safe_http_text(item) for item in items):
+            raise ExportError(error)
+        if not items:
+            continue
+        key = name.lower()
+        # The cleartext HTTP writer appends raw payload bytes without using these framing headers.
+        if key in seen or key in {"content-length", "transfer-encoding"}:
+            raise ExportError(error)
+        if key == "host" and (len(items) != 1 or not _safe_http_host(items[0])):
+            raise ExportError(error)
+        seen.add(key)
+
+
 def _validate(output: dict) -> None:
     protocol = output["type"]
     if protocol == "shadowsocks":
@@ -602,6 +640,8 @@ def _validate(output: dict) -> None:
         if not isinstance(kind, str) or kind not in _TRANSPORT_FIELDS:
             raise ExportError("传输方式无法转换为 sing-box")
         _only_fields(transport, f"type {_TRANSPORT_FIELDS[kind]}")
+        if kind == "http":
+            _validate_http_transport(transport)
     if "multiplex" in output:
         multiplex = _only_fields(output["multiplex"], "enabled protocol max_connections min_streams max_streams padding brutal")
         if "brutal" in multiplex:

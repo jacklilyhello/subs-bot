@@ -133,6 +133,26 @@ class SingBoxExportTests(unittest.TestCase):
         with self.assertRaises(ExportError):
             to_singbox([dict(node, security=False)])
 
+    def test_http_request_validation_applies_to_cross_format_output(self):
+        node = {"name": "Synthetic Clash", "type": "vmess", "server": "203.0.113.41", "port": 443,
+                "uuid": UUID, "cipher": "aes-128-gcm", "network": "http"}
+        valid = {"method": "GET", "path": ["/fixture"], "headers": {"Host": ["front.example.invalid"]}}
+        config = json.dumps({"proxies": [dict(node, **{"http-opts": valid})]})
+        outbound = json.loads(to_singbox(parse_nodes_from_text(config)))["outbounds"][2]
+        self.assertEqual(outbound["transport"], {**valid, "type": "http", "path": "/fixture"})
+
+        bad_clash = json.dumps({"proxies": [dict(node, **{"http-opts": {**valid, "method": "GET secret-marker"}})]})
+        raw = {"add": node["server"], "port": "443", "id": UUID, "net": "h2",
+               "host": "front.example.invalid\r\nX-Fixture: secret-marker"}
+        bad_uri = "vmess://" + base64.b64encode(json.dumps(raw).encode("utf-8")).decode("ascii")
+        for label, source in (("Clash", bad_clash), ("URI", bad_uri)):
+            with self.subTest(source=label):
+                nodes = parse_nodes_from_text(source)
+                self.assertEqual(len(nodes), 1)
+                with self.assertRaises(ExportError) as error:
+                    to_singbox([SHADOWSOCKS, *nodes])
+                self.assertNotIn("secret-marker", str(error.exception))
+
     def test_native_only_protocols_require_native_shape(self):
         for protocol in ("ssh", "shadowtls", "snell", "naive"):
             with self.subTest(protocol=protocol), self.assertRaises(ExportError):
