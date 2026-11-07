@@ -169,6 +169,45 @@ class BoundaryTests(unittest.TestCase):
                     self.api.upload(self.metadata, MODULE)
                 send.assert_called_once()
 
+    def test_upload_rejection_reports_only_bounded_status_codes_and_known_fields(self):
+        secret = "synthetic-private-response"
+        errors = [
+            {"code": 10021, "message": secret, "documentation_url": f"https://example.invalid/{secret}",
+             "source": {"pointer": "/metadata/exports/ProviderContainer/storage", "detail": secret}},
+            {"code": 10026, "source": {"pointer": "/containers/0/images/provider"}},
+            {"code": 10021, "source": {"pointer": f"/metadata/exports/ProviderContainer/{secret}"}},
+            {"code": 87654, "source": {"pointer": f"/metadata/bindings/0/type\n{secret}"}},
+            {"code": "10057", "source": {"pointer": "/migrations"}},
+            {"code": True},
+            {"code": 9999999},
+            {"code": 10026},
+            {"code": 10057, "source": {"pointer": "/migrations"}},
+        ]
+        response = json.dumps({"success": False, "errors": errors, "messages": [{"code": 10015, "message": secret}],
+                               "result": {"id": secret}}).encode()
+        with patch.object(stage.publication, "_response", return_value=(400, {"X-Synthetic": secret}, response)) as send:
+            with self.assertRaises(stage.StageError) as failure:
+                self.api.upload(self.metadata, MODULE)
+        self.assertEqual(str(failure.exception), stage.UPLOAD_ERROR + ' Upload diagnostic '
+                         '{"httpStatus":400,"cloudflareCodes":[10021,10026,87654],'
+                         '"validationFields":["containers","exports"]}.')
+        send.assert_called_once()
+
+    def test_upload_reports_status_without_a_usable_json_body(self):
+        with patch.object(stage.publication, "_response", return_value=(502, {}, b"synthetic-private-html")) as send:
+            with self.assertRaises(stage.StageError) as failure:
+                self.api.upload(self.metadata, MODULE)
+        self.assertEqual(str(failure.exception), stage.UPLOAD_ERROR + ' Upload diagnostic {"httpStatus":502}.')
+        send.assert_called_once()
+
+    def test_upload_without_a_bounded_response_keeps_the_fixed_ambiguous_error(self):
+        with patch.object(stage.publication, "_response",
+                          side_effect=stage.publication.PublicationError("synthetic-private-transport")) as send:
+            with self.assertRaises(stage.StageError) as failure:
+                self.api.upload(self.metadata, MODULE)
+        self.assertEqual(str(failure.exception), stage.UPLOAD_ERROR)
+        send.assert_called_once()
+
     def test_beta_module_and_legacy_named_image_are_independent_and_exact(self):
         runtime = {"id": CANDIDATE, "resources": {"script_runtime": {"containers": self.metadata["containers"]}}}
         with patch.object(stage.publication, "_response", side_effect=[envelope(version()), envelope(runtime)]) as read:
