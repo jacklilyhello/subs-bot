@@ -179,6 +179,20 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 域级 Worker 路由核对使用单独的只读凭据。发布任务内使用项目专用凭据核对 Worker 的 Custom Domain、预览、日志、Cron 及实际数据绑定。 [Cloudflare Worker 路由 API](https://developers.cloudflare.com/api/resources/workers/subresources/routes/)
 
+#### 隔离提供方绑定
+
+默认发布不配置提供方绑定。首次启用时，为同一个 `main` 提交构建应用和提供方，完成私有提供方的隔离激活和停机证明，并单独核对域级路由未指向提供方。将下列精确结构保存到 `subs-bot-isolation` Environment 的受保护配置 `SUBS_BOT_CF_PROVIDER_BINDING_JSON`，并在 GitHub 证明产物到期前运行首次绑定。资源标识和完整配置只存于受控配置。
+
+- `version` 为整数 `2`。
+- `proof` 包含 `revision`、`runId`、`runAttempt`、`artifactId`、`archiveSha256`。运行和产物编号为十进制字符串，摘要为原始 ZIP 字节的 SHA-256。
+- `proofDocument` 为该 ZIP 中 `provider-binding-proof.json` 的完整 JSON 对象。保留证明的所有字段和值，包括证明文档自己的 `version` 值 `1`。
+- `worker` 包含 `workerId`、`workerCreatedOn`。
+- `activation` 包含 `versionId`、`deploymentId`、`namespaceId`。
+
+首次绑定在 D1 迁移前核对 GitHub 受保护激活运行、精确 ZIP 摘要、规范化证明内容以及应用与提供方的同账户归属。之后保留原始配置。应用当前活动版本的不可变注解和绑定记录必须与配置的证明摘要及资源身份完全一致。满足此条件时，后续应用发布可以使用新的 `main` 提交，原 GitHub 产物过期或不可用时仍可继续。每次发布仍回读提供方的活动版本、模块、镜像、SQLite 命名空间和私有设置。应用绑定目标为 `subs-bot-provider-fetch-dev-01` 的 `ProviderFetch` 入口，并向该入口校验所需的提供方修订和镜像摘要。
+
+写入应用版本后回读绑定，激活后再次核对提供方。校验失败时仅按既有守卫恢复先前的应用版本。绑定配置变化、提供方漂移或尝试移除绑定会阻止常规发布，轮换须单独审查。回滚至未绑定版本后，重新绑定仍须取得符合首次绑定要求的 GitHub 证明。 [服务绑定](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/rpc/#named-entrypoints) · [提供方激活与证明](../worker/provider_fetch/README.md)
+
 ### 数据与切换
 
 隔离容量检查使用当前 `main` 的已部署版本，手动运行 `gh workflow run worker-isolation-capacity.yml --ref main`。托管 runner 生成合成快照，依次验证恰好达到 64 MiB NDJSON 和 16 MiB 分享原文的有效输出、分享原文超 1 字节的拒绝、快照清单超 1 字节的拒绝。正向测试流式核对 Base64 长度和摘要，覆盖串行、并发 2 和 4、慢读及中途取消。发布和容量检查使用同一并发组，测试结束先撤销 D1 能力，再清理对应的私有 R2 对象。清理失败时，工作流保留不含凭据或原始能力令牌的恢复清单。
