@@ -158,7 +158,7 @@ test("emitted Worker searches personal subscriptions and sends only guarded priv
     assert.match(detail.text, /流量详情：1\.25 GB \/ 4\.50 GB/u);
     assert.match(detail.text, /Synthetic node \[链接已省略\]/u);
     assert.match(detail.text, /上次刷新未成功/u);
-    assert.deepEqual(detail.buttons.map(({ text }) => text), Object.keys(expectedFormats));
+    assert.deepEqual(detail.buttons.map(({ text }) => text), ["浏览全部节点", ...Object.keys(expectedFormats)]);
     for (const [label, format] of Object.entries(expectedFormats)) {
       const before = sent.length;
       const value = ticket(detail, label);

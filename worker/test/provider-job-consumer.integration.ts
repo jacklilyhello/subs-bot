@@ -1,0 +1,146 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { test } from "node:test";
+
+import { Miniflare } from "miniflare";
+
+import { enqueueOwnedProviderRefresh, enqueueProviderUrlImport, type ProviderAdmission } from "../src/provider-jobs.ts";
+import { getOwnedSubscription } from "../src/storage.ts";
+
+const ownerId = "91001";
+const source = "https://provider.example.invalid/signed?z=synthetic%2Fvalue&a=1";
+const firstShare = "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.10:8388#first";
+const secondShare = "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.20:8388#second";
+const providerRevision = "a".repeat(40);
+const imageSha256 = "b".repeat(64);
+
+function job(admission: ProviderAdmission) {
+  assert.equal(admission.kind, "queued");
+  assert.ok("jobId" in admission);
+  return admission;
+}
+
+async function setup(enabled: boolean) {
+  const directory = process.env.WORKER_TEST_BUNDLE_DIR;
+  assert.ok(directory);
+  const manifest = JSON.parse(await readFile(join(directory, "isolation.json"), "utf8"));
+  const script = await readFile(join(directory, "index.js"), "utf8");
+  const d1Databases = { DB: "provider-consumer-fixture" };
+  const runtime = new Miniflare({ workers: [
+    { name: "app", modules: true, script, compatibilityDate: manifest.compatibilityDate, d1Databases, r2Buckets: ["NODES"],
+      serviceBindings: { PROVIDER_FETCH: { name: "provider", entrypoint: "ProviderFetch" } },
+      bindings: { BUILD_REVISION: manifest.revision, ...(enabled ? { PROVIDER_REVISION: providerRevision, PROVIDER_IMAGE_SHA256: imageSha256 } : {}) } },
+    { name: "provider", modules: true, compatibilityDate: manifest.compatibilityDate, d1Databases,
+      script: `import { WorkerEntrypoint } from 'cloudflare:workers';
+        export class ProviderFetch extends WorkerEntrypoint {
+          async fetchSubscription(input) {
+            if (Object.keys(input).length !== 3 || input.url !== ${JSON.stringify(source)}
+              || input.providerRevision !== ${JSON.stringify(providerRevision)} || input.imageSha256 !== ${JSON.stringify(imageSha256)}) {
+              throw new Error('Synthetic provider input differs.');
+            }
+            const mode = await this.env.DB.prepare('UPDATE provider_fixture_state SET calls=calls+1 RETURNING mode').first('mode');
+            if (mode === 'retry') return {ok:false,code:'http-status',retryable:true,upstreamStatus:503};
+            if (mode === 'stale') await this.env.DB.prepare('INSERT INTO subscription_lifecycle SELECT id,1 FROM subscriptions').run();
+            const first = ${JSON.stringify(firstShare)}, second = ${JSON.stringify(secondShare)};
+            const text = mode === 'initial' ? first : mode === 'malformed' ? first + '\\nss://broken' : second + '\\n' + first;
+            const body = new TextEncoder().encode(text).buffer;
+            const hash = await crypto.subtle.digest('SHA-256',body);
+            return {ok:true,body,bodySha256:mode === 'corrupt' ? '0'.repeat(64) : Array.from(new Uint8Array(hash),
+              byte => byte.toString(16).padStart(2,'0')).join(''),
+              ...(mode === 'initial' ? {metadata:{'subscription-userinfo':'upload=1073741824; download=1073741824; total=4294967296; expire=2000000000'}} : {})};
+          }
+        }
+        export default {fetch(){return new Response(null,{status:404})}};` },
+  ] });
+  try {
+    const db = await runtime.getD1Database("DB", "app");
+    const bucket = await runtime.getR2Bucket("NODES", "app");
+    for (const migration of manifest.migrations) {
+      const sql = await readFile(join(directory, migration.name), "utf8");
+      await db.batch(sql.trim().split(/;\s*/u).filter(Boolean).map((statement) => db.prepare(statement)));
+    }
+    await db.batch([
+      db.prepare("CREATE TABLE provider_fixture_state(mode TEXT NOT NULL,calls INTEGER NOT NULL)"),
+      db.prepare("INSERT INTO provider_fixture_state VALUES ('initial',0)"),
+    ]);
+    const worker = await runtime.getWorker("app");
+    const cron = async () => assert.equal((await worker.scheduled({ cron: "* * * * *" })).outcome, "ok");
+    return { runtime, db, bucket, cron };
+  } catch (error) {
+    await runtime.dispose();
+    throw error;
+  }
+}
+
+test("emitted Worker drains provider import and refresh through named RPC, D1, R2 and HTTP", { timeout: 60_000 }, async (t) => {
+  const { runtime, db, bucket, cron } = await setup(true);
+  t.after(() => runtime.dispose());
+  let sequence = 0;
+  const requestKey = () => (++sequence).toString(16).padStart(64, "0");
+  const admission = job(await enqueueProviderUrlImport(db, { ownerId, sourceUrl: source, requestKey: requestKey() }));
+  const sub = async () => {
+    const item = await getOwnedSubscription(db, ownerId, admission.subscriptionId);
+    assert.ok(item);
+    return item;
+  };
+  const path = `https://fixture.invalid/sub/${(await sub()).token}/base64`;
+  const exportIs = async (text: string) => {
+    const response = await runtime.dispatchFetch(path);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("Cache-Control"), "private, no-store");
+    assert.equal(await response.text(), Buffer.from(text).toString("base64"));
+  };
+  const mode = async (value: string) => db.prepare("UPDATE provider_fixture_state SET mode=?").bind(value).run();
+  const refresh = async () => job(await enqueueOwnedProviderRefresh(db, { ownerId, id: admission.subscriptionId, requestKey: requestKey() }));
+  const status = async (id: number) => db.prepare(`SELECT state,result_code AS result,failure_code AS failure,attempts FROM subscription_provider_jobs WHERE job_id=?`).bind(id).first();
+
+  assert.equal((await runtime.dispatchFetch(path)).status, 404);
+  await cron();
+  assert.deepEqual(await status(admission.jobId), { state: "done", result: "saved", failure: null, attempts: 1 });
+  const initial = await sub();
+  assert.equal(initial.generation, 1);
+  assert.equal(initial.trafficUsed, 2);
+  assert.equal(initial.trafficTotal, 4);
+  assert.equal(initial.expireAt, 2_000_000_000);
+  await exportIs(firstShare);
+
+  const retry = await refresh();
+  await mode("retry");
+  await cron();
+  await cron();
+  assert.deepEqual(await status(retry.jobId), { state: "pending", result: null, failure: "upstream-retryable", attempts: 1 });
+  assert.deepEqual(await sub(), initial);
+  await exportIs(firstShare);
+  await db.prepare("UPDATE subscription_provider_jobs SET due_at=unixepoch() WHERE job_id=?").bind(retry.jobId).run();
+  await mode("refresh");
+  await cron();
+  assert.deepEqual(await status(retry.jobId), { state: "done", result: "saved", failure: null, attempts: 2 });
+  const refreshed = await sub();
+  assert.equal(refreshed.generation, 2);
+  assert.equal(refreshed.token, initial.token);
+  assert.equal(refreshed.trafficTotal, initial.trafficTotal);
+  assert.equal(refreshed.expireAt, initial.expireAt);
+  await exportIs(`${secondShare}\n${firstShare}`);
+
+  for (const [fixture, expected] of [["malformed", "invalid-document"], ["corrupt", "fetch-rejected"], ["stale", "stale-target"]]) {
+    const next = await refresh();
+    await mode(fixture);
+    await cron();
+    assert.equal((await status(next.jobId))?.result, expected);
+    assert.equal((await sub()).generation, 2);
+    await exportIs(`${secondShare}\n${firstShare}`);
+  }
+  assert.equal((await bucket.list()).objects.length, 4);
+  assert.equal(await db.prepare("SELECT calls FROM provider_fixture_state").first("calls"), 6);
+});
+
+test("emitted Worker leaves queued work untouched when the provider pin is missing", { timeout: 60_000 }, async (t) => {
+  const { runtime, db, cron } = await setup(false);
+  t.after(() => runtime.dispose());
+  const queued = job(await enqueueProviderUrlImport(db, { ownerId, sourceUrl: source, requestKey: "c".repeat(64) }));
+  await cron();
+  assert.deepEqual(await db.prepare("SELECT state,attempts FROM subscription_provider_jobs WHERE job_id=?").bind(queued.jobId).first(),
+    { state: "pending", attempts: 0 });
+  assert.equal(await db.prepare("SELECT calls FROM provider_fixture_state").first("calls"), 0);
+});

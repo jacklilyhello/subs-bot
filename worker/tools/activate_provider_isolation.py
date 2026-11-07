@@ -1,11 +1,13 @@
 """Activate and verify the pinned private provider, one explicit write per dispatch."""
 
 from copy import deepcopy
+from datetime import date
 from hashlib import sha256
 import json
 import os
 from pathlib import Path
 import re
+import stat
 from time import monotonic, sleep
 from urllib.request import ProxyHandler, Request, build_opener
 
@@ -27,6 +29,15 @@ ERROR = "The private provider state did not match the pinned release and resourc
 WRITE_ERROR = "The provider operation was not confirmed. Use read-only verification and independently pin its observed state before continuing."
 PIN_ERROR = "The protected provider release or resource identity pin is invalid."
 OPERATIONS = {"verify", "activate", "provision-container", "provision-workflow", "smoke"}
+WORKFLOW_PATH = ".github/workflows/worker-provider-isolation-activate.yml"
+BINDING_PROOF_FILE = "provider-binding-proof.json"
+MAX_BINDING_PROOF = 4096
+BINDING_PROOF_ERROR = "The private provider binding proof does not match the verified run and release."
+BUILD_FIELDS = {"revision", "runId", "runAttempt", "artifactId", "archiveSha256", *publication.MANIFEST_FIELDS}
+PROOF_DIGESTS = {"workerIdentitySha256", "versionSha256", "activationIdentitySha256",
+                 "containerIdentitySha256", "workflowIdentitySha256", "actorSha256", "healthSha256"}
+PROOF_FIELDS = {"status", "publicDenied", "stopped", "healthBytes", "approvedDnsFamilies",
+                "blockedPrivateTargets", *PROOF_DIGESTS}
 
 
 class ActivationError(ValueError):
@@ -54,6 +65,91 @@ def _hash(value):
 
 def _fingerprint(value):
     return _hash(json.dumps(value, sort_keys=True, separators=(",", ":"))) if value else None
+
+
+def _match(pattern, value):
+    return isinstance(value, str) and pattern.fullmatch(value) is not None
+
+
+def _proof_bytes(value):
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+
+
+def parse_binding_proof(raw, *, revision, run_id, run_attempt):
+    """Verify canonical proof bytes against separately authenticated GitHub run metadata."""
+    _require(isinstance(raw, bytes) and 0 < len(raw) <= MAX_BINDING_PROOF, BINDING_PROOF_ERROR)
+    proof = github._parse_object(raw, BINDING_PROOF_ERROR)
+    _require(set(proof) == {"version", "accountSha256", "providerBuild", "activation", "verification"}
+             and type(proof["version"]) is int and proof["version"] == 1
+             and proof["accountSha256"] == publication.TARGET_ACCOUNT_SHA256, BINDING_PROOF_ERROR)
+    build, activation, verification = proof["providerBuild"], proof["activation"], proof["verification"]
+    _require(isinstance(build, dict) and set(build) == BUILD_FIELDS
+             and _match(provider.REVISION, revision) and build["revision"] == revision
+             and all(_match(provider.DECIMAL, build[key]) for key in ("runId", "runAttempt", "artifactId"))
+             and all(_match(provider.HEX, build[key]) for key in BUILD_FIELDS if key.endswith("Sha256")), BINDING_PROOF_ERROR)
+    try:
+        compatibility = date.fromisoformat(build["compatibilityDate"]).isoformat()
+    except (ValueError, TypeError):
+        raise ActivationError(BINDING_PROOF_ERROR) from None
+    _require(build["compatibilityDate"] == compatibility and isinstance(activation, dict)
+             and set(activation) == {"runId", "runAttempt", "isolatedRevision"}
+             and _match(provider.DECIMAL, run_id) and activation["runId"] == run_id
+             and _match(provider.DECIMAL, run_attempt) and activation["runAttempt"] == run_attempt
+             and _match(provider.REVISION, activation["isolatedRevision"]), BINDING_PROOF_ERROR)
+    _require(isinstance(verification, dict) and set(verification) == PROOF_FIELDS
+             and verification["status"] == "complete" and verification["publicDenied"] is True
+             and verification["stopped"] is True and all(_match(provider.HEX, verification[key]) for key in PROOF_DIGESTS)
+             and type(verification["healthBytes"]) is int and 0 < verification["healthBytes"] <= 4096
+             and type(verification["blockedPrivateTargets"]) is int and verification["blockedPrivateTargets"] == 3,
+             BINDING_PROOF_ERROR)
+    families = verification["approvedDnsFamilies"]
+    _require(isinstance(families, list) and families in ([4], [6], [4, 6])
+             and all(type(family) is int for family in families) and raw == _proof_bytes(proof), BINDING_PROOF_ERROR)
+    return proof
+
+
+def _binding_proof_context():
+    revision = os.environ.get("GITHUB_SHA", "")
+    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    run_attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+    _require(os.environ.get("GITHUB_SERVER_URL") == "https://github.com"
+             and os.environ.get("GITHUB_REPOSITORY") == github.REPOSITORY
+             and os.environ.get("GITHUB_REPOSITORY_ID") == str(github.REPOSITORY_ID)
+             and os.environ.get("GITHUB_REF") == github.MAIN_REF
+             and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+             and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"
+             and os.environ.get("GITHUB_WORKFLOW_REF") == f"{github.REPOSITORY}/{WORKFLOW_PATH}@{github.MAIN_REF}"
+             and os.environ.get("GITHUB_WORKFLOW_SHA") == revision and _match(provider.REVISION, revision)
+             and _match(provider.DECIMAL, run_id) and _match(provider.DECIMAL, run_attempt), BINDING_PROOF_ERROR)
+    return revision, run_id, run_attempt
+
+
+def _write_binding_proof(result, revision, run_id, run_attempt):
+    if result["status"] != "complete":
+        return
+    _require(os.environ.get("SUBS_BOT_PROVIDER_ACTIVATION_OPERATION") in {"smoke", "verify"}
+             and set(result) == BUILD_FIELDS | PROOF_FIELDS, BINDING_PROOF_ERROR)
+    raw = _proof_bytes({
+        "version": 1,
+        "accountSha256": publication.TARGET_ACCOUNT_SHA256,
+        "providerBuild": {key: result[key] for key in BUILD_FIELDS},
+        "activation": {"runId": run_id, "runAttempt": run_attempt,
+                       "isolatedRevision": os.environ.get("SUBS_BOT_PROVIDER_ISOLATED_REVISION", "")},
+        "verification": {key: result[key] for key in PROOF_FIELDS},
+    })
+    parse_binding_proof(raw, revision=revision, run_id=run_id, run_attempt=run_attempt)
+    directory = Path(os.environ.get("RUNNER_TEMP", ""))
+    output = Path(os.environ.get("GITHUB_OUTPUT", ""))
+    _require(directory.is_absolute() and output.is_absolute() and output.name != BINDING_PROOF_FILE
+             and output.parent.resolve().is_relative_to(directory.resolve()), BINDING_PROOF_ERROR)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    with os.fdopen(os.open(directory / BINDING_PROOF_FILE, flags, 0o600), "wb") as file:
+        file.write(raw)
+    flags = os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK
+    with os.fdopen(os.open(output, flags), "ab") as file:
+        info = os.fstat(file.fileno())
+        _require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid(), BINDING_PROOF_ERROR)
+        file.write(b"binding_proof=true\n")
 
 
 def _pin(value, fields):
@@ -530,9 +626,16 @@ def activate():
     return {**evidence, **_run(api, operation, release, pins, isolated_revision, guard)}
 
 
+def main():
+    context = _binding_proof_context()
+    result = activate()
+    _write_binding_proof(result, *context)
+    print(json.dumps(result, sort_keys=True))
+
+
 if __name__ == "__main__":
     try:
-        print(json.dumps(activate(), sort_keys=True))
+        main()
     except (ActivationError, stage.StageError, bootstrap.BootstrapError, publication.PublicationError, github.ArtifactError) as error:
         raise SystemExit(str(error)) from None
     except provider.VERIFICATION_ERRORS:

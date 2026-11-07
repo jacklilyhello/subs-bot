@@ -183,7 +183,7 @@ test("emitted /d previews owned matches and atomically recycles the exact confir
     assert.equal(await acceptTelegramBulkTrash(db, policy, { kind: "preview", query: "Foreign", actorId: policy.adminId,
       chatId: policy.adminId, chatType: "private", threadId: null, messageId: 18, messageDate: date, updateId: 18 }), "accepted");
     assert.equal(await claimTelegramReply(db, policy.botId), null);
-    const lease = await claimTelegramReply(db, policy.botId, false, false, false, true);
+    const lease = await claimTelegramReply(db, policy.botId, false, false, false, false, false, false, undefined, true);
     assert.ok(lease?.bulkTrash);
     const prepared = await renderTelegramBulkTrash(db, policy, lease);
     assert.ok(prepared?.ticket);

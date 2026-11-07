@@ -37,6 +37,12 @@ export interface SnapshotPublication {
   expectedLifecycleRevision: number;
 }
 
+export interface SnapshotMetadataUpdate {
+  trafficUsed?: number;
+  trafficTotal?: number;
+  expireAt?: number;
+}
+
 const stagedObjectKeys = Symbol("staged snapshot object keys");
 
 export interface StagedNodeSnapshot {
@@ -177,6 +183,11 @@ async function discardUnpublished(bucket: R2Bucket, keys: string[]): Promise<voi
   }
 }
 
+/** Use only after a confirmed publication miss for this exact candidate. */
+export function discardStagedNodeSnapshot(bucket: R2Bucket, staged: StagedNodeSnapshot): Promise<void> {
+  return discardUnpublished(bucket, staged[stagedObjectKeys]);
+}
+
 /** Write an immutable candidate without changing any subscription pointer. */
 export async function stageNodeSnapshot(
   bucket: R2Bucket,
@@ -268,19 +279,31 @@ export function prepareNodeSnapshotPublication(
   target: SnapshotPublication,
   staged: StagedNodeSnapshot,
   guard?: { sql: string; bindings: readonly (number | string)[] },
+  metadata?: SnapshotMetadataUpdate,
 ): D1PreparedStatement {
   checkPublicationTarget(target);
   const { id, ownerId, expectedGeneration, expectedLifecycleRevision } = target;
   if (staged.id !== id) {
     throw new RangeError("Staged snapshot belongs to a different subscription.");
   }
+  const metadataFields = [];
+  const metadataValues = [];
+  for (const [column, value] of [["traffic_used", metadata?.trafficUsed], ["traffic_total", metadata?.trafficTotal],
+    ["expire_at", metadata?.expireAt]] as const) {
+    if (value === undefined) continue;
+    if (!Number.isFinite(value) || value < 0 || (column === "expire_at" && !validInteger(value, 1))) {
+      throw new RangeError("Invalid subscription snapshot metadata.");
+    }
+    metadataFields.push(`, ${column} = ?`);
+    metadataValues.push(value);
+  }
   return db.prepare(`
     UPDATE subscriptions
     SET generation = generation + 1, snapshot_id = ?, manifest_sha256 = ?, node_count = ?,
-        last_error = NULL, updated_at = ?
+        last_error = NULL, updated_at = ?${metadataFields.join("")}
     WHERE id = ? AND owner_id = ? AND generation = ? AND ${SUBSCRIPTION_LIFECYCLE_REVISION} = ?
       ${guard ? `AND (${guard.sql})` : ""}
-  `).bind(staged.snapshotId, staged.manifestSha256, staged.nodeCount, Math.floor(Date.now() / 1000), id, ownerId,
+  `).bind(staged.snapshotId, staged.manifestSha256, staged.nodeCount, Math.floor(Date.now() / 1000), ...metadataValues, id, ownerId,
     expectedGeneration, expectedLifecycleRevision, ...(guard?.bindings ?? []));
 }
 
@@ -308,7 +331,7 @@ export async function publishNodeSnapshot(
     throw new Error("Subscription snapshot publication failed.");
   }
   if (result.meta.changes === 0) {
-    await discardUnpublished(bucket, staged[stagedObjectKeys]);
+    await discardStagedNodeSnapshot(bucket, staged);
     return false;
   }
   return true;
@@ -383,6 +406,51 @@ export async function* readSnapshotNodes(
   yield* readPlannedSnapshotNodes(bucket, await planSnapshotRead(bucket, snapshot), signal);
 }
 
+function* decodeSnapshotChunk(text: string, count: number): Generator<NodeRecord> {
+  let offset = 0;
+  for (let record = 0; record < count; record += 1) {
+    const end = text.indexOf("\n", offset);
+    if (end <= offset) throw new SnapshotIntegrityError();
+    const value: unknown = JSON.parse(text.slice(offset, end));
+    if (!isRecord(value)) throw new SnapshotIntegrityError();
+    offset = end + 1;
+    yield value;
+  }
+  if (offset !== text.length) throw new SnapshotIntegrityError();
+}
+
+export async function readSnapshotNodeRange(
+  bucket: R2Bucket, snapshot: SubscriptionSnapshot, start: number, count: number, signal?: AbortSignal,
+): Promise<NodeRecord[]> {
+  if (!validInteger(start, 0) || !validInteger(count, 1, 15) || start + count > snapshot.nodeCount || signal?.aborted) {
+    throw new SnapshotIntegrityError();
+  }
+  try {
+    const { prefix, chunks } = await planSnapshotRead(bucket, snapshot);
+    const end = start + count;
+    const nodes: NodeRecord[] = [];
+    let ordinal = 0;
+    for (const [index, chunk] of chunks.entries()) {
+      if (ordinal >= end) break;
+      const next = ordinal + chunk.count;
+      if (next > start) {
+        if (signal?.aborted) throw new SnapshotIntegrityError();
+        const text = await loadObject(bucket, `${prefix}${index}.ndjson`, chunk.sha256, MAX_CHUNK_BYTES, chunk.bytes);
+        // Validate every record of an intersecting chunk before returning any of the page.
+        for (const node of decodeSnapshotChunk(text, chunk.count)) {
+          if (ordinal >= start && ordinal < end) nodes.push(node);
+          ordinal += 1;
+        }
+      }
+      ordinal = next;
+    }
+    if (nodes.length === count && !signal?.aborted) return nodes;
+  } catch {
+    // Normalize decoder and storage errors before exposing the result to callers.
+  }
+  throw new SnapshotIntegrityError();
+}
+
 export async function* readPlannedSnapshotNodes(
   bucket: R2Bucket, { prefix, chunks }: SnapshotReadPlan, signal?: AbortSignal,
 ): AsyncGenerator<NodeRecord> {
@@ -403,22 +471,9 @@ export async function* readPlannedSnapshotNodes(
       const text = await pending[0];
       if (signal?.aborted) return;
       if (text === null) throw new SnapshotIntegrityError();
-      let offset = 0;
-      for (let record = 0; record < chunk.count; record += 1) {
-        const end = text.indexOf("\n", offset);
-        if (end <= offset) {
-          throw new SnapshotIntegrityError();
-        }
-        const value: unknown = JSON.parse(text.slice(offset, end));
-        if (!isRecord(value)) {
-          throw new SnapshotIntegrityError();
-        }
+      for (const value of decodeSnapshotChunk(text, chunk.count)) {
         yield value;
         if (signal?.aborted) return;
-        offset = end + 1;
-      }
-      if (offset !== text.length) {
-        throw new SnapshotIntegrityError();
       }
       pending.shift();
       const next = index + CHUNK_READ_AHEAD;
