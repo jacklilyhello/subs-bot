@@ -114,8 +114,9 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(self.guard_calls, 2)
 
     def test_repository_migration_chain_applies_and_repeats_without_writes(self):
-        # Match the production D1 limit, including autoindexes on long table names.
+        # Match D1 limits for the full schema and ledger guard and generated index names.
         self.api.db.setlimit(sqlite3.SQLITE_LIMIT_LIKE_PATTERN_LENGTH, 50)
+        self.api.db.setlimit(sqlite3.SQLITE_LIMIT_EXPR_DEPTH, 100)
         for file in sorted((WORKER / "migrations").glob("*.sql")):
             if file.name != BASELINE_NAME:
                 self.add_file(file.name, file.read_bytes())
