@@ -11,8 +11,11 @@ const BLOCKED = ["http://127.0.0.1/", "http://[::1]/", "http://169.254.169.254/"
 type ProbeStage = "configuration" | "start" | "readiness" | "image" | "edge" | "address-policy" | "stop";
 
 export class ProviderProbeError extends Error {
-  constructor(readonly stage: ProbeStage) {
+  readonly stage: ProbeStage;
+
+  constructor(stage: ProbeStage) {
     super(`Provider container smoke failed during ${stage}.`);
+    this.stage = stage;
   }
 }
 
