@@ -8,6 +8,7 @@ import { test, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { Miniflare } from "miniflare";
+import { parse } from "yaml";
 
 import { enqueueOwnedProviderRefresh, enqueueProviderUrlImport, type ProviderAdmission } from "../src/provider-jobs.ts";
 import { getOwnedSubscription } from "../src/storage.ts";
@@ -218,4 +219,37 @@ test("protected comparator distinguishes per-node refusal from a stored document
     stdio: "ignore", timeout: 15_000,
   });
   assert.equal(check.status, 0, "The synthetic replay must be accepted by the pinned Sing-box checker.");
+});
+
+const hysteria2 = {
+  name: "Synthetic Hysteria 2", type: "hysteria2", server: "203.0.113.20", port: 443, password: "fixture-only",
+};
+
+test("structured Hysteria 2 cannot disable UDP in a Clash export", { timeout: 60_000 }, async (t) => {
+  const body = Buffer.from(JSON.stringify({ proxies: [{ ...hysteria2, udp: false }] }));
+  const { report } = await protectedReplay(t, body);
+  assert.equal(report.job, "saved");
+  assert.equal(report.document.format, "clash");
+  assert.equal(report.formats.clash.status, 422);
+});
+
+test("structured Hysteria 2 can retain native UDP behavior in a Clash export", { timeout: 60_000 }, async (t) => {
+  const body = Buffer.from(JSON.stringify({ proxies: [{ ...hysteria2, udp: true }] }));
+  const { report, scratch } = await protectedReplay(t, body);
+  assert.equal(report.job, "saved");
+  assert.equal(report.document.format, "clash");
+  for (const format of ["base64", "surge", "singbox"]) {
+    assert.equal(report.formats[format].status, 200);
+  }
+  assert.equal(report.formats.clash.status, 200, "Redundant Hysteria 2 UDP enablement must remain exportable to Mihomo.");
+  const output = await readFile(join(scratch, "clash.body"), "utf8");
+  assert.deepEqual(parse(output).proxies, [hysteria2]);
+  const config = join(scratch, "synthetic-hysteria2.yaml");
+  await writeFile(config, output, { mode: 0o600 });
+  const binary = process.env.MIHOMO_TEST_BINARY;
+  assert.ok(binary);
+  const check = spawnSync(binary, ["-t", "-d", scratch, "-f", config], {
+    stdio: "ignore", env: { HOME: scratch }, timeout: 15_000,
+  });
+  assert.equal(check.status, 0, "The exact synthetic output must be accepted by the pinned Mihomo checker.");
 });
