@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { Miniflare } from "miniflare";
 
@@ -143,4 +147,36 @@ test("emitted Worker leaves queued work untouched when the provider pin is missi
   assert.deepEqual(await db.prepare("SELECT state,attempts FROM subscription_provider_jobs WHERE job_id=?").bind(queued.jobId).first(),
     { state: "pending", attempts: 0 });
   assert.equal(await db.prepare("SELECT calls FROM provider_fixture_state").first("calls"), 0);
+});
+
+test("protected comparator replays the exact named provider body through the emitted Worker", { timeout: 60_000 }, async () => {
+  const bundle = process.env.WORKER_TEST_BUNDLE_DIR;
+  assert.ok(bundle);
+  const scratch = await mkdtemp(join(tmpdir(), "synthetic-provider-replay-"));
+  try {
+    const body = Buffer.from(firstShare);
+    const input = join(scratch, "sample-01.body");
+    const controls = join(scratch, "request.json");
+    await writeFile(input, body, { mode: 0o600 });
+    await writeFile(controls, JSON.stringify({
+      source, decodedBytes: body.length, bodySha256: createHash("sha256").update(body).digest("hex"),
+      rpcMetadata: { "subscription-userinfo": "upload=1073741824; download=1073741824; total=4294967296; expire=2000000000" },
+    }), { mode: 0o600 });
+    const script = fileURLToPath(new URL("../tools/provider-live-worker.ts", import.meta.url));
+    const check = spawnSync(process.execPath, [script, bundle, input, scratch, controls], {
+      stdio: "ignore", env: { PATH: process.env.PATH, HOME: scratch, TMPDIR: scratch }, timeout: 50_000,
+    });
+    assert.equal(check.status, 0, "The protected comparator could not complete its synthetic replay.");
+    const report = JSON.parse(await readFile(join(scratch, "worker.json"), "utf8"));
+    assert.equal(report.job, "saved");
+    assert.deepEqual(report.document, {
+      kind: "parsed", format: "text", envelope: "plain", nodes: 1, malformed: 0, unsupported: 0, ignored: 0,
+    });
+    assert.deepEqual(report.metadata, { trafficUsed: 2, trafficTotal: 4, expireAt: 2_000_000_000 });
+    assert.equal(report.chunks, 1);
+    assert.deepEqual(Object.values(report.formats).map((format) => (format as { status: number }).status), [200, 200, 200, 200, 200]);
+    assert.equal(await readFile(join(scratch, "base64.body"), "ascii"), body.toString("base64"));
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
 });
