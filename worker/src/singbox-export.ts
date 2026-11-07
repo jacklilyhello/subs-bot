@@ -373,10 +373,13 @@ export function validatedNativeSingBox(source: Fields, protocol: string): { outp
 
 export function serializeSingBoxOutbound(node: NodeRecord): { name: string; json: string; hoppingPorts: number } {
   try {
-    const { name, type, protocol, source } = proxyInput(node, "singbox");
+    const { name, type, protocol, source, fromUri } = proxyInput(node, "singbox");
     if (!NATIVE_SCHEMAS.has(protocol)) return unsupported();
-    const output = type === protocol && (Object.hasOwn(source, "server_port") || Object.hasOwn(source, "server_ports"))
-      ? native(source, protocol) : clash(source, protocol, type === "https");
+    const fromNative = type === protocol && (Object.hasOwn(source, "server_port") || Object.hasOwn(source, "server_ports"));
+    const output = fromNative ? native(source, protocol) : clash(source, protocol, type === "https");
+    // Mihomo still selects an AEAD cipher under TLS. Sing-box auto would select zero.
+    if (!fromUri && !fromNative && protocol === "vmess" && output.tls !== undefined
+      && (output.security === "auto" || output.security === "")) return unsupported();
     const hoppingPorts = validate(protocol, output);
     return { name, json: JSON.stringify(output), hoppingPorts };
   } catch {
