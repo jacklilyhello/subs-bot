@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { test } from "node:test";
 
 import { Miniflare } from "miniflare";
@@ -160,8 +160,9 @@ test("publishes parsed nodes through D1 and R2 and renders Base64 and safe Sing-
   try {
     const db = await miniflare.getD1Database("DB");
     const bucket = await miniflare.getR2Bucket("NODES");
-    for (const name of ["0001_subscriptions.sql", "0003_subscription_lifecycle.sql"]) {
-      const sql = await readFile(new URL(`../migrations/${name}`, import.meta.url), "utf8");
+    const migrations = new URL("../migrations/", import.meta.url);
+    for (const name of (await readdir(migrations)).filter((file) => file.endsWith(".sql")).sort()) {
+      const sql = await readFile(new URL(name, migrations), "utf8");
       await db.batch(sql.trim().split(/;\s*/u).filter(Boolean).map((statement) => db.prepare(statement)));
     }
     const subscription = await createSubscription(db, { ownerId: "76001", name: "Synthetic text import",

@@ -4,6 +4,7 @@ import {
   type ExportNodeSource, type NodeRecord, type SnapshotReadPlan, type SubscriptionSnapshot,
 } from "./storage.ts";
 import { MAX_TEMP_BATCH_BYTES, MAX_TEMP_OWNER_BYTES, MAX_TEMP_OWNER_NODES } from "./telegram/temp-import.ts";
+import { compilePathRules, MAX_PATH_RULES, pathRuleMapper, type PathRuleRow } from "./path-rules.ts";
 
 const CODE = /^(?:[A-Za-z0-9_-]{12}|[A-Za-z0-9_-]{22})(?![\s\S])/u;
 const MAX_MEMBERS = 128;
@@ -19,7 +20,7 @@ const pointerColumns = `sub.id, sub.generation, sub.snapshot_id AS snapshotId,
 interface LinkRow { kind: "all" | "selected"; selectedIds: string | null }
 interface TempTotals { batchCount: number; nodeCount: number; bytes: number }
 interface TempRow { json: string; nodeCount: number; bytes: number }
-type Row = LinkRow | SubscriptionSnapshot | TempTotals | TempRow;
+type Row = LinkRow | SubscriptionSnapshot | TempTotals | TempRow | PathRuleRow;
 
 export class AggregateLimitError extends Error {}
 
@@ -104,9 +105,13 @@ export async function getAggregateNodeSource(db: D1Database, bucket: R2Bucket, c
       WHERE link.kind = 'all' AND totals.nodeCount <= ? AND totals.bytes <= ?
       ORDER BY temp.receipt_id LIMIT ?
     `).bind(digest, MAX_TEMP_OWNER_NODES, MAX_TEMP_OWNER_BYTES, MAX_TEMP_OWNER_NODES + 1),
+    db.prepare(`${withLink}
+      SELECT rule.id, rule.keyword, rule.remark FROM link
+      JOIN path_rules AS rule ON rule.owner_id = link.owner_id ORDER BY rule.id LIMIT ?
+    `).bind(digest, MAX_PATH_RULES + 1),
   ]);
-  if (results.length !== 5 || results.some(({ success }) => !success)) throw new SnapshotIntegrityError();
-  const [linkResult, allResult, selectedResult, totalsResult, tempResult] = results;
+  if (results.length !== 6 || results.some(({ success }) => !success)) throw new SnapshotIntegrityError();
+  const [linkResult, allResult, selectedResult, totalsResult, tempResult, ruleResult] = results;
   const link = linkResult.results[0] as LinkRow | undefined;
   if (!link) return null;
   if (link.kind !== "all" && (link.kind !== "selected" || !validSelection(link.selectedIds))) {
@@ -126,6 +131,7 @@ export async function getAggregateNodeSource(db: D1Database, bucket: R2Bucket, c
   }
   if (nodeCount > MAX_SNAPSHOT_NODES) throw new AggregateLimitError();
   if (nodeCount === 0) return null;
+  const rules = snapshots.length > 0 ? compilePathRules(ruleResult.results as PathRuleRow[]) : [];
 
   const plans: SnapshotReadPlan[] = [];
   let bytes = totals.bytes;
@@ -142,9 +148,10 @@ export async function getAggregateNodeSource(db: D1Database, bucket: R2Bucket, c
     nodeCount,
     async *read(signal) {
       // Process sources sequentially so their R2 read-ahead windows never multiply.
+      const map = pathRuleMapper(rules);
       for (const plan of plans) {
         if (signal?.aborted) return;
-        yield* readPlannedSnapshotNodes(bucket, plan, signal);
+        for await (const node of readPlannedSnapshotNodes(bucket, plan, signal)) yield map(node);
       }
       for (const batch of temp) {
         if (signal?.aborted) return;
