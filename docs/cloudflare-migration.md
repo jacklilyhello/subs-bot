@@ -191,6 +191,16 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 域级 Worker 路由核对使用单独的只读凭据。发布任务内使用项目专用凭据核对 Worker 的 Custom Domain、预览、日志、Cron 及实际数据绑定。 [Cloudflare Worker 路由 API](https://developers.cloudflare.com/api/resources/workers/subresources/routes/)
 
+#### 隔离私聊内联搜索
+
+先用当前 `main` 的已核对 Worker CI 产物正常发布，确认活动版本没有 `TELEGRAM_INLINE_SEARCH` 绑定且 D1 已记录 `0025`。发布参数 `inline_search` 默认为 `preserve`，沿用活动版本的设置。首次部署和仍关闭的版本均省略该绑定。启用时只接受 Worker 的版本级 `plain_text` 绑定，值为 `1`。
+
+启用前由用户单独为已核对的隔离测试 Bot 确认 BotFather 的 `/setinline`，并确认 Webhook 仍使用原隔离 URL、密钥和连接上限，接收范围精确为 `message`、`callback_query` 和 `inline_query`。变更时保留待处理更新。无需开启所选内联结果反馈。部署工作流只核对 Cloudflare 状态，Telegram 配置由用户独立核对。 [Telegram 内联设置](https://core.telegram.org/bots/inline) · [Webhook 配置](https://core.telegram.org/bots/api#setwebhook) · [Webhook 回读](https://core.telegram.org/bots/api#getwebhookinfo)
+
+确认上述范围后，在受保护的同一发布工作流指定 `inline_search=enable` 和 `inline_search_confirmation=enable inline search for subs-bot-cf-dev-01`。使用当前活动关闭版本对应的同一 `main` 提交和 Worker CI 产物。发布保留已核对的 Telegram 配置、数据绑定、密钥和提供方配置，且在启用前确认该 Bot 没有仍有效的内联同意。记录发布输出中的活动部署、版本及 `inlineSearchEnabled`，并核对完整模块和绑定回读。`/health` 只用于核对提交。
+
+实际验收在内置浏览器中使用两名获准账号与同一测试 Bot 的私聊。各自执行 `/inline on` 后，使用同一合成查询验证只显示自己的订阅名称。在指定测试群查看同一查询无结果。测试结束在各自私聊执行 `/inline off`。紧急停止输入时由用户先将 Webhook 接收范围恢复到已核对的原集合，保留待处理更新。随后可用 `inline_search=disable` 和 `inline_search_confirmation=disable inline search for subs-bot-cf-dev-01` 发布关闭版本。以活动版本回读确认关闭。回滚保留增量 D1 表和既有记录。重新启用前确认旧同意均已关闭或自然到期。 [Telegram 私聊内联类型](https://core.telegram.org/constructor/inlineQueryPeerTypeSameBotPM) · [Worker 回滚](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/)
+
 #### 隔离提供方绑定
 
 默认发布不配置提供方绑定。首次启用时，为同一个 `main` 提交构建应用和提供方，完成私有提供方的隔离激活和停机证明，并单独核对域级路由未指向提供方。将下列精确结构保存到 `subs-bot-isolation` Environment 的受保护配置 `SUBS_BOT_CF_PROVIDER_BINDING_JSON`，并在 GitHub 证明产物到期前运行首次绑定。资源标识和完整配置只存于受控配置。
@@ -276,6 +286,8 @@ PY
 在受保护的 `main` 运行 `worker-isolation-legacy-candidate.yml`。所有步骤使用同一组全长 32 位小写十六进制 `cohort`、同一次成功的 Worker CI `source_run_id` 和同一已核对的隔离 Worker。开始前确认本轮可在产物保留期内完成，并保持 `main` 和隔离部署稳定。此流程从 CI 的固定合成候选包恢复，目标 D1 和 R2 的名称包含完整 `cohort`。只在源私有 R2 写入本组操作记录。
 
 默认的 `synthetic-legacy` 沿用版本 1 合成包。路径规则演练显式选择 `synthetic-legacy-path`，全程保持同一选项。该选项使用单独的版本 2 产物、目标资源名称及操作记录前缀。固定样例核对映射归属、精确规则文字及编号顺序，并保留已删除规则的编号上界。最终读回输出规则数量、编号上界和数据摘要。候选保持未绑定状态。
+
+选择 `synthetic-legacy-empty` 演练版本 3。它使用独立的产物、D1、R2 和操作记录前缀。预检从固定合成样例重建源 SQLite 与转换包并核对摘要，再验证两个活动订阅、两个回收站订阅、路径规则、原始令牌对应的两个空导出标记、0026 迁移、编号序列及四个 R2 对象。构建与预检须使用能产生同一 SQLite 文件的托管工具链，摘要不符时停止。恢复读回包含标记数量与表摘要。目标保持未绑定，空导出 HTTP 行为另行验收。
 
 1. 依次运行 `verify`、`prepare`、`create-restore-db`、`create-restore-bucket`，每步核对结果后再继续。创建响应不明时先运行只读 `verify`，根据创建意图、时间和实际资源身份独立确认归属，再用 `pin-resource` 提交 `resource` 和 `identity_sha256`。无法确认归属时保留该资源，停止本组后续写入。
 2. 运行 `restore-objects` 核对专用私有 R2 的对象闭包，再运行 `start-import` 向已核对且仍为空的专用 D1 导入。若已有确认的轮询书签，可用同一 `start-import` 继续轮询。响应不明时保留目标和私有操作记录，通过 `verify-restore` 核对完整结果。导入请求未确认、上传链接或产物已失效，或固定版本已变更时，禁止重发首次导入、重置或删除原目标。保留现场核查，后续演练使用新的 `cohort` 和专用资源。 [D1 原生导入](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/import/)
