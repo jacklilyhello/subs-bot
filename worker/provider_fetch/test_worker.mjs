@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import { Miniflare } from "miniflare";
 import { exercise, ProviderProbeError } from "./controller.ts";
@@ -89,7 +90,8 @@ test("refuses a foreign or running image and cleans up owned failed probes", asy
 
 test("the emitted Worker rejects all public fetches without any runtime bindings", async () => {
   assert(process.env.PROVIDER_WORKER_BUNDLE);
-  const runtime = new Miniflare({ modules: true, scriptPath: process.env.PROVIDER_WORKER_BUNDLE, compatibilityDate: "2026-07-30" });
+  const script = await readFile(process.env.PROVIDER_WORKER_BUNDLE, "utf8");
+  const runtime = new Miniflare({ modules: true, script, compatibilityDate: "2026-07-30" });
   try {
     for (const [path, method] of [["/", "GET"], ["/ready", "GET"], ["/v1/fetch", "POST"], ["/v1/edge-proof", "POST"]]) {
       const response = await runtime.dispatchFetch("https://provider.example" + path, { method });
