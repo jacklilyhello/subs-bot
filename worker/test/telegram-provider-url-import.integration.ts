@@ -69,8 +69,9 @@ test("emitted Worker admits private provider URLs only after opt-in and delivers
     await db.batch(sql.trim().split(/;\s*/u).filter(Boolean).map((statement) => db.prepare(statement)));
   }
   const providerMigration = manifest.migrations.find((entry: { name: string }) => entry.name === "0023_telegram_provider_replies.sql");
-  assert.ok(providerMigration);
-  for (const entry of manifest.migrations) if (entry !== providerMigration) await migration(entry);
+  const journalMigration = manifest.migrations.find((entry: { name: string }) => entry.name === "0033_provider_snapshot_journal.sql");
+  assert.ok(providerMigration && journalMigration);
+  for (const entry of manifest.migrations) if (entry !== providerMigration && entry !== journalMigration) await migration(entry);
   await db.batch([db.prepare("CREATE TABLE provider_url_fixture (calls INTEGER NOT NULL)"),
     db.prepare("INSERT INTO provider_url_fixture VALUES (0)")]);
 
@@ -105,6 +106,9 @@ test("emitted Worker admits private provider URLs only after opt-in and delivers
   assert.equal((await post(message(sourceUrl))).status, 200);
   assert.equal(await originCount(), 0, "0023 schema is required despite a valid named binding and flag");
   await migration(providerMigration);
+  assert.equal((await post(message(sourceUrl))).status, 503);
+  assert.equal(await originCount(), 0, "missing journal prevents new provider admission");
+  await migration(journalMigration);
   assert.equal((await post(message(sourceUrl), disabled)).status, 200);
   assert.equal(await originCount(), 0, "binding alone never enables Telegram intake");
   const generic = await enqueueProviderUrlImport(db, { ownerId: "76205", requestKey: "c".repeat(64), sourceUrl });

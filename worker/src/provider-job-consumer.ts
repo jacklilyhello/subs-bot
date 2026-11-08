@@ -3,14 +3,11 @@ import {
   type ProviderFetcher, type ProviderFetchResult, type ProviderPin,
 } from "./provider-fetch-contract.ts";
 import {
-  claimProviderJob, isProviderJobCurrent, prepareProviderJobLeaseGuard, prepareProviderJobSettlement, providerJobLeaseTable,
-  retireStaleProviderJob, settleProviderJob,
+  claimProviderJob, isProviderJobCurrent, retireStaleProviderJob, settleProviderJob,
   type ProviderFailureOutcome, type ProviderJobLease, type ProviderTelegramPolicy,
 } from "./provider-jobs.ts";
-import {
-  digestHex, discardStagedNodeSnapshot, prepareNodeSnapshotPublication, stageNodeSnapshot,
-  type SnapshotMetadataUpdate, type StagedNodeSnapshot,
-} from "./storage.ts";
+import { providerSnapshotJournalReady, publishProviderSnapshot, stageProviderSnapshot } from "./provider-snapshot-journal.ts";
+import { digestHex, type SnapshotMetadataUpdate, type StagedNodeSnapshot } from "./storage.ts";
 import { parseSubscriptionDocument } from "./subscription-document.ts";
 
 const RPC_TIMEOUT_MS = 72_000;
@@ -104,57 +101,14 @@ function subscriptionMetadata(userinfo: string | undefined): SnapshotMetadataUpd
   return metadata;
 }
 
-async function confirmSaved(db: D1Database, lease: ProviderJobLease, staged: StagedNodeSnapshot): Promise<boolean> {
-  const pointer = `id = ? AND owner_id = ? AND generation = ? AND snapshot_id = ? AND manifest_sha256 = ? AND node_count = ?`;
-  const snapshot = [lease.id, lease.ownerId, lease.expectedGeneration + 1, staged.snapshotId, staged.manifestSha256, staged.nodeCount];
-  try {
-    return await db.prepare(`SELECT CASE WHEN EXISTS (SELECT 1 FROM ${providerJobLeaseTable(lease)}
-        WHERE job_id = ? AND owner_id = ? AND request_key = ? AND subscription_id = ? AND source_sha256 = ?
-          AND state = 'done' AND result_code = 'saved' AND attempts = ?)
-      AND (EXISTS (SELECT 1 FROM subscriptions WHERE ${pointer}) OR EXISTS (SELECT 1 FROM subscription_trash WHERE ${pointer}))
-      THEN 1 ELSE 0 END AS saved`)
-      .bind(lease.jobId, lease.ownerId, lease.requestKey, lease.id, lease.sourceSha256, lease.attempts, ...snapshot, ...snapshot)
-      .first<number>("saved") === 1;
-  } catch {
-    return false;
-  }
-}
-
-async function publish(
-  db: D1Database, bucket: R2Bucket, lease: ProviderJobLease, staged: StagedNodeSnapshot, metadata: SnapshotMetadataUpdate,
-): Promise<ConsumerOutcome> {
-  try {
-    const results = await db.batch([
-      prepareNodeSnapshotPublication(db, lease, staged, prepareProviderJobLeaseGuard(lease), metadata),
-      prepareProviderJobSettlement(db, lease, { kind: "saved", snapshotId: staged.snapshotId }, true),
-      db.prepare(`SELECT CASE WHEN changes() = 1 OR NOT EXISTS (
-        SELECT 1 FROM subscriptions WHERE id = ? AND snapshot_id = ?
-        UNION ALL SELECT 1 FROM subscription_trash WHERE id = ? AND snapshot_id = ?)
-        THEN 1 ELSE json_extract('provider publication guard failed', '$') END`)
-        .bind(lease.id, staged.snapshotId, lease.id, staged.snapshotId),
-    ]);
-    if (results.length === 3 && results.every(({ success }) => success)) {
-      const [publication, settlement] = results;
-      if (publication.meta.changes === 1 && settlement.meta.changes === 1) return "saved";
-      if (publication.meta.changes === 0 && settlement.meta.changes === 0) {
-        await discardStagedNodeSnapshot(bucket, staged);
-        await retireStaleProviderJob(db, lease);
-        return "stale";
-      }
-    }
-  } catch {
-    // An unavailable D1 response may conceal a committed pointer and receipt.
-  }
-  return await confirmSaved(db, lease, staged) ? "saved" : "uncertain";
-}
-
 /** Run at most one lease from the selected queue and use the named binding for its source URL. */
 export async function runOneProviderJob(
   db: D1Database, bucket: R2Bucket, provider: ProviderFetcher | undefined, pin: ProviderPin, policy?: ProviderTelegramPolicy,
   includeBatch = false,
 ): Promise<ConsumerOutcome> {
   if (!provider || typeof pin.providerRevision !== "string" || !PROVIDER_REVISION.test(pin.providerRevision) ||
-      typeof pin.imageSha256 !== "string" || !PROVIDER_SHA256.test(pin.imageSha256)) return "disabled";
+      typeof pin.imageSha256 !== "string" || !PROVIDER_SHA256.test(pin.imageSha256) ||
+      !await providerSnapshotJournalReady(db)) return "disabled";
   const lease = await claimProviderJob(db, policy, includeBatch);
   if (lease === null) return "idle";
   if (lease.scope !== "generic" && !await isProviderJobCurrent(db, lease)) {
@@ -184,11 +138,15 @@ export async function runOneProviderJob(
     await retireStaleProviderJob(db, lease);
     return "stale";
   }
-  let staged: StagedNodeSnapshot;
+  let staged: StagedNodeSnapshot | null;
   try {
-    staged = await stageNodeSnapshot(bucket, lease.id, parsed.nodes, lease.leaseId);
+    staged = await stageProviderSnapshot(db, bucket, lease, parsed.nodes);
   } catch {
     return settleProviderJob(db, lease, { kind: "retry", reason: "storage-failed" });
   }
-  return publish(db, bucket, lease, staged, subscriptionMetadata(fetched.metadata?.["subscription-userinfo"]));
+  const outcome = staged
+    ? await publishProviderSnapshot(db, lease, staged, subscriptionMetadata(fetched.metadata?.["subscription-userinfo"]))
+    : "stale";
+  if (outcome === "stale") await retireStaleProviderJob(db, lease);
+  return outcome;
 }

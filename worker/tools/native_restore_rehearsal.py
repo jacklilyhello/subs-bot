@@ -648,6 +648,8 @@ def quiet_expression(tables, observed_at=None):
                     WHERE receipt_id=batch.batch_id))""")
     if "telegram_private_share_creations" in tables:
         conditions.append("NOT EXISTS(SELECT 1 FROM telegram_private_share_creations WHERE state='reserved' OR (state='abandoned' AND cleaned_at IS NULL))")
+    if "provider_snapshot_attempts" in tables:
+        conditions.append(f"NOT EXISTS(SELECT 1 FROM provider_snapshot_attempts WHERE state IN ('open','sealed') AND lease_until > {epoch})")
     if "telegram_selected_links" in tables:
         waits.append("telegram_selected_revoke_ticket")
         conditions.append("NOT EXISTS(SELECT 1 FROM telegram_selected_links AS selected JOIN aggregate_links AS link ON link.code_sha256=selected.code_sha256 WHERE link.revoked_at IS NULL)")
