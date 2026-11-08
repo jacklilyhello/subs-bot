@@ -13,6 +13,7 @@ on:
       - 'worker/tools/prepare_isolation_artifact.py'
       - 'worker/tools/publish_provider_registry.py'
       - 'worker/tools/stage_provider_version.py'
+      - 'worker/tools/stage_provider_api_status_version.py'
       - 'worker/tools/verify_provider_skopeo.py'
       - 'worker/test/test_bootstrap_provider_worker.py'
       - 'worker/test/test_activate_provider_isolation.py'
@@ -28,6 +29,7 @@ on:
       - '.github/workflows/worker-provider-fetch-ci.yml'
       - '.github/workflows/worker-provider-registry-publish.yml'
       - '.github/workflows/worker-provider-version-stage.yml'
+      - '.github/workflows/worker-provider-api-status-version-stage.yml'
   push:
     branches: [main]
     paths:
@@ -41,6 +43,7 @@ on:
       - 'worker/tools/prepare_isolation_artifact.py'
       - 'worker/tools/publish_provider_registry.py'
       - 'worker/tools/stage_provider_version.py'
+      - 'worker/tools/stage_provider_api_status_version.py'
       - 'worker/tools/verify_provider_skopeo.py'
       - 'worker/test/test_bootstrap_provider_worker.py'
       - 'worker/test/test_activate_provider_isolation.py'
@@ -56,6 +59,7 @@ on:
       - '.github/workflows/worker-provider-fetch-ci.yml'
       - '.github/workflows/worker-provider-registry-publish.yml'
       - '.github/workflows/worker-provider-version-stage.yml'
+      - '.github/workflows/worker-provider-api-status-version-stage.yml'
   workflow_dispatch:
 
 permissions:

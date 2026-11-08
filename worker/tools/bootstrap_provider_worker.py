@@ -24,6 +24,7 @@ from publish_provider_registry import (
 
 
 OWNERSHIP_TAG = "subs-bot-provider-isolation"
+API_STATUS_OWNERSHIP_TAG = "subs-bot-provider-api-status-isolation"
 TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z")
 IDENTITY_ENV = "SUBS_BOT_CF_PROVIDER_WORKER_IDENTITY_JSON"
 REFERENCE_FIELDS = ("dispatch_namespace_outbounds", "domains", "durable_objects", "queues", "workers")
@@ -54,6 +55,13 @@ class BootstrapError(ValueError):
 def _require(condition, message):
     if not condition:
         raise BootstrapError(message)
+
+
+def _settings(profile):
+    if profile == provider.FETCH_PROFILE:
+        return CREATE_SETTINGS
+    _require(profile == provider.API_STATUS_PROFILE, "Unknown provider Worker profile.")
+    return {**CREATE_SETTINGS, "name": provider.API_STATUS_SERVICE, "tags": [API_STATUS_OWNERSHIP_TAG]}
 
 
 def _timestamp(value):
@@ -89,8 +97,8 @@ def _pin(value):
     return Identity(obj["workerId"], obj["workerCreatedOn"])
 
 
-def _identity(worker):
-    _require(isinstance(worker, dict) and worker.get("name") == provider.SERVICE,
+def _identity(worker, *, profile=provider.FETCH_PROFILE):
+    _require(isinstance(worker, dict) and worker.get("name") == _settings(profile)["name"],
              "The provider Worker name did not match the fixed target.")
     identity = Identity(worker.get("id"), worker.get("created_on"))
     _require(_timestamp(worker.get("updated_on")) >= _timestamp(identity.created_on),
@@ -117,12 +125,12 @@ def _logging_off(settings, *, preview=False):
     _require(explicitly_disabled or inactive_main_defaults, PROFILE_ERROR)
 
 
-def _verify_profile(worker, expected):
-    _require(_identity(worker) == expected, "The private provider Worker did not match its pinned identity.")
+def _verify_profile(worker, expected, *, profile=provider.FETCH_PROFILE):
+    _require(_identity(worker, profile=profile) == expected, "The private provider Worker did not match its pinned identity.")
     subdomain = worker.get("subdomain")
     references = worker.get("references")
     _require(isinstance(subdomain, dict) and subdomain.get("enabled") is False
-             and subdomain.get("previews_enabled") is False and worker.get("tags") == [OWNERSHIP_TAG]
+             and subdomain.get("previews_enabled") is False and worker.get("tags") == _settings(profile)["tags"]
              and worker.get("deployed_on") is None and isinstance(references, dict)
              and all(references.get(key) == [] for key in REFERENCE_FIELDS), PROFILE_ERROR)
     _logging_off(worker)
