@@ -118,6 +118,26 @@ class BatchAcceptanceTests(unittest.TestCase):
             with self.assertRaises(FixtureError):
                 self.acceptance.snapshots(self.auth, 1, prior)
 
+    def test_dirty_actor_inventory_does_not_return_raw_fields(self):
+        self.acceptance.sources["positive"]["snapshots"] = {"admin-first": {"id": 101}}
+        names = ["support", f"CFBATCH-{COHORT}-positive", f"CFBATCH-{COHORT}-negative", "unrelated"]
+        for index, name in enumerate(names):
+            self.cloud.db.execute("""INSERT INTO subscriptions
+              (id,owner_id,name,source_url,token,created_at,updated_at) VALUES (?,?,?,?,?,unixepoch(),unixepoch())""",
+                (101 + index, POLICY["adminId"], name, smoke.documents.UPLOADED if index == 0 else
+                 "https://example.invalid/fixture", f"{index:032x}"))
+        results = []
+        read = self.acceptance.read
+
+        def record(*args):
+            rows = read(*args)
+            results.append(rows)
+            return rows
+
+        with patch.object(self.acceptance, "read", side_effect=record), self.assertRaises(FixtureError):
+            self.acceptance.inventory()
+        self.assertEqual(results, [[]])
+
 
 class SafetyTests(unittest.TestCase):
     def test_no_cloud_write_method_or_other_query_target_reaches_client(self):

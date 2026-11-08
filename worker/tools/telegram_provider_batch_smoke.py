@@ -167,18 +167,20 @@ class Acceptance:
                 require(not rows and all(not doc.checked_keys(pointer, allow_missing=True) for pointer in source["snapshots"].values()))
 
     def inventory(self):
-        rows = self.read("""SELECT id,owner_id,name,source_url,token,generation,snapshot_id,manifest_sha256,node_count,last_error,
-          COALESCE((SELECT revision FROM subscription_lifecycle WHERE subscription_id=subscriptions.id),0) AS lifecycle
-          FROM subscriptions WHERE owner_id IN (?,?) ORDER BY id LIMIT 7""", *self.actors.values())
-        require(len(rows) == 6)
         imports = {}
+        names = {kind: f"CFBATCH-{self.cohort}-{kind}" for kind in KINDS}
         for role, actor in self.actors.items():
-            owned = [row for row in rows if row["owner_id"] == actor]
-            require(len(owned) == 3 and sum(row["id"] == self.sources["positive"]["snapshots"][f"{role}-first"]["id"]
-                                          and row["source_url"] == documents.UPLOADED for row in owned) == 1)
+            support = self.sources["positive"]["snapshots"][f"{role}-first"]["id"]
+            # Qualify the whole inventory before selecting the two exact fixtures' private fields.
+            owned = self.read("""SELECT id,name,source_url,token,generation,snapshot_id,manifest_sha256,node_count,last_error,
+              COALESCE((SELECT revision FROM subscription_lifecycle WHERE subscription_id=subscriptions.id),0) AS lifecycle
+              FROM subscriptions WHERE owner_id=? AND name IN (?,?) AND id<>?
+              AND (SELECT count(*) FROM (SELECT 1 FROM subscriptions WHERE owner_id=? LIMIT 4))=3
+              AND EXISTS (SELECT 1 FROM subscriptions WHERE id=? AND owner_id=? AND source_url=?)
+              ORDER BY id LIMIT 3""", actor, *names.values(), support, actor, support, actor, documents.UPLOADED)
+            require(len(owned) == 2)
             for kind in KINDS:
-                name = f"CFBATCH-{self.cohort}-{kind}"
-                matches_name = [row for row in owned if row["name"] == name]
+                matches_name = [row for row in owned if row["name"] == names[kind]]
                 require(len(matches_name) == 1)
                 row = matches_name[0]
                 require(matches(SOURCE, row["source_url"]) and matches(documents.TOKEN, row["token"])
