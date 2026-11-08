@@ -21,6 +21,12 @@ ORIGIN = "https://subs-bot-view-fixtures.invalid/"
 LIFECYCLE_ORIGIN = "https://subs-bot-action-fixtures.invalid/"
 FIELDS = "id, owner_id, name, source_url, token, expire_at, created_at, updated_at, generation, node_count"
 PREFIX_MATCH = "substr(source_url, 1, length(?)) = ?"
+PROVIDER_BATCH_QUEUE_TABLES = frozenset(("telegram_provider_batches", "telegram_provider_batch_jobs"))
+PROVIDER_BATCH_INTERACTIONS = "telegram_provider_batch_interactions"
+PROVIDER_BATCH_TABLES = PROVIDER_BATCH_QUEUE_TABLES | {PROVIDER_BATCH_INTERACTIONS}
+PROVIDER_BATCH_SCHEMA = (
+    "FROM sqlite_schema WHERE type='table' AND name IN ('" + "','".join(sorted(PROVIDER_BATCH_TABLES)) + "')"
+)
 
 
 class FixtureError(RuntimeError):
@@ -51,6 +57,44 @@ def query(api, path, payload, result_count):
 
 def rows(api, path, sql, *parameters):
     return query(api, path, statement(sql, *parameters), 1)[0]["results"]
+
+
+def provider_batch_fixture_tables(read):
+    result = read(f"SELECT name {PROVIDER_BATCH_SCHEMA}")
+    tables = frozenset(row["name"] for row in result)
+    if len(tables) != len(result) or tables not in (frozenset(), PROVIDER_BATCH_QUEUE_TABLES, PROVIDER_BATCH_TABLES):
+        raise FixtureError("Provider batch fixture schema differs.")
+    return tables
+
+
+def provider_batch_fixture_quiet(tables, bot, actors):
+    # Keep the schema observation and exact actor check inside the fixture CAS.
+    conditions = [f"(SELECT count(*) {PROVIDER_BATCH_SCHEMA})={len(tables)}"]
+    scope = (bot, *actors)
+    parameters = ()
+    if tables:
+        conditions.extend((
+            """NOT EXISTS(SELECT 1 FROM telegram_provider_batches AS batch
+                WHERE batch.bot_id=? AND batch.actor_id IN (?,?) AND batch.finished_at IS NULL)""",
+            """NOT EXISTS(SELECT 1 FROM telegram_provider_batch_jobs AS job JOIN telegram_provider_batches AS batch USING(batch_id)
+                WHERE batch.bot_id=? AND batch.actor_id IN (?,?) AND job.state IN ('waiting','pending','leased'))""",
+        ))
+        parameters += scope * 2
+    if PROVIDER_BATCH_INTERACTIONS in tables:
+        # A completion can create its terminal outbox row for 15 minutes.
+        conditions.extend((
+            """NOT EXISTS(SELECT 1 FROM telegram_provider_batch_interactions AS interaction
+                JOIN telegram_inbox AS inbox USING(receipt_id) LEFT JOIN telegram_outbox AS reply USING(receipt_id)
+                WHERE inbox.bot_id=? AND inbox.actor_id IN (?,?) AND (reply.state IN ('pending','leased','sending') OR
+                    (interaction.kind='preview' AND interaction.used_by_receipt_id IS NULL AND interaction.expires_at>unixepoch())))""",
+            """NOT EXISTS(SELECT 1 FROM telegram_provider_batches AS batch
+                WHERE batch.bot_id=? AND batch.actor_id IN (?,?) AND batch.finished_at>unixepoch()-900
+                  AND NOT EXISTS(SELECT 1 FROM telegram_provider_batch_interactions AS terminal
+                    JOIN telegram_outbox AS reply USING(receipt_id) WHERE terminal.receipt_id=batch.batch_id
+                      AND terminal.batch_id=batch.batch_id AND terminal.kind='terminal'))""",
+        ))
+        parameters += scope * 2
+    return " AND ".join(conditions), parameters
 
 
 def plan(policy, cohort, purpose="views"):

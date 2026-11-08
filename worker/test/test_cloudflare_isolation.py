@@ -57,6 +57,7 @@ INLINE_BINDING = {"name": cloudflare.INLINE_SEARCH_BINDING, "type": "plain_text"
 INLINE_MIGRATION = {"name": cloudflare.INLINE_SEARCH_MIGRATION, "sha256": cloudflare.INLINE_SEARCH_MIGRATION_SHA256}
 PROVIDER_URL_BINDING = {"name": cloudflare.PROVIDER_URL_IMPORT_BINDING, "type": "plain_text", "text": "1"}
 PROVIDER_REFRESH_BINDING = {"name": cloudflare.PROVIDER_REFRESH_BINDING, "type": "plain_text", "text": "1"}
+PROVIDER_BATCH_BINDING = {"name": cloudflare.PROVIDER_BATCH_BINDING, "type": "plain_text", "text": "1"}
 LEGACY_SHORT_BINDING = {"name": cloudflare.LEGACY_SUBSCRIPTION_SHORT_BINDING, "type": "plain_text", "text": "1"}
 LEGACY_SHORT_MIGRATION = {"name": cloudflare.LEGACY_SUBSCRIPTION_SHORT_MIGRATION,
                           "sha256": cloudflare.LEGACY_SUBSCRIPTION_SHORT_SHA256}
@@ -147,6 +148,10 @@ class FakeCloudflare:
         self.provider_url_ledger_drift = set()
         self.provider_refresh_checks = []
         self.provider_refresh_ledger_drift = {}
+        self.provider_batch_ledger_drift = False
+        self.provider_batch_schema_drift = False
+        self.provider_batch_drain_reads = 0
+        self.provider_batch_live_reads = set()
         self.legacy_short_checks = []
         self.legacy_short_ledger_drift = {}
 
@@ -222,6 +227,30 @@ class FakeCloudflare:
 
     def data_api(self, method, path, payload=None):
         if method == "POST" and path == DATABASE + "/query":
+            sql = payload["sql"]
+            if "AS batchActive" in sql:
+                self.provider_batch_drain_reads += 1
+                return [{"success": True, "results": [
+                    {"batchActive": int(self.provider_batch_drain_reads in self.provider_batch_live_reads)}]}]
+            if "WHERE position IN (21,23,31,32)" in sql:
+                rows = [{"position": position, "name": name, "sha256": digest, "mode": "applied"}
+                        for position, name, digest in cloudflare.PROVIDER_BATCH_MIGRATIONS]
+                if self.provider_batch_ledger_drift:
+                    rows[-1]["sha256"] = "0" * 64
+                return [{"success": True, "results": rows}]
+            if "name GLOB 'telegram_provider_batch*'" in sql:
+                directory = Path(__file__).resolve().parents[1] / "migrations"
+                with closing(sqlite3.connect(":memory:")) as db:
+                    db.row_factory = sqlite3.Row
+                    db.execute("CREATE TABLE telegram_inbox (receipt_id INTEGER PRIMARY KEY, bot_id TEXT, actor_id TEXT, "
+                               "message_date INTEGER, message_id INTEGER, receipt_nonce TEXT)")
+                    for _, name, digest in cloudflare.PROVIDER_BATCH_MIGRATIONS[-2:]:
+                        body = (directory / name).read_bytes()
+                        assert sha256(body).hexdigest() == digest
+                        db.executescript(body.decode("utf-8"))
+                    if self.provider_batch_schema_drift:
+                        db.execute("DROP INDEX telegram_provider_batch_tickets_expiry")
+                    return [{"success": True, "results": [dict(row) for row in db.execute(sql)]}]
             if "AS primaryIndex" in payload["sql"]:
                 assert set(payload) == {"sql"} and payload["sql"].strip().startswith("SELECT ")
                 self.legacy_short_checks.append(self.active["versions"][0]["version_id"])
@@ -353,6 +382,20 @@ class ReleaseTests(unittest.TestCase):
                 active["annotations"]["workers/tag"], False, False, True)
         return active
 
+    def set_provider_batch_baseline(self, *, capable=True, enabled=False, same_artifact=True):
+        active = self.set_provider_refresh_baseline(enabled=True, url=True, same_artifact=same_artifact, inline=True)
+        self.manifest["migrations"].extend({"name": f"{position:04d}_fixture.sql", "sha256": "a" * 64}
+                                          for position in range(29, 33))
+        for position, name, digest in cloudflare.PROVIDER_BATCH_MIGRATIONS:
+            self.manifest["migrations"][position - 1] = {"name": name, "sha256": digest}
+        tag = active["annotations"]["workers/tag"]
+        digest = sha256(NEW_MODULE if same_artifact else OLD_MODULE).hexdigest()
+        active["annotations"]["workers/tag"] = cloudflare._telegram_feature_tag(
+            tag, False, False, provider_batch=enabled, batch_module_sha256=digest if capable else None)
+        if enabled:
+            active["bindings"].append(PROVIDER_BATCH_BINDING)
+        return active
+
     def test_read_only_preflight_rejects_wrong_resource_or_domain(self):
         self.assertEqual(cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET),
                          {"deploymentId": OLD_DEPLOYMENT, "versionId": OLD_VERSION, "revision": OLD_REVISION})
@@ -374,6 +417,7 @@ class ReleaseTests(unittest.TestCase):
             "revision": NEW_REVISION, "versionId": NEW_VERSION, "deploymentId": NEW_DEPLOYMENT,
             "previousVersionId": OLD_VERSION, "changed": True, "inlineSearchEnabled": False,
             "providerUrlImportEnabled": False, "providerRefreshEnabled": False, "legacySubscriptionShortsEnabled": False,
+            "providerBatchEnabled": False,
         })
         self.assertFalse(self.release()["changed"])
         self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
@@ -721,6 +765,75 @@ class ReleaseTests(unittest.TestCase):
                     "SUBS_BOT_PROVIDER_REFRESH_MODE": mode, "SUBS_BOT_PROVIDER_REFRESH_CONFIRMATION": confirmation}, clear=True), \
                  self.assertRaisesRegex(cloudflare.CloudflareError, "mode or confirmation"):
                 release_entry.provider_refresh_release_mode()
+
+    def test_batch_enable_requires_the_exact_verified_off_artifact_and_preserves_other_flags(self):
+        options = {"provider_binding": PROVIDER_BINDING, "provider_guard": Mock(), "provider_batch": True}
+        self.set_provider_batch_baseline(capable=False)
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "same Worker artifact"):
+            self.release(INLINE_CONFIG, **options)
+        self.set_provider_batch_baseline(same_artifact=False)
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "same Worker artifact"):
+            self.release(INLINE_CONFIG, **options)
+        off = self.set_provider_batch_baseline()
+        self.assertEqual(self.api.writes(), [])
+        enabled = self.release(INLINE_CONFIG, **options)
+        for key in ("providerBatchEnabled", "providerRefreshEnabled", "providerUrlImportEnabled", "inlineSearchEnabled"):
+            self.assertTrue(enabled[key])
+        on = self.api.versions[NEW_VERSION]
+        self.assertEqual({row["name"]: row for row in on["bindings"]},
+                         {row["name"]: row for row in [*off["bindings"], PROVIDER_BATCH_BINDING]})
+        disabled = self.release(INLINE_CONFIG, **{**options, "provider_batch": False})
+        self.assertFalse(disabled["providerBatchEnabled"])
+        self.assertEqual(disabled["versionId"], OLD_VERSION)
+        self.assertEqual(self.api.provider_batch_drain_reads, 0)
+
+    def test_batch_release_refuses_ledger_schema_and_unproven_rollback_drift(self):
+        options = {"provider_binding": PROVIDER_BINDING, "provider_guard": Mock()}
+        self.set_provider_batch_baseline(capable=False, same_artifact=False)
+        for drift in ("provider_batch_ledger_drift", "provider_batch_schema_drift"):
+            setattr(self.api, drift, True)
+            with self.assertRaisesRegex(cloudflare.CloudflareError, "schema or ledger"):
+                self.release(INLINE_CONFIG, **options)
+            setattr(self.api, drift, False)
+        self.assertEqual(self.api.writes(), [])
+        # The readback saw active work after activation and still sees it before rollback.
+        self.api.provider_batch_live_reads = {3, 4}
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "safe rollback could not be confirmed"):
+            self.release(INLINE_CONFIG, **options)
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
+        self.assertEqual(self.api.active["versions"][0]["version_id"], NEW_VERSION)
+
+    def test_batch_preflight_checks_active_module_and_exact_ledger_before_migration(self):
+        active = self.set_provider_batch_baseline(enabled=True)
+        readback = lambda: cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET,
+            release_manifest=self.manifest, telegram_config=INLINE_CONFIG, provider_binding=PROVIDER_BINDING)
+        self.api.provider_batch_ledger_drift = True
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "schema or ledger"):
+            readback()
+        self.api.provider_batch_ledger_drift = False
+        active["modules"][0]["content_base64"] = base64.b64encode(OLD_MODULE).decode("ascii")
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "provider batch release tag"):
+            readback()
+        self.assertEqual(self.api.writes(), [])
+
+    def test_batch_rollback_to_proven_drain_runtime_is_allowed_while_work_exists(self):
+        self.set_provider_batch_baseline(enabled=False, same_artifact=False)
+        self.api.health_available = False
+        self.api.provider_batch_live_reads = {1, 2, 3, 4}
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "prior version was restored"):
+            self.release(INLINE_CONFIG, provider_binding=PROVIDER_BINDING, provider_guard=Mock())
+        self.assertEqual(self.api.active["versions"][0]["version_id"], OLD_VERSION)
+        self.assertEqual(self.api.provider_batch_drain_reads, 0)
+
+    def test_batch_operator_mode_is_default_off_and_requires_literal_isolation_confirmation(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(release_entry.provider_batch_release_mode())
+        for mode, enabled in (("enable", True), ("disable", False)):
+            with patch.dict(os.environ, {"SUBS_BOT_PROVIDER_BATCH_MODE": mode}, clear=True):
+                with self.assertRaisesRegex(cloudflare.CloudflareError, "mode or confirmation"):
+                    release_entry.provider_batch_release_mode()
+                os.environ["SUBS_BOT_PROVIDER_BATCH_CONFIRMATION"] = f"{mode} provider batch for {cloudflare.WORKER_NAME}"
+                self.assertIs(release_entry.provider_batch_release_mode(), enabled)
 
     def test_legacy_short_toggle_preserves_existing_provider_and_telegram_flags(self):
         off = self.set_provider_refresh_baseline(enabled=True, url=True, inline=True)

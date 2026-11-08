@@ -17,7 +17,7 @@ from telegram_aggregate_smoke import (
     DECIMAL, MAX_ID, ROLES, SUBSCRIPTION_FIELDS, canonical, digest, key_bytes,
     read_checkpoint, require, validate_release_pin, verify_checkpoint_release,
 )
-from telegram_view_fixtures import FixtureError, query, statement
+from telegram_view_fixtures import FixtureError, provider_batch_fixture_quiet, provider_batch_fixture_tables, query, statement
 
 
 WORKFLOW = "worker-isolation-telegram-fixtures.yml"
@@ -65,6 +65,7 @@ class BulkCohort:
         token_key = hmac.digest(key, b"subs-bot/bulk-trash-fixture/token/v1", "sha256")
         self.tokens = {label: hmac.new(token_key, canonical([identity, cohort, label]).encode(), sha256).hexdigest()
                        for label in LABELS}
+        self.provider_batch_tables = provider_batch_fixture_tables(self.read)
 
     def read(self, sql, *params):
         return self.resources.query(sql, params)
@@ -150,7 +151,8 @@ class BulkCohort:
             condition += """ AND NOT EXISTS(SELECT 1 FROM subscriptions WHERE owner_id IN (?,?)
               AND id NOT IN (SELECT value FROM json_each(?)))"""
             params += (*actors, known)
-        return condition, params
+        batch, batch_params = provider_batch_fixture_quiet(self.provider_batch_tables, self.bot, actors)
+        return condition + " AND " + batch, (*params, *batch_params)
 
     def require_quiet(self, ids, *, isolate_inventory=False):
         condition, params = self.quiet(ids, isolate_inventory=isolate_inventory)

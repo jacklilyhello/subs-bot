@@ -77,9 +77,15 @@ function validInput(policy: TelegramPolicy, input: TelegramProviderBatchInput): 
 export async function telegramProviderBatchReady(db: D1Database): Promise<boolean> {
   try {
     const count = await db.prepare(`SELECT count(*) AS present FROM sqlite_schema WHERE type='table'
-      AND name IN ('telegram_provider_batches','telegram_provider_batch_jobs')`).first<number>("present");
-    if (count !== 0 && count !== 2) throw new Error();
-    return count === 2;
+      AND name IN ('telegram_provider_batches','telegram_provider_batch_jobs') AND tbl_name=name
+      OR type='index' AND ((tbl_name='telegram_provider_batches'
+        AND name IN ('telegram_provider_batches_running','telegram_provider_batches_latest'))
+        OR (tbl_name='telegram_inbox' AND name='telegram_provider_batch_preview_order')
+        OR (tbl_name='telegram_provider_batch_jobs' AND name IN (
+          'telegram_provider_batch_jobs_active_target','telegram_provider_batch_jobs_global_lease',
+          'telegram_provider_batch_jobs_due','telegram_provider_batch_jobs_unsettled')))`).first<number>("present");
+    if (count !== 0 && count !== 9) throw new Error();
+    return count === 9;
   } catch {
     throw new Error("Telegram provider batch schema could not be confirmed.");
   }
