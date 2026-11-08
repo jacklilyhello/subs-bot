@@ -19,6 +19,8 @@ declare global {
 }
 
 const SINGLETON = "provider-api-status-v2";
+const SMOKE_STATUS_URL = "https://subs-bot-cf-dev-01.lilyya.workers.dev/v1/models";
+const SMOKE_STATUS_KEY = "synthetic-provider-smoke-key";
 
 interface Probe {
   providerRevision: string;
@@ -99,13 +101,23 @@ export class ProviderSmoke extends WorkflowEntrypoint<Env, Probe> {
         || event.instanceId !== `provider-smoke-${revision}`) {
       throw new Error("Provider smoke request differs from the pinned release.");
     }
-    return step.do("verify fixed provider egress", { retries: { limit: 0, delay: "1 second" }, timeout: "75 seconds" }, async () => {
+    const egress = await step.do("verify fixed provider egress", { retries: { limit: 0, delay: "1 second" }, timeout: "75 seconds" }, async () => {
       try {
         return await this.ctx.exports.ProviderContainer.getByName(SINGLETON).prove(event.payload);
       } catch {
         throw new Error("Provider container smoke failed.");
       }
     });
+    if (!egress.ok || !("imageSha256" in egress)) return egress;
+    const apiStatus = await step.do("verify fixed API status RPC", { retries: { limit: 0, delay: "1 second" }, timeout: "45 seconds" }, async () => {
+      const result = await this.ctx.exports.ProviderApiStatus.probeApiStatusV2({
+        url: SMOKE_STATUS_URL, key: SMOKE_STATUS_KEY, providerRevision: revision,
+        imageSha256: egress.imageSha256, dispatchBeforeMs: Date.now() + 30_000,
+      });
+      if (!result.ok || result.status !== 404) throw new Error("The fixed provider API status probe did not return the expected status.");
+      return result.status;
+    });
+    return { ...egress, apiStatus };
   }
 }
 

@@ -9,6 +9,8 @@ const imageSha256 = "c".repeat(64);
 const input = { url: "https://fixture.example/v1/models", key: "synthetic-api-key", providerRevision: revision, imageSha256 };
 const image = (service) => `registry.cloudflare.com/${"d".repeat(32)}/${service}@sha256:${imageSha256}`;
 const compatibilityDate = "2026-07-30";
+const isolatedRevision = "f".repeat(40);
+const smokeName = API_STATUS_SERVICE + "-smoke";
 
 test("the V2 probe requires its own image repository before starting the container", async () => {
   for (const [repository, service, allowed] of [
@@ -57,11 +59,26 @@ test("the emitted status Worker exposes only V2 RPC and a fixed default denial",
     }
     export { default, ProviderApiStatus, ProviderSmoke } from "./emitted.mjs";
     export class ProviderContainer extends DurableObject {
+      async prove(probe) {
+        if (!this.ctx.id.equals(this.ctx.exports.ProviderContainer.idFromName("provider-api-status-v2"))
+            || probe.providerRevision !== "${revision}" || probe.isolatedRevision !== "${isolatedRevision}") {
+          throw new Error("Unexpected V2 smoke request.");
+        }
+        await this.ctx.storage.put("smoke", true);
+        return { ok: true, imageSha256: "${imageSha256}" };
+      }
       async probeApiStatusV2(input) {
         if (!this.ctx.id.equals(this.ctx.exports.ProviderContainer.idFromName("provider-api-status-v2"))
             || Object.keys(input).length !== 5 || input.providerRevision !== "${revision}"
-            || input.imageSha256 !== "${imageSha256}" || input.key !== "synthetic-api-key"
+            || input.imageSha256 !== "${imageSha256}"
             || !Number.isSafeInteger(input.dispatchBeforeMs)) throw new Error("Unexpected V2 request.");
+        if (input.url === "https://subs-bot-cf-dev-01.lilyya.workers.dev/v1/models") {
+          if (input.key !== "synthetic-provider-smoke-key" || !(await this.ctx.storage.get("smoke"))
+              || await this.ctx.storage.get("statusSmoke")) throw new Error("Unexpected V2 smoke dispatch.");
+          await this.ctx.storage.put("statusSmoke", true);
+          return { ok: true, status: 404, elapsedMs: 12 };
+        }
+        if (input.url !== "https://fixture.example/v1/models" || input.key !== "synthetic-api-key") throw new Error("Unexpected V2 target.");
         const elapsedMs = (await this.ctx.storage.get("calls") ?? 0) + 1;
         await this.ctx.storage.put("calls", elapsedMs);
         return { ok: true, status: 401, elapsedMs };
@@ -92,7 +109,8 @@ test("the emitted status Worker exposes only V2 RPC and a fixed default denial",
         { type: "ESModule", path: "fixture.mjs", contents: fixture },
         { type: "ESModule", path: "emitted.mjs", contents: script },
       ],
-      additionalUnboundDurableObjects: [{ className: "ProviderContainer", useSQLite: true }] },
+      additionalUnboundDurableObjects: [{ className: "ProviderContainer", useSQLite: true }],
+      workflows: { PROVIDER_SMOKE: { name: smokeName, className: "ProviderSmoke", scriptName: "provider" } } },
   ] });
   try {
     for (const [path, expected] of [
@@ -108,6 +126,17 @@ test("the emitted status Worker exposes only V2 RPC and a fixed default denial",
     for (const path of ["/v1", "/fetch"]) {
       assert.equal((await runtime.dispatchFetch("https://caller.example" + path)).status, 404);
     }
+    const { PROVIDER_SMOKE } = await runtime.getBindings("provider");
+    const smoke = await PROVIDER_SMOKE.create({ id: `provider-smoke-${revision}`,
+      params: { providerRevision: revision, isolatedRevision } });
+    let result;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      result = await smoke.status();
+      if (["complete", "errored", "terminated"].includes(result.status)) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.equal(result?.status, "complete");
+    assert.deepEqual(result.output, { ok: true, imageSha256, apiStatus: 404 });
     const provider = await runtime.getWorker("provider");
     for (const [path, method] of [["/", "GET"], ["/ready", "GET"], ["/v1/fetch", "POST"], ["/v2/api-status", "POST"]]) {
       const response = await provider.fetch("https://provider.example" + path, { method });

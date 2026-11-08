@@ -1,0 +1,77 @@
+name: Activate private Provider API status V2 isolation
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider_ci_run_id:
+        description: Successful Provider Fetch CI run for the staged V2 version at exact current main
+        required: true
+        type: string
+      operation:
+        description: Verify read-only or perform exactly one pinned API status operation
+        required: true
+        type: choice
+        options: [verify, activate, provision-container, provision-workflow, smoke]
+        default: verify
+      confirm_operation:
+        description: For writes, enter the operation followed by a space and subs-bot-provider-api-status-dev-01
+        type: string
+      isolated_revision:
+        description: Exact isolated subscription Worker health revision for smoke or its verification
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: subs-bot-provider-isolation
+  cancel-in-progress: false
+
+jobs:
+  activate:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
+    environment: subs-bot-provider-api-status-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify the exact staged V2 artifact and OCI destination
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_CI_RUN_ID: ${{ inputs.provider_ci_run_id }}
+          SUBS_BOT_CF_PROVIDER_ACCOUNT_ID: ${{ vars.SUBS_BOT_CF_PROVIDER_ACCOUNT_ID }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          python3 -B worker/tools/prepare_provider_api_status_artifact.py > "$RUNNER_TEMP/provider-api-status-v2-provenance.json"
+      - name: Verify or perform one private V2 operation
+        id: api-status-activation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_CI_RUN_ID: ${{ inputs.provider_ci_run_id }}
+          SUBS_BOT_PROVIDER_API_STATUS_ACTIVATION_OPERATION: ${{ inputs.operation }}
+          SUBS_BOT_PROVIDER_API_STATUS_ACTIVATION_CONFIRMATION: ${{ inputs.confirm_operation }}
+          SUBS_BOT_PROVIDER_API_STATUS_ISOLATED_REVISION: ${{ inputs.isolated_revision }}
+          SUBS_BOT_CF_PROVIDER_ACCOUNT_ID: ${{ vars.SUBS_BOT_CF_PROVIDER_ACCOUNT_ID }}
+          SUBS_BOT_CF_PROVIDER_API_STATUS_WORKER_IDENTITY_JSON: ${{ secrets.SUBS_BOT_CF_PROVIDER_API_STATUS_WORKER_IDENTITY_JSON }}
+          SUBS_BOT_CF_PROVIDER_API_STATUS_RELEASE_JSON: ${{ secrets.SUBS_BOT_CF_PROVIDER_API_STATUS_RELEASE_JSON }}
+          SUBS_BOT_CF_PROVIDER_API_STATUS_ACTIVATION_JSON: ${{ secrets.SUBS_BOT_CF_PROVIDER_API_STATUS_ACTIVATION_JSON }}
+          SUBS_BOT_CF_PROVIDER_API_STATUS_CONTAINER_IDENTITY_JSON: ${{ secrets.SUBS_BOT_CF_PROVIDER_API_STATUS_CONTAINER_IDENTITY_JSON }}
+          SUBS_BOT_CF_PROVIDER_API_STATUS_WORKFLOW_IDENTITY_JSON: ${{ secrets.SUBS_BOT_CF_PROVIDER_API_STATUS_WORKFLOW_IDENTITY_JSON }}
+          SUBS_BOT_CF_PROVIDER_API_STATUS_WORKER_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_API_STATUS_WORKER_TOKEN }}
+          SUBS_BOT_CF_PROVIDER_API_STATUS_CONTAINER_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_API_STATUS_CONTAINER_TOKEN }}
+        run: |
+          umask 077
+          python3 -B worker/tools/activate_provider_api_status.py
+      - name: Upload the completed private V2 proof
+        if: steps.api-status-activation.outputs.binding_proof == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: subs-bot-provider-api-status-v2-binding-proof-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/provider-api-status-v2-binding-proof.json
+          if-no-files-found: error
+          retention-days: 30
