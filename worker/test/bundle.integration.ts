@@ -24,6 +24,7 @@ import "./telegram-provider-url-import.integration.ts";
 import "./telegram-provider-refresh.integration.ts";
 import "./telegram-subscription-read.integration.ts";
 import "./telegram-subscription-node-pages.integration.ts";
+import "./telegram-subscription-raw-file.integration.ts";
 import "./telegram-temp-raw.integration.ts";
 import "./telegram-short-links.integration.ts";
 import "./telegram-inline-sort.integration.ts";
