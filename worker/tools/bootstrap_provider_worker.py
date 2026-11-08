@@ -143,10 +143,12 @@ def _verify_profile(worker, expected, *, profile=provider.FETCH_PROFILE):
 class WorkerAPI:
     """Only the fixed Worker shell may be created. Other operations are exact reads."""
 
-    def __init__(self, account, token):
+    def __init__(self, account, token, *, profile=provider.FETCH_PROFILE):
         _require(ACCOUNT.fullmatch(account) and sha256(account.encode("ascii")).hexdigest() == TARGET_ACCOUNT_SHA256,
                  "The protected Cloudflare account does not match the provider target.")
         _require(API_TOKEN.fullmatch(token), "The dedicated Cloudflare Workers credential is missing or malformed.")
+        self._settings = _settings(profile)
+        self.profile = profile
         self._workers = f"{API_ORIGIN}/accounts/{account}/workers/workers"
         self._token = token
         self._opener = build_opener(ProxyHandler({}), github._NoRedirect())
@@ -158,7 +160,7 @@ class WorkerAPI:
         data = None
         if create:
             headers["Content-Type"] = "application/json"
-            data = json.dumps(CREATE_SETTINGS, separators=(",", ":")).encode("ascii")
+            data = json.dumps(self._settings, separators=(",", ":")).encode("ascii")
         request = Request(url, data=data, headers=headers, method="POST" if create else "GET")
         status, _, raw = _response(request, self._opener, error)
         envelope = github._parse_object(raw, error)
@@ -173,7 +175,7 @@ class WorkerAPI:
         return envelope
 
     def by_name(self, *, absent=False):
-        result = self._request(f"{self._workers}/{provider.SERVICE}", absent=absent)
+        result = self._request(f"{self._workers}/{self._settings['name']}", absent=absent)
         if result is None:
             return None
         _require(isinstance(result["result"], dict), READ_ERROR)
@@ -193,25 +195,26 @@ class WorkerAPI:
                          for key, expected in (("count", 0), ("total_count", 0), ("page", 1), ("per_page", 1))), PROFILE_ERROR)
 
 
-def _bootstrap(api, action, pin, guard):
+def _bootstrap(api, action, pin, guard, *, profile=provider.FETCH_PROFILE):
+    _require(api.profile == profile, "The provider Worker client profile does not match the requested shell.")
     if action == "create":
         _require(pin is None, "The protected provider Worker is already pinned. Use verification.")
         _require(api.by_name(absent=True) is None, "The exact provider Worker name is occupied. Creation refused.")
         guard()
         _require(api.by_name(absent=True) is None, "The exact provider Worker name became occupied. Creation refused.")
         try:
-            expected = _identity(api.create())
+            expected = _identity(api.create(), profile=profile)
         except (BootstrapError, PublicationError, github.ArtifactError):
             raise BootstrapError(CREATE_ERROR) from None
         status = "created"
     else:
         _require(action == "verify" and pin is not None, "Verification requires the protected provider Worker identity pin.")
         expected = pin
-        _verify_profile(api.by_name(), expected)
+        _verify_profile(api.by_name(), expected, profile=profile)
         status = "verified"
-    _verify_profile(api.by_id(expected), expected)
+    _verify_profile(api.by_id(expected), expected, profile=profile)
     api.require_no_versions(expected)
-    _verify_profile(api.by_name(), expected)
+    _verify_profile(api.by_name(), expected, profile=profile)
     guard()
     return status, expected
 
