@@ -1,0 +1,37 @@
+name: Verify Provider API status V2 release artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider_ci_run_id:
+        description: Successful Provider Fetch CI run with its API status V2 artifact at this exact main revision
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: subs-bot-provider-isolation
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
+    environment: subs-bot-provider-isolation
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify exact main artifact and private OCI destination
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_CI_RUN_ID: ${{ inputs.provider_ci_run_id }}
+          SUBS_BOT_CF_PROVIDER_ACCOUNT_ID: ${{ vars.SUBS_BOT_CF_PROVIDER_ACCOUNT_ID }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 -B worker/tools/prepare_provider_api_status_artifact.py
