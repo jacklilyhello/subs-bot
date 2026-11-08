@@ -158,6 +158,10 @@ class FakeCloudflare:
         self.api_status_schema_drift = False
         self.api_status_drain_reads = 0
         self.api_status_live_reads = set()
+        self.provider_documents_ledger_drift = False
+        self.provider_documents_schema_drift = False
+        self.provider_documents_drain_reads = 0
+        self.provider_documents_live_reads = set()
         self.legacy_short_checks = []
         self.legacy_short_ledger_drift = {}
 
@@ -234,6 +238,27 @@ class FakeCloudflare:
     def data_api(self, method, path, payload=None):
         if method == "POST" and path == DATABASE + "/query":
             sql = payload["sql"]
+            if "AS providerDocumentsActive" in sql:
+                self.provider_documents_drain_reads += 1
+                return [{"success": True, "results": [{"providerDocumentsActive": int(
+                    self.provider_documents_drain_reads in self.provider_documents_live_reads)}]}]
+            if "WHERE position IN (21,23,33,35)" in sql:
+                rows = [{"position": position, "name": name, "sha256": digest, "mode": "applied"}
+                        for position, name, digest in cloudflare.PROVIDER_URL_DOCUMENTS_MIGRATIONS]
+                if self.provider_documents_ledger_drift:
+                    rows[-1]["sha256"] = "0" * 64
+                return [{"success": True, "results": rows}]
+            if "tbl_name IN ('provider_snapshot_attempts'" in sql:
+                directory = Path(__file__).resolve().parents[1] / "migrations"
+                with closing(sqlite3.connect(":memory:")) as db:
+                    db.row_factory = sqlite3.Row
+                    for _, name, digest in cloudflare.PROVIDER_URL_DOCUMENTS_MIGRATIONS[-2:]:
+                        body = (directory / name).read_bytes()
+                        assert sha256(body).hexdigest() == digest
+                        db.executescript(body.decode("utf-8"))
+                    if self.provider_documents_schema_drift:
+                        db.execute("DROP INDEX provider_snapshot_open_leases")
+                    return [{"success": True, "results": [dict(row) for row in db.execute(sql)]}]
             if "AS apiStatusActive" in sql:
                 self.api_status_drain_reads += 1
                 return [{"success": True, "results": [
@@ -428,6 +453,28 @@ class ReleaseTests(unittest.TestCase):
         ])
         return active
 
+    def set_provider_url_documents_baseline(self, *, capable=True, same_artifact=True, api_status=False):
+        active = self.set_api_status_baseline(same_artifact=same_artifact)
+        self.manifest["migrations"].append({})
+        for position, name, digest in cloudflare.PROVIDER_URL_DOCUMENTS_MIGRATIONS:
+            self.manifest["migrations"][position - 1] = {"name": name, "sha256": digest}
+        revision = active["bindings"][2]["text"]
+        digest = sha256(NEW_MODULE if same_artifact else OLD_MODULE).hexdigest()
+        tag = cloudflare._release_tag(revision, sha256(INLINE_CONFIG.encode()).hexdigest(), None, None, PROVIDER_BINDING)
+        if api_status:
+            active["bindings"].extend([
+                {"type": "service", "name": "PROVIDER_API_STATUS", "service": cloudflare.PROVIDER_API_STATUS_SERVICE,
+                 "entrypoint": cloudflare.PROVIDER_API_STATUS_ENTRYPOINT},
+                {"type": "plain_text", "name": "PROVIDER_API_STATUS_REVISION", "text": API_STATUS_PIN.revision},
+                {"type": "plain_text", "name": "PROVIDER_API_STATUS_IMAGE_SHA256", "text": API_STATUS_PIN.image_sha256},
+                {"type": "plain_text", "name": "PROVIDER_API_STATUS_IDENTITY_SHA256", "text": API_STATUS_PIN.identity_sha256},
+                {"type": "plain_text", "name": cloudflare.API_STATUS_BINDING, "text": "1"},
+            ])
+            tag = cloudflare._api_status_tag(tag, API_STATUS_PIN, True)
+        active["annotations"]["workers/tag"] = cloudflare._telegram_feature_tag(tag, True, True, True,
+            provider_batch=True, batch_module_sha256=digest, url_documents_module_sha256=digest if capable else None)
+        return active
+
     def test_read_only_preflight_rejects_wrong_resource_or_domain(self):
         self.assertEqual(cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET),
                          {"deploymentId": OLD_DEPLOYMENT, "versionId": OLD_VERSION, "revision": OLD_REVISION})
@@ -449,7 +496,7 @@ class ReleaseTests(unittest.TestCase):
             "revision": NEW_REVISION, "versionId": NEW_VERSION, "deploymentId": NEW_DEPLOYMENT,
             "previousVersionId": OLD_VERSION, "changed": True, "inlineSearchEnabled": False,
             "providerUrlImportEnabled": False, "providerRefreshEnabled": False, "legacySubscriptionShortsEnabled": False,
-            "providerBatchEnabled": False, "apiStatusEnabled": False,
+            "providerBatchEnabled": False, "apiStatusEnabled": False, "providerUrlDocumentsEnabled": False,
         })
         self.assertFalse(self.release()["changed"])
         self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
@@ -689,6 +736,77 @@ class ReleaseTests(unittest.TestCase):
                     "SUBS_BOT_PROVIDER_URL_IMPORT_MODE": mode, "SUBS_BOT_PROVIDER_URL_IMPORT_CONFIRMATION": confirmation}, clear=True), \
                  self.assertRaisesRegex(cloudflare.CloudflareError, "mode or confirmation"):
                 release_entry.provider_url_import_release_mode()
+
+    def test_provider_url_document_release_adds_only_the_admission_flag_and_preserves_v2(self):
+        off = self.set_provider_url_documents_baseline(api_status=True)
+        api_gate = Mock(binding=API_STATUS_PIN)
+        options = {"provider_binding": PROVIDER_BINDING, "provider_guard": Mock(), "api_status_gate": lambda: api_gate}
+        default = self.release(INLINE_CONFIG, **options)
+        self.assertFalse(default["providerUrlDocumentsEnabled"])
+        self.assertFalse(default["changed"])
+        enabled = self.release(INLINE_CONFIG, provider_url_documents=True, **options)
+        self.assertTrue(enabled["providerUrlDocumentsEnabled"])
+        for key in ("inlineSearchEnabled", "providerUrlImportEnabled", "providerRefreshEnabled",
+                    "providerBatchEnabled", "apiStatusEnabled"):
+            self.assertTrue(enabled[key])
+        on = self.api.versions[NEW_VERSION]
+        flag = {"type": "plain_text", "name": cloudflare.PROVIDER_URL_DOCUMENTS_BINDING, "text": "1"}
+        self.assertEqual({row["name"]: row for row in on["bindings"]},
+                         {row["name"]: row for row in [*off["bindings"], flag]})
+        self.assertEqual(on["annotations"]["workers/message"], off["annotations"]["workers/message"])
+        self.assertTrue(on["annotations"]["workers/tag"].startswith(cloudflare.PROVIDER_BATCH_TAG_PREFIX))
+        on["bindings"].remove(flag)
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "release tag differs"):
+            cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET)
+        on["bindings"].append(flag)
+        self.assertFalse(self.release(INLINE_CONFIG, **options)["changed"])
+        disabled = self.release(INLINE_CONFIG, provider_url_documents=False, **options)
+        self.assertFalse(disabled["providerUrlDocumentsEnabled"])
+        self.assertTrue(disabled["apiStatusEnabled"])
+        self.assertEqual(disabled["versionId"], OLD_VERSION)
+        self.assertEqual(self.api.provider_documents_drain_reads, 0)
+        api_gate.verify_first_binding.assert_not_called()
+
+    def test_provider_url_document_enable_checks_exact_off_artifact_and_schema_before_writes(self):
+        options = {"release_manifest": self.manifest, "release_revision": NEW_REVISION,
+                   "telegram_config": INLINE_CONFIG, "provider_binding": PROVIDER_BINDING,
+                   "provider_url_documents": True}
+        preflight = lambda: cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET,
+            **{**options, "release_manifest": self.manifest})
+        for state in ({"same_artifact": False}, {"capable": False}):
+            with self.subTest(state=state), self.assertRaisesRegex(cloudflare.CloudflareError, "same Worker artifact"):
+                self.set_provider_url_documents_baseline(**state)
+                preflight()
+        self.set_provider_url_documents_baseline()
+        self.manifest["migrations"][32]["sha256"] = "0" * 64
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "exact 0021, 0023, 0033 and 0035"):
+            preflight()
+        self.set_provider_url_documents_baseline()
+        for drift in ("provider_documents_ledger_drift", "provider_documents_schema_drift"):
+            setattr(self.api, drift, True)
+            with self.subTest(drift=drift), self.assertRaisesRegex(cloudflare.CloudflareError, "schema or ledger"):
+                preflight()
+            setattr(self.api, drift, False)
+        self.assertEqual(preflight()["versionId"], OLD_VERSION)
+        self.assertEqual(self.api.writes(), [])
+
+    def test_provider_url_document_rollback_refuses_an_unproven_runtime_while_work_exists(self):
+        self.set_provider_url_documents_baseline(capable=False, same_artifact=False)
+        self.api.provider_documents_live_reads = {3, 4}
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "safe rollback could not be confirmed"):
+            self.release(INLINE_CONFIG, provider_binding=PROVIDER_BINDING, provider_guard=Mock())
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
+        self.assertEqual(self.api.active["versions"][0]["version_id"], NEW_VERSION)
+
+    def test_provider_url_document_operator_mode_defaults_to_preserve_and_requires_confirmation(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(release_entry.provider_url_documents_release_mode())
+        for mode, enabled in (("enable", True), ("disable", False)):
+            with patch.dict(os.environ, {"SUBS_BOT_PROVIDER_URL_DOCUMENTS_MODE": mode}, clear=True):
+                with self.assertRaisesRegex(cloudflare.CloudflareError, "mode or confirmation"):
+                    release_entry.provider_url_documents_release_mode()
+                os.environ["SUBS_BOT_PROVIDER_URL_DOCUMENTS_CONFIRMATION"] = f"{mode} provider URL documents for {cloudflare.WORKER_NAME}"
+                self.assertIs(release_entry.provider_url_documents_release_mode(), enabled)
 
     def test_refresh_toggle_preserves_provider_and_other_flags(self):
         off = self.set_provider_refresh_baseline(url=True, inline=True)

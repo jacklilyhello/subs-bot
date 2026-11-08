@@ -1,5 +1,5 @@
 import {
-  prepareOwnedProviderRefresh, prepareProviderUrlImport, providerHost, TELEGRAM_PROVIDER_MARKER, type ProviderSql,
+  prepareOwnedProviderRefresh, prepareProviderUrlImport, providerHost, TELEGRAM_PROVIDER_MARKER, type ProviderSql, type ProviderTelegramPolicy,
 } from "../provider-jobs.ts";
 import { digestHex, validInteger } from "../storage.ts";
 import { normalizeSubscriptionName } from "../subscriptions.ts";
@@ -45,7 +45,7 @@ function cleanName(value: string | undefined): string | null {
 
 /** Stage only an already decoded, private event. The consumer performs the fetch. */
 export async function acceptTelegramProviderRequest(
-  db: D1Database, policy: TelegramPolicy, event: TelegramProviderEvent,
+  db: D1Database, policy: TelegramPolicy & ProviderTelegramPolicy, event: TelegramProviderEvent,
   includeBatch = false,
 ): Promise<TelegramProviderAdmission> {
   if (!inTelegramScope(policy, event) || event.chatType !== "private" || event.threadId !== null || event.chatId !== event.actorId ||

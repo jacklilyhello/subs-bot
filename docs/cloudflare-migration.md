@@ -260,6 +260,10 @@ Cron 完成后用同一 `cohort` 运行 `action=capture`，留空确认字段。
 
 两名获准测试者分别在内置浏览器中通过隔离 Bot 私聊提交单条 HTTP(S) 订阅链接，可使用 `名称 | URL` 指定名称。群组、未获准的账号和多行消息均不会创建远程导入任务。发布参数默认为 `preserve`。停止接收新链接时使用 `provider_url_import=disable` 及 `provider_url_import_confirmation=disable provider URL import for subs-bot-cf-dev-01`。关闭后 Cron 继续处理已接受的任务和回执。启用校验失败时，已有回滚守卫可恢复使用同一应用产物的关闭版本。 [Worker 回滚](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/)
 
+独立的 URL 文件入口接受指定账号在私聊上传 UTF-8 TXT 或 LOG，每行一条 HTTP(S) URL。保留文件顺序和前 20 个不同链接，超限数会出现在私聊汇总里。无效 URL 文件或包含超过 4,096 个不同链接的文件会明确失败。混合文档仍走原有节点文件入口。接收时记录授权版本及入口状态。读取文件后先在同一 D1 事务内确认归属、保存新订阅及文件计划，再逐条把刷新工作交给现有提供方队列。原始 URL 只保存在私有订阅表，文件计划只保存归属、版本和摘要。队列满时延后，截止后报告超时。撤权或目标版本变化会阻止后续抓取或发布，已有有效快照由正常刷新规则保留。
+
+隔离环境先从 `main` 以关闭状态部署已校验产物，再用同一产物运行 `worker-isolation-deploy.yml`，指定 `provider_url_documents=enable` 及 `provider_url_documents_confirmation=enable provider URL documents for subs-bot-cf-dev-01`。关闭时使用 `disable` 和同样以 `disable` 开头的确认值。关闭入口后，已有接收回执、刷新租约和私聊汇总仍由同一兼容版本处理。若需回滚至不认识 `0035` 文件队列的旧版本，先关闭入口，核对无带 opt-in 的未完成文档、无未完成的文件计划和关联刷新任务，并等应送达的私聊汇总终结。带有 URL 或凭据的附件不得用作公开测试产物。
+
 #### 隔离私聊远程订阅刷新
 
 先保留默认参数发布当前 `main` 的已核对产物，使已绑定提供方的隔离 Worker 在刷新关闭时运行包含刷新队列恢复的版本。D1 必须已应用确切的 `0018`、`0021`、`0023` 和 `0028` 迁移。使用同一产物，在受保护的 `worker-isolation-deploy.yml` 指定 `provider_refresh=enable` 和 `provider_refresh_confirmation=enable provider refresh for subs-bot-cf-dev-01`。通过发布结果 `providerRefreshEnabled` 和活动版本的 `TELEGRAM_PROVIDER_REFRESH=1` 绑定核对。

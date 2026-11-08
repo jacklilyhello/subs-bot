@@ -712,6 +712,38 @@ class SnapshotTests(unittest.TestCase):
         self.db.execute("UPDATE telegram_outbox SET state='sent',attempts=1,sent_message_id=4 WHERE receipt_id=2")
         self.assertEqual(quiet(70), (1,))
 
+    def test_quiet_blocks_provider_document_work_until_summary_settles_or_expires(self):
+        self.db.executescript("""INSERT INTO telegram_inbox
+            (receipt_id,bot_id,update_id,actor_id,chat_id,chat_type,message_id,message_date,command,receipt_nonce)
+            VALUES (1,'881000',1,'881001','881001','private',1,1,'help','document-job:v1'),
+                   (2,'881000',2,'881001','881001','private',2,2,'help','provider-document:v1');
+            INSERT INTO telegram_document_jobs
+                (receipt_id,bot_id,actor_id,auth_message_date,auth_message_id,state,due_at,expires_at,file_id,name,suffix)
+                VALUES (1,'881000','881001',0,0,'pending',1,60,'synthetic','fixture','txt');
+            INSERT INTO telegram_provider_document_opt_in VALUES (1);""")
+
+        def quiet(epoch, tables=self.source.tables):
+            return self.db.execute("SELECT " + native.quiet_expression(tables, epoch)).fetchone()
+
+        self.assertEqual(quiet(10), (0,))
+        self.db.execute("""UPDATE telegram_document_jobs SET state='done',result_code='expired',finished_at=60,
+                        file_id=NULL,name=NULL,suffix=NULL WHERE receipt_id=1""")
+        self.assertEqual(quiet(60), (1,))
+        self.db.execute("""INSERT INTO telegram_provider_documents
+            (receipt_id,bot_id,actor_id,actor_role,auth_message_date,auth_message_id,expires_at,line_count)
+            VALUES (2,'881000','881001','admin',0,0,70,1)""")
+        older = set(self.source.tables) - {"telegram_provider_document_opt_in", "telegram_provider_documents",
+                                         "telegram_provider_document_lines"}
+        self.assertEqual(quiet(70, older), (1,))
+        self.assertEqual(quiet(1000), (0,))
+        self.db.execute("UPDATE telegram_provider_documents SET finished_at=70 WHERE receipt_id=2")
+        self.assertEqual(quiet(969), (0,))
+        self.assertEqual(quiet(970), (1,))
+        self.db.execute("INSERT INTO telegram_outbox (receipt_id) VALUES (2)")
+        self.assertEqual(quiet(970), (0,))
+        self.db.execute("UPDATE telegram_outbox SET state='sent',attempts=1,sent_message_id=3 WHERE receipt_id=2")
+        self.assertEqual(quiet(70), (1,))
+
     def test_full_schema_large_temp_text_and_r2_closure_roundtrip(self):
         self.snapshot()
         self.db.execute("INSERT INTO subscription_lifecycle VALUES (2,1)")
