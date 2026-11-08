@@ -369,10 +369,13 @@ class APIStatusTests(unittest.TestCase):
         shell = {**stage.bootstrap._settings(API_PROFILE), "id": IDENTITY.worker_id, "created_on": IDENTITY.created_on,
                  "updated_on": IDENTITY.created_on, "deployed_on": None,
                  "references": {key: [] for key in stage.bootstrap.REFERENCE_FIELDS}}
-        with patch.object(api.worker, "by_id", return_value=shell), patch.object(api, "_read", side_effect=[
-                {"result": shell}, deployments, empty]) as read:
+        with patch.object(api.worker, "_request", side_effect=[{"result": shell}, {"result": shell}]) as shell_read,                 patch.object(api, "_read", side_effect=[deployments, empty]) as read:
             self.assertIsNone(api.baseline())
-        self.assertEqual(read.call_args_list, [call(f"/workers/workers/{API_SERVICE}"),
+        self.assertEqual(shell_read.call_args_list, [
+            call(f"{api.worker._workers}/{API_SERVICE}", absent=False),
+            call(f"{api.worker._workers}/{IDENTITY.worker_id}"),
+        ])
+        self.assertEqual(read.call_args_list, [
             call(f"/workers/scripts/{API_SERVICE}/deployments?page=1&per_page=1"),
             call(f"/workers/workers/{IDENTITY.worker_id}/versions?page=1&per_page=2", stage.MAX_VERSION_RESPONSE)])
         metadata = stage._metadata(API_EVIDENCE, API_IMAGE)
