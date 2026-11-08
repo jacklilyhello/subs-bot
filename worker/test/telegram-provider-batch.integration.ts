@@ -73,9 +73,10 @@ test("emitted Worker confirms a private frozen batch and drains it after intake 
   const runtime = new Miniflare({ workers: [
     { ...common, name: "app", modules: true, script, bindings: { ...bindings, TELEGRAM_PROVIDER_BATCH_REFRESH: "1" } },
     { ...common, name: "drain", modules: true, script, bindings },
-    ...(["jobs", "interactions"] as const).map((table) => ({
-      ...common, name: `fault-${table}`, modules: faultModules,
-      bindings: { ...bindings, TELEGRAM_PROVIDER_BATCH_REFRESH: "1", READINESS_FAULT: `telegram_provider_batch_${table}` },
+    ...([["jobs", "telegram_provider_batch_jobs"], ["interactions", "telegram_provider_batch_interactions"],
+      ["journal", "provider_snapshot_attempts"]] as const).map(([name, table]) => ({
+      ...common, name: `fault-${name}`, modules: faultModules,
+      bindings: { ...bindings, TELEGRAM_PROVIDER_BATCH_REFRESH: "1", READINESS_FAULT: table },
     })),
     { name: "provider", modules: true, compatibilityDate: manifest.compatibilityDate, d1Databases: common.d1Databases,
       script: `import { WorkerEntrypoint } from 'cloudflare:workers';
@@ -99,17 +100,19 @@ test("emitted Worker confirms a private frozen batch and drains it after intake 
   const drainOnly = await runtime.getWorker("drain");
   const queueFault = await runtime.getWorker("fault-jobs");
   const controlsFault = await runtime.getWorker("fault-interactions");
+  const journalFault = await runtime.getWorker("fault-journal");
   const db = await runtime.getD1Database("DB", "app");
   const bucket = await runtime.getR2Bucket("NODES", "app");
   const migrations = manifest.migrations as { name: string; sha256: string }[];
   const controls = migrations.find(({ name }) => name === "0032_telegram_provider_batch_controls.sql");
-  assert.ok(controls);
+  const journal = migrations.find(({ name }) => name === "0033_provider_snapshot_journal.sql");
+  assert.ok(controls && journal);
   async function apply(migration: (typeof migrations)[number]) {
     const sql = await readFile(join(directory!, migration.name), "utf8");
     assert.equal(digest(sql), migration.sha256);
     await db.batch(sql.trim().split(/;\s*/u).filter(Boolean).map((statement) => db.prepare(statement)));
   }
-  for (const migration of migrations) if (migration !== controls) await apply(migration);
+  for (const migration of migrations) if (migration !== controls && migration !== journal) await apply(migration);
   await db.batch([db.prepare("CREATE TABLE provider_batch_fixture (calls INTEGER NOT NULL)"),
     db.prepare("INSERT INTO provider_batch_fixture VALUES (0)")]);
   const ownerId = policy.memberId;
@@ -154,6 +157,9 @@ test("emitted Worker confirms a private frozen batch and drains it after intake 
 
   assert.equal((await message(1, "/updateall")).status, 204);
   await apply(controls);
+  assert.equal((await message(45, "/updateall")).status, 204);
+  assert.equal(await receipt(45), null, "missing journal prevents new batch admission");
+  await apply(journal);
   assert.equal((await message(2, "/updateall", drainOnly)).status, 204);
   assert.equal((await message(3, "/updateall status", drainOnly)).status, 204);
   assert.equal((await message(4, "/updateall", app, ownerId, policy.groupId)).status, 204);
@@ -198,7 +204,10 @@ test("emitted Worker confirms a private frozen batch and drains it after intake 
   assert.equal((await click(accepted, preview.id, ticket)).status, 200);
   const jobs = await db.prepare("SELECT subscription_id,state FROM telegram_provider_batch_jobs ORDER BY ordinal").all();
   assert.deepEqual(jobs.results, [{ subscription_id: good.id, state: "waiting" }, { subscription_id: failed.id, state: "waiting" }]);
-  assert.equal((await message(13, "/updateall status", drainOnly)).status, 200);
+  await cron(journalFault);
+  assert.equal(await calls(), 0);
+  assert.equal(await db.prepare("SELECT count(*) AS waiting FROM telegram_provider_batch_jobs WHERE state='waiting'").first("waiting"), 2);
+  assert.equal((await message(13, "/updateall status", journalFault)).status, 200);
   assert.match((await reply(13)).text, /进度：0\/2/u);
   await cron(queueFault);
   assert.equal(await calls(), 0);

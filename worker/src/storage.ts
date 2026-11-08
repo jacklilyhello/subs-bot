@@ -50,7 +50,14 @@ export interface StagedNodeSnapshot {
   readonly snapshotId: string;
   readonly manifestSha256: string;
   readonly nodeCount: number;
+  readonly objectCount: number;
   readonly [stagedObjectKeys]: string[];
+}
+
+export interface SnapshotObjectIntent {
+  readonly ordinal: number;
+  readonly bytes: number;
+  readonly sha256: string;
 }
 
 interface ChunkDescriptor {
@@ -68,6 +75,7 @@ export const MAX_CHUNK_BYTES = 512 * 1024;
 export const MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024;
 export const MAX_SNAPSHOT_NODES = 100_000;
 export const MAX_SNAPSHOT_CHUNKS = 256;
+export const SNAPSHOT_MANIFEST_ORDINAL = MAX_SNAPSHOT_CHUNKS;
 const CHUNK_READ_AHEAD = 4;
 const MAX_MANIFEST_BYTES = 64 * 1024;
 const MAX_OWNER_ID = 9223372036854775807n;
@@ -167,13 +175,17 @@ async function putImmutable(
   bucket: R2Bucket,
   key: string,
   bytes: Uint8Array<ArrayBuffer>,
+  ordinal: number,
+  beforePut?: (intent: SnapshotObjectIntent) => Promise<void>,
 ): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const sha256 = digestHex(digest);
+  if (beforePut) await beforePut({ ordinal, bytes: bytes.byteLength, sha256 });
   const created = await bucket.put(key, bytes, { onlyIf: { etagDoesNotMatch: "*" }, sha256: digest });
   if (!created) {
     throw new Error("Snapshot object could not be created.");
   }
-  return digestHex(digest);
+  return sha256;
 }
 
 async function discardUnpublished(bucket: R2Bucket, keys: string[]): Promise<void> {
@@ -194,6 +206,7 @@ export async function stageNodeSnapshot(
   id: number,
   nodes: Iterable<NodeRecord> | AsyncIterable<NodeRecord>,
   snapshotId = crypto.randomUUID(),
+  beforePut?: (intent: SnapshotObjectIntent) => Promise<void>,
 ): Promise<StagedNodeSnapshot> {
   if (!validInteger(id, 1)) {
     throw new RangeError("Invalid subscription ID.");
@@ -216,7 +229,7 @@ export async function stageNodeSnapshot(
     }
     const body = chunk.subarray(0, chunkBytes);
     const key = `${prefix}${manifest.chunks.length}.ndjson`;
-    const hash = await putImmutable(bucket, key, body);
+    const hash = await putImmutable(bucket, key, body, manifest.chunks.length, beforePut);
     uploaded.push(key);
     manifest.chunks.push({ bytes: chunkBytes, sha256: hash, count: chunkNodes });
     chunkBytes = 0;
@@ -256,11 +269,11 @@ export async function stageNodeSnapshot(
     await uploadChunk();
     const body = Uint8Array.from(encoder.encode(JSON.stringify(manifest)));
     const key = `${prefix}manifest.json`;
-    const manifestSha256 = await putImmutable(bucket, key, body);
+    const manifestSha256 = await putImmutable(bucket, key, body, SNAPSHOT_MANIFEST_ORDINAL, beforePut);
     uploaded.push(key);
-    return Object.freeze({ id, snapshotId, manifestSha256, nodeCount, [stagedObjectKeys]: uploaded });
+    return Object.freeze({ id, snapshotId, manifestSha256, nodeCount, objectCount: uploaded.length, [stagedObjectKeys]: uploaded });
   } catch (error) {
-    await discardUnpublished(bucket, uploaded);
+    if (!beforePut) await discardUnpublished(bucket, uploaded);
     throw error;
   }
 }

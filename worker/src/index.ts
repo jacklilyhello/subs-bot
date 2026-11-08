@@ -11,6 +11,7 @@ import { TextExportError } from "./text-export.ts";
 import { planTextExport, textExportChunks } from "./text-export-response.ts";
 import { PROVIDER_REVISION, PROVIDER_SHA256, type ProviderFetcher, type ProviderPin } from "./provider-fetch-contract.ts";
 import { runOneProviderJob } from "./provider-job-consumer.ts";
+import { providerSnapshotJournalReady } from "./provider-snapshot-journal.ts";
 import { acceptTelegramAggregate, parseTelegramAggregateKey } from "./telegram/aggregate-actions.ts";
 import { acceptTelegramSelected, reapTelegramSelected } from "./telegram/selected-export.ts";
 import { answerTelegramCallback, drainTelegramReplies, sendTelegramInlineAnswer } from "./telegram/delivery.ts";
@@ -163,10 +164,11 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
     const subscriptionRawFile = subscriptionRead && await telegramSubscriptionRawFileReady(env.DB).catch(() => "unavailable" as const);
     const providerQueueReady = await telegramProviderQueueReady(env);
     const providerBatch = await providerBatchReadiness(env);
+    const providerIntakeReady = providerQueueReady && await providerSnapshotJournalReady(env.DB);
     const inlineConsent = inlineSearchEnabled && await telegramInlineSearchReady(env.DB);
     const bulkTrash = await telegramBulkTrashReady(env.DB);
     const githubSearch = telegramGitHubSearchProbe(env.DB);
-    const providerRefresh = env.TELEGRAM_PROVIDER_REFRESH === "1" && providerQueueReady && subscriptionRead
+    const providerRefresh = env.TELEGRAM_PROVIDER_REFRESH === "1" && providerIntakeReady && subscriptionRead
       && await telegramProviderRefreshReady(env.DB).catch(() => false);
     const drainReplies = async () => drainTelegramReplies(env.DB, env.NODES, policy, 4, 20_000, fetch, aggregateKey, privateShare,
       subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerQueueReady, bulkTrash, inlineConsent,
@@ -200,7 +202,7 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
       const candidate = env.TELEGRAM_PROVIDER_URL_IMPORT === "1" && providerQueueReady && decoded.temp.kind === "temp-text"
         ? parseTelegramProviderText(decoded.temp.text) : null;
       if (candidate) {
-        if (providerBatch.queue === "unavailable") return new Response(null, { status: 503, headers: HEADERS });
+        if (!providerIntakeReady || providerBatch.queue === "unavailable") return new Response(null, { status: 503, headers: HEADERS });
         const outcome = await acceptTelegramProviderRequest(env.DB, policy, { ...decoded.temp, ...candidate, kind: "url-import" }, providerBatch.queue);
         if (outcome.kind !== "queued" && outcome.kind !== "ignored") {
           await reconcileTelegramProviderReplies(env.DB, policy);
@@ -280,7 +282,7 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
       if (providerBatch.controls === "unavailable") return new Response(null, { status: 503, headers: HEADERS });
       if (!providerBatch.controls) return new Response(null, { status: 204, headers: HEADERS });
       const event = decoded.providerBatch;
-      const admission = providerQueueReady && env.TELEGRAM_PROVIDER_BATCH_REFRESH === "1";
+      const admission = providerIntakeReady && env.TELEGRAM_PROVIDER_BATCH_REFRESH === "1";
       if (!admission && event.kind !== "status") return new Response(null, { status: 204, headers: HEADERS });
       const outcome = await acceptTelegramProviderBatchControl(env.DB, policy, event, admission);
       if (!admission && outcome === "ignored") return new Response(null, { status: 204, headers: HEADERS });
@@ -394,12 +396,13 @@ async function recoverTelegramWork(env: Env, policy: TelegramPolicy, pin: Provid
   const subscriptionNodes = subscriptionRead && await telegramSubscriptionNodePagesReady(env.DB);
   const subscriptionRawFile = subscriptionRead && await telegramSubscriptionRawFileReady(env.DB).catch(() => "unavailable" as const);
   const providerBatch = await providerBatchReadiness(env);
+  const providerIntakeReady = providerQueueReady && await providerSnapshotJournalReady(env.DB);
   const inlineSearchSchema = await telegramInlineSearchReady(env.DB);
   const inlineConsent = inlineSearchSchema && env.TELEGRAM_INLINE_SEARCH === "1";
   const bulkTrash = await telegramBulkTrashReady(env.DB);
   const githubSearch = telegramGitHubSearchProbe(env.DB);
   const providerRefreshSchema = await telegramProviderRefreshReady(env.DB).catch(() => false);
-  const providerRefresh = env.TELEGRAM_PROVIDER_REFRESH === "1" && providerQueueReady && subscriptionRead && providerRefreshSchema;
+  const providerRefresh = env.TELEGRAM_PROVIDER_REFRESH === "1" && providerIntakeReady && subscriptionRead && providerRefreshSchema;
   const drain = async (limit: number, budget: number) =>
     drainTelegramReplies(env.DB, env.NODES, policy, limit, budget, fetch, aggregateKey, privateShare,
       subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerQueueReady, bulkTrash, inlineConsent,
@@ -439,7 +442,7 @@ async function recoverTelegramWork(env: Env, policy: TelegramPolicy, pin: Provid
   };
   const providers = async () => {
     try {
-      if (providerQueueReady && providerBatch.queue !== "unavailable") {
+      if (providerIntakeReady && providerBatch.queue !== "unavailable") {
         if (providerBatch.queue) await reconcileTelegramProviderBatches(env.DB, policy);
         await runOneProviderJob(env.DB, env.NODES, env.PROVIDER_FETCH, pin, policy, providerBatch.queue);
       }

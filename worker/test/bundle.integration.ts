@@ -274,6 +274,9 @@ test("emitted Worker serves only marked active legacy empty subscriptions", { ti
   await unavailable();
   assert.equal(await restoreOwnedSubscription(db, { ...target, expectedLifecycleRevision: 1 }), true);
 
+  const journal = fixture.migrations.find(({ name }: { name: string }) => name === "0033_provider_snapshot_journal.sql");
+  assert.ok(journal);
+  await applyMigrations(db, directory, [journal]);
   const stored = "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.10:8388#legacy-refresh";
   const refresh = async (key: string, text: string) => {
     const admission = await enqueueOwnedProviderRefresh(db, { id: legacy.id, ownerId, requestKey: key.repeat(64) });
