@@ -202,6 +202,71 @@ class CapacityTests(unittest.TestCase):
     def ledger(self):
         return capacity.load_ledger(self.directory, self.resources.scope_hash)
 
+    def retire_d1_only(self):
+        self.seed()
+        ledger = self.ledger()
+        ledger["phase"] = "cleanup"
+        capacity.save_ledger(self.directory, ledger)
+        for entry in ledger["fixtures"]:
+            self.resources.retire(ledger, entry, self.resources.row(ledger, entry))
+        self.cloud.writes.clear()
+        return ledger
+
+    def test_recovery_verifies_and_retires_only_exact_ledger_objects(self):
+        self.retire_d1_only()
+        self.cloud.objects.pop(next(iter(self.cloud.objects)))
+        unrelated = "subscriptions/1/11111111-1111-4111-8111-111111111111/0.ndjson"
+        self.cloud.objects[unrelated] = b"unrelated fixture"
+        report = capacity.recover_retired(self.directory, self.resources)
+        self.assertEqual(report, {"sourceRunId": RUN, "sourceRevision": REVISION, "mode": "verify",
+                                  "alreadyAbsent": 1, "verifiedPresent": 4, "retiredAndVerified": 0})
+        self.assertEqual(self.cloud.writes, [])
+
+        report = capacity.recover_retired(self.directory, self.resources, retire=True)
+        self.assertEqual(report["retiredAndVerified"], 4)
+        self.assertEqual(self.cloud.objects, {unrelated: b"unrelated fixture"})
+        self.assertEqual(self.cloud.writes, ["DELETE"] * 4)
+        self.assertEqual(capacity.recover_retired(self.directory, self.resources)["alreadyAbsent"], 5)
+        self.assertEqual(self.cloud.writes, ["DELETE"] * 4)
+        self.assertEqual(self.ledger()["phase"], "cleanup")
+
+    def test_recovery_refuses_d1_references_or_unconfirmed_writes_before_reading_r2(self):
+        self.seed()
+        ledger = self.ledger()
+        ledger["phase"] = "cleanup"
+        capacity.save_ledger(self.directory, ledger)
+        with patch.object(self.cloud, "request") as r2:
+            with self.assertRaisesRegex(capacity.CapacityError, "D1 reference"):
+                capacity.recover_retired(self.directory, self.resources, retire=True)
+            ledger["fixtures"][0]["putPending"] = [0]
+            capacity.save_ledger(self.directory, ledger)
+            with self.assertRaisesRegex(capacity.CapacityError, "fully published checkpoint"):
+                capacity.recover_retired(self.directory, self.resources, retire=True)
+            r2.assert_not_called()
+
+    def test_recovery_rechecks_a_short_read_but_holds_an_exact_length_mismatch(self):
+        ledger = self.retire_d1_only()
+        first = capacity.object_key(ledger["fixtures"][0], 0)
+        body = self.cloud.objects[first]
+        read = self.cloud.request
+        short = True
+
+        def short_once(method, key, data=None):
+            nonlocal short
+            if short and method == "GET" and key == first:
+                short = False
+                return body[:-1]
+            return read(method, key, data)
+
+        with patch.object(self.cloud, "request", side_effect=short_once):
+            self.assertEqual(capacity.recover_retired(self.directory, self.resources)["verifiedPresent"], 5)
+        self.wait.assert_called_once_with(1)
+        self.cloud.objects[first] = b"x" * len(body)
+        with self.assertRaisesRegex(capacity.CapacityError, "nonmatching R2 object"):
+            capacity.recover_retired(self.directory, self.resources, retire=True)
+        self.assertEqual(self.cloud.writes, [])
+        self.assertEqual(self.cloud.objects[first], b"x" * len(body))
+
     def test_seed_then_retire_exact_owned_resources(self):
         self.seed()
         self.assertEqual([row["generation"] for row in self.cloud.capacity_rows()], [1, 1, 1])
