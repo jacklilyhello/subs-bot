@@ -272,6 +272,8 @@ Cron 完成后用同一 `cohort` 运行 `action=capture`，留空确认字段。
 
 上传结果未确认时，在产物过期前私下保留原运行的恢复清单。仅使用原清单和对应的隔离资源继续核对清理。待确认对象仍读不到时保留记录，直到核实其内容并确认删除。重新运行容量检查会使用新的合成数据。
 
+使用 `profile=legacy-capacity` 可把同一项实时容量检查连接到旧库转换。托管 runner 将合成节点写入恰好 83,600,000 字节的 SQLite `nodes_json` TEXT，使用原转换器生成并核对完整包，再通过现有隔离发布流程暂存转换得到的 64 MiB NDJSON 分块和清单。转换保留合成能力码，隔离发布重新分配 D1 行 ID 和 R2 前缀。运行仍核对 GET、HEAD、并发、慢读、取消和精确清理。日志只记录计数和摘要，旧 SQLite、转换包和能力码不上传。此流程只接受固定合成数据。真实旧库的记录大小和迁移适用性需另外核对已获准的封存备份。
+
 运行 `gh workflow run worker-isolation-capacity.yml --ref main -f profile=structured-smoke` 可单独检查混合 Base64 导出。该模式在同一个隔离环境暂存两份小快照，用旧版 Python 序列化器的结果校验混合导出的长度和摘要，并检查不支持的结构化节点返回固定的 422 响应。两份快照都检查 GET 和 HEAD，前后各检查一次运行版本。该模式的恢复清单对应 `capacity_resources.py cleanup` 的 `--profile structured-smoke` 参数。
 
 同一工作流的 `profile=singbox-smoke` 针对 `/sing-box` 检查两份专用快照。成功响应必须声明精确字节数，规范化 JSON 摘要与 Python 对照一致。包含外部出站依赖的快照须返回固定的 422。该模式使用同名清理参数。
