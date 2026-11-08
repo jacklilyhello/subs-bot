@@ -60,6 +60,16 @@ on:
         description: Exact isolation confirmation for provider batch enable or disable
         required: false
         type: string
+      api_status:
+        description: Preserve, enable, or disable private Telegram API status admission
+        required: true
+        default: preserve
+        type: choice
+        options: [preserve, enable, disable]
+      api_status_confirmation:
+        description: Exact isolation confirmation for API status enable or disable
+        required: false
+        type: string
 
 permissions:
   actions: read
@@ -70,8 +80,63 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  inspect-api-status:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && inputs.api_status == 'preserve' && inputs.api_status_confirmation == ''
+    environment: subs-bot-isolation
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      required: ${{ steps.inspect.outputs.required }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Read the active API status flag
+        id: inspect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPLOY_TOKEN }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 -B worker/tools/attest_api_status_container.py inspect
+
+  attest-api-status:
+    needs: inspect-api-status
+    if: >-
+      ${{ !cancelled() && github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' &&
+          ((inputs.api_status == 'enable' && inputs.api_status_confirmation == 'enable API status for subs-bot-cf-dev-01') ||
+           needs.inspect-api-status.outputs.required == 'true') }}
+    environment: subs-bot-provider-api-status-isolation
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      attestation: ${{ steps.attest.outputs.attestation }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Attest the exact private V2 Container settings
+        id: attest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CF_PROVIDER_ACCOUNT_ID: ${{ vars.SUBS_BOT_CF_PROVIDER_ACCOUNT_ID }}
+          SUBS_BOT_CF_PROVIDER_API_STATUS_ACTIVATION_JSON: ${{ secrets.SUBS_BOT_CF_PROVIDER_API_STATUS_ACTIVATION_JSON }}
+          SUBS_BOT_CF_PROVIDER_API_STATUS_CONTAINER_IDENTITY_JSON: ${{ secrets.SUBS_BOT_CF_PROVIDER_API_STATUS_CONTAINER_IDENTITY_JSON }}
+          SUBS_BOT_CF_PROVIDER_API_STATUS_CONTAINER_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_API_STATUS_CONTAINER_TOKEN }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 -B worker/tools/attest_api_status_container.py attest
+
   deploy:
-    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
+    needs: [inspect-api-status, attest-api-status]
+    if: ${{ !cancelled() && github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' }}
     environment: subs-bot-isolation
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -100,6 +165,9 @@ jobs:
           SUBS_BOT_LEGACY_SUBSCRIPTION_SHORTS_CONFIRMATION: ${{ inputs.legacy_subscription_shorts_confirmation }}
           SUBS_BOT_PROVIDER_BATCH_MODE: ${{ inputs.provider_batch }}
           SUBS_BOT_PROVIDER_BATCH_CONFIRMATION: ${{ inputs.provider_batch_confirmation }}
+          SUBS_BOT_API_STATUS_MODE: ${{ inputs.api_status }}
+          SUBS_BOT_API_STATUS_CONFIRMATION: ${{ inputs.api_status_confirmation }}
+          SUBS_BOT_API_STATUS_CONTAINER_ATTESTATION: ${{ needs.attest-api-status.outputs.attestation }}
           SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
           SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
           SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPLOY_TOKEN }}
@@ -107,4 +175,5 @@ jobs:
           SUBS_BOT_TELEGRAM_AGGREGATE_KEY: ${{ secrets.SUBS_BOT_TELEGRAM_AGGREGATE_KEY }}
           SUBS_BOT_TELEGRAM_PRIVATE_SHARE_CREATION_KEY: ${{ secrets.SUBS_BOT_TELEGRAM_PRIVATE_SHARE_CREATION_KEY }}
           SUBS_BOT_CF_PROVIDER_BINDING_JSON: ${{ secrets.SUBS_BOT_CF_PROVIDER_BINDING_JSON }}
+          SUBS_BOT_CF_PROVIDER_API_STATUS_BINDING_JSON: ${{ secrets.SUBS_BOT_CF_PROVIDER_API_STATUS_BINDING_JSON }}
         run: python3 -B worker/tools/release_isolation.py
