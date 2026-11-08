@@ -436,6 +436,7 @@ export async function drainTelegramReplies(
   subscriptionRawFileReadiness: boolean | "unavailable" = false,
   providerBatchReadiness: boolean | "unavailable" = false,
   apiStatusReadiness: boolean | "unavailable" = false,
+  apiStatusPromptsEnabled = false,
 ): Promise<void> {
   const deadline = Date.now() + budgetMs;
   const privateShareEnabled = privateShareRuntime.schemaReady && privateShareRuntime.context !== null;
@@ -457,7 +458,8 @@ export async function drainTelegramReplies(
     if (!inTelegramScope(policy, lease)) continue;
     if (lease.apiStatus) {
       const presentation = await renderTelegramApiStatus(db, policy, lease);
-      if (Date.now() >= deadline || !await beginTelegramApiStatusReply(db, policy, lease, presentation?.guard) || !presentation) continue;
+      const guard = presentation?.forceReply && !apiStatusPromptsEnabled ? undefined : presentation?.guard;
+      if (Date.now() >= deadline || !await beginTelegramApiStatusReply(db, policy, lease, guard) || !presentation) continue;
       const timeout = Math.max(1, deadline - Date.now());
       const outcome = presentation.forceReply
         ? await sendTelegramReply(policy, lease, presentation.text, timeout, request, undefined, true)

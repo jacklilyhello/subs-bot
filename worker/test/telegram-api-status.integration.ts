@@ -165,7 +165,7 @@ test("emitted Worker scopes private API prompts and recovers without replaying c
   await migrate(api);
   assert.equal((await send(2, "/ai", off)).status, 204);
   assert.equal((await send(3, "/ai", app, owner, policy.groupId)).status, 204);
-  assert.equal((await send(4, `/ai ${first}|${key}`)).status, 204);
+  assert.equal((await send(4, `/ai ${first} | ${key}`)).status, 204);
   assert.equal((await send(5, `${first} | ${key}`, off)).status, 204);
   assert.equal((await send(6, "/ai", fault)).status, 204);
   for (const id of [1, 2, 3, 4, 5, 6]) assert.equal(await receipt(id), null);
@@ -174,12 +174,12 @@ test("emitted Worker scopes private API prompts and recovers without replaying c
   await cron(fault);
   const outdated = await prompt(8);
   const open = await prompt(9);
-  assert.equal((await send(10, `${first}|${key}`, app, owner, owner, outdated)).status, 200);
-  assert.equal((await send(11, `${first}|${key}`, app, policy.adminId, policy.adminId,
+  assert.equal((await send(10, `${first} | ${key}`, app, owner, owner, outdated)).status, 200);
+  assert.equal((await send(11, `${first} | ${key}`, app, policy.adminId, policy.adminId,
     { ...open, chat_id: policy.adminId })).status, 200);
-  assert.equal((await send(12, `${first}|${key}`, app, owner, owner, { ...open, id: open.id + 1 })).status, 200);
+  assert.equal((await send(12, `${first} | ${key}`, app, owner, owner, { ...open, id: open.id + 1 })).status, 200);
   for (const id of [10, 11, 12]) assert.equal(await receipt(id), null);
-  const text = `${first}|${key}\r\n${second} ${key}`;
+  const text = `${first} | ${key}\r\n${second} ${key}`;
   assert.deepEqual((await Promise.all([send(13, text, app, owner, owner, open), send(14, text, app, owner, owner, open)]))
     .map(({ status }) => status), [200, 200]);
   const admitted = await Promise.all([receipt(13), receipt(14)]);
@@ -240,7 +240,11 @@ test("emitted Worker scopes private API prompts and recovers without replaying c
   assert.equal((await send(26, "/ai", noV2, admin)).status, 204);
   assert.equal(await receipt(26), null);
   const deadlinePrompt = await prompt(27, admin);
-  assert.equal((await send(28, `${first}|${key}`, shortLease, admin, admin, deadlinePrompt)).status, 200);
+  assert.equal((await send(30, text, off, admin, admin, deadlinePrompt)).status, 204);
+  assert.equal((await send(31, text, noV2, admin, admin, deadlinePrompt)).status, 204);
+  assert.equal(await receipt(30), null);
+  assert.equal(await receipt(31), null);
+  assert.equal((await send(28, `${first} | ${key}`, shortLease, admin, admin, deadlinePrompt)).status, 200);
   assert.equal((await reply(28)).text, "API 状态\n1. HTTP 200 · 10 ms");
   const expiry = await db.prepare("SELECT expires_at FROM telegram_api_status WHERE receipt_id=?")
     .bind(await receipt(28)).first<number>("expires_at");
@@ -251,6 +255,10 @@ test("emitted Worker scopes private API prompts and recovers without replaying c
   assert.equal((await send(29, bare, app, admin)).status, 200);
   assert.equal(await db.prepare("SELECT count(*) AS present FROM subscriptions WHERE owner_id=? AND source_url=?")
     .bind(admin, bare).first<number>("present"), 1);
+  assert.equal((await send(32, "/ai", held, admin)).status, 200);
+  assert.deepEqual(await outbox(32), { state: "pending", attempts: 0 });
+  await cron(off);
+  assert.deepEqual(await outbox(32), { state: "failed", attempts: 1 });
   for (const table of ["telegram_api_status", "telegram_inbox", "telegram_outbox", "subscriptions", "telegram_provider_jobs"]) {
     const rows = await db.prepare(`SELECT * FROM ${table}`).all();
     assert.doesNotMatch(JSON.stringify(rows.results), /api\.example\.invalid|synthetic-api-status-key/u);

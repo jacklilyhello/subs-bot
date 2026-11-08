@@ -30,7 +30,7 @@ test("ordinary subscriptions keep literal and encoded URL pipes", () => {
 test("an unverified credential context never opens a prompt or exposes its input", () => {
   for (const text of [
     "/ai",
-    `/AI@FixtureBot ${base}|${key}`,
+    `/AI@FixtureBot ${base} | ${key}`,
     `${base} ${key}`,
     `${base}| ${key}`,
     `${base} |${key}`,
@@ -39,7 +39,7 @@ test("an unverified credential context never opens a prompt or exposes its input
   ]) assert.deepEqual(ordinary(text), { kind: "quarantine", reason: "credential-text" });
   assert.deepEqual(classifyTelegramApiStatusInput({ kind: "unverified-prompt-reply" }),
     { kind: "quarantine", reason: "unverified-prompt" });
-  assert.deepEqual(classifyTelegramApiStatusInput({ kind: "ai-command", args: ` ${base}|${key}` }),
+  assert.deepEqual(classifyTelegramApiStatusInput({ kind: "ai-command", args: ` ${base} | ${key}` }),
     { kind: "quarantine", reason: "command-arguments" });
   assert.deepEqual(ordinary("a".repeat(64 * 1024 + 1)), { kind: "quarantine", reason: "text-limit" });
 });
@@ -56,7 +56,7 @@ test("a verified bare command opens the prompt and a verified reply can cancel",
 
 test("only a verified prompt produces exact private RPC credentials", () => {
   for (const [text, url, expectedKey] of [
-    [`${base}|${key}`, `${base}/v1/models`, key],
+    [`${base} | ${key}`, `${base}/v1/models`, key],
     [`${base}| ${key}`, `${base}/v1/models`, key],
     [`${base} |${key}`, `${base}/v1/models`, key],
     [`\t${base}/ \t${key}  `, `${base}/v1/models`, key],
@@ -64,7 +64,7 @@ test("only a verified prompt produces exact private RPC credentials", () => {
     [`${base}/api/chat/completions ${key}`, `${base}/api/chat/completions`, key],
     [`${base}/with|pipe/models | ${key}`, `${base}/with|pipe/models`, key],
     [`${base} | |${key}`, `${base}/v1/models`, `|${key}`],
-    [`${base}|${"x".repeat(512)}`, `${base}/v1/models`, "x".repeat(512)],
+    [`${base} | ${"x".repeat(512)}`, `${base}/v1/models`, "x".repeat(512)],
   ]) {
     const decision = prompted(text);
     if (decision.kind !== "batch") assert.fail("Expected a verified batch");
@@ -80,30 +80,32 @@ test("invalid verified rows contain no input or credentials", () => {
   for (const text of [
     base,
     `${base}|`,
+    `${base}/models|${key}`,
+    `${base}/models ss://synthetic-key`,
     `${base} |`,
     `${base} | synthetic key`,
-    `${base}|bad\u0000key`,
-    `${base}|非ASCII`,
-    `${base}|${"x".repeat(513)}`,
-    `${base}/${"中".repeat(2800)}|${key}`,
-    `http://api.example.invalid|${key}`,
-    `https://synthetic-user@api.example.invalid|${key}`,
-    `https://api%2eexample.invalid|${key}`,
-    `${base}:8443|${key}`,
-    `${base}:|${key}`,
-    `${base}?|${key}`,
-    `${base}/models?example=query|${key}`,
-    `${base}/models#fragment|${key}`,
-    `${base}\\models|${key}`,
-    `${base}/broken%G1|${key}`,
-    `${base}/broken\ud800|${key}`,
-    `https://[invalid]/models|${key}`,
+    `${base} | bad\u0000key`,
+    `${base} | 非ASCII`,
+    `${base} | ${"x".repeat(513)}`,
+    `${base}/${"中".repeat(2800)} | ${key}`,
+    `http://api.example.invalid | ${key}`,
+    `https://synthetic-user@api.example.invalid | ${key}`,
+    `https://api%2eexample.invalid | ${key}`,
+    `${base}:8443 | ${key}`,
+    `${base}: | ${key}`,
+    `${base}? | ${key}`,
+    `${base}/models?example=query | ${key}`,
+    `${base}/models#fragment | ${key}`,
+    `${base}\\models | ${key}`,
+    `${base}/broken%G1 | ${key}`,
+    `${base}/broken\ud800 | ${key}`,
+    `https://[invalid]/models | ${key}`,
   ]) assert.deepEqual(prompted(text), { kind: "batch", rows: [{ kind: "invalid" }] });
 });
 
 test("verified LF and CRLF batches preserve row order and ignore blank lines", () => {
   const second = `${base}/nested/chat/completions second-synthetic-key`;
-  const decision = prompted(`\n${base}|${key}\r\n \t\r\n${second}\n`);
+  const decision = prompted(`\n${base} | ${key}\r\n \t\r\n${second}\n`);
   if (decision.kind !== "batch") assert.fail("Expected an ordered batch");
   assert.equal(decision.rows.length, 2);
   const [firstRow, secondRow] = decision.rows;
@@ -117,7 +119,7 @@ test("verified LF and CRLF batches preserve row order and ignore blank lines", (
 });
 
 test("a verified malformed row does not hide or renumber a valid sibling", () => {
-  const pair = `${base}|${key}`;
+  const pair = `${base} | ${key}`;
   for (const invalidFirst of [true, false]) {
     const decision = prompted(invalidFirst ? `invalid fixture\n${pair}` : `${pair}\ninvalid fixture`);
     if (decision.kind !== "batch") assert.fail("Expected an ordered batch");
@@ -131,7 +133,7 @@ test("a verified malformed row does not hide or renumber a valid sibling", () =>
 });
 
 test("whole-batch refusal exposes a closed reason and no credential objects", () => {
-  const pair = `${base}|${key}`;
+  const pair = `${base} | ${key}`;
   for (const [text, reason] of [
     ["\n\r\n\t ", "empty"],
     [" ".repeat(4097 - pair.length) + pair, "text-limit"],

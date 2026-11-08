@@ -179,6 +179,7 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
     const subscriptionNodes = subscriptionRead && await telegramSubscriptionNodePagesReady(env.DB);
     const subscriptionRawFile = subscriptionRead && await telegramSubscriptionRawFileReady(env.DB).catch(() => "unavailable" as const);
     const apiStatus = await telegramApiStatusReady(env.DB).catch(() => "unavailable" as const);
+    const statusProvider = apiStatusProvider(env);
     const providerQueueReady = await telegramProviderQueueReady(env);
     const providerBatch = await providerBatchReadiness(env);
     const providerIntakeReady = providerQueueReady && await providerSnapshotJournalReady(env.DB);
@@ -189,11 +190,10 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
       && await telegramProviderRefreshReady(env.DB).catch(() => false);
     const drainReplies = async (budget = 20_000) => drainTelegramReplies(env.DB, env.NODES, policy, 4, budget, fetch, aggregateKey, privateShare,
       subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerQueueReady, bulkTrash, inlineConsent,
-      await githubSearch().catch(() => "unavailable" as const), providerRefresh, subscriptionRawFile, providerBatch.controls, apiStatus);
+      await githubSearch().catch(() => "unavailable" as const), providerRefresh, subscriptionRawFile, providerBatch.controls, apiStatus, statusProvider !== null);
     const drain = () => ctx?.waitUntil(drainReplies().catch(() => undefined));
     if (decoded.apiStatus) {
-      const provider = apiStatusProvider(env);
-      if (!provider || apiStatus !== true) return new Response(null, { status: 204, headers: HEADERS });
+      if (!statusProvider || apiStatus !== true) return new Response(null, { status: 204, headers: HEADERS });
       if (decoded.apiStatus.kind === "prompt") {
         if (await acceptTelegramApiStatusPrompt(env.DB, policy, decoded.apiStatus)) drain();
       } else {
@@ -201,7 +201,7 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
         if (accepted) ctx?.waitUntil((async () => {
           const deadline = Date.now() + 28_000;
           try {
-            await runTelegramApiStatus(env.DB, policy, provider.binding, provider.pin, accepted);
+            await runTelegramApiStatus(env.DB, policy, statusProvider.binding, statusProvider.pin, accepted);
           } finally {
             const ready = await reconcileTelegramApiStatus(env.DB, policy);
             const remaining = deadline - Date.now();
@@ -442,7 +442,7 @@ async function recoverTelegramWork(env: Env, policy: TelegramPolicy, pin: Provid
   const drain = async (limit: number, budget: number) =>
     drainTelegramReplies(env.DB, env.NODES, policy, limit, budget, fetch, aggregateKey, privateShare,
       subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerQueueReady, bulkTrash, inlineConsent,
-      await githubSearch().catch(() => "unavailable" as const), providerRefresh, subscriptionRawFile, providerBatch.controls, apiStatus);
+      await githubSearch().catch(() => "unavailable" as const), providerRefresh, subscriptionRawFile, providerBatch.controls, apiStatus, apiStatusProvider(env) !== null);
   const replies = async () => {
     await drain(10, 45_000);
     await reapTelegramViewTickets(env.DB);

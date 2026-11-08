@@ -1,6 +1,6 @@
 import type { ProviderApiStatusV2Input, ProviderPin } from "../provider-fetch-contract.ts";
 
-export const TELEGRAM_API_STATUS_PROMPT = "请直接回复此消息，每行输入 HTTPS API 地址和 Key，用 | 或空格分隔，最多两行。发送 /cancel 取消。";
+export const TELEGRAM_API_STATUS_PROMPT = "请直接回复此消息，每行输入 HTTPS API 地址和 Key，使用“地址 | Key”或用空格分隔，最多两行。发送 /cancel 取消。";
 const MAX_TEXT_LENGTH = 64 * 1024;
 const MAX_PROMPT_LENGTH = 4096;
 const MAX_PROMPT_ROWS = 2;
@@ -53,8 +53,8 @@ function resemblesCredentialText(text: string): boolean {
     if (AI_COMMAND.test(line)) return true;
     if (!HTTP_START.test(line)) return false;
     const boundary = line.search(/\s/u);
-    // A single URL keeps its original subscription meaning. Compact URL|Key
-    // syntax is interpreted only in a reply to an authenticated API prompt.
+    // A single URL keeps its original subscription meaning. API status input
+    // always separates the address and Key with whitespace.
     if (boundary < 0) return false;
     const rest = line.slice(boundary).trim();
     return rest.startsWith("|") || (!/\s/u.test(rest) && !URI_START.test(rest));
@@ -63,10 +63,6 @@ function resemblesCredentialText(text: string): boolean {
 
 function splitPrompt(text: string): [string, string] | null {
   const fields = text.split(/[ \t]+/u);
-  if (fields.length === 1) {
-    const separator = text.indexOf("|");
-    return separator < 0 ? null : [text.slice(0, separator), text.slice(separator + 1)];
-  }
   if (fields.length === 2) {
     const [address, key] = fields;
     if (address.endsWith("|")) return [address.slice(0, -1), key];
@@ -90,7 +86,7 @@ function endpoint(address: string): string | null {
 
 function parsePromptRow(line: string): TelegramApiStatusRow {
   const pair = splitPrompt(line);
-  if (!pair || !/^[!-~]{1,512}(?![\s\S])/u.test(pair[1])) return { kind: "invalid" };
+  if (!pair || URI_START.test(pair[1]) || !/^[!-~]{1,512}(?![\s\S])/u.test(pair[1])) return { kind: "invalid" };
   const [address, key] = pair;
   const url = endpoint(address);
   if (!url || encoder.encode(url).byteLength > MAX_URL_BYTES
