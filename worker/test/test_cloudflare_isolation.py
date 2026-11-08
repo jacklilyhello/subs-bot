@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, Mock, patch
 from urllib.error import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+import attest_api_status_container as attestation
 import cloudflare_isolation as cloudflare
 import release_isolation as release_entry
 
@@ -65,6 +66,7 @@ AGGREGATE_KEY = base64.urlsafe_b64encode(b"\x17" * 32).decode("ascii").rstrip("=
 PRIVATE_SHARE_KEY = base64.urlsafe_b64encode(b"\x18" * 32).decode("ascii").rstrip("=")
 CRON = {"cron": cloudflare.TELEGRAM_CRON}
 PROVIDER_BINDING = cloudflare.ProviderBinding(NEW_REVISION, "a" * 64, "b" * 64)
+API_STATUS_PIN = cloudflare.ProviderApiStatusBinding(OLD_REVISION, "e" * 64, "f" * 64)
 
 
 def deployment(deployment_id, version, message=None):
@@ -152,6 +154,10 @@ class FakeCloudflare:
         self.provider_batch_schema_drift = False
         self.provider_batch_drain_reads = 0
         self.provider_batch_live_reads = set()
+        self.api_status_ledger_drift = False
+        self.api_status_schema_drift = False
+        self.api_status_drain_reads = 0
+        self.api_status_live_reads = set()
         self.legacy_short_checks = []
         self.legacy_short_ledger_drift = {}
 
@@ -228,6 +234,24 @@ class FakeCloudflare:
     def data_api(self, method, path, payload=None):
         if method == "POST" and path == DATABASE + "/query":
             sql = payload["sql"]
+            if "AS apiStatusActive" in sql:
+                self.api_status_drain_reads += 1
+                return [{"success": True, "results": [
+                    {"apiStatusActive": int(self.api_status_drain_reads in self.api_status_live_reads)}]}]
+            if "WHERE position=34" in sql:
+                digest = "0" * 64 if self.api_status_ledger_drift else cloudflare.API_STATUS_MIGRATION_SHA256
+                return [{"success": True, "results": [{"position": 34, "name": cloudflare.API_STATUS_MIGRATION,
+                                                       "sha256": digest, "mode": "applied"}]}]
+            if "tbl_name='telegram_api_status'" in sql:
+                path = Path(__file__).resolve().parents[1] / "migrations" / cloudflare.API_STATUS_MIGRATION
+                body = path.read_bytes()
+                assert sha256(body).hexdigest() == cloudflare.API_STATUS_MIGRATION_SHA256
+                with closing(sqlite3.connect(":memory:")) as db:
+                    db.row_factory = sqlite3.Row
+                    db.executescript(body.decode("utf-8"))
+                    if self.api_status_schema_drift:
+                        db.execute("DROP INDEX telegram_api_status_expiry")
+                    return [{"success": True, "results": [dict(row) for row in db.execute(sql)]}]
             if "AS batchActive" in sql:
                 self.provider_batch_drain_reads += 1
                 return [{"success": True, "results": [
@@ -396,6 +420,14 @@ class ReleaseTests(unittest.TestCase):
             active["bindings"].append(PROVIDER_BATCH_BINDING)
         return active
 
+    def set_api_status_baseline(self, *, same_artifact=True):
+        active = self.set_provider_batch_baseline(enabled=True, same_artifact=same_artifact)
+        self.manifest["migrations"].extend([
+            {"name": "0033_fixture.sql", "sha256": "a" * 64},
+            {"name": cloudflare.API_STATUS_MIGRATION, "sha256": cloudflare.API_STATUS_MIGRATION_SHA256},
+        ])
+        return active
+
     def test_read_only_preflight_rejects_wrong_resource_or_domain(self):
         self.assertEqual(cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET),
                          {"deploymentId": OLD_DEPLOYMENT, "versionId": OLD_VERSION, "revision": OLD_REVISION})
@@ -417,7 +449,7 @@ class ReleaseTests(unittest.TestCase):
             "revision": NEW_REVISION, "versionId": NEW_VERSION, "deploymentId": NEW_DEPLOYMENT,
             "previousVersionId": OLD_VERSION, "changed": True, "inlineSearchEnabled": False,
             "providerUrlImportEnabled": False, "providerRefreshEnabled": False, "legacySubscriptionShortsEnabled": False,
-            "providerBatchEnabled": False,
+            "providerBatchEnabled": False, "apiStatusEnabled": False,
         })
         self.assertFalse(self.release()["changed"])
         self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
@@ -834,6 +866,127 @@ class ReleaseTests(unittest.TestCase):
                     release_entry.provider_batch_release_mode()
                 os.environ["SUBS_BOT_PROVIDER_BATCH_CONFIRMATION"] = f"{mode} provider batch for {cloudflare.WORKER_NAME}"
                 self.assertIs(release_entry.provider_batch_release_mode(), enabled)
+
+    def test_api_status_enable_preserve_and_disable_keep_v1_and_the_other_flags(self):
+        off = self.set_api_status_baseline()
+        gate = Mock(binding=API_STATUS_PIN)
+        load = Mock(return_value=gate)
+        options = {"provider_binding": PROVIDER_BINDING, "provider_guard": Mock(), "api_status_gate": load}
+        self.assertFalse(self.release(INLINE_CONFIG, **options)["apiStatusEnabled"])
+        self.assertFalse(attestation.inspect_required(self.api.worker_api, TARGET))
+        load.assert_not_called()
+        self.assertTrue(self.release(INLINE_CONFIG, api_status=True, **options)["apiStatusEnabled"])
+        self.assertTrue(attestation.inspect_required(self.api.worker_api, TARGET))
+        on = self.api.versions[NEW_VERSION]
+        names = {row["name"] for row in on["bindings"]}
+        self.assertEqual(names - {row["name"] for row in off["bindings"]},
+                         cloudflare.PROVIDER_API_STATUS_BINDINGS | {cloudflare.API_STATUS_BINDING})
+        self.assertEqual(on["annotations"]["workers/message"], off["annotations"]["workers/message"])
+        self.assertTrue(on["annotations"]["workers/tag"].startswith(cloudflare.PROVIDER_BATCH_TAG_PREFIX))
+        gate.verify_first_binding.assert_called_once_with(NEW_REVISION)
+        self.assertEqual(gate.verify.call_count, 3)
+        self.assertFalse(self.release(INLINE_CONFIG, **options)["changed"])
+        gate.verify_first_binding.assert_called_once_with(NEW_REVISION)
+        gate.binding = cloudflare.ProviderApiStatusBinding(NEW_REVISION, API_STATUS_PIN.image_sha256, "c" * 64)
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "separate release"):
+            self.release(INLINE_CONFIG, **options)
+        self.assertEqual(self.api.active["versions"][0]["version_id"], NEW_VERSION)
+        load.reset_mock(side_effect=True)
+        load.side_effect = AssertionError("Disabled releases must not load the V2 proof.")
+        # The fake has one candidate ID. Rotate its stored enabled record to a fresh synthetic ID before the second upload.
+        active_id = "10000000-0000-4000-8000-000000000009"
+        self.api.versions[active_id] = {**self.api.versions.pop(NEW_VERSION), "id": active_id}
+        self.api.active["versions"][0]["version_id"] = active_id
+        self.assertFalse(self.release(INLINE_CONFIG, api_status=False, **options)["apiStatusEnabled"])
+        self.assertFalse(attestation.inspect_required(self.api.worker_api, TARGET))
+        disabled_names = {row["name"] for row in self.api.versions[NEW_VERSION]["bindings"]}
+        self.assertEqual(disabled_names, names - {cloudflare.API_STATUS_BINDING})
+        load.assert_not_called()
+
+    def test_api_status_container_attestation_reads_only_exact_application_and_checks_private_settings(self):
+        account = TARGET["accountId"]
+        account_digest = sha256(account.encode("ascii")).hexdigest()
+        namespace = "c" * 32
+        created = "2026-07-30T00:00:00.001Z"
+        expected = {"applicationId": namespace, "createdAt": created}
+        active = {"namespaceId": namespace}
+        response = {"id": namespace, "account_id": account, "name": cloudflare.PROVIDER_API_STATUS_SERVICE,
+                    "scheduling_policy": "durable_object", "durable_objects": {"namespace_id": namespace},
+                    "created_at": created, "observability": {"logs": {"enabled": False}},
+                    "configuration": {"authorized_keys": [], "wrangler_ssh": {"enabled": False}}}
+        api = Mock(return_value=response)
+        with patch.object(attestation.publication, "TARGET_ACCOUNT_SHA256", account_digest):
+            actual = attestation.observe_container(api, account, active, expected)
+            api.assert_called_once_with("GET", f"{ACCOUNT}/containers/applications/{namespace}")
+            self.assertEqual(actual, attestation.activation._fingerprint(expected))
+            for drift in ({"observability": {"logs": {"enabled": True}}},
+                          {"configuration": {"authorized_keys": ["synthetic"], "wrangler_ssh": {"enabled": False}}},
+                          {"configuration": {"authorized_keys": [], "wrangler_ssh": {"enabled": True}}},
+                          {"created_at": "2026-07-30T00:00:00.002Z"},
+                          {"name": cloudflare.PROVIDER_SERVICE}):
+                with self.subTest(drift=drift), self.assertRaisesRegex(cloudflare.CloudflareError, "Container privacy"):
+                    api.return_value = {**response, **drift}
+                    attestation.observe_container(api, account, active, expected)
+            api.reset_mock()
+            with self.assertRaisesRegex(cloudflare.CloudflareError, "Container privacy"):
+                attestation.observe_container(api, account, active, {**expected, "applicationId": "d" * 32})
+            api.assert_not_called()
+
+    def test_api_status_attestation_is_bound_to_the_current_job_and_sealed_v3_identity(self):
+        account = attestation.publication.TARGET_ACCOUNT_SHA256
+        container = "e" * 64
+        now = 1_800_000_000
+        context = (NEW_REVISION, "123", "1")
+        proof = {"version": 1, "revision": NEW_REVISION, "runId": "123", "runAttempt": "1", "observedAt": now,
+                 "accountSha256": account, "containerIdentitySha256": container}
+        attestation.verify_attestation(json.dumps(proof), context, account, container, now)
+        for drift in ({"runId": "124"}, {"runAttempt": "2"}, {"revision": OLD_REVISION},
+                      {"observedAt": now - attestation.ATTESTATION_MAX_AGE - 1}, {"observedAt": now + 1},
+                      {"accountSha256": "a" * 64}, {"containerIdentitySha256": "f" * 64}):
+            with self.subTest(drift=drift), self.assertRaisesRegex(cloudflare.CloudflareError, "Container privacy"):
+                attestation.verify_attestation(json.dumps({**proof, **drift}), context, account, container, now)
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "Container privacy"):
+            attestation.verify_attestation("", context, account, container, now)
+
+    def test_api_status_preflight_rejects_unverified_artifact_ledger_and_live_identity(self):
+        gate = Mock(binding=API_STATUS_PIN)
+        options = {"release_manifest": self.manifest, "release_revision": NEW_REVISION,
+                   "telegram_config": INLINE_CONFIG, "provider_binding": PROVIDER_BINDING,
+                   "api_status": True, "api_status_gate": lambda: gate}
+        preflight = lambda: cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET, **options)
+        self.set_api_status_baseline(same_artifact=False)
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "same Worker artifact"):
+            preflight()
+        self.set_api_status_baseline()
+        for drift in ("api_status_ledger_drift", "api_status_schema_drift"):
+            setattr(self.api, drift, True)
+            with self.assertRaisesRegex(cloudflare.CloudflareError, "schema or ledger"):
+                preflight()
+            setattr(self.api, drift, False)
+        gate.verify_first_binding.assert_not_called()
+        gate.verify.side_effect = cloudflare.CloudflareError("Synthetic dependency identity changed.")
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "dependency identity changed"):
+            preflight()
+        gate.verify_first_binding.assert_called_once_with(NEW_REVISION)
+        self.assertEqual(self.api.writes(), [])
+
+    def test_api_status_rollback_refuses_old_runtime_when_recovery_work_is_active(self):
+        self.set_api_status_baseline(same_artifact=False)
+        self.api.api_status_live_reads = {3, 4}
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "safe rollback could not be confirmed"):
+            self.release(INLINE_CONFIG, provider_binding=PROVIDER_BINDING, provider_guard=Mock())
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
+        self.assertEqual(self.api.active["versions"][0]["version_id"], NEW_VERSION)
+
+    def test_api_status_operator_requires_literal_isolation_confirmation(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(release_entry.api_status_release_mode())
+        for mode, expected in (("enable", True), ("disable", False)):
+            with patch.dict(os.environ, {"SUBS_BOT_API_STATUS_MODE": mode}, clear=True):
+                with self.assertRaisesRegex(cloudflare.CloudflareError, "mode or confirmation"):
+                    release_entry.api_status_release_mode()
+                os.environ["SUBS_BOT_API_STATUS_CONFIRMATION"] = f"{mode} API status for {cloudflare.WORKER_NAME}"
+                self.assertIs(release_entry.api_status_release_mode(), expected)
 
     def test_legacy_short_toggle_preserves_existing_provider_and_telegram_flags(self):
         off = self.set_provider_refresh_baseline(enabled=True, url=True, inline=True)

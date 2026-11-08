@@ -62,10 +62,19 @@ PROVIDER_SERVICE = "subs-bot-provider-fetch-dev-01"
 PROVIDER_ENTRYPOINT = "ProviderFetch"
 PROVIDER_BINDINGS = {"PROVIDER_FETCH", "PROVIDER_REVISION", "PROVIDER_IMAGE_SHA256"}
 PROVIDER_MESSAGE = "Reviewed isolated Worker release provider "
+API_STATUS_BINDING = "TELEGRAM_API_STATUS"
+PROVIDER_API_STATUS_SERVICE = "subs-bot-provider-api-status-dev-01"
+PROVIDER_API_STATUS_ENTRYPOINT = "ProviderApiStatus"
+PROVIDER_API_STATUS_BINDINGS = {"PROVIDER_API_STATUS", "PROVIDER_API_STATUS_REVISION",
+                                "PROVIDER_API_STATUS_IMAGE_SHA256", "PROVIDER_API_STATUS_IDENTITY_SHA256"}
+API_STATUS_MIGRATION = "0034_telegram_api_status.sql"
+API_STATUS_MIGRATION_SHA256 = "39f9f1473740ddbff2ff6d218f91f6a5ef050c6b2221e5b915dd7d91a5618664"
+API_STATUS_SCHEMA_SHA256 = "21e64519fa87d4d1435b53888936cfc830d297684842e565b38d3770f145ca65"
 _UNSPECIFIED_TELEGRAM_CONFIG = object()
 _UNSPECIFIED_AGGREGATE_KEY = object()
 _UNSPECIFIED_PRIVATE_SHARE_KEY = object()
 _UNSPECIFIED_PROVIDER_BINDING = object()
+_UNSPECIFIED_API_STATUS_GATE = object()
 ORIGIN = f"https://{WORKER_NAME}.{NAMESPACE}.workers.dev"
 HEALTH_URL = ORIGIN + "/health"
 ISOLATION_RELEASE_USER_AGENT = "subs-bot-isolation-release/1.0"
@@ -181,6 +190,11 @@ class ProviderBinding:
 
 
 @dataclass(frozen=True)
+class ProviderApiStatusBinding(ProviderBinding):
+    """Immutable identity of the independently verified V2 named service."""
+
+
+@dataclass(frozen=True)
 class _Version:
     revision: str
     digest: str
@@ -196,6 +210,8 @@ class _Version:
     legacy_subscription_shorts: bool = False
     telegram_provider_batch: bool = False
     telegram_provider_batch_capable: bool = False
+    api_status_binding: ProviderApiStatusBinding | None = None
+    telegram_api_status: bool = False
 
 
 def _release_tag(revision, telegram_digest, aggregate_digest, private_share_digest, provider_binding):
@@ -214,6 +230,13 @@ def _release_tag(revision, telegram_digest, aggregate_digest, private_share_dige
 
 def _inline_search_tag(tag):
     return "inline-" + sha256(f"{tag}:inline-search:1".encode("ascii")).hexdigest()
+
+
+def _api_status_tag(tag, binding, enabled):
+    if binding is None:
+        return tag
+    value = f"{tag}:api-status-v2:{binding.revision}:{binding.image_sha256}:{binding.identity_sha256}:{int(enabled)}"
+    return "api-status-" + sha256(value.encode("ascii")).hexdigest()
 
 
 def _telegram_feature_tag(tag, inline_search, provider_url_import, provider_refresh=False, legacy_subscription_shorts=False,
@@ -418,6 +441,33 @@ class _Isolation:
         _require(not drained or (active == [{"batchActive": 0}] and type(active[0]["batchActive"]) is int),
                  "Drain isolated provider batches before switching to a different Worker artifact.")
 
+    def verify_api_status(self, *, drained=False):
+        path = f"{self.account}/d1/database/{self.target['d1Id']}/query"
+        error = "The isolated API status schema or ledger could not be verified."
+
+        def read(sql):
+            result = self.data_api("POST", path, {"sql": sql})
+            _require(isinstance(result, list) and len(result) == 1 and result[0].get("success") is True
+                     and isinstance(result[0].get("results"), list), error)
+            return result[0]["results"]
+
+        try:
+            ledger = read("SELECT position,name,sha256,mode FROM subs_bot_schema_migrations WHERE position=34")
+            schema = read("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE "
+                          "tbl_name='telegram_api_status' AND sql IS NOT NULL ORDER BY name")
+            fingerprint = sha256(json.dumps(schema, sort_keys=True, separators=(",", ":")).encode("ascii")).hexdigest()
+            _require(ledger == [{"position": 34, "name": API_STATUS_MIGRATION, "sha256": API_STATUS_MIGRATION_SHA256,
+                                 "mode": "applied"}] and fingerprint == API_STATUS_SCHEMA_SHA256, error)
+            active = read("""SELECT EXISTS(SELECT 1 FROM telegram_api_status AS action
+                LEFT JOIN telegram_outbox AS reply USING(receipt_id)
+                WHERE action.ready_at IS NULL OR reply.state IN ('pending','leased','sending')
+                  OR (action.prompt_receipt_id IS NOT NULL AND action.ready_at>unixepoch()-900
+                      AND reply.receipt_id IS NULL)) AS apiStatusActive""") if drained else None
+        except (CloudflareError, AttributeError, TypeError, ValueError):
+            raise CloudflareError(error) from None
+        _require(not drained or (active == [{"apiStatusActive": 0}] and type(active[0]["apiStatusActive"]) is int),
+                 "Drain isolated API status work before switching to a Worker artifact without verified recovery.")
+
     def verify_legacy_subscription_shorts(self):
         path = f"{self.account}/d1/database/{self.target['d1Id']}/query"
         error = "The isolated legacy subscription short-link schema could not be verified."
@@ -471,26 +521,29 @@ class _Isolation:
                                                      {"enabled": False, "cross_version_cache": False}),
                  "Isolated Worker version runtime settings differ from the supported configuration.")
         rows = version.get("bindings")
-        _require(isinstance(rows, list) and 3 <= len(rows) <= 17
+        _require(isinstance(rows, list) and 3 <= len(rows) <= 22
                  and all(isinstance(row, dict) and isinstance(row.get("name"), str) for row in rows),
                  "Unexpected isolated Worker binding inventory.")
         bindings = {row["name"]: row for row in rows}
         base_bindings = {"DB", "NODES", "BUILD_REVISION"}
         telegram_bindings = base_bindings | TELEGRAM_BINDINGS
         has_provider = bool(PROVIDER_BINDINGS & bindings.keys())
+        has_api_status = bool(PROVIDER_API_STATUS_BINDINGS & bindings.keys())
         inline = bindings.get(INLINE_SEARCH_BINDING)
         provider_url = bindings.get(PROVIDER_URL_IMPORT_BINDING)
         refresh = bindings.get(PROVIDER_REFRESH_BINDING)
         legacy_shorts = bindings.get(LEGACY_SUBSCRIPTION_SHORT_BINDING)
         provider_batch = bindings.get(PROVIDER_BATCH_BINDING)
-        binding_names = set(bindings) - PROVIDER_BINDINGS - {
+        api_status = bindings.get(API_STATUS_BINDING)
+        binding_names = set(bindings) - PROVIDER_BINDINGS - PROVIDER_API_STATUS_BINDINGS - {
             INLINE_SEARCH_BINDING, PROVIDER_URL_IMPORT_BINDING, PROVIDER_REFRESH_BINDING, LEGACY_SUBSCRIPTION_SHORT_BINDING,
-            PROVIDER_BATCH_BINDING,
+            PROVIDER_BATCH_BINDING, API_STATUS_BINDING,
         }
         _require(len(bindings) == len(rows) and binding_names in (base_bindings, telegram_bindings,
             telegram_bindings | AGGREGATE_BINDINGS, telegram_bindings | PRIVATE_SHARE_BINDINGS,
             telegram_bindings | AGGREGATE_BINDINGS | PRIVATE_SHARE_BINDINGS)
-            and (not has_provider or PROVIDER_BINDINGS <= bindings.keys()),
+            and (not has_provider or PROVIDER_BINDINGS <= bindings.keys())
+            and (not has_api_status or (PROVIDER_API_STATUS_BINDINGS <= bindings.keys() and TELEGRAM_BINDINGS <= binding_names)),
                  "Unexpected isolated Worker binding names.")
         _require(inline is None or (TELEGRAM_BINDINGS <= binding_names and inline == {
             "name": INLINE_SEARCH_BINDING, "type": "plain_text", "text": "1",
@@ -507,6 +560,9 @@ class _Isolation:
         _require(provider_batch is None or (has_provider and TELEGRAM_BINDINGS <= binding_names and provider_batch == {
             "name": PROVIDER_BATCH_BINDING, "type": "plain_text", "text": "1",
         }), "Unexpected isolated Worker provider batch binding.")
+        _require(api_status is None or (has_api_status and api_status == {
+            "name": API_STATUS_BINDING, "type": "plain_text", "text": "1",
+        }), "Unexpected isolated Worker API status admission binding.")
         db, r2, rev = (bindings[name] for name in ("DB", "NODES", "BUILD_REVISION"))
         database_ids = [db[key] for key in ("database_id", "id") if db.get(key) is not None]
         _require(db.get("type") == "d1" and database_ids
@@ -560,6 +616,18 @@ class _Isolation:
                              for pin in (revision_pin, image_pin)),
                      "Isolated provider binding target differs from the reviewed service.")
             provider_binding = ProviderBinding(revision_pin.get("text"), image_pin.get("text"), message[len(PROVIDER_MESSAGE):])
+        api_status_binding = None
+        if has_api_status:
+            service = bindings["PROVIDER_API_STATUS"]
+            names = ("PROVIDER_API_STATUS_REVISION", "PROVIDER_API_STATUS_IMAGE_SHA256", "PROVIDER_API_STATUS_IDENTITY_SHA256")
+            pins = [bindings[name] for name in names]
+            _require(set(service) <= {"name", "type", "service", "entrypoint", "environment"}
+                     and service.get("type") == "service" and service.get("service") == PROVIDER_API_STATUS_SERVICE
+                     and service.get("entrypoint") == PROVIDER_API_STATUS_ENTRYPOINT
+                     and service.get("environment") in (None, "production")
+                     and all(set(pin) == {"name", "type", "text"} and pin["type"] == "plain_text" for pin in pins),
+                     "Isolated API status V2 binding differs from the reviewed service.")
+            api_status_binding = ProviderApiStatusBinding(*(pin["text"] for pin in pins))
         tag = annotations.get("workers/tag")
         module_sha256 = sha256(body).hexdigest()
         batch_capable = isinstance(tag, str) and tag.startswith((PROVIDER_BATCH_TAG_PREFIX, PROVIDER_BATCH_READY_TAG_PREFIX))
@@ -571,13 +639,15 @@ class _Isolation:
                  "Isolated Worker legacy subscription short-link release tag differs.")
         _require((provider_batch is not None) == (batch_capable and tag.startswith(PROVIDER_BATCH_TAG_PREFIX)),
                  "Isolated Worker provider batch release tag differs.")
-        if batch_capable or any(binding is not None for binding in (inline, provider_url, refresh, legacy_shorts)):
-            expected = _telegram_feature_tag(_release_tag(rev["text"], telegram_digest, aggregate_digest,
-                                                           private_share_digest, provider_binding),
+        _require(has_api_status or not (isinstance(tag, str) and tag.startswith("api-status-")),
+                 "Isolated Worker API status release tag differs.")
+        if batch_capable or has_api_status or any(binding is not None for binding in (inline, provider_url, refresh, legacy_shorts)):
+            release_tag = _release_tag(rev["text"], telegram_digest, aggregate_digest, private_share_digest, provider_binding)
+            expected = _telegram_feature_tag(_api_status_tag(release_tag, api_status_binding, api_status is not None),
                                              inline is not None, provider_url is not None, refresh is not None,
                                              legacy_shorts is not None, provider_batch is not None,
                                              module_sha256 if batch_capable else None)
-            feature = "inline search"
+            feature = "API status" if has_api_status else "inline search"
             if batch_capable:
                 feature = "provider batch"
             elif legacy_shorts is not None:
@@ -590,7 +660,7 @@ class _Isolation:
         return _Version(rev["text"], module_sha256, version["compatibility_date"],
                         tag, telegram_digest, aggregate_digest, private_share_digest, provider_binding, inline is not None,
                         provider_url is not None, refresh is not None, legacy_shorts is not None,
-                        provider_batch is not None, batch_capable)
+                        provider_batch is not None, batch_capable, api_status_binding, api_status is not None)
 
     def verify_candidate(self, candidate, desired):
         # A version can be visible in its creation response or listing before its module is readable.
@@ -653,6 +723,17 @@ class _Isolation:
             bindings.append({"type": "plain_text", "name": LEGACY_SUBSCRIPTION_SHORT_BINDING, "text": "1"})
         if desired.telegram_provider_batch:
             bindings.append({"type": "plain_text", "name": PROVIDER_BATCH_BINDING, "text": "1"})
+        if desired.api_status_binding is not None:
+            binding = desired.api_status_binding
+            bindings.extend([
+                {"type": "service", "name": "PROVIDER_API_STATUS", "service": PROVIDER_API_STATUS_SERVICE,
+                 "entrypoint": PROVIDER_API_STATUS_ENTRYPOINT},
+                {"type": "plain_text", "name": "PROVIDER_API_STATUS_REVISION", "text": binding.revision},
+                {"type": "plain_text", "name": "PROVIDER_API_STATUS_IMAGE_SHA256", "text": binding.image_sha256},
+                {"type": "plain_text", "name": "PROVIDER_API_STATUS_IDENTITY_SHA256", "text": binding.identity_sha256},
+            ])
+        if desired.telegram_api_status:
+            bindings.append({"type": "plain_text", "name": API_STATUS_BINDING, "text": "1"})
         message = "Reviewed isolated Worker release"
         if desired.provider_binding is not None:
             binding = desired.provider_binding
@@ -942,6 +1023,41 @@ def _provider_batch_target(active, requested, manifest, telegram_digest, provide
     return enabled, capable
 
 
+def _api_status_target(active, requested, manifest, telegram_digest, had_cron, load_gate):
+    _require(requested is None or type(requested) is bool, "Invalid isolated API status release mode.")
+    enabled = active.telegram_api_status if requested is None else requested
+    entries = manifest.get("migrations") if isinstance(manifest, dict) else None
+    includes_schema = isinstance(entries, list) and len(entries) >= 34
+    capable = includes_schema and entries[33] == {"name": API_STATUS_MIGRATION, "sha256": API_STATUS_MIGRATION_SHA256}
+    existing = active.api_status_binding
+    _require(not (includes_schema or existing is not None or enabled) or capable,
+             "Isolated API status requires the exact 0034 migration artifact.")
+    if existing is not None or enabled:
+        _require(had_cron and telegram_digest is not None and telegram_digest == active.telegram_config_sha256,
+                 "Isolated API status requires the same active Telegram policy and Cron.")
+    same_artifact = (isinstance(manifest, dict) and active.revision == manifest.get("revision")
+                     and active.digest == manifest.get("bundleSha256")
+                     and active.compatibility == manifest.get("compatibilityDate"))
+    if enabled and not active.telegram_api_status:
+        _require(same_artifact, "Enable API status only after verifying the same Worker artifact with admission disabled.")
+    gate = None
+    binding = existing
+    if enabled:
+        gate = load_gate() if callable(load_gate) else None
+        binding = getattr(gate, "binding", None)
+        _require(isinstance(binding, ProviderApiStatusBinding), "Enable API status with a verified private V2 activation proof.")
+        _require(existing is None or existing == binding, "Changing the isolated API status V2 pin requires a separate release.")
+    # Turning admission off retains the immutable binding and never needs the dependency to be healthy.
+    return enabled, binding, gate, capable, capable and existing is None and not same_artifact
+
+
+def _verify_api_status_dependency(active, gate, revision):
+    if gate is not None:
+        if active.api_status_binding is None:
+            gate.verify_first_binding(revision)
+        gate.verify()
+
+
 def _require_telegram_config_continuity(active, desired_digest):
     _require(active.telegram_config_sha256 is None or active.telegram_config_sha256 == desired_digest,
              "Changing or dropping the isolated Telegram configuration requires a separate scoped release.")
@@ -952,7 +1068,8 @@ def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECI
                          release_revision=None, provider_first_binding_guard=None, historical_application_revision=None,
                          release_manifest=None,
                          telegram_config=_UNSPECIFIED_TELEGRAM_CONFIG, inline_search=None, provider_url_import=None,
-                         provider_refresh=None, legacy_subscription_shorts=None, provider_batch=None):
+                         provider_refresh=None, legacy_subscription_shorts=None, provider_batch=None,
+                         api_status=None, api_status_gate=_UNSPECIFIED_API_STATUS_GATE):
     """Read ownership, privacy and active binding facts before any release writes."""
     scope = _Isolation(worker_api, data_api, target)
     scope.worker_config()
@@ -1008,6 +1125,16 @@ def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECI
         enabled, _ = _provider_batch_target(version, provider_batch, release_manifest, desired_digest, provider_binding, had_cron)
         if version.telegram_provider_batch_capable or enabled:
             scope.verify_provider_batch()
+    if api_status_gate is not _UNSPECIFIED_API_STATUS_GATE or api_status is not None:
+        enabled, binding, gate, _, _ = _api_status_target(version, api_status, release_manifest, desired_digest,
+                                                        had_cron, api_status_gate)
+        if binding is not None:
+            scope.verify_api_status()
+        if enabled:
+            if not version.telegram_api_status:
+                _verify_health(version.revision)
+            _verify_api_status_dependency(version, gate, release_revision)
+            _require(scope.active() == active, "Active isolated Worker deployment changed during API status proof verification.")
     if provider_binding is not _UNSPECIFIED_PROVIDER_BINDING:
         _verify_first_provider_binding(version, provider_binding, release_revision, provider_first_binding_guard,
                                        historical_application_revision)
@@ -1023,7 +1150,7 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                    historical_application_revision: str | None = None,
                    inline_search: bool | None = None, provider_url_import: bool | None = None,
                    provider_refresh: bool | None = None, legacy_subscription_shorts: bool | None = None,
-                   provider_batch: bool | None = None):
+                   provider_batch: bool | None = None, api_status: bool | None = None, api_status_gate=None):
     """Release the verified Worker and optionally configure its isolated Telegram schedule."""
     _require((provider_binding is None and provider_guard is None) or (provider_binding is not None and callable(provider_guard)),
              "An isolated provider release requires a verified dependency guard.")
@@ -1056,6 +1183,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
     legacy_shorts_enabled = _legacy_subscription_shorts_target(old_version, legacy_subscription_shorts, manifest)
     batch_enabled, batch_capable = _provider_batch_target(old_version, provider_batch, manifest,
         desired.telegram_config_sha256, desired.provider_binding, had_cron)
+    api_status_enabled, api_status_binding, api_gate, api_status_capable, api_status_must_be_drained = _api_status_target(
+        old_version, api_status, manifest, desired.telegram_config_sha256, had_cron, api_status_gate)
     # An unproven previous module can never be the rollback target of an admission-enabled release.
     batch_must_be_drained = batch_capable and not old_version.telegram_provider_batch_capable
     verify_legacy_shorts = old_version.legacy_subscription_shorts or legacy_shorts_enabled
@@ -1073,7 +1202,9 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
     desired = replace(desired, telegram_inline_search=enabled, telegram_provider_url_import=provider_url_enabled,
                       telegram_provider_refresh=refresh_enabled, legacy_subscription_shorts=legacy_shorts_enabled,
                       telegram_provider_batch=batch_enabled, telegram_provider_batch_capable=batch_capable,
-                      tag=_telegram_feature_tag(desired.tag, enabled, provider_url_enabled, refresh_enabled, legacy_shorts_enabled,
+                      telegram_api_status=api_status_enabled, api_status_binding=api_status_binding,
+                      tag=_telegram_feature_tag(_api_status_tag(desired.tag, api_status_binding, api_status_enabled),
+                                                enabled, provider_url_enabled, refresh_enabled, legacy_shorts_enabled,
                                                 batch_enabled, desired.digest if batch_capable else None))
     if inline_bot is not None:
         scope.verify_inline_search(inline_bot, require_fresh=first_enable)
@@ -1083,22 +1214,27 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
         scope.verify_legacy_subscription_shorts()
     if batch_capable:
         scope.verify_provider_batch(drained=batch_must_be_drained)
+    if api_status_capable:
+        scope.verify_api_status(drained=api_status_must_be_drained)
     _verify_first_provider_binding(old_version, desired.provider_binding, desired.revision, provider_first_binding_guard,
                                    historical_application_revision)
     _verify_health(old_version.revision)
     if provider_guard is not None:
         provider_guard()
+    _verify_api_status_dependency(old_version, api_gate, desired.revision)
     if old_version.revision == desired.revision:
         _require(old_version.digest == desired.digest, "Active revision differs from the verified module digest.")
         if (old_version.telegram_config_sha256, old_version.telegram_aggregate_key_sha256,
                 old_version.telegram_private_share_key_sha256, old_version.provider_binding,
                 old_version.telegram_inline_search, old_version.telegram_provider_url_import,
                 old_version.telegram_provider_refresh, old_version.legacy_subscription_shorts,
-                old_version.telegram_provider_batch, old_version.telegram_provider_batch_capable) == (
+                old_version.telegram_provider_batch, old_version.telegram_provider_batch_capable,
+                old_version.api_status_binding, old_version.telegram_api_status) == (
                 desired.telegram_config_sha256, desired.telegram_aggregate_key_sha256,
                 desired.telegram_private_share_key_sha256, desired.provider_binding,
                 desired.telegram_inline_search, desired.telegram_provider_url_import, desired.telegram_provider_refresh,
-                desired.legacy_subscription_shorts, desired.telegram_provider_batch, desired.telegram_provider_batch_capable):
+                desired.legacy_subscription_shorts, desired.telegram_provider_batch, desired.telegram_provider_batch_capable,
+                desired.api_status_binding, desired.telegram_api_status):
             if telegram_config is None:
                 _require(scope.active() == previous, "Active isolated Worker deployment changed during verification.")
                 _guard_current(guard)
@@ -1108,7 +1244,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
             return {"revision": desired.revision, "deploymentId": previous.id, "versionId": previous.version,
                     "previousVersionId": previous.version, "changed": changed, "inlineSearchEnabled": enabled,
                     "providerUrlImportEnabled": provider_url_enabled, "providerRefreshEnabled": refresh_enabled,
-                    "legacySubscriptionShortsEnabled": legacy_shorts_enabled, "providerBatchEnabled": batch_enabled}
+                    "legacySubscriptionShortsEnabled": legacy_shorts_enabled, "providerBatchEnabled": batch_enabled,
+                    "apiStatusEnabled": api_status_enabled}
 
     candidate = scope.staged(desired)
     if candidate is None:
@@ -1121,6 +1258,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
     scope.verify_resources()
     if provider_guard is not None:
         provider_guard()
+    if api_gate is not None:
+        api_gate.verify()
     if inline_bot is not None:
         scope.verify_inline_search(inline_bot, require_fresh=first_enable)
     if verify_provider_schema is not None:
@@ -1129,6 +1268,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
         scope.verify_legacy_subscription_shorts()
     if batch_capable:
         scope.verify_provider_batch(drained=batch_must_be_drained)
+    if api_status_capable:
+        scope.verify_api_status(drained=api_status_must_be_drained)
     _require(scope.active() == previous, "Active isolated Worker deployment changed before activation.")
     _guard_current(guard)
     activated = scope.activate(previous, candidate, f"Isolated Worker release {desired.revision} {uuid4()}")
@@ -1146,8 +1287,12 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
             scope.verify_legacy_subscription_shorts()
         if batch_capable:
             scope.verify_provider_batch(drained=batch_must_be_drained)
+        if api_status_capable:
+            scope.verify_api_status(drained=api_status_must_be_drained)
         if provider_guard is not None:
             provider_guard()
+        if api_gate is not None:
+            api_gate.verify()
         _require(scope.active() == activated, "Active isolated Worker deployment changed during verification.")
     except CloudflareError:
         try:
@@ -1158,10 +1303,12 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
             _require(scope.active() == activated, "Active isolated Worker deployment changed before rollback.")
             if batch_capable:
                 scope.verify_provider_batch(drained=batch_must_be_drained)
+            if api_status_capable:
+                scope.verify_api_status(drained=api_status_must_be_drained)
             _guard_current(guard)
             restored = scope.activate(activated, previous.version, f"Isolated Worker rollback {uuid4()}")
             _verify_health(old_version.revision)
-            if inline_bot is not None or verify_provider_schema is not None or verify_legacy_shorts or batch_capable:
+            if inline_bot is not None or verify_provider_schema is not None or verify_legacy_shorts or batch_capable or api_status_capable:
                 _require(scope.version(restored.version) == old_version, "Isolated Worker Telegram rollback state differs.")
             if old_version.legacy_subscription_shorts:
                 scope.verify_legacy_subscription_shorts()
@@ -1176,4 +1323,5 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
     return {"revision": desired.revision, "deploymentId": activated.id, "versionId": activated.version,
             "previousVersionId": previous.version, "changed": True, "inlineSearchEnabled": enabled,
             "providerUrlImportEnabled": provider_url_enabled, "providerRefreshEnabled": refresh_enabled,
-            "legacySubscriptionShortsEnabled": legacy_shorts_enabled, "providerBatchEnabled": batch_enabled}
+            "legacySubscriptionShortsEnabled": legacy_shorts_enabled, "providerBatchEnabled": batch_enabled,
+            "apiStatusEnabled": api_status_enabled}

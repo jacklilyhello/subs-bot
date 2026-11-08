@@ -4,14 +4,17 @@ import json
 import os
 import re
 import sys
+from functools import cache
 from pathlib import Path
 
+from attest_api_status_container import ATTESTATION_ENV
 from cloudflare_isolation import (
     CloudflareClient, CloudflareError, WORKER_NAME, release_worker, validate_aggregate_key, validate_private_share_key,
     verify_worker_target,
 )
 from d1_migrations import MigrationError, apply_migrations
 from prepare_isolation_artifact import ArtifactError, require_current_main
+from provider_api_status_binding_gate import CONFIG_ENV as API_STATUS_CONFIG_ENV, load_api_status_gate
 from provider_binding_gate import CONFIG_ENV, load_provider_gate
 
 
@@ -88,6 +91,16 @@ def provider_batch_release_mode():
     raise CloudflareError("The isolated provider batch release mode or confirmation is invalid.")
 
 
+def api_status_release_mode():
+    mode = os.environ.get("SUBS_BOT_API_STATUS_MODE", "preserve")
+    confirmation = os.environ.get("SUBS_BOT_API_STATUS_CONFIRMATION", "")
+    if mode == "preserve" and confirmation == "":
+        return None
+    if mode in ("enable", "disable") and confirmation == f"{mode} API status for {WORKER_NAME}":
+        return mode == "enable"
+    raise CloudflareError("The isolated API status release mode or confirmation is invalid.")
+
+
 def release():
     revision = os.environ.get("GITHUB_SHA", "")
     if (os.environ.get("GITHUB_REPOSITORY") != "jacklilyhello/subs-bot"
@@ -101,6 +114,10 @@ def release():
     provider_refresh = provider_refresh_release_mode()
     legacy_subscription_shorts = legacy_subscription_shorts_release_mode()
     provider_batch = provider_batch_release_mode()
+    api_status = api_status_release_mode()
+    if api_status is not None and any(mode is not None for mode in (
+            inline_search, provider_url_import, provider_refresh, legacy_subscription_shorts, provider_batch)):
+        raise CloudflareError("Change isolated API status admission in a separate scoped release.")
     bundle = Path(os.environ["RUNNER_TEMP"]) / "subs-bot-verified"
     manifest = json.loads((bundle / "isolation.json").read_text(encoding="utf-8"))
     if manifest.get("version") != 2 or manifest.get("revision") != revision:
@@ -131,6 +148,11 @@ def release():
     def guard():
         require_current_main(revision)
 
+    @cache
+    def api_status_gate():
+        return load_api_status_gate(os.environ.get(API_STATUS_CONFIG_ENV, ""), target, deploy_token,
+                                    os.environ.get(ATTESTATION_ENV, ""))
+
     data_api = CloudflareClient(data_token)
     worker_api = CloudflareClient(deploy_token)
     guard()
@@ -144,7 +166,8 @@ def release():
                                     historical_application_revision=historical_application_revision, release_manifest=manifest,
                                     telegram_config=telegram_config, inline_search=inline_search,
                                     provider_url_import=provider_url_import, provider_refresh=provider_refresh,
-                                    legacy_subscription_shorts=legacy_subscription_shorts, provider_batch=provider_batch)
+                                    legacy_subscription_shorts=legacy_subscription_shorts, provider_batch=provider_batch,
+                                    api_status=api_status, api_status_gate=api_status_gate)
     if provider_gate is not None:
         provider_gate.verify()
     migrations = apply_migrations(data_api, target, bundle, manifest, guard)
@@ -156,7 +179,8 @@ def release():
                             provider_first_binding_guard=first_provider_proof,
                             historical_application_revision=historical_application_revision, inline_search=inline_search,
                             provider_url_import=provider_url_import, provider_refresh=provider_refresh,
-                            legacy_subscription_shorts=legacy_subscription_shorts, provider_batch=provider_batch)
+                            legacy_subscription_shorts=legacy_subscription_shorts, provider_batch=provider_batch,
+                            api_status=api_status, api_status_gate=api_status_gate)
     guard()
     print(json.dumps(result, sort_keys=True), flush=True)
 
