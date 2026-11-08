@@ -232,7 +232,7 @@ test("emitted Worker answers opted-in sender queries using the owner's durable s
         encoding: "utf8", timeout: 5_000, maxBuffer: 4096,
       });
       const output = check.stdout?.trim() ?? "";
-      const outcome = /^(?:ok|invalid-fixture|sqlite-error|(?:base-claim|base-reap|provider-claim|provider-reap|provider-work-claim-batch|provider-work-claim-single|provider-work-reap-batch) (?:expression-depth|sqlite-error))$/u.test(output)
+      const outcome = /^(?:ok|invalid-fixture|sqlite-error|(?:base-claim|base-reap|provider-claim|provider-reap|provider-work-claim-batch|provider-work-claim-single|provider-work-reap-batch) (?:expression-depth|sqlite-error|invalid-statement|invalid-bindings))$/u.test(output)
         ? output : "unavailable";
       assert.equal(check.status === 0 && outcome === "ok", true, `Queue SQLite depth check: ${outcome}.`);
     }

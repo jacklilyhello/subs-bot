@@ -9,13 +9,13 @@ import sys
 MAX_INPUT_BYTES = 1024 * 1024
 D1_EXPRESSION_DEPTH = 100
 STAGES = {
-    "base-claim": "UPDATE telegram_outbox ",
-    "base-reap": "UPDATE telegram_outbox ",
-    "provider-claim": "UPDATE telegram_outbox ",
-    "provider-reap": "UPDATE telegram_outbox ",
-    "provider-work-claim-batch": "UPDATE telegram_provider_batch_jobs ",
-    "provider-work-claim-single": "UPDATE telegram_provider_jobs ",
-    "provider-work-reap-batch": "WITH terminal AS MATERIALIZED (",
+    "base-claim": ("UPDATE", "telegram_outbox"),
+    "base-reap": ("UPDATE", "telegram_outbox"),
+    "provider-claim": ("UPDATE", "telegram_outbox"),
+    "provider-reap": ("UPDATE", "telegram_outbox"),
+    "provider-work-claim-batch": ("UPDATE", "telegram_provider_batch_jobs"),
+    "provider-work-claim-single": ("UPDATE", "telegram_provider_jobs"),
+    "provider-work-reap-batch": ("WITH", "terminal", "AS", "MATERIALIZED", "("),
 }
 
 
@@ -36,9 +36,12 @@ def check() -> str:
             return "invalid-fixture"
         for query in queries:
             sql, bindings = query["sql"], query["bindings"]
-            if (not isinstance(sql, str) or not sql.lstrip().startswith(STAGES[query["stage"]])
-                    or not isinstance(bindings, list) or len(bindings) > 100):
-                return "invalid-fixture"
+            stage = query["stage"]
+            prefix = STAGES[stage]
+            if not isinstance(sql, str) or tuple(sql.split(maxsplit=len(prefix))[:len(prefix)]) != prefix:
+                return f"{stage} invalid-statement"
+            if not isinstance(bindings, list) or len(bindings) > 100:
+                return f"{stage} invalid-bindings"
             try:
                 # Compile each unchanged statement with its actual synthetic bind values.
                 db.execute("EXPLAIN " + sql, bindings).fetchone()
@@ -46,7 +49,7 @@ def check() -> str:
                 message = str(error).lower()
                 category = ("expression-depth" if "expression tree is too large" in message
                             or "parser stack overflow" in message else "sqlite-error")
-                return f"{query['stage']} {category}"
+                return f"{stage} {category}"
     return "ok"
 
 
