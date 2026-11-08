@@ -23,6 +23,7 @@ import "./provider-job-consumer.integration.ts";
 import "./telegram-provider-url-import.integration.ts";
 import "./telegram-provider-refresh.integration.ts";
 import "./telegram-provider-batch.integration.ts";
+import "./telegram-api-status.integration.ts";
 import "./telegram-subscription-read.integration.ts";
 import "./telegram-subscription-node-pages.integration.ts";
 import "./telegram-subscription-raw-file.integration.ts";
