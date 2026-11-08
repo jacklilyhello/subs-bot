@@ -4,7 +4,7 @@ from http.client import HTTPConnection
 import json
 import os
 import sys
-from time import monotonic, sleep
+from time import monotonic, sleep, time_ns
 
 
 def require(value):
@@ -45,6 +45,10 @@ def main(revision):
     for url in ("https://127.0.0.1/v1/models", "https://[::1]/v1/models", "https://169.254.169.254/v1/models"):
         require(request("POST", "/v1/api-status", {"url": url, "key": "synthetic-probe-key"}) ==
                 (422, {"error": "blocked-address"}))
+    v2 = {"url": "https://127.0.0.1/v1/models", "key": "synthetic-probe-key"}
+    require(request("POST", "/v2/api-status", {**v2, "dispatchBeforeMs": 1}) == (504, {"error": "timeout"}))
+    require(request("POST", "/v2/api-status", {**v2, "dispatchBeforeMs": time_ns() // 1_000_000 + 25_000}) ==
+            (422, {"error": "blocked-address"}))
     print("Hosted nonroot provider image and private port policy verified.")
 
 

@@ -1,9 +1,11 @@
 import { DurableObject, WorkerEntrypoint, WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import type {
-  ProviderApiStatusInput, ProviderApiStatusProber, ProviderApiStatusResult, ProviderFetchInput, ProviderFetchResult,
+  ProviderApiStatusInput, ProviderApiStatusProber, ProviderApiStatusResult, ProviderApiStatusV2Input, ProviderApiStatusV2Prober,
+  ProviderFetchInput, ProviderFetchResult,
 } from "../src/provider-fetch-contract.ts";
 import {
-  apiStatusFailure, exercise, fetchPinnedProvider, probePinnedProviderApiStatus, providerApiStatusRequest, providerApiStatusResult,
+  apiStatusFailure, exercise, fetchPinnedProvider, probePinnedProviderApiStatus, probePinnedProviderApiStatusV2,
+  providerApiStatusRequest, providerApiStatusResult, providerApiStatusV2Expired, providerApiStatusV2Request,
   providerFailure, providerPayload, providerRequest, ProviderProbeError, REVISION, SERVICE, SINGLETON,
 } from "./controller.ts";
 
@@ -80,6 +82,27 @@ export class ProviderContainer extends DurableObject<Env> {
     }
   }
 
+  async probeApiStatusV2(input: ProviderApiStatusV2Input): Promise<ProviderApiStatusResult> {
+    try {
+      const request = providerApiStatusV2Request(input);
+      if (!request) return apiStatusFailure("invalid-request");
+      if (request.providerRevision !== this.env.BUILD_REVISION) return apiStatusFailure("unavailable");
+      if (providerApiStatusV2Expired(request.dispatchBeforeMs)) return apiStatusFailure("timeout");
+      const singleton = this.ctx.exports.ProviderContainer.idFromName(SINGLETON);
+      const container = this.ctx.container;
+      if (!this.ctx.id.equals(singleton) || !container) return apiStatusFailure("unavailable");
+      if (this.busy) return apiStatusFailure("busy");
+      this.busy = true;
+      try {
+        return await probePinnedProviderApiStatusV2(container, request);
+      } finally {
+        this.busy = false;
+      }
+    } catch {
+      return apiStatusFailure("unavailable");
+    }
+  }
+
   async prove(probe: Probe) {
     const revision = this.env.BUILD_REVISION;
     const singleton = this.ctx.exports.ProviderContainer.idFromName(SINGLETON);
@@ -101,7 +124,7 @@ export class ProviderContainer extends DurableObject<Env> {
   }
 }
 
-export class ProviderFetch extends WorkerEntrypoint<Env> implements ProviderApiStatusProber {
+export class ProviderFetch extends WorkerEntrypoint<Env> implements ProviderApiStatusProber, ProviderApiStatusV2Prober {
   async fetchSubscription(input: ProviderFetchInput): Promise<ProviderFetchResult> {
     try {
       const request = providerRequest(input);
@@ -120,6 +143,19 @@ export class ProviderFetch extends WorkerEntrypoint<Env> implements ProviderApiS
       if (request.providerRevision !== this.env.BUILD_REVISION) return apiStatusFailure("unavailable");
       const container = this.ctx.exports.ProviderContainer.getByName(SINGLETON);
       return providerApiStatusResult(await container.probeApiStatus(request));
+    } catch {
+      return apiStatusFailure("unavailable");
+    }
+  }
+
+  async probeApiStatusV2(input: ProviderApiStatusV2Input): Promise<ProviderApiStatusResult> {
+    try {
+      const request = providerApiStatusV2Request(input);
+      if (!request) return apiStatusFailure("invalid-request");
+      if (request.providerRevision !== this.env.BUILD_REVISION) return apiStatusFailure("unavailable");
+      if (providerApiStatusV2Expired(request.dispatchBeforeMs)) return apiStatusFailure("timeout");
+      const container = this.ctx.exports.ProviderContainer.getByName(SINGLETON);
+      return providerApiStatusResult(await container.probeApiStatusV2(request));
     } catch {
       return apiStatusFailure("unavailable");
     }

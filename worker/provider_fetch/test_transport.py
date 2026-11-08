@@ -57,6 +57,28 @@ class PolicyTests(unittest.IsolatedAsyncioTestCase):
                              transport.FetchFailure("blocked-address"))
             dns.assert_not_called()
 
+    async def test_api_probe_v2_rejects_malformed_and_elapsed_deadlines_before_network(self):
+        now = 1_800_000_000_000
+        url = "https://provider.example/v1/models"
+        with (patch.object(transport, "_wall_ms", return_value=now),
+              patch.object(transport, "_dns_addresses", new_callable=AsyncMock) as dns):
+            for deadline in (True, 0, -1, str(now), 1.5, now + 30_001, 1 << 53):
+                with self.subTest(deadline=deadline):
+                    self.assertEqual(await transport.probe_api_status(url, "synthetic-key", dispatch_before_ms=deadline),
+                                     transport.FetchFailure("invalid-request"))
+            self.assertEqual(await transport.probe_api_status(url, "synthetic-key", dispatch_before_ms=now + 1000),
+                             transport.FetchFailure("timeout"))
+            dns.assert_not_called()
+
+        with (patch.object(transport, "_wall_ms", side_effect=[now, now + 9000]),
+              patch.object(transport, "_dns_addresses", new_callable=AsyncMock,
+                           return_value=(ipaddress.ip_address("1.1.1.1"),)) as dns,
+              patch.object(transport.aiohttp, "TCPConnector") as connector):
+            self.assertEqual(await transport.probe_api_status(url, "synthetic-key", dispatch_before_ms=now + 10_000),
+                             transport.FetchFailure("timeout"))
+            dns.assert_awaited_once_with(PROVIDER)
+            connector.assert_not_called()
+
     async def test_queries_both_absolute_types_and_refuses_mixed_answers(self):
         resolver = SimpleNamespace(resolve=AsyncMock(side_effect=[
             SimpleNamespace(rrset=[SimpleNamespace(address="1.1.1.1")]),
@@ -159,6 +181,8 @@ class PinnedTLSIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.handlers = {}
         self.header_delays = {}
         self.connections = set()
+        self.connection_finished = asyncio.Event()
+        self.partial_header_lengths = []
         self.tls = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         self.tls.load_verify_locations(cafile=self.directory / "ca.pem")
         server_tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -208,13 +232,16 @@ class PinnedTLSIntegrationTests(unittest.IsolatedAsyncioTestCase):
             response.extend(f"{key}: {value}" for key, value in extra.items())
             writer.write(("\r\n".join(response) + "\r\n\r\n").encode("ascii") + body)
             await writer.drain()
-        except (OSError, asyncio.IncompleteReadError):
+        except asyncio.IncompleteReadError as error:
+            self.partial_header_lengths.append(len(error.partial))
+        except OSError:
             pass
         finally:
             writer.close()
             with suppress(OSError, TimeoutError):
                 await writer.wait_closed()
             self.connections.discard(task)
+            self.connection_finished.set()
 
     async def test_real_host_sni_pin_and_auth_never_crosses_origins_or_returns(self):
         initial = "/start?key=synthetic%2Fprivate+x"
@@ -252,24 +279,39 @@ class PinnedTLSIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "/v1/chat/completions": (401, {}, b"synthetic private response"),
         }
         with patch.object(transport, "_read_body", side_effect=AssertionError("Unexpected API probe body read.")):
-            for path, status in (("/v1/models", 302), ("/v1/chat/completions", 401)):
-                observed = await transport.probe_api_status(self.url(PROVIDER, path), "synthetic-key")
-                self.assertIsInstance(observed, transport.ApiProbeSuccess)
-                self.assertEqual(observed.status, status)
-                self.assertTrue(0 <= observed.elapsed_ms < 15000)
-                self.assertNotIn("synthetic", repr(observed))
-        self.assertEqual(self.hosts, [PROVIDER, PROVIDER])
+            for version_two in (False, True):
+                for path, status in (("/v1/models", 302), ("/v1/chat/completions", 401)):
+                    deadline = {"dispatch_before_ms": transport._wall_ms() + 25_000} if version_two else {}
+                    observed = await transport.probe_api_status(self.url(PROVIDER, path), "synthetic-key", **deadline)
+                    self.assertIsInstance(observed, transport.ApiProbeSuccess)
+                    self.assertEqual(observed.status, status)
+                    self.assertTrue(0 <= observed.elapsed_ms < 15000)
+                    self.assertNotIn("synthetic", repr(observed))
+        self.assertEqual(self.hosts, [PROVIDER] * 4)
         self.assertEqual(self.sni, self.hosts)
-        self.assertEqual([(r[0], r[1]) for r in self.requests], [("GET", path) for path in self.handlers])
+        self.assertEqual([(r[0], r[1]) for r in self.requests], [("GET", path) for path in self.handlers] * 2)
         self.assertTrue(all(r[3]["authorization"] == "Bearer synthetic-key" and r[3]["x-api-key"] == "synthetic-key"
                             and "cookie" not in r[3] for r in self.requests))
         self.system_dns.assert_not_called()
 
     async def test_api_probe_does_not_replay_after_disconnect(self):
         self.handlers = {"/v1/models": (None, {}, b"")}
-        observed = await transport.probe_api_status(self.url(PROVIDER, "/v1/models"), "synthetic-key")
-        self.assertEqual(observed, transport.FetchFailure("unavailable"))
-        self.assertEqual(len(self.requests), 1)
+        for count, deadline in enumerate(({}, {"dispatch_before_ms": transport._wall_ms() + 25_000}), 1):
+            observed = await transport.probe_api_status(self.url(PROVIDER, "/v1/models"), "synthetic-key", **deadline)
+            self.assertEqual(observed, transport.FetchFailure("unavailable"))
+            self.assertEqual(len(self.requests), count)
+
+    async def test_api_probe_v2_checks_deadline_again_at_the_pinned_tls_send_boundary(self):
+        now = 1_800_000_000_000
+        self.handlers = {"/v1/models": (200, {}, b"unreachable")}
+        with patch.object(transport, "_wall_ms", side_effect=[now, now, now + 9000]):
+            observed = await transport.probe_api_status(self.url(PROVIDER, "/v1/models"), "synthetic-key",
+                                                        dispatch_before_ms=now + 10_000)
+        self.assertEqual(observed, transport.FetchFailure("timeout"))
+        self.assertEqual(self.sni, [PROVIDER])
+        await asyncio.wait_for(self.connection_finished.wait(), timeout=3)
+        self.assertEqual(self.partial_header_lengths, [0])
+        self.assertEqual(self.requests, [])
 
     async def test_redirect_reresolves_and_stops_private_mixed_results(self):
         self.handlers = {"/start": (302, {"Location": "/rebound"}, b"")}

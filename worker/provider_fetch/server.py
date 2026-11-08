@@ -16,6 +16,7 @@ from transport import FetchFailure, fetch_provider, probe_api_status
 
 PORT = 8080
 MAX_REQUEST = 12 * 1024
+API_STATUS_PATHS = {"/v1/api-status", "/v2/api-status"}
 ORIGIN = "https://subs-bot-cf-dev-01.lilyya.workers.dev/health"
 HEADERS = {"Cache-Control": "private, no-store", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff"}
 # Cloudflare's published IPv4 and IPv6 proxy ranges. This gate only narrows the smoke target.
@@ -46,7 +47,7 @@ def reply(result, families=()):
             if type(upstream) is int and 100 <= upstream <= 599 and upstream != 200:
                 return web.json_response({"error": "http-status", "upstreamStatus": upstream}, status=502, headers=HEADERS)
             return problem("unavailable", 502)
-        status = 504 if result.code == "timeout" else 422 if result.code in {"invalid-url", "blocked-address"} else 502
+        status = {"invalid-request": 400, "timeout": 504, "invalid-url": 422, "blocked-address": 422}.get(result.code, 502)
         return problem(result.code, status)
     headers = {**HEADERS, "X-Provider-Body-Sha256": sha256(result.body).hexdigest()}
     if families:
@@ -68,7 +69,7 @@ def application(revision):
             return problem("not-found", 404)
         if (request.method, request.raw_path) == ("GET", "/ready"):
             return web.json_response({"ok": True, "revision": revision}, headers=HEADERS)
-        if request.method != "POST" or request.raw_path not in {"/v1/fetch", "/v1/edge-proof", "/v1/api-status"}:
+        if request.method != "POST" or request.raw_path not in {"/v1/fetch", "/v1/edge-proof", *API_STATUS_PATHS}:
             return problem("not-found", 404)
         if (request.headers.getall("Content-Type", []) != ["application/json"]
                 or request.headers.getall("Content-Encoding", [])):
@@ -86,10 +87,14 @@ def application(revision):
             body = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
             if request.raw_path == "/v1/fetch" and isinstance(body, dict) and set(body) == {"url"} and isinstance(body["url"], str):
                 return reply(await fetch_provider(body["url"]))
-            if request.raw_path == "/v1/api-status" and isinstance(body, dict) and set(body) == {"url", "key"}:
-                if not isinstance(body["url"], str) or not isinstance(body["key"], str):
+            if request.raw_path in API_STATUS_PATHS:
+                version_two = request.raw_path == "/v2/api-status"
+                fields = {"url", "key", "dispatchBeforeMs"} if version_two else {"url", "key"}
+                if (not isinstance(body, dict) or set(body) != fields or not isinstance(body["url"], str)
+                        or not isinstance(body["key"], str) or (version_two and type(body["dispatchBeforeMs"]) is not int)):
                     return problem("invalid-request", 400)
-                status = await probe_api_status(body["url"], body["key"])
+                deadline = {"dispatch_before_ms": body["dispatchBeforeMs"]} if version_two else {}
+                status = await probe_api_status(body["url"], body["key"], **deadline)
                 if isinstance(status, FetchFailure):
                     return reply(status)
                 return web.json_response({"status": status.status, "elapsedMs": status.elapsed_ms}, headers=HEADERS)

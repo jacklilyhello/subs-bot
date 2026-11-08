@@ -60,6 +60,28 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await response.json(), {"status": 401, "elapsedMs": 62})
             probe.assert_awaited_once_with(url, "synthetic-key")
 
+    async def test_api_probe_v2_ingress_requires_its_exact_private_shape(self):
+        url = "https://provider.example/v1/models"
+        v1 = {"url": url, "key": "synthetic-key"}
+        deadline = 1_800_000_000_000
+        v2 = {**v1, "dispatchBeforeMs": deadline}
+        with patch.object(server, "probe_api_status", new_callable=AsyncMock, return_value=ApiProbeSuccess(401, 62)) as probe:
+            for path, host, body, status in (
+                ("/v2/api-status", {}, v2, 404), ("/v2/api-status?fixture=1", HOST, v2, 404),
+                ("/v1/api-status", HOST, v2, 400), ("/v2/api-status", HOST, v1, 400),
+                ("/v2/api-status", HOST, {**v2, "dispatchBeforeMs": True}, 400),
+                ("/v2/api-status", HOST, {**v2, "dispatchBeforeMs": str(deadline)}, 400),
+            ):
+                async with self.client.post(path, headers=host, json=body) as response:
+                    self.assertEqual(response.status, status)
+                    self.assertNotIn("synthetic-key", await response.text())
+            probe.assert_not_called()
+            async with self.client.post("/v2/api-status", headers=HOST, json=v2) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.headers["Cache-Control"], "private, no-store")
+                self.assertEqual(await response.json(), {"status": 401, "elapsedMs": 62})
+            probe.assert_awaited_once_with(url, "synthetic-key", dispatch_before_ms=deadline)
+
     async def test_fixed_edge_probe_narrows_addresses_and_refuses_redirects(self):
         async def synthetic(url, **policy):
             self.assertEqual(url, server.ORIGIN)
