@@ -8,6 +8,7 @@ on:
         type: choice
         options:
           - capacity
+          - legacy-capacity
           - structured-smoke
           - singbox-smoke
           - clash-smoke
@@ -28,21 +29,26 @@ jobs:
     environment: subs-bot-isolation
     runs-on: ubuntu-latest
     env:
-      FIXTURE_PROFILE: ${{ inputs.profile || 'capacity' }}
+      FIXTURE_PROFILE: ${{ inputs.profile == 'legacy-capacity' && 'capacity' || inputs.profile || 'capacity' }}
+      LEGACY_CAPACITY: ${{ inputs.profile == 'legacy-capacity' && '1' || '0' }}
     # Preserve cleanup time even if staging or the client probe uses its entire budget.
-    timeout-minutes: 45
+    timeout-minutes: ${{ inputs.profile == 'legacy-capacity' && 53 || 45 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Generate the bounded synthetic capacity fixtures
-        timeout-minutes: 2
+        timeout-minutes: ${{ inputs.profile == 'legacy-capacity' && 8 || 2 }}
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           CAPACITY_DIR="$RUNNER_TEMP/subs-bot-capacity"
           printf 'CAPACITY_DIR=%s\n' "$CAPACITY_DIR" >> "$GITHUB_ENV"
-          python3 -B worker/tools/capacity_fixtures.py "$CAPACITY_DIR" "$GITHUB_SHA" --profile "$FIXTURE_PROFILE"
+          if [ "$LEGACY_CAPACITY" = "1" ]; then
+            python3 -B worker/tools/legacy_capacity_bridge.py "$CAPACITY_DIR" "$GITHUB_SHA"
+          else
+            python3 -B worker/tools/capacity_fixtures.py "$CAPACITY_DIR" "$GITHUB_SHA" --profile "$FIXTURE_PROFILE"
+          fi
       - name: Verify the active isolation Worker before staging
         id: worker_before
         timeout-minutes: 2
