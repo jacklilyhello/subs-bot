@@ -139,7 +139,7 @@ export async function acceptTelegramDocumentJob(
       ...(providerUrlOptIn && (document?.suffix === "txt" || document?.suffix === "log") ? [db.prepare(`
         INSERT INTO telegram_provider_document_opt_in (receipt_id)
         SELECT incoming.receipt_id FROM telegram_inbox AS incoming JOIN telegram_document_jobs AS job USING (receipt_id)
-        WHERE ${freshReceipt} AND job.state='pending'
+        WHERE ${freshReceipt} AND job.state='pending' AND incoming.message_date BETWEEN unixepoch()-900 AND unixepoch()+30
       `).bind(...key)] : []),
       db.prepare(`
         UPDATE telegram_inbox AS incoming SET receipt_nonce = ?, command = CASE WHEN EXISTS (

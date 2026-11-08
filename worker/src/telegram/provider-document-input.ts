@@ -4,7 +4,7 @@ import { MAX_TELEGRAM_DOCUMENT_BYTES } from "./document-transport.ts";
 export const TELEGRAM_PROVIDER_DOCUMENT_MAX_URLS = 20;
 const MAX_DISTINCT_URLS = 4096;
 const HTTP_START = /^https?:\/\//iu;
-const utf8 = new TextDecoder("utf-8", { fatal: true });
+const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
 
 export type TelegramProviderDocumentInput =
   | { kind: "url-list"; urls: string[]; overflow: number }

@@ -70,6 +70,17 @@ function lines(receiptId: number) {
   }>();
 }
 
+test("only fresh opted-in private files can stage URL work", async () => {
+  for (const messageDate of [now() - 1200, now() + 60]) {
+    assert.equal(await acceptTelegramDocumentJob(db, policy, { ...event(), messageDate, fileName: `${messageDate}.txt` }, true), "accepted");
+  }
+  assert.equal(await db.prepare("SELECT count(*) AS count FROM telegram_provider_document_opt_in").first("count"), 0);
+  const lease = await claimTelegramDocumentJob(db, policy);
+  assert.ok(lease);
+  assert.equal(await stageTelegramProviderDocument(db, policy, lease, { kind: "url-list", urls: urls(1), overflow: 0 }), false);
+  assert.equal(await db.prepare("SELECT count(*) AS count FROM subscriptions").first("count"), 0);
+});
+
 test("seals twenty exact owned targets in order and settles one summary after all jobs", { timeout: 60_000 }, async () => {
   const values = urls(20);
   const existing = await createSubscription(db, { ownerId: policy.memberId, sourceUrl: values[0], name: "Existing" });

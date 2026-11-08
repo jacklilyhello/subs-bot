@@ -501,8 +501,11 @@ async function recoverTelegramWork(env: Env, policy: TelegramPolicy, pin: Provid
     try {
       if (providerIntakeReady && providerBatch.queue !== "unavailable" && providerDocument !== "unavailable") {
         if (providerBatch.queue) await reconcileTelegramProviderBatches(env.DB, policy);
-        if (providerDocument) await promoteTelegramProviderDocument(env.DB, policy, providerBatch.queue);
-        await runOneProviderJob(env.DB, env.NODES, env.PROVIDER_FETCH, pin, providerPolicy, providerBatch.queue);
+        try {
+          if (providerDocument) await promoteTelegramProviderDocument(env.DB, policy, providerBatch.queue);
+        } finally {
+          await runOneProviderJob(env.DB, env.NODES, env.PROVIDER_FETCH, pin, providerPolicy, providerBatch.queue);
+        }
       }
     } finally {
       const results = await Promise.allSettled([
