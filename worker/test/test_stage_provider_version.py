@@ -369,7 +369,10 @@ class APIStatusTests(unittest.TestCase):
         shell = {**stage.bootstrap._settings(API_PROFILE), "id": IDENTITY.worker_id, "created_on": IDENTITY.created_on,
                  "updated_on": IDENTITY.created_on, "deployed_on": None,
                  "references": {key: [] for key in stage.bootstrap.REFERENCE_FIELDS}}
-        with patch.object(api.worker, "_request", side_effect=[{"result": shell}, {"result": shell}]) as shell_read,                 patch.object(api, "_read", side_effect=[deployments, empty]) as read:
+        with (
+            patch.object(api.worker, "_request", side_effect=[{"result": shell}, {"result": shell}]) as shell_read,
+            patch.object(api, "_read", side_effect=[deployments, empty]) as read,
+        ):
             self.assertIsNone(api.baseline())
         self.assertEqual(shell_read.call_args_list, [
             call(f"{api.worker._workers}/{API_SERVICE}", absent=False),
