@@ -1,5 +1,6 @@
 import { collapsePathRuleWhitespace, PATH_RULE_WHITESPACE_PREFIX } from "../path-rules.ts";
 import type { TelegramDocumentJobInput } from "./document-jobs.ts";
+import { classifyTelegramApiStatusInput, TELEGRAM_API_STATUS_PROMPT } from "./api-status-input.ts";
 
 export interface TelegramPolicy {
   botId: string;
@@ -67,6 +68,9 @@ export type TelegramSubscriptionRawFileUpdate = TelegramEventScope & { callbackI
 export type TelegramProviderBatchUpdate = TelegramEventScope & (
   { kind: "preview" | "status" | "usage" } | { kind: "confirm"; callbackId: string; ticket: string }
 );
+export type TelegramApiStatusUpdate = TelegramEventScope & (
+  { kind: "prompt" } | { kind: "reply"; promptMessageId: number; text: string }
+);
 
 export type TelegramInlineSortMode = "default" | "traffic" | "expiry" | "name";
 type TelegramInlineSortAction = { kind: "current" | "usage" } | { kind: "set"; mode: TelegramInlineSortMode };
@@ -109,8 +113,10 @@ type ProviderRefreshUpdate = (GitHubSearchUpdate & { providerRefresh?: never })
   | ({ providerRefresh: TelegramProviderRefreshUpdate } & Partial<Record<keyof GitHubSearchUpdate, never>>);
 type SubscriptionRawFileUpdate = (ProviderRefreshUpdate & { subscriptionRawFile?: never })
   | ({ subscriptionRawFile: TelegramSubscriptionRawFileUpdate } & Partial<Record<keyof ProviderRefreshUpdate, never>>);
-type NormalizedUpdate = (SubscriptionRawFileUpdate & { providerBatch?: never })
+type ProviderBatchUpdate = (SubscriptionRawFileUpdate & { providerBatch?: never })
   | ({ providerBatch: TelegramProviderBatchUpdate } & Partial<Record<keyof SubscriptionRawFileUpdate, never>>);
+type NormalizedUpdate = (ProviderBatchUpdate & { apiStatus?: never })
+  | ({ apiStatus: TelegramApiStatusUpdate } & Partial<Record<keyof ProviderBatchUpdate, never>>);
 
 type DecodedTelegramRequest =
   | ({ status: 200 } & NormalizedUpdate)
@@ -228,7 +234,7 @@ function messageCommand(
   { code: string } | { args: string } | { shareArgs: string } | { selectedQuery: string } | { subscriptionQuery: string } | { shortArgs: string } |
   { inlineSort: TelegramInlineSortAction } | { bulkTrashQuery: string } |
   { inlineConsent: TelegramInlineConsentUpdate["kind"] } | { githubArgs: string } |
-  { providerBatch: "preview" | "status" | "usage" } | null {
+  { providerBatch: "preview" | "status" | "usage" } | { apiStatusArgs: string } | null {
   const { text, entities } = message;
   if (typeof text !== "string" || !Array.isArray(entities)) return null;
   const commands = entities.filter((entity) => isRecord(entity) && entity.type === "bot_command" && entity.offset === 0);
@@ -250,6 +256,7 @@ function messageCommand(
   if (commandName === "o") return { selectedQuery: remainder };
   if (commandName === "short") return { shortArgs: remainder };
   if (commandName === "g") return { githubArgs: remainder };
+  if (commandName === "ai") return { apiStatusArgs: remainder };
   if (commandName === "s") return { subscriptionQuery: remainder };
   if (commandName === "d") return { bulkTrashQuery: remainder };
   if (commandName === "share") return remainder.length <= 4096 ? { shareArgs: remainder } : null;
@@ -378,11 +385,21 @@ function normalizeMessage(
   if (actorId === null) return null;
   const scope = messageScope(message, actorId, updateId, policy);
   if (!scope) return null;
+  const { reply_to_message: origin, text, entities } = message;
+  if (ownBotMessage(origin, policy) && origin.text === TELEGRAM_API_STATUS_PROMPT) {
+    const prompt = messageScope(origin, actorId, updateId, policy);
+    if (typeof text !== "string" || "document" in message || scope.chatType !== "private" || scope.threadId !== null
+      || prompt?.chatType !== "private" || prompt.chatId !== scope.chatId || prompt.threadId !== null
+      || prompt.messageId >= scope.messageId || prompt.messageDate > scope.messageDate) return null;
+    return { apiStatus: { ...scope, kind: "reply", promptMessageId: prompt.messageId, text } };
+  }
   if ("document" in message) return normalizeDocument(message, scope);
   const command = messageCommand(message, policy);
   if (command && typeof command === "object") {
     if ("subscriptionQuery" in command) return { subscriptionRead: { ...scope, kind: "search", query: command.subscriptionQuery } };
     if (scope.chatType !== "private" || scope.threadId !== null) return null;
+    if ("apiStatusArgs" in command) return classifyTelegramApiStatusInput({ kind: "ai-command", args: command.apiStatusArgs }).kind === "open-prompt"
+      ? { apiStatus: { ...scope, kind: "prompt" } } : null;
     if ("bulkTrashQuery" in command) return { bulkTrash: { ...scope, kind: "preview", query: command.bulkTrashQuery } };
     if ("inlineSort" in command) return { inlineSort: { ...scope, ...command.inlineSort } };
     if ("inlineConsent" in command) return { inlineConsent: { ...scope, kind: command.inlineConsent } };
@@ -407,9 +424,9 @@ function normalizeMessage(
   }
   if (command === "list" || command === "expiry" || command === "recycle") return { view: { ...scope, kind: command } };
   if (command) return { command: { ...scope, command } };
+  if (typeof text === "string" && classifyTelegramApiStatusInput({ kind: "ordinary", text }).kind !== "pass-through") return null;
   const lifecycle = renameReply(message, scope, policy);
   if (lifecycle) return { lifecycle };
-  const { text, entities } = message;
   const hasCommandEntity = Array.isArray(entities) && entities.some((entity) => isRecord(entity) && entity.type === "bot_command");
   if (scope.chatType === "private" && scope.threadId === null && typeof text === "string" && !hasCommandEntity) {
     if (text === "更新所有" || text === "🔄 更新所有") return { providerBatch: { ...scope, kind: "preview" } };

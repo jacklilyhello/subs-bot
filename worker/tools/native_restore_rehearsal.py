@@ -646,6 +646,11 @@ def quiet_expression(tables, observed_at=None):
                 WHERE batch.finished_at>{epoch}-900 AND NOT EXISTS(
                     SELECT 1 FROM telegram_provider_batch_interactions JOIN telegram_outbox USING(receipt_id)
                     WHERE receipt_id=batch.batch_id))""")
+    if "telegram_api_status" in tables:
+        conditions.append(f"""NOT EXISTS(SELECT 1 FROM telegram_api_status AS action
+            LEFT JOIN telegram_outbox AS reply USING(receipt_id)
+            WHERE action.ready_at IS NULL OR (action.prompt_receipt_id IS NOT NULL
+              AND action.ready_at>{epoch}-900 AND reply.receipt_id IS NULL))""")
     if "telegram_private_share_creations" in tables:
         conditions.append("NOT EXISTS(SELECT 1 FROM telegram_private_share_creations WHERE state='reserved' OR (state='abandoned' AND cleaned_at IS NULL))")
     if "provider_snapshot_attempts" in tables:

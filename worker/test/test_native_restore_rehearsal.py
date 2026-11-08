@@ -687,6 +687,31 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT " + older).fetchone(), (1,))
         self.assertEqual(self.db.execute("SELECT count(*) FROM provider_snapshot_attempts").fetchone(), (1,))
 
+    def test_quiet_blocks_volatile_api_status_work_and_results_without_outbox(self):
+        self.db.executescript("""INSERT INTO telegram_inbox
+            (receipt_id,bot_id,update_id,actor_id,chat_id,chat_type,message_id,message_date,command,receipt_nonce)
+            VALUES (1,'881000',1,'881001','881001','private',1,1,'help','api-status:v1'),
+                   (2,'881000',2,'881001','881001','private',2,2,'help','api-status:v1');
+            INSERT INTO telegram_api_status
+                (receipt_id,prompt_receipt_id,actor_role,auth_message_date,auth_message_id,expires_at,ready_at,row_one,row_two)
+                VALUES (1,NULL,'admin',0,0,60,1,NULL,NULL),(2,1,'admin',0,0,70,NULL,-2,-1);
+            INSERT INTO telegram_outbox (receipt_id,state,attempts,sent_message_id) VALUES (1,'sent',1,3);""")
+
+        def quiet(epoch, tables=self.source.tables):
+            return self.db.execute("SELECT " + native.quiet_expression(tables, epoch)).fetchone()
+
+        older = set(self.source.tables) - {"telegram_api_status"}
+        self.assertEqual(quiet(60, older), (1,))
+        self.assertEqual(quiet(60), (0,))
+        self.assertEqual(quiet(1000), (0,))
+        self.db.execute("UPDATE telegram_api_status SET row_one=-3,row_two=-3,ready_at=70 WHERE receipt_id=2")
+        self.assertEqual(quiet(969), (0,))
+        self.assertEqual(quiet(970), (1,))
+        self.db.execute("INSERT INTO telegram_outbox (receipt_id) VALUES (2)")
+        self.assertEqual(quiet(70), (0,))
+        self.db.execute("UPDATE telegram_outbox SET state='sent',attempts=1,sent_message_id=4 WHERE receipt_id=2")
+        self.assertEqual(quiet(70), (1,))
+
     def test_full_schema_large_temp_text_and_r2_closure_roundtrip(self):
         self.snapshot()
         self.db.execute("INSERT INTO subscription_lifecycle VALUES (2,1)")
