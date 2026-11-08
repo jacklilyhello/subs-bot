@@ -635,6 +635,17 @@ def quiet_expression(tables, observed_at=None):
             conditions.append(f"NOT EXISTS(SELECT 1 FROM {table} WHERE state IN ('pending','leased'))")
     if "telegram_inline_search_receipts" in tables:
         conditions.append(f"NOT EXISTS(SELECT 1 FROM telegram_inline_search_receipts WHERE state IN ('preflight','sending') AND lease_until > {epoch})")
+    if "telegram_provider_batches" in tables:
+        conditions.append("NOT EXISTS(SELECT 1 FROM telegram_provider_batches WHERE finished_at IS NULL)")
+    if "telegram_provider_batch_jobs" in tables:
+        conditions.append("NOT EXISTS(SELECT 1 FROM telegram_provider_batch_jobs WHERE state IN ('waiting','pending','leased'))")
+    if "telegram_provider_batch_interactions" in tables:
+        waits.append("telegram_provider_batch_interactions")
+        if "telegram_provider_batches" in tables:
+            conditions.append(f"""NOT EXISTS(SELECT 1 FROM telegram_provider_batches AS batch
+                WHERE batch.finished_at>{epoch}-900 AND NOT EXISTS(
+                    SELECT 1 FROM telegram_provider_batch_interactions JOIN telegram_outbox USING(receipt_id)
+                    WHERE receipt_id=batch.batch_id))""")
     if "telegram_private_share_creations" in tables:
         conditions.append("NOT EXISTS(SELECT 1 FROM telegram_private_share_creations WHERE state='reserved' OR (state='abandoned' AND cleaned_at IS NULL))")
     if "telegram_selected_links" in tables:

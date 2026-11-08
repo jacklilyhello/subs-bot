@@ -15,7 +15,8 @@ import type { TelegramPolicy } from "../src/telegram/protocol.ts";
 const queueDiagnosticsModule = `
   import worker from './index.js';
   const tables = ['telegram_aggregate_actions', 'telegram_private_share_creations',
-    'telegram_inline_search_consent', 'telegram_github_search'];
+    'telegram_inline_search_consent', 'telegram_github_search', 'telegram_subscription_raw_file',
+    'telegram_provider_batch_interactions'];
   function errorClass(error) {
     const message = String(error?.message ?? '') + ' ' + String(error?.cause?.message ?? '');
     if (/parser stack overflow|expression tree is too large/i.test(message)) return 'sql-depth';
@@ -27,6 +28,7 @@ const queueDiagnosticsModule = `
   function instrument(env) {
     const db = env.DB;
     const claims = new WeakMap();
+    const work = new WeakMap();
     const record = (stage, outcome) => db.prepare('INSERT OR IGNORE INTO fixture_queue_diagnostics VALUES (?,?)')
       .bind(stage, outcome).run();
     const capture = (stage, query) => db.prepare('INSERT OR IGNORE INTO fixture_queue_sql VALUES (?,?)')
@@ -45,6 +47,17 @@ const queueDiagnosticsModule = `
     return {...env, DB: {
       prepare(sql) {
         const query = db.prepare(sql);
+        const trimmed = sql.trimStart();
+        const combined = sql.includes('UNION ALL SELECT') && sql.includes('FROM telegram_provider_batch_jobs');
+        const workStage = combined && trimmed.startsWith('UPDATE telegram_provider_jobs ') ? 'provider-work-claim-single'
+          : combined && trimmed.startsWith('UPDATE telegram_provider_batch_jobs ') ? 'provider-work-claim-batch'
+          : trimmed.startsWith('WITH terminal AS') && sql.includes('UPDATE telegram_provider_batch_jobs ')
+            ? 'provider-work-reap-batch' : null;
+        if (workStage) return {bind(...bindings) {
+          const statement = query.bind(...bindings);
+          work.set(statement, {stage: workStage, sql, bindings});
+          return statement;
+        }};
         const matrix = tables.every(table => sql.includes(table));
         const mode = sql.includes('telegram_provider_replies') ? 'provider' : 'base';
         const reaper = sql.includes('UPDATE telegram_outbox SET state = CASE');
@@ -62,7 +75,11 @@ const queueDiagnosticsModule = `
           }, result => result.success ? 'ok' : 'other')};
         }};
       },
-      batch(statements) {
+      async batch(statements) {
+        for (const statement of statements) {
+          const query = work.get(statement);
+          if (query) await capture(query.stage, {sql: query.sql, bindings: query.bindings});
+        }
         const claim = statements.map(statement => claims.get(statement)).find(Boolean);
         if (!claim) return db.batch(statements);
         return observe('claim', async () => {
@@ -154,7 +171,7 @@ test("emitted Worker answers opted-in sender queries using the owner's durable s
     { ...common, name: "disabled", bindings },
     { ...common, name: "swapped", bindings: { ...bindings, TELEGRAM_INLINE_SEARCH: "1", TELEGRAM_ISOLATION_CONFIG: JSON.stringify(swapped) } },
     { ...common, name: "provider-enabled", bindings: { ...bindings, TELEGRAM_INLINE_SEARCH: "1",
-      TELEGRAM_PROVIDER_URL_IMPORT: "1", TELEGRAM_PROVIDER_REFRESH: "1",
+      TELEGRAM_PROVIDER_URL_IMPORT: "1", TELEGRAM_PROVIDER_REFRESH: "1", TELEGRAM_PROVIDER_BATCH_REFRESH: "1",
       PROVIDER_REVISION: "a".repeat(40), PROVIDER_IMAGE_SHA256: "b".repeat(64) },
     serviceBindings: { PROVIDER_FETCH: { name: "provider", entrypoint: "ProviderFetch" } } },
     { name: "provider", modules: true, compatibilityDate: manifest.compatibilityDate,
@@ -205,16 +222,17 @@ test("emitted Worker answers opted-in sender queries using the owner's durable s
       WHERE bot_id=? AND update_id=?`).bind(policy.botId, updateId).first();
     const diagnostics = async () => (await db.prepare("SELECT stage,outcome FROM fixture_queue_diagnostics ORDER BY stage,outcome LIMIT 20").all()).results;
     async function assertD1ExpressionLimit() {
-      const queries = await db.prepare("SELECT stage,body FROM fixture_queue_sql ORDER BY stage LIMIT 5")
+      const queries = await db.prepare("SELECT stage,body FROM fixture_queue_sql ORDER BY stage LIMIT 8")
         .all<{ stage: string; body: string }>();
-      assert.deepEqual(queries.results.map(({ stage }) => stage), ["base-claim", "base-reap", "provider-claim", "provider-reap"]);
+      assert.deepEqual(queries.results.map(({ stage }) => stage), ["base-claim", "base-reap", "provider-claim", "provider-reap",
+        "provider-work-claim-batch", "provider-work-claim-single", "provider-work-reap-batch"]);
       const check = spawnSync("python3", ["-B", fileURLToPath(new URL("queue-expression-depth.py", import.meta.url))], {
         input: JSON.stringify({ queries: queries.results.map(({ stage, body }) => ({ stage, ...JSON.parse(body) })),
           migrations: migrations.map(({ name }) => verifiedMigrationSql.get(name)) }),
         encoding: "utf8", timeout: 5_000, maxBuffer: 4096,
       });
       const output = check.stdout?.trim() ?? "";
-      const outcome = /^(?:ok|invalid-fixture|sqlite-error|(?:base|provider)-(?:claim|reap) (?:expression-depth|sqlite-error))$/u.test(output)
+      const outcome = /^(?:ok|invalid-fixture|sqlite-error|(?:base-claim|base-reap|provider-claim|provider-reap|provider-work-claim-batch|provider-work-claim-single|provider-work-reap-batch) (?:expression-depth|sqlite-error|invalid-statement|invalid-bindings))$/u.test(output)
         ? output : "unavailable";
       assert.equal(check.status === 0 && outcome === "ok", true, `Queue SQLite depth check: ${outcome}.`);
     }
@@ -273,6 +291,7 @@ test("emitted Worker answers opted-in sender queries using the owner's durable s
     assert.equal(githubRequests, 1);
     assert.equal((await command(103, "/help", providerEnabled)).status, 200);
     await expectCommand(103, /订阅/u);
+    assert.equal((await providerEnabled.scheduled({ cron: "* * * * *" })).outcome, "ok");
     await assertD1ExpressionLimit();
     for (const [id, actor] of [[7, policy.memberId], [8, policy.adminId]] as const) {
       assert.equal((await query(id, "", { from: { id: Number(actor), is_bot: false } }, changedRoles)).status, 204);

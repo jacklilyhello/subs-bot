@@ -638,6 +638,41 @@ class SnapshotTests(unittest.TestCase):
         self.db.execute("UPDATE telegram_provider_jobs SET state='done',result_code='expired',finished_at=10")
         self.assertEqual(self.db.execute("SELECT " + full).fetchone(), (1,))
 
+    def test_quiet_blocks_batch_tickets_unsettled_children_and_late_replies(self):
+        self.db.executescript("""INSERT INTO telegram_inbox
+            (receipt_id,bot_id,update_id,actor_id,chat_id,chat_type,message_id,message_date,command,receipt_nonce)
+            VALUES (1,'881000',1,'881001','881001','private',1,1,'help','provider-batch-preview:v1'),
+                   (2,'881000',2,'881001','881001','private',2,2,'help','provider-batch-confirm:v1');
+            INSERT INTO telegram_provider_batches
+                (batch_id,preview_receipt_id,origin_attempt,bot_id,actor_id,actor_role,auth_message_date,auth_message_id,
+                 admission_nonce,target_count,skipped_count,created_at,expires_at)
+                VALUES (2,1,1,'881000','881001','admin',0,0,'synthetic',1,0,10,2710);
+            INSERT INTO telegram_provider_batch_interactions
+                (receipt_id,kind,actor_role,auth_message_date,auth_message_id,ready_at,targets,token_sha256,origin_attempt,expires_at)
+                VALUES (1,'preview','admin',0,0,1,'[[1,0,0]]',printf('%064d',1),1,50);
+            INSERT INTO telegram_provider_batch_jobs
+                (batch_id,ordinal,owner_id,request_key,kind,subscription_id,source_sha256,expected_generation,
+                 expected_lifecycle_revision,state,created_at,due_at,expires_at)
+                VALUES (2,1,'881001',printf('%064d',2),'refresh',1,printf('%064d',3),0,0,'waiting',10,10,2710);""")
+        def quiet(epoch, tables=self.source.tables):
+            return self.db.execute("SELECT " + native.quiet_expression(tables, epoch)).fetchone()
+
+        older = set(self.source.tables) - {"telegram_provider_batches", "telegram_provider_batch_jobs",
+                                         "telegram_provider_batch_interactions"}
+        self.assertEqual(quiet(60, older), (1,))
+        self.assertEqual(quiet(60), (0,))
+        self.db.execute("""UPDATE telegram_provider_batches SET finished_at=20,saved_count=1,failed_count=0,
+                        stale_count=0,expired_count=0""")
+        self.assertEqual(quiet(1000), (0,))
+        self.db.execute("UPDATE telegram_provider_batch_jobs SET state='done',result_code='saved',finished_at=20")
+        self.assertEqual(quiet(60), (0,))
+        self.db.execute("""INSERT INTO telegram_provider_batch_interactions
+            (receipt_id,kind,batch_id,actor_role,auth_message_date,auth_message_id,ready_at) VALUES (2,'terminal',2,'admin',0,0,20)""")
+        self.assertEqual(quiet(50), (0,))
+        self.db.execute("INSERT INTO telegram_outbox (receipt_id,state,attempts,sent_message_id) VALUES (2,'sent',1,3)")
+        self.assertEqual(quiet(49), (0,))
+        self.assertEqual(quiet(50), (1,))
+
     def test_full_schema_large_temp_text_and_r2_closure_roundtrip(self):
         self.snapshot()
         self.db.execute("INSERT INTO subscription_lifecycle VALUES (2,1)")

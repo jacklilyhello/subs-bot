@@ -64,6 +64,9 @@ export type TelegramBulkTrashUpdate = TelegramEventScope & (
 export type TelegramSubscriptionNodeUpdate = TelegramEventScope & { callbackId: string; ticket: string };
 export type TelegramProviderRefreshUpdate = TelegramEventScope & { callbackId: string; ticket: string };
 export type TelegramSubscriptionRawFileUpdate = TelegramEventScope & { callbackId: string; ticket: string };
+export type TelegramProviderBatchUpdate = TelegramEventScope & (
+  { kind: "preview" | "status" | "usage" } | { kind: "confirm"; callbackId: string; ticket: string }
+);
 
 export type TelegramInlineSortMode = "default" | "traffic" | "expiry" | "name";
 type TelegramInlineSortAction = { kind: "current" | "usage" } | { kind: "set"; mode: TelegramInlineSortMode };
@@ -104,8 +107,10 @@ type GitHubSearchUpdate = (InlineQueryUpdate & { githubSearch?: never })
   | ({ githubSearch: TelegramGitHubSearchUpdate } & Partial<Record<keyof InlineQueryUpdate, never>>);
 type ProviderRefreshUpdate = (GitHubSearchUpdate & { providerRefresh?: never })
   | ({ providerRefresh: TelegramProviderRefreshUpdate } & Partial<Record<keyof GitHubSearchUpdate, never>>);
-type NormalizedUpdate = (ProviderRefreshUpdate & { subscriptionRawFile?: never })
+type SubscriptionRawFileUpdate = (ProviderRefreshUpdate & { subscriptionRawFile?: never })
   | ({ subscriptionRawFile: TelegramSubscriptionRawFileUpdate } & Partial<Record<keyof ProviderRefreshUpdate, never>>);
+type NormalizedUpdate = (SubscriptionRawFileUpdate & { providerBatch?: never })
+  | ({ providerBatch: TelegramProviderBatchUpdate } & Partial<Record<keyof SubscriptionRawFileUpdate, never>>);
 
 type DecodedTelegramRequest =
   | ({ status: 200 } & NormalizedUpdate)
@@ -129,6 +134,7 @@ export const SUBSCRIPTION_READ_RECEIPT_MARKER = "subread:v1";
 export const SUBSCRIPTION_NODE_TICKET = /^sbn1_[A-Za-z0-9_-]{22}(?![\s\S])/;
 export const PROVIDER_REFRESH_TICKET = /^sbpr1_[A-Za-z0-9_-]{21}[AQgw](?![\s\S])/;
 export const SUBSCRIPTION_RAW_FILE_TICKET = /^sbnf1_[A-Za-z0-9_-]{21}[AQgw](?![\s\S])/;
+export const PROVIDER_BATCH_TICKET = /^sbpb1_[A-Za-z0-9_-]{21}[AQgw](?![\s\S])/;
 const RENAME_CANCEL = /^(?:\/cancel|cancel|取消|退出)(?![\s\S])/iu;
 const PRIVATE_CLAIM = /^claim_([A-Za-z0-9_-]{11}|[A-Za-z0-9_-]{22})(?![\s\S])/u;
 const NON_HUMAN_MESSAGE_FIELDS = [
@@ -221,7 +227,8 @@ function messageCommand(
 ): TelegramCommand["command"] | TelegramViewKind | "temp-raw" | "temp-summary" | "temp-clear" | "aggregate-show" | "aggregate-revoke" |
   { code: string } | { args: string } | { shareArgs: string } | { selectedQuery: string } | { subscriptionQuery: string } | { shortArgs: string } |
   { inlineSort: TelegramInlineSortAction } | { bulkTrashQuery: string } |
-  { inlineConsent: TelegramInlineConsentUpdate["kind"] } | { githubArgs: string } | null {
+  { inlineConsent: TelegramInlineConsentUpdate["kind"] } | { githubArgs: string } |
+  { providerBatch: "preview" | "status" | "usage" } | null {
   const { text, entities } = message;
   if (typeof text !== "string" || !Array.isArray(entities)) return null;
   const commands = entities.filter((entity) => isRecord(entity) && entity.type === "bot_command" && entity.offset === 0);
@@ -249,6 +256,10 @@ function messageCommand(
   if (commandName === "inline") {
     const mode = remainder.trim().toLowerCase();
     return { inlineConsent: mode === "on" || mode === "off" ? mode : "usage" };
+  }
+  if (commandName === "updateall") {
+    const mode = remainder.trim().toLowerCase();
+    return { providerBatch: mode === "" ? "preview" : mode === "status" ? "status" : "usage" };
   }
   if (commandName === "i") {
     switch (remainder.length <= 4096 ? collapsePathRuleWhitespace(remainder) : null) {
@@ -376,6 +387,7 @@ function normalizeMessage(
     if ("inlineSort" in command) return { inlineSort: { ...scope, ...command.inlineSort } };
     if ("inlineConsent" in command) return { inlineConsent: { ...scope, kind: command.inlineConsent } };
     if ("githubArgs" in command) return { githubSearch: { ...scope, args: command.githubArgs } };
+    if ("providerBatch" in command) return { providerBatch: { ...scope, kind: command.providerBatch } };
     if ("shortArgs" in command) return { shortLink: { ...scope, args: command.shortArgs } };
     if ("shareArgs" in command) {
       const sender = isRecord(message.from) ? [message.from.first_name, message.from.last_name]
@@ -400,6 +412,7 @@ function normalizeMessage(
   const { text, entities } = message;
   const hasCommandEntity = Array.isArray(entities) && entities.some((entity) => isRecord(entity) && entity.type === "bot_command");
   if (scope.chatType === "private" && scope.threadId === null && typeof text === "string" && !hasCommandEntity) {
+    if (text === "更新所有" || text === "🔄 更新所有") return { providerBatch: { ...scope, kind: "preview" } };
     const position = subscriptionPosition(text);
     if (position !== null) return { subscriptionRead: { ...scope, kind: "number", position } };
     const short = /^(?:短链|short)(?: +([\s\S]*))?(?![\s\S])/iu.exec(text.replace(/^ +| +$/gu, ""));
@@ -429,6 +442,8 @@ function normalizeCallback(
     ? { providerRefresh: { ...scope, callbackId, ticket } } : null;
   if (SUBSCRIPTION_RAW_FILE_TICKET.test(ticket)) return scope.chatType === "private" && scope.threadId === null
     ? { subscriptionRawFile: { ...scope, callbackId, ticket } } : null;
+  if (PROVIDER_BATCH_TICKET.test(ticket)) return scope.chatType === "private" && scope.threadId === null
+    ? { providerBatch: { ...scope, kind: "confirm", callbackId, ticket } } : null;
   if (SELECTED_TICKET.test(ticket)) return scope.chatType === "private" && scope.threadId === null
     ? { selected: { ...scope, kind: "selected-revoke", callbackId, ticket } } : null;
   if (VIEW_TICKET.test(ticket)) return { view: { ...scope, kind: "callback", callbackId, ticket } };

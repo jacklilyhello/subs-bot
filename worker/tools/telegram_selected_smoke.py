@@ -20,7 +20,7 @@ from telegram_aggregate_smoke import (
     Cohort, SnapshotObjects, canonical, canonical_nonce, digest, expected_fixture_exports, key_bytes,
     probe_fixture_exports, read_checkpoint, require, validate_release_pin,
 )
-from telegram_view_fixtures import FixtureError, statement
+from telegram_view_fixtures import FixtureError, provider_batch_fixture_quiet, provider_batch_fixture_tables, statement
 
 
 WORKFLOW = "worker-isolation-telegram-selected-smoke.yml"
@@ -122,6 +122,7 @@ class SelectedCohort(Cohort):
         provider_table = self.read("SELECT name FROM sqlite_schema WHERE type='table' AND name='telegram_provider_jobs'")
         require(provider_table in ([], [{"name": "telegram_provider_jobs"}]), "Selected provider queue schema differs.")
         self.has_telegram_provider_queue = bool(provider_table)
+        self.provider_batch_tables = provider_batch_fixture_tables(self.read)
 
     def seed_identity(self, label):
         material = hmac.new(key_bytes(self.encoded), canonical(["subs-bot/selected-fixture/v1", self.identity,
@@ -192,9 +193,11 @@ class SelectedCohort(Cohort):
             provider_params = actors
         else:
             condition += " AND NOT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='telegram_provider_jobs')"
+        batch, batch_params = provider_batch_fixture_quiet(self.provider_batch_tables, bot, actors)
+        condition += " AND " + batch
         return statement(_assert_sql(condition) if assertion else "SELECT (" + condition + ") AS quiet",
             bot, *actors, temp_id, *actors, *actors, known, known, bot, *actors, known, known, *actors, bot, *actors, *actors, bot,
-            canonical(list(active)), *provider_params)
+            canonical(list(active)), *provider_params, *batch_params)
 
     def require_quiet(self, ids, temp_id=0, active=()):
         check = self.quiet(ids, temp_id, active)

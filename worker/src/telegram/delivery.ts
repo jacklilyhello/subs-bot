@@ -30,6 +30,7 @@ import {
   beginTelegramSelectedLinkReply, beginTelegramShortLinkReply, beginTelegramReply, claimTelegramReply, isTelegramMemberAllowed,
   beginTelegramGitHubSearchReply, beginTelegramTempRawReply,
   beginTelegramSubscriptionRawFileReply, failLeasedTelegramSubscriptionRawFileReply,
+  beginTelegramProviderBatchReply,
   prepareTelegramPrivateClaimBegin, reapExpiredTelegramReplies, settleTelegramReply,
   type TelegramReplyLease, type TelegramReplyOutcome,
 } from "./store.ts";
@@ -38,6 +39,7 @@ import { renderTelegramTemp } from "./temp-import.ts";
 import { confirmTelegramTempRawSend, prepareTelegramTempRawReply } from "./temp-raw.ts";
 import { renderTelegramProviderReply } from "./provider-replies.ts";
 import { prepareTelegramProviderRefreshButton, type TelegramProviderRefreshTarget } from "./provider-refresh.ts";
+import { renderTelegramProviderBatchReply } from "./provider-batch-controls.ts";
 
 const BOT_API = "https://api.telegram.org";
 const MAX_RESPONSE_BYTES = 64 * 1024;
@@ -134,7 +136,7 @@ export async function sendTelegramReply(
   forceReply = false,
 ): Promise<TelegramReplyOutcome> {
   if ((lease.path || lease.privateShareCreation || lease.tempRaw || lease.shortLink || lease.subscriptionNodes || lease.subscriptionRawFile
-    || lease.providerOutcome !== undefined || lease.bulkTrash || lease.githubSearch)
+    || lease.providerOutcome !== undefined || lease.bulkTrash || lease.githubSearch || lease.providerBatch)
     && (lease.chatType !== "private" || lease.threadId !== null)) {
     return { kind: "failed" };
   }
@@ -431,21 +433,32 @@ export async function drainTelegramReplies(
   gitHubSearchReadiness: boolean | "unavailable" = false,
   providerRefreshEnabled = false,
   subscriptionRawFileReadiness: boolean | "unavailable" = false,
+  providerBatchReadiness: boolean | "unavailable" = false,
 ): Promise<void> {
   const deadline = Date.now() + budgetMs;
   const privateShareEnabled = privateShareRuntime.schemaReady && privateShareRuntime.context !== null;
   const gitHubSearchEnabled = gitHubSearchReadiness === true;
   const gitHubSearch = gitHubSearchEnabled ? policy : gitHubSearchReadiness === "unavailable" ? "unavailable" : undefined;
   const subscriptionRawFileEnabled = subscriptionRawFileReadiness === true;
+  const providerBatchEnabled = providerBatchReadiness === true;
+  const providerBatch = providerBatchEnabled ? policy : providerBatchReadiness === "unavailable" ? "unavailable" : undefined;
   await reapExpiredTelegramReplies(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled,
     shortLinksEnabled, inlineSortEnabled, subscriptionNodesEnabled, providerEnabled, bulkTrashEnabled, inlineConsentEnabled,
-    gitHubSearchEnabled, subscriptionRawFileEnabled);
+    gitHubSearchEnabled, subscriptionRawFileEnabled, providerBatchEnabled);
   for (let processed = 0; processed < limit && Date.now() < deadline; processed += 1) {
     const lease = await claimTelegramReply(db, policy.botId, aggregateKey !== null, privateShareEnabled, subscriptionReadEnabled,
       shortLinksEnabled, inlineSortEnabled, subscriptionNodesEnabled, providerEnabled ? policy : undefined,
-      bulkTrashEnabled, inlineConsentEnabled, gitHubSearch, subscriptionRawFileReadiness);
+      bulkTrashEnabled, inlineConsentEnabled, gitHubSearch, subscriptionRawFileReadiness, providerBatch);
     if (!lease) return;
     if (!inTelegramScope(policy, lease)) continue;
+    if (lease.providerBatch) {
+      const prepared = await renderTelegramProviderBatchReply(db, policy, lease);
+      if (Date.now() >= deadline || !await beginTelegramProviderBatchReply(db, policy, lease, prepared) || !prepared) continue;
+      const buttons = prepared.ticket ? [[{ text: "确认刷新", callback_data: prepared.ticket.value }]] : undefined;
+      const outcome = await sendTelegramReply(policy, lease, prepared.text, Math.max(1, deadline - Date.now()), request, buttons);
+      await settleTelegramReply(db, policy, lease, outcome);
+      continue;
+    }
     if (lease.providerOutcome !== undefined) {
       if (lease.providerRequestKind === undefined) continue;
       const text = renderTelegramProviderReply(lease.providerOutcome, lease.providerRequestKind);

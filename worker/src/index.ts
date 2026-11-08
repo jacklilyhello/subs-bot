@@ -32,6 +32,11 @@ import {
 import { telegramPrivateShareRuntime } from "./telegram/private-share-runtime.ts";
 import { decodeTelegramRequest, parseTelegramPolicy, type TelegramPolicy } from "./telegram/protocol.ts";
 import { acceptTelegramProviderRequest } from "./telegram/provider-admission.ts";
+import { reconcileTelegramProviderBatches, telegramProviderBatchReady } from "./telegram/provider-batch.ts";
+import {
+  acceptTelegramProviderBatchControl, reapTelegramProviderBatchTickets, reconcileTelegramProviderBatchReplies,
+  telegramProviderBatchControlsReady,
+} from "./telegram/provider-batch-controls.ts";
 import { parseTelegramProviderText, reconcileTelegramProviderReplies, telegramProviderRepliesReady } from "./telegram/provider-replies.ts";
 import { reapTelegramProviderRefreshTickets, telegramProviderRefreshReady } from "./telegram/provider-refresh.ts";
 import { acceptTelegramCommand } from "./telegram/store.ts";
@@ -57,6 +62,7 @@ export interface Env {
   TELEGRAM_PROVIDER_URL_IMPORT?: string;
   TELEGRAM_PROVIDER_REFRESH?: string;
   LEGACY_SUBSCRIPTION_SHORTS?: string;
+  TELEGRAM_PROVIDER_BATCH_REFRESH?: string;
 }
 
 const QX_KINDS = new Set(["qx", "quantumult", "quantumultx"]);
@@ -115,6 +121,17 @@ async function telegramProviderQueueReady(env: Env, pin = providerPin(env)): Pro
     && await telegramProviderRepliesReady(env.DB).catch(() => false);
 }
 
+async function providerBatchReadiness(env: Env) {
+  const [queue, controls] = await Promise.all([
+    telegramProviderBatchReady(env.DB).catch(() => "unavailable" as const),
+    telegramProviderBatchControlsReady(env.DB).catch(() => "unavailable" as const),
+  ]);
+  return {
+    queue: queue === false && (controls === true || env.TELEGRAM_PROVIDER_BATCH_REFRESH === "1") ? "unavailable" as const : queue,
+    controls: controls === true && queue !== true ? "unavailable" as const : controls,
+  };
+}
+
 function telegramGitHubSearchProbe(db: D1Database): () => Promise<boolean> {
   let readiness: Promise<boolean> | undefined;
   return () => readiness ??= telegramGitHubSearchReady(db);
@@ -145,6 +162,7 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
     const subscriptionNodes = subscriptionRead && await telegramSubscriptionNodePagesReady(env.DB);
     const subscriptionRawFile = subscriptionRead && await telegramSubscriptionRawFileReady(env.DB).catch(() => "unavailable" as const);
     const providerQueueReady = await telegramProviderQueueReady(env);
+    const providerBatch = await providerBatchReadiness(env);
     const inlineConsent = inlineSearchEnabled && await telegramInlineSearchReady(env.DB);
     const bulkTrash = await telegramBulkTrashReady(env.DB);
     const githubSearch = telegramGitHubSearchProbe(env.DB);
@@ -152,7 +170,7 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
       && await telegramProviderRefreshReady(env.DB).catch(() => false);
     const drainReplies = async () => drainTelegramReplies(env.DB, env.NODES, policy, 4, 20_000, fetch, aggregateKey, privateShare,
       subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerQueueReady, bulkTrash, inlineConsent,
-      await githubSearch().catch(() => "unavailable" as const), providerRefresh, subscriptionRawFile);
+      await githubSearch().catch(() => "unavailable" as const), providerRefresh, subscriptionRawFile, providerBatch.controls);
     const drain = () => ctx?.waitUntil(drainReplies().catch(() => undefined));
     if (decoded.command) {
       await acceptTelegramCommand(env.DB, policy, decoded.command);
@@ -182,7 +200,8 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
       const candidate = env.TELEGRAM_PROVIDER_URL_IMPORT === "1" && providerQueueReady && decoded.temp.kind === "temp-text"
         ? parseTelegramProviderText(decoded.temp.text) : null;
       if (candidate) {
-        const outcome = await acceptTelegramProviderRequest(env.DB, policy, { ...decoded.temp, ...candidate, kind: "url-import" });
+        if (providerBatch.queue === "unavailable") return new Response(null, { status: 503, headers: HEADERS });
+        const outcome = await acceptTelegramProviderRequest(env.DB, policy, { ...decoded.temp, ...candidate, kind: "url-import" }, providerBatch.queue);
         if (outcome.kind !== "queued" && outcome.kind !== "ignored") {
           await reconcileTelegramProviderReplies(env.DB, policy);
           drain();
@@ -245,7 +264,8 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
       if (outcome === "accepted") drain();
     } else if (decoded.providerRefresh) {
       if (!providerRefresh) return new Response(null, { status: 204, headers: HEADERS });
-      const outcome = await acceptTelegramProviderRequest(env.DB, policy, { ...decoded.providerRefresh, kind: "refresh-ticket" });
+      if (providerBatch.queue === "unavailable") return new Response(null, { status: 503, headers: HEADERS });
+      const outcome = await acceptTelegramProviderRequest(env.DB, policy, { ...decoded.providerRefresh, kind: "refresh-ticket" }, providerBatch.queue);
       ctx?.waitUntil(answerTelegramCallback(policy, decoded.providerRefresh.callbackId));
       if (outcome.kind !== "queued" && outcome.kind !== "ignored") {
         await reconcileTelegramProviderReplies(env.DB, policy);
@@ -255,6 +275,16 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
       if (subscriptionRawFile !== true) return new Response(null, { status: 204, headers: HEADERS });
       const outcome = await acceptTelegramSubscriptionRawFile(env.DB, policy, decoded.subscriptionRawFile);
       ctx?.waitUntil(answerTelegramCallback(policy, decoded.subscriptionRawFile.callbackId));
+      if (outcome === "accepted") drain();
+    } else if (decoded.providerBatch) {
+      if (providerBatch.controls === "unavailable") return new Response(null, { status: 503, headers: HEADERS });
+      if (!providerBatch.controls) return new Response(null, { status: 204, headers: HEADERS });
+      const event = decoded.providerBatch;
+      const admission = providerQueueReady && env.TELEGRAM_PROVIDER_BATCH_REFRESH === "1";
+      if (!admission && event.kind !== "status") return new Response(null, { status: 204, headers: HEADERS });
+      const outcome = await acceptTelegramProviderBatchControl(env.DB, policy, event, admission);
+      if (!admission && outcome === "ignored") return new Response(null, { status: 204, headers: HEADERS });
+      if (event.kind === "confirm" && admission) ctx?.waitUntil(answerTelegramCallback(policy, event.callbackId));
       if (outcome === "accepted") drain();
     } else if (decoded.privateShareCreation) {
       if (!privateShare.context) return new Response(null, { status: 204, headers: HEADERS });
@@ -363,6 +393,7 @@ async function recoverTelegramWork(env: Env, policy: TelegramPolicy, pin: Provid
   const inlineSort = await telegramInlineSortReady(env.DB);
   const subscriptionNodes = subscriptionRead && await telegramSubscriptionNodePagesReady(env.DB);
   const subscriptionRawFile = subscriptionRead && await telegramSubscriptionRawFileReady(env.DB).catch(() => "unavailable" as const);
+  const providerBatch = await providerBatchReadiness(env);
   const inlineSearchSchema = await telegramInlineSearchReady(env.DB);
   const inlineConsent = inlineSearchSchema && env.TELEGRAM_INLINE_SEARCH === "1";
   const bulkTrash = await telegramBulkTrashReady(env.DB);
@@ -372,7 +403,7 @@ async function recoverTelegramWork(env: Env, policy: TelegramPolicy, pin: Provid
   const drain = async (limit: number, budget: number) =>
     drainTelegramReplies(env.DB, env.NODES, policy, limit, budget, fetch, aggregateKey, privateShare,
       subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerQueueReady, bulkTrash, inlineConsent,
-      await githubSearch().catch(() => "unavailable" as const), providerRefresh, subscriptionRawFile);
+      await githubSearch().catch(() => "unavailable" as const), providerRefresh, subscriptionRawFile, providerBatch.controls);
   const replies = async () => {
     await drain(10, 45_000);
     await reapTelegramViewTickets(env.DB);
@@ -382,6 +413,7 @@ async function recoverTelegramWork(env: Env, policy: TelegramPolicy, pin: Provid
     if (subscriptionNodes) await reapTelegramSubscriptionNodeTickets(env.DB);
     if (providerRefreshSchema) await reapTelegramProviderRefreshTickets(env.DB);
     if (subscriptionRawFile === true) await reapTelegramRawFileTickets(env.DB);
+    if (providerBatch.controls === true) await reapTelegramProviderBatchTickets(env.DB);
     if (shortLinks) await reapFailedTelegramShortLinks(env.DB, policy.botId);
   };
   const documents = async () => {
@@ -406,11 +438,21 @@ async function recoverTelegramWork(env: Env, policy: TelegramPolicy, pin: Provid
     }
   };
   const providers = async () => {
-    if (!providerQueueReady) return;
     try {
-      await runOneProviderJob(env.DB, env.NODES, env.PROVIDER_FETCH, pin, policy);
+      if (providerQueueReady && providerBatch.queue !== "unavailable") {
+        if (providerBatch.queue) await reconcileTelegramProviderBatches(env.DB, policy);
+        await runOneProviderJob(env.DB, env.NODES, env.PROVIDER_FETCH, pin, policy, providerBatch.queue);
+      }
     } finally {
-      if (await reconcileTelegramProviderReplies(env.DB, policy) > 0) await drain(4, 15_000);
+      const [single, batch] = await Promise.allSettled([
+        providerQueueReady ? reconcileTelegramProviderReplies(env.DB, policy) : Promise.resolve(0),
+        (async () => {
+          if (providerBatch.queue === true) await reconcileTelegramProviderBatches(env.DB, policy, false);
+          return providerBatch.controls === true ? reconcileTelegramProviderBatchReplies(env.DB, policy) : 0;
+        })(),
+      ]);
+      if ((single.status === "fulfilled" && single.value > 0) || (batch.status === "fulfilled" && batch.value > 0)) await drain(4, 15_000);
+      if (single.status === "rejected" || batch.status === "rejected") throw new Error("Telegram provider replies could not recover.");
     }
   };
   const results = await Promise.allSettled([replies(), documents(), creations(), searches(), retireTelegramDocumentStage(env.DB, env.NODES, policy),

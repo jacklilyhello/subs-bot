@@ -8,7 +8,15 @@ import sys
 
 MAX_INPUT_BYTES = 1024 * 1024
 D1_EXPRESSION_DEPTH = 100
-STAGES = ["base-claim", "base-reap", "provider-claim", "provider-reap"]
+STAGES = {
+    "base-claim": ("UPDATE", "telegram_outbox"),
+    "base-reap": ("UPDATE", "telegram_outbox"),
+    "provider-claim": ("UPDATE", "telegram_outbox"),
+    "provider-reap": ("UPDATE", "telegram_outbox"),
+    "provider-work-claim-batch": ("UPDATE", "telegram_provider_batch_jobs"),
+    "provider-work-claim-single": ("UPDATE", "telegram_provider_jobs"),
+    "provider-work-reap-batch": ("WITH", "terminal", "AS", "MATERIALIZED", "("),
+}
 
 
 def check() -> str:
@@ -18,7 +26,7 @@ def check() -> str:
     fixture = json.loads(raw)
     migrations, queries = fixture["migrations"], fixture["queries"]
     if (not isinstance(migrations, list) or not migrations or not all(isinstance(item, str) for item in migrations)
-            or not isinstance(queries, list) or [query["stage"] for query in queries] != STAGES):
+            or not isinstance(queries, list) or [query["stage"] for query in queries] != list(STAGES)):
         return "invalid-fixture"
     with closing(sqlite3.connect(":memory:")) as db:
         for migration in migrations:
@@ -28,9 +36,12 @@ def check() -> str:
             return "invalid-fixture"
         for query in queries:
             sql, bindings = query["sql"], query["bindings"]
-            if (not isinstance(sql, str) or not sql.lstrip().startswith("UPDATE telegram_outbox")
-                    or not isinstance(bindings, list) or len(bindings) > 100):
-                return "invalid-fixture"
+            stage = query["stage"]
+            prefix = STAGES[stage]
+            if not isinstance(sql, str) or tuple(sql.split(maxsplit=len(prefix))[:len(prefix)]) != prefix:
+                return f"{stage} invalid-statement"
+            if not isinstance(bindings, list) or len(bindings) > 100:
+                return f"{stage} invalid-bindings"
             try:
                 # Compile each unchanged statement with its actual synthetic bind values.
                 db.execute("EXPLAIN " + sql, bindings).fetchone()
@@ -38,7 +49,7 @@ def check() -> str:
                 message = str(error).lower()
                 category = ("expression-depth" if "expression tree is too large" in message
                             or "parser stack overflow" in message else "sqlite-error")
-                return f"{query['stage']} {category}"
+                return f"{stage} {category}"
     return "ok"
 
 
