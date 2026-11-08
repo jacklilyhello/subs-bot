@@ -7,9 +7,11 @@ import {
 } from "../src/provider-fetch-contract.ts";
 
 export const SERVICE = "subs-bot-provider-fetch-dev-01";
+export const API_STATUS_SERVICE = "subs-bot-provider-api-status-dev-01";
 export const SINGLETON = "provider-fetch-v1";
 export { REVISION };
-const IMAGE = /^registry\.cloudflare\.com\/[0-9a-f]{32}\/subs-bot-provider-fetch-dev-01@sha256:[0-9a-f]{64}(?![\s\S])/u;
+const IMAGE = /^registry\.cloudflare\.com\/[0-9a-f]{32}\/(subs-bot-provider-fetch-dev-01|subs-bot-provider-api-status-dev-01)@sha256:[0-9a-f]{64}(?![\s\S])/u;
+type ProviderService = typeof SERVICE | typeof API_STATUS_SERVICE;
 const IDLE_MS = 30_000;
 const START_MS = 30_000;
 const FETCH_MS = 28_000;
@@ -235,16 +237,20 @@ function post(port: Fetcher, path: "/v1/edge-proof" | "/v1/fetch" | "/v1/api-sta
 }
 
 async function withPinnedContainer<T>(
-  container: Container, revision: string, use: (port: Fetcher, image: string) => Promise<T>, expectedImageSha256?: string,
-  startupDeadline?: number,
+  container: Container, revision: string, use: (port: Fetcher, image: string) => Promise<T>,
+  { service = SERVICE, imageSha256, startupDeadline }: {
+    service?: ProviderService;
+    imageSha256?: string;
+    startupDeadline?: number;
+  } = {},
 ): Promise<T> {
   let stage: ProbeStage = "configuration";
   let started = false;
   try {
     const image = container.images.provider;
-    requireResult(REVISION.test(revision) && typeof image === "string" && IMAGE.test(image) && !container.running,
+    requireResult(REVISION.test(revision) && typeof image === "string" && IMAGE.exec(image)?.[1] === service && !container.running,
       "The provider container image or stopped state differs.");
-    requireResult(expectedImageSha256 === undefined || image.endsWith(`@sha256:${expectedImageSha256}`),
+    requireResult(imageSha256 === undefined || image.endsWith(`@sha256:${imageSha256}`),
       "The provider container image does not match the caller's pin.");
     const now = Date.now();
     const deadline = Math.min(now + START_MS, startupDeadline ?? Infinity);
@@ -341,7 +347,7 @@ async function fetchPort(port: Fetcher, payload: string): Promise<ProviderFetchR
 export async function fetchPinnedProvider(container: Container, revision: string, payload: string, imageSha256: string): Promise<ProviderFetchResult> {
   try {
     if (typeof imageSha256 !== "string" || !SHA256.test(imageSha256)) return providerFailure("invalid-request");
-    return await withPinnedContainer(container, revision, (port) => fetchPort(port, payload), imageSha256);
+    return await withPinnedContainer(container, revision, (port) => fetchPort(port, payload), { imageSha256 });
   } catch {
     return providerFailure("unavailable");
   }
@@ -388,26 +394,28 @@ export async function probePinnedProviderApiStatus(container: Container, input: 
     const request = providerApiStatusRequest(input);
     if (!request) return apiStatusFailure("invalid-request");
     return await withPinnedContainer(container, request.providerRevision, (port) => apiStatusPort(port, request.url, request.key),
-      request.imageSha256);
+      { imageSha256: request.imageSha256 });
   } catch {
     return apiStatusFailure("unavailable");
   }
 }
 
-export async function probePinnedProviderApiStatusV2(container: Container, input: ProviderApiStatusV2Input): Promise<ProviderApiStatusResult> {
+export async function probePinnedProviderApiStatusV2(
+  container: Container, input: ProviderApiStatusV2Input, service: ProviderService = SERVICE,
+): Promise<ProviderApiStatusResult> {
   const request = providerApiStatusV2Request(input);
   if (!request) return apiStatusFailure("invalid-request");
   const { url, key, providerRevision, imageSha256, dispatchBeforeMs } = request;
   if (providerApiStatusV2Expired(dispatchBeforeMs)) return apiStatusFailure("timeout");
   try {
     return await withPinnedContainer(container, providerRevision, (port) => apiStatusPort(port, url, key, dispatchBeforeMs),
-      imageSha256, dispatchBeforeMs - API_STATUS_V2_DISPATCH_MARGIN_MS);
+      { service, imageSha256, startupDeadline: dispatchBeforeMs - API_STATUS_V2_DISPATCH_MARGIN_MS });
   } catch {
     return apiStatusFailure(providerApiStatusV2Expired(dispatchBeforeMs) ? "timeout" : "unavailable");
   }
 }
 
-export async function exercise(container: Container, revision: string, isolatedRevision: string) {
+export async function exercise(container: Container, revision: string, isolatedRevision: string, service: ProviderService = SERVICE) {
   return withPinnedContainer(container, revision, async (port, image) => {
     let stage: ProbeStage = "edge";
     try {
@@ -436,5 +444,5 @@ export async function exercise(container: Container, revision: string, isolatedR
     } catch {
       throw new ProviderProbeError(stage);
     }
-  });
+  }, { service });
 }

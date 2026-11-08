@@ -13,6 +13,12 @@ import zlib
 
 
 SERVICE = "subs-bot-provider-fetch-dev-01"
+FETCH_PROFILE = "fetch-v1"
+API_STATUS_PROFILE = "api-status-v2"
+API_STATUS_SERVICE = "subs-bot-provider-api-status-dev-01"
+API_STATUS_ENTRYPOINT = "ProviderApiStatus"
+PROFILE_SERVICES = {FETCH_PROFILE: SERVICE, API_STATUS_PROFILE: API_STATUS_SERVICE}
+PROFILE_LABEL = "io.subs-bot.provider.profile"
 COMPATIBILITY = "2026-11-06"
 MANIFEST = "provider-release.json"
 IMAGE = "provider-image.tar"
@@ -82,7 +88,8 @@ def layer_diff_id(archive, member, media_type, budget):
     return "sha256:" + digest.hexdigest(), size
 
 
-def verify_image(path, revision):
+def verify_image(path, revision, *, profile=FETCH_PROFILE):
+    require(profile in PROFILE_SERVICES)
     with tarfile.open(checked_file(path, MAX_IMAGE), mode="r:") as archive:
         members = {}
         seen = set()
@@ -154,54 +161,65 @@ def verify_image(path, revision):
         require(set(members) == referenced and config["architecture"] == "amd64" and config["os"] == "linux")
         runtime = config["config"]
         env = runtime["Env"]
+        labels = runtime["Labels"]
         require(runtime["User"] == "65532:65532" and runtime["Entrypoint"] == ["python", "-B", "-E", "-s", "/app/server.py"]
-                and runtime["WorkingDir"] == "/app" and runtime["Labels"]["org.opencontainers.image.revision"] == revision
+                and runtime["WorkingDir"] == "/app" and labels["org.opencontainers.image.revision"] == revision
                 and runtime["ExposedPorts"] == {"8080/tcp": {}} and not runtime.get("Volumes")
                 and isinstance(env, list) and len(env) <= len(BASE_ENV)
                 and all(isinstance(item, str) and "=" in item and item.partition("=")[0] in BASE_ENV for item in env)
                 and len({item.partition("=")[0] for item in env}) == len(env))
+        require(PROFILE_LABEL not in labels if profile == FETCH_PROFILE else labels.get(PROFILE_LABEL) == profile)
     return manifest_digest, config_digest
 
 
-def release_manifest(directory, revision, requirements, *, ref, run_id, run_attempt):
-    require(isinstance(revision, str) and REVISION.fullmatch(revision))
+def release_manifest(directory, revision, requirements, *, ref, run_id, run_attempt, profile=FETCH_PROFILE):
+    require(isinstance(revision, str) and REVISION.fullmatch(revision) and profile in PROFILE_SERVICES)
     require(isinstance(ref, str) and GIT_REF.fullmatch(ref) and isinstance(run_id, str) and DECIMAL.fullmatch(run_id)
             and isinstance(run_attempt, str) and DECIMAL.fullmatch(run_attempt))
     image = directory / IMAGE
-    manifest_digest, config_digest = verify_image(image, revision)
-    return {"version": 2, "service": SERVICE, "ref": ref, "runId": run_id, "runAttempt": run_attempt,
-            "revision": revision, "compatibilityDate": COMPATIBILITY,
-            "ociArchiveSha256": checksum(image), "ociManifestSha256": manifest_digest, "ociConfigSha256": config_digest,
-            "workerSha256": checksum(checked_file(directory / WORKER, MAX_WORKER)),
-            "requirementsSha256": sha256(checked_file(requirements, MAX_METADATA).read_bytes()).hexdigest()}
+    manifest_digest, config_digest = verify_image(image, revision, profile=profile)
+    manifest = {"version": 2, "service": PROFILE_SERVICES[profile], "ref": ref, "runId": run_id, "runAttempt": run_attempt,
+                "revision": revision, "compatibilityDate": COMPATIBILITY,
+                "ociArchiveSha256": checksum(image), "ociManifestSha256": manifest_digest, "ociConfigSha256": config_digest,
+                "workerSha256": checksum(checked_file(directory / WORKER, MAX_WORKER)),
+                "requirementsSha256": sha256(checked_file(requirements, MAX_METADATA).read_bytes()).hexdigest()}
+    if profile == API_STATUS_PROFILE:
+        manifest.update(version=3, profile=profile, rpcEntrypoint=API_STATUS_ENTRYPOINT)
+    return manifest
 
 
-def verify_release(directory, revision, *, ref, run_id, run_attempt):
+def verify_release(directory, revision, *, ref, run_id, run_attempt, profile=FETCH_PROFILE):
+    require(profile in PROFILE_SERVICES)
     requirements = Path(__file__).with_name("requirements.txt")
     with checked_file(directory / MANIFEST, MAX_METADATA).open("rb") as file:
         recorded = json_object(file)
-    require(type(recorded.get("version")) is int and recorded["version"] == 2
+    require(type(recorded.get("version")) is int and recorded["version"] == (2 if profile == FETCH_PROFILE else 3)
             and (recorded.get("ref"), recorded.get("runId"), recorded.get("runAttempt"), recorded.get("revision"))
             == (ref, run_id, run_attempt, revision))
-    manifest = release_manifest(directory, revision, requirements, ref=ref, run_id=run_id, run_attempt=run_attempt)
+    manifest = release_manifest(directory, revision, requirements, ref=ref, run_id=run_id, run_attempt=run_attempt, profile=profile)
     require(recorded == manifest)
     return manifest
 
 
-def config_for(directory, manifest, account):
+def config_for(directory, manifest, account, *, profile=FETCH_PROFILE):
     require(isinstance(account, str) and re.fullmatch(r"[0-9a-f]{32}", account))
+    require(profile in PROFILE_SERVICES)
+    service = PROFILE_SERVICES[profile]
     digest = manifest["ociManifestSha256"]
-    require(HEX.fullmatch(digest) and manifest["service"] == SERVICE and REVISION.fullmatch(manifest["revision"]))
+    require(HEX.fullmatch(digest) and manifest["service"] == service and REVISION.fullmatch(manifest["revision"]))
+    if profile == API_STATUS_PROFILE:
+        require(manifest.get("version") == 3 and manifest.get("profile") == profile
+                and manifest.get("rpcEntrypoint") == API_STATUS_ENTRYPOINT)
     return {
-        "name": SERVICE, "account_id": account, "main": str((directory / WORKER).resolve()), "no_bundle": True,
+        "name": service, "account_id": account, "main": str((directory / WORKER).resolve()), "no_bundle": True,
         "compatibility_date": COMPATIBILITY, "workers_dev": False, "preview_urls": False, "logpush": False,
         "observability": {"enabled": False, "logs": {"enabled": False, "invocation_logs": False}, "traces": {"enabled": False}},
         "vars": {"BUILD_REVISION": manifest["revision"]},
         "exports": {"ProviderContainer": {"type": "durable-object", "storage": "sqlite"}},
         "containers": [{"class_name": "ProviderContainer", "scheduling_policy": "durable_object",
-                        "images": {"provider": {"image": f"registry.cloudflare.com/{account}/{SERVICE}@sha256:{digest}"}},
+                        "images": {"provider": {"image": f"registry.cloudflare.com/{account}/{service}@sha256:{digest}"}},
                         "observability": {"logs": {"enabled": False}}}],
-        "workflows": [{"name": SERVICE + "-smoke", "binding": "PROVIDER_SMOKE", "class_name": "ProviderSmoke"}],
+        "workflows": [{"name": service + "-smoke", "binding": "PROVIDER_SMOKE", "class_name": "ProviderSmoke"}],
     }
 
 
@@ -210,13 +228,14 @@ def main():
     parser.add_argument("action", choices=("pack", "config"))
     parser.add_argument("directory", type=Path)
     parser.add_argument("revision")
+    parser.add_argument("--profile", choices=tuple(PROFILE_SERVICES), default=FETCH_PROFILE)
     parser.add_argument("--account-id")
     parser.add_argument("--ref", default=os.environ.get("GITHUB_REF"))
     parser.add_argument("--run-id", default=os.environ.get("GITHUB_RUN_ID"))
     parser.add_argument("--run-attempt", default=os.environ.get("GITHUB_RUN_ATTEMPT"))
     args = parser.parse_args()
     try:
-        provenance = {"ref": args.ref, "run_id": args.run_id, "run_attempt": args.run_attempt}
+        provenance = {"ref": args.ref, "run_id": args.run_id, "run_attempt": args.run_attempt, "profile": args.profile}
         if args.action == "pack":
             require(args.account_id is None)
             requirements = Path(__file__).with_name("requirements.txt")
@@ -226,7 +245,7 @@ def main():
                 json.dump(manifest, file, sort_keys=True)
         else:
             manifest = verify_release(args.directory, args.revision, **provenance)
-            print(json.dumps(config_for(args.directory, manifest, args.account_id), indent=2))
+            print(json.dumps(config_for(args.directory, manifest, args.account_id, profile=args.profile), indent=2))
     except VERIFICATION_ERRORS:
         parser.exit(1, "The exact provider release artifact or private configuration could not be verified.\n")
 
