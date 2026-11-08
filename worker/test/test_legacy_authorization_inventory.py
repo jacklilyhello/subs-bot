@@ -174,6 +174,67 @@ class LegacyAuthorizationInventoryTests(unittest.TestCase):
         self.assertEqual(existing.read_bytes(), b"preexisting")
         self.assertFalse((self.output / tool.SEAL).exists())
 
+    def test_untrusted_shared_ancestor_is_rejected_but_sticky_temporary_root_works(self):
+        shared = self.root / "shared"
+        shared.mkdir(mode=0o700)
+        private = shared / "private"
+        private.mkdir(mode=0o700)
+        backup, digest = self.make_backup(filename="shared/private/source.db")
+        direct, direct_digest = self.make_backup()
+        output = private / "inventory"
+        shared.chmod(0o777)
+        self.assert_rejected(backup, digest)
+        self.assertEqual(self.run_cli(direct, direct_digest, output), (2, "", tool.FAILURE + "\n"))
+        self.assertFalse(output.exists())
+        shared.chmod(0o1777)
+        self.assertEqual(self.run_cli(backup, digest, output), (0, tool.SUCCESS + "\n", ""))
+
+    def test_replaced_source_ancestor_fails_even_if_the_backup_inode_did_not_change(self):
+        outer = self.root / "outer"
+        outer.mkdir(mode=0o700)
+        inner = outer / "inner"
+        inner.mkdir(mode=0o700)
+        backup, digest = self.make_backup(filename="outer/inner/source.db")
+        original = tool._source_state(backup)
+        read_authorization = tool._read_authorization
+
+        def replace_ancestor(path):
+            result = read_authorization(path)
+            moved = self.root / "moved"
+            outer.rename(moved)
+            outer.mkdir(mode=0o700)
+            (moved / inner.name).rename(inner)
+            self.assertEqual(tool._source_state(path), original)
+            return result
+
+        with patch.object(tool, "_read_authorization", side_effect=replace_ancestor):
+            self.assert_rejected(backup, digest)
+
+    def test_output_replacement_is_neither_sealed_nor_removed(self):
+        backup, digest = self.make_backup()
+        original = tool._write_private
+        moved = self.root / "moved-output"
+
+        def replace_after_manifest(path, body):
+            original(path, body)
+            if path.name == tool.MANIFEST:
+                self.output.rename(moved)
+                self.output.mkdir(mode=0o700)
+                (self.output / tool.SIDECAR).write_bytes(b"unrelated")
+
+        with patch.object(tool, "_write_private", side_effect=replace_after_manifest):
+            self.assertEqual(self.run_cli(backup, digest), (2, "", tool.FAILURE + "\n"))
+        self.assertEqual((self.output / tool.SIDECAR).read_bytes(), b"unrelated")
+        self.assertFalse((self.output / tool.SEAL).exists())
+        self.assertFalse((moved / tool.SEAL).exists())
+
+    def test_source_byte_cap_applies_before_reading_authorization_rows(self):
+        backup, digest = self.make_backup()
+        with patch.object(tool, "MAX_SOURCE_BYTES", backup.stat().st_size - 1), \
+             patch.object(tool, "_read_authorization") as read:
+            self.assert_rejected(backup, digest)
+        read.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

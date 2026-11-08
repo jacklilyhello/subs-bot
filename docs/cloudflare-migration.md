@@ -303,7 +303,7 @@ PY
 
 ### 旧授权覆盖盘点
 
-普通 Worker CI 只运行合成夹具。真实备份盘点须在单独获准的受保护托管运行中，使用核对过的源码提交和仅供当前账号访问的临时目录。将已经关闭、无 SQLite 伴随文件的 UTF-8、DELETE 日志模式备份放入私有目录，从受信备份交接记录取得独立的 SHA-256。备份须为当前账号拥有的普通文件，使用 `0600` 或 `0400` 权限。输出目录的上级须私有，输出目录须尚未存在。使用无符号链接的实体路径，并在关闭命令跟踪后执行 `python3 -B worker/tools/legacy_authorization_inventory.py BACKUP OUTPUT EXPECTED_SOURCE_SHA256`。程序在不可变只读事务前后核对同一文件的状态及 SHA-256。 [SQLite URI](https://sqlite.org/uri.html)
+普通 Worker CI 只运行合成夹具。真实备份盘点须在单独获准的受保护托管运行中，使用核对过的源码提交和仅供当前账号访问的临时目录。将已经关闭、无 SQLite 伴随文件的 UTF-8、DELETE 日志模式备份放入私有目录，从受信备份交接记录取得独立的 SHA-256。备份须为当前账号拥有的普通文件，使用 `0600` 或 `0400` 权限，最大 2 GiB。备份和输出的直接上级均须私有，输出目录须尚未存在。路径各级由当前账号或 root 所有，允许带 sticky 位的共享临时目录。使用无符号链接的实体路径，并在关闭命令跟踪后执行 `python3 -B worker/tools/legacy_authorization_inventory.py BACKUP OUTPUT EXPECTED_SOURCE_SHA256`。程序在不可变只读事务前后核对路径标识、备份文件状态及 SHA-256。 [SQLite URI](https://sqlite.org/uri.html)
 
 私有 `auth-overrides.ndjson` 按数值用户 ID 升序保存 `userId`、`allowed`、`createdAt` 和 `updatedAt`。`userId` 使用正有符号 64 位整数的十进制字符串，`allowed` 保留整数 `0` 或 `1`，时间保留有序的正 Unix 秒整数，且不超过 `2^53−1`。最多 20,000 行。缺表与空表分别记录。`manifest.json` 绑定源备份摘要、行数、允许与拒绝的计数、文件长度和文件摘要，`manifest.sha256` 最后写入。只有退出码 `0` 且三个文件的清单闭包和摘要均匹配时才接收盘点包。退出码 `2` 表示无法确认。标准输出仅显示固定完成消息。真实备份和盘点包只在批准的私有交接渠道流转，禁止进入 PR、日志、普通 Actions 产物或缓存。
 
