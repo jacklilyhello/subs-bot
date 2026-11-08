@@ -113,8 +113,17 @@ jobs:
           printf '%s  %s\n' '386508bfb1c72c43b6a0eda73708ecdce82546581b0ebcb16366c53757c622b6' "$archive" | sha256sum --check
           gzip -dc "$archive" > "$workdir/mihomo"
           chmod 0700 "$workdir/mihomo"
-          SINGBOX_TEST_BINARY="$workdir/sing-box-1.14.4-linux-amd64/sing-box" \
-            MIHOMO_TEST_BINARY="$workdir/mihomo" npm run test:bundle
+          singbox="$workdir/sing-box-1.14.4-linux-amd64/sing-box"
+          mihomo="$workdir/mihomo"
+          SINGBOX_TEST_BINARY="$singbox" MIHOMO_TEST_BINARY="$mihomo" npm run test:bundle
+          # The pinned clients and their synthetic tunnel have no interface except loopback.
+          sudo -n unshare --net -- bash -euc '
+            ip link set dev lo up
+            umask 077
+            exec setpriv --reuid="$1" --regid="$2" --clear-groups --no-new-privs -- \
+              env -i PATH=/usr/bin:/bin HOME="$3" TMPDIR="$3" WORKER_TEST_BUNDLE_DIR="$4" \
+                SINGBOX_TEST_BINARY="$5" MIHOMO_TEST_BINARY="$6" "$7" --test test/vmess-h2.integration.ts
+          ' -- "$(id -u)" "$(id -g)" "$workdir" "$WORKER_TEST_BUNDLE_DIR" "$singbox" "$mihomo" "$(command -v node)"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: subs-bot-worker-${{ env.BUILD_REVISION }}-${{ github.run_attempt }}
@@ -159,6 +168,16 @@ jobs:
         with:
           name: subs-bot-legacy-private-share-candidate-${{ env.BUILD_REVISION }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/subs-bot-legacy-private-share-candidate/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Build the fixed synthetic legacy typed-short candidate
+        if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: python3 -B tools/legacy_candidate_isolation.py build synthetic-legacy-typed-shorts
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        with:
+          name: subs-bot-legacy-typed-short-candidate-${{ env.BUILD_REVISION }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/subs-bot-legacy-typed-short-candidate/
           if-no-files-found: error
           retention-days: 7
       - name: Check isolated Cloudflare deployment

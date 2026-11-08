@@ -4,6 +4,7 @@ import { SingBoxContentError } from "../singbox-export.ts";
 import { planSingBox } from "../singbox-response.ts";
 import { digestHex, readSnapshotNodes, SUBSCRIPTION_LIFECYCLE_REVISION, validInteger, type SubscriptionSnapshot } from "../storage.ts";
 import { providerRefreshTarget, type TelegramProviderRefreshTarget } from "./provider-refresh.ts";
+import type { TelegramRawFileTarget } from "./subscription-raw-file.ts";
 import { TELEGRAM_AGGREGATE_ORIGIN } from "./aggregate-actions.ts";
 import { inTelegramScope, SUBSCRIPTION_READ_RECEIPT_MARKER, SUBSCRIPTION_READ_TICKET,
   type TelegramPolicy, type TelegramSubscriptionReadUpdate } from "./protocol.ts";
@@ -50,6 +51,7 @@ interface RenderedRead {
   readGuard?: Guard;
   nodeButtons?: TelegramNodePageButton[];
   refreshTarget?: TelegramProviderRefreshTarget;
+  rawFileTarget?: TelegramRawFileTarget;
 }
 
 const privateScope = (event: Pick<ReadLease, "actorId" | "chatId" | "chatType" | "threadId">): boolean =>
@@ -308,7 +310,9 @@ async function renderSearch(
   return { text: lines.length ? ["搜索结果", ...lines].join("\n") : "没有匹配订阅。", readButtons, readGuard: guard };
 }
 
-async function renderDetail(bucket: R2Bucket, row: Metadata, guard: Guard, deadline: number, nodePagesEnabled: boolean): Promise<RenderedRead> {
+async function renderDetail(
+  bucket: R2Bucket, row: Metadata, guard: Guard, deadline: number, nodePagesEnabled: boolean, rawFileEnabled: boolean,
+): Promise<RenderedRead> {
   const lines = [
     `配置名称：${displayTelegramName(row.name)}`,
     `流量详情：${gb(row.trafficUsed)} / ${gb(row.trafficTotal)}`,
@@ -319,6 +323,7 @@ async function renderDetail(bucket: R2Bucket, row: Metadata, guard: Guard, deadl
   if (row.refreshFailed === 1) lines.push("上次刷新未成功。");
   const readButtons: TelegramSubscriptionReadButton[] = [];
   const nodeButtons: TelegramNodePageButton[] = [];
+  let rawFileTarget: TelegramRawFileTarget | undefined;
   if (row.generation > 0) {
     try {
       const signal = AbortSignal.timeout(Math.max(1, Math.min(READ_BUDGET_MS, deadline - Date.now())));
@@ -337,6 +342,7 @@ async function renderDetail(bucket: R2Bucket, row: Metadata, guard: Guard, deadl
         readButtons.push({ text: FORMAT_LABELS[format], kind: "format", subscriptionId: row.id, format });
       }
       if (nodePagesEnabled) nodeButtons.push({ ...snapshot, lifecycleRevision: row.lifecycleRevision, pageOffset: 0, text: "浏览全部节点" });
+      if (rawFileEnabled) rawFileTarget = { ...snapshot, lifecycleRevision: row.lifecycleRevision };
     } catch {
       lines.push("暂时无法读取节点预览。");
     }
@@ -344,7 +350,7 @@ async function renderDetail(bucket: R2Bucket, row: Metadata, guard: Guard, deadl
     lines.push("当前没有已发布的节点。");
   }
   const refreshTarget = await providerRefreshTarget(row, row.sourceUrl);
-  return { text: lines.join("\n"), readButtons, refreshTarget,
+  return { text: lines.join("\n"), readButtons, refreshTarget, rawFileTarget,
     readGuard: subscriptionGuard(guard, row, undefined, refreshTarget ? row.sourceUrl : null),
     ...(nodeButtons.length ? { nodeButtons } : {}) };
 }
@@ -373,7 +379,7 @@ async function renderFormat(db: D1Database, bucket: R2Bucket, row: Metadata, for
 
 export async function renderTelegramSubscriptionRead(
   db: D1Database, bucket: R2Bucket, policy: TelegramPolicy, lease: ReadLease, deadline: number, nodePagesEnabled = false,
-  providerRefreshEnabled = false,
+  providerRefreshEnabled = false, rawFileEnabled = false,
 ): Promise<RenderedRead> {
   const guard = receiptGuard(policy);
   try {
@@ -396,7 +402,7 @@ export async function renderTelegramSubscriptionRead(
       ${providerRefreshEnabled && receipt.kind === "detail" ? "source_url" : "NULL"} AS sourceUrl
       FROM subscriptions WHERE id=? AND owner_id=?`).bind(receipt.subscriptionId, lease.actorId).first<Metadata>();
     if (!row) return { text: "订阅不存在或已被删除。", readGuard: guard };
-    if (receipt.kind === "detail") return await renderDetail(bucket, row, guard, deadline, nodePagesEnabled);
+    if (receipt.kind === "detail") return await renderDetail(bucket, row, guard, deadline, nodePagesEnabled, rawFileEnabled);
     if (receipt.format) return await renderFormat(db, bucket, row, receipt.format, guard, deadline);
   } catch {
     // Do not expose source URLs, node data, tokens or D1/R2 diagnostics.

@@ -1,6 +1,7 @@
 """Cloudflare management release tests with a stateful, in-process API fake."""
 
 import base64
+from contextlib import closing
 from copy import deepcopy
 from hashlib import sha256
 from http.client import IncompleteRead
@@ -56,6 +57,9 @@ INLINE_BINDING = {"name": cloudflare.INLINE_SEARCH_BINDING, "type": "plain_text"
 INLINE_MIGRATION = {"name": cloudflare.INLINE_SEARCH_MIGRATION, "sha256": cloudflare.INLINE_SEARCH_MIGRATION_SHA256}
 PROVIDER_URL_BINDING = {"name": cloudflare.PROVIDER_URL_IMPORT_BINDING, "type": "plain_text", "text": "1"}
 PROVIDER_REFRESH_BINDING = {"name": cloudflare.PROVIDER_REFRESH_BINDING, "type": "plain_text", "text": "1"}
+LEGACY_SHORT_BINDING = {"name": cloudflare.LEGACY_SUBSCRIPTION_SHORT_BINDING, "type": "plain_text", "text": "1"}
+LEGACY_SHORT_MIGRATION = {"name": cloudflare.LEGACY_SUBSCRIPTION_SHORT_MIGRATION,
+                          "sha256": cloudflare.LEGACY_SUBSCRIPTION_SHORT_SHA256}
 AGGREGATE_KEY = base64.urlsafe_b64encode(b"\x17" * 32).decode("ascii").rstrip("=")
 PRIVATE_SHARE_KEY = base64.urlsafe_b64encode(b"\x18" * 32).decode("ascii").rstrip("=")
 CRON = {"cron": cloudflare.TELEGRAM_CRON}
@@ -143,6 +147,8 @@ class FakeCloudflare:
         self.provider_url_ledger_drift = set()
         self.provider_refresh_checks = []
         self.provider_refresh_ledger_drift = {}
+        self.legacy_short_checks = []
+        self.legacy_short_ledger_drift = {}
 
     def worker_api(self, method, path, payload=None):
         self.calls.append((method, path))
@@ -216,6 +222,21 @@ class FakeCloudflare:
 
     def data_api(self, method, path, payload=None):
         if method == "POST" and path == DATABASE + "/query":
+            if "AS primaryIndex" in payload["sql"]:
+                assert set(payload) == {"sql"} and payload["sql"].strip().startswith("SELECT ")
+                self.legacy_short_checks.append(self.active["versions"][0]["version_id"])
+                migration = Path(__file__).resolve().parents[1] / "migrations" / LEGACY_SHORT_MIGRATION["name"]
+                body = migration.read_bytes()
+                assert sha256(body).hexdigest() == LEGACY_SHORT_MIGRATION["sha256"]
+                with closing(sqlite3.connect(":memory:")) as db:
+                    db.row_factory = sqlite3.Row
+                    db.executescript(body.decode("utf-8"))
+                    db.execute("CREATE TABLE subs_bot_schema_migrations (position INTEGER PRIMARY KEY, name TEXT, sha256 TEXT, mode TEXT)")
+                    db.execute("INSERT INTO subs_bot_schema_migrations VALUES (29,?,?,'applied')",
+                               (LEGACY_SHORT_MIGRATION["name"], LEGACY_SHORT_MIGRATION["sha256"]))
+                    row = dict(db.execute(payload["sql"]).fetchone())
+                row.update(self.legacy_short_ledger_drift.get(len(self.legacy_short_checks), {}))
+                return [{"success": True, "results": [row]}]
             if "AS refreshIndex" in payload["sql"]:
                 assert set(payload) == {"sql"} and payload["sql"].strip().startswith("SELECT ")
                 self.provider_refresh_checks.append(self.active["versions"][0]["version_id"])
@@ -352,7 +373,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(self.release(), {
             "revision": NEW_REVISION, "versionId": NEW_VERSION, "deploymentId": NEW_DEPLOYMENT,
             "previousVersionId": OLD_VERSION, "changed": True, "inlineSearchEnabled": False,
-            "providerUrlImportEnabled": False, "providerRefreshEnabled": False,
+            "providerUrlImportEnabled": False, "providerRefreshEnabled": False, "legacySubscriptionShortsEnabled": False,
         })
         self.assertFalse(self.release()["changed"])
         self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
@@ -700,6 +721,78 @@ class ReleaseTests(unittest.TestCase):
                     "SUBS_BOT_PROVIDER_REFRESH_MODE": mode, "SUBS_BOT_PROVIDER_REFRESH_CONFIRMATION": confirmation}, clear=True), \
                  self.assertRaisesRegex(cloudflare.CloudflareError, "mode or confirmation"):
                 release_entry.provider_refresh_release_mode()
+
+    def test_legacy_short_toggle_preserves_existing_provider_and_telegram_flags(self):
+        off = self.set_provider_refresh_baseline(enabled=True, url=True, inline=True)
+        self.manifest["migrations"].append(LEGACY_SHORT_MIGRATION.copy())
+        options = {"provider_binding": PROVIDER_BINDING, "provider_guard": Mock()}
+        self.assertFalse(self.release(INLINE_CONFIG, **options)["legacySubscriptionShortsEnabled"])
+        self.assertEqual(self.api.legacy_short_checks, [])
+        self.assertEqual(self.api.writes(), [])
+
+        enabled = self.release(INLINE_CONFIG, legacy_subscription_shorts=True, **options)
+        self.assertTrue(enabled["legacySubscriptionShortsEnabled"])
+        self.assertTrue(all(enabled[key] for key in ("inlineSearchEnabled", "providerUrlImportEnabled", "providerRefreshEnabled")))
+        on = self.api.versions[NEW_VERSION]
+        self.assertNotEqual(on["annotations"]["workers/tag"], off["annotations"]["workers/tag"])
+        self.assertEqual({row["name"]: row for row in on["bindings"]},
+                         {row["name"]: row for row in [*off["bindings"], LEGACY_SHORT_BINDING]})
+        self.assertEqual(self.api.legacy_short_checks, [OLD_VERSION, OLD_VERSION, NEW_VERSION])
+        self.assertFalse(self.release(INLINE_CONFIG, **options)["changed"])
+
+        disabled = self.release(INLINE_CONFIG, legacy_subscription_shorts=False, **options)
+        self.assertFalse(disabled["legacySubscriptionShortsEnabled"])
+        self.assertTrue(all(disabled[key] for key in ("inlineSearchEnabled", "providerUrlImportEnabled", "providerRefreshEnabled")))
+        self.assertEqual(disabled["versionId"], OLD_VERSION)
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS, DEPLOYMENTS])
+
+    def test_legacy_short_enable_requires_off_artifact_and_exact_migration(self):
+        self.manifest["migrations"] = [{"name": f"{position:04d}_fixture.sql", "sha256": "a" * 64}
+                                       for position in range(1, 29)] + [LEGACY_SHORT_MIGRATION.copy()]
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "same Worker artifact"):
+            self.release(legacy_subscription_shorts=True)
+        self.api.versions[OLD_VERSION] = version(OLD_VERSION, NEW_REVISION, NEW_MODULE)
+        self.manifest["migrations"][28]["sha256"] = "0" * 64
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "exact 0029 migration artifact"):
+            self.release(legacy_subscription_shorts=True)
+        self.assertEqual(self.api.writes(), [])
+
+    def test_legacy_short_schema_drift_fails_before_writes_and_rolls_back_first_enable(self):
+        self.api.versions[OLD_VERSION] = version(OLD_VERSION, NEW_REVISION, NEW_MODULE)
+        self.manifest["migrations"] = [{"name": f"{position:04d}_fixture.sql", "sha256": "a" * 64}
+                                       for position in range(1, 29)] + [LEGACY_SHORT_MIGRATION.copy()]
+        self.api.legacy_short_ledger_drift = {1: {"sha256": "0" * 64}, 2: {"tableSql": "invalid"}, 5: {"primaryIndex": 0}}
+        for _ in range(2):
+            with self.assertRaisesRegex(cloudflare.CloudflareError, "short-link schema could not be verified"):
+                cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET,
+                    release_manifest=self.manifest, legacy_subscription_shorts=True)
+        self.assertEqual(self.api.writes(), [])
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "prior version was restored"):
+            self.release(legacy_subscription_shorts=True)
+        self.assertEqual(self.api.legacy_short_checks, [OLD_VERSION] * 4 + [NEW_VERSION])
+        self.assertEqual(self.api.active["versions"][0]["version_id"], OLD_VERSION)
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS, DEPLOYMENTS])
+
+    def test_legacy_short_binding_readback_and_operator_confirmation_are_exact(self):
+        active = self.api.versions[OLD_VERSION]
+        active["annotations"]["workers/tag"] = cloudflare._telegram_feature_tag(OLD_REVISION, False, False, False, True)
+        active["bindings"].append({**LEGACY_SHORT_BINDING, "text": "0"})
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "short-link binding"):
+            cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET)
+        active["bindings"].pop()
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "short-link release tag"):
+            cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET)
+        self.assertEqual(self.api.writes(), [])
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(release_entry.legacy_subscription_shorts_release_mode())
+        for mode, desired in (("enable", True), ("disable", False)):
+            with self.subTest(mode=mode), patch.dict(os.environ, {
+                    "SUBS_BOT_LEGACY_SUBSCRIPTION_SHORTS_MODE": mode,
+                    "SUBS_BOT_LEGACY_SUBSCRIPTION_SHORTS_CONFIRMATION": f"{mode} legacy subscription shorts for {cloudflare.WORKER_NAME}"}, clear=True):
+                self.assertIs(release_entry.legacy_subscription_shorts_release_mode(), desired)
+        with patch.dict(os.environ, {"SUBS_BOT_LEGACY_SUBSCRIPTION_SHORTS_MODE": "enable"}, clear=True), \
+             self.assertRaisesRegex(cloudflare.CloudflareError, "mode or confirmation"):
+            release_entry.legacy_subscription_shorts_release_mode()
 
     def test_inline_consent_read_is_exact_bot_order_and_expiry(self):
         db = sqlite3.connect(":memory:")

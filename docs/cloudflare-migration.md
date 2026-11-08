@@ -26,6 +26,10 @@ Hysteria 1 分享 URI 的 `peer` 映射到 TLS SNI，上传和下载速率必须
 
 Clash 返回 `text/yaml`，保留旧版的节点选择、自动选择和匹配规则。节点名碰到内建名称、分组名称或其他节点时自动分配后缀，原有不冲突的名称保持原样。支持 Shadowsocks、VMess、VLESS、Trojan、Hysteria 1 和 2、TUIC v5、AnyTLS、SOCKS5 和 HTTP(S) 的可转换设置。支持经过校验的 Hysteria 2 内联 ECH，无法保持语义的 URI 证书钉扎、作用域 IPv6、未支持的协议或本地文件与其他出站依赖返回 `422`。Clash 配置最多 16 MiB 和 25,000 个代理，原始节点名上限与 Sing-box 相同，并使用相同的 Hysteria 跳跃端口计数上限。托管 CI 用校验过 SHA-256 的 Mihomo 1.19.33 读取实际 Worker 响应。 [Mihomo 1.19.33](https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.33) · [Mihomo Hysteria 2](https://wiki.metacubex.one/en/config/proxies/hysteria2/)
 
+原生 VMess 的 `auto` 在启用 TLS 时有两种含义。Mihomo 仍按客户端架构选择 AES-128-GCM 或 ChaCha20-Poly1305，Sing-box 则使用 `zero`。Worker 将原生 Sing-box 的 TLS `auto`（包括空字符串或省略 `security` 字段）转换成 Clash 的显式 `zero`。将 TLS `auto` 的原生 Clash 节点转为 Sing-box 会使整份导出返回 `422`，因为选定任何单一算法都会丢失按架构选择的行为。旧版 Python 仍会输出这类 Clash 节点的 Sing-box 配置，比较结果可能因此不同。 [Mihomo 1.19.33 出站](https://github.com/MetaCubeX/mihomo/blob/v1.19.33/adapter/outbound/vmess.go#L448-L458) · [Mihomo 自动选密](https://github.com/MetaCubeX/sing-vmess/blob/v0.2.5/protocol.go#L128-L133) · [Sing-box 1.14.4 出站](https://github.com/SagerNet/sing-box/blob/v1.14.4/protocol/vmess/outbound.go#L94-L101)
+
+结构化 VMess 的 Clash H2 与 Sing-box HTTP 跨格式转换要求双方能保留所支持的 TLS H2 请求字段。支持仅 TCP、显式 AES-128-GCM 或 ChaCha20-Poly1305、AEAD Alter ID 0、常规 TLS、默认或单独 `h2` 的 ALPN，以及双方按原样发送的绝对路径和主机列表。Sing-box 输入需要显式限定 `network` 为 TCP，因为省略时同时启用 TCP 和 UDP。Clash 转 Sing-box 会写入 `Accept-Encoding: identity`。反向要求 Sing-box 使用有效的 `PUT` 和单一 `identity` 请求头设置。超出该范围时，目标格式返回 `422`，原生配置仍按各自格式的校验规则导出。托管 CI 使用两种固定版本客户端，在仅开放回环的网络环境中校验合成 TCP 往返。 [Mihomo H2 请求](https://github.com/MetaCubeX/mihomo/blob/v1.19.33/transport/vmess/h2.go#L28-L60) · [Sing-box HTTP 请求](https://github.com/SagerNet/sing-box/blob/v1.14.4/transport/v2rayhttp/client.go#L39-L95)
+
 Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks、VMess、Trojan、Hysteria 2、TUIC v5、AnyTLS、SOCKS5 和 HTTP(S) 的可转换设置。Quantumult X 的三个别名返回相同的原生节点资源行，支持 Shadowsocks、VMess、VLESS、Trojan、AnyTLS、SOCKS5 和 HTTP(S)。两个格式都要求每个节点能完整转换。旧版 Surge 生成的 VLESS 声明会返回 `422`。Quantumult X 的已有 URI 先解析再转换。未支持的 URI 或不能等价保留的加密、混淆、证书和传输设置同样返回 `422`。名称和字段内有歧义的分隔符或换行也会拒绝，Surge 中支持厂商语法允许的带引号逗号值。每种输出最多 16 MiB、25,000 个节点和每行 64 KiB，Surge 的选择分组也受单行限制。托管 CI 对照厂商语法和旧版可无损案例，核对实际 Worker 响应的字节。Surge 的配置校验命令随 macOS 应用发布，Quantumult X 提供原生资源示例。两个客户端的实际导入未纳入该 CI。 [Surge 策略](https://manual.nssurge.com/policies/overview.html) · [Surge CLI](https://manual.nssurge.com/tools/cli.html) · [Quantumult X 原生节点示例](https://github.com/crossutility/Quantumult-X/blob/master/server-complete.snippet)
 
 聚合能力链接通过 `GET` 或 `HEAD /agg/{code}/{format}` 使用同一套导出格式。有效聚合码继续通过 `/s/{code}` 返回同源相对重定向。全量链接按订阅 ID 读取所有者的活动已发布快照，再读取同一 Bot 和所有者的临时节点。筛选链接按记录顺序读取已选订阅，暂时移除回收中的订阅，恢复后可继续使用原 ID。订阅到期时间仍为上游元数据。
@@ -70,7 +74,7 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 | --- | --- |
 | `/start`、`/help`、中文回复菜单、`/auth` 列表及增删，支持输入 ID 或回复目标用户。 | 已接入基础欢迎、帮助和私聊管理员授权。核对两账号和测试群的权限隔离、撤权及重投。中文菜单、生产管理员及白名单配置、历史授权覆盖另行核对。 |
 | `/list`、`/expire`、回收站菜单、翻页和跳页。 | `/list`、未来 14 天内到期的 `/expire` 及新增的 `/recycle` 已支持按所有者翻页。核对边界日期、旧票据、跨用户回调和重命名、确认删除、30 天内恢复。菜单、任意页跳转和详情入口分开接入。 |
-| 数字或列表按钮打开详情，浏览节点和流量，单条重命名、刷新、删除、格式链接、短链和节点文件。`/s` 按名称及原始 URL 搜索，`/d` 批量删除匹配项。`/renumber` 只返回当前订阅计数。 | 已有生命周期操作、元数据和快照读取。`0022` 在私聊详情中接入每页 15 条的节点浏览，只展示序号、协议和名称。翻页固定到原快照，返回详情可打开同一订阅的当前版本。`0024` 增加私聊 `/d 关键词或订阅链接`，最多预览 16 条匹配项，使用十分钟内一次性按钮确认。任一目标变更时整批停止，已回收订阅可在 30 天内恢复。详情、搜索、各格式链接及原始 URI 附件分别验收。展示编号由列表计算。原始 URL、节点及能力链接限定在私聊。 |
+| 数字或列表按钮打开详情，浏览节点和流量，单条重命名、刷新、删除、格式链接、短链和节点文件。`/s` 按名称及原始 URL 搜索，`/d` 批量删除匹配项。`/renumber` 只返回当前订阅计数。 | 已有生命周期操作、元数据和快照读取。`0022` 在私聊详情中接入每页 15 条的节点浏览，只展示序号、协议和名称。翻页固定到原快照，返回详情可打开同一订阅的当前版本。`0024` 增加私聊 `/d 关键词或订阅链接`，最多预览 16 条匹配项，使用十分钟内一次性按钮确认。任一目标变更时整批停止，已回收订阅可在 30 天内恢复。`0030` 为私聊详情增加原始 URI 附件。详情、搜索、各格式链接及原始 URI 附件分别验收。展示编号由列表计算。原始 URL、节点及能力链接限定在私聊。 |
 | 粘贴节点加入临时列表，`/temp` 查看原文，`/temp clear` 清空。 | 私聊核对导入、计数、原文、TXT 附件和清空。验收包含顺序、重复、整批拒绝、迟到清空和清空后的旧请求。 |
 | 上传 `.txt`、`.log`、`.yaml`、`.yml`、`.json`，识别节点或订阅 URL，同名文件更新旧导入。 | 已接入私聊节点文档及同名上传替换。验收同一账号保留订阅 ID 和令牌、另一账号同名文件独立、失败保留旧快照。URL 列表和混合文档随提供方导入接入。 |
 | 发送一个或多个 HTTP(S) URL 或 `名称\|URL`，重复 URL 刷新，按上游标题自动命名。单条刷新、详情或导出的按需刷新、更新所有的确认和进度、有效及失败报告、保留或回收失败项。 | 私有抓取入口、订阅元数据和快照发布为基础。先验收实际提供方出网、URL 导入、单条刷新和流量、到期、标题，再验收可恢复的批量刷新、报告和失败项回收。 |
@@ -243,6 +247,8 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 隔离容量检查使用当前 `main` 的已部署版本，手动运行 `gh workflow run worker-isolation-capacity.yml --ref main`。托管 runner 生成合成快照，依次验证恰好达到 64 MiB NDJSON 和 16 MiB 分享原文的有效输出、分享原文超 1 字节的拒绝、快照清单超 1 字节的拒绝。正向测试流式核对 Base64 长度和摘要，覆盖串行、并发 2 和 4、慢读及中途取消。发布和容量检查使用同一并发组，测试结束先撤销 D1 能力，再清理对应的私有 R2 对象。清理失败时，工作流保留不含凭据或原始能力令牌的恢复清单。
 
+上传结果未确认时，在产物过期前私下保留原运行的恢复清单。仅使用原清单和对应的隔离资源继续核对清理。待确认对象仍读不到时保留记录，直到核实其内容并确认删除。重新运行容量检查会使用新的合成数据。
+
 运行 `gh workflow run worker-isolation-capacity.yml --ref main -f profile=structured-smoke` 可单独检查混合 Base64 导出。该模式在同一个隔离环境暂存两份小快照，用旧版 Python 序列化器的结果校验混合导出的长度和摘要，并检查不支持的结构化节点返回固定的 422 响应。两份快照都检查 GET 和 HEAD，前后各检查一次运行版本。该模式的恢复清单对应 `capacity_resources.py cleanup` 的 `--profile structured-smoke` 参数。
 
 同一工作流的 `profile=singbox-smoke` 针对 `/sing-box` 检查两份专用快照。成功响应必须声明精确字节数，规范化 JSON 摘要与 Python 对照一致。包含外部出站依赖的快照须返回固定的 422。该模式使用同名清理参数。
@@ -287,6 +293,10 @@ PY
 
 两名获准测试者只在指定内置浏览器的隔离 Bot 私聊中上传各自目录中的文件。用文件名搜索各自的订阅，打开详情和节点浏览。管理员核对按原顺序显示的 15、15、2 个节点以及上一页和下一页按钮。成员核对自己的一页两个节点。随后以 `prepare` 运行 ID 执行 `capture-created`，由工作流核对同一固定版本下两份快照的有序节点、协议和 Base64 GET、HEAD。停止浏览后，以 `capture-created` 运行 ID 和 `retire <cohort>` 执行 `retire`。退役要求相关详情与节点回复已结束，且只撤销已核对的两个订阅和四个 R2 对象。文档、详情和节点浏览回执保留。该模式的流程止于这三步。
 
+应用 `0030` 后，已有快照的私聊订阅详情可一次性导出 `Base64.txt`。文件沿用旧版命名，内容为按节点顺序排列的原始 URI，采用 UTF-8、LF 分隔且末尾无换行。每份文件限 5,000 个节点及 4 MiB，快照清单声明的 NDJSON 总量限 16 MiB，R2 内容预检与文件组装的时间预算为 5 秒。点击时记录快照和路径规则摘要，发送前核对原消息、授权、快照、生命周期及路径规则。Telegram 明确要求限速重试时会重新核对；发送结果不明时保留回执以避免重复发送。
+
+暂时无法确认附件表时，普通命令和订阅详情仍可用，详情暂停签发附件按钮。若同一私聊已开始发送附件，后续回复会等该租约结束。
+
 容量检查的客户端耗时和吞吐来自这组样本。CPU、内存和平台子请求数量通过隔离 Worker 的聚合指标另行核对。旧 SQLite 的正文体积与转换后的 NDJSON 和分享原文分别测量。真实备份的分布、超限项及可恢复性需要通过获准的数据演练验证。 [Workers 限制](https://developers.cloudflare.com/workers/platform/limits/) · [Workers 指标](https://developers.cloudflare.com/analytics/graphql-api/tutorials/querying-workers-metrics/)
 
 旧库容量盘点在获准的托管环境运行 `python3 -B worker/tools/legacy_inventory.py <封存备份>`。输入须是单独完成、关闭、使用 UTF-8 和 DELETE 日志模式的 SQLite 备份。备份准备在原库之外进行，盘点本身以只读事务运行。报告只包含活动订阅与回收站的聚合计数、原始字节、紧凑 UTF-8 NDJSON 字节、块数、大小限制和旧转换器分享原文估算。无法读取或解析的记录有独立计数。退出码 `0` 表示报告完整，仍需检查超限和无效项。退出码 `2` 表示无法核对备份。容量报告不判定归属映射、旧链接兼容、分享权限或实际 Worker 性能。 [SQLite 增量读取](https://sqlite.org/c3ref/blob_open.html) · [SQLite URI](https://sqlite.org/uri.html)
@@ -305,6 +315,14 @@ PY
 
 验收任务只读取已固定的资源和回执，并对隔离 Worker 的 GET 和 HEAD 检查状态、重定向目标和私有缓存响应头。探针在项目域名收到响应后结束。撤销后保留两条墓碑，原链接返回 `404`。外部 URL 的连接由使用者的客户端处理。
 
+### 旧单订阅短链
+
+`0029` 为旧版 12 位短码提供独立的兼容表。记录保存短码摘要、Bot、所有者、订阅 ID、原订阅令牌摘要、格式和时间。兼容表存在时，其中的摘要始终占用短码，和普通或聚合短码冲突的访问一律返回 `404`。 [D1 数据库批处理](https://developers.cloudflare.com/d1/worker-api/d1-database/#batch)
+
+首次启用前，以默认参数发布并回读同一提交和 Worker 产物的关闭版本。隔离发布工作流 `worker-isolation-deploy.yml` 的 `legacy_subscription_shorts` 默认为 `preserve`，初始不配置 `LEGACY_SUBSCRIPTION_SHORTS`。启用需指定 `legacy_subscription_shorts=enable` 和 `legacy_subscription_shorts_confirmation=enable legacy subscription shorts for subs-bot-cf-dev-01`。发布核对 `0029` 迁移、兼容表和主键索引，并回读 `legacySubscriptionShortsEnabled`。关闭使用 `disable` 和 `disable legacy subscription shorts for subs-bot-cf-dev-01`。关闭公开跳转时继续保留摘要占用和同一 Bot 下的所有者撤销。
+
+启用后，`/s/{code}` 只会跳到当前站点上仍由原所有者持有、令牌摘要一致的订阅。支持原格式按钮及现有 Base64、Sing-box、QX 别名，也保留省略格式的形式。目标移入回收站时返回 `404`，恢复同一订阅与令牌后可再次跳转。私聊 `/short revoke 短码` 可在公开跳转关闭时撤销自己的记录。撤销清除目标字段并保留摘要占用。旧库转换、真实旧域名和外部短链包装另行验收。
+
 ### 隔离合成旧订阅候选应用
 
 在受保护的 `main` 运行 `worker-isolation-legacy-candidate.yml`。所有步骤使用同一组全长 32 位小写十六进制 `cohort`、同一次成功的 Worker CI `source_run_id` 和同一已核对的隔离 Worker。开始前确认本轮可在产物保留期内完成，并保持 `main` 和隔离部署稳定。此流程从 CI 的固定合成候选包恢复，目标 D1 和 R2 的名称包含完整 `cohort`。只在源私有 R2 写入本组操作记录。
@@ -314,6 +332,8 @@ PY
 选择 `synthetic-legacy-empty` 演练版本 3。它使用独立的产物、D1、R2 和操作记录前缀。预检从固定合成样例重建源 SQLite 与转换包并核对摘要，再验证两个活动订阅、两个回收站订阅、路径规则、原始令牌对应的两个空导出标记、0026 迁移、编号序列及四个 R2 对象。构建与预检须使用能产生同一 SQLite 文件的托管工具链，摘要不符时停止。恢复读回包含标记数量与表摘要。目标保持未绑定，空导出 HTTP 行为另行验收。
 
 选择 `synthetic-legacy-private-shares` 可原生恢复 `legacy-private-shares-v1` 的固定合成候选。Worker CI 只打包预置样例。预检在取得 Cloudflare 凭据前从固定旧 SQLite 样例重新构建，逐文件比对 SQL、清单、封印与正文。按下方相同步骤在本组专用 D1 和私有 R2 恢复，目标保持未绑定。最终读回应为三个分享、三条历史领取、分享编号上界 3 和三个正文对象，含指定领取人、已到期记录及恰在到期秒的领取。旧内联标识仅计数。核对完整结构、逐表摘要、对象字节和元数据，检查点只上传计数及摘要。旧 Bot 链接和内联卡片连续性另行验收。
+
+选择 `synthetic-legacy-typed-shorts` 演练版本 4。预检先重建同一份固定 SQLite、订阅转换包和短链盘点，再核对短链、0029 迁移和 SQL 重放。该模式使用独立的候选 D1、私有 R2 和操作记录前缀。预期恢复四条单订阅短链，活动和回收站各两条，并保留四条路径规则、两个空导出标记和四个快照对象。最终证据包含短链表数量和摘要。目标保持未绑定，旧链接 HTTP 行为另行验收。
 
 1. 依次运行 `verify`、`prepare`、`create-restore-db`、`create-restore-bucket`，每步核对结果后再继续。创建响应不明时先运行只读 `verify`，根据创建意图、时间和实际资源身份独立确认归属，再用 `pin-resource` 提交 `resource` 和 `identity_sha256`。无法确认归属时保留该资源，停止本组后续写入。
 2. 运行 `restore-objects` 核对专用私有 R2 的对象闭包，再运行 `start-import` 向已核对且仍为空的专用 D1 导入。若已有确认的轮询书签，可用同一 `start-import` 继续轮询。响应不明时保留目标和私有操作记录，通过 `verify-restore` 核对完整结果。导入请求未确认、上传链接或产物已失效，或固定版本已变更时，禁止重发首次导入、重置或删除原目标。保留现场核查，后续演练使用新的 `cohort` 和专用资源。 [D1 原生导入](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/import/)
@@ -347,6 +367,10 @@ PY
 
 若流程中断，可在确认当前隔离版本后，以同一批次执行 `action=retire` 并在 `confirm_retire` 填写 `retire <cohort>`。遇到所有者、版本、指针或标记不符时保留记录并停止。此流程验证实际 Worker HTTP 和 D1 读取，与 V3 独立原生恢复的对象完整性核对分别记录。
 
+隔离版本已启用 `LEGACY_SUBSCRIPTION_SHORTS` 后，在相同工作流命令附加 `-f profile=typed-shorts`，使用新的随机 16 位小写十六进制批次。流程核对当前 Worker 版本和 `0029` 表，在既有隔离 D1 写入一个合成的旧空订阅。通过 GET 和 HEAD 核对默认、Surge 与 `mixed` 的相对跳转和目标内容，以及错误归属、令牌摘要不符、已撤销、普通和聚合短码冲突的 404。将订阅移入回收站、恢复并复验后，在一个批次中清理该订阅、标记和短码，再核对 404。流程不写入 R2，也不调用 Telegram。
+
+如需恢复清理，使用相同 `profile=typed-shorts`、同一 `cohort` 和上述 `retire` 参数。流程只清理身份、摘要和生命周期均匹配的完整合成批次。写入状态不明时保留批次标识，先核对运行，再按相同批次恢复，不重复提交原写入。短码与订阅令牌不进入日志或产物。同一 Bot 真实所有者通过 Telegram 撤销短码另行验收。
+
 ### 旧私密分享与领取盘点
 
 真实盘点在单独获准的受保护托管运行中使用核对过的源码提交。将关闭的 UTF-8、DELETE 日志模式备份放入仅供当前账号访问的目录，确认普通文件归当前账号所有、没有其他硬链接或 SQLite 伴随文件。准备尚未存在的私有输出目录路径。关闭命令跟踪，运行 `python3 -B worker/tools/legacy_private_share_inventory.py BACKUP OUTPUT EXPECTED_SOURCE_SHA256 LEGACY_BOT_ID LEGACY_BOT_USERNAME`。源 SHA-256 须取自独立的备份交接记录。旧 Bot 的正十进制 ID 和小写用户名须取自单独核对过的身份记录，用户名省略 `@`。程序在不可变只读事务前后核对同一文件及 SHA-256。 [SQLite URI](https://sqlite.org/uri.html)
@@ -360,6 +384,20 @@ PY
 在获准的托管 runner 上，运行 `worker/tools/legacy_private_share_candidate.py INVENTORY_DIR WORKER_ARTIFACT_DIR OUTPUT_DIR INVENTORY_MANIFEST_SHA WORKER_MANIFEST_SHA REVISION APPLIED_AT SOURCE_SQLITE_SHA LEGACY_BOT_ID LEGACY_BOT_USERNAME`。使用已核对的封存清单、原 SQLite 摘要和旧 Bot 身份作为独立输入。输出目录须尚未存在，封存盘点目录、Worker 产物目录和输出父目录仅供当前账号访问。
 
 `legacy-private-shares-v1` 仅填充准确的 0005 分享和领取表。封存程序逐行复核领取人与指定对象、份数和原时间，保留已到期记录的原到期秒，并逐对象核对原 UTF-8 正文的字节和摘要。私有正文存于 `objects/private-shares/`。内联消息标识留在封存盘点中，候选仅记录其数量。SQL 重放核对完整结构、外键、编号序列和对象闭包。每包最多 512 个正文对象，每个最多 64 KiB，SQL 重放上限为 4 MiB，所有数据库行仍受原生恢复上限约束。候选保持未绑定，旧 Bot 链接与内联卡片连续性需另行验收。
+
+### 旧单订阅短链盘点
+
+在获准的受保护托管运行中，对同一份封存 SQLite 使用 `python3 -B worker/tools/legacy_typed_short_inventory.py BACKUP OUTPUT SOURCE_SHA256 OWNER_MAP_JSON OWNER_MAP_SHA256 OLD_HTTPS_ORIGIN LEGACY_BOT_ID`。备份和新输出目录的父目录须仅供当前账号访问。独立核对源文件摘要、规范化归属映射摘要、原 Bot ID 和旧 HTTPS 来源。旧来源使用小写域名，省略端口和尾部斜线。
+
+工具只接收旧来源上可唯一解析的单订阅目标，先核对短链发行者与订阅原归属，再应用归属映射。保存原活动或回收站编号、归属、格式、创建时间及短码和订阅令牌摘要。聚合、外部、递归、归属不一致或多重匹配会阻止整包封存。首版限制为两万条短链、两万个订阅身份、2 GiB 源库和 8 MiB 清单数据。只在获准的私有渠道流转最后写入封印的目录。后续候选封装需要再次核对目标编号、归属及令牌摘要，实际旧链接路由另行验收。
+
+对同一份封存旧库生成订阅转换包及短链盘点，再在 `legacy_restore_package.py` 原有七个参数后附加 `legacy-typed-short-v4 SOURCE_SQLITE_SHA OWNER_MAP_SHA TYPED_SHORT_INVENTORY TYPED_SHORT_MANIFEST_SHA OLD_ORIGIN_SHA LEGACY_BOT_ID`。版本 4 保留版本 3 的空导出标记和可选路径规则。旧库有短链时，订阅转换命令会以退出码 2 保留封存包。此处只接受唯一的 `unhandled:short_links` 阻止项，其数量必须与已核对的盘点一致。封装逐条核对原表与编号、目标编号、映射后归属及令牌摘要，保留原格式、创建时间和旧 Bot 归属。清单与重放 SQL 固定 0026、0029 迁移和短链表摘要。短链记录只含摘要与类型，候选仍为未应用、未绑定的私有包。实际原生恢复及旧短链 HTTP 行为另行验收。
+
+### 旧混合短链只读盘点
+
+在同一份封存旧库上运行 `python3 -B worker/tools/legacy_short_namespace_inventory.py BACKUP OUTPUT SOURCE_SHA256 OWNER_MAP_JSON OWNER_MAP_SHA256 OLD_HTTPS_ORIGIN LEGACY_BOT_ID`。输出目录须尚未存在，目录和文件仅供当前账号访问。清单为每条合法短码记录摘要、类型或阻止原因。外部 URL、旧短码和订阅令牌的原文留在封存源库。
+
+筛选聚合保留旧列表的顺序和重复项，按旧活动订阅的独立编号高水位记录实际匹配位置。归属在映射前核对，回收站同号记录不会补入。可能因归属合并扩大范围的旧全量聚合标记为阻止。该盘点只封存范围和分类。启用前还须独立验证外部跳转等价性、旧聚合成员生命周期、空结果与临时节点行为。
 
 ### 真实数据与生产切换门槛
 

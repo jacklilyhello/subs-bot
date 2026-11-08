@@ -52,12 +52,13 @@ class FixtureDatabase:
         if set(payload) == {"sql", "params"}:
             self.queries.append(payload)
             return [{"success": True, "results": self.query(payload["sql"], payload["params"])}]
+        before = self.db.total_changes
         try:
             with self.db:
                 result = [{"success": True, "results": self.query(row["sql"], row["params"])} for row in payload["batch"]]
         except sqlite3.Error:
             raise smoke.CloudflareError("Synthetic batch was rejected.") from None
-        if self.lose_response:
+        if self.lose_response and self.db.total_changes != before:
             raise smoke.CloudflareError("Synthetic acknowledgement was lost.")
         return result
 
@@ -115,7 +116,9 @@ class EmptyExportSmokeTests(unittest.TestCase):
     def test_recovery_requires_explicit_exact_confirmation(self):
         cohort = "1" * 16
         self.assertEqual(smoke.parse_inputs({"inputs": {"action": "retire", "cohort": cohort, "confirm_retire": "retire " + cohort}}),
-                         ("retire", cohort))
+                         ("retire", cohort, "legacy-empty"))
+        self.assertEqual(smoke.parse_inputs({"inputs": {"action": "verify", "cohort": cohort, "profile": "typed-shorts"}}),
+                         ("verify", cohort, "typed-shorts"))
         with self.assertRaises(FixtureError):
             smoke.parse_inputs({"inputs": {"action": "retire", "cohort": cohort}})
 

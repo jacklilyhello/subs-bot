@@ -14,6 +14,7 @@ from urllib.request import ProxyHandler, Request, build_opener
 from capacity_resources import Resources, integer
 from cloudflare_isolation import CloudflareClient, CloudflareError, ORIGIN, REVISION, _Isolation, _NoRedirect, _verify_health
 from d1_migrations import _assert_sql
+from legacy_typed_short_smoke import TypedShortFixtures, verify_short_probes
 from prepare_isolation_artifact import MAIN_REF, REPOSITORY, _parse_object, require_current_main
 from release_isolation import telegram_release_config
 from telegram_aggregate_smoke import MAX_ID, SUBSCRIPTION_FIELDS, canonical, digest, key_bytes, require
@@ -46,11 +47,12 @@ def phase(label):
 
 def parse_inputs(event):
     inputs = event.get("inputs")
-    require(isinstance(inputs, dict) and set(inputs) <= {"action", "cohort", "confirm_retire"}, ERROR)
+    require(isinstance(inputs, dict) and set(inputs) <= {"action", "cohort", "confirm_retire", "profile"}, ERROR)
     action, cohort, confirm = (inputs.get(key, "") for key in ("action", "cohort", "confirm_retire"))
+    profile = inputs.get("profile", "legacy-empty")
     require(action in {"verify", "retire"} and isinstance(cohort, str) and COHORT.fullmatch(cohort)
-            and confirm == (f"retire {cohort}" if action == "retire" else ""), ERROR)
-    return action, cohort
+            and profile in ("legacy-empty", "typed-shorts") and confirm == (f"retire {cohort}" if action == "retire" else ""), ERROR)
+    return action, cohort, profile
 
 
 class EmptyFixtures:
@@ -198,7 +200,7 @@ def run():
         with Path(os.environ["GITHUB_EVENT_PATH"]).open("rb") as event:
             payload = event.read(65537)
         require(len(payload) <= 65536, ERROR)
-        action, cohort = parse_inputs(_parse_object(payload, ERROR))
+        action, cohort, profile = parse_inputs(_parse_object(payload, ERROR))
         require_current_main(revision)
         raw_policy = telegram_release_config({"migrations": [{"name": "0002_telegram.sql"}]})
         encoded = os.environ["SUBS_BOT_TELEGRAM_AGGREGATE_KEY"]
@@ -220,17 +222,30 @@ def run():
     with phase("migration ledger"):
         require(resources.query("SELECT name,sha256,mode FROM subs_bot_schema_migrations WHERE position=26", ())
                 == [{"name": MIGRATION, "sha256": MIGRATION_SHA256, "mode": "applied"}], ERROR)
+        if profile == "typed-shorts":
+            scope.verify_legacy_subscription_shorts()
+            require(action == "retire" or version.legacy_subscription_shorts is True, ERROR)
 
     def guard():
         require_current_main(revision)
         require(scope.active() == active and scope.worker_config() == config and scope.version(active.version) == version, ERROR)
 
     with phase("fixture setup"):
-        fixtures = EmptyFixtures(resources, json.loads(raw_policy), key_bytes(encoded), cohort)
         opener = build_opener(ProxyHandler({}), _NoRedirect())
+        fixture_type = TypedShortFixtures if profile == "typed-shorts" else EmptyFixtures
+        fixtures = fixture_type(resources, json.loads(raw_policy), key_bytes(encoded), cohort)
 
     def request(token, suffix, method):
         return request_export(opener, token, suffix, method)
+
+    if profile == "typed-shorts":
+        output = run_typed_shorts(fixtures, opener, request, action, guard)
+        with phase("isolated release readback"):
+            guard()
+            _verify_health(revision)
+        print(json.dumps({**output, "action": action, "profile": profile, "privateNoStore": True,
+                          "activeVersion": active.version}, sort_keys=True))
+        return
 
     if action == "verify":
         with phase("fixture seed"):
@@ -253,6 +268,35 @@ def run():
         _verify_health(revision)
     print(json.dumps({"action": action, "verifiedFormats": len(SUFFIXES) if action == "verify" else 0,
                       "syntheticRowsRemoved": removed, "privateNoStore": True, "activeVersion": active.version}, sort_keys=True))
+
+
+def run_typed_shorts(fixtures, opener, request, action, guard):
+    def probe(active):
+        verify_short_probes(fixtures, opener, request, EXPECTED_SURGE, active)
+        if not active:
+            verify_unavailable(fixtures.token, request)
+
+    if action == "verify":
+        with phase("typed fixture seed"):
+            sid = fixtures.seed(guard)
+        try:
+            with phase("typed active redirects"):
+                probe(True)
+            with phase("typed trash and restore"):
+                fixtures.move(sid, True, guard)
+                probe(False)
+                fixtures.move(sid, False, guard)
+                probe(True)
+        finally:
+            with phase("typed fixture retirement"):
+                removed = fixtures.retire(guard, sid)
+                require(removed == 1, ERROR)
+    else:
+        with phase("typed fixture retirement"):
+            removed = fixtures.retire(guard)
+    with phase("typed retired capability probes"):
+        probe(False)
+    return {"verifiedRedirectFormats": 3 if action == "verify" else 0, "syntheticRowsRemoved": removed}
 
 
 if __name__ == "__main__":
