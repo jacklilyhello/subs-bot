@@ -4,7 +4,8 @@ import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import { Miniflare } from "miniflare";
 import {
-  exercise, fetchPinnedProvider, probePinnedProviderApiStatus, providerApiStatusRequest, providerPayload, ProviderProbeError,
+  exercise, fetchPinnedProvider, probePinnedProviderApiStatus, probePinnedProviderApiStatusV2, providerApiStatusRequest,
+  providerApiStatusV2Request, providerPayload, ProviderProbeError,
 } from "./controller.ts";
 
 const revision = "a".repeat(40);
@@ -45,7 +46,7 @@ function fake({ runningImage = image, failStop = false, corruptEdge = false, pro
             "Content-Type": "application/octet-stream", "X-Provider-Approved-Families": "4,6", "X-Provider-Body-Sha256": digest,
           } });
         }
-        if (url === "http://container/v1/api-status" && apiResponse) return apiResponse(init);
+        if (["http://container/v1/api-status", "http://container/v2/api-status"].includes(url) && apiResponse) return apiResponse(init);
         assert.equal(url, "http://container/v1/fetch");
         if (providerResponse) return providerResponse(init);
         return Response.json({ error: "blocked-address" }, { headers, status: 422 });
@@ -197,6 +198,7 @@ test("refuses a foreign or running image and cleans up owned failed probes", asy
 const apiInput = { url: "https://fixture.example:443/tenant/v1/models", key: "synthetic-api-key",
   providerRevision: revision, imageSha256: imageDigest };
 const apiPath = "http://container/v1/api-status";
+const apiV2Path = "http://container/v2/api-status";
 const apiJson = (value, status = 200, extra = {}) => Response.json(value, { status, headers: { ...headers, ...extra } });
 
 test("API status accepts exact pinned bounded input and posts only URL and key once", async () => {
@@ -284,13 +286,50 @@ test("API status body timeout finishes without a second port call", async (t) =>
   assert.deepEqual(calls.at(-1), ["destroy"]);
 });
 
+test("API status v2 refuses a late startup and submits the exact deadline once", async (t) => {
+  const start = 1_800_000_000_000;
+  let now = start;
+  t.mock.method(Date, "now", () => now);
+  const input = { ...apiInput, dispatchBeforeMs: start + 10_000 };
+  assert.deepEqual(providerApiStatusV2Request(input), input);
+  assert.equal(providerApiStatusRequest(input), null);
+  for (const dispatchBeforeMs of [undefined, true, 0, -1, "1800000000000", 1.5, Infinity, start + 30_001, Number.MAX_SAFE_INTEGER + 1]) {
+    const invalid = fake();
+    const request = { ...input, dispatchBeforeMs };
+    assert.equal(providerApiStatusV2Request(request), null);
+    assert.deepEqual(await probePinnedProviderApiStatusV2(invalid.container, request), { ok: false, code: "invalid-request" });
+    assert.deepEqual(invalid.calls, []);
+  }
+  const expired = fake();
+  assert.deepEqual(await probePinnedProviderApiStatusV2(expired.container, { ...input, dispatchBeforeMs: start + 1000 }),
+    { ok: false, code: "timeout" });
+  assert.deepEqual(expired.calls, []);
+
+  const late = fake({ apiResponse: () => assert.fail("Late startup must never post the credential.") });
+  late.container.inspect = async () => { now = input.dispatchBeforeMs; return { image }; };
+  assert.deepEqual(await probePinnedProviderApiStatusV2(late.container, input), { ok: false, code: "timeout" });
+  assert.deepEqual(late.calls.map(([call]) => call), ["start", "idle", "http://container/ready", "destroy"]);
+
+  now = start;
+  for (const [apiResponse, result] of [
+    [() => apiJson({ status: 401, elapsedMs: 1 }), { ok: true, status: 401, elapsedMs: 1 }],
+    [() => { throw new Error(apiInput.key); }, { ok: false, code: "unavailable" }],
+  ]) {
+    const fixture = fake({ apiResponse });
+    assert.deepEqual(await probePinnedProviderApiStatusV2(fixture.container, input), result);
+    assert.deepEqual(fixture.calls.filter(([path]) => path.endsWith("/api-status")), [[apiV2Path,
+      { url: input.url, key: input.key, dispatchBeforeMs: input.dispatchBeforeMs }]]);
+    assert.deepEqual(fixture.calls.at(-1), ["destroy"]);
+  }
+});
+
 test("the emitted Worker rejects all public fetches without any runtime bindings", async () => {
   assert(process.env.PROVIDER_WORKER_BUNDLE);
   const script = await readFile(process.env.PROVIDER_WORKER_BUNDLE, "utf8");
   const runtime = new Miniflare({ modules: true, script, compatibilityDate: "2026-07-30" });
   try {
     for (const [path, method] of [["/", "GET"], ["/ready", "GET"], ["/v1/fetch", "POST"], ["/v1/edge-proof", "POST"],
-      ["/v1/api-status", "POST"]]) {
+      ["/v1/api-status", "POST"], ["/v2/api-status", "POST"]]) {
       const response = await runtime.dispatchFetch("https://provider.example" + path, { method });
       assert.equal(response.status, 404);
       assert.equal(response.headers.get("Cache-Control"), "private, no-store");
@@ -335,6 +374,14 @@ test("the emitted subscription RPC, status RPC and Workflow share one private lo
         if (path === '/probe-busy/v1/models') return { ok: false, code: 'busy' };
         return { ok: true, status: 401, elapsedMs: 12 };
       }
+      async probeApiStatusV2(input) {
+        this.assertSingleton();
+        if (!(await this.ctx.storage.get('accepted'))) throw new Error('wrong fixture status actor');
+        if (Object.keys(input).length !== 5 || input.key !== 'synthetic-api-key'
+          || input.providerRevision !== '${revision}' || input.imageSha256 !== '${imageDigest}'
+          || !Number.isSafeInteger(input.dispatchBeforeMs)) throw new Error('wrong fixture v2 request');
+        return { ok: true, status: 403, elapsedMs: 13 };
+      }
       async prove(probe) {
         this.assertSingleton();
         if (!(await this.ctx.storage.get('accepted')) || probe.providerRevision !== '${revision}'
@@ -354,6 +401,11 @@ test("the emitted subscription RPC, status RPC and Workflow share one private lo
             providerRevision: path === '/probe-wrong-revision' ? '${isolatedRevision}' : '${revision}',
             imageSha256: path === '/probe-wrong-image' ? '${"e".repeat(64)}' : '${imageDigest}',
           };
+          if (path.startsWith('/probe-v2-')) {
+            input.dispatchBeforeMs = Date.now() + (path === '/probe-v2-expired' ? -1 : 20_000);
+            if (path === '/probe-v2-malformed') input.dispatchBeforeMs = 'invalid';
+            return Response.json(await env.PROVIDER.probeApiStatusV2(input));
+          }
           if (path === '/probe-extra') input.headers = {};
           return Response.json(await env.PROVIDER.probeApiStatus(input));
         }
@@ -390,6 +442,9 @@ test("the emitted subscription RPC, status RPC and Workflow share one private lo
       ["/probe-fails", { ok: false, code: "unavailable" }],
       ["/probe-busy", { ok: false, code: "busy" }],
       ["/probe-smuggled", { ok: false, code: "invalid-body" }],
+      ["/probe-v2-positive", { ok: true, status: 403, elapsedMs: 13 }],
+      ["/probe-v2-expired", { ok: false, code: "timeout" }],
+      ["/probe-v2-malformed", { ok: false, code: "invalid-request" }],
     ]) {
       const response = await runtime.dispatchFetch("https://caller.example" + path);
       assert.deepEqual(await response.json(), expected);

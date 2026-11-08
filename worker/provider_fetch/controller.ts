@@ -2,7 +2,7 @@ import {
   PROVIDER_API_STATUS_MAX_ELAPSED_MS as API_STATUS_MAX_ELAPSED_MS,
   PROVIDER_MAX_BODY_BYTES as MAX_BODY_BYTES, PROVIDER_MAX_METADATA_BYTES as MAX_METADATA_BYTES,
   PROVIDER_METADATA_FIELDS as metadataKeys, PROVIDER_REVISION as REVISION, PROVIDER_SHA256 as SHA256,
-  type ProviderApiStatusFailureCode, type ProviderApiStatusInput, type ProviderApiStatusResult,
+  type ProviderApiStatusFailureCode, type ProviderApiStatusInput, type ProviderApiStatusResult, type ProviderApiStatusV2Input,
   type ProviderFailureCode, type ProviderFetchInput, type ProviderFetchResult, type ProviderMetadata,
 } from "../src/provider-fetch-contract.ts";
 
@@ -14,6 +14,8 @@ const IDLE_MS = 30_000;
 const START_MS = 30_000;
 const FETCH_MS = 28_000;
 const API_STATUS_MS = 20_000;
+const API_STATUS_V2_MAX_AHEAD_MS = 30_000;
+const API_STATUS_V2_DISPATCH_MARGIN_MS = 1_000;
 const STOP_MS = 10_000;
 const PORT = 8080;
 const ORIGIN = "http://container";
@@ -85,6 +87,21 @@ export function providerApiStatusRequest(input: unknown): ProviderApiStatusInput
     return null;
   }
   return encoder.encode(JSON.stringify({ url: pinned.url, key })).byteLength <= MAX_REQUEST_BYTES ? { ...pinned, key } : null;
+}
+
+export function providerApiStatusV2Request(input: unknown): ProviderApiStatusV2Input | null {
+  if (!isRecord(input) || Object.keys(input).length !== 5
+    || !["url", "key", "providerRevision", "imageSha256", "dispatchBeforeMs"].every((field) => Object.hasOwn(input, field))) return null;
+  const { url, key, providerRevision, imageSha256, dispatchBeforeMs } = input;
+  if (typeof dispatchBeforeMs !== "number" || !Number.isSafeInteger(dispatchBeforeMs) || dispatchBeforeMs < 1
+    || dispatchBeforeMs > Date.now() + API_STATUS_V2_MAX_AHEAD_MS) return null;
+  const request = providerApiStatusRequest({ url, key, providerRevision, imageSha256 });
+  return request && encoder.encode(JSON.stringify({ url, key, dispatchBeforeMs })).byteLength <= MAX_REQUEST_BYTES
+    ? { ...request, dispatchBeforeMs } : null;
+}
+
+export function providerApiStatusV2Expired(dispatchBeforeMs: number): boolean {
+  return Date.now() >= dispatchBeforeMs - API_STATUS_V2_DISPATCH_MARGIN_MS;
 }
 
 export function apiStatusFailure(code: ProviderApiStatusFailureCode): Extract<ProviderApiStatusResult, { ok: false }> {
@@ -211,7 +228,7 @@ async function ready(port: Fetcher, revision: string, deadline: number): Promise
   throw new Error("Provider container did not become ready.");
 }
 
-function post(port: Fetcher, path: "/v1/edge-proof" | "/v1/fetch" | "/v1/api-status", body: string, signal: AbortSignal) {
+function post(port: Fetcher, path: "/v1/edge-proof" | "/v1/fetch" | "/v1/api-status" | "/v2/api-status", body: string, signal: AbortSignal) {
   return within(port.fetch(ORIGIN + path, {
     method: "POST", headers: { "Content-Type": "application/json" }, body, redirect: "manual", signal,
   }), signal);
@@ -219,6 +236,7 @@ function post(port: Fetcher, path: "/v1/edge-proof" | "/v1/fetch" | "/v1/api-sta
 
 async function withPinnedContainer<T>(
   container: Container, revision: string, use: (port: Fetcher, image: string) => Promise<T>, expectedImageSha256?: string,
+  startupDeadline?: number,
 ): Promise<T> {
   let stage: ProbeStage = "configuration";
   let started = false;
@@ -228,8 +246,10 @@ async function withPinnedContainer<T>(
       "The provider container image or stopped state differs.");
     requireResult(expectedImageSha256 === undefined || image.endsWith(`@sha256:${expectedImageSha256}`),
       "The provider container image does not match the caller's pin.");
-    const deadline = Date.now() + START_MS;
-    const startup = AbortSignal.timeout(START_MS);
+    const now = Date.now();
+    const deadline = Math.min(now + START_MS, startupDeadline ?? Infinity);
+    requireResult(deadline > now, "The provider startup deadline elapsed.");
+    const startup = AbortSignal.timeout(deadline - now);
     stage = "start";
     container.start({ image, instance: "lite", enableInternet: true });
     started = true;
@@ -327,12 +347,18 @@ export async function fetchPinnedProvider(container: Container, revision: string
   }
 }
 
-async function apiStatusPort(port: Fetcher, url: string, key: string): Promise<ProviderApiStatusResult> {
-  const signal = AbortSignal.timeout(API_STATUS_MS);
+async function apiStatusPort(port: Fetcher, url: string, key: string, dispatchBeforeMs?: number): Promise<ProviderApiStatusResult> {
+  const timeout = dispatchBeforeMs === undefined ? API_STATUS_MS
+    : Math.min(API_STATUS_MS, dispatchBeforeMs - API_STATUS_V2_DISPATCH_MARGIN_MS - Date.now());
+  if (timeout <= 0) return apiStatusFailure("timeout");
+  const signal = AbortSignal.timeout(timeout);
   let response: Response;
   try {
     // A request carrying a key is submitted once, even if the outcome is unknown.
-    response = await post(port, "/v1/api-status", JSON.stringify({ url, key }), signal);
+    const path = dispatchBeforeMs === undefined ? "/v1/api-status" : "/v2/api-status";
+    const body = JSON.stringify({ url, key, dispatchBeforeMs });
+    if (dispatchBeforeMs !== undefined && providerApiStatusV2Expired(dispatchBeforeMs)) return apiStatusFailure("timeout");
+    response = await post(port, path, body, signal);
   } catch {
     return apiStatusFailure(signal.aborted ? "timeout" : "unavailable");
   }
@@ -365,6 +391,19 @@ export async function probePinnedProviderApiStatus(container: Container, input: 
       request.imageSha256);
   } catch {
     return apiStatusFailure("unavailable");
+  }
+}
+
+export async function probePinnedProviderApiStatusV2(container: Container, input: ProviderApiStatusV2Input): Promise<ProviderApiStatusResult> {
+  const request = providerApiStatusV2Request(input);
+  if (!request) return apiStatusFailure("invalid-request");
+  const { url, key, providerRevision, imageSha256, dispatchBeforeMs } = request;
+  if (providerApiStatusV2Expired(dispatchBeforeMs)) return apiStatusFailure("timeout");
+  try {
+    return await withPinnedContainer(container, providerRevision, (port) => apiStatusPort(port, url, key, dispatchBeforeMs),
+      imageSha256, dispatchBeforeMs - API_STATUS_V2_DISPATCH_MARGIN_MS);
+  } catch {
+    return apiStatusFailure(providerApiStatusV2Expired(dispatchBeforeMs) ? "timeout" : "unavailable");
   }
 }
 

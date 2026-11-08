@@ -27,6 +27,7 @@ export interface ProviderFetcher {
 export const PROVIDER_API_STATUS_MAX_ELAPSED_MS = 15_000;
 
 export interface ProviderApiStatusInput extends ProviderPin { url: string; key: string }
+export interface ProviderApiStatusV2Input extends ProviderApiStatusInput { dispatchBeforeMs: number }
 
 export type ProviderApiStatusFailureCode = Extract<ProviderFailureCode, "invalid-request" | "invalid-url" | "invalid-auth"
   | "blocked-address" | "busy" | "dns-failed" | "tls-failed" | "unavailable" | "timeout" | "invalid-body">;
@@ -37,4 +38,8 @@ export type ProviderApiStatusResult =
 
 export interface ProviderApiStatusProber {
   probeApiStatus(input: ProviderApiStatusInput): Promise<ProviderApiStatusResult>;
+}
+
+export interface ProviderApiStatusV2Prober {
+  probeApiStatusV2(input: ProviderApiStatusV2Input): Promise<ProviderApiStatusResult>;
 }

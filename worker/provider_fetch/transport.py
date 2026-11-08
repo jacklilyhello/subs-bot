@@ -10,6 +10,7 @@ import ipaddress
 import re
 import socket
 import ssl
+import time
 from typing import Literal
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 import zlib
@@ -25,6 +26,8 @@ from yarl import URL
 TOTAL_SECONDS = 25
 CONNECT_SECONDS = 8
 API_PROBE_SECONDS = 15
+API_PROBE_V2_MAX_AHEAD_MS = 30_000
+API_PROBE_V2_DISPATCH_MARGIN_MS = 1_000
 MAX_REDIRECTS = 5
 MAX_ADDRESSES = 16
 MAX_URL_BYTES = 8192
@@ -41,7 +44,7 @@ INVALID_URL_CHAR = re.compile(r"[\s\\\x00-\x1f\x7f-\x9f]")
 IP = ipaddress.IPv4Address | ipaddress.IPv6Address
 PUBLIC_IPV6 = ipaddress.IPv6Network("2000::/3")
 SPECIAL_IPV6 = tuple(ipaddress.IPv6Network(cidr) for cidr in ("2001::/23", "2002::/16", "3fff::/20"))
-FailureCode = Literal["invalid-url", "invalid-auth", "blocked-address", "dns-failed", "tls-failed", "unavailable",
+FailureCode = Literal["invalid-request", "invalid-url", "invalid-auth", "blocked-address", "dns-failed", "tls-failed", "unavailable",
                       "timeout", "invalid-redirect", "redirect-limit", "http-status", "body-too-large", "invalid-body"]
 
 
@@ -307,7 +310,7 @@ def _metadata(headers):
 
 
 @asynccontextmanager
-async def _pinned_get(target, addresses, headers, *, no_replay=False):
+async def _pinned_get(target, addresses, headers, *, no_replay=False, before_dispatch=None):
     sent = False
 
     async def once(request, send):
@@ -317,25 +320,56 @@ async def _pinned_get(target, addresses, headers, *, no_replay=False):
         sent = True
         return await send(request)
 
+    class GuardedRequest(aiohttp.ClientRequest):
+        async def send(self, connection):
+            # The pinned aiohttp sends a bodyless GET synchronously once the
+            # connection is writable. Refuse its deferred writer path.
+            protocol = connection.protocol
+            if (self.method != "GET" or self.url.scheme != "https" or self.body != b""
+                    or self._continue is not None or self._traces or protocol is None or protocol.writing_paused):
+                raise _Rejected("unavailable")
+            before_dispatch()
+            return await super().send(connection)
+
     resolver = _PinnedResolver(target, addresses)
     connector = aiohttp.TCPConnector(resolver=resolver, socket_factory=resolver.socket, ssl=_public_tls_context(),
                                      use_dns_cache=False, force_close=True)
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=CONNECT_SECONDS)
     async with aiohttp.ClientSession(connector=connector, trust_env=False, cookie_jar=aiohttp.DummyCookieJar(),
                                      auto_decompress=False, timeout=timeout, read_bufsize=CHUNK_BYTES,
-                                     max_headers=32, middlewares=(once,) if no_replay else ()) as session:
+                                     max_headers=32, middlewares=(once,) if no_replay else (),
+                                     request_class=GuardedRequest if before_dispatch else aiohttp.ClientRequest) as session:
         async with session.get(target.url, headers=headers, allow_redirects=False, proxy=None,
                                server_hostname=target.host.removesuffix(".") if target.url.scheme == "https" else None) as response:
             yield response
 
 
-async def probe_api_status(url: str, key: str) -> ApiProbeSuccess | FetchFailure:
+def _wall_ms():
+    return time.time_ns() // 1_000_000
+
+
+async def probe_api_status(url: str, key: str, *, dispatch_before_ms: int | None = None) -> ApiProbeSuccess | FetchFailure:
     """Get the status and latency of one HTTPS API endpoint without reading its response body."""
     if not isinstance(key, str) or not re.fullmatch(r"[!-~]{1,512}", key):
         return FetchFailure("invalid-auth")
     clock = asyncio.get_running_loop().time
     started = clock()
     deadline = started + API_PROBE_SECONDS
+    if dispatch_before_ms is not None:
+        now = _wall_ms()
+        if (type(dispatch_before_ms) is not int or not 1 <= dispatch_before_ms <= (1 << 53) - 1
+                or dispatch_before_ms > now + API_PROBE_V2_MAX_AHEAD_MS):
+            return FetchFailure("invalid-request")
+        remaining = dispatch_before_ms - API_PROBE_V2_DISPATCH_MARGIN_MS - now
+        if remaining <= 0:
+            return FetchFailure("timeout")
+        deadline = min(deadline, started + remaining / 1000)
+
+    def check_dispatch():
+        _check_deadline(deadline)
+        if dispatch_before_ms is not None and _wall_ms() >= dispatch_before_ms - API_PROBE_V2_DISPATCH_MARGIN_MS:
+            raise TimeoutError()
+
     try:
         async with asyncio.timeout_at(deadline):
             target = _parse_target(url)
@@ -343,10 +377,11 @@ async def probe_api_status(url: str, key: str) -> ApiProbeSuccess | FetchFailure
                     or not target.url.raw_path.endswith(("/models", "/chat/completions"))):
                 raise _Rejected("invalid-url")
             addresses = await _checked_addresses(target)
-            _check_deadline(deadline)
+            check_dispatch()
             headers = {"User-Agent": "subs-bot-api-probe/1.0", "Accept": "application/json", "Accept-Encoding": "identity",
                        "Authorization": f"Bearer {key}", "X-API-Key": key}
-            async with _pinned_get(target, addresses, headers, no_replay=True) as response:
+            async with _pinned_get(target, addresses, headers, no_replay=True,
+                                   before_dispatch=check_dispatch if dispatch_before_ms is not None else None) as response:
                 _check_deadline(deadline)
                 if 100 <= response.status <= 599:
                     return ApiProbeSuccess(response.status, int((clock() - started) * 1000))
