@@ -1,5 +1,6 @@
-"""Publish the exact verified Provider Fetch CI image to the isolated registry."""
+"""Publish an exact verified Provider CI image to its isolated registry repository."""
 
+import argparse
 from base64 import b64encode
 from hashlib import sha256
 from http.client import HTTPException
@@ -23,6 +24,10 @@ provider = provenance.provider
 HOST = "registry.cloudflare.com"
 API_ORIGIN = "https://api.cloudflare.com/client/v4"
 EVIDENCE_FILE = "provider-provenance.json"
+API_STATUS_EVIDENCE_FILE = "provider-api-status-v2-provenance.json"
+API_STATUS_CONFIRMATION = "publish api-status-v2 to subs-bot-provider-api-status-dev-01"
+API_STATUS_TOKEN_ENV = "SUBS_BOT_CF_PROVIDER_API_STATUS_CONTAINER_TOKEN"
+API_STATUS_WORKFLOW = ".github/workflows/worker-provider-api-status-registry-publish.yml"
 ACCOUNT = re.compile(r"[0-9a-f]{32}")
 TARGET_ACCOUNT_SHA256 = "ffdbf3dd5d042c6edb68d7f628998a69a22320b0199775bfda9f97593136e508"
 API_TOKEN = re.compile(r"[A-Za-z0-9_.-]{1,4096}")
@@ -36,6 +41,7 @@ OCI_ERROR = "Cloudflare Registry did not return a conclusive manifest result."
 HTTP_LIMIT = provider.MAX_METADATA
 SKOPEO = "/usr/bin/skopeo"
 MANIFEST_FIELDS = ("compatibilityDate", "workerSha256", "ociArchiveSha256", "ociManifestSha256", "ociConfigSha256")
+API_STATUS_FIELDS = ("profile", "service", "rpcEntrypoint")
 
 
 class PublicationError(ValueError):
@@ -55,12 +61,26 @@ def _private_path(path, mode, limit=None):
              "Verified provider files must be private runner files.")
 
 
-def _verified_input(root, revision, run_id):
-    evidence_path = root / EVIDENCE_FILE
+def api_status_registry_pin(account, manifest_digest):
+    _require(isinstance(account, str) and ACCOUNT.fullmatch(account)
+             and isinstance(manifest_digest, str) and provider.HEX.fullmatch(manifest_digest),
+             "The API status OCI account or verified digest is malformed.")
+    repository = f"{HOST}/{account}/{provider.API_STATUS_SERVICE}"
+    image = f"{repository}@sha256:{manifest_digest}"
+    return repository, image, {"registryRepositorySha256": sha256(repository.encode("ascii")).hexdigest(),
+                               "registryImageReferenceSha256": sha256(image.encode("ascii")).hexdigest()}
+
+
+def _verified_input(root, revision, run_id, *, profile=provider.FETCH_PROFILE, account=None):
+    _require(profile in provider.PROFILE_SERVICES, "Unknown provider publication profile.")
+    status = profile == provider.API_STATUS_PROFILE
+    evidence_path = root / (API_STATUS_EVIDENCE_FILE if status else EVIDENCE_FILE)
     _private_path(evidence_path, 0o600, HTTP_LIMIT)
     with evidence_path.open("rb") as source:
         evidence = provider.json_object(source)
     keys = {"revision", "runId", "runAttempt", "artifactId", "archiveSha256", *MANIFEST_FIELDS}
+    if status:
+        keys.update((*API_STATUS_FIELDS, "registryRepositorySha256", "registryImageReferenceSha256"))
     _require(set(evidence) == keys and (evidence["revision"], evidence["runId"]) == (revision, run_id)
              and all(isinstance(evidence[key], str) and provider.DECIMAL.fullmatch(evidence[key])
                      for key in ("runAttempt", "artifactId"))
@@ -69,25 +89,31 @@ def _verified_input(root, revision, run_id):
              and evidence["compatibilityDate"] == provider.COMPATIBILITY,
              "The verified provider build evidence does not match the requested release.")
 
-    directory = root / provenance.VERIFIED_DIRECTORY
+    if status:
+        _, _, pin = api_status_registry_pin(account, evidence["ociManifestSha256"])
+        _require(all(evidence[key] == value for key, value in pin.items()), "The API status registry target proof differs.")
+    directory = root / (provenance.API_STATUS_VERIFIED_DIRECTORY if status else provenance.VERIFIED_DIRECTORY)
     _private_path(directory, 0o700)
     _require({path.name for path in directory.iterdir()} == set(provenance.FILE_LIMITS),
              "The verified provider directory does not contain exactly the three release files.")
     for name, limit in provenance.FILE_LIMITS.items():
         _private_path(directory / name, 0o600, limit)
+    profile_args = {"profile": profile} if status else {}
     try:
         manifest = provider.verify_release(directory, revision, ref=github.MAIN_REF, run_id=run_id,
-                                           run_attempt=evidence["runAttempt"])
+                                           run_attempt=evidence["runAttempt"], **profile_args)
     except provider.VERIFICATION_ERRORS:
         raise PublicationError("The private provider release files no longer verify.") from None
-    _require(all(evidence[key] == manifest[key] for key in MANIFEST_FIELDS),
+    fields = (*MANIFEST_FIELDS, *API_STATUS_FIELDS) if status else MANIFEST_FIELDS
+    _require(all(evidence[key] == manifest[key] for key in fields),
              "The provider release digest differs from the verified GitHub artifact.")
     return directory / provider.IMAGE, evidence
 
 
 def _guard_main(evidence):
     revision = evidence["revision"]
-    actual = provenance._select_artifact(evidence["runId"], revision, github._github_token())
+    profile_args = {"profile": evidence["profile"]} if "profile" in evidence else {}
+    actual = provenance._select_artifact(evidence["runId"], revision, github._github_token(), **profile_args)
     _require(actual == (evidence["runAttempt"], evidence["artifactId"], evidence["archiveSha256"]),
              "The trusted Provider Fetch CI attempt or artifact changed.")
     github.require_current_main(revision)
@@ -154,12 +180,13 @@ def _challenge(header, repository):
 
 
 class Registry:
-    def __init__(self, account, api_token):
+    def __init__(self, account, api_token, *, profile=provider.FETCH_PROFILE):
         _require(ACCOUNT.fullmatch(account) and API_TOKEN.fullmatch(api_token),
                  "The protected Cloudflare account or Containers credential is missing or malformed.")
+        _require(profile in provider.PROFILE_SERVICES, "Unknown provider publication profile.")
         self._account = account
         self._api_token = api_token
-        self.repository = f"{account}/{provider.SERVICE}"
+        self.repository = f"{account}/{provider.PROFILE_SERVICES[profile]}"
         self._opener = build_opener(ProxyHandler({}), github._NoRedirect())
         self._read_authorization = None
 
@@ -282,6 +309,12 @@ def _publish(registry, scratch, archive, evidence):
     tag = f"git-{evidence['revision']}-{expected_manifest[:12]}"
     digest = "sha256:" + expected_manifest
     repo = f"{HOST}/{registry.repository}"
+    if evidence.get("profile") == provider.API_STATUS_PROFILE:
+        account = registry.repository.partition("/")[0]
+        expected_repo, _, pin = api_status_registry_pin(account, expected_manifest)
+        _require(sha256(account.encode("ascii")).hexdigest() == TARGET_ACCOUNT_SHA256
+                 and repo == expected_repo and all(evidence[key] == value for key, value in pin.items()),
+                 "The API status publication repository or digest pin differs.")
     collision = "The provider revision tag already points to a different manifest."
     pull = registry.mint()
     current = registry.manifest(tag, pull, allow_missing=True)
@@ -307,7 +340,9 @@ def _publish(registry, scratch, archive, evidence):
     return {**evidence, "tag": tag, "status": status}
 
 
-def publish():
+def publish(*, profile=provider.FETCH_PROFILE):
+    _require(profile in provider.PROFILE_SERVICES, "Unknown provider publication profile.")
+    status = profile == provider.API_STATUS_PROFILE
     revision = os.environ.get("GITHUB_SHA", "")
     run_id = os.environ.get("SUBS_BOT_PROVIDER_CI_RUN_ID", "")
     runner_temp = Path(os.environ.get("RUNNER_TEMP", ""))
@@ -320,16 +355,30 @@ def publish():
     account = os.environ.get("SUBS_BOT_CF_PROVIDER_ACCOUNT_ID", "")
     _require(ACCOUNT.fullmatch(account) and sha256(account.encode("ascii")).hexdigest() == TARGET_ACCOUNT_SHA256,
              "The protected Cloudflare account does not match the isolation target.")
-    archive, evidence = _verified_input(runner_temp, revision, run_id)
+    if status:
+        _require(os.environ.get("GITHUB_WORKFLOW_REF") == f"{github.REPOSITORY}/{API_STATUS_WORKFLOW}@{github.MAIN_REF}"
+                 and os.environ.get("GITHUB_WORKFLOW_SHA") == revision and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted",
+                 "API status publication requires its exact protected GitHub-hosted workflow.")
+        _require(os.environ.get("SUBS_BOT_PROVIDER_API_STATUS_PUBLISH_CONFIRMATION") == API_STATUS_CONFIRMATION,
+                 "API status registry publication requires exact operator confirmation.")
+        token = os.environ.get(API_STATUS_TOKEN_ENV, "")
+        _require(API_TOKEN.fullmatch(token), "The dedicated API status Containers credential is missing or malformed.")
+        archive, evidence = _verified_input(runner_temp, revision, run_id, profile=profile, account=account)
+    else:
+        token = os.environ.get("SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN", "")
+        archive, evidence = _verified_input(runner_temp, revision, run_id)
     _guard_main(evidence)
-    registry = Registry(account, os.environ.get("SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN", ""))
+    registry = Registry(account, token, profile=profile)
     with tempfile.TemporaryDirectory(prefix=".subs-bot-provider-registry-", dir=runner_temp) as directory:
         return _publish(registry, Path(directory), archive, evidence)
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--profile", choices=tuple(provider.PROFILE_SERVICES), default=provider.FETCH_PROFILE)
+    args = parser.parse_args()
     try:
-        print(json.dumps(publish(), sort_keys=True))
+        print(json.dumps(publish(profile=args.profile), sort_keys=True))
     except (PublicationError, github.ArtifactError) as error:
         raise SystemExit(str(error)) from None
     except provider.VERIFICATION_ERRORS:
