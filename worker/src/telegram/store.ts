@@ -33,6 +33,7 @@ import {
   installTelegramProviderBatchTicket, telegramProviderBatchReplyClock, telegramProviderBatchReplyEligible,
   telegramProviderBatchReplyMarker, TELEGRAM_PROVIDER_BATCH_REPLY_MARKERS, type TelegramProviderBatchDelivery,
 } from "./provider-batch-controls.ts";
+import { TELEGRAM_API_STATUS_MARKER, telegramApiStatusClock, telegramApiStatusEligible, telegramApiStatusReceipt } from "./api-status.ts";
 
 export interface TelegramReplyLease extends TelegramCommand {
   receiptId: number;
@@ -59,6 +60,7 @@ export interface TelegramReplyLease extends TelegramCommand {
   githubSearch?: TelegramGitHubReply;
   subscriptionRawFile?: true;
   providerBatch?: true;
+  apiStatus?: true;
 }
 
 export type TelegramReplyOutcome =
@@ -76,7 +78,7 @@ type ReplyAccess = "allowed" | "denied" | "none";
 type ReplyRow = Omit<TelegramReplyLease,
   "view" | "lifecycle" | "privateClaim" | "temp" | "tempRaw" | "aggregate" | "selected" | "path" | "document" |
   "privateShareCreation" | "subscriptionRead" | "shortLink" | "inlineSort" | "subscriptionNodes" | "providerOutcome" | "providerRequestKind" |
-  "bulkTrash" | "inlineConsent" | "githubSearch" | "subscriptionRawFile" | "providerBatch"> & {
+  "bulkTrash" | "inlineConsent" | "githubSearch" | "subscriptionRawFile" | "providerBatch" | "apiStatus"> & {
   viewKind: TelegramView["kind"] | null;
   afterId: number | null;
   afterEpoch: number | null;
@@ -115,12 +117,13 @@ type ReplyRow = Omit<TelegramReplyLease,
   githubSearchResults: string | null;
   rawFileMarker: number;
   providerBatchMarker: number;
+  apiStatusMarker: number;
 };
 
 function supportedReceipt(alias: "inbox" | "earlier", includeAggregate = false, includePrivateShareCreation = false,
   includeSubscriptionRead = false, includeShortLinks = false, includeInlineSort = false, includeSubscriptionNodes = false,
   includeProvider = false, includeBulkTrash = false, includeInlineConsent = false, includeGitHubSearch = false,
-  includeRawFile = false, includeProviderBatch = false): string {
+  includeRawFile = false, includeProviderBatch = false, includeApiStatus = false): string {
   // Keep feature predicates within D1's expression depth limit in the claim query.
   return `(CASE WHEN ${alias}.receipt_nonce IS NULL THEN 1
     WHEN (${alias}.receipt_nonce = '${TELEGRAM_VIEW_MARKER}'
@@ -179,12 +182,15 @@ function supportedReceipt(alias: "inbox" | "earlier", includeAggregate = false, 
       AND ${alias}.chat_type='private' AND ${alias}.chat_id=${alias}.actor_id AND ${alias}.thread_id IS NULL
       AND EXISTS (SELECT 1 FROM telegram_subscription_raw_file WHERE receipt_id=${alias}.receipt_id)) THEN 1` : ""}
     ${includeProviderBatch ? `WHEN ${telegramProviderBatchReplyMarker(alias)} THEN 1` : ""}
+    ${includeApiStatus ? `WHEN ${telegramApiStatusReceipt(alias)} THEN 1` : ""}
     ELSE 0 END)`;
 }
 
-function replyClock(includeProvider: boolean, alias: "inbox" | "earlier" = "inbox", includeProviderBatch = false): string {
-  const clock = includeProvider ? telegramProviderReplyClock(alias) : `${alias}.received_at`;
-  return includeProviderBatch ? telegramProviderBatchReplyClock(alias, clock) : clock;
+function replyClock(includeProvider: boolean, alias: "inbox" | "earlier" = "inbox", includeProviderBatch = false,
+  includeApiStatus = false): string {
+  const single = includeProvider ? telegramProviderReplyClock(alias) : `${alias}.received_at`;
+  const clock = includeProviderBatch ? telegramProviderBatchReplyClock(alias, single) : single;
+  return includeApiStatus ? telegramApiStatusClock(alias, clock) : clock;
 }
 
 export async function acceptTelegramCommand(
@@ -248,9 +254,11 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
   includePrivateShareCreation = false, includeSubscriptionRead = false, includeShortLinks = false, includeInlineSort = false,
   includeSubscriptionNodes = false, providerPolicy?: TelegramPolicy, includeBulkTrash = false, includeInlineConsent = false,
   gitHubSearch?: TelegramPolicy | "unavailable", rawFileReadiness: boolean | "unavailable" = false,
-  providerBatch?: TelegramPolicy | "unavailable"): Promise<TelegramReplyLease | null> {
+  providerBatch?: TelegramPolicy | "unavailable", apiStatus?: TelegramPolicy | "unavailable"): Promise<TelegramReplyLease | null> {
   const gitHubSearchPolicy = gitHubSearch === "unavailable" ? undefined : gitHubSearch;
   const batchPolicy = providerBatch === "unavailable" ? undefined : providerBatch;
+  const apiPolicy = apiStatus === "unavailable" ? undefined : apiStatus;
+  if (apiPolicy && apiPolicy.botId !== botId) throw new Error("Telegram API status reply scope differs.");
   if ((providerPolicy && providerPolicy.botId !== botId) || (batchPolicy && batchPolicy.botId !== botId)) {
     throw new Error("Telegram provider reply scope differs.");
   }
@@ -260,34 +268,38 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
   const includeGitHubSearch = gitHubSearchPolicy !== undefined;
   const includeRawFile = rawFileReadiness === true;
   const includeProviderBatch = batchPolicy !== undefined;
+  const includeApiStatus = apiPolicy !== undefined;
   const providerCurrent = telegramProviderReplyEligible(providerPolicy, "inbox");
   const earlierProviderCurrent = telegramProviderReplyEligible(providerPolicy, "earlier");
   const githubCurrent = telegramGitHubSearchEligible(gitHubSearchPolicy, "inbox");
   const earlierGithubCurrent = telegramGitHubSearchEligible(gitHubSearchPolicy, "earlier");
   const batchCurrent = telegramProviderBatchReplyEligible(batchPolicy, "inbox");
   const earlierBatchCurrent = telegramProviderBatchReplyEligible(batchPolicy, "earlier");
+  const apiCurrent = telegramApiStatusEligible(apiPolicy, "inbox");
+  const earlierApiCurrent = telegramApiStatusEligible(apiPolicy, "earlier");
   const earlierActive = "earlier.receipt_id < inbox.receipt_id AND earlier_reply.state IN ('pending', 'leased', 'sending')";
   // A provider reply or search can become ready after a newer reply has started delivery.
   const searchPair = `(inbox.receipt_nonce IS '${TELEGRAM_GITHUB_SEARCH_MARKER}' OR
     earlier.receipt_nonce IS '${TELEGRAM_GITHUB_SEARCH_MARKER}')`;
   const delayedBlocker = { sql: `(
     (earlier_reply.state = 'sending' AND earlier_reply.lease_until > unixepoch())
-    OR ((${earlierProviderCurrent.sql}) AND (${earlierGithubCurrent.sql}) AND (${earlierBatchCurrent.sql})
-      AND ${replyClock(includeProvider, "earlier", includeProviderBatch)} + ${MAX_REPLY_AGE_SECONDS} > unixepoch() AND (
+    OR ((${earlierProviderCurrent.sql}) AND (${earlierGithubCurrent.sql}) AND (${earlierBatchCurrent.sql}) AND (${earlierApiCurrent.sql})
+      AND ${replyClock(includeProvider, "earlier", includeProviderBatch, includeApiStatus)} + ${MAX_REPLY_AGE_SECONDS} > unixepoch() AND (
         (earlier_reply.state = 'leased' AND earlier_reply.lease_until > unixepoch())
         OR (earlier.receipt_id < inbox.receipt_id AND earlier_reply.state = 'pending' AND earlier_reply.attempts < ${MAX_ATTEMPTS})
       ))
-  )`, bindings: [...earlierProviderCurrent.bindings, ...earlierGithubCurrent.bindings, ...earlierBatchCurrent.bindings] };
+  )`, bindings: [...earlierProviderCurrent.bindings, ...earlierGithubCurrent.bindings, ...earlierBatchCurrent.bindings, ...earlierApiCurrent.bindings] };
   const ordinaryBlocker = { sql: includeGitHubSearch ? `(
     (NOT ${searchPair} AND ${earlierActive}) OR (${searchPair} AND (
       (earlier_reply.state IN ('leased', 'sending') AND earlier_reply.lease_until > unixepoch())
       OR (earlier.receipt_id < inbox.receipt_id AND earlier_reply.state = 'pending'
         AND earlier_reply.attempts < ${MAX_ATTEMPTS} AND earlier.received_at + ${MAX_REPLY_AGE_SECONDS} > unixepoch()
         AND ${earlierGithubCurrent.sql}))))` : earlierActive, bindings: earlierGithubCurrent.bindings };
-  const batchPair = `inbox.receipt_nonce IN (${TELEGRAM_PROVIDER_BATCH_REPLY_MARKERS})
-    OR earlier.receipt_nonce IN (${TELEGRAM_PROVIDER_BATCH_REPLY_MARKERS})`;
-  const sameChatBlocker = includeProvider ? delayedBlocker : includeProviderBatch ? {
-    sql: `(CASE WHEN ${batchPair} THEN ${delayedBlocker.sql} ELSE (${ordinaryBlocker.sql}) END)`,
+  const delayedMarkers = [includeProviderBatch ? TELEGRAM_PROVIDER_BATCH_REPLY_MARKERS : "",
+    includeApiStatus ? `'${TELEGRAM_API_STATUS_MARKER}'` : ""].filter(Boolean).join(",");
+  const sameChatBlocker = includeProvider ? delayedBlocker : delayedMarkers ? {
+    sql: `(CASE WHEN inbox.receipt_nonce IN (${delayedMarkers}) OR earlier.receipt_nonce IN (${delayedMarkers})
+      THEN ${delayedBlocker.sql} ELSE (${ordinaryBlocker.sql}) END)`,
     bindings: [...delayedBlocker.bindings, ...ordinaryBlocker.bindings],
   } : ordinaryBlocker;
   // Optional companions must not lose their live same-chat exclusion during a readiness fault.
@@ -295,6 +307,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
   if (gitHubSearch === "unavailable") liveMarkers.push(`'${TELEGRAM_GITHUB_SEARCH_MARKER}'`);
   if (rawFileReadiness !== false) liveMarkers.push(`'${TELEGRAM_SUBSCRIPTION_RAW_FILE_MARKER}'`);
   if (providerBatch === "unavailable") liveMarkers.push(TELEGRAM_PROVIDER_BATCH_REPLY_MARKERS);
+  if (apiStatus === "unavailable") liveMarkers.push(`'${TELEGRAM_API_STATUS_MARKER}'`);
   const activeOptionalLease = liveMarkers.length ? `OR (
     earlier_reply.state IN ('leased', 'sending') AND earlier_reply.lease_until > unixepoch()
     AND ((earlier.receipt_nonce IN (${liveMarkers.join(",")}) AND earlier.command = 'help'
@@ -314,22 +327,22 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
         JOIN telegram_inbox AS inbox USING (receipt_id)
         WHERE inbox.bot_id = ? AND ${supportedReceipt("inbox", includeAggregate, includePrivateShareCreation, includeSubscriptionRead,
           includeShortLinks, includeInlineSort, includeSubscriptionNodes, includeProvider, includeBulkTrash, includeInlineConsent,
-          includeGitHubSearch, includeRawFile, includeProviderBatch)}
-          AND ${providerCurrent.sql} AND ${githubCurrent.sql} AND ${batchCurrent.sql}
+          includeGitHubSearch, includeRawFile, includeProviderBatch, includeApiStatus)}
+          AND ${providerCurrent.sql} AND ${githubCurrent.sql} AND ${batchCurrent.sql} AND ${apiCurrent.sql}
           AND reply.state = 'pending'
           AND reply.due_at <= unixepoch() AND reply.attempts < ${MAX_ATTEMPTS}
-          AND ${replyClock(includeProvider, "inbox", includeProviderBatch)} + ${MAX_REPLY_AGE_SECONDS} > unixepoch()
+          AND ${replyClock(includeProvider, "inbox", includeProviderBatch, includeApiStatus)} + ${MAX_REPLY_AGE_SECONDS} > unixepoch()
           AND NOT EXISTS (
             SELECT 1 FROM telegram_inbox AS earlier
             JOIN telegram_outbox AS earlier_reply USING (receipt_id)
             WHERE earlier.bot_id = inbox.bot_id AND earlier.actor_id = inbox.actor_id AND earlier.chat_id = inbox.chat_id
               AND ((${supportedReceipt("earlier", includeAggregate, includePrivateShareCreation, includeSubscriptionRead,
                 includeShortLinks, includeInlineSort, includeSubscriptionNodes, includeProvider, includeBulkTrash, includeInlineConsent,
-                includeGitHubSearch, includeRawFile, includeProviderBatch)} AND ${sameChatBlocker.sql}) ${activeOptionalLease})
+                includeGitHubSearch, includeRawFile, includeProviderBatch, includeApiStatus)} AND ${sameChatBlocker.sql}) ${activeOptionalLease})
           )
         ORDER BY inbox.receipt_id LIMIT 1
       )
-    `).bind(leaseId, botId, ...providerCurrent.bindings, ...githubCurrent.bindings, ...batchCurrent.bindings,
+    `).bind(leaseId, botId, ...providerCurrent.bindings, ...githubCurrent.bindings, ...batchCurrent.bindings, ...apiCurrent.bindings,
       ...sameChatBlocker.bindings),
     db.prepare(`
       SELECT inbox.receipt_id AS receiptId, inbox.update_id AS updateId, inbox.actor_id AS actorId,
@@ -358,7 +371,8 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
         ${includeGitHubSearch ? "github.state" : "NULL"} AS githubSearchState,
         ${includeGitHubSearch ? "github.public_results" : "NULL"} AS githubSearchResults,
         CASE WHEN inbox.receipt_nonce='${TELEGRAM_SUBSCRIPTION_RAW_FILE_MARKER}' THEN 1 ELSE 0 END AS rawFileMarker,
-        ${includeProviderBatch ? `CASE WHEN ${telegramProviderBatchReplyMarker("inbox")} THEN 1 ELSE 0 END` : "0"} AS providerBatchMarker
+        ${includeProviderBatch ? `CASE WHEN ${telegramProviderBatchReplyMarker("inbox")} THEN 1 ELSE 0 END` : "0"} AS providerBatchMarker,
+        CASE WHEN inbox.receipt_nonce='${TELEGRAM_API_STATUS_MARKER}' THEN 1 ELSE 0 END AS apiStatusMarker
       FROM telegram_outbox AS reply JOIN telegram_inbox AS inbox USING (receipt_id)
       LEFT JOIN telegram_view AS page ON page.receipt_id = inbox.receipt_id AND inbox.receipt_nonce = '${TELEGRAM_VIEW_MARKER}'
       LEFT JOIN telegram_lifecycle_action AS action ON action.receipt_id = inbox.receipt_id
@@ -393,7 +407,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
       WHERE reply.lease_id = ? AND reply.state = 'leased' AND inbox.bot_id = ?
         AND ${supportedReceipt("inbox", includeAggregate, includePrivateShareCreation, includeSubscriptionRead,
           includeShortLinks, includeInlineSort, includeSubscriptionNodes, includeProvider, includeBulkTrash, includeInlineConsent,
-          includeGitHubSearch, includeRawFile, includeProviderBatch)}
+          includeGitHubSearch, includeRawFile, includeProviderBatch, includeApiStatus)}
     `).bind(leaseId, botId),
   ]);
   if (!write?.success || !read?.success) throw new Error("Telegram reply claim could not be confirmed.");
@@ -406,7 +420,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
     pathKind, pathAfterId, pathAffectedCount,
     documentKind, documentNodeCount, privateShareCreationReceipt, subscriptionReadReceipt, shortLinkReceipt,
     inlineSortKind, inlineSortMode, subscriptionNodeMarker, providerResult, providerKind, bulkTrashMarker, inlineConsentKind,
-    githubSearchState, githubSearchResults, rawFileMarker, providerBatchMarker, ...lease } = row;
+    githubSearchState, githubSearchResults, rawFileMarker, providerBatchMarker, apiStatusMarker, ...lease } = row;
   if ((providerResult === null) !== (providerKind === null)) throw new Error("Telegram provider reply kind could not be confirmed.");
   const lifecycle = lifecycleKind === null || lifecycleSubscriptionId === null || lifecycleExpectedRevision === null
     ? undefined : { kind: lifecycleKind, subscriptionId: lifecycleSubscriptionId, expectedLifecycleRevision: lifecycleExpectedRevision };
@@ -434,6 +448,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
     ...(githubSearchState === null ? {} : { githubSearch: { state: githubSearchState, publicResults: githubSearchResults } }),
     ...(rawFileMarker === 1 ? { subscriptionRawFile: true as const } : {}),
     ...(providerBatchMarker === 1 ? { providerBatch: true as const } : {}),
+    ...(apiStatusMarker === 1 ? { apiStatus: true as const } : {}),
     ...(privateClaimCodeSha256 === null ? {} : { privateClaim: { codeSha256: privateClaimCodeSha256 } }) };
 }
 
@@ -463,8 +478,8 @@ function beginReplyStatement(
           AND inbox.command = ? AND ${supportedReceipt("inbox", lease.aggregate !== undefined || lease.selected !== undefined,
             lease.privateShareCreation === true, lease.subscriptionRead === true, lease.shortLink === true,
             lease.inlineSort !== undefined, lease.subscriptionNodes === true, provider !== null, lease.bulkTrash === true,
-            lease.inlineConsent !== undefined, lease.githubSearch !== undefined, lease.subscriptionRawFile === true, lease.providerBatch === true)}
-          AND ${replyClock(provider !== null, "inbox", lease.providerBatch === true)} + ${MAX_REPLY_AGE_SECONDS} > unixepoch()
+            lease.inlineConsent !== undefined, lease.githubSearch !== undefined, lease.subscriptionRawFile === true, lease.providerBatch === true, lease.apiStatus === true)}
+          AND ${replyClock(provider !== null, "inbox", lease.providerBatch === true, lease.apiStatus === true)} + ${MAX_REPLY_AGE_SECONDS} > unixepoch()
           ${provider ? `AND (${provider.sql})` : ""}
           ${guard ? `AND (${guard.sql})` : ""}
           ${exactDocumentEpoch}
@@ -619,7 +634,7 @@ export async function beginTelegramReply(
   rawFileTicket?: TelegramRawFileTicket,
 ): Promise<boolean> {
   if (!inTelegramScope(policy, lease) || lease.privateClaim || lease.inlineSort || lease.bulkTrash || lease.inlineConsent || lease.githubSearch
-    || lease.subscriptionRawFile || lease.providerBatch
+    || lease.subscriptionRawFile || lease.providerBatch || lease.apiStatus
     || ((lease.aggregate || lease.selected || lease.path || lease.privateShareCreation
     || lease.tempRaw || lease.shortLink || lease.subscriptionNodes || lease.providerOutcome !== undefined)
     && (lease.chatType !== "private" || lease.threadId !== null))
@@ -759,6 +774,21 @@ export async function beginTelegramProviderBatchReply(
   return false;
 }
 
+export async function beginTelegramApiStatusReply(
+  db: D1Database, policy: TelegramPolicy, lease: TelegramReplyLease,
+  guard: { sql: string; bindings: readonly (string | number | null)[] } | undefined,
+): Promise<boolean> {
+  if (!lease.apiStatus || !inTelegramScope(policy, lease) || lease.chatType !== "private" || lease.threadId !== null) return false;
+  if (guard && await beginReplyStatement(db, policy, lease, "allowed", guard).first() !== null) return true;
+  const closed = await db.prepare(`UPDATE telegram_outbox SET state='failed',lease_id=NULL,lease_until=NULL
+    WHERE receipt_id=? AND state='leased' AND lease_id=? AND attempts=? AND EXISTS (
+      SELECT 1 FROM telegram_inbox AS inbox WHERE inbox.receipt_id=telegram_outbox.receipt_id
+        AND inbox.bot_id=? AND inbox.actor_id=? AND inbox.chat_id=? AND ${telegramApiStatusReceipt("inbox")})`)
+    .bind(lease.receiptId, lease.leaseId, lease.attempts, policy.botId, lease.actorId, lease.chatId).run();
+  if (!closed.success) throw new Error("Telegram API status reply could not close.");
+  return false;
+}
+
 export async function settleTelegramReply(
   db: D1Database,
   policy: TelegramPolicy,
@@ -768,12 +798,13 @@ export async function settleTelegramReply(
   const identity = [lease.leaseId, lease.attempts, policy.botId, lease.updateId, lease.receiptId] as const;
   const includeProvider = lease.providerOutcome !== undefined;
   const includeProviderBatch = lease.providerBatch === true;
+  const includeApiStatus = lease.apiStatus === true;
   const sameReply = `lease_id = ? AND attempts = ? AND receipt_id = (
     SELECT receipt_id FROM telegram_inbox AS inbox
     WHERE bot_id = ? AND update_id = ? AND receipt_id = ? AND ${supportedReceipt("inbox", lease.aggregate !== undefined || lease.selected !== undefined,
       lease.privateShareCreation === true, lease.subscriptionRead === true, lease.shortLink === true,
       lease.inlineSort !== undefined, lease.subscriptionNodes === true, includeProvider, lease.bulkTrash === true,
-      lease.inlineConsent !== undefined, lease.githubSearch !== undefined, lease.subscriptionRawFile === true, lease.providerBatch === true)}
+      lease.inlineConsent !== undefined, lease.githubSearch !== undefined, lease.subscriptionRawFile === true, lease.providerBatch === true, lease.apiStatus === true)}
   )`;
   if (outcome.kind === "sent") {
     if (!Number.isSafeInteger(outcome.messageId) || outcome.messageId <= 0) {
@@ -793,7 +824,7 @@ export async function settleTelegramReply(
     await db.prepare(`
       UPDATE telegram_outbox SET state = CASE
         WHEN attempts < ${MAX_ATTEMPTS} AND unixepoch() + ? < (
-          SELECT ${replyClock(includeProvider, "inbox", includeProviderBatch)} FROM telegram_inbox AS inbox WHERE inbox.receipt_id = telegram_outbox.receipt_id
+          SELECT ${replyClock(includeProvider, "inbox", includeProviderBatch, includeApiStatus)} FROM telegram_inbox AS inbox WHERE inbox.receipt_id = telegram_outbox.receipt_id
         ) + ${MAX_REPLY_AGE_SECONDS} THEN 'pending' ELSE 'failed' END,
         due_at = unixepoch() + ?, lease_id = NULL, lease_until = NULL
       WHERE ${sameReply} AND state = 'sending'
@@ -812,21 +843,21 @@ export async function settleTelegramReply(
 export async function reapExpiredTelegramReplies(db: D1Database, botId: string, includeAggregate = false,
   includePrivateShareCreation = false, includeSubscriptionRead = false, includeShortLinks = false, includeInlineSort = false,
   includeSubscriptionNodes = false, includeProvider = false, includeBulkTrash = false, includeInlineConsent = false,
-  includeGitHubSearch = false, includeRawFile = false, includeProviderBatch = false): Promise<void> {
+  includeGitHubSearch = false, includeRawFile = false, includeProviderBatch = false, includeApiStatus = false): Promise<void> {
   await db.prepare(`
     UPDATE telegram_outbox SET state = CASE
       WHEN state = 'sending' THEN 'uncertain'
       WHEN state = 'leased' AND attempts < ${MAX_ATTEMPTS} AND (
-        SELECT ${replyClock(includeProvider, "inbox", includeProviderBatch)} FROM telegram_inbox AS inbox WHERE inbox.receipt_id = telegram_outbox.receipt_id
+        SELECT ${replyClock(includeProvider, "inbox", includeProviderBatch, includeApiStatus)} FROM telegram_inbox AS inbox WHERE inbox.receipt_id = telegram_outbox.receipt_id
       ) + ${MAX_REPLY_AGE_SECONDS} > unixepoch() THEN 'pending' ELSE 'failed' END,
       lease_id = CASE WHEN state = 'sending' THEN lease_id ELSE NULL END, lease_until = NULL
     WHERE receipt_id IN (
       SELECT reply.receipt_id FROM telegram_outbox AS reply JOIN telegram_inbox AS inbox USING (receipt_id)
       WHERE inbox.bot_id = ? AND ${supportedReceipt("inbox", includeAggregate, includePrivateShareCreation, includeSubscriptionRead,
         includeShortLinks, includeInlineSort, includeSubscriptionNodes, includeProvider, includeBulkTrash, includeInlineConsent,
-        includeGitHubSearch, includeRawFile, includeProviderBatch)} AND (
+        includeGitHubSearch, includeRawFile, includeProviderBatch, includeApiStatus)} AND (
         (reply.state IN ('leased', 'sending') AND reply.lease_until <= unixepoch())
-        OR (reply.state IN ('pending', 'leased') AND ${replyClock(includeProvider, "inbox", includeProviderBatch)} + ${MAX_REPLY_AGE_SECONDS} <= unixepoch())
+        OR (reply.state IN ('pending', 'leased') AND ${replyClock(includeProvider, "inbox", includeProviderBatch, includeApiStatus)} + ${MAX_REPLY_AGE_SECONDS} <= unixepoch())
       )
       ORDER BY reply.receipt_id LIMIT ${REAP_LIMIT}
     )
