@@ -1,0 +1,54 @@
+name: Publish isolated Provider API status V2 OCI image
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider_ci_run_id:
+        description: Successful Provider Fetch CI run with its V2 artifact at this exact main revision
+        required: true
+        type: string
+      confirm_publish:
+        description: Enter publish api-status-v2 to subs-bot-provider-api-status-dev-01
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: subs-bot-provider-isolation
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
+    environment: subs-bot-provider-api-status-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 14
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install pinned Skopeo from signed Ubuntu repositories
+        run: bash worker/tools/install_provider_skopeo.sh
+      - name: Verify exact V2 artifact and OCI destination
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_CI_RUN_ID: ${{ inputs.provider_ci_run_id }}
+          SUBS_BOT_CF_PROVIDER_ACCOUNT_ID: ${{ vars.SUBS_BOT_CF_PROVIDER_ACCOUNT_ID }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          python3 -B worker/tools/prepare_provider_api_status_artifact.py > "$RUNNER_TEMP/provider-api-status-v2-provenance.json"
+      - name: Publish and verify the V2 registry digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_CI_RUN_ID: ${{ inputs.provider_ci_run_id }}
+          SUBS_BOT_PROVIDER_API_STATUS_PUBLISH_CONFIRMATION: ${{ inputs.confirm_publish }}
+          SUBS_BOT_CF_PROVIDER_ACCOUNT_ID: ${{ vars.SUBS_BOT_CF_PROVIDER_ACCOUNT_ID }}
+          SUBS_BOT_CF_PROVIDER_API_STATUS_CONTAINER_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_API_STATUS_CONTAINER_TOKEN }}
+        run: |
+          umask 077
+          python3 -B worker/tools/publish_provider_registry.py --profile api-status-v2

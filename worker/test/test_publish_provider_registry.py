@@ -31,6 +31,9 @@ EVIDENCE = {
     "compatibilityDate": publication.provider.COMPATIBILITY, "workerSha256": "f" * 64,
     "ociArchiveSha256": "1" * 64, "ociManifestSha256": MANIFEST, "ociConfigSha256": CONFIG,
 }
+API_REPO, _, API_PIN = publication.api_status_registry_pin(ACCOUNT, MANIFEST)
+API_EVIDENCE = {**EVIDENCE, **API_PIN, "profile": "api-status-v2", "service": publication.provider.API_STATUS_SERVICE,
+                "rpcEntrypoint": "ProviderApiStatus"}
 
 
 def headers(**values):
@@ -57,6 +60,11 @@ class RegistryTests(unittest.TestCase):
                              f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT}/containers/registries/{publication.HOST}/credentials")
             self.assertEqual(request.get_header("Authorization"), "Bearer synthetic-token")
             self.assertEqual(json.loads(request.data), {"expiration_minutes": 15, "permissions": permissions})
+
+    def test_status_registry_uses_its_fixed_repository(self):
+        registry = publication.Registry(ACCOUNT, "synthetic-status-token", profile=publication.provider.API_STATUS_PROFILE)
+        self.assertEqual(f"{publication.HOST}/{registry.repository}", API_REPO)
+        self.assertNotEqual(registry.repository, self.registry.repository)
 
     def test_credentials_from_wrong_account_or_host_are_rejected(self):
         result = {"account_id": ACCOUNT, "registry_host": publication.HOST, "username": PULL[0], "password": PULL[1]}
@@ -241,6 +249,19 @@ class PublicationTests(unittest.TestCase):
         self._copy.assert_called_once()
         self._config.assert_not_called()
 
+    def test_status_publication_cannot_mint_for_the_fetch_repository(self):
+        with patch.object(publication, "TARGET_ACCOUNT_SHA256", sha256(ACCOUNT.encode("ascii")).hexdigest()):
+            with self.assertRaisesRegex(publication.PublicationError, "repository or digest pin differs"):
+                publication._publish(self.registry, self.scratch, self.archive, API_EVIDENCE)
+            self.registry.mint.assert_not_called()
+            self.registry.repository = API_REPO.removeprefix(publication.HOST + "/")
+            self.registry.manifest.side_effect = [None, None, MANIFEST, MANIFEST]
+            result = publication._publish(self.registry, self.scratch, self.archive, API_EVIDENCE)
+        self.assertEqual(result, {**API_EVIDENCE, "tag": TAG, "status": "published"})
+        self._copy.assert_called_once_with(self.scratch, self.archive, f"{API_REPO}:{TAG}",
+                                           self.scratch / "push-auth.json", DIGEST)
+        self._config.assert_called_once_with(self.scratch, f"{API_REPO}@{DIGEST}", self.scratch / "pull-auth.json")
+
 
 class LocalBoundaryTests(unittest.TestCase):
     def test_evidence_is_bound_to_private_verified_files_and_trusted_run(self):
@@ -333,6 +354,53 @@ class LocalBoundaryTests(unittest.TestCase):
                 publication.publish()
             read.assert_not_called()
             registry.assert_not_called()
+
+    def test_status_requires_its_own_workflow_confirmation_and_credential(self):
+        environment = {
+            "GITHUB_REPOSITORY": publication.github.REPOSITORY, "GITHUB_REF": publication.github.MAIN_REF,
+            "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_SHA": REVISION, "GITHUB_WORKFLOW_SHA": REVISION,
+            "RUNNER_ENVIRONMENT": "github-hosted", "SUBS_BOT_PROVIDER_CI_RUN_ID": "10",
+            "SUBS_BOT_CF_PROVIDER_ACCOUNT_ID": ACCOUNT, "SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN": "synthetic-fetch-token",
+            "GITHUB_WORKFLOW_REF": f"{publication.github.REPOSITORY}/{publication.API_STATUS_WORKFLOW}@{publication.github.MAIN_REF}",
+        }
+        profile = publication.provider.API_STATUS_PROFILE
+        with tempfile.TemporaryDirectory() as runner_temp, patch.dict(os.environ, {**environment, "RUNNER_TEMP": runner_temp}, clear=True), \
+                patch.object(publication, "TARGET_ACCOUNT_SHA256", sha256(ACCOUNT.encode("ascii")).hexdigest()), \
+                patch.object(publication, "_verified_input", return_value=(Path("fixture"), API_EVIDENCE)) as read, \
+                patch.object(publication, "_guard_main"), patch.object(publication, "Registry") as registry, \
+                patch.object(publication, "_publish", return_value={"status": "synthetic"}):
+            with self.assertRaisesRegex(publication.PublicationError, "operator confirmation"):
+                publication.publish(profile=profile)
+            os.environ["SUBS_BOT_PROVIDER_API_STATUS_PUBLISH_CONFIRMATION"] = publication.API_STATUS_CONFIRMATION
+            with self.assertRaisesRegex(publication.PublicationError, "dedicated API status"):
+                publication.publish(profile=profile)
+            os.environ[publication.API_STATUS_TOKEN_ENV] = "synthetic-status-token"
+            with patch.dict(os.environ, {"GITHUB_WORKFLOW_REF": "foreign-workflow"}):
+                with self.assertRaisesRegex(publication.PublicationError, "exact protected GitHub-hosted workflow"):
+                    publication.publish(profile=profile)
+            read.assert_not_called()
+            registry.assert_not_called()
+            self.assertEqual(publication.publish(profile=profile), {"status": "synthetic"})
+            read.assert_called_once_with(Path(runner_temp), REVISION, "10", profile=profile, account=ACCOUNT)
+            registry.assert_called_once_with(ACCOUNT, "synthetic-status-token", profile=profile)
+
+    def test_status_rechecks_exact_artifact_and_never_uses_v1_evidence_file(self):
+        profile = publication.provider.API_STATUS_PROFILE
+        with patch.object(publication.github, "require_current_main"), patch.object(
+                publication.github, "_github_token", return_value="synthetic"), patch.object(
+                publication.provenance, "_select_artifact", return_value=("2", "15", "e" * 64)) as select:
+            publication._guard_main(API_EVIDENCE)
+            select.assert_called_once_with("10", REVISION, "synthetic", profile=profile)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / publication.EVIDENCE_FILE).write_text(json.dumps(EVIDENCE))
+            with self.assertRaises(FileNotFoundError):
+                publication._verified_input(root, REVISION, "10", profile=profile, account=ACCOUNT)
+            path = root / publication.API_STATUS_EVIDENCE_FILE
+            path.write_text(json.dumps({**API_EVIDENCE, "registryImageReferenceSha256": "0" * 64}))
+            path.chmod(0o600)
+            with self.assertRaisesRegex(publication.PublicationError, "registry target proof differs"):
+                publication._verified_input(root, REVISION, "10", profile=profile, account=ACCOUNT)
 
 
 if __name__ == "__main__":

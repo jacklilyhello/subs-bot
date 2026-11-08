@@ -7,7 +7,7 @@ from pathlib import Path
 
 import prepare_isolation_artifact as github
 import prepare_provider_artifact as provenance
-from publish_provider_registry import ACCOUNT, HOST, TARGET_ACCOUNT_SHA256
+from publish_provider_registry import ACCOUNT, TARGET_ACCOUNT_SHA256, api_status_registry_pin
 
 provider = provenance.provider
 
@@ -26,14 +26,12 @@ def prepare():
         manifest = provider.json_object(source)
     fields = ("profile", "service", "rpcEntrypoint", "ociManifestSha256", "ociConfigSha256", "workerSha256")
     provider.require(all(manifest[field] == evidence[field] for field in fields))
-    repository = f"{HOST}/{account}/{provider.API_STATUS_SERVICE}"
-    image = f"{repository}@sha256:{evidence['ociManifestSha256']}"
+    _, image, pin = api_status_registry_pin(account, evidence["ociManifestSha256"])
     config = provider.config_for(directory, manifest, account, profile=profile)
     provider.require(config["name"] == provider.API_STATUS_SERVICE and len(config["containers"]) == 1
                      and config["containers"][0]["images"] == {"provider": {"image": image}})
     github.require_current_main(evidence["revision"])
-    return {**evidence, "registryRepositorySha256": sha256(repository.encode("ascii")).hexdigest(),
-            "registryImageReferenceSha256": sha256(image.encode("ascii")).hexdigest()}
+    return {**evidence, **pin}
 
 
 if __name__ == "__main__":
