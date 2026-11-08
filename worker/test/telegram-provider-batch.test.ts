@@ -94,15 +94,35 @@ async function start(input: TelegramProviderBatchInput) {
 async function queue(queuePolicy = policy, promote = true) {
   let failure: unknown;
   let outcomes: { success: boolean; changes: number }[] = [];
+  const prepared = new Map<D1PreparedStatement, { sql: string; bindings: unknown[] }>();
   const observed = {
-    prepare: db.prepare.bind(db),
+    prepare(sql: string) {
+      return {
+        bind(...bindings: unknown[]) {
+          const statement = db.prepare(sql).bind(...bindings);
+          prepared.set(statement, { sql, bindings });
+          return statement;
+        },
+      } as D1PreparedStatement;
+    },
     async batch<T>(statements: D1PreparedStatement[]) {
       try {
         const results = await db.batch<T>(statements);
         outcomes = results.map(({ success, meta }) => ({ success, changes: meta.changes }));
         return results;
       } catch (error) {
-        failure = error;
+        const rejected: number[] = [];
+        for (const [index, statement] of statements.entries()) {
+          const query = prepared.get(statement);
+          if (query) {
+            try {
+              await db.prepare(`EXPLAIN ${query.sql}`).bind(...query.bindings).all();
+            } catch {
+              rejected.push(index + 1);
+            }
+          }
+        }
+        failure = new Error(`Synthetic reconciliation EXPLAIN rejected statement slots ${JSON.stringify(rejected)}`, { cause: error });
         throw error;
       }
     },

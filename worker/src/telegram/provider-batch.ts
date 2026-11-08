@@ -191,7 +191,7 @@ export async function reconcileTelegramProviderBatches(
 ): Promise<{ promoted: number; finished: number }> {
   const scope = telegramProviderBatchOrigin(policy, true);
   try {
-    const steps = [...prepareTelegramProviderBatchQueue(db, policy, promote), db.prepare(`WITH terminal AS (
+    const steps = [...prepareTelegramProviderBatchQueue(db, policy, promote), db.prepare(`WITH terminal AS MATERIALIZED (
       SELECT batch.batch_id,max(job.finished_at) AS finished_at,${COUNTS}
       FROM telegram_provider_batches AS batch JOIN telegram_provider_batch_jobs AS job USING(batch_id)
       WHERE batch.finished_at IS NULL AND (${scope.sql})

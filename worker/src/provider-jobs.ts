@@ -333,16 +333,21 @@ export function telegramProviderBatchOrigin(policy: ProviderTelegramPolicy, forR
           SELECT allowed=1 AND message_date=batch.auth_message_date AND message_id=batch.auth_message_id
           FROM telegram_auth WHERE bot_id=batch.bot_id AND user_id=batch.actor_id
         ),batch.auth_message_date=0 AND batch.auth_message_id=0)))`;
+  // Shallow guard groups keep this shared predicate within D1's expression-depth limit when nested.
   return { sql: `batch.bot_id=? AND EXISTS (
     SELECT 1 FROM telegram_inbox AS confirmation JOIN telegram_inbox AS preview ON preview.receipt_id=batch.preview_receipt_id
     JOIN telegram_outbox AS sent ON sent.receipt_id=preview.receipt_id
-    WHERE confirmation.receipt_id=batch.batch_id AND confirmation.bot_id=batch.bot_id AND confirmation.actor_id=batch.actor_id
-      AND confirmation.chat_type='private' AND confirmation.chat_id=confirmation.actor_id AND confirmation.thread_id IS NULL
-      AND confirmation.command='help' AND confirmation.receipt_nonce='${TELEGRAM_PROVIDER_BATCH_CONFIRM_MARKER}'
-      AND preview.bot_id=batch.bot_id AND preview.actor_id=batch.actor_id AND preview.chat_type='private'
-      AND preview.chat_id=preview.actor_id AND preview.thread_id IS NULL AND preview.command='help'
-      AND preview.receipt_nonce='${TELEGRAM_PROVIDER_BATCH_PREVIEW_MARKER}' AND sent.state='sent'
-      AND sent.sent_message_id=confirmation.message_id AND sent.attempts=batch.origin_attempt AND (${role}))`,
+    WHERE confirmation.receipt_id=batch.batch_id AND CASE
+      WHEN (confirmation.bot_id=batch.bot_id AND confirmation.actor_id=batch.actor_id
+        AND confirmation.chat_type='private' AND confirmation.chat_id=confirmation.actor_id
+        AND confirmation.thread_id IS NULL) IS NOT TRUE THEN 0
+      WHEN (confirmation.command='help' AND confirmation.receipt_nonce='${TELEGRAM_PROVIDER_BATCH_CONFIRM_MARKER}'
+        AND preview.bot_id=batch.bot_id AND preview.actor_id=batch.actor_id) IS NOT TRUE THEN 0
+      WHEN (preview.chat_type='private' AND preview.chat_id=preview.actor_id AND preview.thread_id IS NULL
+        AND preview.command='help' AND preview.receipt_nonce='${TELEGRAM_PROVIDER_BATCH_PREVIEW_MARKER}') IS NOT TRUE THEN 0
+      WHEN (sent.state='sent' AND sent.sent_message_id=confirmation.message_id AND sent.attempts=batch.origin_attempt)
+        IS NOT TRUE THEN 0
+      ELSE (${role}) END)`,
     bindings: [policy.botId, policy.adminId, policy.memberId] };
 }
 
@@ -439,7 +444,7 @@ function terminalJobs(db: D1Database, scope: JobScope, includeWaiting = false): 
   const authorized = scopeAuthorization(scope);
   const unsettled = includeWaiting ? "state IN ('waiting', 'pending', 'leased')" : liveState;
   return db.prepare(`
-    WITH terminal AS (
+    WITH terminal AS ${scope !== "generic" && scope.queue === "batch" ? "MATERIALIZED " : ""}(
       SELECT job.job_id, CASE
         WHEN job.expires_at <= unixepoch() THEN 'expired'
         WHEN NOT (${currentTarget} AND ${authorized.sql}) THEN 'stale-target'
