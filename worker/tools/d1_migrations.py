@@ -27,7 +27,7 @@ UUID = re.compile(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}")
 TABLE = re.compile(r"CREATE TABLE ([a-z][a-z0-9_]*) \(")
 INDEX = re.compile(r"CREATE (?:UNIQUE )?INDEX ([a-z][a-z0-9_]*) ON ([a-z][a-z0-9_]*)[ \t\n]+\(")
 # Cumulative trusted migration text. Each resulting D1 statement is bounded separately.
-MAX_MIGRATION_BYTES = 64 * 1024
+MAX_MIGRATION_BYTES = 72 * 1024
 MAX_D1_STATEMENT_BYTES = 100_000
 
 
@@ -92,9 +92,13 @@ def _load_migrations(bundle_dir: Path, manifest: dict) -> list[Migration]:
             _require((name, digest) == (BASELINE_NAME, BASELINE_SHA256), "Original migration 0001 changed.")
         file = directory / name
         _require(not file.is_symlink() and file.is_file(), "Migration file is missing or is not a regular artifact file.")
-        total_bytes += file.stat().st_size
-        _require(total_bytes <= MAX_MIGRATION_BYTES, "Migration SQL exceeds the isolation tool's size limit.")
-        data = file.read_bytes()
+        remaining = MAX_MIGRATION_BYTES - total_bytes
+        size_error = "Migration SQL exceeds the isolation tool's size limit."
+        _require(file.stat().st_size <= remaining, size_error)
+        with file.open("rb") as stream:
+            data = stream.read(remaining + 1)
+        _require(len(data) <= remaining, size_error)
+        total_bytes += len(data)
         _require(hashlib.sha256(data).hexdigest() == digest, "Migration artifact digest does not match.")
         try:
             sql = data.decode("utf-8")
@@ -196,7 +200,9 @@ def _validate_indexes(api, path: str, objects: tuple[SchemaObject, ...]) -> None
 
 
 def _matches_schema(api, path: str, objects: tuple[SchemaObject, ...]) -> bool:
-    return _rows(api, path, f"SELECT ({_schema_condition(objects)}) AS matches") == [{"matches": 1}]
+    sql = f"SELECT ({_schema_condition(objects)}) AS matches"
+    _require(len(sql.encode("utf-8")) < MAX_D1_STATEMENT_BYTES, "D1 schema readback exceeds statement limits.")
+    return _rows(api, path, sql) == [{"matches": 1}]
 
 
 def _read_state(api, path: str, migrations: list[Migration]) -> tuple[str, list[dict]]:
@@ -242,7 +248,7 @@ def _assert_sql(condition: str) -> str:
     return f"SELECT CASE WHEN {condition} THEN 1 ELSE json_extract('migration guard failed', '$') END AS guard"
 
 
-def _apply_one(api, path, migrations, kind, history, guard):
+def _plan_one(migrations, kind, history):
     position = len(history) + 1
     migration = migrations[position - 1]
     mode = "adopted" if kind == "legacy" else "applied"
@@ -263,7 +269,11 @@ def _apply_one(api, path, migrations, kind, history, guard):
         f"INSERT INTO {LEDGER} (position, name, sha256, mode) VALUES"
         f" ({position}, {_literal(migration.name)}, {_literal(migration.sha256)}, {_literal(mode)})"))
     _require(all(len(sql.encode("utf-8")) < MAX_D1_STATEMENT_BYTES for sql in statements), "D1 migration guard exceeds statement limits.")
-    expected = [*history, {"position": position, "name": migration.name, "sha256": migration.sha256, "mode": mode}]
+    return statements, [*history, {"position": position, "name": migration.name, "sha256": migration.sha256, "mode": mode}]
+
+
+def _apply_one(api, path, migrations, kind, history, guard):
+    statements, expected = _plan_one(migrations, kind, history)
     guard()
     failed = False
     try:
@@ -298,6 +308,13 @@ def apply_migrations(api, target: dict, bundle_dir: Path, manifest: dict, guard)
     _require(isinstance(database, dict) and (database.get("uuid"), database.get("name"), database.get("created_at"))
              == (database_id, DATABASE_NAME, created), "D1 identity does not match the pinned isolation database.")
     kind, history = _read_state(api, path, migrations)
+    # Check every pending transaction before the first can change D1. The
+    # prospective schema readback is shorter than the same predicate in its
+    # checked post-migration assertion.
+    planned_kind, planned_history = kind, history
+    while len(planned_history) < len(migrations):
+        _, planned_history = _plan_one(migrations, planned_kind, planned_history)
+        planned_kind = "managed"
     while len(history) < len(migrations):
         history = _apply_one(api, path, migrations, kind, history, guard)
         kind = "managed"

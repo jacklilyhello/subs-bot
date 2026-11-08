@@ -12,7 +12,10 @@ from pathlib import Path
 WORKER = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(WORKER / "tools"))
 
-from d1_migrations import BASELINE_NAME, LEDGER, MAX_D1_STATEMENT_BYTES, MigrationError, apply_migrations  # noqa: E402
+from d1_migrations import (  # noqa: E402
+    BASELINE_NAME, LEDGER, MAX_D1_STATEMENT_BYTES, MAX_MIGRATION_BYTES, MigrationError, SchemaObject,
+    _matches_schema, apply_migrations,
+)
 
 
 TARGET = {
@@ -30,6 +33,13 @@ CREATE TABLE test_messages (
 ) STRICT;
 CREATE INDEX test_messages_actor ON test_messages (actor_id, id);
 """
+
+
+def sized_budget_ddl(size, padding):
+    head = b"CREATE TABLE test_budget (id INTEGER PRIMARY KEY, marker TEXT NOT NULL DEFAULT '"
+    tail = b"') STRICT;\n"
+    repeats, leftover = divmod(size - len(head) - len(tail), len(padding))
+    return head + padding * repeats + b"x" * leftover + tail
 
 
 class FakeD1:
@@ -133,6 +143,45 @@ class MigrationTests(unittest.TestCase):
         self.assertNotIn("telegram_subscription_read_ticket", guards[2 * read_migration])
         self.assertIn("telegram_subscription_read_ticket", guards[2 * read_migration + 1])
         self.assertEqual(self.api.db.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_exact_cumulative_cap_above_64_kib_applies_and_reads_back(self):
+        self.assertEqual(MAX_MIGRATION_BYTES, 72 * 1024)
+        self.add_file("0002_budget.sql", sized_budget_ddl(MAX_MIGRATION_BYTES - len(BASELINE), "é".encode()))
+        expected = [{**item, "mode": "applied"} for item in self.manifest["migrations"]]
+        self.assertEqual(self.apply(), expected)
+        self.assertEqual(self.apply(), expected)
+        self.assertTrue(self.api.table_exists("test_budget"))
+        self.assertEqual(len(self.api.mutations), 2)
+        self.assertTrue(any(64 * 1024 < len(sql.encode("utf-8")) < MAX_D1_STATEMENT_BYTES
+                            for sql in self.api.executed if sql.startswith("SELECT (")))
+
+    def test_cumulative_cap_plus_one_fails_before_any_api_request(self):
+        self.add_file("0002_budget.sql", sized_budget_ddl(MAX_MIGRATION_BYTES - len(BASELINE) + 1, b"x"))
+
+        def unreachable(*_args):
+            self.fail("Oversized artifact reached the D1 API.")
+
+        with self.assertRaisesRegex(MigrationError, "Migration SQL exceeds the isolation tool's size limit"):
+            apply_migrations(unreachable, TARGET, self.bundle, self.manifest, self.guard)
+        self.assertEqual(self.guard_calls, 0)
+
+    def test_late_guard_overflow_blocks_earlier_pending_transactions(self):
+        self.add_file(NEXT_NAME, NEXT_SQL)
+        # Quoting this valid DDL for the exact schema predicate doubles its apostrophes.
+        self.add_file("0003_budget.sql", sized_budget_ddl(MAX_MIGRATION_BYTES - len(BASELINE) - len(NEXT_SQL), b"''"))
+        with self.assertRaisesRegex(MigrationError, "D1 migration guard exceeds statement limits"):
+            self.apply()
+        self.assertEqual(self.api.mutations, [])
+        self.assertEqual(self.guard_calls, 0)
+        self.assertFalse(self.api.table_exists("subscriptions"))
+
+    def test_oversized_schema_readback_stops_before_query(self):
+        ddl = sized_budget_ddl(MAX_MIGRATION_BYTES, b"''").decode().rstrip(";\n")
+        object_to_check = SchemaObject("table", "test_budget", "test_budget", ddl)
+        with self.assertRaisesRegex(MigrationError, "D1 schema readback exceeds statement limits"):
+            _matches_schema(self.api, self.api.path, (object_to_check,))
+        self.assertEqual(self.api.executed, [])
+        self.assertEqual(self.api.mutations, [])
 
     def test_legacy_adopts_0001_without_replay_or_reset_and_applies_next(self):
         self.api.seed_legacy()
