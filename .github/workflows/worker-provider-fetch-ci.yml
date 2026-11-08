@@ -149,3 +149,73 @@ jobs:
           path: ${{ runner.temp }}/subs-bot-provider/
           if-no-files-found: error
           retention-days: 14
+
+  api-status-runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    env:
+      BUILD_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.BUILD_REVISION }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - name: Typecheck and exercise the emitted API status Worker
+        working-directory: worker
+        run: |
+          test "$(git rev-parse HEAD)" = "$BUILD_REVISION"
+          npm ci --ignore-scripts
+          mkdir -p "$RUNNER_TEMP/subs-bot-provider-api-status"
+          ./node_modules/.bin/tsc -p provider_fetch/tsconfig-api-status.json
+          ./node_modules/.bin/esbuild provider_fetch/api_status_worker.ts --bundle --format=esm --platform=browser \
+            --external:cloudflare:workers --target=es2022 --outfile="$RUNNER_TEMP/subs-bot-provider-api-status/provider-worker.js"
+          PROVIDER_WORKER_BUNDLE="$RUNNER_TEMP/subs-bot-provider-api-status/provider-worker.js" \
+            node --test provider_fetch/test_api_status_worker.mjs
+      - name: Build and verify the isolated API status OCI artifact
+        working-directory: worker/provider_fetch
+        run: |
+          artifact="$RUNNER_TEMP/subs-bot-provider-api-status"
+          trap 'docker rm -f provider-api-status-ci >/dev/null 2>&1 || true; docker buildx rm provider-api-status-ci >/dev/null 2>&1 || true' EXIT
+          docker buildx create --name provider-api-status-ci --driver docker-container \
+            --driver-opt 'image=moby/buildkit@sha256:97719ccb2ac86fb44fd36f330a6d302f63dddd5326f3ada24f9c05ccac0d9098'
+          docker buildx build --builder provider-api-status-ci --platform linux/amd64 \
+            --build-arg "BUILD_REVISION=$BUILD_REVISION" --label io.subs-bot.provider.profile=api-status-v2 \
+            --provenance=false --sbom=false --output "type=oci,oci-mediatypes=true,dest=$artifact/provider-image.tar" \
+            --output "type=docker,name=provider-api-status-ci:tested,dest=$RUNNER_TEMP/provider-api-status-docker.tar" .
+          python3 -B release_artifact.py pack "$artifact" "$BUILD_REVISION" --profile api-status-v2
+          docker load --input "$RUNNER_TEMP/provider-api-status-docker.tar"
+          config_digest="$(jq -er .ociConfigSha256 "$artifact/provider-release.json")"
+          test "$(docker image inspect --format '{{.Id}}' provider-api-status-ci:tested)" = "sha256:$config_digest"
+          docker run --detach --name provider-api-status-ci --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --memory 256m --cpus 0.0625 "sha256:$config_digest"
+          docker exec -i provider-api-status-ci python -B - "$BUILD_REVISION" < probe_image.py
+          python3 -B release_artifact.py config "$artifact" "$BUILD_REVISION" --profile api-status-v2 \
+            --account-id aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa > "$RUNNER_TEMP/provider-api-status-private-config.json"
+          jq -e --arg repository "registry.cloudflare.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/subs-bot-provider-api-status-dev-01" \
+            --arg digest "$(jq -er .ociManifestSha256 "$artifact/provider-release.json")" \
+            '.workers_dev == false and .preview_urls == false and .observability.enabled == false and .logpush == false and
+              .name == "subs-bot-provider-api-status-dev-01" and
+              .compatibility_date == "2026-11-06" and (has("compatibility_flags") | not) and
+              .exports == {"ProviderContainer":{"type":"durable-object","storage":"sqlite"}} and
+              .workflows == [{"name":"subs-bot-provider-api-status-dev-01-smoke","binding":"PROVIDER_SMOKE","class_name":"ProviderSmoke"}] and
+              .containers == [{"class_name":"ProviderContainer","scheduling_policy":"durable_object",
+                "images":{"provider":{"image":($repository + "@sha256:" + $digest)}},"observability":{"logs":{"enabled":false}}}] and
+              ((has("durable_objects") or has("d1_databases") or has("r2_buckets") or has("routes") or has("triggers") or has("services")) | not)' \
+            "$RUNNER_TEMP/provider-api-status-private-config.json" > /dev/null
+      - name: Install the same pinned Skopeo used for publication
+        run: bash worker/tools/install_provider_skopeo.sh
+      - name: Verify the exact API status OCI archive with Skopeo offline
+        run: |
+          umask 077
+          sudo unshare --net --setgid="$(id -g)" --setuid="$(id -u)" -- \
+            /usr/bin/python3 -B worker/tools/verify_provider_skopeo.py \
+              "$RUNNER_TEMP/subs-bot-provider-api-status" "$RUNNER_TEMP"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: subs-bot-provider-api-status-v2-${{ env.BUILD_REVISION }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/subs-bot-provider-api-status/
+          if-no-files-found: error
+          retention-days: 14

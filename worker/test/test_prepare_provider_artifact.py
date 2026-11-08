@@ -48,14 +48,17 @@ def tar_bytes(members):
 
 
 def oci_fixture(*, wrong_diff_id=False, foreign_layer=False, wrong_platform=False, unreferenced=False,
-                duplicate_metadata=False):
+                duplicate_metadata=False, profile=None):
     plain = tar_bytes({"app/fixture.txt": b"isolated image fixture"})
     layer = gzip.compress(plain, mtime=0)
+    labels = {"org.opencontainers.image.revision": REVISION}
+    if profile is not None:
+        labels[provider.PROFILE_LABEL] = profile
     config = encoded({
         "architecture": "amd64", "os": "linux",
         "rootfs": {"type": "layers", "diff_ids": ["sha256:" + ("0" * 64 if wrong_diff_id else sha256(plain).hexdigest())]},
         "config": {"User": "65532:65532", "Entrypoint": ["python", "-B", "-E", "-s", "/app/server.py"],
-                   "WorkingDir": "/app", "Labels": {"org.opencontainers.image.revision": REVISION},
+                   "WorkingDir": "/app", "Labels": labels,
                    "ExposedPorts": {"8080/tcp": {}}, "Env": ["PATH=/usr/bin"]},
     })
     config_descriptor = descriptor(config, provider.OCI_CONFIG)
@@ -252,6 +255,40 @@ class PrepareProviderArtifactTests(unittest.TestCase):
         self.main_revisions = [REVISION]
         self.archive = zip_fixture({**self.members, provider.WORKER: b"different Worker module"})
         self.assert_private_failure("manifest or its exact contents did not verify")
+
+    def test_exact_status_artifact_cannot_enter_the_existing_fetch_release(self):
+        source = self.root / "source"
+        image = source / provider.IMAGE
+        requirements = Path(provider.__file__).with_name("requirements.txt")
+        provenance = {"ref": github.MAIN_REF, "run_id": RUN_ID, "run_attempt": ATTEMPT}
+        for label in (None, "foreign-profile"):
+            image.write_bytes(oci_fixture(profile=label))
+            with self.assertRaises(ValueError):
+                provider.release_manifest(source, REVISION, requirements, **provenance, profile=provider.API_STATUS_PROFILE)
+        image.write_bytes(oci_fixture(profile=provider.API_STATUS_PROFILE))
+        with self.assertRaises(ValueError):
+            provider.release_manifest(source, REVISION, requirements, **provenance)
+        manifest = provider.release_manifest(source, REVISION, requirements, **provenance, profile=provider.API_STATUS_PROFILE)
+        self.assertEqual({key: manifest[key] for key in ("version", "service", "profile", "rpcEntrypoint")}, {
+            "version": 3, "service": "subs-bot-provider-api-status-dev-01", "profile": "api-status-v2",
+            "rpcEntrypoint": "ProviderApiStatus",
+        })
+        recorded = source / provider.MANIFEST
+        recorded.write_bytes(encoded(manifest))
+        self.assertEqual(provider.verify_release(source, REVISION, **provenance, profile=provider.API_STATUS_PROFILE), manifest)
+        with self.assertRaises(ValueError):
+            provider.verify_release(source, REVISION, **provenance)
+        self.archive = zip_fixture({**self.members, provider.IMAGE: image.read_bytes(), provider.MANIFEST: encoded(manifest)})
+        self.assert_private_failure("manifest or its exact contents did not verify")
+        account = "b" * 32
+        config = provider.config_for(source, manifest, account, profile=provider.API_STATUS_PROFILE)
+        self.assertEqual(config["containers"][0]["images"]["provider"]["image"],
+                         f"registry.cloudflare.com/{account}/subs-bot-provider-api-status-dev-01@sha256:{manifest['ociManifestSha256']}")
+        with self.assertRaises(ValueError):
+            provider.config_for(source, manifest, account)
+        recorded.write_bytes(encoded(manifest | {"rpcEntrypoint": "ProviderFetch"}))
+        with self.assertRaises(ValueError):
+            provider.verify_release(source, REVISION, **provenance, profile=provider.API_STATUS_PROFILE)
 
     def test_refuses_foreign_oci_descriptors_and_mismatched_rootfs(self):
         path = self.root / "image.tar"
