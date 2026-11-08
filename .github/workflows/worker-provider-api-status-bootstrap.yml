@@ -1,0 +1,51 @@
+name: Bootstrap private Provider API status V2 Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider_ci_run_id:
+        description: Successful Provider Fetch CI run with its V2 artifact at this exact main revision
+        required: true
+        type: string
+      operation:
+        description: Verify the pinned empty Worker or explicitly create its private shell
+        required: true
+        type: choice
+        options: [verify, create]
+        default: verify
+      confirm_create:
+        description: For create, enter create subs-bot-provider-api-status-dev-01
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: subs-bot-provider-isolation
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
+    environment: subs-bot-provider-api-status-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify V2 provenance and bootstrap the exact private Worker shell
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_CI_RUN_ID: ${{ inputs.provider_ci_run_id }}
+          SUBS_BOT_PROVIDER_API_STATUS_BOOTSTRAP_OPERATION: ${{ inputs.operation }}
+          SUBS_BOT_PROVIDER_API_STATUS_BOOTSTRAP_CONFIRMATION: ${{ inputs.confirm_create }}
+          SUBS_BOT_CF_PROVIDER_ACCOUNT_ID: ${{ vars.SUBS_BOT_CF_PROVIDER_ACCOUNT_ID }}
+          SUBS_BOT_CF_PROVIDER_API_STATUS_WORKER_IDENTITY_JSON: ${{ secrets.SUBS_BOT_CF_PROVIDER_API_STATUS_WORKER_IDENTITY_JSON }}
+          SUBS_BOT_CF_PROVIDER_API_STATUS_WORKER_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_API_STATUS_WORKER_TOKEN }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          python3 -B worker/tools/bootstrap_provider_api_status_worker.py
