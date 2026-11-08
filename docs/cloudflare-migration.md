@@ -399,6 +399,14 @@ PY
 
 筛选聚合保留旧列表的顺序和重复项，按旧活动订阅的独立编号高水位记录实际匹配位置。归属在映射前核对，回收站同号记录不会补入。可能因归属合并扩大范围的旧全量聚合标记为阻止。该盘点只封存范围和分类。启用前还须独立验证外部跳转等价性、旧聚合成员生命周期、空结果与临时节点行为。
 
+### 旧外部短链离线比较
+
+托管 CI 使用合成 SQLite 和本次构建的 Worker，比较旧版 `aiohttp.web.HTTPFound` 与 Worker `/s/` 的 `Location` 字节。比较阶段在仅开放回环接口的网络命名空间中运行，关闭核心转储。Worker 通过内存中的单行短链记录走实际 `GET` 和 `HEAD` 路径，响应只返回固定判定。外部地址原文从封存 SQLite 经匿名管道传入内存，封存报告只保存短码摘要和判定。主机后的斜线或转义差异也会单独记录。 [aiohttp 重定向](https://docs.aiohttp.org/en/stable/_modules/aiohttp/web_exceptions.html) · [Miniflare 模块测试](https://developers.cloudflare.com/workers/testing/miniflare/writing-tests/)
+
+离线工具入口为 `python3 -B worker/tools/legacy_short_redirect_oracle.py PRIVATE_CONFIG_JSON`。配置仅供当前账号访问，包含路径 `backup`、`inventory`、`bundle`、`output` 和 `ownerMap`，以及 `sourceSha256`、`inventorySha256`、`workerManifestSha256`、`ownerMapSha256`、`oldOrigin`、`legacyBotId`、`revision`、`pythonVersion` 和 `yarlVersion`。工具核对构建版本、源库和盘点摘要，并重建盘点验证闭合；输出目录须尚未存在。
+
+当前证据限于合成样例，使用旧代码指定的 aiohttp 3.11.18 和测试用 yarl 1.20.0。真实比较须先独立确认旧部署的 Python、aiohttp 和 yarl 版本，并使用相同运行时及经独立核验的 Worker 构建。报告保持离线封存，进入真实候选与激活前另行核对旧链接、目标环境和恢复证据。
+
 ### 真实数据与生产切换门槛
 
 1. 先只读核对 Cloudflare 目标账户、Zone、`subs-bot.lilyya.top` 的 DNS、Worker 路由和 Custom Domain 绑定。新资源记录账号、环境及资源 ID，隔离与生产分别使用各自的 Worker、D1、R2 和队列。现有配置冲突须在改动前报告。目标主机名可用且切换获准后，仅增加所需的 Custom Domain 绑定。 [Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)
