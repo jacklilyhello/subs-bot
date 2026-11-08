@@ -91,8 +91,27 @@ async function start(input: TelegramProviderBatchInput) {
   return (result[1].results[0] as { batchId: number } | undefined)?.batchId ?? null;
 }
 
-async function queue() {
-  return reconcileTelegramProviderBatches(db, policy);
+async function queue(queuePolicy = policy, promote = true) {
+  let failure: unknown;
+  let outcomes: { success: boolean; changes: number }[] = [];
+  const observed = {
+    prepare: db.prepare.bind(db),
+    async batch<T>(statements: D1PreparedStatement[]) {
+      try {
+        const results = await db.batch<T>(statements);
+        outcomes = results.map(({ success, meta }) => ({ success, changes: meta.changes }));
+        return results;
+      } catch (error) {
+        failure = error;
+        throw error;
+      }
+    },
+  } as D1Database;
+  try {
+    return await reconcileTelegramProviderBatches(observed, queuePolicy, promote);
+  } catch (error) {
+    throw new Error(`Synthetic reconciliation statement outcomes ${JSON.stringify(outcomes)}`, { cause: failure ?? error });
+  }
 }
 
 async function status(actorId = policy.memberId, batchId?: number) {
@@ -196,7 +215,7 @@ test("revoke and role change fence live work and freeze the exact stale and dead
   assert.equal(await status(), null);
   const swapped = { ...policy, adminId: policy.memberId, memberId: policy.adminId };
   assert.equal(await settleProviderJob(db, lease, { kind: "retry", reason: "timeout" }), "stale");
-  assert.deepEqual(await reconcileTelegramProviderBatches(db, swapped), { promoted: 0, finished: 1 });
+  assert.deepEqual(await queue(swapped), { promoted: 0, finished: 1 });
   assert.equal(await status(), null);
   assert.equal(await db.prepare("SELECT stale_count FROM telegram_provider_batches").first("stale_count"), 2);
 
@@ -209,7 +228,7 @@ test("revoke and role change fence live work and freeze the exact stale and dead
     db.prepare("UPDATE telegram_provider_batch_jobs SET created_at=?,due_at=?,expires_at=? WHERE owner_id=?")
       .bind(past, past, past + 2700, policy.adminId),
   ]);
-  assert.deepEqual(await reconcileTelegramProviderBatches(db, policy, false), { promoted: 0, finished: 1 });
+  assert.deepEqual(await queue(policy, false), { promoted: 0, finished: 1 });
   assert.equal((await status(policy.adminId))?.expired, 1);
 });
 
@@ -219,7 +238,7 @@ test("a role swap can retire old work but cannot read, promote or lease it", asy
   assert.ok(batchId);
   const swapped = { ...policy, adminId: policy.memberId, memberId: policy.adminId };
   assert.equal(await readTelegramProviderBatchProgress(db, swapped, policy.memberId, batchId), null);
-  assert.deepEqual(await reconcileTelegramProviderBatches(db, swapped), { promoted: 0, finished: 1 });
+  assert.deepEqual(await queue(swapped), { promoted: 0, finished: 1 });
   assert.equal(await claimProviderJob(db, swapped, true), null);
   assert.equal(await db.prepare("SELECT stale_count FROM telegram_provider_batches").first("stale_count"), 1);
 });
