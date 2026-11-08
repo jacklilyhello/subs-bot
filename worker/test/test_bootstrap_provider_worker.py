@@ -11,6 +11,7 @@ from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import bootstrap_provider_worker as bootstrap
+import bootstrap_provider_api_status_worker as api_status
 
 
 ACCOUNT = "a" * 32
@@ -27,6 +28,10 @@ def worker():
         **deepcopy(bootstrap.CREATE_SETTINGS), "id": WORKER_ID, "created_on": CREATED, "updated_on": UPDATED,
         "deployed_on": None, "references": {key: [] for key in bootstrap.REFERENCE_FIELDS},
     }
+
+
+def status_worker():
+    return {**worker(), "name": bootstrap.provider.API_STATUS_SERVICE, "tags": [bootstrap.API_STATUS_OWNERSHIP_TAG]}
 
 
 def envelope(status, result=None, *, success=True, errors=None, **extra):
@@ -113,10 +118,37 @@ class WorkerAPITests(unittest.TestCase):
         with self.assertRaisesRegex(bootstrap.BootstrapError, "credential is missing"):
             bootstrap.WorkerAPI(ACCOUNT, "")
 
+    def test_status_create_checks_two_absences_then_reads_its_exact_private_identity(self):
+        profile = bootstrap.provider.API_STATUS_PROFILE
+        api = bootstrap.WorkerAPI(ACCOUNT, "synthetic-status-token", profile=profile)
+        with patch.object(bootstrap, "_response") as read:
+            with self.assertRaisesRegex(bootstrap.BootstrapError, "client profile"):
+                bootstrap._bootstrap(self.api, "create", None, Mock(), profile=profile)
+            read.assert_not_called()
+        absent = envelope(404, success=False, errors=[{"code": 10007}])
+        empty = envelope(200, [], result_info={"count": 0, "total_count": 0, "page": 1, "per_page": 1})
+        with patch.object(bootstrap, "_response", side_effect=[absent, absent, envelope(201, status_worker()),
+                envelope(200, status_worker()), empty, envelope(200, status_worker())]) as read:
+            self.assertEqual(bootstrap._bootstrap(api, "create", None, Mock(), profile=profile), ("created", IDENTITY))
+        requests = [call_.args[0] for call_ in read.call_args_list]
+        base = f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT}/workers/workers"
+        named = f"{base}/subs-bot-provider-api-status-dev-01"
+        self.assertEqual([(request.method, request.full_url) for request in requests], [
+            ("GET", named), ("GET", named), ("POST", base), ("GET", f"{base}/{WORKER_ID}"),
+            ("GET", f"{base}/{WORKER_ID}/versions?page=1&per_page=1"), ("GET", named),
+        ])
+        self.assertEqual(json.loads(requests[2].data), bootstrap._settings(profile))
+        self.assertEqual(json.loads(requests[2].data)["subdomain"], {"enabled": False, "previews_enabled": False})
+        with self.assertRaisesRegex(bootstrap.BootstrapError, "fixed target"):
+            bootstrap._verify_profile(worker(), IDENTITY, profile=profile)
+        with self.assertRaisesRegex(bootstrap.BootstrapError, "private, empty settings"):
+            bootstrap._verify_profile({**status_worker(), "tags": [bootstrap.OWNERSHIP_TAG]}, IDENTITY, profile=profile)
+
 
 class BootstrapTests(unittest.TestCase):
     def setUp(self):
         self.api = Mock(spec=bootstrap.WorkerAPI)
+        self.api.profile = bootstrap.provider.FETCH_PROFILE
         self.guard = Mock()
         self.api.by_id.return_value = worker()
         self.api.create.return_value = worker()
@@ -241,6 +273,51 @@ class BootstrapTests(unittest.TestCase):
             with self.assertRaisesRegex(bootstrap.BootstrapError, "exact main revision"):
                 bootstrap.bootstrap()
             cloud.assert_not_called()
+
+
+class APIStatusWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        revision = "c" * 40
+        self.environment = {"GITHUB_REPOSITORY": bootstrap.github.REPOSITORY, "GITHUB_REF": bootstrap.github.MAIN_REF,
+            "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_SHA": revision, "GITHUB_WORKFLOW_SHA": revision,
+            "GITHUB_WORKFLOW_REF": f"{bootstrap.github.REPOSITORY}/{api_status.WORKFLOW}@{bootstrap.github.MAIN_REF}",
+            "RUNNER_ENVIRONMENT": "github-hosted", "GITHUB_RUN_ATTEMPT": "1", "SUBS_BOT_CF_PROVIDER_ACCOUNT_ID": ACCOUNT,
+            "SUBS_BOT_PROVIDER_API_STATUS_BOOTSTRAP_OPERATION": "verify", api_status.IDENTITY_ENV: json.dumps(PIN),
+            api_status.TOKEN_ENV: "synthetic-status-token", "SUBS_BOT_CF_PROVIDER_WORKER_TOKEN": "synthetic-fetch-token"}
+
+    def test_v2_rejects_other_workflow_v1_credential_and_create_retry_before_artifact_read(self):
+        for changes, error in (({"GITHUB_WORKFLOW_REF": "different-workflow"}, "exact protected"),
+                ({api_status.TOKEN_ENV: ""}, "dedicated API status"),
+                ({"SUBS_BOT_PROVIDER_API_STATUS_BOOTSTRAP_OPERATION": "create", api_status.IDENTITY_ENV: "",
+                  "GITHUB_RUN_ATTEMPT": "2", "SUBS_BOT_PROVIDER_API_STATUS_BOOTSTRAP_CONFIRMATION": api_status.CONFIRM_CREATE},
+                 "first-attempt")):
+            with patch.dict(os.environ, self.environment | changes, clear=True), patch.object(api_status.artifact, "prepare") as read:
+                with self.assertRaisesRegex(bootstrap.BootstrapError, error):
+                    api_status.bootstrap()
+                read.assert_not_called()
+
+    def test_v2_verify_binds_artifact_workflow_and_private_pin_without_writing(self):
+        profile = bootstrap.provider.API_STATUS_PROFILE
+        revision = self.environment["GITHUB_SHA"]
+        evidence = {"revision": revision, "profile": profile, "service": bootstrap.provider.API_STATUS_SERVICE,
+                    "rpcEntrypoint": "ProviderApiStatus", "artifactId": "42", "runId": "41", "runAttempt": "1",
+                    "archiveSha256": "a" * 64}
+        worker_api = Mock(spec=bootstrap.WorkerAPI)
+        worker_api.profile = profile
+        worker_api.by_name.return_value = worker_api.by_id.return_value = status_worker()
+        with patch.dict(os.environ, self.environment, clear=True), patch.object(api_status.artifact, "prepare", return_value=evidence), \
+                patch.object(api_status.github, "_github_token", return_value="synthetic-gh"), \
+                patch.object(api_status.github, "require_current_main"), \
+                patch.object(api_status.provenance, "_select_artifact", return_value=("1", "42", "a" * 64)) as select, \
+                patch.object(bootstrap, "WorkerAPI", return_value=worker_api) as client:
+            result = api_status.bootstrap()
+        self.assertEqual(select.call_args_list, [call("41", revision, "synthetic-gh", profile=profile)] * 2)
+        client.assert_called_once_with(ACCOUNT, "synthetic-status-token", profile=profile)
+        worker_api.create.assert_not_called()
+        self.assertEqual(result["workerIdentitySha256"], IDENTITY.fingerprint())
+        self.assertEqual(result["service"], bootstrap.provider.API_STATUS_SERVICE)
+        self.assertNotIn(WORKER_ID, json.dumps(result))
+        self.assertNotIn(CREATED, json.dumps(result))
 
 
 if __name__ == "__main__":
