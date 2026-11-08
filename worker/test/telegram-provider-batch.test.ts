@@ -36,14 +36,16 @@ before(async () => {
   db = await miniflare.getD1Database("DB");
   bucket = await miniflare.getR2Bucket("NODES");
   for (const file of ["0001_subscriptions.sql", "0002_telegram.sql", "0003_subscription_lifecycle.sql",
-    "0015_subscription_provider_jobs.sql", "0021_telegram_provider_admission.sql", "0031_telegram_provider_batch_queue.sql"]) {
+    "0015_subscription_provider_jobs.sql", "0021_telegram_provider_admission.sql", "0031_telegram_provider_batch_queue.sql",
+    "0033_provider_snapshot_journal.sql"]) {
     if (file.startsWith("0031_")) assert.equal(await telegramProviderBatchReady(db), false);
     const sql = await readFile(new URL(`../migrations/${file}`, import.meta.url), "utf8");
     await db.batch(sql.trim().split(/;\s*/u).filter(Boolean).map((part) => db.prepare(part)));
   }
 });
 beforeEach(async () => {
-  await db.batch(["telegram_provider_batch_jobs", "telegram_provider_batches", "telegram_provider_requests", "telegram_provider_jobs",
+  await db.batch(["provider_snapshot_object_intents", "provider_snapshot_attempts",
+    "telegram_provider_batch_jobs", "telegram_provider_batches", "telegram_provider_requests", "telegram_provider_jobs",
     "telegram_outbox", "telegram_inbox", "telegram_auth", "subscription_provider_jobs", "subscriptions", "subscription_trash",
     "subscription_lifecycle"].map((table) => db.prepare(`DELETE FROM ${table}`)));
   const { objects } = await bucket.list();
@@ -286,11 +288,13 @@ test("the existing publication transaction handles ambiguous batch success and l
     prepare: db.prepare.bind(db),
     batch: async (statements: D1PreparedStatement[]) => {
       const result = await db.batch(statements);
-      if (statements.length === 3) throw new Error("Synthetic lost publication response");
+      if (statements.length === 5) throw new Error("Synthetic lost publication response");
       return result;
     },
   } as D1Database;
   assert.equal(await runOneProviderJob(lost, bucket, good, pin, policy, true), "saved");
+  assert.deepEqual(await db.prepare(`SELECT queue,bot_id AS botId,state FROM provider_snapshot_attempts WHERE subscription_id=?`)
+    .bind(target.id).first(), { queue: "telegram_provider_batch_jobs", botId: policy.botId, state: "published" });
   assert.deepEqual(await queue(), { promoted: 0, finished: 1 });
   assert.equal((await status(policy.adminId))?.saved, 1);
   const subscription = await getOwnedSubscription(db, policy.adminId, target.id);

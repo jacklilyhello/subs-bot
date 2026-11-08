@@ -673,6 +673,20 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(quiet(49), (0,))
         self.assertEqual(quiet(50), (1,))
 
+    def test_quiet_blocks_live_provider_snapshot_intents_and_preserves_expired_evidence(self):
+        self.db.execute("""INSERT INTO provider_snapshot_attempts
+            (snapshot_id,queue,job_id,job_attempt,subscription_id,owner_id,request_key,source_sha256,
+             expected_generation,expected_lifecycle_revision,lease_until,bot_id,created_at,state)
+            VALUES (?,'subscription_provider_jobs',1,1,1,'881001',?,?,0,0,10,'',1,'open')""",
+            (SNAPSHOT, "a" * 64, "b" * 64))
+        full = native.quiet_expression(self.source.tables, 9)
+        expired = native.quiet_expression(self.source.tables, 10)
+        older = native.quiet_expression(set(self.source.tables) - {"provider_snapshot_attempts"}, 9)
+        self.assertEqual(self.db.execute("SELECT " + full).fetchone(), (0,))
+        self.assertEqual(self.db.execute("SELECT " + expired).fetchone(), (1,))
+        self.assertEqual(self.db.execute("SELECT " + older).fetchone(), (1,))
+        self.assertEqual(self.db.execute("SELECT count(*) FROM provider_snapshot_attempts").fetchone(), (1,))
+
     def test_full_schema_large_temp_text_and_r2_closure_roundtrip(self):
         self.snapshot()
         self.db.execute("INSERT INTO subscription_lifecycle VALUES (2,1)")

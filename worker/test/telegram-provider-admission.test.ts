@@ -61,14 +61,15 @@ before(async () => {
   db = await miniflare.getD1Database("DB");
   bucket = await miniflare.getR2Bucket("NODES");
   for (const file of ["0001_subscriptions.sql", "0002_telegram.sql", "0003_subscription_lifecycle.sql",
-    "0015_subscription_provider_jobs.sql", "0021_telegram_provider_admission.sql"]) {
+    "0015_subscription_provider_jobs.sql", "0021_telegram_provider_admission.sql", "0033_provider_snapshot_journal.sql"]) {
     const sql = await readFile(new URL(`../migrations/${file}`, import.meta.url), "utf8");
     await db.batch(sql.trim().split(/;\s*/u).filter(Boolean).map((statement) => db.prepare(statement)));
   }
 });
 
 beforeEach(async () => {
-  await db.batch(["telegram_provider_requests", "telegram_provider_jobs", "telegram_inbox", "telegram_auth",
+  await db.batch(["provider_snapshot_object_intents", "provider_snapshot_attempts",
+    "telegram_provider_requests", "telegram_provider_jobs", "telegram_inbox", "telegram_auth",
     "subscription_provider_jobs", "subscriptions", "subscription_trash", "subscription_lifecycle"]
     .map((table) => db.prepare(`DELETE FROM ${table}`)));
   const { objects } = await bucket.list();
@@ -200,10 +201,10 @@ test("authorized terminal refresh failure updates only the fixed warning and pre
   assert.equal((await bucket.list()).objects.length, 2);
 });
 
-test("authorization changing after R2 staging prevents pointer publication and retires the exact unreferenced attempt", async () => {
+test("authorization changing after R2 staging prevents publication and preserves the journaled candidate", async () => {
   const initial = job(await admit(source()));
   const injected = { prepare: db.prepare.bind(db), batch: async (statements: D1PreparedStatement[]) => {
-    if (statements.length === 3) {
+    if (statements.length === 5) {
       assert.equal((await bucket.list()).objects.length, 2);
       await auth(0, now(), 900);
     }
@@ -214,5 +215,8 @@ test("authorization changing after R2 staging prevents pointer publication and r
   assert.equal(row?.generation, 0);
   assert.equal(row?.lastError, null);
   assert.equal(await db.prepare("SELECT result_code FROM telegram_provider_jobs WHERE job_id=?").bind(initial.jobId).first("result_code"), "stale-target");
-  assert.equal((await bucket.list()).objects.length, 0);
+  assert.equal((await bucket.list()).objects.length, 2);
+  assert.equal(await db.prepare("SELECT state FROM provider_snapshot_attempts WHERE queue='telegram_provider_jobs' AND job_id=?")
+    .bind(initial.jobId).first("state"), "sealed");
+  assert.equal(await db.prepare("SELECT count(*) AS count FROM provider_snapshot_object_intents").first("count"), 2);
 });
