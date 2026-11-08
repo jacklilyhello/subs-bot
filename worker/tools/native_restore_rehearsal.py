@@ -646,6 +646,14 @@ def quiet_expression(tables, observed_at=None):
                 WHERE batch.finished_at>{epoch}-900 AND NOT EXISTS(
                     SELECT 1 FROM telegram_provider_batch_interactions JOIN telegram_outbox USING(receipt_id)
                     WHERE receipt_id=batch.batch_id))""")
+    if "telegram_provider_document_opt_in" in tables:
+        conditions.append("""NOT EXISTS(SELECT 1 FROM telegram_provider_document_opt_in AS opted
+            JOIN telegram_document_jobs AS job USING(receipt_id) WHERE job.state IN ('pending','leased'))""")
+    if "telegram_provider_documents" in tables:
+        conditions.append(f"""NOT EXISTS(SELECT 1 FROM telegram_provider_documents AS document
+            LEFT JOIN telegram_outbox AS reply USING(receipt_id)
+            WHERE document.finished_at IS NULL OR reply.state IN ('pending','leased','sending')
+              OR (document.finished_at>{epoch}-900 AND reply.receipt_id IS NULL))""")
     if "telegram_api_status" in tables:
         conditions.append(f"""NOT EXISTS(SELECT 1 FROM telegram_api_status AS action
             LEFT JOIN telegram_outbox AS reply USING(receipt_id)

@@ -27,14 +27,14 @@ CREATE TABLE telegram_provider_documents (
     CHECK (actor_role <> 'admin' OR auth_message_date = 0)
 ) STRICT;
 
-CREATE UNIQUE INDEX telegram_provider_documents_active_actor
-    ON telegram_provider_documents (bot_id, actor_id) WHERE finished_at IS NULL;
+CREATE UNIQUE INDEX telegram_provider_documents_active_actor ON telegram_provider_documents (bot_id, actor_id)
+    WHERE finished_at IS NULL;
 
-CREATE INDEX telegram_provider_documents_pending
-    ON telegram_provider_documents (bot_id, expires_at, receipt_id) WHERE finished_at IS NULL;
+CREATE INDEX telegram_provider_documents_pending ON telegram_provider_documents (bot_id, expires_at, receipt_id)
+    WHERE finished_at IS NULL;
 
-CREATE INDEX telegram_provider_documents_finished
-    ON telegram_provider_documents (bot_id, finished_at, receipt_id) WHERE finished_at IS NOT NULL;
+CREATE INDEX telegram_provider_documents_finished ON telegram_provider_documents (bot_id, finished_at, receipt_id)
+    WHERE finished_at IS NOT NULL;
 
 CREATE TABLE telegram_provider_document_lines (
     receipt_id INTEGER NOT NULL REFERENCES telegram_provider_documents (receipt_id),
@@ -66,5 +66,5 @@ CREATE TABLE telegram_provider_document_lines (
     )
 ) STRICT;
 
-CREATE INDEX telegram_provider_document_lines_waiting
-    ON telegram_provider_document_lines (due_at, receipt_id, ordinal) WHERE job_id IS NULL AND result_code IS NULL;
+CREATE INDEX telegram_provider_document_lines_waiting ON telegram_provider_document_lines (due_at, receipt_id, ordinal)
+    WHERE job_id IS NULL AND result_code IS NULL;
