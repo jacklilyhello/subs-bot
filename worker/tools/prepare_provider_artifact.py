@@ -25,6 +25,7 @@ import release_artifact as provider
 WORKFLOW_ID = 409913800
 WORKFLOW_PATH = ".github/workflows/worker-provider-fetch-ci.yml"
 VERIFIED_DIRECTORY = "subs-bot-provider-verified"
+API_STATUS_VERIFIED_DIRECTORY = "subs-bot-provider-api-status-v2-verified"
 FILE_LIMITS = {provider.MANIFEST: provider.MAX_METADATA, provider.WORKER: provider.MAX_WORKER,
                provider.IMAGE: provider.MAX_IMAGE}
 MAX_ZIP = sum(FILE_LIMITS.values()) + 1024 * 1024
@@ -35,9 +36,15 @@ STORAGE_TIMEOUT_SECONDS = 120
 STORAGE_OPENER = build_opener(ProxyHandler({}), github._NoRedirect())
 
 
-def _select_artifact(run_id, revision, token):
+def _select_artifact(run_id, revision, token, *, profile=provider.FETCH_PROFILE):
+    if profile == provider.FETCH_PROFILE:
+        prefix, label = "subs-bot-provider", "Provider Fetch CI"
+    elif profile == provider.API_STATUS_PROFILE:
+        prefix, label = "subs-bot-provider-api-status-v2", "Provider API Status CI"
+    else:
+        raise github.ArtifactError("Unknown provider release profile.")
     return github.select_main_artifact(run_id, revision, token, workflow_id=WORKFLOW_ID, workflow_path=WORKFLOW_PATH,
-                                       artifact_prefix="subs-bot-provider", workflow_label="Provider Fetch CI")
+                                       artifact_prefix=prefix, workflow_label=label)
 
 
 def _write_private(path):
@@ -110,7 +117,7 @@ def _unpack(path, staged):
         raise github.ArtifactError(error) from None
 
 
-def prepare(*, provider_revision=None):
+def prepare(*, provider_revision=None, profile=provider.FETCH_PROFILE):
     main_revision = os.environ.get("GITHUB_SHA", "")
     revision = provider_revision if provider_revision is not None else main_revision
     run_id = os.environ.get("SUBS_BOT_PROVIDER_CI_RUN_ID", "")
@@ -118,10 +125,18 @@ def prepare(*, provider_revision=None):
     if (os.environ.get("GITHUB_REF") != github.MAIN_REF or not provider.DECIMAL.fullmatch(run_id)
             or not Path(runner_temp).is_absolute()):
         raise github.ArtifactError("Provider artifact verification requires main, a CI run ID and runner temporary storage.")
+    if profile == provider.API_STATUS_PROFILE:
+        if revision != main_revision:
+            raise github.ArtifactError("API status artifact verification requires the exact current main revision.")
+        directory_name = API_STATUS_VERIFIED_DIRECTORY
+    elif profile == provider.FETCH_PROFILE:
+        directory_name = VERIFIED_DIRECTORY
+    else:
+        raise github.ArtifactError("Unknown provider release profile.")
     token = github._github_token()
     github.require_current_main(main_revision)
-    attempt, artifact_id, digest = _select_artifact(run_id, revision, token)
-    destination = Path(runner_temp) / VERIFIED_DIRECTORY
+    attempt, artifact_id, digest = _select_artifact(run_id, revision, token, profile=profile)
+    destination = Path(runner_temp) / directory_name
     if os.path.lexists(destination):
         raise github.ArtifactError("The verified provider artifact directory already exists.")
     with tempfile.TemporaryDirectory(prefix=".subs-bot-provider-", dir=runner_temp) as directory:
@@ -132,19 +147,23 @@ def prepare(*, provider_revision=None):
         _download_zip(artifact_id, token, digest, archive)
         _unpack(archive, staged)
         try:
-            manifest = provider.verify_release(staged, revision, ref=github.MAIN_REF, run_id=run_id, run_attempt=attempt)
+            manifest = provider.verify_release(staged, revision, ref=github.MAIN_REF, run_id=run_id, run_attempt=attempt,
+                                               profile=profile)
         except provider.VERIFICATION_ERRORS:
             raise github.ArtifactError("The provider release manifest or its exact contents did not verify.") from None
-        if _select_artifact(run_id, revision, token) != (attempt, artifact_id, digest):
+        if _select_artifact(run_id, revision, token, profile=profile) != (attempt, artifact_id, digest):
             raise github.ArtifactError("The trusted provider build artifact changed during verification.")
         github.require_current_main(main_revision)
         if os.path.lexists(destination):
             raise github.ArtifactError("The verified provider artifact directory already exists.")
         staged.rename(destination)
-    return {"revision": revision, "runId": run_id, "runAttempt": attempt, "artifactId": artifact_id,
-            "archiveSha256": digest, "compatibilityDate": manifest["compatibilityDate"],
-            "workerSha256": manifest["workerSha256"], "ociArchiveSha256": manifest["ociArchiveSha256"],
-            "ociManifestSha256": manifest["ociManifestSha256"], "ociConfigSha256": manifest["ociConfigSha256"]}
+    evidence = {"revision": revision, "runId": run_id, "runAttempt": attempt, "artifactId": artifact_id,
+                "archiveSha256": digest, "compatibilityDate": manifest["compatibilityDate"],
+                "workerSha256": manifest["workerSha256"], "ociArchiveSha256": manifest["ociArchiveSha256"],
+                "ociManifestSha256": manifest["ociManifestSha256"], "ociConfigSha256": manifest["ociConfigSha256"]}
+    if profile == provider.API_STATUS_PROFILE:
+        evidence.update({key: manifest[key] for key in ("profile", "service", "rpcEntrypoint")})
+    return evidence
 
 
 if __name__ == "__main__":

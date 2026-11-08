@@ -17,6 +17,7 @@ from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import prepare_provider_artifact as release
+import prepare_provider_api_status_artifact as api_status
 
 
 github = release.github
@@ -126,6 +127,7 @@ class PrepareProviderArtifactTests(unittest.TestCase):
         self.main_revisions = [REVISION, REVISION]
         self.listed = 0
         self.second_digest = None
+        self.reported_name = None
         self.enterContext(patch.object(github, "_get_json", side_effect=self.github_json))
         self.redirect = self.enterContext(patch.object(github._OPENER, "open", side_effect=self.github_redirect))
         self.storage = self.enterContext(patch.object(release.STORAGE_OPENER, "open", side_effect=self.storage_open))
@@ -142,7 +144,10 @@ class PrepareProviderArtifactTests(unittest.TestCase):
         if path == f"/actions/runs/{RUN_ID}/artifacts?name={self.artifact['name']}&per_page=2":
             self.listed += 1
             digest = self.second_digest if self.listed == 2 and self.second_digest else sha256(self.archive).hexdigest()
-            return {"total_count": 1, "artifacts": [{"digest": "sha256:" + digest, **self.artifact}]}
+            artifact = {"digest": "sha256:" + digest, **self.artifact}
+            if self.reported_name is not None:
+                artifact["name"] = self.reported_name
+            return {"total_count": 1, "artifacts": [artifact]}
         self.fail("Unexpected GitHub API request.")
 
     def github_redirect(self, request, *, timeout):
@@ -255,6 +260,61 @@ class PrepareProviderArtifactTests(unittest.TestCase):
         self.main_revisions = [REVISION]
         self.archive = zip_fixture({**self.members, provider.WORKER: b"different Worker module"})
         self.assert_private_failure("manifest or its exact contents did not verify")
+
+    def status_artifact(self):
+        self.artifact["name"] = f"subs-bot-provider-api-status-v2-{REVISION}-{ATTEMPT}"
+        source = self.root / "source"
+        image = oci_fixture(profile=provider.API_STATUS_PROFILE)
+        (source / provider.IMAGE).write_bytes(image)
+        (source / provider.WORKER).write_bytes(b"export class ProviderApiStatus {}\n")
+        manifest = provider.release_manifest(source, REVISION, Path(provider.__file__).with_name("requirements.txt"),
+                                             ref=github.MAIN_REF, run_id=RUN_ID, run_attempt=ATTEMPT,
+                                             profile=provider.API_STATUS_PROFILE)
+        self.archive = zip_fixture({provider.IMAGE: image, provider.MANIFEST: encoded(manifest),
+                                    provider.WORKER: (source / provider.WORKER).read_bytes()})
+        return manifest
+
+    def test_status_preflight_binds_exact_main_artifact_to_its_own_registry_reference(self):
+        manifest = self.status_artifact()
+        account = "d" * 32
+        repo = f"registry.cloudflare.com/{account}/subs-bot-provider-api-status-dev-01"
+        self.main_revisions.append(REVISION)
+        with patch.dict(os.environ, {"GITHUB_EVENT_NAME": "workflow_dispatch", "SUBS_BOT_CF_PROVIDER_ACCOUNT_ID": account}), \
+                patch.object(api_status, "TARGET_ACCOUNT_SHA256", sha256(account.encode("ascii")).hexdigest()):
+            evidence = api_status.prepare()
+        self.assertEqual({key: evidence[key] for key in ("profile", "service", "rpcEntrypoint")}, {
+            "profile": "api-status-v2", "service": "subs-bot-provider-api-status-dev-01", "rpcEntrypoint": "ProviderApiStatus",
+        })
+        self.assertEqual(evidence["registryRepositorySha256"], sha256(repo.encode("ascii")).hexdigest())
+        image = f"{repo}@sha256:{manifest['ociManifestSha256']}"
+        self.assertEqual(evidence["registryImageReferenceSha256"], sha256(image.encode("ascii")).hexdigest())
+        self.assertNotIn(account, json.dumps(evidence))
+        self.assertTrue((self.root / release.API_STATUS_VERIFIED_DIRECTORY).is_dir())
+        self.assertFalse((self.root / release.VERIFIED_DIRECTORY).exists())
+        self.assertEqual(self.listed, 2)
+        self.assertEqual(self.main_revisions, [])
+
+    def test_status_preflight_refuses_wrong_github_name_v1_payload_and_historical_main(self):
+        self.artifact["name"] = f"subs-bot-provider-api-status-v2-{REVISION}-{ATTEMPT}"
+        self.reported_name = f"subs-bot-provider-{REVISION}-{ATTEMPT}"
+        with self.assertRaisesRegex(github.ArtifactError, "invalid provenance or digest"):
+            release.prepare(profile=provider.API_STATUS_PROFILE)
+        self.storage.assert_not_called()
+        self.reported_name = None
+        with self.assertRaisesRegex(github.ArtifactError, "exact contents did not verify"):
+            release.prepare(profile=provider.API_STATUS_PROFILE)
+        with self.assertRaisesRegex(github.ArtifactError, "exact current main"):
+            release.prepare(profile=provider.API_STATUS_PROFILE, provider_revision="b" * 40)
+        self.assertFalse((self.root / release.API_STATUS_VERIFIED_DIRECTORY).exists())
+        self.assertFalse((self.root / release.VERIFIED_DIRECTORY).exists())
+
+    def test_status_preflight_rejects_foreign_account_before_fetching(self):
+        with patch.dict(os.environ, {"GITHUB_EVENT_NAME": "workflow_dispatch", "SUBS_BOT_CF_PROVIDER_ACCOUNT_ID": "d" * 32}), \
+                patch.object(api_status, "TARGET_ACCOUNT_SHA256", "0" * 64), \
+                patch.object(release, "prepare") as artifact_prepare:
+            with self.assertRaisesRegex(github.ArtifactError, "isolated account"):
+                api_status.prepare()
+            artifact_prepare.assert_not_called()
 
     def test_exact_status_artifact_cannot_enter_the_existing_fetch_release(self):
         source = self.root / "source"
