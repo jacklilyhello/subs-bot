@@ -19,10 +19,12 @@ type UrlImport = AdmissionKey & { sourceUrl: string; name?: string };
 type Refresh = AdmissionKey & { id: number; expectedGeneration?: number; expectedLifecycleRevision?: number };
 
 export const TELEGRAM_PROVIDER_MARKER = "provider-request:v1";
+export const TELEGRAM_PROVIDER_BATCH_PREVIEW_MARKER = "provider-batch-preview:v1";
+export const TELEGRAM_PROVIDER_BATCH_CONFIRM_MARKER = "provider-batch-confirm:v1";
 export type ProviderTelegramPolicy = { readonly botId: string; readonly adminId: string; readonly memberId: string };
-type JobScope = ProviderTelegramPolicy | "generic";
-// Keep Telegram work invisible to older consumers of the generic queue.
-type JobTable = "subscription_provider_jobs" | "telegram_provider_jobs";
+type JobScope = (ProviderTelegramPolicy & { readonly includeBatch?: true; readonly queue?: "batch" }) | "generic";
+// A rollback to the older Telegram consumer must never see batch rows or their leases.
+type JobTable = "subscription_provider_jobs" | "telegram_provider_jobs" | "telegram_provider_batch_jobs";
 
 export type ProviderAdmission =
   | { kind: "queued" | "coalesced" | "duplicate"; jobId: number; subscriptionId: number }
@@ -65,7 +67,8 @@ const receiptFields = `job_id AS jobId, subscription_id AS subscriptionId, kind,
   source_sha256 AS sourceSha256, result_code AS resultCode`;
 const liveState = "state IN ('pending', 'leased')";
 function jobTable(scope: JobScope): JobTable {
-  return scope === "generic" ? "subscription_provider_jobs" : "telegram_provider_jobs";
+  return scope === "generic" ? "subscription_provider_jobs"
+    : scope.queue === "batch" ? "telegram_provider_batch_jobs" : "telegram_provider_jobs";
 }
 
 export function providerJobLeaseTable(lease: ProviderJobLease): JobTable {
@@ -82,10 +85,17 @@ function sameJob(scope: JobScope, table: JobTable): Guard {
     bindings: authorization.bindings };
 }
 
-function jobCapacity(owner: string, table: JobTable): string {
-  return `NOT EXISTS (SELECT 1 FROM ${table} AS active WHERE active.owner_id = ${owner}
-    AND active.${liveState} LIMIT 1 OFFSET ${MAX_OWNER_JOBS - 1})
-    AND NOT EXISTS (SELECT 1 FROM ${table} WHERE ${liveState} LIMIT 1 OFFSET ${MAX_GLOBAL_JOBS - 1})`;
+function activeJobs(scope: JobScope): string {
+  const columns = "owner_id,subscription_id";
+  if (scope === "generic" || !scope.includeBatch) return `SELECT ${columns} FROM ${jobTable(scope)} WHERE ${liveState}`;
+  return `SELECT ${columns} FROM telegram_provider_jobs WHERE ${liveState}
+    UNION ALL SELECT ${columns} FROM telegram_provider_batch_jobs WHERE ${liveState}`;
+}
+
+function jobCapacity(owner: string, scope: JobScope): string {
+  const active = activeJobs(scope);
+  return `NOT EXISTS (SELECT 1 FROM (${active}) AS active WHERE active.owner_id = ${owner} LIMIT 1 OFFSET ${MAX_OWNER_JOBS - 1})
+    AND NOT EXISTS (SELECT 1 FROM (${active}) LIMIT 1 OFFSET ${MAX_GLOBAL_JOBS - 1})`;
 }
 
 function validateKey({ ownerId, requestKey }: AdmissionKey): void {
@@ -107,7 +117,7 @@ export function providerHost(value: unknown): string | null {
   }
 }
 
-async function sourceDigest(sourceUrl: string): Promise<string> {
+export async function providerSourceDigest(sourceUrl: string): Promise<string> {
   return digestHex(await crypto.subtle.digest("SHA-256", encoder.encode(sourceUrl)));
 }
 
@@ -133,8 +143,8 @@ function prepareAdmission(
 ): D1PreparedStatement {
   const table = jobTable(scope);
   const same = sameJob(scope, table);
-  const activeJob = `EXISTS (SELECT 1 FROM ${table} AS active
-    WHERE active.owner_id = target.owner_id AND active.subscription_id = target.id AND active.${liveState})`;
+  const activeJob = `EXISTS (SELECT 1 FROM (${activeJobs(scope)}) AS active
+    WHERE active.owner_id = target.owner_id AND active.subscription_id = target.id)`;
   return db.prepare(`
     WITH candidates AS (
       SELECT subscriptions.id, subscriptions.owner_id, subscriptions.generation,
@@ -145,7 +155,7 @@ function prepareAdmission(
       FROM candidates AS target WHERE (SELECT count(*) FROM candidates) = 1
         AND target.generation < 9007199254740991
         AND NOT EXISTS (SELECT 1 FROM ${table} WHERE owner_id = target.owner_id AND request_key = ?)
-        AND (${same.sql} OR (NOT ${activeJob} AND ${jobCapacity("target.owner_id", table)}))
+        AND (${same.sql} OR (NOT ${activeJob} AND ${jobCapacity("target.owner_id", scope)}))
     )
     INSERT INTO ${table}
       (owner_id, request_key, kind, subscription_id, source_sha256, expected_generation, expected_lifecycle_revision,
@@ -160,10 +170,10 @@ function prepareAdmission(
 
 function prepareAdmissionPlan(
   db: D1Database, key: AdmissionKey, kind: ProviderJobLease["kind"], target: Guard, digest: string,
-  refusal: Guard, create?: { sourceUrl: string; name: string }, fence?: Guard, authorization?: ProviderTelegramPolicy,
+  refusal: Guard, create?: { sourceUrl: string; name: string }, fence?: Guard, authorization?: ProviderTelegramPolicy, includeBatch = false,
 ): AdmissionPlan {
   const steps: D1PreparedStatement[] = [];
-  const scope = authorization ?? "generic";
+  const scope = jobScope(authorization, includeBatch);
   const table = jobTable(scope);
   const token = create ? crypto.randomUUID().replaceAll("-", "") : null;
   if (create && token) {
@@ -178,7 +188,7 @@ function prepareAdmissionPlan(
         AND NOT EXISTS (SELECT 1 FROM subscriptions WHERE owner_id = ?
           AND (lower(substr(source_url, 1, 7)) = 'http://' OR lower(substr(source_url, 1, 8)) = 'https://')
           LIMIT 1 OFFSET ${MAX_OWNER_SOURCES - 1})
-        AND ${jobCapacity("?", table)}
+        AND ${jobCapacity("?", scope)}
         ${fence ? `AND (${fence.sql})` : ""}
     `).bind(key.ownerId, create.name, create.sourceUrl, token, key.ownerId, key.requestKey,
       key.ownerId, create.sourceUrl, key.ownerId, create.sourceUrl, token, key.ownerId, key.ownerId, ...(fence?.bindings ?? [])));
@@ -228,13 +238,13 @@ async function admit(
 }
 
 export async function prepareProviderUrlImport(
-  db: D1Database, input: UrlImport, fence?: Guard, authorization?: ProviderTelegramPolicy,
+  db: D1Database, input: UrlImport, fence?: Guard, authorization?: ProviderTelegramPolicy, includeBatch = false,
 ): Promise<{ digest: string; plan: AdmissionPlan }> {
   validateKey(input);
   const host = providerHost(input.sourceUrl);
   if (!host) throw new RangeError("Invalid provider source URL.");
   const name = normalizeSubscriptionName(input.name ?? Array.from(host).slice(0, 64).join(""));
-  const digest = await sourceDigest(input.sourceUrl);
+  const digest = await providerSourceDigest(input.sourceUrl);
   const target = { sql: "subscriptions.owner_id = ? AND subscriptions.source_url = ?",
     bindings: [input.ownerId, input.sourceUrl] };
   const refusal = {
@@ -245,11 +255,11 @@ export async function prepareProviderUrlImport(
     bindings: [...target.bindings, ...target.bindings, input.ownerId, input.sourceUrl],
   };
   return { digest, plan: prepareAdmissionPlan(db, input, "url-import", target, digest, refusal, { sourceUrl: input.sourceUrl, name },
-    fence, authorization) };
+    fence, authorization, includeBatch) };
 }
 
 export async function prepareOwnedProviderRefresh(
-  db: D1Database, input: Refresh, fence?: Guard, readFence?: Guard, authorization?: ProviderTelegramPolicy,
+  db: D1Database, input: Refresh, fence?: Guard, readFence?: Guard, authorization?: ProviderTelegramPolicy, includeBatch = false,
 ): Promise<{ digest: string; plan: AdmissionPlan } | null> {
   validateKey(input);
   const { id, expectedGeneration, expectedLifecycleRevision } = input;
@@ -270,8 +280,8 @@ export async function prepareOwnedProviderRefresh(
   const exact = { sql: `${owned.sql} ${version.sql}`, bindings: [...owned.bindings, ...version.bindings] };
   const refusal = { sql: `CASE WHEN EXISTS (SELECT 1 FROM subscriptions WHERE ${exact.sql})
     THEN 'capacity' ELSE 'unavailable' END`, bindings: exact.bindings };
-  const digest = await sourceDigest(sourceUrl);
-  return { digest, plan: prepareAdmissionPlan(db, input, "refresh", exact, digest, refusal, undefined, fence, authorization) };
+  const digest = await providerSourceDigest(sourceUrl);
+  return { digest, plan: prepareAdmissionPlan(db, input, "refresh", exact, digest, refusal, undefined, fence, authorization, includeBatch) };
 }
 
 /** Internal admission for an already authorized owner. No network request occurs here. */
@@ -311,8 +321,44 @@ const currentTarget = `EXISTS (
     AND ${SUBSCRIPTION_LIFECYCLE_REVISION} = job.expected_lifecycle_revision
 )`;
 
+/** The batch alias is fixed so the same provenance fence can protect work and readback. */
+export function telegramProviderBatchOrigin(policy: ProviderTelegramPolicy, forRetirement = false): ProviderSql {
+  // Only retirement may classify an old role of a still-approved actor as stale.
+  const role = forRetirement ? `batch.actor_id IN (?,?) AND (
+    (batch.actor_role='admin' AND batch.auth_message_date=0 AND batch.auth_message_id=0)
+    OR (batch.actor_role='member' AND preview.message_date>batch.auth_message_date AND confirmation.message_date>batch.auth_message_date))`
+    : `((batch.actor_id=? AND batch.actor_role='admin' AND batch.auth_message_date=0 AND batch.auth_message_id=0)
+      OR (batch.actor_id=? AND batch.actor_role='member' AND preview.message_date>batch.auth_message_date
+        AND confirmation.message_date>batch.auth_message_date AND COALESCE((
+          SELECT allowed=1 AND message_date=batch.auth_message_date AND message_id=batch.auth_message_id
+          FROM telegram_auth WHERE bot_id=batch.bot_id AND user_id=batch.actor_id
+        ),batch.auth_message_date=0 AND batch.auth_message_id=0)))`;
+  // Shallow guard groups keep this shared predicate within D1's expression-depth limit when nested.
+  return { sql: `batch.bot_id=? AND EXISTS (
+    SELECT 1 FROM telegram_inbox AS confirmation JOIN telegram_inbox AS preview ON preview.receipt_id=batch.preview_receipt_id
+    JOIN telegram_outbox AS sent ON sent.receipt_id=preview.receipt_id
+    WHERE confirmation.receipt_id=batch.batch_id AND CASE
+      WHEN (confirmation.bot_id=batch.bot_id AND confirmation.actor_id=batch.actor_id
+        AND confirmation.chat_type='private' AND confirmation.chat_id=confirmation.actor_id
+        AND confirmation.thread_id IS NULL) IS NOT TRUE THEN 0
+      WHEN (confirmation.command='help' AND confirmation.receipt_nonce='${TELEGRAM_PROVIDER_BATCH_CONFIRM_MARKER}'
+        AND preview.bot_id=batch.bot_id AND preview.actor_id=batch.actor_id) IS NOT TRUE THEN 0
+      WHEN (preview.chat_type='private' AND preview.chat_id=preview.actor_id AND preview.thread_id IS NULL
+        AND preview.command='help' AND preview.receipt_nonce='${TELEGRAM_PROVIDER_BATCH_PREVIEW_MARKER}') IS NOT TRUE THEN 0
+      WHEN (sent.state='sent' AND sent.sent_message_id=confirmation.message_id AND sent.attempts=batch.origin_attempt)
+        IS NOT TRUE THEN 0
+      ELSE (${role}) END)`,
+    bindings: [policy.botId, policy.adminId, policy.memberId] };
+}
+
 function scopeAuthorization(scope: JobScope, alias: "job" | "active" = "job", forRetirement = false): Guard {
   if (scope === "generic") return { sql: "1", bindings: [] };
+  if (scope.queue === "batch") {
+    const origin = telegramProviderBatchOrigin(scope, forRetirement);
+    return { sql: `EXISTS (SELECT 1 FROM telegram_provider_batches AS batch WHERE batch.batch_id=${alias}.batch_id
+      AND batch.actor_id=${alias}.owner_id AND batch.finished_at IS NULL AND batch.expires_at=${alias}.expires_at
+      AND ${alias}.kind='refresh' AND (${origin.sql}))`, bindings: origin.bindings };
+  }
   const epoch = isolatedTelegramRoleEpochSql(scope, "inbox", forRetirement ? "recorded" : "current");
   return { sql: `EXISTS (SELECT 1 FROM telegram_provider_requests AS origin
     JOIN telegram_inbox AS inbox USING (receipt_id) WHERE origin.job_id = ${alias}.job_id AND origin.outcome = 'admitted'
@@ -323,12 +369,16 @@ function scopeAuthorization(scope: JobScope, alias: "job" | "active" = "job", fo
     bindings: [scope.botId, ...epoch.bindings] };
 }
 
-function jobScope(policy?: ProviderTelegramPolicy): JobScope {
-  if (!policy) return "generic";
+function jobScope(policy?: ProviderTelegramPolicy, includeBatch = false, queue?: "batch"): JobScope {
+  if (!policy) {
+    if (includeBatch || queue) throw new Error("Invalid provider authorization policy.");
+    return "generic";
+  }
   const { botId, adminId, memberId } = policy;
   [botId, adminId, memberId].forEach(checkOwnerId);
   if (new Set([botId, adminId, memberId]).size !== 3) throw new Error("Invalid provider authorization policy.");
-  return Object.freeze({ botId, adminId, memberId });
+  return Object.freeze({ botId, adminId, memberId, ...(includeBatch ? { includeBatch: true as const } : {}),
+    ...(queue ? { queue } : {}) });
 }
 
 function validateClaim(row: ClaimedRow): void {
@@ -388,52 +438,91 @@ export async function isProviderJobCurrent(db: D1Database, lease: ProviderJobLea
   }
 }
 
-/** Claim at most one current job globally and read its exact private source. */
-export async function claimProviderJob(db: D1Database, policy?: ProviderTelegramPolicy): Promise<ProviderJobLease | null> {
-  try {
-    const scope = jobScope(policy);
-    const table = jobTable(scope);
-    const visible = scopeAuthorization(scope, "job", true);
+function terminalJobs(db: D1Database, scope: JobScope, includeWaiting = false): D1PreparedStatement {
+  const table = jobTable(scope);
+  const visible = scopeAuthorization(scope, "job", true);
+  const authorized = scopeAuthorization(scope);
+  const unsettled = includeWaiting ? "state IN ('waiting', 'pending', 'leased')" : liveState;
+  return db.prepare(`
+    WITH terminal AS ${scope !== "generic" && scope.queue === "batch" ? "MATERIALIZED " : ""}(
+      SELECT job.job_id, CASE
+        WHEN job.expires_at <= unixepoch() THEN 'expired'
+        WHEN NOT (${currentTarget} AND ${authorized.sql}) THEN 'stale-target'
+        WHEN job.attempts >= ${MAX_ATTEMPTS} THEN 'attempts-exhausted'
+      END AS result_code
+      FROM ${table} AS job WHERE job.${unsettled} AND (${visible.sql})
+        AND (job.state = 'pending' OR (job.state='leased' AND job.lease_until <= unixepoch())
+          ${includeWaiting ? "OR job.state='waiting'" : ""})
+    )
+    UPDATE ${table} SET state = 'done', result_code = terminal.result_code,
+      finished_at = unixepoch(), lease_id = NULL, lease_until = NULL
+    FROM terminal WHERE ${table}.job_id = terminal.job_id AND terminal.result_code IS NOT NULL
+  `).bind(...authorized.bindings, ...visible.bindings);
+}
+
+/** Prepare a sweep and at most one quota-checked promotion for the Telegram family. */
+export function prepareTelegramProviderBatchQueue(db: D1Database, policy: ProviderTelegramPolicy, promote: boolean): D1PreparedStatement[] {
+  const scope = jobScope(policy, true, "batch");
+  const steps = [terminalJobs(db, scope, true)];
+  if (promote) {
     const authorized = scopeAuthorization(scope);
+    steps.push(db.prepare(`UPDATE telegram_provider_batch_jobs SET state='pending',due_at=unixepoch()
+      WHERE job_id=(SELECT job.job_id FROM telegram_provider_batch_jobs AS job JOIN telegram_provider_batches AS batch USING(batch_id)
+        WHERE job.state IN ('waiting', 'pending', 'leased') AND job.state='waiting'
+          AND job.expires_at>unixepoch() AND ${currentTarget} AND (${authorized.sql})
+          AND ${jobCapacity("job.owner_id", scope)}
+          AND NOT EXISTS (SELECT 1 FROM (${activeJobs(scope)}) AS active
+            WHERE active.owner_id=job.owner_id AND active.subscription_id=job.subscription_id)
+        ORDER BY batch.created_at,batch.batch_id,job.ordinal LIMIT 1)`).bind(...authorized.bindings));
+  }
+  return steps;
+}
+
+function claimCandidates(scopes: readonly JobScope[]): Guard {
+  const noLease = scopes.map((scope) => `NOT EXISTS (SELECT 1 FROM ${jobTable(scope)} WHERE state='leased')`).join(" AND ");
+  const noLiveLease = scopes.map((scope) =>
+    `NOT EXISTS (SELECT 1 FROM ${jobTable(scope)} WHERE state='leased' AND lease_until>unixepoch())`).join(" AND ");
+  const bindings: Binding[] = [];
+  const candidates = scopes.map((scope) => {
+    const table = jobTable(scope);
+    const authorized = scopeAuthorization(scope);
+    bindings.push(...authorized.bindings);
+    return `SELECT '${table}' AS queue,job.job_id,job.due_at FROM ${table} AS job
+      WHERE job.${liveState} AND job.expires_at>unixepoch() AND job.attempts<${MAX_ATTEMPTS}
+        AND ${currentTarget} AND (${authorized.sql}) AND ${noLiveLease}
+        AND ((job.state='leased' AND job.lease_until<=unixepoch())
+          OR (job.state='pending' AND job.due_at<=unixepoch() AND ${noLease}))`;
+  });
+  return { sql: `${candidates.join(" UNION ALL ")} ORDER BY due_at,queue,job_id LIMIT 1`, bindings };
+}
+
+/** Include batch scope on every Telegram-family admission and claim while batch work can be live. */
+export async function claimProviderJob(db: D1Database, policy?: ProviderTelegramPolicy, includeBatch = false): Promise<ProviderJobLease | null> {
+  try {
+    const single = jobScope(policy, includeBatch);
+    const scopes = includeBatch ? [single, jobScope(policy, true, "batch")] : [single];
     const leaseId = crypto.randomUUID();
-    const steps = [
-      db.prepare(`
-        WITH terminal AS (
-          SELECT job.job_id, CASE
-            WHEN job.expires_at <= unixepoch() THEN 'expired'
-            WHEN NOT (${currentTarget} AND ${authorized.sql}) THEN 'stale-target'
-            WHEN job.attempts >= ${MAX_ATTEMPTS} THEN 'attempts-exhausted'
-          END AS result_code
-          FROM ${table} AS job WHERE job.${liveState} AND (${visible.sql})
-            AND (job.state = 'pending' OR job.lease_until <= unixepoch())
-        )
-        UPDATE ${table} SET state = 'done', result_code = terminal.result_code,
-          finished_at = unixepoch(), lease_id = NULL, lease_until = NULL
-        FROM terminal WHERE ${table}.job_id = terminal.job_id AND terminal.result_code IS NOT NULL
-      `).bind(...authorized.bindings, ...visible.bindings),
-      db.prepare(`
+    const candidates = claimCandidates(scopes);
+    const steps = [...scopes.map((scope) => terminalJobs(db, scope)), ...scopes.map((scope) => {
+      const table = jobTable(scope);
+      return db.prepare(`
         UPDATE ${table} SET state = 'leased', attempts = attempts + 1, lease_id = ?,
           lease_until = min(unixepoch() + ${LEASE_SECONDS}, expires_at)
-        WHERE job_id = (
-          SELECT job.job_id FROM ${table} AS job
-          WHERE job.expires_at > unixepoch() AND job.attempts < ${MAX_ATTEMPTS}
-            AND ${currentTarget} AND (${authorized.sql})
-            AND ((job.state = 'leased' AND job.lease_until <= unixepoch()) OR
-              (job.state = 'pending' AND job.due_at <= unixepoch()
-                AND NOT EXISTS (SELECT 1 FROM ${table} WHERE state = 'leased')))
-          ORDER BY job.due_at, job.job_id LIMIT 1
-        )
+        WHERE job_id = (SELECT job_id FROM (${candidates.sql}) WHERE queue='${table}')
         RETURNING job_id AS jobId, subscription_id AS id, owner_id AS ownerId, kind, request_key AS requestKey,
           expected_generation AS expectedGeneration, expected_lifecycle_revision AS expectedLifecycleRevision,
           source_sha256 AS sourceSha256, lease_id AS leaseId, lease_until AS leaseUntil, expires_at AS expiresAt, attempts
-      `).bind(leaseId, ...authorized.bindings),
-    ];
+      `).bind(leaseId, ...candidates.bindings);
+    })];
     const results = await db.batch<ClaimedRow>(steps);
-    if (results.length !== steps.length || results.some(({ success }) => !success) || results[1].results.length > 1) {
+    if (results.length !== steps.length || results.some(({ success }) => !success)) {
       throw new Error("Provider job claim could not be confirmed.");
     }
-    const lease = results[1].results[0];
-    if (!lease) return null;
+    const claimed = scopes.flatMap((scope, index) => results[scopes.length + index].results.map((lease) => ({ scope, lease })));
+    if (claimed.length === 0) return null;
+    if (claimed.length !== 1) throw new Error("Provider job claim could not be confirmed.");
+    const [{ scope, lease }] = claimed;
+    const table = jobTable(scope);
     validateClaim(lease);
     if (lease.leaseId !== leaseId) throw new Error("Provider job claim could not be confirmed.");
     const live = leaseGuard(lease, scope);
@@ -441,7 +530,7 @@ export async function claimProviderJob(db: D1Database, policy?: ProviderTelegram
       AND generation = ? AND ${SUBSCRIPTION_LIFECYCLE_REVISION} = ? AND ${live.sql}`)
       .bind(lease.id, lease.ownerId, lease.expectedGeneration, lease.expectedLifecycleRevision, ...live.bindings)
       .first<string>("source_url");
-    if (sourceUrl !== null && providerHost(sourceUrl) && await sourceDigest(sourceUrl) === lease.sourceSha256) {
+    if (sourceUrl !== null && providerHost(sourceUrl) && await providerSourceDigest(sourceUrl) === lease.sourceSha256) {
       return Object.freeze({ ...lease, sourceUrl, scope });
     }
     const retire = leaseGuard(lease, scope, true);
@@ -506,10 +595,11 @@ export async function settleProviderJob(
     let row: SettlementRow | null;
     if (lease.scope !== "generic") {
       const authorized = scopeAuthorization(lease.scope);
+      const table = providerJobLeaseTable(lease);
       const [result, metadata] = await db.batch<SettlementRow>([settlement, db.prepare(`
         UPDATE subscriptions SET last_error = 'provider-refresh-failed'
         WHERE id = ? AND owner_id = ? AND source_url = ? AND generation = ? AND ${SUBSCRIPTION_LIFECYCLE_REVISION} = ?
-          AND changes() = 1 AND EXISTS (SELECT 1 FROM telegram_provider_jobs AS job
+          AND changes() = 1 AND EXISTS (SELECT 1 FROM ${table} AS job
             WHERE job.job_id = ? AND job.owner_id = subscriptions.owner_id AND job.request_key = ?
               AND job.state = 'done' AND job.result_code IN ('fetch-rejected','invalid-document','storage-failed','attempts-exhausted')
               AND (${authorized.sql}))`)

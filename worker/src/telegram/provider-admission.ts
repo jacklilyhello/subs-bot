@@ -46,6 +46,7 @@ function cleanName(value: string | undefined): string | null {
 /** Stage only an already decoded, private event. The consumer performs the fetch. */
 export async function acceptTelegramProviderRequest(
   db: D1Database, policy: TelegramPolicy, event: TelegramProviderEvent,
+  includeBatch = false,
 ): Promise<TelegramProviderAdmission> {
   if (!inTelegramScope(policy, event) || event.chatType !== "private" || event.threadId !== null || event.chatId !== event.actorId ||
       !validInteger(event.updateId, 1) || !validInteger(event.messageId, 1) || !validInteger(event.messageDate, 1)) return { kind: "ignored" };
@@ -69,7 +70,7 @@ export async function acceptTelegramProviderRequest(
       if (!name || !providerHost(event.sourceUrl)) {
         refusal = fixedRefusal("invalid-url");
       } else {
-        const { plan } = await prepareProviderUrlImport(db, { ...input, sourceUrl: event.sourceUrl, name }, fence, policy);
+        const { plan } = await prepareProviderUrlImport(db, { ...input, sourceUrl: event.sourceUrl, name }, fence, policy, includeBatch);
         admission = plan.statements;
         refusal = plan.refusal;
       }
@@ -80,7 +81,7 @@ export async function acceptTelegramProviderRequest(
         && validInteger(target.expectedLifecycleRevision, 0) ? await prepareOwnedProviderRefresh(db, {
           ...input, id: target.id, expectedGeneration: target.expectedGeneration,
           expectedLifecycleRevision: target.expectedLifecycleRevision,
-        }, fence, gate, policy) : null;
+        }, fence, gate, policy, includeBatch) : null;
       if (refresh && prepared?.digest !== refresh.sourceSha256) return { kind: "ignored" };
       admission = prepared?.plan.statements ?? [];
       refusal = prepared?.plan.refusal ?? fixedRefusal("unavailable");

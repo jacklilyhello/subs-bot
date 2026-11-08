@@ -151,10 +151,11 @@ async function publish(
 /** Run at most one lease from the selected queue and use the named binding for its source URL. */
 export async function runOneProviderJob(
   db: D1Database, bucket: R2Bucket, provider: ProviderFetcher | undefined, pin: ProviderPin, policy?: ProviderTelegramPolicy,
+  includeBatch = false,
 ): Promise<ConsumerOutcome> {
   if (!provider || typeof pin.providerRevision !== "string" || !PROVIDER_REVISION.test(pin.providerRevision) ||
       typeof pin.imageSha256 !== "string" || !PROVIDER_SHA256.test(pin.imageSha256)) return "disabled";
-  const lease = await claimProviderJob(db, policy);
+  const lease = await claimProviderJob(db, policy, includeBatch);
   if (lease === null) return "idle";
   if (lease.scope !== "generic" && !await isProviderJobCurrent(db, lease)) {
     await retireStaleProviderJob(db, lease);
