@@ -15,6 +15,7 @@ from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import stage_provider_version as stage
+import stage_provider_api_status_version as api_status
 
 
 ACCOUNT = "a" * 32
@@ -33,6 +34,10 @@ EVIDENCE = {
     "workerSha256": MODULE_SHA, "ociArchiveSha256": "9" * 64,
     "ociManifestSha256": MANIFEST, "ociConfigSha256": CONFIG,
 }
+API_SERVICE = stage.provider.API_STATUS_SERVICE
+API_PROFILE = stage.provider.API_STATUS_PROFILE
+_, API_IMAGE, API_PIN = stage.publication.api_status_registry_pin(ACCOUNT, MANIFEST)
+API_EVIDENCE = {**EVIDENCE, **API_PIN, "profile": API_PROFILE, "service": API_SERVICE, "rpcEntrypoint": "ProviderApiStatus"}
 
 
 def envelope(result, *, status=200, **extra):
@@ -105,6 +110,27 @@ class StageTests(unittest.TestCase):
             self.run_stage()
         self.versions.upload.assert_called_once()
         self.versions.verify.assert_not_called()
+
+    def test_api_status_does_not_read_or_upload_until_both_targets_match(self):
+        self.versions.profile = stage.provider.FETCH_PROFILE
+        with self.assertRaisesRegex(stage.StageError, "target profile differs"):
+            stage._stage(self.versions, self.image, "stage", API_EVIDENCE, MODULE, self.guard)
+        self.versions.profile = API_PROFILE
+        with self.assertRaisesRegex(stage.StageError, "target profile differs"):
+            stage._stage(self.versions, self.image, "stage", API_EVIDENCE, MODULE, self.guard)
+        self.versions.baseline.assert_not_called()
+        self.image.verify.assert_not_called()
+        self.versions.upload.assert_not_called()
+        self.image.reference = API_IMAGE
+        self.versions.baseline.side_effect = [None, None, CANDIDATE]
+        self.assertEqual(stage._stage(self.versions, self.image, "stage", API_EVIDENCE, MODULE, self.guard),
+                         ("staged", CANDIDATE))
+        metadata = stage._metadata(API_EVIDENCE, API_IMAGE)
+        self.versions.upload.assert_called_once_with(metadata, MODULE)
+        self.assertEqual(set(metadata["exports"]), {"ProviderContainer", "ProviderApiStatus"})
+        self.assertEqual(metadata["containers"], [{"name": API_SERVICE, "class_name": "ProviderContainer",
+                                                   "images": {"provider": API_IMAGE}}])
+        self.assertEqual(metadata["bindings"][1]["workflow_name"], API_SERVICE + "-smoke")
 
     def test_stale_main_or_failed_image_never_uploads(self):
         self.versions.baseline.return_value = None
@@ -325,6 +351,61 @@ class ImageTests(unittest.TestCase):
             with self.subTest(reply=reply), patch.object(stage.publication, "_response", return_value=reply):
                 with self.assertRaisesRegex(stage.StageError, "was not ready"):
                     self.image.prepare(Mock())
+
+    def test_api_status_uses_the_separate_repository_and_rejects_a_forged_pin(self):
+        status_image = stage.PublishedImage(ACCOUNT, "synthetic-preparation-token", API_EVIDENCE, self.image._scratch)
+        self.assertEqual(status_image.reference, API_IMAGE)
+        with self.assertRaisesRegex(stage.StageError, "repository or digest pin differs"):
+            stage.PublishedImage(ACCOUNT, "synthetic-preparation-token",
+                                 {**API_EVIDENCE, "registryImageReferenceSha256": "0" * 64}, self.image._scratch)
+
+
+class APIStatusTests(unittest.TestCase):
+    def test_shell_and_version_readback_reject_other_profile_names_and_bindings(self):
+        with patch.object(stage.bootstrap, "TARGET_ACCOUNT_SHA256", sha256(ACCOUNT.encode()).hexdigest()):
+            api = stage.WorkerVersions(ACCOUNT, "synthetic-status-worker-token", IDENTITY, profile=API_PROFILE)
+        empty = {"result": [], "result_info": {"page": 1, "per_page": 2, "count": 0, "total_count": 0}}
+        deployments = {"result": {"deployments": []}, "result_info": {"page": 1, "count": 0, "total_count": 0}}
+        shell = {**stage.bootstrap._settings(API_PROFILE), "id": IDENTITY.worker_id, "created_on": IDENTITY.created_on,
+                 "updated_on": IDENTITY.created_on, "deployed_on": None,
+                 "references": {key: [] for key in stage.bootstrap.REFERENCE_FIELDS}}
+        with (
+            patch.object(api.worker, "_request", side_effect=[{"result": shell}, {"result": shell}]) as shell_read,
+            patch.object(api, "_read", side_effect=[deployments, empty]) as read,
+        ):
+            self.assertIsNone(api.baseline())
+        self.assertEqual(shell_read.call_args_list, [
+            call(f"{api.worker._workers}/{API_SERVICE}", absent=False),
+            call(f"{api.worker._workers}/{IDENTITY.worker_id}"),
+        ])
+        self.assertEqual(read.call_args_list, [
+            call(f"/workers/scripts/{API_SERVICE}/deployments?page=1&per_page=1"),
+            call(f"/workers/workers/{IDENTITY.worker_id}/versions?page=1&per_page=2", stage.MAX_VERSION_RESPONSE)])
+        metadata = stage._metadata(API_EVIDENCE, API_IMAGE)
+        beta = {**version(), **{key: metadata[key] for key in ("exports", "annotations", "bindings")}}
+        stage._verify_version(beta, CANDIDATE, metadata, MODULE_SHA, service=API_SERVICE)
+        bad_binding = [beta["bindings"][0], {**beta["bindings"][1], "script_name": stage.provider.SERVICE}]
+        for changes in ({"exports": version()["exports"]}, {"bindings": bad_binding}):
+            with self.assertRaisesRegex(stage.StageError, "did not match"):
+                stage._verify_version({**beta, **changes}, CANDIDATE, metadata, MODULE_SHA, service=API_SERVICE)
+
+    def test_exact_workflow_confirmation_and_separate_preparation_token_are_required(self):
+        env = {"GITHUB_REPOSITORY": stage.github.REPOSITORY, "GITHUB_REF": stage.github.MAIN_REF,
+               "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_SHA": REVISION, "GITHUB_WORKFLOW_SHA": REVISION,
+               "GITHUB_WORKFLOW_REF": f"{stage.github.REPOSITORY}/{api_status.WORKFLOW}@{stage.github.MAIN_REF}",
+               "RUNNER_ENVIRONMENT": "github-hosted", "GITHUB_RUN_ATTEMPT": "1", "SUBS_BOT_PROVIDER_CI_RUN_ID": "10",
+               "RUNNER_TEMP": "/tmp/synthetic", "SUBS_BOT_PROVIDER_API_STATUS_STAGE_OPERATION": "stage",
+               "SUBS_BOT_PROVIDER_API_STATUS_STAGE_CONFIRMATION": api_status.CONFIRM_STAGE,
+               api_status.IDENTITY_ENV: json.dumps({"workerId": IDENTITY.worker_id, "workerCreatedOn": IDENTITY.created_on}),
+               api_status.WORKER_TOKEN_ENV: "synthetic-status-worker", api_status.IMAGE_TOKEN_ENV: "synthetic-image-prep",
+               stage.publication.API_STATUS_TOKEN_ENV: "synthetic-registry-publisher"}
+        for changes, error in (({"GITHUB_WORKFLOW_REF": "other"}, "exact protected"), ({"GITHUB_RUN_ATTEMPT": "2"}, "first-attempt"),
+                ({api_status.IMAGE_TOKEN_ENV: ""}, "Separate dedicated"),
+                ({api_status.IMAGE_TOKEN_ENV: env[api_status.WORKER_TOKEN_ENV]}, "Separate dedicated")):
+            with patch.dict(os.environ, env | changes, clear=True), patch.object(stage.publication, "_verified_input") as read:
+                with self.assertRaisesRegex(stage.StageError, error):
+                    api_status.stage()
+                read.assert_not_called()
 
 
 if __name__ == "__main__":

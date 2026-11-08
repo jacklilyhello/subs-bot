@@ -43,18 +43,22 @@ def _require(condition, message):
 
 
 def _metadata(evidence, image):
+    profile = evidence.get("profile", provider.FETCH_PROFILE)
+    _require(profile in provider.PROFILE_SERVICES, "Unknown provider version profile.")
+    service = provider.PROFILE_SERVICES[profile]
+    entrypoint = provider.API_STATUS_ENTRYPOINT if profile == provider.API_STATUS_PROFILE else "ProviderFetch"
     return {
         "main_module": provider.WORKER,
         "compatibility_date": evidence["compatibilityDate"],
         "bindings": [
             {"name": "BUILD_REVISION", "type": "plain_text", "text": evidence["revision"]},
-            {"name": "PROVIDER_SMOKE", "type": "workflow", "workflow_name": WORKFLOW, "class_name": "ProviderSmoke"},
+            {"name": "PROVIDER_SMOKE", "type": "workflow", "workflow_name": service + "-smoke", "class_name": "ProviderSmoke"},
         ],
         "exports": {
-            "ProviderContainer": {"type": "durable-object", "storage": "sqlite", "container": provider.SERVICE},
-            "ProviderFetch": {"type": "worker"},
+            "ProviderContainer": {"type": "durable-object", "storage": "sqlite", "container": service},
+            entrypoint: {"type": "worker"},
         },
-        "containers": [{"name": provider.SERVICE, "class_name": "ProviderContainer", "images": {"provider": image}}],
+        "containers": [{"name": service, "class_name": "ProviderContainer", "images": {"provider": image}}],
         "annotations": {
             "workers/tag": f"provider-{evidence['revision']}-{evidence['artifactId']}",
             "workers/message": f"provider-ci/{evidence['runId']}/{evidence['runAttempt']}/{evidence['artifactId']}",
@@ -139,11 +143,14 @@ def _one_page(envelope, rows, maximum, *, per_page=None):
 
 
 class WorkerVersions:
-    def __init__(self, account, token, identity):
-        self.worker = bootstrap.WorkerAPI(account, token)
+    def __init__(self, account, token, identity, *, profile=provider.FETCH_PROFILE):
+        _require(profile in provider.PROFILE_SERVICES, "Unknown provider version profile.")
+        self.profile = profile
+        self._service = provider.PROFILE_SERVICES[profile]
+        self.worker = bootstrap.WorkerAPI(account, token, profile=profile)
         self.identity = identity
         self._base = f"{publication.API_ORIGIN}/accounts/{account}"
-        self._legacy = f"/workers/scripts/{provider.SERVICE}"
+        self._legacy = f"/workers/scripts/{self._service}"
         self._beta = f"/workers/workers/{identity.worker_id}/versions"
         self._token = token
         self._opener = build_opener(ProxyHandler({}), github._NoRedirect())
@@ -152,8 +159,8 @@ class WorkerVersions:
         return _json_request(self._base + path, self._opener, self._token, VERSION_ERROR, limit=limit)[1]
 
     def baseline(self):
-        bootstrap._verify_profile(self.worker.by_name(), self.identity)
-        bootstrap._verify_profile(self.worker.by_id(self.identity), self.identity)
+        bootstrap._verify_profile(self.worker.by_name(), self.identity, profile=self.profile)
+        bootstrap._verify_profile(self.worker.by_id(self.identity), self.identity, profile=self.profile)
         deployments = self._read(f"{self._legacy}/deployments?page=1&per_page=1")
         result = deployments["result"]
         _require(isinstance(result, dict), VERSION_ERROR)
@@ -183,12 +190,12 @@ class WorkerVersions:
     def verify(self, candidate, metadata, module_sha256):
         candidate = _version_id(candidate)
         beta = self._read(f"{self._beta}/{candidate}?include=modules", MAX_VERSION_RESPONSE)["result"]
-        _verify_version(beta, candidate, metadata, module_sha256)
+        _verify_version(beta, candidate, metadata, module_sha256, service=self._service)
         legacy = self._read(f"{self._legacy}/versions/{candidate}")["result"]
-        _verify_legacy_version(legacy, candidate, metadata)
+        _verify_legacy_version(legacy, candidate, metadata, service=self._service)
 
 
-def _verify_legacy_version(version, candidate, metadata):
+def _verify_legacy_version(version, candidate, metadata, *, service=provider.SERVICE):
     _require(isinstance(version, dict) and version.get("id") == candidate, VERSION_ERROR)
     resources = version.get("resources")
     runtime = resources.get("script_runtime") if isinstance(resources, dict) else None
@@ -196,7 +203,7 @@ def _verify_legacy_version(version, candidate, metadata):
     _verify_compatibility(runtime)
     # Some legacy responses omit bindings. The Beta version detail always verifies the exact inventory.
     if resources.get("bindings") not in (None, {}):
-        _verify_bindings(resources["bindings"], metadata["bindings"])
+        _verify_bindings(resources["bindings"], metadata["bindings"], service=service)
 
 
 def _verify_compatibility(runtime):
@@ -205,18 +212,18 @@ def _verify_compatibility(runtime):
              and runtime.get("compatibility_flags") in (None, []), VERSION_ERROR)
 
 
-def _verify_bindings(bindings, expected):
+def _verify_bindings(bindings, expected, *, service=provider.SERVICE):
     _require(isinstance(bindings, list) and len(bindings) == len(expected)
              and all(isinstance(row, dict) and isinstance(row.get("name"), str) for row in bindings), VERSION_ERROR)
     by_name = {row["name"]: row for row in bindings}
     for binding in expected:
         row = by_name.get(binding["name"])
         _require(isinstance(row, dict) and all(row.get(key) == value for key, value in binding.items())
-                 and row.get("script_name") in (None, provider.SERVICE) and row.get("environment") in (None, "production")
+                 and row.get("script_name") in (None, service) and row.get("environment") in (None, "production")
                  and row.get("namespace_id") is None and row.get("dispatch_namespace") is None, VERSION_ERROR)
 
 
-def _verify_version(version, candidate, metadata, module_sha256):
+def _verify_version(version, candidate, metadata, module_sha256, *, service=provider.SERVICE):
     _require(isinstance(version, dict) and version.get("id") == candidate
              and version.get("main_module") == provider.WORKER and version.get("urls") == []
              and version.get("usage_model") in (None, "standard")
@@ -227,7 +234,7 @@ def _verify_version(version, candidate, metadata, module_sha256):
     annotations = version.get("annotations")
     _require(isinstance(annotations, dict)
              and all(annotations.get(key) == expected for key, expected in metadata["annotations"].items()), VERSION_ERROR)
-    _verify_bindings(version.get("bindings"), metadata["bindings"])
+    _verify_bindings(version.get("bindings"), metadata["bindings"], service=service)
     exports = version.get("exports")
     _require(isinstance(exports, dict) and set(exports) - set(metadata["exports"]) <= {"default"}, VERSION_ERROR)
     for name, expected in metadata["exports"].items():
@@ -258,7 +265,8 @@ class PublishedImage:
         _require(publication.ACCOUNT.fullmatch(account)
                  and sha256(account.encode("ascii")).hexdigest() == publication.TARGET_ACCOUNT_SHA256,
                  "The protected Cloudflare account does not match the provider target.")
-        self._registry = publication.Registry(account, token)
+        profile = evidence.get("profile", provider.FETCH_PROFILE)
+        self._registry = publication.Registry(account, token, profile=profile)
         self._token = token
         self._url = f"{publication.API_ORIGIN}/accounts/{account}/containers/image-preparations"
         self._opener = build_opener(ProxyHandler({}), github._NoRedirect())
@@ -266,6 +274,10 @@ class PublishedImage:
         self._manifest = evidence["ociManifestSha256"]
         self._config = evidence["ociConfigSha256"]
         self.reference = f"{publication.HOST}/{self._registry.repository}@sha256:{self._manifest}"
+        if profile == provider.API_STATUS_PROFILE:
+            _, reference, pin = publication.api_status_registry_pin(account, self._manifest)
+            _require(self.reference == reference and all(evidence[key] == value for key, value in pin.items()),
+                     "The API status image repository or digest pin differs.")
 
     def verify(self):
         pull = self._registry.mint()
@@ -294,6 +306,10 @@ class PublishedImage:
 
 
 def _stage(versions, image, operation, evidence, module, guard):
+    if evidence.get("profile") == provider.API_STATUS_PROFILE:
+        _require(versions.profile == provider.API_STATUS_PROFILE
+                 and sha256(image.reference.encode("ascii")).hexdigest() == evidence["registryImageReferenceSha256"],
+                 "The API status version or image target profile differs.")
     metadata = _metadata(evidence, image.reference)
     candidate = versions.baseline()
     image.verify()
