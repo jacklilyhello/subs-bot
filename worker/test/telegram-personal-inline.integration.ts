@@ -16,7 +16,7 @@ const queueDiagnosticsModule = `
   import worker from './index.js';
   const tables = ['telegram_aggregate_actions', 'telegram_private_share_creations',
     'telegram_inline_search_consent', 'telegram_github_search', 'telegram_subscription_raw_file',
-    'telegram_provider_batch_interactions', 'telegram_api_status'];
+    'telegram_provider_batch_interactions', 'telegram_api_status', 'telegram_provider_documents'];
   function errorClass(error) {
     const message = String(error?.message ?? '') + ' ' + String(error?.cause?.message ?? '');
     if (/parser stack overflow|expression tree is too large/i.test(message)) return 'sql-depth';

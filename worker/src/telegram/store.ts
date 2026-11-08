@@ -282,7 +282,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
   const includeProviderBatch = batchPolicy !== undefined;
   const includeApiStatus = apiPolicy !== undefined;
   const includeProviderDocument = documentPolicy !== undefined;
-  const earlierGithubCurrent = telegramGitHubSearchEligible(gitHubSearchPolicy, "earlier");
+  const githubCurrent = telegramGitHubSearchEligible(gitHubSearchPolicy, "inbox");
   // Durable receipt markers are mutually exclusive. A flat CASE keeps optional grants within D1's expression depth.
   const eligible = (alias: "inbox" | "earlier") => {
     const guards = [
@@ -300,33 +300,29 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
     };
   };
   const current = eligible("inbox");
-  const earlierCurrent = eligible("earlier");
-  const earlierActive = "earlier.receipt_id < inbox.receipt_id AND earlier_reply.state IN ('pending', 'leased', 'sending')";
+  const earlierActive = "earlier.receipt_id < inbox.receipt_id";
   // A provider reply or search can become ready after a newer reply has started delivery.
   const searchPair = `(inbox.receipt_nonce IS '${TELEGRAM_GITHUB_SEARCH_MARKER}' OR
     earlier.receipt_nonce IS '${TELEGRAM_GITHUB_SEARCH_MARKER}')`;
-  const delayedBlocker = { sql: `(
-    (earlier_reply.state = 'sending' AND earlier_reply.lease_until > unixepoch())
-    OR ((${earlierCurrent.sql})
-      AND ${replyClock(includeProvider, "earlier", includeProviderBatch, includeApiStatus, includeProviderDocument)} + ${MAX_REPLY_AGE_SECONDS} > unixepoch() AND (
-        (earlier_reply.state = 'leased' AND earlier_reply.lease_until > unixepoch())
-        OR (earlier.receipt_id < inbox.receipt_id AND earlier_reply.state = 'pending' AND earlier_reply.attempts < ${MAX_ATTEMPTS})
+  const delayedBlocker = `(
+    (earlier.state = 'sending' AND earlier.lease_until > unixepoch())
+    OR (earlier.eligible AND earlier.reply_clock + ${MAX_REPLY_AGE_SECONDS} > unixepoch() AND (
+        (earlier.state = 'leased' AND earlier.lease_until > unixepoch())
+        OR (earlier.receipt_id < inbox.receipt_id AND earlier.state = 'pending' AND earlier.attempts < ${MAX_ATTEMPTS})
       ))
-  )`, bindings: earlierCurrent.bindings };
-  const ordinaryBlocker = { sql: includeGitHubSearch ? `(
+  )`;
+  const ordinaryBlocker = includeGitHubSearch ? `(
     (NOT ${searchPair} AND ${earlierActive}) OR (${searchPair} AND (
-      (earlier_reply.state IN ('leased', 'sending') AND earlier_reply.lease_until > unixepoch())
-      OR (earlier.receipt_id < inbox.receipt_id AND earlier_reply.state = 'pending'
-        AND earlier_reply.attempts < ${MAX_ATTEMPTS} AND earlier.received_at + ${MAX_REPLY_AGE_SECONDS} > unixepoch()
-        AND ${earlierGithubCurrent.sql}))))` : earlierActive, bindings: earlierGithubCurrent.bindings };
+      (earlier.state IN ('leased', 'sending') AND earlier.lease_until > unixepoch())
+      OR (earlier.receipt_id < inbox.receipt_id AND earlier.state = 'pending'
+        AND earlier.attempts < ${MAX_ATTEMPTS} AND earlier.received_at + ${MAX_REPLY_AGE_SECONDS} > unixepoch()
+        AND earlier.github_eligible))))` : earlierActive;
   const delayedMarkers = [includeProviderBatch ? TELEGRAM_PROVIDER_BATCH_REPLY_MARKERS : "",
     includeApiStatus ? `'${TELEGRAM_API_STATUS_MARKER}'` : "",
     includeProviderDocument ? `'${TELEGRAM_PROVIDER_DOCUMENT_MARKER}'` : ""].filter(Boolean).join(",");
-  const sameChatBlocker = includeProvider ? delayedBlocker : delayedMarkers ? {
-    sql: `(CASE WHEN inbox.receipt_nonce IN (${delayedMarkers}) OR earlier.receipt_nonce IN (${delayedMarkers})
-      THEN ${delayedBlocker.sql} ELSE (${ordinaryBlocker.sql}) END)`,
-    bindings: [...delayedBlocker.bindings, ...ordinaryBlocker.bindings],
-  } : ordinaryBlocker;
+  const sameChatBlocker = includeProvider ? delayedBlocker : delayedMarkers ?
+    `(CASE WHEN inbox.receipt_nonce IN (${delayedMarkers}) OR earlier.receipt_nonce IN (${delayedMarkers})
+      THEN ${delayedBlocker} ELSE (${ordinaryBlocker}) END)` : ordinaryBlocker;
   // Optional companions must not lose their live same-chat exclusion during a readiness fault.
   const liveMarkers: string[] = [];
   if (gitHubSearch === "unavailable") liveMarkers.push(`'${TELEGRAM_GITHUB_SEARCH_MARKER}'`);
@@ -335,7 +331,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
   if (apiStatus === "unavailable") liveMarkers.push(`'${TELEGRAM_API_STATUS_MARKER}'`);
   if (providerDocument === "unavailable") liveMarkers.push(`'${TELEGRAM_PROVIDER_DOCUMENT_MARKER}'`);
   const activeOptionalLease = liveMarkers.length ? `OR (
-    earlier_reply.state IN ('leased', 'sending') AND earlier_reply.lease_until > unixepoch()
+    earlier.state IN ('leased', 'sending') AND earlier.lease_until > unixepoch()
     AND ((earlier.receipt_nonce IN (${liveMarkers.join(",")}) AND earlier.command = 'help'
       AND earlier.chat_type = 'private' AND earlier.chat_id = earlier.actor_id AND earlier.thread_id IS NULL)
       ${includeRawFile ? `OR inbox.receipt_nonce IS '${TELEGRAM_SUBSCRIPTION_RAW_FILE_MARKER}'` : ""})
@@ -349,26 +345,29 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
       UPDATE telegram_outbox
       SET state = 'leased', attempts = attempts + 1, lease_id = ?, lease_until = unixepoch() + ${LEASE_SECONDS}
       WHERE receipt_id = (
-        SELECT inbox.receipt_id FROM telegram_outbox AS reply
-        JOIN telegram_inbox AS inbox USING (receipt_id)
-        WHERE inbox.bot_id = ? AND ${supportedReceipt("inbox", includeAggregate, includePrivateShareCreation, includeSubscriptionRead,
-          includeShortLinks, includeInlineSort, includeSubscriptionNodes, includeProvider, includeBulkTrash, includeInlineConsent,
-          includeGitHubSearch, includeRawFile, includeProviderBatch, includeApiStatus, includeProviderDocument)}
-          AND ${current.sql}
-          AND reply.state = 'pending'
-          AND reply.due_at <= unixepoch() AND reply.attempts < ${MAX_ATTEMPTS}
-          AND ${replyClock(includeProvider, "inbox", includeProviderBatch, includeApiStatus, includeProviderDocument)} + ${MAX_REPLY_AGE_SECONDS} > unixepoch()
+      WITH active AS MATERIALIZED (
+        SELECT inbox.receipt_id,inbox.actor_id,inbox.chat_id,inbox.chat_type,inbox.thread_id,inbox.command,
+          inbox.receipt_nonce,inbox.received_at,reply.state,reply.lease_until,reply.due_at,reply.attempts,
+          ${current.sql} AS eligible, ${githubCurrent.sql} AS github_eligible,
+          ${replyClock(includeProvider, "inbox", includeProviderBatch, includeApiStatus, includeProviderDocument)} AS reply_clock,
+          ${supportedReceipt("inbox", includeAggregate, includePrivateShareCreation, includeSubscriptionRead,
+            includeShortLinks, includeInlineSort, includeSubscriptionNodes, includeProvider, includeBulkTrash, includeInlineConsent,
+            includeGitHubSearch, includeRawFile, includeProviderBatch, includeApiStatus, includeProviderDocument)} AS supported
+        FROM telegram_outbox AS reply JOIN telegram_inbox AS inbox USING (receipt_id)
+        WHERE inbox.bot_id=? AND reply.state IN ('pending','leased','sending')
+      )
+        SELECT inbox.receipt_id FROM active AS inbox
+        WHERE inbox.supported AND inbox.eligible AND inbox.state='pending'
+          AND inbox.due_at <= unixepoch() AND inbox.attempts < ${MAX_ATTEMPTS}
+          AND inbox.reply_clock + ${MAX_REPLY_AGE_SECONDS} > unixepoch()
           AND NOT EXISTS (
-            SELECT 1 FROM telegram_inbox AS earlier
-            JOIN telegram_outbox AS earlier_reply USING (receipt_id)
-            WHERE earlier.bot_id = inbox.bot_id AND earlier.actor_id = inbox.actor_id AND earlier.chat_id = inbox.chat_id
-              AND ((${supportedReceipt("earlier", includeAggregate, includePrivateShareCreation, includeSubscriptionRead,
-                includeShortLinks, includeInlineSort, includeSubscriptionNodes, includeProvider, includeBulkTrash, includeInlineConsent,
-                includeGitHubSearch, includeRawFile, includeProviderBatch, includeApiStatus, includeProviderDocument)} AND ${sameChatBlocker.sql}) ${activeOptionalLease})
+            SELECT 1 FROM active AS earlier
+            WHERE earlier.actor_id=inbox.actor_id AND earlier.chat_id=inbox.chat_id
+              AND ((earlier.supported AND ${sameChatBlocker}) ${activeOptionalLease})
           )
         ORDER BY inbox.receipt_id LIMIT 1
       )
-    `).bind(leaseId, botId, ...current.bindings, ...sameChatBlocker.bindings),
+    `).bind(leaseId, ...current.bindings, ...githubCurrent.bindings, botId),
     db.prepare(`
       SELECT inbox.receipt_id AS receiptId, inbox.update_id AS updateId, inbox.actor_id AS actorId,
         inbox.chat_id AS chatId, inbox.chat_type AS chatType,
