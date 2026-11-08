@@ -78,6 +78,7 @@ export async function acceptTelegramDocumentJob(
   db: D1Database,
   policy: TelegramPolicy,
   event: TelegramDocumentJobInput,
+  providerUrlOptIn = false,
 ): Promise<"accepted" | "coalesced" | "capacity" | "invalid-document" | "ignored"> {
   if (!canonicalId(policy.botId) || !canonicalId(event.actorId) || event.chatType !== "private" ||
       event.threadId !== null || !inTelegramScope(policy, event) || !validInteger(event.updateId, 1) ||
@@ -135,6 +136,11 @@ export async function acceptTelegramDocumentJob(
         SELECT incoming.receipt_id FROM telegram_inbox AS incoming JOIN telegram_document_jobs AS job USING (receipt_id)
         WHERE ${freshReceipt} AND job.state = 'done'
       `).bind(...key),
+      ...(providerUrlOptIn && (document?.suffix === "txt" || document?.suffix === "log") ? [db.prepare(`
+        INSERT INTO telegram_provider_document_opt_in (receipt_id)
+        SELECT incoming.receipt_id FROM telegram_inbox AS incoming JOIN telegram_document_jobs AS job USING (receipt_id)
+        WHERE ${freshReceipt} AND job.state='pending'
+      `).bind(...key)] : []),
       db.prepare(`
         UPDATE telegram_inbox AS incoming SET receipt_nonce = ?, command = CASE WHEN EXISTS (
           SELECT 1 FROM telegram_document_jobs AS job WHERE job.receipt_id = incoming.receipt_id
@@ -145,7 +151,8 @@ export async function acceptTelegramDocumentJob(
     ];
     const results = await db.batch<{ resultCode: "coalesced" | "capacity" | "invalid-document" | null }>(steps);
     if (results.length === steps.length && results.every(({ success }) => success)) {
-      const [, job, , receipt] = results;
+      const job = results[1];
+      const receipt = results.at(-1)!;
       if (receipt.results.length === 1 && job.results.length === 1) {
         const { resultCode } = job.results[0];
         if (resultCode === "coalesced" || resultCode === "capacity" || resultCode === "invalid-document") return resultCode;

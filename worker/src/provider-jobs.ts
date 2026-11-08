@@ -1,14 +1,15 @@
 import { checkOwnerId, digestHex, SUBSCRIPTION_LIFECYCLE_REVISION, validInteger } from "./storage.ts";
 import { normalizeSubscriptionName } from "./subscriptions.ts";
 import { isolatedTelegramRoleEpochSql } from "./telegram/authorization-sql.ts";
+import { providerDocumentOrigin } from "./telegram/provider-document-origin.ts";
 
 export const PROVIDER_JOB_TTL_SECONDS = 3600;
 const LEASE_SECONDS = 120;
 const MAX_ATTEMPTS = 3;
 const MAX_OWNER_JOBS = 4;
 const MAX_GLOBAL_JOBS = 8;
-const MAX_OWNER_SOURCES = 100;
-const TRASH_SECONDS = 2_592_000;
+export const MAX_PROVIDER_OWNER_SOURCES = 100;
+export const PROVIDER_TRASH_SECONDS = 2_592_000;
 const MAX_URL_BYTES = 8192;
 const SHA256 = /^[0-9a-f]{64}(?![\s\S])/u;
 const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}(?![\s\S])/u;
@@ -21,7 +22,9 @@ type Refresh = AdmissionKey & { id: number; expectedGeneration?: number; expecte
 export const TELEGRAM_PROVIDER_MARKER = "provider-request:v1";
 export const TELEGRAM_PROVIDER_BATCH_PREVIEW_MARKER = "provider-batch-preview:v1";
 export const TELEGRAM_PROVIDER_BATCH_CONFIRM_MARKER = "provider-batch-confirm:v1";
-export type ProviderTelegramPolicy = { readonly botId: string; readonly adminId: string; readonly memberId: string };
+export type ProviderTelegramPolicy = {
+  readonly botId: string; readonly adminId: string; readonly memberId: string; readonly includeDocuments?: true;
+};
 type JobScope = (ProviderTelegramPolicy & { readonly includeBatch?: true; readonly queue?: "batch" }) | "generic";
 // A rollback to the older Telegram consumer must never see batch rows or their leases.
 type JobTable = "subscription_provider_jobs" | "telegram_provider_jobs" | "telegram_provider_batch_jobs";
@@ -183,11 +186,11 @@ function prepareAdmissionPlan(
       WHERE NOT EXISTS (SELECT 1 FROM ${table} WHERE owner_id = ? AND request_key = ?)
         AND NOT EXISTS (SELECT 1 FROM subscriptions WHERE owner_id = ? AND source_url = ?)
         AND NOT EXISTS (SELECT 1 FROM subscription_trash WHERE owner_id = ? AND source_url = ?
-          AND deleted_at >= unixepoch() - ${TRASH_SECONDS})
+          AND deleted_at >= unixepoch() - ${PROVIDER_TRASH_SECONDS})
         AND NOT EXISTS (SELECT 1 FROM subscription_trash WHERE token = ?)
         AND NOT EXISTS (SELECT 1 FROM subscriptions WHERE owner_id = ?
           AND (lower(substr(source_url, 1, 7)) = 'http://' OR lower(substr(source_url, 1, 8)) = 'https://')
-          LIMIT 1 OFFSET ${MAX_OWNER_SOURCES - 1})
+          LIMIT 1 OFFSET ${MAX_PROVIDER_OWNER_SOURCES - 1})
         AND ${jobCapacity("?", scope)}
         ${fence ? `AND (${fence.sql})` : ""}
     `).bind(key.ownerId, create.name, create.sourceUrl, token, key.ownerId, key.requestKey,
@@ -250,7 +253,7 @@ export async function prepareProviderUrlImport(
   const refusal = {
     sql: `CASE WHEN (SELECT count(*) FROM (SELECT 1 FROM subscriptions WHERE ${target.sql} LIMIT 2)) > 1
       THEN 'conflict' WHEN NOT EXISTS (SELECT 1 FROM subscriptions WHERE ${target.sql}) AND EXISTS (
-        SELECT 1 FROM subscription_trash WHERE owner_id = ? AND source_url = ? AND deleted_at >= unixepoch() - ${TRASH_SECONDS}
+        SELECT 1 FROM subscription_trash WHERE owner_id = ? AND source_url = ? AND deleted_at >= unixepoch() - ${PROVIDER_TRASH_SECONDS}
       ) THEN 'unavailable' ELSE 'capacity' END`,
     bindings: [...target.bindings, ...target.bindings, input.ownerId, input.sourceUrl],
   };
@@ -360,13 +363,25 @@ function scopeAuthorization(scope: JobScope, alias: "job" | "active" = "job", fo
       AND ${alias}.kind='refresh' AND (${origin.sql}))`, bindings: origin.bindings };
   }
   const epoch = isolatedTelegramRoleEpochSql(scope, "inbox", forRetirement ? "recorded" : "current");
-  return { sql: `EXISTS (SELECT 1 FROM telegram_provider_requests AS origin
+  const direct = { sql: `EXISTS (SELECT 1 FROM telegram_provider_requests AS origin
     JOIN telegram_inbox AS inbox USING (receipt_id) WHERE origin.job_id = ${alias}.job_id AND origin.outcome = 'admitted'
       AND origin.kind = ${alias}.kind AND inbox.bot_id = ? AND inbox.actor_id = ${alias}.owner_id
       AND inbox.chat_id = inbox.actor_id AND inbox.chat_type = 'private' AND inbox.thread_id IS NULL
       AND inbox.command = 'help' AND inbox.receipt_nonce = '${TELEGRAM_PROVIDER_MARKER}'
       AND ${epoch.sql})`,
     bindings: [scope.botId, ...epoch.bindings] };
+  if (!scope.includeDocuments) return direct;
+  const document = providerDocumentOrigin(scope, forRetirement ? "recorded" : "current");
+  return { sql: `(${direct.sql} OR EXISTS (
+    SELECT 1 FROM telegram_provider_document_lines AS line
+    JOIN telegram_provider_documents AS origin USING (receipt_id) JOIN telegram_inbox AS inbox USING (receipt_id)
+    WHERE line.job_id=${alias}.job_id AND line.result_code IS NULL AND origin.finished_at IS NULL
+      AND line.subscription_id=${alias}.subscription_id AND line.source_sha256=${alias}.source_sha256
+      AND line.expected_generation=${alias}.expected_generation
+      AND line.expected_lifecycle_revision=${alias}.expected_lifecycle_revision
+      AND origin.actor_id=${alias}.owner_id AND ${alias}.kind='refresh'
+      ${forRetirement ? "" : "AND origin.expires_at>unixepoch()"} AND (${document.sql})
+  ))`, bindings: [...direct.bindings, ...document.bindings] };
 }
 
 function jobScope(policy?: ProviderTelegramPolicy, includeBatch = false, queue?: "batch"): JobScope {
@@ -378,6 +393,7 @@ function jobScope(policy?: ProviderTelegramPolicy, includeBatch = false, queue?:
   [botId, adminId, memberId].forEach(checkOwnerId);
   if (new Set([botId, adminId, memberId]).size !== 3) throw new Error("Invalid provider authorization policy.");
   return Object.freeze({ botId, adminId, memberId, ...(includeBatch ? { includeBatch: true as const } : {}),
+    ...(policy.includeDocuments ? { includeDocuments: true as const } : {}),
     ...(queue ? { queue } : {}) });
 }
 

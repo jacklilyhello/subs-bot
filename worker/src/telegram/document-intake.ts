@@ -2,6 +2,8 @@ import { parseSubscriptionDocument } from "../subscription-document.ts";
 import { claimTelegramDocumentJob, prepareTelegramDocumentJobLeaseGuard } from "./document-jobs.ts";
 import { finishTelegramDocumentJob, MAX_TELEGRAM_DOCUMENT_NODES, persistTelegramDocumentJob } from "./document-persistence.ts";
 import { downloadTelegramDocument } from "./document-transport.ts";
+import { stageTelegramProviderDocument } from "./provider-document.ts";
+import { parseTelegramProviderDocument } from "./provider-document-input.ts";
 import type { TelegramPolicy } from "./protocol.ts";
 
 const DOWNLOAD_BUDGET_MS = 20_000;
@@ -11,6 +13,7 @@ export async function runTelegramDocumentIntake(
   db: D1Database,
   bucket: R2Bucket,
   policy: TelegramPolicy,
+  providerDocumentsReady = false,
 ): Promise<boolean> {
   const lease = await claimTelegramDocumentJob(db, policy);
   if (!lease) return false;
@@ -29,6 +32,26 @@ export async function runTelegramDocumentIntake(
     await finishTelegramDocumentJob(db, policy, lease, download.kind === "retryable"
       ? { kind: "retry" } : { kind: "failed", reason: "download-rejected" });
     return true;
+  }
+
+  if (providerDocumentsReady && (lease.suffix === "txt" || lease.suffix === "log") &&
+      await db.prepare("SELECT 1 AS opted FROM telegram_provider_document_opt_in WHERE receipt_id=?")
+        .bind(lease.receiptId).first<number>("opted") === 1) {
+    const urls = parseTelegramProviderDocument(download.bytes, lease.suffix);
+    if (urls.kind === "invalid-url-list") {
+      await finishTelegramDocumentJob(db, policy, lease, { kind: "failed", reason: "invalid-document" });
+      return true;
+    }
+    if (urls.kind === "url-list") {
+      try {
+        if (!await stageTelegramProviderDocument(db, policy, lease, urls)) {
+          await finishTelegramDocumentJob(db, policy, lease, { kind: "failed", reason: "coalesced" });
+        }
+      } catch {
+        await finishTelegramDocumentJob(db, policy, lease, { kind: "retry" });
+      }
+      return true;
+    }
   }
 
   const syntax = lease.suffix === "json" ? "json" : lease.suffix === "yaml" || lease.suffix === "yml" ? "yaml" : "auto";

@@ -30,6 +30,16 @@ on:
         description: Exact isolation confirmation for provider URL import enable or disable
         required: false
         type: string
+      provider_url_documents:
+        description: Preserve, enable, or disable new private Telegram URL document imports
+        required: true
+        default: preserve
+        type: choice
+        options: [preserve, enable, disable]
+      provider_url_documents_confirmation:
+        description: Exact isolation confirmation for provider URL document enable or disable
+        required: false
+        type: string
       provider_refresh:
         description: Preserve, enable, or disable private Telegram provider refresh admission
         required: true
@@ -159,6 +169,8 @@ jobs:
           SUBS_BOT_INLINE_SEARCH_CONFIRMATION: ${{ inputs.inline_search_confirmation }}
           SUBS_BOT_PROVIDER_URL_IMPORT_MODE: ${{ inputs.provider_url_import }}
           SUBS_BOT_PROVIDER_URL_IMPORT_CONFIRMATION: ${{ inputs.provider_url_import_confirmation }}
+          SUBS_BOT_PROVIDER_URL_DOCUMENTS_MODE: ${{ inputs.provider_url_documents }}
+          SUBS_BOT_PROVIDER_URL_DOCUMENTS_CONFIRMATION: ${{ inputs.provider_url_documents_confirmation }}
           SUBS_BOT_PROVIDER_REFRESH_MODE: ${{ inputs.provider_refresh }}
           SUBS_BOT_PROVIDER_REFRESH_CONFIRMATION: ${{ inputs.provider_refresh_confirmation }}
           SUBS_BOT_LEGACY_SUBSCRIPTION_SHORTS_MODE: ${{ inputs.legacy_subscription_shorts }}
