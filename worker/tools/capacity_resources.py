@@ -608,6 +608,55 @@ def cleanup(directory, resources, *, profile="capacity"):
     save_ledger(directory, ledger)
 
 
+def read_retired_object(objects, key, descriptor):
+    for delay in (0, 1, 2):
+        if delay:
+            sleep(delay)
+        try:
+            body = objects.request("GET", key)
+        except R2ObjectError as error:
+            if error.outcome != "transport failure" and not re.fullmatch(r"HTTP 5[0-9]{2}", error.outcome):
+                raise
+            continue
+        if body is None or len(body) >= descriptor["bytes"]:
+            return body
+    raise CapacityError("Capacity recovery could not confirm a complete R2 response.")
+
+
+def recover_retired(directory, resources, *, retire=False):
+    ledger = load_ledger(directory, resources.scope_hash)
+    require(ledger is not None and ledger["phase"] == "cleanup", "A capacity cleanup checkpoint is required.")
+    require(all(entry["rowId"] is not None and not entry["reservePending"] and not entry["putPending"]
+                and len(entry["armed"]) == len(entry["objects"]) for entry in ledger["fixtures"]),
+            "Capacity recovery requires a fully published checkpoint.")
+    resources.verify()
+    require(all(resources.row(ledger, entry) is None for entry in ledger["fixtures"]),
+            "Capacity recovery found a D1 reference and left R2 untouched.")
+    report = {"alreadyAbsent": 0, "verifiedPresent": 0, "retiredAndVerified": 0}
+    for entry in ledger["fixtures"]:
+        for index in entry["armed"]:
+            key = object_key(entry, index)
+            descriptor = entry["objects"][index]
+            body = read_retired_object(resources.objects, key, descriptor)
+            if body is None:
+                report["alreadyAbsent"] += 1
+                continue
+            require(matches_object(body, entry, index), "Capacity recovery left a nonmatching R2 object in place.")
+            report["verifiedPresent"] += 1
+            if retire:
+                try:
+                    resources.objects.request("DELETE", key)
+                except R2ObjectError:
+                    pass  # An uncertain response can still be confirmed by exact readback.
+                require(read_retired_object(resources.objects, key, descriptor) is None,
+                        "Capacity recovery could not verify R2 object retirement.")
+                report["retiredAndVerified"] += 1
+    require(all(resources.row(ledger, entry) is None for entry in ledger["fixtures"]),
+            "Capacity recovery detected an unexpected D1 reference on final readback.")
+    return {"sourceRunId": ledger["runId"], "sourceRevision": ledger["revision"],
+            "mode": "retire" if retire else "verify", **report}
+
+
 def verify_release(revision):
     require_current_main(revision)
     _verify_health(revision)
@@ -632,10 +681,13 @@ def verify_worker_fingerprint(directory, resources, worker_api, revision, *, bef
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("seed", "cleanup", "verify-worker-before", "verify-worker-after"))
+    parser.add_argument("action", choices=("seed", "cleanup", "recover-retired", "verify-worker-before", "verify-worker-after"))
     parser.add_argument("directory", type=Path)
     parser.add_argument("--profile", choices=FIXTURE_PROFILES, default="capacity")
+    parser.add_argument("--retire", action="store_true")
     args = parser.parse_args()
+    if (args.retire and args.action != "recover-retired") or (args.action == "recover-retired" and args.profile != "capacity"):
+        parser.error("Capacity recovery options do not match the selected action.")
     try:
         target = json_body(os.environ.get("SUBS_BOT_CF_ISOLATION_TARGET_JSON", "null"))
         token = os.environ.get("SUBS_BOT_CF_BOOTSTRAP_TOKEN")
@@ -651,6 +703,8 @@ def main():
             elif args.action == "cleanup":
                 cleanup(args.directory, resources, profile=args.profile)
                 print("Isolated capacity fixture cleanup verified.")
+            elif args.action == "recover-retired":
+                print(json.dumps(recover_retired(args.directory, resources, retire=args.retire), sort_keys=True))
             else:
                 deploy_token = os.environ.get("SUBS_BOT_CF_DEPLOY_TOKEN")
                 require(deploy_token != token, "Separate scoped Worker and data credentials are required.")

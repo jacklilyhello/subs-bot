@@ -1,0 +1,82 @@
+name: Recover retired isolation capacity fixtures
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Failed capacity run ID
+        required: true
+        type: string
+      source_attempt:
+        description: Exact failed run attempt
+        required: true
+        type: string
+      source_revision:
+        description: Full commit from the failed run
+        required: true
+        type: string
+      source_archive_sha256:
+        description: Recovery artifact archive SHA-256 without prefix
+        required: true
+        type: string
+      mode:
+        description: Verify only or retire the exact verified R2 objects
+        type: choice
+        options:
+          - verify
+          - retire
+        default: verify
+      confirmation:
+        description: To retire, enter retire RUN_ID attempt ATTEMPT
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: subs-bot-isolation-deploy
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
+    environment: subs-bot-isolation
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Authenticate the exact failed capacity checkpoint
+        timeout-minutes: 3
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_ATTEMPT: ${{ inputs.source_attempt }}
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          SOURCE_ARCHIVE_SHA256: ${{ inputs.source_archive_sha256 }}
+          MODE: ${{ inputs.mode }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/branches/main" --jq .commit.sha)" = "$GITHUB_SHA"
+          case "$MODE" in
+            verify) test -z "$CONFIRMATION" ;;
+            retire) test "$CONFIRMATION" = "retire $SOURCE_RUN_ID attempt $SOURCE_ATTEMPT" ;;
+            *) exit 1 ;;
+          esac
+          python3 -B worker/tools/capacity_recovery_artifact.py "$RUNNER_TEMP/capacity-recovery" \
+            "$SOURCE_RUN_ID" "$SOURCE_ATTEMPT" "$SOURCE_REVISION" "$SOURCE_ARCHIVE_SHA256"
+      - name: Verify retired D1 references and recover only recorded R2 keys
+        timeout-minutes: 25
+        env:
+          MODE: ${{ inputs.mode }}
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
+        run: |
+          args=()
+          if [ "$MODE" = retire ]; then args+=(--retire); fi
+          python3 -B worker/tools/capacity_resources.py recover-retired \
+            "$RUNNER_TEMP/capacity-recovery" "${args[@]}"
