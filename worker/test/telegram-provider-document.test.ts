@@ -12,8 +12,11 @@ import {
 import { acceptTelegramProviderRequest } from "../src/telegram/provider-admission.ts";
 import { promoteTelegramProviderDocument, settleTelegramProviderDocuments, stageTelegramProviderDocument } from "../src/telegram/provider-document.ts";
 import { TELEGRAM_PROVIDER_DOCUMENT_MARKER } from "../src/telegram/provider-document-origin.ts";
-import { reconcileTelegramProviderDocumentReplies } from "../src/telegram/provider-document-replies.ts";
+import { reconcileTelegramProviderDocumentReplies, renderTelegramProviderDocumentReply } from "../src/telegram/provider-document-replies.ts";
 import type { TelegramPolicy } from "../src/telegram/protocol.ts";
+import {
+  acceptTelegramCommand, beginTelegramProviderDocumentReply, claimTelegramReply, reapExpiredTelegramReplies, settleTelegramReply,
+} from "../src/telegram/store.ts";
 
 const miniflare = new Miniflare({ modules: true, compatibilityDate: "2026-07-30", d1Databases: ["DB"],
   r2Buckets: ["NODES"], script: "export default { fetch() { return new Response(null); } };" });
@@ -81,6 +84,15 @@ test("only fresh opted-in private files can stage URL work", async () => {
   assert.equal(await db.prepare("SELECT count(*) AS count FROM subscriptions").first("count"), 0);
 });
 
+test("the complete reply schema still claims ordinary private commands", async () => {
+  const input = event();
+  await acceptTelegramCommand(db, policy, { ...input, command: "help" });
+  await reapExpiredTelegramReplies(db, policy.botId, true, true, true, true, true, true, false, true, false, true, true, true, true, true);
+  const lease = await claimTelegramReply(db, policy.botId, true, true, true, true, true, true, undefined, true, false,
+    policy, true, policy, policy, policy);
+  assert.equal(lease?.command, "help");
+});
+
 test("seals twenty exact owned targets in order and settles one summary after all jobs", { timeout: 60_000 }, async () => {
   const values = urls(20);
   const existing = await createSubscription(db, { ownerId: policy.memberId, sourceUrl: values[0], name: "Existing" });
@@ -131,6 +143,16 @@ test("seals twenty exact owned targets in order and settles one summary after al
   assert.equal(await reconcileTelegramProviderDocumentReplies(db, policy), 1);
   assert.equal(await reconcileTelegramProviderDocumentReplies(db, policy), 0);
   assert.deepEqual(await db.prepare("SELECT receipt_id FROM telegram_outbox").first(), { receipt_id: receipt });
+  const reply = await claimTelegramReply(db, policy.botId, true, true, true, true, true, true, policy, true, true,
+    policy, true, policy, policy, policy);
+  assert.equal(reply?.receiptId, receipt);
+  assert.ok(reply?.providerDocument);
+  const summary = await renderTelegramProviderDocumentReply(db, policy, reply);
+  assert.equal(summary?.text, "订阅链接文件已处理。\n已保存 1 条\n已合并 0 条\n失败 19 条\n超出上限 2 条");
+  assert.equal(await beginTelegramProviderDocumentReply(db, policy, reply, summary?.guard), true);
+  await settleTelegramReply(db, policy, reply, { kind: "sent", messageId: 55501 });
+  assert.equal(await reconcileTelegramProviderDocumentReplies(db, policy), 0);
+  assert.equal(await db.prepare("SELECT state FROM telegram_outbox").first("state"), "sent");
 });
 
 test("shared owner quota defers an exact line and allows a later due line to progress", { timeout: 30_000 }, async () => {

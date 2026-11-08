@@ -35,6 +35,7 @@ import {
 } from "./provider-batch-controls.ts";
 import { TELEGRAM_API_STATUS_MARKER, telegramApiStatusClock, telegramApiStatusEligible, telegramApiStatusReceipt } from "./api-status.ts";
 import { TELEGRAM_PROVIDER_DOCUMENT_MARKER } from "./provider-document-origin.ts";
+import { TELEGRAM_PROVIDER_MARKER } from "../provider-jobs.ts";
 import {
   telegramProviderDocumentReplyClock, telegramProviderDocumentReplyEligible, telegramProviderDocumentReplyMarker,
 } from "./provider-document-replies.ts";
@@ -281,30 +282,37 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
   const includeProviderBatch = batchPolicy !== undefined;
   const includeApiStatus = apiPolicy !== undefined;
   const includeProviderDocument = documentPolicy !== undefined;
-  const providerCurrent = telegramProviderReplyEligible(providerPolicy, "inbox");
-  const earlierProviderCurrent = telegramProviderReplyEligible(providerPolicy, "earlier");
-  const githubCurrent = telegramGitHubSearchEligible(gitHubSearchPolicy, "inbox");
   const earlierGithubCurrent = telegramGitHubSearchEligible(gitHubSearchPolicy, "earlier");
-  const batchCurrent = telegramProviderBatchReplyEligible(batchPolicy, "inbox");
-  const earlierBatchCurrent = telegramProviderBatchReplyEligible(batchPolicy, "earlier");
-  const apiCurrent = telegramApiStatusEligible(apiPolicy, "inbox");
-  const earlierApiCurrent = telegramApiStatusEligible(apiPolicy, "earlier");
-  const documentCurrent = telegramProviderDocumentReplyEligible(documentPolicy, "inbox");
-  const earlierDocumentCurrent = telegramProviderDocumentReplyEligible(documentPolicy, "earlier");
+  // Durable receipt markers are mutually exclusive. A flat CASE keeps optional grants within D1's expression depth.
+  const eligible = (alias: "inbox" | "earlier") => {
+    const guards = [
+      [`'${TELEGRAM_PROVIDER_MARKER}'`, telegramProviderReplyEligible(providerPolicy, alias)],
+      [`'${TELEGRAM_GITHUB_SEARCH_MARKER}'`, telegramGitHubSearchEligible(gitHubSearchPolicy, alias)],
+      [TELEGRAM_PROVIDER_BATCH_REPLY_MARKERS, telegramProviderBatchReplyEligible(batchPolicy, alias)],
+      [`'${TELEGRAM_API_STATUS_MARKER}'`, telegramApiStatusEligible(apiPolicy, alias)],
+      [`'${TELEGRAM_PROVIDER_DOCUMENT_MARKER}'`, telegramProviderDocumentReplyEligible(documentPolicy, alias)],
+    ] as const;
+    const active = guards.filter(([, guard]) => guard.sql !== "1");
+    return {
+      sql: active.length ? `(CASE ${active.map(([markers, guard]) => `WHEN ${alias}.receipt_nonce IN (${markers}) THEN ${guard.sql}`)
+        .join(" ")} ELSE 1 END)` : "1",
+      bindings: active.flatMap(([, guard]) => [...guard.bindings]),
+    };
+  };
+  const current = eligible("inbox");
+  const earlierCurrent = eligible("earlier");
   const earlierActive = "earlier.receipt_id < inbox.receipt_id AND earlier_reply.state IN ('pending', 'leased', 'sending')";
   // A provider reply or search can become ready after a newer reply has started delivery.
   const searchPair = `(inbox.receipt_nonce IS '${TELEGRAM_GITHUB_SEARCH_MARKER}' OR
     earlier.receipt_nonce IS '${TELEGRAM_GITHUB_SEARCH_MARKER}')`;
   const delayedBlocker = { sql: `(
     (earlier_reply.state = 'sending' AND earlier_reply.lease_until > unixepoch())
-    OR ((${earlierProviderCurrent.sql}) AND (${earlierGithubCurrent.sql}) AND (${earlierBatchCurrent.sql}) AND (${earlierApiCurrent.sql})
-      ${includeProviderDocument ? `AND (${earlierDocumentCurrent.sql})` : ""}
+    OR ((${earlierCurrent.sql})
       AND ${replyClock(includeProvider, "earlier", includeProviderBatch, includeApiStatus, includeProviderDocument)} + ${MAX_REPLY_AGE_SECONDS} > unixepoch() AND (
         (earlier_reply.state = 'leased' AND earlier_reply.lease_until > unixepoch())
         OR (earlier.receipt_id < inbox.receipt_id AND earlier_reply.state = 'pending' AND earlier_reply.attempts < ${MAX_ATTEMPTS})
       ))
-  )`, bindings: [...earlierProviderCurrent.bindings, ...earlierGithubCurrent.bindings, ...earlierBatchCurrent.bindings,
-    ...earlierApiCurrent.bindings, ...earlierDocumentCurrent.bindings] };
+  )`, bindings: earlierCurrent.bindings };
   const ordinaryBlocker = { sql: includeGitHubSearch ? `(
     (NOT ${searchPair} AND ${earlierActive}) OR (${searchPair} AND (
       (earlier_reply.state IN ('leased', 'sending') AND earlier_reply.lease_until > unixepoch())
@@ -346,8 +354,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
         WHERE inbox.bot_id = ? AND ${supportedReceipt("inbox", includeAggregate, includePrivateShareCreation, includeSubscriptionRead,
           includeShortLinks, includeInlineSort, includeSubscriptionNodes, includeProvider, includeBulkTrash, includeInlineConsent,
           includeGitHubSearch, includeRawFile, includeProviderBatch, includeApiStatus, includeProviderDocument)}
-          AND ${providerCurrent.sql} AND ${githubCurrent.sql} AND ${batchCurrent.sql} AND ${apiCurrent.sql}
-          ${includeProviderDocument ? `AND ${documentCurrent.sql}` : ""}
+          AND ${current.sql}
           AND reply.state = 'pending'
           AND reply.due_at <= unixepoch() AND reply.attempts < ${MAX_ATTEMPTS}
           AND ${replyClock(includeProvider, "inbox", includeProviderBatch, includeApiStatus, includeProviderDocument)} + ${MAX_REPLY_AGE_SECONDS} > unixepoch()
@@ -361,8 +368,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
           )
         ORDER BY inbox.receipt_id LIMIT 1
       )
-    `).bind(leaseId, botId, ...providerCurrent.bindings, ...githubCurrent.bindings, ...batchCurrent.bindings, ...apiCurrent.bindings,
-      ...documentCurrent.bindings, ...sameChatBlocker.bindings),
+    `).bind(leaseId, botId, ...current.bindings, ...sameChatBlocker.bindings),
     db.prepare(`
       SELECT inbox.receipt_id AS receiptId, inbox.update_id AS updateId, inbox.actor_id AS actorId,
         inbox.chat_id AS chatId, inbox.chat_type AS chatType,
