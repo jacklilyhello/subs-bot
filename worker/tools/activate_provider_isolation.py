@@ -40,6 +40,7 @@ BINDING_PROOF_FILE = "provider-binding-proof.json"
 MAX_BINDING_PROOF = 4096
 BINDING_PROOF_ERROR = "The private provider binding proof does not match the verified run and release."
 BUILD_FIELDS = {"revision", "runId", "runAttempt", "artifactId", "archiveSha256", *publication.MANIFEST_FIELDS}
+API_STATUS_BUILD_FIELDS = BUILD_FIELDS | {*publication.API_STATUS_FIELDS, "registryRepositorySha256", "registryImageReferenceSha256"}
 PROOF_DIGESTS = {"workerIdentitySha256", "versionSha256", "activationIdentitySha256",
                  "containerIdentitySha256", "workflowIdentitySha256", "actorSha256", "healthSha256"}
 PROOF_FIELDS = {"status", "publicDenied", "stopped", "healthBytes", "approvedDnsFamilies",
@@ -106,12 +107,16 @@ def _provider_revision(main_revision, run_id, operation, isolated_revision):
     return HISTORICAL_PROVIDER_REVISION
 
 
-def parse_binding_proof(raw, *, revision, run_id, run_attempt):
+def parse_binding_proof(raw, *, revision, run_id, run_attempt, profile=provider.FETCH_PROFILE):
     """Verify canonical proof bytes against separately authenticated GitHub run metadata."""
+    _require(profile in provider.PROFILE_SERVICES, BINDING_PROOF_ERROR)
+    status_profile = profile == provider.API_STATUS_PROFILE
+    build_fields = API_STATUS_BUILD_FIELDS if status_profile else BUILD_FIELDS
+    proof_fields = PROOF_FIELDS | {"apiStatus"} if status_profile else PROOF_FIELDS
     _require(isinstance(raw, bytes) and 0 < len(raw) <= MAX_BINDING_PROOF, BINDING_PROOF_ERROR)
     proof = github._parse_object(raw, BINDING_PROOF_ERROR)
     _require(set(proof) == {"version", "accountSha256", "providerBuild", "activation", "verification"}
-             and type(proof["version"]) is int and proof["version"] in (1, 2)
+             and type(proof["version"]) is int and proof["version"] in ((3,) if status_profile else (1, 2))
              and proof["accountSha256"] == publication.TARGET_ACCOUNT_SHA256, BINDING_PROOF_ERROR)
     build, activation, verification = proof["providerBuild"], proof["activation"], proof["verification"]
     historical = proof["version"] == 2
@@ -119,11 +124,14 @@ def parse_binding_proof(raw, *, revision, run_id, run_attempt):
     activation_fields = {"runId", "runAttempt", "isolatedRevision"}
     if historical:
         activation_fields.add("revision")
-    _require(isinstance(build, dict) and set(build) == BUILD_FIELDS
+    _require(isinstance(build, dict) and set(build) == build_fields
              and _match(provider.REVISION, revision) and build["revision"] == expected_build
              and (not historical or (revision != expected_build and build["runId"] == HISTORICAL_PROVIDER_CI_RUN))
              and all(_match(provider.DECIMAL, build[key]) for key in ("runId", "runAttempt", "artifactId"))
-             and all(_match(provider.HEX, build[key]) for key in BUILD_FIELDS if key.endswith("Sha256")), BINDING_PROOF_ERROR)
+             and all(_match(provider.HEX, build[key]) for key in build_fields if key.endswith("Sha256")), BINDING_PROOF_ERROR)
+    if status_profile:
+        _require((build["profile"], build["service"], build["rpcEntrypoint"])
+                 == (profile, provider.API_STATUS_SERVICE, provider.API_STATUS_ENTRYPOINT), BINDING_PROOF_ERROR)
     try:
         compatibility = date.fromisoformat(build["compatibilityDate"]).isoformat()
     except (ValueError, TypeError):
@@ -135,19 +143,21 @@ def parse_binding_proof(raw, *, revision, run_id, run_attempt):
              and _match(provider.REVISION, activation["isolatedRevision"])
              and (not historical or (activation["revision"] == revision and activation["isolatedRevision"] == expected_build)),
              BINDING_PROOF_ERROR)
-    _require(isinstance(verification, dict) and set(verification) == PROOF_FIELDS
+    _require(isinstance(verification, dict) and set(verification) == proof_fields
              and verification["status"] == "complete" and verification["publicDenied"] is True
              and verification["stopped"] is True and all(_match(provider.HEX, verification[key]) for key in PROOF_DIGESTS)
              and type(verification["healthBytes"]) is int and 0 < verification["healthBytes"] <= 4096
              and type(verification["blockedPrivateTargets"]) is int and verification["blockedPrivateTargets"] == 3,
              BINDING_PROOF_ERROR)
+    if status_profile:
+        _require(type(verification["apiStatus"]) is int and verification["apiStatus"] == 404, BINDING_PROOF_ERROR)
     families = verification["approvedDnsFamilies"]
     _require(isinstance(families, list) and families in ([4], [6], [4, 6])
              and all(type(family) is int for family in families) and raw == _proof_bytes(proof), BINDING_PROOF_ERROR)
     return proof
 
 
-def _binding_proof_context():
+def _binding_proof_context(*, workflow_path=WORKFLOW_PATH):
     revision = os.environ.get("GITHUB_SHA", "")
     run_id = os.environ.get("GITHUB_RUN_ID", "")
     run_attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
@@ -157,7 +167,7 @@ def _binding_proof_context():
              and os.environ.get("GITHUB_REF") == github.MAIN_REF
              and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
              and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"
-             and os.environ.get("GITHUB_WORKFLOW_REF") == f"{github.REPOSITORY}/{WORKFLOW_PATH}@{github.MAIN_REF}"
+             and os.environ.get("GITHUB_WORKFLOW_REF") == f"{github.REPOSITORY}/{workflow_path}@{github.MAIN_REF}"
              and os.environ.get("GITHUB_WORKFLOW_SHA") == revision and _match(provider.REVISION, revision)
              and _match(provider.DECIMAL, run_id) and _match(provider.DECIMAL, run_attempt), BINDING_PROOF_ERROR)
     return revision, run_id, run_attempt
@@ -181,12 +191,16 @@ def _write_binding_proof(result, revision, run_id, run_attempt):
         "verification": {key: result[key] for key in PROOF_FIELDS},
     })
     parse_binding_proof(raw, revision=revision, run_id=run_id, run_attempt=run_attempt)
+    _write_proof_artifact(raw, BINDING_PROOF_FILE)
+
+
+def _write_proof_artifact(raw, filename):
     directory = Path(os.environ.get("RUNNER_TEMP", ""))
     output = Path(os.environ.get("GITHUB_OUTPUT", ""))
-    _require(directory.is_absolute() and output.is_absolute() and output.name != BINDING_PROOF_FILE
+    _require(directory.is_absolute() and output.is_absolute() and output.name != filename
              and output.parent.resolve().is_relative_to(directory.resolve()), BINDING_PROOF_ERROR)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-    with os.fdopen(os.open(directory / BINDING_PROOF_FILE, flags, 0o600), "wb") as file:
+    with os.fdopen(os.open(directory / filename, flags, 0o600), "wb") as file:
         file.write(raw)
     flags = os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK
     with os.fdopen(os.open(output, flags), "ab") as file:
@@ -247,10 +261,10 @@ def _actor_page(envelope):
     return rows, direct or nested
 
 
-def _private_profile(worker, identity, active, caller=None):
-    _require(bootstrap._identity(worker) == identity)
+def _private_profile(worker, identity, active, caller=None, *, profile=provider.FETCH_PROFILE):
+    _require(bootstrap._identity(worker, profile=profile) == identity)
     subdomain = worker.get("subdomain")
-    _require(worker.get("tags") == [bootstrap.OWNERSHIP_TAG] and isinstance(subdomain, dict)
+    _require(worker.get("tags") == bootstrap._settings(profile)["tags"] and isinstance(subdomain, dict)
              and subdomain.get("enabled") is False and subdomain.get("previews_enabled") is False)
     if active:
         bootstrap._timestamp(worker.get("deployed_on"))
@@ -268,12 +282,12 @@ def _private_profile(worker, identity, active, caller=None):
         bootstrap._logging_off(preview, preview=True)
 
 
-def _references(worker, identity, namespace):
+def _references(worker, identity, namespace, *, service=provider.SERVICE):
     rows = worker["references"].get("durable_objects")
     _require(rows == [] or (namespace is not None and isinstance(rows, list) and len(rows) == 1
              and isinstance(rows[0], dict) and rows[0].get("namespace_id") == namespace
              and rows[0].get("worker_id") == identity.worker_id
-             and rows[0].get("worker_name") == provider.SERVICE))
+             and rows[0].get("worker_name") == service))
 
 
 def _write_diagnostic(phase, status=None, envelope=None):
@@ -292,7 +306,12 @@ def _write_diagnostic(phase, status=None, envelope=None):
 class ProviderAPI:
     """Fixed project operations with at most one attempted mutation per process."""
 
-    def __init__(self, account, worker_token, container_token, identity, *, worker_reads_only=False):
+    def __init__(self, account, worker_token, container_token, identity, *, worker_reads_only=False,
+                 profile=provider.FETCH_PROFILE):
+        _require(profile in provider.PROFILE_SERVICES)
+        self.profile = profile
+        self.service = provider.PROFILE_SERVICES[profile]
+        self.workflow_name = self.service + "-smoke"
         self.worker = bootstrap.WorkerAPI(account, worker_token)
         if worker_reads_only:
             _require(container_token == "")
@@ -303,9 +322,9 @@ class ProviderAPI:
         self.account = account
         self.identity = identity
         self.base = f"{publication.API_ORIGIN}/accounts/{account}"
-        self.worker_path = f"/workers/scripts/{provider.SERVICE}"
+        self.worker_path = f"/workers/scripts/{self.service}"
         self.beta_path = f"/workers/workers/{identity.worker_id}/versions"
-        self.workflow_path = f"/workflows/{stage.WORKFLOW}"
+        self.workflow_path = f"/workflows/{self.workflow_name}"
         self._worker_token = worker_token
         self._container_token = container_token
         self._opener = build_opener(ProxyHandler({}), github._NoRedirect())
@@ -353,6 +372,11 @@ class ProviderAPI:
     def _write(self, path, body, *, container=False, method="POST"):
         return self._request(path, container=container, method=method, body=body)["result"]
 
+    def by_name(self):
+        if self.profile == provider.FETCH_PROFILE:
+            return self.worker.by_name()
+        return self._request(f"/workers/workers/{self.service}")["result"]
+
     def deploy(self, release):
         return self._write(self.worker_path + "/deployments", {
             "strategy": "percentage", "versions": [{"version_id": release["versionId"], "percentage": 100}],
@@ -361,14 +385,14 @@ class ProviderAPI:
 
     def create_container(self, namespace):
         return self._write("/containers/applications", {
-            "name": provider.SERVICE, "scheduling_policy": "durable_object",
+            "name": self.service, "scheduling_policy": "durable_object",
             "durable_objects": {"namespace_id": _id(namespace)},
             "configuration": {"authorized_keys": [], "wrangler_ssh": {"enabled": False}},
             "observability": {"logs": {"enabled": False}},
         }, container=True)
 
     def create_workflow(self):
-        return self._write(self.workflow_path, {"script_name": provider.SERVICE, "class_name": "ProviderSmoke",
+        return self._write(self.workflow_path, {"script_name": self.service, "class_name": "ProviderSmoke",
                            "schedules": [], "concurrency": {"limit": 1}}, method="PUT")
 
     def trigger(self, release, isolated_revision):
@@ -402,20 +426,26 @@ class ProviderAPI:
         rows = _page(envelope, envelope["result"], 1)
         _require(len(rows) == 1 and isinstance(rows[0], dict) and rows[0].get("id") == release["versionId"])
         legacy = self._request(self.worker_path + "/versions/" + release["versionId"])["result"]
-        image = f"{publication.HOST}/{self.account}/{provider.SERVICE}@sha256:{release['ociManifestSha256']}"
+        image = f"{publication.HOST}/{self.account}/{self.service}@sha256:{release['ociManifestSha256']}"
+        if self.profile == provider.API_STATUS_PROFILE:
+            _, pinned_image, pin = publication.api_status_registry_pin(self.account, release["ociManifestSha256"])
+            _require(image == pinned_image and all(release.get(key) == value for key, value in pin.items()))
         metadata = stage._metadata(release, image)
-        stage._verify_legacy_version(legacy, release["versionId"], metadata)
+        stage._verify_legacy_version(legacy, release["versionId"], metadata, service=self.service)
         namespace = None
-        if active:
+        if active or self.profile == provider.API_STATUS_PROFILE:
             envelope = self._request("/workers/durable_objects/namespaces?page=1&per_page=1000")
             namespaces = _page(envelope, envelope["result"], 1000)
-            found = [row for row in namespaces if isinstance(row, dict) and row.get("script") == provider.SERVICE]
-            _require(len(found) == 1 and found[0].get("class") == "ProviderContainer" and found[0].get("use_sqlite") is True
-                     and found[0].get("preview") is None and found[0].get("dispatch_namespace") is None)
-            namespace = _id(found[0].get("id"))
+            found = [row for row in namespaces if isinstance(row, dict) and row.get("script") == self.service]
+            if active:
+                _require(len(found) == 1 and found[0].get("class") == "ProviderContainer" and found[0].get("use_sqlite") is True
+                         and found[0].get("preview") is None and found[0].get("dispatch_namespace") is None)
+                namespace = _id(found[0].get("id"))
+            else:
+                _require(found == [])
         beta = self._request(self.beta_path + "/" + release["versionId"] + "?include=modules",
                              limit=stage.MAX_VERSION_RESPONSE)["result"]
-        stage._verify_version(beta, release["versionId"], metadata, release["workerSha256"])
+        stage._verify_version(beta, release["versionId"], metadata, release["workerSha256"], service=self.service)
         return namespace
 
     def container(self, namespace):
@@ -424,7 +454,7 @@ class ProviderAPI:
         envelope = self._request("/containers/applications?per_page=500", container=True)
         inventory = _page(envelope, envelope["result"], 500, cursor=True)
         _require(all(isinstance(row, dict) for row in inventory))
-        rows = [row for row in inventory if row.get("name") == provider.SERVICE
+        rows = [row for row in inventory if row.get("name") == self.service
                 or (namespace is not None and row.get("id") == namespace)]
         if not rows:
             return None
@@ -432,7 +462,7 @@ class ProviderAPI:
         detail = self._request("/containers/applications/" + namespace, container=True)
         value = detail["result"]
         _require(isinstance(value, dict) and value.get("id") == namespace and value.get("account_id") == self.account
-                 and value.get("name") == provider.SERVICE and value.get("scheduling_policy") == "durable_object"
+                 and value.get("name") == self.service and value.get("scheduling_policy") == "durable_object"
                  and value.get("durable_objects") == {"namespace_id": namespace}
                  and value.get("observability") == {"logs": {"enabled": False}}
                  and value["observability"]["logs"]["enabled"] is False)
@@ -450,8 +480,8 @@ class ProviderAPI:
         if envelope is None:
             return None
         value = envelope["result"]
-        _require(isinstance(value, dict) and value.get("name") == stage.WORKFLOW
-                 and value.get("script_name") == provider.SERVICE and value.get("class_name") == "ProviderSmoke"
+        _require(isinstance(value, dict) and value.get("name") == self.workflow_name
+                 and value.get("script_name") == self.service and value.get("class_name") == "ProviderSmoke"
                  and (value.get("script_deleted") is None or value.get("script_deleted") is False)
                  and value.get("schedules", []) == [])
         pin = {"workflowId": _uuid(value.get("id")), "createdOn": value.get("created_on")}
@@ -506,7 +536,7 @@ class ProviderAPI:
                  and actors[0].get("id") == actor and actors[0].get("hasStoredData") is True)
         instance = self._request(f"/containers/applications/{namespace}/instances/{actor}", container=True)["result"]
         _require(isinstance(instance, dict) and instance.get("id") == actor and instance.get("application_id") == namespace)
-        expected_image = f"{publication.HOST}/{self.account}/{provider.SERVICE}@sha256:{manifest}"
+        expected_image = f"{publication.HOST}/{self.account}/{self.service}@sha256:{manifest}"
         started = bootstrap._timestamp(start)
         for observed in (rows[0], instance):
             status = observed.get("status")
@@ -533,14 +563,15 @@ def _public(url, expected_revision=None):
 
 
 def _observe(api, release):
+    _require(release.get("profile", provider.FETCH_PROFILE) == api.profile)
     deployment = api.deployment(release)
     active = deployment is not None
-    by_name, by_id = api.worker.by_name(), api.worker.by_id(api.identity)
+    by_name, by_id = api.by_name(), api.worker.by_id(api.identity)
     for worker in (by_name, by_id):
-        _private_profile(worker, api.identity, active)
+        _private_profile(worker, api.identity, active, profile=api.profile)
     namespace = api.version(release, active)
     for worker in (by_name, by_id):
-        _references(worker, api.identity, namespace)
+        _references(worker, api.identity, namespace, service=api.service)
     state = {"activation": None, "container": api.container(namespace), "workflow": api.workflow(), "instance": None}
     if active:
         state["activation"] = {"deploymentId": deployment["id"], "namespaceId": namespace}
@@ -549,7 +580,8 @@ def _observe(api, release):
             state["instance"] = api.smoke_instance(release, state["workflow"])
     else:
         _require(state["container"] is None and state["workflow"] is None)
-    _public(PROVIDER_URL)
+    url = PROVIDER_URL if api.profile == provider.FETCH_PROFILE else f"https://{api.service}.lilyya.workers.dev/health"
+    _public(url)
     return state
 
 
@@ -573,12 +605,13 @@ def _smoke_result(instance, release, workflow, isolated_revision, health):
     if isinstance(output, str):
         _require(len(output) <= 2048)
         output = github._parse_object(output, ERROR)
+    expected_status = {"apiStatus": 404} if release.get("profile") == provider.API_STATUS_PROFILE else {}
     _require(isinstance(output, dict) and output.get("ok") is True and output.get("stopped") is True
-             and all(type(output.get(key)) is int for key in ("edgeStatus", "bodyBytes", "blockedPrivateTargets"))
+             and all(type(output.get(key)) is int for key in ("edgeStatus", "bodyBytes", "blockedPrivateTargets", *expected_status))
              and output == {"ok": True, "revision": release["revision"], "isolatedRevision": isolated_revision,
                        "imageSha256": release["ociManifestSha256"], "edgeStatus": 200,
                        "approvedDnsFamilies": output.get("approvedDnsFamilies"), "bodyBytes": health["bytes"],
-                       "bodySha256": health["sha256"], "blockedPrivateTargets": 3, "stopped": True}
+                       "bodySha256": health["sha256"], "blockedPrivateTargets": 3, "stopped": True, **expected_status}
              and output["approvedDnsFamilies"] in ([4], [6], [4, 6])
              and all(type(family) is int for family in output["approvedDnsFamilies"]))
     return output
@@ -678,6 +711,8 @@ def _run(api, operation, release, pins, isolated_revision, guard):
             result["healthBytes"] = health["bytes"]
             result["approvedDnsFamilies"] = proof["approvedDnsFamilies"]
             result["blockedPrivateTargets"] = 3
+            if release.get("profile") == provider.API_STATUS_PROFILE:
+                result["apiStatus"] = proof["apiStatus"]
     # Detect a replacement after any long smoke poll or independent shutdown readback.
     _require(_observe(api, release) == state, "The provider state changed during verification.")
     guard()

@@ -13,6 +13,7 @@ from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import activate_provider_isolation as activation
+import activate_provider_api_status as api_status
 
 
 ACCOUNT = "a" * 32
@@ -47,6 +48,12 @@ NO_PINS = {"activation": None, "container": None, "workflow": None}
 HEALTH = b'{"ok":true,"service":"subs-bot","revision":"' + ISOLATED.encode() + b'"}'
 HEALTH_PROOF = {"status": 200, "bytes": len(HEALTH), "sha256": sha256(HEALTH).hexdigest()}
 IMAGE = f"registry.cloudflare.com/{ACCOUNT}/{activation.provider.SERVICE}@sha256:{RELEASE['ociManifestSha256']}"
+V2 = activation.provider.API_STATUS_PROFILE
+V2_SERVICE = activation.provider.API_STATUS_SERVICE
+_, V2_IMAGE, V2_IMAGE_PIN = activation.publication.api_status_registry_pin(ACCOUNT, RELEASE["ociManifestSha256"])
+V2_EVIDENCE = {**EVIDENCE, **V2_IMAGE_PIN, "profile": V2, "service": V2_SERVICE,
+               "rpcEntrypoint": activation.provider.API_STATUS_ENTRYPOINT}
+V2_RELEASE = {**V2_EVIDENCE, "versionId": VERSION}
 
 
 def envelope(result, **extra):
@@ -572,6 +579,60 @@ class ProofTests(unittest.TestCase):
             guard.assert_called_once_with(EVIDENCE)
 
 
+class ApiStatusActivationTests(unittest.TestCase):
+    def test_v2_uses_fixed_worker_workflow_container_and_image_scope(self):
+        with patch.object(activation.bootstrap, "TARGET_ACCOUNT_SHA256", sha256(ACCOUNT.encode()).hexdigest()):
+            api = activation.ProviderAPI(ACCOUNT, "synthetic-worker", "synthetic-container", IDENTITY, profile=V2)
+        shell = {**worker(), **activation.bootstrap._settings(V2)}
+        with patch.object(api, "_request", return_value=envelope(shell)) as request:
+            activation._private_profile(api.by_name(), IDENTITY, False, profile=V2)
+            request.assert_called_once_with(f"/workers/workers/{V2_SERVICE}")
+        with self.assertRaises(activation.bootstrap.BootstrapError):
+            activation._private_profile(worker(), IDENTITY, False, profile=V2)
+        with patch.object(api, "_write") as write:
+            api.create_container(NAMESPACE)
+            self.assertEqual(write.call_args.args[1]["name"], V2_SERVICE)
+            self.assertEqual(write.call_args.args[1]["durable_objects"], {"namespace_id": NAMESPACE})
+            api.create_workflow()
+            self.assertEqual(write.call_args.args[0], f"/workflows/{V2_SERVICE}-smoke")
+            self.assertEqual(write.call_args.args[1]["script_name"], V2_SERVICE)
+        metadata = activation.stage._metadata(V2_RELEASE, V2_IMAGE)
+        beta = {**version(), **{key: metadata[key] for key in ("exports", "bindings", "annotations")}}
+        legacy = {"id": VERSION, "resources": {"script_runtime": {"containers": metadata["containers"],
+                   "compatibility_date": metadata["compatibility_date"]}}}
+        v2_namespace = {"id": NAMESPACE, "script": V2_SERVICE, "class": "ProviderContainer", "use_sqlite": True}
+        v1_namespace = {**v2_namespace, "id": "c" * 32, "script": activation.provider.SERVICE}
+        for active, namespaces, expected in ((False, [v1_namespace], None), (True, [v1_namespace, v2_namespace], NAMESPACE)):
+            with patch.object(api, "_request", side_effect=[envelope([{"id": VERSION}]), envelope(legacy), envelope(namespaces), envelope(beta)]):
+                self.assertEqual(api.version(V2_RELEASE, active), expected)
+        for release, returned, active in (({**V2_RELEASE, "registryImageReferenceSha256": "f" * 64}, legacy, False),
+                                          (V2_RELEASE, legacy_version(), True), (V2_RELEASE, legacy, False)):
+            with patch.object(api, "_request", side_effect=[envelope([{"id": VERSION}]), envelope(returned), envelope([v2_namespace])]):
+                with self.assertRaises((activation.ActivationError, activation.stage.StageError)):
+                    api.version(release, active)
+
+    def test_v2_workflow_output_requires_exact_404_in_addition_to_egress(self):
+        instance = smoke()
+        with self.assertRaises(activation.ActivationError):
+            activation._smoke_result(instance, V2_RELEASE, WORKFLOW_PIN, ISOLATED, HEALTH_PROOF)
+        instance["output"] = {**json.loads(instance["output"]), "apiStatus": 404}
+        self.assertEqual(activation._smoke_result(instance, V2_RELEASE, WORKFLOW_PIN, ISOLATED, HEALTH_PROOF)["apiStatus"], 404)
+        with self.assertRaises(activation.ActivationError):
+            activation._smoke_result(instance, RELEASE, WORKFLOW_PIN, ISOLATED, HEALTH_PROOF)
+
+    def test_v2_mutation_confirmation_and_credentials_precede_artifact_access(self):
+        env = {"SUBS_BOT_PROVIDER_CI_RUN_ID": "10", "RUNNER_TEMP": "/tmp", api_status.OPERATION_ENV: "activate",
+               api_status.CONFIRMATION_ENV: f"activate {V2_SERVICE}", api_status.version.IDENTITY_ENV:
+               json.dumps({"workerId": IDENTITY.worker_id, "workerCreatedOn": CREATED}),
+               api_status.version.WORKER_TOKEN_ENV: "synthetic-worker", api_status.CONTAINER_TOKEN_ENV: "synthetic-container"}
+        for attempt, change in (("2", {}), ("1", {api_status.CONFIRMATION_ENV: "activate"}),
+                                ("1", {api_status.CONTAINER_TOKEN_ENV: "synthetic-worker"})):
+            with patch.dict(os.environ, env | change, clear=True), patch.object(activation.publication, "_verified_input") as artifact:
+                with self.assertRaises(activation.ActivationError):
+                    api_status.activate(REVISION, attempt)
+                artifact.assert_not_called()
+
+
 class BindingProofTests(unittest.TestCase):
     def setUp(self):
         directory = TemporaryDirectory()
@@ -601,6 +662,24 @@ class BindingProofTests(unittest.TestCase):
 
     def verify(self, raw, **overrides):
         return activation.parse_binding_proof(raw, **{"revision": REVISION, "run_id": "100", "run_attempt": "2", **overrides})
+
+    def test_api_status_proof_is_separate_and_requires_exact_named_rpc_status(self):
+        env = {**self.env, "GITHUB_WORKFLOW_REF": f"{activation.github.REPOSITORY}/{api_status.WORKFLOW}@{activation.github.MAIN_REF}",
+               api_status.ISOLATED_REVISION_ENV: ISOLATED}
+        with patch.dict(os.environ, env, clear=True), patch.object(
+                api_status, "activate", return_value={**V2_EVIDENCE, **self.verification, "apiStatus": 404}), patch("builtins.print"):
+            api_status.main()
+        raw = self.proof_file.with_name(api_status.PROOF_FILE).read_bytes()
+        self.assertFalse(self.proof_file.exists())
+        parsed = self.verify(raw, profile=V2)
+        self.assertEqual(parsed["version"], 3)
+        self.assertEqual(parsed["providerBuild"], V2_EVIDENCE)
+        self.assertEqual(parsed["verification"]["apiStatus"], 404)
+        with self.assertRaises(activation.ActivationError):
+            self.verify(raw)
+        for status in (403, "404", True, None):
+            with self.subTest(status=status), self.assertRaises(activation.ActivationError):
+                self.verify(activation._proof_bytes({**parsed, "verification": {**parsed["verification"], "apiStatus": status}}), profile=V2)
 
     def test_completed_verification_writes_only_the_canonical_redacted_proof_and_signal(self):
         with patch.dict(os.environ, self.env, clear=True), patch.object(
