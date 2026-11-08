@@ -15,7 +15,7 @@ STAGES = {
     "provider-reap": "UPDATE telegram_outbox ",
     "provider-work-claim-batch": "UPDATE telegram_provider_batch_jobs ",
     "provider-work-claim-single": "UPDATE telegram_provider_jobs ",
-    "provider-work-reap-batch": "WITH terminal AS (",
+    "provider-work-reap-batch": "WITH terminal AS MATERIALIZED (",
 }
 
 
