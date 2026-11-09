@@ -44,7 +44,8 @@ type LegacySelectedRetirement = "absent" | "unregistered" | "ready";
 const RETIREMENT_MIGRATION = "0038_legacy_selected_aggregates.sql";
 const RETIREMENT_SHA256 = "29ddd93dc46120614c4837268ac2c0a0c5b4c48af9d7e4fe4de1e5e24451b74f";
 const RETIREMENT_TABLES = "name IN ('legacy_selected_aggregates','legacy_selected_members')";
-const RETIREMENT_PIN = `SELECT 1 FROM subs_bot_schema_migrations WHERE position=38 AND name=? AND sha256=? AND mode='applied'`;
+export const LEGACY_SELECTED_RETIREMENT_PIN = `EXISTS (SELECT 1 FROM subs_bot_schema_migrations WHERE position=38
+  AND name='${RETIREMENT_MIGRATION}' AND sha256='${RETIREMENT_SHA256}' AND mode='applied')`;
 const MUTATION_ERROR = "Subscription lifecycle operation could not be confirmed.";
 
 const MAX_PAGE_SIZE = 50;
@@ -169,12 +170,12 @@ function retirementFence(readiness: LegacySelectedRetirement, id: number, ownerI
   if (readiness === "unregistered") return {
     sql: "EXISTS (SELECT 1 FROM legacy_selected_members) OR EXISTS (SELECT 1 FROM legacy_selected_aggregates)", bindings: [],
   };
-  return { sql: `NOT EXISTS (${RETIREMENT_PIN}) OR EXISTS (
+  return { sql: `NOT ${LEGACY_SELECTED_RETIREMENT_PIN} OR EXISTS (
     SELECT 1 FROM subscription_trash AS trash
     JOIN subscription_lifecycle AS lifecycle ON lifecycle.subscription_id=trash.id AND lifecycle.revision=trash.lifecycle_revision
     JOIN legacy_selected_members AS watched ON watched.id=trash.id AND watched.retired=0
     WHERE trash.id=? AND trash.owner_id=? AND trash.lifecycle_revision=?)`,
-  bindings: [RETIREMENT_MIGRATION, RETIREMENT_SHA256, id, ownerId, nextRevision] };
+  bindings: [id, ownerId, nextRevision] };
 }
 
 export function normalizeSubscriptionName(name: string): string {

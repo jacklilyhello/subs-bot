@@ -448,6 +448,12 @@ PY
 
 首次发布时两个表保持为空。后续候选导入需从同一封存库核对每个编号及归属，将已失效的历史编号预先标记，并单独验收公开导出行为。加载这些记录前，部署和回滚流程都必须限制到能维护成员标记的 Worker 版本。切回更早的版本会漏记回收事务，即使当时关闭旧聚合读取，也会影响之后再次启用时的结果。
 
+### 旧所选聚合的 HTTP 读取
+
+对通过 `0038` 账本和标记确认的 12 字符旧所选码，Worker 按保存的顺序读取成员，保留重复项并跳过已标记失效的编号。未标记失效的成员必须仍属于原归属。零代快照需要通过 `0026` 的令牌摘要和空快照标记核验。缺少标记或快照损坏时返回错误，避免把异常当成有效的空订阅。
+
+有效的空结果沿用旧格式内容。通过成员核验的旧所选链接在未知格式下回退到 Clash。`HEAD` 只返回响应头。Worker 由运行时从响应体推导 `Content-Length`，旧服务对非空响应提供的 `HEAD` 长度字段单独记录。`/s` 保留相对跳转和私有缓存策略。普通链接沿用原有行为。实际旧库的成员与归属核对、格式对照及候选导入需分别完成。 [Workers Response](https://developers.cloudflare.com/workers/runtime-apis/response/#set-the-content-length-header)
+
 ### 旧外部短链离线比较
 
 托管 CI 使用合成 SQLite 和本次构建的 Worker，比较旧版 `aiohttp.web.HTTPFound` 与 Worker `/s/` 的 `Location` 字节。比较阶段在仅开放回环接口的网络命名空间中运行，关闭核心转储。Worker 通过内存中的单行短链记录走实际 `GET` 和 `HEAD` 路径，响应只返回固定判定。外部地址原文从封存 SQLite 经匿名管道传入内存，封存报告只保存短码摘要和判定。主机后的斜线或转义差异也会单独记录。 [aiohttp 重定向](https://docs.aiohttp.org/en/stable/_modules/aiohttp/web_exceptions.html) · [Miniflare 模块测试](https://developers.cloudflare.com/workers/testing/miniflare/writing-tests/)
