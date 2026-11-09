@@ -532,6 +532,14 @@ Telegram 的清空操作在同一次 D1 事务中确认授权、清空界限、�
 
 隔离部署在两个表有数据时要求当前版本和候选版本具备读取和清空能力，并核对两个表结构及 `0039` 记录。该约束也适用于回滚。空表允许恢复至上一版 Worker。安装行在用户清空后仍保留启用界限。运行时发布只建立结构，候选导入和启用使用后续受保护流程。
 
+#### 合成临时节点原生恢复演练
+
+从固定的合成 SQLite 和原归属生成封存盘点，保留两个所有者共 503 条记录，覆盖 500 条单批边界和跨批次重复项。候选包将原名称、URI、顺序和摘要写入三批旧数据，并将安装状态保持为休眠。包只包含清单、清单摘要和 D1 导入 SQL。每条 SQL 受 D1 的 100,000 字节上限约束。此固定样本用于验证实际恢复链路，最大 256 KiB 批次和真实数据仍需单独核验。 [D1 平台限制](https://developers.cloudflare.com/d1/platform/limits/)
+
+托管 Worker CI 在仅回环网络内回放同一候选 SQL。先核对休眠状态，再仅在临时测试数据库启用，比较实际旧 Python 路由和编译后 Worker 的导出，并验证私聊读取、归属及清空。成功后，受信的 `main` 构建才发布这份候选包。旧动态聚合码仍由后续兼容阶段处理。
+
+在 `worker-isolation-legacy-candidate.yml` 选择 `synthetic-legacy-temp-nodes`。用同一个新的 32 位十六进制 `cohort` 和同一个成功的 `source_run_id`，依次运行 `verify`、`prepare`、`create-restore-db`、`start-import` 和 `verify-restore`。创建结果不明时按既有 `pin-resource` 流程只核对该候选 D1。流程使用项目私有维护日志和 D1 原生文件导入，候选 D1 保持未绑定，候选数据没有 R2 对象。验收核对完整 schema、外键、数据摘要和休眠状态。 [Cloudflare D1 文件导入 API](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/import/)
+
 ### 真实数据与生产切换门槛
 
 1. 先只读核对 Cloudflare 目标账户、Zone、`subs-bot.lilyya.top` 的 DNS、Worker 路由和 Custom Domain 绑定。新资源记录账号、环境及资源 ID，隔离与生产分别使用各自的 Worker、D1、R2 和队列。现有配置冲突须在改动前报告。目标主机名可用且切换获准后，仅增加所需的 Custom Domain 绑定。 [Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)

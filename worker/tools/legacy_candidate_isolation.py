@@ -32,11 +32,13 @@ SHARE_PROFILE = native.LEGACY_PRIVATE_SHARE_CANDIDATE_PROFILE
 TYPED_PROFILE = native.LEGACY_TYPED_SHORT_CANDIDATE_PROFILE
 MIXED_PROFILE = native.LEGACY_MIXED_SHORT_CANDIDATE_PROFILE
 SELECTED_PROFILE = native.LEGACY_SELECTED_AGGREGATE_CANDIDATE_PROFILE
+TEMP_PROFILE = native.LEGACY_TEMP_CANDIDATE_PROFILE
 ARTIFACT_PREFIX = "subs-bot-legacy-candidate"
 ARTIFACT_PREFIXES = {PROFILE: ARTIFACT_PREFIX, PATH_PROFILE: "subs-bot-legacy-path-candidate",
                      EMPTY_PROFILE: "subs-bot-legacy-empty-candidate", SHARE_PROFILE: "subs-bot-legacy-private-share-candidate",
                      TYPED_PROFILE: "subs-bot-legacy-typed-short-candidate", MIXED_PROFILE: "subs-bot-legacy-mixed-short-candidate",
-                     SELECTED_PROFILE: "subs-bot-legacy-selected-aggregate-candidate"}
+                     SELECTED_PROFILE: "subs-bot-legacy-selected-aggregate-candidate",
+                     TEMP_PROFILE: "subs-bot-legacy-temp-node-candidate"}
 CANDIDATE_DIRECTORY = "subs-bot-verified-legacy-candidate"
 PROVENANCE = "legacy-candidate-provenance.json"
 EVIDENCE = "legacy-candidate-evidence.json"
@@ -125,7 +127,7 @@ def candidate_directory(profile):
 def candidate_version(profile):
     require(profile in ARTIFACT_PREFIXES)
     return {PROFILE: 1, PATH_PROFILE: 2, EMPTY_PROFILE: 3, SHARE_PROFILE: 1, TYPED_PROFILE: 4,
-            MIXED_PROFILE: 5, SELECTED_PROFILE: 6}[profile]
+            MIXED_PROFILE: 5, SELECTED_PROFILE: 6, TEMP_PROFILE: 7}[profile]
 
 
 def path_mapping():
@@ -229,7 +231,7 @@ def _build_mixed_candidate(worker, output, worker_pin, scratch, oracle, *, produ
 
 
 def build_synthetic_candidate(worker, output, revision, run_id, attempt, *, profile=PROFILE):
-    require(profile != SELECTED_PROFILE)
+    require(profile not in (SELECTED_PROFILE, TEMP_PROFILE))
     version = candidate_version(profile)
     worker_sha = native.digest(package.read_private(worker / "isolation.json", artifact._MAX_JSON))
     _, worker_pin = package.worker_artifact(worker, revision, worker_sha)
@@ -269,6 +271,10 @@ def package_files(document, *, profile=PROFILE):
         from legacy_selected_native_candidate import selected_candidate_files
 
         return selected_candidate_files(document)
+    if profile == TEMP_PROFILE:
+        from legacy_temp_native_candidate import temp_candidate_files
+
+        return temp_candidate_files(document)
     files = {package.MANIFEST, package.MARKER, package.SQL, package.LINEAGE}
     objects = document.get("objects")
     require(isinstance(objects, list) and len(objects) == 4)
@@ -298,6 +304,10 @@ def unpack_candidate(body, archive_sha, destination, *, profile=PROFILE):
             limits.update(MIXED_ORACLE_LIMITS)
         if profile == SELECTED_PROFILE:
             from legacy_selected_native_candidate import PACKAGE_LIMITS
+
+            limits = PACKAGE_LIMITS
+        if profile == TEMP_PROFILE:
+            from legacy_temp_native_candidate import PACKAGE_LIMITS
 
             limits = PACKAGE_LIMITS
         expected_files = share_fixture.files(document, OBJECT_LIMIT) if profile == SHARE_PROFILE else package_files(document, profile=profile)
@@ -545,7 +555,11 @@ class CandidateSource(native.Source):
         config = self.scope.worker_config()
         self.scope.verify_resources()
         active = self.scope.active()
-        version = self.scope.version(active.version)
+        if self.api.profile == TEMP_PROFILE:
+            version, capable = self.scope.version(active.version, with_legacy_temp=True)
+            require(capable is True)
+        else:
+            version = self.scope.version(active.version)
         return {"deploymentId": active.id, "versionId": active.version, "version": asdict(version),
                 "configurationSha256": native.digest(native.canonical(config)), "cronEnabled": self.scope.cron_enabled()}
 
@@ -567,6 +581,8 @@ class CandidateSource(native.Source):
 class CandidateRehearsal(native.Rehearsal):
     resource_kinds = ("database", "objects")
     creation_window_seconds = 120
+    sql_limit = SQL_LIMIT
+    import_ready_phase = "objects-restored"
 
     def __init__(self, api, source, journal, candidate):
         super().__init__(api, source, journal, None)
@@ -583,7 +599,7 @@ class CandidateRehearsal(native.Rehearsal):
     def manifest(self):
         document = self.candidate.document
         self.api.allow_restore(keys=self.candidate.entries)
-        self.candidate.read_file(document["sql"], package.SQL, SQL_LIMIT, extra={"md5"})
+        self.candidate.read_file(document["sql"], package.SQL, self.sql_limit, extra={"md5"})
         return document, self.candidate.sql
 
     def before_target_write(self):
@@ -591,6 +607,7 @@ class CandidateRehearsal(native.Rehearsal):
         self.source.before_write()
 
     def restore_objects(self):
+        require("objects" in self.resource_kinds)
         self.verify_resources(all_required=True)
         document, _ = self.manifest()
         entries = document["objects"]
@@ -621,11 +638,33 @@ class CandidateRehearsal(native.Rehearsal):
         self.journal.update(phase="objects-restored")
 
 
+class TempCandidateRehearsal(CandidateRehearsal):
+    resource_kinds = ("database",)
+    import_ready_phase = "prepared"
+
+    def __init__(self, api, source, journal, candidate):
+        from legacy_temp_native_candidate import PACKAGE_LIMITS
+
+        super().__init__(api, source, journal, candidate)
+        self.sql_limit = PACKAGE_LIMITS[package.SQL]
+
+    def verify_object_bytes(self, document):
+        require(document["objectCount"] == 0 and document["objects"] == [] and self.candidate.entries == {})
+
+
+def validate_checkpoint_action(action, resource, resources):
+    require(isinstance(action, str) and action in ACTIONS)
+    if action in {"create-restore-bucket", "restore-objects"}:
+        require("objects" in resources)
+    if action == "pin-resource":
+        require(resource in resources)
+
+
 def run_action(action, engine, pin, *, resource=None, identity_sha=None):
-    require(action in ACTIONS)
+    resources = engine.resource_kinds
+    validate_checkpoint_action(action, resource, resources)
     journal, source = engine.journal, engine.source
     state = journal.load()
-    resources = engine.resource_kinds
     unconfirmed = {}
     observed_summary = None
     if state is not None:
@@ -654,12 +693,11 @@ def run_action(action, engine, pin, *, resource=None, identity_sha=None):
             elif action == "create-restore-bucket":
                 engine.create("objects")
             elif action == "pin-resource":
-                require(resource in resources)
                 engine.pin_resource(resource, identity_sha)
             elif action == "restore-objects":
                 engine.restore_objects()
             elif action == "start-import":
-                require(journal.value["phase"] in {"objects-restored", "imported", "verified"})
+                require(journal.value["phase"] in {engine.import_ready_phase, "imported", "verified"})
                 observed_summary = engine.start_import()
         finally:
             journal.release()
@@ -682,6 +720,9 @@ def run_action(action, engine, pin, *, resource=None, identity_sha=None):
         result.update(counts=engine.candidate.document["counts"], generationZeroHttp="not-validated",
                       shortLinkCompatibility=engine.candidate.document["shortLinkCompatibility"],
                       selectedHttpOracle=SELECTED_HTTP_SCOPE, selectedHttpOracleSha256=pin["candidate"]["selectedHttpOracleSha256"])
+    elif profile == TEMP_PROFILE:
+        result.update(counts=engine.candidate.document["counts"], restoreScope=engine.candidate.document["scope"],
+                      r2Closure="not-applicable")
     else:
         result.update(counts=EMPTY_COUNTS if profile in (EMPTY_PROFILE, TYPED_PROFILE, MIXED_PROFILE) else COUNTS,
                       generationZeroHttp="not-validated")
@@ -691,7 +732,9 @@ def run_action(action, engine, pin, *, resource=None, identity_sha=None):
         result["shortLinkCompatibility"] = MIXED_COMPATIBILITY
     if observed_summary is not None:
         result.update({"verifiedDataSha256": observed_summary["dataSha256"], "verifiedRowCount": observed_summary["rowCount"],
-                       "schemaSha256": pin["candidate"]["schemaSha256"], "foreignKeys": "verified", "r2Closure": "verified"})
+                       "schemaSha256": pin["candidate"]["schemaSha256"], "foreignKeys": "verified"})
+        if profile != TEMP_PROFILE:
+            result["r2Closure"] = "verified"
         if profile in (PATH_PROFILE, EMPTY_PROFILE, TYPED_PROFILE, MIXED_PROFILE):
             result.update(verifiedPathRuleCount=observed_summary["tableCounts"]["path_rules"],
                           verifiedPathSequenceHighWater=PATH_SEQUENCE,
@@ -723,7 +766,7 @@ def run_action(action, engine, pin, *, resource=None, identity_sha=None):
                           externalShortMigrationSha256=package.EXTERNAL_SHORT_MIGRATION_SHA256,
                           namespaceManifestSha256=pin["candidate"]["namespaceManifestSha256"],
                           oracleManifestSha256=pin["candidate"]["oracleManifestSha256"])
-        if profile == SELECTED_PROFILE:
+        if profile in (SELECTED_PROFILE, TEMP_PROFILE):
             result.update(engine.candidate.native_evidence(observed_summary))
         if profile == SHARE_PROFILE:
             counts, hashes = observed_summary["tableCounts"], observed_summary["tableSha256"]
@@ -753,6 +796,10 @@ def verified_candidate(runner, provenance, scratch, *, profile=PROFILE):
         from legacy_selected_native_candidate import SelectedCandidate
 
         return SelectedCandidate(runner / candidate_directory(profile), worker, worker_pin, scratch)
+    if profile == TEMP_PROFILE:
+        from legacy_temp_native_candidate import TempCandidate
+
+        return TempCandidate(runner / candidate_directory(profile), worker, worker_pin, scratch)
     objects = migrations._objects(chain, len(chain), managed=True)
     schema = SimpleNamespace(migrations=chain, objects=objects, schema_sha256=native._schema_digest(objects),
                              tables=sorted(obj.name for obj in objects if obj.type == "table"))
@@ -809,7 +856,7 @@ def apply(runner, revision, inputs):
         manifest = native.parsed(package.read_private(worker / "isolation.json", artifact._MAX_JSON), artifact._MAX_JSON)
         source = CandidateSource(api, read_worker, target, worker, manifest, lambda: artifact.require_current_main(revision))
         live = source.verify()
-        if profile == SELECTED_PROFILE:
+        if profile in (SELECTED_PROFILE, TEMP_PROFILE):
             version = live["version"]
             require((version["revision"], version["digest"], version["compatibility"])
                     == (revision, manifest["bundleSha256"], manifest["compatibilityDate"]))
@@ -818,7 +865,8 @@ def apply(runner, revision, inputs):
         run_id, attempt = (os.environ.get(key, "") for key in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"))
         require(all(native.matches(artifact._DECIMAL, value) for value in (run_id, attempt)))
         journal = native.Journal(api, run_id + "/" + attempt, guard=source.before_write)
-        result = run_action(inputs["action"], CandidateRehearsal(api, source, journal, candidate), pin,
+        engine = TempCandidateRehearsal if profile == TEMP_PROFILE else CandidateRehearsal
+        result = run_action(inputs["action"], engine(api, source, journal, candidate), pin,
                             resource=inputs.get("resource"), identity_sha=inputs.get("identity_sha256"))
     put(runner / EVIDENCE, native.canonical(result))
     print(native.canonical(result).decode("ascii"))
@@ -843,14 +891,17 @@ def main(args):
         event = native.parsed(file.read(65537), 65536)
     inputs = event.get("inputs")
     require(isinstance(inputs, dict) and set(inputs) <= {"action", "cohort", "source_run_id", "resource", "identity_sha256", "profile"}
-            and inputs.get("action") in ACTIONS and native.matches(native.COHORT, inputs.get("cohort"))
+            and native.matches(native.COHORT, inputs.get("cohort"))
             and native.matches(artifact._DECIMAL, inputs.get("source_run_id")) and inputs.get("profile", PROFILE) in ARTIFACT_PREFIXES)
+    profile = inputs.get("profile", PROFILE)
+    engine = TempCandidateRehearsal if profile == TEMP_PROFILE else CandidateRehearsal
+    validate_checkpoint_action(inputs.get("action"), inputs.get("resource"), engine.resource_kinds)
     if inputs["action"] == "pin-resource":
-        require(inputs.get("resource") in CandidateRehearsal.resource_kinds and native.matches(native.DIGEST, inputs.get("identity_sha256")))
+        require(native.matches(native.DIGEST, inputs.get("identity_sha256")))
     else:
         require(not inputs.get("identity_sha256"))
     if args == ["preflight"]:
-        preflight(runner, revision, inputs["source_run_id"], profile=inputs.get("profile", PROFILE))
+        preflight(runner, revision, inputs["source_run_id"], profile=profile)
     else:
         apply(runner, revision, inputs)
 

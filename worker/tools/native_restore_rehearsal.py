@@ -69,10 +69,12 @@ LEGACY_PRIVATE_SHARE_CANDIDATE_PROFILE = "synthetic-legacy-private-shares"
 LEGACY_TYPED_SHORT_CANDIDATE_PROFILE = "synthetic-legacy-typed-shorts"
 LEGACY_MIXED_SHORT_CANDIDATE_PROFILE = "synthetic-legacy-mixed-shorts"
 LEGACY_SELECTED_AGGREGATE_CANDIDATE_PROFILE = "synthetic-legacy-selected-aggregates"
+LEGACY_TEMP_CANDIDATE_PROFILE = "synthetic-legacy-temp-nodes"
 LEGACY_CANDIDATE_NAMES = {LEGACY_CANDIDATE_PROFILE: "legacy", LEGACY_PATH_CANDIDATE_PROFILE: "legacy-path",
                           LEGACY_EMPTY_CANDIDATE_PROFILE: "legacy-empty", LEGACY_PRIVATE_SHARE_CANDIDATE_PROFILE: "legacy-share",
                           LEGACY_TYPED_SHORT_CANDIDATE_PROFILE: "legacy-typed", LEGACY_MIXED_SHORT_CANDIDATE_PROFILE: "legacy-mixed",
-                          LEGACY_SELECTED_AGGREGATE_CANDIDATE_PROFILE: "legacy-select"}
+                          LEGACY_SELECTED_AGGREGATE_CANDIDATE_PROFILE: "legacy-select",
+                          LEGACY_TEMP_CANDIDATE_PROFILE: "legacy-temp"}
 ACCOUNT_SHA256 = "ffdbf3dd5d042c6edb68d7f628998a69a22320b0199775bfda9f97593136e508"
 
 
@@ -224,7 +226,9 @@ class RehearsalAPI:
         self.archive_prefix = f"rehearsals/{cohort}/"
         if profile in LEGACY_CANDIDATE_NAMES:
             label = LEGACY_CANDIDATE_NAMES[profile]
-            self.names = {"database": f"subs-bot-cf-{label}-db-{cohort}", "objects": f"subs-bot-cf-{label}-r2-{cohort}"}
+            self.names = {"database": f"subs-bot-cf-{label}-db-{cohort}"}
+            if profile != LEGACY_TEMP_CANDIDATE_PROFILE:
+                self.names["objects"] = f"subs-bot-cf-{label}-r2-{cohort}"
             self.journal_prefix = f"maintenance/{label}-candidate/{cohort}/journal/"
         self.buckets = {WORKER_NAME, *(self.names[kind] for kind in self.names if kind != "database")}
         self.databases = {target["d1Id"]}
@@ -238,8 +242,12 @@ class RehearsalAPI:
         return self.json(method, path, payload)
 
     def allow_restore(self, database_id=None, keys=None, object_bucket=None):
+        temp_only = self.profile == LEGACY_TEMP_CANDIDATE_PROFILE
+        if temp_only:
+            require(object_bucket is None and (keys is None or not keys))
         if database_id is not None:
-            require(matches(UUID, database_id) and database_id != self.target["d1Id"])
+            require(matches(UUID, database_id) and database_id != self.target["d1Id"]
+                    and (not temp_only or database_id in self.databases))
             self.databases.add(database_id)
             self.restore_id = database_id
         if keys is not None:
@@ -252,6 +260,13 @@ class RehearsalAPI:
     def json(self, method, path, payload=None, *, envelope=False):
         require(method in {"GET", "POST"} and path.startswith(self.root + "/") and not any(c in path for c in ("#", "\\", "\n", "\r")))
         route = path.partition("?")[0]
+        if self.profile == LEGACY_TEMP_CANDIDATE_PROFILE:
+            if method == "GET" and route == self.root + "/d1/database":
+                require(path == route + "?" + urlencode({"name": self.names["database"], "per_page": 100}))
+            elif method == "GET":
+                require(route not in {self.root + "/r2/buckets", self.root + "/tokens/verify"})
+            else:
+                require(path == route)
         if method == "POST":
             if route == self.root + "/d1/database":
                 require(payload == {"name": self.names["database"], "read_replication": {"mode": "disabled"}})
@@ -292,6 +307,9 @@ class RehearsalAPI:
                 query = parse_qs(urlsplit(path).query, max_num_fields=3)
                 prefix = query.get("prefix", [])
                 require(len(prefix) == 1 and re.fullmatch(re.escape(self.journal_prefix) + r"(?:[0-9]{6}-)?", prefix[0]))
+                if self.profile == LEGACY_TEMP_CANDIDATE_PROFILE:
+                    require(set(query) <= {"prefix", "per_page", "cursor"}
+                            and all(len(values) == 1 for values in query.values()))
         headers = {"Authorization": "Bearer " + self.token, "Accept": "application/json", "Cache-Control": "no-cache",
                    "cf-r2-jurisdiction": "default"}
         body = None if payload is None else canonical(payload)
@@ -365,7 +383,8 @@ class RehearsalAPI:
             raise
 
     def put_restored_object(self, key, body, metadata):
-        require(self.restore_bucket == self.names["objects"] and key in self.restore_keys and matches(KEY, key))
+        require("objects" in self.names and self.restore_bucket == self.names["objects"]
+                and key in self.restore_keys and matches(KEY, key))
         require(isinstance(body, bytes) and 0 < len(body) <= OBJECT_BYTES)
         validate_metadata(metadata)
         if self.s3_access_key is None:

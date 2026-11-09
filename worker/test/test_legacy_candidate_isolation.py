@@ -510,6 +510,75 @@ class CandidateArtifactTests(unittest.TestCase):
         with self.assertRaises(tool.native.RehearsalError):
             self.verify(self.archive())
 
+    def test_temp_profile_imports_dormant_candidate_with_only_the_private_journal(self):
+        from legacy_temp_native_candidate import build_temp_fixture
+
+        native = tool.native
+        module = self.worker / "index.js"
+        script = module.read_bytes() + b"/* subs-bot:legacy-temp-read:v1 subs-bot:legacy-temp-mutate:v1 */\n"
+        module.write_bytes(script)
+        worker_manifest = self.worker / "isolation.json"
+        worker_manifest.write_bytes(native.canonical({**json.loads(worker_manifest.read_bytes()),
+                                                      "bundleSha256": native.digest(script)}))
+        fixture_root = self.root / "synthetic-temp-fixture"
+        fixture_root.mkdir(mode=0o700)
+        self.output = build_temp_fixture(fixture_root, self.worker, self.release["revision"]).candidate
+        archive = self.archive()
+        with self.assertRaises(native.RehearsalError):
+            self.verify(archive, tool.SELECTED_PROFILE)
+        candidate = self.verify(archive, tool.TEMP_PROFILE)
+        pin = {"profile": tool.TEMP_PROFILE, "worker": self.release,
+               "candidate": {**candidate.pin(), "artifactId": "123", "archiveSha256": native.digest(archive)}}
+
+        class TempMemoryAPI(native_tests.MemoryAPI):
+            def __call__(api, method, path, payload):
+                self.assertEqual((method, path), ("POST", api.root + f"/d1/database/{native_tests.RESTORE_ID}/query"))
+                self.assertTrue(native.readonly_sql(payload["sql"]))
+                self.assertLessEqual(len(payload["sql"].encode("utf-8")), 100_000)
+                return [{"success": True, "results": api.rows(native_tests.RESTORE_ID, payload["sql"])}]
+
+        api = TempMemoryAPI()
+        api.names = {"database": "synthetic-temp-db"}
+        api.journal_prefix = "maintenance/legacy-temp-candidate/synthetic/journal/"
+        source = native_tests.fake_source()
+        journal = native.Journal(api, "1/1", guard=source.before_write)
+        engine = tool.TempCandidateRehearsal(api, source, journal, candidate)
+        engine.observe = Mock(side_effect=lambda kind: None if kind not in api.resource else
+                              native.resource_identity(kind, api.resource[kind], api.names[kind]))
+        self.assertEqual(tool.run_action("prepare", engine, pin)["resourceCount"], 0)
+        self.assertEqual(tool.run_action("create-restore-db", engine, pin)["resourceCount"], 1)
+        self.assertEqual(set(journal.value["resources"]), {"database"})
+        self.assertEqual(journal.value["phase"], "prepared")
+
+        with closing(sqlite3.connect(":memory:")) as db:
+            api.db = db
+            chain = tool.package.worker_artifact(self.worker, self.release["revision"], native.digest(worker_manifest.read_bytes()))[0]
+            source.schema.side_effect = lambda database_id: tool.migrations._read_state(
+                api, api.root + f"/d1/database/{database_id}", chain)
+
+            def import_result(payload):
+                if payload["action"] == "init":
+                    return {"filename": "fixture.sql", "upload_url": "https://fixture.invalid/upload"}
+                self.assertEqual(payload["action"], "ingest")
+                db.executescript(candidate.sql.read_text(encoding="utf-8"))
+                return {"success": True, "status": "complete"}
+
+            api.response = import_result
+            with patch.object(native, "signed_transfer") as transfer:
+                imported = tool.run_action("start-import", engine, pin)
+                transfer.assert_called_once_with("https://fixture.invalid/upload", upload=candidate.sql,
+                                                 expected_md5=candidate.document["sqlMd5"])
+            self.assertEqual((imported["phase"], imported["objectCount"], imported["r2Closure"]), ("verified", 0, "not-applicable"))
+            self.assertEqual((imported["verifiedTempInstallationCount"], imported["verifiedTempBatchCount"],
+                              imported["verifiedTempNodeCount"], imported["verifiedTempCutover"]), (1, 3, 503, "dormant"))
+            self.assertTrue(all(bucket == native.WORKER_NAME and key.startswith(api.journal_prefix) for bucket, key in api.objects))
+            api.calls.clear()
+            self.assertEqual(tool.run_action("verify-restore", engine, pin)["verifiedDataSha256"], imported["verifiedDataSha256"])
+            db.execute("UPDATE legacy_temp_installations SET cutover_epoch=1")
+            with self.assertRaises(native.RehearsalError):
+                tool.run_action("verify-restore", engine, pin)
+            self.assertFalse(any(method in {"POST", "PUT", "S3 PUT"} for method, _, _ in api.calls))
+
 
 class CandidateBoundaryTests(unittest.TestCase):
     def test_only_candidate_names_use_the_full_cohort(self):
@@ -644,6 +713,64 @@ class CandidateBoundaryTests(unittest.TestCase):
                 with self.assertRaises(native.RehearsalError):
                     request()
             response.assert_not_called()
+
+    def test_temp_profile_denies_target_r2_and_unrelated_resources_before_io(self):
+        native = tool.native
+        with patch.object(native, "ACCOUNT_SHA256", native.digest(native_tests.ACCOUNT.encode())), patch.object(native, "_response") as response:
+            api = native.RehearsalAPI(native_tests.TARGET, "synthetic-token", native_tests.COHORT, profile=tool.TEMP_PROFILE)
+            self.assertEqual(api.names, {"database": f"subs-bot-cf-legacy-temp-db-{api.cohort}"})
+            self.assertEqual(api.buckets, {native.WORKER_NAME})
+            self.assertEqual(api.journal_prefix, f"maintenance/legacy-temp-candidate/{api.cohort}/journal/")
+            r2 = api.root + "/r2/buckets"
+            d1 = api.root + "/d1/database"
+            own_journal = api.journal_prefix + "000001-" + "a" * 32 + ".json"
+            unowned_journal = own_journal.replace("legacy-temp-candidate", "legacy-select-candidate")
+            unowned_bucket = f"subs-bot-cf-legacy-temp-r2-{api.cohort}"
+            object_key = f"subscriptions/1/{native_tests.SNAPSHOT}/manifest.json"
+            for request in (
+                lambda: api.json("GET", d1),
+                lambda: api.json("GET", d1 + "?name=foreign&per_page=100"),
+                lambda: api.json("POST", d1 + "?unreviewed=true", {"name": api.names["database"], "read_replication": {"mode": "disabled"}}),
+                lambda: api.json("POST", api.source + "/query", {"sql": "SELECT id FROM subscriptions"}),
+                lambda: api.json("POST", api.source + "/import", {"action": "init", "etag": "a" * 32}),
+                lambda: api.allow_restore(native_tests.RESTORE_ID),
+                lambda: api.json("GET", r2),
+                lambda: api.json("POST", r2, {"name": unowned_bucket, "storageClass": "Standard"}),
+                lambda: api.json("GET", r2 + "/" + unowned_bucket),
+                lambda: api.list_objects(native.WORKER_NAME, prefix="subscriptions/", maximum=1),
+                lambda: api.r2("GET", native.WORKER_NAME, object_key),
+                lambda: api.r2("PUT", native.WORKER_NAME, unowned_journal, b"{}"),
+                lambda: api.r2("PUT", unowned_bucket, object_key, b"{}"),
+                lambda: api.allow_restore(keys={object_key}),
+                lambda: api.allow_restore(object_bucket=unowned_bucket),
+                lambda: api.put_restored_object(object_key, b"{}", native_tests.EMPTY_METADATA),
+            ):
+                with self.assertRaises(native.RehearsalError):
+                    request()
+            response.assert_not_called()
+
+            response.return_value = native_tests.envelope([])
+            self.assertEqual(api.json("GET", d1 + "?name=" + api.names["database"] + "&per_page=100"), [])
+            response.return_value = native_tests.envelope(None)
+            api.r2("PUT", native.WORKER_NAME, own_journal, b"{}")
+            self.assertEqual(response.call_count, 2)
+
+    def test_temp_profile_rejects_r2_checkpoints_before_reading_or_claiming_journal(self):
+        engine = Mock(resource_kinds=tool.TempCandidateRehearsal.resource_kinds)
+        for action, resource in (("create-restore-bucket", None), ("restore-objects", None), ("pin-resource", "objects")):
+            with self.subTest(action=action), self.assertRaises(tool.native.RehearsalError):
+                tool.run_action(action, engine, {}, resource=resource, identity_sha="a" * 64)
+        engine.journal.load.assert_not_called()
+        engine.journal.claim.assert_not_called()
+
+    def test_temp_profile_rejects_incomplete_active_worker_capability(self):
+        source = object.__new__(tool.CandidateSource)
+        source.api = SimpleNamespace(profile=tool.TEMP_PROFILE)
+        source.scope = Mock()
+        source.scope.version.return_value = (None, False)
+        with self.assertRaises(tool.native.RehearsalError):
+            source.live_pin()
+        source.scope.version.assert_called_once_with(source.scope.active.return_value.version, with_legacy_temp=True)
 
     def test_different_runtime_pin_stops_before_claim(self):
         journal = Mock()
