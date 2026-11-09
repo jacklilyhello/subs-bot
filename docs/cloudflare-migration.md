@@ -516,6 +516,12 @@ PY
 
 验收分别核对三个聚合码摘要、三个来源标记、四个监视编号（其中一个已失效）、订阅序列 `72`、全库数据摘要、外键、完整性和十二个 R2 对象。HTTP 对照报告和原生恢复报告分别留证。真实旧库和生产切换走后续独立验收。 [D1 导入](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/import/)
 
+### 旧临时节点离线盘点
+
+在获准的托管环境运行 `python3 -B worker/tools/legacy_temp_inventory.py BACKUP OUTPUT SOURCE_SHA256 OWNER_MAP_JSON OWNER_MAP_SHA256 LEGACY_BOT_ID`。使用关闭且没有日志侧车的 SQLite 一致性备份、独立核对的源库及归属映射摘要。输入文件及输出父目录只允许当前账号访问。工具按旧编号逐行核对临时节点表、编号序列和归属。对可进入 Worker 验证的行，原名称和原 URI 按 JSON 原样保存，保留重复项和顺序。
+
+盘点按预计的批次结构计算 UTF-8 字节和数量，单独记录超限、归属不明确和结构异常。退出码 `0` 表示盘点完整且未发现本阶段的阻塞项；退出码 `2` 需核对固定错误，或读取已经封存的诊断盘点。无论退出码，只有 `manifest.sha256` 与清单和数据文件摘要均一致时才使用盘点。临时节点的协议和实际导出行为仍须通过对应 Worker 构建验证。封存目录含原始 URI，只在获准的私有渠道保存。
+
 ### 真实数据与生产切换门槛
 
 1. 先只读核对 Cloudflare 目标账户、Zone、`subs-bot.lilyya.top` 的 DNS、Worker 路由和 Custom Domain 绑定。新资源记录账号、环境及资源 ID，隔离与生产分别使用各自的 Worker、D1、R2 和队列。现有配置冲突须在改动前报告。目标主机名可用且切换获准后，仅增加所需的 Custom Domain 绑定。 [Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)
