@@ -350,6 +350,19 @@ PY
 
 旧表只保存当前覆盖及时间。实际授权还依赖原管理员配置、允许列表和公开模式，须另行核对。此盘点不写入 Worker、D1 或 Telegram 回执。现有候选仍会拒绝未处理的非空授权覆盖。
 
+### 旧授权离线核对
+
+在获准的私有托管目录内运行 `python3 -B worker/tools/legacy_authorization_reconcile.py BACKUP INVENTORY CONFIG TARGET OUTPUT SOURCE_SHA256 INVENTORY_SHA256 CONFIG_SHA256 TARGET_SHA256`。四个独立摘要分别固定旧 SQLite、盘点的 `manifest.json`、完整 `CONFIG` 及完整 `TARGET`。工具从同一封存备份重建覆盖盘点，逐字节核对原三文件包。`OUTPUT` 必须尚未存在，且位于盘点目录之外。
+
+`CONFIG` 和 `TARGET` 都是仅当前账号可读的 `version: 1` JSON。按键排序，采用紧凑 ASCII 编码，末尾只有一个 LF。两份文件均只含以下字段及 `version`。
+
+- `CONFIG` 的 `source` 含 `botId`、40 位小写十六进制 `revision`、`deploymentSha256` 和与 `SOURCE_SHA256` 一致的 `sqliteSha256`。另有 `allowedUserIds` 和 `adminUserIds`，每个列表最多 20,000 个 ID，严格按数值递增。Bot 和用户 ID 均使用正有符号 64 位整数的十进制字符串。`adminUserIds: null` 代表旧配置未设置管理员变量，继承白名单。`[]` 代表显式设置为空。投影须来自同一冻结部署的实际生效配置，由独立交接证据确认 Bot 和部署身份。交接文件只保留上述字段。
+- `TARGET` 含 `botId`、`adminId` 和 `memberId`，三个 ID 必须不同，且为不超过 `2^53−1` 的正十进制字符串。它固定待比较的两个目标角色，不变更现有隔离聊天范围。
+
+核对按旧版顺序计算常规访问权限。管理员优先，其次是显式允许或拒绝覆盖，再用白名单决定。旧白名单为空时，默认公开。用户 ID 原样保留，不应用订阅所有者映射。私有输出保留原始 `auth-overrides.ndjson`，并在 `principals.ndjson` 记录角色、判定依据、白名单成员身份、目标角色和阻断项。清单绑定输入摘要、输出摘要和计数，`manifest.sha256` 最后写入。目录和文件分别使用 `0700` 和 `0600`。
+
+清单以 `different-bot` 和 `public-default` 标记 Bot 身份变化及公开默认。逐用户标记包括目标范围外 `outside-target`、保留 Bot 身份 `reserved-identity`、ID 超限 `id-out-of-range`、目标管理员不匹配 `target-admin-mismatch`、旧管理员被列为目标成员 `target-member-admin`，以及已拒绝的目标成员需要拒绝基线 `member-denial-needs-baseline`。Worker 当前在没有授权行时允许目标成员。退出码 `0` 表示报告已封存，即使仍有阻断项。真实报告只走批准的私有交接。该命令只生成文件，隔离发布、D1 数据和 Telegram 配置继续独立管理。
+
 ### 普通短链双账号验收
 
 受保护的 `worker-isolation-telegram-short-links-smoke.yml` 对同一活动版本执行 `prepare`、`issued` 和 `retired`。使用同一个 `cohort` 和 Worker CI 运行 ID。后两步引用前一步的成功运行。两名获准用户只在指定内置浏览器私聊分别签发 `https://example.com/subs-bot-normal-short/<cohort>/admin` 和 `https://example.org/subs-bot-normal-short/<cohort>/member`。管理员先尝试撤销普通用户的测试短码，随后各自撤销自己的短链。提交的浏览器证据只包含三项摘要。
