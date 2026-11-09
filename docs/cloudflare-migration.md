@@ -572,6 +572,12 @@ python3 -B worker/tools/legacy_restore_package.py \
 
 候选把活动订阅、回收站、路径规则、四种短链和临时节点写入同一次 SQL 回放。单订阅短链沿用迁移后的稳定编号；所选聚合保留顺序、重复项和已退役编号；全量聚合和临时节点安装保持休眠。检查全局短码摘要唯一性、各类精确行集合、所有者与能力摘要、外键、数据摘要和 R2 对象闭包。聚合范围可能因所有者映射扩大时停止封存。清单分别记录外部跳转的离线对照与其余链接的待验收状态。非空私密分享、领取和授权仍需对应的联合恢复与规则对账步骤。
 
+#### V10 联合恢复私密分享和领取
+
+使用 V9 的同一份封存 SQLite 和旧 Bot 身份生成私密分享盘点。将 V9 命令中的 `legacy-unified-v9` 改为 `legacy-unified-shares-v10`，在末尾追加 `SHARE_INVENTORY SHARE_INVENTORY_MANIFEST_SHA LEGACY_BOT_USERNAME`。输入独立核对过的小写旧 Bot 用户名，省略 `@`。封存时重新从同一 SQLite 盘点分享，逐文件复核正文和领取记录摘要，再和订阅、短链及临时节点一起回放。
+
+保留发送者、领取者、指定对象、份数、到期时间及原始正文。订阅的所有者映射仅用于订阅域。已到期的分享和已有领取历史随数据一起恢复。原内联消息标识留在私有盘点内，候选只记录数量。订阅快照和私密正文共同校验 R2 对象完整性和容量。候选保持私有、未绑定；同一 Bot 下的旧领取链接、旧卡片行为、授权基线和真实数据导入另行验收。
+
 ### 真实数据与生产切换门槛
 
 1. 先只读核对 Cloudflare 目标账户、Zone、`subs-bot.lilyya.top` 的 DNS、Worker 路由和 Custom Domain 绑定。新资源记录账号、环境及资源 ID，隔离与生产分别使用各自的 Worker、D1、R2 和队列。现有配置冲突须在改动前报告。目标主机名可用且切换获准后，仅增加所需的 Custom Domain 绑定。 [Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)
