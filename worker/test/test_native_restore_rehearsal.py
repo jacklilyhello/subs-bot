@@ -442,6 +442,73 @@ class BoundaryTests(unittest.TestCase):
                     api.json("POST", path + "/query", {"sql": "SELECT (1) AS matches;\n" + injected})
             self.assertEqual(send.call_count, 2)
 
+    def test_candidate_d1_large_schema_reads_all_groups_in_one_request(self):
+        api = native.RehearsalAPI(self.api.target, "synthetic-data-token", COHORT, profile=native.LEGACY_TEMP_CANDIDATE_PROFILE)
+        api.databases.add(RESTORE_ID)
+        api.allow_restore(RESTORE_ID)
+        path = api.root + f"/d1/database/{RESTORE_ID}"
+        migrations = native.migrations
+        definitions = {"subscriptions": "CREATE TABLE subscriptions (token TEXT UNIQUE)"}
+        for index in range(3):
+            name = f"fixture_{index}"
+            definitions[name] = f"CREATE TABLE {name} (text TEXT CHECK (text <> '{'a' * 35_000}; -- literal'))"
+        objects = tuple(migrations.SchemaObject("table", name, name, sql) for name, sql in definitions.items())
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        for sql in definitions.values():
+            db.execute(sql)
+
+        def response(_opener, request, _maximum):
+            self.assertEqual(request.full_url, "https://api.cloudflare.com/client/v4" + path + "/query")
+            self.assertEqual(request.get_method(), "POST")
+            payload = json.loads(request.data)
+            self.assertEqual(set(payload), {"sql"})
+            sql = payload["sql"]
+            self.assertGreater(len(sql.encode("utf-8")), migrations.MAX_D1_STATEMENT_BYTES)
+            statements = native.readonly_schema_batch(sql)
+            self.assertIsNotNone(statements)
+            self.assertEqual(len(statements), 2)
+            self.assertTrue(all(len(statement.encode("utf-8")) < migrations.MAX_D1_STATEMENT_BYTES for statement in statements))
+            self.assertIn("; -- literal", sql)
+            return envelope([{"success": True, "results": [{"matches": db.execute(statement).fetchone()[0]}]}
+                             for statement in statements])
+
+        with patch.object(native, "_response", side_effect=response) as send:
+            self.assertTrue(migrations._matches_schema(api, path, objects))
+        send.assert_called_once()
+
+    def test_candidate_d1_schema_batch_rejects_other_sql_parameters_and_limits(self):
+        api = native.RehearsalAPI(self.api.target, "synthetic-data-token", COHORT, profile=native.LEGACY_CANDIDATE_PROFILE)
+        api.allow_restore(RESTORE_ID)
+        path = api.root + f"/d1/database/{RESTORE_ID}/query"
+        check = "SELECT (1) AS matches"
+
+        def batch(*statements):
+            return ";\n".join(statements) + ";"
+
+        valid = batch(check, check)
+        too_wide = f"SELECT ('{'é' * 50_000}') AS matches"
+        wide = f"SELECT ('{'x' * 75_000}') AS matches"
+        cases = (
+            {"sql": batch(check, "UPDATE subscriptions SET token='changed'")},
+            {"sql": batch(check, "PRAGMA quick_check")},
+            {"sql": batch(check, "SELECT 1")},
+            {"sql": batch(check, "SELECT (1) UNION SELECT (1) AS matches")},
+            {"sql": batch(check, "SELECT (1 /* comment */) AS matches")},
+            {"sql": batch(check, "-- comment\n" + check)},
+            {"sql": batch(check, "SELECT (:unbound) AS matches")},
+            {"sql": valid, "params": []},
+            {"sql": batch(check, "SELECT (?) AS matches"), "params": ["1"]},
+            {"sql": batch(check, too_wide)},
+            {"sql": batch(wide, wide, wide)},
+            {"sql": batch(*([check] * (native.MAX_SCHEMA_READ_STATEMENTS + 1)))},
+        )
+        with patch.object(native, "_response") as send:
+            for index, payload in enumerate(cases):
+                with self.subTest(case=index), self.assertRaises(native.RehearsalError):
+                    api.json("POST", path, payload)
+            send.assert_not_called()
+
     def test_d1_rest_keyset_page_uses_strings_and_casts_only_integer_keys(self):
         self.api.allow_restore(RESTORE_ID)
         db = sqlite3.connect(":memory:")

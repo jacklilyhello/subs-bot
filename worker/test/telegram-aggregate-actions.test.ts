@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import { Miniflare } from "miniflare";
 import { getAggregateNodeSource, hasAggregateLink } from "../src/aggregate.ts";
+import { LEGACY_ALL_MIGRATION, LEGACY_ALL_MIGRATION_SHA256 } from "../src/legacy-all-aggregates.ts";
 import { createSubscription, publishNodeSnapshot } from "../src/storage.ts";
 import {
   acceptTelegramAggregate, parseTelegramAggregateKey, resolveTelegramAggregateCode,
@@ -34,6 +35,10 @@ async function migrate(database: D1Database, throughAggregate = true) {
     const bytes = await readFile(new URL(name, migrationDir));
     await database.batch(bytes.toString("utf8").trim().split(/;\s*/u).filter(Boolean).map((statement) => database.prepare(statement)));
     await recordTempFixtureMigration(database, { name, sha256: createHash("sha256").update(bytes).digest("hex") });
+    if (name === LEGACY_ALL_MIGRATION) {
+      await database.prepare("INSERT INTO subs_bot_schema_migrations (position,name,sha256,mode) VALUES (40,?,?,'applied')")
+        .bind(name, LEGACY_ALL_MIGRATION_SHA256).run();
+    }
   }
 }
 
@@ -205,6 +210,42 @@ test("rechecks the exact access epoch at the link send boundary and keeps notice
   assert.equal(sent[0]?.text, "聚合链接已变更，请重新发送 /export。");
   assert.ok(sent[1]?.text.includes(`${TELEGRAM_AGGREGATE_ORIGIN}/agg/${code}/clash`));
   assert.ok(sent.every(({ chatId }) => chatId === config.memberId));
+});
+
+test("excludes marked legacy digests from native slot revocation and final delivery", async () => {
+  const config = policy("82044", "82441", "82442");
+  await seed(db, bucket, config.memberId, "native-only");
+  const inventory = digest("synthetic issuance isolation");
+  await db.prepare("INSERT INTO legacy_temp_installations VALUES (?,?,?)")
+    .bind(config.botId, inventory, fixtureDate - 1).run();
+  const mark = (code: string) => db.prepare("INSERT INTO legacy_all_aggregates VALUES (?,?,?,?)")
+    .bind(digest(code), config.botId, config.memberId, inventory).run();
+  const legacy = "N".repeat(12);
+  await db.prepare("INSERT INTO aggregate_links (code_sha256,owner_id,kind,bot_id) VALUES (?,?,'all',?)")
+    .bind(digest(legacy), config.memberId, config.botId).run();
+  await mark(legacy);
+  // A damaged modern slot still cannot revoke or reuse a legacy capability.
+  await db.prepare("INSERT INTO telegram_aggregate_slots VALUES (?,?,1,?,?,1,?,1)")
+    .bind(config.botId, config.memberId, digest(legacy), "A".repeat(22), fixtureDate - 1).run();
+  assert.equal(await acceptTelegramAggregate(db, config, event(config, 1, 2, "revoke"), key), "accepted");
+  assert.equal((await action(config, 1))?.result, "already-revoked");
+  assert.equal(await hasAggregateLink(db, legacy), true);
+  const { sent, request } = telegramReplies(config);
+  await drainTelegramReplies(db, bucket, config, 4, 10_000, request, key);
+  assert.equal(sent.length, 1);
+
+  assert.equal(await acceptTelegramAggregate(db, config, event(config, 2, 3), key), "accepted");
+  const lease = await claimTelegramReply(db, config.botId, true);
+  assert.ok(lease?.aggregate);
+  const scope = { ...lease, aggregate: lease.aggregate };
+  const modern = await resolveTelegramAggregateCode(db, config, scope, key);
+  assert.ok(modern);
+  assert.equal(modern.length, 22);
+  await mark(modern);
+  assert.equal(await resolveTelegramAggregateCode(db, config, scope, key), null);
+  assert.equal(await beginTelegramAggregateLinkReply(db, config, lease), false);
+  assert.equal(await hasAggregateLink(db, modern), false);
+  assert.equal(await hasAggregateLink(db, legacy), true);
 });
 
 test("records an empty or over-limit result without minting a capability", async () => {

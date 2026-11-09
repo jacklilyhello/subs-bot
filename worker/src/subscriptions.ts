@@ -1,4 +1,5 @@
 import { checkOwnerId, SUBSCRIPTION_LIFECYCLE_REVISION, validInteger } from "./storage.ts";
+import { prepareLegacyAllAppend } from "./legacy-all-aggregates.ts";
 
 export interface SubscriptionListItem {
   id: number;
@@ -37,7 +38,7 @@ interface PreparedSubscriptionMutation {
   first: D1PreparedStatement;
   followups: D1PreparedStatement[];
   writes: number;
-  watchWrite?: boolean;
+  optionalWriteIndex?: number;
 }
 
 type LegacySelectedRetirement = "absent" | "unregistered" | "ready";
@@ -137,14 +138,14 @@ export async function readLegacySelectedRetirement(db: D1Database): Promise<Lega
   throw new Error(MUTATION_ERROR);
 }
 
-async function mutate(db: D1Database, { first, followups, writes, watchWrite }: PreparedSubscriptionMutation): Promise<boolean> {
+async function mutate(db: D1Database, { first, followups, writes, optionalWriteIndex }: PreparedSubscriptionMutation): Promise<boolean> {
   try {
     const statements = [first, ...followups];
     const results = await db.batch(statements);
     const changed = results[0]?.meta.changes;
     if ((changed === 0 || changed === 1) && results.length === statements.length) {
       const confirmed = results.every(({ success, meta }, index) => success
-        && (watchWrite && index === writes ? meta.changes === 0 || meta.changes === changed
+        && (index === optionalWriteIndex ? meta.changes === 0 || meta.changes === changed
           : meta.changes === (index < writes ? changed : 0)));
       if (confirmed) return changed === 1;
     }
@@ -245,9 +246,10 @@ export async function prepareOwnedSubscriptionMutation(
         guardExclusiveRow(db, id, ownerId, retirementFence(readiness, id, ownerId, nextRevision)),
       ],
       writes: 3,
-      watchWrite,
+      optionalWriteIndex: watchWrite ? 3 : undefined,
     };
   }
+  const order = await prepareLegacyAllAppend(db, id, ownerId, { sql: "changes()=1", bindings: [] });
   return {
     first: db.prepare(`
       INSERT INTO subscriptions (${STORED_FIELDS})
@@ -272,9 +274,12 @@ export async function prepareOwnedSubscriptionMutation(
           AND EXISTS (SELECT 1 FROM subscriptions WHERE id = subscription_trash.id
             AND owner_id = subscription_trash.owner_id AND token = subscription_trash.token)
       `).bind(id, ownerId, expectedLifecycleRevision, nextRevision),
+      order.assert,
+      ...(order.append ? [order.append] : []),
       guardExclusiveRow(db, id, ownerId),
     ],
     writes: 3,
+    optionalWriteIndex: order.append ? 4 : undefined,
   };
 }
 

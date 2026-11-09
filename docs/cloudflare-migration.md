@@ -540,6 +540,14 @@ Telegram 的清空操作在同一次 D1 事务中确认授权、清空界限、�
 
 在 `worker-isolation-legacy-candidate.yml` 选择 `synthetic-legacy-temp-nodes`。用同一个新的 32 位十六进制 `cohort` 和同一个成功的 `source_run_id`，依次运行 `verify`、`prepare`、`create-restore-db`、`start-import` 和 `verify-restore`。创建结果不明时按既有 `pin-resource` 流程只核对该候选 D1。流程使用项目私有维护日志和 D1 原生文件导入，候选 D1 保持未绑定，候选数据没有 R2 对象。验收核对完整 schema、外键、数据摘要和休眠状态。 [Cloudflare D1 文件导入 API](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/import/)
 
+### 旧全量聚合链接运行时
+
+`0040` 为旧全量聚合码保存 Bot、所有者和已启用的临时节点盘点身份。通过核验的 12 字符链接保留动态订阅范围、临时节点、同源短链重定向和旧格式回退。全部记录清空后，仍按旧格式返回空配置。能力码仍只存摘要，迁移链接与 Telegram 新签发的全量链接使用独立记录。
+
+旧 Python 恢复回收站订阅时会重新分配编号，使该订阅排在当时列表末尾。Worker 保留订阅 ID 和令牌，并在同一 D1 事务中为旧全量聚合记下追加顺序。后续普通新增使用更高的订阅编号，预留编号的附件订阅在实际发布时记下顺序。已标记但仍休眠的范围拒绝会丢失排序的恢复或附件发布，直到对应盘点启用。所选聚合仍按各自的成员记录导出。
+
+托管验证对照实际 Python 和编译后的 Worker，覆盖先后恢复、随后新增、清空、旧别名和重定向。运行时发布只建立空表。带数据的发布和回滚要求对应版本同时具备旧链接读取和排序写入能力。导入旧码及相关真实数据核验分别进行。
+
 ### 真实数据与生产切换门槛
 
 1. 先只读核对 Cloudflare 目标账户、Zone、`subs-bot.lilyya.top` 的 DNS、Worker 路由和 Custom Domain 绑定。新资源记录账号、环境及资源 ID，隔离与生产分别使用各自的 Worker、D1、R2 和队列。现有配置冲突须在改动前报告。目标主机名可用且切换获准后，仅增加所需的 Custom Domain 绑定。 [Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)

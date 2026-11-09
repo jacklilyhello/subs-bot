@@ -55,6 +55,8 @@ MAX_CHECKPOINTS = 4096
 TOTAL_OBJECT_BYTES = 256 * 1024 * 1024
 MAX_ROWS = 20_000
 MAX_CELL_BYTES = 2_000_000
+MAX_SCHEMA_READ_BYTES = 200_000
+MAX_SCHEMA_READ_STATEMENTS = 4
 MAX_SAFE = 2**53 - 1
 LEASE_SECONDS = 120
 POLL_SECONDS = 120
@@ -280,8 +282,8 @@ class RehearsalAPI:
                 params = payload.get("params", [])
                 require(isinstance(params, list) and all(isinstance(value, str) for value in params))
                 sql = payload["sql"].strip()
-                require(readonly_sql(sql))
-                require(len(sql.encode()) <= 100_000)
+                require((len(sql.encode()) <= migrations.MAX_D1_STATEMENT_BYTES and readonly_sql(sql))
+                        or ("params" not in payload and readonly_schema_batch(payload["sql"]) is not None))
             elif route == self.source + "/export" and self.profile == "native":
                 require(isinstance(payload, dict) and set(payload) <= {"output_format", "dump_options", "current_bookmark"}
                         and payload.get("output_format") == "polling" and payload.get("dump_options") == {"compatibility": "d1"})
@@ -561,14 +563,21 @@ class Journal:
             self.save(value)
 
 
-def readonly_sql(sql):
+def readonly_sql(sql, *, schema_check=False):
     if not isinstance(sql, str):
         return False
     sql = sql.strip()
-    if not (sql.startswith("SELECT ") or re.fullmatch(r"PRAGMA (?:table_list|table_info|table_xinfo|index_list|index_xinfo|foreign_key_check|quick_check)(?:\([^;\r\n]*\))?", sql)):
+    if schema_check:
+        prefix, suffix = "SELECT (", ") AS matches"
+        if not sql.startswith(prefix) or not sql.endswith(suffix):
+            return False
+        sql = sql[len(prefix):-len(suffix)]
+        if not sql.strip():
+            return False
+    elif not (sql.startswith("SELECT ") or re.fullmatch(r"PRAGMA (?:table_list|table_info|table_xinfo|index_list|index_xinfo|foreign_key_check|quick_check)(?:\([^;\r\n]*\))?", sql)):
         return False
     quote_char = None
-    offset = 0
+    offset = depth = 0
     while offset < len(sql):
         char = sql[offset]
         if quote_char:
@@ -581,8 +590,32 @@ def readonly_sql(sql):
             quote_char = char
         elif char == ";" or sql[offset:offset + 2] in ("--", "/*"):
             return False
+        elif schema_check and char in "?@:$`[]":
+            return False
+        elif schema_check and char == "(":
+            depth += 1
+        elif schema_check and char == ")":
+            if depth == 0:
+                return False
+            depth -= 1
         offset += 1
-    return quote_char is None
+    return quote_char is None and depth == 0
+
+
+def readonly_schema_batch(sql: str) -> tuple[str, ...] | None:
+    """Accept only the canonical multi-SELECT produced by the exact schema check."""
+    # Bound repeated SQLite tokenization even when semicolons occur inside literals.
+    if len(sql.encode("utf-8")) > MAX_SCHEMA_READ_BYTES or sql.count(";") > 64 or "\0" in sql or "\r" in sql:
+        return None
+    try:
+        statements = tuple(migrations._statements(sql))
+    except migrations.MigrationError:
+        return None
+    if (not 2 <= len(statements) <= MAX_SCHEMA_READ_STATEMENTS or ";\n".join(statements) + ";" != sql
+            or any(len(statement.encode("utf-8")) >= migrations.MAX_D1_STATEMENT_BYTES
+                   or not readonly_sql(statement, schema_check=True) for statement in statements)):
+        return None
+    return statements
 
 
 def _identifier(value):

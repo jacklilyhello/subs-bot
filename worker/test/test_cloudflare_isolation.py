@@ -177,6 +177,10 @@ class FakeCloudflare:
         self.temp_occupancy = None
         self.temp_occupancy_at = {}
         self.temp_reads = 0
+        self.dynamic_all_schema = "absent"
+        self.dynamic_all_occupancy = None
+        self.dynamic_all_occupancy_at = {}
+        self.dynamic_all_reads = 0
 
     def worker_api(self, method, path, payload=None):
         self.calls.append((method, path))
@@ -251,6 +255,39 @@ class FakeCloudflare:
     def data_api(self, method, path, payload=None):
         if method == "POST" and path == DATABASE + "/query":
             sql = payload["sql"]
+            if any(field in sql for field in ("AS dynamicAllTables", "AS dynamicAllRegistered", "AS dynamicAllMarkerSql")):
+                if "AS dynamicAllMarkerSql" in sql:
+                    self.dynamic_all_reads += 1
+                occupied = self.dynamic_all_occupancy_at.get(self.dynamic_all_reads, self.dynamic_all_occupancy)
+                state = self.dynamic_all_schema
+                with closing(sqlite3.connect(":memory:")) as db:
+                    db.row_factory = sqlite3.Row
+                    if state == "ledger-view":
+                        db.execute("CREATE VIEW subs_bot_schema_migrations AS SELECT 1")
+                    elif state not in ("absent", "missing-ledger"):
+                        db.execute("CREATE TABLE subs_bot_schema_migrations(position INTEGER PRIMARY KEY,name TEXT,sha256 TEXT,mode TEXT)")
+                        if state not in ("old-ledger", "unregistered"):
+                            digest = "0" * 64 if state == "bad-ledger" else cloudflare.LEGACY_DYNAMIC_ALL_MIGRATION_SHA256
+                            db.execute("INSERT INTO subs_bot_schema_migrations VALUES (40,?,?,'applied')",
+                                       (cloudflare.LEGACY_DYNAMIC_ALL_MIGRATION, digest))
+                    if state not in ("absent", "old-ledger", "missing-tables", "ledger-view"):
+                        migrations = Path(__file__).resolve().parents[1] / "migrations"
+                        ddl = (migrations / cloudflare.LEGACY_DYNAMIC_ALL_MIGRATION).read_text(encoding="utf-8")
+                        if state == "partial":
+                            ddl = ddl.partition(";")[0]
+                        if state == "bad-ddl":
+                            ddl = ddl.replace("tie BETWEEN 1 AND", "tie BETWEEN 2 AND")
+                        if state == "bad-index":
+                            ddl = ddl.replace("ON legacy_all_aggregates (owner_id)", "ON legacy_all_aggregates (bot_id)")
+                        db.executescript(ddl)
+                        if state == "extra-index":
+                            db.execute("CREATE INDEX unexpected_order_tie ON legacy_all_subscription_order(tie)")
+                        # Count each sidecar independently even when drift has left only one side populated.
+                        if occupied == "marker":
+                            db.execute("INSERT INTO legacy_all_aggregates VALUES (?,'123','456',?)", ("1" * 64, "2" * 64))
+                        if occupied == "order":
+                            db.execute("INSERT INTO legacy_all_subscription_order VALUES (1,'456',1,1)")
+                    return [{"success": True, "results": [dict(row) for row in db.execute(sql)]}]
             if any(field in sql for field in ("AS tempTables", "AS tempRegistered", "AS tempInstallSql")):
                 if "AS tempInstallSql" in sql:
                     self.temp_reads += 1
@@ -637,6 +674,79 @@ class ReleaseTests(unittest.TestCase):
         both = (cloudflare.LEGACY_TEMP_READ_MARKER, cloudflare.LEGACY_TEMP_MUTATE_MARKER)
         self.set_temp_capabilities(desired=both)
         self.api.temp_schema = "ready"
+        self.api.health_available = False
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "prior version was restored"):
+            self.release_selected()
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS, DEPLOYMENTS])
+        self.assertEqual(self.api.active["versions"][0]["version_id"], OLD_VERSION)
+
+    def set_dynamic_all_capabilities(self, *, active=(), desired=(), exact_pin=True):
+        temp = (cloudflare.LEGACY_TEMP_READ_MARKER, cloudflare.LEGACY_TEMP_MUTATE_MARKER)
+        self.set_temp_capabilities(active=(*temp, *active), desired=(*temp, *desired))
+        self.api.temp_schema = "ready"
+        if not exact_pin:
+            self.manifest["migrations"][39]["sha256"] = "0" * 64
+
+    def test_dynamic_all_floor_refuses_each_occupied_table_unless_both_versions_are_capable(self):
+        both = (cloudflare.LEGACY_DYNAMIC_ALL_READ_MARKER, cloudflare.LEGACY_DYNAMIC_ALL_ORDER_MARKER)
+        self.api.dynamic_all_schema = "ready"
+        for active, desired in ((both, ()), ((), both)):
+            self.set_dynamic_all_capabilities(active=active, desired=desired)
+            for occupied in ("marker", "order"):
+                self.api.dynamic_all_occupancy = occupied
+                with self.subTest(active=bool(active), occupied=occupied):
+                    with self.assertRaisesRegex(cloudflare.CloudflareError, "while isolated dynamic aggregate rows exist"):
+                        cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET,
+                                                        legacy_dynamic_all_capable=bool(desired))
+                    with self.assertRaisesRegex(cloudflare.CloudflareError, "while isolated dynamic aggregate rows exist"):
+                        self.release_selected()
+        self.assertEqual(self.api.writes(), [])
+        self.set_dynamic_all_capabilities(active=both, desired=both)
+        self.assertTrue(self.release_selected()["changed"])
+
+    def test_dynamic_all_floor_pins_markers_migration_tables_and_indexes(self):
+        read, order = cloudflare.LEGACY_DYNAMIC_ALL_READ_MARKER, cloudflare.LEGACY_DYNAMIC_ALL_ORDER_MARKER
+        for desired, exact_pin in (((read,), True), ((order,), True), ((read, order), False)):
+            self.set_dynamic_all_capabilities(desired=desired, exact_pin=exact_pin)
+            with self.subTest(desired=desired, exact_pin=exact_pin), self.assertRaisesRegex(cloudflare.CloudflareError, "verified Worker"):
+                self.release_selected()
+        self.assertEqual(self.api.calls, [])
+        self.set_dynamic_all_capabilities(desired=(read, order))
+        self.api.dynamic_all_schema = "old-ledger"
+        self.assertEqual(cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET,
+            legacy_dynamic_all_capable=cloudflare.legacy_dynamic_all_artifact(self.bundle, self.manifest))["versionId"], OLD_VERSION)
+        for state in ("old-ledger", "partial", "missing-tables", "missing-ledger", "unregistered", "bad-ledger", "bad-ddl",
+                      "bad-index", "extra-index", "ledger-view"):
+            self.api.dynamic_all_schema = state
+            with self.subTest(state=state), self.assertRaisesRegex(cloudflare.CloudflareError, "dynamic aggregate schema or ledger"):
+                self.release_selected()
+        self.assertEqual(self.api.writes(), [])
+
+    def test_dynamic_all_floor_rechecks_after_staging_before_forward_activation(self):
+        both = (cloudflare.LEGACY_DYNAMIC_ALL_READ_MARKER, cloudflare.LEGACY_DYNAMIC_ALL_ORDER_MARKER)
+        self.set_dynamic_all_capabilities(active=both)
+        self.api.dynamic_all_schema = "ready"
+        self.api.dynamic_all_occupancy_at = {3: "marker"}
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "while isolated dynamic aggregate rows exist"):
+            self.release_selected()
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false"])
+        self.assertEqual(self.api.active["versions"][0]["version_id"], OLD_VERSION)
+
+    def test_dynamic_all_floor_blocks_rollback_when_order_rows_appear_after_activation(self):
+        both = (cloudflare.LEGACY_DYNAMIC_ALL_READ_MARKER, cloudflare.LEGACY_DYNAMIC_ALL_ORDER_MARKER)
+        self.set_dynamic_all_capabilities(desired=both)
+        self.api.dynamic_all_schema = "ready"
+        self.api.dynamic_all_occupancy_at = {4: "order", 5: "order"}
+        self.api.health_available = False
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "safe rollback could not be confirmed"):
+            self.release_selected()
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
+        self.assertEqual(self.api.active["versions"][0]["version_id"], NEW_VERSION)
+
+    def test_dynamic_all_floor_allows_empty_schema_rollback_to_prior_runtime(self):
+        both = (cloudflare.LEGACY_DYNAMIC_ALL_READ_MARKER, cloudflare.LEGACY_DYNAMIC_ALL_ORDER_MARKER)
+        self.set_dynamic_all_capabilities(desired=both)
+        self.api.dynamic_all_schema = "ready"
         self.api.health_available = False
         with self.assertRaisesRegex(cloudflare.CloudflareError, "prior version was restored"):
             self.release_selected()
@@ -1825,6 +1935,7 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(verify.call_args.kwargs["private_share_key"], PRIVATE_SHARE_KEY)
             self.assertIs(verify.call_args.kwargs["legacy_selected_capable"], False)
             self.assertIs(verify.call_args.kwargs["legacy_temp_capable"], False)
+            self.assertIs(verify.call_args.kwargs["legacy_dynamic_all_capable"], False)
             migrate.assert_not_called()
             deploy.assert_not_called()
 
