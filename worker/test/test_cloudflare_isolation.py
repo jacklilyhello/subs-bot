@@ -169,6 +169,10 @@ class FakeCloudflare:
         self.group_share_cards_work = None
         self.legacy_short_checks = []
         self.legacy_short_ledger_drift = {}
+        self.selected_schema = "absent"
+        self.selected_occupancy = None
+        self.selected_occupancy_at = {}
+        self.selected_reads = 0
 
     def worker_api(self, method, path, payload=None):
         self.calls.append((method, path))
@@ -243,6 +247,35 @@ class FakeCloudflare:
     def data_api(self, method, path, payload=None):
         if method == "POST" and path == DATABASE + "/query":
             sql = payload["sql"]
+            if any(field in sql for field in ("AS sidecars", "AS selectedRegistered", "AS markerSql")):
+                if "AS markerSql" in sql:
+                    self.selected_reads += 1
+                occupied = self.selected_occupancy_at.get(self.selected_reads, self.selected_occupancy)
+                migrations = Path(__file__).resolve().parents[1] / "migrations"
+                with closing(sqlite3.connect(":memory:")) as db:
+                    db.row_factory = sqlite3.Row
+                    db.execute("PRAGMA foreign_keys=ON")
+                    if self.selected_schema != "absent":
+                        db.execute("CREATE TABLE subs_bot_schema_migrations(position INTEGER PRIMARY KEY,name TEXT,sha256 TEXT,mode TEXT)")
+                        if self.selected_schema not in ("old-ledger", "unregistered"):
+                            digest = "0" * 64 if self.selected_schema == "bad-ledger" else cloudflare.LEGACY_SELECTED_MIGRATION_SHA256
+                            db.execute("INSERT INTO subs_bot_schema_migrations VALUES (38,?,?,'applied')",
+                                       (cloudflare.LEGACY_SELECTED_MIGRATION, digest))
+                    if self.selected_schema not in ("absent", "old-ledger", "missing-sidecars"):
+                        db.executescript((migrations / "0009_aggregate_links.sql").read_text(encoding="utf-8"))
+                        ddl = (migrations / cloudflare.LEGACY_SELECTED_MIGRATION).read_text(encoding="utf-8")
+                        if self.selected_schema == "partial":
+                            ddl = ddl.splitlines()[0]
+                        if self.selected_schema == "bad-ddl":
+                            ddl = ddl.replace("CHECK(retired IN(0,1))", "CHECK(retired IN(0,1,2))")
+                        db.executescript(ddl)
+                        if occupied == "marker":
+                            key = "1" * 64
+                            db.execute("INSERT INTO aggregate_links VALUES (?,'123','selected',NULL,'[1]',1,2)", (key,))
+                            db.execute("INSERT INTO legacy_selected_aggregates VALUES (?)", (key,))
+                        if occupied == "retired-member":
+                            db.execute("INSERT INTO legacy_selected_members VALUES (1,1)")
+                    return [{"success": True, "results": [dict(row) for row in db.execute(sql)]}]
             if "WHERE position=37" in sql or "tbl_name IN ('telegram_group_share_cards'" in sql or "AS groupShareCardsActive" in sql:
                 migrations = Path(__file__).resolve().parents[1] / "migrations"
                 migration = migrations / cloudflare.GROUP_SHARE_CARDS_MIGRATION
@@ -425,6 +458,86 @@ class ReleaseTests(unittest.TestCase):
                                          self.manifest, self.api.guard, telegram_config=telegram_config,
                                          aggregate_key=aggregate_key, private_share_key=private_share_key, **options)
 
+    def set_selected_capabilities(self, *, active=(), desired=(), exact_pin=True):
+        self.set_group_share_cards_baseline(same_artifact=False, prior_markers=active, next_markers=desired)
+        migrations = Path(__file__).resolve().parents[1] / "migrations"
+        self.manifest["migrations"] = [{"name": file.name, "sha256": sha256(file.read_bytes()).hexdigest()}
+                                      for file in sorted(migrations.glob("*.sql"))]
+        if not exact_pin:
+            self.manifest["migrations"][37]["sha256"] = "0" * 64
+
+    def release_selected(self):
+        return self.release(INLINE_CONFIG, private_share_key=PRIVATE_SHARE_KEY,
+                            provider_binding=PROVIDER_BINDING, provider_guard=Mock())
+
+    def test_selected_floor_refuses_any_marked_or_watched_rows_for_an_incapable_target(self):
+        retirement = cloudflare.LEGACY_SELECTED_RETIREMENT_MARKER
+        both = (retirement, cloudflare.LEGACY_SELECTED_HTTP_MARKER)
+        self.api.selected_schema = "ready"
+        self.set_selected_capabilities(active=both, desired=(retirement,))
+        for occupancy in ("marker", "retired-member"):
+            self.api.selected_occupancy = occupancy
+            with self.subTest(occupancy=occupancy), self.assertRaisesRegex(cloudflare.CloudflareError, "while isolated legacy selected rows exist"):
+                self.release_selected()
+            with self.subTest(preflight=occupancy), self.assertRaisesRegex(cloudflare.CloudflareError, "while isolated legacy selected rows exist"):
+                cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET, legacy_selected_capable=False)
+        self.set_selected_capabilities(active=(retirement,), desired=both)
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "while isolated legacy selected rows exist"):
+            self.release_selected()
+        self.assertEqual(self.api.writes(), [])
+        self.set_selected_capabilities(active=both, desired=both)
+        self.assertTrue(self.release_selected()["changed"])
+
+    def test_selected_floor_requires_exact_immutable_capabilities_and_live_schema(self):
+        retirement = cloudflare.LEGACY_SELECTED_RETIREMENT_MARKER
+        http = cloudflare.LEGACY_SELECTED_HTTP_MARKER
+        both = (retirement, http)
+        for desired, pin in (((http,), True), (both, False)):
+            self.set_selected_capabilities(desired=desired, exact_pin=pin)
+            with self.subTest(desired=desired, pin=pin), self.assertRaisesRegex(cloudflare.CloudflareError, "verified Worker"):
+                self.release_selected()
+        self.assertEqual(self.api.calls, [])
+        self.set_selected_capabilities(active=(retirement,), desired=both)
+        self.api.selected_schema = "old-ledger"
+        self.assertEqual(cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET,
+            legacy_selected_capable=cloudflare.legacy_selected_artifact(self.bundle, self.manifest))["versionId"], OLD_VERSION)
+        for state in ("old-ledger", "partial", "missing-sidecars", "unregistered", "bad-ledger", "bad-ddl"):
+            self.api.selected_schema = state
+            with self.subTest(state=state), self.assertRaisesRegex(cloudflare.CloudflareError, "schema or ledger"):
+                self.release_selected()
+        self.assertEqual(self.api.writes(), [])
+
+    def test_selected_floor_rechecks_occupancy_after_staging_before_forward_activation(self):
+        retirement = cloudflare.LEGACY_SELECTED_RETIREMENT_MARKER
+        self.set_selected_capabilities(active=(retirement, cloudflare.LEGACY_SELECTED_HTTP_MARKER), desired=(retirement,))
+        self.api.selected_schema = "ready"
+        self.api.selected_occupancy_at = {2: "retired-member"}
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "while isolated legacy selected rows exist"):
+            self.release_selected()
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false"])
+        self.assertEqual(self.api.active["versions"][0]["version_id"], OLD_VERSION)
+
+    def test_selected_floor_rechecks_occupancy_before_automatic_rollback(self):
+        retirement = cloudflare.LEGACY_SELECTED_RETIREMENT_MARKER
+        self.set_selected_capabilities(active=(retirement,), desired=(retirement, cloudflare.LEGACY_SELECTED_HTTP_MARKER))
+        self.api.selected_schema = "ready"
+        self.api.selected_occupancy_at = {4: "marker"}
+        self.api.health_available = False
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "safe rollback could not be confirmed"):
+            self.release_selected()
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
+        self.assertEqual(self.api.active["versions"][0]["version_id"], NEW_VERSION)
+
+    def test_selected_floor_can_rollback_to_retirement_only_while_both_tables_are_empty(self):
+        retirement = cloudflare.LEGACY_SELECTED_RETIREMENT_MARKER
+        self.set_selected_capabilities(active=(retirement,), desired=(retirement, cloudflare.LEGACY_SELECTED_HTTP_MARKER))
+        self.api.selected_schema = "ready"
+        self.api.health_available = False
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "prior version was restored"):
+            self.release_selected()
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS, DEPLOYMENTS])
+        self.assertEqual(self.api.active["versions"][0]["version_id"], OLD_VERSION)
+
     def set_old_telegram_config(self, config=TELEGRAM_CONFIG):
         self.api.versions[OLD_VERSION]["bindings"].extend([
             {"type": "secret_text", "name": cloudflare.TELEGRAM_CONFIG_BINDING},
@@ -535,17 +648,20 @@ class ReleaseTests(unittest.TestCase):
             mixed_documents=False if capable else None)
         return active
 
-    def set_group_share_cards_baseline(self, *, capable=True, same_artifact=True, enabled=False, api_status=False):
+    def set_group_share_cards_baseline(self, *, capable=True, same_artifact=True, enabled=False, api_status=False,
+                                       prior_markers=(), next_markers=()):
         active = self.set_mixed_documents_baseline(same_artifact=same_artifact, api_status=api_status)
         self.manifest["migrations"].append({"name": cloudflare.GROUP_SHARE_CARDS_MIGRATION,
                                              "sha256": cloudflare.GROUP_SHARE_CARDS_MIGRATION_SHA256})
         module = NEW_MODULE + b" /* " + cloudflare.GROUP_SHARE_CARDS_MARKER + b" */"
+        module += b"".join(b" /* " + marker + b" */" for marker in next_markers)
         self.api.upload_module = module
         (self.bundle / "index.js").write_bytes(module)
         self.manifest["bundleSha256"] = sha256(module).hexdigest()
         active_module = (NEW_MODULE if same_artifact else OLD_MODULE)
         if capable:
             active_module += b" /* " + cloudflare.GROUP_SHARE_CARDS_MARKER + b" */"
+        active_module += b"".join(b" /* " + marker + b" */" for marker in prior_markers)
         active["modules"][0]["content_base64"] = base64.b64encode(active_module).decode("ascii")
         key_digest = sha256(PRIVATE_SHARE_KEY.encode()).hexdigest()
         active["bindings"].extend([
@@ -693,6 +809,7 @@ class ReleaseTests(unittest.TestCase):
         self.set_inline_baseline()
         directory = self.bundle / "subs-bot-verified"
         directory.mkdir()
+        (directory / "index.js").write_bytes((self.bundle / "index.js").read_bytes())
         (directory / "isolation.json").write_text(json.dumps(self.manifest), encoding="utf-8")
         environment = {"GITHUB_SHA": NEW_REVISION, "GITHUB_REPOSITORY": "jacklilyhello/subs-bot",
             "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/main", "RUNNER_TEMP": str(self.bundle),
@@ -1584,6 +1701,7 @@ class ReleaseTests(unittest.TestCase):
     def test_protected_entry_rejects_key_change_before_any_migration(self):
         directory = self.bundle / "subs-bot-verified"
         directory.mkdir()
+        (directory / "index.js").write_bytes((self.bundle / "index.js").read_bytes())
         manifest = {**self.manifest, "migrations": [{"name": "0014_telegram_aggregate_issuance.sql"},
                                                    {"name": "0016_telegram_private_share_creation.sql"}]}
         (directory / "isolation.json").write_text(json.dumps(manifest), encoding="utf-8")
@@ -1600,12 +1718,14 @@ class ReleaseTests(unittest.TestCase):
             with self.assertRaisesRegex(cloudflare.CloudflareError, "rotation"):
                 release_entry.release()
             self.assertEqual(verify.call_args.kwargs["private_share_key"], PRIVATE_SHARE_KEY)
+            self.assertIs(verify.call_args.kwargs["legacy_selected_capable"], False)
             migrate.assert_not_called()
             deploy.assert_not_called()
 
     def test_protected_entry_rejects_provider_drift_before_any_migration(self):
         directory = self.bundle / "subs-bot-verified"
         directory.mkdir()
+        (directory / "index.js").write_bytes((self.bundle / "index.js").read_bytes())
         (directory / "isolation.json").write_text(json.dumps(self.manifest), encoding="utf-8")
         environment = {"GITHUB_SHA": NEW_REVISION, "GITHUB_REPOSITORY": "jacklilyhello/subs-bot",
             "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/main", "RUNNER_TEMP": str(self.bundle),
@@ -1804,6 +1924,7 @@ class ReleaseTests(unittest.TestCase):
     def test_protected_first_binding_requires_live_artifact_before_migrations(self):
         directory = self.bundle / "subs-bot-verified"
         directory.mkdir()
+        (directory / "index.js").write_bytes((self.bundle / "index.js").read_bytes())
         (directory / "isolation.json").write_text(json.dumps(self.manifest), encoding="utf-8")
         environment = {"GITHUB_SHA": NEW_REVISION, "GITHUB_REPOSITORY": "jacklilyhello/subs-bot",
             "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/main", "RUNNER_TEMP": str(self.bundle),

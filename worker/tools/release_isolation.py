@@ -9,8 +9,8 @@ from pathlib import Path
 
 from attest_api_status_container import ATTESTATION_ENV
 from cloudflare_isolation import (
-    CloudflareClient, CloudflareError, WORKER_NAME, group_share_cards_artifact, release_worker, validate_aggregate_key,
-    validate_private_share_key, verify_worker_target,
+    CloudflareClient, CloudflareError, WORKER_NAME, group_share_cards_artifact, legacy_selected_artifact, release_worker,
+    validate_aggregate_key, validate_private_share_key, verify_worker_target,
 )
 from d1_migrations import MigrationError, apply_migrations
 from prepare_isolation_artifact import ArtifactError, require_current_main
@@ -168,6 +168,7 @@ def release():
     if manifest.get("version") != 2 or manifest.get("revision") != revision:
         raise ValueError("The verified artifact does not match this release.")
     group_cards_capable = group_share_cards_artifact(bundle, manifest)
+    selected_capable = legacy_selected_artifact(bundle, manifest)
     telegram_config = telegram_release_config(manifest)
     aggregate_key = None
     if any(item["name"] == "0014_telegram_aggregate_issuance.sql" for item in manifest["migrations"]):
@@ -215,7 +216,8 @@ def release():
                                     legacy_subscription_shorts=legacy_subscription_shorts, provider_batch=provider_batch,
                                     api_status=api_status, api_status_gate=api_status_gate,
                                     provider_url_documents=provider_url_documents, mixed_documents=mixed_documents,
-                                    group_share_cards=group_share_cards, group_share_cards_capable=group_cards_capable)
+                                    group_share_cards=group_share_cards, group_share_cards_capable=group_cards_capable,
+                                    legacy_selected_capable=selected_capable)
     if provider_gate is not None:
         provider_gate.verify()
     migrations = apply_migrations(data_api, target, bundle, manifest, guard)
