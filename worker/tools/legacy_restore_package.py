@@ -39,6 +39,12 @@ TYPED_SHORT_MIGRATION_SHA256 = "1a0da8aa8aedde095b3e1a4bc71b5e03376587882288c4e2
 TYPED_SHORTS = "legacy_subscription_short_links"
 TYPED_SHORT_COLUMNS = ("code_sha256", "bot_id", "owner_id", "subscription_id", "token_sha256", "format", "created_at", "revoked_at")
 TYPED_SHORT_LINE_BYTES = 1024
+MIXED_SHORT_PROFILE = "legacy-mixed-short-v5"
+EXTERNAL_SHORT_MIGRATION = "0019_telegram_short_links.sql"
+EXTERNAL_SHORT_MIGRATION_SHA256 = "44cda07068dd84435542771899824c1d4196a1ffdc18f990abcb723e5bdaa3c1"
+EXTERNAL_SHORTS = "normal_short_links"
+EXTERNAL_SHORT_COLUMNS = ("code_sha256", "code_length", "bot_id", "owner_id", "origin_receipt_id", "nonce",
+                          "key_version", "target_url", "created_at", "revoked_at")
 COLUMNS = ("id", "owner_id", "name", "source_url", "token", "expire_at", "traffic_used", "traffic_total",
            "last_error", "created_at", "updated_at", "generation", "snapshot_id", "manifest_sha256", "node_count")
 TABLE_COLUMNS = {
@@ -343,6 +349,19 @@ def verify_typed_short_links(db, expected):
            OR EXISTS (SELECT 1 FROM aggregate_links WHERE code_sha256=typed.code_sha256) LIMIT 1""").fetchone() is None)
 
 
+def load_external_short_links(db, rows, bot_id):
+    # Imported 12-character links have no Telegram issuance receipt or derived nonce.
+    expected = [(code, 12, bot_id, owner, None, None, None, target, created_at, None)
+                for code, owner, target, created_at in rows]
+    db.executemany(f"INSERT INTO {EXTERNAL_SHORTS} ({','.join(EXTERNAL_SHORT_COLUMNS)}) VALUES (?,?,?,?,?,?,?,?,?,?)", expected)
+    return expected
+
+
+def verify_external_short_links(db, expected):
+    actual = db.execute(f"SELECT {','.join(EXTERNAL_SHORT_COLUMNS)} FROM {EXTERNAL_SHORTS} ORDER BY code_sha256")
+    require(all(row == target for row, target in zip_longest(actual, expected)))
+
+
 def db_summary(db, layout):
     return native.data_summary(layout, lambda table, definition: db.execute(
         "SELECT " + ",".join(native._identifier(name) for name, _ in definition["columns"])
@@ -389,12 +408,14 @@ def describe(path):
 
 
 def build_candidate(conversion, worker, output, *, converter_manifest_sha, worker_manifest_sha, revision, applied_at,
-                    profile=None, source_sqlite_sha=None, owner_map_sha=None, typed_short=None):
+                    profile=None, source_sqlite_sha=None, owner_map_sha=None, typed_short=None, mixed_short=None):
     try:
-        include_typed_shorts = profile == TYPED_SHORT_PROFILE
-        include_empty_exports = profile in (EMPTY_EXPORT_PROFILE, TYPED_SHORT_PROFILE)
+        include_mixed_shorts = profile == MIXED_SHORT_PROFILE
+        include_typed_shorts = profile in (TYPED_SHORT_PROFILE, MIXED_SHORT_PROFILE)
+        include_empty_exports = profile in (EMPTY_EXPORT_PROFILE, TYPED_SHORT_PROFILE, MIXED_SHORT_PROFILE)
         require(profile is None or include_empty_exports)
-        require((typed_short is not None) == include_typed_shorts)
+        require((typed_short is not None) == (profile == TYPED_SHORT_PROFILE)
+                and (mixed_short is not None) == include_mixed_shorts)
         if include_empty_exports:
             require(native.matches(native.DIGEST, source_sqlite_sha) and native.matches(native.DIGEST, owner_map_sha))
         else:
@@ -405,11 +426,24 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
         output = converter._safe_path(Path(output), existing=False)
         require(not output.is_relative_to(conversion) and not output.is_relative_to(worker))
         typed_domain = None
-        if include_typed_shorts:
+        chain, build = worker_artifact(worker, revision, worker_manifest_sha)
+        if include_mixed_shorts:
+            from legacy_mixed_short_candidate import MixedShortError, MixedShortInput, read_mixed_shorts
+
+            require(isinstance(mixed_short, MixedShortInput)
+                    and all(not output.is_relative_to(private_path(path, directory=True))
+                            for path in (mixed_short.namespace, mixed_short.oracle)))
+            try:
+                mixed = read_mixed_shorts(mixed_short, source_sha=source_sqlite_sha, owner_map_sha=owner_map_sha,
+                                          build=build, worker_manifest_sha=worker_manifest_sha, working_parent=output.parent)
+            except MixedShortError:
+                raise PackageError(ERROR) from None
+            typed_domain, typed_rows, legacy_bot_id = mixed.domain, mixed.typed_rows, mixed_short.legacy_bot_id
+        elif include_typed_shorts:
             typed_root, typed_domain, typed_rows = read_typed_short_artifact(typed_short, source_sqlite_sha, owner_map_sha)
             require(not output.is_relative_to(typed_root))
+            legacy_bot_id = typed_short.legacy_bot_id
         source, files = converter_artifact(conversion, converter_manifest_sha, typed_short_domain=typed_domain)
-        chain, build = worker_artifact(worker, revision, worker_manifest_sha)
         if include_empty_exports:
             require(source["sourceSha256"] == source_sqlite_sha and source["ownerMapSha256"] == owner_map_sha
                     and len(chain) >= 26 and chain[25].name == EMPTY_EXPORT_MIGRATION
@@ -417,6 +451,11 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
         if include_typed_shorts:
             require(len(chain) >= 29 and (chain[28].name, chain[28].sha256)
                     == (TYPED_SHORT_MIGRATION, TYPED_SHORT_MIGRATION_SHA256))
+        if include_mixed_shorts:
+            require((chain[18].name, chain[18].sha256) == (EXTERNAL_SHORT_MIGRATION, EXTERNAL_SHORT_MIGRATION_SHA256))
+        extra_tables = {TYPED_SHORTS: TYPED_SHORT_COLUMNS} if include_typed_shorts else {}
+        if include_mixed_shorts:
+            extra_tables[EXTERNAL_SHORTS] = EXTERNAL_SHORT_COLUMNS
         path_mapping = source.get("pathIdMapping")
         if path_mapping is not None:
             require(len(chain) >= 10 and chain[9].name == "0010_path_rules.sql")
@@ -445,7 +484,9 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                 if path_mapping is not None:
                     load_path_rules(db, conversion, source, files)
                 if include_typed_shorts:
-                    typed_expected, typed_counts = load_typed_short_links(db, output / LINEAGE, typed_rows, typed_short.legacy_bot_id)
+                    typed_expected, typed_counts = load_typed_short_links(db, output / LINEAGE, typed_rows, legacy_bot_id)
+                if include_mixed_shorts:
+                    external_expected = load_external_short_links(db, mixed.external_rows, legacy_bot_id)
                 require(db.execute("""SELECT 1 FROM subscriptions AS active JOIN subscription_trash AS trash
                     ON active.id=trash.id OR active.token=trash.token LIMIT 1""").fetchone() is None)
                 db.execute("DELETE FROM sqlite_sequence WHERE name='subscriptions'")
@@ -456,7 +497,7 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                 write_sql(db, schema, sequence, replay_sql,
                           path_sequence=path_mapping["sourceHighWater"] if path_mapping is not None else None,
                           include_empty_exports=include_empty_exports,
-                          extra_tables={TYPED_SHORTS: TYPED_SHORT_COLUMNS} if include_typed_shorts else None)
+                          extra_tables=extra_tables)
 
             def read_object(key):
                 raw = expected_file(conversion, files, "objects/" + key, native.OBJECT_BYTES)
@@ -477,6 +518,8 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                     verify_empty_export_markers(replayed)
                 if include_typed_shorts:
                     verify_typed_short_links(replayed, typed_expected)
+                if include_mixed_shorts:
+                    verify_external_short_links(replayed, external_expected)
                 objects = native.object_references(replayed, read_object, copy_object)
             require({"objects/" + item["key"] for item in objects} == set(files) - metadata_files(source))
             replay_sql.rename(sql)
@@ -505,8 +548,18 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                           typedShortLinks={**typed_counts, "migrationSha256": TYPED_SHORT_MIGRATION_SHA256,
                                            "tableSha256": summary["tableSha256"][TYPED_SHORTS]},
                           shortLinkCompatibility="not-validated")
-            source_pin.update(typedShortInventoryManifestSha256=typed_short.manifest_sha256,
-                              oldOriginSha256=typed_short.old_origin_sha256, legacyBotId=typed_short.legacy_bot_id)
+            if not include_mixed_shorts:
+                source_pin.update(typedShortInventoryManifestSha256=typed_short.manifest_sha256,
+                                  oldOriginSha256=typed_short.old_origin_sha256, legacyBotId=legacy_bot_id)
+        if include_mixed_shorts:
+            external_count = len(external_expected)
+            require(summary["tableCounts"][EXTERNAL_SHORTS] == external_count
+                    and external_count + typed_counts["rows"] == typed_domain["rows"])
+            report.update(version=5, legacyDomains=report["legacyDomains"] + "-and-external-shorts",
+                          externalShortLinks={"rows": external_count, "migrationSha256": EXTERNAL_SHORT_MIGRATION_SHA256,
+                                              "tableSha256": summary["tableSha256"][EXTERNAL_SHORTS]},
+                          shortLinkCompatibility={"typed": "not-validated", "external": "offline-equivalent"})
+            source_pin.update(mixed.proof)
         manifest = {**report, "source": source_pin, "workerArtifact": build,
                     "ledger": ledger, "layout": layout, "summary": summary, "objects": objects,
                     "lineage": describe(output / LINEAGE), "sql": {**describe(sql), "md5": native.file_hash(sql, "md5")[1]}}
@@ -525,19 +578,30 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
 
 def main(args=None):
     args = sys.argv[1:] if args is None else args
-    if (len(args) not in (7, 10, 14) or not re.fullmatch(r"[1-9][0-9]{0,15}", args[6])
-            or (len(args) == 10 and args[7] != EMPTY_EXPORT_PROFILE) or (len(args) == 14 and args[7] != TYPED_SHORT_PROFILE)):
+    if (len(args) not in (7, 10, 11, 14) or not re.fullmatch(r"[1-9][0-9]{0,15}", args[6])
+            or (len(args) == 10 and args[7] != EMPTY_EXPORT_PROFILE) or (len(args) == 14 and args[7] != TYPED_SHORT_PROFILE)
+            or (len(args) == 11 and args[7] != MIXED_SHORT_PROFILE)):
         print("Usage: legacy_restore_package.py CONVERTER_DIR WORKER_ARTIFACT_DIR OUTPUT_DIR CONVERTER_MANIFEST_SHA WORKER_MANIFEST_SHA REVISION APPLIED_AT"
               " [legacy-empty-v3 SOURCE_SQLITE_SHA OWNER_MAP_SHA | legacy-typed-short-v4 SOURCE_SQLITE_SHA OWNER_MAP_SHA "
-              "TYPED_SHORT_INVENTORY TYPED_SHORT_MANIFEST_SHA OLD_ORIGIN_SHA LEGACY_BOT_ID]",
+              "TYPED_SHORT_INVENTORY TYPED_SHORT_MANIFEST_SHA OLD_ORIGIN_SHA LEGACY_BOT_ID | "
+              "legacy-mixed-short-v5 SOURCE_SQLITE_SHA OWNER_MAP_SHA PRIVATE_INPUT_JSON]",
               file=sys.stderr)
         return 2
     try:
         profile, source_sqlite_sha, owner_map_sha = args[7:10] if len(args) >= 10 else (None, None, None)
         typed_short = TypedShortInput(Path(args[10]), *args[11:]) if len(args) == 14 else None
+        mixed_short = None
+        if len(args) == 11:
+            from legacy_mixed_short_candidate import MixedShortError, read_mixed_short_input
+
+            try:
+                mixed_short = read_mixed_short_input(Path(args[10]))
+            except MixedShortError:
+                raise PackageError(ERROR) from None
         result = build_candidate(*map(Path, args[:3]), converter_manifest_sha=args[3], worker_manifest_sha=args[4],
                                  revision=args[5], applied_at=int(args[6]), profile=profile,
-                                 source_sqlite_sha=source_sqlite_sha, owner_map_sha=owner_map_sha, typed_short=typed_short)
+                                 source_sqlite_sha=source_sqlite_sha, owner_map_sha=owner_map_sha, typed_short=typed_short,
+                                 mixed_short=mixed_short)
         print(json.dumps(result, ensure_ascii=True, sort_keys=True))
         return 0
     except PackageError as error:

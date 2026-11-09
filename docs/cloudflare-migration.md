@@ -448,6 +448,14 @@ PY
 
 当前证据限于合成样例，使用旧代码指定的 aiohttp 3.11.18 和测试用 yarl 1.20.0。真实比较须先独立确认旧部署的 Python、aiohttp 和 yarl 版本，并使用相同运行时及经独立核验的 Worker 构建。报告保持离线封存，进入真实候选与激活前另行核对旧链接、目标环境和恢复证据。
 
+### 封存混合旧短链候选
+
+在获准的托管 runner 上，在 `legacy_restore_package.py` 的原有七个参数后附加 `legacy-mixed-short-v5 SOURCE_SQLITE_SHA OWNER_MAP_SHA PRIVATE_INPUT_JSON`。私有 JSON 包含绝对路径 `source`、`ownerMap`、`namespace`、`oracle`，其对应的独立封存摘要 `namespaceSha256`、`oracleSha256`，以及 `oldOrigin`、`legacyBotId`、`legacyPythonVersion`、`legacyYarlVersion`。旧运行时版本来自独立核对的部署记录，输出父目录仅供当前账号访问。
+
+版本 5 从同一封存 SQLite 重建完整短链盘点，再用同一份 Worker 构建的离线报告逐条核对外部短链。每条外部链接均须通过旧 `HTTPFound` 和 Worker `GET`、`HEAD` 的状态与 `Location` 字节比较。`0029` 表保留指向活动或回收站订阅的旧短码摘要和目标谱系。`0019` 表保留外部短码摘要、精确目标、归属与时间。旧外部短链没有 Telegram 签发回执，候选保留该事实。聚合、未知、部分通过或多余的盘点记录会阻止封存。
+
+封存包沿用旧订阅编号、空导出标记、路径规则和对象校验。SQL 在独立临时库重放并复核结构、数据摘要、外键和对象闭包。`restore.sql` 含外部目标原文，须通过私有渠道保存。候选保持未应用、未绑定。外部重定向对照是离线证据，目标云端恢复、旧能力链接连续性及切换仍分别验收。
+
 ### 真实数据与生产切换门槛
 
 1. 先只读核对 Cloudflare 目标账户、Zone、`subs-bot.lilyya.top` 的 DNS、Worker 路由和 Custom Domain 绑定。新资源记录账号、环境及资源 ID，隔离与生产分别使用各自的 Worker、D1、R2 和队列。现有配置冲突须在改动前报告。目标主机名可用且切换获准后，仅增加所需的 Custom Domain 绑定。 [Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)
