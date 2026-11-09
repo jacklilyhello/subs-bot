@@ -1,4 +1,4 @@
-CREATE TABLE telegram_group_share_cards(
+CREATE TABLE telegram_group_share_cards (
  receipt_id INTEGER PRIMARY KEY REFERENCES telegram_private_share_creations(receipt_id),
  group_id TEXT NOT NULL,
  state TEXT NOT NULL CHECK(state IN('pending','sending','sent','failed','uncertain')),
@@ -12,8 +12,8 @@ CREATE TABLE telegram_group_share_cards(
  CHECK((lease_id IS NULL)=(lease_until IS NULL)),
  UNIQUE(group_id,message_id)
 ) STRICT;
-CREATE INDEX telegram_group_share_due ON telegram_group_share_cards(state,due_at,receipt_id);
-CREATE TABLE telegram_group_share_scopes(
+CREATE INDEX telegram_group_share_due ON telegram_group_share_cards (state,due_at,receipt_id);
+CREATE TABLE telegram_group_share_scopes (
  receipt_id INTEGER PRIMARY KEY REFERENCES telegram_inbox(receipt_id),
  card_id INTEGER NOT NULL REFERENCES telegram_group_share_cards(receipt_id),
  auth_date INTEGER NOT NULL,

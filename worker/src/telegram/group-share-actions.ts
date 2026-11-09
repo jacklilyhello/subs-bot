@@ -8,7 +8,7 @@ const PICK_MARKER = "group-share-pick:v1";
 const PICK_SECONDS = 600;
 const SAFE_ERROR = "Telegram group share action could not be confirmed.";
 const MIGRATION_NAME = "0037_telegram_group_share_cards.sql";
-const MIGRATION_SHA256 = "8754268cb362e54c6a4ad249baa556682c998ddbc8b43c4fbd2c93c3781adef2";
+const MIGRATION_SHA256 = "064f461428f244f780e5655528fb0dc7e35676d1f805145ffff722b50780c748";
 type Sql = { sql: string; bindings: readonly (string | number)[] };
 
 export async function telegramGroupShareReady(db: D1Database): Promise<boolean> {
