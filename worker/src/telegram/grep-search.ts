@@ -10,7 +10,7 @@ async function readEvent(response: Response, id: number): Promise<Record<string,
     return null;
   }
   const reader = response.body.getReader();
-  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
   let total = 0;
   let tail = "";
   let event = "message";
