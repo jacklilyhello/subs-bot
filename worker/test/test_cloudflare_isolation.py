@@ -459,14 +459,16 @@ class ReleaseTests(unittest.TestCase):
                                          aggregate_key=aggregate_key, private_share_key=private_share_key, **options)
 
     def set_selected_capabilities(self, *, active=(), desired=(), exact_pin=True):
-        old_module, new_module = [module + b"".join(b" /* " + marker + b" */" for marker in markers)
-                                  for module, markers in ((OLD_MODULE, active), (NEW_MODULE, desired))]
-        self.api.versions[OLD_VERSION] = version(OLD_VERSION, OLD_REVISION, old_module)
-        self.api.upload_module = new_module
-        self.manifest["bundleSha256"] = sha256(new_module).hexdigest()
-        self.manifest["migrations"] = ([{}] * 37 + [{"name": cloudflare.LEGACY_SELECTED_MIGRATION,
-            "sha256": cloudflare.LEGACY_SELECTED_MIGRATION_SHA256 if exact_pin else "0" * 64}])
-        (self.bundle / "index.js").write_bytes(new_module)
+        self.set_group_share_cards_baseline(same_artifact=False, prior_markers=active, next_markers=desired)
+        migrations = Path(__file__).resolve().parents[1] / "migrations"
+        self.manifest["migrations"] = [{"name": file.name, "sha256": sha256(file.read_bytes()).hexdigest()}
+                                      for file in sorted(migrations.glob("*.sql"))]
+        if not exact_pin:
+            self.manifest["migrations"][37]["sha256"] = "0" * 64
+
+    def release_selected(self):
+        return self.release(INLINE_CONFIG, private_share_key=PRIVATE_SHARE_KEY,
+                            provider_binding=PROVIDER_BINDING, provider_guard=Mock())
 
     def test_selected_floor_refuses_any_marked_or_watched_rows_for_an_incapable_target(self):
         retirement = cloudflare.LEGACY_SELECTED_RETIREMENT_MARKER
@@ -476,15 +478,15 @@ class ReleaseTests(unittest.TestCase):
         for occupancy in ("marker", "retired-member"):
             self.api.selected_occupancy = occupancy
             with self.subTest(occupancy=occupancy), self.assertRaisesRegex(cloudflare.CloudflareError, "while isolated legacy selected rows exist"):
-                self.release()
+                self.release_selected()
             with self.subTest(preflight=occupancy), self.assertRaisesRegex(cloudflare.CloudflareError, "while isolated legacy selected rows exist"):
                 cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET, legacy_selected_capable=False)
         self.set_selected_capabilities(active=(retirement,), desired=both)
         with self.assertRaisesRegex(cloudflare.CloudflareError, "while isolated legacy selected rows exist"):
-            self.release()
+            self.release_selected()
         self.assertEqual(self.api.writes(), [])
         self.set_selected_capabilities(active=both, desired=both)
-        self.assertTrue(self.release()["changed"])
+        self.assertTrue(self.release_selected()["changed"])
 
     def test_selected_floor_requires_exact_immutable_capabilities_and_live_schema(self):
         retirement = cloudflare.LEGACY_SELECTED_RETIREMENT_MARKER
@@ -493,7 +495,7 @@ class ReleaseTests(unittest.TestCase):
         for desired, pin in (((http,), True), (both, False)):
             self.set_selected_capabilities(desired=desired, exact_pin=pin)
             with self.subTest(desired=desired, pin=pin), self.assertRaisesRegex(cloudflare.CloudflareError, "verified Worker"):
-                self.release()
+                self.release_selected()
         self.assertEqual(self.api.calls, [])
         self.set_selected_capabilities(active=(retirement,), desired=both)
         self.api.selected_schema = "old-ledger"
@@ -502,7 +504,7 @@ class ReleaseTests(unittest.TestCase):
         for state in ("old-ledger", "partial", "missing-sidecars", "unregistered", "bad-ledger", "bad-ddl"):
             self.api.selected_schema = state
             with self.subTest(state=state), self.assertRaisesRegex(cloudflare.CloudflareError, "schema or ledger"):
-                self.release()
+                self.release_selected()
         self.assertEqual(self.api.writes(), [])
 
     def test_selected_floor_rechecks_occupancy_after_staging_before_forward_activation(self):
@@ -511,7 +513,7 @@ class ReleaseTests(unittest.TestCase):
         self.api.selected_schema = "ready"
         self.api.selected_occupancy_at = {2: "retired-member"}
         with self.assertRaisesRegex(cloudflare.CloudflareError, "while isolated legacy selected rows exist"):
-            self.release()
+            self.release_selected()
         self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false"])
         self.assertEqual(self.api.active["versions"][0]["version_id"], OLD_VERSION)
 
@@ -522,7 +524,7 @@ class ReleaseTests(unittest.TestCase):
         self.api.selected_occupancy_at = {4: "marker"}
         self.api.health_available = False
         with self.assertRaisesRegex(cloudflare.CloudflareError, "safe rollback could not be confirmed"):
-            self.release()
+            self.release_selected()
         self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
         self.assertEqual(self.api.active["versions"][0]["version_id"], NEW_VERSION)
 
@@ -532,7 +534,7 @@ class ReleaseTests(unittest.TestCase):
         self.api.selected_schema = "ready"
         self.api.health_available = False
         with self.assertRaisesRegex(cloudflare.CloudflareError, "prior version was restored"):
-            self.release()
+            self.release_selected()
         self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS, DEPLOYMENTS])
         self.assertEqual(self.api.active["versions"][0]["version_id"], OLD_VERSION)
 
@@ -646,17 +648,20 @@ class ReleaseTests(unittest.TestCase):
             mixed_documents=False if capable else None)
         return active
 
-    def set_group_share_cards_baseline(self, *, capable=True, same_artifact=True, enabled=False, api_status=False):
+    def set_group_share_cards_baseline(self, *, capable=True, same_artifact=True, enabled=False, api_status=False,
+                                       prior_markers=(), next_markers=()):
         active = self.set_mixed_documents_baseline(same_artifact=same_artifact, api_status=api_status)
         self.manifest["migrations"].append({"name": cloudflare.GROUP_SHARE_CARDS_MIGRATION,
                                              "sha256": cloudflare.GROUP_SHARE_CARDS_MIGRATION_SHA256})
         module = NEW_MODULE + b" /* " + cloudflare.GROUP_SHARE_CARDS_MARKER + b" */"
+        module += b"".join(b" /* " + marker + b" */" for marker in next_markers)
         self.api.upload_module = module
         (self.bundle / "index.js").write_bytes(module)
         self.manifest["bundleSha256"] = sha256(module).hexdigest()
         active_module = (NEW_MODULE if same_artifact else OLD_MODULE)
         if capable:
             active_module += b" /* " + cloudflare.GROUP_SHARE_CARDS_MARKER + b" */"
+        active_module += b"".join(b" /* " + marker + b" */" for marker in prior_markers)
         active["modules"][0]["content_base64"] = base64.b64encode(active_module).decode("ascii")
         key_digest = sha256(PRIVATE_SHARE_KEY.encode()).hexdigest()
         active["bindings"].extend([
