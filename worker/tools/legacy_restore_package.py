@@ -16,6 +16,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from uuid import NAMESPACE_URL, uuid5
 
+from cloudflare_isolation import CloudflareError, LEGACY_SELECTED_MIGRATION_SHA256, legacy_selected_artifact
 import d1_migrations as migrations
 import legacy_snapshot_convert as converter
 import legacy_typed_short_inventory as typed_inventory
@@ -40,11 +41,18 @@ TYPED_SHORTS = "legacy_subscription_short_links"
 TYPED_SHORT_COLUMNS = ("code_sha256", "bot_id", "owner_id", "subscription_id", "token_sha256", "format", "created_at", "revoked_at")
 TYPED_SHORT_LINE_BYTES = 1024
 MIXED_SHORT_PROFILE = "legacy-mixed-short-v5"
+SELECTED_SHORT_PROFILE = "legacy-selected-short-v6"
 EXTERNAL_SHORT_MIGRATION = "0019_telegram_short_links.sql"
 EXTERNAL_SHORT_MIGRATION_SHA256 = "44cda07068dd84435542771899824c1d4196a1ffdc18f990abcb723e5bdaa3c1"
 EXTERNAL_SHORTS = "normal_short_links"
 EXTERNAL_SHORT_COLUMNS = ("code_sha256", "code_length", "bot_id", "owner_id", "origin_receipt_id", "nonce",
                           "key_version", "target_url", "created_at", "revoked_at")
+AGGREGATE_LINKS = "aggregate_links"
+SELECTED_MARKERS = "legacy_selected_aggregates"
+SELECTED_WATCHES = "legacy_selected_members"
+AGGREGATE_COLUMNS = ("code_sha256", "owner_id", "kind", "bot_id", "selected_ids", "created_at", "revoked_at")
+SELECTED_COLUMNS = {AGGREGATE_LINKS: AGGREGATE_COLUMNS, SELECTED_MARKERS: ("code_sha256",),
+                    SELECTED_WATCHES: ("id", "retired")}
 COLUMNS = ("id", "owner_id", "name", "source_url", "token", "expire_at", "traffic_used", "traffic_total",
            "last_error", "created_at", "updated_at", "generation", "snapshot_id", "manifest_sha256", "node_count")
 TABLE_COLUMNS = {
@@ -362,6 +370,43 @@ def verify_external_short_links(db, expected):
     require(all(row == target for row, target in zip_longest(actual, expected)))
 
 
+def load_selected_aggregate_links(db, mixed, source):
+    high = mixed.proof["selectedActiveHighWater"]
+    require(native.integer(high, 1, source["trashIdMapping"]["sourceHighWater"]))
+    links, markers, members = [], [], {}
+    for row in mixed.selected_rows:
+        active_positions = set(row.active_positions)
+        for position, identity in enumerate(row.legacy_ids):
+            require(native.integer(identity, 1, high))
+            if identity not in members:
+                require(len(members) < native.MAX_ROWS)
+                active = db.execute("SELECT owner_id,token FROM subscriptions WHERE id=?", (identity,)).fetchone()
+                # Imported trash is assigned above the old allocator high-water.
+                require(db.execute("SELECT 1 FROM subscription_trash WHERE id=?", (identity,)).fetchone() is None)
+                members[identity] = (active[0], native.digest(active[1].encode("ascii"))) if active is not None else None
+            expected_member = (row.owner_id, mixed.selected_active_tokens[identity]) if position in active_positions else None
+            require(members[identity] == expected_member)
+        links.append((row.code_sha256, row.owner_id, "selected", None,
+                      native.canonical(row.legacy_ids).decode("ascii"), row.created_at, None))
+        markers.append((row.code_sha256,))
+    watches = [(identity, int(member is None)) for identity, member in sorted(members.items())]
+    expected = {AGGREGATE_LINKS: links, SELECTED_MARKERS: markers, SELECTED_WATCHES: watches}
+    for table, rows in expected.items():
+        columns = SELECTED_COLUMNS[table]
+        db.executemany(f"INSERT INTO {table} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})", rows)
+    return expected
+
+
+def verify_selected_aggregate_links(db, expected, sequence):
+    for table, rows in expected.items():
+        columns = SELECTED_COLUMNS[table]
+        actual = db.execute(f"SELECT {','.join(columns)} FROM {table} ORDER BY {columns[0]}")
+        require(all(row == target for row, target in zip_longest(actual, rows)))
+    require(db.execute("SELECT seq FROM sqlite_sequence WHERE name='subscriptions'").fetchall() == [(sequence,)])
+    require(db.execute("""SELECT 1 FROM aggregate_links AS aggregate
+        JOIN normal_short_links AS normal USING (code_sha256) LIMIT 1""").fetchone() is None)
+
+
 def db_summary(db, layout):
     return native.data_summary(layout, lambda table, definition: db.execute(
         "SELECT " + ",".join(native._identifier(name) for name, _ in definition["columns"])
@@ -410,9 +455,10 @@ def describe(path):
 def build_candidate(conversion, worker, output, *, converter_manifest_sha, worker_manifest_sha, revision, applied_at,
                     profile=None, source_sqlite_sha=None, owner_map_sha=None, typed_short=None, mixed_short=None):
     try:
-        include_mixed_shorts = profile == MIXED_SHORT_PROFILE
-        include_typed_shorts = profile in (TYPED_SHORT_PROFILE, MIXED_SHORT_PROFILE)
-        include_empty_exports = profile in (EMPTY_EXPORT_PROFILE, TYPED_SHORT_PROFILE, MIXED_SHORT_PROFILE)
+        include_selected_shorts = profile == SELECTED_SHORT_PROFILE
+        include_mixed_shorts = profile in (MIXED_SHORT_PROFILE, SELECTED_SHORT_PROFILE)
+        include_typed_shorts = profile == TYPED_SHORT_PROFILE or include_mixed_shorts
+        include_empty_exports = profile == EMPTY_EXPORT_PROFILE or include_typed_shorts
         require(profile is None or include_empty_exports)
         require((typed_short is not None) == (profile == TYPED_SHORT_PROFILE)
                 and (mixed_short is not None) == include_mixed_shorts)
@@ -427,15 +473,18 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
         require(not output.is_relative_to(conversion) and not output.is_relative_to(worker))
         typed_domain = None
         chain, build = worker_artifact(worker, revision, worker_manifest_sha)
+        if include_selected_shorts:
+            require(legacy_selected_artifact(worker, build))
         if include_mixed_shorts:
-            from legacy_mixed_short_candidate import MixedShortError, MixedShortInput, read_mixed_shorts
+            from legacy_mixed_short_candidate import MixedShortError, MixedShortInput, read_mixed_shorts, read_selected_shorts
 
             require(isinstance(mixed_short, MixedShortInput)
                     and all(not output.is_relative_to(private_path(path, directory=True))
                             for path in (mixed_short.namespace, mixed_short.oracle)))
+            read_shorts = read_selected_shorts if include_selected_shorts else read_mixed_shorts
             try:
-                mixed = read_mixed_shorts(mixed_short, source_sha=source_sqlite_sha, owner_map_sha=owner_map_sha,
-                                          build=build, worker_manifest_sha=worker_manifest_sha, working_parent=output.parent)
+                mixed = read_shorts(mixed_short, source_sha=source_sqlite_sha, owner_map_sha=owner_map_sha,
+                                    build=build, worker_manifest_sha=worker_manifest_sha, working_parent=output.parent)
             except MixedShortError:
                 raise PackageError(ERROR) from None
             typed_domain, typed_rows, legacy_bot_id = mixed.domain, mixed.typed_rows, mixed_short.legacy_bot_id
@@ -456,6 +505,8 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
         extra_tables = {TYPED_SHORTS: TYPED_SHORT_COLUMNS} if include_typed_shorts else {}
         if include_mixed_shorts:
             extra_tables[EXTERNAL_SHORTS] = EXTERNAL_SHORT_COLUMNS
+        if include_selected_shorts:
+            extra_tables.update(SELECTED_COLUMNS)
         path_mapping = source.get("pathIdMapping")
         if path_mapping is not None:
             require(len(chain) >= 10 and chain[9].name == "0010_path_rules.sql")
@@ -487,6 +538,8 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                     typed_expected, typed_counts = load_typed_short_links(db, output / LINEAGE, typed_rows, legacy_bot_id)
                 if include_mixed_shorts:
                     external_expected = load_external_short_links(db, mixed.external_rows, legacy_bot_id)
+                if include_selected_shorts:
+                    selected_expected = load_selected_aggregate_links(db, mixed, source)
                 require(db.execute("""SELECT 1 FROM subscriptions AS active JOIN subscription_trash AS trash
                     ON active.id=trash.id OR active.token=trash.token LIMIT 1""").fetchone() is None)
                 db.execute("DELETE FROM sqlite_sequence WHERE name='subscriptions'")
@@ -520,6 +573,8 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                     verify_typed_short_links(replayed, typed_expected)
                 if include_mixed_shorts:
                     verify_external_short_links(replayed, external_expected)
+                if include_selected_shorts:
+                    verify_selected_aggregate_links(replayed, selected_expected, sequence)
                 objects = native.object_references(replayed, read_object, copy_object)
             require({"objects/" + item["key"] for item in objects} == set(files) - metadata_files(source))
             replay_sql.rename(sql)
@@ -553,13 +608,26 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                                   oldOriginSha256=typed_short.old_origin_sha256, legacyBotId=legacy_bot_id)
         if include_mixed_shorts:
             external_count = len(external_expected)
+            selected_count = len(selected_expected[AGGREGATE_LINKS]) if include_selected_shorts else 0
             require(summary["tableCounts"][EXTERNAL_SHORTS] == external_count
-                    and external_count + typed_counts["rows"] == typed_domain["rows"])
+                    and external_count + typed_counts["rows"] + selected_count == typed_domain["rows"])
             report.update(version=5, legacyDomains=report["legacyDomains"] + "-and-external-shorts",
                           externalShortLinks={"rows": external_count, "migrationSha256": EXTERNAL_SHORT_MIGRATION_SHA256,
                                               "tableSha256": summary["tableSha256"][EXTERNAL_SHORTS]},
                           shortLinkCompatibility={"typed": "not-validated", "external": "offline-equivalent"})
             source_pin.update(mixed.proof)
+        if include_selected_shorts:
+            watches = selected_expected[SELECTED_WATCHES]
+            require(all(summary["tableCounts"][table] == len(rows) for table, rows in selected_expected.items()))
+            compatibility = {**report["shortLinkCompatibility"], "selected": "not-validated"}
+            if external_count == 0:
+                compatibility["external"] = "not-applicable"
+            report.update(version=6, legacyDomains=report["legacyDomains"] + "-and-selected-aggregates",
+                          selectedAggregateLinks={"rows": selected_count, "watchRows": len(watches),
+                              "retiredWatchRows": sum(retired for _, retired in watches),
+                              "migrationSha256": LEGACY_SELECTED_MIGRATION_SHA256,
+                              "tableSha256": {table: summary["tableSha256"][table] for table in SELECTED_COLUMNS}},
+                          shortLinkCompatibility=compatibility)
         manifest = {**report, "source": source_pin, "workerArtifact": build,
                     "ledger": ledger, "layout": layout, "summary": summary, "objects": objects,
                     "lineage": describe(output / LINEAGE), "sql": {**describe(sql), "md5": native.file_hash(sql, "md5")[1]}}
@@ -571,7 +639,7 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
         with native.private_file(output / MARKER) as file:
             file.write(manifest_sha.encode("ascii") + b"\n")
         return {**report, "manifestSha256": manifest_sha}
-    except (PackageError, converter.ConversionError, migrations.MigrationError, native.RehearsalError, artifact.ArtifactError,
+    except (PackageError, CloudflareError, converter.ConversionError, migrations.MigrationError, native.RehearsalError, artifact.ArtifactError,
             OSError, sqlite3.Error, ValueError, TypeError, KeyError, UnicodeError, RecursionError, OverflowError):
         raise PackageError(ERROR) from None
 
@@ -580,11 +648,11 @@ def main(args=None):
     args = sys.argv[1:] if args is None else args
     if (len(args) not in (7, 10, 11, 14) or not re.fullmatch(r"[1-9][0-9]{0,15}", args[6])
             or (len(args) == 10 and args[7] != EMPTY_EXPORT_PROFILE) or (len(args) == 14 and args[7] != TYPED_SHORT_PROFILE)
-            or (len(args) == 11 and args[7] != MIXED_SHORT_PROFILE)):
+            or (len(args) == 11 and args[7] not in (MIXED_SHORT_PROFILE, SELECTED_SHORT_PROFILE))):
         print("Usage: legacy_restore_package.py CONVERTER_DIR WORKER_ARTIFACT_DIR OUTPUT_DIR CONVERTER_MANIFEST_SHA WORKER_MANIFEST_SHA REVISION APPLIED_AT"
               " [legacy-empty-v3 SOURCE_SQLITE_SHA OWNER_MAP_SHA | legacy-typed-short-v4 SOURCE_SQLITE_SHA OWNER_MAP_SHA "
               "TYPED_SHORT_INVENTORY TYPED_SHORT_MANIFEST_SHA OLD_ORIGIN_SHA LEGACY_BOT_ID | "
-              "legacy-mixed-short-v5 SOURCE_SQLITE_SHA OWNER_MAP_SHA PRIVATE_INPUT_JSON]",
+              "{legacy-mixed-short-v5|legacy-selected-short-v6} SOURCE_SQLITE_SHA OWNER_MAP_SHA PRIVATE_INPUT_JSON]",
               file=sys.stderr)
         return 2
     try:
