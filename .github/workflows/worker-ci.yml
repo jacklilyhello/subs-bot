@@ -138,14 +138,14 @@ jobs:
               env -i PATH=/usr/bin:/bin HOME="$3" TMPDIR="$3" WORKER_TEST_BUNDLE_DIR="$4" \
                 SINGBOX_TEST_BINARY="$5" MIHOMO_TEST_BINARY="$6" "$7" --test test/vmess-h2.integration.ts
           ' -- "$(id -u)" "$(id -g)" "$workdir" "$WORKER_TEST_BUNDLE_DIR" "$singbox" "$mihomo" "$(command -v node)"
-      - name: Compare legacy external redirects offline
+      - name: Compare legacy short-link responses offline
         env:
           WORKER_TEST_BUNDLE_DIR: ${{ runner.temp }}/subs-bot-worker
         run: |
           workdir="$(mktemp -d)"
           trap 'rm -rf -- "$workdir"' EXIT
           python3 -m venv "$workdir/venv"
-          "$workdir/venv/bin/python" -m pip install --disable-pip-version-check 'aiohttp==3.11.18' 'yarl==1.20.0'
+          "$workdir/venv/bin/python" -m pip install --disable-pip-version-check -r ../requirements.txt 'yarl==1.20.0'
           offline_python() {
             sudo -n unshare --net -- bash -euc '
               ip link set dev lo up
@@ -157,6 +157,8 @@ jobs:
           }
           offline_python WORKER_TEST_BUNDLE_DIR="$WORKER_TEST_BUNDLE_DIR" WORKER_TEST_REVISION="$BUILD_REVISION" \
             "$workdir/venv/bin/python" -B test/legacy-short-redirect-oracle.integration.py
+          offline_python WORKER_TEST_BUNDLE_DIR="$WORKER_TEST_BUNDLE_DIR" WORKER_TEST_REVISION="$BUILD_REVISION" \
+            "$workdir/venv/bin/python" -B test/legacy-selected-short-oracle.integration.py
           if [[ "$GITHUB_REPOSITORY" == 'jacklilyhello/subs-bot' && "$GITHUB_REF" == 'refs/heads/main' &&
                 ( "$GITHUB_EVENT_NAME" == 'push' || "$GITHUB_EVENT_NAME" == 'workflow_dispatch' ) ]]; then
             test "$BUILD_REVISION" = "$GITHUB_SHA"
