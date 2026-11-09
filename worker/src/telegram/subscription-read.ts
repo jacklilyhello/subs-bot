@@ -312,6 +312,7 @@ async function renderSearch(
 
 async function renderDetail(
   bucket: R2Bucket, row: Metadata, guard: Guard, deadline: number, nodePagesEnabled: boolean, rawFileEnabled: boolean,
+  subscriptionShareEnabled: boolean,
 ): Promise<RenderedRead> {
   const lines = [
     `配置名称：${displayTelegramName(row.name)}`,
@@ -349,6 +350,7 @@ async function renderDetail(
   } else {
     lines.push("当前没有已发布的节点。");
   }
+  if (subscriptionShareEnabled) lines.push(`私密分享此订阅：/share sub ${row.id}`);
   const refreshTarget = await providerRefreshTarget(row, row.sourceUrl);
   return { text: lines.join("\n"), readButtons, refreshTarget, rawFileTarget,
     readGuard: subscriptionGuard(guard, row, undefined, refreshTarget ? row.sourceUrl : null),
@@ -379,7 +381,7 @@ async function renderFormat(db: D1Database, bucket: R2Bucket, row: Metadata, for
 
 export async function renderTelegramSubscriptionRead(
   db: D1Database, bucket: R2Bucket, policy: TelegramPolicy, lease: ReadLease, deadline: number, nodePagesEnabled = false,
-  providerRefreshEnabled = false, rawFileEnabled = false,
+  providerRefreshEnabled = false, rawFileEnabled = false, subscriptionShareEnabled = false,
 ): Promise<RenderedRead> {
   const guard = receiptGuard(policy);
   try {
@@ -402,7 +404,8 @@ export async function renderTelegramSubscriptionRead(
       ${providerRefreshEnabled && receipt.kind === "detail" ? "source_url" : "NULL"} AS sourceUrl
       FROM subscriptions WHERE id=? AND owner_id=?`).bind(receipt.subscriptionId, lease.actorId).first<Metadata>();
     if (!row) return { text: "订阅不存在或已被删除。", readGuard: guard };
-    if (receipt.kind === "detail") return await renderDetail(bucket, row, guard, deadline, nodePagesEnabled, rawFileEnabled);
+    if (receipt.kind === "detail") return await renderDetail(bucket, row, guard, deadline, nodePagesEnabled, rawFileEnabled,
+      subscriptionShareEnabled);
     if (receipt.format) return await renderFormat(db, bucket, row, receipt.format, guard, deadline);
   } catch {
     // Do not expose source URLs, node data, tokens or D1/R2 diagnostics.

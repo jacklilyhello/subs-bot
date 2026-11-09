@@ -1,12 +1,15 @@
 import { MAX_PRIVATE_SHARE_BYTES, privateShareCodeDigest } from "../private-shares.ts";
-import { checkOwnerId, digestHex, validInteger } from "../storage.ts";
-import { inTelegramScope, type TelegramEventScope, type TelegramPolicy } from "./protocol.ts";
+import { ISOLATION_PUBLIC_ORIGIN } from "../short-links.ts";
+import { checkOwnerId, digestHex, getOwnedSubscription, SUBSCRIPTION_LIFECYCLE_REVISION, validInteger,
+  type SubscriptionMetadata } from "../storage.ts";
+import { inTelegramScope, type TelegramEventScope, type TelegramPolicy, type TelegramPrivateShareCreationUpdate } from "./protocol.ts";
 
 export const TELEGRAM_PRIVATE_SHARE_CREATION_MARKER = "share-create:v1";
 const KEY_VERSION = 1;
 const MAX_CLAIMS = 100;
 const MAX_DURATION_MINUTES = 10_080;
 const MAX_COMMAND_UNITS = 4_096;
+const MAX_SOURCE_BYTES = 16 * 1024;
 const RESERVATION_SECONDS = 600;
 const CLEANUP_GRACE_SECONDS = 20 * 60;
 const MAX_PENDING_PER_ACTOR = 4;
@@ -15,6 +18,9 @@ const CHECK_DELAY_SECONDS = 60;
 // R2 acknowledgements can be lost with the original isolate, so absence is not final.
 const CLEANED_RECHECK_SECONDS = 60 * 60;
 const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}(?![\s\S])/u;
+const SUBSCRIPTION_TOKEN = /^[A-Za-z0-9_-]{16,128}(?![\s\S])/u;
+// The legacy uploader used secrets.token_urlsafe(8).
+const LEGACY_UPLOADED_SOURCE = /^uploaded:\/\/[A-Za-z0-9_-]{10}[AEIMQUYcgkosw048](?![\s\S])/u;
 const ENCODER = new TextEncoder();
 const safeError = "Telegram private share creation could not be confirmed.";
 
@@ -27,6 +33,9 @@ export interface PrivateShareCreationDraft {
 
 export type TelegramPrivateShareCreationInput = TelegramEventScope & PrivateShareCreationDraft & { senderName?: string };
 export type PrivateShareCreationOutcome = "published" | "pending" | "ignored";
+type PrivateShareOptions = Omit<PrivateShareCreationDraft, "content">;
+export type TelegramSubscriptionShareSelection = PrivateShareOptions & { subscriptionId: number };
+export type TelegramSubscriptionShareOutcome = PrivateShareCreationOutcome | "unavailable";
 export interface TelegramPrivateShareCreationKey {
   readonly version: 1;
   readonly installation: string;
@@ -67,19 +76,12 @@ function contentBytes(content: string): Uint8Array<ArrayBuffer> | null {
   return bytes.byteLength <= MAX_PRIVATE_SHARE_BYTES ? Uint8Array.from(bytes) : null;
 }
 
-/** Parse the argument string after a verified /share command entity. The delimiter owns one separator. */
-export function parseTelegramPrivateShareArgs(args: string): PrivateShareCreationDraft | null {
-  if (typeof args !== "string" || args.length > MAX_COMMAND_UNITS) return null;
-  const separator = /(?:^|[ \t\r\n])--(?:\r\n|[ \t\r\n])/u.exec(args);
-  if (!separator) return null;
-  const content = args.slice(separator.index + separator[0].length);
-  if (!contentBytes(content)) return null;
-  const header = args.slice(0, separator.index).trim();
+function parsePrivateShareOptions(options: readonly string[]): PrivateShareOptions | null {
   const seen = new Set<string>();
   let maxClaims = 1;
   let targetUserId: string | null = null;
   let durationMinutes = 10;
-  for (const option of header === "" ? [] : header.split(/[ \t\r\n]+/u)) {
+  for (const option of options) {
     const match = /^(id|x|s)([0-9]{1,19})(?![\s\S])/iu.exec(option);
     if (!match) return null;
     const field = match[1].toLowerCase();
@@ -95,7 +97,51 @@ export function parseTelegramPrivateShareArgs(args: string): PrivateShareCreatio
       durationMinutes = Number(value);
     } else return null;
   }
-  return { content, maxClaims, targetUserId, durationMinutes };
+  return { maxClaims, targetUserId, durationMinutes };
+}
+
+/** Parse the argument string after a verified /share command entity. The delimiter owns one separator. */
+export function parseTelegramPrivateShareArgs(args: string): PrivateShareCreationDraft | null {
+  if (typeof args !== "string" || args.length > MAX_COMMAND_UNITS) return null;
+  const separator = /(?:^|[ \t\r\n])--(?:\r\n|[ \t\r\n])/u.exec(args);
+  if (!separator) return null;
+  const content = args.slice(separator.index + separator[0].length);
+  if (!contentBytes(content)) return null;
+  const header = args.slice(0, separator.index).trim();
+  const options = parsePrivateShareOptions(header === "" ? [] : header.split(/[ \t\r\n]+/u));
+  return options ? { content, ...options } : null;
+}
+
+export function parseTelegramSubscriptionShareArgs(args: string): TelegramSubscriptionShareSelection | null {
+  if (typeof args !== "string" || args.length > MAX_COMMAND_UNITS) return null;
+  const [kind, id = "", ...header] = args.trim().split(/[ \t\r\n]+/u);
+  if (kind.toLowerCase() !== "sub" || !/^[1-9][0-9]{0,15}(?![\s\S])/u.test(id)) return null;
+  const subscriptionId = Number(id);
+  if (!validInteger(subscriptionId, 1)) return null;
+  const options = parsePrivateShareOptions(header);
+  return options ? { subscriptionId, ...options } : null;
+}
+
+function subscriptionShareBody(row: SubscriptionMetadata): string | null {
+  if (typeof row.token !== "string" || !SUBSCRIPTION_TOKEN.test(row.token) ||
+      typeof row.name !== "string" || row.name.length > 512 ||
+      typeof row.sourceUrl !== "string" || row.sourceUrl.length > MAX_SOURCE_BYTES ||
+      ENCODER.encode(row.sourceUrl).byteLength > MAX_SOURCE_BYTES) return null;
+  const name = row.name.replace(/[\p{Cc}\p{Cf}\p{Cs}\u2028\u2029]/gu, " ");
+  if (!name.trim()) return null;
+  const source = row.sourceUrl;
+  let sourceLine = "🌐 来源：本地导入";
+  if (source !== "uploaded://telegram-document" && !LEGACY_UPLOADED_SOURCE.test(source)) {
+    if (!/^https?:\/\/[^/?#\\]/iu.test(source) || source.trim() !== source ||
+        /[\\\p{Cc}\p{Cf}\p{Cs}\u2028\u2029]/u.test(source)) return null;
+    try {
+      if (!new URL(source).hostname) return null;
+    } catch {
+      return null;
+    }
+    sourceLine = `🌐 原始链接：${source}`;
+  }
+  return `🏷️ 订阅名称：${name}\n${sourceLine}\n⚡ Clash 配置：${ISOLATION_PUBLIC_ORIGIN}/sub/${row.token}/clash`;
 }
 
 function base64Url(bytes: Uint8Array): string {
@@ -153,6 +199,8 @@ const actorOrder = `NOT EXISTS (SELECT 1 FROM telegram_private_share_creations A
   WHERE earlier.bot_id = creation.bot_id AND earlier.actor_id = creation.actor_id AND earlier.state = 'reserved'
     AND earlier.reservation_expires_at > unixepoch() AND earlier.receipt_id < creation.receipt_id)`;
 const fresh = "inbox.bot_id = ? AND inbox.update_id = ? AND inbox.receipt_nonce = ?";
+const currentMember = `COALESCE((SELECT allowed = 1 AND message_date < ? FROM telegram_auth
+  WHERE bot_id = ? AND user_id = ?), 1)`;
 
 async function readEvent(db: D1Database, policy: TelegramPolicy, event: TelegramPrivateShareCreationInput): Promise<CreationRow | null> {
   return await db.prepare(`SELECT ${fields} ${joinedReceipt} WHERE ${matchingInbox} AND inbox.bot_id = ?
@@ -168,25 +216,30 @@ async function reserve(
   payloadBytes: number,
   senderName: string,
   installation: string,
-): Promise<CreationRow | null> {
+  source?: SubscriptionMetadata,
+): Promise<CreationRow | "unavailable" | null> {
   const receipt = [policy.botId, event.updateId, crypto.randomUUID()] as const;
+  const sourceMatches = `EXISTS (SELECT 1 FROM subscriptions WHERE id=? AND owner_id=? AND name=? AND source_url=?
+    AND token=? AND generation=? AND ${SUBSCRIPTION_LIFECYCLE_REVISION}=?)`;
+  const sourceBindings = source ? [source.id, event.actorId, source.name, source.sourceUrl, source.token,
+    source.generation, source.lifecycleRevision] : [];
   const steps = [
     db.prepare(`
       INSERT INTO telegram_inbox
         (bot_id, update_id, actor_id, chat_id, chat_type, message_id, message_date, thread_id, command, receipt_nonce)
       SELECT ?, ?, ?, ?, 'private', ?, ?, NULL, 'help', ?
       WHERE ? BETWEEN unixepoch() - ${RESERVATION_SECONDS} AND unixepoch() + 60
-        AND (? = ? OR COALESCE((SELECT allowed = 1 AND message_date < ? FROM telegram_auth
-          WHERE bot_id = ? AND user_id = ?), 1))
+        AND (? = ? OR ${currentMember})
         AND NOT EXISTS (SELECT 1 FROM telegram_private_share_creations AS newer WHERE newer.bot_id = ?
           AND newer.actor_id = ? AND (newer.message_date, newer.message_id) >= (?, ?))
         AND NOT EXISTS (SELECT 1 FROM telegram_private_share_creations AS pending WHERE pending.bot_id = ?
           AND pending.actor_id = ? AND pending.state = 'reserved' AND pending.reservation_expires_at > unixepoch()
           LIMIT 1 OFFSET ${MAX_PENDING_PER_ACTOR - 1})
+        ${source ? `AND ${sourceMatches}` : ""}
       ON CONFLICT (bot_id, update_id) DO NOTHING
     `).bind(policy.botId, event.updateId, event.actorId, event.chatId, event.messageId, event.messageDate, receipt[2],
       event.messageDate, event.actorId, policy.adminId, event.messageDate, policy.botId, event.actorId,
-      policy.botId, event.actorId, event.messageDate, event.messageId, policy.botId, event.actorId),
+      policy.botId, event.actorId, event.messageDate, event.messageId, policy.botId, event.actorId, ...sourceBindings),
     db.prepare(`
       INSERT INTO telegram_private_share_creations (receipt_id, bot_id, actor_id, message_date, message_id,
         auth_message_date, auth_message_id, state, payload_id, payload_sha256, payload_bytes, sender_name,
@@ -204,17 +257,25 @@ async function reserve(
       SELECT 1 FROM telegram_private_share_creations WHERE receipt_id = inbox.receipt_id
     ) THEN command END WHERE ${fresh} RETURNING receipt_id`).bind(TELEGRAM_PRIVATE_SHARE_CREATION_MARKER, ...receipt),
   ];
+  if (source) steps.push(db.prepare(`SELECT ${sourceMatches} AS matched`).bind(...sourceBindings));
+  let refused = false;
   try {
     const results = await db.batch(steps);
     if (results.length !== steps.length || results.some(({ success }) => !success) || results[2].results.length > 1) {
       throw new Error(safeError);
+    }
+    if (source) {
+      const rows = results[3].results as { matched: number }[];
+      if (rows.length !== 1 || (rows[0].matched !== 0 && rows[0].matched !== 1)) throw new Error(safeError);
+      refused = rows[0].matched === 0;
     }
   } catch {
     const confirmed = await readEvent(db, policy, event);
     if (confirmed) return confirmed;
     throw new Error(safeError);
   }
-  return await readEvent(db, policy, event);
+  // A previously accepted request may still resume its exact journal even if new admission now fails.
+  return await readEvent(db, policy, event) ?? (refused ? "unavailable" : null);
 }
 
 function payloadKey(row: CreationRow): string {
@@ -326,28 +387,38 @@ async function publish(
   return await readOutcome(db, policy, row, codeSha256);
 }
 
-export async function acceptTelegramPrivateShareCreation(
+function validCreation(
+  policy: TelegramPolicy,
+  event: TelegramEventScope & PrivateShareOptions,
+  context: TelegramPrivateShareCreationKey,
+): boolean {
+  return privateScope(policy, event) && validInteger(event.updateId, 1) && validInteger(event.messageId, 1) &&
+    validInteger(event.messageDate, 1) && validInteger(event.maxClaims, 1, MAX_CLAIMS) &&
+    validInteger(event.durationMinutes, 1, MAX_DURATION_MINUTES) && context.version === KEY_VERSION &&
+    (event.targetUserId === null || event.targetUserId === policy.adminId || event.targetUserId === policy.memberId);
+}
+
+async function createShare(
   db: D1Database,
   bucket: R2Bucket,
   policy: TelegramPolicy,
   event: TelegramPrivateShareCreationInput,
   context: TelegramPrivateShareCreationKey,
-): Promise<PrivateShareCreationOutcome> {
-  if (!privateScope(policy, event) || !validInteger(event.updateId, 1) || !validInteger(event.messageId, 1) ||
-      !validInteger(event.messageDate, 1) || !validInteger(event.maxClaims, 1, MAX_CLAIMS) ||
-      !validInteger(event.durationMinutes, 1, MAX_DURATION_MINUTES) || context.version !== KEY_VERSION ||
-      (event.targetUserId !== null && event.targetUserId !== policy.adminId && event.targetUserId !== policy.memberId)) return "ignored";
+  source?: SubscriptionMetadata,
+): Promise<TelegramSubscriptionShareOutcome> {
   const bytes = contentBytes(event.content);
-  if (!bytes) return "ignored";
+  if (!bytes) return source ? "unavailable" : "ignored";
   try {
     const payloadDigest = await crypto.subtle.digest("SHA-256", bytes);
     const senderName = safeSenderName(event.senderName);
     const payloadSha256 = digestHex(payloadDigest);
-    const row = await reserve(db, policy, event, payloadSha256, bytes.byteLength, senderName, context.installation);
-    if (!row || row.payloadSha256 !== payloadSha256 || row.payloadBytes !== bytes.byteLength ||
+    const row = await reserve(db, policy, event, payloadSha256, bytes.byteLength, senderName, context.installation, source);
+    if (row === "unavailable") return row;
+    if (!row) return "ignored";
+    if (row.payloadSha256 !== payloadSha256 || row.payloadBytes !== bytes.byteLength ||
         row.senderName !== senderName || row.maxClaims !== event.maxClaims || row.targetUserId !== event.targetUserId ||
         row.durationMinutes !== event.durationMinutes || row.installation !== context.installation ||
-        row.keyVersion !== context.version) return "ignored";
+        row.keyVersion !== context.version) return source ? "unavailable" : "ignored";
     const codeSha256 = await privateShareCodeDigest(await deriveCode(context, row.botId, row.actorId, row.payloadId));
     if (!codeSha256) throw new Error(safeError);
     const outcome = await readOutcome(db, policy, row, codeSha256);
@@ -371,6 +442,40 @@ export async function acceptTelegramPrivateShareCreation(
       if (!reopened.success) throw new Error(safeError);
     }
     return published;
+  } catch {
+    throw new Error(safeError);
+  }
+}
+
+export async function acceptTelegramPrivateShareCreation(
+  db: D1Database,
+  bucket: R2Bucket,
+  policy: TelegramPolicy,
+  event: TelegramPrivateShareCreationInput,
+  context: TelegramPrivateShareCreationKey,
+): Promise<PrivateShareCreationOutcome> {
+  if (!validCreation(policy, event, context)) return "ignored";
+  const outcome = await createShare(db, bucket, policy, event, context);
+  return outcome === "unavailable" ? "ignored" : outcome;
+}
+
+export async function acceptTelegramSubscriptionShare(
+  db: D1Database,
+  bucket: R2Bucket,
+  policy: TelegramPolicy,
+  event: TelegramPrivateShareCreationUpdate & TelegramSubscriptionShareSelection,
+  context: TelegramPrivateShareCreationKey,
+): Promise<TelegramSubscriptionShareOutcome> {
+  if (!validCreation(policy, event, context) || !validInteger(event.subscriptionId, 1)) return "ignored";
+  try {
+    if (event.actorId !== policy.adminId && await db.prepare(`SELECT ${currentMember} AS allowed`)
+      .bind(event.messageDate, policy.botId, event.actorId).first<number>("allowed") !== 1) return "ignored";
+    const row = await getOwnedSubscription(db, event.actorId, event.subscriptionId);
+    if (!row || row.id !== event.subscriptionId || row.ownerId !== event.actorId ||
+        !validInteger(row.generation, 0) || !validInteger(row.lifecycleRevision, 0)) return "unavailable";
+    const content = subscriptionShareBody(row);
+    if (content === null) return "unavailable";
+    return await createShare(db, bucket, policy, { ...event, content }, context, row);
   } catch {
     throw new Error(safeError);
   }

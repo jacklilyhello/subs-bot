@@ -277,8 +277,9 @@ async function renderReply(
   }
   const allowed = lease.actorId === policy.adminId || await isTelegramMemberAllowed(db, policy);
   if (!allowed) return { text: "当前账号没有使用权限。", access: "denied" };
+  if (lease.subscriptionShareUnavailable) return { text: "无法分享此订阅。请在私聊打开自己的订阅详情后重试。", access: "allowed" };
   if (lease.subscriptionRead) return { ...await renderTelegramSubscriptionRead(db, bucket, policy, lease, deadline,
-    subscriptionNodesEnabled, providerRefreshEnabled, subscriptionRawFileEnabled), access: "allowed" };
+    subscriptionNodesEnabled, providerRefreshEnabled, subscriptionRawFileEnabled, privateShareEnabled), access: "allowed" };
   if (lease.subscriptionNodes) {
     const { backId, ...page } = await renderTelegramSubscriptionNodePage(db, bucket, policy, lease, deadline);
     return { ...page, access: "allowed", ...(backId === undefined ? {} : {
@@ -341,7 +342,8 @@ async function renderReply(
       + (subscriptionReadEnabled ? "\n发送列表编号查看订阅详情。" : "")
       + (menuFeatures.aggregate ? "\n/export 导出全部订阅，/o 关键词导出所选订阅。" : "")
       + (menuFeatures.batchRefresh ? "\n/updateall 预览批量刷新。" : "")
-      + (privateShareEnabled ? "\n创建私密分享：/share [x份数] [id领取人ID] [s分钟] -- 正文。" : "") : "");
+      + (privateShareEnabled ? "\n创建私密分享：/share [x份数] [id领取人ID] [s分钟] -- 正文。"
+        + "\n分享自己的订阅：/share sub 订阅ID [x份数] [id领取人ID] [s分钟]。" : "") : "");
   return {
     text: lease.command === "start" ? `欢迎使用 subs-bot。\n${help}` : help,
     access: "allowed",

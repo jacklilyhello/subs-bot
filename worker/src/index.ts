@@ -29,8 +29,8 @@ import { answerTelegramInlineSearch, reapTelegramInlineSearch } from "./telegram
 import { acceptTelegramPath } from "./telegram/path-management.ts";
 import { acceptTelegramPrivateClaim } from "./telegram/private-claims.ts";
 import {
-  acceptTelegramPrivateShareCreation, parseTelegramPrivateShareArgs,
-  recoverTelegramPrivateShareCreation, retireAbandonedTelegramPrivateShareCreation,
+  acceptTelegramPrivateShareCreation, acceptTelegramSubscriptionShare, parseTelegramPrivateShareArgs,
+  parseTelegramSubscriptionShareArgs, recoverTelegramPrivateShareCreation, retireAbandonedTelegramPrivateShareCreation,
 } from "./telegram/private-share-creation.ts";
 import { telegramPrivateShareRuntime } from "./telegram/private-share-runtime.ts";
 import { decodeTelegramRequest, parseTelegramPolicy, type TelegramPolicy } from "./telegram/protocol.ts";
@@ -365,12 +365,24 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
     } else if (decoded.privateShareCreation) {
       if (!privateShare.context) return new Response(null, { status: 204, headers: HEADERS });
       const input = decoded.privateShareCreation;
-      const draft = parseTelegramPrivateShareArgs(input.args);
-      if (!draft || (draft.targetUserId !== null && draft.targetUserId !== policy.adminId && draft.targetUserId !== policy.memberId)) {
-        await acceptTelegramCommand(env.DB, policy, { ...input, command: "help" });
-        drain();
-      } else if (await acceptTelegramPrivateShareCreation(env.DB, env.NODES, policy, { ...input, ...draft }, privateShare.context) === "published") {
-        drain();
+      if (/^\s*sub(?:\s|$)/iu.test(input.args)) {
+        const selection = parseTelegramSubscriptionShareArgs(input.args);
+        const targetAllowed = selection?.targetUserId === null || selection?.targetUserId === policy.adminId
+          || selection?.targetUserId === policy.memberId;
+        const outcome = selection && targetAllowed ? await acceptTelegramSubscriptionShare(env.DB, env.NODES, policy,
+          { ...input, ...selection }, privateShare.context) : "unavailable";
+        if (outcome === "unavailable") {
+          await acceptTelegramCommand(env.DB, policy, { ...input, command: "help" }, "subscription-share-unavailable");
+        }
+        if (outcome === "unavailable" || outcome === "published") drain();
+      } else {
+        const draft = parseTelegramPrivateShareArgs(input.args);
+        if (!draft || (draft.targetUserId !== null && draft.targetUserId !== policy.adminId && draft.targetUserId !== policy.memberId)) {
+          await acceptTelegramCommand(env.DB, policy, { ...input, command: "help" });
+          drain();
+        } else if (await acceptTelegramPrivateShareCreation(env.DB, env.NODES, policy, { ...input, ...draft }, privateShare.context) === "published") {
+          drain();
+        }
       }
     }
     return new Response(null, { status: decoded.status, headers: HEADERS });

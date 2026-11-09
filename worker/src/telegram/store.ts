@@ -56,6 +56,7 @@ export interface TelegramReplyLease extends TelegramCommand {
   path?: TelegramPathReply;
   document?: { kind: TelegramDocumentJobResult; nodeCount: number | null };
   privateShareCreation?: true;
+  subscriptionShareUnavailable?: true;
   shortLink?: true;
   subscriptionRead?: true;
   inlineSort?: TelegramInlineSortReply;
@@ -80,12 +81,13 @@ const LEASE_SECONDS = 30;
 const MAX_REPLY_AGE_SECONDS = 15 * 60;
 const MAX_ATTEMPTS = 4;
 const REAP_LIMIT = 40;
+const SUBSCRIPTION_SHARE_UNAVAILABLE_MARKER = "share-sub-unavailable:v1";
 
 type ReplyAccess = "allowed" | "denied" | "none";
 
 type ReplyRow = Omit<TelegramReplyLease,
   "view" | "lifecycle" | "privateClaim" | "temp" | "tempRaw" | "aggregate" | "selected" | "path" | "document" |
-  "privateShareCreation" | "subscriptionRead" | "shortLink" | "inlineSort" | "subscriptionNodes" | "providerOutcome" | "providerRequestKind" |
+  "privateShareCreation" | "subscriptionShareUnavailable" | "subscriptionRead" | "shortLink" | "inlineSort" | "subscriptionNodes" | "providerOutcome" | "providerRequestKind" |
   "bulkTrash" | "inlineConsent" | "githubSearch" | "subscriptionRawFile" | "providerBatch" | "apiStatus" | "providerDocument"> & {
   viewKind: TelegramView["kind"] | null;
   afterId: number | null;
@@ -113,6 +115,7 @@ type ReplyRow = Omit<TelegramReplyLease,
   documentKind: TelegramDocumentJobResult | null;
   documentNodeCount: number | null;
   privateShareCreationReceipt: number | null;
+  subscriptionShareUnavailableMarker: number;
   shortLinkReceipt: number | null;
   subscriptionReadReceipt: number | null;
   inlineSortKind: TelegramInlineSortReply["kind"] | null;
@@ -142,6 +145,8 @@ function supportedReceipt(alias: "inbox" | "earlier", includeAggregate = false, 
       AND EXISTS (SELECT 1 FROM telegram_lifecycle_action WHERE receipt_id = ${alias}.receipt_id)) THEN 1
     WHEN (${alias}.receipt_nonce IN ('${TELEGRAM_PRIVATE_CLAIM_MARKER}','${TELEGRAM_GROUP_CLAIM_MARKER}')
       AND EXISTS (SELECT 1 FROM telegram_private_claim WHERE receipt_id = ${alias}.receipt_id)) THEN 1
+    WHEN (${alias}.receipt_nonce = '${SUBSCRIPTION_SHARE_UNAVAILABLE_MARKER}' AND ${alias}.command = 'help'
+      AND ${alias}.chat_type = 'private' AND ${alias}.chat_id = ${alias}.actor_id AND ${alias}.thread_id IS NULL) THEN 1
     WHEN (${alias}.receipt_nonce = '${TELEGRAM_TEMP_MARKER}'
       AND EXISTS (SELECT 1 FROM telegram_temp_reply WHERE receipt_id = ${alias}.receipt_id)) THEN 1
     WHEN (${tempRawMarker(alias)} AND ${alias}.chat_type='private' AND ${alias}.actor_id=${alias}.chat_id
@@ -209,8 +214,12 @@ export async function acceptTelegramCommand(
   db: D1Database,
   policy: TelegramPolicy,
   command: TelegramCommand,
+  reply?: "subscription-share-unavailable",
 ): Promise<"accepted" | "duplicate"> {
   if (!inTelegramScope(policy, command)) throw new RangeError("Telegram command is outside the isolation scope.");
+  if (reply && (command.command !== "help" || command.chatType !== "private" || command.threadId !== null)) {
+    throw new RangeError("The private subscription share reply is outside its scope.");
+  }
 
   const receipt = crypto.randomUUID();
   const key = [policy.botId, command.updateId, receipt] as const;
@@ -242,12 +251,12 @@ export async function acceptTelegramCommand(
       SELECT receipt_id FROM telegram_inbox WHERE bot_id = ? AND update_id = ? AND receipt_nonce = ?
     `).bind(...key),
     db.prepare(`
-      UPDATE telegram_inbox SET receipt_nonce = NULL
+      UPDATE telegram_inbox SET receipt_nonce = ${reply ? `'${SUBSCRIPTION_SHARE_UNAVAILABLE_MARKER}'` : "NULL"}
       WHERE bot_id = ? AND update_id = ? AND receipt_nonce = ?
       RETURNING receipt_id
     `).bind(...key),
   );
-  // Clearing the nonce in the same transaction fences even a replay of the identical batch.
+  // Replacing the temporary nonce in the same transaction also fences exact batch replay.
   const results = await db.batch(steps);
   const receiptResult = results.at(-1);
   if (!receiptResult || results.length !== steps.length || results.some((result) => !result.success)) {
@@ -387,6 +396,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
         path.kind AS pathKind, path.after_id AS pathAfterId, path.affected_count AS pathAffectedCount,
         document.result_code AS documentKind, saved.node_count AS documentNodeCount,
         ${includePrivateShareCreation ? "creation.receipt_id" : "NULL"} AS privateShareCreationReceipt,
+        CASE WHEN inbox.receipt_nonce='${SUBSCRIPTION_SHARE_UNAVAILABLE_MARKER}' THEN 1 ELSE 0 END AS subscriptionShareUnavailableMarker,
         ${includeSubscriptionRead ? "detail.receipt_id" : "NULL"} AS subscriptionReadReceipt,
         ${includeShortLinks ? "short.receipt_id" : "NULL"} AS shortLinkReceipt,
         ${includeInlineSort ? "sort.kind" : "NULL"} AS inlineSortKind,
@@ -448,7 +458,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
     tempUnsupportedCount, tempIgnoredCount, tempRawMarker: rawMarker, aggregateResult, aggregateRevision, aggregateCodeSha256,
     selectedResult, selectedCodeSha256,
     pathKind, pathAfterId, pathAffectedCount,
-    documentKind, documentNodeCount, privateShareCreationReceipt, subscriptionReadReceipt, shortLinkReceipt,
+    documentKind, documentNodeCount, privateShareCreationReceipt, subscriptionShareUnavailableMarker, subscriptionReadReceipt, shortLinkReceipt,
     inlineSortKind, inlineSortMode, subscriptionNodeMarker, providerResult, providerKind, bulkTrashMarker, inlineConsentKind,
     githubSearchState, githubSearchResults, rawFileMarker, providerBatchMarker, apiStatusMarker, providerDocumentMarker, ...lease } = row;
   if ((providerResult === null) !== (providerKind === null)) throw new Error("Telegram provider reply kind could not be confirmed.");
@@ -468,6 +478,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
       { path: { kind: pathKind, afterId: pathAfterId, affectedCount: pathAffectedCount } }),
     ...(documentKind === null ? {} : { document: { kind: documentKind, nodeCount: documentNodeCount } }),
     ...(privateShareCreationReceipt === null ? {} : { privateShareCreation: true as const }),
+    ...(subscriptionShareUnavailableMarker === 1 ? { subscriptionShareUnavailable: true as const } : {}),
     ...(shortLinkReceipt === null ? {} : { shortLink: true as const }),
     ...(subscriptionReadReceipt === null ? {} : { subscriptionRead: true as const }),
     ...(inlineSortKind === null ? {} : { inlineSort: { kind: inlineSortKind, mode: inlineSortMode } }),
