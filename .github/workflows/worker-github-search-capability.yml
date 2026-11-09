@@ -1,0 +1,27 @@
+name: Probe public GitHub and Grep search capabilities
+run-name: Public search capability probe for ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: subs-bot-public-search-capability
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && github.run_attempt == '1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Probe fixed public fixtures without credentials
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          env -i PATH=/usr/bin:/bin python3 -I -B worker/tools/github_search_capability.py
