@@ -236,7 +236,7 @@ class ExportRouteTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(response.status, 200)
                     self.assertEqual(response.content_type, "text/plain")
                     self.assert_private(response)
-                    self.assertEqual(response.content_length, len(encoded))
+                    self.assertEqual(response.content_length, len(encoded) if encoded else None)
                     self.assertEqual(await response.read(), b"")
 
             await assert_export(ordered_code, second_node, stale_node, first_node, second_node)
