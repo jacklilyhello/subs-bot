@@ -560,6 +560,18 @@ V8 离线候选使用同一份一致性 SQLite 和同一份归属映射，分别
 
 在 `worker-isolation-legacy-candidate.yml` 选择 `synthetic-legacy-dynamic-all`。使用同一个新的 32 位十六进制 `cohort` 和同一个成功的 `source_run_id`，按 `verify`、`prepare`、`create-restore-db`、`create-restore-bucket`、`restore-objects`、`start-import`、`verify-restore` 执行。创建结果不明时使用既有 `pin-resource` 流程。候选 D1 和 R2 保持未绑定且私有，导入后复核完整 schema、外键、数据与对象摘要、旧链接和临时节点的休眠状态。
 
+#### V9 统一短链与临时节点候选
+
+使用同一份封存 SQLite、归属映射、旧 Bot 身份及 HTTPS 来源，生成订阅转换包、短码盘点、外部短链对照和临时节点盘点。短码盘点覆盖单订阅、外部、所选聚合及全量聚合，外部对照固定同一份盘点和 Worker 构建。复用混合短链的私有输入 JSON，将临时节点盘点目录及封存摘要另作参数。在获准的托管环境运行：
+
+```sh
+python3 -B worker/tools/legacy_restore_package.py \
+  CONVERTER_DIR WORKER_ARTIFACT_DIR OUTPUT_DIR CONVERTER_MANIFEST_SHA WORKER_MANIFEST_SHA REVISION APPLIED_AT \
+  legacy-unified-v9 SOURCE_SQLITE_SHA OWNER_MAP_SHA PRIVATE_INPUT_JSON TEMP_INVENTORY TEMP_INVENTORY_MANIFEST_SHA
+```
+
+候选把活动订阅、回收站、路径规则、四种短链和临时节点写入同一次 SQL 回放。单订阅短链沿用迁移后的稳定编号；所选聚合保留顺序、重复项和已退役编号；全量聚合和临时节点安装保持休眠。检查全局短码摘要唯一性、各类精确行集合、所有者与能力摘要、外键、数据摘要和 R2 对象闭包。聚合范围可能因所有者映射扩大时停止封存。清单分别记录外部跳转的离线对照与其余链接的待验收状态。非空私密分享、领取和授权仍需对应的联合恢复与规则对账步骤。
+
 ### 真实数据与生产切换门槛
 
 1. 先只读核对 Cloudflare 目标账户、Zone、`subs-bot.lilyya.top` 的 DNS、Worker 路由和 Custom Domain 绑定。新资源记录账号、环境及资源 ID，隔离与生产分别使用各自的 Worker、D1、R2 和队列。现有配置冲突须在改动前报告。目标主机名可用且切换获准后，仅增加所需的 Custom Domain 绑定。 [Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)

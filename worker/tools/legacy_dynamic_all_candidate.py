@@ -11,6 +11,7 @@ import sqlite3
 from tempfile import TemporaryDirectory
 
 from cloudflare_isolation import LEGACY_DYNAMIC_ALL_MIGRATION_SHA256, LEGACY_TEMP_MIGRATION_SHA256
+from legacy_mixed_short_candidate import UnifiedShortRows
 import legacy_restore_package as package
 import legacy_short_namespace_inventory as namespace
 import legacy_snapshot_convert as converter
@@ -61,12 +62,15 @@ class VerifiedDynamicAll:
     rows: dict[str, tuple[tuple[str | int | None, ...], ...]] = field(repr=False)
     active_lineage: tuple[tuple[int, str, str], ...] = field(repr=False)
 
-    def report(self, summary):
+    def report(self, summary, *, unified=False):
         hashes, counts = summary["tableSha256"], summary["tableCounts"]
-        require(all(counts[table] == len(rows) for table, rows in self.rows.items()) and counts[ORDER] == 0)
+        require(all(counts[table] == len(rows) for table, rows in self.rows.items()
+                    if not unified or table != package.AGGREGATE_LINKS) and counts[ORDER] == 0)
+        links = self.rows[package.AGGREGATE_LINKS]
+        require(not unified or counts[package.AGGREGATE_LINKS] >= len(links))
         batches = self.rows[BATCHES]
-        return {
-            "dynamicAll": {"rows": counts[package.AGGREGATE_LINKS], "markers": counts[MARKERS], "orderRows": counts[ORDER],
+        result = {
+            "dynamicAll": {"rows": len(links), "markers": counts[MARKERS], "orderRows": counts[ORDER],
                            "state": "dormant", "migrationSha256": LEGACY_DYNAMIC_ALL_MIGRATION_SHA256,
                            "tableSha256": {table: hashes[table] for table in (package.AGGREGATE_LINKS, MARKERS, ORDER)}},
             "legacyTempBaseline": {"installations": counts[INSTALLATIONS], "batches": counts[BATCHES],
@@ -74,8 +78,12 @@ class VerifiedDynamicAll:
                                    "state": "dormant", "migrationSha256": LEGACY_TEMP_MIGRATION_SHA256,
                                    "payloadBytes": sum(row[6] for row in batches),
                                    "tableSha256": {table: hashes[table] for table in (INSTALLATIONS, BATCHES)}},
-            "shortLinkCompatibility": {"dynamicAll": "not-validated"},
         }
+        if unified:
+            result["dynamicAll"]["partitionSha256"] = native.digest(native.canonical(links))
+        else:
+            result["shortLinkCompatibility"] = {"dynamicAll": "not-validated"}
+        return result
 
 
 @dataclass(frozen=True)
@@ -148,10 +156,11 @@ def _source_rows(source, rows_path, owners, expected):
 
 
 def read_dynamic_all(pins: DynamicAllInput, *, source_sha: str, owner_map_sha: str, converter_manifest_sha: str,
-                     working_parent: Path) -> VerifiedDynamicAll:
+                     working_parent: Path, mixed: UnifiedShortRows | None = None) -> VerifiedDynamicAll:
     try:
         require(isinstance(pins, DynamicAllInput) and all(native.matches(native.DIGEST, value) for value in (
             source_sha, owner_map_sha, converter_manifest_sha, pins.namespace_sha256, pins.temp_manifest_sha256)))
+        require(mixed is None or isinstance(mixed, UnifiedShortRows))
         source = package.private_path(pins.source)
         owners = converter._owner_map(pins.owner_map)
         require(native.digest(converter._json(dict(sorted(owners.items())))) == owner_map_sha)
@@ -160,6 +169,12 @@ def read_dynamic_all(pins: DynamicAllInput, *, source_sha: str, owner_map_sha: s
         require(not parent.is_relative_to(short_dir) and not parent.is_relative_to(temp_dir))
         state = typed._source_state(source)
         temp._verify_backup(source, state, source_sha)
+        if mixed is not None:
+            require((source, short_dir, state, source_sha, owner_map_sha) == (
+                mixed.source, mixed.namespace, mixed.source_state, mixed.source_sha256, mixed.owner_map_sha256)
+                and mixed.proof["namespaceManifestSha256"] == pins.namespace_sha256
+                and mixed.proof["legacyBotId"] == pins.legacy_bot_id
+                and mixed.proof["oldOriginSha256"] == native.digest(typed._origin(pins.old_origin)))
         with TemporaryDirectory(prefix="dynamic-all-source-", dir=parent) as temporary:
             root = Path(temporary)
             # Rebuild the converter too. Merely resealing supplied outputs would
@@ -167,17 +182,23 @@ def read_dynamic_all(pins: DynamicAllInput, *, source_sha: str, owner_map_sha: s
             converted = root / "conversion"
             converter.convert_backup(source, converted, owner_map=owners)
             require(native.file_hash(converted / package.MANIFEST)[1] == converter_manifest_sha)
-            rebuilt = root / "namespace"
-            namespace.seal_inventory(source, rebuilt, source_sha256=source_sha, owner_map=owners,
-                                     owner_map_sha256=owner_map_sha, old_origin=pins.old_origin, legacy_bot_id=pins.legacy_bot_id)
-            _compare_namespace(short_dir, rebuilt)
-            raw = package.read_pinned(rebuilt / namespace.MANIFEST, SEALS[namespace.MANIFEST], pins.namespace_sha256)
-            short_report = native.parsed(raw, SEALS[namespace.MANIFEST])
-            inventory = short_report["inventory"]
-            total = inventory["rows"]
-            require(inventory["present"] is True and inventory["blocked"] == 0 and native.integer(total, 1, typed.MAX_SHORTS)
-                    and inventory["kinds"] == {kind: total if kind == "aggregate-all" else 0 for kind in namespace.KINDS})
-            links, lineage = _source_rows(source, rebuilt / namespace.ROWS, owners, total)
+            if mixed is None:
+                rebuilt = root / "namespace"
+                namespace.seal_inventory(source, rebuilt, source_sha256=source_sha, owner_map=owners,
+                                         owner_map_sha256=owner_map_sha, old_origin=pins.old_origin, legacy_bot_id=pins.legacy_bot_id)
+                _compare_namespace(short_dir, rebuilt)
+                raw = package.read_pinned(rebuilt / namespace.MANIFEST, SEALS[namespace.MANIFEST], pins.namespace_sha256)
+                short_report = native.parsed(raw, SEALS[namespace.MANIFEST])
+                inventory = short_report["inventory"]
+                total = inventory["rows"]
+                require(inventory["present"] is True and inventory["blocked"] == 0 and native.integer(total, 1, typed.MAX_SHORTS)
+                        and inventory["kinds"] == {kind: total if kind == "aggregate-all" else 0 for kind in namespace.KINDS})
+                links, lineage = _source_rows(source, rebuilt / namespace.ROWS, owners, total)
+                short_domain = {"present": True, "rows": total}
+                origin_sha, namespace_rows_sha = short_report["oldOriginSha256"], short_report["files"][0]["sha256"]
+            else:
+                links, lineage, short_domain = mixed.dynamic_all_rows, mixed.active_lineage, mixed.domain
+                origin_sha, namespace_rows_sha = mixed.proof["oldOriginSha256"], mixed.proof["namespaceRowsSha256"]
             projected = projection.verify_projection(source, temp_dir, root, source_sha256=source_sha, owner_map=owners,
                         owner_map_sha256=owner_map_sha, legacy_bot_id=pins.legacy_bot_id,
                         inventory_manifest_sha256=pins.temp_manifest_sha256)
@@ -185,17 +206,17 @@ def read_dynamic_all(pins: DynamicAllInput, *, source_sha: str, owner_map_sha: s
         temp_manifest = native.parsed(package.read_pinned(temp_dir / temp.MANIFEST, 64 * 1024, pins.temp_manifest_sha256), 64 * 1024)
         bot, temp_sha = pins.legacy_bot_id, pins.temp_manifest_sha256
         rows = {
-            INSTALLATIONS: ((bot, temp_sha, None),),
+            INSTALLATIONS: ((bot, temp_sha, None),) if links or projected.batches else (),
             BATCHES: tuple((bot, row.owner_id, row.first_legacy_id, row.last_legacy_id, row.payload_json, row.node_count,
                             row.payload_bytes, native.digest(row.payload_json.encode("utf-8"))) for row in projected.batches),
             package.AGGREGATE_LINKS: tuple((digest, owner, "all", bot, None, created_at, None) for digest, owner, created_at in links),
             MARKERS: tuple((digest, bot, owner, temp_sha) for digest, owner, _ in links),
         }
-        proof = {"legacyBotId": bot, "oldOriginSha256": short_report["oldOriginSha256"],
-                 "namespaceManifestSha256": pins.namespace_sha256, "namespaceRowsSha256": short_report["files"][0]["sha256"],
+        proof = {"legacyBotId": bot, "oldOriginSha256": origin_sha,
+                 "namespaceManifestSha256": pins.namespace_sha256, "namespaceRowsSha256": namespace_rows_sha,
                  "tempInventoryManifestSha256": temp_sha, "tempInventoryRowsSha256": temp_manifest["files"][0]["sha256"],
                  "activeLineageSha256": native.digest(native.canonical(lineage))}
-        return VerifiedDynamicAll({"present": True, "rows": total}, {"present": temp_manifest["inventory"]["present"],
+        return VerifiedDynamicAll(short_domain, {"present": temp_manifest["inventory"]["present"],
                                   "rows": projected.node_count}, proof, rows, lineage)
     except (namespace.InventoryError, typed.InventoryError, temp.InventoryError, projection.ProjectionError,
             converter.ConversionError, native.RehearsalError, OSError, sqlite3.Error, ValueError, TypeError, KeyError, RecursionError):
@@ -214,14 +235,17 @@ def load_dynamic_all(db: sqlite3.Connection, data: VerifiedDynamicAll):
         db.executemany(f"INSERT INTO {table} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})", data.rows[table])
 
 
-def verify_dynamic_all(db: sqlite3.Connection, data: VerifiedDynamicAll, objects: list[dict]):
+def verify_dynamic_all(db: sqlite3.Connection, data: VerifiedDynamicAll, objects: list[dict], *, unified=False):
     _verify_active(db, data)
     for table, columns in DYNAMIC_COLUMNS.items():
         order = "bot_id,actor_id,first_legacy_id" if table == BATCHES else columns[0]
-        rows = db.execute(f"SELECT {','.join(columns)} FROM {table} ORDER BY {order}")
+        scope = "WHERE kind='all'" if unified and table == package.AGGREGATE_LINKS else ""
+        rows = db.execute(f"SELECT {','.join(columns)} FROM {table} {scope} ORDER BY {order}")
         require(all(row == expected for row, expected in zip_longest(rows, sorted(data.rows[table]))))
-    for table in (ORDER, package.SELECTED_MARKERS, package.SELECTED_WATCHES, package.EXTERNAL_SHORTS, package.TYPED_SHORTS,
-                  "telegram_inbox", "telegram_outbox", "telegram_temp_batch"):
+    empty_tables = (ORDER, "telegram_inbox", "telegram_outbox", "telegram_temp_batch")
+    if not unified:
+        empty_tables += (package.SELECTED_MARKERS, package.SELECTED_WATCHES, package.EXTERNAL_SHORTS, package.TYPED_SHORTS)
+    for table in empty_tables:
         require(db.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is None)
 
     # Check current composite input limits, excluding trash and foreign scopes.

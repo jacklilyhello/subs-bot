@@ -45,6 +45,7 @@ TYPED_SHORT_LINE_BYTES = 1024
 MIXED_SHORT_PROFILE = "legacy-mixed-short-v5"
 SELECTED_SHORT_PROFILE = "legacy-selected-short-v6"
 DYNAMIC_ALL_PROFILE = "legacy-dynamic-all-v8"
+UNIFIED_PROFILE = "legacy-unified-v9"
 EXTERNAL_SHORT_MIGRATION = "0019_telegram_short_links.sql"
 EXTERNAL_SHORT_MIGRATION_SHA256 = "44cda07068dd84435542771899824c1d4196a1ffdc18f990abcb723e5bdaa3c1"
 EXTERNAL_SHORTS = "normal_short_links"
@@ -403,14 +404,25 @@ def load_selected_aggregate_links(db, mixed, source):
     return expected
 
 
-def verify_selected_aggregate_links(db, expected, sequence):
+def verify_selected_aggregate_links(db, expected, sequence, *, unified=False):
     for table, rows in expected.items():
         columns = SELECTED_COLUMNS[table]
-        actual = db.execute(f"SELECT {','.join(columns)} FROM {table} ORDER BY {columns[0]}")
+        selected = " WHERE kind='selected'" if unified and table == AGGREGATE_LINKS else ""
+        actual = db.execute(f"SELECT {','.join(columns)} FROM {table}{selected} ORDER BY {columns[0]}")
         require(all(row == target for row, target in zip_longest(actual, rows)))
-    require(db.execute("SELECT seq FROM sqlite_sequence WHERE name='subscriptions'").fetchall() == [(sequence,)])
+    require(db.execute("SELECT seq FROM sqlite_sequence WHERE name='subscriptions'").fetchall()
+            == ([(sequence,)] if sequence else []))
     require(db.execute("""SELECT 1 FROM aggregate_links AS aggregate
         JOIN normal_short_links AS normal USING (code_sha256) LIMIT 1""").fetchone() is None)
+
+
+def verify_short_namespace(db, expected_rows):
+    actual = db.execute(f"""SELECT count(*), count(DISTINCT code_sha256) FROM (
+        SELECT code_sha256 FROM {TYPED_SHORTS} UNION ALL
+        SELECT code_sha256 FROM {EXTERNAL_SHORTS} UNION ALL
+        SELECT code_sha256 FROM {AGGREGATE_LINKS}
+    )""").fetchone()
+    require(actual == (expected_rows, expected_rows))
 
 
 def db_summary(db, layout):
@@ -462,9 +474,10 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                     profile=None, source_sqlite_sha=None, owner_map_sha=None, typed_short=None, mixed_short=None,
                     dynamic_all=None):
     try:
-        include_dynamic_all = profile == DYNAMIC_ALL_PROFILE
-        include_selected_shorts = profile == SELECTED_SHORT_PROFILE
-        include_mixed_shorts = profile in (MIXED_SHORT_PROFILE, SELECTED_SHORT_PROFILE)
+        unified = profile == UNIFIED_PROFILE
+        include_dynamic_all = profile == DYNAMIC_ALL_PROFILE or unified
+        include_selected_shorts = profile == SELECTED_SHORT_PROFILE or unified
+        include_mixed_shorts = profile == MIXED_SHORT_PROFILE or include_selected_shorts
         include_typed_shorts = profile == TYPED_SHORT_PROFILE or include_mixed_shorts
         include_empty_exports = profile == EMPTY_EXPORT_PROFILE or include_typed_shorts or include_dynamic_all
         require(profile is None or include_empty_exports)
@@ -485,12 +498,15 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
         if include_selected_shorts:
             require(legacy_selected_artifact(worker, build))
         if include_mixed_shorts:
-            from legacy_mixed_short_candidate import MixedShortError, MixedShortInput, read_mixed_shorts, read_selected_shorts
+            from legacy_mixed_short_candidate import (
+                MixedShortError, MixedShortInput, read_mixed_shorts, read_selected_shorts, read_unified_shorts,
+            )
 
             require(isinstance(mixed_short, MixedShortInput)
                     and all(not output.is_relative_to(private_path(path, directory=True))
                             for path in (mixed_short.namespace, mixed_short.oracle)))
-            read_shorts = read_selected_shorts if include_selected_shorts else read_mixed_shorts
+            read_shorts = {MIXED_SHORT_PROFILE: read_mixed_shorts, SELECTED_SHORT_PROFILE: read_selected_shorts,
+                           UNIFIED_PROFILE: read_unified_shorts}[profile]
             try:
                 mixed = read_shorts(mixed_short, source_sha=source_sqlite_sha, owner_map_sha=owner_map_sha,
                                     build=build, worker_manifest_sha=worker_manifest_sha, working_parent=output.parent)
@@ -501,7 +517,7 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
             typed_root, typed_domain, typed_rows = read_typed_short_artifact(typed_short, source_sqlite_sha, owner_map_sha)
             require(not output.is_relative_to(typed_root))
             legacy_bot_id = typed_short.legacy_bot_id
-        elif include_dynamic_all:
+        if include_dynamic_all:
             from legacy_dynamic_all_candidate import (
                 DYNAMIC_COLUMNS, DynamicAllInput, load_dynamic_all, read_dynamic_all, verify_dynamic_all,
             )
@@ -510,8 +526,15 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                     and legacy_dynamic_all_artifact(worker, build)
                     and all(not output.is_relative_to(private_path(path, directory=True))
                             for path in (dynamic_all.namespace_dir, dynamic_all.temp_dir)))
+            if unified:
+                require(private_path(dynamic_all.source) == private_path(mixed_short.source)
+                        and private_path(dynamic_all.namespace_dir, directory=True) == private_path(mixed_short.namespace, directory=True)
+                        and (dynamic_all.namespace_sha256, dynamic_all.old_origin, dynamic_all.legacy_bot_id)
+                        == (mixed_short.namespace_sha256, mixed_short.old_origin, mixed_short.legacy_bot_id))
             dynamic = read_dynamic_all(dynamic_all, source_sha=source_sqlite_sha, owner_map_sha=owner_map_sha,
-                                       converter_manifest_sha=converter_manifest_sha, working_parent=output.parent)
+                                       converter_manifest_sha=converter_manifest_sha, working_parent=output.parent,
+                                       mixed=mixed if unified else None)
+            require(not unified or typed_domain == dynamic.short_domain)
             typed_domain, temp_domain = dynamic.short_domain, dynamic.temp_domain
         source, files = converter_artifact(conversion, converter_manifest_sha, typed_short_domain=typed_domain, temp_domain=temp_domain)
         if include_empty_exports:
@@ -562,7 +585,8 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                 if include_mixed_shorts:
                     external_expected = load_external_short_links(db, mixed.external_rows, legacy_bot_id)
                 if include_selected_shorts:
-                    selected_expected = load_selected_aggregate_links(db, mixed, source)
+                    selected_expected = (load_selected_aggregate_links(db, mixed, source) if mixed.selected_rows
+                                         else {table: [] for table in SELECTED_COLUMNS})
                 if include_dynamic_all:
                     load_dynamic_all(db, dynamic)
                 require(db.execute("""SELECT 1 FROM subscriptions AS active JOIN subscription_trash AS trash
@@ -602,10 +626,12 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                 if include_mixed_shorts:
                     verify_external_short_links(replayed, external_expected)
                 if include_selected_shorts:
-                    verify_selected_aggregate_links(replayed, selected_expected, sequence)
+                    verify_selected_aggregate_links(replayed, selected_expected, sequence, unified=unified)
                 objects = native.object_references(replayed, read_object, copy_object)
                 if include_dynamic_all:
-                    verify_dynamic_all(replayed, dynamic, objects)
+                    verify_dynamic_all(replayed, dynamic, objects, unified=unified)
+                if unified:
+                    verify_short_namespace(replayed, typed_domain["rows"])
             require({"objects/" + item["key"] for item in objects} == set(files) - metadata_files(source))
             replay_sql.rename(sql)
         report = {"version": 1, "scope": "fresh-unbound-d1-r2", "legacyDomains": "active-and-trash-only",
@@ -639,8 +665,9 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
         if include_mixed_shorts:
             external_count = len(external_expected)
             selected_count = len(selected_expected[AGGREGATE_LINKS]) if include_selected_shorts else 0
+            dynamic_count = len(dynamic.rows[AGGREGATE_LINKS]) if unified else 0
             require(summary["tableCounts"][EXTERNAL_SHORTS] == external_count
-                    and external_count + typed_counts["rows"] + selected_count == typed_domain["rows"])
+                    and external_count + typed_counts["rows"] + selected_count + dynamic_count == typed_domain["rows"])
             report.update(version=5, legacyDomains=report["legacyDomains"] + "-and-external-shorts",
                           externalShortLinks={"rows": external_count, "migrationSha256": EXTERNAL_SHORT_MIGRATION_SHA256,
                                               "tableSha256": summary["tableSha256"][EXTERNAL_SHORTS]},
@@ -648,7 +675,8 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
             source_pin.update(mixed.proof)
         if include_selected_shorts:
             watches = selected_expected[SELECTED_WATCHES]
-            require(all(summary["tableCounts"][table] == len(rows) for table, rows in selected_expected.items()))
+            require(all(summary["tableCounts"][table] == len(rows) + (dynamic_count if table == AGGREGATE_LINKS else 0)
+                        for table, rows in selected_expected.items()))
             compatibility = {**report["shortLinkCompatibility"], "selected": "not-validated"}
             if external_count == 0:
                 compatibility["external"] = "not-applicable"
@@ -659,8 +687,18 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                               "tableSha256": {table: summary["tableSha256"][table] for table in SELECTED_COLUMNS}},
                           shortLinkCompatibility=compatibility)
         if include_dynamic_all:
-            report.update(version=8, legacyDomains=report["legacyDomains"] + "-and-temporary-nodes-and-dynamic-all",
-                          **dynamic.report(summary))
+            dynamic_report = dynamic.report(summary, unified=unified)
+            if unified:
+                compatibility = report["shortLinkCompatibility"]
+                if not typed_counts["rows"]:
+                    compatibility["typed"] = "not-applicable"
+                if not selected_count:
+                    compatibility["selected"] = "not-applicable"
+                compatibility["dynamicAll"] = "not-validated" if dynamic_count else "not-applicable"
+                report["selectedAggregateLinks"]["partitionSha256"] = native.digest(native.canonical(selected_expected[AGGREGATE_LINKS]))
+                require(all(source_pin[key] == dynamic.proof[key] for key in source_pin.keys() & dynamic.proof.keys()))
+            report.update(version=9 if unified else 8, legacyDomains=report["legacyDomains"] + "-and-temporary-nodes-and-dynamic-all",
+                          **dynamic_report)
             source_pin.update(dynamic.proof)
         manifest = {**report, "source": source_pin, "workerArtifact": build,
                     "ledger": ledger, "layout": layout, "summary": summary, "objects": objects,
@@ -680,34 +718,48 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
 
 def main(args=None):
     args = sys.argv[1:] if args is None else args
-    if (len(args) not in (7, 10, 11, 14) or not re.fullmatch(r"[1-9][0-9]{0,15}", args[6])
+    if (len(args) not in (7, 10, 11, 13, 14) or not re.fullmatch(r"[1-9][0-9]{0,15}", args[6])
             or (len(args) == 10 and args[7] != EMPTY_EXPORT_PROFILE) or (len(args) == 14 and args[7] != TYPED_SHORT_PROFILE)
+            or (len(args) == 13 and args[7] != UNIFIED_PROFILE)
             or (len(args) == 11 and args[7] not in (MIXED_SHORT_PROFILE, SELECTED_SHORT_PROFILE))):
         print("Usage: legacy_restore_package.py CONVERTER_DIR WORKER_ARTIFACT_DIR OUTPUT_DIR CONVERTER_MANIFEST_SHA WORKER_MANIFEST_SHA REVISION APPLIED_AT"
               " [legacy-empty-v3 SOURCE_SQLITE_SHA OWNER_MAP_SHA | legacy-typed-short-v4 SOURCE_SQLITE_SHA OWNER_MAP_SHA "
               "TYPED_SHORT_INVENTORY TYPED_SHORT_MANIFEST_SHA OLD_ORIGIN_SHA LEGACY_BOT_ID | "
-              "{legacy-mixed-short-v5|legacy-selected-short-v6} SOURCE_SQLITE_SHA OWNER_MAP_SHA PRIVATE_INPUT_JSON]",
+              "{legacy-mixed-short-v5|legacy-selected-short-v6} SOURCE_SQLITE_SHA OWNER_MAP_SHA PRIVATE_INPUT_JSON | "
+              "legacy-unified-v9 SOURCE_SQLITE_SHA OWNER_MAP_SHA PRIVATE_INPUT_JSON TEMP_INVENTORY TEMP_INVENTORY_MANIFEST_SHA]",
               file=sys.stderr)
         return 2
     try:
         profile, source_sqlite_sha, owner_map_sha = args[7:10] if len(args) >= 10 else (None, None, None)
         typed_short = TypedShortInput(Path(args[10]), *args[11:]) if len(args) == 14 else None
-        mixed_short = None
-        if len(args) == 11:
+        mixed_short = dynamic_all = None
+        if len(args) in (11, 13):
             from legacy_mixed_short_candidate import MixedShortError, read_mixed_short_input
 
             try:
                 mixed_short = read_mixed_short_input(Path(args[10]))
             except MixedShortError:
                 raise PackageError(ERROR) from None
+        if profile == UNIFIED_PROFILE:
+            from legacy_dynamic_all_candidate import DynamicAllInput
+
+            temp_dir = Path(args[11])
+            require(temp_dir.is_absolute())
+            maximum = typed_inventory.MAX_METADATA_BYTES
+            owner_map = converter._owner_map(native.parsed(read_private(mixed_short.owner_map, maximum), maximum))
+            dynamic_all = DynamicAllInput(mixed_short.source, owner_map, mixed_short.namespace, mixed_short.namespace_sha256,
+                                          temp_dir, args[12], mixed_short.old_origin, mixed_short.legacy_bot_id)
         result = build_candidate(*map(Path, args[:3]), converter_manifest_sha=args[3], worker_manifest_sha=args[4],
                                  revision=args[5], applied_at=int(args[6]), profile=profile,
                                  source_sqlite_sha=source_sqlite_sha, owner_map_sha=owner_map_sha, typed_short=typed_short,
-                                 mixed_short=mixed_short)
+                                 mixed_short=mixed_short, dynamic_all=dynamic_all)
         print(json.dumps(result, ensure_ascii=True, sort_keys=True))
         return 0
     except PackageError as error:
         print(str(error), file=sys.stderr)
+        return 2
+    except (converter.ConversionError, native.RehearsalError, OSError, ValueError, TypeError, RecursionError):
+        print(ERROR, file=sys.stderr)
         return 2
 
 
