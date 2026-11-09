@@ -508,6 +508,14 @@ PY
 
 托管 Worker CI 从封存的合成 SQLite 创建 V6 候选，在仅回环网络中运行旧版实际 Python 路由，并把候选 SQL 和经摘要核对的对象装入编译后 Worker 的 D1、R2 测试绑定。对照覆盖固定顺序与重复项、历史缺口、同号回收站记录、零代空订阅、旧格式别名和相对跳转。Base64 和空响应比对实际字节，非空 Clash 与 Sing-box 比对有序的连接字段，HEAD 长度和重定向正文差异单独记录。测试只保留分类计数，实际旧库和原生 Cloudflare 恢复另行验收。 [Miniflare D1](https://developers.cloudflare.com/workers/testing/miniflare/storage/d1/)
 
+#### V6 原生恢复演练
+
+由同一次成功的 `main` Worker CI 生成 Worker 和 V6 合成候选产物。两端 HTTP 对照通过后，分类报告绑定原始构建清单、源库与候选摘要，并随候选一并封存。受保护流程在写入前离线重建固定候选，逐字节核对 SQL、对象与清单，并确认当前隔离 Worker 已运行同一提交和模块。
+
+在 `worker-isolation-legacy-candidate.yml` 选择 `synthetic-legacy-selected-aggregates`。所有阶段使用同一个新的 32 位十六进制 `cohort` 和同一个成功的 `source_run_id`，按 `verify`、`prepare`、`create-restore-db`、`create-restore-bucket`、`restore-objects`、`start-import`、`verify-restore` 顺序执行。创建结果不明时按本页既有 `pin-resource` 流程核对身份，再继续该批次。V6 使用独立的私有 D1、R2 和维护日志路径，恢复资源保持未绑定。
+
+验收分别核对三个聚合码摘要、三个来源标记、四个监视编号（其中一个已失效）、订阅序列 `72`、全库数据摘要、外键、完整性和十二个 R2 对象。HTTP 对照报告和原生恢复报告分别留证。真实旧库和生产切换走后续独立验收。 [D1 导入](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/import/)
+
 ### 真实数据与生产切换门槛
 
 1. 先只读核对 Cloudflare 目标账户、Zone、`subs-bot.lilyya.top` 的 DNS、Worker 路由和 Custom Domain 绑定。新资源记录账号、环境及资源 ID，隔离与生产分别使用各自的 Worker、D1、R2 和队列。现有配置冲突须在改动前报告。目标主机名可用且切换获准后，仅增加所需的 Custom Domain 绑定。 [Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)

@@ -157,15 +157,21 @@ jobs:
           }
           offline_python WORKER_TEST_BUNDLE_DIR="$WORKER_TEST_BUNDLE_DIR" WORKER_TEST_REVISION="$BUILD_REVISION" \
             "$workdir/venv/bin/python" -B test/legacy-short-redirect-oracle.integration.py
-          offline_python WORKER_TEST_BUNDLE_DIR="$WORKER_TEST_BUNDLE_DIR" WORKER_TEST_REVISION="$BUILD_REVISION" \
-            "$workdir/venv/bin/python" -B test/legacy-selected-short-oracle.integration.py
           if [[ "$GITHUB_REPOSITORY" == 'jacklilyhello/subs-bot' && "$GITHUB_REF" == 'refs/heads/main' &&
                 ( "$GITHUB_EVENT_NAME" == 'push' || "$GITHUB_EVENT_NAME" == 'workflow_dispatch' ) ]]; then
             test "$BUILD_REVISION" = "$GITHUB_SHA"
             test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+            offline_python WORKER_TEST_BUNDLE_DIR="$WORKER_TEST_BUNDLE_DIR" WORKER_TEST_REVISION="$BUILD_REVISION" \
+              GITHUB_REPOSITORY="$GITHUB_REPOSITORY" GITHUB_REF="$GITHUB_REF" GITHUB_SHA="$GITHUB_SHA" \
+              GITHUB_EVENT_NAME="$GITHUB_EVENT_NAME" GITHUB_RUN_ID="$GITHUB_RUN_ID" GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+              RUNNER_TEMP="$RUNNER_TEMP" "$workdir/venv/bin/python" -B test/legacy-selected-short-oracle.integration.py \
+              --output "$RUNNER_TEMP/subs-bot-legacy-selected-aggregate-candidate"
             offline_python GITHUB_REPOSITORY="$GITHUB_REPOSITORY" GITHUB_REF="$GITHUB_REF" GITHUB_SHA="$GITHUB_SHA" \
               GITHUB_EVENT_NAME="$GITHUB_EVENT_NAME" GITHUB_RUN_ID="$GITHUB_RUN_ID" GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
               RUNNER_TEMP="$RUNNER_TEMP" "$workdir/venv/bin/python" -B tools/legacy_candidate_isolation.py build synthetic-legacy-mixed-shorts
+          else
+            offline_python WORKER_TEST_BUNDLE_DIR="$WORKER_TEST_BUNDLE_DIR" WORKER_TEST_REVISION="$BUILD_REVISION" \
+              "$workdir/venv/bin/python" -B test/legacy-selected-short-oracle.integration.py
           fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: >-
@@ -174,6 +180,15 @@ jobs:
         with:
           name: subs-bot-legacy-mixed-short-candidate-${{ env.BUILD_REVISION }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/subs-bot-legacy-mixed-short-candidate/
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: >-
+          github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        with:
+          name: subs-bot-legacy-selected-aggregate-candidate-${{ env.BUILD_REVISION }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/subs-bot-legacy-selected-aggregate-candidate/
           if-no-files-found: error
           retention-days: 7
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
