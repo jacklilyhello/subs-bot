@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+from platform import python_version
 import sqlite3
 import sys
 import tempfile
@@ -14,8 +15,10 @@ from uuid import NAMESPACE_URL, uuid5
 from zipfile import ZipFile
 
 import d1_migrations as migrations
+import legacy_mixed_short_candidate as mixed_shorts
 import legacy_private_share_fixture as share_fixture
 import legacy_restore_package as package
+import legacy_short_namespace_inventory as short_namespace
 import legacy_snapshot_convert as converter
 import native_restore_rehearsal as native
 import prepare_isolation_artifact as artifact
@@ -27,10 +30,11 @@ PATH_PROFILE = native.LEGACY_PATH_CANDIDATE_PROFILE
 EMPTY_PROFILE = native.LEGACY_EMPTY_CANDIDATE_PROFILE
 SHARE_PROFILE = native.LEGACY_PRIVATE_SHARE_CANDIDATE_PROFILE
 TYPED_PROFILE = native.LEGACY_TYPED_SHORT_CANDIDATE_PROFILE
+MIXED_PROFILE = native.LEGACY_MIXED_SHORT_CANDIDATE_PROFILE
 ARTIFACT_PREFIX = "subs-bot-legacy-candidate"
 ARTIFACT_PREFIXES = {PROFILE: ARTIFACT_PREFIX, PATH_PROFILE: "subs-bot-legacy-path-candidate",
                      EMPTY_PROFILE: "subs-bot-legacy-empty-candidate", SHARE_PROFILE: "subs-bot-legacy-private-share-candidate",
-                     TYPED_PROFILE: "subs-bot-legacy-typed-short-candidate"}
+                     TYPED_PROFILE: "subs-bot-legacy-typed-short-candidate", MIXED_PROFILE: "subs-bot-legacy-mixed-short-candidate"}
 CANDIDATE_DIRECTORY = "subs-bot-verified-legacy-candidate"
 PROVENANCE = "legacy-candidate-provenance.json"
 EVIDENCE = "legacy-candidate-evidence.json"
@@ -79,6 +83,16 @@ TYPED_LINK_FIXTURES = (
     ("TypedTmp0004", "empty-trash", "qx"),
 )
 TYPED_COUNTS = {"rows": 4, "activeRows": 2, "trashRows": 2}
+EXTERNAL_LINK_FIXTURES = (
+    ("MixedExt0001", 123, "https://example.org/route?value=synthetic-secret&mode=exact#keep"),
+    ("MixedExt0002", -100123, "http://example.net/legacy/path?mode=original#keep"),
+)
+MIXED_ORACLE = "oracle"
+MIXED_YARL = "1.20.0"
+MIXED_COMPATIBILITY = {"typed": "not-validated", "external": "offline-equivalent"}
+MIXED_ORACLE_LIMITS = {f"{MIXED_ORACLE}/{package.MANIFEST}": mixed_shorts.MANIFEST_BYTES,
+                       f"{MIXED_ORACLE}/{package.MARKER}": 65,
+                       f"{MIXED_ORACLE}/{mixed_shorts.ORACLE_ROWS}": 4096}
 MANIFEST_FIELDS = {"version", "scope", "legacyDomains", "schemaSha256", "dataSha256", "counts", "objectCount", "objectBytes",
                    "sourceHighWater", "targetSequenceHighWater", "generationZeroHttp", "formatCompatibility", "source",
                    "workerArtifact", "ledger", "layout", "summary", "objects", "lineage", "sql"}
@@ -108,7 +122,7 @@ def candidate_directory(profile):
 
 def candidate_version(profile):
     require(profile in ARTIFACT_PREFIXES)
-    return {PROFILE: 1, PATH_PROFILE: 2, EMPTY_PROFILE: 3, SHARE_PROFILE: 1, TYPED_PROFILE: 4}[profile]
+    return {PROFILE: 1, PATH_PROFILE: 2, EMPTY_PROFILE: 3, SHARE_PROFILE: 1, TYPED_PROFILE: 4, MIXED_PROFILE: 5}[profile]
 
 
 def path_mapping():
@@ -116,7 +130,7 @@ def path_mapping():
 
 
 def fixture_rows(profile):
-    return (*FIXTURES, EMPTY_TRASH_FIXTURE) if profile in (EMPTY_PROFILE, TYPED_PROFILE) else FIXTURES
+    return (*FIXTURES, EMPTY_TRASH_FIXTURE) if profile in (EMPTY_PROFILE, TYPED_PROFILE, MIXED_PROFILE) else FIXTURES
 
 
 def typed_fixture_links():
@@ -126,12 +140,17 @@ def typed_fixture_links():
         yield code, owner, target_id, token, format_name, FIXTURE_CREATED + index
 
 
+def external_fixture_links():
+    for index, (code, owner, target) in enumerate(EXTERNAL_LINK_FIXTURES, len(TYPED_LINK_FIXTURES)):
+        yield code, owner, target, FIXTURE_CREATED + index
+
+
 def make_synthetic_source(path, profile=PROFILE):
     version = candidate_version(profile)
     put(path, b"")
     with closing(sqlite3.connect(path)) as db, db:
         for table, time_field in (("subscriptions", "updated_at"), ("deleted_subs", "deleted_at")):
-            unique_token = " UNIQUE" if profile == TYPED_PROFILE and table == "subscriptions" else ""
+            unique_token = " UNIQUE" if profile in (TYPED_PROFILE, MIXED_PROFILE) and table == "subscriptions" else ""
             db.execute(f"""CREATE TABLE {table} (id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,name TEXT NOT NULL,url TEXT NOT NULL,token TEXT NOT NULL{unique_token},
                 expire_at INTEGER,traffic_used REAL,traffic_total REAL,nodes_json TEXT NOT NULL,
@@ -150,12 +169,14 @@ def make_synthetic_source(path, profile=PROFILE):
             db.executemany("INSERT INTO path_maps VALUES (?,?,?,?)", PATH_FIXTURES)
             db.execute("INSERT INTO path_maps VALUES (?,123,'deleted rule','synthetic')", (PATH_SEQUENCE,))
             db.execute("DELETE FROM path_maps WHERE id=?", (PATH_SEQUENCE,))
-        if profile == TYPED_PROFILE:
+        if profile in (TYPED_PROFILE, MIXED_PROFILE):
             db.execute("""CREATE TABLE short_links (
                 code TEXT PRIMARY KEY,user_id INTEGER NOT NULL,target_url TEXT NOT NULL,created_at INTEGER NOT NULL)""")
             db.executemany("INSERT INTO short_links VALUES (?,?,?,?)", (
                 (code, owner, f"{TYPED_ORIGIN}/sub/{token}" + (f"/{format_name}" if format_name else ""), created)
                 for code, owner, _, token, format_name, created in typed_fixture_links()))
+        if profile == MIXED_PROFILE:
+            db.executemany("INSERT INTO short_links VALUES (?,?,?,?)", external_fixture_links())
 
 
 def convert_synthetic_source(root, profile):
@@ -173,6 +194,37 @@ def convert_synthetic_source(root, profile):
     return conversion, pins
 
 
+def _build_mixed_candidate(worker, output, worker_pin, scratch, oracle, *, produce_oracle=False):
+    conversion, pins = convert_synthetic_source(scratch, MIXED_PROFILE)
+    source, owners, namespace = (scratch / name for name in ("synthetic.sqlite", "owners.json", "namespace"))
+    put(owners, native.canonical(OWNER_MAP))
+    short_namespace.seal_inventory(source, namespace, source_sha256=pins["sqliteSha256"], owner_map=OWNER_MAP,
+                                  owner_map_sha256=pins["ownerMapSha256"], old_origin=TYPED_ORIGIN, legacy_bot_id=TYPED_BOT)
+    namespace_sha = native.file_hash(namespace / short_namespace.MANIFEST)[1]
+    if produce_oracle:
+        # This branch is used by Worker CI in the pinned, network-isolated environment.
+        from legacy_short_redirect_oracle import seal_oracle
+
+        seal_oracle({"backup": str(source), "ownerMap": str(owners), "inventory": str(namespace),
+                     "bundle": str(worker), "output": str(oracle), "sourceSha256": pins["sqliteSha256"],
+                     "ownerMapSha256": pins["ownerMapSha256"], "oldOrigin": TYPED_ORIGIN, "legacyBotId": TYPED_BOT,
+                     "inventorySha256": namespace_sha, "workerManifestSha256": worker_pin["manifestSha256"],
+                     "revision": worker_pin["revision"], "pythonVersion": python_version(), "yarlVersion": MIXED_YARL})
+    oracle_sha = native.digest(package.read_private(oracle / package.MANIFEST, mixed_shorts.MANIFEST_BYTES))
+    sidecar = mixed_shorts.MixedShortInput(source, owners, TYPED_ORIGIN, TYPED_BOT, namespace, namespace_sha,
+                                          oracle, oracle_sha, python_version(), MIXED_YARL)
+    report = package.build_candidate(conversion, worker, output, converter_manifest_sha=pins["converterManifestSha256"],
+                                     worker_manifest_sha=worker_pin["manifestSha256"], revision=worker_pin["revision"],
+                                     applied_at=APPLIED_AT, profile=package.MIXED_SHORT_PROFILE,
+                                     source_sqlite_sha=pins["sqliteSha256"], owner_map_sha=pins["ownerMapSha256"],
+                                     mixed_short=sidecar)
+    require(report["version"] == 5 and report["counts"] == EMPTY_COUNTS and report["objectCount"] == 4
+            and report["pathIdMapping"] == path_mapping() and report["shortLinkCompatibility"] == MIXED_COMPATIBILITY
+            and all(report["typedShortLinks"][key] == value for key, value in TYPED_COUNTS.items())
+            and report["externalShortLinks"]["rows"] == len(EXTERNAL_LINK_FIXTURES))
+    return report
+
+
 def build_synthetic_candidate(worker, output, revision, run_id, attempt, *, profile=PROFILE):
     version = candidate_version(profile)
     worker_sha = native.digest(package.read_private(worker / "isolation.json", artifact._MAX_JSON))
@@ -180,6 +232,15 @@ def build_synthetic_candidate(worker, output, revision, run_id, attempt, *, prof
     require((worker_pin["runId"], worker_pin["runAttempt"]) == (run_id, attempt))
     if profile == SHARE_PROFILE:
         return share_fixture.build(worker, output, worker_pin, applied_at=APPLIED_AT)
+    if profile == MIXED_PROFILE:
+        output = converter._safe_path(output, existing=False)
+        with tempfile.TemporaryDirectory(prefix="legacy-mixed-", dir=output.parent) as temporary:
+            scratch = Path(temporary)
+            staged, oracle = scratch / "candidate", scratch / MIXED_ORACLE
+            report = _build_mixed_candidate(worker, staged, worker_pin, scratch, oracle, produce_oracle=True)
+            oracle.rename(staged / MIXED_ORACLE)
+            staged.rename(converter._safe_path(output, existing=False))
+        return report
     with tempfile.TemporaryDirectory(prefix="legacy-synthetic-", dir=output.parent) as temporary:
         conversion, pins = convert_synthetic_source(Path(temporary), profile)
         options = {} if version < 3 else {"profile": package.EMPTY_EXPORT_PROFILE, "source_sqlite_sha": pins["sqliteSha256"],
@@ -199,7 +260,7 @@ def build_synthetic_candidate(worker, output, revision, run_id, attempt, *, prof
     return report
 
 
-def package_files(document):
+def package_files(document, *, profile=PROFILE):
     files = {package.MANIFEST, package.MARKER, package.SQL, package.LINEAGE}
     objects = document.get("objects")
     require(isinstance(objects, list) and len(objects) == 4)
@@ -210,6 +271,8 @@ def package_files(document):
                 and entry["metadata"] == {"custom": {}, "http": {}})
         files.add("objects/" + entry["key"])
     require(len(files) == 8)
+    if profile == MIXED_PROFILE:
+        files.update(MIXED_ORACLE_LIMITS)
     return files
 
 
@@ -223,7 +286,9 @@ def unpack_candidate(body, archive_sha, destination, *, profile=PROFILE):
         require(type(document.get("version")) is int and document["version"] == candidate_version(profile))
         limits = {package.MANIFEST: native.MANIFEST_BYTES, package.MARKER: 65,
                   package.SQL: SQL_LIMIT, package.LINEAGE: LINEAGE_LIMIT}
-        expected_files = share_fixture.files(document, OBJECT_LIMIT) if profile == SHARE_PROFILE else package_files(document)
+        if profile == MIXED_PROFILE:
+            limits.update(MIXED_ORACLE_LIMITS)
+        expected_files = share_fixture.files(document, OBJECT_LIMIT) if profile == SHARE_PROFILE else package_files(document, profile=profile)
         require(set(members) == expected_files)
         require(all(0 < entry.file_size <= limits.get(name, OBJECT_LIMIT) for name, entry in members.items()))
         destination.mkdir(mode=0o700)
@@ -265,7 +330,7 @@ def fixture_contents(db, document, profile=PROFILE):
     require(db.execute("SELECT subscription_id,revision FROM subscription_lifecycle ORDER BY subscription_id").fetchall()
             == [(target_id, 1) for target_id in trash_ids])
     sequences = [("subscriptions", trash_ids[-1])]
-    if profile in (PATH_PROFILE, EMPTY_PROFILE, TYPED_PROFILE):
+    if profile in (PATH_PROFILE, EMPTY_PROFILE, TYPED_PROFILE, MIXED_PROFILE):
         expected_paths = [(row_id, OWNER_MAP.get(str(owner), str(owner)), keyword, remark) for row_id, owner, keyword, remark in PATH_FIXTURES]
         require(db.execute("SELECT id,owner_id,keyword,remark FROM path_rules ORDER BY id").fetchall() == expected_paths)
         sequences.insert(0, ("path_rules", PATH_SEQUENCE))
@@ -274,9 +339,10 @@ def fixture_contents(db, document, profile=PROFILE):
 
 
 class Candidate:
-    def __init__(self, root, source, worker_pin, scratch, *, profile=PROFILE):
+    def __init__(self, root, source, worker_pin, scratch, *, profile=PROFILE, worker=None):
         version = candidate_version(profile)
-        has_paths, has_empty, has_typed = version >= 2, version >= 3, profile == TYPED_PROFILE
+        has_paths, has_empty, has_typed = version >= 2, version >= 3, profile in (TYPED_PROFILE, MIXED_PROFILE)
+        has_mixed = profile == MIXED_PROFILE
         counts = EMPTY_COUNTS if has_empty else COUNTS
         sequence = EMPTY_TARGET_SEQUENCE if has_empty else TARGET_SEQUENCE
         self.profile = profile
@@ -293,9 +359,15 @@ class Candidate:
         if has_typed:
             fields |= {"typedShortLinks", "shortLinkCompatibility"}
             domains += "-and-typed-single-shorts"
-            require(document.get("shortLinkCompatibility") == "not-validated" and len(source.migrations) >= 29
+            require(document.get("shortLinkCompatibility") == (MIXED_COMPATIBILITY if has_mixed else "not-validated")
+                    and len(source.migrations) >= 29
                     and (source.migrations[28].name, source.migrations[28].sha256)
                     == (package.TYPED_SHORT_MIGRATION, package.TYPED_SHORT_MIGRATION_SHA256))
+        if has_mixed:
+            fields.add("externalShortLinks")
+            domains += "-and-external-shorts"
+            require(worker is not None and (source.migrations[18].name, source.migrations[18].sha256)
+                    == (package.EXTERNAL_SHORT_MIGRATION, package.EXTERNAL_SHORT_MIGRATION_SHA256))
         require(set(document) == fields and native.canonical(document) == raw
                 and type(document.get("version")) is int and document["version"] == version
                 and document.get("scope") == "fresh-unbound-d1-r2" and document.get("legacyDomains") == domains
@@ -306,20 +378,32 @@ class Candidate:
         if has_paths:
             require(document["pathIdMapping"] == path_mapping()
                     and len(source.migrations) >= 10 and source.migrations[9].name == "0010_path_rules.sql")
-        source_hashes = {"sqliteSha256", "ownerMapSha256", "converterManifestSha256"}
-        if has_typed:
-            source_hashes |= {"typedShortInventoryManifestSha256", "oldOriginSha256"}
-        require(set(document["source"]) == (source_hashes | ({"legacyBotId"} if has_typed else set()))
-                and all(native.matches(native.DIGEST, document["source"][key]) for key in source_hashes)
-                and (not has_typed or document["source"]["legacyBotId"] == TYPED_BOT)
-                and document["source"]["ownerMapSha256"] == native.digest(native.canonical(OWNER_MAP)))
-        if has_empty:
-            # Rebuild the fixed source rather than trusting an internally consistent replacement archive.
-            with tempfile.TemporaryDirectory(prefix="candidate-source-", dir=scratch) as temporary:
-                _, expected_source = convert_synthetic_source(Path(temporary), profile)
-            require(document["source"] == expected_source)
         require({path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file() or path.is_symlink()}
-                == package_files(document))
+                == package_files(document, profile=profile))
+        if has_mixed:
+            # Rebuild from fixed local fixtures and the sealed oracle metadata carried by
+            # the exact hosted build. This path never starts the oracle or Node.
+            with tempfile.TemporaryDirectory(prefix="candidate-source-", dir=scratch) as temporary:
+                rebuilt_root = Path(temporary)
+                rebuilt = rebuilt_root / "candidate"
+                try:
+                    _build_mixed_candidate(worker, rebuilt, worker_pin, rebuilt_root, root / MIXED_ORACLE)
+                except (package.PackageError, short_namespace.InventoryError):
+                    raise native.RehearsalError(ERROR) from None
+                require(package.read_private(rebuilt / package.MANIFEST, native.MANIFEST_BYTES) == raw)
+        else:
+            source_hashes = {"sqliteSha256", "ownerMapSha256", "converterManifestSha256"}
+            if has_typed:
+                source_hashes |= {"typedShortInventoryManifestSha256", "oldOriginSha256"}
+            require(set(document["source"]) == (source_hashes | ({"legacyBotId"} if has_typed else set()))
+                    and all(native.matches(native.DIGEST, document["source"][key]) for key in source_hashes)
+                    and (not has_typed or document["source"]["legacyBotId"] == TYPED_BOT)
+                    and document["source"]["ownerMapSha256"] == native.digest(native.canonical(OWNER_MAP)))
+            if has_empty:
+                # Rebuild the fixed source rather than trusting an internally consistent replacement archive.
+                with tempfile.TemporaryDirectory(prefix="candidate-source-", dir=scratch) as temporary:
+                    _, expected_source = convert_synthetic_source(Path(temporary), profile)
+                require(document["source"] == expected_source)
         self.sql = root / package.SQL
         sql = self.read_file(document["sql"], package.SQL, SQL_LIMIT, extra={"md5"})
         require(document["sql"]["md5"] == native.file_hash(self.sql, "md5")[1])
@@ -357,6 +441,15 @@ class Candidate:
                 expected_counts[package.TYPED_SHORTS] = TYPED_COUNTS["rows"]
                 require(document["typedShortLinks"] == {**TYPED_COUNTS, "migrationSha256": package.TYPED_SHORT_MIGRATION_SHA256,
                     "tableSha256": summary["tableSha256"][package.TYPED_SHORTS]})
+            if has_mixed:
+                expected_external = sorted((native.digest(code.encode("ascii")), 12, TYPED_BOT, OWNER_MAP.get(str(owner), str(owner)),
+                                            None, None, None, target, created, None)
+                                           for code, owner, target, created in external_fixture_links())
+                package.verify_external_short_links(db, expected_external)
+                expected_counts[package.EXTERNAL_SHORTS] = len(expected_external)
+                require(document["externalShortLinks"] == {"rows": len(expected_external),
+                    "migrationSha256": package.EXTERNAL_SHORT_MIGRATION_SHA256,
+                    "tableSha256": summary["tableSha256"][package.EXTERNAL_SHORTS]})
             require(summary["tableCounts"] == expected_counts)
             self.entries = {entry["key"]: entry for entry in document["objects"]}
             require(self.entries.keys() == objects.keys() and document["objectBytes"] == sum(map(len, objects.values())))
@@ -364,9 +457,11 @@ class Candidate:
             references = native.object_references(db, lambda key: (self.read_object(self.entries[key]), self.entries[key]["metadata"]))
             require(references == document["objects"])
             canonical_sql = scratch / "canonical.sql"
+            extra_tables = {package.TYPED_SHORTS: package.TYPED_SHORT_COLUMNS} if has_typed else {}
+            if has_mixed:
+                extra_tables[package.EXTERNAL_SHORTS] = package.EXTERNAL_SHORT_COLUMNS
             package.write_sql(db, source.objects, sequence, canonical_sql, path_sequence=PATH_SEQUENCE if has_paths else None,
-                              include_empty_exports=has_empty,
-                              extra_tables={package.TYPED_SHORTS: package.TYPED_SHORT_COLUMNS} if has_typed else None)
+                              include_empty_exports=has_empty, extra_tables=extra_tables)
             require(package.read_private(canonical_sql, SQL_LIMIT) == sql)
         self.document = {**document, "sqlMd5": document["sql"]["md5"]}
 
@@ -385,15 +480,19 @@ class Candidate:
         result = {"packageManifestSha256": self.manifest_sha, "schemaSha256": self.document["schemaSha256"],
                   "dataSha256": self.document["dataSha256"], "sqlSha256": self.document["sql"]["sha256"],
                   "sqlMd5": self.document["sqlMd5"]}
-        if self.profile in (PATH_PROFILE, EMPTY_PROFILE, TYPED_PROFILE):
+        if self.profile in (PATH_PROFILE, EMPTY_PROFILE, TYPED_PROFILE, MIXED_PROFILE):
             result.update(pathRulesSha256=self.document["summary"]["tableSha256"]["path_rules"], pathSequenceHighWater=PATH_SEQUENCE)
-        if self.profile in (EMPTY_PROFILE, TYPED_PROFILE):
-            result.update({key: value for key, value in self.document["source"].items() if key != "legacyBotId"},
+        if self.profile in (EMPTY_PROFILE, TYPED_PROFILE, MIXED_PROFILE):
+            result.update({key: value for key, value in self.document["source"].items() if key.endswith("Sha256")},
                           emptyExportMarkersSha256=self.document["emptyExportMarkers"]["tableSha256"],
                           emptyExportMigrationSha256=package.EMPTY_EXPORT_MIGRATION_SHA256)
-        if self.profile == TYPED_PROFILE:
+        if self.profile in (TYPED_PROFILE, MIXED_PROFILE):
             result.update(typedShortLinksSha256=self.document["typedShortLinks"]["tableSha256"],
                           typedShortMigrationSha256=package.TYPED_SHORT_MIGRATION_SHA256)
+        if self.profile == MIXED_PROFILE:
+            result.update(externalShortLinksSha256=self.document["externalShortLinks"]["tableSha256"],
+                          externalShortMigrationSha256=package.EXTERNAL_SHORT_MIGRATION_SHA256,
+                          workerManifestSha256=self.document["workerArtifact"]["manifestSha256"])
         return result
 
 
@@ -566,33 +665,46 @@ def run_action(action, engine, pin, *, resource=None, identity_sha=None):
     if profile == SHARE_PROFILE:
         result.update(counts=share_fixture.COUNTS, shareCompatibility="not-validated")
     else:
-        result.update(counts=EMPTY_COUNTS if profile in (EMPTY_PROFILE, TYPED_PROFILE) else COUNTS,
+        result.update(counts=EMPTY_COUNTS if profile in (EMPTY_PROFILE, TYPED_PROFILE, MIXED_PROFILE) else COUNTS,
                       generationZeroHttp="not-validated")
     if profile == TYPED_PROFILE:
         result["shortLinkCompatibility"] = "not-validated"
+    if profile == MIXED_PROFILE:
+        result["shortLinkCompatibility"] = MIXED_COMPATIBILITY
     if observed_summary is not None:
         result.update({"verifiedDataSha256": observed_summary["dataSha256"], "verifiedRowCount": observed_summary["rowCount"],
                        "schemaSha256": pin["candidate"]["schemaSha256"], "foreignKeys": "verified", "r2Closure": "verified"})
-        if profile in (PATH_PROFILE, EMPTY_PROFILE, TYPED_PROFILE):
+        if profile in (PATH_PROFILE, EMPTY_PROFILE, TYPED_PROFILE, MIXED_PROFILE):
             result.update(verifiedPathRuleCount=observed_summary["tableCounts"]["path_rules"],
                           verifiedPathSequenceHighWater=PATH_SEQUENCE,
                           pathRulesSha256=observed_summary["tableSha256"]["path_rules"],
                           sqliteSequenceSha256=observed_summary["tableSha256"]["sqlite_sequence"])
-        if profile in (EMPTY_PROFILE, TYPED_PROFILE):
+        if profile in (EMPTY_PROFILE, TYPED_PROFILE, MIXED_PROFILE):
             marker_count = observed_summary["tableCounts"][package.EMPTY_EXPORTS]
             marker_digest = observed_summary["tableSha256"][package.EMPTY_EXPORTS]
             require(marker_count == 2 and marker_digest == pin["candidate"]["emptyExportMarkersSha256"])
             result.update(verifiedEmptyExportMarkerCount=marker_count, emptyExportMarkersSha256=marker_digest,
                           emptyExportMigrationSha256=pin["candidate"]["emptyExportMigrationSha256"],
                           verifiedSubscriptionSequenceHighWater=EMPTY_TARGET_SEQUENCE)
-        if profile == TYPED_PROFILE:
+        if profile in (TYPED_PROFILE, MIXED_PROFILE):
             short_count = observed_summary["tableCounts"][package.TYPED_SHORTS]
             short_digest = observed_summary["tableSha256"][package.TYPED_SHORTS]
             require(short_count == TYPED_COUNTS["rows"] and short_digest == pin["candidate"]["typedShortLinksSha256"]
                     and pin["candidate"]["typedShortMigrationSha256"] == package.TYPED_SHORT_MIGRATION_SHA256)
             result.update(verifiedTypedShortLinkCount=short_count, typedShortLinksSha256=short_digest,
-                          typedShortMigrationSha256=package.TYPED_SHORT_MIGRATION_SHA256,
-                          typedShortInventoryManifestSha256=pin["candidate"]["typedShortInventoryManifestSha256"])
+                          typedShortMigrationSha256=package.TYPED_SHORT_MIGRATION_SHA256)
+            if profile == TYPED_PROFILE:
+                result["typedShortInventoryManifestSha256"] = pin["candidate"]["typedShortInventoryManifestSha256"]
+        if profile == MIXED_PROFILE:
+            external_count = observed_summary["tableCounts"][package.EXTERNAL_SHORTS]
+            external_digest = observed_summary["tableSha256"][package.EXTERNAL_SHORTS]
+            require(external_count == len(EXTERNAL_LINK_FIXTURES)
+                    and external_digest == pin["candidate"]["externalShortLinksSha256"]
+                    and pin["candidate"]["externalShortMigrationSha256"] == package.EXTERNAL_SHORT_MIGRATION_SHA256)
+            result.update(verifiedExternalShortLinkCount=external_count, externalShortLinksSha256=external_digest,
+                          externalShortMigrationSha256=package.EXTERNAL_SHORT_MIGRATION_SHA256,
+                          namespaceManifestSha256=pin["candidate"]["namespaceManifestSha256"],
+                          oracleManifestSha256=pin["candidate"]["oracleManifestSha256"])
         if profile == SHARE_PROFILE:
             counts, hashes = observed_summary["tableCounts"], observed_summary["tableSha256"]
             require(counts["private_shares"] == share_fixture.COUNTS["shares"]
@@ -620,7 +732,7 @@ def verified_candidate(runner, provenance, scratch, *, profile=PROFILE):
     objects = migrations._objects(chain, len(chain), managed=True)
     schema = SimpleNamespace(migrations=chain, objects=objects, schema_sha256=native._schema_digest(objects),
                              tables=sorted(obj.name for obj in objects if obj.type == "table"))
-    return Candidate(runner / candidate_directory(profile), schema, worker_pin, scratch, profile=profile)
+    return Candidate(runner / candidate_directory(profile), schema, worker_pin, scratch, profile=profile, worker=worker)
 
 
 def preflight(runner, revision, run_id, *, profile=PROFILE):

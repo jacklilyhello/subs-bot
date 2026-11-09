@@ -58,7 +58,7 @@ jobs:
           node-version: '24'
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: '3.11'
+          python-version: '3.11.18'
       - name: Verify Unicode 14 case-folding source
         run: |
           python3 -B tools/generate_casefold.py > "$RUNNER_TEMP/unicode14-casefold.ts"
@@ -144,14 +144,34 @@ jobs:
           trap 'rm -rf -- "$workdir"' EXIT
           python3 -m venv "$workdir/venv"
           "$workdir/venv/bin/python" -m pip install --disable-pip-version-check 'aiohttp==3.11.18' 'yarl==1.20.0'
-          sudo -n unshare --net -- bash -euc '
-            ip link set dev lo up
-            umask 077
-            ulimit -c 0
-            exec setpriv --reuid="$1" --regid="$2" --clear-groups --no-new-privs -- \
-              env -i PATH="$5:/usr/bin:/bin" HOME="$3" TMPDIR="$3" WORKER_TEST_BUNDLE_DIR="$4" WORKER_TEST_REVISION="$6" \
-                "$3/venv/bin/python" -B test/legacy-short-redirect-oracle.integration.py
-          ' -- "$(id -u)" "$(id -g)" "$workdir" "$WORKER_TEST_BUNDLE_DIR" "$(dirname "$(command -v node)")" "$BUILD_REVISION"
+          offline_python() {
+            sudo -n unshare --net -- bash -euc '
+              ip link set dev lo up
+              umask 077
+              ulimit -c 0
+              exec setpriv --reuid="$1" --regid="$2" --clear-groups --no-new-privs -- \
+                env -i PATH="$4:/usr/bin:/bin" HOME="$3" TMPDIR="$3" "${@:5}"
+            ' -- "$(id -u)" "$(id -g)" "$workdir" "$(dirname "$(command -v node)")" "$@"
+          }
+          offline_python WORKER_TEST_BUNDLE_DIR="$WORKER_TEST_BUNDLE_DIR" WORKER_TEST_REVISION="$BUILD_REVISION" \
+            "$workdir/venv/bin/python" -B test/legacy-short-redirect-oracle.integration.py
+          if [[ "$GITHUB_REPOSITORY" == 'jacklilyhello/subs-bot' && "$GITHUB_REF" == 'refs/heads/main' &&
+                ( "$GITHUB_EVENT_NAME" == 'push' || "$GITHUB_EVENT_NAME" == 'workflow_dispatch' ) ]]; then
+            test "$BUILD_REVISION" = "$GITHUB_SHA"
+            test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+            offline_python GITHUB_REPOSITORY="$GITHUB_REPOSITORY" GITHUB_REF="$GITHUB_REF" GITHUB_SHA="$GITHUB_SHA" \
+              GITHUB_EVENT_NAME="$GITHUB_EVENT_NAME" GITHUB_RUN_ID="$GITHUB_RUN_ID" GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+              RUNNER_TEMP="$RUNNER_TEMP" "$workdir/venv/bin/python" -B tools/legacy_candidate_isolation.py build synthetic-legacy-mixed-shorts
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: >-
+          github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        with:
+          name: subs-bot-legacy-mixed-short-candidate-${{ env.BUILD_REVISION }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/subs-bot-legacy-mixed-short-candidate/
+          if-no-files-found: error
+          retention-days: 7
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: subs-bot-worker-${{ env.BUILD_REVISION }}-${{ github.run_attempt }}
