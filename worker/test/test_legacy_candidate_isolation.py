@@ -493,6 +493,75 @@ class CandidateArtifactTests(unittest.TestCase):
             child.assert_not_called()
             socket.assert_not_called()
 
+    def test_dynamic_all_dispatch_binds_exact_ci_attempt_oracle_and_active_module(self):
+        from cloudflare_isolation import (LEGACY_DYNAMIC_ALL_ORDER_MARKER, LEGACY_DYNAMIC_ALL_READ_MARKER,
+                                          LEGACY_TEMP_MUTATE_MARKER, LEGACY_TEMP_READ_MARKER)
+        from legacy_dynamic_all_candidate import build_dynamic_all_fixture
+        from legacy_dynamic_all_native_candidate import DYNAMIC_ALL_HTTP_SCOPE, HTTP_OUTCOMES, seal_dynamic_all_http_report
+
+        native = tool.native
+        module = self.worker / "index.js"
+        module.write_bytes(module.read_bytes() + b"/* " + b" ".join((LEGACY_TEMP_READ_MARKER, LEGACY_TEMP_MUTATE_MARKER,
+            LEGACY_DYNAMIC_ALL_READ_MARKER, LEGACY_DYNAMIC_ALL_ORDER_MARKER)) + b" */\n")
+        path = self.worker / "isolation.json"
+        worker_manifest = {**json.loads(path.read_bytes()), "bundleSha256": native.digest(module.read_bytes())}
+        path.write_bytes(native.canonical(worker_manifest))
+        _, worker_pin = tool.package.worker_artifact(self.worker, self.release["revision"], native.digest(path.read_bytes()))
+        root = self.root / "synthetic-dynamic-all"
+        root.mkdir(mode=0o700)
+        fixture = build_dynamic_all_fixture(root, self.worker, self.release["revision"])
+        proof = seal_dynamic_all_http_report(fixture, worker_pin, dict(HTTP_OUTCOMES))
+        self.output = fixture.candidate
+        archive = self.archive()
+        archive_sha = native.digest(archive)
+        release = {**self.release, "artifactId": "24", "archiveSha256": "c" * 64}
+        revision, run_id = release["revision"], release["runId"]
+        profile = tool.DYNAMIC_ALL_PROFILE
+        inputs = {"profile": profile, "action": "verify", "cohort": native_tests.COHORT, "source_run_id": run_id}
+        environment = {"SUBS_BOT_CI_RUN_ID": run_id, "SUBS_BOT_CF_ISOLATION_TARGET_JSON": "{}", "GITHUB_RUN_ID": "90",
+                       "GITHUB_RUN_ATTEMPT": "3", "SUBS_BOT_CF_BOOTSTRAP_TOKEN": "synthetic-data",
+                       "SUBS_BOT_CF_DEPLOY_TOKEN": "synthetic-worker"}
+        with patch.dict(os.environ, environment), patch.object(tool.artifact, "prepare", return_value=release), \
+             patch.object(tool.artifact, "_github_token", return_value="synthetic-gh"), \
+             patch.object(tool.artifact, "select_main_artifact", return_value=("2", "25", archive_sha)) as select, \
+             patch.object(tool.artifact, "_download", return_value=archive) as download, \
+             patch.object(tool.artifact, "_select_artifact", return_value=("1", "24", "c" * 64)), \
+             patch.object(tool.artifact, "require_current_main"):
+            with self.assertRaises(native.RehearsalError):
+                tool.preflight(self.root, revision, run_id, profile=profile)
+            download.assert_not_called()
+            select.return_value = ("1", "25", archive_sha)
+            tool.preflight(self.root, revision, run_id, profile=profile)
+            download.assert_called_once_with("25", "synthetic-gh")
+            self.assertTrue(all(call.kwargs["artifact_prefix"] == "subs-bot-legacy-dynamic-all-candidate"
+                                for call in select.call_args_list))
+        provenance = json.loads((self.root / tool.PROVENANCE).read_bytes())
+        self.assertEqual(provenance["worker"], release)
+        self.assertEqual(provenance["candidate"]["dynamicAllHttpOracleSha256"], proof)
+
+        source = Mock(scope_sha256="d" * 64)
+        active = {"revision": revision, "compatibility": worker_manifest["compatibilityDate"],
+                  "digest": worker_manifest["bundleSha256"]}
+        journal = Mock(value=None)
+        journal.load.return_value = None
+        with patch.dict(os.environ, environment), patch.object(tool.native, "RehearsalAPI"), patch.object(tool, "CloudflareClient"), \
+             patch.object(tool, "CandidateSource", return_value=source), patch.object(native, "Journal", return_value=journal) as log, \
+             patch.object(native, "_verify_health") as health, patch.object(tool.DynamicAllCandidateRehearsal, "observe", return_value=None):
+            source.verify.return_value = {"version": {**active, "digest": "e" * 64}}
+            with self.assertRaises(native.RehearsalError):
+                tool.apply(self.root, revision, inputs)
+            log.assert_not_called()
+            source.verify.return_value = {"version": active}
+            tool.apply(self.root, revision, inputs)
+            log.assert_called_once()
+            health.assert_called_once_with(revision)
+            journal.claim.assert_not_called()
+        evidence = json.loads((self.root / tool.EVIDENCE).read_bytes())
+        self.assertEqual((evidence["profile"], evidence["phase"], evidence["resourceCount"], evidence["objectCount"]),
+                         (profile, "unprepared", 0, 8))
+        self.assertEqual((evidence["candidateArtifactId"], evidence["candidateArchiveSha256"], evidence["dynamicAllHttpOracle"],
+                          evidence["dynamicAllHttpOracleSha256"]), ("25", archive_sha, DYNAMIC_ALL_HTTP_SCOPE, proof))
+
     def test_correct_archive_digest_does_not_admit_extra_member(self):
         self.build()
         with self.assertRaises(tool.native.RehearsalError):
@@ -777,6 +846,70 @@ class CandidateBoundaryTests(unittest.TestCase):
         with self.assertRaises(tool.native.RehearsalError):
             source.live_pin()
         source.scope.version.assert_called_once_with(source.scope.active.return_value.version, with_legacy_temp=True)
+
+    def test_dynamic_all_profile_only_allows_its_candidate_and_checkpoint_resources(self):
+        native = tool.native
+        with patch.object(native, "ACCOUNT_SHA256", native.digest(native_tests.ACCOUNT.encode())), patch.object(native, "_response") as send:
+            api = native.RehearsalAPI(native_tests.TARGET, "synthetic-token", native_tests.COHORT, profile=tool.DYNAMIC_ALL_PROFILE)
+            self.assertEqual(api.names, {"database": f"subs-bot-cf-legacy-all-db-{api.cohort}",
+                                         "objects": f"subs-bot-cf-legacy-all-r2-{api.cohort}"})
+            self.assertEqual(api.buckets, {native.WORKER_NAME, api.names["objects"]})
+            self.assertEqual(api.journal_prefix, f"maintenance/legacy-all-candidate/{api.cohort}/journal/")
+            selected = native.RehearsalAPI(native_tests.TARGET, "synthetic-token", native_tests.COHORT, profile=tool.SELECTED_PROFILE)
+            d1, r2 = api.root + "/d1/database", api.root + "/r2/buckets"
+            own_journal = api.journal_prefix + "000001-" + "a" * 32 + ".json"
+            unrelated = selected.journal_prefix + "000001-" + "a" * 32 + ".json"
+            key = f"subscriptions/1/{native_tests.SNAPSHOT}/manifest.json"
+            for request in (
+                lambda: api.json("GET", d1),
+                lambda: api.json("GET", r2),
+                lambda: api.json("GET", d1 + "?name=" + selected.names["database"] + "&per_page=100"),
+                lambda: api.json("GET", r2 + "?name_contains=" + selected.names["objects"] + "&per_page=100"),
+                lambda: api.json("POST", d1, {"name": selected.names["database"], "read_replication": {"mode": "disabled"}}),
+                lambda: api.json("POST", r2, {"name": selected.names["objects"], "storageClass": "Standard"}),
+                lambda: api.rows(native_tests.SOURCE_ID, "SELECT id FROM subscriptions"),
+                lambda: api.json("POST", api.source + "/export", {"output_format": "polling", "dump_options": {"compatibility": "d1"}}),
+                lambda: api.json("POST", api.source + "/import", {"action": "init", "etag": "a" * 32}),
+                lambda: api.allow_restore(native_tests.RESTORE_ID),
+                lambda: api.allow_restore(object_bucket=selected.names["objects"]),
+                lambda: api.allow_restore(keys={f"private-shares/{native_tests.PAYLOAD}.txt"}),
+                lambda: api.r2("GET", api.names["objects"], key),
+                lambda: api.r2("GET", native.WORKER_NAME, key),
+                lambda: api.r2("PUT", native.WORKER_NAME, unrelated, b"{}"),
+            ):
+                with self.assertRaises(native.RehearsalError):
+                    request()
+            send.assert_not_called()
+
+            send.return_value = native_tests.envelope([])
+            self.assertEqual(api.json("GET", d1 + "?name=" + api.names["database"] + "&per_page=100"), [])
+            self.assertEqual(api.json("GET", r2 + "?name_contains=" + api.names["objects"] + "&per_page=100"), [])
+            api.allow_restore(keys={key}, object_bucket=api.names["objects"])
+            api.r2("GET", api.names["objects"], key)
+            api.r2("PUT", native.WORKER_NAME, own_journal, b"{}")
+            self.assertEqual(send.call_count, 4)
+
+    def test_dynamic_all_live_pin_requires_complete_temp_and_order_capability(self):
+        source = object.__new__(tool.CandidateSource)
+        source.api = SimpleNamespace(profile=tool.DYNAMIC_ALL_PROFILE)
+        source.scope = Mock()
+        for temp_capable, dynamic_capable in ((True, False), (False, True)):
+            source.scope.version.return_value = (None, temp_capable, dynamic_capable)
+            with self.subTest(temp=temp_capable), self.assertRaises(tool.native.RehearsalError):
+                source.live_pin()
+            source.scope.version.assert_called_with(source.scope.active.return_value.version, with_legacy_temp=True,
+                                                          with_legacy_dynamic_all=True)
+
+    def test_dynamic_all_keeps_object_checkpoint_and_uses_its_own_sql_bound(self):
+        api = Mock()
+        candidate = Mock(entries={"subscriptions/example": {}}, document={"sql": {}}, sql=Path("restore.sql"))
+        engine = tool.DynamicAllCandidateRehearsal(api, Mock(), Mock(), candidate)
+
+        self.assertEqual(engine.resource_kinds, ("database", "objects"))
+        self.assertEqual(engine.import_ready_phase, "objects-restored")
+        self.assertEqual(engine.manifest(), (candidate.document, candidate.sql))
+        api.allow_restore.assert_called_once_with(keys=candidate.entries)
+        candidate.read_file.assert_called_once_with(candidate.document["sql"], tool.package.SQL, 256 * 1024, extra={"md5"})
 
     def test_different_runtime_pin_stops_before_claim(self):
         journal = Mock()
