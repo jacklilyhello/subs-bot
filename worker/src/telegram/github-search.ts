@@ -1,4 +1,5 @@
 import { validInteger } from "../storage.ts";
+import { grepCodeContent } from "./grep-search.ts";
 import { inTelegramScope, type TelegramGitHubSearchUpdate, type TelegramPolicy } from "./protocol.ts";
 
 export const TELEGRAM_GITHUB_SEARCH_MARKER = "github-search:v1";
@@ -8,12 +9,17 @@ export const TELEGRAM_GITHUB_SEARCH_SCHEMA_SHA256 = "189751e07f92b8616de22cfc859
 const LOOKUP_SECONDS = 12;
 const COOLDOWN_SECONDS = 15;
 const LOOKUP_TIMEOUT_MS = 5000;
+const CODE_LOOKUP_TIMEOUT_MS = 8000;
 const MAX_REPLY_AGE_SECONDS = 900;
 const REAP_LIMIT = 16;
 const MAX_REPOSITORIES = 5;
+const MAX_CODE_MATCHES = 2;
 const MAX_RESPONSE_BYTES = 256 * 1024;
 const MAX_PROJECTION_BYTES = 1024;
 const GITHUB_API = "https://api.github.com/search/repositories";
+const GITHUB_REPO_API = "https://api.github.com/repos/";
+const GITHUB_HEADERS = { Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2026-03-10",
+  "User-Agent": "subs-bot-public-search/1.0" };
 const GITHUB_BROWSER = "https://github.com/search?type=code";
 const GITHUB_ORIGIN = "https://github.com";
 const OWNER = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/u;
@@ -26,6 +32,8 @@ type InboxAlias = "inbox" | "earlier";
 type ReplyState = "usage" | "limited" | "found" | "empty" | "unavailable";
 export type TelegramGitHubReply = { state: ReplyState; publicResults: string | null };
 type Repository = { name: string; stars: number };
+type RepositorySearch = { state: "found" | "empty" | "unavailable"; repos: Repository[] };
+type CodeMatch = { repo: string; ref: string; path: string };
 type Admission = { kind: "ignored" | "reply" } | { kind: "lookup"; receiptId: number; nonce: string; query: string };
 type Receipt = { receiptId: number; state: "looking" | "usage" | "limited" };
 
@@ -228,14 +236,13 @@ async function readGitHubResponse(response: Response): Promise<unknown> {
   }
 }
 
-async function searchPublicRepositories(query: string, request: typeof fetch): Promise<TelegramGitHubReply> {
-  const unavailable = { state: "unavailable", publicResults: null } as const;
+async function searchPublicRepositories(query: string, request: typeof fetch, timeoutMs: number): Promise<RepositorySearch> {
+  const unavailable: RepositorySearch = { state: "unavailable", repos: [] };
   try {
     const url = new URL(GITHUB_API);
     url.search = new URLSearchParams({ q: `${query} is:public`, sort: "stars", order: "desc", per_page: "5" }).toString();
     const response = await request(url, {
-      method: "GET", redirect: "manual", signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS), cache: "no-store",
-      headers: { Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2026-03-10", "User-Agent": "subs-bot-public-search/1.0" },
+      method: "GET", redirect: "manual", signal: AbortSignal.timeout(timeoutMs), cache: "no-store", headers: GITHUB_HEADERS,
     });
     const data = record(await readGitHubResponse(response));
     if (!data || !Array.isArray(data.items) || data.items.length > MAX_REPOSITORIES) return unavailable;
@@ -252,12 +259,93 @@ async function searchPublicRepositories(query: string, request: typeof fetch): P
       repos.push({ name: item.full_name, stars: item.stargazers_count });
     }
     if (!repos.length) return data.items.length === 0 && data.incomplete_results === false
-      ? { state: "empty", publicResults: null } : unavailable;
-    const publicResults = JSON.stringify(repos);
-    return publicResults.length <= MAX_PROJECTION_BYTES ? { state: "found", publicResults } : unavailable;
+      ? { state: "empty", repos } : unavailable;
+    return { state: "found", repos };
   } catch {
     return unavailable;
   }
+}
+
+function codeQuery(query: string): { query: string; repo?: string } | null {
+  const terms: string[] = [];
+  let repo: string | undefined;
+  for (const token of query.split(" ")) {
+    if (!token.includes(":")) terms.push(token);
+    else if (token.startsWith("repo:") && repo === undefined && repositoryName(token.slice(5))) repo = token.slice(5);
+    else return null; // A repository-only qualifier must not broaden the code search.
+  }
+  return terms.length ? { query: terms.join(" "), repo } : null;
+}
+
+function codeMatch(value: unknown): CodeMatch | null {
+  const item = record(value);
+  if (!item || !repositoryName(item.repo) || typeof item.ref !== "string" || typeof item.path !== "string"
+    || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}(?![\s\S])/u.test(item.ref)
+    || !/^[A-Za-z0-9_./-]{1,160}(?![\s\S])/u.test(item.path)
+    || item.path.split("/").some((part) => part === "" || part === "." || part === "..")) return null;
+  return { repo: item.repo, ref: item.ref, path: item.path };
+}
+
+function codeUrl({ repo, ref, path }: CodeMatch): string {
+  return `${GITHUB_ORIGIN}/${repo}/blob/${ref}/${path}`;
+}
+
+function grepMatch(raw: unknown, repoFilter: string | undefined): CodeMatch | null {
+  const item = record(raw);
+  if (item?.type !== "text" || typeof item.text !== "string") return null;
+  // Only read the leading metadata, even when a snippet contains the same labels.
+  const match = /^Repository: ([^\r\n]+)\r?\nPath: ([^\r\n]+)\r?\nURL: ([^\r\n]+)\r?\nLicense: [^\r\n]*\r?\n(?:\r?\n){0,2}Snippets:(?:\r?\n|$)/u.exec(item.text);
+  if (!match) return null;
+  const [, repo, path, url] = match;
+  if (!repositoryName(repo) || (repoFilter && repo.toLowerCase() !== repoFilter.toLowerCase())) return null;
+  const prefix = `${GITHUB_ORIGIN}/${repo}/blob/`;
+  if (!url.startsWith(prefix) || !url.endsWith(`/${path}`)) return null;
+  const candidate = codeMatch({ repo, path, ref: url.slice(prefix.length, -(path.length + 1)) });
+  return candidate && url === codeUrl(candidate) ? candidate : null;
+}
+
+async function searchPublicCode(query: string, request: typeof fetch, signal: AbortSignal,
+  stillAuthorized: () => Promise<boolean>, repositories: Promise<RepositorySearch>): Promise<CodeMatch[]> {
+  const code = codeQuery(query);
+  if (!code || signal.aborted) return [];
+  const matches = new Map<string, CodeMatch>();
+  for (const item of await grepCodeContent(request, signal, code.query, code.repo, stillAuthorized)) {
+    const candidate = grepMatch(item, code.repo);
+    if (candidate) matches.set(codeUrl(candidate), candidate);
+    if (matches.size === MAX_CODE_MATCHES) break;
+  }
+  if (!matches.size || signal.aborted) return [];
+  const verified = new Map<string, Promise<boolean>>((await repositories).repos.map(({ name }) => [name, Promise.resolve(true)] as const));
+  const codeMatches = [...matches.values()];
+  for (const { repo } of codeMatches) {
+    if (!verified.has(repo)) verified.set(repo, (async () => {
+      try {
+        if (signal.aborted) return false;
+        const response = await request(GITHUB_REPO_API + repo, {
+          method: "GET", redirect: "manual", cache: "no-store", signal, headers: GITHUB_HEADERS,
+        });
+        const data = record(await readGitHubResponse(response));
+        return data?.private === false && data.visibility === "public" && data.full_name === repo
+          && data.html_url === `${GITHUB_ORIGIN}/${repo}`;
+      } catch {
+        return false;
+      }
+    })());
+  }
+  const allowed = await Promise.all(codeMatches.map(({ repo }) => verified.get(repo)));
+  return codeMatches.filter((_, index) => allowed[index]);
+}
+
+function packSearchReply(repositorySearch: RepositorySearch, code: CodeMatch[]): TelegramGitHubReply {
+  const { state, repos } = repositorySearch;
+  for (let count = code.length; count > 0; count--) {
+    const publicResults = JSON.stringify({ v: 2, repos, code: code.slice(0, count) });
+    // Both repository names and accepted file metadata are ASCII.
+    if (publicResults.length <= MAX_PROJECTION_BYTES) return { state: "found", publicResults };
+  }
+  if (state !== "found") return { state, publicResults: null };
+  const publicResults = JSON.stringify(repos);
+  return publicResults.length <= MAX_PROJECTION_BYTES ? { state, publicResults } : { state: "unavailable", publicResults: null };
 }
 
 /** The winning webhook owns the ephemeral query. A recovered lookup sends the fixed fallback instead of replaying egress. */
@@ -273,14 +361,22 @@ export async function runTelegramGitHubSearch(
   try {
     const fetchNonce = crypto.randomUUID();
     const claimed = await db.prepare(`UPDATE telegram_github_search AS search SET lookup_nonce = ?
-      WHERE ${active} RETURNING receipt_id`)
-      .bind(fetchNonce, admission.receiptId, admission.nonce, policy.botId, ...current.bindings).first("receipt_id");
-    if (claimed !== admission.receiptId) return false;
-    const result = await searchPublicRepositories(admission.query, request);
+      WHERE ${active} RETURNING receipt_id AS receiptId, lookup_until AS lookupUntil`)
+      .bind(fetchNonce, admission.receiptId, admission.nonce, policy.botId, ...current.bindings)
+      .first<{ receiptId: number; lookupUntil: number }>();
+    if (claimed?.receiptId !== admission.receiptId) return false;
+    const remaining = Math.min(CODE_LOOKUP_TIMEOUT_MS, claimed.lookupUntil * 1000 - Date.now() - 500);
+    if (remaining <= 0) return false;
+    const bindings = [admission.receiptId, fetchNonce, policy.botId, ...current.bindings];
+    const stillAuthorized = async () => await db.prepare(`SELECT 1 FROM telegram_github_search AS search WHERE ${active}`)
+      .bind(...bindings).first() !== null;
+    const repositorySearch = searchPublicRepositories(admission.query, request, Math.min(LOOKUP_TIMEOUT_MS, remaining));
+    const code = await searchPublicCode(admission.query, request, AbortSignal.timeout(remaining), stillAuthorized, repositorySearch);
+    const result = packSearchReply(await repositorySearch, code);
     const [updated, queued] = await db.batch([
       db.prepare(`UPDATE telegram_github_search AS search
         SET state = ?, public_results = ?, lookup_nonce = NULL, lookup_until = NULL WHERE ${active}`)
-        .bind(result.state, result.publicResults, admission.receiptId, fetchNonce, policy.botId, ...current.bindings),
+        .bind(result.state, result.publicResults, ...bindings),
       db.prepare(`INSERT INTO telegram_outbox (receipt_id)
         SELECT receipt_id FROM telegram_github_search WHERE receipt_id = ? AND changes() = 1`).bind(admission.receiptId),
     ]);
@@ -329,19 +425,31 @@ export function renderTelegramGitHubReply(reply: TelegramGitHubReply): {
   text: string;
   keyboard?: { text: string; url: string }[][];
 } {
-  if (reply.state === "usage") return { text: "用法：/g 关键词或开源项目名称，例如 /g clash。关键词将发送到 GitHub 以查找公开仓库。" };
+  if (reply.state === "usage") return { text: "用法：/g 关键词或开源项目名称，例如 /g clash。搜索词会发给 GitHub 查找公开仓库，纯关键词或带 repo: 的查询也会发给 Grep 查找公开代码。请勿发送凭据或私密内容。" };
   const browser = [{ text: "在 GitHub 网页搜索代码", url: GITHUB_BROWSER }];
   if (reply.state === "found" && reply.publicResults && reply.publicResults.length <= MAX_PROJECTION_BYTES) {
     try {
-      const repos: unknown = JSON.parse(reply.publicResults);
-      if (Array.isArray(repos) && repos.length > 0 && repos.length <= MAX_REPOSITORIES) {
-        const text = ["GitHub 公开仓库"];
+      const value: unknown = JSON.parse(reply.publicResults);
+      const projection = record(value);
+      const repos = Array.isArray(value) ? value : projection?.v === 2 ? projection.repos : null;
+      const code = Array.isArray(value) ? [] : projection?.v === 2 ? projection.code : null;
+      if (Array.isArray(repos) && repos.length <= MAX_REPOSITORIES && Array.isArray(code) && code.length <= MAX_CODE_MATCHES
+        && (repos.length > 0 || code.length > 0)) {
+        const text: string[] = repos.length ? ["GitHub 公开仓库"] : [];
         const keyboard = [];
         for (const item of repos) {
           const repo = record(item);
           if (!repo || !repositoryName(repo.name) || !validInteger(repo.stars, 0)) throw new Error();
           text.push(`${repo.name} · ★ ${repo.stars}`);
           keyboard.push([{ text: repo.name, url: `${GITHUB_ORIGIN}/${repo.name}` }]);
+        }
+        if (code.length) text.push("Grep 公开代码");
+        for (const item of code) {
+          const match = codeMatch(item);
+          if (!match) throw new Error();
+          text.push(`${match.repo}/${match.path}`);
+          const fileName = match.path.slice(match.path.lastIndexOf("/") + 1);
+          keyboard.push([{ text: fileName.slice(0, 64), url: codeUrl(match) }]);
         }
         return { text: text.join("\n"), keyboard: [...keyboard, browser] };
       }
