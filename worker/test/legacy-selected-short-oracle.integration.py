@@ -56,11 +56,14 @@ def require(condition, check):
 
 
 def prepare_worker(source: Path, destination: Path, revision: str) -> str:
-    manifest = package.native.parsed(package.read_private(source / "isolation.json", artifact._MAX_JSON), artifact._MAX_JSON)
+    raw = package.read_private(source / "isolation.json", artifact._MAX_JSON)
+    manifest = package.native.parsed(raw, artifact._MAX_JSON)
     require(manifest["revision"] == revision and manifest["ref"].startswith("refs/"), "build-provenance")
     # Package tooling consumes the main archive shape. For PR CI normalize
     # only the ref in this private synthetic copy, never in the emitted artifact.
-    manifest["ref"] = artifact.MAIN_REF
+    if manifest["ref"] != artifact.MAIN_REF:
+        manifest["ref"] = artifact.MAIN_REF
+        raw = package.native.canonical(manifest)
     hashes, sizes = artifact._expected_hashes(manifest, revision, manifest["runId"], manifest["runAttempt"])
     destination.mkdir(mode=0o700)
     total = 0
@@ -71,7 +74,6 @@ def prepare_worker(source: Path, destination: Path, revision: str) -> str:
         target = destination / name
         target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         protected.put(target, body)
-    raw = package.native.canonical(manifest)
     protected.put(destination / "isolation.json", raw)
     return package.native.digest(raw)
 
