@@ -7,6 +7,7 @@ import {
   type TelegramLifecycleReply, type TelegramLifecycleTicket,
 } from "./lifecycle-actions.ts";
 import { TELEGRAM_PRIVATE_CLAIM_MARKER } from "./private-claims.ts";
+import { groupShareClaimGuard, TELEGRAM_GROUP_CLAIM_MARKER } from "./group-share-actions.ts";
 import { TELEGRAM_TEMP_MARKER, tempRawMarker, type TelegramTempReply } from "./temp-import.ts";
 import type { TelegramTempRawGuard } from "./temp-raw.ts";
 import { aggregateLinkDeliveryGuard, TELEGRAM_AGGREGATE_MARKER, type TelegramAggregateReply } from "./aggregate-actions.ts";
@@ -47,7 +48,7 @@ export interface TelegramReplyLease extends TelegramCommand {
   attempts: number;
   view: TelegramView | null;
   lifecycle?: TelegramLifecycleReply;
-  privateClaim?: { codeSha256: string };
+  privateClaim?: { codeSha256: string; group?: true };
   temp?: TelegramTempReply;
   tempRaw?: true;
   aggregate?: TelegramAggregateReply;
@@ -93,6 +94,7 @@ type ReplyRow = Omit<TelegramReplyLease,
   lifecycleSubscriptionId: number | null;
   lifecycleExpectedRevision: number | null;
   privateClaimCodeSha256: string | null;
+  groupClaimMarker: number;
   tempKind: TelegramTempReply["kind"] | null;
   tempNodeCount: number | null;
   tempTotalCount: number | null;
@@ -138,7 +140,7 @@ function supportedReceipt(alias: "inbox" | "earlier", includeAggregate = false, 
       AND EXISTS (SELECT 1 FROM telegram_view WHERE receipt_id = ${alias}.receipt_id)) THEN 1
     WHEN (${alias}.receipt_nonce = '${TELEGRAM_LIFECYCLE_MARKER}'
       AND EXISTS (SELECT 1 FROM telegram_lifecycle_action WHERE receipt_id = ${alias}.receipt_id)) THEN 1
-    WHEN (${alias}.receipt_nonce = '${TELEGRAM_PRIVATE_CLAIM_MARKER}'
+    WHEN (${alias}.receipt_nonce IN ('${TELEGRAM_PRIVATE_CLAIM_MARKER}','${TELEGRAM_GROUP_CLAIM_MARKER}')
       AND EXISTS (SELECT 1 FROM telegram_private_claim WHERE receipt_id = ${alias}.receipt_id)) THEN 1
     WHEN (${alias}.receipt_nonce = '${TELEGRAM_TEMP_MARKER}'
       AND EXISTS (SELECT 1 FROM telegram_temp_reply WHERE receipt_id = ${alias}.receipt_id)) THEN 1
@@ -377,6 +379,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
         page.kind AS viewKind, page.after_id AS afterId, page.after_epoch AS afterEpoch,
         action.kind AS lifecycleKind, action.subscription_id AS lifecycleSubscriptionId,
         action.expected_revision AS lifecycleExpectedRevision, claim.code_sha256 AS privateClaimCodeSha256,
+        CASE WHEN inbox.receipt_nonce='${TELEGRAM_GROUP_CLAIM_MARKER}' THEN 1 ELSE 0 END AS groupClaimMarker,
         temp.kind AS tempKind, temp.node_count AS tempNodeCount, temp.total_count AS tempTotalCount,
         temp.malformed_count AS tempMalformedCount, temp.unsupported_count AS tempUnsupportedCount,
         temp.ignored_count AS tempIgnoredCount,
@@ -441,7 +444,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
   const row = read.results[0];
   if (!row) return null;
   const { viewKind, afterId, afterEpoch, lifecycleKind, lifecycleSubscriptionId, lifecycleExpectedRevision,
-    privateClaimCodeSha256, tempKind, tempNodeCount, tempTotalCount, tempMalformedCount,
+    privateClaimCodeSha256, groupClaimMarker, tempKind, tempNodeCount, tempTotalCount, tempMalformedCount,
     tempUnsupportedCount, tempIgnoredCount, tempRawMarker: rawMarker, aggregateResult, aggregateRevision, aggregateCodeSha256,
     selectedResult, selectedCodeSha256,
     pathKind, pathAfterId, pathAffectedCount,
@@ -477,7 +480,8 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
     ...(providerBatchMarker === 1 ? { providerBatch: true as const } : {}),
     ...(apiStatusMarker === 1 ? { apiStatus: true as const } : {}),
     ...(providerDocumentMarker === 1 ? { providerDocument: true as const } : {}),
-    ...(privateClaimCodeSha256 === null ? {} : { privateClaim: { codeSha256: privateClaimCodeSha256 } }) };
+    ...(privateClaimCodeSha256 === null ? {} : { privateClaim: { codeSha256: privateClaimCodeSha256,
+      ...(groupClaimMarker === 1 ? { group: true as const } : {}) } }) };
 }
 
 function beginReplyStatement(
@@ -489,6 +493,7 @@ function beginReplyStatement(
 ): D1PreparedStatement {
   const provider = lease.providerOutcome === undefined || lease.providerRequestKind === undefined ? null
     : telegramProviderReplySendGuard(policy, lease.providerOutcome, lease.providerRequestKind);
+  const claimMarker = lease.privateClaim?.group ? TELEGRAM_GROUP_CLAIM_MARKER : TELEGRAM_PRIVATE_CLAIM_MARKER;
   const exactDocumentEpoch = lease.document?.kind === "saved" && access === "allowed" && lease.actorId !== policy.adminId
     ? `AND EXISTS (
       SELECT 1 FROM telegram_document_jobs AS job LEFT JOIN telegram_auth AS auth
@@ -514,10 +519,11 @@ function beginReplyStatement(
           ${guard ? `AND (${guard.sql})` : ""}
           ${exactDocumentEpoch}
           AND (
-            (? = 'private-claim' AND inbox.receipt_nonce = '${TELEGRAM_PRIVATE_CLAIM_MARKER}'
+            (? = 'private-claim' AND inbox.receipt_nonce = '${claimMarker}'
               AND inbox.chat_type = 'private' AND inbox.actor_id = inbox.chat_id AND inbox.thread_id IS NULL
               AND EXISTS (SELECT 1 FROM telegram_private_claim WHERE receipt_id = inbox.receipt_id AND code_sha256 = ?))
-            OR (inbox.receipt_nonce IS NOT '${TELEGRAM_PRIVATE_CLAIM_MARKER}' AND (
+            OR (inbox.receipt_nonce IS NOT '${TELEGRAM_PRIVATE_CLAIM_MARKER}'
+              AND inbox.receipt_nonce IS NOT '${TELEGRAM_GROUP_CLAIM_MARKER}' AND (
               (? = 'none' AND inbox.command IN ('auth-list', 'auth-add', 'auth-remove', 'auth-usage')) OR (
                 CASE WHEN inbox.actor_id = ? THEN 1 ELSE COALESCE((
                   SELECT allowed FROM telegram_auth WHERE bot_id = inbox.bot_id AND user_id = inbox.actor_id
@@ -541,7 +547,18 @@ export function prepareTelegramPrivateClaimBegin(
   if (!inTelegramScope(policy, lease) || lease.chatType !== "private" || lease.threadId !== null || !lease.privateClaim) {
     return null;
   }
-  return beginReplyStatement(db, policy, lease, "private-claim");
+  return beginReplyStatement(db, policy, lease, "private-claim", lease.privateClaim.group ? groupShareClaimGuard(policy) : undefined);
+}
+
+export async function closeUnsentTelegramGroupClaim(db: D1Database, policy: TelegramPolicy, lease: TelegramReplyLease): Promise<void> {
+  if (!lease.privateClaim?.group) return;
+  const closed = await db.prepare(`UPDATE telegram_outbox SET state='failed',lease_id=NULL,lease_until=NULL
+    WHERE receipt_id=? AND state='leased' AND lease_id=? AND attempts=? AND EXISTS (
+      SELECT 1 FROM telegram_inbox WHERE receipt_id=telegram_outbox.receipt_id AND bot_id=? AND update_id=?
+        AND actor_id=? AND chat_id=actor_id AND chat_type='private' AND thread_id IS NULL
+        AND receipt_nonce='${TELEGRAM_GROUP_CLAIM_MARKER}')`)
+    .bind(lease.receiptId, lease.leaseId, lease.attempts, policy.botId, lease.updateId, lease.actorId).run();
+  if (!closed.success) throw new Error("Telegram group claim could not close.");
 }
 
 export async function beginTelegramAggregateLinkReply(db: D1Database, policy: TelegramPolicy, lease: TelegramReplyLease): Promise<boolean> {

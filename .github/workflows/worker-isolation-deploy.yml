@@ -50,6 +50,16 @@ on:
         description: Exact isolation confirmation for mixed document enable or disable
         required: false
         type: string
+      group_share_cards:
+        description: Preserve, enable, or disable new Telegram group share cards
+        required: true
+        default: preserve
+        type: choice
+        options: [preserve, enable, disable]
+      group_share_cards_confirmation:
+        description: Exact isolation confirmation for group share card enable or disable
+        required: false
+        type: string
       provider_refresh:
         description: Preserve, enable, or disable private Telegram provider refresh admission
         required: true
@@ -183,6 +193,8 @@ jobs:
           SUBS_BOT_PROVIDER_URL_DOCUMENTS_CONFIRMATION: ${{ inputs.provider_url_documents_confirmation }}
           SUBS_BOT_MIXED_DOCUMENTS_MODE: ${{ inputs.mixed_documents }}
           SUBS_BOT_MIXED_DOCUMENTS_CONFIRMATION: ${{ inputs.mixed_documents_confirmation }}
+          SUBS_BOT_GROUP_SHARE_CARDS_MODE: ${{ inputs.group_share_cards }}
+          SUBS_BOT_GROUP_SHARE_CARDS_CONFIRMATION: ${{ inputs.group_share_cards_confirmation }}
           SUBS_BOT_PROVIDER_REFRESH_MODE: ${{ inputs.provider_refresh }}
           SUBS_BOT_PROVIDER_REFRESH_CONFIRMATION: ${{ inputs.provider_refresh_confirmation }}
           SUBS_BOT_LEGACY_SUBSCRIPTION_SHORTS_MODE: ${{ inputs.legacy_subscription_shorts }}

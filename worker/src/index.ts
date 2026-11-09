@@ -14,12 +14,14 @@ import { runOneProviderJob } from "./provider-job-consumer.ts";
 import { providerSnapshotJournalReady } from "./provider-snapshot-journal.ts";
 import { acceptTelegramAggregate, parseTelegramAggregateKey } from "./telegram/aggregate-actions.ts";
 import { acceptTelegramSelected, reapTelegramSelected } from "./telegram/selected-export.ts";
-import { answerTelegramCallback, drainTelegramReplies, sendTelegramInlineAnswer } from "./telegram/delivery.ts";
+import { answerTelegramCallback, drainTelegramReplies, sendTelegramGroupShareCard, sendTelegramInlineAnswer } from "./telegram/delivery.ts";
 import { runTelegramDocumentIntake, telegramMixedDocumentReady } from "./telegram/document-intake.ts";
 import { acceptTelegramDocumentJob } from "./telegram/document-jobs.ts";
 import { reconcileTelegramDocumentJobReplies, retireTelegramDocumentStage } from "./telegram/document-persistence.ts";
 import { acceptTelegramLifecycle, reapTelegramLifecycle } from "./telegram/lifecycle-actions.ts";
 import { acceptTelegramGitHubSearch, recoverTelegramGitHubSearch, runTelegramGitHubSearch, telegramGitHubSearchReady } from "./telegram/github-search.ts";
+import { acceptTelegramGroupShare, telegramGroupShareReady } from "./telegram/group-share-actions.ts";
+import { drainTelegramGroupShareCards } from "./telegram/group-share-delivery.ts";
 import { acceptTelegramBulkTrash, telegramBulkTrashReady } from "./telegram/bulk-trash.ts";
 import { acceptTelegramInlineSort, telegramInlineSortReady } from "./telegram/inline-sort.ts";
 import { acceptTelegramInlineConsent, telegramInlineSearchReady } from "./telegram/inline-search-consent.ts";
@@ -61,6 +63,7 @@ export interface Env {
   TELEGRAM_ISOLATION_CONFIG?: string;
   TELEGRAM_AGGREGATE_KEY?: string;
   TELEGRAM_PRIVATE_SHARE_CREATION_KEY?: string;
+  TELEGRAM_GROUP_SHARE_CARDS?: string;
   TELEGRAM_INLINE_SEARCH?: string;
   PROVIDER_FETCH?: ProviderFetcher;
   PROVIDER_REVISION?: string;
@@ -158,6 +161,10 @@ function telegramGitHubSearchProbe(db: D1Database): () => Promise<boolean> {
   return () => readiness ??= telegramGitHubSearchReady(db);
 }
 
+function drainGroupShareCards(db: D1Database, policy: TelegramPolicy): Promise<void> {
+  return drainTelegramGroupShareCards(db, policy, (actorId, method, body) => sendTelegramGroupShareCard(policy, actorId, method, body));
+}
+
 async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
   if (request.method !== "POST") {
     return plain("Method not allowed.", 405, request.method === "HEAD", { Allow: "POST" });
@@ -175,7 +182,8 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
       return new Response(null, { status: 204, headers: HEADERS });
     }
     const aggregateKey = await parseTelegramAggregateKey(env.TELEGRAM_AGGREGATE_KEY);
-    const privateShare = await telegramPrivateShareRuntime(env.DB, env.TELEGRAM_PRIVATE_SHARE_CREATION_KEY);
+    const privateShare = await telegramPrivateShareRuntime(env.DB, env.TELEGRAM_PRIVATE_SHARE_CREATION_KEY,
+      env.TELEGRAM_GROUP_SHARE_CARDS === "1");
     const shortLinkNamespaces = await readShortLinkNamespaces(env.DB);
     const shortLinks = shortLinkNamespaces.normal;
     const subscriptionRead = await telegramSubscriptionReadReady(env.DB);
@@ -235,6 +243,18 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
       }
       if (outcome === "accepted") {
         drain();
+      }
+    } else if (decoded.groupShare) {
+      const event = decoded.groupShare;
+      const ready = privateShare.context && (event.kind !== "publish" || privateShare.groupCardsEnabled)
+        && await telegramGroupShareReady(env.DB);
+      const accepted = ready && await acceptTelegramGroupShare(env.DB, policy, event) === "accepted";
+      if (event.kind === "handoff") {
+        if (accepted) drain();
+      } else {
+        const text = !accepted ? "此卡片暂不可用。" : event.kind === "publish" ? "已提交到指定群。" : "已选中。请打开机器人私聊领取。";
+        ctx?.waitUntil(answerTelegramCallback(policy, event.callbackId, text));
+        if (accepted && event.kind === "publish") ctx?.waitUntil(drainGroupShareCards(env.DB, policy).catch(() => undefined));
       }
     } else if (decoded.privateClaim) {
       const outcome = await acceptTelegramPrivateClaim(env.DB, policy, decoded.privateClaim);
@@ -443,7 +463,8 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
 
 async function recoverTelegramWork(env: Env, policy: TelegramPolicy, pin: ProviderPin, providerQueueReady: boolean): Promise<void> {
   const aggregateKey = await parseTelegramAggregateKey(env.TELEGRAM_AGGREGATE_KEY);
-  const privateShare = await telegramPrivateShareRuntime(env.DB, env.TELEGRAM_PRIVATE_SHARE_CREATION_KEY);
+  const privateShare = await telegramPrivateShareRuntime(env.DB, env.TELEGRAM_PRIVATE_SHARE_CREATION_KEY,
+    env.TELEGRAM_GROUP_SHARE_CARDS === "1");
   const shortLinks = await normalShortLinksReady(env.DB);
   const subscriptionRead = await telegramSubscriptionReadReady(env.DB);
   const inlineSort = await telegramInlineSortReady(env.DB);
@@ -496,6 +517,9 @@ async function recoverTelegramWork(env: Env, policy: TelegramPolicy, pin: Provid
       await drain(4, 15_000);
     }
   };
+  const groupCards = async () => {
+    if (privateShare.context && await telegramGroupShareReady(env.DB)) await drainGroupShareCards(env.DB, policy);
+  };
   const searches = async () => {
     if (await githubSearch().catch(() => false) && await recoverTelegramGitHubSearch(env.DB, policy) > 0) {
       await drain(4, 15_000);
@@ -531,7 +555,7 @@ async function recoverTelegramWork(env: Env, policy: TelegramPolicy, pin: Provid
       if (results.some((result) => result.status === "rejected")) throw new Error("Telegram provider replies could not recover.");
     }
   };
-  const results = await Promise.allSettled([replies(), documents(), creations(), searches(), apiStatusReplies(), retireTelegramDocumentStage(env.DB, env.NODES, policy),
+  const results = await Promise.allSettled([replies(), documents(), creations(), groupCards(), searches(), apiStatusReplies(), retireTelegramDocumentStage(env.DB, env.NODES, policy),
     privateShare.schemaReady ? retireAbandonedTelegramPrivateShareCreation(env.DB, env.NODES, policy) : Promise.resolve(),
     providers(), inlineSearchSchema ? reapTelegramInlineSearch(env.DB, policy.botId) : Promise.resolve()]);
   if (results.some(({ status }) => status === "rejected")) {

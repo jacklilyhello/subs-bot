@@ -638,6 +638,27 @@ class SnapshotTests(unittest.TestCase):
         self.db.execute("UPDATE telegram_provider_jobs SET state='done',result_code='expired',finished_at=10")
         self.assertEqual(self.db.execute("SELECT " + full).fetchone(), (1,))
 
+    def test_quiet_blocks_group_card_publication_and_unreconciled_edits(self):
+        self.published_share()
+        self.db.execute("INSERT INTO telegram_group_share_cards(receipt_id,group_id,state,due_at) VALUES (1,'-881003','pending',5)")
+
+        def quiet(epoch, tables=self.source.tables):
+            return self.db.execute("SELECT " + native.quiet_expression(tables, epoch)).fetchone()
+
+        older = set(self.source.tables) - {"telegram_group_share_cards", "telegram_group_share_scopes"}
+        self.assertEqual(quiet(10, older), (1,))
+        self.assertEqual(quiet(10), (0,))
+        self.db.execute("UPDATE telegram_group_share_cards SET state='sending',lease_id='synthetic',lease_until=10")
+        self.assertEqual(quiet(10), (0,))
+        self.db.execute("UPDATE telegram_group_share_cards SET state='uncertain'")
+        self.assertEqual(quiet(9), (0,))
+        self.assertEqual(quiet(10), (1,))
+        self.db.execute("UPDATE telegram_group_share_cards SET state='sent',message_id=2")
+        self.assertEqual(quiet(9), (0,))
+        self.assertEqual(quiet(10), (0,))
+        self.db.execute("UPDATE telegram_group_share_cards SET lease_id=NULL,lease_until=NULL")
+        self.assertEqual(quiet(10), (1,))
+
     def test_quiet_blocks_batch_tickets_unsettled_children_and_late_replies(self):
         self.db.executescript("""INSERT INTO telegram_inbox
             (receipt_id,bot_id,update_id,actor_id,chat_id,chat_type,message_id,message_date,command,receipt_nonce)

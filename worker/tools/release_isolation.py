@@ -9,8 +9,8 @@ from pathlib import Path
 
 from attest_api_status_container import ATTESTATION_ENV
 from cloudflare_isolation import (
-    CloudflareClient, CloudflareError, WORKER_NAME, release_worker, validate_aggregate_key, validate_private_share_key,
-    verify_worker_target,
+    CloudflareClient, CloudflareError, WORKER_NAME, group_share_cards_artifact, release_worker, validate_aggregate_key,
+    validate_private_share_key, verify_worker_target,
 )
 from d1_migrations import MigrationError, apply_migrations
 from prepare_isolation_artifact import ArtifactError, require_current_main
@@ -81,6 +81,16 @@ def mixed_documents_release_mode():
     raise CloudflareError("The isolated mixed document release mode or confirmation is invalid.")
 
 
+def group_share_cards_release_mode():
+    mode = os.environ.get("SUBS_BOT_GROUP_SHARE_CARDS_MODE", "preserve")
+    confirmation = os.environ.get("SUBS_BOT_GROUP_SHARE_CARDS_CONFIRMATION", "")
+    if mode == "preserve" and confirmation == "":
+        return None
+    if mode in ("enable", "disable") and confirmation == f"{mode} group share cards for {WORKER_NAME}":
+        return mode == "enable"
+    raise CloudflareError("The isolated group share card release mode or confirmation is invalid.")
+
+
 def provider_refresh_release_mode():
     mode = os.environ.get("SUBS_BOT_PROVIDER_REFRESH_MODE", "preserve")
     confirmation = os.environ.get("SUBS_BOT_PROVIDER_REFRESH_CONFIRMATION", "")
@@ -133,6 +143,7 @@ def release():
     provider_url_import = provider_url_import_release_mode()
     provider_url_documents = provider_url_documents_release_mode()
     mixed_documents = mixed_documents_release_mode()
+    group_share_cards = group_share_cards_release_mode()
     provider_refresh = provider_refresh_release_mode()
     legacy_subscription_shorts = legacy_subscription_shorts_release_mode()
     provider_batch = provider_batch_release_mode()
@@ -148,10 +159,15 @@ def release():
             inline_search, provider_url_import, provider_refresh, legacy_subscription_shorts, provider_batch))
             or (provider_url_documents is not None and not (mixed_documents is False and provider_url_documents is False))):
         raise CloudflareError("Change isolated mixed document admission in a separate scoped release.")
+    if group_share_cards is not None and any(mode is not None for mode in (
+            inline_search, provider_url_import, provider_refresh, legacy_subscription_shorts, provider_batch,
+            api_status, provider_url_documents, mixed_documents)):
+        raise CloudflareError("Change isolated group share card admission in a separate scoped release.")
     bundle = Path(os.environ["RUNNER_TEMP"]) / "subs-bot-verified"
     manifest = json.loads((bundle / "isolation.json").read_text(encoding="utf-8"))
     if manifest.get("version") != 2 or manifest.get("revision") != revision:
         raise ValueError("The verified artifact does not match this release.")
+    group_cards_capable = group_share_cards_artifact(bundle, manifest)
     telegram_config = telegram_release_config(manifest)
     aggregate_key = None
     if any(item["name"] == "0014_telegram_aggregate_issuance.sql" for item in manifest["migrations"]):
@@ -198,7 +214,8 @@ def release():
                                     provider_url_import=provider_url_import, provider_refresh=provider_refresh,
                                     legacy_subscription_shorts=legacy_subscription_shorts, provider_batch=provider_batch,
                                     api_status=api_status, api_status_gate=api_status_gate,
-                                    provider_url_documents=provider_url_documents, mixed_documents=mixed_documents)
+                                    provider_url_documents=provider_url_documents, mixed_documents=mixed_documents,
+                                    group_share_cards=group_share_cards, group_share_cards_capable=group_cards_capable)
     if provider_gate is not None:
         provider_gate.verify()
     migrations = apply_migrations(data_api, target, bundle, manifest, guard)
@@ -212,7 +229,8 @@ def release():
                             provider_url_import=provider_url_import, provider_refresh=provider_refresh,
                             legacy_subscription_shorts=legacy_subscription_shorts, provider_batch=provider_batch,
                             api_status=api_status, api_status_gate=api_status_gate,
-                            provider_url_documents=provider_url_documents, mixed_documents=mixed_documents)
+                            provider_url_documents=provider_url_documents, mixed_documents=mixed_documents,
+                            group_share_cards=group_share_cards)
     guard()
     print(json.dumps(result, sort_keys=True), flush=True)
 

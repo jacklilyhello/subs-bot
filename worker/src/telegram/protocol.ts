@@ -53,6 +53,11 @@ export type TelegramTempUpdate = TelegramEventScope & (
 
 export type TelegramPathUpdate = TelegramEventScope & { kind: "path"; args: string };
 export type TelegramPrivateShareCreationUpdate = TelegramEventScope & { args: string; senderName?: string };
+export type TelegramGroupShareUpdate = TelegramEventScope & (
+  { kind: "publish"; callbackId: string } | { kind: "pick"; callbackId: string } | { kind: "handoff" }
+);
+export const GROUP_SHARE_PUBLISH_CALLBACK = "group-share:publish:v1";
+export const GROUP_SHARE_PICK_CALLBACK = "group-share:pick:v1";
 export type TelegramShortLinkUpdate = TelegramEventScope & { args: string };
 export type TelegramSubscriptionReadUpdate = TelegramEventScope & (
   | { kind: "search"; query: string }
@@ -116,8 +121,10 @@ type SubscriptionRawFileUpdate = (ProviderRefreshUpdate & { subscriptionRawFile?
   | ({ subscriptionRawFile: TelegramSubscriptionRawFileUpdate } & Partial<Record<keyof ProviderRefreshUpdate, never>>);
 type ProviderBatchUpdate = (SubscriptionRawFileUpdate & { providerBatch?: never })
   | ({ providerBatch: TelegramProviderBatchUpdate } & Partial<Record<keyof SubscriptionRawFileUpdate, never>>);
-type NormalizedUpdate = (ProviderBatchUpdate & { apiStatus?: never })
+type ApiStatusUpdate = (ProviderBatchUpdate & { apiStatus?: never })
   | ({ apiStatus: TelegramApiStatusUpdate } & Partial<Record<keyof ProviderBatchUpdate, never>>);
+type NormalizedUpdate = (ApiStatusUpdate & { groupShare?: never })
+  | ({ groupShare: TelegramGroupShareUpdate } & Partial<Record<keyof ApiStatusUpdate, never>>);
 
 type DecodedTelegramRequest =
   | ({ status: 200 } & NormalizedUpdate)
@@ -235,7 +242,7 @@ function messageCommand(
   { code: string } | { args: string } | { shareArgs: string } | { selectedQuery: string } | { subscriptionQuery: string } | { shortArgs: string } |
   { inlineSort: TelegramInlineSortAction } | { bulkTrashQuery: string } |
   { inlineConsent: TelegramInlineConsentUpdate["kind"] } | { githubArgs: string } |
-  { providerBatch: "preview" | "status" | "usage" } | { apiStatusArgs: string } | null {
+  { providerBatch: "preview" | "status" | "usage" } | { apiStatusArgs: string } | "group-share-handoff" | null {
   const { text, entities } = message;
   if (typeof text !== "string" || !Array.isArray(entities)) return null;
   const commands = entities.filter((entity) => isRecord(entity) && entity.type === "bot_command" && entity.offset === 0);
@@ -283,6 +290,7 @@ function messageCommand(
   const args = remainder.trim().split(/\s+/u).filter(Boolean);
   switch (commandName) {
     case "start": {
+      if (args.length === 1 && args[0] === "group") return "group-share-handoff";
       if (!args[0]?.startsWith("claim_")) return "start";
       const claim = args.length === 1 ? PRIVATE_CLAIM.exec(args[0]) : null;
       return claim ? { code: claim[1] } : null;
@@ -420,6 +428,8 @@ function normalizeMessage(
   if (command === "temp-raw" || command === "temp-summary" || command === "temp-clear") {
     return scope.chatType === "private" && scope.threadId === null ? { temp: { ...scope, kind: command } } : null;
   }
+  if (command === "group-share-handoff") return scope.chatType === "private" && scope.threadId === null
+    ? { groupShare: { ...scope, kind: "handoff" } } : null;
   if (command === "aggregate-show" || command === "aggregate-revoke") {
     return scope.chatType === "private" && scope.threadId === null
       ? { aggregate: { ...scope, kind: command === "aggregate-show" ? "show" : "revoke" } } : null;
@@ -458,6 +468,10 @@ function normalizeCallback(
       !ownBotMessage(message, policy) || "inline_message_id" in callback || "game_short_name" in callback) return null;
   const scope = messageScope(message, String(actor.id), updateId, policy);
   if (!scope) return null;
+  if (ticket === GROUP_SHARE_PUBLISH_CALLBACK) return scope.chatType === "private" && scope.threadId === null
+    ? { groupShare: { ...scope, kind: "publish", callbackId } } : null;
+  if (ticket === GROUP_SHARE_PICK_CALLBACK) return scope.chatType !== "private" && scope.threadId === null
+    ? { groupShare: { ...scope, kind: "pick", callbackId } } : null;
   if (SUBSCRIPTION_READ_TICKET.test(ticket)) return { subscriptionRead: { ...scope, kind: "callback", callbackId, ticket } };
   if (BULK_TRASH_TICKET.test(ticket)) return scope.chatType === "private" && scope.threadId === null
     ? { bulkTrash: { ...scope, kind: "confirm", callbackId, ticket } } : null;

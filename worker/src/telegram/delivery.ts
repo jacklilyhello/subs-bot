@@ -6,7 +6,7 @@ import type { PrivateShareClaimResult } from "../private-shares.ts";
 import {
   prepareTelegramLifecycleTickets, renderTelegramLifecycle, type TelegramLifecycleButton,
 } from "./lifecycle-actions.ts";
-import { inTelegramScope, type TelegramPolicy } from "./protocol.ts";
+import { GROUP_SHARE_PUBLISH_CALLBACK, inTelegramScope, type TelegramPolicy } from "./protocol.ts";
 import { closeUnsentTelegramBulkTrashReply, confirmTelegramBulkTrashSend, renderTelegramBulkTrash } from "./bulk-trash.ts";
 import { renderTelegramInlineSort } from "./inline-sort.ts";
 import { renderTelegramInlineConsent } from "./inline-search-consent.ts";
@@ -15,6 +15,7 @@ import { renderTelegramPath } from "./path-management.ts";
 import { beginTelegramPrivateClaim, prepareTelegramPrivateClaim } from "./private-claims.ts";
 import { resolveTelegramPrivateShareCreationReply } from "./private-share-creation.ts";
 import { PRIVATE_SHARE_DISABLED, type TelegramPrivateShareRuntime } from "./private-share-runtime.ts";
+import { telegramGroupShareReady } from "./group-share-actions.ts";
 import { confirmTelegramShortLinkSend, prepareTelegramShortLinkReply, retireUnsentTelegramShortLink } from "./short-link-actions.ts";
 import {
   confirmTelegramSubscriptionReadSend, prepareTelegramSubscriptionReadTickets, renderTelegramSubscriptionRead,
@@ -31,7 +32,7 @@ import {
   beginTelegramGitHubSearchReply, beginTelegramTempRawReply,
   beginTelegramSubscriptionRawFileReply, failLeasedTelegramSubscriptionRawFileReply,
   beginTelegramApiStatusReply, beginTelegramProviderBatchReply, beginTelegramProviderDocumentReply,
-  prepareTelegramPrivateClaimBegin, reapExpiredTelegramReplies, settleTelegramReply,
+  closeUnsentTelegramGroupClaim, prepareTelegramPrivateClaimBegin, reapExpiredTelegramReplies, settleTelegramReply,
   type TelegramReplyLease, type TelegramReplyOutcome,
 } from "./store.ts";
 import { prepareTelegramViewTickets, renderTelegramView, type TelegramViewButton } from "./views.ts";
@@ -87,15 +88,16 @@ function positiveInteger(value: unknown): value is number {
 
 async function sendTelegram(
   policy: TelegramPolicy,
-  lease: TelegramReplyLease,
-  method: "sendMessage" | "sendDocument",
+  scope: Pick<TelegramReplyLease, "actorId" | "chatId" | "chatType">,
+  method: "sendMessage" | "sendDocument" | "editMessageText",
   body: Record<string, unknown> | FormData,
   timeoutMs: number,
   request: typeof fetch,
 ): Promise<TelegramReplyOutcome> {
-  if (!inTelegramScope(policy, lease)) return { kind: "failed" };
+  if (!inTelegramScope(policy, scope)) return { kind: "failed" };
   try {
     const multipart = body instanceof FormData;
+    const editId = method === "editMessageText" && !multipart ? body.message_id : undefined;
     const response = await request(`${BOT_API}/bot${policy.botToken}/${method}`, {
       method: "POST",
       redirect: "manual",
@@ -107,12 +109,15 @@ async function sendTelegram(
     if (response.ok && payload?.ok === true) {
       const result = record(payload.result);
       const chat = record(result?.chat);
-      if (positiveInteger(result?.message_id) && typeof chat?.id === "number" &&
-          Number.isSafeInteger(chat.id) && String(chat.id) === lease.chatId) {
+      if (positiveInteger(result?.message_id) && (method !== "editMessageText" || result.message_id === editId) &&
+          typeof chat?.id === "number" && Number.isSafeInteger(chat.id) && String(chat.id) === scope.chatId) {
         return { kind: "sent", messageId: result.message_id };
       }
     } else if (payload?.ok === false && payload.error_code === response.status &&
         response.status >= 400 && response.status < 500 && response.status !== 408) {
+      if (response.status === 400 && positiveInteger(editId) && typeof payload.description === "string" &&
+          (payload.description === "Bad Request: message is not modified" ||
+            payload.description.startsWith("Bad Request: message is not modified:"))) return { kind: "sent", messageId: editId };
       if (response.status === 429) {
         const delay = record(payload.parameters)?.retry_after;
         if (positiveInteger(delay) && delay <= 900) return { kind: "retry", delaySeconds: delay };
@@ -123,6 +128,15 @@ async function sendTelegram(
     // A transport or malformed response cannot prove Telegram did not deliver.
   }
   return { kind: "uncertain" };
+}
+
+export function sendTelegramGroupShareCard(
+  policy: TelegramPolicy, actorId: string, method: "sendMessage" | "editMessageText", body: Record<string, unknown>,
+): Promise<TelegramReplyOutcome> {
+  if (body.chat_id !== policy.groupId || (method === "editMessageText" && !positiveInteger(body.message_id))) {
+    return Promise.resolve({ kind: "failed" });
+  }
+  return sendTelegram(policy, { actorId, chatId: policy.groupId, chatType: "group" }, method, body, 5_000, fetch);
 }
 
 function replyParameters(lease: TelegramReplyLease) {
@@ -192,14 +206,14 @@ export async function sendTelegramPrivateClaimReply(
   return sendTelegram(policy, lease, "sendDocument", form, timeoutMs, request);
 }
 
-export async function answerTelegramCallback(policy: TelegramPolicy, callbackId: string): Promise<void> {
+export async function answerTelegramCallback(policy: TelegramPolicy, callbackId: string, text?: string): Promise<void> {
   try {
     const response = await fetch(`${BOT_API}/bot${policy.botToken}/answerCallbackQuery`, {
       method: "POST",
       redirect: "manual",
       signal: AbortSignal.timeout(CALLBACK_TIMEOUT_MS),
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ callback_query_id: callbackId }),
+      body: JSON.stringify({ callback_query_id: callbackId, ...(text === undefined ? {} : { text, cache_time: 0 }) }),
     });
     await response.body?.cancel();
   } catch {
@@ -568,9 +582,11 @@ export async function drainTelegramReplies(
     }
     if (lease.privateShareCreation && privateShareRuntime.context) {
       const reply = await resolveTelegramPrivateShareCreationReply(db, policy, lease, privateShareRuntime.context);
+      const groupButton = reply && privateShareRuntime.groupCardsEnabled && await telegramGroupShareReady(db)
+        ? [[{ text: "发到指定群", callback_data: GROUP_SHARE_PUBLISH_CALLBACK }]] : undefined;
       if (reply && Date.now() < deadline && await beginTelegramPrivateShareCreationReply(db, policy, lease, reply)) {
         const text = `私密分享已创建。\nhttps://t.me/${policy.botUsername}?start=claim_${reply.code}\n份数上限：${reply.maxClaims}\n到期时间（UTC）：${new Date(reply.expireAt * 1000).toISOString()}`;
-        const outcome = await sendTelegramReply(policy, lease, text, Math.max(1, deadline - Date.now()), request);
+        const outcome = await sendTelegramReply(policy, lease, text, Math.max(1, deadline - Date.now()), request, groupButton);
         await settleTelegramReply(db, policy, lease, outcome);
         continue;
       }
@@ -618,7 +634,10 @@ export async function drainTelegramReplies(
       const prepared = await prepareTelegramPrivateClaim(db, bucket, policy, lease);
       if (Date.now() >= deadline) continue;
       const result = await beginTelegramPrivateClaim(db, policy, lease, prepared, begin);
-      if (result === null) continue;
+      if (result === null) {
+        await closeUnsentTelegramGroupClaim(db, policy, lease);
+        continue;
+      }
       const outcome = await sendTelegramPrivateClaimReply(policy, lease, result,
         Math.max(1, deadline - Date.now()), request);
       await settleTelegramReply(db, policy, lease, outcome);
