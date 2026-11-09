@@ -3,7 +3,9 @@
 from contextlib import closing
 from io import BytesIO
 import json
+import os
 from pathlib import Path
+from shutil import rmtree
 import sqlite3
 import sys
 from tempfile import TemporaryDirectory
@@ -15,6 +17,7 @@ from zipfile import ZipFile
 WORKER = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(WORKER / "tools"))
 import legacy_candidate_isolation as tool
+import legacy_short_redirect_oracle as redirect_oracle
 import test_legacy_restore_package as package_tests
 import test_native_restore_rehearsal as native_tests
 
@@ -32,6 +35,43 @@ class CandidateArtifactTests(unittest.TestCase):
 
     def build(self, profile=tool.PROFILE):
         return tool.build_synthetic_candidate(self.worker, self.output, self.release["revision"], "1234", "1", profile=profile)
+
+    def seal_synthetic_oracle(self, config):
+        # This fixture replaces only the unprivileged oracle producer. Construct
+        # its wire metadata independently from the exact synthetic source.
+        source = Path(config["backup"])
+        with closing(sqlite3.connect(source.as_uri() + "?mode=ro&immutable=1", uri=True)) as db:
+            links = db.execute("SELECT code,target_url FROM short_links ORDER BY rowid").fetchall()
+        external = [code for code, url in links if not url.startswith(config["oldOrigin"] + "/sub/")]
+        self.assertEqual((len(links), len(external)), (6, 2))
+        build = json.loads((Path(config["bundle"]) / "isolation.json").read_bytes())
+        worker = {key: build[key] for key in ("revision", "compatibilityDate", "bundleSha256")}
+        worker["manifestSha256"] = config["workerManifestSha256"]
+
+        def line(value):
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8") + b"\n"
+
+        rows = b"".join(line({"codeSha256": tool.native.digest(code.encode("ascii")), "state": "equivalent"}) for code in external)
+        report = line({
+            "version": 1, "kind": "legacy-external-redirect-oracle", "scope": "offline-dormant",
+            "sourceSha256": config["sourceSha256"], "inventorySha256": config["inventorySha256"], "worker": worker,
+            "legacySerializer": {"python": config["pythonVersion"], "aiohttp": "3.11.18", "yarl": config["yarlVersion"]},
+            "sourceRows": 6, "externalRows": 2, "inventoryBlockedRows": 0,
+            "outcomes": {"equivalent": 2, "inventory-blocked": 0, "legacy-rejected": 0, "worker-refused": 0,
+                         "location-differs": 0, "worker-unconfirmed": 0},
+            "files": [{"file": "external.ndjson", "bytes": len(rows), "sha256": tool.native.digest(rows)}],
+        })
+        output = Path(config["output"])
+        output.mkdir(mode=0o700)
+        tool.put(output / "external.ndjson", rows)
+        tool.put(output / "manifest.json", report)
+        tool.put(output / "manifest.sha256", (tool.native.digest(report) + "\n").encode("ascii"))
+
+    def build_mixed(self):
+        with patch.object(redirect_oracle, "seal_oracle", side_effect=self.seal_synthetic_oracle) as producer:
+            report = self.build(tool.MIXED_PROFILE)
+        producer.assert_called_once()
+        return report
 
     def test_share_build_keeps_private_files_under_hosted_runner_temp(self):
         runner = self.root / "runner-temp"
@@ -266,7 +306,7 @@ class CandidateArtifactTests(unittest.TestCase):
     def test_typed_profile_rebuilds_the_fixed_source_and_verifies_exact_restore_evidence(self):
         report = self.build(tool.TYPED_PROFILE)
         archive = self.archive()
-        for other in (tool.PROFILE, tool.PATH_PROFILE, tool.EMPTY_PROFILE, tool.SHARE_PROFILE):
+        for other in (tool.PROFILE, tool.PATH_PROFILE, tool.EMPTY_PROFILE, tool.SHARE_PROFILE, tool.MIXED_PROFILE):
             with self.subTest(profile=other), self.assertRaises(tool.native.RehearsalError):
                 self.verify(archive, other)
         candidate = self.verify(archive, tool.TYPED_PROFILE)
@@ -333,6 +373,125 @@ class CandidateArtifactTests(unittest.TestCase):
         self.reseal(document)
         with self.assertRaises(tool.native.RehearsalError):
             self.verify(self.archive(), tool.TYPED_PROFILE)
+
+    def test_mixed_profile_seals_exact_external_and_typed_rows(self):
+        report = self.build_mixed()
+        archive = self.archive()
+        for other in (tool.PROFILE, tool.PATH_PROFILE, tool.EMPTY_PROFILE, tool.SHARE_PROFILE, tool.TYPED_PROFILE):
+            with self.subTest(profile=other), self.assertRaises(tool.native.RehearsalError):
+                self.verify(archive, other)
+        candidate = self.verify(archive, tool.MIXED_PROFILE)
+        document, pin = candidate.document, candidate.pin()
+        self.assertEqual(report["version"], 5)
+        self.assertEqual(document["shortLinkCompatibility"], {"typed": "not-validated", "external": "offline-equivalent"})
+        self.assertEqual(len(candidate.entries), 4)
+        self.assertEqual(document["targetSequenceHighWater"], 72)
+        self.assertEqual(pin["packageManifestSha256"], report["manifestSha256"])
+        self.assertEqual(pin["typedShortMigrationSha256"], tool.package.TYPED_SHORT_MIGRATION_SHA256)
+        self.assertEqual(pin["externalShortMigrationSha256"], tool.package.EXTERNAL_SHORT_MIGRATION_SHA256)
+        self.assertEqual(pin["typedShortLinksSha256"], document["summary"]["tableSha256"][tool.package.TYPED_SHORTS])
+        self.assertEqual(pin["externalShortLinksSha256"], document["summary"]["tableSha256"][tool.package.EXTERNAL_SHORTS])
+        self.assertNotIn("legacyBotId", pin)
+
+        oracle = self.output / tool.MIXED_ORACLE
+        self.assertEqual({path.name for path in oracle.iterdir()}, {"manifest.json", "manifest.sha256", "external.ndjson"})
+        oracle_bytes = (oracle / "manifest.json").read_bytes()
+        self.assertEqual(pin["oracleManifestSha256"], tool.native.digest(oracle_bytes))
+        oracle_manifest = json.loads(oracle_bytes)
+        self.assertEqual(oracle_manifest["worker"], {key: document["workerArtifact"][key] for key in
+            ("revision", "compatibilityDate", "bundleSha256", "manifestSha256")})
+        self.assertEqual(oracle_manifest["legacySerializer"], {"python": tool.python_version(), "aiohttp": "3.11.18", "yarl": "1.20.0"})
+        self.assertEqual(oracle_manifest["inventorySha256"], pin["namespaceManifestSha256"])
+        self.assertEqual((oracle_manifest["sourceRows"], oracle_manifest["externalRows"], oracle_manifest["inventoryBlockedRows"]), (6, 2, 0))
+
+        first_target = "https://example.org/route?value=synthetic-secret&mode=exact#keep"
+        second_target = "http://example.net/legacy/path?mode=original#keep"
+        sql = candidate.sql.read_text(encoding="utf-8")
+        self.assertNotIn("MixedExt0001", sql)
+        self.assertNotIn("MixedExt0002", sql)
+        with closing(sqlite3.connect(":memory:")) as db:
+            db.executescript(sql)
+            self.assertEqual(db.execute(f"SELECT code_sha256,code_length,owner_id,target_url,created_at,origin_receipt_id,nonce,key_version,revoked_at "
+                                        f"FROM {tool.package.EXTERNAL_SHORTS} ORDER BY created_at").fetchall(), [
+                (tool.native.digest(b"MixedExt0001"), 12, "123", first_target, tool.FIXTURE_CREATED + 4, None, None, None, None),
+                (tool.native.digest(b"MixedExt0002"), 12, "456", second_target, tool.FIXTURE_CREATED + 5, None, None, None, None),
+            ])
+            self.assertEqual(db.execute(f"SELECT subscription_id,owner_id,format FROM {tool.package.TYPED_SHORTS} "
+                                        "ORDER BY subscription_id").fetchall(),
+                             [(2, "123", ""), (5, "123", "sing-box"), (71, "456", "v2ray"), (72, "456", "qx")])
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_mixed_profile_rejects_resealed_oracle_substitution(self):
+        self.build_mixed()
+        directory = self.output / tool.MIXED_ORACLE
+        manifest = directory / "manifest.json"
+        original = json.loads(manifest.read_bytes())
+        document = json.loads((self.output / tool.package.MANIFEST).read_bytes())
+        # A replacement oracle can re-seal itself and the package. Its Worker
+        # and serializer pins must still match the independently rebuilt pins.
+        for field, key, replacement in (("worker", "bundleSha256", "b" * 64), ("legacySerializer", "yarl", "1.20.1")):
+            with self.subTest(field=field):
+                altered = {**original, field: {**original[field], key: replacement}}
+                raw = tool.converter._json(altered) + b"\n"
+                manifest.write_bytes(raw)
+                (directory / "manifest.sha256").write_bytes((tool.native.digest(raw) + "\n").encode("ascii"))
+                document["source"]["oracleManifestSha256"] = tool.native.digest(raw)
+                if field == "legacySerializer":
+                    document["source"][field] = altered[field]
+                self.reseal(document)
+                destination = self.root / tool.candidate_directory(tool.MIXED_PROFILE)
+                archive = self.archive()
+                tool.unpack_candidate(archive, tool.native.digest(archive), destination, profile=tool.MIXED_PROFILE)
+                with TemporaryDirectory(dir=self.root) as scratch, self.assertRaises(tool.native.RehearsalError):
+                    tool.verified_candidate(self.root, {"profile": tool.MIXED_PROFILE, "worker": self.release}, Path(scratch),
+                                            profile=tool.MIXED_PROFILE)
+                rmtree(destination)
+
+    def test_mixed_preflight_and_apply_rebuild_without_launching_the_oracle(self):
+        self.build_mixed()
+        archive = self.archive()
+        digest = tool.native.digest(archive)
+        release = {**self.release, "artifactId": "24", "archiveSha256": "c" * 64}
+        selected = ("1", "25", digest)
+        inputs = {"profile": tool.MIXED_PROFILE, "action": "verify", "cohort": native_tests.COHORT, "source_run_id": "1234"}
+        environment = {"SUBS_BOT_CI_RUN_ID": "1234", "SUBS_BOT_CF_ISOLATION_TARGET_JSON": "{}",
+                       "SUBS_BOT_CF_BOOTSTRAP_TOKEN": "synthetic-data", "SUBS_BOT_CF_DEPLOY_TOKEN": "synthetic-worker"}
+
+        class ProtectedResourceBoundaryReached(Exception):
+            pass
+
+        forbidden = AssertionError("Protected reconstruction must remain offline.")
+        with patch.dict(os.environ, environment), patch.object(tool.artifact, "prepare", return_value=release), \
+             patch.object(tool.artifact, "_github_token", return_value="synthetic-gh"), \
+             patch.object(tool.artifact, "select_main_artifact", return_value=selected) as select, \
+             patch.object(tool.artifact, "_download", return_value=archive) as download, \
+             patch.object(tool.artifact, "_select_artifact", return_value=("1", "24", "c" * 64)), \
+             patch.object(tool.artifact, "require_current_main") as require_main, \
+             patch.object(redirect_oracle, "seal_oracle", side_effect=forbidden) as oracle, \
+             patch("subprocess.Popen", side_effect=forbidden) as child, patch("socket.socket", side_effect=forbidden) as socket, \
+             patch.object(tool.native, "RehearsalAPI", side_effect=ProtectedResourceBoundaryReached) as boundary:
+            tool.preflight(self.root, release["revision"], "1234", profile=tool.MIXED_PROFILE)
+            download.assert_called_once_with("25", "synthetic-gh")
+            self.assertEqual([call.kwargs["artifact_prefix"] for call in select.call_args_list],
+                             ["subs-bot-legacy-mixed-short-candidate"] * 2)
+            require_main.assert_called_once_with(release["revision"])
+            path = self.root / tool.PROVENANCE
+            provenance = json.loads(path.read_bytes())
+            self.assertEqual(provenance["candidate"]["archiveSha256"], digest)
+            self.assertEqual(provenance["worker"], release)
+            with self.assertRaises(ProtectedResourceBoundaryReached):
+                tool.apply(self.root, release["revision"], inputs)
+            boundary.assert_called_once_with({}, "synthetic-data", native_tests.COHORT, profile=tool.MIXED_PROFILE)
+            for key in ("oracleManifestSha256", "typedShortLinksSha256", "externalShortLinksSha256"):
+                with self.subTest(key=key):
+                    changed = {**provenance, "candidate": {**provenance["candidate"], key: "f" * 64}}
+                    path.write_bytes(tool.native.canonical(changed))
+                    with self.assertRaises(tool.native.RehearsalError):
+                        tool.apply(self.root, release["revision"], inputs)
+            boundary.assert_called_once()
+            oracle.assert_not_called()
+            child.assert_not_called()
+            socket.assert_not_called()
 
     def test_correct_archive_digest_does_not_admit_extra_member(self):
         self.build()
