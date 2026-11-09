@@ -14,7 +14,7 @@ sys.path.insert(0, str(WORKER / "tools"))
 
 from d1_migrations import (  # noqa: E402
     BASELINE_NAME, LEDGER, MAX_D1_STATEMENT_BYTES, MAX_MIGRATION_BYTES, MigrationError, SchemaObject,
-    _matches_schema, apply_migrations,
+    _matches_schema, _statements, apply_migrations,
 )
 
 
@@ -50,10 +50,12 @@ class FakeD1:
         self.metadata = {"uuid": TARGET["d1Id"], "name": "subs-bot-cf-dev-01", "created_at": TARGET["d1CreatedAt"]}
         self.path = f"/accounts/{TARGET['accountId']}/d1/database/{TARGET['d1Id']}"
         self.mutations = []
+        self.reads = []
         self.executed = []
         self.db.set_trace_callback(self.executed.append)
         self.fail_before_ledger = False
         self.lose_success_response = False
+        self.rewrite_batch = None
 
     def __call__(self, method, path, payload=None):
         if method == "GET" and path == self.path:
@@ -61,10 +63,21 @@ class FakeD1:
         if method != "POST" or path != self.path + "/query" or set(payload) != {"sql"}:
             raise AssertionError("unexpected D1 request")
         sql = payload["sql"]
+        statements = list(_statements(sql if sql.endswith(";") else sql + ";"))
+        if any(len(statement.encode("utf-8")) >= MAX_D1_STATEMENT_BYTES for statement in statements):
+            raise AssertionError("oversized D1 statement")
         if not sql.startswith("SELECT CASE WHEN"):
-            return [{"success": True, "results": [dict(row) for row in self.db.execute(sql)]}]
+            self.reads.append(statements)
+            self.db.execute("BEGIN")
+            try:
+                return [{"success": True, "results": [dict(row) for row in self.db.execute(statement)]}
+                        for statement in statements]
+            finally:
+                self.db.rollback()
 
         self.mutations.append(sql)
+        if self.rewrite_batch:
+            sql = self.rewrite_batch(sql)
         if self.fail_before_ledger:
             sql = sql.replace(f"INSERT INTO {LEDGER} ", f"SELECT json_extract('deliberate failure', '$');\nINSERT INTO {LEDGER} ", 1)
         try:
@@ -136,12 +149,16 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(self.apply(), expected)
         self.assertEqual(len(self.api.mutations), len(expected))
         self.assertEqual(self.guard_calls, len(expected))
-        guards = [sql for sql in self.api.executed if sql.lstrip().startswith("SELECT CASE WHEN")]
-        self.assertEqual(len(guards), 2 * len(expected))
+        batches = [list(_statements(sql)) for sql in self.api.mutations]
+        guards = [sql for batch in batches for sql in batch if sql.startswith("SELECT CASE WHEN")]
+        self.assertGreaterEqual(len(guards), 2 * len(expected))
         self.assertLess(max(len(sql.encode("utf-8")) for sql in guards), MAX_D1_STATEMENT_BYTES)
         read_migration = next(i for i, item in enumerate(expected) if item["name"] == "0018_telegram_subscription_reads.sql")
-        self.assertNotIn("telegram_subscription_read_ticket", guards[2 * read_migration])
-        self.assertIn("telegram_subscription_read_ticket", guards[2 * read_migration + 1])
+        batch = batches[read_migration]
+        first_ddl = next(i for i, sql in enumerate(batch) if sql.startswith("CREATE TABLE"))
+        self.assertNotIn("telegram_subscription_read_ticket", "\n".join(batch[:first_ddl]))
+        self.assertTrue(any("telegram_subscription_read_ticket" in sql for sql in batch[first_ddl:]
+                            if sql.startswith("SELECT CASE WHEN")))
         self.assertEqual(self.api.db.execute("PRAGMA foreign_key_check").fetchall(), [])
 
     def test_exact_cumulative_cap_above_64_kib_applies_and_reads_back(self):
@@ -182,6 +199,47 @@ class MigrationTests(unittest.TestCase):
             _matches_schema(self.api, self.api.path, (object_to_check,))
         self.assertEqual(self.api.executed, [])
         self.assertEqual(self.api.mutations, [])
+
+    def test_split_post_guards_rollback_together_and_readback_checks_every_group(self):
+        large_ddl = sized_budget_ddl(34 * 1024, b"''")
+        self.add_file("0002_split.sql", large_ddl + large_ddl.replace(b"test_budget", b"test_budget_second", 1))
+        # Keep the schema count and names exact while changing the later object's SQL.
+        self.api.rewrite_batch = lambda sql: sql.replace(
+            "CREATE TABLE test_budget_second (id INTEGER PRIMARY KEY, marker TEXT",
+            "CREATE TABLE test_budget_second (id INTEGER PRIMARY KEY, altered TEXT", 1,
+        )
+        with self.assertRaisesRegex(MigrationError, "prior state is safe to retry"):
+            self.apply()
+        self.assertFalse(self.api.table_exists("test_budget"))
+        self.assertFalse(self.api.table_exists("test_budget_second"))
+        self.assertEqual(self.api.db.execute(f"SELECT count(*) FROM {LEDGER}").fetchone()[0], 1)
+        failed_batch = list(_statements(self.api.mutations[-1]))
+        after_ddl = next(i for i, sql in enumerate(failed_batch) if sql.startswith("CREATE TABLE test_budget_second")) + 1
+        self.assertGreaterEqual(len(failed_batch[after_ddl:-1]), 2)
+        self.assertTrue(all(sql.startswith("SELECT CASE WHEN") for sql in failed_batch[after_ddl:-1]))
+        self.assertIn("test_budget_second", failed_batch[-2])
+
+        self.api.rewrite_batch = None
+        expected = [{**item, "mode": "applied"} for item in self.manifest["migrations"]]
+        self.assertEqual(self.apply(), expected)
+        self.assertEqual(self.apply(), expected)
+        self.assertTrue(any(len(batch) > 1 for batch in self.api.reads))
+        self.api.db.execute("ALTER TABLE test_budget_second RENAME COLUMN marker TO altered")
+        with self.assertRaisesRegex(MigrationError, "schema differs"):
+            self.apply()
+        self.assertEqual(len(self.api.mutations), 3)
+
+    def test_managed_transaction_rechecks_exact_ledger_after_operator_guard(self):
+        self.apply()
+        self.add_file(NEXT_NAME, NEXT_SQL)
+
+        def change_history():
+            self.api.db.execute(f"UPDATE {LEDGER} SET sha256 = ? WHERE position = 1", ("0" * 64,))
+
+        with self.assertRaisesRegex(MigrationError, "state could not be verified"):
+            self.apply(guard=change_history)
+        self.assertFalse(self.api.table_exists("test_messages"))
+        self.assertEqual(self.api.db.execute(f"SELECT count(*) FROM {LEDGER}").fetchone()[0], 1)
 
     def test_legacy_adopts_0001_without_replay_or_reset_and_applies_next(self):
         self.api.seed_legacy()
