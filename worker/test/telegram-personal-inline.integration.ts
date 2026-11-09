@@ -25,7 +25,7 @@ const queueDiagnosticsModule = `
     if (/SQLITE_ERROR|syntax error/i.test(message)) return 'sql-other';
     return 'other';
   }
-  function instrument(env) {
+  function instrument(env, ctx) {
     const db = env.DB;
     const claims = new WeakMap();
     const work = new WeakMap();
@@ -48,6 +48,28 @@ const queueDiagnosticsModule = `
       prepare(sql) {
         const query = db.prepare(sql);
         const trimmed = sql.trimStart();
+        if (trimmed.startsWith("UPDATE telegram_inline_search_receipts AS request SET state='sending'")) {
+          return {bind(...bindings) {
+            const statement = query.bind(...bindings);
+            const race = bindings.includes(215) ? 'clear' : bindings.includes(222) ? 'revoke' : null;
+            if (!race) return statement;
+            return {async first(...fields) {
+              // Execute an actual bundled webhook after the inline inventory scan but before its send fence.
+              const policy = JSON.parse(env.TELEGRAM_ISOLATION_CONFIG);
+              const actor = race === 'clear' ? policy.memberId : policy.adminId;
+              const id = race === 'clear' ? 216 : 223;
+              const text = race === 'clear' ? '/temp clear' : '/auth remove ' + policy.memberId;
+              const response = await worker.fetch(new Request('https://fixture.invalid/telegram/webhook', {
+                method: 'POST', headers: {'content-type': 'application/json', 'x-telegram-bot-api-secret-token': policy.webhookSecret},
+                body: JSON.stringify({update_id: id, message: {message_id: id, date: Math.floor(Date.now() / 1000), text,
+                  from: {id: Number(actor), is_bot: false}, chat: {id: Number(actor), type: 'private'},
+                  entities: [{type: 'bot_command', offset: 0, length: text.split(' ', 1)[0].length}]}}),
+              }), env, ctx);
+              await record('inline-' + race + '-before-send', response.status === 200 ? 'ok' : 'other');
+              return statement.first(...fields);
+            }};
+          }};
+        }
         const combined = sql.includes('UNION ALL SELECT') && sql.includes('FROM telegram_provider_batch_jobs');
         const workStage = combined && trimmed.startsWith('UPDATE telegram_provider_jobs ') ? 'provider-work-claim-single'
           : combined && trimmed.startsWith('UPDATE telegram_provider_batch_jobs ') ? 'provider-work-claim-batch'
@@ -91,8 +113,8 @@ const queueDiagnosticsModule = `
     }};
   }
   export default {
-    fetch(request, env, ctx) { return worker.fetch(request, instrument(env), ctx); },
-    scheduled(controller, env, ctx) { return worker.scheduled(controller, instrument(env), ctx); },
+    fetch(request, env, ctx) { return worker.fetch(request, instrument(env, ctx), ctx); },
+    scheduled(controller, env, ctx) { return worker.scheduled(controller, instrument(env, ctx), ctx); },
   };
 `;
 
@@ -109,7 +131,8 @@ test("emitted Worker answers opted-in sender queries using the owner's durable s
   };
   const sent: { id: number; text: string; origin: number }[] = [];
   let githubRequests = 0;
-  type Answer = { inline_query_id: string; results: InlineSearchArticle[]; is_personal: boolean; cache_time: number; next_offset: string };
+  type Answer = { inline_query_id: string; results: (InlineSearchArticle & { description?: string })[];
+    is_personal: boolean; cache_time: number; next_offset: string };
   const answers: Answer[] = [];
   const started = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
@@ -140,12 +163,18 @@ test("emitted Worker answers opted-in sender queries using the owner's durable s
         assert.equal(answer.next_offset, "");
         assert.ok(answer.results.length <= 50);
         for (const article of answer.results) {
-          assert.deepEqual(Object.keys(article).sort(), ["id", "input_message_content", "title", "type"]);
+          const temporary = article.description !== undefined;
+          assert.deepEqual(Object.keys(article).sort(), [
+            ...(temporary ? ["description"] : []), "id", "input_message_content", "title", "type",
+          ]);
+          if (temporary) assert.equal(article.description, "临时节点 · 私聊 /temp 查看原文");
           assert.match(article.id, /^[a-f0-9-]{36}$/u);
-          assert.deepEqual(article.input_message_content, { message_text: "在此私聊发送 /list 或 /s 关键词查看订阅详情。",
+          assert.deepEqual(article.input_message_content, { message_text: temporary ? "临时节点仅在机器人私聊中查看。请发送 /temp。"
+            : "在此私聊发送 /list 或 /s 关键词查看订阅详情。",
             link_preview_options: { is_disabled: true } });
         }
-        assert.doesNotMatch(JSON.stringify(answer.results), /https?:\/\/|synthetic-source-secret|synthetic-title-secret|FOREIGN/u);
+        assert.doesNotMatch(JSON.stringify(answer.results),
+          /https?:\/\/|ss:\/\/|203\.0\.113\.|synthetic-source-secret|synthetic-title-secret|synthetic-temp-title-secret|FOREIGN/u);
         answers.push(answer);
         if (answer.inline_query_id === "fixture-uncertain") return Response.json({ ok: true, result: false });
         if (answer.inline_query_id === "fixture-held") {
@@ -210,10 +239,10 @@ test("emitted Worker answers opted-in sender queries using the owner's durable s
       body: JSON.stringify(update),
     });
     const command = (updateId: number, text: string, worker = app,
-      { actorId = policy.memberId, date = Math.floor(Date.now() / 1000) } = {}) => post({ update_id: updateId, message: {
+      { actorId = policy.memberId, date = Math.floor(Date.now() / 1000), chatId = actorId } = {}) => post({ update_id: updateId, message: {
       message_id: updateId, date, text,
-      from: { id: Number(actorId), is_bot: false }, chat: { id: Number(actorId), type: "private" },
-      entities: [{ type: "bot_command", offset: 0, length: text.split(/\s/u, 1)[0].length }],
+      from: { id: Number(actorId), is_bot: false }, chat: { id: Number(chatId), type: chatId === policy.groupId ? "supergroup" : "private" },
+      ...(text.startsWith("/") ? { entities: [{ type: "bot_command", offset: 0, length: text.split(/\s/u, 1)[0].length }] } : {}),
     } }, worker);
     const query = (updateId: number, text = "", fields: Record<string, unknown> = {}, worker = app) => post({ update_id: updateId,
       inline_query: { id: `fixture-inline-${updateId}`, from: { id: Number(policy.memberId), is_bot: false },
@@ -416,6 +445,95 @@ test("emitted Worker answers opted-in sender queries using the owner's durable s
     assert.equal(await receipt(21), null);
     assert.equal((await receipt(33))?.state, "uncertain");
     assert.equal(answers.length, beforeRecovery, "Cron never retries an inline answer");
+
+    // Start a new synthetic query window without weakening the preceding quota and scan-cap checks.
+    await db.batch([
+      db.prepare("DELETE FROM subscriptions WHERE owner_id=? AND token GLOB 'inline-cap-fixture-*'").bind(policy.memberId),
+      db.prepare(`UPDATE telegram_inline_search_receipts SET received_at=received_at-120,lease_until=lease_until-120
+        WHERE bot_id=? AND actor_id=?`).bind(policy.botId, policy.memberId),
+    ]);
+    assert.equal((await command(200, "/inline temp on", app, { chatId: policy.groupId })).status, 204);
+    assert.equal(await db.prepare("SELECT 1 FROM telegram_inbox WHERE bot_id=? AND update_id=200").bind(policy.botId).first(), null);
+
+    const firstAuth = Buffer.from("aes-256-gcm:synthetic-first-only").toString("base64url");
+    const first = `ss://${firstAuth}@203.0.113.21:8388#Cap%20Temp%20first%20https%3A%2F%2Fexample.invalid%2Fsynthetic-temp-title-secret`;
+    const second = "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.22:8388#Cap%20Temp%20second";
+    const foreign = "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.23:8388#FOREIGN%20temp";
+    const tempTitles = ["🧪 Cap Temp first [链接已省略]", "🧪 Cap Temp second"];
+    for (const [id, text, actorId] of [[201, first, policy.memberId], [202, second, policy.memberId],
+      [203, foreign, policy.adminId]] as const) {
+      assert.equal((await command(id, text, app, { actorId })).status, 200);
+      await expectCommand(id, /已加入临时列表 1 条节点/u);
+    }
+
+    assert.equal((await command(204, "/inline on")).status, 200);
+    await expectCommand(204, /已开启私聊内联搜索，有效期/u);
+    assert.equal((await query(205, "203.0.113.21")).status, 204);
+    assert.deepEqual(titles(), [], "ordinary consent has no temporary-node scope");
+
+    assert.deepEqual((await Promise.all([command(206, "/inline temp on"), command(206, "/inline temp on")]))
+      .map(({ status }) => status), [200, 200]);
+    await expectCommand(206, /^已开启私聊内联搜索及临时节点名称，有效期 15 分钟。可发送 \/inline off 关闭。$/u);
+    assert.equal(sent.filter(({ origin }) => origin === 206).length, 1);
+    assert.deepEqual(await db.prepare(`SELECT inbox.receipt_nonce AS marker,consent.kind
+      FROM telegram_inbox AS inbox JOIN telegram_inline_search_consent AS consent USING(receipt_id)
+      WHERE inbox.bot_id=? AND inbox.update_id=206`).bind(policy.botId).first(), { marker: "inline-consent-temp:v1", kind: "on" });
+    assert.equal((await query(207)).status, 204);
+    assert.deepEqual(titles(), [visible[1], visible[2], visible[0], visible[3], visible[4], ...tempTitles]);
+    assert.deepEqual(answers.at(-1)?.results.map(({ description }) => description !== undefined),
+      [false, false, false, false, false, true, true]);
+    assert.equal((await query(208, firstAuth)).status, 204);
+    assert.deepEqual(titles(), [tempTitles[0]], "an exact raw match still sends only safe metadata");
+    assert.equal(JSON.stringify(answers.at(-1)?.results).includes(firstAuth), false);
+    const afterTempSearch = answers.length;
+    assert.equal((await query(208, "changed-synthetic-text")).status, 204);
+    assert.equal((await query(209, "", { id: "fixture-inline-208" })).status, 204);
+    assert.equal((await query(210, "", { chat_type: "supergroup" })).status, 204);
+    assert.equal(await receipt(209), null);
+    assert.equal(await receipt(210), null);
+    assert.equal(answers.length, afterTempSearch);
+
+    await seedMany(49, 1, "Cap ");
+    assert.equal((await query(211, "Cap")).status, 204);
+    assert.equal(titles()?.length, 50);
+    assert.deepEqual(titles()?.slice(-2), ["Cap 0049", tempTitles[0]], "subscription and temp cards share one 50-result limit");
+
+    assert.equal((await command(212, "/inline on")).status, 200);
+    await expectCommand(212, /已开启私聊内联搜索，有效期/u);
+    assert.equal((await query(213, "203.0.113.21")).status, 204);
+    assert.deepEqual(titles(), [], "fresh ordinary consent replaces temporary-node consent");
+    assert.equal((await command(214, "/inline temp on")).status, 200);
+    await expectCommand(214, /临时节点名称/u);
+    const beforeClear = answers.length;
+    assert.equal((await query(215, "203.0.113.21")).status, 204);
+    await expectCommand(216, /已移除 2 条临时节点/u);
+    assert.equal((await receipt(215))?.state, "dropped");
+    assert.equal(answers.length, beforeClear, "a cleared inventory cannot send its stale cards");
+    assert.equal((await query(217, "203.0.113.21")).status, 204);
+    assert.deepEqual(titles(), []);
+
+    assert.equal((await command(218, "/inline off")).status, 200);
+    await expectCommand(218, /已关闭私聊内联搜索/u);
+    assert.equal((await query(219)).status, 204);
+    assert.equal(await receipt(219), null);
+    assert.equal((await command(220, first)).status, 200);
+    await expectCommand(220, /已加入临时列表 1 条节点/u);
+    assert.equal((await command(221, "/inline temp on")).status, 200);
+    await expectCommand(221, /临时节点名称/u);
+    const beforeRevocation = answers.length;
+    assert.equal((await query(222, "203.0.113.21")).status, 204);
+    await expectCommand(223, /已撤权/u);
+    assert.equal((await receipt(222))?.state, "dropped");
+    assert.equal((await query(224)).status, 204);
+    assert.equal(await receipt(224), null);
+    assert.equal(answers.length, beforeRevocation, "a revoked preflight cannot answer or reacquire access");
+    const tempDiagnostics = await diagnostics();
+    for (const stage of ["inline-clear-before-send", "inline-revoke-before-send"]) {
+      assert.ok(tempDiagnostics.some((row) => row.stage === stage && row.outcome === "ok"));
+    }
+    const tempReceipts = await db.prepare("SELECT * FROM telegram_inline_search_receipts WHERE update_id>=205").all();
+    assert.doesNotMatch(JSON.stringify(tempReceipts.results), /203\.0\.113\.|ss:\/\/|Cap Temp|synthetic-temp-title-secret|fixture-inline-/u);
+    assert.equal(JSON.stringify(tempReceipts.results).includes(firstAuth), false);
   } finally {
     release.resolve();
     await runtime.dispose();

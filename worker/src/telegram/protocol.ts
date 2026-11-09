@@ -76,7 +76,7 @@ export type TelegramApiStatusUpdate = TelegramEventScope & (
 export type TelegramInlineSortMode = "default" | "traffic" | "expiry" | "name";
 type TelegramInlineSortAction = { kind: "current" | "usage" } | { kind: "set"; mode: TelegramInlineSortMode };
 export type TelegramInlineSortUpdate = TelegramEventScope & TelegramInlineSortAction;
-export type TelegramInlineConsentUpdate = TelegramEventScope & { kind: "on" | "off" | "usage" };
+export type TelegramInlineConsentUpdate = TelegramEventScope & { kind: "on" | "temp-on" | "off" | "usage" };
 export type TelegramInlineQuery = { updateId: number; actorId: string; chatType: "sender"; queryId: string; query: string };
 export type TelegramGitHubSearchUpdate = TelegramEventScope & { args: string };
 
@@ -263,6 +263,7 @@ function messageCommand(
   if (commandName === "share") return remainder.length <= 4096 ? { shareArgs: remainder } : null;
   if (commandName === "inline") {
     const mode = remainder.trim().toLowerCase();
+    if (mode === "temp on") return { inlineConsent: "temp-on" };
     return { inlineConsent: mode === "on" || mode === "off" ? mode : "usage" };
   }
   if (commandName === "updateall") {

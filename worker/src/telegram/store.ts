@@ -24,7 +24,8 @@ import { insertTelegramNodePageTickets, TELEGRAM_SUBSCRIPTION_NODE_MARKER, type 
 import { telegramProviderReplyClock, telegramProviderReplyEligible, telegramProviderReplyMarker, telegramProviderReplySendGuard,
   type TelegramProviderReply, type TelegramProviderRequestKind } from "./provider-replies.ts";
 import { insertTelegramProviderRefreshTicket, type TelegramProviderRefreshTicket } from "./provider-refresh.ts";
-import { TELEGRAM_INLINE_CONSENT_MARKER, type TelegramInlineConsentReply } from "./inline-search-consent.ts";
+import { telegramInlineConsentMarker, TELEGRAM_INLINE_CONSENT_MARKER, TELEGRAM_INLINE_TEMP_CONSENT_MARKER,
+  type TelegramInlineConsentReply } from "./inline-search-consent.ts";
 import { TELEGRAM_GITHUB_SEARCH_MARKER, telegramGitHubSearchEligible, telegramGitHubSearchMarker, telegramGitHubSendGuard,
   type TelegramGitHubReply } from "./github-search.ts";
 import { insertTelegramRawFileTicket, TELEGRAM_SUBSCRIPTION_RAW_FILE_MARKER,
@@ -180,7 +181,7 @@ function supportedReceipt(alias: "inbox" | "earlier", includeAggregate = false, 
     ${includeBulkTrash ? `WHEN (${alias}.receipt_nonce='${TELEGRAM_BULK_TRASH_MARKER}' AND ${alias}.command='help'
       AND ${alias}.chat_type='private' AND ${alias}.actor_id=${alias}.chat_id AND ${alias}.thread_id IS NULL
       AND EXISTS (SELECT 1 FROM telegram_bulk_trash WHERE receipt_id=${alias}.receipt_id)) THEN 1` : ""}
-    ${includeInlineConsent ? `WHEN (${alias}.receipt_nonce='${TELEGRAM_INLINE_CONSENT_MARKER}' AND ${alias}.command='help'
+    ${includeInlineConsent ? `WHEN (${telegramInlineConsentMarker(alias)} AND ${alias}.command='help'
       AND ${alias}.chat_type='private' AND ${alias}.actor_id=${alias}.chat_id AND ${alias}.thread_id IS NULL
       AND EXISTS (SELECT 1 FROM telegram_inline_search_consent AS consent WHERE consent.receipt_id=${alias}.receipt_id
         AND consent.bot_id=${alias}.bot_id AND consent.actor_id=${alias}.actor_id)) THEN 1` : ""}
@@ -391,7 +392,8 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
         ${includeProvider ? "provider.outcome" : "NULL"} AS providerResult,
         ${includeProvider ? "(SELECT kind FROM telegram_provider_requests WHERE receipt_id=provider.receipt_id)" : "NULL"} AS providerKind,
         CASE WHEN inbox.receipt_nonce='${TELEGRAM_BULK_TRASH_MARKER}' THEN 1 ELSE 0 END AS bulkTrashMarker,
-        ${includeInlineConsent ? "consent.kind" : "NULL"} AS inlineConsentKind,
+        ${includeInlineConsent ? `CASE WHEN consent.kind='on' AND inbox.receipt_nonce='${TELEGRAM_INLINE_TEMP_CONSENT_MARKER}'
+          THEN 'temp-on' ELSE consent.kind END` : "NULL"} AS inlineConsentKind,
         ${includeGitHubSearch ? "github.state" : "NULL"} AS githubSearchState,
         ${includeGitHubSearch ? "github.public_results" : "NULL"} AS githubSearchResults,
         CASE WHEN inbox.receipt_nonce='${TELEGRAM_SUBSCRIPTION_RAW_FILE_MARKER}' THEN 1 ELSE 0 END AS rawFileMarker,
@@ -426,7 +428,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
       ${includeProvider ? `LEFT JOIN telegram_provider_replies AS provider ON provider.receipt_id=inbox.receipt_id
         AND ${telegramProviderReplyMarker("inbox")}` : ""}
       ${includeInlineConsent ? `LEFT JOIN telegram_inline_search_consent AS consent ON consent.receipt_id=inbox.receipt_id
-        AND inbox.receipt_nonce='${TELEGRAM_INLINE_CONSENT_MARKER}'` : ""}
+        AND ${telegramInlineConsentMarker("inbox")}` : ""}
       ${includeGitHubSearch ? `LEFT JOIN telegram_github_search AS github ON github.receipt_id = inbox.receipt_id
         AND inbox.receipt_nonce = '${TELEGRAM_GITHUB_SEARCH_MARKER}'` : ""}
       WHERE reply.lease_id = ? AND reply.state = 'leased' AND inbox.bot_id = ?
@@ -734,13 +736,15 @@ export async function beginTelegramInlineSortReply(db: D1Database, policy: Teleg
 
 export async function beginTelegramInlineConsentReply(db: D1Database, policy: TelegramPolicy, lease: TelegramReplyLease): Promise<boolean> {
   if (!lease.inlineConsent || !inTelegramScope(policy, lease) || lease.chatType !== "private" || lease.threadId !== null) return false;
-  return beginTelegramInlineReply(db, policy, lease, { sql: `inbox.receipt_nonce='${TELEGRAM_INLINE_CONSENT_MARKER}' AND EXISTS (
+  const temp = lease.inlineConsent === "temp-on";
+  return beginTelegramInlineReply(db, policy, lease, { sql: `inbox.receipt_nonce=? AND EXISTS (
     SELECT 1 FROM telegram_inline_search_consent AS consent LEFT JOIN telegram_auth AS auth
       ON auth.bot_id=inbox.bot_id AND auth.user_id=inbox.actor_id AND inbox.actor_id<>?
     WHERE consent.receipt_id=inbox.receipt_id AND consent.bot_id=inbox.bot_id AND consent.actor_id=inbox.actor_id AND consent.kind=?
       AND consent.actor_role=CASE WHEN inbox.actor_id=? THEN 'admin' WHEN inbox.actor_id=? THEN 'member' END
       AND consent.auth_message_date=COALESCE(auth.message_date,0) AND consent.auth_message_id=COALESCE(auth.message_id,0))`,
-  bindings: [policy.adminId, lease.inlineConsent, policy.adminId, policy.memberId] });
+  bindings: [temp ? TELEGRAM_INLINE_TEMP_CONSENT_MARKER : TELEGRAM_INLINE_CONSENT_MARKER,
+    policy.adminId, temp ? "on" : lease.inlineConsent, policy.adminId, policy.memberId] });
 }
 
 async function beginTelegramInlineReply(
