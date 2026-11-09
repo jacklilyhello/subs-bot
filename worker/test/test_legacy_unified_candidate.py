@@ -52,7 +52,7 @@ class LegacyUnifiedCandidateTests(unittest.TestCase):
         self.worker_pin = {key: build[key] for key in ("revision", "compatibilityDate", "bundleSha256")}
         self.worker_pin["manifestSha256"] = self.base.worker_sha
 
-    def capture(self, name, *, coalesced=False, absent_domains=False):
+    def capture(self, name, *, coalesced=False, absent_domains=False, extra_source_rows=None):
         root = self.base.root / name
         root.mkdir(mode=0o700)
         source, conversion, output = (root / item for item in ("source.sqlite", "conversion", "candidate"))
@@ -73,6 +73,8 @@ class LegacyUnifiedCandidateTests(unittest.TestCase):
             if absent_domains:
                 db.execute("DROP TABLE short_links")
                 db.execute("DROP TABLE temp_nodes")
+            if extra_source_rows is not None:
+                extra_source_rows(db)
         source_sha = fixtures.digest(source.read_bytes())
         owner_map = root / "owners.json"
         fixtures.put(owner_map, fixtures.body(owners))

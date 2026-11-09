@@ -2,6 +2,7 @@
 
 from collections import Counter
 from contextlib import closing, contextmanager, suppress
+from dataclasses import dataclass, field
 from hashlib import sha256
 import os
 from pathlib import Path
@@ -40,6 +41,22 @@ USAGE = ("Usage: legacy_private_share_candidate.py INVENTORY_DIR WORKER_ARTIFACT
 
 class CandidateError(RuntimeError):
     """Only fixed errors may leave the candidate builder."""
+
+
+@dataclass(frozen=True)
+class UnifiedShareInput:
+    inventory_dir: Path = field(repr=False)
+    inventory_manifest_sha256: str
+    legacy_bot_username: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class VerifiedUnifiedShare:
+    root: Path = field(repr=False)
+    counts: dict
+    files: dict
+    domains: dict
+    proof: dict[str, str]
 
 
 def require(condition):
@@ -99,6 +116,45 @@ def open_inventory_file(root, entry):
         yield file
         after = os.fstat(file.fileno())
         require((before.st_size, before.st_mtime_ns, before.st_ctime_ns) == (after.st_size, after.st_mtime_ns, after.st_ctime_ns))
+
+
+def verify_unified_share_source(pins: UnifiedShareInput, *, source: Path, source_sha: str, legacy_bot_id: str,
+                                working_parent: Path) -> VerifiedUnifiedShare:
+    """Rebuild the complete share seal from the exact source of the unified package."""
+    try:
+        require(isinstance(pins, UnifiedShareInput) and native.matches(native.DIGEST, pins.inventory_manifest_sha256))
+        root = package.private_path(pins.inventory_dir, directory=True)
+        source = package.private_path(source)
+        parent = package.private_path(working_parent, directory=True)
+        require(not parent.is_relative_to(root))
+        bot = {"id": legacy_bot_id, "username": pins.legacy_bot_username}
+        manifest_sha = pins.inventory_manifest_sha256
+        counts, files = read_inventory(root, manifest_sha, source_sha, bot)
+        state = inventory._source_state(source)
+        companions = tuple(Path(str(source) + suffix) for suffix in ("-wal", "-shm", "-journal"))
+        require(not any(os.path.lexists(path) for path in companions))
+        with TemporaryDirectory(prefix="unified-share-source-", dir=parent) as temporary:
+            rebuilt = Path(temporary) / "share-inventory"
+            inventory.seal_inventory(source, rebuilt, source_sha, legacy_bot_id, pins.legacy_bot_username)
+            require(read_inventory(rebuilt, manifest_sha, source_sha, bot) == (counts, files))
+            for entry in files.values():
+                with open_inventory_file(root, entry) as supplied, open_inventory_file(rebuilt, entry) as expected:
+                    while block := expected.read(64 * 1024):
+                        require(supplied.read(len(block)) == block)
+                    require(not supplied.read(1))
+        require(inventory._source_state(source) == state and not any(os.path.lexists(path) for path in companions)
+                and read_inventory(root, manifest_sha, source_sha, bot) == (counts, files))
+        domains = {"shares": {"present": counts["present"], "rows": counts["shares"]},
+                   "share_claims": {"present": counts["present"], "rows": counts["claims"]}}
+        proof = {"privateShareInventoryManifestSha256": manifest_sha,
+                 "privateShareRowsSha256": files[inventory.SHARES]["sha256"],
+                 "privateShareClaimRowsSha256": files[inventory.CLAIMS]["sha256"],
+                 "privateSharePayloadsSha256": files[inventory.PAYLOADS]["sha256"],
+                 "legacyShareBotUsernameSha256": native.digest(pins.legacy_bot_username.encode("ascii"))}
+        return VerifiedUnifiedShare(root, counts, files, domains, proof)
+    except (CandidateError, package.PackageError, inventory.InventoryError, converter.ConversionError,
+            native.RehearsalError, OSError, sqlite3.Error, ValueError, TypeError, KeyError, RecursionError, OverflowError):
+        raise CandidateError(ERROR) from None
 
 
 def read_rows(root, entry, max_line):
