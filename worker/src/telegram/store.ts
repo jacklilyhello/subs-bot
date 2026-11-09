@@ -408,7 +408,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
       LEFT JOIN telegram_lifecycle_action AS action ON action.receipt_id = inbox.receipt_id
         AND inbox.receipt_nonce = '${TELEGRAM_LIFECYCLE_MARKER}'
       LEFT JOIN telegram_private_claim AS claim ON claim.receipt_id = inbox.receipt_id
-        AND inbox.receipt_nonce = '${TELEGRAM_PRIVATE_CLAIM_MARKER}'
+        AND inbox.receipt_nonce IN ('${TELEGRAM_PRIVATE_CLAIM_MARKER}','${TELEGRAM_GROUP_CLAIM_MARKER}')
       LEFT JOIN telegram_temp_reply AS temp ON temp.receipt_id = inbox.receipt_id
         AND (inbox.receipt_nonce = '${TELEGRAM_TEMP_MARKER}' OR ${tempRawMarker("inbox")})
       ${includeAggregate ? `LEFT JOIN telegram_aggregate_actions AS aggregate ON aggregate.receipt_id = inbox.receipt_id
