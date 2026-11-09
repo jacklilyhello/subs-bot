@@ -1,5 +1,6 @@
 import { digestHex } from "./storage.ts";
 import { LEGACY_SELECTED_RETIREMENT_PIN } from "./subscriptions.ts";
+import { legacyAllActiveMarkerSql } from "./legacy-all-aggregates.ts";
 
 export const ISOLATION_PUBLIC_ORIGIN = "https://subs-bot-cf-dev-01.lilyya.workers.dev";
 export const SHORT_CODE = /^(?:[A-Za-z0-9_-]{12}|[A-Za-z0-9_-]{22})(?![\s\S])/u;
@@ -81,6 +82,10 @@ export interface ShortLinkNamespaces {
   selectedMarker: boolean;
   selectedMembers: boolean;
   legacyEmpty: boolean;
+  allMarker: boolean;
+  allOrder: boolean;
+  tempInstallations: boolean;
+  tempBatches: boolean;
 }
 
 export async function readShortLinkNamespaces(db: D1Database): Promise<ShortLinkNamespaces> {
@@ -91,15 +96,22 @@ export async function readShortLinkNamespaces(db: D1Database): Promise<ShortLink
       count(CASE WHEN name='subs_bot_schema_migrations' THEN 1 END) AS migrationLedger,
       count(CASE WHEN name='legacy_selected_aggregates' THEN 1 END) AS selectedMarker,
       count(CASE WHEN name='legacy_selected_members' THEN 1 END) AS selectedMembers,
-      count(CASE WHEN name='legacy_empty_subscription_exports' THEN 1 END) AS legacyEmpty
+      count(CASE WHEN name='legacy_empty_subscription_exports' THEN 1 END) AS legacyEmpty,
+      count(CASE WHEN name='legacy_all_aggregates' THEN 1 END) AS allMarker,
+      count(CASE WHEN name='legacy_all_subscription_order' THEN 1 END) AS allOrder,
+      count(CASE WHEN name='legacy_temp_installations' THEN 1 END) AS tempInstallations,
+      count(CASE WHEN name='legacy_temp_batches' THEN 1 END) AS tempBatches
       FROM sqlite_schema WHERE type='table' AND name IN ('normal_short_links','telegram_short_link_actions',
         'legacy_subscription_short_links','subs_bot_schema_migrations','legacy_selected_aggregates',
-        'legacy_selected_members','legacy_empty_subscription_exports')`)
+        'legacy_selected_members','legacy_empty_subscription_exports','legacy_all_aggregates',
+        'legacy_all_subscription_order','legacy_temp_installations','legacy_temp_batches')`)
       .first<Record<keyof ShortLinkNamespaces, number>>();
     if (row && (row.normal === 0 || row.normal === 2)) {
       return { normal: row.normal === 2, legacySubscription: row.legacySubscription === 1,
         migrationLedger: row.migrationLedger === 1, selectedMarker: row.selectedMarker === 1,
-        selectedMembers: row.selectedMembers === 1, legacyEmpty: row.legacyEmpty === 1 };
+        selectedMembers: row.selectedMembers === 1, legacyEmpty: row.legacyEmpty === 1,
+        allMarker: row.allMarker === 1, allOrder: row.allOrder === 1,
+        tempInstallations: row.tempInstallations === 1, tempBatches: row.tempBatches === 1 };
     }
   } catch {
     // Fail closed when namespace state cannot be read.
@@ -122,6 +134,23 @@ export function legacySelectedStatusSql(schema: ShortLinkNamespaces): string {
     THEN 0 WHEN ${ready} THEN 1 ELSE -1 END`;
 }
 
+export function legacyAllStatusSql(schema: ShortLinkNamespaces): string {
+  if (!schema.allMarker) return `CASE WHEN aggregate_links.kind='all' AND EXISTS (SELECT 1 FROM main.sqlite_schema
+    WHERE name IN ('legacy_all_aggregates','legacy_all_subscription_order')) THEN -1 ELSE 0 END`;
+  const ready = schema.allOrder && schema.migrationLedger && schema.normal && schema.legacySubscription
+    && schema.tempInstallations && schema.tempBatches ? legacyAllActiveMarkerSql("aggregate_links") : "0";
+  return `CASE WHEN NOT EXISTS (SELECT 1 FROM legacy_all_aggregates WHERE code_sha256=aggregate_links.code_sha256)
+    THEN 0 WHEN (${ready}) THEN 1 ELSE -1 END`;
+}
+
+export function aggregateNamespace(codeLength: number, selected: number, all: number): "native" | "legacy-selected" | "legacy-all" | null {
+  if (selected === 0 && all === 0) return "native";
+  if (codeLength !== 12) return null;
+  if (selected === 1 && all === 0) return "legacy-selected";
+  if (selected === 0 && all === 1) return "legacy-all";
+  return null;
+}
+
 type ShortRow = {
   kind: "aggregate" | "external" | "legacy-subscription";
   codeLength: number | null;
@@ -131,6 +160,7 @@ type ShortRow = {
   tokenSha256: string | null;
   format: string | null;
   legacySelected: number;
+  legacyAll: number;
 };
 
 /** Even a disabled compatibility namespace reserves its digests. */
@@ -139,23 +169,24 @@ export async function resolveShortLocation(db: D1Database, code: string, serveLe
   const namespaces = await readShortLinkNamespaces(db);
   const digest = await shortCodeDigest(code);
   const legacyEnabled = serveLegacy && code.length === 12 && namespaces.normal && namespaces.legacySubscription && namespaces.migrationLedger;
-  const legacyTarget = legacyEnabled ? `sub.token, link.token_sha256, link.format,0
+  const legacyTarget = legacyEnabled ? `sub.token, link.token_sha256, link.format,0,0
     FROM legacy_subscription_short_links AS link
     LEFT JOIN subscriptions AS sub ON sub.id=link.subscription_id AND sub.owner_id=link.owner_id
       AND link.revoked_at IS NULL AND ${LEGACY_SUBSCRIPTION_SHORT_PIN}
       AND NOT EXISTS (SELECT 1 FROM subscription_trash AS trash WHERE trash.id=sub.id OR trash.token=sub.token)
-    WHERE link.code_sha256=?` : "NULL,NULL,NULL,0 FROM legacy_subscription_short_links AS link WHERE link.code_sha256=?";
+    WHERE link.code_sha256=?` : "NULL,NULL,NULL,0,0 FROM legacy_subscription_short_links AS link WHERE link.code_sha256=?";
   const result = await db.prepare(`SELECT 'aggregate' AS kind,NULL AS codeLength,NULL AS targetUrl,revoked_at AS revokedAt,
-      NULL AS token,NULL AS tokenSha256,NULL AS format,${legacySelectedStatusSql(namespaces)} AS legacySelected
+      NULL AS token,NULL AS tokenSha256,NULL AS format,${legacySelectedStatusSql(namespaces)} AS legacySelected,
+      ${legacyAllStatusSql(namespaces)} AS legacyAll
       FROM aggregate_links WHERE code_sha256=?
-    ${namespaces.normal ? `UNION ALL SELECT 'external',code_length,target_url,revoked_at,NULL,NULL,NULL,0
+    ${namespaces.normal ? `UNION ALL SELECT 'external',code_length,target_url,revoked_at,NULL,NULL,NULL,0,0
       FROM normal_short_links WHERE code_sha256=?` : ""}
     ${namespaces.legacySubscription ? `UNION ALL SELECT 'legacy-subscription',12,NULL,link.revoked_at,${legacyTarget}` : ""}`)
     .bind(digest, ...(namespaces.normal ? [digest] : []), ...(namespaces.legacySubscription ? [digest] : [])).all<ShortRow>();
   if (!result.success) throw new Error("Short link state could not be read.");
   if (result.results.length !== 1 || result.results[0].revokedAt !== null) return null;
   const row = result.results[0];
-  if (row.kind === "aggregate") return row.legacySelected === 0 || (row.legacySelected === 1 && code.length === 12)
+  if (row.kind === "aggregate") return aggregateNamespace(code.length, row.legacySelected, row.legacyAll) !== null
     ? `/agg/${code}/clash` : null;
   if (row.kind === "legacy-subscription") {
     if (!legacyEnabled || row.token === null || !LEGACY_SUBSCRIPTION_TOKEN.test(row.token)

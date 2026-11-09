@@ -7,6 +7,7 @@ import { Miniflare } from "miniflare";
 
 import { getAggregateNodeSource } from "../src/aggregate.ts";
 import worker from "../src/index.ts";
+import { LEGACY_ALL_MIGRATION, LEGACY_ALL_MIGRATION_SHA256 } from "../src/legacy-all-aggregates.ts";
 import { MAX_PATH_RULES } from "../src/path-rules.ts";
 import { createSubscription, MAX_CHUNK_BYTES, publishNodeSnapshot, type ExportNodeSource,
   type SubscriptionMetadata } from "../src/storage.ts";
@@ -33,6 +34,11 @@ before(async () => {
     const bytes = await readFile(new URL(name, migrations));
     await db.batch(bytes.toString("utf8").trim().split(/;\s*/u).filter(Boolean).map((statement) => db.prepare(statement)));
     await recordTempFixtureMigration(db, { name, sha256: createHash("sha256").update(bytes).digest("hex") });
+    if (name === LEGACY_ALL_MIGRATION) {
+      assert.equal(createHash("sha256").update(bytes).digest("hex"), LEGACY_ALL_MIGRATION_SHA256);
+      await db.prepare("INSERT INTO subs_bot_schema_migrations (position,name,sha256,mode) VALUES (40,?,?,'applied')")
+        .bind(LEGACY_ALL_MIGRATION, LEGACY_ALL_MIGRATION_SHA256).run();
+    }
   }
   // The emitted Worker tests cover native response framing.
   class FixedLengthStreamShim extends TransformStream<Uint8Array, Uint8Array> {
@@ -145,6 +151,62 @@ test("a replayable source pins publication and temp values across concurrent cha
   await temp(config, 2);
   assert.deepEqual(await sourceShares(captured), before);
   assert.deepEqual(await encodedShares(code), [share("after-refresh")]);
+});
+
+test("serves only pinned legacy all links with legacy ordering, aliases and empty exports", async () => {
+  const config = policy("98043", "88043");
+  const legacy = "T".repeat(12);
+  const native = "T".repeat(22);
+  const inventory = sha256("synthetic legacy dynamic inventory");
+  await db.prepare("INSERT INTO legacy_temp_installations VALUES (?,?,NULL)").bind(config.botId, inventory).run();
+  await link(legacy, config);
+  await link(native, config);
+  await db.prepare("INSERT INTO legacy_all_aggregates (code_sha256,bot_id,owner_id,inventory_sha256) VALUES (?,?,?,?)")
+    .bind(sha256(legacy), config.botId, config.memberId, inventory).run();
+  const first = await subscription(config.memberId, "First", ["first-ranked"]);
+  const second = await subscription(config.memberId, "Second", ["second-ranked"]);
+  await subscription(config.adminId, "Foreign", ["foreign-rank"]);
+  await db.prepare("INSERT INTO legacy_all_subscription_order (subscription_id,owner_id,anchor,tie) VALUES (?,?,?,1)")
+    .bind(first.id, config.memberId, second.id).run();
+  for (const path of [`/agg/${legacy}/base64`, `/s/${legacy}`]) assert.equal((await request(path)).status, 404);
+  assert.equal((await request(`/agg/${legacy}/unknown-format`)).status, 406);
+  assert.deepEqual(await encodedShares(native), ["first-ranked", "second-ranked"].map(share));
+
+  await db.prepare("UPDATE legacy_temp_installations SET cutover_epoch=unixepoch()-1 WHERE bot_id=?").bind(config.botId).run();
+  assert.deepEqual(await encodedShares(legacy, "MIXED"), ["second-ranked", "first-ranked"].map(share));
+  const clash = await request(`/agg/${legacy}/unknown-format`);
+  assert.equal(clash.status, 200);
+  assert.equal(clash.headers.get("Content-Type"), "text/yaml; charset=utf-8");
+  assert.match(await clash.text(), /"name":"second-ranked"[^\n]+\n  - \{"name":"first-ranked"/u);
+  const short = await request(`/s/${legacy}`, "HEAD");
+  assert.equal(short.status, 302);
+  assert.equal(short.headers.get("Location"), `/agg/${legacy}/clash`);
+  assert.equal(await short.text(), "");
+  assert.equal((await request(`/agg/${legacy}`)).status, 404);
+
+  await db.prepare("INSERT INTO normal_short_links (code_sha256,code_length,bot_id,owner_id,target_url) VALUES (?,12,?,?,?)")
+    .bind(sha256(legacy), config.botId, config.memberId, "https://example.org/ambiguous").run();
+  for (const path of [`/agg/${legacy}/base64`, `/s/${legacy}`]) assert.equal((await request(path)).status, 404);
+  await db.prepare("DELETE FROM normal_short_links WHERE code_sha256=?").bind(sha256(legacy)).run();
+  await db.prepare("UPDATE legacy_all_aggregates SET inventory_sha256=? WHERE code_sha256=?")
+    .bind("a".repeat(64), sha256(legacy)).run();
+  for (const path of [`/agg/${legacy}/base64`, `/s/${legacy}`]) assert.equal((await request(path)).status, 404);
+  await db.prepare("UPDATE legacy_all_aggregates SET inventory_sha256=? WHERE code_sha256=?").bind(inventory, sha256(legacy)).run();
+
+  await db.prepare("UPDATE legacy_all_subscription_order SET owner_id=? WHERE subscription_id=?").bind(config.adminId, first.id).run();
+  assert.equal((await request(`/agg/${legacy}/base64`)).status, 503);
+  assert.deepEqual(await encodedShares(native), ["first-ranked", "second-ranked"].map(share));
+  await db.prepare("UPDATE legacy_all_subscription_order SET owner_id=? WHERE subscription_id=?").bind(config.memberId, first.id).run();
+  for (const row of [first, second]) {
+    assert.equal(await trashOwnedSubscription(db, { id: row.id, ownerId: row.ownerId, expectedLifecycleRevision: 0 }), true);
+  }
+  for (const method of ["GET", "HEAD"]) {
+    const empty = await request(`/agg/${legacy}/v2ray`, method);
+    assert.equal(empty.status, 200);
+    assert.equal(empty.headers.get("Content-Type"), "text/plain; charset=utf-8");
+    assert.equal(await empty.text(), "");
+  }
+  assert.equal((await request(`/agg/${native}/base64`)).status, 404);
 });
 
 test("maps only owned subscription nodes and pins rules across selected and all replays", async () => {

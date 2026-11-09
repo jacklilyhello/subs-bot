@@ -1,3 +1,4 @@
+import { readShortLinkNamespaces } from "../short-links.ts";
 import { inTelegramScope, type TelegramCommand, type TelegramPolicy } from "./protocol.ts";
 import {
   insertTelegramViewTickets, TELEGRAM_VIEW_MARKER, type TelegramView, type TelegramViewTicket,
@@ -575,9 +576,9 @@ export async function closeUnsentTelegramGroupClaim(db: D1Database, policy: Tele
 
 export async function beginTelegramAggregateLinkReply(db: D1Database, policy: TelegramPolicy, lease: TelegramReplyLease): Promise<boolean> {
   if (!inTelegramScope(policy, lease) || lease.chatType !== "private" || lease.threadId !== null || !lease.aggregate) return false;
-  const mode = await readTempStorage(db).catch(() => null);
-  if (mode === null) return false;
-  const guard = aggregateLinkDeliveryGuard(policy, lease.aggregate, mode);
+  const [mode, schema] = await Promise.all([readTempStorage(db).catch(() => null), readShortLinkNamespaces(db).catch(() => null)]);
+  if (mode === null || schema === null) return false;
+  const guard = aggregateLinkDeliveryGuard(policy, lease.aggregate, mode, schema.allMarker);
   return guard !== null && await beginReplyStatement(db, policy, lease, "allowed", guard).first() !== null;
 }
 

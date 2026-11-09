@@ -1,6 +1,6 @@
 import { MAX_AGGREGATE_MEMBERS } from "../aggregate.ts";
 import { MAX_PATH_RULES } from "../path-rules.ts";
-import { ISOLATION_PUBLIC_ORIGIN } from "../short-links.ts";
+import { ISOLATION_PUBLIC_ORIGIN, readShortLinkNamespaces } from "../short-links.ts";
 import { digestHex, MAX_SNAPSHOT_NODES, validInteger } from "../storage.ts";
 import { inTelegramScope, type TelegramAggregateUpdate, type TelegramPolicy } from "./protocol.ts";
 import {
@@ -18,6 +18,7 @@ const NONCE = /^[A-Za-z0-9_-]{22}(?![\s\S])/u;
 const KEY = /^[A-Za-z0-9_-]{43}(?![\s\S])/u;
 const DIGEST = /^[a-f0-9]{64}(?![\s\S])/u;
 const fresh = "inbox.bot_id = ? AND inbox.update_id = ? AND inbox.receipt_nonce = ?";
+const noAllMarkerTable = "NOT EXISTS (SELECT 1 FROM main.sqlite_schema WHERE name='legacy_all_aggregates')";
 
 export type TelegramAggregateResult = "issued" | "ready" | "empty" | "limit" | "revoked" | "already-revoked" | "stale";
 export interface TelegramAggregateReply {
@@ -55,18 +56,27 @@ async function codeDigest(code: string): Promise<string> {
   return digestHex(await crypto.subtle.digest("SHA-256", ENCODER.encode(code)));
 }
 
+function unmarkedLink(allMarker: boolean): string {
+  return allMarker ? "NOT EXISTS (SELECT 1 FROM legacy_all_aggregates WHERE code_sha256=link.code_sha256)" : noAllMarkerTable;
+}
+
 export async function acceptTelegramAggregate(
   db: D1Database,
   policy: TelegramPolicy,
   event: TelegramAggregateUpdate,
   key: CryptoKey,
+  markerTable?: boolean,
 ): Promise<"accepted" | "ignored"> {
   if (event.chatType !== "private" || event.threadId !== null || !inTelegramScope(policy, event) ||
       !validInteger(event.updateId, 1) || !validInteger(event.messageId, 1) || !validInteger(event.messageDate, 1) ||
       (event.kind !== "show" && event.kind !== "revoke")) return "ignored";
   try {
     const show = event.kind === "show";
-    const tempMode = show ? await readTempStorage(db) : "live-only";
+    const [tempMode, allMarker] = await Promise.all([
+      show ? readTempStorage(db) : "live-only" as const,
+      markerTable ?? readShortLinkNamespaces(db).then((schema) => schema.allMarker),
+    ]);
+    const nativeLink = unmarkedLink(allMarker);
     const tempCutover = show ? `OR NOT (${tempSchemaGuard(tempMode)})
       OR NOT (${tempCutoverAllows(tempMode, "scoped.bot_id", "scoped.message_date")})` : "";
     const nonce = show ? base64Url(crypto.getRandomValues(new Uint8Array(16))) : null;
@@ -89,7 +99,7 @@ export async function acceptTelegramAggregate(
             CASE WHEN inbox.actor_id = ? THEN 0 ELSE COALESCE(auth.message_id, 0) END AS auth_id
           FROM telegram_inbox AS inbox LEFT JOIN telegram_aggregate_slots AS slot USING (bot_id, actor_id)
           LEFT JOIN aggregate_links AS link ON link.code_sha256 = slot.code_sha256 AND link.owner_id = inbox.actor_id
-            AND link.bot_id = inbox.bot_id AND link.kind = 'all' AND link.revoked_at IS NULL
+            AND link.bot_id = inbox.bot_id AND link.kind = 'all' AND link.revoked_at IS NULL AND (${nativeLink})
           LEFT JOIN telegram_auth AS auth ON auth.bot_id = inbox.bot_id AND auth.user_id = inbox.actor_id
           WHERE ${fresh}
         ), snapshots AS (
@@ -109,7 +119,8 @@ export async function acceptTelegramAggregate(
             WHEN message_date <= unixepoch() - ${MAX_COMMAND_AGE_SECONDS}
               OR message_date > unixepoch() + ${FUTURE_SKEW_SECONDS}
               OR (message_date, message_id) <= (last_date, last_id)
-              OR (actor_id <> ? AND auth_date >= message_date) ${tempCutover} THEN 'stale'
+              OR (actor_id <> ? AND auth_date >= message_date) ${tempCutover}
+              ${allMarker ? "" : `OR NOT (${noAllMarkerTable})`} THEN 'stale'
             WHEN ? = 'revoke' THEN CASE WHEN current_hash IS NULL THEN 'already-revoked' ELSE 'revoked' END
             WHEN snapshots.members > ${MAX_AGGREGATE_MEMBERS} OR temp_totals.nodes > ${MAX_TEMP_OWNER_NODES}
               OR temp_totals.bytes > ${MAX_TEMP_OWNER_BYTES} OR snapshots.nodes + temp_totals.nodes > ${MAX_SNAPSHOT_NODES}
@@ -138,6 +149,7 @@ export async function acceptTelegramAggregate(
         FROM telegram_inbox AS inbox JOIN telegram_aggregate_actions AS action USING (receipt_id)
         WHERE ${fresh} AND action.result = 'revoked' AND link.code_sha256 = action.code_sha256
           AND link.owner_id = inbox.actor_id AND link.bot_id = inbox.bot_id AND link.kind = 'all' AND link.revoked_at IS NULL
+          AND (${nativeLink})
       `).bind(...receipt),
       db.prepare(`
         INSERT INTO telegram_aggregate_slots (bot_id, actor_id, revision, code_sha256, nonce, key_version, message_date, message_id)
@@ -161,7 +173,7 @@ export async function acceptTelegramAggregate(
           SELECT 1 FROM telegram_aggregate_actions AS action JOIN telegram_outbox USING (receipt_id)
           LEFT JOIN telegram_aggregate_slots AS slot ON slot.bot_id = inbox.bot_id AND slot.actor_id = inbox.actor_id
           LEFT JOIN aggregate_links AS link ON link.code_sha256 = action.code_sha256 AND link.owner_id = inbox.actor_id
-            AND link.bot_id = inbox.bot_id AND link.kind = 'all'
+            AND link.bot_id = inbox.bot_id AND link.kind = 'all' AND (${nativeLink})
           WHERE action.receipt_id = inbox.receipt_id AND CASE action.result
             WHEN 'issued' THEN slot.revision = action.revision AND slot.code_sha256 = link.code_sha256 AND link.revoked_at IS NULL
             WHEN 'ready' THEN slot.revision = action.revision AND slot.code_sha256 = link.code_sha256 AND link.revoked_at IS NULL
@@ -182,7 +194,9 @@ export async function acceptTelegramAggregate(
   throw new Error("Telegram aggregate receipt could not be confirmed.");
 }
 
-export function aggregateLinkDeliveryGuard(policy: TelegramPolicy, reply: TelegramAggregateReply, mode: TempStorageMode): AggregateGuard | null {
+export function aggregateLinkDeliveryGuard(
+  policy: TelegramPolicy, reply: TelegramAggregateReply, mode: TempStorageMode, allMarker: boolean,
+): AggregateGuard | null {
   if ((reply.result !== "ready" && reply.result !== "issued") || !validInteger(reply.revision, 1) ||
       reply.codeSha256 === null || !DIGEST.test(reply.codeSha256)) return null;
   return {
@@ -193,7 +207,7 @@ export function aggregateLinkDeliveryGuard(policy: TelegramPolicy, reply: Telegr
         SELECT 1 FROM telegram_aggregate_actions AS aggregate
         JOIN telegram_aggregate_slots AS slot ON slot.bot_id = inbox.bot_id AND slot.actor_id = inbox.actor_id
         JOIN aggregate_links AS link ON link.code_sha256 = slot.code_sha256 AND link.owner_id = inbox.actor_id
-          AND link.bot_id = inbox.bot_id AND link.kind = 'all' AND link.revoked_at IS NULL
+          AND link.bot_id = inbox.bot_id AND link.kind = 'all' AND link.revoked_at IS NULL AND (${unmarkedLink(allMarker)})
         WHERE aggregate.receipt_id = inbox.receipt_id AND aggregate.result IN ('issued', 'ready')
           AND aggregate.revision = ? AND aggregate.code_sha256 = ?
           AND slot.revision = aggregate.revision AND slot.code_sha256 = aggregate.code_sha256 AND slot.key_version = ${KEY_VERSION}
@@ -215,9 +229,9 @@ export async function resolveTelegramAggregateCode(
 ): Promise<string | null> {
   if (!key || (scope.aggregate.result !== "ready" && scope.aggregate.result !== "issued")) return null;
   try {
-    const mode = await readTempStorage(db).catch(() => null);
-    if (mode === null) return null;
-    const guard = aggregateLinkDeliveryGuard(policy, scope.aggregate, mode);
+    const [mode, schema] = await Promise.all([readTempStorage(db).catch(() => null), readShortLinkNamespaces(db).catch(() => null)]);
+    if (mode === null || schema === null) return null;
+    const guard = aggregateLinkDeliveryGuard(policy, scope.aggregate, mode, schema.allMarker);
     if (!guard) return null;
     const nonce = await db.prepare(`SELECT slot.nonce FROM telegram_inbox AS inbox
       JOIN telegram_aggregate_slots AS slot ON slot.bot_id = inbox.bot_id AND slot.actor_id = inbox.actor_id

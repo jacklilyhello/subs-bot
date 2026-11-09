@@ -283,7 +283,7 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
       if (outcome === "accepted") drain();
     } else if (decoded.aggregate) {
       if (!aggregateKey) return new Response(null, { status: 204, headers: HEADERS });
-      if (await acceptTelegramAggregate(env.DB, policy, decoded.aggregate, aggregateKey) === "accepted") drain();
+      if (await acceptTelegramAggregate(env.DB, policy, decoded.aggregate, aggregateKey, shortLinkNamespaces.allMarker) === "accepted") drain();
     } else if (decoded.path) {
       const outcome = await acceptTelegramPath(env.DB, policy, decoded.path);
       if (outcome === "accepted") {
@@ -426,15 +426,15 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
   const requestedFormat = kind.toLowerCase();
   const knownFormat = EXPORT_KINDS.has(requestedFormat);
   if (!knownFormat && (!aggregate || token.length !== 12)) return plain("Export format unavailable.", 406, head);
-  let legacySelected = false;
+  let legacyAggregate = false;
 
   try {
     const aggregateSource = aggregate ? await getAggregateNodeSource(env.DB, env.NODES, token, !knownFormat) : null;
-    legacySelected = aggregateSource?.legacySelected === true;
-    if (!knownFormat && !legacySelected) return plain("Export format unavailable.", 406, head);
+    legacyAggregate = aggregateSource?.legacyAggregate === true;
+    if (!knownFormat && !legacyAggregate) return plain("Export format unavailable.", 406, head);
     const format = knownFormat ? requestedFormat : "clash";
     let source = aggregate ? aggregateSource : await getSubscriptionNodeSource(env.DB, env.NODES, token);
-    if (legacySelected && source?.nodeCount === 0) return legacyEmptyExportResponse(format, head, HEADERS, true);
+    if (legacyAggregate && source?.nodeCount === 0) return legacyEmptyExportResponse(format, head, HEADERS, true);
     if (subscription && !source) {
       const state = await legacyEmptyExportState(env.DB, token);
       if (state === "empty") return legacyEmptyExportResponse(format, head, HEADERS);
@@ -444,7 +444,7 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
     if (!source) return plain("Not found.", 404, head);
     const exportHeaders = (media: string, bytes: number) => {
       const headers: Record<string, string> = { ...HEADERS, "Content-Type": media };
-      if (legacySelected && head && bytes > 0) headers["Content-Length"] = String(bytes);
+      if (legacyAggregate && head && bytes > 0) headers["Content-Length"] = String(bytes);
       return headers;
     };
     if (format === "clash") {
@@ -458,7 +458,7 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
       const plan = await planSingBox(source);
       return new Response(
         head ? null : fixedLengthBody((signal) => singBoxChunks(source, plan, signal), plan.bytes),
-        { headers: exportHeaders(legacySelected ? "application/json; charset=utf-8" : "application/json", plan.bytes) },
+        { headers: exportHeaders(legacyAggregate ? "application/json; charset=utf-8" : "application/json", plan.bytes) },
       );
     }
     if (format === "surge" || QX_KINDS.has(format)) {
@@ -473,7 +473,7 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
     const body = head ? null : fixedLengthBody((signal) => base64Chunks(source, signal), length);
     return new Response(body, { headers: exportHeaders("text/plain; charset=utf-8", length) });
   } catch (error) {
-    if (!knownFormat && !legacySelected) return plain("Export format unavailable.", 406, head);
+    if (!knownFormat && !legacyAggregate) return plain("Export format unavailable.", 406, head);
     if (error instanceof AggregateLimitError || error instanceof ExportContentError || error instanceof SingBoxContentError
         || error instanceof ClashContentError || error instanceof TextExportError || error instanceof PathRuleContentError) {
       return plain("Subscription content cannot be exported.", 422, head);

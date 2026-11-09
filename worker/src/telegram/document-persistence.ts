@@ -9,6 +9,7 @@ import {
 import { prepareTelegramProviderDocumentMarker, prepareTelegramProviderDocumentPlan,
   type TelegramProviderDocumentSources } from "./provider-document.ts";
 import type { TelegramPolicy } from "./protocol.ts";
+import { prepareLegacyAllAppend } from "../legacy-all-aggregates.ts";
 
 export const MAX_TELEGRAM_DOCUMENT_NODES = 500;
 const UPLOADED_SOURCE = "uploaded://telegram-document";
@@ -176,7 +177,12 @@ export async function persistTelegramDocumentJob(
     const pointer = "EXISTS (SELECT 1 FROM subscriptions WHERE id = ? AND owner_id = ? AND snapshot_id = ?)";
     const pointerKey = [reservation.id, lease.actorId, snapshotId] as const;
     const saved = "EXISTS (SELECT 1 FROM telegram_document_jobs WHERE receipt_id = ? AND state = 'done' AND result_code = 'saved')";
+    const order = reservation.newToken === null ? null : await prepareLegacyAllAppend(db, reservation.id, lease.actorId, {
+      sql: `${pointer} AND ${saved}`, bindings: [...pointerKey, lease.receiptId],
+    }, { newShellTokens: plan?.newShellTokens, durableCommitGuard: true });
+    const beforePlan = order?.beforeShells ? [order.beforeShells] : [];
     const steps = [
+      ...beforePlan,
       ...(plan?.steps ?? []),
       preparePublication(db, policy, lease, reservation, staged, nameSha256, plan?.exists),
       prepareTelegramDocumentJobSettlement(db, policy, lease, { kind: "saved" }, true),
@@ -198,11 +204,12 @@ export async function persistTelegramDocumentJob(
         .bind(snapshotId, ...pointerKey),
       db.prepare(`DELETE FROM telegram_document_reservations WHERE receipt_id = ? AND ${pointer}`)
         .bind(lease.receiptId, ...pointerKey),
+      ...(order ? [order.assert, ...(order.append ? [order.append] : []), ...(order.verify ? [order.verify] : [])] : []),
     ];
     const results = await db.batch(steps);
     verifyBatch(results, steps.length);
-    if (results[(plan?.steps.length ?? 0) + 1].results.length === 1) return "saved";
-    if (plan && results[0].meta.changes === 0) {
+    if (results[beforePlan.length + (plan?.steps.length ?? 0) + 1].results.length === 1) return "saved";
+    if (plan && results[beforePlan.length].meta.changes === 0) {
       await finishTelegramDocumentJob(db, policy, lease, { kind: "failed", reason: "coalesced" });
       return "stale";
     }

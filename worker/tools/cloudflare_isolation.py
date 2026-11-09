@@ -78,6 +78,13 @@ LEGACY_TEMP_READ_MARKER = b"subs-bot:legacy-temp-read:v1"
 LEGACY_TEMP_MUTATE_MARKER = b"subs-bot:legacy-temp-mutate:v1"
 LEGACY_TEMP_INSTALL_TABLE_SHA256 = "8cf3847e5df08a64261e82fbb972d9cde57be94143b35ca1de7c0f8dbbf0856f"
 LEGACY_TEMP_BATCH_TABLE_SHA256 = "2cc851299d68628cb46fe2d927adf027b551d010ac17e1bd42f8746273e59eca"
+LEGACY_DYNAMIC_ALL_MIGRATION = "0040_legacy_all_aggregates.sql"
+LEGACY_DYNAMIC_ALL_MIGRATION_SHA256 = "55a3de863e8b05eff6a25c52f5fe1b2e8be8f246f6b2e23348b6ef2a4456e3ed"
+LEGACY_DYNAMIC_ALL_READ_MARKER = b"subs-bot:legacy-dynamic-all-read:v1"
+LEGACY_DYNAMIC_ALL_ORDER_MARKER = b"subs-bot:legacy-dynamic-all-order:v1"
+LEGACY_DYNAMIC_ALL_TABLE_SHA256 = "283a9dca5ffe1b9e68a12aa3038fd7cd52c39d06a050aff5b2b8be6b085105ff"
+LEGACY_DYNAMIC_ALL_INDEX_SHA256 = "3660ac17b67cb885524869ae0b7a2b7fcd9c678b370b334fbaea29ba9acc43ce"
+LEGACY_DYNAMIC_ALL_ORDER_TABLE_SHA256 = "6198ba160f56bd64c98b962b7f972b43d4dcdd60df2193f5796da79e4a230087"
 AGGREGATE_KEY_BINDING = "TELEGRAM_AGGREGATE_KEY"
 AGGREGATE_DIGEST_BINDING = "TELEGRAM_AGGREGATE_KEY_SHA256"
 PRIVATE_SHARE_KEY_BINDING = "TELEGRAM_PRIVATE_SHARE_CREATION_KEY"
@@ -731,6 +738,64 @@ class _Isolation:
         _require(allow_rows or (state["installations"], state["batches"]) == (0, 0),
                  "Keep a Worker with verified legacy temporary-node reads and mutations while isolated baseline rows exist.")
 
+    def verify_legacy_dynamic_all_floor(self, *, allow_rows, require_schema):
+        path = f"{self.account}/d1/database/{self.target['d1Id']}/query"
+        error = "The isolated legacy dynamic aggregate schema or ledger could not be verified."
+
+        def read(sql, names):
+            result = self.data_api("POST", path, {"sql": sql})
+            _require(isinstance(result, list) and len(result) == 1 and result[0].get("success") is True, error)
+            rows = result[0].get("results")
+            _require(isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict)
+                     and set(rows[0]) == set(names), error)
+            return rows[0]
+
+        try:
+            schema = read("""SELECT
+                count(CASE WHEN name IN ('legacy_all_aggregates','legacy_all_subscription_order') THEN 1 END) AS dynamicAllTables,
+                count(CASE WHEN name='legacy_all_aggregates_owner' THEN 1 END) AS ownerIndexObjects,
+                count(CASE WHEN name='subs_bot_schema_migrations' THEN 1 END) AS ledgerObjects,
+                count(CASE WHEN name='subs_bot_schema_migrations' AND type='table' THEN 1 END) AS ledger
+                FROM sqlite_schema""", ("dynamicAllTables", "ownerIndexObjects", "ledgerObjects", "ledger"))
+            _require(all(type(schema[key]) is int for key in schema) and schema["ledger"] in (0, 1)
+                     and schema["ledgerObjects"] == schema["ledger"], error)
+            if schema["dynamicAllTables"] == 0:
+                _require(not require_schema and schema["ownerIndexObjects"] == 0, error)
+                if schema["ledger"]:
+                    pin = read(f"""SELECT EXISTS (SELECT 1 FROM subs_bot_schema_migrations
+                        WHERE position=40 OR name='{LEGACY_DYNAMIC_ALL_MIGRATION}') AS dynamicAllRegistered""", ("dynamicAllRegistered",))
+                    _require(type(pin["dynamicAllRegistered"]) is int and pin["dynamicAllRegistered"] == 0, error)
+                return
+            _require(schema["dynamicAllTables"] == 2 and schema["ownerIndexObjects"] == 1 and schema["ledger"] == 1, error)
+            state = read(f"""SELECT
+                (SELECT sql FROM sqlite_schema WHERE type='table' AND name='legacy_all_aggregates'
+                    AND tbl_name='legacy_all_aggregates') AS dynamicAllMarkerSql,
+                (SELECT sql FROM sqlite_schema WHERE type='table' AND name='legacy_all_subscription_order'
+                    AND tbl_name='legacy_all_subscription_order') AS orderSql,
+                (SELECT sql FROM sqlite_schema WHERE type='index' AND name='legacy_all_aggregates_owner'
+                    AND tbl_name='legacy_all_aggregates') AS ownerIndexSql,
+                (SELECT count(*) FROM sqlite_schema WHERE tbl_name IN ('legacy_all_aggregates','legacy_all_subscription_order')) AS objects,
+                (SELECT count(*) FROM sqlite_schema WHERE type='index' AND sql IS NULL AND (
+                    (tbl_name='legacy_all_aggregates' AND name='sqlite_autoindex_legacy_all_aggregates_1') OR
+                    (tbl_name='legacy_all_subscription_order' AND name='sqlite_autoindex_legacy_all_subscription_order_1'))) AS autoIndexes,
+                (SELECT count(*) FROM subs_bot_schema_migrations WHERE position=40 OR name='{LEGACY_DYNAMIC_ALL_MIGRATION}') AS pins,
+                EXISTS (SELECT 1 FROM subs_bot_schema_migrations WHERE position=40 AND name='{LEGACY_DYNAMIC_ALL_MIGRATION}'
+                    AND sha256='{LEGACY_DYNAMIC_ALL_MIGRATION_SHA256}' AND mode='applied') AS pinned,
+                EXISTS (SELECT 1 FROM legacy_all_aggregates) AS markers,
+                EXISTS (SELECT 1 FROM legacy_all_subscription_order) AS orderRows""",
+                ("dynamicAllMarkerSql", "orderSql", "ownerIndexSql", "objects", "autoIndexes", "pins", "pinned", "markers", "orderRows"))
+            _require(all(type(state[key]) is int and state[key] == expected for key, expected in
+                         (("objects", 5), ("autoIndexes", 2), ("pins", 1), ("pinned", 1)))
+                     and all(type(state[key]) is int and state[key] in (0, 1) for key in ("markers", "orderRows"))
+                     and all(isinstance(state[key], str) and sha256(state[key].encode("utf-8")).hexdigest() == expected
+                             for key, expected in (("dynamicAllMarkerSql", LEGACY_DYNAMIC_ALL_TABLE_SHA256),
+                                                   ("orderSql", LEGACY_DYNAMIC_ALL_ORDER_TABLE_SHA256),
+                                                   ("ownerIndexSql", LEGACY_DYNAMIC_ALL_INDEX_SHA256))), error)
+        except (CloudflareError, AttributeError, TypeError, ValueError):
+            raise CloudflareError(error) from None
+        _require(allow_rows or (state["markers"], state["orderRows"]) == (0, 0),
+                 "Keep a Worker with verified legacy dynamic aggregate reads and ordering while isolated dynamic aggregate rows exist.")
+
     def active(self):
         result = _object(self.worker_api("GET", self.deployments), "deployments").get("deployments")
         _require(isinstance(result, list) and result, "Isolated Worker has no verified active deployment.")
@@ -745,7 +810,7 @@ class _Isolation:
         annotations = _object(active.get("annotations") or {}, "deployment annotations")
         return _Deployment(active["id"], allocation["version_id"], annotations.get("workers/message"))
 
-    def version(self, version_id, *, with_legacy_selected=False, with_legacy_temp=False):
+    def version(self, version_id, *, with_legacy_selected=False, with_legacy_temp=False, with_legacy_dynamic_all=False):
         _require(_matches(UUID, version_id), "Invalid isolated Worker version ID.")
         version = _object(self.worker_api("GET", f"{self.versions}/{version_id}?include=modules"), "Worker version")
         _require(version.get("id") == version_id and version.get("main_module") == "index.js"
@@ -929,12 +994,12 @@ class _Isolation:
                         provider_batch is not None, batch_capable, api_status_binding, api_status is not None,
                         provider_documents is not None, documents_capable, mixed_documents is not None, mixed_documents_capable,
                         group_share_cards is not None, group_share_cards_capable)
-        if with_legacy_temp:
-            temp_capable = _legacy_temp_module_capable(body)
-            if with_legacy_selected:
-                return value, _legacy_selected_module_capable(body), temp_capable
-            return value, temp_capable
-        return (value, _legacy_selected_module_capable(body)) if with_legacy_selected else value
+        capabilities = tuple(check(body) for requested, check in (
+            (with_legacy_selected, _legacy_selected_module_capable),
+            (with_legacy_temp, _legacy_temp_module_capable),
+            (with_legacy_dynamic_all, _legacy_dynamic_all_module_capable),
+        ) if requested)
+        return (value, *capabilities) if capabilities else value
 
     def verify_candidate(self, candidate, desired):
         # A version can be visible in its creation response or listing before its module is readable.
@@ -1054,12 +1119,15 @@ class _Isolation:
         raise CloudflareError("Isolated Worker upload could not be confirmed.", uncertain=True)
 
     def activate(self, previous, version_id, message, *, current_capable, target_capable, guard,
-                 current_temp_capable=False, target_temp_capable=False):
+                 current_temp_capable=False, target_temp_capable=False,
+                 current_dynamic_all_capable=False, target_dynamic_all_capable=False):
         # All tracked application deployment writes use this boundary, including rollback.
         self.verify_legacy_selected_floor(allow_rows=current_capable and target_capable,
                                           require_schema=current_capable or target_capable)
         self.verify_legacy_temp_floor(allow_rows=current_temp_capable and target_temp_capable,
                                       require_schema=current_temp_capable or target_temp_capable)
+        self.verify_legacy_dynamic_all_floor(allow_rows=current_dynamic_all_capable and target_dynamic_all_capable,
+                                             require_schema=current_dynamic_all_capable or target_dynamic_all_capable)
         _require(self.active() == previous, "Active isolated Worker deployment changed before activation.")
         _guard_current(guard)
         try:
@@ -1175,6 +1243,27 @@ def _legacy_temp_artifact_capable(module, manifest):
 
 def legacy_temp_artifact(bundle_dir, manifest):
     return _legacy_temp_artifact_capable(_verified_module(bundle_dir, manifest.get("bundleSha256")), manifest)
+
+
+def _legacy_dynamic_all_module_capable(module):
+    return LEGACY_DYNAMIC_ALL_READ_MARKER in module and LEGACY_DYNAMIC_ALL_ORDER_MARKER in module
+
+
+def _legacy_dynamic_all_artifact_capable(module, manifest):
+    migrations = manifest.get("migrations")
+    has_marker = LEGACY_DYNAMIC_ALL_READ_MARKER in module or LEGACY_DYNAMIC_ALL_ORDER_MARKER in module
+    capable = _legacy_dynamic_all_module_capable(module)
+    _require(isinstance(migrations, list) and (not has_marker or capable),
+             "The verified Worker lacks complete legacy dynamic aggregate capability.")
+    if len(migrations) >= 40 or has_marker:
+        _require(len(migrations) >= 40 and migrations[39] == {
+            "name": LEGACY_DYNAMIC_ALL_MIGRATION, "sha256": LEGACY_DYNAMIC_ALL_MIGRATION_SHA256,
+        }, "The verified Worker artifact does not pin the exact legacy dynamic aggregate migration.")
+    return capable
+
+
+def legacy_dynamic_all_artifact(bundle_dir, manifest):
+    return _legacy_dynamic_all_artifact_capable(_verified_module(bundle_dir, manifest.get("bundleSha256")), manifest)
 
 
 def _artifact(bundle_dir, manifest, telegram_config, aggregate_key=None, private_share_key=None, provider_binding=None):
@@ -1474,15 +1563,15 @@ def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECI
                          provider_refresh=None, legacy_subscription_shorts=None, provider_batch=None,
                          api_status=None, api_status_gate=_UNSPECIFIED_API_STATUS_GATE, provider_url_documents=None,
                          mixed_documents=None, group_share_cards=None, group_share_cards_capable=None,
-                         legacy_selected_capable=None, legacy_temp_capable=None):
+                         legacy_selected_capable=None, legacy_temp_capable=None, legacy_dynamic_all_capable=None):
     """Read ownership, privacy and active binding facts before any release writes."""
     scope = _Isolation(worker_api, data_api, target)
     scope.worker_config()
     had_cron = scope.cron_enabled()
     scope.verify_resources()
     active = scope.active()
-    version, active_selected_capable, active_temp_capable = scope.version(
-        active.version, with_legacy_selected=True, with_legacy_temp=True)
+    version, active_selected_capable, active_temp_capable, active_dynamic_all_capable = scope.version(
+        active.version, with_legacy_selected=True, with_legacy_temp=True, with_legacy_dynamic_all=True)
     if legacy_selected_capable is not None:
         _require(type(legacy_selected_capable) is bool, "The verified legacy selected release capability is invalid.")
         # A first capable release may still be about to apply 0038.
@@ -1492,6 +1581,10 @@ def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECI
         _require(type(legacy_temp_capable) is bool, "The verified legacy temporary-node release capability is invalid.")
         scope.verify_legacy_temp_floor(allow_rows=active_temp_capable and legacy_temp_capable,
                                        require_schema=active_temp_capable)
+    if legacy_dynamic_all_capable is not None:
+        _require(type(legacy_dynamic_all_capable) is bool, "The verified legacy dynamic aggregate release capability is invalid.")
+        scope.verify_legacy_dynamic_all_floor(allow_rows=active_dynamic_all_capable and legacy_dynamic_all_capable,
+                                             require_schema=active_dynamic_all_capable)
     # Read-only fixtures can inspect the live binding without the secret.
     desired_digest = None
     if telegram_config is not _UNSPECIFIED_TELEGRAM_CONFIG:
@@ -1596,13 +1689,14 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
     module, desired = _artifact(bundle_dir, manifest, telegram_config, aggregate_key, private_share_key, provider_binding)
     desired_selected_capable = _legacy_selected_artifact_capable(module, manifest)
     desired_temp_capable = _legacy_temp_artifact_capable(module, manifest)
+    desired_dynamic_all_capable = _legacy_dynamic_all_artifact_capable(module, manifest)
     scope = _Isolation(worker_api, data_api, target)
     config = scope.worker_config()
     had_cron = scope.cron_enabled()
     scope.verify_resources()
     previous = scope.active()
-    old_version, old_selected_capable, old_temp_capable = scope.version(
-        previous.version, with_legacy_selected=True, with_legacy_temp=True)
+    old_version, old_selected_capable, old_temp_capable, old_dynamic_all_capable = scope.version(
+        previous.version, with_legacy_selected=True, with_legacy_temp=True, with_legacy_dynamic_all=True)
     _require(expected_active is None or expected_active == {
         "deploymentId": previous.id, "versionId": previous.version, "revision": old_version.revision,
     }, "Isolated Worker deployment changed while verifying D1.")
@@ -1610,6 +1704,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                                       require_schema=old_selected_capable or desired_selected_capable)
     scope.verify_legacy_temp_floor(allow_rows=old_temp_capable and desired_temp_capable,
                                    require_schema=old_temp_capable or desired_temp_capable)
+    scope.verify_legacy_dynamic_all_floor(allow_rows=old_dynamic_all_capable and desired_dynamic_all_capable,
+                                         require_schema=old_dynamic_all_capable or desired_dynamic_all_capable)
     _require(old_version.compatibility == desired.compatibility, "Worker compatibility date change requires separate approval.")
     _require_telegram_config_continuity(old_version, desired.telegram_config_sha256)
     _require(telegram_config is not None or (not had_cron and old_version.telegram_config_sha256 is None),
@@ -1712,6 +1808,7 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                 desired.telegram_group_share_cards, desired.telegram_group_share_cards_capable):
             scope.verify_legacy_selected_floor(allow_rows=old_selected_capable, require_schema=old_selected_capable)
             scope.verify_legacy_temp_floor(allow_rows=old_temp_capable, require_schema=old_temp_capable)
+            scope.verify_legacy_dynamic_all_floor(allow_rows=old_dynamic_all_capable, require_schema=old_dynamic_all_capable)
             if telegram_config is None:
                 _require(scope.active() == previous, "Active isolated Worker deployment changed during verification.")
                 _guard_current(guard)
@@ -1730,6 +1827,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
         _require(scope.active() == previous, "Active isolated Worker deployment changed before upload.")
         scope.verify_legacy_temp_floor(allow_rows=old_temp_capable and desired_temp_capable,
                                        require_schema=old_temp_capable or desired_temp_capable)
+        scope.verify_legacy_dynamic_all_floor(allow_rows=old_dynamic_all_capable and desired_dynamic_all_capable,
+                                             require_schema=old_dynamic_all_capable or desired_dynamic_all_capable)
         _guard_current(guard)
         candidate = scope.upload(module, desired, telegram_config, aggregate_key, private_share_key)
 
@@ -1758,7 +1857,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
         scope.verify_group_share_cards(drained=not group_capable)
     activated = scope.activate(previous, candidate, f"Isolated Worker release {desired.revision} {uuid4()}",
                                current_capable=old_selected_capable, target_capable=desired_selected_capable, guard=guard,
-                               current_temp_capable=old_temp_capable, target_temp_capable=desired_temp_capable)
+                               current_temp_capable=old_temp_capable, target_temp_capable=desired_temp_capable,
+                               current_dynamic_all_capable=old_dynamic_all_capable, target_dynamic_all_capable=desired_dynamic_all_capable)
     try:
         _require(scope.worker_config() == config, "Isolated Worker configuration changed after activation.")
         _require(scope.cron_enabled() == had_cron, "Isolated Worker schedule changed during activation.")
@@ -1766,6 +1866,7 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
         _require(scope.version(activated.version) == desired, "Active Worker version differs from the verified artifact.")
         scope.verify_legacy_selected_floor(allow_rows=desired_selected_capable, require_schema=desired_selected_capable)
         scope.verify_legacy_temp_floor(allow_rows=desired_temp_capable, require_schema=desired_temp_capable)
+        scope.verify_legacy_dynamic_all_floor(allow_rows=desired_dynamic_all_capable, require_schema=desired_dynamic_all_capable)
         _verify_health(desired.revision)
         if inline_bot is not None:
             scope.verify_inline_search(inline_bot)
@@ -1807,10 +1908,12 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                 scope.verify_group_share_cards(drained=not old_version.telegram_group_share_cards_capable)
             restored = scope.activate(activated, previous.version, f"Isolated Worker rollback {uuid4()}",
                                       current_capable=desired_selected_capable, target_capable=old_selected_capable, guard=guard,
-                                      current_temp_capable=desired_temp_capable, target_temp_capable=old_temp_capable)
+                                      current_temp_capable=desired_temp_capable, target_temp_capable=old_temp_capable,
+                                      current_dynamic_all_capable=desired_dynamic_all_capable, target_dynamic_all_capable=old_dynamic_all_capable)
             _verify_health(old_version.revision)
             scope.verify_legacy_selected_floor(allow_rows=old_selected_capable, require_schema=old_selected_capable)
             scope.verify_legacy_temp_floor(allow_rows=old_temp_capable, require_schema=old_temp_capable)
+            scope.verify_legacy_dynamic_all_floor(allow_rows=old_dynamic_all_capable, require_schema=old_dynamic_all_capable)
             if (inline_bot is not None or verify_provider_schema is not None or verify_legacy_shorts or batch_capable
                     or api_status_capable or documents_capable or verify_group_schema):
                 _require(scope.version(restored.version) == old_version, "Isolated Worker Telegram rollback state differs.")

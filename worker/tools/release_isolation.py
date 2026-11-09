@@ -9,7 +9,8 @@ from pathlib import Path
 
 from attest_api_status_container import ATTESTATION_ENV
 from cloudflare_isolation import (
-    CloudflareClient, CloudflareError, WORKER_NAME, group_share_cards_artifact, legacy_selected_artifact, legacy_temp_artifact,
+    CloudflareClient, CloudflareError, WORKER_NAME, group_share_cards_artifact, legacy_dynamic_all_artifact,
+    legacy_selected_artifact, legacy_temp_artifact,
     release_worker, validate_aggregate_key, validate_private_share_key, verify_worker_target,
 )
 from d1_migrations import MigrationError, apply_migrations
@@ -170,6 +171,7 @@ def release():
     group_cards_capable = group_share_cards_artifact(bundle, manifest)
     selected_capable = legacy_selected_artifact(bundle, manifest)
     temp_capable = legacy_temp_artifact(bundle, manifest)
+    dynamic_all_capable = legacy_dynamic_all_artifact(bundle, manifest)
     telegram_config = telegram_release_config(manifest)
     aggregate_key = None
     if any(item["name"] == "0014_telegram_aggregate_issuance.sql" for item in manifest["migrations"]):
@@ -218,7 +220,8 @@ def release():
                                     api_status=api_status, api_status_gate=api_status_gate,
                                     provider_url_documents=provider_url_documents, mixed_documents=mixed_documents,
                                     group_share_cards=group_share_cards, group_share_cards_capable=group_cards_capable,
-                                    legacy_selected_capable=selected_capable, legacy_temp_capable=temp_capable)
+                                    legacy_selected_capable=selected_capable, legacy_temp_capable=temp_capable,
+                                    legacy_dynamic_all_capable=dynamic_all_capable)
     if provider_gate is not None:
         provider_gate.verify()
     migrations = apply_migrations(data_api, target, bundle, manifest, guard)

@@ -97,7 +97,7 @@ export async function prepareTelegramProviderDocumentPlan(
       WHERE receipt_id=?)=? THEN 1 ELSE json_extract('provider document line guard failed','$') END`)
       .bind(...stageBindings, lease.receiptId, inputs.length),
   ];
-  return { steps, exists, staged: { sql: staged, bindings: stageBindings } };
+  return { steps, exists, staged: { sql: staged, bindings: stageBindings }, newShellTokens: inputs.map(({ token }) => token) };
 }
 
 export function prepareTelegramProviderDocumentMarker(db: D1Database, receiptId: number): D1PreparedStatement[] {
