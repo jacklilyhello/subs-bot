@@ -64,6 +64,17 @@ class MixedShortRows:
     selected_active_tokens: dict[int, str] = field(default_factory=dict, repr=False)
 
 
+@dataclass(frozen=True, kw_only=True)
+class UnifiedShortRows(MixedShortRows):
+    dynamic_all_rows: tuple[tuple[str, str, int], ...] = field(repr=False)
+    active_lineage: tuple[tuple[int, str, str], ...] = field(repr=False)
+    source: Path = field(repr=False)
+    namespace: Path = field(repr=False)
+    source_state: tuple[int, ...] = field(repr=False)
+    source_sha256: str
+    owner_map_sha256: str
+
+
 def _require(condition: object) -> None:
     if not condition:
         raise MixedShortError(FAILURE)
@@ -111,9 +122,10 @@ def _source_has_no_sidecars(source: Path) -> bool:
     return not any(os.path.lexists(str(source) + suffix) for suffix in ("-wal", "-shm", "-journal"))
 
 
-def _collect_rows(source: Path, namespace_rows: Path, owners: dict[str, str], inventory: dict):
-    typed_rows, external_rows, selected_rows = [], [], []
+def _collect_rows(source: Path, namespace_rows: Path, owners: dict[str, str], inventory: dict, *, unified=False):
+    typed_rows, external_rows, selected_rows, all_rows = [], [], [], []
     selected_active_tokens = {}
+    active_lineage = ()
     coalesced_owners = {owner for original, owner in owners.items() if original != owner}
     with closing(sqlite3.connect(source.as_uri() + "?mode=ro&immutable=1", uri=True, isolation_level=None)) as db:
         db.execute("PRAGMA trusted_schema=OFF")
@@ -123,22 +135,32 @@ def _collect_rows(source: Path, namespace_rows: Path, owners: dict[str, str], in
                  and db.execute("PRAGMA query_only").fetchone() == (1,)
                  and db.execute("PRAGMA encoding").fetchone() == ("UTF-8",))
         db.execute("BEGIN")
+        if unified:
+            targets = typed_inventory._targets(db, typed_inventory._tables(db))
+            active_lineage = tuple(sorted((identity, owners.get(str(owner), str(owner)), sha256(token).hexdigest())
+                                          for token, (table, identity, owner) in targets.items() if table == "subscriptions"))
         rows = db.execute("""
             SELECT rowid, typeof(code), typeof(target_url),
                 CASE WHEN typeof(user_id)='integer' THEN user_id END,
                 CASE WHEN typeof(created_at)='integer' THEN created_at END
             FROM main.short_links ORDER BY rowid LIMIT ?
-        """, (typed_inventory.MAX_SHORTS + 1,))
+        """, (typed_inventory.MAX_SHORTS + 1,)) if inventory["present"] else ()
         # This file was generated in our private scratch from the pinned source.
         with namespace_rows.open("rb") as metadata:
             for record, line in zip(rows, metadata, strict=True):
                 rowid, code_type, target_type, issuer, created_at = record
                 item = json.loads(line)
                 _require(item["state"] == "classified")
+                if unified and item["kind"] in ("aggregate-all", "aggregate-selected"):
+                    # Dynamic membership and path rules must not
+                    # acquire another legacy issuer's scope, even for empty rows.
+                    owner = str(issuer)
+                    _require(native.integer(issuer, 1, converter.MAX_OWNER) and item["sourceIssuerId"] == item["ownerId"] == owner
+                             and owners.get(owner, owner) == owner and owner not in coalesced_owners)
                 if item["kind"] == "typed-subscription":
                     typed_rows.append({key: item[key] for key in TYPED_FIELDS})
                     continue
-                _require(item["kind"] in ("external", "aggregate-selected")
+                _require((item["kind"] in ("external", "aggregate-selected") or (unified and item["kind"] == "aggregate-all"))
                          and type(issuer) is int and type(created_at) is int)
                 code = typed_inventory._text_bytes(db, "short_links", "code", rowid, code_type, 12)
                 target, issue = namespace_inventory.read_target(db, rowid, target_type)
@@ -148,7 +170,10 @@ def _collect_rows(source: Path, namespace_rows: Path, owners: dict[str, str], in
                          and sha256(target).hexdigest() == item["targetSha256"]
                          and issuer_id == item["sourceIssuerId"] and owners.get(issuer_id, issuer_id) == item["ownerId"]
                          and created_at == item["createdAt"])
-                if item["kind"] == "aggregate-selected":
+                if item["kind"] == "aggregate-all":
+                    _require(target == b"aggregate://all")
+                    all_rows.append((item["codeSha256"], item["ownerId"], created_at))
+                elif item["kind"] == "aggregate-selected":
                     legacy_ids = tuple(item["legacyIds"])
                     active_positions = tuple(item["activePositions"])
                     _require(target == namespace_inventory.IDS_PREFIX + b",".join(str(identity).encode("ascii") for identity in legacy_ids))
@@ -174,8 +199,9 @@ def _collect_rows(source: Path, namespace_rows: Path, owners: dict[str, str], in
     _require(len(typed_rows) == inventory["kinds"]["typed-subscription"]
              and len(external_rows) == inventory["kinds"]["external"]
              and len(selected_rows) == inventory["kinds"]["aggregate-selected"]
-             and len(typed_rows) + len(external_rows) + len(selected_rows) == inventory["rows"])
-    return typed_rows, external_rows, selected_rows, selected_active_tokens
+             and len(all_rows) == inventory["kinds"]["aggregate-all"]
+             and len(typed_rows) + len(external_rows) + len(selected_rows) + len(all_rows) == inventory["rows"])
+    return typed_rows, external_rows, selected_rows, selected_active_tokens, all_rows, active_lineage
 
 
 def _verify_oracle(pins: MixedShortInput, source_sha: str, worker: dict, source_count: int, external_rows: list) -> dict:
@@ -209,7 +235,13 @@ def read_selected_shorts(pins: MixedShortInput, *, source_sha: str, owner_map_sh
     return _read_shorts(pins, source_sha, owner_map_sha, build, worker_manifest_sha, working_parent, selected=True)
 
 
-def _read_shorts(pins, source_sha, owner_map_sha, build, worker_manifest_sha, working_parent, *, selected):
+def read_unified_shorts(pins: MixedShortInput, *, source_sha: str, owner_map_sha: str, build: dict,
+                        worker_manifest_sha: str, working_parent: Path) -> UnifiedShortRows:
+    """Verify the complete four-kind namespace for the separate unified profile."""
+    return _read_shorts(pins, source_sha, owner_map_sha, build, worker_manifest_sha, working_parent, selected=False, unified=True)
+
+
+def _read_shorts(pins, source_sha, owner_map_sha, build, worker_manifest_sha, working_parent, *, selected, unified=False):
     try:
         _require(isinstance(pins, MixedShortInput) and all(native.matches(converter.HASH, digest) for digest in (
             source_sha, owner_map_sha, worker_manifest_sha, pins.namespace_sha256, pins.oracle_sha256,
@@ -221,6 +253,7 @@ def _read_shorts(pins, source_sha, owner_map_sha, build, worker_manifest_sha, wo
                  and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", worker["compatibilityDate"])
                  and native.matches(converter.HASH, worker["bundleSha256"])
                  and build.get("manifestSha256", worker_manifest_sha) == worker_manifest_sha)
+        _require(not unified or build.get("manifestSha256") == worker_manifest_sha)
         worker["manifestSha256"] = worker_manifest_sha
         source = _private_path(pins.source)
         owners = converter._owner_map(native.parsed(_private_bytes(pins.owner_map, typed_inventory.MAX_METADATA_BYTES),
@@ -241,15 +274,19 @@ def _read_shorts(pins, source_sha, owner_map_sha, build, worker_manifest_sha, wo
                      and converter._file_hash(rows_path) == (descriptor["bytes"], descriptor["sha256"]))
             inventory = manifest["inventory"]
             kinds = inventory["kinds"]
-            _require(inventory["present"] and inventory["blocked"] == 0
-                     and kinds["aggregate-all"] == kinds["unclassified"] == 0)
-            if selected:
-                _require(kinds["aggregate-selected"] > 0)
+            _require(inventory["blocked"] == 0 and kinds["unclassified"] == 0)
+            if unified:
+                _require(type(inventory["present"]) is bool and native.integer(inventory["rows"], 0, typed_inventory.MAX_SHORTS)
+                         and (inventory["present"] or inventory["rows"] == 0))
             else:
-                _require(kinds["external"] > 0 and kinds["aggregate-selected"] == 0)
+                _require(inventory["present"] and kinds["aggregate-all"] == 0)
+                if selected:
+                    _require(kinds["aggregate-selected"] > 0)
+                else:
+                    _require(kinds["external"] > 0 and kinds["aggregate-selected"] == 0)
             _require(_source_has_no_sidecars(source) and typed_inventory._source_state(source) == source_state)
-            typed_rows, external_rows, selected_rows, active_tokens = _collect_rows(
-                source, reconstructed / namespace_inventory.ROWS, owners, inventory)
+            typed_rows, external_rows, selected_rows, active_tokens, all_rows, active_lineage = _collect_rows(
+                source, reconstructed / namespace_inventory.ROWS, owners, inventory, unified=unified)
         typed_inventory._verify_source(source, source_sha, source_state)
         _require(_source_has_no_sidecars(source))
         serializer = _verify_oracle(pins, source_sha, worker, inventory["rows"], external_rows)
@@ -257,11 +294,17 @@ def _read_shorts(pins, source_sha, owner_map_sha, build, worker_manifest_sha, wo
                  "oldOriginSha256": manifest["oldOriginSha256"], "legacyBotId": pins.legacy_bot_id,
                  "rows": inventory["rows"], "typedRows": len(typed_rows), "externalRows": len(external_rows),
                  "legacySerializer": serializer}
-        if selected:
+        if selected or unified:
             proof.update(selectedRows=len(selected_rows), selectedActiveHighWater=inventory["activeHighWater"])
-        return MixedShortRows({"present": True, "rows": inventory["rows"]},
-                              sorted(typed_rows, key=lambda row: row["codeSha256"]), sorted(external_rows), proof,
-                              tuple(sorted(selected_rows, key=lambda row: row.code_sha256)), active_tokens)
+        rows = ({"present": inventory["present"], "rows": inventory["rows"]},
+                sorted(typed_rows, key=lambda row: row["codeSha256"]), sorted(external_rows), proof,
+                tuple(sorted(selected_rows, key=lambda row: row.code_sha256)), active_tokens)
+        if unified:
+            proof.update(dynamicAllRows=len(all_rows), namespaceRowsSha256=descriptor["sha256"])
+            return UnifiedShortRows(*rows, dynamic_all_rows=tuple(sorted(all_rows)), active_lineage=active_lineage,
+                                    source=source, namespace=_private_path(pins.namespace, directory=True), source_state=source_state,
+                                    source_sha256=source_sha, owner_map_sha256=owner_map_sha)
+        return MixedShortRows(*rows)
     except (MixedShortError, converter.ConversionError, namespace_inventory.InventoryError, typed_inventory.InventoryError,
             native.RehearsalError, OSError, sqlite3.Error, ValueError, TypeError, KeyError, RecursionError, OverflowError):
         raise MixedShortError(FAILURE) from None
