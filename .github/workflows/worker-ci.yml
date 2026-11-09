@@ -105,16 +105,10 @@ jobs:
           workdir="$(mktemp -d)"
           trap 'rm -rf -- "$workdir"' EXIT
           archive="$workdir/sing-box.tar.gz"
-          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 120 \
-            https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-linux-amd64.tar.gz \
-            --output "$archive"
-          printf '%s  %s\n' '699a1b510aa4396b2176d32d1181920399ebf1e267835da6f3b598d0f7c24968' "$archive" | sha256sum --check
+          bash tools/download-validation-client.sh sing-box "$archive"
           tar -xzf "$archive" -C "$workdir"
           archive="$workdir/mihomo.gz"
-          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 120 \
-            https://github.com/MetaCubeX/mihomo/releases/download/v1.19.33/mihomo-linux-amd64-compatible-v1.19.33.gz \
-            --output "$archive"
-          printf '%s  %s\n' '386508bfb1c72c43b6a0eda73708ecdce82546581b0ebcb16366c53757c622b6' "$archive" | sha256sum --check
+          bash tools/download-validation-client.sh mihomo "$archive"
           gzip -dc "$archive" > "$workdir/mihomo"
           chmod 0700 "$workdir/mihomo"
           singbox="$workdir/sing-box-1.14.4-linux-amd64/sing-box"

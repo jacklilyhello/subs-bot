@@ -35,10 +35,7 @@ jobs:
           workdir="$(mktemp -d)"
           trap 'rm -rf -- "$workdir"' EXIT
           archive="$workdir/sing-box.tar.gz"
-          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 120 \
-            https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-linux-amd64.tar.gz \
-            --output "$archive"
-          printf '%s  %s\n' '699a1b510aa4396b2176d32d1181920399ebf1e267835da6f3b598d0f7c24968' "$archive" | sha256sum --check
+          bash worker/tools/download-validation-client.sh sing-box "$archive"
           tar -xzf "$archive" -C "$workdir"
           python tests/test_structured_export_regressions.py --emit-singbox > "$workdir/shadowsocks.json"
           python tests/test_singbox_export.py --emit-singbox > "$workdir/protocols.json"
