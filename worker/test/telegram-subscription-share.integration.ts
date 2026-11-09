@@ -73,7 +73,7 @@ test("the emitted Worker shares exactly one owned subscription payload with its 
       // Change only the generation after the source read and before the reservation transaction.
       assert.equal(await publishNodeSnapshot(db, bucket, { id: own.id, ownerId: policy.adminId,
         expectedGeneration: 0, expectedLifecycleRevision: 0 },
-      [{ share: "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.10:8388#Bundle-share-node" }]), true);
+      [{ name: "Bundle-share-node", share: "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.10:8388#Bundle-share-node" }]), true);
       publishedDuringAdmission = true;
     }
     return db.batch(statements);
