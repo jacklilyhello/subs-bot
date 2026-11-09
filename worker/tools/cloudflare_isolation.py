@@ -39,6 +39,11 @@ MIXED_DOCUMENTS_BINDING = "TELEGRAM_MIXED_DOCUMENTS"
 MIXED_DOCUMENTS_MIGRATION = "0036_telegram_mixed_document_opt_in.sql"
 MIXED_DOCUMENTS_MIGRATION_SHA256 = "05b67a3a3ddfb49b6f801b87dafae240f7328711e9e6c598b8b67e8738a892f8"
 MIXED_DOCUMENTS_TABLE_SHA256 = "0277bcc1e391b3c06c1db96babf44ba7ac54fe27d52fa3478c2079f2fe41212e"
+GROUP_SHARE_CARDS_BINDING = "TELEGRAM_GROUP_SHARE_CARDS"
+GROUP_SHARE_CARDS_MARKER = b"subs-bot:telegram-group-share-cards:v1"
+GROUP_SHARE_CARDS_MIGRATION = "0037_telegram_group_share_cards.sql"
+GROUP_SHARE_CARDS_MIGRATION_SHA256 = "064f461428f244f780e5655528fb0dc7e35676d1f805145ffff722b50780c748"
+GROUP_SHARE_CARDS_SCHEMA_SHA256 = "66ea7065ed9ce609e30c330e0214c296afac91c7648d2cae71f1907eb82f34c7"
 PROVIDER_REFRESH_BINDING = "TELEGRAM_PROVIDER_REFRESH"
 PROVIDER_REFRESH_TAG_PREFIX = "provider-rf-"
 PROVIDER_REFRESH_MIGRATIONS = (
@@ -227,6 +232,8 @@ class _Version:
     telegram_provider_url_documents_capable: bool = False
     telegram_mixed_documents: bool = False
     telegram_mixed_documents_capable: bool = False
+    telegram_group_share_cards: bool = False
+    telegram_group_share_cards_capable: bool = False
 
 
 def _release_tag(revision, telegram_digest, aggregate_digest, private_share_digest, provider_binding):
@@ -256,7 +263,7 @@ def _api_status_tag(tag, binding, enabled):
 
 def _telegram_feature_tag(tag, inline_search, provider_url_import, provider_refresh=False, legacy_subscription_shorts=False,
                           provider_batch=False, batch_module_sha256=None, *, url_documents=False, url_documents_module_sha256=None,
-                          mixed_documents=None):
+                          mixed_documents=None, group_share_cards=None):
     if inline_search:
         tag = _inline_search_tag(tag)
     if provider_url_import:
@@ -270,6 +277,9 @@ def _telegram_feature_tag(tag, inline_search, provider_url_import, provider_refr
         tag = sha256(pin.encode("ascii")).hexdigest()
     if mixed_documents is not None:
         pin = f"{tag}:mixed-documents:{int(mixed_documents)}:{MIXED_DOCUMENTS_TABLE_SHA256}"
+        tag = sha256(pin.encode("ascii")).hexdigest()
+    if group_share_cards is not None:
+        pin = f"{tag}:group-share-cards:{int(group_share_cards)}:{GROUP_SHARE_CARDS_MIGRATION_SHA256}"
         tag = sha256(pin.encode("ascii")).hexdigest()
     if batch_module_sha256 is not None:
         prefix = PROVIDER_BATCH_TAG_PREFIX if provider_batch else PROVIDER_BATCH_READY_TAG_PREFIX
@@ -469,6 +479,38 @@ class _Isolation:
         except (CloudflareError, AttributeError, TypeError, ValueError):
             raise CloudflareError(error) from None
 
+    def verify_group_share_cards(self, *, drained=False):
+        path = f"{self.account}/d1/database/{self.target['d1Id']}/query"
+        error = "The isolated group share card schema or ledger could not be verified."
+
+        def read(sql):
+            result = self.data_api("POST", path, {"sql": sql})
+            _require(isinstance(result, list) and len(result) == 1 and result[0].get("success") is True
+                     and isinstance(result[0].get("results"), list), error)
+            return result[0]["results"]
+
+        try:
+            ledger = read("SELECT position,name,sha256,mode FROM subs_bot_schema_migrations WHERE position=37")
+            schema = read("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE sql IS NOT NULL "
+                          "AND tbl_name IN ('telegram_group_share_cards','telegram_group_share_scopes') ORDER BY name")
+            fingerprint = sha256(json.dumps(schema, sort_keys=True, separators=(",", ":")).encode("ascii")).hexdigest()
+            _require(ledger == [{"position": 37, "name": GROUP_SHARE_CARDS_MIGRATION,
+                                 "sha256": GROUP_SHARE_CARDS_MIGRATION_SHA256, "mode": "applied"}]
+                     and fingerprint == GROUP_SHARE_CARDS_SCHEMA_SHA256, error)
+            active = read("""SELECT EXISTS(
+                SELECT 1 FROM telegram_group_share_cards
+                WHERE state IN ('pending','sending') OR lease_until>unixepoch()
+            ) OR EXISTS (
+                SELECT 1 FROM telegram_group_share_scopes AS scope
+                JOIN telegram_inbox AS inbox USING(receipt_id)
+                JOIN telegram_outbox AS reply USING(receipt_id)
+                WHERE inbox.receipt_nonce='group-claim:v1' AND reply.state IN ('pending','leased','sending')
+            ) AS groupShareCardsActive""") if drained else None
+        except (CloudflareError, AttributeError, TypeError, ValueError):
+            raise CloudflareError(error) from None
+        _require(not drained or (active == [{"groupShareCardsActive": 0}] and type(active[0]["groupShareCardsActive"]) is int),
+                 "Drain isolated group share card work before switching to a Worker artifact without verified recovery.")
+
     def verify_provider_refresh(self):
         path = f"{self.account}/d1/database/{self.target['d1Id']}/query"
         error = "The isolated provider refresh migrations could not be verified."
@@ -599,7 +641,7 @@ class _Isolation:
                                                      {"enabled": False, "cross_version_cache": False}),
                  "Isolated Worker version runtime settings differ from the supported configuration.")
         rows = version.get("bindings")
-        _require(isinstance(rows, list) and 3 <= len(rows) <= 24
+        _require(isinstance(rows, list) and 3 <= len(rows) <= 25
                  and all(isinstance(row, dict) and isinstance(row.get("name"), str) for row in rows),
                  "Unexpected isolated Worker binding inventory.")
         bindings = {row["name"]: row for row in rows}
@@ -611,6 +653,7 @@ class _Isolation:
         provider_url = bindings.get(PROVIDER_URL_IMPORT_BINDING)
         provider_documents = bindings.get(PROVIDER_URL_DOCUMENTS_BINDING)
         mixed_documents = bindings.get(MIXED_DOCUMENTS_BINDING)
+        group_share_cards = bindings.get(GROUP_SHARE_CARDS_BINDING)
         refresh = bindings.get(PROVIDER_REFRESH_BINDING)
         legacy_shorts = bindings.get(LEGACY_SUBSCRIPTION_SHORT_BINDING)
         provider_batch = bindings.get(PROVIDER_BATCH_BINDING)
@@ -618,6 +661,7 @@ class _Isolation:
         binding_names = set(bindings) - PROVIDER_BINDINGS - PROVIDER_API_STATUS_BINDINGS - {
             INLINE_SEARCH_BINDING, PROVIDER_URL_IMPORT_BINDING, PROVIDER_REFRESH_BINDING, LEGACY_SUBSCRIPTION_SHORT_BINDING,
             PROVIDER_BATCH_BINDING, API_STATUS_BINDING, PROVIDER_URL_DOCUMENTS_BINDING, MIXED_DOCUMENTS_BINDING,
+            GROUP_SHARE_CARDS_BINDING,
         }
         _require(len(bindings) == len(rows) and binding_names in (base_bindings, telegram_bindings,
             telegram_bindings | AGGREGATE_BINDINGS, telegram_bindings | PRIVATE_SHARE_BINDINGS,
@@ -637,6 +681,9 @@ class _Isolation:
         _require(mixed_documents is None or (provider_documents is not None and mixed_documents == {
             "name": MIXED_DOCUMENTS_BINDING, "type": "plain_text", "text": "1",
         }), "Unexpected isolated Worker mixed document binding.")
+        _require(group_share_cards is None or (TELEGRAM_BINDINGS | PRIVATE_SHARE_BINDINGS <= binding_names
+                 and group_share_cards == {"name": GROUP_SHARE_CARDS_BINDING, "type": "plain_text", "text": "1"}),
+                 "Unexpected isolated Worker group share card binding.")
         _require(refresh is None or (has_provider and TELEGRAM_BINDINGS <= binding_names and refresh == {
             "name": PROVIDER_REFRESH_BINDING, "type": "plain_text", "text": "1",
         }), "Unexpected isolated Worker provider refresh binding.")
@@ -729,6 +776,8 @@ class _Isolation:
                  "Isolated Worker API status release tag differs.")
         documents_capable = False
         mixed_documents_capable = False
+        group_share_cards_capable = False
+        has_group_share_cards_marker = GROUP_SHARE_CARDS_MARKER in body
         if batch_capable or has_api_status or any(binding is not None for binding in (inline, provider_url, refresh, legacy_shorts)):
             release_tag = _release_tag(rev["text"], telegram_digest, aggregate_digest, private_share_digest, provider_binding)
             tag_inputs = (_api_status_tag(release_tag, api_status_binding, api_status is not None),
@@ -736,8 +785,11 @@ class _Isolation:
                           provider_batch is not None, module_sha256 if batch_capable else None)
             expected = _telegram_feature_tag(*tag_inputs)
             document_tag_inputs = {"url_documents": provider_documents is not None, "url_documents_module_sha256": module_sha256}
-            mixed_documents_capable = batch_capable and tag == _telegram_feature_tag(*tag_inputs, **document_tag_inputs,
-                mixed_documents=mixed_documents is not None)
+            mixed_tag_inputs = {**document_tag_inputs, "mixed_documents": mixed_documents is not None}
+            group_share_cards_capable = batch_capable and has_group_share_cards_marker and tag == _telegram_feature_tag(
+                *tag_inputs, **mixed_tag_inputs, group_share_cards=group_share_cards is not None)
+            mixed_documents_capable = group_share_cards_capable or (batch_capable and tag == _telegram_feature_tag(
+                *tag_inputs, **mixed_tag_inputs))
             documents_capable = mixed_documents_capable or (batch_capable and tag == _telegram_feature_tag(*tag_inputs,
                 **document_tag_inputs))
             feature = "API status" if has_api_status else "inline search"
@@ -752,11 +804,15 @@ class _Isolation:
             _require(tag == expected or documents_capable, f"Isolated Worker {feature} release tag differs.")
         _require(provider_documents is None or documents_capable, "Isolated Worker provider URL document release tag differs.")
         _require(mixed_documents is None or mixed_documents_capable, "Isolated Worker mixed document release tag differs.")
+        _require(group_share_cards_capable == has_group_share_cards_marker
+                 and (group_share_cards is None or group_share_cards_capable),
+                 "Isolated Worker group share card release tag differs.")
         return _Version(rev["text"], module_sha256, version["compatibility_date"],
                         tag, telegram_digest, aggregate_digest, private_share_digest, provider_binding, inline is not None,
                         provider_url is not None, refresh is not None, legacy_shorts is not None,
                         provider_batch is not None, batch_capable, api_status_binding, api_status is not None,
-                        provider_documents is not None, documents_capable, mixed_documents is not None, mixed_documents_capable)
+                        provider_documents is not None, documents_capable, mixed_documents is not None, mixed_documents_capable,
+                        group_share_cards is not None, group_share_cards_capable)
 
     def verify_candidate(self, candidate, desired):
         # A version can be visible in its creation response or listing before its module is readable.
@@ -817,6 +873,8 @@ class _Isolation:
             bindings.append({"type": "plain_text", "name": PROVIDER_URL_DOCUMENTS_BINDING, "text": "1"})
         if desired.telegram_mixed_documents:
             bindings.append({"type": "plain_text", "name": MIXED_DOCUMENTS_BINDING, "text": "1"})
+        if desired.telegram_group_share_cards:
+            bindings.append({"type": "plain_text", "name": GROUP_SHARE_CARDS_BINDING, "text": "1"})
         if desired.telegram_provider_refresh:
             bindings.append({"type": "plain_text", "name": PROVIDER_REFRESH_BINDING, "text": "1"})
         if desired.legacy_subscription_shorts:
@@ -929,11 +987,7 @@ def validate_private_share_key(raw):
              "The isolated private share key must be a canonical Base64URL encoding of 32 bytes.")
 
 
-def _artifact(bundle_dir, manifest, telegram_config, aggregate_key=None, private_share_key=None, provider_binding=None):
-    _require(isinstance(manifest, dict) and manifest.get("version") == 2
-             and _matches(REVISION, manifest.get("revision")) and _matches(DIGEST, manifest.get("bundleSha256"))
-             and _matches(DATE, manifest.get("compatibilityDate")) and isinstance(manifest.get("migrations"), list),
-             "Invalid verified Worker release manifest.")
+def _verified_module(bundle_dir, expected_digest):
     try:
         path = Path(bundle_dir) / "index.js"
         _require(path.is_file() and not path.is_symlink(), "Verified Worker module is not a regular file.")
@@ -941,8 +995,23 @@ def _artifact(bundle_dir, manifest, telegram_config, aggregate_key=None, private
             module = source.read(MAX_MODULE_BYTES + 1)
     except (OSError, ValueError, TypeError):
         raise CloudflareError("Verified Worker module is unavailable.") from None
-    _require(0 < len(module) <= MAX_MODULE_BYTES and sha256(module).hexdigest() == manifest["bundleSha256"],
+    _require(0 < len(module) <= MAX_MODULE_BYTES and sha256(module).hexdigest() == expected_digest,
              "Verified Worker module digest mismatch.")
+    return module
+
+
+def group_share_cards_artifact(bundle_dir, manifest):
+    # Earlier artifact manifests cannot advertise the group-card schema.
+    return len(manifest["migrations"]) >= 37 and GROUP_SHARE_CARDS_MARKER in _verified_module(
+        bundle_dir, manifest.get("bundleSha256"))
+
+
+def _artifact(bundle_dir, manifest, telegram_config, aggregate_key=None, private_share_key=None, provider_binding=None):
+    _require(isinstance(manifest, dict) and manifest.get("version") == 2
+             and _matches(REVISION, manifest.get("revision")) and _matches(DIGEST, manifest.get("bundleSha256"))
+             and _matches(DATE, manifest.get("compatibilityDate")) and isinstance(manifest.get("migrations"), list),
+             "Invalid verified Worker release manifest.")
+    module = _verified_module(bundle_dir, manifest["bundleSha256"])
     revision = manifest["revision"]
     telegram_digest = None
     aggregate_digest = None
@@ -1106,6 +1175,28 @@ def _mixed_documents_target(active, requested, manifest, documents_enabled, docu
     return enabled, capable
 
 
+def _group_share_cards_target(active, requested, manifest, capable, telegram_digest, private_share_digest, had_cron):
+    _require(requested is None or type(requested) is bool, "Invalid isolated group share card release mode.")
+    enabled = active.telegram_group_share_cards if requested is None else requested
+    entries = manifest.get("migrations") if isinstance(manifest, dict) else None
+    includes_schema = isinstance(entries, list) and len(entries) >= 37
+    if includes_schema or capable:
+        _require(includes_schema and entries[36] == {
+            "name": GROUP_SHARE_CARDS_MIGRATION, "sha256": GROUP_SHARE_CARDS_MIGRATION_SHA256,
+        }, "Isolated group share cards require the exact 0037 migration artifact.")
+    _require(not (active.telegram_group_share_cards or enabled) or capable,
+             "Keep a verified group share card artifact active when changing or preserving admission.")
+    if active.telegram_group_share_cards or enabled:
+        _require(had_cron and telegram_digest is not None and telegram_digest == active.telegram_config_sha256
+                 and private_share_digest is not None and private_share_digest == active.telegram_private_share_key_sha256,
+                 "Group share cards require the existing isolated Telegram policy, Cron and private share key.")
+    if enabled and not active.telegram_group_share_cards:
+        _require(active.telegram_group_share_cards_capable and active.revision == manifest.get("revision")
+                 and active.digest == manifest.get("bundleSha256") and active.compatibility == manifest.get("compatibilityDate"),
+                 "Enable group share cards only after verifying the same Worker artifact with admission disabled.")
+    return enabled
+
+
 def _provider_refresh_target(active, requested, manifest, telegram_digest, provider_binding, had_cron):
     _require(requested is None or type(requested) is bool, "Invalid isolated provider refresh release mode.")
     enabled = active.telegram_provider_refresh if requested is None else requested
@@ -1211,7 +1302,7 @@ def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECI
                          telegram_config=_UNSPECIFIED_TELEGRAM_CONFIG, inline_search=None, provider_url_import=None,
                          provider_refresh=None, legacy_subscription_shorts=None, provider_batch=None,
                          api_status=None, api_status_gate=_UNSPECIFIED_API_STATUS_GATE, provider_url_documents=None,
-                         mixed_documents=None):
+                         mixed_documents=None, group_share_cards=None, group_share_cards_capable=None):
     """Read ownership, privacy and active binding facts before any release writes."""
     scope = _Isolation(worker_api, data_api, target)
     scope.worker_config()
@@ -1230,9 +1321,11 @@ def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECI
         validate_aggregate_key(aggregate_key)
         _require(version.telegram_aggregate_key_sha256 == sha256(aggregate_key.encode("ascii")).hexdigest(),
                  "Changing the isolated aggregate key requires a separate rotation release.")
+    private_share_digest = None
     if private_share_key is not _UNSPECIFIED_PRIVATE_SHARE_KEY and version.telegram_private_share_key_sha256 is not None:
         validate_private_share_key(private_share_key)
-        _require(version.telegram_private_share_key_sha256 == sha256(private_share_key.encode("ascii")).hexdigest(),
+        private_share_digest = sha256(private_share_key.encode("ascii")).hexdigest()
+        _require(version.telegram_private_share_key_sha256 == private_share_digest,
                  "Changing the isolated private share key requires a separate rotation release.")
     if release_manifest is not None or inline_search is not None:
         enabled, bot_id = _inline_search_target(version, inline_search, release_manifest, telegram_config)
@@ -1289,6 +1382,14 @@ def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECI
                 _verify_health(version.revision)
             _verify_api_status_dependency(version, gate, release_revision)
             _require(scope.active() == active, "Active isolated Worker deployment changed during API status proof verification.")
+    if group_share_cards_capable is not None or group_share_cards is not None:
+        enabled = _group_share_cards_target(version, group_share_cards, release_manifest, group_share_cards_capable,
+                                            desired_digest, private_share_digest, had_cron)
+        if version.telegram_group_share_cards_capable or enabled:
+            scope.verify_group_share_cards(drained=not group_share_cards_capable)
+        if enabled and not version.telegram_group_share_cards:
+            _verify_health(version.revision)
+            _require(scope.active() == active, "Active isolated Worker deployment changed during group share card verification.")
     if provider_binding is not _UNSPECIFIED_PROVIDER_BINDING:
         _verify_first_provider_binding(version, provider_binding, release_revision, provider_first_binding_guard,
                                        historical_application_revision)
@@ -1305,7 +1406,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                    inline_search: bool | None = None, provider_url_import: bool | None = None,
                    provider_refresh: bool | None = None, legacy_subscription_shorts: bool | None = None,
                    provider_batch: bool | None = None, api_status: bool | None = None, api_status_gate=None,
-                   provider_url_documents: bool | None = None, mixed_documents: bool | None = None):
+                   provider_url_documents: bool | None = None, mixed_documents: bool | None = None,
+                   group_share_cards: bool | None = None):
     """Release the verified Worker and optionally configure its isolated Telegram schedule."""
     _require((provider_binding is None and provider_guard is None) or (provider_binding is not None and callable(provider_guard)),
              "An isolated provider release requires a verified dependency guard.")
@@ -1336,6 +1438,10 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
     documents_enabled, documents_capable = _provider_url_documents_target(old_version, provider_url_documents, manifest,
         desired.telegram_config_sha256, desired.provider_binding, had_cron)
     mixed_enabled, mixed_capable = _mixed_documents_target(old_version, mixed_documents, manifest, documents_enabled, documents_capable)
+    group_capable = GROUP_SHARE_CARDS_MARKER in module
+    group_enabled = _group_share_cards_target(old_version, group_share_cards, manifest, group_capable,
+                                             desired.telegram_config_sha256, desired.telegram_private_share_key_sha256, had_cron)
+    verify_group_schema = group_capable or old_version.telegram_group_share_cards_capable
     # Mixed opt-ins are children of provider opt-ins and all committed plans use the existing document ledger.
     documents_must_be_drained = ((documents_capable and not old_version.telegram_provider_url_documents_capable)
                                  or (mixed_capable and not old_version.telegram_mixed_documents_capable))
@@ -1366,12 +1472,14 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                       telegram_api_status=api_status_enabled, api_status_binding=api_status_binding,
                       telegram_provider_url_documents=documents_enabled, telegram_provider_url_documents_capable=documents_capable,
                       telegram_mixed_documents=mixed_enabled, telegram_mixed_documents_capable=mixed_capable,
+                      telegram_group_share_cards=group_enabled, telegram_group_share_cards_capable=group_capable,
                       tag=_telegram_feature_tag(_api_status_tag(desired.tag, api_status_binding, api_status_enabled),
                                                 enabled, provider_url_enabled, refresh_enabled, legacy_shorts_enabled,
                                                 batch_enabled, desired.digest if batch_capable else None,
                                                 url_documents=documents_enabled,
                                                 url_documents_module_sha256=desired.digest if documents_capable else None,
-                                                mixed_documents=mixed_enabled if mixed_capable else None))
+                                                mixed_documents=mixed_enabled if mixed_capable else None,
+                                                group_share_cards=group_enabled if group_capable else None))
     if inline_bot is not None:
         scope.verify_inline_search(inline_bot, require_fresh=first_enable)
     if verify_provider_schema is not None:
@@ -1386,6 +1494,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
         scope.verify_provider_url_documents(drained=documents_must_be_drained)
     if mixed_capable:
         scope.verify_mixed_documents()
+    if verify_group_schema:
+        scope.verify_group_share_cards(drained=not group_capable)
     _verify_first_provider_binding(old_version, desired.provider_binding, desired.revision, provider_first_binding_guard,
                                    historical_application_revision)
     _verify_health(old_version.revision)
@@ -1401,14 +1511,16 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                 old_version.telegram_provider_batch, old_version.telegram_provider_batch_capable,
                 old_version.api_status_binding, old_version.telegram_api_status,
                 old_version.telegram_provider_url_documents, old_version.telegram_provider_url_documents_capable,
-                old_version.telegram_mixed_documents, old_version.telegram_mixed_documents_capable) == (
+                old_version.telegram_mixed_documents, old_version.telegram_mixed_documents_capable,
+                old_version.telegram_group_share_cards, old_version.telegram_group_share_cards_capable) == (
                 desired.telegram_config_sha256, desired.telegram_aggregate_key_sha256,
                 desired.telegram_private_share_key_sha256, desired.provider_binding,
                 desired.telegram_inline_search, desired.telegram_provider_url_import, desired.telegram_provider_refresh,
                 desired.legacy_subscription_shorts, desired.telegram_provider_batch, desired.telegram_provider_batch_capable,
                 desired.api_status_binding, desired.telegram_api_status,
                 desired.telegram_provider_url_documents, desired.telegram_provider_url_documents_capable,
-                desired.telegram_mixed_documents, desired.telegram_mixed_documents_capable):
+                desired.telegram_mixed_documents, desired.telegram_mixed_documents_capable,
+                desired.telegram_group_share_cards, desired.telegram_group_share_cards_capable):
             if telegram_config is None:
                 _require(scope.active() == previous, "Active isolated Worker deployment changed during verification.")
                 _guard_current(guard)
@@ -1420,7 +1532,7 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                     "providerUrlImportEnabled": provider_url_enabled, "providerRefreshEnabled": refresh_enabled,
                     "legacySubscriptionShortsEnabled": legacy_shorts_enabled, "providerBatchEnabled": batch_enabled,
                     "apiStatusEnabled": api_status_enabled, "providerUrlDocumentsEnabled": documents_enabled,
-                    "mixedDocumentsEnabled": mixed_enabled}
+                    "mixedDocumentsEnabled": mixed_enabled, "groupShareCardsEnabled": group_enabled}
 
     candidate = scope.staged(desired)
     if candidate is None:
@@ -1449,6 +1561,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
         scope.verify_provider_url_documents(drained=documents_must_be_drained)
     if mixed_capable:
         scope.verify_mixed_documents()
+    if verify_group_schema:
+        scope.verify_group_share_cards(drained=not group_capable)
     _require(scope.active() == previous, "Active isolated Worker deployment changed before activation.")
     _guard_current(guard)
     activated = scope.activate(previous, candidate, f"Isolated Worker release {desired.revision} {uuid4()}")
@@ -1472,6 +1586,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
             scope.verify_provider_url_documents(drained=documents_must_be_drained)
         if mixed_capable:
             scope.verify_mixed_documents()
+        if verify_group_schema:
+            scope.verify_group_share_cards(drained=not group_capable)
         if provider_guard is not None:
             provider_guard()
         if api_gate is not None:
@@ -1492,11 +1608,13 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                 scope.verify_provider_url_documents(drained=documents_must_be_drained)
             if mixed_capable:
                 scope.verify_mixed_documents()
+            if verify_group_schema:
+                scope.verify_group_share_cards(drained=not old_version.telegram_group_share_cards_capable)
             _guard_current(guard)
             restored = scope.activate(activated, previous.version, f"Isolated Worker rollback {uuid4()}")
             _verify_health(old_version.revision)
             if (inline_bot is not None or verify_provider_schema is not None or verify_legacy_shorts or batch_capable
-                    or api_status_capable or documents_capable):
+                    or api_status_capable or documents_capable or verify_group_schema):
                 _require(scope.version(restored.version) == old_version, "Isolated Worker Telegram rollback state differs.")
             if old_version.legacy_subscription_shorts:
                 scope.verify_legacy_subscription_shorts()
@@ -1513,4 +1631,4 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
             "providerUrlImportEnabled": provider_url_enabled, "providerRefreshEnabled": refresh_enabled,
             "legacySubscriptionShortsEnabled": legacy_shorts_enabled, "providerBatchEnabled": batch_enabled,
             "apiStatusEnabled": api_status_enabled, "providerUrlDocumentsEnabled": documents_enabled,
-            "mixedDocumentsEnabled": mixed_enabled}
+            "mixedDocumentsEnabled": mixed_enabled, "groupShareCardsEnabled": group_enabled}

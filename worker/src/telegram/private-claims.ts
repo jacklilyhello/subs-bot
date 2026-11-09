@@ -5,6 +5,7 @@ import {
 import {
   inTelegramScope, type TelegramEventScope, type TelegramPolicy, type TelegramPrivateClaimUpdate,
 } from "./protocol.ts";
+import { groupShareClaimGuard, TELEGRAM_GROUP_CLAIM_MARKER } from "./group-share-actions.ts";
 
 export const TELEGRAM_PRIVATE_CLAIM_MARKER = "claim:v1";
 
@@ -12,7 +13,7 @@ interface ClaimLease extends TelegramEventScope {
   receiptId: number;
   leaseId: string;
   attempts: number;
-  privateClaim?: { codeSha256: string };
+  privateClaim?: { codeSha256: string; group?: true };
 }
 
 const sha256 = /^[0-9a-f]{64}(?![\s\S])/u;
@@ -82,6 +83,13 @@ export async function prepareTelegramPrivateClaim(
   if (!inPrivateScope(policy, lease) || !codeSha256 || !sha256.test(codeSha256)) {
     throw new Error(deliveryError);
   }
+  if (lease.privateClaim?.group) {
+    const guard = groupShareClaimGuard(policy);
+    const allowed = await db.prepare(`SELECT 1 FROM telegram_inbox AS inbox WHERE inbox.receipt_id=?
+      AND inbox.bot_id=? AND inbox.actor_id=? AND inbox.receipt_nonce=? AND (${guard.sql})`)
+      .bind(lease.receiptId, policy.botId, lease.actorId, TELEGRAM_GROUP_CLAIM_MARKER, ...guard.bindings).first();
+    if (allowed === null) return { kind: "unavailable", botId: policy.botId, actorId: lease.actorId, codeSha256 };
+  }
   return preparePrivateShareClaim(db, bucket, { botId: policy.botId, actorId: lease.actorId, codeSha256 });
 }
 
@@ -104,8 +112,9 @@ export async function beginTelegramPrivateClaim(
         AND inbox.thread_id IS ? AND inbox.message_id = ? AND inbox.message_date = ?
         AND inbox.receipt_nonce = ? AND claim.code_sha256 = ?
         AND reply.state = 'sending' AND reply.lease_id = ? AND reply.attempts = ?`;
+    const marker = lease.privateClaim.group ? TELEGRAM_GROUP_CLAIM_MARKER : TELEGRAM_PRIVATE_CLAIM_MARKER;
     const bindings = [lease.receiptId, policy.botId, lease.updateId, lease.actorId, lease.threadId, lease.messageId,
-      lease.messageDate, TELEGRAM_PRIVATE_CLAIM_MARKER, prepared.codeSha256, lease.leaseId, lease.attempts] as const;
+      lease.messageDate, marker, prepared.codeSha256, lease.leaseId, lease.attempts] as const;
     const shareSteps = prepared.kind === "verified"
       ? privateShareClaimStatements(db, prepared, {
         sql: `changes() = 1 AND EXISTS (${scope} AND reply.lease_until > unixepoch())`, bindings,

@@ -163,6 +163,10 @@ class FakeCloudflare:
         self.provider_documents_drain_reads = 0
         self.provider_documents_live_reads = set()
         self.mixed_documents_drift = {}
+        self.upload_module = NEW_MODULE
+        self.group_share_cards_ledger_drift = False
+        self.group_share_cards_schema_drift = False
+        self.group_share_cards_work = None
         self.legacy_short_checks = []
         self.legacy_short_ledger_drift = {}
 
@@ -190,7 +194,7 @@ class FakeCloudflare:
         if method == "POST" and path == VERSIONS + "?deploy=false":
             if self.upload_error:
                 raise cloudflare.CloudflareError("Synthetic upload error.", http_status=self.upload_error)
-            assert payload["modules"][0]["content_base64"] == base64.b64encode(NEW_MODULE).decode("ascii")
+            assert payload["modules"][0]["content_base64"] == base64.b64encode(self.upload_module).decode("ascii")
             assert payload["bindings"][0]["database_id"] == TARGET["d1Id"]
             self.versions[NEW_VERSION] = {**deepcopy(payload), "id": NEW_VERSION}
             for row in self.versions[NEW_VERSION]["bindings"]:
@@ -239,6 +243,34 @@ class FakeCloudflare:
     def data_api(self, method, path, payload=None):
         if method == "POST" and path == DATABASE + "/query":
             sql = payload["sql"]
+            if "WHERE position=37" in sql or "tbl_name IN ('telegram_group_share_cards'" in sql or "AS groupShareCardsActive" in sql:
+                migrations = Path(__file__).resolve().parents[1] / "migrations"
+                migration = migrations / cloudflare.GROUP_SHARE_CARDS_MIGRATION
+                body = migration.read_bytes()
+                digest = sha256(body).hexdigest()
+                with closing(sqlite3.connect(":memory:")) as db:
+                    db.row_factory = sqlite3.Row
+                    db.executescript((migrations / "0002_telegram.sql").read_text(encoding="utf-8"))
+                    db.executescript(body.decode("utf-8"))
+                    db.execute("CREATE TABLE subs_bot_schema_migrations (position INTEGER PRIMARY KEY, name TEXT, sha256 TEXT, mode TEXT)")
+                    db.execute("INSERT INTO subs_bot_schema_migrations VALUES (37, ?, ?, 'applied')",
+                               (migration.name, "0" * 64 if self.group_share_cards_ledger_drift else digest))
+                    if self.group_share_cards_schema_drift:
+                        db.execute("DROP INDEX telegram_group_share_due")
+                    work = self.group_share_cards_work
+                    if work in ("pending", "sending"):
+                        db.execute("INSERT INTO telegram_group_share_cards VALUES (1,'-1',?,unixepoch(),0,NULL,NULL,NULL,0)", (work,))
+                    elif work in ("edit", "claim", "idle"):
+                        db.execute("""INSERT INTO telegram_group_share_cards VALUES
+                            (1,'-1','sent',unixepoch(),0,1,?,CASE WHEN ? THEN unixepoch()+30 END,0)""",
+                            ("edit-fixture" if work == "edit" else None, work == "edit"))
+                    if work == "claim":
+                        db.execute("""INSERT INTO telegram_inbox
+                            (receipt_id,bot_id,update_id,actor_id,chat_id,chat_type,message_id,message_date,command,receipt_nonce)
+                            VALUES (1,'1',1,'2','2','private',1,unixepoch(),'help','group-claim:v1')""")
+                        db.execute("INSERT INTO telegram_group_share_scopes VALUES (1,1,0,0,unixepoch())")
+                        db.execute("INSERT INTO telegram_outbox (receipt_id) VALUES (1)")
+                    return [{"success": True, "results": [dict(row) for row in db.execute(sql)]}]
             if "WHERE position=36" in sql:
                 migration = Path(__file__).resolve().parents[1] / "migrations" / cloudflare.MIXED_DOCUMENTS_MIGRATION
                 body = migration.read_bytes()
@@ -503,6 +535,35 @@ class ReleaseTests(unittest.TestCase):
             mixed_documents=False if capable else None)
         return active
 
+    def set_group_share_cards_baseline(self, *, capable=True, same_artifact=True, enabled=False, api_status=False):
+        active = self.set_mixed_documents_baseline(same_artifact=same_artifact, api_status=api_status)
+        self.manifest["migrations"].append({"name": cloudflare.GROUP_SHARE_CARDS_MIGRATION,
+                                             "sha256": cloudflare.GROUP_SHARE_CARDS_MIGRATION_SHA256})
+        module = NEW_MODULE + b" /* " + cloudflare.GROUP_SHARE_CARDS_MARKER + b" */"
+        self.api.upload_module = module
+        (self.bundle / "index.js").write_bytes(module)
+        self.manifest["bundleSha256"] = sha256(module).hexdigest()
+        active_module = (NEW_MODULE if same_artifact else OLD_MODULE)
+        if capable:
+            active_module += b" /* " + cloudflare.GROUP_SHARE_CARDS_MARKER + b" */"
+        active["modules"][0]["content_base64"] = base64.b64encode(active_module).decode("ascii")
+        key_digest = sha256(PRIVATE_SHARE_KEY.encode()).hexdigest()
+        active["bindings"].extend([
+            {"type": "secret_text", "name": cloudflare.PRIVATE_SHARE_KEY_BINDING},
+            {"type": "plain_text", "name": cloudflare.PRIVATE_SHARE_DIGEST_BINDING, "text": key_digest},
+        ])
+        if enabled:
+            active["bindings"].append({"type": "plain_text", "name": cloudflare.GROUP_SHARE_CARDS_BINDING, "text": "1"})
+        digest = sha256(active_module).hexdigest()
+        tag = cloudflare._release_tag(active["bindings"][2]["text"], sha256(INLINE_CONFIG.encode()).hexdigest(),
+                                      None, key_digest, PROVIDER_BINDING)
+        active["annotations"]["workers/tag"] = cloudflare._telegram_feature_tag(
+            cloudflare._api_status_tag(tag, API_STATUS_PIN if api_status else None, api_status),
+            True, True, True, provider_batch=True, batch_module_sha256=digest,
+            url_documents=True, url_documents_module_sha256=digest, mixed_documents=False,
+            group_share_cards=enabled if capable else None)
+        return active
+
     def test_read_only_preflight_rejects_wrong_resource_or_domain(self):
         self.assertEqual(cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET),
                          {"deploymentId": OLD_DEPLOYMENT, "versionId": OLD_VERSION, "revision": OLD_REVISION})
@@ -525,7 +586,7 @@ class ReleaseTests(unittest.TestCase):
             "previousVersionId": OLD_VERSION, "changed": True, "inlineSearchEnabled": False,
             "providerUrlImportEnabled": False, "providerRefreshEnabled": False, "legacySubscriptionShortsEnabled": False,
             "providerBatchEnabled": False, "apiStatusEnabled": False, "providerUrlDocumentsEnabled": False,
-            "mixedDocumentsEnabled": False,
+            "mixedDocumentsEnabled": False, "groupShareCardsEnabled": False,
         })
         self.assertFalse(self.release()["changed"])
         self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
@@ -906,6 +967,103 @@ class ReleaseTests(unittest.TestCase):
                     release_entry.mixed_documents_release_mode()
                 os.environ["SUBS_BOT_MIXED_DOCUMENTS_CONFIRMATION"] = f"{mode} mixed documents for {cloudflare.WORKER_NAME}"
                 self.assertIs(release_entry.mixed_documents_release_mode(), enabled)
+
+    def test_group_share_card_toggle_preserves_other_bindings_and_can_disable_with_work(self):
+        self.set_group_share_cards_baseline(capable=False, same_artifact=False, api_status=True)
+        api_gate = Mock(binding=API_STATUS_PIN)
+        options = {"provider_binding": PROVIDER_BINDING, "provider_guard": Mock(), "api_status_gate": lambda: api_gate}
+        default = self.release(INLINE_CONFIG, private_share_key=PRIVATE_SHARE_KEY, **options)
+        self.assertFalse(default["groupShareCardsEnabled"])
+        # Move the fake's immutable off version to a distinct slot before enabling the same artifact.
+        off_id = "10000000-0000-4000-8000-000000000009"
+        off = self.api.versions[off_id] = {**self.api.versions.pop(NEW_VERSION), "id": off_id}
+        self.api.active["versions"][0]["version_id"] = off_id
+        enabled = self.release(INLINE_CONFIG, private_share_key=PRIVATE_SHARE_KEY, group_share_cards=True, **options)
+        for key in ("groupShareCardsEnabled", "inlineSearchEnabled", "providerUrlImportEnabled", "providerRefreshEnabled",
+                    "providerUrlDocumentsEnabled", "providerBatchEnabled", "apiStatusEnabled"):
+            self.assertTrue(enabled[key])
+        on = self.api.versions[NEW_VERSION]
+        flag = {"type": "plain_text", "name": cloudflare.GROUP_SHARE_CARDS_BINDING, "text": "1"}
+        self.assertEqual({row["name"]: row for row in on["bindings"]},
+                         {row["name"]: row for row in [*off["bindings"], flag]})
+        self.assertFalse(self.release(INLINE_CONFIG, private_share_key=PRIVATE_SHARE_KEY, **options)["changed"])
+        on_id = "10000000-0000-4000-8000-000000000010"
+        self.api.versions[on_id] = {**self.api.versions.pop(NEW_VERSION), "id": on_id}
+        self.api.active["versions"][0]["version_id"] = on_id
+        self.api.group_share_cards_work = "claim"
+        disabled = self.release(INLINE_CONFIG, private_share_key=PRIVATE_SHARE_KEY, group_share_cards=False, **options)
+        self.assertFalse(disabled["groupShareCardsEnabled"])
+        self.assertEqual(disabled["versionId"], off_id)
+        self.assertEqual(self.api.active["versions"][0]["version_id"], off_id)
+
+    def test_group_share_cards_preflight_requires_exact_off_artifact_and_schema(self):
+        def preflight():
+            return cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET,
+                release_manifest=self.manifest, release_revision=NEW_REVISION, telegram_config=INLINE_CONFIG,
+                private_share_key=PRIVATE_SHARE_KEY, provider_binding=PROVIDER_BINDING, group_share_cards=True,
+                group_share_cards_capable=cloudflare.group_share_cards_artifact(self.bundle, self.manifest))
+
+        for state in ({"same_artifact": False}, {"capable": False}):
+            with self.subTest(state=state), self.assertRaisesRegex(cloudflare.CloudflareError, "same Worker artifact"):
+                self.set_group_share_cards_baseline(**state)
+                preflight()
+        self.set_group_share_cards_baseline()
+        self.api.worker_responses[SCHEDULES] = {"schedules": []}
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "Cron"):
+            preflight()
+        self.api.worker_responses[SCHEDULES] = {"schedules": [CRON]}
+        self.manifest["migrations"][36]["sha256"] = "0" * 64
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "exact 0037"):
+            preflight()
+        self.set_group_share_cards_baseline()
+        for field in ("group_share_cards_ledger_drift", "group_share_cards_schema_drift"):
+            with self.subTest(field=field):
+                setattr(self.api, field, True)
+                with self.assertRaisesRegex(cloudflare.CloudflareError, "group share card schema or ledger"):
+                    preflight()
+                setattr(self.api, field, False)
+        self.assertEqual(preflight()["versionId"], OLD_VERSION)
+        self.assertEqual(self.api.writes(), [])
+
+    def test_group_share_cards_unaware_downgrade_requires_disabled_admission_and_drained_work(self):
+        options = {"provider_binding": PROVIDER_BINDING, "provider_guard": Mock()}
+        for enabled in (True, False):
+            self.set_group_share_cards_baseline(enabled=enabled)
+            # A new artifact may intentionally remove support, while the additive schema remains.
+            self.manifest.update(revision="e" * 40, bundleSha256=sha256(NEW_MODULE).hexdigest())
+            (self.bundle / "index.js").write_bytes(NEW_MODULE)
+            self.api.upload_module = NEW_MODULE
+            if enabled:
+                with self.assertRaisesRegex(cloudflare.CloudflareError, "Keep a verified group share card artifact active"):
+                    self.release(INLINE_CONFIG, private_share_key=PRIVATE_SHARE_KEY, group_share_cards=False, **options)
+                continue
+            for work in ("pending", "sending", "edit", "claim"):
+                with self.subTest(work=work), self.assertRaisesRegex(cloudflare.CloudflareError, "Drain isolated group share card work"):
+                    self.api.group_share_cards_work = work
+                    self.release(INLINE_CONFIG, private_share_key=PRIVATE_SHARE_KEY, **options)
+        self.assertEqual(self.api.writes(), [])
+        self.api.group_share_cards_work = "idle"
+        self.assertFalse(self.release(INLINE_CONFIG, private_share_key=PRIVATE_SHARE_KEY, **options)["groupShareCardsEnabled"])
+
+    def test_group_share_cards_failed_verification_does_not_rollback_past_live_work(self):
+        self.set_group_share_cards_baseline(capable=False, same_artifact=False)
+        self.api.group_share_cards_work = "claim"
+        self.api.health_available = False
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "safe rollback could not be confirmed"):
+            self.release(INLINE_CONFIG, private_share_key=PRIVATE_SHARE_KEY,
+                         provider_binding=PROVIDER_BINDING, provider_guard=Mock())
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
+        self.assertEqual(self.api.active["versions"][0]["version_id"], NEW_VERSION)
+
+    def test_group_share_card_operator_modes_require_exact_isolation_confirmation(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(release_entry.group_share_cards_release_mode())
+        for mode, enabled in (("enable", True), ("disable", False)):
+            with patch.dict(os.environ, {"SUBS_BOT_GROUP_SHARE_CARDS_MODE": mode}, clear=True):
+                with self.assertRaisesRegex(cloudflare.CloudflareError, "mode or confirmation"):
+                    release_entry.group_share_cards_release_mode()
+                os.environ["SUBS_BOT_GROUP_SHARE_CARDS_CONFIRMATION"] = f"{mode} group share cards for {cloudflare.WORKER_NAME}"
+                self.assertIs(release_entry.group_share_cards_release_mode(), enabled)
 
     def test_refresh_toggle_preserves_provider_and_other_flags(self):
         off = self.set_provider_refresh_baseline(url=True, inline=True)

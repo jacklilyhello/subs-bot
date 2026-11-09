@@ -661,6 +661,11 @@ def quiet_expression(tables, observed_at=None):
               AND action.ready_at>{epoch}-900 AND reply.receipt_id IS NULL))""")
     if "telegram_private_share_creations" in tables:
         conditions.append("NOT EXISTS(SELECT 1 FROM telegram_private_share_creations WHERE state='reserved' OR (state='abandoned' AND cleaned_at IS NULL))")
+    if "telegram_group_share_cards" in tables:
+        # A sent card still carrying an edit lease is unresolved until the consumer clears it.
+        conditions.append(f"""NOT EXISTS(SELECT 1 FROM telegram_group_share_cards
+            WHERE state IN ('pending','sending') OR lease_until>{epoch}
+              OR (state='sent' AND lease_until IS NOT NULL))""")
     if "provider_snapshot_attempts" in tables:
         conditions.append(f"NOT EXISTS(SELECT 1 FROM provider_snapshot_attempts WHERE state IN ('open','sealed') AND lease_until > {epoch})")
     if "telegram_selected_links" in tables:
