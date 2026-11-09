@@ -564,7 +564,8 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
     botId: "123456789", botUsername: "fixture_subs_bot", adminId: "1001", memberId: "1002", groupId: "-1003",
     botToken: `123456789:${"a".repeat(35)}`, webhookSecret: "fixture-webhook-secret-00000000000000",
   };
-  const replies: Array<{ chatId: string; messageId: number; replyTo: number; text: string; button?: string; actions?: number }> = [];
+  const replies: Array<{ chatId: string; messageId: number; replyTo: number; text: string; button?: string; actions?: number;
+    menu?: string[][] }> = [];
   const sentBodies: unknown[] = [];
   const callbackId = "fixture-page-callback";
   let acknowledged = 0;
@@ -575,7 +576,8 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
     modules: true,
     script: bundle.toString("utf8"),
     compatibilityDate: fixture.compatibilityDate,
-    bindings: { BUILD_REVISION: fixture.revision, TELEGRAM_ISOLATION_CONFIG: JSON.stringify(policy) },
+    bindings: { BUILD_REVISION: fixture.revision, TELEGRAM_ISOLATION_CONFIG: JSON.stringify(policy),
+      TELEGRAM_AGGREGATE_KEY: Buffer.alloc(32, 0x19).toString("base64url") },
     d1Databases: ["DB"],
     r2Buckets: ["NODES"],
     outboundService: async (request: Request) => {
@@ -592,13 +594,17 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
         chat_id: string;
         text: string;
         reply_parameters: { message_id: number };
-        reply_markup?: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
+        reply_markup?: { inline_keyboard?: Array<Array<{ text: string; callback_data: string }>> };
       };
       const observed = { chatId: payload.chat_id, text: payload.text, replyTo: payload.reply_parameters?.message_id };
       sentBodies.push(observed);
       assert.deepEqual(observed, { chatId: expected.chatId, text: expected.text, replyTo: expected.replyTo });
-      if (expected.button) {
-        const [button, ...actions] = payload.reply_markup?.inline_keyboard.flat() ?? [];
+      if (expected.menu) {
+        assert.deepEqual(payload.reply_markup, {
+          keyboard: expected.menu.map((row) => row.map((text) => ({ text }))), resize_keyboard: true,
+        });
+      } else if (expected.button) {
+        const [button, ...actions] = payload.reply_markup?.inline_keyboard?.flat() ?? [];
         assert.ok(button);
         assert.equal(button.text, expected.button);
         assert.match(button.callback_data, /^sbv1_[A-Za-z0-9_-]{22}$/u);
@@ -639,8 +645,9 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
       chat: { id: Number(policy.groupId), type: "group" },
       entities: [{ type: "bot_command", offset: 0, length: text.length }],
     };
-    function expectSend(chatId: string, messageId: number, replyTo: number, expectedText: string, button?: string, actions?: number) {
-      replies.push({ chatId, messageId, replyTo, text: expectedText, button, actions });
+    function expectSend(chatId: string, messageId: number, replyTo: number, expectedText: string, button?: string, actions?: number,
+      menu?: string[][]) {
+      replies.push({ chatId, messageId, replyTo, text: expectedText, button, actions, menu });
       return { chatId, text: expectedText, replyTo };
     }
     const webhook = "https://subs-bot.example/telegram/webhook";
@@ -712,7 +719,7 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
     await waitForReplies([10, 8, 9, 18], 3);
     const confirmation = expectSend(policy.groupId, 20, 19, "订阅名称已更新。");
     const rename = { update_id: 15, message: {
-      ...message, message_id: 19, text: "Renamed in compiled Worker", entities: [],
+      ...message, message_id: 19, text: "❓ 帮助菜单", entities: [],
       reply_to_message: { ...botMessage, message_id: 18 },
     } };
     assert.deepEqual((await Promise.all([post(rename), post(rename)])).map((result) => result.status), [200, 200]);
@@ -721,7 +728,7 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
       SELECT owner_id, name, revision
       FROM subscriptions JOIN subscription_lifecycle ON id = subscription_id
       WHERE owner_id = ?
-    `).bind(policy.memberId).first(), { owner_id: policy.memberId, name: "Renamed in compiled Worker", revision: 1 });
+    `).bind(policy.memberId).first(), { owner_id: policy.memberId, name: "❓ 帮助菜单", revision: 1 });
 
     const bucket = await miniflare.getR2Bucket("NODES");
     const share = await createPrivateShare(db, bucket, {
@@ -801,9 +808,40 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
     assert.ok(rule);
     assert.deepEqual(rule, { id: rule.id, owner_id: policy.adminId, keyword: "Straße", remark: "合成路径标签" });
     const ruleList = expectSend(policy.adminId, 314, 313, `你的路径规则\n#${rule.id} Straße → 合成路径标签`);
-    assert.equal((await post({ update_id: 311, message: { ...pathEvent.message, message_id: 313, text: "/path" } })).status, 200);
+    assert.equal((await post({ update_id: 311, message: { ...pathEvent.message, message_id: 313, text: "🧭 路径对应",
+      entities: [] } })).status, 200);
     await waitForReplies([10, 8, 9, 18, 20, 22, 24, 26, 28, 312, 314], 3);
     assert.deepEqual(sentBodies.slice(-2), [ruleSaved, ruleList]);
+
+    const ids = [10, 8, 9, 18, 20, 22, 24, 26, 28, 312, 314];
+    const menu = [["📦 订阅列表", "🟠 临期列表"], ["📤 导出链接"], ["♻️ 撤销删除"], ["🧭 路径对应", "❓ 帮助菜单"]];
+    const publicHelp = "使用 /list 查看你的订阅，/expire 查看临期，/recycle 查看回收站。\n/s 关键词搜索订阅。";
+    const privateHelp = publicHelp + "\n/temp 查看临时节点，/path 管理路径规则。\n发送列表编号查看订阅详情。"
+      + "\n/export 导出全部订阅，/o 关键词导出所选订阅。";
+    const adminStart = expectSend(policy.adminId, 316, 315, `欢迎使用 subs-bot。\n${privateHelp}`, undefined, undefined, menu);
+    const memberHelp = expectSend(policy.memberId, 318, 317, privateHelp, undefined, undefined, menu);
+    assert.equal((await post({ update_id: 312, message: { ...pathEvent.message, message_id: 315, text: "/start",
+      entities: [{ type: "bot_command", offset: 0, length: 6 }] } })).status, 200);
+    await waitForReplies([...ids, 316], 3);
+    const helpEvent = { update_id: 313, message: { ...memberPrivate, message_id: 317, text: "/help",
+      entities: [{ type: "bot_command", offset: 0, length: 5 }] } };
+    assert.deepEqual((await Promise.all([post(helpEvent), post(helpEvent)])).map((result) => result.status), [200, 200]);
+    await waitForReplies([...ids, 316, 318], 3);
+    const groupHelp = expectSend(policy.groupId, 320, 319, publicHelp);
+    assert.equal((await post({ update_id: 314, message: { ...message, message_id: 319, text: "❓ 帮助菜单", entities: [] } })).status, 200);
+    await waitForReplies([...ids, 316, 318, 320], 3);
+    const groupAlias = expectSend(policy.groupId, 322, 321, firstPage, "下一页", 8);
+    assert.equal((await post({ update_id: 315, message: { ...message, message_id: 321, text: "📦 订阅列表", entities: [] } })).status, 200);
+    await waitForReplies([...ids, 316, 318, 320, 322], 3);
+    for (const [index, label] of ["📤 导出链接", "🧭 路径对应", "🔄 更新所有", "群里随便聊聊"].entries()) {
+      assert.equal((await post({ update_id: 323 + index, message: { ...message, message_id: 323 + index, text: label, entities: [] } })).status, 204);
+    }
+    await db.prepare("UPDATE telegram_auth SET allowed = 0 WHERE bot_id = ? AND user_id = ?")
+      .bind(policy.botId, policy.memberId).run();
+    const denied = expectSend(policy.memberId, 328, 327, "当前账号没有使用权限。");
+    assert.equal((await post({ update_id: 327, message: { ...memberPrivate, message_id: 327, text: "帮助", entities: [] } })).status, 200);
+    await waitForReplies([...ids, 316, 318, 320, 322, 328], 3);
+    assert.deepEqual(sentBodies.slice(-5), [adminStart, memberHelp, groupHelp, groupAlias, denied]);
     assert.deepEqual(replies, []);
   } finally {
     await miniflare.dispose();

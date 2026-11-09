@@ -87,6 +87,24 @@ function decodeMessage(text: string, fields: Record<string, unknown> = {}) {
   return decode({ update_id: updateId, message: message(text, fields) });
 }
 
+test("matches only explicit legacy menu labels and preserves private-only dispatch", async () => {
+  const plain = { entities: [] };
+  const group = { ...plain, chat: { id: Number(policy.groupId), type: "supergroup" }, message_thread_id: 15 };
+  for (const [label, kind] of [["📋 订阅列表", "list"], ["临期列表", "expiry"], ["♻️ 撤销删除", "recycle"]] as const) {
+    const decoded = await decodeMessage(label, group);
+    assert.equal(decoded.view?.kind, kind);
+    assert.equal(decoded.view?.threadId, 15);
+  }
+  assert.equal((await decodeMessage("帮助菜单", group)).command?.command, "help");
+  assert.equal((await decodeMessage("📤 导出链接", plain)).aggregate?.kind, "show");
+  assert.equal((await decodeMessage("路径对应", plain)).path?.args, "");
+  assert.equal((await decodeMessage("更新所有", plain)).providerBatch?.kind, "preview");
+  for (const text of ["📤 导出链接", "路径对应", "🔄 更新所有", "想看看订阅列表", "重置编号"]) {
+    assert.equal((await decodeMessage(text, group)).status, 204);
+  }
+  assert.equal((await decodeMessage("订阅列表", { ...group, entities: [{ type: "bot_command", offset: 0, length: 4 }] })).status, 204);
+});
+
 test("normalizes private /i into an enum without enabling inline events", async () => {
   for (const [label, mode] of [["默认", "default"], ["流量", "traffic"], ["到期", "expiry"], ["名称", "name"]] as const) {
     const command = `/i@${policy.botUsername}`;

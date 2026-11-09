@@ -187,6 +187,7 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
     const providerQueueReady = await telegramProviderQueueReady(env);
     const providerBatch = await providerBatchReadiness(env);
     const providerIntakeReady = providerQueueReady && await providerSnapshotJournalReady(env.DB);
+    const providerBatchAdmission = providerIntakeReady && env.TELEGRAM_PROVIDER_BATCH_REFRESH === "1";
     const providerDocument = await telegramProviderDocumentReady(env.DB).catch(() => "unavailable" as const);
     const providerPolicy = providerDocument === true ? { ...policy, includeDocuments: true as const } : policy;
     const inlineConsent = inlineSearchEnabled && await telegramInlineSearchReady(env.DB);
@@ -197,7 +198,7 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
     const drainReplies = async (budget = 20_000) => drainTelegramReplies(env.DB, env.NODES, policy, 4, budget, fetch, aggregateKey, privateShare,
       subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerQueueReady, bulkTrash, inlineConsent,
       await githubSearch().catch(() => "unavailable" as const), providerRefresh, subscriptionRawFile, providerBatch.controls, apiStatus,
-      statusProvider !== null, providerDocument);
+      statusProvider !== null, providerDocument, providerBatchAdmission);
     const drain = () => ctx?.waitUntil(drainReplies().catch(() => undefined));
     if (decoded.apiStatus) {
       if (!statusProvider || apiStatus !== true) return new Response(null, { status: 204, headers: HEADERS });
@@ -336,11 +337,10 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
       if (providerBatch.controls === "unavailable") return new Response(null, { status: 503, headers: HEADERS });
       if (!providerBatch.controls) return new Response(null, { status: 204, headers: HEADERS });
       const event = decoded.providerBatch;
-      const admission = providerIntakeReady && env.TELEGRAM_PROVIDER_BATCH_REFRESH === "1";
-      if (!admission && event.kind !== "status") return new Response(null, { status: 204, headers: HEADERS });
-      const outcome = await acceptTelegramProviderBatchControl(env.DB, policy, event, admission);
-      if (!admission && outcome === "ignored") return new Response(null, { status: 204, headers: HEADERS });
-      if (event.kind === "confirm" && admission) ctx?.waitUntil(answerTelegramCallback(policy, event.callbackId));
+      if (!providerBatchAdmission && event.kind !== "status") return new Response(null, { status: 204, headers: HEADERS });
+      const outcome = await acceptTelegramProviderBatchControl(env.DB, policy, event, providerBatchAdmission);
+      if (!providerBatchAdmission && outcome === "ignored") return new Response(null, { status: 204, headers: HEADERS });
+      if (event.kind === "confirm" && providerBatchAdmission) ctx?.waitUntil(answerTelegramCallback(policy, event.callbackId));
       if (outcome === "accepted") drain();
     } else if (decoded.privateShareCreation) {
       if (!privateShare.context) return new Response(null, { status: 204, headers: HEADERS });
@@ -452,6 +452,7 @@ async function recoverTelegramWork(env: Env, policy: TelegramPolicy, pin: Provid
   const apiStatus = await telegramApiStatusReady(env.DB).catch(() => "unavailable" as const);
   const providerBatch = await providerBatchReadiness(env);
   const providerIntakeReady = providerQueueReady && await providerSnapshotJournalReady(env.DB);
+  const providerBatchAdmission = providerIntakeReady && env.TELEGRAM_PROVIDER_BATCH_REFRESH === "1";
   const providerDocument = await telegramProviderDocumentReady(env.DB).catch(() => "unavailable" as const);
   const providerPolicy = providerDocument === true ? { ...policy, includeDocuments: true as const } : policy;
   const inlineSearchSchema = await telegramInlineSearchReady(env.DB);
@@ -464,7 +465,7 @@ async function recoverTelegramWork(env: Env, policy: TelegramPolicy, pin: Provid
     drainTelegramReplies(env.DB, env.NODES, policy, limit, budget, fetch, aggregateKey, privateShare,
       subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerQueueReady, bulkTrash, inlineConsent,
       await githubSearch().catch(() => "unavailable" as const), providerRefresh, subscriptionRawFile, providerBatch.controls, apiStatus,
-      apiStatusProvider(env) !== null, providerDocument);
+      apiStatusProvider(env) !== null, providerDocument, providerBatchAdmission);
   const replies = async () => {
     await drain(10, 45_000);
     await reapTelegramViewTickets(env.DB);

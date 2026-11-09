@@ -59,11 +59,11 @@ test("emitted Worker refreshes only the owned version pinned by a private sent d
       assert.equal(request.method, "POST");
       if (request.url === api + "/answerCallbackQuery") return Response.json({ ok: true, result: true });
       assert.equal(request.url, api + "/sendMessage");
-      const body = await request.json() as { chat_id: string; text: string; reply_markup?: { inline_keyboard: Button[][] } };
+      const body = await request.json() as { chat_id: string; text: string; reply_markup?: { inline_keyboard?: Button[][] } };
       assert.ok(body.chat_id === policy.adminId || body.chat_id === policy.memberId);
       assert.doesNotMatch(body.text, /provider\.example\.invalid|synthetic-refresh-secret|ss:\/\//u);
       const id = 1000 + sent.length;
-      sent.push({ id, text: body.text, buttons: body.reply_markup?.inline_keyboard.flat() ?? [] });
+      sent.push({ id, text: body.text, buttons: body.reply_markup?.inline_keyboard?.flat() ?? [] });
       return Response.json({ ok: true, result: { message_id: id, chat: { id: Number(body.chat_id) } } });
     },
   };

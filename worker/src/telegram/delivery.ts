@@ -42,6 +42,7 @@ import { prepareTelegramProviderRefreshButton, type TelegramProviderRefreshTarge
 import { renderTelegramProviderBatchReply } from "./provider-batch-controls.ts";
 import { renderTelegramProviderDocumentReply } from "./provider-document-replies.ts";
 import { renderTelegramApiStatus } from "./api-status.ts";
+import { telegramMainMenuKeyboard, type TelegramMainMenuFeatures } from "./main-menu.ts";
 
 const BOT_API = "https://api.telegram.org";
 const MAX_RESPONSE_BYTES = 64 * 1024;
@@ -136,6 +137,7 @@ export async function sendTelegramReply(
   request: typeof fetch = fetch,
   keyboard?: InlineKeyboard,
   forceReply = false,
+  mainMenu?: TelegramMainMenuFeatures,
 ): Promise<TelegramReplyOutcome> {
   if ((lease.path || lease.privateShareCreation || lease.tempRaw || lease.shortLink || lease.subscriptionNodes || lease.subscriptionRawFile
     || lease.providerOutcome !== undefined || lease.bulkTrash || lease.githubSearch || lease.providerBatch || lease.apiStatus || lease.providerDocument)
@@ -148,7 +150,9 @@ export async function sendTelegramReply(
     reply_parameters: replyParameters(lease),
     link_preview_options: { is_disabled: true },
     ...(keyboard?.length ? { reply_markup: { inline_keyboard: keyboard } }
-      : forceReply && lease.chatType === "private" ? { reply_markup: { force_reply: true } } : {}),
+      : forceReply && lease.chatType === "private" ? { reply_markup: { force_reply: true } }
+      : mainMenu && lease.chatType === "private" && lease.threadId === null && (lease.command === "start" || lease.command === "help")
+        ? { reply_markup: { keyboard: telegramMainMenuKeyboard(mainMenu), resize_keyboard: true } } : {}),
     text,
   }, timeoutMs, request);
 }
@@ -228,6 +232,7 @@ async function renderReply(
   policy: TelegramPolicy,
   lease: TelegramReplyLease,
   deadline: number,
+  menuFeatures: TelegramMainMenuFeatures,
   privateShareEnabled = false,
   subscriptionReadEnabled = false,
   subscriptionNodesEnabled = false,
@@ -244,6 +249,7 @@ async function renderReply(
   rawFileTarget?: TelegramRawFileTarget;
   readGuard?: { sql: string; bindings: readonly (string | number | null)[] };
   forceReply?: boolean;
+  mainMenu?: TelegramMainMenuFeatures;
 }> {
   if (lease.command.startsWith("auth-")) {
     if (lease.actorId !== policy.adminId) return { text: "只有管理员可以管理授权。", access: "none" };
@@ -314,10 +320,19 @@ async function renderReply(
     if (page.nextAfterId !== null) names.push(`仅显示前 ${LIST_LIMIT} 条。`);
     return { text: names.length ? `你的订阅\n${names.join("\n")}` : "你的订阅列表为空。", access: "allowed" };
   }
-  const help = "使用 /list 查看你的订阅，/expire 查看临期，/recycle 查看回收站，/temp 查看临时节点，私聊 /path 管理路径规则，/o 关键词导出所选订阅。"
-    + (subscriptionReadEnabled ? "\n/s 关键词搜索订阅，私聊发送列表编号可查看订阅详情。" : "")
-    + (privateShareEnabled ? "\n私聊创建私密分享：/share [x份数] [id领取人ID] [s分钟] -- 正文。" : "");
-  return { text: lease.command === "start" ? `欢迎使用 subs-bot。\n${help}` : help, access: "allowed" };
+  const privateChat = lease.chatType === "private" && lease.threadId === null;
+  const help = "使用 /list 查看你的订阅，/expire 查看临期，/recycle 查看回收站。"
+    + (subscriptionReadEnabled ? "\n/s 关键词搜索订阅。" : "")
+    + (privateChat ? "\n/temp 查看临时节点，/path 管理路径规则。"
+      + (subscriptionReadEnabled ? "\n发送列表编号查看订阅详情。" : "")
+      + (menuFeatures.aggregate ? "\n/export 导出全部订阅，/o 关键词导出所选订阅。" : "")
+      + (menuFeatures.batchRefresh ? "\n/updateall 预览批量刷新。" : "")
+      + (privateShareEnabled ? "\n创建私密分享：/share [x份数] [id领取人ID] [s分钟] -- 正文。" : "") : "");
+  return {
+    text: lease.command === "start" ? `欢迎使用 subs-bot。\n${help}` : help,
+    access: "allowed",
+    ...(privateChat && (lease.command === "start" || lease.command === "help") ? { mainMenu: menuFeatures } : {}),
+  };
 }
 
 async function deliverTelegramShortLink(
@@ -439,6 +454,7 @@ export async function drainTelegramReplies(
   apiStatusReadiness: boolean | "unavailable" = false,
   apiStatusPromptsEnabled = false,
   providerDocumentReadiness: boolean | "unavailable" = false,
+  providerBatchAdmissionEnabled = false,
 ): Promise<void> {
   const deadline = Date.now() + budgetMs;
   const privateShareEnabled = privateShareRuntime.schemaReady && privateShareRuntime.context !== null;
@@ -447,6 +463,7 @@ export async function drainTelegramReplies(
   const subscriptionRawFileEnabled = subscriptionRawFileReadiness === true;
   const providerBatchEnabled = providerBatchReadiness === true;
   const providerBatch = providerBatchEnabled ? policy : providerBatchReadiness === "unavailable" ? "unavailable" : undefined;
+  const menuFeatures = { aggregate: aggregateKey !== null, batchRefresh: providerBatchEnabled && providerBatchAdmissionEnabled };
   const apiStatusEnabled = apiStatusReadiness === true;
   const apiStatus = apiStatusEnabled ? policy : apiStatusReadiness === "unavailable" ? "unavailable" : undefined;
   const providerDocumentEnabled = providerDocumentReadiness === true;
@@ -607,7 +624,7 @@ export async function drainTelegramReplies(
       await settleTelegramReply(db, policy, lease, outcome);
       continue;
     }
-    const reply = await renderReply(db, bucket, policy, lease, deadline, privateShareEnabled, subscriptionReadEnabled,
+    const reply = await renderReply(db, bucket, policy, lease, deadline, menuFeatures, privateShareEnabled, subscriptionReadEnabled,
       subscriptionNodesEnabled, providerRefreshEnabled, subscriptionRawFileEnabled);
     const [view, lifecycle, read, nodes, refresh, rawFile] = await Promise.all([
       reply.buttons?.length ? prepareTelegramViewTickets(reply.buttons) : undefined,
@@ -630,7 +647,7 @@ export async function drainTelegramReplies(
     const keyboard = [...(view?.keyboard ?? []), ...(lifecycle?.keyboard ?? []), ...(nodes?.keyboard ?? []), ...(read?.keyboard ?? []),
       ...(refresh ? [[refresh.button]] : []), ...(rawFile ? [[rawFile.button]] : [])];
     const outcome = await sendTelegramReply(policy, lease, reply.text, Math.max(1, deadline - Date.now()), request,
-      keyboard, reply.forceReply);
+      keyboard, reply.forceReply, reply.mainMenu);
     await settleTelegramReply(db, policy, lease, outcome);
   }
 }
