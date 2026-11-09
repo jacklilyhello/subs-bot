@@ -506,6 +506,8 @@ PY
 
 候选保留所选编号的顺序和重复项。活动成员须对应同号、同归属且令牌摘要一致的已转换订阅。原归属被重新映射，或有其他旧归属映射到同一账号时，有活动成员的链接会阻止封存，避免套用其他旧归属的路径规则。全部编号均已失效的链接仍可保留。回收站同号记录不补入，旧活动编号范围内的缺口标记为永久失效。SQL 重放核对聚合行、标记、监视编号、订阅序列、外键和 R2 对象闭包。现有版本 5 的受保护恢复流程会拒绝版本 6。旧 Python 与实际 Worker 构建的 HTTP 对照、独立目标的原生恢复和真实旧库验收仍分别进行。
 
+托管 Worker CI 从封存的合成 SQLite 创建 V6 候选，在仅回环网络中运行旧版实际 Python 路由，并把候选 SQL 和经摘要核对的对象装入编译后 Worker 的 D1、R2 测试绑定。对照覆盖固定顺序与重复项、历史缺口、同号回收站记录、零代空订阅、旧格式别名和相对跳转。Base64 和空响应比对实际字节，非空 Clash 与 Sing-box 比对有序的连接字段，HEAD 长度和重定向正文差异单独记录。测试只保留分类计数，实际旧库和原生 Cloudflare 恢复另行验收。 [Miniflare D1](https://developers.cloudflare.com/workers/testing/miniflare/storage/d1/)
+
 ### 真实数据与生产切换门槛
 
 1. 先只读核对 Cloudflare 目标账户、Zone、`subs-bot.lilyya.top` 的 DNS、Worker 路由和 Custom Domain 绑定。新资源记录账号、环境及资源 ID，隔离与生产分别使用各自的 Worker、D1、R2 和队列。现有配置冲突须在改动前报告。目标主机名可用且切换获准后，仅增加所需的 Custom Domain 绑定。 [Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)
