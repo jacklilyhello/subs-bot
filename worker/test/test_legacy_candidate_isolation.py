@@ -627,6 +627,24 @@ class CandidateBoundaryTests(unittest.TestCase):
                     request()
             response.assert_not_called()
 
+    def test_selected_profile_cannot_access_mixed_targets_or_journal(self):
+        native = tool.native
+        with patch.object(native, "ACCOUNT_SHA256", native.digest(native_tests.ACCOUNT.encode())), patch.object(native, "_response") as response:
+            selected = native.RehearsalAPI(native_tests.TARGET, "synthetic-token", native_tests.COHORT, profile=tool.SELECTED_PROFILE)
+            mixed = native.RehearsalAPI(native_tests.TARGET, "synthetic-token", native_tests.COHORT, profile=tool.MIXED_PROFILE)
+            self.assertEqual(selected.names, {"database": f"subs-bot-cf-legacy-select-db-{selected.cohort}",
+                                              "objects": f"subs-bot-cf-legacy-select-r2-{selected.cohort}"})
+            self.assertEqual(selected.journal_prefix, f"maintenance/legacy-select-candidate/{selected.cohort}/journal/")
+            for request in (
+                lambda: selected.json("POST", selected.root + "/d1/database", {"name": mixed.names["database"],
+                                                                                 "read_replication": {"mode": "disabled"}}),
+                lambda: selected.json("POST", selected.root + "/r2/buckets", {"name": mixed.names["objects"], "storageClass": "Standard"}),
+                lambda: selected.r2("GET", native.WORKER_NAME, mixed.journal_prefix + "000001-" + "a" * 32 + ".json"),
+            ):
+                with self.assertRaises(native.RehearsalError):
+                    request()
+            response.assert_not_called()
+
     def test_different_runtime_pin_stops_before_claim(self):
         journal = Mock()
         journal.load.return_value = {"sourcePin": {"artifact": "unchanged", "live": "previous"}, "scopeSha256": "scope"}

@@ -37,6 +37,7 @@ QX = ("qx", "quantumult", "quantumultx")
 SINGBOX = ("singbox", "sing-box")
 FORMATS = (*BASE64, *QX, *SINGBOX, "clash", "surge", "unknown-format")
 MAX_BODY = 64 * 1024
+PUBLISH_DIRECTORY = "subs-bot-legacy-selected-aggregate-candidate"
 HEADER_FIELDS = {
     "contentType": "Content-Type", "cacheControl": "Cache-Control", "referrerPolicy": "Referrer-Policy",
     "noSniff": "X-Content-Type-Options", "contentLength": "Content-Length", "location": "Location",
@@ -357,7 +358,49 @@ def compare(cases, legacy, worker):
     return counts
 
 
-def main():
+def publication_target(arguments, bundle, revision):
+    if not arguments:
+        return None, None
+    require(len(arguments) == 2 and arguments[0] == "--output", "arguments")
+    runner = Path(os.environ.get("RUNNER_TEMP", ""))
+    output = Path(arguments[1])
+    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+    require(runner.is_absolute() and output == runner / PUBLISH_DIRECTORY and bundle == runner / "subs-bot-worker"
+            and os.environ.get("GITHUB_REPOSITORY") == artifact.REPOSITORY
+            and os.environ.get("GITHUB_REF") == artifact.MAIN_REF
+            and os.environ.get("GITHUB_SHA") == revision and artifact._REVISION.fullmatch(revision)
+            and os.environ.get("GITHUB_EVENT_NAME") in {"push", "workflow_dispatch"}
+            and artifact._DECIMAL.fullmatch(run_id) and artifact._DECIMAL.fullmatch(attempt), "publication-provenance")
+    output = package.converter._safe_path(output, existing=False)
+    state = runner.stat()
+    require(state.st_uid == os.geteuid() and not state.st_mode & 0o022, "publication-directory")
+    raw = package.read_private(bundle / "isolation.json", artifact._MAX_JSON)
+    manifest = package.native.parsed(raw, artifact._MAX_JSON)
+    require((manifest.get("ref"), manifest.get("revision"), manifest.get("runId"), manifest.get("runAttempt"))
+            == (artifact.MAIN_REF, revision, run_id, attempt), "publication-worker-pin")
+    return output, package.native.digest(raw)
+
+
+def publish(candidate, worker, revision, worker_sha, outcomes, destination):
+    from legacy_selected_native_candidate import seal_selected_http_report
+
+    _, worker_pin = package.worker_artifact(worker, revision, worker_sha)
+    seal_selected_http_report(candidate, worker_pin, outcomes)
+    # Reserve the exact name without replacing any preexisting output. Both
+    # directories are on RUNNER_TEMP, so the completed package moves at once.
+    destination.mkdir(mode=0o700)
+    reservation = destination.lstat()
+    try:
+        candidate.candidate.rename(destination)
+    except OSError:
+        with suppress(OSError):
+            if os.path.samestat(reservation, destination.lstat()):
+                destination.rmdir()
+        raise
+
+
+def main(arguments):
     require(sys.platform == "linux" and os.geteuid() != 0
             and [name for _, name in socket.if_nameindex()] == ["lo"]
             and resource.getrlimit(resource.RLIMIT_CORE)[0] == 0, "loopback-only-namespace")
@@ -365,11 +408,13 @@ def main():
             and version("yarl") == fixture.YARL, "legacy-runtime-version")
     bundle = Path(os.environ["WORKER_TEST_BUNDLE_DIR"])
     revision = os.environ["WORKER_TEST_REVISION"]
-    with TemporaryDirectory(prefix="legacy-selected-oracle-") as name:
+    destination, original_worker_sha = publication_target(arguments, bundle, revision)
+    with TemporaryDirectory(prefix="legacy-selected-oracle-", dir=destination.parent if destination else None) as name:
         root = Path(name)
         worker = root / "worker"
         try:
             worker_sha = prepare_worker(bundle, worker, revision)
+            require(original_worker_sha is None or worker_sha == original_worker_sha, "publication-worker-pin")
             candidate = fixture.build_selected_fixture(root, worker, revision)
         except (package.PackageError, package.native.RehearsalError, artifact.ArtifactError):
             raise OracleError("v6-fixture-build") from None
@@ -378,13 +423,16 @@ def main():
         legacy = asyncio.run(legacy_responses(root, candidate, cases))
         require(package.native.file_hash(candidate.source)[1] == candidate.source_sha256, "legacy-source-unchanged")
         counts = compare(cases, legacy, replies)
-        print(json.dumps({"requestCountPerRuntime": len(cases), **counts, "legacy-lifecycle": "confirmed",
-                          "foreign-source-policy": "blocked"}, sort_keys=True))
+        outcomes = {"requestCountPerRuntime": len(cases), **counts, "legacy-lifecycle": "confirmed",
+                    "foreign-source-policy": "blocked"}
+        if destination is not None:
+            publish(candidate, worker, revision, worker_sha, outcomes, destination)
+        print(json.dumps(outcomes, sort_keys=True))
 
 
 if __name__ == "__main__":
     try:
-        main()
+        main(sys.argv[1:])
     except OracleError as error:
         print(f"Legacy selected HTTP oracle failed at {error}.", file=sys.stderr)
         raise SystemExit(2) from None

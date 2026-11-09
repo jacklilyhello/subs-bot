@@ -68,9 +68,11 @@ LEGACY_EMPTY_CANDIDATE_PROFILE = "synthetic-legacy-empty"
 LEGACY_PRIVATE_SHARE_CANDIDATE_PROFILE = "synthetic-legacy-private-shares"
 LEGACY_TYPED_SHORT_CANDIDATE_PROFILE = "synthetic-legacy-typed-shorts"
 LEGACY_MIXED_SHORT_CANDIDATE_PROFILE = "synthetic-legacy-mixed-shorts"
+LEGACY_SELECTED_AGGREGATE_CANDIDATE_PROFILE = "synthetic-legacy-selected-aggregates"
 LEGACY_CANDIDATE_NAMES = {LEGACY_CANDIDATE_PROFILE: "legacy", LEGACY_PATH_CANDIDATE_PROFILE: "legacy-path",
                           LEGACY_EMPTY_CANDIDATE_PROFILE: "legacy-empty", LEGACY_PRIVATE_SHARE_CANDIDATE_PROFILE: "legacy-share",
-                          LEGACY_TYPED_SHORT_CANDIDATE_PROFILE: "legacy-typed", LEGACY_MIXED_SHORT_CANDIDATE_PROFILE: "legacy-mixed"}
+                          LEGACY_TYPED_SHORT_CANDIDATE_PROFILE: "legacy-typed", LEGACY_MIXED_SHORT_CANDIDATE_PROFILE: "legacy-mixed",
+                          LEGACY_SELECTED_AGGREGATE_CANDIDATE_PROFILE: "legacy-select"}
 ACCOUNT_SHA256 = "ffdbf3dd5d042c6edb68d7f628998a69a22320b0199775bfda9f97593136e508"
 
 
