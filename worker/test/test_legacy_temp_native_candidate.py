@@ -94,13 +94,13 @@ class LegacyTempNativeCandidateTests(unittest.TestCase):
         document = json.loads(path.read_bytes())
         sql = fixture.candidate / tool.package.SQL
         statements = sql.read_text(encoding="utf-8").splitlines(keepends=True)
-        for index, statement in enumerate(statements):
-            if statement.startswith('INSERT INTO "legacy_temp_installations"'):
-                self.assertTrue(statement.endswith(",NULL);\n"))
-                statements[index] = statement.removesuffix("NULL);\n") + "1700000000);\n"
-                break
-        else:
-            self.fail("expected one dormant installation insert")
+        matches = [index for index, statement in enumerate(statements)
+                   if statement.startswith(f"INSERT INTO {tool.INSTALLATIONS} (")]
+        self.assertEqual(len(matches), 1)
+        index, = matches
+        statement = statements[index]
+        self.assertTrue(statement.endswith(",NULL);\n"))
+        statements[index] = statement.removesuffix("NULL);\n") + "1700000000);\n"
         changed = "".join(statements).encode("utf-8")
         sql.write_bytes(changed)
         document["sql"].update(bytes=len(changed), sha256=tool.native.digest(changed), md5=md5(changed, usedforsecurity=False).hexdigest())
