@@ -7,6 +7,7 @@ import { Miniflare } from "miniflare";
 
 import { enqueueProviderUrlImport } from "../src/provider-jobs.ts";
 import type { TelegramPolicy } from "../src/telegram/protocol.ts";
+import { recordTempFixtureMigration } from "./temp-migration-fixture.ts";
 
 const policy: TelegramPolicy = {
   botId: "76201", adminId: "76202", memberId: "76203", groupId: "-10076204",
@@ -67,6 +68,7 @@ test("emitted Worker admits private provider URLs only after opt-in and delivers
     const sql = await readFile(join(directory!, entry.name), "utf8");
     assert.equal(createHash("sha256").update(sql).digest("hex"), entry.sha256);
     await db.batch(sql.trim().split(/;\s*/u).filter(Boolean).map((statement) => db.prepare(statement)));
+    await recordTempFixtureMigration(db, entry);
   }
   const providerMigration = manifest.migrations.find((entry: { name: string }) => entry.name === "0023_telegram_provider_replies.sql");
   const journalMigration = manifest.migrations.find((entry: { name: string }) => entry.name === "0033_provider_snapshot_journal.sql");
