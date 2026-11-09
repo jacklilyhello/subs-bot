@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import { after, before, test } from "node:test";
 
@@ -11,24 +12,40 @@ import {
 } from "../src/telegram/temp-import.ts";
 import { beginTelegramReply, beginTelegramTempRawReply, claimTelegramReply, settleTelegramReply } from "../src/telegram/store.ts";
 import { confirmTelegramTempRawSend, prepareTelegramTempRawReply } from "../src/telegram/temp-raw.ts";
+import { LEGACY_TEMP_MIGRATION_NAME, LEGACY_TEMP_MIGRATION_SHA256 } from "../src/telegram/temp-storage.ts";
 
 const miniflare = new Miniflare({
   modules: true,
   script: "export default { fetch() { return new Response(null); } };",
   compatibilityDate: "2026-07-30",
-  d1Databases: ["DB"],
+  d1Databases: ["DB", "RESTORED", "UNPINNED"],
 });
 const migrationDir = new URL("../migrations/", import.meta.url);
 const firstShare = "hy2://first.example.invalid#synthetic-first";
 const secondShare = "ssr://synthetic-opaque-share#synthetic-second";
 let db: D1Database;
+let restored: D1Database;
+let unpinned: D1Database;
+
+async function applyMigration(target: D1Database, name: string): Promise<void> {
+  const sql = await readFile(new URL(name, migrationDir), "utf8");
+  await target.batch(sql.trim().split(/;\s*/u).filter(Boolean).map((statement) => target.prepare(statement)));
+}
 
 before(async () => {
   db = await miniflare.getD1Database("DB");
   for (const name of (await readdir(migrationDir)).filter((file) => file.endsWith(".sql")).sort()) {
-    const sql = await readFile(new URL(name, migrationDir), "utf8");
-    await db.batch(sql.trim().split(/;\s*/u).filter(Boolean).map((statement) => db.prepare(statement)));
+    if (name !== LEGACY_TEMP_MIGRATION_NAME) await applyMigration(db, name);
   }
+  restored = await miniflare.getD1Database("RESTORED");
+  for (const name of ["0002_telegram.sql", "0008_telegram_temp_nodes.sql", LEGACY_TEMP_MIGRATION_NAME]) {
+    await applyMigration(restored, name);
+  }
+  await restored.prepare(`CREATE TABLE subs_bot_schema_migrations(position INTEGER PRIMARY KEY,name TEXT,sha256 TEXT,mode TEXT)`).run();
+  await restored.prepare("INSERT INTO subs_bot_schema_migrations VALUES (39,?,?,'applied')")
+    .bind(LEGACY_TEMP_MIGRATION_NAME, LEGACY_TEMP_MIGRATION_SHA256).run();
+  unpinned = await miniflare.getD1Database("UNPINNED");
+  await applyMigration(unpinned, LEGACY_TEMP_MIGRATION_NAME);
 });
 
 after(() => miniflare.dispose());
@@ -52,8 +69,8 @@ function submit(config: TelegramPolicy, update: TelegramTempUpdate) {
   return acceptTelegramTemp(db, config, update);
 }
 
-async function storedReply(config: TelegramPolicy, updateId: number) {
-  return db.prepare(`
+async function storedReply(config: TelegramPolicy, updateId: number, target = db) {
+  return target.prepare(`
     SELECT inbox.receipt_nonce AS marker, outbox.state, reply.kind, reply.node_count AS nodeCount,
       reply.total_count AS totalCount, reply.malformed_count AS malformedCount,
       reply.unsupported_count AS unsupportedCount, reply.ignored_count AS ignoredCount
@@ -61,6 +78,85 @@ async function storedReply(config: TelegramPolicy, updateId: number) {
     JOIN telegram_temp_reply AS reply USING (receipt_id) WHERE inbox.bot_id = ? AND inbox.update_id = ?
   `).bind(config.botId, updateId).first<TelegramTempReply & { marker: string; state: string }>();
 }
+
+async function install(botId: string, cutoff: number | null): Promise<void> {
+  await restored.prepare("INSERT INTO legacy_temp_installations VALUES (?,?,?)").bind(botId, "a".repeat(64), cutoff).run();
+}
+
+async function baseline(botId: string, actorId: string, first: number, count = 1): Promise<void> {
+  const json = JSON.stringify(Array.from({ length: count }, () => ({ name: "old node", type: "temp", share: firstShare })));
+  await restored.prepare("INSERT INTO legacy_temp_batches VALUES (?,?,?,?,?,?,?,?)")
+    .bind(botId, actorId, first, first + count - 1, json, count, Buffer.byteLength(json), createHash("sha256").update(json).digest("hex")).run();
+}
+
+test("fails closed when legacy baseline tables exist without the exact ledger pin", async () => {
+  const config = policy("97101");
+  await assert.rejects(acceptTelegramTemp(unpinned, config, paste(config, 1)), /receipt could not be confirmed/u);
+});
+
+test("clears restored and older live data atomically while fencing delayed messages and other scopes", async () => {
+  const config = policy("97102");
+  const otherBot = "97103";
+  const cutoff = 1_800_000_000;
+  await install(config.botId, cutoff);
+  await install(otherBot, cutoff);
+  await baseline(config.botId, config.memberId, 1);
+  await baseline(config.botId, config.adminId, 2);
+  await baseline(otherBot, config.memberId, 1);
+  for (const update of [paste(config, 1), { ...event(config, 2), kind: "temp-clear" as const }]) {
+    assert.equal(await acceptTelegramTemp(restored, config, update), "ignored");
+    assert.equal(await storedReply(config, update.updateId, restored), null);
+  }
+  const afterCutover = (updateId: number, messageId: number) => ({ ...event(config, updateId, messageId), messageDate: cutoff + 1 });
+  for (const [id, messageId] of [[3, 10], [4, 30]]) {
+    assert.equal(await acceptTelegramTemp(restored, config, { ...afterCutover(id, messageId), kind: "temp-text", text: firstShare }), "accepted");
+  }
+  assert.equal((await storedReply(config, 4, restored))?.totalCount, 3);
+  const clear = { ...afterCutover(5, 20), kind: "temp-clear" } as const;
+  await restored.prepare(`CREATE TRIGGER fixture_baseline_clear_abort BEFORE INSERT ON telegram_outbox
+    WHEN EXISTS (SELECT 1 FROM telegram_inbox WHERE receipt_id=NEW.receipt_id AND bot_id='97102' AND update_id=5)
+    BEGIN SELECT RAISE(IGNORE); END`).run();
+  try {
+    await assert.rejects(acceptTelegramTemp(restored, config, clear), /receipt could not be confirmed/u);
+    assert.equal(await storedReply(config, 5, restored), null);
+    assert.equal(await restored.prepare("SELECT count(*) AS n FROM legacy_temp_batches").first("n"), 3);
+    assert.equal(await restored.prepare("SELECT count(*) AS n FROM telegram_temp_batch WHERE bot_id=?")
+      .bind(config.botId).first("n"), 2);
+    assert.equal(await restored.prepare("SELECT count(*) AS n FROM telegram_temp_clear_fence WHERE bot_id=?")
+      .bind(config.botId).first("n"), 0);
+  } finally {
+    await restored.prepare("DROP TRIGGER fixture_baseline_clear_abort").run();
+  }
+  assert.equal(await acceptTelegramTemp(restored, config, clear), "accepted");
+  assert.equal(await acceptTelegramTemp(restored, config, clear), "ignored");
+  const reply = await storedReply(config, 5, restored);
+  assert.deepEqual([reply?.kind, reply?.nodeCount, reply?.totalCount], ["cleared", 2, 1]);
+  assert.equal(await acceptTelegramTemp(restored, config, { ...afterCutover(6, 19), kind: "temp-clear" }), "accepted");
+  assert.equal((await storedReply(config, 6, restored))?.kind, "stale");
+  assert.equal(await restored.prepare("SELECT message_id FROM telegram_temp_batch WHERE bot_id=?").bind(config.botId).first("message_id"), 30);
+  assert.deepEqual((await restored.prepare("SELECT bot_id,actor_id FROM legacy_temp_batches WHERE bot_id IN (?,?) ORDER BY bot_id")
+    .bind(config.botId, otherBot).all()).results, [{ bot_id: config.botId, actor_id: config.adminId },
+    { bot_id: otherBot, actor_id: config.memberId }]);
+  assert.equal(await restored.prepare("SELECT cutover_epoch FROM legacy_temp_installations WHERE bot_id=?")
+    .bind(config.botId).first("cutover_epoch"), cutoff);
+});
+
+test("restored nodes count against the same atomic admission quota while dormant data is excluded", async () => {
+  const config = policy("97104");
+  const cutoff = 1_800_000_000;
+  await install(config.botId, null);
+  await baseline(config.botId, config.memberId, 1, 499);
+  for (let index = 1; index < 10; index++) await baseline(config.botId, config.memberId, 500 * index, 500);
+  assert.equal(await acceptTelegramTemp(restored, config, { ...event(config, 1), kind: "temp-summary" }), "accepted");
+  assert.equal((await storedReply(config, 1, restored))?.totalCount, 0);
+  await restored.prepare("UPDATE legacy_temp_installations SET cutover_epoch=? WHERE bot_id=?")
+    .bind(cutoff, config.botId).run();
+  assert.deepEqual(await Promise.all([2, 3].map((id) => acceptTelegramTemp(restored, config,
+    { ...paste(config, id), messageDate: cutoff + 1 }))), ["accepted", "accepted"]);
+  const replies = await Promise.all([2, 3].map((id) => storedReply(config, id, restored)));
+  assert.deepEqual(replies.map((reply) => reply?.kind).sort(), ["added", "capacity"]);
+  assert.ok(replies.every((reply) => reply?.totalCount === MAX_TEMP_OWNER_NODES));
+});
 
 async function totals(config: TelegramPolicy, actorId = config.memberId) {
   return db.prepare(`

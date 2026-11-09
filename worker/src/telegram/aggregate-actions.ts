@@ -3,7 +3,10 @@ import { MAX_PATH_RULES } from "../path-rules.ts";
 import { ISOLATION_PUBLIC_ORIGIN } from "../short-links.ts";
 import { digestHex, MAX_SNAPSHOT_NODES, validInteger } from "../storage.ts";
 import { inTelegramScope, type TelegramAggregateUpdate, type TelegramPolicy } from "./protocol.ts";
-import { MAX_TEMP_OWNER_BYTES, MAX_TEMP_OWNER_NODES } from "./temp-import.ts";
+import {
+  MAX_TEMP_OWNER_BYTES, MAX_TEMP_OWNER_NODES, ownedTempRowsSql, readTempStorage, tempCutoverAllows, tempSchemaGuard,
+  type TempStorageMode,
+} from "./temp-storage.ts";
 
 export const TELEGRAM_AGGREGATE_MARKER = "aggregate:v1";
 export const TELEGRAM_AGGREGATE_ORIGIN = ISOLATION_PUBLIC_ORIGIN;
@@ -62,7 +65,11 @@ export async function acceptTelegramAggregate(
       !validInteger(event.updateId, 1) || !validInteger(event.messageId, 1) || !validInteger(event.messageDate, 1) ||
       (event.kind !== "show" && event.kind !== "revoke")) return "ignored";
   try {
-    const nonce = event.kind === "show" ? base64Url(crypto.getRandomValues(new Uint8Array(16))) : null;
+    const show = event.kind === "show";
+    const tempMode = show ? await readTempStorage(db) : "live-only";
+    const tempCutover = show ? `OR NOT (${tempSchemaGuard(tempMode)})
+      OR NOT (${tempCutoverAllows(tempMode, "scoped.bot_id", "scoped.message_date")})` : "";
+    const nonce = show ? base64Url(crypto.getRandomValues(new Uint8Array(16))) : null;
     const candidateHash = nonce === null ? null : await codeDigest(await deriveCode(key, policy.botId, event.actorId, nonce));
     const receipt = [policy.botId, event.updateId, crypto.randomUUID()] as const;
     const steps = [
@@ -90,18 +97,19 @@ export async function acceptTelegramAggregate(
             SELECT sub.node_count FROM scoped JOIN subscriptions AS sub ON sub.owner_id = scoped.actor_id
             WHERE sub.generation > 0 ORDER BY sub.id LIMIT ${MAX_AGGREGATE_MEMBERS + 1}
           )
+        ), temp_scope AS (
+          SELECT bot_id,actor_id,NULL AS before_receipt,message_date AS visibility_epoch FROM scoped WHERE ${show ? 1 : 0}
         ), temp_totals AS (
-          SELECT COALESCE(sum(node_count), 0) AS nodes, COALESCE(sum(payload_bytes), 0) AS bytes FROM (
-            SELECT batch.node_count, batch.payload_bytes FROM scoped JOIN telegram_temp_batch AS batch
-              ON batch.bot_id = scoped.bot_id AND batch.actor_id = scoped.actor_id
-            ORDER BY batch.receipt_id LIMIT ${MAX_TEMP_OWNER_NODES + 1}
+          SELECT COALESCE(sum(nodeCount),0) AS nodes,COALESCE(sum(bytes),0) AS bytes FROM (
+            SELECT nodeCount,bytes FROM (${ownedTempRowsSql(tempMode, "temp_scope", { verifyLive: false })})
+            ORDER BY source,id LIMIT ${MAX_TEMP_OWNER_NODES + 1}
           )
         ), classified AS (
           SELECT scoped.*, CASE
             WHEN message_date <= unixepoch() - ${MAX_COMMAND_AGE_SECONDS}
               OR message_date > unixepoch() + ${FUTURE_SKEW_SECONDS}
               OR (message_date, message_id) <= (last_date, last_id)
-              OR (actor_id <> ? AND auth_date >= message_date) THEN 'stale'
+              OR (actor_id <> ? AND auth_date >= message_date) ${tempCutover} THEN 'stale'
             WHEN ? = 'revoke' THEN CASE WHEN current_hash IS NULL THEN 'already-revoked' ELSE 'revoked' END
             WHEN snapshots.members > ${MAX_AGGREGATE_MEMBERS} OR temp_totals.nodes > ${MAX_TEMP_OWNER_NODES}
               OR temp_totals.bytes > ${MAX_TEMP_OWNER_BYTES} OR snapshots.nodes + temp_totals.nodes > ${MAX_SNAPSHOT_NODES}
@@ -174,12 +182,13 @@ export async function acceptTelegramAggregate(
   throw new Error("Telegram aggregate receipt could not be confirmed.");
 }
 
-export function aggregateLinkDeliveryGuard(policy: TelegramPolicy, reply: TelegramAggregateReply): AggregateGuard | null {
+export function aggregateLinkDeliveryGuard(policy: TelegramPolicy, reply: TelegramAggregateReply, mode: TempStorageMode): AggregateGuard | null {
   if ((reply.result !== "ready" && reply.result !== "issued") || !validInteger(reply.revision, 1) ||
       reply.codeSha256 === null || !DIGEST.test(reply.codeSha256)) return null;
   return {
     sql: `inbox.receipt_nonce = '${TELEGRAM_AGGREGATE_MARKER}' AND inbox.command = 'help'
       AND inbox.chat_type = 'private' AND inbox.chat_id = inbox.actor_id AND inbox.thread_id IS NULL
+      AND (${tempSchemaGuard(mode)}) AND (${tempCutoverAllows(mode, "inbox.bot_id", "inbox.message_date")})
       AND EXISTS (
         SELECT 1 FROM telegram_aggregate_actions AS aggregate
         JOIN telegram_aggregate_slots AS slot ON slot.bot_id = inbox.bot_id AND slot.actor_id = inbox.actor_id
@@ -204,9 +213,12 @@ export async function resolveTelegramAggregateCode(
   scope: { receiptId: number; actorId: string; aggregate: TelegramAggregateReply },
   key: CryptoKey | null,
 ): Promise<string | null> {
-  const guard = aggregateLinkDeliveryGuard(policy, scope.aggregate);
-  if (!key || !guard) return null;
+  if (!key || (scope.aggregate.result !== "ready" && scope.aggregate.result !== "issued")) return null;
   try {
+    const mode = await readTempStorage(db).catch(() => null);
+    if (mode === null) return null;
+    const guard = aggregateLinkDeliveryGuard(policy, scope.aggregate, mode);
+    if (!guard) return null;
     const nonce = await db.prepare(`SELECT slot.nonce FROM telegram_inbox AS inbox
       JOIN telegram_aggregate_slots AS slot ON slot.bot_id = inbox.bot_id AND slot.actor_id = inbox.actor_id
       WHERE inbox.receipt_id = ? AND inbox.bot_id = ? AND inbox.actor_id = ? AND inbox.receipt_nonce = ? AND ${guard.sql}

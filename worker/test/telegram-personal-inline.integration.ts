@@ -460,6 +460,25 @@ test("emitted Worker answers opted-in sender queries using the owner's durable s
     const second = "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.22:8388#Cap%20Temp%20second";
     const foreign = "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.23:8388#FOREIGN%20temp";
     const tempTitles = ["🧪 Cap Temp first [链接已省略]", "🧪 Cap Temp second"];
+    const restoredTitle = "🧪 Restored [链接已省略]";
+    const restoredShare = "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.24:8388#synthetic-restored-share";
+    const restoredNodes = JSON.stringify([{ name: "Restored https://example.invalid/synthetic-temp-title-secret",
+      share: restoredShare, type: "temp" }]);
+    const restoredDigest = sha256(Buffer.from(restoredNodes));
+    const cutoff = Math.floor(Date.now() / 1000) - 60;
+    const foreignBot = policy.botId === "100" ? "101" : "100";
+    const installation = (botId: string, epoch: number | null) => db.prepare("INSERT INTO legacy_temp_installations VALUES (?,?,?)")
+      .bind(botId, "a".repeat(64), epoch);
+    const batch = (botId: string, actorId: string, name?: string) => {
+      const nodes = name ? JSON.stringify([{ name, share: restoredShare, type: "temp" }]) : restoredNodes;
+      return db.prepare("INSERT INTO legacy_temp_batches VALUES (?,?,1,1,?,1,?,?)")
+        .bind(botId, actorId, nodes, Buffer.byteLength(nodes), sha256(Buffer.from(nodes)));
+    };
+    await db.batch([
+      installation(policy.botId, cutoff), installation(foreignBot, cutoff),
+      batch(policy.botId, policy.memberId), batch(policy.botId, policy.adminId, "FOREIGN restored owner"),
+      batch(foreignBot, policy.memberId, "FOREIGN restored bot"),
+    ]);
     for (const [id, text, actorId] of [[201, first, policy.memberId], [202, second, policy.memberId],
       [203, foreign, policy.adminId]] as const) {
       assert.equal((await command(id, text, app, { actorId })).status, 200);
@@ -479,9 +498,9 @@ test("emitted Worker answers opted-in sender queries using the owner's durable s
       FROM telegram_inbox AS inbox JOIN telegram_inline_search_consent AS consent USING(receipt_id)
       WHERE inbox.bot_id=? AND inbox.update_id=206`).bind(policy.botId).first(), { marker: "inline-consent-temp:v1", kind: "on" });
     assert.equal((await query(207)).status, 204);
-    assert.deepEqual(titles(), [visible[1], visible[2], visible[0], visible[3], visible[4], ...tempTitles]);
+    assert.deepEqual(titles(), [visible[1], visible[2], visible[0], visible[3], visible[4], restoredTitle, ...tempTitles]);
     assert.deepEqual(answers.at(-1)?.results.map(({ description }) => description !== undefined),
-      [false, false, false, false, false, true, true]);
+      [false, false, false, false, false, true, true, true]);
     assert.equal((await query(208, firstAuth)).status, 204);
     assert.deepEqual(titles(), [tempTitles[0]], "an exact raw match still sends only safe metadata");
     assert.equal(JSON.stringify(answers.at(-1)?.results).includes(firstAuth), false);
@@ -504,11 +523,27 @@ test("emitted Worker answers opted-in sender queries using the owner's durable s
     assert.deepEqual(titles(), [], "fresh ordinary consent replaces temporary-node consent");
     assert.equal((await command(214, "/inline temp on")).status, 200);
     await expectCommand(214, /临时节点名称/u);
+    // An admitted inline receipt at or before activation sees no restored data.
+    const setCutoff = (epoch: number) => db.prepare("UPDATE legacy_temp_installations SET cutover_epoch=? WHERE bot_id=?")
+      .bind(epoch, policy.botId).run();
+    await setCutoff(Math.floor(Date.now() / 1000) + 120);
+    assert.equal((await query(225, "203.0.113.24")).status, 204);
+    assert.deepEqual(titles(), []);
+    await setCutoff(cutoff);
+    const setRestoredDigest = (digest: string) => db.prepare(
+      "UPDATE legacy_temp_batches SET payload_sha256=? WHERE bot_id=? AND actor_id=?",
+    ).bind(digest, policy.botId, policy.memberId).run();
+    await setRestoredDigest("b".repeat(64));
+    assert.equal((await query(226, "203.0.113.24")).status, 204);
+    assert.equal((await receipt(226))?.result_count, 0);
+    assert.deepEqual(titles(), [], "a digest mismatch cannot expose a restored name");
+    await setRestoredDigest(restoredDigest);
     const beforeClear = answers.length;
     assert.equal((await query(215, "203.0.113.21")).status, 204);
-    await expectCommand(216, /已移除 2 条临时节点/u);
+    await expectCommand(216, /已移除 3 条临时节点/u);
     assert.equal((await receipt(215))?.state, "dropped");
     assert.equal(answers.length, beforeClear, "a cleared inventory cannot send its stale cards");
+    assert.equal((await db.prepare("SELECT count(*) AS n FROM legacy_temp_batches").first<{ n: number }>())?.n, 2);
     assert.equal((await query(217, "203.0.113.21")).status, 204);
     assert.deepEqual(titles(), []);
 

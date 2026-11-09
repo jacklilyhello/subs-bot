@@ -16,6 +16,7 @@ import { acceptTelegramDocumentJob } from "../src/telegram/document-jobs.ts";
 import { acceptTelegramPath } from "../src/telegram/path-management.ts";
 import { beginTelegramAggregateLinkReply, claimTelegramReply, settleTelegramReply } from "../src/telegram/store.ts";
 import type { TelegramAggregateUpdate, TelegramPolicy } from "../src/telegram/protocol.ts";
+import { recordTempFixtureMigration } from "./temp-migration-fixture.ts";
 
 const migrationDir = new URL("../migrations/", import.meta.url);
 const encodedKey = Buffer.alloc(32, 0x47).toString("base64url");
@@ -30,8 +31,9 @@ let key: CryptoKey;
 async function migrate(database: D1Database, throughAggregate = true) {
   for (const name of (await readdir(migrationDir)).filter((file) => file.endsWith(".sql")).sort()) {
     if (!throughAggregate && name.startsWith("0014_")) break;
-    const sql = await readFile(new URL(name, migrationDir), "utf8");
-    await database.batch(sql.trim().split(/;\s*/u).filter(Boolean).map((statement) => database.prepare(statement)));
+    const bytes = await readFile(new URL(name, migrationDir));
+    await database.batch(bytes.toString("utf8").trim().split(/;\s*/u).filter(Boolean).map((statement) => database.prepare(statement)));
+    await recordTempFixtureMigration(database, { name, sha256: createHash("sha256").update(bytes).digest("hex") });
   }
 }
 

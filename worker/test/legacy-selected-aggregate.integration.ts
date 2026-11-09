@@ -34,7 +34,7 @@ test("emitted marked selected exports preserve legacy order, empty framing and p
       assert.equal(sha(bytes), migration.sha256);
       await db.batch(bytes.toString("utf8").trim().split(/;\s*/u).filter(Boolean).map((sql) => db.prepare(sql)));
     }
-    for (const migration of migrations) if (migration !== retirement) await apply(migration);
+    for (const migration of migrations.slice(0, migrations.indexOf(retirement))) await apply(migration);
 
     async function seed(name: string, published = false, ownerId = owner) {
       const sub = await createSubscription(db, { ownerId, name, sourceUrl: "uploaded://legacy-selected-fixture" });

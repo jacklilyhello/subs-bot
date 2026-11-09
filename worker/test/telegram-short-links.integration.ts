@@ -9,6 +9,7 @@ import { parseTelegramAggregateKey } from "../src/telegram/aggregate-actions.ts"
 import { acceptTelegramShortLink, confirmTelegramShortLinkSend, prepareTelegramShortLinkReply } from "../src/telegram/short-link-actions.ts";
 import { beginTelegramShortLinkReply, claimTelegramReply, settleTelegramReply } from "../src/telegram/store.ts";
 import type { TelegramPolicy } from "../src/telegram/protocol.ts";
+import { recordTempFixtureMigration } from "./temp-migration-fixture.ts";
 
 const policy: TelegramPolicy = {
   botId: "75301", botUsername: "fixture_short_bot", adminId: "75302", memberId: "75303", groupId: "-10075304",
@@ -63,6 +64,7 @@ test("emitted Worker issues, retries and revokes owned short links without overl
       const bytes = await readFile(join(directory!, migration.name));
       assert.equal(createHash("sha256").update(bytes).digest("hex"), migration.sha256);
       await db.batch(bytes.toString("utf8").trim().split(/;\s*/u).filter(Boolean).map((sql) => db.prepare(sql)));
+      await recordTempFixtureMigration(db, migration);
     }
     const migration = manifest.migrations.find((item: { name: string }) => item.name === "0019_telegram_short_links.sql");
     assert.ok(migration);
