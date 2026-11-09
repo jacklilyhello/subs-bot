@@ -46,11 +46,22 @@ class MixedShortInput:
 
 
 @dataclass(frozen=True)
+class SelectedShortRow:
+    code_sha256: str
+    owner_id: str
+    created_at: int
+    legacy_ids: tuple[int, ...]
+    active_positions: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class MixedShortRows:
     domain: dict
     typed_rows: list[dict]
     external_rows: list[tuple[str, str, str, int]] = field(repr=False)
     proof: dict
+    selected_rows: tuple[SelectedShortRow, ...] = field(default=(), repr=False)
+    selected_active_tokens: dict[int, str] = field(default_factory=dict, repr=False)
 
 
 def _require(condition: object) -> None:
@@ -101,7 +112,9 @@ def _source_has_no_sidecars(source: Path) -> bool:
 
 
 def _collect_rows(source: Path, namespace_rows: Path, owners: dict[str, str], inventory: dict):
-    typed_rows, external_rows = [], []
+    typed_rows, external_rows, selected_rows = [], [], []
+    selected_active_tokens = {}
+    coalesced_owners = {owner for original, owner in owners.items() if original != owner}
     with closing(sqlite3.connect(source.as_uri() + "?mode=ro&immutable=1", uri=True, isolation_level=None)) as db:
         db.execute("PRAGMA trusted_schema=OFF")
         db.execute("PRAGMA query_only=ON")
@@ -125,21 +138,44 @@ def _collect_rows(source: Path, namespace_rows: Path, owners: dict[str, str], in
                 if item["kind"] == "typed-subscription":
                     typed_rows.append({key: item[key] for key in TYPED_FIELDS})
                     continue
-                _require(item["kind"] == "external" and type(issuer) is int and type(created_at) is int)
+                _require(item["kind"] in ("external", "aggregate-selected")
+                         and type(issuer) is int and type(created_at) is int)
                 code = typed_inventory._text_bytes(db, "short_links", "code", rowid, code_type, 12)
                 target, issue = namespace_inventory.read_target(db, rowid, target_type)
                 issuer_id = str(issuer)
                 _require(typed_inventory._CODE.fullmatch(code) and sha256(code).hexdigest() == item["codeSha256"]
-                         and target and len(target) <= namespace_inventory.MAX_EXTERNAL_BYTES and issue is None
+                         and target and issue is None
                          and sha256(target).hexdigest() == item["targetSha256"]
                          and issuer_id == item["sourceIssuerId"] and owners.get(issuer_id, issuer_id) == item["ownerId"]
                          and created_at == item["createdAt"])
-                external_rows.append((item["codeSha256"], item["ownerId"], target.decode("utf-8", "strict"), created_at))
+                if item["kind"] == "aggregate-selected":
+                    legacy_ids = tuple(item["legacyIds"])
+                    active_positions = tuple(item["activePositions"])
+                    _require(target == namespace_inventory.IDS_PREFIX + b",".join(str(identity).encode("ascii") for identity in legacy_ids))
+                    # The Worker applies path rules of the mapped owner. A remap
+                    # can change those rules for any still-visible member.
+                    _require(not active_positions or (issuer_id == item["ownerId"] and issuer_id not in coalesced_owners))
+                    for position in active_positions:
+                        identity = legacy_ids[position]
+                        if identity not in selected_active_tokens:
+                            _require(len(selected_active_tokens) < native.MAX_ROWS)
+                            active = db.execute("SELECT user_id, typeof(token) FROM main.subscriptions WHERE id=?",
+                                                (identity,)).fetchone()
+                            _require(active is not None and type(active[0]) is int and active[0] == issuer)
+                            token = typed_inventory._text_bytes(db, "subscriptions", "token", identity, active[1], 128)
+                            _require(typed_inventory.TOKEN.fullmatch(token.decode("ascii")))
+                            selected_active_tokens[identity] = sha256(token).hexdigest()
+                    selected_rows.append(SelectedShortRow(item["codeSha256"], item["ownerId"], created_at,
+                                                         legacy_ids, active_positions))
+                else:
+                    _require(len(target) <= namespace_inventory.MAX_EXTERNAL_BYTES)
+                    external_rows.append((item["codeSha256"], item["ownerId"], target.decode("utf-8", "strict"), created_at))
         db.execute("ROLLBACK")
     _require(len(typed_rows) == inventory["kinds"]["typed-subscription"]
              and len(external_rows) == inventory["kinds"]["external"]
-             and len(typed_rows) + len(external_rows) == inventory["rows"])
-    return typed_rows, external_rows
+             and len(selected_rows) == inventory["kinds"]["aggregate-selected"]
+             and len(typed_rows) + len(external_rows) + len(selected_rows) == inventory["rows"])
+    return typed_rows, external_rows, selected_rows, selected_active_tokens
 
 
 def _verify_oracle(pins: MixedShortInput, source_sha: str, worker: dict, source_count: int, external_rows: list) -> dict:
@@ -164,6 +200,16 @@ def _verify_oracle(pins: MixedShortInput, source_sha: str, worker: dict, source_
 def read_mixed_shorts(pins: MixedShortInput, *, source_sha: str, owner_map_sha: str, build: dict,
                       worker_manifest_sha: str, working_parent: Path) -> MixedShortRows:
     """Bind every row to the same closed source, verified Worker and trusted oracle seal."""
+    return _read_shorts(pins, source_sha, owner_map_sha, build, worker_manifest_sha, working_parent, selected=False)
+
+
+def read_selected_shorts(pins: MixedShortInput, *, source_sha: str, owner_map_sha: str, build: dict,
+                         worker_manifest_sha: str, working_parent: Path) -> MixedShortRows:
+    """Consume selected rows only for an explicitly selected dormant package."""
+    return _read_shorts(pins, source_sha, owner_map_sha, build, worker_manifest_sha, working_parent, selected=True)
+
+
+def _read_shorts(pins, source_sha, owner_map_sha, build, worker_manifest_sha, working_parent, *, selected):
     try:
         _require(isinstance(pins, MixedShortInput) and all(native.matches(converter.HASH, digest) for digest in (
             source_sha, owner_map_sha, worker_manifest_sha, pins.namespace_sha256, pins.oracle_sha256,
@@ -195,10 +241,15 @@ def read_mixed_shorts(pins: MixedShortInput, *, source_sha: str, owner_map_sha: 
                      and converter._file_hash(rows_path) == (descriptor["bytes"], descriptor["sha256"]))
             inventory = manifest["inventory"]
             kinds = inventory["kinds"]
-            _require(inventory["present"] and inventory["blocked"] == 0 and kinds["external"] > 0
-                     and not any(kinds[key] for key in ("aggregate-all", "aggregate-selected", "unclassified")))
+            _require(inventory["present"] and inventory["blocked"] == 0
+                     and kinds["aggregate-all"] == kinds["unclassified"] == 0)
+            if selected:
+                _require(kinds["aggregate-selected"] > 0)
+            else:
+                _require(kinds["external"] > 0 and kinds["aggregate-selected"] == 0)
             _require(_source_has_no_sidecars(source) and typed_inventory._source_state(source) == source_state)
-            typed_rows, external_rows = _collect_rows(source, reconstructed / namespace_inventory.ROWS, owners, inventory)
+            typed_rows, external_rows, selected_rows, active_tokens = _collect_rows(
+                source, reconstructed / namespace_inventory.ROWS, owners, inventory)
         typed_inventory._verify_source(source, source_sha, source_state)
         _require(_source_has_no_sidecars(source))
         serializer = _verify_oracle(pins, source_sha, worker, inventory["rows"], external_rows)
@@ -206,8 +257,11 @@ def read_mixed_shorts(pins: MixedShortInput, *, source_sha: str, owner_map_sha: 
                  "oldOriginSha256": manifest["oldOriginSha256"], "legacyBotId": pins.legacy_bot_id,
                  "rows": inventory["rows"], "typedRows": len(typed_rows), "externalRows": len(external_rows),
                  "legacySerializer": serializer}
+        if selected:
+            proof.update(selectedRows=len(selected_rows), selectedActiveHighWater=inventory["activeHighWater"])
         return MixedShortRows({"present": True, "rows": inventory["rows"]},
-                              sorted(typed_rows, key=lambda row: row["codeSha256"]), sorted(external_rows), proof)
+                              sorted(typed_rows, key=lambda row: row["codeSha256"]), sorted(external_rows), proof,
+                              tuple(sorted(selected_rows, key=lambda row: row.code_sha256)), active_tokens)
     except (MixedShortError, converter.ConversionError, namespace_inventory.InventoryError, typed_inventory.InventoryError,
             native.RehearsalError, OSError, sqlite3.Error, ValueError, TypeError, KeyError, RecursionError, OverflowError):
         raise MixedShortError(FAILURE) from None
