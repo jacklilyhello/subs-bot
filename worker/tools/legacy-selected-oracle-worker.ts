@@ -7,6 +7,7 @@ import { networkInterfaces } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { Log, LogLevel, Miniflare } from "miniflare";
 import { parse as parseYaml } from "yaml";
+import { makeUnifiedClaimOracle } from "./legacy-unified-claim-oracle.ts";
 import { LEGACY_ALL_MIGRATION, LEGACY_ALL_MIGRATION_SHA256 } from "../src/legacy-all-aggregates.ts";
 import { LEGACY_SUBSCRIPTION_SHORT_MIGRATION, LEGACY_SUBSCRIPTION_SHORT_SHA256 } from "../src/short-links.ts";
 import { restoreOwnedSubscription } from "../src/subscriptions.ts";
@@ -57,7 +58,7 @@ type Migration = { name: string; sha256: string };
 type ProbeRequest = { method: "GET" | "HEAD"; route: "short" | "aggregate"; code: string; format: string | null };
 type DynamicPhase = (typeof DYNAMIC_PHASES)[number];
 type Stage = "sandbox" | "input" | "request-shape" | "artifact" | "sql-replay" | "d1-readback" | "r2-replay"
-  | "health" | "request" | "cutoff" | "restore" | "dispose";
+  | "health" | "request" | "cutoff" | "restore" | "historical-claim" | "dispose";
 let stage: Stage = "sandbox";
 let caseNumber = 0;
 let dynamic = false;
@@ -601,11 +602,13 @@ async function main() {
   const uid = sandbox();
   stage = "input";
   const loaded = await load(await readInput(), uid);
+  const claim = unified ? makeUnifiedClaimOracle() : null;
   const runtime = new Miniflare({
     modules: true, script: loaded.script, compatibilityDate: loaded.compatibilityDate, host: "127.0.0.1",
     log: new Log(LogLevel.NONE), d1Databases: ["DB"], r2Buckets: ["NODES"],
-    bindings: { BUILD_REVISION: loaded.revision, ...(unified ? { LEGACY_SUBSCRIPTION_SHORTS: "1" } : {}) },
-    outboundService: () => { throw new Error("Isolated restore oracle outbound denied."); },
+    bindings: { BUILD_REVISION: loaded.revision, ...(claim ? { LEGACY_SUBSCRIPTION_SHORTS: "1",
+      TELEGRAM_ISOLATION_CONFIG: JSON.stringify(claim.policy) } : {}) },
+    outboundService: claim?.outboundService ?? (() => { throw new Error("Isolated restore oracle outbound denied."); }),
   });
   let responses: unknown;
   try {
@@ -628,7 +631,10 @@ async function main() {
       return results;
     };
     if (loaded.probes === null) {
-      responses = await verifyUnifiedRoutes(runtime, loaded.manifest);
+      requireOracle(claim);
+      const routes = await verifyUnifiedRoutes(runtime, loaded.manifest);
+      stage = "historical-claim";
+      responses = { ...routes, historicalClaimReplies: await claim.verify(runtime, ORIGIN) };
     } else if (Array.isArray(loaded.probes)) {
       responses = await runProbes(loaded.probes);
     } else {
