@@ -15,6 +15,7 @@ on:
       - '.github/workflows/worker-isolation-private-share-command-smoke.yml'
       - '.github/workflows/worker-isolation-native-restore.yml'
       - '.github/workflows/worker-isolation-legacy-candidate.yml'
+      - '.github/workflows/worker-isolation-legacy-selected-smoke.yml'
       - '.github/workflows/worker-isolation-telegram-selected-smoke.yml'
       - '.github/workflows/worker-isolation-telegram-short-links-smoke.yml'
   push:
@@ -32,6 +33,7 @@ on:
       - '.github/workflows/worker-isolation-private-share-command-smoke.yml'
       - '.github/workflows/worker-isolation-native-restore.yml'
       - '.github/workflows/worker-isolation-legacy-candidate.yml'
+      - '.github/workflows/worker-isolation-legacy-selected-smoke.yml'
       - '.github/workflows/worker-isolation-telegram-selected-smoke.yml'
       - '.github/workflows/worker-isolation-telegram-short-links-smoke.yml'
   workflow_dispatch:

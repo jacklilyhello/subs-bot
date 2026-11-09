@@ -191,7 +191,7 @@ def _request(method, path, deadline, label="probe"):
         connection.close()
 
 
-def _check_headers(response, expected_status, label, media_type):
+def _check_headers(response, expected_status, label, media_type, *, location=None):
     if response.status != expected_status:
         raise ProbeError(f"Unexpected HTTP status {response.status} for {label}.")
     cache = {value.strip().lower() for value in response.getheader("Cache-Control", "").split(",")}
@@ -199,9 +199,9 @@ def _check_headers(response, expected_status, label, media_type):
             or response.getheader("X-Content-Type-Options") != "nosniff"
             or response.getheader("Age") is not None
             or response.getheader("CF-Cache-Status", "").upper() not in {"", "DYNAMIC", "BYPASS"}
-            or response.getheader("Set-Cookie") is not None or response.getheader("Location") is not None):
+            or response.getheader("Set-Cookie") is not None or response.getheader("Location") != location):
         raise ProbeError(f"Response privacy headers differ for {label}.")
-    if (response.getheader("Content-Type", "").split(";", 1)[0].strip().lower() != media_type
+    if ((media_type is not None and response.getheader("Content-Type", "").split(";", 1)[0].strip().lower() != media_type)
             or response.getheader("Content-Encoding", "identity").lower() != "identity"):
         raise ProbeError(f"Response media type or encoding differs for {label}.")
 
