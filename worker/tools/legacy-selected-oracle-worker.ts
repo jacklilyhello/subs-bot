@@ -6,7 +6,9 @@ import { lstat, open, opendir, realpath } from "node:fs/promises";
 import { networkInterfaces } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { Log, LogLevel, Miniflare } from "miniflare";
+import { parse as parseYaml } from "yaml";
 import { LEGACY_ALL_MIGRATION, LEGACY_ALL_MIGRATION_SHA256 } from "../src/legacy-all-aggregates.ts";
+import { LEGACY_SUBSCRIPTION_SHORT_MIGRATION, LEGACY_SUBSCRIPTION_SHORT_SHA256 } from "../src/short-links.ts";
 import { restoreOwnedSubscription } from "../src/subscriptions.ts";
 import { LEGACY_TEMP_MIGRATION_NAME, LEGACY_TEMP_MIGRATION_SHA256 } from "../src/telegram/temp-storage.ts";
 
@@ -16,9 +18,11 @@ const DATE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}(?![\s\S])/u;
 const CODE = /^[A-Za-z0-9_-]{12}(?![\s\S])/u;
 const UUID = "[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}";
 const KEY = new RegExp(`^subscriptions/[1-9][0-9]{0,15}/${UUID}/(?:manifest\\.json|(?:0|[1-9][0-9]{0,2})\\.ndjson)(?![\\s\\S])`, "u");
+const PRIVATE_SHARE_KEY = new RegExp(`^private-shares/${UUID}\\.txt(?![\\s\\S])`, "u");
 const MIGRATION = "0038_legacy_selected_aggregates.sql";
 const MIGRATION_SHA = "29ddd93dc46120614c4837268ac2c0a0c5b4c48af9d7e4fe4de1e5e24451b74f";
 const DYNAMIC_PROFILE = "dynamic-all-v8";
+const UNIFIED_PROFILE = "unified-shares-v10";
 const DYNAMIC_BOT = "74111";
 const DYNAMIC_OWNER = "74112";
 const DYNAMIC_FOREIGN = "74115";
@@ -29,6 +33,8 @@ const DYNAMIC_COUNTS = { subscriptions: 4, subscription_trash: 1, path_rules: 1,
   aggregate_links: 3, legacy_all_aggregates: 3, legacy_all_subscription_order: 0, legacy_temp_installations: 1,
   legacy_temp_batches: 3, normal_short_links: 0, legacy_subscription_short_links: 0, legacy_selected_aggregates: 0,
   legacy_selected_members: 0, telegram_inbox: 0, telegram_outbox: 0, telegram_temp_batch: 0, telegram_aggregate_slots: 0 };
+const UNIFIED_COUNTS = { ...DYNAMIC_COUNTS, aggregate_links: 4, normal_short_links: 1, legacy_subscription_short_links: 2,
+  legacy_selected_aggregates: 1, legacy_selected_members: 3, private_shares: 2, private_share_claims: 1 };
 const MAX_INPUT = 1024 * 1024;
 const MAX_SQL = 256 * 1024;
 const MAX_OBJECTS = 64;
@@ -55,6 +61,7 @@ type Stage = "sandbox" | "input" | "request-shape" | "artifact" | "sql-replay" |
 let stage: Stage = "sandbox";
 let caseNumber = 0;
 let dynamic = false;
+let unified = false;
 
 function requireOracle(condition: unknown): asserts condition {
   if (!condition) throw new Error("Invalid isolated V6 oracle input or response.");
@@ -207,8 +214,11 @@ function statements(value: unknown, bytes: Buffer): string[] {
 
 function verifyDynamicManifest(manifest: RecordValue) {
   const links = manifest.dynamicAll, temp = manifest.legacyTempBaseline, summary = manifest.summary, source = manifest.source;
-  requireOracle(manifest.version === 8 && manifest.objectCount === 8 && manifest.targetSequenceHighWater === DYNAMIC_TRASH
-    && exact(manifest.shortLinkCompatibility, ["dynamicAll"]) && manifest.shortLinkCompatibility.dynamicAll === "not-validated"
+  const compatibility = manifest.shortLinkCompatibility;
+  requireOracle(manifest.version === (unified ? 10 : 8) && manifest.objectCount === (unified ? 10 : 8)
+    && manifest.targetSequenceHighWater === DYNAMIC_TRASH
+    && exact(compatibility, unified ? ["typed", "external", "selected", "dynamicAll"] : ["dynamicAll"])
+    && compatibility.dynamicAll === "not-validated"
     && record(source) && source.legacyBotId === DYNAMIC_BOT && matches(DIGEST, source.tempInventoryManifestSha256)
     && record(links) && links.rows === 3 && links.markers === 3 && links.orderRows === 0
     && links.state === "dormant" && links.migrationSha256 === LEGACY_ALL_MIGRATION_SHA256
@@ -216,7 +226,11 @@ function verifyDynamicManifest(manifest: RecordValue) {
     && temp.state === "dormant" && temp.migrationSha256 === LEGACY_TEMP_MIGRATION_SHA256 && integer(temp.payloadBytes, 1, MAX_SQL)
     && record(summary) && record(summary.tableCounts) && record(summary.tableSha256));
   const counts = summary.tableCounts;
-  requireOracle(Object.entries(DYNAMIC_COUNTS).every(([table, expected]) => counts[table] === expected));
+  requireOracle(Object.entries(unified ? UNIFIED_COUNTS : DYNAMIC_COUNTS).every(([table, expected]) => counts[table] === expected));
+  if (unified) {
+    requireOracle(compatibility.typed === "not-validated" && compatibility.external === "offline-equivalent"
+      && compatibility.selected === "not-validated" && manifest.shareCompatibility === "not-validated");
+  }
   const hashes = summary.tableSha256;
   for (const [detail, tables] of [[links, ["aggregate_links", "legacy_all_aggregates", "legacy_all_subscription_order"]],
     [temp, ["legacy_temp_installations", "legacy_temp_batches"]]] as const) {
@@ -228,10 +242,11 @@ function verifyDynamicManifest(manifest: RecordValue) {
 
 async function load(input: RecordValue, uid: number) {
   dynamic = input.profile === DYNAMIC_PROFILE;
+  unified = input.profile === UNIFIED_PROFILE;
   requireOracle(exact(input, ["workerDir", "workerManifestSha256", "candidateDir", "candidateManifestSha256", "revision",
-    "sqlStatements", "requests", ...(dynamic ? ["profile"] : [])]) && matches(REVISION, input.revision));
+    "sqlStatements", ...(unified ? [] : ["requests"]), ...(dynamic || unified ? ["profile"] : [])]) && matches(REVISION, input.revision));
   stage = "request-shape";
-  const probes = dynamic ? dynamicRequests(input.requests) : requests(input.requests);
+  const probes = unified ? null : dynamic ? dynamicRequests(input.requests) : requests(input.requests);
   stage = "artifact";
   const worker = await privateRoot(input.workerDir, uid);
   const candidate = await privateRoot(input.candidateDir, uid);
@@ -249,11 +264,15 @@ async function load(input: RecordValue, uid: number) {
     && manifest.workerArtifact.bundleSha256 === build.bundleSha256 && manifest.workerArtifact.compatibilityDate === build.compatibilityDate
     && manifest.workerArtifact.runId === build.runId && manifest.workerArtifact.runAttempt === build.runAttempt
     && JSON.stringify(migrations(manifest.workerArtifact.migrations)) === JSON.stringify(chain));
-  if (dynamic) {
+  if (dynamic || unified) {
     verifyDynamicManifest(manifest);
     requireOracle(chain[38]?.name === LEGACY_TEMP_MIGRATION_NAME && chain[38].sha256 === LEGACY_TEMP_MIGRATION_SHA256
       && chain[39]?.name === LEGACY_ALL_MIGRATION && chain[39].sha256 === LEGACY_ALL_MIGRATION_SHA256
       && script.includes("subs-bot:legacy-dynamic-all-read:v1") && script.includes("subs-bot:legacy-dynamic-all-order:v1"));
+    if (unified) {
+      requireOracle(chain[28]?.name === LEGACY_SUBSCRIPTION_SHORT_MIGRATION
+        && chain[28].sha256 === LEGACY_SUBSCRIPTION_SHORT_SHA256);
+    }
   } else {
     requireOracle(manifest.version === 6 && record(manifest.selectedAggregateLinks)
       && record(manifest.shortLinkCompatibility) && manifest.shortLinkCompatibility.selected === "not-validated"
@@ -265,10 +284,25 @@ async function load(input: RecordValue, uid: number) {
     && manifest.objectCount === manifest.objects.length);
   const objects = new Map<string, Buffer>();
   const inventory = new Set(["manifest.json", "manifest.sha256", "restore.sql", "lineage.ndjson"]);
+  if (unified) {
+    const source = manifest.source;
+    requireOracle(record(source));
+    const oracle = parsed(await pinnedFile(join(candidate, "oracle/manifest.json"), 4096, source.oracleManifestSha256, uid));
+    const seal = await privateFile(join(candidate, "oracle/manifest.sha256"), 65, uid);
+    requireOracle(seal.equals(Buffer.from(`${source.oracleManifestSha256}\n`, "ascii")) && oracle.externalRows === 1
+      && oracle.sourceSha256 === source.sqliteSha256 && Array.isArray(oracle.files) && oracle.files.length === 1);
+    const entry = oracle.files[0];
+    requireOracle(exact(entry, ["file", "bytes", "sha256"]) && entry.file === "external.ndjson" && integer(entry.bytes, 1, 1024));
+    const rows = await pinnedFile(join(candidate, "oracle/external.ndjson"), 1024, entry.sha256, uid);
+    requireOracle(rows.length === entry.bytes);
+    for (const name of ["manifest.json", "manifest.sha256", "external.ndjson"]) inventory.add(`oracle/${name}`);
+  }
   let objectBytes = 0;
   for (const item of manifest.objects) {
-    requireOracle(exact(item, ["key", "bytes", "sha256", "metadata"]) && matches(KEY, item.key) && !objects.has(item.key)
-      && integer(item.bytes, 1, MAX_OBJECT_BYTES) && (objectBytes += item.bytes) <= MAX_OBJECT_BYTES
+    requireOracle(exact(item, ["key", "bytes", "sha256", "metadata"]));
+    const privateShare = unified && matches(PRIVATE_SHARE_KEY, item.key);
+    requireOracle((matches(KEY, item.key) || (privateShare && typeof item.key === "string")) && !objects.has(item.key)
+      && integer(item.bytes, 1, privateShare ? 64 * 1024 : MAX_OBJECT_BYTES) && (objectBytes += item.bytes) <= MAX_OBJECT_BYTES
       && exact(item.metadata, ["custom", "http"]) && exact(item.metadata.custom, []) && exact(item.metadata.http, []));
     const path = `objects/${item.key}`;
     const body = await pinnedFile(join(candidate, path), item.bytes, item.sha256, uid);
@@ -277,6 +311,7 @@ async function load(input: RecordValue, uid: number) {
     objects.set(item.key, body);
   }
   requireOracle(objectBytes === manifest.objectBytes);
+  if (unified) requireOracle(inventory.size === 17 && [...objects.keys()].filter((key) => PRIVATE_SHARE_KEY.test(key)).length === 2);
   await checkInventory(candidate, inventory, uid);
   return { script, revision: input.revision, compatibilityDate: build.compatibilityDate, chain, manifest, sql, objects, probes };
 }
@@ -315,6 +350,17 @@ async function verifyReferences(db: D1Database, objects: Map<string, Buffer>): P
     }
     requireOracle(nodes === row.nodes);
   }
+  if (unified) {
+    const shares = await db.prepare(`SELECT payload_id,payload_bytes,payload_sha256 FROM private_shares ORDER BY id LIMIT 3`).all<{
+      payload_id: string; payload_bytes: number; payload_sha256: string;
+    }>();
+    requireOracle(shares.success && shares.results.length === 2);
+    for (const row of shares.results) {
+      const key = `private-shares/${row.payload_id}.txt`;
+      requireOracle(PRIVATE_SHARE_KEY.test(key) && matches(DIGEST, row.payload_sha256) && integer(row.payload_bytes, 1, 64 * 1024)
+        && object(key, row.payload_sha256).length === row.payload_bytes);
+    }
+  }
   requireOracle(referenced.size === objects.size);
 }
 
@@ -348,8 +394,9 @@ async function replay(runtime: Miniflare, loaded: Awaited<ReturnType<typeof load
   requireOracle(record(summary) && record(summary.tableCounts));
   const tables = ["subscriptions", "subscription_trash", "subscription_lifecycle", "path_rules", "legacy_empty_subscription_exports",
     "normal_short_links", "legacy_subscription_short_links", "aggregate_links", "legacy_selected_aggregates", "legacy_selected_members",
-    "telegram_inbox", ...(dynamic ? ["telegram_outbox", "telegram_temp_batch", "telegram_aggregate_slots", "legacy_temp_installations",
-      "legacy_temp_batches", "legacy_all_aggregates", "legacy_all_subscription_order"] : [])];
+    "telegram_inbox", ...(dynamic || unified ? ["telegram_outbox", "telegram_temp_batch", "telegram_aggregate_slots",
+      "legacy_temp_installations", "legacy_temp_batches", "legacy_all_aggregates", "legacy_all_subscription_order"] : []),
+    ...(unified ? ["private_shares", "private_share_claims"] : [])];
   const counts = await db.batch<{ count: number }>(tables.map((table) => db.prepare(`SELECT count(*) AS count FROM ${table}`)));
   requireOracle(counts.length === tables.length && counts.every((row, index) => row.success && row.results.length === 1
     && integer(row.results[0].count, 0, 512) && row.results[0].count === (summary.tableCounts as RecordValue)[tables[index]])
@@ -447,6 +494,10 @@ async function bodyBytes(response: Response, maximum: number): Promise<Buffer> {
 async function probe(runtime: Miniflare, request: ProbeRequest, remaining: number) {
   const { method, route, code, format } = request;
   const path = route === "short" ? `/s/${code}` : `/agg/${code}${format === null ? "" : `/${format}`}`;
+  return probePath(runtime, method, path, route === "short" ? null : format === null ? undefined : MEDIA.get(format), remaining);
+}
+
+async function probePath(runtime: Miniflare, method: "GET" | "HEAD", path: string, media: string | null | undefined, remaining: number) {
   const response = await runtime.dispatchFetch(ORIGIN + path, { method, redirect: "manual", headers: { "Accept-Encoding": "identity" } });
   const { status, headers } = response;
   const contentType = headers.get("Content-Type");
@@ -459,9 +510,9 @@ async function probe(runtime: Miniflare, request: ProbeRequest, remaining: numbe
     && !headers.has("Set-Cookie") && !headers.has("Age") && (headers.get("Content-Encoding") ?? "identity") === "identity"
     && (contentLength === null || (/^(?:0|[1-9][0-9]{0,5})$/u.test(contentLength) && Number(contentLength) <= MAX_BODY)));
   if (status === 302) {
-    requireOracle(route === "short" && contentType === null && matches(/^[\x21-\x7e]{1,512}(?![\s\S])/u, location));
+    requireOracle(media === null && contentType === null && matches(/^[\x21-\x7e]{1,512}(?![\s\S])/u, location));
   } else if (status === 200) {
-    requireOracle(route === "aggregate" && format !== null && contentType === MEDIA.get(format) && location === null);
+    requireOracle(typeof media === "string" && contentType === media && location === null);
   } else {
     requireOracle([404, 406, 422, 503].includes(status) && contentType === TEXT && location === null);
   }
@@ -474,14 +525,87 @@ async function probe(runtime: Miniflare, request: ProbeRequest, remaining: numbe
   return { status, contentType, cacheControl, referrerPolicy, noSniff, contentLength, location, bodyBase64: body.toString("base64") };
 }
 
+async function verifyUnifiedRoutes(runtime: Miniflare, manifest: RecordValue) {
+  const selected = "UnifiedSel01", typedActive = "UnifiedAct01", typedTrash = "UnifiedDel01", external = "UnifiedExt01";
+  const all = Object.keys(DYNAMIC_CODES), [owner, tempOnly, empty] = all;
+  const alphaPath = "/sub/legacy-dynamic-token-alpha/clash", trashPath = "/sub/legacy-dynamic-token-trash/v2ray";
+  const rawBase64 = (...labels: string[]) => Buffer.from(labels.map(
+    (label) => `ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.10:8388#${label}`).join("\n")).toString("base64");
+  let remaining = MAX_RESPONSE_BYTES;
+  let routePairs = 0;
+  async function pair(path: string, status: number, media: string | null, location: string | null = null) {
+    const responses = [];
+    for (const method of ["GET", "HEAD"] as const) {
+      stage = "request";
+      caseNumber += 1;
+      const response = await probePath(runtime, method, path, media, remaining);
+      requireOracle(response.status === status && response.location === location);
+      remaining -= Buffer.byteLength(response.bodyBase64, "base64");
+      responses.push(response);
+    }
+    const [get, head] = responses;
+    const bytes = Buffer.from(get.bodyBase64, "base64");
+    requireOracle(head.bodyBase64 === "" && head.contentType === get.contentType);
+    if (status === 200 && media === TEXT && path.startsWith("/agg/") && bytes.length > 0) {
+      requireOracle(head.contentLength === String(bytes.length));
+    } else {
+      requireOracle(head.contentLength === null || head.contentLength === String(bytes.length));
+    }
+    if (status === 404) requireOracle(bytes.equals(Buffer.from("Not found.")));
+    routePairs += 1;
+    return bytes;
+  }
+  const redirect = (code: string, location: string) => pair(`/s/${code}`, 302, null, location);
+  const missing = (path: string) => pair(path, 404, null);
+  async function exportBase64(path: string, ...labels: string[]) {
+    const bytes = await pair(path, 200, TEXT);
+    requireOracle(bytes.equals(Buffer.from(rawBase64(...labels), "ascii")));
+  }
+  const exportAggregate = (code: string, ...labels: string[]) => exportBase64(`/agg/${code}/base64`, ...labels);
+
+  await redirect(typedActive, alphaPath);
+  const clash: unknown = parseYaml(decoder.decode(await pair(alphaPath, 200, YAML)));
+  requireOracle(record(clash) && Array.isArray(clash.proxies) && clash.proxies.length === 1);
+  const [proxy] = clash.proxies;
+  requireOracle(exact(proxy, ["name", "type", "server", "port", "cipher", "password"])
+    && proxy.name === "alpha → mapped" && proxy.type === "ss" && proxy.server === "203.0.113.10" && proxy.port === 8388
+    && proxy.cipher === "aes-256-gcm" && proxy.password === "fixture");
+  await missing(`/s/${typedTrash}`);
+  await redirect(external, "https://example.org/fixture?mode=exact#keep");
+  await redirect(selected, `/agg/${selected}/clash`);
+  await exportAggregate(selected, "beta", "alpha", "beta");
+  await missing("/s/DynAllX00004");
+  for (const code of all) {
+    await missing(`/s/${code}`);
+    await missing(`/agg/${code}/base64`);
+  }
+
+  stage = "cutoff";
+  await activateDynamic(runtime, manifest);
+  for (const code of all) await redirect(code, `/agg/${code}/clash`);
+  await exportAggregate(owner, "alpha", "beta", "temporary", "temporary");
+  await exportAggregate(tempOnly, "temporary-only");
+  await exportAggregate(empty);
+  await exportAggregate(selected, "beta", "alpha", "beta");
+
+  stage = "restore";
+  await restoreDynamic(runtime);
+  await redirect(typedTrash, trashPath);
+  await exportBase64(trashPath, "trash");
+  await exportAggregate(selected, "beta", "alpha", "beta");
+  await exportAggregate(owner, "alpha", "beta", "trash", "temporary", "temporary");
+  return { routePairs };
+}
+
 async function main() {
   const uid = sandbox();
   stage = "input";
   const loaded = await load(await readInput(), uid);
   const runtime = new Miniflare({
     modules: true, script: loaded.script, compatibilityDate: loaded.compatibilityDate, host: "127.0.0.1",
-    log: new Log(LogLevel.NONE), d1Databases: ["DB"], r2Buckets: ["NODES"], bindings: { BUILD_REVISION: loaded.revision },
-    outboundService: () => { throw new Error("Isolated V6 oracle outbound denied."); },
+    log: new Log(LogLevel.NONE), d1Databases: ["DB"], r2Buckets: ["NODES"],
+    bindings: { BUILD_REVISION: loaded.revision, ...(unified ? { LEGACY_SUBSCRIPTION_SHORTS: "1" } : {}) },
+    outboundService: () => { throw new Error("Isolated restore oracle outbound denied."); },
   });
   let responses: unknown;
   try {
@@ -503,7 +627,9 @@ async function main() {
       }
       return results;
     };
-    if (Array.isArray(loaded.probes)) {
+    if (loaded.probes === null) {
+      responses = await verifyUnifiedRoutes(runtime, loaded.manifest);
+    } else if (Array.isArray(loaded.probes)) {
       responses = await runProbes(loaded.probes);
     } else {
       const dormant = await runProbes(loaded.probes.dormant);
@@ -522,7 +648,7 @@ async function main() {
       throw new Error("Could not dispose isolated V6 runtime.");
     }
   }
-  process.stdout.write(JSON.stringify({ responses }) + "\n");
+  process.stdout.write(JSON.stringify(unified ? { continuity: responses } : { responses }) + "\n");
 }
 
 try {
@@ -530,6 +656,6 @@ try {
 } catch {
   // Capability strings, package paths, SQL and body bytes stay off stderr.
   const detail = (stage as Stage) === "request" ? `request, case ${caseNumber}` : stage;
-  process.stderr.write(`The isolated ${dynamic ? "V8" : "V6"} Worker oracle could not be confirmed (${detail}).\n`);
+  process.stderr.write(`The isolated ${unified ? "V10" : dynamic ? "V8" : "V6"} Worker oracle could not be confirmed (${detail}).\n`);
   process.exitCode = 2;
 }
