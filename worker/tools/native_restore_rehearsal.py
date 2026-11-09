@@ -263,8 +263,8 @@ class RehearsalAPI:
                 params = payload.get("params", [])
                 require(isinstance(params, list) and all(isinstance(value, str) for value in params))
                 sql = payload["sql"].strip()
-                require(readonly_sql(sql))
                 require(len(sql.encode()) <= 100_000)
+                require(readonly_sql(sql) or readonly_schema_batch(sql))
             elif route == self.source + "/export" and self.profile == "native":
                 require(isinstance(payload, dict) and set(payload) <= {"output_format", "dump_options", "current_bookmark"}
                         and payload.get("output_format") == "polling" and payload.get("dump_options") == {"compatibility": "d1"})
@@ -562,6 +562,18 @@ def readonly_sql(sql):
             return False
         offset += 1
     return quote_char is None
+
+
+def readonly_schema_batch(sql):
+    # The migration reader emits one REST batch to observe every schema predicate together.
+    try:
+        statements = tuple(migrations._statements(sql))
+    except (migrations.MigrationError, ValueError):
+        return False
+    return bool(statements) and sql == ";\n".join(statements) + ";" and all(
+        statement.startswith("SELECT (") and statement.endswith(") AS matches") and readonly_sql(statement)
+        for statement in statements
+    )
 
 
 def _identifier(value):
