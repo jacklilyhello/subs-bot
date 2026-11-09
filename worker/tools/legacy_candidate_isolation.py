@@ -33,12 +33,14 @@ TYPED_PROFILE = native.LEGACY_TYPED_SHORT_CANDIDATE_PROFILE
 MIXED_PROFILE = native.LEGACY_MIXED_SHORT_CANDIDATE_PROFILE
 SELECTED_PROFILE = native.LEGACY_SELECTED_AGGREGATE_CANDIDATE_PROFILE
 TEMP_PROFILE = native.LEGACY_TEMP_CANDIDATE_PROFILE
+DYNAMIC_ALL_PROFILE = native.LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE
 ARTIFACT_PREFIX = "subs-bot-legacy-candidate"
 ARTIFACT_PREFIXES = {PROFILE: ARTIFACT_PREFIX, PATH_PROFILE: "subs-bot-legacy-path-candidate",
                      EMPTY_PROFILE: "subs-bot-legacy-empty-candidate", SHARE_PROFILE: "subs-bot-legacy-private-share-candidate",
                      TYPED_PROFILE: "subs-bot-legacy-typed-short-candidate", MIXED_PROFILE: "subs-bot-legacy-mixed-short-candidate",
                      SELECTED_PROFILE: "subs-bot-legacy-selected-aggregate-candidate",
-                     TEMP_PROFILE: "subs-bot-legacy-temp-node-candidate"}
+                     TEMP_PROFILE: "subs-bot-legacy-temp-node-candidate",
+                     DYNAMIC_ALL_PROFILE: "subs-bot-legacy-dynamic-all-candidate"}
 CANDIDATE_DIRECTORY = "subs-bot-verified-legacy-candidate"
 PROVENANCE = "legacy-candidate-provenance.json"
 EVIDENCE = "legacy-candidate-evidence.json"
@@ -127,7 +129,7 @@ def candidate_directory(profile):
 def candidate_version(profile):
     require(profile in ARTIFACT_PREFIXES)
     return {PROFILE: 1, PATH_PROFILE: 2, EMPTY_PROFILE: 3, SHARE_PROFILE: 1, TYPED_PROFILE: 4,
-            MIXED_PROFILE: 5, SELECTED_PROFILE: 6, TEMP_PROFILE: 7}[profile]
+            MIXED_PROFILE: 5, SELECTED_PROFILE: 6, TEMP_PROFILE: 7, DYNAMIC_ALL_PROFILE: 8}[profile]
 
 
 def path_mapping():
@@ -231,7 +233,7 @@ def _build_mixed_candidate(worker, output, worker_pin, scratch, oracle, *, produ
 
 
 def build_synthetic_candidate(worker, output, revision, run_id, attempt, *, profile=PROFILE):
-    require(profile not in (SELECTED_PROFILE, TEMP_PROFILE))
+    require(profile not in (SELECTED_PROFILE, TEMP_PROFILE, DYNAMIC_ALL_PROFILE))
     version = candidate_version(profile)
     worker_sha = native.digest(package.read_private(worker / "isolation.json", artifact._MAX_JSON))
     _, worker_pin = package.worker_artifact(worker, revision, worker_sha)
@@ -275,6 +277,10 @@ def package_files(document, *, profile=PROFILE):
         from legacy_temp_native_candidate import temp_candidate_files
 
         return temp_candidate_files(document)
+    if profile == DYNAMIC_ALL_PROFILE:
+        from legacy_dynamic_all_native_candidate import dynamic_all_candidate_files
+
+        return dynamic_all_candidate_files(document)
     files = {package.MANIFEST, package.MARKER, package.SQL, package.LINEAGE}
     objects = document.get("objects")
     require(isinstance(objects, list) and len(objects) == 4)
@@ -308,6 +314,10 @@ def unpack_candidate(body, archive_sha, destination, *, profile=PROFILE):
             limits = PACKAGE_LIMITS
         if profile == TEMP_PROFILE:
             from legacy_temp_native_candidate import PACKAGE_LIMITS
+
+            limits = PACKAGE_LIMITS
+        if profile == DYNAMIC_ALL_PROFILE:
+            from legacy_dynamic_all_native_candidate import PACKAGE_LIMITS
 
             limits = PACKAGE_LIMITS
         expected_files = share_fixture.files(document, OBJECT_LIMIT) if profile == SHARE_PROFILE else package_files(document, profile=profile)
@@ -558,6 +568,10 @@ class CandidateSource(native.Source):
         if self.api.profile == TEMP_PROFILE:
             version, capable = self.scope.version(active.version, with_legacy_temp=True)
             require(capable is True)
+        elif self.api.profile == DYNAMIC_ALL_PROFILE:
+            version, temp_capable, dynamic_capable = self.scope.version(
+                active.version, with_legacy_temp=True, with_legacy_dynamic_all=True)
+            require(temp_capable is True and dynamic_capable is True)
         else:
             version = self.scope.version(active.version)
         return {"deploymentId": active.id, "versionId": active.version, "version": asdict(version),
@@ -652,6 +666,17 @@ class TempCandidateRehearsal(CandidateRehearsal):
         require(document["objectCount"] == 0 and document["objects"] == [] and self.candidate.entries == {})
 
 
+class DynamicAllCandidateRehearsal(CandidateRehearsal):
+    def __init__(self, api, source, journal, candidate):
+        from legacy_dynamic_all_native_candidate import PACKAGE_LIMITS
+
+        super().__init__(api, source, journal, candidate)
+        self.sql_limit = PACKAGE_LIMITS[package.SQL]
+
+
+CANDIDATE_ENGINES = {TEMP_PROFILE: TempCandidateRehearsal, DYNAMIC_ALL_PROFILE: DynamicAllCandidateRehearsal}
+
+
 def validate_checkpoint_action(action, resource, resources):
     require(isinstance(action, str) and action in ACTIONS)
     if action in {"create-restore-bucket", "restore-objects"}:
@@ -723,6 +748,13 @@ def run_action(action, engine, pin, *, resource=None, identity_sha=None):
     elif profile == TEMP_PROFILE:
         result.update(counts=engine.candidate.document["counts"], restoreScope=engine.candidate.document["scope"],
                       r2Closure="not-applicable")
+    elif profile == DYNAMIC_ALL_PROFILE:
+        from legacy_dynamic_all_native_candidate import DYNAMIC_ALL_HTTP_SCOPE
+
+        result.update(counts=engine.candidate.document["counts"], restoreScope=engine.candidate.document["scope"],
+                      shortLinkCompatibility=engine.candidate.document["shortLinkCompatibility"],
+                      dynamicAllHttpOracle=DYNAMIC_ALL_HTTP_SCOPE,
+                      dynamicAllHttpOracleSha256=pin["candidate"]["dynamicAllHttpOracleSha256"])
     else:
         result.update(counts=EMPTY_COUNTS if profile in (EMPTY_PROFILE, TYPED_PROFILE, MIXED_PROFILE) else COUNTS,
                       generationZeroHttp="not-validated")
@@ -766,7 +798,7 @@ def run_action(action, engine, pin, *, resource=None, identity_sha=None):
                           externalShortMigrationSha256=package.EXTERNAL_SHORT_MIGRATION_SHA256,
                           namespaceManifestSha256=pin["candidate"]["namespaceManifestSha256"],
                           oracleManifestSha256=pin["candidate"]["oracleManifestSha256"])
-        if profile in (SELECTED_PROFILE, TEMP_PROFILE):
+        if profile in (SELECTED_PROFILE, TEMP_PROFILE, DYNAMIC_ALL_PROFILE):
             result.update(engine.candidate.native_evidence(observed_summary))
         if profile == SHARE_PROFILE:
             counts, hashes = observed_summary["tableCounts"], observed_summary["tableSha256"]
@@ -800,6 +832,10 @@ def verified_candidate(runner, provenance, scratch, *, profile=PROFILE):
         from legacy_temp_native_candidate import TempCandidate
 
         return TempCandidate(runner / candidate_directory(profile), worker, worker_pin, scratch)
+    if profile == DYNAMIC_ALL_PROFILE:
+        from legacy_dynamic_all_native_candidate import DynamicAllCandidate
+
+        return DynamicAllCandidate(runner / candidate_directory(profile), worker, worker_pin, scratch)
     objects = migrations._objects(chain, len(chain), managed=True)
     schema = SimpleNamespace(migrations=chain, objects=objects, schema_sha256=native._schema_digest(objects),
                              tables=sorted(obj.name for obj in objects if obj.type == "table"))
@@ -856,7 +892,7 @@ def apply(runner, revision, inputs):
         manifest = native.parsed(package.read_private(worker / "isolation.json", artifact._MAX_JSON), artifact._MAX_JSON)
         source = CandidateSource(api, read_worker, target, worker, manifest, lambda: artifact.require_current_main(revision))
         live = source.verify()
-        if profile in (SELECTED_PROFILE, TEMP_PROFILE):
+        if profile in (SELECTED_PROFILE, TEMP_PROFILE, DYNAMIC_ALL_PROFILE):
             version = live["version"]
             require((version["revision"], version["digest"], version["compatibility"])
                     == (revision, manifest["bundleSha256"], manifest["compatibilityDate"]))
@@ -865,7 +901,7 @@ def apply(runner, revision, inputs):
         run_id, attempt = (os.environ.get(key, "") for key in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"))
         require(all(native.matches(artifact._DECIMAL, value) for value in (run_id, attempt)))
         journal = native.Journal(api, run_id + "/" + attempt, guard=source.before_write)
-        engine = TempCandidateRehearsal if profile == TEMP_PROFILE else CandidateRehearsal
+        engine = CANDIDATE_ENGINES.get(profile, CandidateRehearsal)
         result = run_action(inputs["action"], engine(api, source, journal, candidate), pin,
                             resource=inputs.get("resource"), identity_sha=inputs.get("identity_sha256"))
     put(runner / EVIDENCE, native.canonical(result))
@@ -894,7 +930,7 @@ def main(args):
             and native.matches(native.COHORT, inputs.get("cohort"))
             and native.matches(artifact._DECIMAL, inputs.get("source_run_id")) and inputs.get("profile", PROFILE) in ARTIFACT_PREFIXES)
     profile = inputs.get("profile", PROFILE)
-    engine = TempCandidateRehearsal if profile == TEMP_PROFILE else CandidateRehearsal
+    engine = CANDIDATE_ENGINES.get(profile, CandidateRehearsal)
     validate_checkpoint_action(inputs.get("action"), inputs.get("resource"), engine.resource_kinds)
     if inputs["action"] == "pin-resource":
         require(native.matches(native.DIGEST, inputs.get("identity_sha256")))

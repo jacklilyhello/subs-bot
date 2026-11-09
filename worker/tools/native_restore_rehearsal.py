@@ -72,11 +72,13 @@ LEGACY_TYPED_SHORT_CANDIDATE_PROFILE = "synthetic-legacy-typed-shorts"
 LEGACY_MIXED_SHORT_CANDIDATE_PROFILE = "synthetic-legacy-mixed-shorts"
 LEGACY_SELECTED_AGGREGATE_CANDIDATE_PROFILE = "synthetic-legacy-selected-aggregates"
 LEGACY_TEMP_CANDIDATE_PROFILE = "synthetic-legacy-temp-nodes"
+LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE = "synthetic-legacy-dynamic-all"
 LEGACY_CANDIDATE_NAMES = {LEGACY_CANDIDATE_PROFILE: "legacy", LEGACY_PATH_CANDIDATE_PROFILE: "legacy-path",
                           LEGACY_EMPTY_CANDIDATE_PROFILE: "legacy-empty", LEGACY_PRIVATE_SHARE_CANDIDATE_PROFILE: "legacy-share",
                           LEGACY_TYPED_SHORT_CANDIDATE_PROFILE: "legacy-typed", LEGACY_MIXED_SHORT_CANDIDATE_PROFILE: "legacy-mixed",
                           LEGACY_SELECTED_AGGREGATE_CANDIDATE_PROFILE: "legacy-select",
-                          LEGACY_TEMP_CANDIDATE_PROFILE: "legacy-temp"}
+                          LEGACY_TEMP_CANDIDATE_PROFILE: "legacy-temp",
+                          LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE: "legacy-all"}
 ACCOUNT_SHA256 = "ffdbf3dd5d042c6edb68d7f628998a69a22320b0199775bfda9f97593136e508"
 
 
@@ -249,11 +251,14 @@ class RehearsalAPI:
             require(object_bucket is None and (keys is None or not keys))
         if database_id is not None:
             require(matches(UUID, database_id) and database_id != self.target["d1Id"]
-                    and (not temp_only or database_id in self.databases))
+                    and (self.profile not in (LEGACY_TEMP_CANDIDATE_PROFILE, LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE)
+                         or database_id in self.databases))
             self.databases.add(database_id)
             self.restore_id = database_id
         if keys is not None:
             require(len(keys) <= MAX_OBJECTS and all(matches(KEY, key) for key in keys))
+            if self.profile == LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE:
+                require(all(key.startswith("subscriptions/") for key in keys))
             self.restore_keys = set(keys)
         if object_bucket is not None:
             require(object_bucket == self.names["objects"])
@@ -268,6 +273,13 @@ class RehearsalAPI:
             elif method == "GET":
                 require(route not in {self.root + "/r2/buckets", self.root + "/tokens/verify"})
             else:
+                require(path == route)
+        if self.profile == LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE:
+            if method == "GET" and route == self.root + "/d1/database":
+                require(path == route + "?" + urlencode({"name": self.names["database"], "per_page": 100}))
+            elif method == "GET" and route == self.root + "/r2/buckets":
+                require(path == route + "?" + urlencode({"name_contains": self.names["objects"], "per_page": 100}))
+            elif method == "POST" or route == self.root + "/tokens/verify":
                 require(path == route)
         if method == "POST":
             if route == self.root + "/d1/database":
@@ -309,7 +321,7 @@ class RehearsalAPI:
                 query = parse_qs(urlsplit(path).query, max_num_fields=3)
                 prefix = query.get("prefix", [])
                 require(len(prefix) == 1 and re.fullmatch(re.escape(self.journal_prefix) + r"(?:[0-9]{6}-)?", prefix[0]))
-                if self.profile == LEGACY_TEMP_CANDIDATE_PROFILE:
+                if self.profile in (LEGACY_TEMP_CANDIDATE_PROFILE, LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE):
                     require(set(query) <= {"prefix", "per_page", "cursor"}
                             and all(len(values) == 1 for values in query.values()))
         headers = {"Authorization": "Bearer " + self.token, "Accept": "application/json", "Cache-Control": "no-cache",

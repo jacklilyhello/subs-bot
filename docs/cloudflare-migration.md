@@ -554,6 +554,12 @@ V8 离线候选使用同一份一致性 SQLite 和同一份归属映射，分别
 
 托管验证把候选 SQL 和 R2 对象逐字节回放到临时环境，先确认休眠链接无法读取，再在该临时副本中启用。对照旧 Python 和编译后 Worker 的 Base64 字节、纯临时节点、空配置、相对重定向和回收站恢复。合成回收站记录使用固定的未来时间，使校验可重复。非空 Clash 分别核对旧端的临时节点记录和 Worker 的完整代理配置。原候选的安装记录保持休眠。Cloudflare 原生导入、实际旧库和生产启用各自需要后续验收。
 
+#### V8 原生恢复演练
+
+通过对照后，受信的 `main` Worker CI 发布原候选及其 HTTP 对照记录。记录绑定原 Worker 构建清单、源 SQLite 和候选清单。受保护流程独立重建固定候选，核对 SQL、归属、完整对象集和 HTTP 对照记录，再确认当前隔离 Worker 已运行同一模块和提交并具备 0039 与 0040 的读写能力。
+
+在 `worker-isolation-legacy-candidate.yml` 选择 `synthetic-legacy-dynamic-all`。使用同一个新的 32 位十六进制 `cohort` 和同一个成功的 `source_run_id`，按 `verify`、`prepare`、`create-restore-db`、`create-restore-bucket`、`restore-objects`、`start-import`、`verify-restore` 执行。创建结果不明时使用既有 `pin-resource` 流程。候选 D1 和 R2 保持未绑定且私有，导入后复核完整 schema、外键、数据与对象摘要、旧链接和临时节点的休眠状态。
+
 ### 真实数据与生产切换门槛
 
 1. 先只读核对 Cloudflare 目标账户、Zone、`subs-bot.lilyya.top` 的 DNS、Worker 路由和 Custom Domain 绑定。新资源记录账号、环境及资源 ID，隔离与生产分别使用各自的 Worker、D1、R2 和队列。现有配置冲突须在改动前报告。目标主机名可用且切换获准后，仅增加所需的 Custom Domain 绑定。 [Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)

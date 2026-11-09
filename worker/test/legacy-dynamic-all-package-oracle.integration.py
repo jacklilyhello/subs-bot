@@ -21,6 +21,7 @@ sys.path.insert(0, str(TOOLS))
 import legacy_candidate_isolation as candidate_io
 import legacy_dynamic_all_candidate as fixture
 import legacy_restore_package as package
+import prepare_isolation_artifact as artifact
 
 
 BASE64 = ("base64", "v2ray", "mixed")
@@ -30,6 +31,7 @@ QX = ("qx", "quantumult", "quantumultx")
 EMPTY_FORMATS = (*BASE64, *CLASH, *SINGBOX, "surge", *QX)
 MISSING = "DynAllX00004"
 CODES = (fixture.OWNER_CODE, fixture.TEMP_ONLY_CODE, fixture.EMPTY_CODE)
+PUBLISH_DIRECTORY = "subs-bot-legacy-dynamic-all-candidate"
 CHILD_STAGE = re.compile(rb"The isolated V8 Worker oracle could not be confirmed \("
                          rb"(sandbox|input|request-shape|artifact|sql-replay|d1-readback|r2-replay|health|cutoff|restore|dispose|"
                          rb"request, case (?:[1-9]|[1-5][0-9]|6[0-4]))\)\.\n")
@@ -185,20 +187,63 @@ def compare(requests, old, worker, selected_oracle):
     return counts
 
 
-def main():
-    require(len(sys.argv) == 1, "arguments")
+def publication_target(arguments, bundle, revision):
+    if not arguments:
+        return None, None
+    require(len(arguments) == 2 and arguments[0] == "--output", "arguments")
+    runner = Path(os.environ.get("RUNNER_TEMP", ""))
+    output = Path(arguments[1])
+    run = os.environ.get("GITHUB_RUN_ID", "")
+    attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+    require(runner.is_absolute() and output == runner / PUBLISH_DIRECTORY and bundle == runner / "subs-bot-worker"
+            and os.environ.get("GITHUB_REPOSITORY") == artifact.REPOSITORY
+            and os.environ.get("GITHUB_REF") == artifact.MAIN_REF and os.environ.get("GITHUB_SHA") == revision
+            and os.environ.get("GITHUB_EVENT_NAME") in {"push", "workflow_dispatch"}
+            and artifact._REVISION.fullmatch(revision) and artifact._DECIMAL.fullmatch(run)
+            and artifact._DECIMAL.fullmatch(attempt), "publication-provenance")
+    output = package.converter._safe_path(output, existing=False)
+    state = runner.stat()
+    require(state.st_uid == os.geteuid() and not state.st_mode & 0o022, "publication-directory")
+    raw = package.read_private(bundle / "isolation.json", artifact._MAX_JSON)
+    manifest = package.native.parsed(raw, artifact._MAX_JSON)
+    require((manifest.get("ref"), manifest.get("revision"), manifest.get("runId"), manifest.get("runAttempt"))
+            == (artifact.MAIN_REF, revision, run, attempt), "publication-worker-pin")
+    return output, package.native.digest(raw)
+
+
+def publish(candidate, worker, revision, worker_sha, outcomes, destination):
+    from legacy_dynamic_all_native_candidate import seal_dynamic_all_http_report
+
+    _, worker_pin = package.worker_artifact(worker, revision, worker_sha)
+    seal_dynamic_all_http_report(candidate, worker_pin, outcomes)
+    # Both directories are on RUNNER_TEMP. Reserve the unused output name and
+    # move the tested package as a unit after the proof is present.
+    destination.mkdir(mode=0o700)
+    reservation = destination.lstat()
+    try:
+        candidate.candidate.rename(destination)
+    except OSError:
+        with suppress(OSError):
+            if os.path.samestat(reservation, destination.lstat()):
+                destination.rmdir()
+        raise
+
+
+def main(arguments):
     # Reuse the existing fixed scripts without changing either command contract.
     selected_oracle = run_path(str(TEST / "legacy-selected-short-oracle.integration.py"))
     dynamic_oracle = run_path(str(TEST / "legacy-dynamic-all-python.py"))
     dynamic_oracle["verify_sandbox"]()
     bundle = Path(os.environ["WORKER_TEST_BUNDLE_DIR"])
     revision = os.environ["WORKER_TEST_REVISION"]
-    with TemporaryDirectory(prefix="legacy-dynamic-all-package-oracle-") as directory:
+    destination, original_worker_sha = publication_target(arguments, bundle, revision)
+    with TemporaryDirectory(prefix="legacy-dynamic-all-package-oracle-", dir=destination.parent if destination else None) as directory:
         root = Path(directory)
         worker, fixtures, legacy_copy = root / "worker", root / "fixture", root / "legacy"
         fixtures.mkdir(mode=0o700)
         legacy_copy.mkdir(mode=0o700)
         worker_sha = selected_oracle["prepare_worker"](bundle, worker, revision)
+        require(original_worker_sha is None or worker_sha == original_worker_sha, "publication-worker-pin")
         candidate = fixture.build_dynamic_all_fixture(fixtures, worker, revision)
         source = package.read_pinned(candidate.source, 1024 * 1024, candidate.source_sha256)
         candidate_io.put(legacy_copy / "legacy.sqlite", source)
@@ -208,13 +253,15 @@ def main():
         counts = compare(requests, old, new, selected_oracle)
         require(package.native.file_hash(candidate.source)[1] == candidate.source_sha256, "source-unchanged")
         selected_oracle["sql_statements"](candidate)
-        print(json.dumps({"candidateVersion": 8, "historicalRestoreChecks": 1,
-                          "legacyIncompleteClashTempRows": 2, **counts}, sort_keys=True))
+        outcomes = {"candidateVersion": 8, "historicalRestoreChecks": 1, "legacyIncompleteClashTempRows": 2, **counts}
+        if destination is not None:
+            publish(candidate, worker, revision, worker_sha, outcomes, destination)
+        print(json.dumps(outcomes, sort_keys=True))
 
 
 if __name__ == "__main__":
     try:
-        main()
+        main(sys.argv[1:])
     except OracleError as error:
         print(f"Legacy dynamic all package oracle failed at {error}.", file=sys.stderr)
         raise SystemExit(2) from None
