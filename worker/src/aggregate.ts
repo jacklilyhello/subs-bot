@@ -165,7 +165,8 @@ export async function getAggregateNodeSource(
       FROM link JOIN json_each(link.selected_ids) AS member
       LEFT JOIN legacy_selected_members AS watch ON watch.id=member.value
       LEFT JOIN subscriptions AS sub ON watch.retired=0 AND sub.owner_id=link.owner_id AND sub.id=member.value
-        AND NOT EXISTS (SELECT 1 FROM subscription_trash AS trash WHERE trash.id=sub.id OR trash.token=sub.token)
+        AND NOT EXISTS (SELECT 1 FROM subscription_trash AS trash WHERE trash.id=sub.id)
+        AND NOT EXISTS (SELECT 1 FROM subscription_trash AS trash WHERE trash.token=sub.token)
       ${readEmpty ? `LEFT JOIN legacy_empty_subscription_exports AS legacy_empty ON sub.generation=0
         AND legacy_empty.subscription_id=sub.id AND legacy_empty.owner_id=sub.owner_id AND ${LEGACY_EMPTY_EXPORT_PIN}` : ""}
       WHERE link.legacySelected=1 AND member.type='integer'
