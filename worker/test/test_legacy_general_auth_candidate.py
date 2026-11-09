@@ -81,8 +81,8 @@ class LegacyGeneralAuthorizationCandidateTests(unittest.TestCase):
                 ("105", "104", 0, 1, None, None, None),
                 ("105", "106", 1, 0, None, None, None),
             ])
-            self.assertEqual(db.execute(f"SELECT * FROM {tool.GROUPS} ORDER BY chat_id DESC").fetchall(),
-                             [("105", "-100100"), ("105", "-100200")])
+            self.assertEqual(db.execute(f"SELECT * FROM {tool.GROUPS} ORDER BY CAST(chat_id AS INTEGER)").fetchall(),
+                             [("105", "-100200"), ("105", "-100100")])
             self.assertEqual(db.execute(f"SELECT admin_mode,unlisted_default FROM {tool.INSTALLATION}").fetchall(),
                              [("explicit", "denied")])
             for table in ("telegram_auth", "telegram_inbox", "telegram_outbox"):
