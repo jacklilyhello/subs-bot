@@ -47,7 +47,7 @@ test("emitted Worker confirms a private frozen batch and drains it after intake 
   const script = await readFile(join(directory, "index.js"), "utf8");
   assert.equal(digest(script), manifest.bundleSha256);
   type Button = { text: string; callback_data: string };
-  const sent: { id: number; text: string; buttons: Button[] }[] = [];
+  const sent: { id: number; text: string; buttons: Button[]; menu: string[] }[] = [];
   const common = {
     compatibilityDate: manifest.compatibilityDate,
     d1Databases: { DB: "provider-batch-controls-fixture" }, r2Buckets: { NODES: "provider-batch-controls-fixture" },
@@ -57,11 +57,13 @@ test("emitted Worker confirms a private frozen batch and drains it after intake 
       assert.equal(request.method, "POST");
       if (request.url === api + "/answerCallbackQuery") return Response.json({ ok: true, result: true });
       assert.equal(request.url, api + "/sendMessage");
-      const body = await request.json() as { chat_id: string; text: string; reply_markup?: { inline_keyboard: Button[][] } };
+      const body = await request.json() as { chat_id: string; text: string;
+        reply_markup?: { inline_keyboard?: Button[][]; keyboard?: { text: string }[][] } };
       assert.ok([policy.adminId, policy.memberId].includes(body.chat_id));
       assert.doesNotMatch(body.text, /provider\.example\.invalid|synthetic-batch-source|ss:\/\//u);
       const id = 2000 + sent.length;
-      sent.push({ id, text: body.text, buttons: body.reply_markup?.inline_keyboard.flat() ?? [] });
+      sent.push({ id, text: body.text, buttons: body.reply_markup?.inline_keyboard?.flat() ?? [],
+        menu: body.reply_markup?.keyboard?.flat().map(({ text }) => text) ?? [] });
       return Response.json({ ok: true, result: { message_id: id, chat: { id: Number(body.chat_id) } } });
     },
   };
@@ -169,13 +171,23 @@ test("emitted Worker confirms a private frozen batch and drains it after intake 
   assert.equal((await message(42, "/updateall", controlsFault)).status, 503);
   for (const updateId of [40, 41, 42]) assert.equal(await receipt(updateId), null);
   assert.equal((await message(43, "/help", queueFault)).status, 200);
-  assert.match((await reply(43)).text, /\/list/u);
+  const queueFaultHelp = await reply(43);
+  assert.match(queueFaultHelp.text, /\/list/u);
+  assert.ok(!queueFaultHelp.menu.includes("🔄 更新所有"));
   assert.equal((await message(44, "/help", controlsFault)).status, 200);
-  assert.match((await reply(44)).text, /\/list/u);
+  const controlsFaultHelp = await reply(44);
+  assert.match(controlsFaultHelp.text, /\/list/u);
+  assert.ok(!controlsFaultHelp.menu.includes("🔄 更新所有"));
+  assert.equal((await message(46, "/help", drainOnly)).status, 200);
+  assert.ok(!(await reply(46)).menu.includes("🔄 更新所有"));
+  assert.equal((await message(47, "/help")).status, 200);
+  const enabledHelp = await reply(47);
+  assert.ok(enabledHelp.menu.includes("🔄 更新所有"));
+  assert.ok(!enabledHelp.menu.includes("📤 导出链接"));
 
   assert.equal((await message(5, "/updateall")).status, 200);
   const oldPreview = await reply(5);
-  assert.equal((await message(6, "更新所有")).status, 200);
+  assert.equal((await message(6, "🔄 更新所有")).status, 200);
   const preview = await reply(6);
   assert.match(preview.text, /确认刷新 2 条/u);
   assert.match(preview.text, /未纳入 1 条/u);

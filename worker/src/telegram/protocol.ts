@@ -1,6 +1,7 @@
 import { collapsePathRuleWhitespace, PATH_RULE_WHITESPACE_PREFIX } from "../path-rules.ts";
 import type { TelegramDocumentJobInput } from "./document-jobs.ts";
 import { classifyTelegramApiStatusInput, TELEGRAM_API_STATUS_PROMPT } from "./api-status-input.ts";
+import { telegramMainMenuAction } from "./main-menu.ts";
 
 export interface TelegramPolicy {
   botId: string;
@@ -428,14 +429,20 @@ function normalizeMessage(
   const lifecycle = renameReply(message, scope, policy);
   if (lifecycle) return { lifecycle };
   const hasCommandEntity = Array.isArray(entities) && entities.some((entity) => isRecord(entity) && entity.type === "bot_command");
-  if (scope.chatType === "private" && scope.threadId === null && typeof text === "string" && !hasCommandEntity) {
-    if (text === "更新所有" || text === "🔄 更新所有") return { providerBatch: { ...scope, kind: "preview" } };
+  const privateChat = scope.chatType === "private" && scope.threadId === null;
+  const menu = typeof text === "string" && !hasCommandEntity ? telegramMainMenuAction(text) : null;
+  if (menu === "list" || menu === "expiry" || menu === "recycle") return { view: { ...scope, kind: menu } };
+  if (menu === "help") return { command: { ...scope, command: "help" } };
+  if (menu === "aggregate") return privateChat ? { aggregate: { ...scope, kind: "show" } } : null;
+  if (menu === "batchRefresh") return privateChat ? { providerBatch: { ...scope, kind: "preview" } } : null;
+  if (menu === "path") return privateChat ? { path: { ...scope, kind: "path", args: "" } } : null;
+  if (privateChat && typeof text === "string" && !hasCommandEntity) {
     const position = subscriptionPosition(text);
     if (position !== null) return { subscriptionRead: { ...scope, kind: "number", position } };
     const short = /^(?:短链|short)(?: +([\s\S]*))?(?![\s\S])/iu.exec(text.replace(/^ +| +$/gu, ""));
     if (short || text === "🔗 短链") return { shortLink: { ...scope, args: short?.[1] ?? "" } };
   }
-  return scope.chatType === "private" && scope.threadId === null && typeof text === "string"
+  return privateChat && typeof text === "string"
     && text.trim() !== "" && !text.trimStart().startsWith("/")
     && !hasCommandEntity
     ? { temp: { ...scope, kind: "temp-text", text } } : null;

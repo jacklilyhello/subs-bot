@@ -77,11 +77,11 @@ test("emitted Worker delivers the exact raw private file and fences its retries"
       } else {
         assert.equal(request.url, api + "/sendMessage");
         const body = await request.json() as { chat_id: string; text: string; reply_parameters: { message_id: number };
-          reply_markup?: { inline_keyboard: { text: string; callback_data: string }[][] } };
+          reply_markup?: { inline_keyboard?: { text: string; callback_data: string }[][] } };
         assert.equal(body.chat_id, ownerId);
         assert.doesNotMatch(body.text, /ss:\/\/|fixture-password|sbnf1_/u);
         sent.push({ id, replyTo: body.reply_parameters.message_id, text: body.text,
-          ticket: body.reply_markup?.inline_keyboard.flat().find(({ text }) => text === "📦 导出节点")?.callback_data });
+          ticket: body.reply_markup?.inline_keyboard?.flat().find(({ text }) => text === "📦 导出节点")?.callback_data });
       }
       return Response.json({ ok: true, result: { message_id: id, chat: { id: Number(ownerId) } } });
     },
