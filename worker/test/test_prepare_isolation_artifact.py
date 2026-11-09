@@ -205,6 +205,13 @@ class PrepareIsolationArtifactTests(unittest.TestCase):
                 self.use_archive({**self.manifest, key: value}, self.files)
                 self.assert_rejected("invalid provenance or file metadata")
 
+    def test_rejects_an_empty_or_oversized_worker_with_matching_digest(self):
+        for length in (0, release.MAX_MODULE_BYTES + 1):
+            with self.subTest(length=length):
+                module = b" " * length
+                self.use_archive({**self.manifest, "bundleSha256": digest(module)}, {**self.files, "index.js": module})
+                self.assert_rejected("empty or exceeds the isolation size limit")
+
     def test_rejects_unexpected_missing_or_modified_entries(self):
         self.use_archive(self.manifest, {**self.files, "execute.py": b"fixture"})
         self.assert_rejected("missing or unexpected files")
