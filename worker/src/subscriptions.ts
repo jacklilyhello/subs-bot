@@ -37,7 +37,15 @@ interface PreparedSubscriptionMutation {
   first: D1PreparedStatement;
   followups: D1PreparedStatement[];
   writes: number;
+  watchWrite?: boolean;
 }
+
+type LegacySelectedRetirement = "absent" | "unregistered" | "ready";
+const RETIREMENT_MIGRATION = "0038_legacy_selected_aggregates.sql";
+const RETIREMENT_SHA256 = "29ddd93dc46120614c4837268ac2c0a0c5b4c48af9d7e4fe4de1e5e24451b74f";
+const RETIREMENT_TABLES = "name IN ('legacy_selected_aggregates','legacy_selected_members')";
+const RETIREMENT_PIN = `SELECT 1 FROM subs_bot_schema_migrations WHERE position=38 AND name=? AND sha256=? AND mode='applied'`;
+const MUTATION_ERROR = "Subscription lifecycle operation could not be confirmed.";
 
 const MAX_PAGE_SIZE = 50;
 const TRASH_SECONDS = 30 * 24 * 60 * 60;
@@ -105,27 +113,68 @@ export async function listDeletedSubscriptions(
   return { items, nextCursor: rows.length > limit ? { deletedAt: last.deletedAt, id: last.id } : null };
 }
 
-async function mutate(db: D1Database, statements: D1PreparedStatement[], writes: number): Promise<boolean> {
+export async function readLegacySelectedRetirement(db: D1Database): Promise<LegacySelectedRetirement> {
   try {
+    const schema = await db.prepare(`SELECT /* subs-bot:legacy-selected-retirement:v1 */
+      count(CASE WHEN ${RETIREMENT_TABLES} THEN 1 END) AS watched,
+      count(CASE WHEN name='subs_bot_schema_migrations' THEN 1 END) AS ledger
+      FROM sqlite_schema WHERE type='table' AND (${RETIREMENT_TABLES} OR name='subs_bot_schema_migrations')`)
+      .first<{ watched: number; ledger: number }>();
+    if (schema && (schema.watched === 0 || schema.watched === 2) && (schema.ledger === 0 || schema.ledger === 1)) {
+      const pin = schema.ledger === 1 ? await db.prepare(`SELECT position,name,sha256,mode FROM subs_bot_schema_migrations
+        WHERE position=38 OR name=? LIMIT 2`).bind(RETIREMENT_MIGRATION).all<{
+          position: number; name: string; sha256: string; mode: string;
+        }>() : null;
+      if (pin === null || (pin.success && pin.results.length === 0)) return schema.watched === 0 ? "absent" : "unregistered";
+      const row = pin.results[0];
+      if (pin.success && pin.results.length === 1 && schema.watched === 2 && row.position === 38
+        && row.name === RETIREMENT_MIGRATION && row.sha256 === RETIREMENT_SHA256 && row.mode === "applied") return "ready";
+    }
+  } catch {
+    // Treat unexpected schema or ledger state as an unconfirmed operation.
+  }
+  throw new Error(MUTATION_ERROR);
+}
+
+async function mutate(db: D1Database, { first, followups, writes, watchWrite }: PreparedSubscriptionMutation): Promise<boolean> {
+  try {
+    const statements = [first, ...followups];
     const results = await db.batch(statements);
     const changed = results[0]?.meta.changes;
-    if ((changed === 0 || changed === 1) && results.length === statements.length
-      && results.every((result, index) => result.success && result.meta.changes === (index < writes ? changed : 0))) {
-      return changed === 1;
+    if ((changed === 0 || changed === 1) && results.length === statements.length) {
+      const confirmed = results.every(({ success, meta }, index) => success
+        && (watchWrite && index === writes ? meta.changes === 0 || meta.changes === changed
+          : meta.changes === (index < writes ? changed : 0)));
+      if (confirmed) return changed === 1;
     }
   } catch {
     // Avoid exposing stored URLs, tokens or backend errors.
   }
-  throw new Error("Subscription lifecycle operation could not be confirmed.");
+  throw new Error(MUTATION_ERROR);
 }
 
-function guardExclusiveRow(db: D1Database, id: number, ownerId: string): D1PreparedStatement {
+function guardExclusiveRow(db: D1Database, id: number, ownerId: string, retirement?: SubscriptionMutationGuard): D1PreparedStatement {
   // Revision zero is reserved for absent lifecycle rows. A CHECK failure rolls back an incomplete move.
   return db.prepare(`
     INSERT INTO subscription_lifecycle (subscription_id, revision)
-    SELECT ?, 0 WHERE EXISTS (SELECT 1 FROM subscriptions WHERE id = ? AND owner_id = ?)
-      AND EXISTS (SELECT 1 FROM subscription_trash WHERE id = ?)
-  `).bind(id, id, ownerId, id);
+    SELECT ?, 0 WHERE (EXISTS (SELECT 1 FROM subscriptions WHERE id = ? AND owner_id = ?)
+      AND EXISTS (SELECT 1 FROM subscription_trash WHERE id = ?)) ${retirement ? `OR (${retirement.sql})` : ""}
+  `).bind(id, id, ownerId, id, ...(retirement?.bindings ?? []));
+}
+
+function retirementFence(readiness: LegacySelectedRetirement, id: number, ownerId: string, nextRevision: number): SubscriptionMutationGuard {
+  // The mutation and this assertion share one batch. Never skip a watch that
+  // appeared after a preflight on the older schema or on empty unregistered tables.
+  if (readiness === "absent") return { sql: `EXISTS (SELECT 1 FROM sqlite_schema WHERE ${RETIREMENT_TABLES})`, bindings: [] };
+  if (readiness === "unregistered") return {
+    sql: "EXISTS (SELECT 1 FROM legacy_selected_members) OR EXISTS (SELECT 1 FROM legacy_selected_aggregates)", bindings: [],
+  };
+  return { sql: `NOT EXISTS (${RETIREMENT_PIN}) OR EXISTS (
+    SELECT 1 FROM subscription_trash AS trash
+    JOIN subscription_lifecycle AS lifecycle ON lifecycle.subscription_id=trash.id AND lifecycle.revision=trash.lifecycle_revision
+    JOIN legacy_selected_members AS watched ON watched.id=trash.id AND watched.retired=0
+    WHERE trash.id=? AND trash.owner_id=? AND trash.lifecycle_revision=?)`,
+  bindings: [RETIREMENT_MIGRATION, RETIREMENT_SHA256, id, ownerId, nextRevision] };
 }
 
 export function normalizeSubscriptionName(name: string): string {
@@ -139,12 +188,13 @@ export function normalizeSubscriptionName(name: string): string {
 
 // The first statement determines whether the operation started. If a caller
 // records that result before the followups, its write must preserve changes().
-export function prepareOwnedSubscriptionMutation(
+export async function prepareOwnedSubscriptionMutation(
   db: D1Database,
   target: SubscriptionLifecycleTarget,
   mutation: SubscriptionMutation,
   guard?: SubscriptionMutationGuard,
-): PreparedSubscriptionMutation {
+  retirement?: LegacySelectedRetirement,
+): Promise<PreparedSubscriptionMutation> {
   checkTarget(target);
   const { id, ownerId, expectedLifecycleRevision } = target;
   const nextRevision = expectedLifecycleRevision + 1;
@@ -167,6 +217,8 @@ export function prepareOwnedSubscriptionMutation(
     };
   }
   if (mutation.kind === "trash") {
+    const readiness = retirement ?? await readLegacySelectedRetirement(db);
+    const watchWrite = readiness === "ready";
     return {
       first: db.prepare(`
         INSERT INTO subscription_trash (${STORED_FIELDS}, deleted_at, lifecycle_revision)
@@ -186,9 +238,13 @@ export function prepareOwnedSubscriptionMutation(
             AND EXISTS (SELECT 1 FROM subscription_trash WHERE id = subscriptions.id
               AND owner_id = subscriptions.owner_id AND lifecycle_revision = ?)
         `).bind(id, ownerId, nextRevision, nextRevision),
-        guardExclusiveRow(db, id, ownerId),
+        // This must immediately follow the guarded physical delete.
+        ...(watchWrite ? [db.prepare(`UPDATE legacy_selected_members SET retired=1
+          WHERE id=? AND retired=0 AND changes()=1`).bind(id)] : []),
+        guardExclusiveRow(db, id, ownerId, retirementFence(readiness, id, ownerId, nextRevision)),
       ],
       writes: 3,
+      watchWrite,
     };
   }
   return {
@@ -221,9 +277,8 @@ export function prepareOwnedSubscriptionMutation(
   };
 }
 
-function performMutation(db: D1Database, target: SubscriptionLifecycleTarget, mutation: SubscriptionMutation) {
-  const { first, followups, writes } = prepareOwnedSubscriptionMutation(db, target, mutation);
-  return mutate(db, [first, ...followups], writes);
+async function performMutation(db: D1Database, target: SubscriptionLifecycleTarget, mutation: SubscriptionMutation) {
+  return mutate(db, await prepareOwnedSubscriptionMutation(db, target, mutation));
 }
 
 export async function renameOwnedSubscription(

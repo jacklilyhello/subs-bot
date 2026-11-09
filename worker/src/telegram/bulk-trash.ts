@@ -1,5 +1,5 @@
 import { digestHex, SUBSCRIPTION_LIFECYCLE_REVISION, validInteger } from "../storage.ts";
-import { prepareOwnedSubscriptionMutation } from "../subscriptions.ts";
+import { prepareOwnedSubscriptionMutation, readLegacySelectedRetirement } from "../subscriptions.ts";
 import { inTelegramScope, BULK_TRASH_TICKET, type TelegramBulkTrashUpdate, type TelegramEventScope, type TelegramPolicy } from "./protocol.ts";
 import { selectedQuery, unicode14Lower } from "./selected-search.ts";
 import { displayTelegramName } from "./views.ts";
@@ -170,13 +170,14 @@ export async function acceptTelegramBulkTrash(
         SELECT receipt_id,CASE WHEN stable THEN 'trashed' ELSE 'stale' END,CASE WHEN stable THEN target_count ELSE 0 END,
           NULL,actor_role,auth_message_date,auth_message_id FROM checked`).bind(...key),
       );
+      const retirement = await readLegacySelectedRetirement(db);
       for (const [id, generation, revision] of targets) {
-        const move = prepareOwnedSubscriptionMutation(db, { id, ownerId: event.actorId, expectedLifecycleRevision: revision },
+        const move = await prepareOwnedSubscriptionMutation(db, { id, ownerId: event.actorId, expectedLifecycleRevision: revision },
           { kind: "trash" }, {
             sql: `generation=? AND EXISTS (SELECT 1 FROM telegram_inbox AS incoming JOIN telegram_bulk_trash AS action USING(receipt_id)
               WHERE ${FRESH} AND action.kind='trashed')`,
             bindings: [generation, ...key],
-          });
+          }, retirement);
         statements.push(move.first, ...move.followups);
       }
     }

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { after, before, test } from "node:test";
 
@@ -9,7 +10,7 @@ import {
   type SubscriptionMetadata,
 } from "../src/storage.ts";
 import {
-  listDeletedSubscriptions, listOwnedSubscriptions, renameOwnedSubscription,
+  listDeletedSubscriptions, listOwnedSubscriptions, prepareOwnedSubscriptionMutation, renameOwnedSubscription,
   restoreOwnedSubscription, trashOwnedSubscription,
 } from "../src/subscriptions.ts";
 
@@ -269,4 +270,54 @@ test("rejects a snapshot publication that straddles a delete and restore", { tim
   assert.deepEqual(await getSubscriptionSnapshot(db, row.token), snapshot);
   const kept = (await bucket.list({ prefix: `subscriptions/${row.id}/` })).objects.map(({ key }) => key);
   assert.ok(kept.length === 2 && kept.every((key) => key.startsWith(`subscriptions/${row.id}/${snapshot.snapshotId}/`)));
+});
+
+test("retires only an exactly watched subscription in the committed trash transaction", async () => {
+  const migration = "0038_legacy_selected_aggregates.sql";
+  const row = await create("9007199254741001", "Watched fixture");
+  const oldPlan = await prepareOwnedSubscriptionMutation(db, target(row), { kind: "trash" });
+  for (const file of ["0009_aggregate_links.sql", migration]) {
+    const sql = await readFile(new URL(`../migrations/${file}`, import.meta.url), "utf8");
+    await db.batch(sql.trim().split(/;\s*/u).filter(Boolean).map((statement) => db.prepare(statement)));
+  }
+  const sha = createHash("sha256").update(await readFile(new URL(`../migrations/${migration}`, import.meta.url))).digest("hex");
+  const watched = () => db.prepare("SELECT retired FROM legacy_selected_members WHERE id=?").bind(row.id).first<number>("retired");
+  await db.prepare("INSERT INTO legacy_selected_members VALUES (?,0)").bind(row.id).run();
+  await assert.rejects(db.batch([oldPlan.first, ...oldPlan.followups]));
+  // An unregistered watcher must never be silently skipped, even with both tables present.
+  await assert.rejects(trashOwnedSubscription(db, target(row)), /could not be confirmed/u);
+  assert.deepEqual(await getOwnedSubscription(db, row.ownerId, row.id), row);
+  assert.equal(await watched(), 0);
+  await db.batch([
+    db.prepare("CREATE TABLE subs_bot_schema_migrations(position INTEGER PRIMARY KEY,name TEXT,sha256 TEXT,mode TEXT) STRICT"),
+    db.prepare("INSERT INTO subs_bot_schema_migrations VALUES (38,?,?,'applied')").bind(migration, "0".repeat(64)),
+  ]);
+  await assert.rejects(trashOwnedSubscription(db, target(row)), /could not be confirmed/u);
+  await db.prepare("UPDATE subs_bot_schema_migrations SET sha256=? WHERE position=38").bind(sha).run();
+
+  assert.equal(await trashOwnedSubscription(db, { ...target(row), ownerId: "9007199254741002" }), false);
+  assert.equal(await renameOwnedSubscription(db, target(row), "Renamed watched fixture"), true);
+  assert.equal(await trashOwnedSubscription(db, target(row)), false);
+  assert.equal(await watched(), 0);
+  const renamed = await getOwnedSubscription(db, row.ownerId, row.id);
+  assert.ok(renamed);
+  await db.prepare(`CREATE TRIGGER ignore_fixture_retirement BEFORE UPDATE ON legacy_selected_members
+    WHEN OLD.id=${row.id} BEGIN SELECT RAISE(IGNORE); END`).run();
+  try {
+    await assert.rejects(trashOwnedSubscription(db, target(renamed)), /could not be confirmed/u);
+    assert.deepEqual(await getOwnedSubscription(db, row.ownerId, row.id), renamed);
+    assert.equal(await watched(), 0);
+    assert.deepEqual((await listDeletedSubscriptions(db, row.ownerId, { limit: 1 })).items, []);
+  } finally {
+    await db.prepare("DROP TRIGGER ignore_fixture_retirement").run();
+  }
+  assert.equal(await trashOwnedSubscription(db, target(renamed)), true);
+  assert.equal(await watched(), 1);
+  assert.equal(await trashOwnedSubscription(db, target(renamed)), false);
+  assert.equal(await restoreOwnedSubscription(db, target(renamed, 2)), true);
+  assert.equal(await watched(), 1);
+
+  const unwatched = await create(row.ownerId, "Unwatched fixture");
+  assert.equal(await trashOwnedSubscription(db, target(unwatched)), true);
+  assert.equal(await db.prepare("SELECT retired FROM legacy_selected_members WHERE id=?").bind(unwatched.id).first(), null);
 });

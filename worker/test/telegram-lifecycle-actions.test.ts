@@ -141,12 +141,21 @@ test("requires confirmation, rolls back a failed delete receipt, and restores th
   const config = policy("90002");
   const owned = await create(config.memberId, "Owned fixture");
   const foreign = await create(config.adminId, "Foreign fixture");
+  const migration = "0038_legacy_selected_aggregates.sql";
+  const sha = createHash("sha256").update(await readFile(new URL(migration, migrationDir))).digest("hex");
+  await db.batch([
+    db.prepare("CREATE TABLE subs_bot_schema_migrations(position INTEGER PRIMARY KEY,name TEXT,sha256 TEXT,mode TEXT) STRICT"),
+    db.prepare("INSERT INTO subs_bot_schema_migrations VALUES (38,?,?,'applied')").bind(migration, sha),
+    db.prepare("INSERT INTO legacy_selected_members VALUES (?,0),(?,0)").bind(owned.id, foreign.id),
+  ]);
+  const watched = (id: number) => db.prepare("SELECT retired FROM legacy_selected_members WHERE id=?").bind(id).first<number>("retired");
   const [ask, foreignAsk] = await view(config, 10, 200, "list", [
     button("trash-prompt", owned.id), button("trash-prompt", foreign.id),
   ]);
   assert.equal(await acceptTelegramLifecycle(db, config, click(config, 15, foreignAsk, 200)), "accepted");
   assert.equal((await action(config, 15))?.kind, "stale");
   assert.ok(await getOwnedSubscription(db, config.adminId, foreign.id));
+  assert.equal(await watched(foreign.id), 0);
   await deliver(config, 15, 201);
 
   assert.equal(await acceptTelegramLifecycle(db, config, click(config, 20, ask, 200)), "accepted");
@@ -164,6 +173,7 @@ test("requires confirmation, rolls back a failed delete receipt, and restores th
   try {
     await assert.rejects(acceptTelegramLifecycle(db, config, request), /could not be confirmed/u);
     assert.equal((await getOwnedSubscription(db, config.memberId, owned.id))?.lifecycleRevision, 0);
+    assert.equal(await watched(owned.id), 0);
     assert.equal((await ticket(confirm))?.used_by_receipt_id, null);
     assert.equal(await action(config, 30), null);
   } finally {
@@ -176,6 +186,7 @@ test("requires confirmation, rolls back a failed delete receipt, and restores th
   const applied = replies[0] === "accepted" ? 30 : 31;
   assert.equal((await action(config, applied))?.kind, "trashed");
   assert.equal(await getOwnedSubscription(db, config.memberId, owned.id), null);
+  assert.equal(await watched(owned.id), 1);
   const trash = await db.prepare("SELECT token, lifecycle_revision FROM subscription_trash WHERE id = ?")
     .bind(owned.id).first();
   assert.deepEqual(trash, { token: owned.token, lifecycle_revision: 1 });
@@ -187,6 +198,7 @@ test("requires confirmation, rolls back a failed delete receipt, and restores th
   const restored = await getOwnedSubscription(db, config.memberId, owned.id);
   assert.equal(restored?.token, owned.token);
   assert.equal(restored?.lifecycleRevision, 2);
+  assert.equal(await watched(owned.id), 1);
   assert.equal(await db.prepare("SELECT id FROM subscription_trash WHERE id = ?").bind(owned.id).first(), null);
 });
 

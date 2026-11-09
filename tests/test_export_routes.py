@@ -203,6 +203,56 @@ class ExportRouteTests(unittest.IsolatedAsyncioTestCase):
         update.effective_message.reply_html.assert_not_awaited()
         update.effective_message.reply_text.assert_awaited_once_with(bot._EXPORT_UNSUPPORTED)
 
+    async def test_selected_aggregate_keeps_order_and_does_not_follow_a_restored_id(self):
+        first_node = {**SUPPORTED, "name": "First fixture", "server": "203.0.113.11"}
+        stale_node = {**SUPPORTED, "name": "Restored fixture", "server": "203.0.113.12"}
+        second_node = {**SUPPORTED, "name": "Second fixture", "server": "203.0.113.13"}
+        foreign_node = {**SUPPORTED, "name": "Foreign fixture", "server": "203.0.113.14"}
+        first = await self.store.add_imported_sub(OWNER, "first", [first_node])
+        stale = await self.store.add_imported_sub(OWNER, "stale", [stale_node])
+        second = await self.store.add_imported_sub(OWNER, "second", [second_node])
+        foreign = await self.store.add_imported_sub(OWNER + 1, "foreign", [foreign_node])
+        userinfo = base64.urlsafe_b64encode(f"aes-256-gcm:{PASSWORD}".encode("ascii")).decode("ascii").rstrip("=")
+        await self.store.add_temp(OWNER, f"ss://{userinfo}@203.0.113.16:8388#Temporary", "Temporary")
+
+        async def selected(*rows):
+            ids = ",".join(str(row["id"]) for row in rows)
+            return await self.store.create_short(OWNER, f"aggregate://ids/{ids}")
+
+        ordered_code = await selected(second, stale, first, second)
+        empty_code = await selected(stale, foreign)
+        async with self.http_session() as (session, origin):
+            async def assert_export(code, *nodes):
+                url = f"{origin}/agg/{code}/base64"
+                async with session.get(url, allow_redirects=False) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.content_type, "text/plain")
+                    self.assert_private(response)
+                    encoded = await response.read()
+                    links = base64.b64decode(encoded, validate=True).decode("utf-8").splitlines()
+                    actual = [(unquote(uri.fragment), uri.hostname, uri.port) for uri in map(urlsplit, links)]
+                    self.assertEqual(actual, [(node["name"], node["server"], node["port"]) for node in nodes])
+                async with session.head(url, allow_redirects=False) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.content_type, "text/plain")
+                    self.assert_private(response)
+                    self.assertEqual(response.content_length, len(encoded) if encoded else None)
+                    self.assertEqual(await response.read(), b"")
+
+            await assert_export(ordered_code, second_node, stale_node, first_node, second_node)
+            self.assertTrue(await self.store.delete_sub(OWNER, stale["id"]))
+            await assert_export(ordered_code, second_node, first_node, second_node)
+
+            deleted, = await self.store.list_deleted(OWNER)
+            restored = await self.store.restore_deleted(OWNER, deleted["id"])
+            self.assertIsNotNone(restored)
+            self.assertGreater(restored["id"], foreign["id"])
+            self.assertEqual(restored["token"], stale["token"])
+            # The legacy selection stores IDs. The restore preserves the token and allocates a new ID.
+            await assert_export(ordered_code, second_node, first_node, second_node)
+            await assert_export(empty_code)
+            await assert_export(await selected(restored), stale_node)
+
     async def test_access_logs_keep_status_without_capability_urls(self):
         sub = await self.store.add_imported_sub(OWNER, "supported", [SUPPORTED])
         await self.store.add_imported_sub(OWNER, "unsupported", [UNSUPPORTED])
