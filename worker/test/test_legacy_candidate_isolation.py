@@ -533,9 +533,15 @@ class CandidateArtifactTests(unittest.TestCase):
         class TempMemoryAPI(native_tests.MemoryAPI):
             def __call__(api, method, path, payload):
                 self.assertEqual((method, path), ("POST", api.root + f"/d1/database/{native_tests.RESTORE_ID}/query"))
-                self.assertTrue(native.readonly_sql(payload["sql"]))
-                self.assertLessEqual(len(payload["sql"].encode("utf-8")), 100_000)
-                return [{"success": True, "results": api.rows(native_tests.RESTORE_ID, payload["sql"])}]
+                self.assertEqual(set(payload), {"sql"})
+                sql = payload["sql"]
+                if native.readonly_sql(sql):
+                    self.assertLessEqual(len(sql.encode("utf-8")), tool.migrations.MAX_D1_STATEMENT_BYTES)
+                    statements = (sql,)
+                else:
+                    statements = native.readonly_schema_batch(sql)
+                    self.assertIsNotNone(statements)
+                return [{"success": True, "results": api.rows(native_tests.RESTORE_ID, statement)} for statement in statements]
 
         api = TempMemoryAPI()
         api.names = {"database": "synthetic-temp-db"}
