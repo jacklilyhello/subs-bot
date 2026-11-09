@@ -160,23 +160,29 @@ def _write_private(path: Path, data: bytes | bytearray) -> None:
         os.fsync(file.fileno())
 
 
-def seal_inventory(backup: Path, output: Path, expected_source_sha256: str) -> None:
-    """Write a deterministic private package from an independently pinned source."""
+def _verified_source_rows(backup: Path, expected_source_sha256: str) -> tuple[bool, bytearray, int, int]:
     _require(_SHA256.fullmatch(expected_source_sha256) is not None)
     source, source_parent = _private_parent(backup)
-    destination, output_parent = _private_parent(output)
     identity = _source_state(source)
     _require(_fingerprint(source, identity) == expected_source_sha256 and _private_parent(source)[1] == source_parent)
-    present, rows, count, allowed = _read_authorization(source)
+    result = _read_authorization(source)
     _require(_fingerprint(source, identity) == expected_source_sha256 and _private_parent(source)[1] == source_parent)
+    return result
 
-    manifest = _canonical_line({
-        "version": 1, "kind": "legacy-authorization-inventory", "sourceSha256": expected_source_sha256,
+
+def _inventory_manifest(source_sha256: str, present: bool, rows: bytearray, count: int, allowed: int) -> bytes:
+    return _canonical_line({
+        "version": 1, "kind": "legacy-authorization-inventory", "sourceSha256": source_sha256,
         "authOverrides": {
             "present": present, "rows": count, "allowedRows": allowed, "deniedRows": count - allowed,
             "file": SIDECAR, "bytes": len(rows), "sha256": sha256(rows).hexdigest(),
         },
     })
+
+
+def _seal_package(destination: Path, output_parent: tuple, manifest: bytes, sidecars: dict[str, bytes | bytearray]) -> None:
+    _require(all(Path(name).name == name and name not in {"", ".", "..", MANIFEST, SEAL} for name in sidecars))
+    names = {*sidecars, MANIFEST}
     _require(_private_parent(destination)[1] == output_parent)
     destination.mkdir(mode=0o700)
     output_identity = _directory_identity(destination)
@@ -186,20 +192,29 @@ def seal_inventory(backup: Path, output: Path, expected_source_sha256: str) -> N
         return _private_parent(destination)[1] == output_parent and _directory_identity(destination) == output_identity
 
     try:
-        _write_private(destination / SIDECAR, rows)
+        for name, raw in sidecars.items():
+            _write_private(destination / name, raw)
         _write_private(destination / MANIFEST, manifest)
-        _require(same_output())
+        _require(same_output() and {path.name for path in destination.iterdir()} == names)
         _write_private(destination / SEAL, sha256(manifest).hexdigest().encode("ascii") + b"\n")
-        _require(same_output())
+        _require(same_output() and {path.name for path in destination.iterdir()} == names | {SEAL})
     except BaseException:
         # Leave a moved directory alone. Its replacement may contain unrelated files.
         with suppress(OSError, InventoryError):
             if same_output():
-                for name in (SEAL, MANIFEST, SIDECAR):
+                for name in (SEAL, MANIFEST, *sidecars):
                     with suppress(OSError):
                         (destination / name).unlink()
                 destination.rmdir()
         raise
+
+
+def seal_inventory(backup: Path, output: Path, expected_source_sha256: str) -> None:
+    """Write a deterministic private package from an independently pinned source."""
+    destination, output_parent = _private_parent(output)
+    present, rows, count, allowed = _verified_source_rows(backup, expected_source_sha256)
+    manifest = _inventory_manifest(expected_source_sha256, present, rows, count, allowed)
+    _seal_package(destination, output_parent, manifest, {SIDECAR: rows})
 
 
 def main(args: list[str] | None = None) -> int:
