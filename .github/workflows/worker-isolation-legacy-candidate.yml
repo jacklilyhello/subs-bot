@@ -18,6 +18,7 @@ on:
           - synthetic-legacy-selected-aggregates
           - synthetic-legacy-temp-nodes
           - synthetic-legacy-dynamic-all
+          - synthetic-legacy-unified-shares
       action:
         description: One protected synthetic checkpoint
         required: true
@@ -72,7 +73,8 @@ jobs:
         with:
           python-version: >-
             ${{ (inputs.profile == 'synthetic-legacy-mixed-shorts' || inputs.profile == 'synthetic-legacy-selected-aggregates'
-            || inputs.profile == 'synthetic-legacy-temp-nodes' || inputs.profile == 'synthetic-legacy-dynamic-all')
+            || inputs.profile == 'synthetic-legacy-temp-nodes' || inputs.profile == 'synthetic-legacy-dynamic-all'
+            || inputs.profile == 'synthetic-legacy-unified-shares')
             && '3.11.18' || '3.11' }}
       - name: Verify trusted Worker and synthetic candidate artifacts
         env:
@@ -91,7 +93,8 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: >-
-            ${{ inputs.profile == 'synthetic-legacy-dynamic-all' && 'subs-bot-legacy-dynamic-all-candidate-evidence'
+            ${{ inputs.profile == 'synthetic-legacy-unified-shares' && 'subs-bot-legacy-unified-share-candidate-evidence'
+            || inputs.profile == 'synthetic-legacy-dynamic-all' && 'subs-bot-legacy-dynamic-all-candidate-evidence'
             || inputs.profile == 'synthetic-legacy-temp-nodes' && 'subs-bot-legacy-temp-node-candidate-evidence'
             || inputs.profile == 'synthetic-legacy-selected-aggregates' && 'subs-bot-legacy-selected-aggregate-candidate-evidence'
             || inputs.profile == 'synthetic-legacy-mixed-shorts' && 'subs-bot-legacy-mixed-short-candidate-evidence'

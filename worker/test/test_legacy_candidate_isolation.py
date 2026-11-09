@@ -911,6 +911,103 @@ class CandidateBoundaryTests(unittest.TestCase):
         api.allow_restore.assert_called_once_with(keys=candidate.entries)
         candidate.read_file.assert_called_once_with(candidate.document["sql"], tool.package.SQL, 256 * 1024, extra={"md5"})
 
+    def test_unified_share_profile_requires_both_object_namespaces_on_the_pinned_bucket(self):
+        native = tool.native
+        with patch.object(native, "ACCOUNT_SHA256", native.digest(native_tests.ACCOUNT.encode())), patch.object(native, "_response") as send:
+            api = native.RehearsalAPI(native_tests.TARGET, "synthetic-token", native_tests.COHORT, profile=tool.UNIFIED_SHARE_PROFILE)
+            self.assertEqual(api.names, {"database": f"subs-bot-cf-legacy-unified-db-{api.cohort}",
+                                         "objects": f"subs-bot-cf-legacy-unified-r2-{api.cohort}"})
+            self.assertEqual(api.journal_prefix, f"maintenance/legacy-unified-candidate/{api.cohort}/journal/")
+            self.assertEqual(api.buckets, {native.WORKER_NAME, api.names["objects"]})
+            snapshots = {f"subscriptions/{identity}/{native_tests.SNAPSHOT}/{leaf}"
+                         for identity in range(1, 5) for leaf in ("manifest.json", "0.ndjson")}
+            share = f"private-shares/{native_tests.PAYLOAD}.txt"
+            shares = {share, f"private-shares/{native_tests.SNAPSHOT}.txt"}
+            keys = snapshots | shares
+            d1, r2 = api.root + "/d1/database", api.root + "/r2/buckets"
+            bucket = api.names["objects"]
+            for request in (
+                lambda: api.allow_restore(keys=snapshots),
+                lambda: api.allow_restore(keys=keys - {share} | {f"subscriptions/9/{native_tests.SNAPSHOT}/manifest.json"}),
+                lambda: api.allow_restore(native_tests.RESTORE_ID),
+                lambda: api.json("GET", d1),
+                lambda: api.json("GET", r2),
+                lambda: api.list_objects(bucket, maximum=10),
+                lambda: api.rows(native_tests.SOURCE_ID, "SELECT id FROM subscriptions"),
+                lambda: api.json("POST", api.source + "/export", {"output_format": "polling", "dump_options": {"compatibility": "d1"}}),
+                lambda: api.r2("GET", native.WORKER_NAME, share),
+                lambda: api.list_objects(native.WORKER_NAME, prefix="private-shares/", maximum=1),
+                lambda: api.allow_restore(object_bucket=native.WORKER_NAME),
+            ):
+                with self.assertRaises(native.RehearsalError):
+                    request()
+            api.allow_restore(keys=keys)
+            with self.assertRaises(native.RehearsalError):
+                api.r2("GET", bucket, share)
+            api.allow_restore(object_bucket=bucket)
+            with self.assertRaises(native.RehearsalError):
+                api.list_objects(bucket, prefix="private-shares/", maximum=1)
+            send.assert_not_called()
+
+            send.return_value = native_tests.envelope([])
+            self.assertEqual(api.json("GET", d1 + "?name=" + api.names["database"] + "&per_page=100"), [])
+            self.assertEqual(api.json("GET", r2 + "?name_contains=" + bucket + "&per_page=100"), [])
+            self.assertEqual(api.list_objects(bucket, maximum=10), [])
+            self.assertEqual(api.list_objects(bucket, prefix=share, maximum=2), [])
+            api.r2("GET", bucket, share)
+            api.r2("GET", bucket, next(iter(snapshots)))
+            api.r2("PUT", native.WORKER_NAME, api.journal_prefix + "000001-" + "a" * 32 + ".json", b"{}")
+            self.assertEqual(send.call_count, 7)
+
+    def test_unified_share_live_pin_requires_all_three_legacy_capabilities(self):
+        source = object.__new__(tool.CandidateSource)
+        source.api = SimpleNamespace(profile=tool.UNIFIED_SHARE_PROFILE)
+        source.scope = Mock()
+        for selected, temp, dynamic in ((False, True, True), (True, False, True), (True, True, False)):
+            source.scope.version.return_value = (None, selected, temp, dynamic)
+            with self.subTest(selected=selected, temp=temp, dynamic=dynamic), self.assertRaises(tool.native.RehearsalError):
+                source.live_pin()
+        source.scope.version.assert_called_with(source.scope.active.return_value.version, with_legacy_selected=True,
+                                                with_legacy_temp=True, with_legacy_dynamic_all=True)
+
+    def test_unified_share_verification_keeps_oracle_scope_and_exact_restore_evidence(self):
+        from legacy_unified_share_native_candidate import UNIFIED_SHARE_ORACLE_SCOPE
+
+        pin = {"profile": tool.UNIFIED_SHARE_PROFILE, "worker": {}, "candidate": {"packageManifestSha256": "a" * 64,
+            "schemaSha256": "b" * 64, "archiveSha256": "c" * 64, "artifactId": "24",
+            "unifiedShareOracleManifestSha256": "d" * 64}}
+        source = Mock(scope_sha256="e" * 64)
+        state = {"phase": "verified", "sourcePin": pin, "scopeSha256": source.scope_sha256,
+                 "resources": {kind: {"pin": {}} for kind in ("database", "objects")},
+                 "importState": {"state": "verified"}}
+        journal = Mock(value=state)
+        journal.load.return_value = state
+        entries = {f"synthetic-entry-{index}": {} for index in range(10)}
+        document = {"counts": {"activeRows": 4}, "scope": "fresh-unbound-d1-r2", "sql": {},
+                    "shortLinkCompatibility": {"external": "offline-equivalent"}, "shareCompatibility": "not-validated"}
+        candidate = Mock(entries=entries, document=document, sql=Path("restore.sql"))
+        candidate.native_evidence.return_value = {"verifiedPrivateShareCount": 2}
+        api = Mock()
+        engine = tool.CANDIDATE_ENGINES[tool.UNIFIED_SHARE_PROFILE](api, source, journal, candidate)
+        self.assertEqual(engine.import_ready_phase, "objects-restored")
+        self.assertEqual(engine.manifest(), (document, candidate.sql))
+        api.allow_restore.assert_called_once_with(keys=entries)
+        candidate.read_file.assert_called_once_with(document["sql"], tool.package.SQL, 256 * 1024, extra={"md5"})
+
+        summary = {"dataSha256": "f" * 64, "rowCount": 69}
+        engine.read_restored_summary = Mock(return_value=(summary, document))
+        result = tool.run_action("verify-restore", engine, pin)
+        self.assertEqual({key: result[key] for key in (
+            "resourceCount", "objectCount", "restoreScope", "unifiedShareOracle", "unifiedShareOracleManifestSha256",
+            "r2Closure", "r2Metadata", "foreignKeys", "verifiedPrivateShareCount", "shareCompatibility")}, {
+            "resourceCount": 2, "objectCount": 10, "restoreScope": "fresh-unbound-d1-r2",
+            "unifiedShareOracle": UNIFIED_SHARE_ORACLE_SCOPE, "unifiedShareOracleManifestSha256": "d" * 64,
+            "r2Closure": "verified", "r2Metadata": "verified", "foreignKeys": "verified",
+            "verifiedPrivateShareCount": 2, "shareCompatibility": "not-validated",
+        })
+        candidate.native_evidence.assert_called_once_with(summary)
+        journal.claim.assert_not_called()
+
     def test_different_runtime_pin_stops_before_claim(self):
         journal = Mock()
         journal.load.return_value = {"sourcePin": {"artifact": "unchanged", "live": "previous"}, "scopeSha256": "scope"}

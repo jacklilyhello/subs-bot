@@ -578,6 +578,12 @@ python3 -B worker/tools/legacy_restore_package.py \
 
 保留发送者、领取者、指定对象、份数、到期时间及原始正文。订阅的所有者映射仅用于订阅域。已到期的分享和已有领取历史随数据一起恢复。原内联消息标识留在私有盘点内，候选只记录数量。订阅快照和私密正文共同校验 R2 对象完整性和容量。候选保持私有、未绑定；同一 Bot 下的旧领取链接、旧卡片行为、授权基线和真实数据导入另行验收。
 
+#### V10 联合包原生恢复演练
+
+托管 Worker CI 从一份固定合成 SQLite 生成联合候选，并用实际旧 Python 和同一提交的编译后 Worker 核对外部短链跳转。受信的 `main` 构建发布准确候选和三份外部跳转证明文件。证明绑定源 SQLite、短链盘点和 Worker 构建。受保护步骤独立重建候选，核对完整归档、SQL、两类 R2 对象和摘要，并确认隔离 Worker 正在运行同一提交的构建，具备旧所选聚合、临时节点和全量聚合的读写能力。
+
+在 `worker-isolation-legacy-candidate.yml` 选择 `synthetic-legacy-unified-shares`。以同一个新的 32 位十六进制 `cohort` 和同一个成功的 `source_run_id` 依次运行 `verify`、`prepare`、`create-restore-db`、`create-restore-bucket`、`restore-objects`、`start-import`、`verify-restore`。资源创建结果不明时，先按 `pin-resource` 核对准确资源。恢复到专用未绑定 D1 和私有 R2，并读回复核完整 schema、外键、编号序列、数据与 10 个对象的摘要、四类短链和临时节点休眠状态。合成数据含一条已有领取和一条已到期分享；验收保持这些原值，旧卡片交互和真实源数据另行核对。
+
 ### 真实数据与生产切换门槛
 
 1. 先只读核对 Cloudflare 目标账户、Zone、`subs-bot.lilyya.top` 的 DNS、Worker 路由和 Custom Domain 绑定。新资源记录账号、环境及资源 ID，隔离与生产分别使用各自的 Worker、D1、R2 和队列。现有配置冲突须在改动前报告。目标主机名可用且切换获准后，仅增加所需的 Custom Domain 绑定。 [Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)

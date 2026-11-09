@@ -73,12 +73,14 @@ LEGACY_MIXED_SHORT_CANDIDATE_PROFILE = "synthetic-legacy-mixed-shorts"
 LEGACY_SELECTED_AGGREGATE_CANDIDATE_PROFILE = "synthetic-legacy-selected-aggregates"
 LEGACY_TEMP_CANDIDATE_PROFILE = "synthetic-legacy-temp-nodes"
 LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE = "synthetic-legacy-dynamic-all"
+LEGACY_UNIFIED_SHARE_CANDIDATE_PROFILE = "synthetic-legacy-unified-shares"
 LEGACY_CANDIDATE_NAMES = {LEGACY_CANDIDATE_PROFILE: "legacy", LEGACY_PATH_CANDIDATE_PROFILE: "legacy-path",
                           LEGACY_EMPTY_CANDIDATE_PROFILE: "legacy-empty", LEGACY_PRIVATE_SHARE_CANDIDATE_PROFILE: "legacy-share",
                           LEGACY_TYPED_SHORT_CANDIDATE_PROFILE: "legacy-typed", LEGACY_MIXED_SHORT_CANDIDATE_PROFILE: "legacy-mixed",
                           LEGACY_SELECTED_AGGREGATE_CANDIDATE_PROFILE: "legacy-select",
                           LEGACY_TEMP_CANDIDATE_PROFILE: "legacy-temp",
-                          LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE: "legacy-all"}
+                          LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE: "legacy-all",
+                          LEGACY_UNIFIED_SHARE_CANDIDATE_PROFILE: "legacy-unified"}
 ACCOUNT_SHA256 = "ffdbf3dd5d042c6edb68d7f628998a69a22320b0199775bfda9f97593136e508"
 
 
@@ -251,7 +253,8 @@ class RehearsalAPI:
             require(object_bucket is None and (keys is None or not keys))
         if database_id is not None:
             require(matches(UUID, database_id) and database_id != self.target["d1Id"]
-                    and (self.profile not in (LEGACY_TEMP_CANDIDATE_PROFILE, LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE)
+                    and (self.profile not in (LEGACY_TEMP_CANDIDATE_PROFILE, LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE,
+                                              LEGACY_UNIFIED_SHARE_CANDIDATE_PROFILE)
                          or database_id in self.databases))
             self.databases.add(database_id)
             self.restore_id = database_id
@@ -259,6 +262,10 @@ class RehearsalAPI:
             require(len(keys) <= MAX_OBJECTS and all(matches(KEY, key) for key in keys))
             if self.profile == LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE:
                 require(all(key.startswith("subscriptions/") for key in keys))
+            if self.profile == LEGACY_UNIFIED_SHARE_CANDIDATE_PROFILE:
+                require(len(set(keys)) == len(keys) == 10
+                        and sum(key.startswith("subscriptions/") for key in keys) == 8
+                        and sum(key.startswith("private-shares/") for key in keys) == 2)
             self.restore_keys = set(keys)
         if object_bucket is not None:
             require(object_bucket == self.names["objects"])
@@ -274,7 +281,7 @@ class RehearsalAPI:
                 require(route not in {self.root + "/r2/buckets", self.root + "/tokens/verify"})
             else:
                 require(path == route)
-        if self.profile == LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE:
+        if self.profile in (LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE, LEGACY_UNIFIED_SHARE_CANDIDATE_PROFILE):
             if method == "GET" and route == self.root + "/d1/database":
                 require(path == route + "?" + urlencode({"name": self.names["database"], "per_page": 100}))
             elif method == "GET" and route == self.root + "/r2/buckets":
@@ -321,9 +328,20 @@ class RehearsalAPI:
                 query = parse_qs(urlsplit(path).query, max_num_fields=3)
                 prefix = query.get("prefix", [])
                 require(len(prefix) == 1 and re.fullmatch(re.escape(self.journal_prefix) + r"(?:[0-9]{6}-)?", prefix[0]))
-                if self.profile in (LEGACY_TEMP_CANDIDATE_PROFILE, LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE):
+                if self.profile in (LEGACY_TEMP_CANDIDATE_PROFILE, LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE,
+                                    LEGACY_UNIFIED_SHARE_CANDIDATE_PROFILE):
                     require(set(query) <= {"prefix", "per_page", "cursor"}
                             and all(len(values) == 1 for values in query.values()))
+            elif self.profile == LEGACY_UNIFIED_SHARE_CANDIDATE_PROFILE:
+                if route == self.root + f"/r2/buckets/{self.names['objects']}/objects":
+                    query = parse_qs(urlsplit(path).query, keep_blank_values=True, max_num_fields=3)
+                    prefix = query.get("prefix", [])
+                    require(self.restore_bucket == self.names["objects"] and self.restore_keys
+                            and len(prefix) == 1 and (prefix[0] == "" or prefix[0] in self.restore_keys)
+                            and set(query) <= {"prefix", "per_page", "cursor"}
+                            and all(len(values) == 1 for values in query.values()))
+                elif route not in {self.root + "/d1/database", self.root + "/r2/buckets"}:
+                    require(path == route)
         headers = {"Authorization": "Bearer " + self.token, "Accept": "application/json", "Cache-Control": "no-cache",
                    "cf-r2-jurisdiction": "default"}
         body = None if payload is None else canonical(payload)
@@ -371,6 +389,8 @@ class RehearsalAPI:
             require(key == self.archive_prefix + "manifest.json" or re.fullmatch(re.escape(self.archive_prefix) + r"(?:sql/[0-9]{1,3}\.sql|blobs/[a-f0-9]{64})", key))
         else:
             require(method == "GET" and key in self.restore_keys)
+            if self.profile == LEGACY_UNIFIED_SHARE_CANDIDATE_PROFILE:
+                require(self.restore_bucket == bucket)
         require(method != "GET" or body is None)
         headers = {"Authorization": "Bearer " + self.token, "Accept": "application/octet-stream",
                    "Accept-Encoding": "identity", "cf-r2-jurisdiction": "default"}
