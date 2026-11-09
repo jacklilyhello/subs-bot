@@ -34,13 +34,15 @@ MIXED_PROFILE = native.LEGACY_MIXED_SHORT_CANDIDATE_PROFILE
 SELECTED_PROFILE = native.LEGACY_SELECTED_AGGREGATE_CANDIDATE_PROFILE
 TEMP_PROFILE = native.LEGACY_TEMP_CANDIDATE_PROFILE
 DYNAMIC_ALL_PROFILE = native.LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE
+UNIFIED_SHARE_PROFILE = native.LEGACY_UNIFIED_SHARE_CANDIDATE_PROFILE
 ARTIFACT_PREFIX = "subs-bot-legacy-candidate"
 ARTIFACT_PREFIXES = {PROFILE: ARTIFACT_PREFIX, PATH_PROFILE: "subs-bot-legacy-path-candidate",
                      EMPTY_PROFILE: "subs-bot-legacy-empty-candidate", SHARE_PROFILE: "subs-bot-legacy-private-share-candidate",
                      TYPED_PROFILE: "subs-bot-legacy-typed-short-candidate", MIXED_PROFILE: "subs-bot-legacy-mixed-short-candidate",
                      SELECTED_PROFILE: "subs-bot-legacy-selected-aggregate-candidate",
                      TEMP_PROFILE: "subs-bot-legacy-temp-node-candidate",
-                     DYNAMIC_ALL_PROFILE: "subs-bot-legacy-dynamic-all-candidate"}
+                     DYNAMIC_ALL_PROFILE: "subs-bot-legacy-dynamic-all-candidate",
+                     UNIFIED_SHARE_PROFILE: "subs-bot-legacy-unified-share-candidate"}
 CANDIDATE_DIRECTORY = "subs-bot-verified-legacy-candidate"
 PROVENANCE = "legacy-candidate-provenance.json"
 EVIDENCE = "legacy-candidate-evidence.json"
@@ -129,7 +131,7 @@ def candidate_directory(profile):
 def candidate_version(profile):
     require(profile in ARTIFACT_PREFIXES)
     return {PROFILE: 1, PATH_PROFILE: 2, EMPTY_PROFILE: 3, SHARE_PROFILE: 1, TYPED_PROFILE: 4,
-            MIXED_PROFILE: 5, SELECTED_PROFILE: 6, TEMP_PROFILE: 7, DYNAMIC_ALL_PROFILE: 8}[profile]
+            MIXED_PROFILE: 5, SELECTED_PROFILE: 6, TEMP_PROFILE: 7, DYNAMIC_ALL_PROFILE: 8, UNIFIED_SHARE_PROFILE: 10}[profile]
 
 
 def path_mapping():
@@ -233,7 +235,7 @@ def _build_mixed_candidate(worker, output, worker_pin, scratch, oracle, *, produ
 
 
 def build_synthetic_candidate(worker, output, revision, run_id, attempt, *, profile=PROFILE):
-    require(profile not in (SELECTED_PROFILE, TEMP_PROFILE, DYNAMIC_ALL_PROFILE))
+    require(profile not in (SELECTED_PROFILE, TEMP_PROFILE, DYNAMIC_ALL_PROFILE, UNIFIED_SHARE_PROFILE))
     version = candidate_version(profile)
     worker_sha = native.digest(package.read_private(worker / "isolation.json", artifact._MAX_JSON))
     _, worker_pin = package.worker_artifact(worker, revision, worker_sha)
@@ -281,6 +283,10 @@ def package_files(document, *, profile=PROFILE):
         from legacy_dynamic_all_native_candidate import dynamic_all_candidate_files
 
         return dynamic_all_candidate_files(document)
+    if profile == UNIFIED_SHARE_PROFILE:
+        from legacy_unified_share_native_candidate import unified_share_candidate_files
+
+        return unified_share_candidate_files(document)
     files = {package.MANIFEST, package.MARKER, package.SQL, package.LINEAGE}
     objects = document.get("objects")
     require(isinstance(objects, list) and len(objects) == 4)
@@ -322,7 +328,15 @@ def unpack_candidate(body, archive_sha, destination, *, profile=PROFILE):
             limits = PACKAGE_LIMITS
         expected_files = share_fixture.files(document, OBJECT_LIMIT) if profile == SHARE_PROFILE else package_files(document, profile=profile)
         require(set(members) == expected_files)
-        require(all(0 < entry.file_size <= limits.get(name, OBJECT_LIMIT) for name, entry in members.items()))
+        if profile == UNIFIED_SHARE_PROFILE:
+            from legacy_unified_share_native_candidate import PACKAGE_LIMITS, unified_share_object_limit
+
+            require(sum(entry.file_size for entry in members.values()) <= 512 * 1024)
+            require(all(0 < entry.file_size <= (PACKAGE_LIMITS[name] if name in PACKAGE_LIMITS
+                                               else unified_share_object_limit(name.removeprefix("objects/")))
+                        for name, entry in members.items()))
+        else:
+            require(all(0 < entry.file_size <= limits.get(name, OBJECT_LIMIT) for name, entry in members.items()))
         destination.mkdir(mode=0o700)
         for name, entry in members.items():
             path = destination / name
@@ -572,6 +586,10 @@ class CandidateSource(native.Source):
             version, temp_capable, dynamic_capable = self.scope.version(
                 active.version, with_legacy_temp=True, with_legacy_dynamic_all=True)
             require(temp_capable is True and dynamic_capable is True)
+        elif self.api.profile == UNIFIED_SHARE_PROFILE:
+            version, selected_capable, temp_capable, dynamic_capable = self.scope.version(
+                active.version, with_legacy_selected=True, with_legacy_temp=True, with_legacy_dynamic_all=True)
+            require(selected_capable is True and temp_capable is True and dynamic_capable is True)
         else:
             version = self.scope.version(active.version)
         return {"deploymentId": active.id, "versionId": active.version, "version": asdict(version),
@@ -674,7 +692,16 @@ class DynamicAllCandidateRehearsal(CandidateRehearsal):
         self.sql_limit = PACKAGE_LIMITS[package.SQL]
 
 
-CANDIDATE_ENGINES = {TEMP_PROFILE: TempCandidateRehearsal, DYNAMIC_ALL_PROFILE: DynamicAllCandidateRehearsal}
+class UnifiedShareCandidateRehearsal(CandidateRehearsal):
+    def __init__(self, api, source, journal, candidate):
+        from legacy_unified_share_native_candidate import SQL_LIMIT
+
+        super().__init__(api, source, journal, candidate)
+        self.sql_limit = SQL_LIMIT
+
+
+CANDIDATE_ENGINES = {TEMP_PROFILE: TempCandidateRehearsal, DYNAMIC_ALL_PROFILE: DynamicAllCandidateRehearsal,
+                     UNIFIED_SHARE_PROFILE: UnifiedShareCandidateRehearsal}
 
 
 def validate_checkpoint_action(action, resource, resources):
@@ -755,6 +782,14 @@ def run_action(action, engine, pin, *, resource=None, identity_sha=None):
                       shortLinkCompatibility=engine.candidate.document["shortLinkCompatibility"],
                       dynamicAllHttpOracle=DYNAMIC_ALL_HTTP_SCOPE,
                       dynamicAllHttpOracleSha256=pin["candidate"]["dynamicAllHttpOracleSha256"])
+    elif profile == UNIFIED_SHARE_PROFILE:
+        from legacy_unified_share_native_candidate import UNIFIED_SHARE_ORACLE_SCOPE
+
+        result.update(counts=engine.candidate.document["counts"], restoreScope=engine.candidate.document["scope"],
+                      shortLinkCompatibility=engine.candidate.document["shortLinkCompatibility"],
+                      shareCompatibility=engine.candidate.document["shareCompatibility"],
+                      unifiedShareOracle=UNIFIED_SHARE_ORACLE_SCOPE,
+                      unifiedShareOracleManifestSha256=pin["candidate"]["unifiedShareOracleManifestSha256"])
     else:
         result.update(counts=EMPTY_COUNTS if profile in (EMPTY_PROFILE, TYPED_PROFILE, MIXED_PROFILE) else COUNTS,
                       generationZeroHttp="not-validated")
@@ -798,8 +833,10 @@ def run_action(action, engine, pin, *, resource=None, identity_sha=None):
                           externalShortMigrationSha256=package.EXTERNAL_SHORT_MIGRATION_SHA256,
                           namespaceManifestSha256=pin["candidate"]["namespaceManifestSha256"],
                           oracleManifestSha256=pin["candidate"]["oracleManifestSha256"])
-        if profile in (SELECTED_PROFILE, TEMP_PROFILE, DYNAMIC_ALL_PROFILE):
+        if profile in (SELECTED_PROFILE, TEMP_PROFILE, DYNAMIC_ALL_PROFILE, UNIFIED_SHARE_PROFILE):
             result.update(engine.candidate.native_evidence(observed_summary))
+        if profile == UNIFIED_SHARE_PROFILE:
+            result["r2Metadata"] = "verified"
         if profile == SHARE_PROFILE:
             counts, hashes = observed_summary["tableCounts"], observed_summary["tableSha256"]
             require(counts["private_shares"] == share_fixture.COUNTS["shares"]
@@ -836,6 +873,10 @@ def verified_candidate(runner, provenance, scratch, *, profile=PROFILE):
         from legacy_dynamic_all_native_candidate import DynamicAllCandidate
 
         return DynamicAllCandidate(runner / candidate_directory(profile), worker, worker_pin, scratch)
+    if profile == UNIFIED_SHARE_PROFILE:
+        from legacy_unified_share_native_candidate import UnifiedShareCandidate
+
+        return UnifiedShareCandidate(runner / candidate_directory(profile), worker, worker_pin, scratch)
     objects = migrations._objects(chain, len(chain), managed=True)
     schema = SimpleNamespace(migrations=chain, objects=objects, schema_sha256=native._schema_digest(objects),
                              tables=sorted(obj.name for obj in objects if obj.type == "table"))
@@ -892,7 +933,7 @@ def apply(runner, revision, inputs):
         manifest = native.parsed(package.read_private(worker / "isolation.json", artifact._MAX_JSON), artifact._MAX_JSON)
         source = CandidateSource(api, read_worker, target, worker, manifest, lambda: artifact.require_current_main(revision))
         live = source.verify()
-        if profile in (SELECTED_PROFILE, TEMP_PROFILE, DYNAMIC_ALL_PROFILE):
+        if profile in (SELECTED_PROFILE, TEMP_PROFILE, DYNAMIC_ALL_PROFILE, UNIFIED_SHARE_PROFILE):
             version = live["version"]
             require((version["revision"], version["digest"], version["compatibility"])
                     == (revision, manifest["bundleSha256"], manifest["compatibilityDate"]))
