@@ -29,6 +29,7 @@ import {
   beginTelegramAggregateLinkReply, beginTelegramBulkTrashReply, beginTelegramInlineConsentReply, beginTelegramInlineSortReply,
   beginTelegramPrivateShareCreationReply,
   beginTelegramSelectedLinkReply, beginTelegramShortLinkReply, beginTelegramReply, claimTelegramReply, isTelegramMemberAllowed,
+  readTelegramAuthChangeOutcome,
   beginTelegramGitHubSearchReply, beginTelegramTempRawReply,
   beginTelegramSubscriptionRawFileReply, failLeasedTelegramSubscriptionRawFileReply,
   beginTelegramApiStatusReply, beginTelegramProviderBatchReply, beginTelegramProviderDocumentReply,
@@ -269,6 +270,14 @@ async function renderReply(
     if (lease.actorId !== policy.adminId) return { text: "只有管理员可以管理授权。", access: "none" };
     if (lease.chatType !== "private") return { text: "请在私聊中管理授权。", access: "none" };
     if (lease.command === "auth-usage") return { text: "用法：/auth list、/auth add 用户ID、/auth remove 用户ID。", access: "none" };
+    if (lease.command === "auth-add" || lease.command === "auth-remove") {
+      const allowed = lease.command === "auth-add";
+      const outcome = await readTelegramAuthChangeOutcome(db, policy, lease, allowed);
+      if (outcome === "confirmed") return { text: `用户 ${policy.memberId}：${allowed ? "已授权" : "已撤权"}。`, access: "none" };
+      const text = outcome === "superseded" ? "收到更新的授权操作。请用 /auth list 查看当前状态。"
+        : "无法核对这次授权操作。请用 /auth list 查看当前状态。";
+      return { text, access: "none" };
+    }
     const memberAllowed = await isTelegramMemberAllowed(db, policy);
     return {
       text: `管理员 ${policy.adminId}\n用户 ${policy.memberId}：${memberAllowed ? "已授权" : "已撤权"}`,
