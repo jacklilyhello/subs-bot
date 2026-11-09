@@ -182,14 +182,14 @@ function renameReceiptSteps(
   ];
 }
 
-function mutationSteps(
+async function mutationSteps(
   db: D1Database,
   key: readonly [string, number, string],
   ownerId: string,
   candidate: Candidate,
   mutation: SubscriptionMutation,
-): D1PreparedStatement[] {
-  const prepared = prepareOwnedSubscriptionMutation(db, {
+): Promise<D1PreparedStatement[]> {
+  const prepared = await prepareOwnedSubscriptionMutation(db, {
     id: candidate.subscriptionId, ownerId, expectedLifecycleRevision: candidate.expectedLifecycleRevision,
   }, mutation, {
     sql: `EXISTS (SELECT 1 FROM telegram_inbox AS incoming
@@ -257,7 +257,7 @@ export async function acceptTelegramLifecycle(
       }
       steps.push(...renameReceiptSteps(db, key, candidate, kind));
     }
-    if (mutation) steps.push(...mutationSteps(db, key, event.actorId, candidate, mutation));
+    if (mutation) steps.push(...await mutationSteps(db, key, event.actorId, candidate, mutation));
     steps.push(
       db.prepare(`
         INSERT INTO telegram_outbox (receipt_id)

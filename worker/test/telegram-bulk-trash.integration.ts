@@ -48,7 +48,8 @@ test("emitted /d previews owned matches and atomically recycles the exact confir
     const bucket = await runtime.getR2Bucket("NODES");
     const migrations = manifest.migrations as { name: string; sha256: string }[];
     const bulk = migrations.find(({ name }) => name === "0024_telegram_bulk_trash.sql");
-    assert.ok(bulk);
+    const retirement = migrations.find(({ name }) => name === "0038_legacy_selected_aggregates.sql");
+    assert.ok(bulk && retirement);
     async function applyMigration(migration: (typeof migrations)[number]) {
       const bytes = await readFile(join(directory!, migration.name));
       assert.equal(sha256(bytes), migration.sha256);
@@ -97,6 +98,14 @@ test("emitted /d previews owned matches and atomically recycles the exact confir
     const second = await seed(policy.memberId, "URL match", "straße-aς/synthetic-source-secret");
     const decoy = await seed(policy.memberId, "STRASSE-AΣ decoy", "decoy");
     const foreign = await seed(policy.adminId, "Foreign Straße-AΣ match", "foreign");
+    await db.batch([
+      db.prepare("CREATE TABLE subs_bot_schema_migrations(position INTEGER PRIMARY KEY,name TEXT,sha256 TEXT,mode TEXT) STRICT"),
+      db.prepare("INSERT INTO subs_bot_schema_migrations VALUES (38,?,?,'applied')").bind(retirement.name, retirement.sha256),
+      db.prepare("INSERT INTO legacy_selected_members VALUES (?,0),(?,0),(?,0),(?,0)")
+        .bind(first.id, second.id, decoy.id, foreign.id),
+    ]);
+    const watched = async () => (await db.prepare("SELECT retired FROM legacy_selected_members ORDER BY id").all<{ retired: number }>())
+      .results.map(({ retired }) => retired);
     const needle = "/d STRAẞE-Aς";
     const uri = "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.9:8388#Synthetic";
     const publish = (generation: number) => publishNodeSnapshot(db, bucket, { id: second.id, ownerId: policy.memberId,
@@ -127,6 +136,7 @@ test("emitted /d previews owned matches and atomically recycles the exact confir
     assert.equal((await click(9, preview.id, ticket(preview))).status, 200);
     assert.match((await reply(9)).text, /本次未移动任何订阅/u);
     assert.deepEqual(await trash(), []);
+    assert.deepEqual(await watched(), [0, 0, 0, 0]);
     assert.ok(await getOwnedSubscription(db, policy.memberId, first.id));
     assert.ok(await getOwnedSubscription(db, policy.memberId, second.id));
     assert.equal((await command(10, needle)).status, 200);
@@ -138,6 +148,7 @@ test("emitted /d previews owned matches and atomically recycles the exact confir
       assert.equal((await click(11, retryable.id, code)).status, 503);
       assert.equal(await state(11), null);
       assert.deepEqual(await trash(), []);
+      assert.deepEqual(await watched(), [0, 0, 0, 0]);
       for (const item of [first, second]) assert.equal((await getOwnedSubscription(db, policy.memberId, item.id))?.lifecycleRevision, 0);
       assert.deepEqual(await db.prepare("SELECT confirmed_by_receipt_id FROM telegram_bulk_trash WHERE token_sha256=?")
         .bind(sha256(code)).first(), { confirmed_by_receipt_id: null });
@@ -146,6 +157,7 @@ test("emitted /d previews owned matches and atomically recycles the exact confir
     }
     assert.equal((await click(11, retryable.id, code)).status, 200);
     assert.match((await reply(11)).text, /已将 2 条订阅移入回收站/u);
+    assert.deepEqual(await watched(), [1, 1, 0, 0]);
     assert.equal((await click(12, retryable.id, code)).status, 200);
     assert.equal(await state(12), null);
     assert.deepEqual((await trash()).map(({ id, lifecycleRevision }) => [id, lifecycleRevision]).sort((a, b) => a[0] - b[0]),
@@ -154,6 +166,7 @@ test("emitted /d previews owned matches and atomically recycles the exact confir
     assert.ok(await getOwnedSubscription(db, policy.adminId, foreign.id));
     assert.equal((await runtime.dispatchFetch(`https://fixture.invalid/sub/${second.token}/base64`)).status, 404);
     assert.equal(await restoreOwnedSubscription(db, { id: second.id, ownerId: policy.memberId, expectedLifecycleRevision: 1 }), true);
+    assert.deepEqual(await watched(), [1, 1, 0, 0]);
     const recovered = await runtime.dispatchFetch(`https://fixture.invalid/sub/${second.token}/base64`);
     assert.equal(recovered.status, 200);
     assert.equal(await recovered.text(), Buffer.from(uri).toString("base64"));
@@ -166,9 +179,12 @@ test("emitted /d previews owned matches and atomically recycles the exact confir
     assert.equal(await state(14), null);
     assert.ok(await getOwnedSubscription(db, policy.memberId, second.id));
 
+    const boundaryIds: number[] = [];
     for (let index = 0; index < 17; index++) {
-      await seed(policy.adminId, `all-overlap ${index < 16 ? "exact-boundary" : "outside-boundary"} ${index}`, `cap-${index}`);
+      const row = await seed(policy.adminId, `all-overlap ${index < 16 ? "exact-boundary" : "outside-boundary"} ${index}`, `cap-${index}`);
+      boundaryIds.push(row.id);
     }
+    await db.prepare("INSERT INTO legacy_selected_members SELECT value,0 FROM json_each(?)").bind(JSON.stringify(boundaryIds)).run();
     assert.equal((await command(15, "/d all-overlap", policy.adminId)).status, 200);
     const limit = await reply(15);
     assert.match(limit.text, /超过 16 条订阅/u);
@@ -179,6 +195,7 @@ test("emitted /d previews owned matches and atomically recycles the exact confir
     assert.equal((await click(17, max.id, ticket(max), policy.adminId)).status, 200);
     assert.match((await reply(17)).text, /已将 16 条订阅移入回收站/u);
     assert.equal((await trash(policy.adminId)).length, 16);
+    assert.deepEqual((await watched()).slice(4), [...Array<number>(16).fill(1), 0]);
 
     assert.equal(await acceptTelegramBulkTrash(db, policy, { kind: "preview", query: "Foreign", actorId: policy.adminId,
       chatId: policy.adminId, chatType: "private", threadId: null, messageId: 18, messageDate: date, updateId: 18 }), "accepted");
