@@ -40,6 +40,40 @@ UNSUPPORTED = {
 HTTP_ERROR = "Some nodes or connection settings are unsupported by this export format."
 BASE64_KINDS = ("base64", "v2ray", "mixed")
 SINGBOX_KINDS = ("singbox", "sing-box")
+EMPTY_SELECTED_EXPORTS = (
+    (BASE64_KINDS + ("qx", "quantumult", "quantumultx"), "text/plain", b""),
+    (("surge",), "text/plain", b"[Proxy]\n\n[Proxy Group]\nProxy = select, DIRECT\n\n[Rule]\nFINAL,Proxy\n"),
+    (SINGBOX_KINDS, "application/json", b"""{
+  "outbounds": [
+    {
+      "type": "selector",
+      "tag": "proxy",
+      "outbounds": [
+        "direct"
+      ]
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}"""),
+    (("clash", "unknown-format"), "text/yaml", """proxies: []
+proxy-groups:
+- name: 🚀 节点选择
+  type: select
+  proxies:
+  - DIRECT
+- name: ♻️ 自动选择
+  type: url-test
+  proxies:
+  - DIRECT
+  url: http://www.gstatic.com/generate_204
+  interval: 300
+rules:
+- MATCH,🚀 节点选择
+""".encode("utf-8")),
+)
 
 
 def telegram_update(data=None):
@@ -250,8 +284,29 @@ class ExportRouteTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(restored["token"], stale["token"])
             # The legacy selection stores IDs. The restore preserves the token and allocates a new ID.
             await assert_export(ordered_code, second_node, first_node, second_node)
-            await assert_export(empty_code)
             await assert_export(await selected(restored), stale_node)
+
+            for method in ("GET", "HEAD"):
+                with self.subTest(route="short", method=method):
+                    async with session.request(method, f"{origin}/s/{empty_code}", allow_redirects=False) as response:
+                        self.assertEqual(response.status, 302)
+                        self.assertEqual(response.headers.get("Location"), f"/agg/{empty_code}/clash")
+                        if method == "HEAD":
+                            self.assertEqual(await response.read(), b"")
+
+            for kinds, media_type, body in EMPTY_SELECTED_EXPORTS:
+                for kind in kinds:
+                    for method in ("GET", "HEAD"):
+                        with self.subTest(kind=kind, method=method):
+                            url = f"{origin}/agg/{empty_code}/{kind}"
+                            async with session.request(method, url, allow_redirects=False) as response:
+                                self.assertEqual(response.status, 200)
+                                self.assert_private(response)
+                                self.assertEqual(response.content_type, media_type)
+                                self.assertEqual(response.charset, "utf-8")
+                                if method == "HEAD":
+                                    self.assertEqual(response.content_length, len(body) if body else None)
+                                self.assertEqual(await response.read(), body if method == "GET" else b"")
 
     async def test_access_logs_keep_status_without_capability_urls(self):
         sub = await self.store.add_imported_sub(OWNER, "supported", [SUPPORTED])

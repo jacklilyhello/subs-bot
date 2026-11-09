@@ -2,6 +2,8 @@ import { digestHex } from "./storage.ts";
 
 const MIGRATION_NAME = "0026_legacy_empty_subscription_exports.sql";
 const MIGRATION_SHA256 = "124eb153b8f8d1fc01165d2ba0db1adee8948cd6bffe8a8ad2465afa62da3976";
+export const LEGACY_EMPTY_EXPORT_PIN = `EXISTS (SELECT 1 FROM subs_bot_schema_migrations WHERE position=26
+  AND name='${MIGRATION_NAME}' AND sha256='${MIGRATION_SHA256}' AND mode='applied')`;
 
 export async function legacyEmptyExportState(db: D1Database, token: string): Promise<"empty" | "published" | null> {
   // An older schema still serves published subscriptions without this feature.
@@ -21,12 +23,11 @@ export async function legacyEmptyExportState(db: D1Database, token: string): Pro
       sub.generation = 0 AND sub.snapshot_id IS NULL AND sub.manifest_sha256 IS NULL AND sub.node_count = 0
       AND EXISTS (SELECT 1 FROM legacy_empty_subscription_exports AS marker
         WHERE marker.subscription_id = sub.id AND marker.owner_id = sub.owner_id AND marker.token_sha256 = ?)
-      AND EXISTS (SELECT 1 FROM subs_bot_schema_migrations WHERE position = 26
-        AND name = ? AND sha256 = ? AND mode = 'applied')
+      AND ${LEGACY_EMPTY_EXPORT_PIN}
       AND NOT EXISTS (SELECT 1 FROM subscription_trash AS trash WHERE trash.id = sub.id OR trash.token = sub.token)
     ) AS marked
     FROM subscriptions AS sub WHERE sub.token = ?
-  `).bind(digest, MIGRATION_NAME, MIGRATION_SHA256, token).first<{ generation: number; marked: number }>();
+  `).bind(digest, token).first<{ generation: number; marked: number }>();
   if (!current) return null;
   if (current.generation > 0) return "published";
   return current.marked === 1 ? "empty" : null;
@@ -53,7 +54,8 @@ const EMPTY_SINGBOX = JSON.stringify({ outbounds: [
 ] }, null, 2);
 const EMPTY_SURGE = "[Proxy]\n\n[Proxy Group]\nProxy = select, DIRECT\n\n[Rule]\nFINAL,Proxy\n";
 
-export function legacyEmptyExportResponse(format: string, head: boolean, privacyHeaders: Record<string, string>): Response {
+export function legacyEmptyExportResponse(format: string, head: boolean, privacyHeaders: Record<string, string>,
+  legacySelected = false): Response {
   let body: string;
   let contentType = "text/plain; charset=utf-8";
   switch (format) {
@@ -64,7 +66,7 @@ export function legacyEmptyExportResponse(format: string, head: boolean, privacy
     case "singbox":
     case "sing-box":
       body = EMPTY_SINGBOX;
-      contentType = "application/json";
+      contentType = legacySelected ? "application/json; charset=utf-8" : "application/json";
       break;
     case "surge":
       body = EMPTY_SURGE;
@@ -80,5 +82,7 @@ export function legacyEmptyExportResponse(format: string, head: boolean, privacy
     default:
       throw new Error("Legacy empty export format unavailable.");
   }
-  return new Response(head ? null : body, { headers: { ...privacyHeaders, "Content-Type": contentType } });
+  const headers: Record<string, string> = { ...privacyHeaders, "Content-Type": contentType };
+  if (legacySelected && head && body) headers["Content-Length"] = String(new TextEncoder().encode(body).length);
+  return new Response(head ? null : body, { headers });
 }

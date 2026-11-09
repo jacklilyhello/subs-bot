@@ -36,6 +36,7 @@ import "./telegram-bulk-trash.integration.ts";
 import "./telegram-personal-inline.integration.ts";
 import "./telegram-github-search.integration.ts";
 import "./legacy-subscription-short-links.integration.ts";
+import "./legacy-selected-aggregate.integration.ts";
 
 test("emitted Worker /o freezes owned subscription membership and excludes temporary nodes", { timeout: 60_000 }, async () => {
   const directory = process.env.WORKER_TEST_BUNDLE_DIR;

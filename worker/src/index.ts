@@ -423,13 +423,18 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
   }
   if (!matchedExport) return plain("Not found.", 404, head);
   const [, token, kind = "clash"] = matchedExport;
-  const format = kind.toLowerCase();
-  if (!EXPORT_KINDS.has(format)) return plain("Export format unavailable.", 406, head);
+  const requestedFormat = kind.toLowerCase();
+  const knownFormat = EXPORT_KINDS.has(requestedFormat);
+  if (!knownFormat && (!aggregate || token.length !== 12)) return plain("Export format unavailable.", 406, head);
+  let legacySelected = false;
 
   try {
-    const namespaces = aggregate ? await readShortLinkNamespaces(env.DB) : null;
-    let source = namespaces ? await getAggregateNodeSource(env.DB, env.NODES, token, namespaces.normal, namespaces.legacySubscription)
-      : await getSubscriptionNodeSource(env.DB, env.NODES, token);
+    const aggregateSource = aggregate ? await getAggregateNodeSource(env.DB, env.NODES, token, !knownFormat) : null;
+    legacySelected = aggregateSource?.legacySelected === true;
+    if (!knownFormat && !legacySelected) return plain("Export format unavailable.", 406, head);
+    const format = knownFormat ? requestedFormat : "clash";
+    let source = aggregate ? aggregateSource : await getSubscriptionNodeSource(env.DB, env.NODES, token);
+    if (legacySelected && source?.nodeCount === 0) return legacyEmptyExportResponse(format, head, HEADERS, true);
     if (subscription && !source) {
       const state = await legacyEmptyExportState(env.DB, token);
       if (state === "empty") return legacyEmptyExportResponse(format, head, HEADERS);
@@ -437,18 +442,23 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
       if (state === "published") source = await getSubscriptionNodeSource(env.DB, env.NODES, token);
     }
     if (!source) return plain("Not found.", 404, head);
+    const exportHeaders = (media: string, bytes: number) => {
+      const headers: Record<string, string> = { ...HEADERS, "Content-Type": media };
+      if (legacySelected && head && bytes > 0) headers["Content-Length"] = String(bytes);
+      return headers;
+    };
     if (format === "clash") {
       const plan = await planClash(source);
       return new Response(
         head ? null : fixedLengthBody((signal) => clashChunks(source, plan, signal), plan.bytes),
-        { headers: { ...HEADERS, "Content-Type": "text/yaml; charset=utf-8" } },
+        { headers: exportHeaders("text/yaml; charset=utf-8", plan.bytes) },
       );
     }
     if (format === "singbox" || format === "sing-box") {
       const plan = await planSingBox(source);
       return new Response(
         head ? null : fixedLengthBody((signal) => singBoxChunks(source, plan, signal), plan.bytes),
-        { headers: { ...HEADERS, "Content-Type": "application/json" } },
+        { headers: exportHeaders(legacySelected ? "application/json; charset=utf-8" : "application/json", plan.bytes) },
       );
     }
     if (format === "surge" || QX_KINDS.has(format)) {
@@ -456,15 +466,14 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
       const plan = await planTextExport(source, textFormat);
       return new Response(head ? null : fixedLengthBody(
         (signal) => textExportChunks(source, textFormat, plan, signal), plan.bytes,
-      ), { headers: { ...HEADERS, "Content-Type": "text/plain; charset=utf-8" } });
+      ), { headers: exportHeaders("text/plain; charset=utf-8", plan.bytes) });
     }
     // Measure and verify the source before returning success, without retaining its content.
     const length = await planBase64(source);
     const body = head ? null : fixedLengthBody((signal) => base64Chunks(source, signal), length);
-    return new Response(body, {
-      headers: { ...HEADERS, "Content-Type": "text/plain; charset=utf-8" },
-    });
+    return new Response(body, { headers: exportHeaders("text/plain; charset=utf-8", length) });
   } catch (error) {
+    if (!knownFormat && !legacySelected) return plain("Export format unavailable.", 406, head);
     if (error instanceof AggregateLimitError || error instanceof ExportContentError || error instanceof SingBoxContentError
         || error instanceof ClashContentError || error instanceof TextExportError || error instanceof PathRuleContentError) {
       return plain("Subscription content cannot be exported.", 422, head);
