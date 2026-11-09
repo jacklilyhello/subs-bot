@@ -16,7 +16,9 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from uuid import NAMESPACE_URL, uuid5
 
-from cloudflare_isolation import CloudflareError, LEGACY_SELECTED_MIGRATION_SHA256, legacy_selected_artifact
+from cloudflare_isolation import (
+    CloudflareError, LEGACY_SELECTED_MIGRATION_SHA256, legacy_dynamic_all_artifact, legacy_selected_artifact, legacy_temp_artifact,
+)
 import d1_migrations as migrations
 import legacy_snapshot_convert as converter
 import legacy_typed_short_inventory as typed_inventory
@@ -42,6 +44,7 @@ TYPED_SHORT_COLUMNS = ("code_sha256", "bot_id", "owner_id", "subscription_id", "
 TYPED_SHORT_LINE_BYTES = 1024
 MIXED_SHORT_PROFILE = "legacy-mixed-short-v5"
 SELECTED_SHORT_PROFILE = "legacy-selected-short-v6"
+DYNAMIC_ALL_PROFILE = "legacy-dynamic-all-v8"
 EXTERNAL_SHORT_MIGRATION = "0019_telegram_short_links.sql"
 EXTERNAL_SHORT_MIGRATION_SHA256 = "44cda07068dd84435542771899824c1d4196a1ffdc18f990abcb723e5bdaa3c1"
 EXTERNAL_SHORTS = "normal_short_links"
@@ -129,22 +132,25 @@ def worker_artifact(root, revision, manifest_sha):
     return chain, {**identity, "manifestSha256": manifest_sha}
 
 
-def converter_artifact(root, manifest_sha, *, typed_short_domain=None):
+def converter_artifact(root, manifest_sha, *, typed_short_domain=None, temp_domain=None):
+    consumed = {name: descriptor for name, descriptor in (("short_links", typed_short_domain), ("temp_nodes", temp_domain))
+                if descriptor is not None}
     raw = read_pinned(root / MANIFEST, 64 * 1024, manifest_sha)
-    manifest = converter.verify_bundle(root, require_complete=typed_short_domain is None)
+    manifest = converter.verify_bundle(root, require_complete=not consumed)
     require(read_pinned(root / MANIFEST, 64 * 1024, manifest_sha) == raw)
     require(read_private(root / MARKER, 65) == manifest_sha.encode("ascii") + b"\n")
     domains = manifest["domains"]
     handled = {*converter.HANDLED, "meta"}
     if manifest["version"] == 2:
         handled.add(converter.PATH_DOMAIN)
-    if typed_short_domain is not None:
-        # Consume only the exact domain proven by the independently sealed sidecar.
-        short_count = typed_short_domain["rows"]
-        require(type(domains["short_links"]["present"]) is bool and type(domains["short_links"]["rows"]) is int
-                and domains["short_links"] == typed_short_domain
-                and manifest["blockers"] == ({"unhandled:short_links": short_count} if short_count else {}))
-        handled.add("short_links")
+    if consumed:
+        # Only these exact domains may be consumed by independently sealed inputs.
+        for name, descriptor in consumed.items():
+            require(isinstance(descriptor, dict) and set(descriptor) == {"present", "rows"}
+                    and type(descriptor["present"]) is bool and native.integer(descriptor["rows"])
+                    and (descriptor["present"] or descriptor["rows"] == 0) and domains[name] == descriptor)
+        require(manifest["blockers"] == {f"unhandled:{name}": item["rows"] for name, item in consumed.items() if item["rows"]})
+        handled.update(consumed)
     require(all(type(item["rows"]) is int and item["rows"] >= 0 for item in domains.values())
             and all(domains[name]["rows"] == 0 for name in converter.DOMAINS if name not in handled)
             and domains["meta"]["unhandledRows"] == 0 and domains["meta"]["rows"] == domains["meta"]["consumedRows"])
@@ -453,15 +459,17 @@ def describe(path):
 
 
 def build_candidate(conversion, worker, output, *, converter_manifest_sha, worker_manifest_sha, revision, applied_at,
-                    profile=None, source_sqlite_sha=None, owner_map_sha=None, typed_short=None, mixed_short=None):
+                    profile=None, source_sqlite_sha=None, owner_map_sha=None, typed_short=None, mixed_short=None,
+                    dynamic_all=None):
     try:
+        include_dynamic_all = profile == DYNAMIC_ALL_PROFILE
         include_selected_shorts = profile == SELECTED_SHORT_PROFILE
         include_mixed_shorts = profile in (MIXED_SHORT_PROFILE, SELECTED_SHORT_PROFILE)
         include_typed_shorts = profile == TYPED_SHORT_PROFILE or include_mixed_shorts
-        include_empty_exports = profile == EMPTY_EXPORT_PROFILE or include_typed_shorts
+        include_empty_exports = profile == EMPTY_EXPORT_PROFILE or include_typed_shorts or include_dynamic_all
         require(profile is None or include_empty_exports)
         require((typed_short is not None) == (profile == TYPED_SHORT_PROFILE)
-                and (mixed_short is not None) == include_mixed_shorts)
+                and (mixed_short is not None) == include_mixed_shorts and (dynamic_all is not None) == include_dynamic_all)
         if include_empty_exports:
             require(native.matches(native.DIGEST, source_sqlite_sha) and native.matches(native.DIGEST, owner_map_sha))
         else:
@@ -472,6 +480,7 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
         output = converter._safe_path(Path(output), existing=False)
         require(not output.is_relative_to(conversion) and not output.is_relative_to(worker))
         typed_domain = None
+        temp_domain = None
         chain, build = worker_artifact(worker, revision, worker_manifest_sha)
         if include_selected_shorts:
             require(legacy_selected_artifact(worker, build))
@@ -492,7 +501,19 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
             typed_root, typed_domain, typed_rows = read_typed_short_artifact(typed_short, source_sqlite_sha, owner_map_sha)
             require(not output.is_relative_to(typed_root))
             legacy_bot_id = typed_short.legacy_bot_id
-        source, files = converter_artifact(conversion, converter_manifest_sha, typed_short_domain=typed_domain)
+        elif include_dynamic_all:
+            from legacy_dynamic_all_candidate import (
+                DYNAMIC_COLUMNS, DynamicAllInput, load_dynamic_all, read_dynamic_all, verify_dynamic_all,
+            )
+
+            require(isinstance(dynamic_all, DynamicAllInput) and legacy_temp_artifact(worker, build)
+                    and legacy_dynamic_all_artifact(worker, build)
+                    and all(not output.is_relative_to(private_path(path, directory=True))
+                            for path in (dynamic_all.namespace_dir, dynamic_all.temp_dir)))
+            dynamic = read_dynamic_all(dynamic_all, source_sha=source_sqlite_sha, owner_map_sha=owner_map_sha,
+                                       converter_manifest_sha=converter_manifest_sha, working_parent=output.parent)
+            typed_domain, temp_domain = dynamic.short_domain, dynamic.temp_domain
+        source, files = converter_artifact(conversion, converter_manifest_sha, typed_short_domain=typed_domain, temp_domain=temp_domain)
         if include_empty_exports:
             require(source["sourceSha256"] == source_sqlite_sha and source["ownerMapSha256"] == owner_map_sha
                     and len(chain) >= 26 and chain[25].name == EMPTY_EXPORT_MIGRATION
@@ -507,6 +528,8 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
             extra_tables[EXTERNAL_SHORTS] = EXTERNAL_SHORT_COLUMNS
         if include_selected_shorts:
             extra_tables.update(SELECTED_COLUMNS)
+        if include_dynamic_all:
+            extra_tables.update(DYNAMIC_COLUMNS)
         path_mapping = source.get("pathIdMapping")
         if path_mapping is not None:
             require(len(chain) >= 10 and chain[9].name == "0010_path_rules.sql")
@@ -540,6 +563,8 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                     external_expected = load_external_short_links(db, mixed.external_rows, legacy_bot_id)
                 if include_selected_shorts:
                     selected_expected = load_selected_aggregate_links(db, mixed, source)
+                if include_dynamic_all:
+                    load_dynamic_all(db, dynamic)
                 require(db.execute("""SELECT 1 FROM subscriptions AS active JOIN subscription_trash AS trash
                     ON active.id=trash.id OR active.token=trash.token LIMIT 1""").fetchone() is None)
                 db.execute("DELETE FROM sqlite_sequence WHERE name='subscriptions'")
@@ -551,6 +576,9 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                           path_sequence=path_mapping["sourceHighWater"] if path_mapping is not None else None,
                           include_empty_exports=include_empty_exports,
                           extra_tables=extra_tables)
+                if include_dynamic_all:
+                    for statement in migrations._statements(replay_sql.read_text(encoding="utf-8")):
+                        require(len(statement.encode("utf-8")) + 2 <= migrations.MAX_D1_STATEMENT_BYTES)
 
             def read_object(key):
                 raw = expected_file(conversion, files, "objects/" + key, native.OBJECT_BYTES)
@@ -576,6 +604,8 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                 if include_selected_shorts:
                     verify_selected_aggregate_links(replayed, selected_expected, sequence)
                 objects = native.object_references(replayed, read_object, copy_object)
+                if include_dynamic_all:
+                    verify_dynamic_all(replayed, dynamic, objects)
             require({"objects/" + item["key"] for item in objects} == set(files) - metadata_files(source))
             replay_sql.rename(sql)
         report = {"version": 1, "scope": "fresh-unbound-d1-r2", "legacyDomains": "active-and-trash-only",
@@ -628,6 +658,10 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                               "migrationSha256": LEGACY_SELECTED_MIGRATION_SHA256,
                               "tableSha256": {table: summary["tableSha256"][table] for table in SELECTED_COLUMNS}},
                           shortLinkCompatibility=compatibility)
+        if include_dynamic_all:
+            report.update(version=8, legacyDomains=report["legacyDomains"] + "-and-temporary-nodes-and-dynamic-all",
+                          **dynamic.report(summary))
+            source_pin.update(dynamic.proof)
         manifest = {**report, "source": source_pin, "workerArtifact": build,
                     "ledger": ledger, "layout": layout, "summary": summary, "objects": objects,
                     "lineage": describe(output / LINEAGE), "sql": {**describe(sql), "md5": native.file_hash(sql, "md5")[1]}}

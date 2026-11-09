@@ -161,6 +161,8 @@ jobs:
             "$workdir/venv/bin/python" -B test/legacy-temp-worker-oracle.integration.py
           offline_python WORKER_TEST_BUNDLE_DIR="$WORKER_TEST_BUNDLE_DIR" WORKER_TEST_REVISION="$BUILD_REVISION" \
             SUBS_BOT_LEGACY_PYTHON="$workdir/venv/bin/python" "$(command -v node)" --test test/legacy-dynamic-all.integration.ts
+          offline_python WORKER_TEST_BUNDLE_DIR="$WORKER_TEST_BUNDLE_DIR" WORKER_TEST_REVISION="$BUILD_REVISION" \
+            "$workdir/venv/bin/python" -B test/legacy-dynamic-all-package-oracle.integration.py
           if [[ "$GITHUB_REPOSITORY" == 'jacklilyhello/subs-bot' && "$GITHUB_REF" == 'refs/heads/main' &&
                 ( "$GITHUB_EVENT_NAME" == 'push' || "$GITHUB_EVENT_NAME" == 'workflow_dispatch' ) ]]; then
             test "$BUILD_REVISION" = "$GITHUB_SHA"
