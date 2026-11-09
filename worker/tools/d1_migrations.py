@@ -218,6 +218,8 @@ def _validate_indexes(api, path: str, objects: tuple[SchemaObject, ...]) -> None
 def _matches_schema(api, path: str, objects: tuple[SchemaObject, ...]) -> bool:
     statements = _bounded_statements(_schema_conditions(objects), lambda condition: f"SELECT ({condition}) AS matches",
                                      "D1 schema readback exceeds statement limits.")
+    if len(statements) == 1:
+        return _rows(api, path, statements[0]) == [{"matches": 1}]
     # Read every group from the same REST batch, so they see one schema state.
     results = _results(api, path, ";\n".join(statements) + ";")
     _require(len(results) == len(statements) and all(isinstance(row.get("results"), list) for row in results),
