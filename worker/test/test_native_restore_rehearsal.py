@@ -409,6 +409,39 @@ class BoundaryTests(unittest.TestCase):
         self.assertFalse(native.readonly_sql("PRAGMA foreign_keys=OFF"))
         self.assertFalse(native.readonly_sql("SELECT 1 /* mutation */"))
 
+    def test_candidate_d1_schema_reads_use_the_single_statement_boundary(self):
+        api = native.RehearsalAPI(self.api.target, "synthetic-data-token", COHORT, profile="synthetic-legacy-mixed-shorts")
+        api.allow_restore(RESTORE_ID)
+        path = api.root + f"/d1/database/{RESTORE_ID}"
+        migrations = native.migrations
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        queries = []
+
+        def response(_opener, request, _maximum):
+            self.assertEqual(request.full_url, "https://api.cloudflare.com/client/v4" + path + "/query")
+            sql = json.loads(request.data)["sql"]
+            queries.append(sql)
+            return envelope([{"success": True, "results": [{"matches": db.execute(sql).fetchone()[0]}]}])
+
+        with patch.object(native, "_response", side_effect=response) as send:
+            self.assertTrue(migrations._matches_schema(api, path, ()))
+            definitions = {
+                "subscriptions": "CREATE TABLE subscriptions (token TEXT UNIQUE)",
+                "example": "CREATE TABLE example (text TEXT CHECK (text <> 'semicolon; -- literal'))",
+            }
+            for sql in definitions.values():
+                db.execute(sql)
+            objects = tuple(migrations.SchemaObject("table", name, name, sql) for name, sql in definitions.items())
+            self.assertTrue(migrations._matches_schema(api, path, objects))
+            self.assertIn("semicolon; -- literal", queries[1])
+            self.assertTrue(all(sql.startswith("SELECT (") and sql.endswith(") AS matches") for sql in queries))
+            for injected in ("DELETE FROM subscriptions;", "PRAGMA quick_check;", "-- hidden\nSELECT (1) AS matches;",
+                             "SELECT (1) AS matches"):
+                with self.subTest(injected=injected), self.assertRaises(native.RehearsalError):
+                    api.json("POST", path + "/query", {"sql": "SELECT (1) AS matches;\n" + injected})
+            self.assertEqual(send.call_count, 2)
+
     def test_d1_rest_keyset_page_uses_strings_and_casts_only_integer_keys(self):
         self.api.allow_restore(RESTORE_ID)
         db = sqlite3.connect(":memory:")
