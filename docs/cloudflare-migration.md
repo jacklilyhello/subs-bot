@@ -123,6 +123,8 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 查找期间只保留去重回执、短租约和授权版本。关键词只在当前调用中使用。查找结束后保存回复所需的仓库名称及星标，并在定时恢复中清理已送达、已失效或超过回复窗口的结果。中断的查找由 Cron 提供固定网页入口，已接收的其他命令可继续发送。发送前复核当前授权，明确限流后可重试，结果不明时保留回执。托管测试使用合成的 GitHub 和 Bot 响应。真人验收另用两名指定账号和测试 Bot 各执行一次公开关键词查询，并在已批准群确认同一命令不会产生查找。
 
+公开代码搜索能力单独通过 `worker-github-search-capability.yml` 在 `main` 手动核对。托管任务不接收业务凭据，只用固定公开夹具查询 GitHub 代码接口和 Vercel Grep MCP。输出仅含 HTTP 状态、已识别的协议和响应类别及计数。GitHub 只有完整的零命中响应才算无结果。Grep 的空内容和未识别文本只记录形状。探针结果只证明托管 runner 观察到的行为。 [GitHub 代码搜索 API](https://docs.github.com/en/rest/search/search#search-code) · [Grep MCP](https://vercel.com/blog/grep-a-million-github-repositories-via-mcp)
+
 ### 订阅搜索、详情和格式链接
 
 `/s 关键词` 按当前用户的活动订阅搜索名称和来源，沿用旧版的 Unicode 小写子串匹配。每页最多显示 8 项，搜索限于 512 条订阅及 8 MiB 元数据。群聊只显示用户自己的匹配名称和编号。普通私聊可通过搜索结果、`/list`、`/expire` 的详情按钮，或直接发送活动列表顺序编号查看详情。详情显示流量、到期、节点数量及最多 8 个已校验的节点名称。来源 URL、节点凭据和刷新错误原文不进入回复。
