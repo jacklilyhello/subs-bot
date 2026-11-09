@@ -995,8 +995,8 @@ def _verified_module(bundle_dir, expected_digest):
             module = source.read(MAX_MODULE_BYTES + 1)
     except (OSError, ValueError, TypeError):
         raise CloudflareError("Verified Worker module is unavailable.") from None
-    _require(0 < len(module) <= MAX_MODULE_BYTES and sha256(module).hexdigest() == expected_digest,
-             "Verified Worker module digest mismatch.")
+    _require(0 < len(module) <= MAX_MODULE_BYTES, "The verified Worker module is empty or exceeds the isolation size limit.")
+    _require(sha256(module).hexdigest() == expected_digest, "Verified Worker module digest mismatch.")
     return module
 
 

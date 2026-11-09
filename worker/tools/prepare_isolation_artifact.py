@@ -16,6 +16,8 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from zipfile import BadZipFile, ZIP_DEFLATED, ZIP_STORED, ZipFile
 import zlib
 
+from cloudflare_isolation import MAX_MODULE_BYTES
+
 
 REPOSITORY = "jacklilyhello/subs-bot"
 REPOSITORY_ID = 1441743951
@@ -315,6 +317,8 @@ def _unpack(archive_body, digest, revision, run_id, attempt, runner_temp):
             hashes, sizes = _expected_hashes(manifest, revision, run_id, attempt)
             if set(members) != set(hashes) | {"isolation.json"}:
                 raise ArtifactError("The release archive contains missing or unexpected files.")
+            if not 0 < members["index.js"].file_size <= MAX_MODULE_BYTES:
+                raise ArtifactError("The verified Worker module is empty or exceeds the isolation size limit.")
             for name, member in members.items():
                 body = manifest_body if name == "isolation.json" else archive.read(member)
                 if (name in hashes and _sha256(body) != hashes[name]) or (name in sizes and len(body) != sizes[name]):

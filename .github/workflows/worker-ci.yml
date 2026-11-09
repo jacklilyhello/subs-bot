@@ -84,6 +84,20 @@ jobs:
         run: npm run check
       - name: Build Worker module
         run: npm run build
+      - name: Check isolated Worker module size
+        run: |
+          python3 -B - <<'PY'
+          from pathlib import Path
+          import sys
+
+          sys.path.insert(0, "tools")
+          from cloudflare_isolation import MAX_MODULE_BYTES
+
+          size = Path("dist/index.js").stat().st_size
+          if not 0 < size <= MAX_MODULE_BYTES:
+              raise SystemExit(f"Worker module size {size} is outside the supported range of 1 to {MAX_MODULE_BYTES} bytes.")
+          print(f"Worker module size verified at {size} of {MAX_MODULE_BYTES} bytes.")
+          PY
       - name: Test Worker
         run: npm test
       - name: Test release tooling
