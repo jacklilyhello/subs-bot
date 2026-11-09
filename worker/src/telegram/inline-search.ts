@@ -1,6 +1,7 @@
 import { trimPathRuleWhitespace } from "../path-rules.ts";
 import { digestHex, SUBSCRIPTION_LIFECYCLE_REVISION, validInteger } from "../storage.ts";
-import { activeInlineConsent } from "./inline-search-consent.ts";
+import { activeInlineConsent, TELEGRAM_INLINE_CONSENT_MARKER, TELEGRAM_INLINE_TEMP_CONSENT_MARKER } from "./inline-search-consent.ts";
+import { readTelegramInlineTempNodes } from "./inline-temp-nodes.ts";
 import type { TelegramInlineQuery, TelegramInlineSortMode, TelegramPolicy } from "./protocol.ts";
 import { unicode14Lower } from "./selected-search.ts";
 import { displayTelegramName } from "./views.ts";
@@ -21,6 +22,7 @@ export type InlineSearchArticle = {
   type: "article";
   id: string;
   title: string;
+  description?: string;
   input_message_content: { message_text: string; link_preview_options: { is_disabled: true } };
 };
 export type InlineSearchOutcome = "sent" | "failed" | "uncertain";
@@ -120,7 +122,7 @@ export async function answerTelegramInlineSearch(
   const consent = activeInlineConsent(policy);
   let state: "new" | "preflight" | "sending" = "new";
   try {
-    const [cleanup, admitted] = await db.batch<{ mode: TelegramInlineSortMode }>([
+    const [cleanup, admitted] = await db.batch<{ mode: TelegramInlineSortMode; consentMarker: string }>([
       db.prepare(`UPDATE telegram_inline_search_receipts SET state=${expiredState}
         WHERE bot_id=? AND actor_id=? AND ${activeStates} AND lease_until<=unixepoch()`).bind(policy.botId, event.actorId),
       db.prepare(`INSERT INTO telegram_inline_search_receipts
@@ -133,26 +135,37 @@ export async function answerTelegramInlineSearch(
           AND NOT EXISTS (SELECT 1 FROM telegram_inbox WHERE bot_id=consent.bot_id AND update_id=?)
           AND NOT EXISTS (SELECT 1 FROM telegram_inline_search_receipts WHERE bot_id=consent.bot_id AND actor_id=consent.actor_id
             AND received_at>unixepoch()-60 LIMIT 1 OFFSET ${QUERY_LIMIT_PER_MINUTE - 1})
-        ON CONFLICT DO NOTHING RETURNING sort_mode AS mode`).bind(event.updateId, queryDigest, policy.botId, event.actorId,
+        ON CONFLICT DO NOTHING RETURNING sort_mode AS mode,
+          (SELECT receipt_nonce FROM telegram_inbox WHERE receipt_id=telegram_inline_search_receipts.consent_receipt_id) AS consentMarker`)
+        .bind(event.updateId, queryDigest, policy.botId, event.actorId,
         event.updateId, ...consent.bindings, event.updateId),
     ]);
     if (!cleanup?.success || !admitted?.success || admitted.results.length > 1) throw new Error();
     const receipt = admitted.results[0];
     if (!receipt) return;
     state = "preflight";
-    const scan = await scanOwned(db, event.actorId, needle, receipt.mode, Date.now() + SCAN_MS);
+    const marker = receipt.consentMarker;
+    if (marker !== TELEGRAM_INLINE_CONSENT_MARKER && marker !== TELEGRAM_INLINE_TEMP_CONSENT_MARKER) throw new Error();
+    const sendConsent = activeInlineConsent(policy, marker);
+    const deadline = Date.now() + SCAN_MS;
+    const scan = await scanOwned(db, event.actorId, needle, receipt.mode, deadline);
     const results = scan?.results ?? [];
+    const temp = marker === TELEGRAM_INLINE_TEMP_CONSENT_MARKER && scan && results.length < MAX_RESULTS
+      ? await readTelegramInlineTempNodes(db, policy, event, needle, MAX_RESULTS - results.length, deadline) : undefined;
+    if (temp === null) results.length = 0;
+    else if (temp) results.push(...temp.results);
     const begin = await db.prepare(`UPDATE telegram_inline_search_receipts AS request SET state='sending',result_count=?
       WHERE ${requestKey} AND request.state='preflight' AND request.lease_until>=unixepoch()+${ANSWER_SECONDS + 1}
         AND EXISTS (SELECT 1 FROM telegram_inline_search_consent AS consent WHERE consent.receipt_id=request.consent_receipt_id
           AND consent.bot_id=request.bot_id AND consent.actor_id=request.actor_id AND consent.update_id<request.update_id
-          AND ${consent.sql})
+          AND ${sendConsent.sql})
         AND request.sort_mode=COALESCE((SELECT mode FROM telegram_inline_sort_preferences
           WHERE bot_id=request.bot_id AND actor_id=request.actor_id),'default')
         AND request.sort_update_id=COALESCE((SELECT update_id FROM telegram_inline_sort_preferences
           WHERE bot_id=request.bot_id AND actor_id=request.actor_id),0)
-        ${scan ? `AND (${inventoryGuard})` : ""} RETURNING update_id`).bind(results.length, ...key, ...consent.bindings,
-      ...(scan ? [scan.inventory, scan.inventory] : [])).first();
+        ${scan ? `AND (${inventoryGuard})` : ""}
+        ${temp ? `AND (${temp.guard.sql})` : ""} RETURNING update_id`).bind(results.length, ...key, ...sendConsent.bindings,
+      ...(scan ? [scan.inventory, scan.inventory] : []), ...(temp?.guard.bindings ?? [])).first();
     if (begin === null) {
       await finish(db, key, "preflight", "dropped");
       return;

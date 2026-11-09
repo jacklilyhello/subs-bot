@@ -6,7 +6,7 @@ export const TELEGRAM_TEMP_RAW_PREFIX = "temp-raw:v1:";
 export const MAX_TEMP_BATCH_BYTES = 256 * 1024;
 export const MAX_TEMP_OWNER_NODES = 5_000;
 export const MAX_TEMP_OWNER_BYTES = 4 * 1024 * 1024;
-const MAX_TEMP_BATCH_NODES = 500;
+export const MAX_TEMP_BATCH_NODES = 500;
 const MAX_TEMP_TEXT_BYTES = 64 * 1024;
 
 type TempReplyKind = "added" | "rejected" | "no-nodes" | "invalid-encoding" | "limit"

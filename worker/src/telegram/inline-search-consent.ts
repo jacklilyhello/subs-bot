@@ -2,9 +2,15 @@ import { validInteger } from "../storage.ts";
 import { inTelegramScope, type TelegramInlineConsentUpdate, type TelegramPolicy } from "./protocol.ts";
 
 export const TELEGRAM_INLINE_CONSENT_MARKER = "inline-consent:v1";
-export type TelegramInlineConsentReply = "on" | "off" | "usage" | "stale";
+export const TELEGRAM_INLINE_TEMP_CONSENT_MARKER = "inline-consent-temp:v1";
+export type TelegramInlineConsentMarker = typeof TELEGRAM_INLINE_CONSENT_MARKER | typeof TELEGRAM_INLINE_TEMP_CONSENT_MARKER;
+export type TelegramInlineConsentReply = TelegramInlineConsentUpdate["kind"] | "stale";
 const CONSENT_SECONDS = 900;
 const COMMAND_FRESHNESS_SECONDS = 60;
+
+export function telegramInlineConsentMarker(alias: string): string {
+  return `${alias}.receipt_nonce IN ('${TELEGRAM_INLINE_CONSENT_MARKER}','${TELEGRAM_INLINE_TEMP_CONSENT_MARKER}')`;
+}
 
 export async function telegramInlineSearchReady(db: D1Database): Promise<boolean> {
   try {
@@ -27,6 +33,8 @@ export async function acceptTelegramInlineConsent(
     // An older opt-out can still close a live consent. The ordering guard below protects newer choices.
     const maxAge = COMMAND_FRESHNESS_SECONDS + (event.kind === "off" ? CONSENT_SECONDS : 0);
     const role = event.actorId === policy.adminId ? "admin" : "member";
+    const temp = event.kind === "temp-on";
+    const kind = temp ? "on" : event.kind;
     const fresh = "incoming.bot_id=? AND incoming.update_id=? AND incoming.receipt_nonce=?";
     const steps = [db.prepare(`INSERT INTO telegram_inbox
       (bot_id,update_id,actor_id,chat_id,chat_type,message_id,message_date,thread_id,command,receipt_nonce)
@@ -45,11 +53,13 @@ export async function acceptTelegramInlineConsent(
     ) INSERT INTO telegram_inline_search_consent
       (receipt_id,bot_id,actor_id,kind,message_date,update_id,expires_at,actor_role,auth_message_date,auth_message_id)
       SELECT receipt_id,bot_id,actor_id,kind,message_date,update_id,CASE WHEN kind='on' THEN unixepoch()+${CONSENT_SECONDS} END,
-        ?,auth_date,auth_id FROM classified`).bind(event.kind, event.kind, policy.adminId, ...key, role), db.prepare(`INSERT INTO telegram_outbox (receipt_id)
+        ?,auth_date,auth_id FROM classified`).bind(kind, kind, policy.adminId, ...key, role), db.prepare(`INSERT INTO telegram_outbox (receipt_id)
       SELECT incoming.receipt_id FROM telegram_inbox AS incoming WHERE ${fresh}`).bind(...key), db.prepare(`UPDATE telegram_inbox AS incoming
-      SET receipt_nonce=?,command=CASE WHEN EXISTS (SELECT 1 FROM telegram_inline_search_consent JOIN telegram_outbox USING(receipt_id)
+      SET receipt_nonce=CASE WHEN ?=1 AND EXISTS (SELECT 1 FROM telegram_inline_search_consent
+        WHERE receipt_id=incoming.receipt_id AND kind='on') THEN ? ELSE ? END,
+      command=CASE WHEN EXISTS (SELECT 1 FROM telegram_inline_search_consent JOIN telegram_outbox USING(receipt_id)
         WHERE receipt_id=incoming.receipt_id) THEN command END WHERE ${fresh} RETURNING receipt_id`)
-      .bind(TELEGRAM_INLINE_CONSENT_MARKER, ...key)];
+      .bind(Number(temp), TELEGRAM_INLINE_TEMP_CONSENT_MARKER, TELEGRAM_INLINE_CONSENT_MARKER, ...key)];
     const results = await db.batch(steps);
     const receipt = results.at(-1);
     if (receipt && results.length === steps.length && results.every(({ success }) => success) && receipt.results.length <= 1) {
@@ -61,7 +71,7 @@ export async function acceptTelegramInlineConsent(
   throw new Error("Telegram inline search consent could not be confirmed.");
 }
 
-export function activeInlineConsent(policy: TelegramPolicy): { sql: string; bindings: readonly string[] } {
+export function activeInlineConsent(policy: TelegramPolicy, marker?: TelegramInlineConsentMarker): { sql: string; bindings: readonly string[] } {
   return { sql: `consent.kind='on' AND consent.expires_at>unixepoch()
     AND consent.receipt_id=(SELECT latest.receipt_id FROM telegram_inline_search_consent AS latest
       WHERE latest.bot_id=consent.bot_id AND latest.actor_id=consent.actor_id AND latest.kind IN ('on','off')
@@ -69,20 +79,22 @@ export function activeInlineConsent(policy: TelegramPolicy): { sql: string; bind
     AND EXISTS (SELECT 1 FROM telegram_inbox AS origin WHERE origin.receipt_id=consent.receipt_id
       AND origin.bot_id=consent.bot_id AND origin.actor_id=consent.actor_id AND origin.chat_id=origin.actor_id
       AND origin.chat_type='private' AND origin.thread_id IS NULL AND origin.command='help'
-      AND origin.receipt_nonce='${TELEGRAM_INLINE_CONSENT_MARKER}' AND origin.update_id=consent.update_id
+      AND ${marker === undefined ? telegramInlineConsentMarker("origin") : "origin.receipt_nonce=?"} AND origin.update_id=consent.update_id
       AND origin.message_date=consent.message_date)
     AND ((consent.actor_id=? AND consent.actor_role='admin' AND consent.auth_message_date=0 AND consent.auth_message_id=0) OR (
       consent.actor_id=? AND consent.actor_role='member' AND consent.message_date>consent.auth_message_date AND COALESCE((
         SELECT allowed=1 AND message_date=consent.auth_message_date AND message_id=consent.auth_message_id
         FROM telegram_auth WHERE bot_id=consent.bot_id AND user_id=consent.actor_id
-      ),consent.auth_message_date=0 AND consent.auth_message_id=0)))`, bindings: [policy.adminId, policy.memberId] };
+      ),consent.auth_message_date=0 AND consent.auth_message_id=0)))`,
+  bindings: marker === undefined ? [policy.adminId, policy.memberId] : [marker, policy.adminId, policy.memberId] };
 }
 
 export function renderTelegramInlineConsent(kind: TelegramInlineConsentReply): string {
   switch (kind) {
     case "on": return "已开启私聊内联搜索，有效期 15 分钟。可发送 /inline off 关闭。";
+    case "temp-on": return "已开启私聊内联搜索及临时节点名称，有效期 15 分钟。可发送 /inline off 关闭。";
     case "off": return "已关闭私聊内联搜索。";
     case "stale": return "内联搜索设置已有更新。";
-    case "usage": return "用法：/inline on 开启 15 分钟，/inline off 关闭。用 /i 设置排序。";
+    case "usage": return "用法：/inline on 搜索订阅，/inline temp on 同时搜索临时节点，均有效 15 分钟。/inline off 关闭。用 /i 设置订阅排序。";
   }
 }
