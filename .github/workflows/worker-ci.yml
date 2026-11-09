@@ -104,27 +104,11 @@ jobs:
         run: |
           workdir="$(mktemp -d)"
           trap 'rm -rf -- "$workdir"' EXIT
-          download_client() {
-            local name=$1 output=$2 asset_api=$3 release_url=$4
-            local -a transfer=(-q --fail --silent --show-error --location --max-redirs 5
-              --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 60
-              --retry 2 --retry-max-time 90 --retry-connrefused --output "$output")
-            printf 'Downloading the pinned %s asset through the GitHub release API.\n' "$name"
-            if ! curl "${transfer[@]}" --header 'Accept: application/octet-stream' \
-              --header 'X-GitHub-Api-Version: 2026-03-10' "$asset_api"; then
-              printf '%s asset API download failed. Trying the official release URL.\n' "$name"
-              curl "${transfer[@]}" "$release_url"
-            fi
-          }
           archive="$workdir/sing-box.tar.gz"
-          download_client Sing-box "$archive" https://api.github.com/repos/SagerNet/sing-box/releases/assets/669526810 \
-            https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-linux-amd64.tar.gz
-          printf '%s  %s\n' '699a1b510aa4396b2176d32d1181920399ebf1e267835da6f3b598d0f7c24968' "$archive" | sha256sum --check
+          bash tools/download-validation-client.sh sing-box "$archive"
           tar -xzf "$archive" -C "$workdir"
           archive="$workdir/mihomo.gz"
-          download_client Mihomo "$archive" https://api.github.com/repos/MetaCubeX/mihomo/releases/assets/663189170 \
-            https://github.com/MetaCubeX/mihomo/releases/download/v1.19.33/mihomo-linux-amd64-compatible-v1.19.33.gz
-          printf '%s  %s\n' '386508bfb1c72c43b6a0eda73708ecdce82546581b0ebcb16366c53757c622b6' "$archive" | sha256sum --check
+          bash tools/download-validation-client.sh mihomo "$archive"
           gzip -dc "$archive" > "$workdir/mihomo"
           chmod 0700 "$workdir/mihomo"
           singbox="$workdir/sing-box-1.14.4-linux-amd64/sing-box"
