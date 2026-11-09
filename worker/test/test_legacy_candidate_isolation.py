@@ -49,7 +49,7 @@ class CandidateArtifactTests(unittest.TestCase):
         worker["manifestSha256"] = config["workerManifestSha256"]
 
         def line(value):
-            return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8") + b"\n"
 
         rows = b"".join(line({"codeSha256": tool.native.digest(code.encode("ascii")), "state": "equivalent"}) for code in external)
         report = line({
