@@ -64,17 +64,25 @@ class LegacyAuthorizationReconcileTests(unittest.TestCase):
             "allowedUserIds": allowed, "adminUserIds": admins,
         })
 
-    def run_cli(self, *, source_sha=None, inventory_sha=None, config_sha=None, target_sha=None):
+    def write_general_target(self, groups, **fields):
+        self.target_sha = self.write_document(self.target, {
+            "version": 1, "scope": "general-dormant", "botId": "105", "groupChatIds": groups, **fields,
+        })
+
+    def run_cli(self, *, source_sha=None, inventory_sha=None, config_sha=None, target_sha=None, general=False):
         arguments = [str(path) for path in (self.backup, self.inventory, self.config, self.target, self.output)]
         arguments += [source_sha or self.source_sha, inventory_sha or self.inventory_sha,
                       config_sha or self.config_sha, target_sha or self.target_sha]
+        if general:
+            arguments.insert(0, "preview-general")
         stdout, stderr = io.StringIO(), io.StringIO()
         with redirect_stdout(stdout), redirect_stderr(stderr):
             status = tool.main(arguments)
         return status, stdout.getvalue(), stderr.getvalue()
 
-    def read_report(self):
-        self.assertEqual(self.run_cli(), (0, tool.SUCCESS + "\n", ""))
+    def read_report(self, *, general=False):
+        success = tool.GENERAL_SUCCESS if general else tool.SUCCESS
+        self.assertEqual(self.run_cli(general=general), (0, success + "\n", ""))
         raw = (self.output / inventory.MANIFEST).read_bytes()
         report = json.loads(raw)
         self.assertEqual((self.output / inventory.SEAL).read_text(), sha256(raw).hexdigest() + "\n")
@@ -203,6 +211,68 @@ class LegacyAuthorizationReconcileTests(unittest.TestCase):
         self.assert_rejected()
         self.assertEqual({entry.name for entry in self.inventory.iterdir()},
                          {inventory.MANIFEST, inventory.SEAL, inventory.SIDECAR})
+
+    def test_general_preview_preserves_multiple_admins_denials_and_exact_topology(self):
+        unsupported_id = tool.GENERAL_MAX_ID + 1
+        self.make_source(((101, 0, 10, 20), (102, 0, 12, 25), (103, 1, 15, 30),
+                          (105, 1, 18, 32), (unsupported_id, 1, 20, 40)))
+        self.write_config(["101", "102", "104"], ["101", "106"])
+        self.write_general_target(["-100200", "-100100"])
+        self.assert_rejected()
+        report, rows = self.read_report(general=True)
+        self.assertEqual((report["version"], report["kind"], report["scope"], report["unlistedDefault"]),
+                         (1, "legacy-general-authorization-preview", "offline-dormant", "denied"))
+        self.assertIs(report["activationAllowed"], False)
+        self.assertEqual(report["target"], json.loads(self.target.read_bytes()))
+        self.assertEqual((report["sourceSha256"], report["inventoryManifestSha256"], report["configSha256"], report["targetSha256"]),
+                         (self.source_sha, self.inventory_sha, self.config_sha, self.target_sha))
+        self.assertEqual((self.output / inventory.SIDECAR).read_bytes(), (self.inventory / inventory.SIDECAR).read_bytes())
+        self.assertEqual({user: (row["legacyRole"], row["basis"]) for user, row in rows.items()}, {
+            "101": ("admin", "administrator"), "102": ("denied", "override-deny"), "103": ("member", "override-allow"),
+            "104": ("member", "allowlist"), "105": ("member", "override-allow"), "106": ("admin", "administrator"),
+            str(unsupported_id): ("member", "override-allow"),
+        })
+        self.assertEqual(rows["105"]["blockers"], ["reserved-identity"])
+        self.assertEqual(rows[str(unsupported_id)]["blockers"], ["id-out-of-range"])
+        self.assertEqual({key: count for key, count in report["blockers"].items() if count},
+                         {"reserved-identity": 1, "id-out-of-range": 1})
+
+    def test_general_preview_distinguishes_admin_inheritance_and_reports_public_without_enabling_it(self):
+        self.make_source(((101, 0, 10, 20), (102, 1, 12, 25)))
+        self.write_general_target([])
+        for index, (allowlist, administrators, role, mode, default) in enumerate((
+            (["101"], None, "admin", "inherited", "denied"),
+            (["101"], [], "denied", "explicit", "denied"),
+            ([], [], "denied", "explicit", "public"),
+        )):
+            with self.subTest(index=index):
+                self.output = self.root / f"general-{index}"
+                self.write_config(allowlist, administrators, bot="106")
+                report, rows = self.read_report(general=True)
+                self.assertIs(report["activationAllowed"], False)
+                self.assertEqual(report["target"]["groupChatIds"], [])
+                self.assertEqual((rows["101"]["legacyRole"], rows["102"]["basis"]), (role, "override-allow"))
+                self.assertEqual((report["adminMode"], report["unlistedDefault"]), (mode, default))
+                self.assertEqual(report["blockers"]["public-default-requires-approval"], int(default == "public"))
+                self.assertEqual(report["blockers"]["different-bot"], 1)
+
+    def test_general_preview_rejects_unpinned_or_unbounded_inputs(self):
+        self.make_source(((103, 1, 10, 20),))
+        self.write_config(["101"], ["102"])
+        self.assert_rejected(general=True)  # The two-user target cannot enter the general profile.
+        for groups in ("-100", ["1"], ["-0"], ["-01"], ["-2", "-2"], ["-1", "-2"], [f"-{tool.GENERAL_MAX_ID + 1}"],
+                       [str(-group) for group in range(tool.GENERAL_MAX_GROUPS + 1, 0, -1)]):
+            with self.subTest(groups=groups):
+                self.write_general_target(groups)
+                self.assert_rejected(general=True)
+        self.write_general_target([], activationAllowed=True)
+        self.assert_rejected(general=True)
+        self.write_general_target([], scope="isolation")
+        self.assert_rejected(general=True)
+        self.write_general_target([])
+        self.assert_rejected(general=True, target_sha="0" * 64)
+        with patch.object(tool, "MAX_CONFIG_IDS", 2):
+            self.assert_rejected(general=True)
 
 
 if __name__ == "__main__":
