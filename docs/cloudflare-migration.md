@@ -473,6 +473,17 @@ PY
 
 后续导入或隔离实测写入这两张表时，须使用与 Worker 发布相同的受保护并发组，并核对目标 D1 和实际 Worker 版本。人工回滚也须走这个发布门槛。遇到账本、表结构或版本不一致时保留现场，先核对是否有遗漏的回收记录，再决定恢复步骤。
 
+#### 隔离 HTTP 实测
+
+先将包含部署门槛和实测工作流的当前 `main` 部署到项目隔离 Worker。在 `main` 手动运行 `worker-isolation-legacy-selected-smoke.yml`。每个批次使用一个全新的 32 位小写十六进制 `cohort`，各阶段沿用这个值并按顺序传入 `action`。
+
+1. `prepare` 核对隔离版本、存储和账本，将 D1 接下来的三个订阅编号封存到检查点。
+2. `reserve` 的 `source_run_id` 填成功的 `prepare` 运行编号。请在封存后 30 分钟内预留。如果期间有其他订阅占用这些编号，改用新批次重新准备。
+3. `verify` 的 `source_run_id` 填成功的 `reserve` 运行编号。写入四个合成 R2 对象后核对导出顺序、重复项、跳转、空格式和缓存响应头。`GET` 核对非空内容的精确长度，`HEAD` 长度按实际响应单独记录。再设置一个合成成员失效标记，确认普通聚合仍包含该成员。实际回收和恢复事务由托管集成测试覆盖。
+4. `retire` 的 `confirm_retire` 填 `retire <cohort>`，`source_run_id` 填同批次任一成功的 `prepare`、`reserve` 或 `verify` 运行编号。先清理精确匹配的 D1 记录，再清理四个对象，最后确认链接均返回 404。
+
+检查点保留 30 天，保留原始 `prepare` 运行编号直至清理成功。如果预留结果未知且尚未观察到订阅记录，等待预留期限结束后再清理。每次 R2 写入前先在对应的合成订阅预留行记账。已记账的对象仍不可见时，重试和清理都会停在该记录，待独立核对写入结果后再处理。清理可在已部署的后续 `main` 执行，目标、密钥和发布门槛须继续通过核对。检查点只保存重建合成批次所需的身份信息，HTTP 证据只报告状态、长度和摘要。
+
 ### 旧外部短链离线比较
 
 托管 CI 使用合成 SQLite 和本次构建的 Worker，比较旧版 `aiohttp.web.HTTPFound` 与 Worker `/s/` 的 `Location` 字节。比较阶段在仅开放回环接口的网络命名空间中运行，关闭核心转储。Worker 通过内存中的单行短链记录走实际 `GET` 和 `HEAD` 路径，响应只返回固定判定。外部地址原文从封存 SQLite 经匿名管道传入内存，封存报告只保存短码摘要和判定。主机后的斜线或转义差异也会单独记录。 [aiohttp 重定向](https://docs.aiohttp.org/en/stable/_modules/aiohttp/web_exceptions.html) · [Miniflare 模块测试](https://developers.cloudflare.com/workers/testing/miniflare/writing-tests/)
