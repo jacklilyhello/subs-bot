@@ -35,6 +35,10 @@ PROVIDER_URL_DOCUMENTS_MIGRATIONS = (
     (35, "0035_telegram_provider_documents.sql", "9a3fc29e9ea19abac2874a11a0152497eee63a54ecb401168c153fb838f92505"),
 )
 PROVIDER_URL_DOCUMENTS_SCHEMA_SHA256 = "1c10a1883dec04447fd4bf2c687a029da2d6723768ea43490cfc998b15054e37"
+MIXED_DOCUMENTS_BINDING = "TELEGRAM_MIXED_DOCUMENTS"
+MIXED_DOCUMENTS_MIGRATION = "0036_telegram_mixed_document_opt_in.sql"
+MIXED_DOCUMENTS_MIGRATION_SHA256 = "05b67a3a3ddfb49b6f801b87dafae240f7328711e9e6c598b8b67e8738a892f8"
+MIXED_DOCUMENTS_TABLE_SHA256 = "0277bcc1e391b3c06c1db96babf44ba7ac54fe27d52fa3478c2079f2fe41212e"
 PROVIDER_REFRESH_BINDING = "TELEGRAM_PROVIDER_REFRESH"
 PROVIDER_REFRESH_TAG_PREFIX = "provider-rf-"
 PROVIDER_REFRESH_MIGRATIONS = (
@@ -221,6 +225,8 @@ class _Version:
     telegram_api_status: bool = False
     telegram_provider_url_documents: bool = False
     telegram_provider_url_documents_capable: bool = False
+    telegram_mixed_documents: bool = False
+    telegram_mixed_documents_capable: bool = False
 
 
 def _release_tag(revision, telegram_digest, aggregate_digest, private_share_digest, provider_binding):
@@ -249,7 +255,8 @@ def _api_status_tag(tag, binding, enabled):
 
 
 def _telegram_feature_tag(tag, inline_search, provider_url_import, provider_refresh=False, legacy_subscription_shorts=False,
-                          provider_batch=False, batch_module_sha256=None, *, url_documents=False, url_documents_module_sha256=None):
+                          provider_batch=False, batch_module_sha256=None, *, url_documents=False, url_documents_module_sha256=None,
+                          mixed_documents=None):
     if inline_search:
         tag = _inline_search_tag(tag)
     if provider_url_import:
@@ -260,6 +267,9 @@ def _telegram_feature_tag(tag, inline_search, provider_url_import, provider_refr
         tag = LEGACY_SUBSCRIPTION_SHORT_TAG_PREFIX + sha256(f"{tag}:legacy-subscription-shorts:1".encode("ascii")).hexdigest()
     if url_documents_module_sha256 is not None:
         pin = f"{tag}:provider-url-documents:{int(url_documents)}:{url_documents_module_sha256}:{PROVIDER_URL_DOCUMENTS_SCHEMA_SHA256}"
+        tag = sha256(pin.encode("ascii")).hexdigest()
+    if mixed_documents is not None:
+        pin = f"{tag}:mixed-documents:{int(mixed_documents)}:{MIXED_DOCUMENTS_TABLE_SHA256}"
         tag = sha256(pin.encode("ascii")).hexdigest()
     if batch_module_sha256 is not None:
         prefix = PROVIDER_BATCH_TAG_PREFIX if provider_batch else PROVIDER_BATCH_READY_TAG_PREFIX
@@ -436,6 +446,29 @@ class _Isolation:
         _require(not drained or (active == [{"providerDocumentsActive": 0}] and type(active[0]["providerDocumentsActive"]) is int),
                  "Drain isolated provider URL documents before switching to a Worker artifact without verified recovery.")
 
+    def verify_mixed_documents(self):
+        path = f"{self.account}/d1/database/{self.target['d1Id']}/query"
+        error = "The isolated mixed document schema or ledger could not be verified."
+        try:
+            result = self.data_api("POST", path, {"sql": """
+                SELECT name,sha256,mode,
+                  (SELECT sql FROM sqlite_schema WHERE type='table' AND name='telegram_mixed_document_opt_in') AS tableSql,
+                  (SELECT count(*) FROM sqlite_schema WHERE sql IS NOT NULL
+                    AND tbl_name='telegram_mixed_document_opt_in') AS schemaCount
+                FROM subs_bot_schema_migrations WHERE position=36
+            """})
+            _require(isinstance(result, list) and len(result) == 1 and result[0].get("success") is True, error)
+            rows = result[0].get("results")
+            _require(isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict), error)
+            row = rows[0]
+            _require(set(row) == {"name", "sha256", "mode", "tableSql", "schemaCount"}
+                     and (row["name"], row["sha256"], row["mode"]) == (MIXED_DOCUMENTS_MIGRATION, MIXED_DOCUMENTS_MIGRATION_SHA256, "applied")
+                     and type(row["schemaCount"]) is int and row["schemaCount"] == 1
+                     and isinstance(row["tableSql"], str)
+                     and sha256(row["tableSql"].encode("ascii")).hexdigest() == MIXED_DOCUMENTS_TABLE_SHA256, error)
+        except (CloudflareError, AttributeError, TypeError, ValueError):
+            raise CloudflareError(error) from None
+
     def verify_provider_refresh(self):
         path = f"{self.account}/d1/database/{self.target['d1Id']}/query"
         error = "The isolated provider refresh migrations could not be verified."
@@ -566,7 +599,7 @@ class _Isolation:
                                                      {"enabled": False, "cross_version_cache": False}),
                  "Isolated Worker version runtime settings differ from the supported configuration.")
         rows = version.get("bindings")
-        _require(isinstance(rows, list) and 3 <= len(rows) <= 23
+        _require(isinstance(rows, list) and 3 <= len(rows) <= 24
                  and all(isinstance(row, dict) and isinstance(row.get("name"), str) for row in rows),
                  "Unexpected isolated Worker binding inventory.")
         bindings = {row["name"]: row for row in rows}
@@ -577,13 +610,14 @@ class _Isolation:
         inline = bindings.get(INLINE_SEARCH_BINDING)
         provider_url = bindings.get(PROVIDER_URL_IMPORT_BINDING)
         provider_documents = bindings.get(PROVIDER_URL_DOCUMENTS_BINDING)
+        mixed_documents = bindings.get(MIXED_DOCUMENTS_BINDING)
         refresh = bindings.get(PROVIDER_REFRESH_BINDING)
         legacy_shorts = bindings.get(LEGACY_SUBSCRIPTION_SHORT_BINDING)
         provider_batch = bindings.get(PROVIDER_BATCH_BINDING)
         api_status = bindings.get(API_STATUS_BINDING)
         binding_names = set(bindings) - PROVIDER_BINDINGS - PROVIDER_API_STATUS_BINDINGS - {
             INLINE_SEARCH_BINDING, PROVIDER_URL_IMPORT_BINDING, PROVIDER_REFRESH_BINDING, LEGACY_SUBSCRIPTION_SHORT_BINDING,
-            PROVIDER_BATCH_BINDING, API_STATUS_BINDING, PROVIDER_URL_DOCUMENTS_BINDING,
+            PROVIDER_BATCH_BINDING, API_STATUS_BINDING, PROVIDER_URL_DOCUMENTS_BINDING, MIXED_DOCUMENTS_BINDING,
         }
         _require(len(bindings) == len(rows) and binding_names in (base_bindings, telegram_bindings,
             telegram_bindings | AGGREGATE_BINDINGS, telegram_bindings | PRIVATE_SHARE_BINDINGS,
@@ -600,6 +634,9 @@ class _Isolation:
         _require(provider_documents is None or (has_provider and TELEGRAM_BINDINGS <= binding_names and provider_documents == {
             "name": PROVIDER_URL_DOCUMENTS_BINDING, "type": "plain_text", "text": "1",
         }), "Unexpected isolated Worker provider URL document binding.")
+        _require(mixed_documents is None or (provider_documents is not None and mixed_documents == {
+            "name": MIXED_DOCUMENTS_BINDING, "type": "plain_text", "text": "1",
+        }), "Unexpected isolated Worker mixed document binding.")
         _require(refresh is None or (has_provider and TELEGRAM_BINDINGS <= binding_names and refresh == {
             "name": PROVIDER_REFRESH_BINDING, "type": "plain_text", "text": "1",
         }), "Unexpected isolated Worker provider refresh binding.")
@@ -691,14 +728,18 @@ class _Isolation:
         _require(has_api_status or not (isinstance(tag, str) and tag.startswith("api-status-")),
                  "Isolated Worker API status release tag differs.")
         documents_capable = False
+        mixed_documents_capable = False
         if batch_capable or has_api_status or any(binding is not None for binding in (inline, provider_url, refresh, legacy_shorts)):
             release_tag = _release_tag(rev["text"], telegram_digest, aggregate_digest, private_share_digest, provider_binding)
             tag_inputs = (_api_status_tag(release_tag, api_status_binding, api_status is not None),
                           inline is not None, provider_url is not None, refresh is not None, legacy_shorts is not None,
                           provider_batch is not None, module_sha256 if batch_capable else None)
             expected = _telegram_feature_tag(*tag_inputs)
-            documents_capable = batch_capable and tag == _telegram_feature_tag(*tag_inputs,
-                url_documents=provider_documents is not None, url_documents_module_sha256=module_sha256)
+            document_tag_inputs = {"url_documents": provider_documents is not None, "url_documents_module_sha256": module_sha256}
+            mixed_documents_capable = batch_capable and tag == _telegram_feature_tag(*tag_inputs, **document_tag_inputs,
+                mixed_documents=mixed_documents is not None)
+            documents_capable = mixed_documents_capable or (batch_capable and tag == _telegram_feature_tag(*tag_inputs,
+                **document_tag_inputs))
             feature = "API status" if has_api_status else "inline search"
             if batch_capable:
                 feature = "provider batch"
@@ -710,11 +751,12 @@ class _Isolation:
                 feature = "provider URL import"
             _require(tag == expected or documents_capable, f"Isolated Worker {feature} release tag differs.")
         _require(provider_documents is None or documents_capable, "Isolated Worker provider URL document release tag differs.")
+        _require(mixed_documents is None or mixed_documents_capable, "Isolated Worker mixed document release tag differs.")
         return _Version(rev["text"], module_sha256, version["compatibility_date"],
                         tag, telegram_digest, aggregate_digest, private_share_digest, provider_binding, inline is not None,
                         provider_url is not None, refresh is not None, legacy_shorts is not None,
                         provider_batch is not None, batch_capable, api_status_binding, api_status is not None,
-                        provider_documents is not None, documents_capable)
+                        provider_documents is not None, documents_capable, mixed_documents is not None, mixed_documents_capable)
 
     def verify_candidate(self, candidate, desired):
         # A version can be visible in its creation response or listing before its module is readable.
@@ -773,6 +815,8 @@ class _Isolation:
             bindings.append({"type": "plain_text", "name": PROVIDER_URL_IMPORT_BINDING, "text": "1"})
         if desired.telegram_provider_url_documents:
             bindings.append({"type": "plain_text", "name": PROVIDER_URL_DOCUMENTS_BINDING, "text": "1"})
+        if desired.telegram_mixed_documents:
+            bindings.append({"type": "plain_text", "name": MIXED_DOCUMENTS_BINDING, "text": "1"})
         if desired.telegram_provider_refresh:
             bindings.append({"type": "plain_text", "name": PROVIDER_REFRESH_BINDING, "text": "1"})
         if desired.legacy_subscription_shorts:
@@ -1041,6 +1085,27 @@ def _provider_url_documents_target(active, requested, manifest, telegram_digest,
     return enabled, capable
 
 
+def _mixed_documents_target(active, requested, manifest, documents_enabled, documents_capable):
+    _require(requested is None or type(requested) is bool, "Invalid isolated mixed document release mode.")
+    enabled = active.telegram_mixed_documents if requested is None else requested
+    entries = manifest.get("migrations") if isinstance(manifest, dict) else None
+    includes_schema = isinstance(entries, list) and len(entries) >= 36
+    capable = documents_capable and includes_schema and entries[35] == {
+        "name": MIXED_DOCUMENTS_MIGRATION, "sha256": MIXED_DOCUMENTS_MIGRATION_SHA256,
+    }
+    _require(not (includes_schema or active.telegram_mixed_documents_capable or enabled) or capable,
+             "Isolated mixed documents require the exact 0036 migration artifact and provider URL document schema.")
+    if enabled:
+        # The existing URL-document release gate verifies the pinned V1 Provider, Telegram policy and Cron.
+        _require(active.telegram_provider_url_documents and documents_enabled,
+                 "Isolated mixed documents require active and preserved provider URL document admission.")
+        if not active.telegram_mixed_documents:
+            _require(active.telegram_mixed_documents_capable and active.revision == manifest.get("revision")
+                     and active.digest == manifest.get("bundleSha256") and active.compatibility == manifest.get("compatibilityDate"),
+                     "Enable mixed documents only after verifying the same Worker artifact with admission disabled.")
+    return enabled, capable
+
+
 def _provider_refresh_target(active, requested, manifest, telegram_digest, provider_binding, had_cron):
     _require(requested is None or type(requested) is bool, "Invalid isolated provider refresh release mode.")
     enabled = active.telegram_provider_refresh if requested is None else requested
@@ -1145,7 +1210,8 @@ def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECI
                          release_manifest=None,
                          telegram_config=_UNSPECIFIED_TELEGRAM_CONFIG, inline_search=None, provider_url_import=None,
                          provider_refresh=None, legacy_subscription_shorts=None, provider_batch=None,
-                         api_status=None, api_status_gate=_UNSPECIFIED_API_STATUS_GATE, provider_url_documents=None):
+                         api_status=None, api_status_gate=_UNSPECIFIED_API_STATUS_GATE, provider_url_documents=None,
+                         mixed_documents=None):
     """Read ownership, privacy and active binding facts before any release writes."""
     scope = _Isolation(worker_api, data_api, target)
     scope.worker_config()
@@ -1201,12 +1267,16 @@ def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECI
         enabled, _ = _provider_batch_target(version, provider_batch, release_manifest, desired_digest, provider_binding, had_cron)
         if version.telegram_provider_batch_capable or enabled:
             scope.verify_provider_batch()
-    if release_manifest is not None or provider_url_documents is not None:
-        enabled, _ = _provider_url_documents_target(version, provider_url_documents, release_manifest, desired_digest,
-                                                   provider_binding, had_cron)
-        if version.telegram_provider_url_documents_capable or enabled:
+    if release_manifest is not None or provider_url_documents is not None or mixed_documents is not None:
+        documents_enabled, documents_capable = _provider_url_documents_target(version, provider_url_documents,
+            release_manifest, desired_digest, provider_binding, had_cron)
+        mixed_enabled, _ = _mixed_documents_target(version, mixed_documents, release_manifest, documents_enabled, documents_capable)
+        if version.telegram_provider_url_documents_capable or documents_enabled:
             scope.verify_provider_url_documents()
-        if enabled and not version.telegram_provider_url_documents:
+        if version.telegram_mixed_documents_capable or mixed_enabled:
+            scope.verify_mixed_documents()
+        if ((documents_enabled and not version.telegram_provider_url_documents)
+                or (mixed_enabled and not version.telegram_mixed_documents)):
             _verify_health(version.revision)
             _require(scope.active() == active, "Active isolated Worker deployment changed during URL document verification.")
     if api_status_gate is not _UNSPECIFIED_API_STATUS_GATE or api_status is not None:
@@ -1235,7 +1305,7 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                    inline_search: bool | None = None, provider_url_import: bool | None = None,
                    provider_refresh: bool | None = None, legacy_subscription_shorts: bool | None = None,
                    provider_batch: bool | None = None, api_status: bool | None = None, api_status_gate=None,
-                   provider_url_documents: bool | None = None):
+                   provider_url_documents: bool | None = None, mixed_documents: bool | None = None):
     """Release the verified Worker and optionally configure its isolated Telegram schedule."""
     _require((provider_binding is None and provider_guard is None) or (provider_binding is not None and callable(provider_guard)),
              "An isolated provider release requires a verified dependency guard.")
@@ -1265,7 +1335,10 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
         desired.telegram_config_sha256, desired.provider_binding, had_cron)
     documents_enabled, documents_capable = _provider_url_documents_target(old_version, provider_url_documents, manifest,
         desired.telegram_config_sha256, desired.provider_binding, had_cron)
-    documents_must_be_drained = documents_capable and not old_version.telegram_provider_url_documents_capable
+    mixed_enabled, mixed_capable = _mixed_documents_target(old_version, mixed_documents, manifest, documents_enabled, documents_capable)
+    # Mixed opt-ins are children of provider opt-ins and all committed plans use the existing document ledger.
+    documents_must_be_drained = ((documents_capable and not old_version.telegram_provider_url_documents_capable)
+                                 or (mixed_capable and not old_version.telegram_mixed_documents_capable))
     refresh_enabled = _provider_refresh_target(old_version, provider_refresh, manifest,
         desired.telegram_config_sha256, desired.provider_binding, had_cron)
     legacy_shorts_enabled = _legacy_subscription_shorts_target(old_version, legacy_subscription_shorts, manifest)
@@ -1292,11 +1365,13 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                       telegram_provider_batch=batch_enabled, telegram_provider_batch_capable=batch_capable,
                       telegram_api_status=api_status_enabled, api_status_binding=api_status_binding,
                       telegram_provider_url_documents=documents_enabled, telegram_provider_url_documents_capable=documents_capable,
+                      telegram_mixed_documents=mixed_enabled, telegram_mixed_documents_capable=mixed_capable,
                       tag=_telegram_feature_tag(_api_status_tag(desired.tag, api_status_binding, api_status_enabled),
                                                 enabled, provider_url_enabled, refresh_enabled, legacy_shorts_enabled,
                                                 batch_enabled, desired.digest if batch_capable else None,
                                                 url_documents=documents_enabled,
-                                                url_documents_module_sha256=desired.digest if documents_capable else None))
+                                                url_documents_module_sha256=desired.digest if documents_capable else None,
+                                                mixed_documents=mixed_enabled if mixed_capable else None))
     if inline_bot is not None:
         scope.verify_inline_search(inline_bot, require_fresh=first_enable)
     if verify_provider_schema is not None:
@@ -1309,6 +1384,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
         scope.verify_api_status(drained=api_status_must_be_drained)
     if documents_capable:
         scope.verify_provider_url_documents(drained=documents_must_be_drained)
+    if mixed_capable:
+        scope.verify_mixed_documents()
     _verify_first_provider_binding(old_version, desired.provider_binding, desired.revision, provider_first_binding_guard,
                                    historical_application_revision)
     _verify_health(old_version.revision)
@@ -1323,13 +1400,15 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                 old_version.telegram_provider_refresh, old_version.legacy_subscription_shorts,
                 old_version.telegram_provider_batch, old_version.telegram_provider_batch_capable,
                 old_version.api_status_binding, old_version.telegram_api_status,
-                old_version.telegram_provider_url_documents, old_version.telegram_provider_url_documents_capable) == (
+                old_version.telegram_provider_url_documents, old_version.telegram_provider_url_documents_capable,
+                old_version.telegram_mixed_documents, old_version.telegram_mixed_documents_capable) == (
                 desired.telegram_config_sha256, desired.telegram_aggregate_key_sha256,
                 desired.telegram_private_share_key_sha256, desired.provider_binding,
                 desired.telegram_inline_search, desired.telegram_provider_url_import, desired.telegram_provider_refresh,
                 desired.legacy_subscription_shorts, desired.telegram_provider_batch, desired.telegram_provider_batch_capable,
                 desired.api_status_binding, desired.telegram_api_status,
-                desired.telegram_provider_url_documents, desired.telegram_provider_url_documents_capable):
+                desired.telegram_provider_url_documents, desired.telegram_provider_url_documents_capable,
+                desired.telegram_mixed_documents, desired.telegram_mixed_documents_capable):
             if telegram_config is None:
                 _require(scope.active() == previous, "Active isolated Worker deployment changed during verification.")
                 _guard_current(guard)
@@ -1340,7 +1419,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                     "previousVersionId": previous.version, "changed": changed, "inlineSearchEnabled": enabled,
                     "providerUrlImportEnabled": provider_url_enabled, "providerRefreshEnabled": refresh_enabled,
                     "legacySubscriptionShortsEnabled": legacy_shorts_enabled, "providerBatchEnabled": batch_enabled,
-                    "apiStatusEnabled": api_status_enabled, "providerUrlDocumentsEnabled": documents_enabled}
+                    "apiStatusEnabled": api_status_enabled, "providerUrlDocumentsEnabled": documents_enabled,
+                    "mixedDocumentsEnabled": mixed_enabled}
 
     candidate = scope.staged(desired)
     if candidate is None:
@@ -1367,6 +1447,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
         scope.verify_api_status(drained=api_status_must_be_drained)
     if documents_capable:
         scope.verify_provider_url_documents(drained=documents_must_be_drained)
+    if mixed_capable:
+        scope.verify_mixed_documents()
     _require(scope.active() == previous, "Active isolated Worker deployment changed before activation.")
     _guard_current(guard)
     activated = scope.activate(previous, candidate, f"Isolated Worker release {desired.revision} {uuid4()}")
@@ -1388,6 +1470,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
             scope.verify_api_status(drained=api_status_must_be_drained)
         if documents_capable:
             scope.verify_provider_url_documents(drained=documents_must_be_drained)
+        if mixed_capable:
+            scope.verify_mixed_documents()
         if provider_guard is not None:
             provider_guard()
         if api_gate is not None:
@@ -1406,6 +1490,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                 scope.verify_api_status(drained=api_status_must_be_drained)
             if documents_capable:
                 scope.verify_provider_url_documents(drained=documents_must_be_drained)
+            if mixed_capable:
+                scope.verify_mixed_documents()
             _guard_current(guard)
             restored = scope.activate(activated, previous.version, f"Isolated Worker rollback {uuid4()}")
             _verify_health(old_version.revision)
@@ -1426,4 +1512,5 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
             "previousVersionId": previous.version, "changed": True, "inlineSearchEnabled": enabled,
             "providerUrlImportEnabled": provider_url_enabled, "providerRefreshEnabled": refresh_enabled,
             "legacySubscriptionShortsEnabled": legacy_shorts_enabled, "providerBatchEnabled": batch_enabled,
-            "apiStatusEnabled": api_status_enabled, "providerUrlDocumentsEnabled": documents_enabled}
+            "apiStatusEnabled": api_status_enabled, "providerUrlDocumentsEnabled": documents_enabled,
+            "mixedDocumentsEnabled": mixed_enabled}

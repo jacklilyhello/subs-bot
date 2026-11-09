@@ -4,16 +4,25 @@ import { finishTelegramDocumentJob, MAX_TELEGRAM_DOCUMENT_NODES, persistTelegram
 import { downloadTelegramDocument } from "./document-transport.ts";
 import { stageTelegramProviderDocument } from "./provider-document.ts";
 import { parseTelegramProviderDocument } from "./provider-document-input.ts";
+import { parseTelegramMixedDocument } from "./mixed-document-input.ts";
 import type { TelegramPolicy } from "./protocol.ts";
 
 const DOWNLOAD_BUDGET_MS = 20_000;
 const MIN_FINISH_WINDOW_MS = 5_000;
+
+export async function telegramMixedDocumentReady(db: D1Database): Promise<boolean> {
+  const present = await db.prepare(`SELECT count(*) AS present FROM sqlite_schema
+    WHERE type='table' AND name='telegram_mixed_document_opt_in'`).first<number>("present");
+  if (present === 0 || present === 1) return present === 1;
+  throw new Error("Telegram mixed document schema could not be confirmed.");
+}
 
 export async function runTelegramDocumentIntake(
   db: D1Database,
   bucket: R2Bucket,
   policy: TelegramPolicy,
   providerDocumentsReady = false,
+  mixedDocumentsReady = false,
 ): Promise<boolean> {
   const lease = await claimTelegramDocumentJob(db, policy);
   if (!lease) return false;
@@ -34,35 +43,47 @@ export async function runTelegramDocumentIntake(
     return true;
   }
 
+  let mixed: Extract<ReturnType<typeof parseTelegramMixedDocument>, { kind: "mixed" }> | undefined;
   if (providerDocumentsReady && (lease.suffix === "txt" || lease.suffix === "log") &&
       await db.prepare("SELECT 1 AS opted FROM telegram_provider_document_opt_in WHERE receipt_id=?")
         .bind(lease.receiptId).first<number>("opted") === 1) {
-    const urls = parseTelegramProviderDocument(download.bytes, lease.suffix);
-    if (urls.kind === "invalid-url-list") {
-      await finishTelegramDocumentJob(db, policy, lease, { kind: "failed", reason: "invalid-document" });
-      return true;
-    }
-    if (urls.kind === "url-list") {
-      try {
-        if (!await stageTelegramProviderDocument(db, policy, lease, urls)) {
-          await finishTelegramDocumentJob(db, policy, lease, { kind: "failed", reason: "coalesced" });
-        }
-      } catch {
-        await finishTelegramDocumentJob(db, policy, lease, { kind: "retry" });
+    if (mixedDocumentsReady && await db.prepare("SELECT 1 AS opted FROM telegram_mixed_document_opt_in WHERE receipt_id=?")
+      .bind(lease.receiptId).first<number>("opted") === 1) {
+      const candidate = parseTelegramMixedDocument(download.bytes, lease.suffix);
+      if (candidate.kind === "invalid-mixed") {
+        await finishTelegramDocumentJob(db, policy, lease, { kind: "failed", reason: "invalid-document" });
+        return true;
       }
-      return true;
+      if (candidate.kind === "mixed") mixed = candidate;
+    }
+    if (!mixed) {
+      const urls = parseTelegramProviderDocument(download.bytes, lease.suffix);
+      if (urls.kind === "invalid-url-list") {
+        await finishTelegramDocumentJob(db, policy, lease, { kind: "failed", reason: "invalid-document" });
+        return true;
+      }
+      if (urls.kind === "url-list") {
+        try {
+          if (!await stageTelegramProviderDocument(db, policy, lease, urls)) {
+            await finishTelegramDocumentJob(db, policy, lease, { kind: "failed", reason: "coalesced" });
+          }
+        } catch {
+          await finishTelegramDocumentJob(db, policy, lease, { kind: "retry" });
+        }
+        return true;
+      }
     }
   }
 
   const syntax = lease.suffix === "json" ? "json" : lease.suffix === "yaml" || lease.suffix === "yml" ? "yaml" : "auto";
-  const parsed = parseSubscriptionDocument(download.bytes, { syntax, maxNodes: MAX_TELEGRAM_DOCUMENT_NODES });
-  if (parsed.kind !== "parsed" || parsed.rejected.malformed !== 0 || parsed.rejected.unsupported !== 0) {
+  const parsed = mixed ?? parseSubscriptionDocument(download.bytes, { syntax, maxNodes: MAX_TELEGRAM_DOCUMENT_NODES });
+  if (parsed.kind !== "mixed" && (parsed.kind !== "parsed" || parsed.rejected.malformed !== 0 || parsed.rejected.unsupported !== 0)) {
     await finishTelegramDocumentJob(db, policy, lease, { kind: "failed", reason: "invalid-document" });
     return true;
   }
 
   try {
-    await persistTelegramDocumentJob(db, bucket, policy, lease, parsed.nodes, { parsed: parsed.nodes.length });
+    await persistTelegramDocumentJob(db, bucket, policy, lease, parsed.nodes, { parsed: parsed.nodes.length }, mixed);
   } catch {
     // The publication may have committed. The exact lease makes retry a no-op for a saved receipt.
     try {

@@ -5,7 +5,8 @@ import {
 import { digestHex, SUBSCRIPTION_LIFECYCLE_REVISION } from "../storage.ts";
 import { normalizeSubscriptionName } from "../subscriptions.ts";
 import {
-  prepareTelegramDocumentJobLeaseGuard, prepareTelegramDocumentJobSettlement, type TelegramDocumentJobLease,
+  prepareTelegramDocumentJobLeaseGuard, prepareTelegramDocumentJobSettlement, TELEGRAM_DOCUMENT_JOB_MARKER,
+  type TelegramDocumentJobLease,
 } from "./document-jobs.ts";
 import { TELEGRAM_PROVIDER_DOCUMENT_MAX_URLS, type TelegramProviderDocumentInput } from "./provider-document-input.ts";
 import { providerDocumentOrigin, TELEGRAM_PROVIDER_DOCUMENT_MARKER } from "./provider-document-origin.ts";
@@ -17,6 +18,7 @@ const PROMOTION_HEADROOM_SECONDS = 120;
 const encoder = new TextEncoder();
 
 type UrlList = Extract<TelegramProviderDocumentInput, { kind: "url-list" }>;
+export type TelegramProviderDocumentSources = Pick<UrlList, "urls" | "overflow">;
 type WaitingLine = {
   receiptId: number; ordinal: number; sourceSha256: string; ownerId: string;
   subscriptionId: number; expectedGeneration: number; expectedLifecycleRevision: number;
@@ -36,70 +38,89 @@ export async function telegramProviderDocumentReady(db: D1Database): Promise<boo
   throw new Error("Telegram provider document schema could not be confirmed.");
 }
 
-export async function stageTelegramProviderDocument(
-  db: D1Database, policy: TelegramPolicy, lease: TelegramDocumentJobLease, input: UrlList,
-): Promise<boolean> {
+export async function prepareTelegramProviderDocumentPlan(
+  db: D1Database, policy: TelegramPolicy, lease: TelegramDocumentJobLease, input: TelegramProviderDocumentSources,
+  mixed = false,
+) {
   if (input.urls.length < 1 || input.urls.length > TELEGRAM_PROVIDER_DOCUMENT_MAX_URLS) {
     throw new RangeError("Invalid provider document line count.");
   }
+  const guard = prepareTelegramDocumentJobLeaseGuard(policy, lease);
+  const exists = { sql: "EXISTS (SELECT 1 FROM telegram_provider_documents WHERE receipt_id=?)", bindings: [lease.receiptId] };
+  const staged = `${exists.sql} AND (${guard.sql})`;
+  const stageBindings = [lease.receiptId, ...guard.bindings];
+  const inputs = await Promise.all(input.urls.map(async (sourceUrl) => {
+    const host = providerHost(sourceUrl);
+    if (!host) throw new Error();
+    return { sourceUrl, name: normalizeSubscriptionName(Array.from(host).slice(0, 64).join("")),
+      digest: await providerSourceDigest(sourceUrl), token: crypto.randomUUID().replaceAll("-", "") };
+  }));
+  const steps = [
+    db.prepare(`INSERT INTO telegram_provider_documents
+      (receipt_id,bot_id,actor_id,actor_role,auth_message_date,auth_message_id,expires_at,line_count,overflow_count)
+      SELECT receipt_id,bot_id,actor_id,?,auth_message_date,auth_message_id,unixepoch()+${PARENT_TTL_SECONDS},?,?
+      FROM telegram_document_jobs AS source WHERE source.receipt_id=? AND (${guard.sql})
+        AND EXISTS (SELECT 1 FROM telegram_provider_document_opt_in WHERE receipt_id=source.receipt_id)
+        ${mixed ? "AND EXISTS (SELECT 1 FROM telegram_mixed_document_opt_in WHERE receipt_id=source.receipt_id)" : ""}
+        AND NOT EXISTS (SELECT 1 FROM telegram_provider_documents AS active WHERE active.bot_id=source.bot_id
+          AND active.actor_id=source.actor_id AND active.finished_at IS NULL)`)
+      .bind(lease.actorId === policy.adminId ? "admin" : "member", inputs.length, input.overflow, lease.receiptId, ...guard.bindings),
+    ...inputs.flatMap(({ sourceUrl, name, digest, token }, ordinal) => {
+      const trashed = `EXISTS (SELECT 1 FROM subscription_trash WHERE owner_id=? AND source_url=?
+        AND deleted_at>=unixepoch()-${PROVIDER_TRASH_SECONDS})`;
+      return [
+        db.prepare(`INSERT INTO subscriptions(owner_id,name,source_url,token,created_at,updated_at)
+          SELECT ?,?,?,?,unixepoch(),unixepoch() WHERE (${staged})
+          AND NOT EXISTS (SELECT 1 FROM subscriptions WHERE owner_id=? AND source_url=?)
+          AND NOT ${trashed} AND NOT EXISTS (SELECT 1 FROM subscription_trash WHERE token=?)
+          AND NOT EXISTS (SELECT 1 FROM subscriptions WHERE owner_id=? AND
+            (lower(substr(source_url,1,7))='http://' OR lower(substr(source_url,1,8))='https://')
+            LIMIT 1 OFFSET ${MAX_PROVIDER_OWNER_SOURCES - 1})`)
+          .bind(lease.actorId, name, sourceUrl, token, ...stageBindings, lease.actorId, sourceUrl,
+            lease.actorId, sourceUrl, token, lease.actorId),
+        db.prepare(`WITH matching AS (
+            SELECT id,generation,${SUBSCRIPTION_LIFECYCLE_REVISION} AS revision FROM subscriptions
+            WHERE owner_id=? AND source_url=? LIMIT 2
+          )
+          INSERT INTO telegram_provider_document_lines (receipt_id,ordinal,due_at,source_sha256,
+            subscription_id,expected_generation,expected_lifecycle_revision,result_code)
+          SELECT ?,?,unixepoch(),?,target.id,target.generation,target.revision,CASE
+            WHEN target.id IS NOT NULL THEN NULL WHEN (SELECT count(*) FROM matching)>1 THEN 'conflict'
+            WHEN (SELECT count(*) FROM matching)=1 THEN 'stale-target'
+            WHEN ${trashed} THEN 'unavailable' ELSE 'capacity' END
+          FROM (SELECT 1) LEFT JOIN matching AS target ON (SELECT count(*) FROM matching)=1 AND target.generation<9007199254740991
+          WHERE (${staged})`)
+          .bind(lease.actorId, sourceUrl, lease.receiptId, ordinal, digest, lease.actorId, sourceUrl, ...stageBindings),
+      ];
+    }),
+    db.prepare(`SELECT CASE WHEN NOT (${staged}) OR (SELECT count(*) FROM telegram_provider_document_lines
+      WHERE receipt_id=?)=? THEN 1 ELSE json_extract('provider document line guard failed','$') END`)
+      .bind(...stageBindings, lease.receiptId, inputs.length),
+  ];
+  return { steps, exists, staged: { sql: staged, bindings: stageBindings } };
+}
+
+export function prepareTelegramProviderDocumentMarker(db: D1Database, receiptId: number): D1PreparedStatement[] {
+  return [
+    db.prepare(`UPDATE telegram_inbox SET receipt_nonce=? WHERE receipt_id=? AND receipt_nonce=? AND changes()=1`)
+      .bind(TELEGRAM_PROVIDER_DOCUMENT_MARKER, receiptId, TELEGRAM_DOCUMENT_JOB_MARKER),
+    db.prepare(`SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM telegram_provider_documents WHERE receipt_id=?)
+      OR changes()=1 THEN 1 ELSE json_extract('provider document settlement guard failed','$') END`).bind(receiptId),
+  ];
+}
+
+export async function stageTelegramProviderDocument(
+  db: D1Database, policy: TelegramPolicy, lease: TelegramDocumentJobLease, input: UrlList,
+): Promise<boolean> {
   try {
-    const guard = prepareTelegramDocumentJobLeaseGuard(policy, lease);
-    const staged = `EXISTS (SELECT 1 FROM telegram_provider_documents WHERE receipt_id=?) AND (${guard.sql})`;
-    const stageBindings = [lease.receiptId, ...guard.bindings];
-    const inputs = await Promise.all(input.urls.map(async (sourceUrl) => {
-      const host = providerHost(sourceUrl);
-      if (!host) throw new Error();
-      return { sourceUrl, name: normalizeSubscriptionName(Array.from(host).slice(0, 64).join("")),
-        digest: await providerSourceDigest(sourceUrl), token: crypto.randomUUID().replaceAll("-", "") };
-    }));
+    const plan = await prepareTelegramProviderDocumentPlan(db, policy, lease, input);
     const steps = [
-      db.prepare(`INSERT INTO telegram_provider_documents
-        (receipt_id,bot_id,actor_id,actor_role,auth_message_date,auth_message_id,expires_at,line_count,overflow_count)
-        SELECT receipt_id,bot_id,actor_id,?,auth_message_date,auth_message_id,unixepoch()+${PARENT_TTL_SECONDS},?,?
-        FROM telegram_document_jobs AS source WHERE source.receipt_id=? AND (${guard.sql})
-          AND EXISTS (SELECT 1 FROM telegram_provider_document_opt_in WHERE receipt_id=source.receipt_id)
-          AND NOT EXISTS (SELECT 1 FROM telegram_provider_documents AS active WHERE active.bot_id=source.bot_id
-            AND active.actor_id=source.actor_id AND active.finished_at IS NULL)`)
-        .bind(lease.actorId === policy.adminId ? "admin" : "member", inputs.length, input.overflow, lease.receiptId, ...guard.bindings),
-      ...inputs.flatMap(({ sourceUrl, name, digest, token }, ordinal) => {
-        const trashed = `EXISTS (SELECT 1 FROM subscription_trash WHERE owner_id=? AND source_url=?
-          AND deleted_at>=unixepoch()-${PROVIDER_TRASH_SECONDS})`;
-        return [
-          db.prepare(`INSERT INTO subscriptions(owner_id,name,source_url,token,created_at,updated_at)
-            SELECT ?,?,?,?,unixepoch(),unixepoch() WHERE (${staged})
-            AND NOT EXISTS (SELECT 1 FROM subscriptions WHERE owner_id=? AND source_url=?)
-            AND NOT ${trashed} AND NOT EXISTS (SELECT 1 FROM subscription_trash WHERE token=?)
-            AND NOT EXISTS (SELECT 1 FROM subscriptions WHERE owner_id=? AND
-              (lower(substr(source_url,1,7))='http://' OR lower(substr(source_url,1,8))='https://')
-              LIMIT 1 OFFSET ${MAX_PROVIDER_OWNER_SOURCES - 1})`)
-            .bind(lease.actorId, name, sourceUrl, token, ...stageBindings, lease.actorId, sourceUrl,
-              lease.actorId, sourceUrl, token, lease.actorId),
-          db.prepare(`WITH matching AS (
-              SELECT id,generation,${SUBSCRIPTION_LIFECYCLE_REVISION} AS revision FROM subscriptions
-              WHERE owner_id=? AND source_url=? LIMIT 2
-            )
-            INSERT INTO telegram_provider_document_lines (receipt_id,ordinal,due_at,source_sha256,
-              subscription_id,expected_generation,expected_lifecycle_revision,result_code)
-            SELECT ?,?,unixepoch(),?,target.id,target.generation,target.revision,CASE
-              WHEN target.id IS NOT NULL THEN NULL WHEN (SELECT count(*) FROM matching)>1 THEN 'conflict'
-              WHEN (SELECT count(*) FROM matching)=1 THEN 'stale-target'
-              WHEN ${trashed} THEN 'unavailable' ELSE 'capacity' END
-            FROM (SELECT 1) LEFT JOIN matching AS target ON (SELECT count(*) FROM matching)=1 AND target.generation<9007199254740991
-            WHERE (${staged})`)
-            .bind(lease.actorId, sourceUrl, lease.receiptId, ordinal, digest, lease.actorId, sourceUrl, ...stageBindings),
-        ];
-      }),
-      db.prepare(`SELECT CASE WHEN NOT (${staged}) OR (SELECT count(*) FROM telegram_provider_document_lines
-        WHERE receipt_id=?)=? THEN 1 ELSE json_extract('provider document line guard failed','$') END`)
-        .bind(...stageBindings, lease.receiptId, inputs.length),
+      ...plan.steps,
       // Settlement retains the standard document replay identity while scrubbing the Telegram file fields.
-      db.prepare(`DELETE FROM telegram_provider_document_opt_in WHERE (${staged}) AND receipt_id=?`)
-        .bind(...stageBindings, lease.receiptId),
+      db.prepare(`DELETE FROM telegram_provider_document_opt_in WHERE (${plan.staged.sql}) AND receipt_id=?`)
+        .bind(...plan.staged.bindings, lease.receiptId),
       prepareTelegramDocumentJobSettlement(db, policy, lease, { kind: "saved" }, true),
-      db.prepare(`UPDATE telegram_inbox SET receipt_nonce=? WHERE receipt_id=? AND changes()=1`)
-        .bind(TELEGRAM_PROVIDER_DOCUMENT_MARKER, lease.receiptId),
-      db.prepare(`SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM telegram_provider_documents WHERE receipt_id=?)
-        OR changes()=1 THEN 1 ELSE json_extract('provider document settlement guard failed','$') END`).bind(lease.receiptId),
+      ...prepareTelegramProviderDocumentMarker(db, lease.receiptId),
     ];
     const result = await db.batch(steps);
     assertBatch(result, steps);

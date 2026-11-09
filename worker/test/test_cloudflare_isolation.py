@@ -162,6 +162,7 @@ class FakeCloudflare:
         self.provider_documents_schema_drift = False
         self.provider_documents_drain_reads = 0
         self.provider_documents_live_reads = set()
+        self.mixed_documents_drift = {}
         self.legacy_short_checks = []
         self.legacy_short_ledger_drift = {}
 
@@ -238,6 +239,17 @@ class FakeCloudflare:
     def data_api(self, method, path, payload=None):
         if method == "POST" and path == DATABASE + "/query":
             sql = payload["sql"]
+            if "WHERE position=36" in sql:
+                migration = Path(__file__).resolve().parents[1] / "migrations" / cloudflare.MIXED_DOCUMENTS_MIGRATION
+                body = migration.read_bytes()
+                digest = sha256(body).hexdigest()
+                with closing(sqlite3.connect(":memory:")) as db:
+                    db.row_factory = sqlite3.Row
+                    db.executescript(body.decode("utf-8"))
+                    db.execute("CREATE TABLE subs_bot_schema_migrations (position INTEGER PRIMARY KEY, name TEXT, sha256 TEXT, mode TEXT)")
+                    db.execute("INSERT INTO subs_bot_schema_migrations VALUES (36, ?, ?, 'applied')", (migration.name, digest))
+                    rows = [{**dict(row), **self.mixed_documents_drift} for row in db.execute(sql)]
+                    return [{"success": True, "results": rows}]
             if "AS providerDocumentsActive" in sql:
                 self.provider_documents_drain_reads += 1
                 return [{"success": True, "results": [{"providerDocumentsActive": int(
@@ -475,6 +487,22 @@ class ReleaseTests(unittest.TestCase):
             provider_batch=True, batch_module_sha256=digest, url_documents_module_sha256=digest if capable else None)
         return active
 
+    def set_mixed_documents_baseline(self, *, capable=True, same_artifact=True, url_documents=True, api_status=False):
+        active = self.set_provider_url_documents_baseline(same_artifact=same_artifact, api_status=api_status)
+        self.manifest["migrations"].append({"name": cloudflare.MIXED_DOCUMENTS_MIGRATION,
+                                             "sha256": cloudflare.MIXED_DOCUMENTS_MIGRATION_SHA256})
+        revision = active["bindings"][2]["text"]
+        digest = sha256(NEW_MODULE if same_artifact else OLD_MODULE).hexdigest()
+        tag = cloudflare._release_tag(revision, sha256(INLINE_CONFIG.encode()).hexdigest(), None, None, PROVIDER_BINDING)
+        if api_status:
+            tag = cloudflare._api_status_tag(tag, API_STATUS_PIN, True)
+        if url_documents:
+            active["bindings"].append({"type": "plain_text", "name": cloudflare.PROVIDER_URL_DOCUMENTS_BINDING, "text": "1"})
+        active["annotations"]["workers/tag"] = cloudflare._telegram_feature_tag(tag, True, True, True,
+            provider_batch=True, batch_module_sha256=digest, url_documents=url_documents, url_documents_module_sha256=digest,
+            mixed_documents=False if capable else None)
+        return active
+
     def test_read_only_preflight_rejects_wrong_resource_or_domain(self):
         self.assertEqual(cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET),
                          {"deploymentId": OLD_DEPLOYMENT, "versionId": OLD_VERSION, "revision": OLD_REVISION})
@@ -497,6 +525,7 @@ class ReleaseTests(unittest.TestCase):
             "previousVersionId": OLD_VERSION, "changed": True, "inlineSearchEnabled": False,
             "providerUrlImportEnabled": False, "providerRefreshEnabled": False, "legacySubscriptionShortsEnabled": False,
             "providerBatchEnabled": False, "apiStatusEnabled": False, "providerUrlDocumentsEnabled": False,
+            "mixedDocumentsEnabled": False,
         })
         self.assertFalse(self.release()["changed"])
         self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
@@ -807,6 +836,76 @@ class ReleaseTests(unittest.TestCase):
                     release_entry.provider_url_documents_release_mode()
                 os.environ["SUBS_BOT_PROVIDER_URL_DOCUMENTS_CONFIRMATION"] = f"{mode} provider URL documents for {cloudflare.WORKER_NAME}"
                 self.assertIs(release_entry.provider_url_documents_release_mode(), enabled)
+
+    def test_mixed_document_toggle_preserves_url_and_v2_and_supports_disabling_both(self):
+        off = self.set_mixed_documents_baseline(api_status=True)
+        api_gate = Mock(binding=API_STATUS_PIN)
+        options = {"provider_binding": PROVIDER_BINDING, "provider_guard": Mock(), "api_status_gate": lambda: api_gate}
+        default = self.release(INLINE_CONFIG, **options)
+        self.assertFalse(default["mixedDocumentsEnabled"])
+        self.assertFalse(default["changed"])
+        enabled = self.release(INLINE_CONFIG, mixed_documents=True, **options)
+        for key in ("mixedDocumentsEnabled", "providerUrlDocumentsEnabled", "providerBatchEnabled", "apiStatusEnabled"):
+            self.assertTrue(enabled[key])
+        on = self.api.versions[NEW_VERSION]
+        flag = {"type": "plain_text", "name": cloudflare.MIXED_DOCUMENTS_BINDING, "text": "1"}
+        self.assertEqual({row["name"]: row for row in on["bindings"]},
+                         {row["name"]: row for row in [*off["bindings"], flag]})
+        self.assertTrue(on["annotations"]["workers/tag"].startswith(cloudflare.PROVIDER_BATCH_TAG_PREFIX))
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "preserved provider URL document admission"):
+            self.release(INLINE_CONFIG, provider_url_documents=False, **options)
+        self.assertFalse(self.release(INLINE_CONFIG, **options)["changed"])
+        # Free the fake's single upload slot while retaining the immutable active version.
+        active_id = "10000000-0000-4000-8000-000000000009"
+        self.api.versions[active_id] = {**self.api.versions.pop(NEW_VERSION), "id": active_id}
+        self.api.active["versions"][0]["version_id"] = active_id
+        disabled = self.release(INLINE_CONFIG, mixed_documents=False, provider_url_documents=False, **options)
+        self.assertFalse(disabled["mixedDocumentsEnabled"])
+        self.assertFalse(disabled["providerUrlDocumentsEnabled"])
+        self.assertTrue(disabled["apiStatusEnabled"])
+        self.assertEqual(self.api.provider_documents_drain_reads, 0)
+        api_gate.verify_first_binding.assert_not_called()
+
+    def test_mixed_document_enable_requires_exact_off_artifact_url_flag_and_schema(self):
+        preflight = lambda: cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET,
+            release_manifest=self.manifest, release_revision=NEW_REVISION, telegram_config=INLINE_CONFIG,
+            provider_binding=PROVIDER_BINDING, mixed_documents=True)
+        for state, message in (({"same_artifact": False}, "same Worker artifact"),
+                               ({"capable": False}, "same Worker artifact"),
+                               ({"url_documents": False}, "preserved provider URL document admission")):
+            with self.subTest(state=state), self.assertRaisesRegex(cloudflare.CloudflareError, message):
+                self.set_mixed_documents_baseline(**state)
+                preflight()
+        self.set_mixed_documents_baseline()
+        self.manifest["migrations"][35]["sha256"] = "0" * 64
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "exact 0036"):
+            preflight()
+        self.set_mixed_documents_baseline()
+        for drift in ({"sha256": "0" * 64}, {"schemaCount": 2}, {"tableSql": "CREATE TABLE changed (receipt_id INTEGER)"}):
+            with self.subTest(drift=drift), self.assertRaisesRegex(cloudflare.CloudflareError, "mixed document schema or ledger"):
+                self.api.mixed_documents_drift = drift
+                preflight()
+        self.api.mixed_documents_drift = {}
+        self.assertEqual(preflight()["versionId"], OLD_VERSION)
+        self.assertEqual(self.api.writes(), [])
+
+    def test_mixed_document_rollback_requires_draining_work_before_an_old_artifact(self):
+        self.set_mixed_documents_baseline(capable=False, same_artifact=False)
+        self.api.provider_documents_live_reads = {3, 4}
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "safe rollback could not be confirmed"):
+            self.release(INLINE_CONFIG, provider_binding=PROVIDER_BINDING, provider_guard=Mock())
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
+        self.assertEqual(self.api.active["versions"][0]["version_id"], NEW_VERSION)
+
+    def test_mixed_document_operator_modes_require_exact_isolation_confirmation(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(release_entry.mixed_documents_release_mode())
+        for mode, enabled in (("enable", True), ("disable", False)):
+            with patch.dict(os.environ, {"SUBS_BOT_MIXED_DOCUMENTS_MODE": mode}, clear=True):
+                with self.assertRaisesRegex(cloudflare.CloudflareError, "mode or confirmation"):
+                    release_entry.mixed_documents_release_mode()
+                os.environ["SUBS_BOT_MIXED_DOCUMENTS_CONFIRMATION"] = f"{mode} mixed documents for {cloudflare.WORKER_NAME}"
+                self.assertIs(release_entry.mixed_documents_release_mode(), enabled)
 
     def test_refresh_toggle_preserves_provider_and_other_flags(self):
         off = self.set_provider_refresh_baseline(url=True, inline=True)

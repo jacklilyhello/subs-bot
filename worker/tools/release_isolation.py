@@ -71,6 +71,16 @@ def provider_url_documents_release_mode():
     raise CloudflareError("The isolated provider URL document release mode or confirmation is invalid.")
 
 
+def mixed_documents_release_mode():
+    mode = os.environ.get("SUBS_BOT_MIXED_DOCUMENTS_MODE", "preserve")
+    confirmation = os.environ.get("SUBS_BOT_MIXED_DOCUMENTS_CONFIRMATION", "")
+    if mode == "preserve" and confirmation == "":
+        return None
+    if mode in ("enable", "disable") and confirmation == f"{mode} mixed documents for {WORKER_NAME}":
+        return mode == "enable"
+    raise CloudflareError("The isolated mixed document release mode or confirmation is invalid.")
+
+
 def provider_refresh_release_mode():
     mode = os.environ.get("SUBS_BOT_PROVIDER_REFRESH_MODE", "preserve")
     confirmation = os.environ.get("SUBS_BOT_PROVIDER_REFRESH_CONFIRMATION", "")
@@ -122,17 +132,22 @@ def release():
     inline_search = inline_search_release_mode()
     provider_url_import = provider_url_import_release_mode()
     provider_url_documents = provider_url_documents_release_mode()
+    mixed_documents = mixed_documents_release_mode()
     provider_refresh = provider_refresh_release_mode()
     legacy_subscription_shorts = legacy_subscription_shorts_release_mode()
     provider_batch = provider_batch_release_mode()
     api_status = api_status_release_mode()
     if api_status is not None and any(mode is not None for mode in (
             inline_search, provider_url_import, provider_refresh, legacy_subscription_shorts, provider_batch,
-            provider_url_documents)):
+            provider_url_documents, mixed_documents)):
         raise CloudflareError("Change isolated API status admission in a separate scoped release.")
     if provider_url_documents is not None and any(mode is not None for mode in (
             inline_search, provider_url_import, provider_refresh, legacy_subscription_shorts, provider_batch)):
         raise CloudflareError("Change isolated provider URL document admission in a separate scoped release.")
+    if mixed_documents is not None and (any(mode is not None for mode in (
+            inline_search, provider_url_import, provider_refresh, legacy_subscription_shorts, provider_batch))
+            or (provider_url_documents is not None and not (mixed_documents is False and provider_url_documents is False))):
+        raise CloudflareError("Change isolated mixed document admission in a separate scoped release.")
     bundle = Path(os.environ["RUNNER_TEMP"]) / "subs-bot-verified"
     manifest = json.loads((bundle / "isolation.json").read_text(encoding="utf-8"))
     if manifest.get("version") != 2 or manifest.get("revision") != revision:
@@ -183,7 +198,7 @@ def release():
                                     provider_url_import=provider_url_import, provider_refresh=provider_refresh,
                                     legacy_subscription_shorts=legacy_subscription_shorts, provider_batch=provider_batch,
                                     api_status=api_status, api_status_gate=api_status_gate,
-                                    provider_url_documents=provider_url_documents)
+                                    provider_url_documents=provider_url_documents, mixed_documents=mixed_documents)
     if provider_gate is not None:
         provider_gate.verify()
     migrations = apply_migrations(data_api, target, bundle, manifest, guard)
@@ -197,7 +212,7 @@ def release():
                             provider_url_import=provider_url_import, provider_refresh=provider_refresh,
                             legacy_subscription_shorts=legacy_subscription_shorts, provider_batch=provider_batch,
                             api_status=api_status, api_status_gate=api_status_gate,
-                            provider_url_documents=provider_url_documents)
+                            provider_url_documents=provider_url_documents, mixed_documents=mixed_documents)
     guard()
     print(json.dumps(result, sort_keys=True), flush=True)
 

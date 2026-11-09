@@ -79,6 +79,7 @@ export async function acceptTelegramDocumentJob(
   policy: TelegramPolicy,
   event: TelegramDocumentJobInput,
   providerUrlOptIn = false,
+  mixedOptIn = false,
 ): Promise<"accepted" | "coalesced" | "capacity" | "invalid-document" | "ignored"> {
   if (!canonicalId(policy.botId) || !canonicalId(event.actorId) || event.chatType !== "private" ||
       event.threadId !== null || !inTelegramScope(policy, event) || !validInteger(event.updateId, 1) ||
@@ -140,6 +141,11 @@ export async function acceptTelegramDocumentJob(
         INSERT INTO telegram_provider_document_opt_in (receipt_id)
         SELECT incoming.receipt_id FROM telegram_inbox AS incoming JOIN telegram_document_jobs AS job USING (receipt_id)
         WHERE ${freshReceipt} AND job.state='pending' AND incoming.message_date BETWEEN unixepoch()-900 AND unixepoch()+30
+      `).bind(...key)] : []),
+      ...(mixedOptIn && providerUrlOptIn && (document?.suffix === "txt" || document?.suffix === "log") ? [db.prepare(`
+        INSERT INTO telegram_mixed_document_opt_in (receipt_id)
+        SELECT incoming.receipt_id FROM telegram_inbox AS incoming JOIN telegram_provider_document_opt_in USING (receipt_id)
+        WHERE ${freshReceipt}
       `).bind(...key)] : []),
       db.prepare(`
         UPDATE telegram_inbox AS incoming SET receipt_nonce = ?, command = CASE WHEN EXISTS (
