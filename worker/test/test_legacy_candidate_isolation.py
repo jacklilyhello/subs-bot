@@ -432,7 +432,7 @@ class CandidateArtifactTests(unittest.TestCase):
         for field, key, replacement in (("worker", "bundleSha256", "b" * 64), ("legacySerializer", "yarl", "1.20.1")):
             with self.subTest(field=field):
                 altered = {**original, field: {**original[field], key: replacement}}
-                raw = tool.native.canonical(altered) + b"\n"
+                raw = tool.converter._json(altered) + b"\n"
                 manifest.write_bytes(raw)
                 (directory / "manifest.sha256").write_bytes((tool.native.digest(raw) + "\n").encode("ascii"))
                 document["source"]["oracleManifestSha256"] = tool.native.digest(raw)
