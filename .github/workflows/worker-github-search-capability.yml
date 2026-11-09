@@ -3,6 +3,14 @@ run-name: Public search capability probe for ${{ github.sha }}
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: Check upstream capabilities or replay the exact Worker Grep request shape
+        type: choice
+        options:
+          - provider-capability
+          - worker-runtime-shape
+        default: provider-capability
 
 permissions:
   contents: read
@@ -22,6 +30,17 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Probe fixed public fixtures without credentials
+        if: inputs.mode == 'provider-capability'
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           env -i PATH=/usr/bin:/bin python3 -I -B worker/tools/github_search_capability.py
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: inputs.mode == 'worker-runtime-shape'
+        with:
+          node-version: '24'
+      - name: Probe the actual Worker adapter with the fixed public query
+        if: inputs.mode == 'worker-runtime-shape'
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          probe_node=$(command -v node)
+          env -i PATH=/usr/bin:/bin "$probe_node" worker/tools/grep-runtime-shape.ts

@@ -125,6 +125,8 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 公开代码搜索能力单独通过 `worker-github-search-capability.yml` 在 `main` 手动核对。托管任务不接收业务凭据，只用固定公开夹具查询 GitHub 代码接口和 Vercel Grep MCP。输出仅含 HTTP 状态、已识别的协议和响应类别及计数。GitHub 只有完整的零命中响应才算无结果。Grep 的空内容和未识别文本只记录形状。探针结果只证明托管 runner 观察到的行为。 [GitHub 代码搜索 API](https://docs.github.com/en/rest/search/search#search-code) · [Grep MCP](https://vercel.com/blog/grep-a-million-github-repositories-via-mcp)
 
+`worker-runtime-shape` 模式在 Node 24 直接运行同一提交的 Worker Grep 适配器，使用固定公开查询 `addClass repo:jquery/jquery`，复现运行时握手和查找参数，并在同一时间预算内核对匿名 GitHub 仓库可见性。报告只包含阶段、状态、耗时和结构计数。该模式使用 GitHub runner 的网络，并以合成检查替代 D1 授权查询。
+
 ### 订阅搜索、详情和格式链接
 
 `/s 关键词` 按当前用户的活动订阅搜索名称和来源，沿用旧版的 Unicode 小写子串匹配。每页最多显示 8 项，搜索限于 512 条订阅及 8 MiB 元数据。群聊只显示用户自己的匹配名称和编号。普通私聊可通过搜索结果、`/list`、`/expire` 的详情按钮，或直接发送活动列表顺序编号查看详情。详情显示流量、到期、节点数量及最多 8 个已校验的节点名称。来源 URL、节点凭据和刷新错误原文不进入回复。
