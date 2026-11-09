@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { Miniflare } from "miniflare";
 import type { TelegramPolicy } from "../src/telegram/protocol.ts";
+import { recordTempFixtureMigration } from "./temp-migration-fixture.ts";
 
 const policy: TelegramPolicy = {
   botId: "75101", botUsername: "fixture_temp_raw_bot", adminId: "75102", memberId: "75103", groupId: "-10075104",
@@ -63,6 +64,7 @@ test("emitted Worker returns exact private temporary URIs and one bounded plain 
       const bytes = await readFile(join(directory, migration.name));
       assert.equal(createHash("sha256").update(bytes).digest("hex"), migration.sha256);
       await db.batch(bytes.toString("utf8").trim().split(/;\s*/u).filter(Boolean).map((sql) => db.prepare(sql)));
+      await recordTempFixtureMigration(db, migration);
     }
     const date = Math.floor(Date.now() / 1000);
     const event = (id: number, text: string, owner = policy.memberId, chat = owner) => ({

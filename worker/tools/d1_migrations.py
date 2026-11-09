@@ -27,8 +27,9 @@ SHA256 = re.compile(r"[a-f0-9]{64}")
 UUID = re.compile(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}")
 TABLE = re.compile(r"CREATE TABLE ([a-z][a-z0-9_]*) \(")
 INDEX = re.compile(r"CREATE (?:UNIQUE )?INDEX ([a-z][a-z0-9_]*) ON ([a-z][a-z0-9_]*)[ \t\n]+\(")
-# Cumulative trusted migration text. Each resulting D1 statement is bounded separately.
-MAX_MIGRATION_BYTES = 72 * 1024
+# Cumulative trusted migration text, including the temporary-node schema and
+# bounded headroom. Generated D1 statements retain their separate 100 KB cap.
+MAX_MIGRATION_BYTES = 80 * 1024
 MAX_D1_STATEMENT_BYTES = 100_000
 
 

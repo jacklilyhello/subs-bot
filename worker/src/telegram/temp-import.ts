@@ -1,12 +1,12 @@
 import { parseNodeText } from "../text-import.ts";
 import { inTelegramScope, type TelegramPolicy, type TelegramTempUpdate } from "./protocol.ts";
+import {
+  MAX_TEMP_BATCH_BYTES, MAX_TEMP_BATCH_NODES, MAX_TEMP_OWNER_BYTES, MAX_TEMP_OWNER_NODES, TELEGRAM_TEMP_MARKER,
+  ownedTempRowsSql, readTempStorage, tempCutoverAllows, tempSchemaGuard, type TempStorageMode,
+} from "./temp-storage.ts";
 
-export const TELEGRAM_TEMP_MARKER = "temp:v1";
+export { MAX_TEMP_BATCH_BYTES, MAX_TEMP_BATCH_NODES, MAX_TEMP_OWNER_BYTES, MAX_TEMP_OWNER_NODES, TELEGRAM_TEMP_MARKER };
 export const TELEGRAM_TEMP_RAW_PREFIX = "temp-raw:v1:";
-export const MAX_TEMP_BATCH_BYTES = 256 * 1024;
-export const MAX_TEMP_OWNER_NODES = 5_000;
-export const MAX_TEMP_OWNER_BYTES = 4 * 1024 * 1024;
-export const MAX_TEMP_BATCH_NODES = 500;
 const MAX_TEMP_TEXT_BYTES = 64 * 1024;
 
 type TempReplyKind = "added" | "rejected" | "no-nodes" | "invalid-encoding" | "limit"
@@ -34,7 +34,7 @@ type ReceiptKey = readonly [botId: string, updateId: number, nonce: string];
 const freshReceipt = "incoming.bot_id = ? AND incoming.update_id = ? AND incoming.receipt_nonce = ?";
 const sameOwner = "temp.bot_id = incoming.bot_id AND temp.actor_id = incoming.actor_id";
 const atOrBefore = "(temp.message_date, temp.message_id) <= (incoming.message_date, incoming.message_id)";
-const ownerTotal = `SELECT COALESCE(sum(temp.node_count), 0) FROM telegram_temp_batch AS temp WHERE ${sameOwner}`;
+const visibleAtOrBefore = "WHERE source=0 OR (date,message)<=(incoming.message_date,incoming.message_id)";
 const olderThanClear = `EXISTS (
   SELECT 1 FROM telegram_temp_clear_fence AS fence
   WHERE fence.bot_id = incoming.bot_id AND fence.actor_id = incoming.actor_id
@@ -46,6 +46,12 @@ const currentClear = `EXISTS (
     AND (fence.message_date, fence.message_id) = (incoming.message_date, incoming.message_id)
 )`;
 const encoder = new TextEncoder();
+
+function tempOwnerQuery(mode: TempStorageMode, select: string, where = ""): string {
+  return `WITH temp_scope AS (SELECT incoming.bot_id AS bot_id,incoming.actor_id AS actor_id,NULL AS before_receipt,
+    incoming.message_date AS visibility_epoch),
+    temp_rows AS (${ownedTempRowsSql(mode, "temp_scope")}) SELECT ${select} FROM temp_rows ${where}`;
+}
 
 // The original receipt schema has space for a versioned marker. Store only
 // the grant and clear epochs here. The receipt ID bounds the raw read.
@@ -83,7 +89,7 @@ function planText(text: string): TextPlan {
   return { kind: "added", ...counts, payload: { json, bytes } };
 }
 
-function textSteps(db: D1Database, key: ReceiptKey, plan: TextPlan): D1PreparedStatement[] {
+function textSteps(db: D1Database, key: ReceiptKey, plan: TextPlan, mode: TempStorageMode): D1PreparedStatement[] {
   const steps: D1PreparedStatement[] = [];
   const payload = plan.payload;
   if (payload) {
@@ -94,8 +100,7 @@ function textSteps(db: D1Database, key: ReceiptKey, plan: TextPlan): D1PreparedS
       SELECT incoming.receipt_id, incoming.bot_id, incoming.actor_id, incoming.message_date, incoming.message_id,
         ?, ?, ? FROM telegram_inbox AS incoming
       WHERE ${freshReceipt} AND NOT ${olderThanClear}
-        AND (SELECT COALESCE(sum(temp.node_count), 0) <= ? AND COALESCE(sum(temp.payload_bytes), 0) <= ?
-          FROM telegram_temp_batch AS temp WHERE ${sameOwner})
+        AND (${tempOwnerQuery(mode, "COALESCE(sum(nodeCount),0)<=? AND COALESCE(sum(bytes),0)<=?")})
     `).bind(payload.json, plan.nodeCount, payload.bytes, ...key,
       MAX_TEMP_OWNER_NODES - plan.nodeCount, MAX_TEMP_OWNER_BYTES - payload.bytes));
   }
@@ -109,7 +114,16 @@ function textSteps(db: D1Database, key: ReceiptKey, plan: TextPlan): D1PreparedS
   return steps;
 }
 
-function clearSteps(db: D1Database, key: ReceiptKey): D1PreparedStatement[] {
+function clearSteps(db: D1Database, key: ReceiptKey, mode: TempStorageMode): D1PreparedStatement[] {
+  const clearBaseline = mode === "legacy-ready" ? [db.prepare(`
+    DELETE FROM legacy_temp_batches AS batch /* subs-bot:legacy-temp-mutate:v1 */ WHERE EXISTS (
+      SELECT 1 FROM telegram_inbox AS incoming JOIN telegram_temp_reply AS reply USING (receipt_id)
+      JOIN legacy_temp_installations AS installation ON installation.bot_id=incoming.bot_id
+        AND installation.cutover_epoch<incoming.message_date
+      WHERE ${freshReceipt} AND reply.kind='cleared' AND ${currentClear}
+        AND batch.bot_id=incoming.bot_id AND batch.actor_id=incoming.actor_id
+    )
+  `).bind(...key)] : [];
   return [
     db.prepare(`
       INSERT INTO telegram_temp_clear_fence (bot_id, actor_id, message_date, message_id)
@@ -123,9 +137,10 @@ function clearSteps(db: D1Database, key: ReceiptKey): D1PreparedStatement[] {
     db.prepare(`
       INSERT INTO telegram_temp_reply (receipt_id, kind, node_count)
       SELECT incoming.receipt_id, CASE WHEN ${currentClear} THEN 'cleared' ELSE 'stale' END,
-        CASE WHEN ${currentClear} THEN (${ownerTotal} AND ${atOrBefore}) ELSE 0 END
+        CASE WHEN ${currentClear} THEN (${tempOwnerQuery(mode, "COALESCE(sum(nodeCount),0)", visibleAtOrBefore)}) ELSE 0 END
       FROM telegram_inbox AS incoming WHERE ${freshReceipt}
     `).bind(...key),
+    ...clearBaseline,
     db.prepare(`
       DELETE FROM telegram_temp_batch WHERE receipt_id IN (
         SELECT temp.receipt_id FROM telegram_inbox AS incoming
@@ -145,26 +160,31 @@ export async function acceptTelegramTemp(
   if (event.chatType !== "private" || event.threadId !== null || !inTelegramScope(policy, event)) return "ignored";
 
   try {
+    const mode = await readTempStorage(db);
+    const ownerTotal = tempOwnerQuery(mode, "COALESCE(sum(nodeCount),0)");
     const raw = event.kind === "temp-raw";
     const nonce = crypto.randomUUID();
     const key = [policy.botId, event.updateId, nonce] as const;
-    const steps = [db.prepare(`
+    const steps = [db.prepare(`SELECT CASE WHEN (${tempSchemaGuard(mode)}) THEN 1
+      ELSE json_extract('temporary storage schema changed','$') END AS ready`), db.prepare(`
       INSERT INTO telegram_inbox
         (bot_id, update_id, actor_id, chat_id, chat_type, message_id, message_date, thread_id, command, receipt_nonce)
       SELECT ?, ?, ?, ?, 'private', ?, ?, NULL, 'help', ?
       WHERE (? = ? OR COALESCE((SELECT allowed = 1 AND message_date < ?
         FROM telegram_auth WHERE bot_id = ? AND user_id = ?), 1))
+      ${mode === "legacy-ready" ? `AND (${tempCutoverAllows(mode, "?", "?")})` : ""}
       ${raw ? `AND ? BETWEEN unixepoch()-900 AND unixepoch()+30
         AND NOT EXISTS (SELECT 1 FROM telegram_temp_clear_fence
           WHERE bot_id=? AND actor_id=? AND (message_date,message_id)>=(?,?))` : ""}
       ON CONFLICT (bot_id, update_id) DO NOTHING
     `).bind(policy.botId, event.updateId, event.actorId, event.chatId, event.messageId, event.messageDate, nonce,
       event.actorId, policy.adminId, event.messageDate, policy.botId, event.actorId,
+      ...(mode === "legacy-ready" ? [policy.botId, event.messageDate] : []),
       ...(raw ? [event.messageDate, policy.botId, event.actorId, event.messageDate, event.messageId] : []))];
     if (event.kind === "temp-text") {
-      steps.push(...textSteps(db, key, planText(event.text)));
+      steps.push(...textSteps(db, key, planText(event.text), mode));
     } else if (event.kind === "temp-clear") {
-      steps.push(...clearSteps(db, key));
+      steps.push(...clearSteps(db, key, mode));
     } else {
       steps.push(db.prepare(`
         INSERT INTO telegram_temp_reply (receipt_id, kind, node_count)
@@ -189,9 +209,7 @@ export async function acceptTelegramTemp(
               SELECT 1 FROM telegram_temp_batch AS temp
               WHERE temp.receipt_id = incoming.receipt_id AND ${sameOwner} AND temp.node_count = reply.node_count
             ))
-            AND (reply.kind <> 'cleared' OR NOT EXISTS (
-              SELECT 1 FROM telegram_temp_batch AS temp WHERE ${sameOwner} AND ${atOrBefore}
-            ))
+            AND (reply.kind <> 'cleared' OR NOT EXISTS (${tempOwnerQuery(mode, "1", visibleAtOrBefore)}))
         ) THEN command END
         WHERE ${freshReceipt}
         RETURNING receipt_id

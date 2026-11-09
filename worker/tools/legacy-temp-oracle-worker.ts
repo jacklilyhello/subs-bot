@@ -6,6 +6,7 @@ import { lstat, open, realpath } from "node:fs/promises";
 import { networkInterfaces } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { Log, LogLevel, Miniflare } from "miniflare";
+import { recordTempFixtureMigration } from "../test/temp-migration-fixture.ts";
 
 const DIGEST = /^[a-f0-9]{64}(?![\s\S])/u;
 const REVISION = /^[a-f0-9]{40}(?![\s\S])/u;
@@ -148,7 +149,7 @@ async function readInputs(uid: number) {
     requireOracle(exact(entry, ["name", "sha256"]) && matches(MIGRATION, entry.name) && Number(entry.name.slice(0, 4)) === index + 1);
     const body = await pinnedFile(join(directory, entry.name), entry.sha256, MAX_MIGRATION_BYTES - bytes, uid);
     bytes += body.length;
-    migrations.push({ name: entry.name, sql: decoder.decode(body) });
+    migrations.push({ name: entry.name, sha256: sha(body), sql: decoder.decode(body) });
   }
   requireOracle(migrations[1].name === "0002_telegram.sql" && migrations[7].name === "0008_telegram_temp_nodes.sql"
     && migrations[8].name === "0009_aggregate_links.sql");
@@ -161,6 +162,7 @@ async function setup(db: D1Database, fixture: Awaited<ReturnType<typeof readInpu
     const statements = migration.sql.trim().split(/;\s*/u).filter(Boolean);
     const result = await db.batch(statements.map((sql) => db.prepare(sql)));
     requireOracle(result.length === statements.length && result.every((entry) => entry.success === true));
+    await recordTempFixtureMigration(db, migration);
   }
   stage = "d1-seed";
   const { botId, owners } = fixture;

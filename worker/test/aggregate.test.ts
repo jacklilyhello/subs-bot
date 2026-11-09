@@ -13,6 +13,7 @@ import { createSubscription, MAX_CHUNK_BYTES, publishNodeSnapshot, type ExportNo
 import { restoreOwnedSubscription, trashOwnedSubscription } from "../src/subscriptions.ts";
 import type { TelegramPolicy, TelegramTempUpdate } from "../src/telegram/protocol.ts";
 import { acceptTelegramTemp } from "../src/telegram/temp-import.ts";
+import { recordTempFixtureMigration } from "./temp-migration-fixture.ts";
 
 const miniflare = new Miniflare({
   modules: true,
@@ -29,8 +30,9 @@ before(async () => {
   db = await miniflare.getD1Database("DB");
   bucket = await miniflare.getR2Bucket("NODES");
   for (const name of (await readdir(migrations)).filter((file) => file.endsWith(".sql")).sort()) {
-    const sql = await readFile(new URL(name, migrations), "utf8");
-    await db.batch(sql.trim().split(/;\s*/u).filter(Boolean).map((statement) => db.prepare(statement)));
+    const bytes = await readFile(new URL(name, migrations));
+    await db.batch(bytes.toString("utf8").trim().split(/;\s*/u).filter(Boolean).map((statement) => db.prepare(statement)));
+    await recordTempFixtureMigration(db, { name, sha256: createHash("sha256").update(bytes).digest("hex") });
   }
   // The emitted Worker tests cover native response framing.
   class FixedLengthStreamShim extends TransformStream<Uint8Array, Uint8Array> {

@@ -173,6 +173,10 @@ class FakeCloudflare:
         self.selected_occupancy = None
         self.selected_occupancy_at = {}
         self.selected_reads = 0
+        self.temp_schema = "absent"
+        self.temp_occupancy = None
+        self.temp_occupancy_at = {}
+        self.temp_reads = 0
 
     def worker_api(self, method, path, payload=None):
         self.calls.append((method, path))
@@ -247,6 +251,34 @@ class FakeCloudflare:
     def data_api(self, method, path, payload=None):
         if method == "POST" and path == DATABASE + "/query":
             sql = payload["sql"]
+            if any(field in sql for field in ("AS tempTables", "AS tempRegistered", "AS tempInstallSql")):
+                if "AS tempInstallSql" in sql:
+                    self.temp_reads += 1
+                occupied = self.temp_occupancy_at.get(self.temp_reads, self.temp_occupancy)
+                with closing(sqlite3.connect(":memory:")) as db:
+                    db.row_factory = sqlite3.Row
+                    if self.temp_schema not in ("absent", "missing-ledger"):
+                        db.execute("CREATE TABLE subs_bot_schema_migrations(position INTEGER PRIMARY KEY,name TEXT,sha256 TEXT,mode TEXT)")
+                        if self.temp_schema not in ("old-ledger", "unregistered"):
+                            digest = "0" * 64 if self.temp_schema == "bad-ledger" else cloudflare.LEGACY_TEMP_MIGRATION_SHA256
+                            db.execute("INSERT INTO subs_bot_schema_migrations VALUES (39,?,?,'applied')",
+                                       (cloudflare.LEGACY_TEMP_MIGRATION, digest))
+                    if self.temp_schema not in ("absent", "old-ledger", "missing-tables"):
+                        migrations = Path(__file__).resolve().parents[1] / "migrations"
+                        ddl = (migrations / cloudflare.LEGACY_TEMP_MIGRATION).read_text(encoding="utf-8")
+                        if self.temp_schema == "partial":
+                            ddl = ddl.partition(";")[0]
+                        if self.temp_schema == "bad-ddl":
+                            ddl = ddl.replace("node_count BETWEEN 1 AND 500", "node_count BETWEEN 1 AND 501")
+                        db.executescript(ddl)
+                        if self.temp_schema == "extra-index":
+                            db.execute("CREATE INDEX unexpected_temp_actor ON legacy_temp_batches(actor_id)")
+                        if occupied == "installation":
+                            db.execute("INSERT INTO legacy_temp_installations VALUES ('123',?,NULL)", ("1" * 64,))
+                        if occupied == "orphan-batch":
+                            # The rollback floor must see occupied child rows even after external drift.
+                            db.execute("INSERT INTO legacy_temp_batches VALUES ('123','456',1,1,'[{}]',1,4,?)", ("2" * 64,))
+                    return [{"success": True, "results": [dict(row) for row in db.execute(sql)]}]
             if any(field in sql for field in ("AS sidecars", "AS selectedRegistered", "AS markerSql")):
                 if "AS markerSql" in sql:
                     self.selected_reads += 1
@@ -532,6 +564,79 @@ class ReleaseTests(unittest.TestCase):
         retirement = cloudflare.LEGACY_SELECTED_RETIREMENT_MARKER
         self.set_selected_capabilities(active=(retirement,), desired=(retirement, cloudflare.LEGACY_SELECTED_HTTP_MARKER))
         self.api.selected_schema = "ready"
+        self.api.health_available = False
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "prior version was restored"):
+            self.release_selected()
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS, DEPLOYMENTS])
+        self.assertEqual(self.api.active["versions"][0]["version_id"], OLD_VERSION)
+
+    def set_temp_capabilities(self, *, active=(), desired=(), exact_pin=True):
+        selected = (cloudflare.LEGACY_SELECTED_HTTP_MARKER, cloudflare.LEGACY_SELECTED_RETIREMENT_MARKER)
+        self.set_selected_capabilities(active=(*selected, *active), desired=(*selected, *desired))
+        self.api.selected_schema = "ready"
+        if not exact_pin:
+            self.manifest["migrations"][38]["sha256"] = "0" * 64
+
+    def test_temp_floor_refuses_each_occupied_table_unless_both_versions_are_capable(self):
+        both = (cloudflare.LEGACY_TEMP_READ_MARKER, cloudflare.LEGACY_TEMP_MUTATE_MARKER)
+        self.api.temp_schema = "ready"
+        for active, desired in ((both, ()), ((), both)):
+            self.set_temp_capabilities(active=active, desired=desired)
+            for occupied in ("installation", "orphan-batch"):
+                self.api.temp_occupancy = occupied
+                with self.subTest(active=bool(active), occupied=occupied):
+                    with self.assertRaisesRegex(cloudflare.CloudflareError, "while isolated baseline rows exist"):
+                        cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET,
+                                                        legacy_temp_capable=bool(desired))
+                    with self.assertRaisesRegex(cloudflare.CloudflareError, "while isolated baseline rows exist"):
+                        self.release_selected()
+        self.assertEqual(self.api.writes(), [])
+        self.set_temp_capabilities(active=both, desired=both)
+        self.api.temp_occupancy = "installation"
+        self.assertTrue(self.release_selected()["changed"])
+
+    def test_temp_floor_pins_both_markers_exact_ledger_schema_and_indexes(self):
+        read, mutate = cloudflare.LEGACY_TEMP_READ_MARKER, cloudflare.LEGACY_TEMP_MUTATE_MARKER
+        for desired, pin in (((read,), True), ((mutate,), True), ((read, mutate), False)):
+            self.set_temp_capabilities(desired=desired, exact_pin=pin)
+            with self.subTest(desired=desired, pin=pin), self.assertRaisesRegex(cloudflare.CloudflareError, "verified Worker"):
+                self.release_selected()
+        self.assertEqual(self.api.calls, [])
+        self.set_temp_capabilities(desired=(read, mutate))
+        self.api.temp_schema = "old-ledger"
+        self.assertEqual(cloudflare.verify_worker_target(self.api.worker_api, self.api.data_api, TARGET,
+            legacy_temp_capable=cloudflare.legacy_temp_artifact(self.bundle, self.manifest))["versionId"], OLD_VERSION)
+        for state in ("old-ledger", "partial", "missing-tables", "missing-ledger", "unregistered", "bad-ledger", "bad-ddl", "extra-index"):
+            self.api.temp_schema = state
+            with self.subTest(state=state), self.assertRaisesRegex(cloudflare.CloudflareError, "temporary-node schema or ledger"):
+                self.release_selected()
+        self.assertEqual(self.api.writes(), [])
+
+    def test_temp_floor_rechecks_after_staging_before_forward_activation(self):
+        both = (cloudflare.LEGACY_TEMP_READ_MARKER, cloudflare.LEGACY_TEMP_MUTATE_MARKER)
+        self.set_temp_capabilities(active=both)
+        self.api.temp_schema = "ready"
+        self.api.temp_occupancy_at = {3: "installation"}
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "while isolated baseline rows exist"):
+            self.release_selected()
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false"])
+        self.assertEqual(self.api.active["versions"][0]["version_id"], OLD_VERSION)
+
+    def test_temp_floor_blocks_rollback_when_baseline_appears_after_activation(self):
+        both = (cloudflare.LEGACY_TEMP_READ_MARKER, cloudflare.LEGACY_TEMP_MUTATE_MARKER)
+        self.set_temp_capabilities(desired=both)
+        self.api.temp_schema = "ready"
+        self.api.temp_occupancy_at = {4: "installation", 5: "installation"}
+        self.api.health_available = False
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "safe rollback could not be confirmed"):
+            self.release_selected()
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
+        self.assertEqual(self.api.active["versions"][0]["version_id"], NEW_VERSION)
+
+    def test_temp_floor_allows_empty_baseline_rollback_to_prior_runtime(self):
+        both = (cloudflare.LEGACY_TEMP_READ_MARKER, cloudflare.LEGACY_TEMP_MUTATE_MARKER)
+        self.set_temp_capabilities(desired=both)
+        self.api.temp_schema = "ready"
         self.api.health_available = False
         with self.assertRaisesRegex(cloudflare.CloudflareError, "prior version was restored"):
             self.release_selected()
@@ -1719,6 +1824,7 @@ class ReleaseTests(unittest.TestCase):
                 release_entry.release()
             self.assertEqual(verify.call_args.kwargs["private_share_key"], PRIVATE_SHARE_KEY)
             self.assertIs(verify.call_args.kwargs["legacy_selected_capable"], False)
+            self.assertIs(verify.call_args.kwargs["legacy_temp_capable"], False)
             migrate.assert_not_called()
             deploy.assert_not_called()
 

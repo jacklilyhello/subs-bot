@@ -72,6 +72,12 @@ LEGACY_SELECTED_HTTP_MARKER = b"subs-bot:legacy-selected-http:v1"
 LEGACY_SELECTED_RETIREMENT_MARKER = b"subs-bot:legacy-selected-retirement:v1"
 LEGACY_SELECTED_MARKER_TABLE_SHA256 = "6122d2db8608de2a1a548e4e210751cc4797ad4dd7de5be04f22a5de2973358c"
 LEGACY_SELECTED_MEMBER_TABLE_SHA256 = "7fd16b93997c1646e6160cec599a282564dc9ac3b0ab06a9a7166eacd95ab3f3"
+LEGACY_TEMP_MIGRATION = "0039_legacy_temp_baseline.sql"
+LEGACY_TEMP_MIGRATION_SHA256 = "4a5253618caf42baf997301d4e27c1d11f15166dadf48740d1c7d60da3af82d6"
+LEGACY_TEMP_READ_MARKER = b"subs-bot:legacy-temp-read:v1"
+LEGACY_TEMP_MUTATE_MARKER = b"subs-bot:legacy-temp-mutate:v1"
+LEGACY_TEMP_INSTALL_TABLE_SHA256 = "8cf3847e5df08a64261e82fbb972d9cde57be94143b35ca1de7c0f8dbbf0856f"
+LEGACY_TEMP_BATCH_TABLE_SHA256 = "2cc851299d68628cb46fe2d927adf027b551d010ac17e1bd42f8746273e59eca"
 AGGREGATE_KEY_BINDING = "TELEGRAM_AGGREGATE_KEY"
 AGGREGATE_DIGEST_BINDING = "TELEGRAM_AGGREGATE_KEY_SHA256"
 PRIVATE_SHARE_KEY_BINDING = "TELEGRAM_PRIVATE_SHARE_CREATION_KEY"
@@ -673,6 +679,58 @@ class _Isolation:
         _require(allow_rows or (state["markers"], state["members"]) == (0, 0),
                  "Keep a Worker with verified legacy selected export and retirement while isolated legacy selected rows exist.")
 
+    def verify_legacy_temp_floor(self, *, allow_rows, require_schema):
+        path = f"{self.account}/d1/database/{self.target['d1Id']}/query"
+        error = "The isolated legacy temporary-node schema or ledger could not be verified."
+
+        def read(sql, names):
+            result = self.data_api("POST", path, {"sql": sql})
+            _require(isinstance(result, list) and len(result) == 1 and result[0].get("success") is True, error)
+            rows = result[0].get("results")
+            _require(isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict)
+                     and set(rows[0]) == set(names), error)
+            return rows[0]
+
+        try:
+            schema = read("""SELECT
+                count(CASE WHEN name IN ('legacy_temp_installations','legacy_temp_batches') THEN 1 END) AS tempTables,
+                count(CASE WHEN name='subs_bot_schema_migrations' AND type='table' THEN 1 END) AS tempLedger
+                FROM sqlite_schema""", ("tempTables", "tempLedger"))
+            _require(type(schema["tempTables"]) is int and type(schema["tempLedger"]) is int and schema["tempLedger"] in (0, 1), error)
+            if schema["tempTables"] == 0:
+                _require(not require_schema, error)
+                if schema["tempLedger"]:
+                    pin = read(f"""SELECT EXISTS (SELECT 1 FROM subs_bot_schema_migrations
+                        WHERE position=39 OR name='{LEGACY_TEMP_MIGRATION}') AS tempRegistered""", ("tempRegistered",))
+                    _require(type(pin["tempRegistered"]) is int and pin["tempRegistered"] == 0, error)
+                return
+            _require(schema["tempTables"] == 2 and schema["tempLedger"] == 1, error)
+            state = read(f"""SELECT
+                (SELECT sql FROM sqlite_schema WHERE type='table' AND name='legacy_temp_installations'
+                    AND tbl_name='legacy_temp_installations') AS tempInstallSql,
+                (SELECT sql FROM sqlite_schema WHERE type='table' AND name='legacy_temp_batches'
+                    AND tbl_name='legacy_temp_batches') AS tempBatchSql,
+                (SELECT count(*) FROM sqlite_schema WHERE tbl_name IN ('legacy_temp_installations','legacy_temp_batches')) AS objects,
+                (SELECT count(*) FROM sqlite_schema WHERE type='index' AND sql IS NULL AND (
+                    (tbl_name='legacy_temp_installations' AND name='sqlite_autoindex_legacy_temp_installations_1') OR
+                    (tbl_name='legacy_temp_batches' AND name='sqlite_autoindex_legacy_temp_batches_1'))) AS primaryIndexes,
+                (SELECT count(*) FROM subs_bot_schema_migrations WHERE position=39 OR name='{LEGACY_TEMP_MIGRATION}') AS pins,
+                EXISTS (SELECT 1 FROM subs_bot_schema_migrations WHERE position=39 AND name='{LEGACY_TEMP_MIGRATION}'
+                    AND sha256='{LEGACY_TEMP_MIGRATION_SHA256}' AND mode='applied') AS pinned,
+                EXISTS (SELECT 1 FROM legacy_temp_installations) AS installations,
+                EXISTS (SELECT 1 FROM legacy_temp_batches) AS batches""",
+                ("tempInstallSql", "tempBatchSql", "objects", "primaryIndexes", "pins", "pinned", "installations", "batches"))
+            _require(all(type(state[key]) is int and state[key] == expected for key, expected in
+                         (("objects", 4), ("primaryIndexes", 2), ("pins", 1), ("pinned", 1)))
+                     and all(type(state[key]) is int and state[key] in (0, 1) for key in ("installations", "batches"))
+                     and isinstance(state["tempInstallSql"], str) and isinstance(state["tempBatchSql"], str)
+                     and sha256(state["tempInstallSql"].encode("ascii")).hexdigest() == LEGACY_TEMP_INSTALL_TABLE_SHA256
+                     and sha256(state["tempBatchSql"].encode("ascii")).hexdigest() == LEGACY_TEMP_BATCH_TABLE_SHA256, error)
+        except (CloudflareError, AttributeError, TypeError, ValueError):
+            raise CloudflareError(error) from None
+        _require(allow_rows or (state["installations"], state["batches"]) == (0, 0),
+                 "Keep a Worker with verified legacy temporary-node reads and mutations while isolated baseline rows exist.")
+
     def active(self):
         result = _object(self.worker_api("GET", self.deployments), "deployments").get("deployments")
         _require(isinstance(result, list) and result, "Isolated Worker has no verified active deployment.")
@@ -687,7 +745,7 @@ class _Isolation:
         annotations = _object(active.get("annotations") or {}, "deployment annotations")
         return _Deployment(active["id"], allocation["version_id"], annotations.get("workers/message"))
 
-    def version(self, version_id, *, with_legacy_selected=False):
+    def version(self, version_id, *, with_legacy_selected=False, with_legacy_temp=False):
         _require(_matches(UUID, version_id), "Invalid isolated Worker version ID.")
         version = _object(self.worker_api("GET", f"{self.versions}/{version_id}?include=modules"), "Worker version")
         _require(version.get("id") == version_id and version.get("main_module") == "index.js"
@@ -871,6 +929,11 @@ class _Isolation:
                         provider_batch is not None, batch_capable, api_status_binding, api_status is not None,
                         provider_documents is not None, documents_capable, mixed_documents is not None, mixed_documents_capable,
                         group_share_cards is not None, group_share_cards_capable)
+        if with_legacy_temp:
+            temp_capable = _legacy_temp_module_capable(body)
+            if with_legacy_selected:
+                return value, _legacy_selected_module_capable(body), temp_capable
+            return value, temp_capable
         return (value, _legacy_selected_module_capable(body)) if with_legacy_selected else value
 
     def verify_candidate(self, candidate, desired):
@@ -990,10 +1053,13 @@ class _Isolation:
                 return candidate
         raise CloudflareError("Isolated Worker upload could not be confirmed.", uncertain=True)
 
-    def activate(self, previous, version_id, message, *, current_capable, target_capable, guard):
+    def activate(self, previous, version_id, message, *, current_capable, target_capable, guard,
+                 current_temp_capable=False, target_temp_capable=False):
         # All tracked application deployment writes use this boundary, including rollback.
         self.verify_legacy_selected_floor(allow_rows=current_capable and target_capable,
                                           require_schema=current_capable or target_capable)
+        self.verify_legacy_temp_floor(allow_rows=current_temp_capable and target_temp_capable,
+                                      require_schema=current_temp_capable or target_temp_capable)
         _require(self.active() == previous, "Active isolated Worker deployment changed before activation.")
         _guard_current(guard)
         try:
@@ -1088,6 +1154,27 @@ def _legacy_selected_artifact_capable(module, manifest):
 
 def legacy_selected_artifact(bundle_dir, manifest):
     return _legacy_selected_artifact_capable(_verified_module(bundle_dir, manifest.get("bundleSha256")), manifest)
+
+
+def _legacy_temp_module_capable(module):
+    return LEGACY_TEMP_READ_MARKER in module and LEGACY_TEMP_MUTATE_MARKER in module
+
+
+def _legacy_temp_artifact_capable(module, manifest):
+    migrations = manifest.get("migrations")
+    has_marker = LEGACY_TEMP_READ_MARKER in module or LEGACY_TEMP_MUTATE_MARKER in module
+    capable = _legacy_temp_module_capable(module)
+    _require(isinstance(migrations, list) and (not has_marker or capable),
+             "The verified Worker lacks complete legacy temporary-node capability.")
+    if len(migrations) >= 39 or has_marker:
+        _require(len(migrations) >= 39 and migrations[38] == {
+            "name": LEGACY_TEMP_MIGRATION, "sha256": LEGACY_TEMP_MIGRATION_SHA256,
+        }, "The verified Worker artifact does not pin the exact legacy temporary-node migration.")
+    return capable
+
+
+def legacy_temp_artifact(bundle_dir, manifest):
+    return _legacy_temp_artifact_capable(_verified_module(bundle_dir, manifest.get("bundleSha256")), manifest)
 
 
 def _artifact(bundle_dir, manifest, telegram_config, aggregate_key=None, private_share_key=None, provider_binding=None):
@@ -1387,19 +1474,24 @@ def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECI
                          provider_refresh=None, legacy_subscription_shorts=None, provider_batch=None,
                          api_status=None, api_status_gate=_UNSPECIFIED_API_STATUS_GATE, provider_url_documents=None,
                          mixed_documents=None, group_share_cards=None, group_share_cards_capable=None,
-                         legacy_selected_capable=None):
+                         legacy_selected_capable=None, legacy_temp_capable=None):
     """Read ownership, privacy and active binding facts before any release writes."""
     scope = _Isolation(worker_api, data_api, target)
     scope.worker_config()
     had_cron = scope.cron_enabled()
     scope.verify_resources()
     active = scope.active()
-    version, active_selected_capable = scope.version(active.version, with_legacy_selected=True)
+    version, active_selected_capable, active_temp_capable = scope.version(
+        active.version, with_legacy_selected=True, with_legacy_temp=True)
     if legacy_selected_capable is not None:
         _require(type(legacy_selected_capable) is bool, "The verified legacy selected release capability is invalid.")
         # A first capable release may still be about to apply 0038.
         scope.verify_legacy_selected_floor(allow_rows=active_selected_capable and legacy_selected_capable,
                                           require_schema=active_selected_capable)
+    if legacy_temp_capable is not None:
+        _require(type(legacy_temp_capable) is bool, "The verified legacy temporary-node release capability is invalid.")
+        scope.verify_legacy_temp_floor(allow_rows=active_temp_capable and legacy_temp_capable,
+                                       require_schema=active_temp_capable)
     # Read-only fixtures can inspect the live binding without the secret.
     desired_digest = None
     if telegram_config is not _UNSPECIFIED_TELEGRAM_CONFIG:
@@ -1503,17 +1595,21 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
              "An isolated provider release requires a verified dependency guard.")
     module, desired = _artifact(bundle_dir, manifest, telegram_config, aggregate_key, private_share_key, provider_binding)
     desired_selected_capable = _legacy_selected_artifact_capable(module, manifest)
+    desired_temp_capable = _legacy_temp_artifact_capable(module, manifest)
     scope = _Isolation(worker_api, data_api, target)
     config = scope.worker_config()
     had_cron = scope.cron_enabled()
     scope.verify_resources()
     previous = scope.active()
-    old_version, old_selected_capable = scope.version(previous.version, with_legacy_selected=True)
+    old_version, old_selected_capable, old_temp_capable = scope.version(
+        previous.version, with_legacy_selected=True, with_legacy_temp=True)
     _require(expected_active is None or expected_active == {
         "deploymentId": previous.id, "versionId": previous.version, "revision": old_version.revision,
     }, "Isolated Worker deployment changed while verifying D1.")
     scope.verify_legacy_selected_floor(allow_rows=old_selected_capable and desired_selected_capable,
                                       require_schema=old_selected_capable or desired_selected_capable)
+    scope.verify_legacy_temp_floor(allow_rows=old_temp_capable and desired_temp_capable,
+                                   require_schema=old_temp_capable or desired_temp_capable)
     _require(old_version.compatibility == desired.compatibility, "Worker compatibility date change requires separate approval.")
     _require_telegram_config_continuity(old_version, desired.telegram_config_sha256)
     _require(telegram_config is not None or (not had_cron and old_version.telegram_config_sha256 is None),
@@ -1615,6 +1711,7 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                 desired.telegram_mixed_documents, desired.telegram_mixed_documents_capable,
                 desired.telegram_group_share_cards, desired.telegram_group_share_cards_capable):
             scope.verify_legacy_selected_floor(allow_rows=old_selected_capable, require_schema=old_selected_capable)
+            scope.verify_legacy_temp_floor(allow_rows=old_temp_capable, require_schema=old_temp_capable)
             if telegram_config is None:
                 _require(scope.active() == previous, "Active isolated Worker deployment changed during verification.")
                 _guard_current(guard)
@@ -1631,6 +1728,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
     candidate = scope.staged(desired)
     if candidate is None:
         _require(scope.active() == previous, "Active isolated Worker deployment changed before upload.")
+        scope.verify_legacy_temp_floor(allow_rows=old_temp_capable and desired_temp_capable,
+                                       require_schema=old_temp_capable or desired_temp_capable)
         _guard_current(guard)
         candidate = scope.upload(module, desired, telegram_config, aggregate_key, private_share_key)
 
@@ -1658,13 +1757,15 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
     if verify_group_schema:
         scope.verify_group_share_cards(drained=not group_capable)
     activated = scope.activate(previous, candidate, f"Isolated Worker release {desired.revision} {uuid4()}",
-                               current_capable=old_selected_capable, target_capable=desired_selected_capable, guard=guard)
+                               current_capable=old_selected_capable, target_capable=desired_selected_capable, guard=guard,
+                               current_temp_capable=old_temp_capable, target_temp_capable=desired_temp_capable)
     try:
         _require(scope.worker_config() == config, "Isolated Worker configuration changed after activation.")
         _require(scope.cron_enabled() == had_cron, "Isolated Worker schedule changed during activation.")
         scope.verify_resources()
         _require(scope.version(activated.version) == desired, "Active Worker version differs from the verified artifact.")
         scope.verify_legacy_selected_floor(allow_rows=desired_selected_capable, require_schema=desired_selected_capable)
+        scope.verify_legacy_temp_floor(allow_rows=desired_temp_capable, require_schema=desired_temp_capable)
         _verify_health(desired.revision)
         if inline_bot is not None:
             scope.verify_inline_search(inline_bot)
@@ -1705,9 +1806,11 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
             if verify_group_schema:
                 scope.verify_group_share_cards(drained=not old_version.telegram_group_share_cards_capable)
             restored = scope.activate(activated, previous.version, f"Isolated Worker rollback {uuid4()}",
-                                      current_capable=desired_selected_capable, target_capable=old_selected_capable, guard=guard)
+                                      current_capable=desired_selected_capable, target_capable=old_selected_capable, guard=guard,
+                                      current_temp_capable=desired_temp_capable, target_temp_capable=old_temp_capable)
             _verify_health(old_version.revision)
             scope.verify_legacy_selected_floor(allow_rows=old_selected_capable, require_schema=old_selected_capable)
+            scope.verify_legacy_temp_floor(allow_rows=old_temp_capable, require_schema=old_temp_capable)
             if (inline_bot is not None or verify_provider_schema is not None or verify_legacy_shorts or batch_capable
                     or api_status_capable or documents_capable or verify_group_schema):
                 _require(scope.version(restored.version) == old_version, "Isolated Worker Telegram rollback state differs.")

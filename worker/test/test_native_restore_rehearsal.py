@@ -465,6 +465,26 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(second["params"], ["001", "31"])
         self.assertIn('("tenant","id") > (?, CAST(? AS INTEGER))', second["sql"])
 
+    def test_legacy_temp_restore_readback_pages_one_payload_at_a_time(self):
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.row_factory = sqlite3.Row
+        db.execute("CREATE TABLE legacy_temp_batches (bot TEXT, actor TEXT, id INTEGER, payload TEXT, PRIMARY KEY(bot,actor,id))")
+        db.executemany("INSERT INTO legacy_temp_batches VALUES (?,?,?,?)",
+                       [("123", "456", 1, "a" * 240_000), ("123", "456", 2, "b" * 240_000)])
+        layout = native.table_layout(db, ["legacy_temp_batches"])
+        expected = native.data_summary(layout, lambda _table, _definition: db.execute(
+            "SELECT bot,actor,id,payload FROM legacy_temp_batches ORDER BY bot,actor,id"))
+
+        def rows(database_id, sql, parameters):
+            self.assertEqual(database_id, RESTORE_ID)
+            self.assertTrue(sql.endswith("LIMIT 1"))
+            return [dict(row) for row in db.execute(sql, parameters)]
+
+        with patch.object(self.api, "rows", side_effect=rows) as read:
+            self.assertEqual(native.remote_summary(self.api, RESTORE_ID, layout), expected)
+        self.assertEqual(read.call_count, 3)
+
     def test_r2_inventory_cannot_treat_a_truncated_page_as_complete(self):
         first = {"key": "private-shares/first.txt"}
         second = {"key": "private-shares/second.txt"}

@@ -1,10 +1,10 @@
 import { validInteger } from "../storage.ts";
-import { isValidStoredShare } from "../stored-share.ts";
 import { inTelegramScope, type TelegramCommand, type TelegramPolicy } from "./protocol.ts";
+import { renderTelegramTemp, tempRawStamp, type TelegramTempReply } from "./temp-import.ts";
 import {
-  MAX_TEMP_BATCH_BYTES, MAX_TEMP_OWNER_BYTES, MAX_TEMP_OWNER_NODES, renderTelegramTemp,
-  TELEGRAM_TEMP_MARKER, tempRawStamp, type TelegramTempReply,
-} from "./temp-import.ts";
+  MAX_TEMP_OWNER_BYTES, MAX_TEMP_OWNER_NODES, ownedTempRowsSql, readTempBatchNodes, readTempStorage, tempInventoryGuard,
+  tempSchemaGuard, verifyTempInventory, type TempBatchMeta, type TempBatchRow, type TempStorageMode,
+} from "./temp-storage.ts";
 
 const PAGE_BYTES = 512 * 1024;
 const PAGE_BATCHES = 256;
@@ -25,15 +25,6 @@ export type TelegramTempRawReply =
   | { kind: "document"; caption: string; file: Blob; guard: TelegramTempRawGuard }
   | { kind: "stale" | "unavailable" };
 
-interface BatchMeta {
-  id: number;
-  date: number;
-  message: number;
-  nodeCount: number;
-  bytes: number;
-}
-type RawBatch = BatchMeta & { json: string };
-
 const scope = `inbox.receipt_id=? AND inbox.bot_id=? AND inbox.update_id=? AND inbox.actor_id=?
   AND inbox.chat_id=? AND inbox.chat_type='private' AND inbox.chat_id=inbox.actor_id AND inbox.thread_id IS NULL
   AND inbox.message_id=? AND inbox.message_date=? AND inbox.command='help'
@@ -42,12 +33,7 @@ const eligible = `inbox.receipt_nonce=(${tempRawStamp("inbox")}) AND (inbox.acto
   SELECT allowed=1 AND message_date<inbox.message_date FROM telegram_auth
   WHERE bot_id=inbox.bot_id AND user_id=inbox.actor_id
 ),1))`;
-const metadata = "batch.receipt_id AS id,batch.message_date AS date,batch.message_id AS message,batch.node_count AS nodeCount,batch.payload_bytes AS bytes";
-const ownPaste = `JOIN telegram_inbox AS paste ON paste.receipt_id=batch.receipt_id AND paste.bot_id=batch.bot_id
-  AND paste.actor_id=batch.actor_id AND paste.chat_id=batch.actor_id AND paste.chat_type='private' AND paste.thread_id IS NULL
-  AND paste.message_date=batch.message_date AND paste.message_id=batch.message_id AND paste.receipt_nonce='${TELEGRAM_TEMP_MARKER}'
-  JOIN telegram_temp_reply AS accepted ON accepted.receipt_id=paste.receipt_id AND accepted.kind='added'
-    AND accepted.node_count=batch.node_count`;
+const tempScope = `SELECT inbox.bot_id,inbox.actor_id,inbox.receipt_id AS before_receipt,inbox.message_date AS visibility_epoch`;
 
 function scopeArgs(policy: TelegramPolicy, lease: RawLease) {
   return [lease.receiptId, policy.botId, lease.updateId, lease.actorId, lease.chatId, lease.messageId,
@@ -59,33 +45,26 @@ function readyScope(policy: TelegramPolicy, lease: RawLease): lease is RawLease 
     && lease.threadId === null && inTelegramScope(policy, lease);
 }
 
-function exactInventory(policy: TelegramPolicy, rows: readonly BatchMeta[], nodeCount: number): TelegramTempRawGuard {
-  const inventory = JSON.stringify(rows.map((row) => [row.id, row.date, row.message, row.nodeCount, row.bytes]));
+function exactInventory(policy: TelegramPolicy, mode: TempStorageMode, rows: readonly TempBatchMeta[], nodeCount: number): TelegramTempRawGuard {
+  const inventory = tempInventoryGuard(mode, tempScope, rows);
   return {
     sql: `(${eligible}) AND EXISTS (SELECT 1 FROM telegram_temp_reply
       WHERE receipt_id=inbox.receipt_id AND kind='summary' AND total_count=?)
-      AND (SELECT count(*) FROM telegram_temp_batch
-        WHERE bot_id=inbox.bot_id AND actor_id=inbox.actor_id AND receipt_id<inbox.receipt_id)=?
-      AND NOT EXISTS (SELECT 1 FROM json_each(?) AS expected
-        LEFT JOIN telegram_temp_batch AS batch ON batch.receipt_id=json_extract(expected.value,'$[0]')
-          AND batch.bot_id=inbox.bot_id AND batch.actor_id=inbox.actor_id AND batch.receipt_id<inbox.receipt_id
-          AND batch.message_date=json_extract(expected.value,'$[1]') AND batch.message_id=json_extract(expected.value,'$[2]')
-          AND batch.node_count=json_extract(expected.value,'$[3]') AND batch.payload_bytes=json_extract(expected.value,'$[4]')
-        WHERE batch.receipt_id IS NULL)`,
-    bindings: [policy.adminId, policy.adminId, nodeCount, rows.length, inventory],
+      AND (${inventory.sql})`,
+    bindings: [policy.adminId, policy.adminId, nodeCount, ...inventory.bindings],
   };
 }
 
-async function readPage(db: D1Database, policy: TelegramPolicy, lease: RawLease, expected: readonly BatchMeta[]) {
+async function readPage(db: D1Database, policy: TelegramPolicy, lease: RawLease, mode: TempStorageMode, expected: readonly TempBatchMeta[]) {
   return db.prepare(`WITH authorized AS (
-    SELECT inbox.bot_id,inbox.actor_id,inbox.receipt_id FROM telegram_inbox AS inbox JOIN telegram_outbox AS reply USING(receipt_id)
-    WHERE ${scope} AND reply.state='leased' AND (${eligible})
-  ) SELECT ${metadata},batch.nodes_json AS json FROM authorized
-    JOIN telegram_temp_batch AS batch ON batch.bot_id=authorized.bot_id AND batch.actor_id=authorized.actor_id
-      AND batch.receipt_id<authorized.receipt_id
-    JOIN json_each(?) AS expected ON expected.value=batch.receipt_id
-    ${ownPaste} ORDER BY batch.receipt_id`)
-    .bind(...scopeArgs(policy, lease), policy.adminId, policy.adminId, JSON.stringify(expected.map((row) => row.id))).all<RawBatch>();
+    ${tempScope} FROM telegram_inbox AS inbox JOIN telegram_outbox AS reply USING(receipt_id)
+    WHERE ${scope} AND reply.state='leased' AND (${eligible}) AND (${tempSchemaGuard(mode)})
+  ), wanted AS (
+    SELECT json_extract(value,'$[0]') AS source,json_extract(value,'$[1]') AS id FROM json_each(?)
+  ) SELECT * FROM (${ownedTempRowsSql(mode, "authorized", { includePayload: true, verifyLive: true, keysCte: "wanted" })})
+    ORDER BY source,id`)
+    .bind(...scopeArgs(policy, lease), policy.adminId, policy.adminId,
+      JSON.stringify(expected.map(({ source, id }) => [source, id]))).all<TempBatchRow>();
 }
 
 export async function prepareTelegramTempRawReply(
@@ -93,37 +72,28 @@ export async function prepareTelegramTempRawReply(
 ): Promise<TelegramTempRawReply> {
   if (!readyScope(policy, lease)) return { kind: "stale" };
   try {
+    const mode = await readTempStorage(db);
     // The first transaction reads only identities and declared byte counts. A
     // later retry sees the same immutable batches or refuses the old request.
-    const [receipt, metadataRows] = await db.batch<BatchMeta | { totalCount: number }>([
+    const [receipt, metadataRows] = await db.batch<TempBatchMeta | { totalCount: number }>([
       db.prepare(`SELECT action.total_count AS totalCount FROM telegram_inbox AS inbox
         JOIN telegram_outbox AS reply USING(receipt_id) JOIN telegram_temp_reply AS action USING(receipt_id)
-        WHERE ${scope} AND reply.state='leased' AND action.kind='summary' AND (${eligible})`)
+        WHERE ${scope} AND reply.state='leased' AND action.kind='summary' AND (${eligible}) AND (${tempSchemaGuard(mode)})`)
         .bind(...scopeArgs(policy, lease), policy.adminId, policy.adminId),
-      db.prepare(`SELECT ${metadata} FROM telegram_temp_batch AS batch ${ownPaste}
-        WHERE batch.bot_id=? AND batch.actor_id=? AND batch.receipt_id<? ORDER BY batch.receipt_id LIMIT ?`)
-        .bind(policy.botId, lease.actorId, lease.receiptId, MAX_TEMP_OWNER_NODES + 1),
+      db.prepare(`WITH owned AS (
+        SELECT ? AS bot_id,? AS actor_id,? AS before_receipt,? AS visibility_epoch
+      ) SELECT * FROM (${ownedTempRowsSql(mode, "owned", { verifyLive: true })}) ORDER BY source,id LIMIT ?`)
+        .bind(policy.botId, lease.actorId, lease.receiptId, lease.messageDate, MAX_TEMP_OWNER_NODES + 1),
     ]);
     if (!receipt?.success || !metadataRows?.success) return { kind: "unavailable" };
     const admitted = receipt.results[0] as { totalCount: number } | undefined;
     if (!admitted || admitted.totalCount !== lease.temp.totalCount) return { kind: "stale" };
-    const rows = metadataRows.results as BatchMeta[];
+    const rows = metadataRows.results as TempBatchMeta[];
     if (!validInteger(admitted.totalCount, 0, MAX_TEMP_OWNER_NODES) || rows.length > MAX_TEMP_OWNER_NODES) {
       return { kind: "unavailable" };
     }
-    let nodes = 0;
-    let bytes = 0;
-    let previousId = 0;
-    for (const row of rows) {
-      if (!validInteger(row.id, previousId + 1, lease.receiptId - 1) || !validInteger(row.date, 1)
-        || !validInteger(row.message, 1) || !validInteger(row.nodeCount, 1, 500) || !validInteger(row.bytes, 1, MAX_TEMP_BATCH_BYTES)) {
-        return { kind: "unavailable" };
-      }
-      previousId = row.id;
-      nodes += row.nodeCount;
-      bytes += row.bytes;
-    }
-    if (nodes !== admitted.totalCount || bytes > MAX_TEMP_OWNER_BYTES) return { kind: "unavailable" };
+    const { nodeCount: nodes } = verifyTempInventory(rows);
+    if (nodes !== admitted.totalCount) return { kind: "unavailable" };
 
     const lines: string[] = [];
     let rawBytes = 0;
@@ -137,33 +107,32 @@ export async function prepareTelegramTempRawReply(
         size += rows[end++].bytes;
       }
       const expected = rows.slice(start, end);
-      const page = await readPage(db, policy, lease, expected);
+      const page = await readPage(db, policy, lease, mode, expected);
       if (!page.success) return { kind: "unavailable" };
       if (page.results.length !== expected.length) return { kind: "stale" };
       for (const [index, batch] of page.results.entries()) {
         const reference = expected[index];
-        if (batch.id !== reference.id || batch.date !== reference.date || batch.message !== reference.message
-          || batch.nodeCount !== reference.nodeCount || batch.bytes !== reference.bytes || typeof batch.json !== "string"
-          || encoder.encode(batch.json).byteLength !== batch.bytes) return { kind: "unavailable" };
-        const parsed: unknown = JSON.parse(batch.json);
-        if (!Array.isArray(parsed) || parsed.length !== batch.nodeCount) return { kind: "unavailable" };
-        for (const node of parsed) {
-          if (node === null || typeof node !== "object" || Array.isArray(node) || !isValidStoredShare(node.share)) {
-            return { kind: "unavailable" };
-          }
+        if (batch.source !== reference.source || batch.id !== reference.id || batch.lastId !== reference.lastId
+          || batch.date !== reference.date || batch.message !== reference.message || batch.accepted !== reference.accepted
+          || batch.nodeCount !== reference.nodeCount || batch.bytes !== reference.bytes || batch.sha256 !== reference.sha256) {
+          return { kind: "unavailable" };
+        }
+        for (const node of await readTempBatchNodes(batch, { requireStoredShare: true })) {
+          const share = node.share;
+          if (typeof share !== "string") return { kind: "unavailable" };
           const separator = lines.length ? 1 : 0;
-          rawBytes += encoder.encode(node.share).byteLength + separator;
-          units += node.share.length + separator;
+          rawBytes += encoder.encode(share).byteLength + separator;
+          units += share.length + separator;
           if (rawBytes > MAX_TEMP_OWNER_BYTES) return { kind: "unavailable" };
-          document ||= /\p{Cf}/u.test(node.share);
-          lines.push(node.share);
+          document ||= /\p{Cf}/u.test(share);
+          lines.push(share);
         }
       }
       start = end;
     }
     if (lines.length !== nodes || Date.now() >= deadline) return { kind: "unavailable" };
     const caption = renderTelegramTemp(lease.temp);
-    const guard = exactInventory(policy, rows, nodes);
+    const guard = exactInventory(policy, mode, rows, nodes);
     if (!document && caption.length + (nodes ? 2 + units : 0) <= TEXT_UNITS) {
       return { kind: "text", text: nodes ? caption + "\n\n" + lines.join("\n") : caption, guard };
     }

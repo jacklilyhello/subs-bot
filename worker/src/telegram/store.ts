@@ -10,6 +10,7 @@ import { TELEGRAM_PRIVATE_CLAIM_MARKER } from "./private-claims.ts";
 import { groupShareClaimGuard, TELEGRAM_GROUP_CLAIM_MARKER } from "./group-share-actions.ts";
 import { TELEGRAM_TEMP_MARKER, tempRawMarker, type TelegramTempReply } from "./temp-import.ts";
 import type { TelegramTempRawGuard } from "./temp-raw.ts";
+import { readTempStorage } from "./temp-storage.ts";
 import { aggregateLinkDeliveryGuard, TELEGRAM_AGGREGATE_MARKER, type TelegramAggregateReply } from "./aggregate-actions.ts";
 import { TELEGRAM_PATH_MARKER, type TelegramPathReply } from "./path-management.ts";
 import { TELEGRAM_DOCUMENT_JOB_MARKER, type TelegramDocumentJobResult } from "./document-jobs.ts";
@@ -574,7 +575,9 @@ export async function closeUnsentTelegramGroupClaim(db: D1Database, policy: Tele
 
 export async function beginTelegramAggregateLinkReply(db: D1Database, policy: TelegramPolicy, lease: TelegramReplyLease): Promise<boolean> {
   if (!inTelegramScope(policy, lease) || lease.chatType !== "private" || lease.threadId !== null || !lease.aggregate) return false;
-  const guard = aggregateLinkDeliveryGuard(policy, lease.aggregate);
+  const mode = await readTempStorage(db).catch(() => null);
+  if (mode === null) return false;
+  const guard = aggregateLinkDeliveryGuard(policy, lease.aggregate, mode);
   return guard !== null && await beginReplyStatement(db, policy, lease, "allowed", guard).first() !== null;
 }
 

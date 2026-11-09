@@ -738,7 +738,7 @@ def remote_summary(api, database_id, layout):
         last = None
         while True:
             predicate = "" if last is None else " WHERE (" + ",".join(map(_identifier, primary)) + ") > (" + key_bindings + ")"
-            limit = 1 if table == "telegram_temp_batch" else 32
+            limit = 1 if table in {"telegram_temp_batch", "legacy_temp_batches"} else 32
             sql = "SELECT " + ",".join(map(_identifier, columns)) + " FROM " + _identifier(table) + predicate
             sql += " ORDER BY " + ",".join(map(_identifier, primary)) + f" LIMIT {limit}"
             page = api.rows(database_id, sql, last or ())

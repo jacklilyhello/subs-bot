@@ -3,7 +3,10 @@ import {
   planSnapshotRead, readPlannedSnapshotNodes, SnapshotIntegrityError, validInteger,
   type ExportNodeSource, type NodeRecord, type SnapshotReadPlan, type SubscriptionSnapshot,
 } from "./storage.ts";
-import { MAX_TEMP_BATCH_BYTES, MAX_TEMP_OWNER_BYTES, MAX_TEMP_OWNER_NODES } from "./telegram/temp-import.ts";
+import {
+  MAX_TEMP_OWNER_BYTES, MAX_TEMP_OWNER_NODES, ownedTempRowsSql, readTempBatchNodes, readTempStorage, tempSchemaGuard,
+  verifyTempInventory, TempStorageLimitError, type TempBatchRow,
+} from "./telegram/temp-storage.ts";
 import { compilePathRules, MAX_PATH_RULES, pathRuleMapper, type PathRuleRow } from "./path-rules.ts";
 import { legacySelectedStatusSql, readShortLinkNamespaces, SHORT_CODE, shortCodeDigest } from "./short-links.ts";
 import { LEGACY_EMPTY_EXPORT_PIN } from "./legacy-empty-export.ts";
@@ -12,16 +15,11 @@ const EMPTY_TOKEN = /^[A-Za-z0-9_-]{16,128}(?![\s\S])/u;
 export const MAX_AGGREGATE_MEMBERS = 128;
 const encoder = new TextEncoder();
 const activeLink = "FROM aggregate_links WHERE code_sha256 = ? AND revoked_at IS NULL";
-const ownerTemp = `FROM link JOIN telegram_temp_batch AS temp
-  ON temp.bot_id = link.bot_id AND temp.actor_id = link.owner_id WHERE link.kind = 'all'`;
-const tempTotals = `SELECT count(*) AS batchCount, COALESCE(sum(node_count), 0) AS nodeCount,
-  COALESCE(sum(payload_bytes), 0) AS bytes ${ownerTemp}`;
 const pointerColumns = `sub.id, sub.generation, sub.snapshot_id AS snapshotId,
   sub.manifest_sha256 AS manifestSha256, sub.node_count AS nodeCount`;
 
-interface LinkRow { kind: "all" | "selected"; selectedIds: string | null; legacySelected: number }
+interface LinkRow { kind: "all" | "selected"; selectedIds: string | null; legacySelected: number; tempReady: number }
 interface TempTotals { batchCount: number; nodeCount: number; bytes: number }
-interface TempRow { json: string; nodeCount: number; bytes: number }
 interface LegacyMember {
   position: number;
   selectedId: number;
@@ -34,7 +32,7 @@ interface LegacyMember {
   emptyToken: string | null;
   emptyTokenSha256: string | null;
 }
-type Row = LinkRow | SubscriptionSnapshot | TempTotals | TempRow | PathRuleRow | LegacyMember;
+type Row = LinkRow | SubscriptionSnapshot | TempTotals | TempBatchRow | PathRuleRow | LegacyMember;
 interface AggregateNodeSource extends ExportNodeSource { readonly legacySelected: boolean }
 
 export class AggregateLimitError extends Error {}
@@ -82,37 +80,18 @@ async function legacySnapshots(ids: number[], members: LegacyMember[]): Promise<
   return snapshots;
 }
 
-function verifyTemp(totals: TempTotals, rows: TempRow[]): void {
+function verifyTemp(totals: TempTotals, rows: TempBatchRow[]): void {
   if (!validInteger(totals.batchCount, 0) || !validInteger(totals.nodeCount, 0) || !validInteger(totals.bytes, 0)) {
     throw new SnapshotIntegrityError();
   }
   if (totals.nodeCount > MAX_TEMP_OWNER_NODES || totals.bytes > MAX_TEMP_OWNER_BYTES) throw new AggregateLimitError();
-  let nodes = 0;
-  let bytes = 0;
-  for (const row of rows) {
-    if (typeof row.json !== "string" || !validInteger(row.nodeCount, 1, 500) ||
-        !validInteger(row.bytes, 1, MAX_TEMP_BATCH_BYTES) || encoder.encode(row.json).length !== row.bytes) {
-      throw new SnapshotIntegrityError();
-    }
-    nodes += row.nodeCount;
-    bytes += row.bytes;
-  }
-  if (nodes !== totals.nodeCount || bytes !== totals.bytes || rows.length !== totals.batchCount) {
-    throw new SnapshotIntegrityError();
-  }
-}
-
-function* readTemp({ json, nodeCount }: TempRow): Generator<NodeRecord> {
   try {
-    const nodes: unknown = JSON.parse(json);
-    if (!Array.isArray(nodes) || nodes.length !== nodeCount) throw new SnapshotIntegrityError();
-    for (const node of nodes) {
-      if (typeof node !== "object" || node === null || Array.isArray(node)) throw new SnapshotIntegrityError();
-      yield node as NodeRecord;
-    }
-  } catch {
-    throw new SnapshotIntegrityError();
+    const checked = verifyTempInventory(rows);
+    if (checked.nodeCount === totals.nodeCount && checked.bytes === totals.bytes && rows.length === totals.batchCount) return;
+  } catch (error) {
+    if (error instanceof TempStorageLimitError) throw new AggregateLimitError();
   }
+  throw new SnapshotIntegrityError();
 }
 
 export async function getAggregateNodeSource(
@@ -120,7 +99,7 @@ export async function getAggregateNodeSource(
 ): Promise<AggregateNodeSource | null> {
   const digest = await codeDigest(code);
   if (digest === null) return null;
-  const schema = await readShortLinkNamespaces(db);
+  const [schema, tempStorage] = await Promise.all([readShortLinkNamespaces(db), readTempStorage(db).catch(() => null)]);
   const availableLink = `${activeLink}
     ${schema.normal ? "AND NOT EXISTS (SELECT 1 FROM normal_short_links AS normal WHERE normal.code_sha256=aggregate_links.code_sha256)" : ""}
     ${schema.legacySubscription ? `AND NOT EXISTS (SELECT 1 FROM legacy_subscription_short_links AS legacy
@@ -130,10 +109,19 @@ export async function getAggregateNodeSource(
   const readLegacy = code.length === 12 && schema.selectedMarker && schema.selectedMembers
     && schema.migrationLedger && schema.normal && schema.legacySubscription;
   const readEmpty = schema.legacyEmpty && schema.migrationLedger;
+  const mode = tempStorage ?? "live-only";
+  const tempReady = tempStorage === null ? "0" : tempSchemaGuard(mode);
+  const withTemp = `${withLink}, temp_scope AS (
+    SELECT bot_id,owner_id AS actor_id,NULL AS before_receipt,NULL AS visibility_epoch
+    FROM link WHERE kind='all' AND (${tempReady})
+  )`;
+  const tempTotals = `SELECT count(*) AS batchCount,COALESCE(sum(nodeCount),0) AS nodeCount,COALESCE(sum(bytes),0) AS bytes
+    FROM (${ownedTempRowsSql(mode, "temp_scope", { verifyLive: false })})`;
   // All inputs come from one D1 transaction. Each statement starts at the same digest
   // and only the matching owner can contribute a subscription or temporary batch.
   const results = await db.batch<Row>([
-    db.prepare(`${withLink} SELECT kind, selected_ids AS selectedIds, legacySelected FROM link`).bind(digest),
+    db.prepare(`${withLink} SELECT kind, selected_ids AS selectedIds, legacySelected,
+      CASE WHEN kind='all' THEN (${tempReady}) ELSE 1 END AS tempReady FROM link`).bind(digest),
     db.prepare(`${withLink}
       SELECT ${pointerColumns} FROM link JOIN subscriptions AS sub ON sub.owner_id = link.owner_id
       WHERE link.kind = 'all' AND sub.generation > 0 ORDER BY sub.id LIMIT ?
@@ -144,14 +132,10 @@ export async function getAggregateNodeSource(
       WHERE link.kind = 'selected' AND link.legacySelected=0 AND member.type = 'integer' AND sub.generation > 0
       ORDER BY CAST(member.key AS INTEGER) LIMIT ?
     `).bind(digest, MAX_AGGREGATE_MEMBERS + 1),
-    db.prepare(`${withLink} ${tempTotals}`).bind(digest),
-    db.prepare(`${withLink}, totals AS (${tempTotals})
-      SELECT temp.nodes_json AS json, temp.node_count AS nodeCount, temp.payload_bytes AS bytes
-      FROM link JOIN telegram_temp_batch AS temp
-        ON temp.bot_id = link.bot_id AND temp.actor_id = link.owner_id
-      CROSS JOIN totals
-      WHERE link.kind = 'all' AND totals.nodeCount <= ? AND totals.bytes <= ?
-      ORDER BY temp.receipt_id LIMIT ?
+    db.prepare(`${withTemp} ${tempTotals}`).bind(digest),
+    db.prepare(`${withTemp}, totals AS (${tempTotals})
+      SELECT temp.* FROM totals CROSS JOIN (${ownedTempRowsSql(mode, "temp_scope", { includePayload: true, verifyLive: false })}) AS temp
+      WHERE totals.nodeCount <= ? AND totals.bytes <= ? ORDER BY temp.source,temp.id LIMIT ?
     `).bind(digest, MAX_TEMP_OWNER_NODES, MAX_TEMP_OWNER_BYTES, MAX_TEMP_OWNER_NODES + 1),
     db.prepare(`${withLink}
       SELECT rule.id, rule.keyword, rule.remark FROM link
@@ -179,12 +163,13 @@ export async function getAggregateNodeSource(
   const legacySelected = link.legacySelected === 1 && readLegacy;
   if (link.legacySelected !== 0 && !legacySelected) return null;
   if (legacyOnly && !legacySelected) return null;
+  if (link.tempReady !== 1) throw new SnapshotIntegrityError();
   const ids = link.kind === "selected" ? selectionIds(link.selectedIds) : null;
   if (link.kind !== "all" && ids === null) throw new SnapshotIntegrityError();
   const snapshots = legacySelected && ids ? await legacySnapshots(ids, legacyResult.results as LegacyMember[])
     : (link.kind === "all" ? allResult.results : selectedResult.results) as SubscriptionSnapshot[];
   const totals = totalsResult.results[0] as TempTotals | undefined;
-  const temp = tempResult.results as TempRow[];
+  const temp = tempResult.results as TempBatchRow[];
   if (!totals) throw new SnapshotIntegrityError();
   verifyTemp(totals, temp);
 
@@ -221,7 +206,13 @@ export async function getAggregateNodeSource(
       }
       for (const batch of temp) {
         if (signal?.aborted) return;
-        for (const node of readTemp(batch)) {
+        let nodes: NodeRecord[];
+        try {
+          nodes = await readTempBatchNodes(batch);
+        } catch {
+          throw new SnapshotIntegrityError();
+        }
+        for (const node of nodes) {
           if (signal?.aborted) return;
           yield node;
         }

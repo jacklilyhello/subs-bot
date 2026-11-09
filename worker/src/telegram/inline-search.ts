@@ -122,7 +122,7 @@ export async function answerTelegramInlineSearch(
   const consent = activeInlineConsent(policy);
   let state: "new" | "preflight" | "sending" = "new";
   try {
-    const [cleanup, admitted] = await db.batch<{ mode: TelegramInlineSortMode; consentMarker: string }>([
+    const [cleanup, admitted] = await db.batch<{ mode: TelegramInlineSortMode; consentMarker: string; receivedAt: number }>([
       db.prepare(`UPDATE telegram_inline_search_receipts SET state=${expiredState}
         WHERE bot_id=? AND actor_id=? AND ${activeStates} AND lease_until<=unixepoch()`).bind(policy.botId, event.actorId),
       db.prepare(`INSERT INTO telegram_inline_search_receipts
@@ -135,7 +135,7 @@ export async function answerTelegramInlineSearch(
           AND NOT EXISTS (SELECT 1 FROM telegram_inbox WHERE bot_id=consent.bot_id AND update_id=?)
           AND NOT EXISTS (SELECT 1 FROM telegram_inline_search_receipts WHERE bot_id=consent.bot_id AND actor_id=consent.actor_id
             AND received_at>unixepoch()-60 LIMIT 1 OFFSET ${QUERY_LIMIT_PER_MINUTE - 1})
-        ON CONFLICT DO NOTHING RETURNING sort_mode AS mode,
+        ON CONFLICT DO NOTHING RETURNING sort_mode AS mode, received_at AS receivedAt,
           (SELECT receipt_nonce FROM telegram_inbox WHERE receipt_id=telegram_inline_search_receipts.consent_receipt_id) AS consentMarker`)
         .bind(event.updateId, queryDigest, policy.botId, event.actorId,
         event.updateId, ...consent.bindings, event.updateId),
@@ -151,7 +151,7 @@ export async function answerTelegramInlineSearch(
     const scan = await scanOwned(db, event.actorId, needle, receipt.mode, deadline);
     const results = scan?.results ?? [];
     const temp = marker === TELEGRAM_INLINE_TEMP_CONSENT_MARKER && scan && results.length < MAX_RESULTS
-      ? await readTelegramInlineTempNodes(db, policy, event, needle, MAX_RESULTS - results.length, deadline) : undefined;
+      ? await readTelegramInlineTempNodes(db, policy, event, needle, MAX_RESULTS - results.length, deadline, receipt.receivedAt) : undefined;
     if (temp === null) results.length = 0;
     else if (temp) results.push(...temp.results);
     const begin = await db.prepare(`UPDATE telegram_inline_search_receipts AS request SET state='sending',result_count=?

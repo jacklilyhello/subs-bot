@@ -17,6 +17,7 @@ import { createSubscription, getOwnedSubscription, publishNodeSnapshot } from ".
 import type { TelegramPolicy } from "../src/telegram/protocol.ts";
 import { acceptTelegramCommand } from "../src/telegram/store.ts";
 import { verifyIsolation } from "../tools/verify-isolation.mjs";
+import { recordTempFixtureMigration } from "./temp-migration-fixture.ts";
 import "./backup-rehearsal.integration.ts";
 import "./telegram-private-share-command.integration.ts";
 import "./telegram-subscription-share.integration.ts";
@@ -116,6 +117,7 @@ async function applyMigrations(db: D1Database, directory: string, migrations: Ar
     assert.equal(digest(migration), sha256);
     const statements = migration.toString("utf8").trim().split(/;\s*/u).filter(Boolean);
     await db.batch(statements.map((statement) => db.prepare(statement)));
+    await recordTempFixtureMigration(db, { name, sha256 });
   }
 }
 
