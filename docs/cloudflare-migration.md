@@ -366,6 +366,12 @@ PY
 
 清单以 `different-bot` 和 `public-default` 标记 Bot 身份变化及公开默认。逐用户标记包括目标范围外 `outside-target`、保留 Bot 身份 `reserved-identity`、ID 超限 `id-out-of-range`、目标管理员不匹配 `target-admin-mismatch`、旧管理员被列为目标成员 `target-member-admin`，以及已拒绝的目标成员需要拒绝基线 `member-denial-needs-baseline`。Worker 当前在没有授权行时允许目标成员。退出码 `0` 表示报告已封存，即使仍有阻断项。真实报告只走批准的私有交接。该命令只生成文件，隔离发布、D1 数据和 Telegram 配置继续独立管理。
 
+#### 通用授权休眠预览
+
+在同一核对命令的脚本名后添加 `preview-general`，并使用独立核对的通用 `TARGET`。它只含 `version: 1`、`scope: "general-dormant"`、`botId` 和 `groupChatIds`。群 ID 使用规范负十进制字符串，按数值递增且最多 64 个。空群列表代表仅私聊。目标 Bot、群及参与者使用小于 `2^52` 的 ID 绝对值。输入与封存输出均沿用本节的私有路径和摘要要求。
+
+预览最多完整列出 20,000 名已配置或已有覆盖记录的用户。清单记录精确目标拓扑、输入及输出摘要、旧默认权限和阻断项。原始允许及拒绝覆盖逐字节保留。旧白名单为空时记录旧公开默认，并标记 `public-default-requires-approval`。Bot 不同、保留身份及越界用户也会记录阻断。预览始终封存为 `activationAllowed: false`，部署仍由原有隔离流程管理。
+
 ### 普通短链双账号验收
 
 受保护的 `worker-isolation-telegram-short-links-smoke.yml` 对同一活动版本执行 `prepare`、`issued` 和 `retired`。使用同一个 `cohort` 和 Worker CI 运行 ID。后两步引用前一步的成功运行。两名获准用户只在指定内置浏览器私聊分别签发 `https://example.com/subs-bot-normal-short/<cohort>/admin` 和 `https://example.org/subs-bot-normal-short/<cohort>/member`。管理员先尝试撤销普通用户的测试短码，随后各自撤销自己的短链。提交的浏览器证据只包含三项摘要。

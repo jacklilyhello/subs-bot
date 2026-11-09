@@ -4,7 +4,8 @@ CONFIG and TARGET are private canonical ASCII JSON lines with version 1.
 CONFIG carries source botId, revision, deploymentSha256 and sqliteSha256,
 plus numerically sorted allowedUserIds and adminUserIds lists of decimal IDs.
 A null adminUserIds means the legacy setting was omitted. An empty list means
-it was explicitly empty. TARGET carries botId, adminId and memberId only.
+it was explicitly empty. The default TARGET carries botId, adminId and memberId.
+The separate general preview takes a dormant Bot and explicit group topology.
 The independent pins identify reviewed inputs. The backup alone cannot prove
 which Bot or effective startup configuration used it.
 """
@@ -29,15 +30,23 @@ MAX_CONFIG_IDS = 20_000
 MAX_CONFIG_BYTES = 1024 * 1024
 MAX_OVERRIDE_BYTES = inventory.MAX_ROWS * 128
 MAX_TARGET_ID = 2**53 - 1
+GENERAL_MAX_ID = 2**52 - 1
+GENERAL_MAX_GROUPS = 64
+GENERAL_COMMAND = "preview-general"
+GENERAL_TARGET_SCOPE = "general-dormant"
 REVISION = re.compile(r"[0-9a-f]{40}", re.ASCII)
 USER_ID = re.compile(r"[1-9][0-9]{0,18}", re.ASCII)
 BLOCKERS = (
     "different-bot", "public-default", "outside-target", "reserved-identity",
     "id-out-of-range", "target-admin-mismatch", "target-member-admin", "member-denial-needs-baseline",
 )
+GENERAL_BLOCKERS = ("different-bot", "public-default-requires-approval", "reserved-identity", "id-out-of-range")
 USAGE = ("Usage: legacy_authorization_reconcile.py BACKUP INVENTORY CONFIG TARGET OUTPUT "
+         "SOURCE_SHA256 INVENTORY_SHA256 CONFIG_SHA256 TARGET_SHA256\n"
+         "       legacy_authorization_reconcile.py preview-general BACKUP INVENTORY CONFIG TARGET OUTPUT "
          "SOURCE_SHA256 INVENTORY_SHA256 CONFIG_SHA256 TARGET_SHA256")
 SUCCESS = "Legacy authorization reconciliation sealed."
+GENERAL_SUCCESS = "Dormant general authorization preview sealed."
 FAILURE = "Legacy authorization reconciliation could not be confirmed safely."
 
 
@@ -104,13 +113,21 @@ def _verify_inventory(path: Path, expected_sha256: str, manifest: bytes, overrid
              and _inventory_is_closed(path))
 
 
+def _legacy_role(
+    user: int, allowlist: set[int], administrators: set[int], override_roles: dict[int, bool],
+) -> tuple[str, str]:
+    if user in administrators:
+        return "admin", "administrator"
+    if user in override_roles:
+        return ("member", "override-allow") if override_roles[user] else ("denied", "override-deny")
+    if user in allowlist:
+        return "member", "allowlist"
+    return ("denied", "default-deny") if allowlist else ("member", "public")
+
+
 def _principal_plan(
-    source_bot: int, allowlist: set[int], administrators: set[int], overrides: bytearray, target: dict,
+    source_bot: int, allowlist: set[int], administrators: set[int], override_roles: dict[int, bool], target: dict,
 ) -> tuple[bytearray, dict[str, int], int]:
-    override_roles = {}
-    for raw in overrides.splitlines():
-        row = json.loads(raw)
-        override_roles[int(row["userId"])] = row["allowed"] == 1
     target_bot, target_admin, target_member = (_id(target[field], MAX_TARGET_ID)
                                               for field in ("botId", "adminId", "memberId"))
     _require(len({target_bot, target_admin, target_member}) == 3)
@@ -122,17 +139,7 @@ def _principal_plan(
     blockers["public-default"] = int(not allowlist)
     output = bytearray()
     for user in principals:
-        if user in administrators:
-            role, basis = "admin", "administrator"
-        elif user in override_roles:
-            role, basis = ("member", "override-allow") if override_roles[user] else ("denied", "override-deny")
-        elif user in allowlist:
-            role, basis = "member", "allowlist"
-        elif not allowlist:
-            role, basis = "member", "public"
-        else:
-            role, basis = "denied", "default-deny"
-
+        role, basis = _legacy_role(user, allowlist, administrators, override_roles)
         target_role = "reserved" if user in reserved else target_roles.get(user, "outside-target")
         reasons = []
         if target_role == "reserved":
@@ -155,9 +162,47 @@ def _principal_plan(
     return output, dict(blockers), len(principals)
 
 
+def _general_target(target: dict) -> int:
+    _require(target["scope"] == GENERAL_TARGET_SCOPE)
+    bot = _id(target["botId"], GENERAL_MAX_ID)
+    groups = target["groupChatIds"]
+    _require(type(groups) is list and len(groups) <= GENERAL_MAX_GROUPS)
+    previous = -GENERAL_MAX_ID - 1
+    for group in groups:
+        _require(type(group) is str and group.startswith("-"))
+        current = -_id(group[1:], GENERAL_MAX_ID)
+        _require(previous < current)
+        previous = current
+    return bot
+
+
+def _general_plan(
+    source_bot: int, allowlist: set[int], administrators: set[int], override_roles: dict[int, bool], target_bot: int,
+) -> tuple[bytearray, dict[str, int], int]:
+    principals = allowlist.union(administrators, override_roles)
+    _require(len(principals) <= MAX_CONFIG_IDS)
+    reserved = {source_bot, target_bot}
+    blockers = Counter(dict.fromkeys(GENERAL_BLOCKERS, 0))
+    blockers["different-bot"] = int(source_bot != target_bot)
+    blockers["public-default-requires-approval"] = int(not allowlist)
+    output = bytearray()
+    for user in sorted(principals):
+        role, basis = _legacy_role(user, allowlist, administrators, override_roles)
+        reasons = []
+        if user in reserved:
+            reasons.append("reserved-identity")
+        if user > GENERAL_MAX_ID:
+            reasons.append("id-out-of-range")
+        blockers.update(reasons)
+        output.extend(inventory._canonical_line({
+            "userId": str(user), "legacyRole": role, "basis": basis, "allowlisted": user in allowlist, "blockers": reasons,
+        }))
+    return output, dict(blockers), len(principals)
+
+
 def seal_reconciliation(
     backup: Path, inventory_dir: Path, config_path: Path, target_path: Path, output: Path,
-    *, source_sha256: str, inventory_sha256: str, config_sha256: str, target_sha256: str,
+    *, source_sha256: str, inventory_sha256: str, config_sha256: str, target_sha256: str, general_preview: bool = False,
 ) -> None:
     """Recompute the old inventory and classify principals without applying the result."""
     _require(all(inventory._SHA256.fullmatch(digest) is not None
@@ -166,7 +211,8 @@ def seal_reconciliation(
     _require(not destination.is_relative_to(inventory_dir.absolute()))
     config = _pinned_document(config_path, config_sha256, MAX_CONFIG_BYTES,
                               {"version", "source", "allowedUserIds", "adminUserIds"})
-    target = _pinned_document(target_path, target_sha256, 4096, {"version", "botId", "adminId", "memberId"})
+    target_fields = {"version", "botId", "scope", "groupChatIds"} if general_preview else {"version", "botId", "adminId", "memberId"}
+    target = _pinned_document(target_path, target_sha256, 4096, target_fields)
     _require(type(config["version"]) is int and config["version"] == 1
              and type(target["version"]) is int and target["version"] == 1)
     source = config["source"]
@@ -178,13 +224,21 @@ def seal_reconciliation(
     allowlist = _ids(config["allowedUserIds"])
     inherits_administrators = config["adminUserIds"] is None
     administrators = allowlist if inherits_administrators else _ids(config["adminUserIds"])
+    target_bot = _general_target(target) if general_preview else None
 
     present, overrides, count, allowed = inventory._verified_source_rows(backup, source_sha256)
     manifest = inventory._inventory_manifest(source_sha256, present, overrides, count, allowed)
     _verify_inventory(inventory_dir, inventory_sha256, manifest, overrides)
-    plan, blockers, principal_count = _principal_plan(source_bot, allowlist, administrators, overrides, target)
+    override_roles = {}
+    for raw in overrides.splitlines():
+        row = json.loads(raw)
+        override_roles[int(row["userId"])] = row["allowed"] == 1
+    if target_bot is None:
+        plan, blockers, principal_count = _principal_plan(source_bot, allowlist, administrators, override_roles, target)
+    else:
+        plan, blockers, principal_count = _general_plan(source_bot, allowlist, administrators, override_roles, target_bot)
     sidecars = {inventory.SIDECAR: overrides, PRINCIPALS: plan}
-    report = inventory._canonical_line({
+    report = {
         "version": 1, "kind": "legacy-authorization-reconciliation", "scope": "offline-dormant",
         "sourceSha256": source_sha256, "sourceRevision": source["revision"], "sourceDeploymentSha256": source["deploymentSha256"],
         "inventoryManifestSha256": inventory_sha256, "configSha256": config_sha256, "targetSha256": target_sha256,
@@ -193,8 +247,10 @@ def seal_reconciliation(
         "overrideTablePresent": present, "overrideRows": count, "principalRows": principal_count,
         "blockers": blockers,
         "files": [{"file": name, "bytes": len(raw), "sha256": sha256(raw).hexdigest()} for name, raw in sidecars.items()],
-    })
-    inventory._seal_package(destination, parents, report, sidecars)
+    }
+    if general_preview:
+        report.update(kind="legacy-general-authorization-preview", activationAllowed=False, target=target)
+    inventory._seal_package(destination, parents, inventory._canonical_line(report), sidecars)
 
 
 def main(args: list[str] | None = None) -> int:
@@ -202,6 +258,9 @@ def main(args: list[str] | None = None) -> int:
     if args in (["-h"], ["--help"]):
         print(USAGE)
         return 0
+    general_preview = args[:1] == [GENERAL_COMMAND]
+    if general_preview:
+        args = args[1:]
     if len(args) != 9:
         print(USAGE, file=sys.stderr)
         return 2
@@ -209,14 +268,15 @@ def main(args: list[str] | None = None) -> int:
     source_sha256, inventory_sha256, config_sha256, target_sha256 = args[5:]
     try:
         seal_reconciliation(backup, inventory_dir, config, target, output, source_sha256=source_sha256,
-                            inventory_sha256=inventory_sha256, config_sha256=config_sha256, target_sha256=target_sha256)
+                            inventory_sha256=inventory_sha256, config_sha256=config_sha256, target_sha256=target_sha256,
+                            general_preview=general_preview)
     except KeyboardInterrupt:
         print("Legacy authorization reconciliation was interrupted.", file=sys.stderr)
         return 130
     except Exception:
         print(FAILURE, file=sys.stderr)
         return 2
-    print(SUCCESS)
+    print(GENERAL_SUCCESS if general_preview else SUCCESS)
     return 0
 
 
