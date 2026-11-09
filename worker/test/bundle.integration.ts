@@ -121,6 +121,117 @@ async function applyMigrations(db: D1Database, directory: string, migrations: Ar
   }
 }
 
+test("emitted Worker acknowledges the exact authorization operation and distinguishes stale or unconfirmed commands",
+  { timeout: 60_000 }, async (t) => {
+    const directory = process.env.WORKER_TEST_BUNDLE_DIR;
+    assert.ok(directory);
+    const fixture = JSON.parse(await readFile(join(directory, "isolation.json"), "utf8"));
+    const script = await readFile(join(directory, "index.js"));
+    assert.equal(digest(script), fixture.bundleSha256);
+    const policy: TelegramPolicy = {
+      botId: "77901", botUsername: "Fixture_Auth_Bot", adminId: "77902", memberId: "77903", groupId: "-10077904",
+      botToken: "77901:synthetic-token", webhookSecret: "synthetic-auth-ack-webhook",
+    };
+    const sent: Array<{ chatId: string; replyTo: number; text: string }> = [];
+    const runtime = new Miniflare({
+      modules: [
+        { type: "ESModule", path: "fixture.js", contents: `
+          import worker from './index.js';
+          export default {
+            // Commit webhook admission now and let the real scheduled handler drain explicitly.
+            fetch(request, env) { return worker.fetch(request, env); },
+            scheduled: worker.scheduled,
+          };
+        ` },
+        { type: "ESModule", path: "index.js", contents: script.toString("utf8") },
+      ],
+      compatibilityDate: fixture.compatibilityDate, d1Databases: ["DB"], r2Buckets: ["NODES"],
+      bindings: { BUILD_REVISION: fixture.revision, TELEGRAM_ISOLATION_CONFIG: JSON.stringify(policy) },
+      outboundService: async (request: Request) => {
+        assert.equal(request.url, `https://api.telegram.org/bot${policy.botToken}/sendMessage`);
+        assert.equal(request.method, "POST");
+        const { chat_id: chatId, text, reply_parameters: { message_id: replyTo } } = await request.json() as {
+          chat_id: string; text: string; reply_parameters: { message_id: number };
+        };
+        sent.push({ chatId, replyTo, text });
+        return Response.json({ ok: true, result: { message_id: 1000 + replyTo, chat: { id: Number(chatId) } } });
+      },
+    });
+    t.after(() => runtime.dispose());
+    const db = await runtime.getD1Database("DB");
+    await applyMigrations(db, directory, fixture.migrations);
+    const worker = await runtime.getWorker();
+    const date = Math.floor(Date.now() / 1000) - 10;
+    const authRow = () => db.prepare(`SELECT allowed, message_date AS date, message_id AS messageId
+      FROM telegram_auth WHERE bot_id=? AND user_id=?`).bind(policy.botId, policy.memberId).first();
+    const outbox = () => db.prepare(`SELECT inbox.update_id AS updateId, reply.state
+      FROM telegram_inbox AS inbox JOIN telegram_outbox AS reply USING (receipt_id)
+      WHERE inbox.bot_id=? ORDER BY inbox.receipt_id`).bind(policy.botId).all();
+    const reply = (replyTo: number, text: string, chatId = policy.adminId) => ({ chatId, replyTo, text });
+    const drain = async (expected: typeof sent) => {
+      assert.equal((await worker.scheduled({ cron: "* * * * *" })).outcome, "ok");
+      assert.deepEqual(sent.splice(0), expected);
+      assert.ok((await outbox()).results.every(({ state }) => state === "sent"));
+    };
+    const post = async (updateId: number, messageDate: number, args: string, actorId = policy.adminId, group = false) => {
+      const command = group ? `/auth@${policy.botUsername}` : "/auth";
+      const response = await runtime.dispatchFetch("https://fixture.invalid/telegram/webhook", {
+        method: "POST", headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": policy.webhookSecret },
+        body: JSON.stringify({ update_id: updateId, message: {
+          message_id: 100 + updateId, date: messageDate, text: `${command} ${args}`,
+          from: { id: Number(actorId), is_bot: false }, chat: { id: Number(group ? policy.groupId : actorId), type: group ? "group" : "private" },
+          entities: [{ type: "bot_command", offset: 0, length: command.length }],
+        } }),
+      });
+      assert.equal(response.status, 200);
+    };
+    const grant = `add ${policy.memberId}`;
+    const revoke = `remove ${policy.memberId}`;
+    const superseded = "收到更新的授权操作。请用 /auth list 查看当前状态。";
+    const unconfirmed = "无法核对这次授权操作。请用 /auth list 查看当前状态。";
+
+    await post(1, date, revoke);
+    assert.deepEqual(await authRow(), { allowed: 0, date, messageId: 101 });
+    await post(3, date, grant);
+    const regranted = { allowed: 1, date, messageId: 103 };
+    assert.deepEqual(await authRow(), regranted);
+    assert.equal(sent.length, 0);
+    assert.deepEqual((await outbox()).results, [{ updateId: 1, state: "pending" }, { updateId: 3, state: "pending" }]);
+    await drain([reply(101, superseded), reply(103, `用户 ${policy.memberId}：已授权。`)]);
+
+    await post(1, date, revoke); // Same update delivered again after the regrant.
+    await post(2, date, revoke); // Older Telegram message first reaches this Worker after the regrant.
+    assert.deepEqual(await authRow(), regranted);
+    await drain([reply(102, superseded)]);
+    assert.deepEqual((await outbox()).results.map(({ updateId }) => updateId), [1, 3, 2]);
+
+    await post(4, date + 1, revoke);
+    await drain([reply(104, `用户 ${policy.memberId}：已撤权。`)]);
+    await post(5, date + 1, grant);
+    const latest = { allowed: 1, date: date + 1, messageId: 105 };
+    await drain([reply(105, `用户 ${policy.memberId}：已授权。`)]);
+
+    await post(6, date + 2, "list");
+    await drain([reply(106, `管理员 ${policy.adminId}\n用户 ${policy.memberId}：已授权`)]);
+    await post(7, date + 2, revoke, policy.memberId);
+    await drain([reply(107, "只有管理员可以管理授权。", policy.memberId)]);
+    await post(8, date + 2, revoke, policy.adminId, true);
+    await drain([reply(108, "请在私聊中管理授权。", policy.groupId)]);
+    assert.deepEqual(await authRow(), latest);
+
+    // Inject readback states that a normally committed admin operation cannot produce.
+    await post(9, date + 3, grant);
+    await db.prepare("DELETE FROM telegram_auth WHERE bot_id=? AND user_id=?").bind(policy.botId, policy.memberId).run();
+    await drain([reply(109, unconfirmed)]);
+    await post(10, date + 4, grant);
+    await db.prepare("UPDATE telegram_auth SET message_date=?,message_id=? WHERE bot_id=? AND user_id=?")
+      .bind(date + 3, 109, policy.botId, policy.memberId).run();
+    await drain([reply(110, unconfirmed)]);
+    await post(11, date + 5, revoke);
+    await db.prepare("UPDATE telegram_auth SET allowed=1 WHERE bot_id=? AND user_id=?").bind(policy.botId, policy.memberId).run();
+    await drain([reply(111, unconfirmed)]);
+  });
+
 test("emitted Sing-box guards raw HTTP request fields", { timeout: 60_000 }, async (t) => {
   const directory = process.env.WORKER_TEST_BUNDLE_DIR;
   assert.ok(directory);

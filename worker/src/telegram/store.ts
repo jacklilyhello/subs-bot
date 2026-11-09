@@ -273,6 +273,22 @@ export async function isTelegramMemberAllowed(db: D1Database, policy: TelegramPo
   return row === null || row.allowed === 1;
 }
 
+type TelegramAuthChangeOutcome = "confirmed" | "superseded" | "unconfirmed";
+
+export async function readTelegramAuthChangeOutcome(
+  db: D1Database, policy: TelegramPolicy, receipt: Pick<TelegramCommand, "messageDate" | "messageId">, allowed: boolean,
+): Promise<TelegramAuthChangeOutcome> {
+  const { messageDate, messageId } = receipt;
+  const row = await db.prepare(`SELECT CASE
+    WHEN (message_date, message_id) > (?, ?) THEN 'superseded'
+    WHEN (message_date, message_id) = (?, ?) AND allowed = ? THEN 'confirmed'
+    ELSE 'unconfirmed' END AS outcome
+    FROM telegram_auth WHERE bot_id = ? AND user_id = ?`)
+    .bind(messageDate, messageId, messageDate, messageId, Number(allowed), policy.botId, policy.memberId)
+    .first<{ outcome: TelegramAuthChangeOutcome }>();
+  return row?.outcome ?? "unconfirmed";
+}
+
 export async function claimTelegramReply(db: D1Database, botId: string, includeAggregate = false,
   includePrivateShareCreation = false, includeSubscriptionRead = false, includeShortLinks = false, includeInlineSort = false,
   includeSubscriptionNodes = false, providerPolicy?: TelegramPolicy, includeBulkTrash = false, includeInlineConsent = false,
