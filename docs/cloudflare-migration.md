@@ -585,7 +585,9 @@ python3 -B worker/tools/legacy_restore_package.py \
 
 在 `worker-isolation-legacy-candidate.yml` 选择 `synthetic-legacy-unified-shares`。以同一个新的 32 位十六进制 `cohort` 和同一个成功的 `source_run_id` 依次运行 `verify`、`prepare`、`create-restore-db`、`create-restore-bucket`、`restore-objects`、`start-import`、`verify-restore`。资源创建结果不明时，先按 `pin-resource` 核对准确资源。恢复到专用未绑定 D1 和私有 R2，并读回复核完整 schema、外键、编号序列、数据与 10 个对象的摘要、四类短链和临时节点休眠状态。合成数据含一条已有领取和一条已到期分享；验收保持这些原值，旧卡片交互和真实源数据另行核对。
 
-发布 V10 候选前，托管 CI 把同一份 SQL 和十个 R2 对象载入一次性回环环境，用编译后的 Worker 核对 24 组 GET 和 HEAD。覆盖单订阅短链、所选及全量聚合、外部重定向，以及休眠、测试启用和回收站恢复后的行为。所选聚合保留原有顺序和重复项，已退役的历史编号不会恢复。测试只在临时副本启用全量链接，封存候选继续休眠。私密分享领取和旧卡片交互仍需分别验收。
+发布 V10 候选前，托管 CI 把同一份 SQL 和十个 R2 对象载入一次性回环环境，用编译后的 Worker 核对 24 组 GET 和 HEAD。覆盖单订阅短链、所选及全量聚合、外部重定向，以及休眠、测试启用和回收站恢复后的行为。所选聚合保留原有顺序和重复项，已退役的历史编号不会恢复。测试只在临时副本启用全量链接，封存候选继续休眠。
+
+同一临时副本通过编译后的 Telegram Webhook 重放合成旧领取码。回环替身核对历史领取者收到的附件字节、原领取份数、指定对象不符和已过期两种拒绝，以及重复投递的去重。旧内联卡片交互另行核对。
 
 ### 真实数据与生产切换门槛
 

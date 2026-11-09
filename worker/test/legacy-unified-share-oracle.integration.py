@@ -23,8 +23,9 @@ import prepare_isolation_artifact as artifact
 
 PUBLISH_DIRECTORY = "subs-bot-legacy-unified-share-candidate"
 ROUTE_PAIRS = 24
+HISTORICAL_CLAIM_REPLIES = 3
 WORKER_FAILURE = re.compile(rb"The isolated V10 Worker oracle could not be confirmed \("
-                            rb"(sandbox|input|request-shape|artifact|sql-replay|d1-readback|r2-replay|health|cutoff|restore|dispose|"
+                            rb"(sandbox|input|request-shape|artifact|sql-replay|d1-readback|r2-replay|health|cutoff|restore|historical-claim|dispose|"
                             rb"request, case (?:[1-9]|[1-3][0-9]|4[0-8]))\)\.\n")
 
 
@@ -32,7 +33,7 @@ class RouteContinuityError(RuntimeError):
     """Only a fixed Worker stage or bounded case number may leave the probe."""
 
 
-def worker_route_pairs(root, worker, worker_sha, revision, candidate, sql_statements):
+def worker_continuity(root, worker, worker_sha, revision, candidate, sql_statements):
     node = which("node")
     fixture.require(node is not None)
     raw = package.native.canonical({
@@ -57,9 +58,11 @@ def worker_route_pairs(root, worker, worker_sha, revision, candidate, sql_statem
         raise RouteContinuityError("route-replay, " + (detail[1].decode("ascii") if detail else "unconfirmed"))
     report = package.native.parsed(output, 128)
     fixture.require(set(report) == {"continuity"} and type(report["continuity"]) is dict
-                    and set(report["continuity"]) == {"routePairs"}
-                    and package.native.integer(report["continuity"]["routePairs"], ROUTE_PAIRS, ROUTE_PAIRS))
-    return report["continuity"]["routePairs"]
+                    and set(report["continuity"]) == {"routePairs", "historicalClaimReplies"}
+                    and package.native.integer(report["continuity"]["routePairs"], ROUTE_PAIRS, ROUTE_PAIRS)
+                    and package.native.integer(report["continuity"]["historicalClaimReplies"],
+                                               HISTORICAL_CLAIM_REPLIES, HISTORICAL_CLAIM_REPLIES))
+    return report["continuity"]
 
 
 def publication_target(arguments, bundle, revision):
@@ -117,12 +120,13 @@ def main(arguments):
             stage = "candidate"
             candidate = fixture.build_unified_share_fixture(source_root, worker, revision, produce_oracle=True)
             stage = "route-replay"
-            route_pairs = worker_route_pairs(root, worker, worker_sha, revision, candidate, selected_oracle["sql_statements"])
+            continuity = worker_continuity(root, worker, worker_sha, revision, candidate, selected_oracle["sql_statements"])
             package.read_pinned(candidate.candidate / package.MANIFEST, package.native.MANIFEST_BYTES, candidate.candidate_sha256)
             if destination is not None:
                 stage = "publication"
                 publish(candidate, destination)
-        print(json.dumps({"candidateVersion": 10, "equivalentExternalRows": 1, "workerRoutePairs": route_pairs,
+        print(json.dumps({"candidateVersion": 10, "equivalentExternalRows": 1, "workerRoutePairs": continuity["routePairs"],
+                          "historicalClaimReplies": continuity["historicalClaimReplies"],
                           "privateShares": 2, "claimRows": 1, "objects": 10}, sort_keys=True))
         return 0
     except RouteContinuityError as error:
