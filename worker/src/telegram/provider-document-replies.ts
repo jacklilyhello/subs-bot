@@ -1,12 +1,13 @@
 import { validInteger } from "../storage.ts";
 import type { ProviderSql } from "../provider-jobs.ts";
+import { MAX_TELEGRAM_DOCUMENT_NODES } from "./document-persistence.ts";
 import { MAX_TELEGRAM_DOCUMENT_BYTES } from "./document-transport.ts";
 import { providerDocumentOrigin, TELEGRAM_PROVIDER_DOCUMENT_MARKER } from "./provider-document-origin.ts";
 import { inTelegramScope, type TelegramPolicy } from "./protocol.ts";
 import type { TelegramReplyLease } from "./store.ts";
 
 type Alias = "inbox" | "earlier";
-type Summary = { lineCount: number; overflow: number; finishedAt: number; saved: number; coalesced: number };
+type Summary = { lineCount: number; overflow: number; finishedAt: number; saved: number; coalesced: number; localNodes: number };
 const REPLY_SECONDS = 900;
 const RECONCILE_LIMIT = 16;
 const ready = `origin.finished_at > unixepoch() - ${REPLY_SECONDS} AND origin.finished_at <= unixepoch()`;
@@ -20,6 +21,8 @@ function countLines(result?: "saved" | "coalesced"): string {
   return `(SELECT count(*) FROM telegram_provider_document_lines AS line WHERE line.receipt_id=origin.receipt_id
     ${result === undefined ? "" : `AND line.result_code='${result}'`})`;
 }
+
+const localCount = `COALESCE((SELECT node_count FROM telegram_document_saved_counts WHERE receipt_id=origin.receipt_id),0)`;
 
 const terminalLines = `${countLines()}=origin.line_count AND NOT EXISTS (
   SELECT 1 FROM telegram_provider_document_lines AS line WHERE line.receipt_id=origin.receipt_id
@@ -69,22 +72,24 @@ export async function renderTelegramProviderDocumentReply(
   const origin = providerDocumentOrigin(policy);
   const exact = `origin.receipt_id=inbox.receipt_id AND ${origin.sql} AND ${ready} AND ${terminalLines}`;
   const summary = await db.prepare(`SELECT origin.line_count AS lineCount,origin.overflow_count AS overflow,
-    origin.finished_at AS finishedAt,${countLines("saved")} AS saved,${countLines("coalesced")} AS coalesced
+    origin.finished_at AS finishedAt,${countLines("saved")} AS saved,${countLines("coalesced")} AS coalesced,${localCount} AS localNodes
     FROM telegram_provider_documents AS origin JOIN telegram_inbox AS inbox USING (receipt_id)
     JOIN telegram_outbox AS reply USING (receipt_id)
     WHERE inbox.receipt_id=? AND inbox.actor_id=? AND inbox.chat_id=? AND reply.state='leased'
       AND reply.lease_id=? AND reply.attempts=? AND reply.lease_until>unixepoch() AND ${exact}`)
     .bind(lease.receiptId, lease.actorId, lease.chatId, lease.leaseId, lease.attempts, ...origin.bindings).first<Summary>();
   if (!summary) return null;
-  const { lineCount, overflow, finishedAt, saved, coalesced } = summary;
+  const { lineCount, overflow, finishedAt, saved, coalesced, localNodes } = summary;
   if (!validInteger(lineCount, 1, 20) || !validInteger(overflow, 0, MAX_TELEGRAM_DOCUMENT_BYTES) || !validInteger(finishedAt, 1)
-      || !validInteger(saved, 0, lineCount) || !validInteger(coalesced, 0, lineCount - saved)) return null;
+      || !validInteger(saved, 0, lineCount) || !validInteger(coalesced, 0, lineCount - saved)
+      || !validInteger(localNodes, 0, MAX_TELEGRAM_DOCUMENT_NODES)) return null;
   const failed = lineCount - saved - coalesced;
+  const prefix = localNodes > 0 ? `混合文件已处理。\n本地节点已保存 ${localNodes} 个\n远程订阅` : "订阅链接文件已处理。\n";
   return {
-    text: `订阅链接文件已处理。\n已保存 ${saved} 条\n已合并 ${coalesced} 条\n失败 ${failed} 条\n超出上限 ${overflow} 条`,
+    text: `${prefix}已保存 ${saved} 条\n已合并 ${coalesced} 条\n失败 ${failed} 条\n超出上限 ${overflow} 条`,
     guard: { sql: `EXISTS (SELECT 1 FROM telegram_provider_documents AS origin WHERE ${exact}
       AND origin.line_count=? AND origin.overflow_count=? AND origin.finished_at=?
-      AND ${countLines("saved")}=? AND ${countLines("coalesced")}=?)`,
-      bindings: [...origin.bindings, lineCount, overflow, finishedAt, saved, coalesced] },
+      AND ${countLines("saved")}=? AND ${countLines("coalesced")}=? AND ${localCount}=?)`,
+      bindings: [...origin.bindings, lineCount, overflow, finishedAt, saved, coalesced, localNodes] },
   };
 }

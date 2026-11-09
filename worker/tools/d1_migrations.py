@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 import sqlite3
+from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
 
@@ -156,7 +157,7 @@ def _all_conditions(parts: list[str]) -> str:
     return f"({_all_conditions(parts[:middle])})\nAND ({_all_conditions(parts[middle:])})"
 
 
-def _schema_condition(objects: tuple[SchemaObject, ...]) -> str:
+def _schema_conditions(objects: tuple[SchemaObject, ...]) -> list[str]:
     # Ignore only D1's reserved storage table and SQLite's generated indexes.
     # The full CREATE TABLE SQL pins inline UNIQUE/PK/CHECK constraints.
     explicit = "sqlite_schema WHERE tbl_name <> '_cf_KV' AND sql IS NOT NULL"
@@ -175,7 +176,22 @@ def _schema_condition(objects: tuple[SchemaObject, ...]) -> str:
     if objects:
         parts.append("""EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'index' AND tbl_name = 'subscriptions'
             AND name = 'sqlite_autoindex_subscriptions_1' AND sql IS NULL)""")
-    return _all_conditions(parts)
+    return parts
+
+
+def _schema_condition(objects: tuple[SchemaObject, ...]) -> str:
+    return _all_conditions(_schema_conditions(objects))
+
+
+def _bounded_statements(parts: list[str], render: Callable[[str], str], message: str) -> list[str]:
+    sql = render(_all_conditions(parts))
+    if len(sql.encode("utf-8")) < MAX_D1_STATEMENT_BYTES:
+        return [sql]
+    # Split only between complete predicates. Every group must succeed, and
+    # each statement retains a balanced expression even when a group is large.
+    _require(len(parts) > 1, message)
+    middle = len(parts) // 2
+    return _bounded_statements(parts[:middle], render, message) + _bounded_statements(parts[middle:], render, message)
 
 
 def _validate_indexes(api, path: str, objects: tuple[SchemaObject, ...]) -> None:
@@ -200,9 +216,13 @@ def _validate_indexes(api, path: str, objects: tuple[SchemaObject, ...]) -> None
 
 
 def _matches_schema(api, path: str, objects: tuple[SchemaObject, ...]) -> bool:
-    sql = f"SELECT ({_schema_condition(objects)}) AS matches"
-    _require(len(sql.encode("utf-8")) < MAX_D1_STATEMENT_BYTES, "D1 schema readback exceeds statement limits.")
-    return _rows(api, path, sql) == [{"matches": 1}]
+    statements = _bounded_statements(_schema_conditions(objects), lambda condition: f"SELECT ({condition}) AS matches",
+                                     "D1 schema readback exceeds statement limits.")
+    # Read every group from the same REST batch, so they see one schema state.
+    results = _results(api, path, ";\n".join(statements) + ";")
+    _require(len(results) == len(statements) and all(isinstance(row.get("results"), list) for row in results),
+             "Unexpected D1 read response.")
+    return all(row["results"] == [{"matches": 1}] for row in results)
 
 
 def _read_state(api, path: str, migrations: list[Migration]) -> tuple[str, list[dict]]:
@@ -233,14 +253,14 @@ def _read_state(api, path: str, migrations: list[Migration]) -> tuple[str, list[
     return "managed", history
 
 
-def _history_condition(history: list[dict]) -> str:
+def _history_conditions(history: list[dict]) -> list[str]:
     parts = [f"(SELECT count(*) FROM {LEDGER}) = {len(history)}"]
     parts.extend(
         f"EXISTS (SELECT 1 FROM {LEDGER} WHERE position = {row['position']}"
         f" AND name = {_literal(row['name'])} AND sha256 = {_literal(row['sha256'])} AND mode = {_literal(row['mode'])})"
         for row in history
     )
-    return _all_conditions(parts)
+    return parts
 
 
 def _assert_sql(condition: str) -> str:
@@ -253,22 +273,23 @@ def _plan_one(migrations, kind, history):
     migration = migrations[position - 1]
     mode = "adopted" if kind == "legacy" else "applied"
     expected_before = _objects(migrations, 1 if kind == "legacy" else position - 1, managed=kind == "managed")
-    before = _schema_condition(expected_before)
+    before = _schema_conditions(expected_before)
     if kind == "legacy":
-        before += "\nAND NOT EXISTS (SELECT 1 FROM subscriptions)"
+        before.append("NOT EXISTS (SELECT 1 FROM subscriptions)")
     elif kind == "managed":
-        before += "\nAND " + _history_condition(history)
+        before.extend(_history_conditions(history))
 
-    after = _schema_condition(_objects(migrations, position, managed=True))
-    statements = [_assert_sql(before)]
+    after = _schema_conditions(_objects(migrations, position, managed=True))
+    limit_error = "D1 migration guard exceeds statement limits."
+    statements = _bounded_statements(before, _assert_sql, limit_error)
     if kind != "managed":
         statements.append(LEDGER_SQL)
     if mode == "applied":
         statements.extend(obj.sql for obj in migration.objects)
-    statements.extend((_assert_sql(after),
-        f"INSERT INTO {LEDGER} (position, name, sha256, mode) VALUES"
-        f" ({position}, {_literal(migration.name)}, {_literal(migration.sha256)}, {_literal(mode)})"))
-    _require(all(len(sql.encode("utf-8")) < MAX_D1_STATEMENT_BYTES for sql in statements), "D1 migration guard exceeds statement limits.")
+    statements.extend(_bounded_statements(after, _assert_sql, limit_error))
+    statements.append(f"INSERT INTO {LEDGER} (position, name, sha256, mode) VALUES"
+                      f" ({position}, {_literal(migration.name)}, {_literal(migration.sha256)}, {_literal(mode)})")
+    _require(all(len(sql.encode("utf-8")) < MAX_D1_STATEMENT_BYTES for sql in statements), limit_error)
     return statements, [*history, {"position": position, "name": migration.name, "sha256": migration.sha256, "mode": mode}]
 
 

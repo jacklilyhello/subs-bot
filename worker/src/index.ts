@@ -15,7 +15,7 @@ import { providerSnapshotJournalReady } from "./provider-snapshot-journal.ts";
 import { acceptTelegramAggregate, parseTelegramAggregateKey } from "./telegram/aggregate-actions.ts";
 import { acceptTelegramSelected, reapTelegramSelected } from "./telegram/selected-export.ts";
 import { answerTelegramCallback, drainTelegramReplies, sendTelegramInlineAnswer } from "./telegram/delivery.ts";
-import { runTelegramDocumentIntake } from "./telegram/document-intake.ts";
+import { runTelegramDocumentIntake, telegramMixedDocumentReady } from "./telegram/document-intake.ts";
 import { acceptTelegramDocumentJob } from "./telegram/document-jobs.ts";
 import { reconcileTelegramDocumentJobReplies, retireTelegramDocumentStage } from "./telegram/document-persistence.ts";
 import { acceptTelegramLifecycle, reapTelegramLifecycle } from "./telegram/lifecycle-actions.ts";
@@ -67,6 +67,7 @@ export interface Env {
   PROVIDER_IMAGE_SHA256?: string;
   TELEGRAM_PROVIDER_URL_IMPORT?: string;
   TELEGRAM_PROVIDER_URL_DOCUMENTS?: string;
+  TELEGRAM_MIXED_DOCUMENTS?: string;
   TELEGRAM_PROVIDER_REFRESH?: string;
   LEGACY_SUBSCRIPTION_SHORTS?: string;
   TELEGRAM_PROVIDER_BATCH_REFRESH?: string;
@@ -292,10 +293,14 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
       }
     } else if (decoded.document) {
       const optIn = env.TELEGRAM_PROVIDER_URL_DOCUMENTS === "1";
+      const mixedOptIn = env.TELEGRAM_MIXED_DOCUMENTS === "1";
       if (optIn && (providerDocument !== true || !providerIntakeReady || providerBatch.queue === "unavailable")) {
         return new Response(null, { status: 503, headers: HEADERS });
       }
-      await acceptTelegramDocumentJob(env.DB, policy, decoded.document, optIn);
+      if (mixedOptIn && (!optIn || !await telegramMixedDocumentReady(env.DB))) {
+        return new Response(null, { status: 503, headers: HEADERS });
+      }
+      await acceptTelegramDocumentJob(env.DB, policy, decoded.document, optIn, mixedOptIn);
     } else if (decoded.shortLink) {
       if (!shortLinks) return new Response(null, { status: 204, headers: HEADERS });
       if (await acceptTelegramShortLink(env.DB, policy, decoded.shortLink, aggregateKey, shortLinkNamespaces) === "accepted") drain();
@@ -474,9 +479,10 @@ async function recoverTelegramWork(env: Env, policy: TelegramPolicy, pin: Provid
   };
   const documents = async () => {
     if (providerDocument === "unavailable") return;
+    const mixedDocument = providerDocument && await telegramMixedDocumentReady(env.DB);
     let claimed = false;
     try {
-      claimed = await runTelegramDocumentIntake(env.DB, env.NODES, policy, providerDocument);
+      claimed = await runTelegramDocumentIntake(env.DB, env.NODES, policy, providerDocument, mixedDocument);
     } finally {
       const reconciled = await reconcileTelegramDocumentJobReplies(env.DB, policy);
       if (claimed || reconciled > 0) {

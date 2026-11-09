@@ -6,6 +6,8 @@ import {
   prepareTelegramDocumentJobLeaseGuard, prepareTelegramDocumentJobSettlement, TELEGRAM_DOCUMENT_JOB_MARKER,
   type TelegramDocumentJobLease, type TelegramDocumentJobOutcome,
 } from "./document-jobs.ts";
+import { prepareTelegramProviderDocumentMarker, prepareTelegramProviderDocumentPlan,
+  type TelegramProviderDocumentSources } from "./provider-document.ts";
 import type { TelegramPolicy } from "./protocol.ts";
 
 export const MAX_TELEGRAM_DOCUMENT_NODES = 500;
@@ -75,9 +77,10 @@ async function reserveSubscription(db: D1Database, policy: TelegramPolicy, lease
 function prepareTerminalOutbox(db: D1Database, receiptId: number): D1PreparedStatement {
   return db.prepare(`
     INSERT INTO telegram_outbox (receipt_id)
-    SELECT receipt_id FROM telegram_document_jobs WHERE receipt_id = ? AND state = 'done'
+    SELECT job.receipt_id FROM telegram_document_jobs AS job JOIN telegram_inbox AS inbox USING (receipt_id)
+    WHERE job.receipt_id = ? AND job.state = 'done' AND job.result_code <> 'saved' AND inbox.receipt_nonce = ?
     ON CONFLICT (receipt_id) DO NOTHING
-  `).bind(receiptId);
+  `).bind(receiptId, TELEGRAM_DOCUMENT_JOB_MARKER);
 }
 
 export async function finishTelegramDocumentJob(
@@ -109,12 +112,15 @@ function preparePublication(
   reservation: Reservation,
   staged: StagedNodeSnapshot,
   nameSha256: string,
+  companion?: { sql: string; bindings: readonly number[] },
 ): D1PreparedStatement {
   const leaseGuard = prepareTelegramDocumentJobLeaseGuard(policy, lease);
   const guard = {
     sql: `${leaseGuard.sql} AND ${NO_NEWER_DOCUMENT} AND EXISTS (SELECT 1 FROM telegram_document_stages
-      WHERE receipt_id = ? AND lease_id = ? AND snapshot_id = ? AND subscription_id = ?)`,
-    bindings: [...leaseGuard.bindings, lease.receiptId, nameSha256, lease.receiptId, lease.leaseId, staged.snapshotId, reservation.id],
+      WHERE receipt_id = ? AND lease_id = ? AND snapshot_id = ? AND subscription_id = ?)
+      ${companion ? `AND (${companion.sql})` : ""}`,
+    bindings: [...leaseGuard.bindings, lease.receiptId, nameSha256, lease.receiptId, lease.leaseId, staged.snapshotId, reservation.id,
+      ...(companion?.bindings ?? [])],
   };
   const matching = "owner_id = ? AND name = ? AND source_url GLOB 'uploaded://*'";
   if (reservation.newToken === null) {
@@ -141,6 +147,7 @@ export async function persistTelegramDocumentJob(
   lease: TelegramDocumentJobLease,
   nodes: readonly NodeRecord[],
   counts: { parsed: number },
+  mixed?: TelegramProviderDocumentSources,
 ): Promise<"saved" | "stale"> {
   if (!validInteger(counts.parsed, 1, MAX_TELEGRAM_DOCUMENT_NODES) || counts.parsed !== nodes.length) {
     throw new RangeError("Invalid Telegram document node count.");
@@ -165,25 +172,40 @@ export async function persistTelegramDocumentJob(
     if (journal !== snapshotId) return "stale";
 
     const staged = await stageNodeSnapshot(bucket, reservation.id, nodes, snapshotId);
+    const plan = mixed ? await prepareTelegramProviderDocumentPlan(db, policy, lease, mixed, true) : null;
     const pointer = "EXISTS (SELECT 1 FROM subscriptions WHERE id = ? AND owner_id = ? AND snapshot_id = ?)";
+    const pointerKey = [reservation.id, lease.actorId, snapshotId] as const;
     const saved = "EXISTS (SELECT 1 FROM telegram_document_jobs WHERE receipt_id = ? AND state = 'done' AND result_code = 'saved')";
     const steps = [
-      preparePublication(db, policy, lease, reservation, staged, nameSha256),
+      ...(plan?.steps ?? []),
+      preparePublication(db, policy, lease, reservation, staged, nameSha256, plan?.exists),
       prepareTelegramDocumentJobSettlement(db, policy, lease, { kind: "saved" }, true),
-      assertBatch(db, `NOT ${pointer} OR changes() = 1`).bind(reservation.id, lease.actorId, snapshotId),
+      assertBatch(db, `NOT ${pointer} OR changes() = 1`).bind(...pointerKey),
+      ...(plan ? [assertBatch(db, `NOT ${plan.exists.sql} OR (${pointer} AND changes() = 1)`)
+        .bind(...plan.exists.bindings, ...pointerKey)] : []),
       db.prepare(`INSERT INTO telegram_document_saved_counts (receipt_id, node_count, name_sha256)
         SELECT ?, ?, ? WHERE ${pointer} AND ${saved}`)
-        .bind(lease.receiptId, counts.parsed, nameSha256, reservation.id, lease.actorId, snapshotId, lease.receiptId),
-      db.prepare(`INSERT INTO telegram_outbox (receipt_id) SELECT ? WHERE changes() = 1`).bind(lease.receiptId),
-      assertBatch(db, `NOT ${pointer} OR changes() = 1`).bind(reservation.id, lease.actorId, snapshotId),
+        .bind(lease.receiptId, counts.parsed, nameSha256, ...pointerKey, lease.receiptId),
+      ...(plan ? [
+        db.prepare(`DELETE FROM telegram_provider_document_opt_in WHERE receipt_id=? AND changes()=1
+          AND EXISTS (SELECT 1 FROM telegram_mixed_document_opt_in WHERE receipt_id=?)`).bind(lease.receiptId, lease.receiptId),
+        ...prepareTelegramProviderDocumentMarker(db, lease.receiptId),
+      ] : [
+        db.prepare(`INSERT INTO telegram_outbox (receipt_id) SELECT ? WHERE changes() = 1`).bind(lease.receiptId),
+        assertBatch(db, `NOT ${pointer} OR changes() = 1`).bind(...pointerKey),
+      ]),
       db.prepare(`DELETE FROM telegram_document_stages WHERE snapshot_id = ? AND ${pointer}`)
-        .bind(snapshotId, reservation.id, lease.actorId, snapshotId),
+        .bind(snapshotId, ...pointerKey),
       db.prepare(`DELETE FROM telegram_document_reservations WHERE receipt_id = ? AND ${pointer}`)
-        .bind(lease.receiptId, reservation.id, lease.actorId, snapshotId),
+        .bind(lease.receiptId, ...pointerKey),
     ];
     const results = await db.batch(steps);
     verifyBatch(results, steps.length);
-    if (results[1].results.length === 1) return "saved";
+    if (results[(plan?.steps.length ?? 0) + 1].results.length === 1) return "saved";
+    if (plan && results[0].meta.changes === 0) {
+      await finishTelegramDocumentJob(db, policy, lease, { kind: "failed", reason: "coalesced" });
+      return "stale";
+    }
     // A live lease with a changed target gets the same bounded retry policy as storage failures.
     await finishTelegramDocumentJob(db, policy, lease, { kind: "retry" });
     return "stale";
