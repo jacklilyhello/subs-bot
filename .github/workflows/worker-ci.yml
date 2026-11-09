@@ -104,16 +104,28 @@ jobs:
         run: |
           workdir="$(mktemp -d)"
           trap 'rm -rf -- "$workdir"' EXIT
+          download_client() {
+            local output=$1
+            shift
+            curl -q --fail --silent --show-error --location --max-redirs 5 \
+              --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 60 \
+              --retry 2 --retry-max-time 90 --retry-connrefused --output "$output" "$@"
+          }
           archive="$workdir/sing-box.tar.gz"
-          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 120 \
-            https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-linux-amd64.tar.gz \
-            --output "$archive"
+          printf '%s\n' 'Downloading the pinned Sing-box asset through the GitHub release API.'
+          if ! download_client "$archive" --header 'Accept: application/octet-stream' \
+            --header 'X-GitHub-Api-Version: 2026-03-10' \
+            https://api.github.com/repos/SagerNet/sing-box/releases/assets/669526810; then
+            printf '%s\n' 'GitHub asset API download failed. Trying the official release URL.'
+            download_client "$archive" \
+              https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-linux-amd64.tar.gz
+          fi
           printf '%s  %s\n' '699a1b510aa4396b2176d32d1181920399ebf1e267835da6f3b598d0f7c24968' "$archive" | sha256sum --check
           tar -xzf "$archive" -C "$workdir"
           archive="$workdir/mihomo.gz"
-          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 120 \
-            https://github.com/MetaCubeX/mihomo/releases/download/v1.19.33/mihomo-linux-amd64-compatible-v1.19.33.gz \
-            --output "$archive"
+          printf '%s\n' 'Downloading the pinned Mihomo release.'
+          download_client "$archive" \
+            https://github.com/MetaCubeX/mihomo/releases/download/v1.19.33/mihomo-linux-amd64-compatible-v1.19.33.gz
           printf '%s  %s\n' '386508bfb1c72c43b6a0eda73708ecdce82546581b0ebcb16366c53757c622b6' "$archive" | sha256sum --check
           gzip -dc "$archive" > "$workdir/mihomo"
           chmod 0700 "$workdir/mihomo"
