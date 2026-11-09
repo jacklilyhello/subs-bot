@@ -14,6 +14,7 @@ from unicodedata import category
 
 import legacy_snapshot_convert as converter
 import legacy_typed_short_inventory as backup
+from legacy_inventory import InventoryError as BackupError
 
 
 ROWS = "rows.ndjson"
@@ -258,7 +259,7 @@ def seal_inventory(backup_path, output, *, source_sha256, owner_map, owner_map_s
         backup._write_file(target / SEAL, (descriptor["sha256"].encode("ascii") + b"\n",), 65)
         return {"inventory": counts, "workerValidation": "pending", "completeImportable": False,
                 "manifestSha256": descriptor["sha256"]}
-    except (InventoryError, backup.InventoryError, converter.ConversionError, OSError, sqlite3.Error,
+    except (InventoryError, BackupError, backup.InventoryError, converter.ConversionError, OSError, sqlite3.Error,
             ValueError, TypeError, KeyError, RecursionError, OverflowError) as error:
         if destination is not None:
             for name in (SEAL, MANIFEST, ROWS):
