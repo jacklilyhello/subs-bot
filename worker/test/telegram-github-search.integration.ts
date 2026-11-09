@@ -23,6 +23,11 @@ test("emitted Worker preserves private GitHub search and ordinary delivery acros
     const releaseHelp = Promise.withResolvers<void>();
     const releaseGitHubReply = Promise.withResolvers<void>();
     const upstreamUrls: URL[] = [];
+    const grepMethods: string[] = [];
+    const codeQuery = "synthetic-source-phrase";
+    const opaqueQuery = "synthetic-opaque-phrase";
+    const opaqueRepo = "public-fixture/Code";
+    const fileUrl = "https://github.com/public-fixture/Code/blob/main/src/demo.ts";
     type Sent = {
       chat_id: string; text: string; reply_parameters: { message_id: number };
       link_preview_options: unknown; reply_markup?: { inline_keyboard: Array<Array<{ text: string; url: string }>> };
@@ -61,15 +66,49 @@ test("emitted Worker preserves private GitHub search and ordinary delivery acros
       bindings: { BUILD_REVISION: manifest.revision, TELEGRAM_ISOLATION_CONFIG: JSON.stringify(policy) },
       outboundService: async (request: Request) => {
         const url = new URL(request.url);
+        if (url.origin === "https://mcp.grep.app") {
+          assert.equal(url.href, "https://mcp.grep.app/");
+          assert.equal(request.method, "POST");
+          for (const name of ["Authorization", "Cookie", "Mcp-Session-Id"]) assert.equal(request.headers.get(name), null);
+          const rpc = await request.json() as { method: string; id: number; params?: { arguments?: { query?: string } } };
+          grepMethods.push(rpc.method);
+          assert.equal(request.headers.get("MCP-Protocol-Version"), rpc.method === "initialize" ? null : "2025-06-18");
+          if (rpc.method === "notifications/initialized") return new Response(null, { status: 202 });
+          const hit = (repo: string, link: string) => ({ type: "text",
+            text: `Repository: ${repo}\nPath: src/demo.ts\nURL: ${link}\nLicense: MIT\n\nSnippets:\nsynthetic-raw-excerpt` });
+          const query = rpc.params?.arguments?.query;
+          if (rpc.method !== "initialize") {
+            assert.equal(rpc.method, "tools/call");
+            assert.ok(query === codeQuery || query === opaqueQuery);
+            assert.deepEqual(rpc.params, { name: "searchGitHub",
+              arguments: { query, ...(query === opaqueQuery ? { repo: opaqueRepo } : {}), useRegexp: false } });
+          }
+          const content = query === opaqueQuery ? [{ type: "text", text: "synthetic-opaque-text" }] : [
+            hit("forged/Code", "https://github.com@unexpected.invalid/forged/Code/blob/main/src/demo.ts"),
+            hit("retired-fixture/Code", "https://github.com/retired-fixture/Code/blob/main/src/demo.ts"),
+            hit("public-fixture/Code", fileUrl),
+          ];
+          const result = rpc.method === "initialize" ? { protocolVersion: "2025-06-18" } : { content };
+          return new Response(`: priming\r\ndata: \r\n\r\nevent: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result })}\n\n`,
+            { headers: { "Content-Type": "text/event-stream" } });
+        }
         if (url.origin !== "https://api.telegram.org") {
           upstreamUrls.push(url);
-          assert.equal(url.origin + url.pathname, "https://api.github.com/search/repositories");
           assert.equal(request.method, "GET");
           assert.equal(request.headers.get("Authorization"), null);
           assert.equal(request.headers.get("Cookie"), null);
           assert.equal(request.headers.get("X-GitHub-Api-Version"), "2026-03-10");
           assert.equal(request.headers.get("Accept"), "application/vnd.github+json");
-          if (url.searchParams.get("q") === "redirect-demo is:public") {
+          if (url.pathname.startsWith("/repos/")) {
+            assert.equal(url.origin, "https://api.github.com");
+            const repo = url.pathname.slice(7);
+            assert.ok(repo === "public-fixture/Code" || repo === "retired-fixture/Code");
+            const visible = repo === "public-fixture/Code";
+            return Response.json({ full_name: repo, html_url: `https://github.com/${repo}`,
+              private: !visible, visibility: visible ? "public" : "private" });
+          }
+          assert.equal(url.origin + url.pathname, "https://api.github.com/search/repositories");
+          if (url.searchParams.get("q") === "redirect-demo in:name is:public") {
             return new Response(null, { status: 302, headers: { Location: "https://grep.app/api/search" } });
           }
           await releaseLookup.promise;
@@ -147,7 +186,7 @@ test("emitted Worker preserves private GitHub search and ordinary delivery acros
       assert.equal((await post(2, publicQuery, policy.memberId, policy.memberId, now - 301)).status, 204);
       assert.equal((await post(3, "/g https://synthetic.invalid/with-credential")).status, 200);
       await waitFor(async () => await state(3) === "sent");
-      assert.match(sent[0].text, /^用法/u);
+      assert.match(sent[0].text, /^用法.*GitHub.*Grep/u);
       assert.equal(upstreamUrls.length, 0);
 
       assert.equal((await post(4, publicQuery)).status, 200);
@@ -169,9 +208,9 @@ test("emitted Worker preserves private GitHub search and ordinary delivery acros
       assert.equal(upstreamUrls[0].searchParams.get("q"), "private-fixture-argument user:octocat in:name is:public");
       assert.equal(upstreamUrls[0].searchParams.get("order"), "desc");
 
-      assert.equal((await post(8, "/g redirect-demo", policy.adminId)).status, 200);
+      assert.equal((await post(8, "/g redirect-demo in:name", policy.adminId)).status, 200);
       await waitFor(async () => fallbackAttempts === 1 && await state(8) === "pending");
-      assert.equal((await post(8, "/g redirect-demo", policy.adminId)).status, 204);
+      assert.equal((await post(8, "/g redirect-demo in:name", policy.adminId)).status, 204);
       await db.prepare("UPDATE telegram_outbox SET due_at=unixepoch() WHERE receipt_id=(SELECT receipt_id FROM telegram_inbox WHERE update_id=8)").run();
       const worker = await runtime.getWorker();
       assert.equal((await worker.scheduled({ cron: "* * * * *" })).outcome, "ok");
@@ -218,6 +257,34 @@ test("emitted Worker preserves private GitHub search and ordinary delivery acros
       assert.equal(await state(9), "sent");
       assert.equal(heldReplyAttempts, 2);
       assert.equal(upstreamUrls.length, 2, "readiness failures and existing reply recovery never replay lookup egress");
+      assert.deepEqual(grepMethods, [], "repository-only qualifiers must not be forwarded to Grep");
+
+      await db.prepare("UPDATE telegram_github_search SET started_at=unixepoch()-16 WHERE started_at IS NOT NULL").run();
+      assert.equal((await post(14, `/g ${codeQuery}`)).status, 200);
+      await waitFor(async () => await state(14) === "sent");
+      assert.equal((await post(14, `/g ${codeQuery}`)).status, 204);
+      assert.deepEqual(grepMethods, ["initialize", "notifications/initialized", "tools/call"]);
+      const codeAnswer = sent.find((item) => item.reply_parameters.message_id === 14);
+      assert.equal(codeAnswer?.chat_id, policy.memberId);
+      assert.equal(codeAnswer?.text, "GitHub 公开仓库\noctocat/Hello-World · ★ 10\nGrep 公开代码\npublic-fixture/Code/src/demo.ts");
+      assert.deepEqual(codeAnswer.reply_markup?.inline_keyboard.flat().map(({ url }) => url),
+        ["https://github.com/octocat/Hello-World", fileUrl, "https://github.com/search?type=code"]);
+      assert.deepEqual(upstreamUrls.slice(2).map(({ pathname }) => pathname).sort(),
+        ["/repos/public-fixture/Code", "/repos/retired-fixture/Code", "/search/repositories"]);
+      const projected = await db.prepare(`SELECT public_results FROM telegram_github_search JOIN telegram_inbox USING (receipt_id)
+        WHERE update_id=14`).first<string>("public_results");
+      assert.ok(projected);
+      assert.doesNotMatch(projected, /synthetic-source-phrase|synthetic-raw-excerpt|retired-fixture|unexpected/u);
+
+      await db.prepare("UPDATE telegram_github_search SET started_at=unixepoch()-16 WHERE started_at IS NOT NULL").run();
+      assert.equal((await post(15, `/g ${opaqueQuery} repo:${opaqueRepo}`)).status, 200);
+      await waitFor(async () => await state(15) === "sent");
+      assert.deepEqual(grepMethods.slice(3), ["initialize", "notifications/initialized", "tools/call"]);
+      assert.equal(upstreamUrls.at(-1)?.pathname, "/search/repositories");
+      const opaque = sent.find((item) => item.reply_parameters.message_id === 15);
+      assert.equal(opaque?.text, "GitHub 公开仓库\noctocat/Hello-World · ★ 10");
+      assert.deepEqual(opaque.reply_markup?.inline_keyboard.flat().map(({ url }) => url),
+        ["https://github.com/octocat/Hello-World", "https://github.com/search?type=code"]);
     } finally {
       releaseLookup.resolve();
       releaseHelp.resolve();

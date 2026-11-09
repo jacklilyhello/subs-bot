@@ -6,6 +6,7 @@ import {
   acceptTelegramGitHubSearch, normalizeGitHubSearchQuery, recoverTelegramGitHubSearch, renderTelegramGitHubReply,
   runTelegramGitHubSearch,
 } from "../src/telegram/github-search.ts";
+import { grepCodeContent } from "../src/telegram/grep-search.ts";
 import type { TelegramGitHubSearchUpdate, TelegramPolicy } from "../src/telegram/protocol.ts";
 import { acceptTelegramCommand, beginTelegramGitHubSearchReply, claimTelegramReply } from "../src/telegram/store.ts";
 
@@ -145,4 +146,46 @@ test("GitHub lookup failures use a fixed fallback without retrying or retaining 
     assert.deepEqual((await db.prepare("SELECT state,public_results FROM telegram_github_search ORDER BY receipt_id").all()).results,
       responses.map(() => ({ state: "unavailable", public_results: null })));
   });
+});
+
+test("Grep handshake cannot send the query after the member authorization changes", async () => {
+  await withDatabase(async (db, now) => {
+    const admission = await acceptTelegramGitHubSearch(db, policy, { ...event(1, now), args: "synthetic-lookup repo:octocat/Hello-World" });
+    assert.ok(admission.kind === "lookup");
+    const methods: string[] = [];
+    const request: typeof fetch = async (input, init) => {
+      if (String(input).startsWith("https://api.github.com/search/repositories?")) {
+        return Response.json({ items: [], incomplete_results: false });
+      }
+      const rpc = JSON.parse(String(init?.body)) as { method: string; id?: number };
+      methods.push(rpc.method);
+      if (rpc.method === "initialize") return new Response(
+        `data: ${JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result: { protocolVersion: "2025-06-18" } })}\n\n`,
+        { headers: { "Content-Type": "text/event-stream" } });
+      await db.prepare("INSERT INTO telegram_auth (bot_id,user_id,allowed,message_date,message_id) VALUES (?,?,0,?,1)")
+        .bind(policy.botId, policy.memberId, now).run();
+      return new Response(null, { status: 202 });
+    };
+    assert.equal(await runTelegramGitHubSearch(db, policy, admission, request), false);
+    assert.deepEqual(methods, ["initialize", "notifications/initialized"]);
+    assert.equal(await claim(db), null);
+  });
+});
+
+test("Grep refuses redirects and a session contract not verified by the hosted probe", async () => {
+  for (const response of [
+    new Response(null, { status: 302, headers: { Location: "https://unexpected.invalid/" } }),
+    new Response('data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}\n\n',
+      { headers: { "Content-Type": "text/event-stream", "Mcp-Session-Id": "unexpected-session" } }),
+  ]) {
+    const requests: Array<{ url: string; init?: RequestInit }> = [];
+    assert.deepEqual(await grepCodeContent(async (input, init) => {
+      requests.push({ url: String(input), init });
+      return response;
+    }, AbortSignal.timeout(1000), "synthetic-lookup", undefined, async () => true), []);
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].url, "https://mcp.grep.app/");
+    assert.equal(requests[0].init?.redirect, "manual");
+    assert.doesNotMatch(String(requests[0].init?.body), /synthetic-lookup/u);
+  }
 });
