@@ -23,7 +23,7 @@ const encoder = new TextEncoder();
 const fresh = "incoming.bot_id = ? AND incoming.update_id = ? AND incoming.receipt_nonce = ?";
 const freshInbox = `EXISTS (SELECT 1 FROM telegram_inbox AS incoming WHERE ${fresh})`;
 
-function currentAdmission(policy: TelegramPolicy, event: TelegramEventScope): ProviderSql {
+export function telegramProviderMessageAdmission(policy: TelegramPolicy, event: TelegramEventScope): ProviderSql {
   return {
     sql: `? BETWEEN unixepoch() - 900 AND unixepoch() + 30 AND (? = ? OR COALESCE((
       SELECT allowed = 1 AND message_date < ? FROM telegram_auth WHERE bot_id = ? AND user_id = ?
@@ -59,7 +59,7 @@ export async function acceptTelegramProviderRequest(
       `subs-bot:telegram-provider-request:v1\n${policy.botId}\n${event.updateId}`)));
     const nonce = crypto.randomUUID();
     const key = [policy.botId, event.updateId, nonce] as const;
-    const current = currentAdmission(policy, event);
+    const current = telegramProviderMessageAdmission(policy, event);
     const gate = refresh ? { sql: `(${current.sql}) AND (${refresh.guard.sql})`,
       bindings: [...current.bindings, ...refresh.guard.bindings] } : current;
     const fence = { sql: freshInbox, bindings: key };
