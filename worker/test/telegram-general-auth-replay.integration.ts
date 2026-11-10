@@ -293,6 +293,10 @@ test("closed general authorization replays a sealed candidate in a separate emit
     { name: "ordinary-short", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: shortConfig,
         PUBLIC_ORIGIN: PRODUCTION_PUBLIC_ORIGIN, TELEGRAM_AGGREGATE_KEY: aggregateKeyRaw }, outboundService: privateTransport },
+    { name: "typed-short-rollback", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
+      bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_AGGREGATE_KEY: aggregateKeyRaw,
+        TELEGRAM_ISOLATION_CONFIG: JSON.stringify({ ...isolation, botId: pin.botId, botToken: generalToken, memberId: "101" }) },
+      outboundService: privateTransport },
     ...[true, false].map((enabled) => ({ name: enabled ? "provider-open" : "provider-paused", modules: true,
       script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"], outboundService: privateTransport,
       serviceBindings: { PROVIDER_FETCH: { name: "provider-rpc", entrypoint: "ProviderFetch" } },
@@ -1795,6 +1799,20 @@ test("closed general authorization replays a sealed candidate in a separate emit
     assert.equal(response.status, 302);
     assert.equal(response.headers.get("Location"), `/sub/${initial.token}/base64`);
   }
+  const typedRollback = await runtime.getWorker("typed-short-rollback");
+  const isolatedRevoke = 7760;
+  assert.equal((await post(101, `/short revoke ${reservedTypedCode}`, { updateId: isolatedRevoke,
+    worker: typedRollback, secret: isolation.webhookSecret })).status, 200);
+  const isolatedReply = () => db.prepare(`SELECT reply.sent_message_id AS messageId FROM telegram_inbox AS inbox
+    JOIN telegram_outbox AS reply USING(receipt_id) WHERE inbox.bot_id=? AND inbox.update_id=? AND reply.state='sent'`)
+    .bind(pin.botId, isolatedRevoke).first<number>("messageId");
+  for (const end = Date.now() + 4000; !await isolatedReply() && Date.now() < end;) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const isolatedReplyId = await isolatedReply();
+  assert.ok(isolatedReplyId);
+  assert.equal(lifecycleMessagesById.get(isolatedReplyId)?.text, "没有可撤销的短链。");
+  assert.equal((await typedRollback.fetch(typedPath, { redirect: "manual" })).headers.get("Location"), `/sub/${initial.token}/base64`);
   const originReceipt = await db.prepare("SELECT receipt_id FROM telegram_inbox WHERE bot_id=? AND update_id=7378")
     .bind(pin.botId).first<number>("receipt_id");
   assert.ok(originReceipt);

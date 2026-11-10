@@ -66,6 +66,11 @@ const noConflicts = `NOT EXISTS(SELECT 1 FROM normal_short_links WHERE code_sha2
   AND NOT EXISTS(SELECT 1 FROM legacy_subscription_short_links WHERE code_sha256=link.code_sha256)
   AND NOT EXISTS(SELECT 1 FROM aggregate_links WHERE code_sha256=link.code_sha256)`;
 
+export function isolatedSubscriptionShortOrigin(link: "link" | "typed"): string {
+  return `NOT EXISTS (SELECT 1 FROM telegram_inbox AS origin WHERE origin.receipt_id=${link}.origin_receipt_id
+    AND origin.receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MARKER}')`;
+}
+
 /** Preflight the format before calling. Only the normalized target and the exact read guard cross this boundary. */
 export async function prepareTelegramSubscriptionShort(
   db: D1Database, policy: TelegramPolicy, lease: Lease, target: SubscriptionShortTarget, guard: Guard,

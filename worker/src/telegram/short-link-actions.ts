@@ -9,7 +9,8 @@ import { GENERAL_ACTOR_QUEUE_CAPACITY, GENERAL_LATEST_ACTOR_SQL, GENERAL_NO_LEGA
   GENERAL_POLICY_PIN_SQL, GENERAL_RECEIPT_SCHEMA, GENERAL_REPLY_TTL, generalCurrentAuthoritySql,
   generalPolicyBindings, prepareGeneralReceiptAuthority } from "./general-receipt.ts";
 import { inTelegramScope, type TelegramEventScope, type TelegramPolicy, type TelegramShortLinkUpdate } from "./protocol.ts";
-import { REVOKE_SUBSCRIPTION_SHORT, SUBSCRIPTION_SHORT_CODE, SUBSCRIPTION_SHORT_PIN, telegramSubscriptionShortsReady } from "./subscription-shorts.ts";
+import { isolatedSubscriptionShortOrigin, REVOKE_SUBSCRIPTION_SHORT, SUBSCRIPTION_SHORT_CODE, SUBSCRIPTION_SHORT_PIN,
+  telegramSubscriptionShortsReady } from "./subscription-shorts.ts";
 
 export const TELEGRAM_SHORT_LINK_MARKER = "short:v1";
 export const GENERAL_TELEGRAM_SHORT_MARKER = "general-short:v1";
@@ -128,7 +129,7 @@ export async function acceptTelegramShortLink(
           AND owned.bot_id=inbox.bot_id AND owned.revoked_at IS NULL AND owned.code_length=? ${noLegacyConflict}
         ${typedRevoke ? `LEFT JOIN telegram_subscription_short_links AS typed ON typed.code_sha256=?
           AND typed.owner_id=inbox.actor_id AND typed.bot_id=inbox.bot_id AND typed.revoked_at IS NULL
-          AND ${SUBSCRIPTION_SHORT_PIN}
+          AND ${SUBSCRIPTION_SHORT_PIN} AND (${isolatedSubscriptionShortOrigin("typed")})
           AND NOT EXISTS (SELECT 1 FROM normal_short_links WHERE code_sha256=typed.code_sha256)
           AND NOT EXISTS (SELECT 1 FROM legacy_subscription_short_links WHERE code_sha256=typed.code_sha256)
           AND NOT EXISTS (SELECT 1 FROM aggregate_links WHERE code_sha256=typed.code_sha256)` : ""}
@@ -165,7 +166,7 @@ export async function acceptTelegramShortLink(
         FROM telegram_inbox AS inbox JOIN telegram_short_link_actions AS action USING(receipt_id)
         WHERE ${fresh} AND action.result='revoked' AND link.code_sha256=action.code_sha256
           AND link.bot_id=inbox.bot_id AND link.owner_id=inbox.actor_id AND link.revoked_at IS NULL
-          AND ${SUBSCRIPTION_SHORT_PIN}`).bind(...receipt)] : []),
+          AND ${SUBSCRIPTION_SHORT_PIN} AND (${isolatedSubscriptionShortOrigin("link")})`).bind(...receipt)] : []),
       ...(legacyRevoke ? [db.prepare(`UPDATE legacy_subscription_short_links AS link
         SET revoked_at=max(created_at,unixepoch()),subscription_id=NULL,token_sha256=NULL,format=NULL
         FROM telegram_inbox AS inbox JOIN telegram_short_link_actions AS action USING(receipt_id)
