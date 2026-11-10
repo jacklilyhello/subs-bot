@@ -3,6 +3,7 @@
 import base64
 from contextlib import closing
 from copy import deepcopy
+from dataclasses import asdict
 from hashlib import sha256
 from http.client import IncompleteRead
 from io import BytesIO
@@ -19,7 +20,11 @@ from urllib.error import HTTPError
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import attest_api_status_container as attestation
 import cloudflare_isolation as cloudflare
+import page_jump_activation
+import page_jump_control
+import page_jump_recovery
 import release_isolation as release_entry
+import stage_page_jump_isolation as page_stage
 
 
 TARGET = {
@@ -126,6 +131,7 @@ class FakeCloudflare:
         }
         self.calls = []
         self.lose_upload = False
+        self.page_jump_journal = "absent"
         self.lose_activation = False
         self.lose_activation_readback = False
         self.health_available = True
@@ -182,6 +188,7 @@ class FakeCloudflare:
         self.dynamic_all_occupancy_at = {}
         self.dynamic_all_reads = 0
         self.page_jump_replies = []
+        self.page_jump_control_open = False
 
     def worker_api(self, method, path, payload=None):
         self.calls.append((method, path))
@@ -194,6 +201,8 @@ class FakeCloudflare:
             if path == VERSIONS + "?page=1&per_page=100":
                 return [{"id": row["id"], "annotations": deepcopy(row["annotations"])}
                         for row in self.versions.values()]
+            if path == VERSIONS + "?page=2&per_page=100":
+                return []
             if path.startswith(VERSIONS + "/") and path.endswith("?include=modules"):
                 version_id = path.split("/")[-1].split("?")[0]
                 if version_id == NEW_VERSION and self.candidate_readback_errors:
@@ -256,12 +265,31 @@ class FakeCloudflare:
     def data_api(self, method, path, payload=None):
         if method == "POST" and path == DATABASE + "/query":
             sql = payload["sql"]
+            if "AS pageJumpJournal," in sql:
+                return [{"success": True, "results": [{
+                    "pageJumpJournal": int(self.page_jump_journal not in ("absent", "registered-only")), "ledger": 1,
+                }]}]
+            if "AS pageJumpJournalRegistered" in sql:
+                return [{"success": True, "results": [{"pageJumpJournalRegistered": int(self.page_jump_journal != "absent")}]}]
+            if "AS schema_sql" in sql and page_jump_activation.JOURNAL in sql:
+                migration = Path(__file__).resolve().parents[1] / "migrations" / page_jump_activation.MIGRATION
+                pending = (self.page_jump_journal == "pending" or
+                           self.page_jump_journal == "pending-on-rollback" and self.active["id"] == NEW_DEPLOYMENT)
+                return [{"success": True, "results": [{
+                    "pinned": int(self.page_jump_journal != "table-only"),
+                    "schema_sql": migration.read_text(encoding="utf-8").removesuffix(";\n"),
+                    "pending": int(pending),
+                }]}]
             if "AS pageJumpUnsettled" in sql:
                 # Verify the guard works against baseline inbox/outbox alone, before 0042 exists.
                 with closing(sqlite3.connect(":memory:")) as db:
                     db.row_factory = sqlite3.Row
                     migration = Path(__file__).resolve().parents[1] / "migrations" / "0002_telegram.sql"
                     db.executescript(migration.read_text(encoding="utf-8"))
+                    if "FROM telegram_page_jump_controls" in sql:
+                        db.executescript(migration.with_name(cloudflare.PAGE_JUMP_CONTROL_MIGRATION).read_text(encoding="utf-8"))
+                        if self.page_jump_control_open:
+                            db.execute("INSERT INTO telegram_page_jump_controls VALUES ('123',1,1,0)")
                     for receipt, (marker, state) in enumerate(self.page_jump_replies, 1):
                         db.execute("""INSERT INTO telegram_inbox
                             (receipt_id,bot_id,update_id,actor_id,chat_id,chat_type,message_id,message_date,command,receipt_nonce)
@@ -777,14 +805,17 @@ class ReleaseTests(unittest.TestCase):
              "text": sha256(config.encode("utf-8")).hexdigest()},
         ])
 
-    def set_page_jump_artifact(self):
-        module = NEW_MODULE + b"\n/* " + cloudflare.PAGE_JUMP_MARKER + b" */\n"
+    def set_page_jump_artifact(self, *, controls=False):
+        markers = [cloudflare.PAGE_JUMP_MARKER]
+        if controls:
+            markers.append(cloudflare.PAGE_JUMP_CONTROL_MARKER)
+        module = NEW_MODULE + b"\n/* " + b" ".join(markers) + b" */\n"
         self.api.upload_module = module
         (self.bundle / "index.js").write_bytes(module)
         self.manifest["bundleSha256"] = sha256(module).hexdigest()
         migrations = Path(__file__).resolve().parents[1] / "migrations"
         self.manifest["migrations"] = [{"name": file.name, "sha256": sha256(file.read_bytes()).hexdigest()}
-                                      for file in sorted(migrations.glob("*.sql"))[:42]]
+                                      for file in sorted(migrations.glob("*.sql"))[:43 if controls else 42]]
 
     def test_page_jump_marker_requires_the_exact_0042_artifact(self):
         self.set_page_jump_artifact()
@@ -833,6 +864,188 @@ class ReleaseTests(unittest.TestCase):
         self.api.versions[OLD_VERSION]["bindings"].append({"name": cloudflare.PAGE_JUMP_BINDING, "type": "plain_text", "text": "1"})
         with self.assertRaisesRegex(cloudflare.CloudflareError, "separately reviewed pause and drain"):
             self.release(TELEGRAM_CONFIG)
+        self.assertEqual(self.api.writes(), [])
+
+    def test_page_jump_epoch_runtime_requires_exact_0043(self):
+        self.set_page_jump_artifact(controls=True)
+        cloudflare.verify_page_jump_artifact(self.bundle, self.manifest)
+        original = self.manifest["migrations"]
+        for migrations in (original[:-1], original[:-1] + [{**original[-1], "sha256": "0" * 64}]):
+            with self.subTest(count=len(migrations)), self.assertRaisesRegex(cloudflare.CloudflareError, "exact 0043"):
+                cloudflare.verify_page_jump_artifact(self.bundle, {**self.manifest, "migrations": migrations})
+        self.set_page_jump_artifact()
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "exact 0043"):
+            cloudflare.verify_page_jump_artifact(self.bundle, {**self.manifest, "migrations": original})
+
+    def test_ordinary_release_rejects_pending_and_partial_page_jump_journal_before_upload(self):
+        for state in ("pending", "registered-only", "table-only"):
+            self.api.page_jump_journal = state
+            with self.subTest(state=state), self.assertRaisesRegex(cloudflare.CloudflareError, "journal|unresolved"):
+                self.release()
+            self.assertEqual(self.api.writes(), [])
+        self.api.page_jump_journal = "clear"
+        self.assertTrue(self.release()["changed"])
+
+    def test_automatic_rollback_rechecks_page_jump_journal_before_post(self):
+        self.api.page_jump_journal = "pending-on-rollback"
+        self.api.health_available = False
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "safe rollback could not be confirmed"):
+            self.release()
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
+        self.assertEqual(self.api.active["id"], NEW_DEPLOYMENT)
+
+    def test_page_jump_epoch_downgrade_checks_closed_gate_and_only_unrecognized_receipts(self):
+        self.set_page_jump_artifact()
+        previous = self.api.versions[OLD_VERSION]
+        previous["modules"][0]["content_base64"] = base64.b64encode(
+            OLD_MODULE + cloudflare.PAGE_JUMP_MARKER + cloudflare.PAGE_JUMP_CONTROL_MARKER).decode("ascii")
+        self.api.page_jump_control_open = True
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "Close isolated page-jump admission"):
+            self.release()
+        self.api.page_jump_control_open = False
+        self.api.page_jump_replies = [("view-jump:v2", "sending")]
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "page-jump replies have drained"):
+            self.release()
+        self.assertEqual(self.api.writes(), [])
+        self.api.page_jump_replies = [("view-jump:v1", "pending"), ("view-jump:v2", "uncertain")]
+        self.assertTrue(self.release()["changed"])
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
+
+    def test_page_jump_plan_stage_and_resume_without_activating(self):
+        self.set_page_jump_artifact(controls=True)
+        self.api.versions[OLD_VERSION] = version(OLD_VERSION, NEW_REVISION, self.api.upload_module)
+        self.set_old_telegram_config(INLINE_CONFIG)
+        self.api.worker_responses[SCHEDULES] = {"schedules": [CRON]}
+        old_tag = cloudflare._release_tag(NEW_REVISION, sha256(INLINE_CONFIG.encode()).hexdigest(), None, None, None)
+        self.api.versions[OLD_VERSION]["annotations"]["workers/tag"] = old_tag
+        self.manifest.update(runId="700", runAttempt="1")
+        (self.bundle / "isolation.json").write_text(json.dumps(self.manifest), encoding="utf-8")
+        control = Mock()
+        control.path = DATABASE + "/query"
+        gate = None
+        control.observe.side_effect = lambda: page_jump_control.PageJumpObservation(gate, False)
+
+        def reserve(expected, run_id, guard):
+            nonlocal gate
+            self.assertIsNone(expected)
+            self.assertTrue(guard())
+            gate = page_jump_control.PageJumpGate(run_id, False, 0)
+            return gate
+
+        control.reserve.side_effect = reserve
+
+        def prepare(expected=None, attempt=1):
+            return page_stage.prepare_stage(self.api.worker_api, self.api.data_api, TARGET, self.bundle, self.manifest,
+                INLINE_CONFIG, None, None, self.api.guard, run_id=701, attempt=attempt, expected=expected)
+
+        with patch.object(page_stage, "artifact_proof", return_value={"artifactId": "900", "archiveSha256": "e" * 64}), patch.object(
+                page_stage, "PageJumpControl", return_value=control), patch.object(
+                page_stage, "_load_migrations", return_value=[1]), patch.object(page_stage, "_read_state", return_value=("managed", [1])):
+            plan = prepare()
+            self.assertEqual(plan["phase"], "planned")
+            self.assertEqual(self.api.writes(), [])
+            control.reserve.assert_not_called()
+            with self.assertRaisesRegex(cloudflare.CloudflareError, "checkpoint differs"):
+                prepare({**plan["checkpoint"], "gateSha256": "0" * 64})
+            self.assertEqual(self.api.writes(), [])
+            staged = prepare(plan["checkpoint"])
+            self.assertEqual(staged["phase"], "staged")
+            self.assertEqual(staged["epoch"], 701)
+            self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false"])
+            self.assertEqual(self.api.active["versions"][0]["version_id"], OLD_VERSION)
+            self.assertEqual(prepare(plan["checkpoint"], attempt=2)["candidateSha256"], staged["candidateSha256"])
+            self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false"])
+
+            scope = cloudflare._Isolation(self.api.worker_api, self.api.data_api, TARGET)
+            candidate = scope.version(NEW_VERSION, page_jump_epoch=701)
+            self.assertEqual(candidate.telegram_page_jump_epoch, 701)
+            with self.assertRaisesRegex(cloudflare.CloudflareError, "separately reviewed pause and drain"):
+                scope.version(NEW_VERSION)
+            with self.assertRaisesRegex(cloudflare.CloudflareError, "epoch differs"):
+                scope.version(NEW_VERSION, page_jump_epoch=702)
+            with self.assertRaisesRegex(cloudflare.CloudflareError, "may only be staged"):
+                scope.activate(scope.active(), NEW_VERSION, "synthetic", current_version=scope.version(OLD_VERSION),
+                    target_version=candidate, current_capable=False, target_capable=False, guard=self.api.guard)
+            self.api.versions[NEW_VERSION]["annotations"]["workers/tag"] = old_tag
+            with self.assertRaisesRegex(cloudflare.CloudflareError, "release tag differs"):
+                scope.version(NEW_VERSION, page_jump_epoch=701)
+            with self.assertRaisesRegex(cloudflare.CloudflareError, "no verified candidate"):
+                prepare(plan["checkpoint"], attempt=3)
+            self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false"])
+        serialized = json.dumps(staged)
+        for private in (TARGET["accountId"], TARGET["d1Id"], OLD_VERSION, NEW_VERSION, INLINE_CONFIG):
+            self.assertNotIn(private, serialized)
+
+    def test_page_jump_stage_proof_matches_exact_ci_manifest_and_owner_only_file(self):
+        manifest = {"revision": NEW_REVISION, "runId": "700", "runAttempt": "2"}
+        proof = {**manifest, "artifactId": "800", "archiveSha256": "e" * 64}
+        path = self.bundle / page_stage.ARTIFACT_PROOF_NAME
+        path.write_text(json.dumps(proof), encoding="ascii")
+        path.chmod(0o600)
+        self.assertEqual(page_stage.artifact_proof(self.bundle, manifest), proof)
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "exact verified Worker CI artifact"):
+            page_stage.artifact_proof(self.bundle, {**manifest, "runAttempt": "1"})
+        path.chmod(0o644)
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "exact verified Worker CI artifact"):
+            page_stage.artifact_proof(self.bundle, manifest)
+
+    def test_page_jump_stage_inputs_require_exact_confirmation_checkpoint_and_hosted_run(self):
+        confirmation = f"stage page jump for {cloudflare.WORKER_NAME}"
+        value = {"activeSha256": "a" * 64, "gateSha256": "b" * 64, "priorEpoch": None}
+        self.assertEqual(page_stage.stage_inputs("stage", confirmation, json.dumps(value)), ("stage", value))
+        for mode, text, raw in (("preserve", confirmation, ""), ("plan", "", "{}"), ("stage", "wrong", json.dumps(value)),
+                                ("stage", confirmation, json.dumps({**value, "priorEpoch": True})),
+                                ("stage", confirmation, '{"priorEpoch":null,' + json.dumps(value)[1:])):
+            with self.subTest(mode=mode), self.assertRaises(cloudflare.CloudflareError):
+                page_stage.stage_inputs(mode, text, raw)
+        env = {"GITHUB_WORKFLOW_REF": page_stage.WORKFLOW_REF, "RUNNER_ENVIRONMENT": "github-hosted",
+               "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "2"}
+        self.assertEqual(page_stage.hosted_run(env), (100, 2))
+        with self.assertRaises(cloudflare.CloudflareError):
+            page_stage.hosted_run({**env, "GITHUB_RUN_ID": "9007199254740992"})
+
+    def test_page_jump_recovery_can_pause_exact_historical_candidate_without_health_or_current_artifact(self):
+        self.set_page_jump_artifact(controls=True)
+        self.api.versions[OLD_VERSION] = version(OLD_VERSION, OLD_REVISION, self.api.upload_module)
+        self.set_old_telegram_config(INLINE_CONFIG)
+        ordinary_tag = cloudflare._release_tag(OLD_REVISION, sha256(INLINE_CONFIG.encode()).hexdigest(), None, None, None)
+        self.api.versions[OLD_VERSION]["annotations"]["workers/tag"] = cloudflare._page_jump_tag(
+            ordinary_tag, 700, self.manifest["bundleSha256"])
+        self.api.versions[OLD_VERSION]["bindings"].append(cloudflare._page_jump_binding(700))
+        scope = cloudflare._Isolation(self.api.worker_api, self.api.data_api, TARGET)
+        bound = scope.version(OLD_VERSION, page_jump_epoch=700)
+        archived = {"epoch": 700, "candidateSha256": page_stage._digest({"versionId": OLD_VERSION, "version": asdict(bound)}),
+                    "bundleSha256": bound.digest, "ciManifestSha256": "1" * 64, "ciRunId": "100", "ciRunAttempt": "1",
+                    "ciArtifactId": "200", "ciArchiveSha256": "2" * 64}
+        sources = {"stage": {"runId": "700", "runAttempt": "1", "revision": OLD_REVISION, "archiveSha256": "3" * 64}}
+        control = Mock()
+        stopped = page_jump_control.PageJumpGate(701, False, 20)
+
+        def pause(expected, run_id, guard):
+            self.assertEqual(expected, page_jump_control.PageJumpGate(700, False, 0))
+            self.assertEqual(run_id, 701)
+            self.assertTrue(guard())
+            return stopped
+
+        control.pause.side_effect = pause
+        control.observe.return_value = page_jump_control.PageJumpObservation(stopped, False)
+        with patch.object(page_jump_recovery, "read_source", return_value=archived) as source, patch.object(
+                page_jump_recovery, "PageJumpControl", return_value=control), patch.object(
+                cloudflare, "_read_health", side_effect=AssertionError("Recovery must not require application health.")):
+            evidence = page_jump_recovery.prepare_recovery(self.api.worker_api, self.api.data_api, TARGET, NEW_REVISION,
+                INLINE_CONFIG, self.api.guard, mode="pause", sources=sources, run_id=701, attempt=1)
+            self.assertEqual((evidence["phase"], evidence["epoch"], evidence["revision"]), ("paused", 701, NEW_REVISION))
+            sources["pause"] = {"runId": "701", "runAttempt": "1", "revision": NEW_REVISION, "archiveSha256": "4" * 64}
+            source.side_effect = [archived, evidence]
+            drained = page_jump_recovery.prepare_recovery(self.api.worker_api, self.api.data_api, TARGET, NEW_REVISION,
+                INLINE_CONFIG, self.api.guard, mode="drain", sources=sources, run_id=702, attempt=1)
+            self.assertEqual((drained["phase"], drained["epoch"]), ("drained", 701))
+            control.verify_drained.assert_called_once()
+            control.observe.return_value = page_jump_control.PageJumpObservation(page_jump_control.PageJumpGate(703, False, 20), False)
+            source.side_effect = [archived, evidence]
+            with self.assertRaisesRegex(cloudflare.CloudflareError, "paused gate changed"):
+                page_jump_recovery.prepare_recovery(self.api.worker_api, self.api.data_api, TARGET, NEW_REVISION,
+                    INLINE_CONFIG, self.api.guard, mode="drain", sources=sources, run_id=704, attempt=1)
         self.assertEqual(self.api.writes(), [])
 
     def set_inline_baseline(self):

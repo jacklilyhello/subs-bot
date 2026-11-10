@@ -1,6 +1,6 @@
 import { SUBSCRIPTION_LIFECYCLE_REVISION, validInteger } from "../storage.ts";
 import { normalizeSubscriptionName, prepareOwnedSubscriptionMutation, type SubscriptionMutation } from "../subscriptions.ts";
-import { inTelegramScope, TELEGRAM_PAGE_JUMP_MARKER, type TelegramLifecycleUpdate, type TelegramPolicy } from "./protocol.ts";
+import { inTelegramScope, TELEGRAM_PAGE_JUMP_RECEIPTS, type TelegramLifecycleUpdate, type TelegramPolicy } from "./protocol.ts";
 import { TELEGRAM_VIEW_RECEIPTS } from "./views.ts";
 
 export const TELEGRAM_LIFECYCLE_MARKER = "lifecycle:v1";
@@ -63,7 +63,7 @@ const actionOrigin = `(
 const eligibleOrigin = `inbox.bot_id = ? AND inbox.actor_id = ? AND inbox.chat_id = ?
   AND inbox.chat_type = ? AND inbox.thread_id IS ? AND reply.state = 'sent' AND reply.sent_message_id = ?
   AND (inbox.actor_id = ? OR COALESCE((
-    SELECT allowed=1 AND (inbox.receipt_nonce<>'${TELEGRAM_PAGE_JUMP_MARKER}' OR message_date<inbox.message_date)
+    SELECT allowed=1 AND (inbox.receipt_nonce NOT IN (${TELEGRAM_PAGE_JUMP_RECEIPTS}) OR message_date<inbox.message_date)
     FROM telegram_auth WHERE bot_id = inbox.bot_id AND user_id = inbox.actor_id
   ), 1) = 1)`;
 

@@ -1,3 +1,6 @@
+import { AggregateLimitError, getAggregateNodeSource } from "../aggregate.ts";
+import { ExportContentError, planBase64 } from "../base64-response.ts";
+import { PathRuleContentError } from "../path-rules.ts";
 import { listOwnedSubscriptions } from "../subscriptions.ts";
 import { resolveTelegramAggregateCode, TELEGRAM_AGGREGATE_ORIGIN } from "./aggregate-actions.ts";
 import { prepareSelectedLimitTickets, prepareSelectedRevokeTicket, renderTelegramSelected,
@@ -7,7 +10,7 @@ import {
   prepareTelegramLifecycleTickets, renderTelegramLifecycle, type TelegramLifecycleButton,
 } from "./lifecycle-actions.ts";
 import { GROUP_SHARE_PUBLISH_CALLBACK, inTelegramScope, TELEGRAM_PAGE_JUMP_CALLBACK, type TelegramPolicy } from "./protocol.ts";
-import { confirmTelegramPageJumpSend, renderTelegramPageJump, telegramPageJumpReady, telegramPageJumpSendGuard } from "./page-jump.ts";
+import { confirmTelegramPageJumpSend, currentTelegramPageJumpEpoch, renderTelegramPageJump, telegramPageJumpSendGuard } from "./page-jump.ts";
 import { closeUnsentTelegramBulkTrashReply, confirmTelegramBulkTrashSend, renderTelegramBulkTrash } from "./bulk-trash.ts";
 import { renderTelegramInlineSort } from "./inline-sort.ts";
 import { renderTelegramInlineConsent } from "./inline-search-consent.ts";
@@ -51,10 +54,49 @@ const BOT_API = "https://api.telegram.org";
 const MAX_RESPONSE_BYTES = 64 * 1024;
 const SEND_TIMEOUT_MS = 10_000;
 const CALLBACK_TIMEOUT_MS = 3_000;
+const AGGREGATE_BASE64_TIMEOUT_MS = 2_500;
 const LIST_LIMIT = 20;
 
 type ReplyAccess = "allowed" | "denied" | "none";
 type InlineKeyboard = ({ text: string; callback_data: string } | { text: string; url: string })[][];
+
+async function aggregateBase64Section(db: D1Database, bucket: R2Bucket, code: string, deadline: number): Promise<string> {
+  const unavailable = "Base64：暂时无法验证，请稍后重试。";
+  const start = Date.now();
+  const budget = Math.min(AGGREGATE_BASE64_TIMEOUT_MS, deadline - start - SEND_TIMEOUT_MS);
+  if (budget <= 0) return unavailable;
+  const controller = new AbortController();
+  const { signal } = controller;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  async function preflight(): Promise<string> {
+    try {
+      const source = await getAggregateNodeSource(db, bucket, code, false, signal);
+      if (!source) return unavailable;
+      await planBase64(source, signal);
+      if (Date.now() >= start + budget) return unavailable;
+      return `Base64 聚合订阅链接\n${TELEGRAM_AGGREGATE_ORIGIN}/agg/${code}/base64`;
+    } catch (error) {
+      return error instanceof ExportContentError || error instanceof PathRuleContentError || error instanceof AggregateLimitError
+        ? "Base64：订阅内容不支持此格式。" : unavailable;
+    }
+  }
+
+  // An in-flight binding read can outlast the timer. Cancel further reads without holding up the Clash reply.
+  try {
+    return await Promise.race([
+      preflight(),
+      new Promise<string>((resolve) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          resolve(unavailable);
+        }, budget);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
 
 async function readBotReply(response: Response): Promise<unknown> {
   if (!response.body) return null;
@@ -88,19 +130,18 @@ function positiveInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
-async function sendTelegram(
-  policy: TelegramPolicy,
-  scope: Pick<TelegramReplyLease, "actorId" | "chatId" | "chatType">,
+async function postTelegram(
+  botToken: string,
+  chatId: string,
   method: "sendMessage" | "sendDocument" | "editMessageText",
   body: Record<string, unknown> | FormData,
   timeoutMs: number,
   request: typeof fetch,
 ): Promise<TelegramReplyOutcome> {
-  if (!inTelegramScope(policy, scope)) return { kind: "failed" };
   try {
     const multipart = body instanceof FormData;
     const editId = method === "editMessageText" && !multipart ? body.message_id : undefined;
-    const response = await request(`${BOT_API}/bot${policy.botToken}/${method}`, {
+    const response = await request(`${BOT_API}/bot${botToken}/${method}`, {
       method: "POST",
       redirect: "manual",
       signal: AbortSignal.timeout(Math.min(SEND_TIMEOUT_MS, timeoutMs)),
@@ -112,7 +153,7 @@ async function sendTelegram(
       const result = record(payload.result);
       const chat = record(result?.chat);
       if (positiveInteger(result?.message_id) && (method !== "editMessageText" || result.message_id === editId) &&
-          typeof chat?.id === "number" && Number.isSafeInteger(chat.id) && String(chat.id) === scope.chatId) {
+          typeof chat?.id === "number" && Number.isSafeInteger(chat.id) && String(chat.id) === chatId) {
         return { kind: "sent", messageId: result.message_id };
       }
     } else if (payload?.ok === false && payload.error_code === response.status &&
@@ -130,6 +171,27 @@ async function sendTelegram(
     // A transport or malformed response cannot prove Telegram did not deliver.
   }
   return { kind: "uncertain" };
+}
+
+function sendTelegram(
+  policy: TelegramPolicy,
+  scope: Pick<TelegramReplyLease, "actorId" | "chatId" | "chatType">,
+  method: "sendMessage" | "sendDocument" | "editMessageText",
+  body: Record<string, unknown> | FormData,
+  timeoutMs: number,
+  request: typeof fetch,
+): Promise<TelegramReplyOutcome> {
+  return inTelegramScope(policy, scope)
+    ? postTelegram(policy.botToken, scope.chatId, method, body, timeoutMs, request)
+    : Promise.resolve({ kind: "failed" });
+}
+
+export function sendGeneralTelegramPrivateReply(
+  botToken: string, actorId: string, messageId: number, text: string,
+): Promise<TelegramReplyOutcome> {
+  return postTelegram(botToken, actorId, "sendMessage", {
+    chat_id: actorId, text, reply_parameters: { message_id: messageId }, link_preview_options: { is_disabled: true },
+  }, 5_000, fetch);
 }
 
 export function sendTelegramGroupShareCard(
@@ -485,7 +547,7 @@ export async function drainTelegramReplies(
   apiStatusPromptsEnabled = false,
   providerDocumentReadiness: boolean | "unavailable" = false,
   providerBatchAdmissionEnabled = false,
-  pageJumpEnabled = false,
+  pageJumpEpoch: number | null = null,
 ): Promise<void> {
   const deadline = Date.now() + budgetMs;
   const privateShareEnabled = privateShareRuntime.schemaReady && privateShareRuntime.context !== null;
@@ -638,11 +700,15 @@ export async function drainTelegramReplies(
     }
     if (lease.aggregate && lease.chatType === "private" && lease.threadId === null) {
       const code = await resolveTelegramAggregateCode(db, policy, { ...lease, aggregate: lease.aggregate }, aggregateKey);
-      if (code !== null && Date.now() < deadline && await beginTelegramAggregateLinkReply(db, policy, lease)) {
-        const text = `Clash 聚合订阅链接\n${TELEGRAM_AGGREGATE_ORIGIN}/agg/${code}/clash\n发送 /export revoke 可撤销链接。`;
-        const outcome = await sendTelegramReply(policy, lease, text, Math.max(1, deadline - Date.now()), request);
-        await settleTelegramReply(db, policy, lease, outcome);
-        continue;
+      if (code !== null && Date.now() < deadline) {
+        const base64 = await aggregateBase64Section(db, bucket, code, deadline);
+        if (Date.now() < deadline && await beginTelegramAggregateLinkReply(db, policy, lease)) {
+          const text = `Clash 聚合订阅链接\n${TELEGRAM_AGGREGATE_ORIGIN}/agg/${code}/clash\n${base64}\n发送 /export revoke 可撤销链接。`;
+          const remaining = deadline - Date.now();
+          const outcome = remaining > 0 ? await sendTelegramReply(policy, lease, text, remaining, request) : { kind: "failed" as const };
+          await settleTelegramReply(db, policy, lease, outcome);
+          continue;
+        }
       }
     }
     if (lease.privateClaim) {
@@ -661,15 +727,17 @@ export async function drainTelegramReplies(
       continue;
     }
     const jump = lease.pageJump ? await renderTelegramPageJump(db, lease.receiptId) : null;
-    if (lease.pageJump && !jump) {
+    const prompt = jump !== null && jump !== "page" && jump.forceReply;
+    const promptEpoch = prompt ? await currentTelegramPageJumpEpoch(db, policy.botId, lease.receiptId) : null;
+    if (lease.pageJump && (!jump || (prompt && promptEpoch === null))) {
       await closeUnsentTelegramPageJump(db, policy, lease);
       continue;
     }
     const reply: Awaited<ReturnType<typeof renderReply>> = jump && jump !== "page" ? { ...jump, access: "allowed" }
       : await renderReply(db, bucket, policy, lease, deadline, menuFeatures, privateShareEnabled, subscriptionReadEnabled,
         subscriptionNodesEnabled, providerRefreshEnabled, subscriptionRawFileEnabled);
-    const jumpButton = pageJumpEnabled && lease.view?.kind === "list" && (!jump || jump === "page") && reply.access === "allowed"
-      && await telegramPageJumpReady(db);
+    const jumpButton = pageJumpEpoch !== null && lease.view?.kind === "list" && (!jump || jump === "page") && reply.access === "allowed"
+      && await currentTelegramPageJumpEpoch(db, policy.botId, lease.receiptId) === pageJumpEpoch;
     const [view, lifecycle, read, nodes, refresh, rawFile] = await Promise.all([
       reply.buttons?.length ? prepareTelegramViewTickets(reply.buttons) : undefined,
       reply.lifecycleButtons?.length ? prepareTelegramLifecycleTickets(reply.lifecycleButtons) : undefined,
@@ -679,7 +747,7 @@ export async function drainTelegramReplies(
       reply.rawFileTarget ? prepareTelegramRawFileButton(reply.rawFileTarget) : undefined,
     ]);
     if (Date.now() >= deadline) continue;
-    const jumpGuard = jump ? telegramPageJumpSendGuard(policy) : undefined;
+    const jumpGuard = jump ? telegramPageJumpSendGuard(policy, promptEpoch) : undefined;
     if (!await beginTelegramReply(db, policy, lease, reply.access, view?.tickets, lifecycle?.tickets, read?.tickets, reply.readGuard,
       nodes?.tickets, refresh?.ticket, rawFile?.ticket, jumpGuard)) {
       if (jump) await closeUnsentTelegramPageJump(db, policy, lease);

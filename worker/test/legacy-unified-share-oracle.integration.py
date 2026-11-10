@@ -24,8 +24,9 @@ import prepare_isolation_artifact as artifact
 PUBLISH_DIRECTORY = "subs-bot-legacy-unified-share-candidate"
 ROUTE_PAIRS = 24
 HISTORICAL_CLAIM_REPLIES = 3
-WORKER_FAILURE = re.compile(rb"The isolated V10 Worker oracle could not be confirmed \("
-                            rb"(sandbox|input|request-shape|artifact|sql-replay|d1-readback|r2-replay|health|cutoff|restore|historical-claim|dispose|"
+AUTH_ACTIVATION = {"admittedActors": 2, "confirmedReplies": 3, "discardedReplies": 2, "uncertainReplies": 1}
+WORKER_FAILURE = re.compile(rb"The isolated V(?:10|11) Worker oracle could not be confirmed \("
+                            rb"(sandbox|input|request-shape|artifact|sql-replay|d1-readback|r2-replay|health|cutoff|restore|historical-claim|general-auth|dispose|"
                             rb"request, case (?:[1-9]|[1-3][0-9]|4[0-8]))\)\.\n")
 
 
@@ -33,11 +34,12 @@ class RouteContinuityError(RuntimeError):
     """Only a fixed Worker stage or bounded case number may leave the probe."""
 
 
-def worker_continuity(root, worker, worker_sha, revision, candidate, sql_statements):
+def worker_continuity(root, worker, worker_sha, revision, candidate, sql_statements, *, v11=False):
     node = which("node")
     fixture.require(node is not None)
     raw = package.native.canonical({
-        "profile": "unified-shares-v10", "workerDir": str(worker), "workerManifestSha256": worker_sha,
+        "profile": "unified-auth-v11" if v11 else "unified-shares-v10",
+        "workerDir": str(worker), "workerManifestSha256": worker_sha,
         "candidateDir": str(candidate.candidate), "candidateManifestSha256": candidate.candidate_sha256,
         "revision": revision, "sqlStatements": sql_statements(candidate),
     })
@@ -56,7 +58,13 @@ def worker_continuity(root, worker, worker_sha, revision, candidate, sql_stateme
     if child.returncode:
         detail = WORKER_FAILURE.fullmatch(diagnostic)
         raise RouteContinuityError("route-replay, " + (detail[1].decode("ascii") if detail else "unconfirmed"))
-    report = package.native.parsed(output, 128)
+    report = package.native.parsed(output, 256 if v11 else 128)
+    if v11:
+        fixture.require(set(report) == {"activation"} and type(report["activation"]) is dict
+                        and set(report["activation"]) == set(AUTH_ACTIVATION)
+                        and all(package.native.integer(report["activation"][name], count, count)
+                                for name, count in AUTH_ACTIVATION.items()))
+        return report["activation"]
     fixture.require(set(report) == {"continuity"} and type(report["continuity"]) is dict
                     and set(report["continuity"]) == {"routePairs", "historicalClaimReplies"}
                     and package.native.integer(report["continuity"]["routePairs"], ROUTE_PAIRS, ROUTE_PAIRS)
@@ -124,8 +132,12 @@ def main(arguments):
             stage = "candidate"
             if v11:
                 candidate = fixture.build_unified_auth_fixture(source_root, worker, revision, produce_oracle=True)
+                stage = "general-auth"
+                activation = worker_continuity(root, worker, worker_sha, revision, candidate,
+                                               selected_oracle["sql_statements"], v11=True)
                 outcomes = {"candidateVersion": 11, "equivalentExternalRows": 1, "privateShares": 2, "claimRows": 1, "objects": 10,
-                            "generalAuthorization": {"activationAllowed": False, "counts": fixture.AUTH_COUNTS}}
+                            "generalAuthorization": {"activationAllowed": False, "counts": fixture.AUTH_COUNTS},
+                            "hostedSyntheticActivation": activation}
             else:
                 candidate = fixture.build_unified_share_fixture(source_root, worker, revision, produce_oracle=True)
                 stage = "route-replay"
@@ -139,7 +151,8 @@ def main(arguments):
         print(json.dumps(outcomes, sort_keys=True))
         return 0
     except RouteContinuityError as error:
-        print(f"Synthetic unified share candidate could not be confirmed ({error}).", file=sys.stderr)
+        label = "authorization" if v11 else "share"
+        print(f"Synthetic unified {label} candidate could not be confirmed ({error}).", file=sys.stderr)
         return 2
     except Exception:
         label = "authorization" if v11 else "share"

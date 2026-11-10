@@ -36,7 +36,8 @@ export type TelegramViewUpdate = TelegramEventScope & (
 
 export const TELEGRAM_PAGE_JUMP_CALLBACK = "list:jump:v1";
 export const TELEGRAM_PAGE_JUMP_PROMPT = "🔢 请回复这条消息，输入要跳转的页码数字（如 2）。";
-export const TELEGRAM_PAGE_JUMP_MARKER = "view-jump:v1";
+export const TELEGRAM_PAGE_JUMP_MARKER = "view-jump:v2";
+export const TELEGRAM_PAGE_JUMP_RECEIPTS = `'view-jump:v1','${TELEGRAM_PAGE_JUMP_MARKER}'`;
 export type TelegramPageJumpUpdate = TelegramEventScope & (
   | { kind: "open"; callbackId: string }
   | { kind: "reply"; promptMessageId: number; page: number | null; cancelled: boolean }
@@ -186,6 +187,15 @@ function canonicalId(value: unknown, negative = false): value is string {
   return matches(value, pattern) && Number.isSafeInteger(Number(value)) && String(Number(value)) === value;
 }
 
+export type TelegramBotCredentials = Pick<TelegramPolicy, "botId" | "botUsername" | "webhookSecret" | "botToken">;
+
+export function readTelegramBotCredentials(value: Record<string, unknown>): TelegramBotCredentials | null {
+  const { botId, botUsername, webhookSecret, botToken } = value;
+  return canonicalId(botId) && matches(botUsername, USERNAME) && matches(webhookSecret, WEBHOOK_SECRET)
+    && matches(botToken, BOT_TOKEN) && botToken.startsWith(`${botId}:`)
+    ? { botId, botUsername, webhookSecret, botToken } : null;
+}
+
 export function parseTelegramPolicy(input: unknown): TelegramPolicy | null {
   if (typeof input !== "string" || input.length > 4096) return null;
   let value: unknown;
@@ -195,14 +205,11 @@ export function parseTelegramPolicy(input: unknown): TelegramPolicy | null {
     return null;
   }
   if (!isRecord(value) || Object.keys(value).length !== 7) return null;
-  const { botId, botUsername, adminId, memberId, groupId, webhookSecret, botToken } = value;
-  if (
-    !canonicalId(botId) || !canonicalId(adminId) || !canonicalId(memberId) || !canonicalId(groupId, true)
-    || new Set([botId, adminId, memberId]).size !== 3
-    || !matches(botUsername, USERNAME) || !matches(webhookSecret, WEBHOOK_SECRET)
-    || !matches(botToken, BOT_TOKEN) || !botToken.startsWith(`${botId}:`)
-  ) return null;
-  return { botId, botUsername, adminId, memberId, groupId, webhookSecret, botToken };
+  const credentials = readTelegramBotCredentials(value);
+  const { adminId, memberId, groupId } = value;
+  if (!credentials || !canonicalId(adminId) || !canonicalId(memberId) || !canonicalId(groupId, true)
+    || new Set([credentials.botId, adminId, memberId]).size !== 3) return null;
+  return { ...credentials, adminId, memberId, groupId };
 }
 
 export function inTelegramScope(policy: TelegramPolicy, event: Pick<TelegramEventScope, "actorId" | "chatId" | "chatType">): boolean {

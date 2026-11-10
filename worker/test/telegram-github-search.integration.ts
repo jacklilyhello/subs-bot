@@ -99,15 +99,16 @@ test("emitted Worker preserves private GitHub search and ordinary delivery acros
           assert.equal(request.headers.get("Cookie"), null);
           assert.equal(request.headers.get("X-GitHub-Api-Version"), "2026-03-10");
           assert.equal(request.headers.get("Accept"), "application/vnd.github+json");
-          if (url.pathname.startsWith("/repos/")) {
-            assert.equal(url.origin, "https://api.github.com");
-            const repo = url.pathname.slice(7);
-            assert.ok(repo === "public-fixture/Code" || repo === "retired-fixture/Code");
-            const visible = repo === "public-fixture/Code";
-            return Response.json({ full_name: repo, html_url: `https://github.com/${repo}`,
-              private: !visible, visibility: visible ? "public" : "private" });
-          }
           assert.equal(url.origin + url.pathname, "https://api.github.com/search/repositories");
+          if (url.searchParams.get("per_page") === "1") {
+            const repo = ["public-fixture/Code", "retired-fixture/Code"]
+              .find((name) => url.searchParams.get("q") === `repo:${name} is:public fork:true`);
+            assert.ok(repo);
+            const visible = repo === "public-fixture/Code";
+            return Response.json({ total_count: 1, incomplete_results: false, items: [
+              { full_name: repo, html_url: `https://github.com/${repo}`, private: !visible, visibility: visible ? "public" : "private" },
+            ] });
+          }
           if (url.searchParams.get("q") === "redirect-demo in:name is:public") {
             return new Response(null, { status: 302, headers: { Location: "https://grep.app/api/search" } });
           }
@@ -269,8 +270,8 @@ test("emitted Worker preserves private GitHub search and ordinary delivery acros
       assert.equal(codeAnswer?.text, "GitHub 公开仓库\noctocat/Hello-World · ★ 10\nGrep 公开代码\npublic-fixture/Code/src/demo.ts");
       assert.deepEqual(codeAnswer.reply_markup?.inline_keyboard.flat().map(({ url }) => url),
         ["https://github.com/octocat/Hello-World", fileUrl, "https://github.com/search?type=code"]);
-      assert.deepEqual(upstreamUrls.slice(2).map(({ pathname }) => pathname).sort(),
-        ["/repos/public-fixture/Code", "/repos/retired-fixture/Code", "/search/repositories"]);
+      assert.deepEqual(upstreamUrls.slice(2).map(({ searchParams }) => searchParams.get("q")),
+        [`${codeQuery} is:public`, "repo:retired-fixture/Code is:public fork:true", "repo:public-fixture/Code is:public fork:true"]);
       const projected = await db.prepare(`SELECT public_results FROM telegram_github_search JOIN telegram_inbox USING (receipt_id)
         WHERE update_id=14`).first<string>("public_results");
       assert.ok(projected);

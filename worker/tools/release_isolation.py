@@ -1,5 +1,6 @@
 """Release only the verified main artifact to the dedicated isolation resources."""
 
+from dataclasses import asdict
 import json
 import os
 import re
@@ -11,17 +12,27 @@ from attest_api_status_container import ATTESTATION_ENV
 from cloudflare_isolation import (
     CloudflareClient, CloudflareError, WORKER_NAME, group_share_cards_artifact, legacy_dynamic_all_artifact,
     legacy_selected_artifact, legacy_temp_artifact,
-    release_worker, validate_aggregate_key, validate_private_share_key, verify_page_jump_artifact, verify_worker_target,
+    _Isolation, release_worker, validate_aggregate_key, validate_private_share_key, verify_page_jump_artifact,
+    verify_worker_target,
 )
 from d1_migrations import MigrationError, apply_migrations
+from page_jump_activation import activate_once, activation_inputs, reconcile_activation
+from page_jump_open import open_admission
+from page_jump_recovery import prepare_recovery, recovery_inputs
+from page_jump_rollback import pause_durable, rollback_once
 from prepare_isolation_artifact import ArtifactError, require_current_main
 from provider_api_status_binding_gate import CONFIG_ENV as API_STATUS_CONFIG_ENV, load_api_status_gate
 from provider_binding_gate import CONFIG_ENV, load_provider_gate
+from stage_page_jump_isolation import _digest, hosted_run, prepare_stage, stage_inputs, write_evidence
 
 
 def telegram_release_config(manifest):
     if not any(item["name"] == "0002_telegram.sql" for item in manifest["migrations"]):
         return None
+    return isolated_telegram_config()
+
+
+def isolated_telegram_config():
     raw = os.environ.get("SUBS_BOT_TELEGRAM_TEST_CONFIG", "")
     if not raw or len(raw) > 2048:
         raise CloudflareError("This revision requires the isolated Telegram configuration.")
@@ -40,6 +51,19 @@ def telegram_release_config(manifest):
     except (KeyError, ValueError, TypeError):
         raise CloudflareError("The isolated Telegram configuration is invalid.") from None
     return raw
+
+
+def isolation_credentials():
+    target = json.loads(os.environ.get("SUBS_BOT_CF_ISOLATION_TARGET_JSON", "null"))
+    if not isinstance(target, dict) or set(target) != {
+        "accountId", "workerId", "workerCreatedOn", "d1Id", "d1CreatedAt", "r2CreatedOn", "namespace",
+    }:
+        raise ValueError("The isolation environment must contain the reviewed resource identities.")
+    data_token = os.environ.get("SUBS_BOT_CF_BOOTSTRAP_TOKEN")
+    deploy_token = os.environ.get("SUBS_BOT_CF_DEPLOY_TOKEN")
+    if not data_token or not deploy_token or data_token == deploy_token:
+        raise ValueError("Separate Cloudflare data and deployment credentials are required.")
+    return target, data_token, deploy_token
 
 
 def inline_search_release_mode():
@@ -149,6 +173,59 @@ def release():
     legacy_subscription_shorts = legacy_subscription_shorts_release_mode()
     provider_batch = provider_batch_release_mode()
     api_status = api_status_release_mode()
+    page_jump = os.environ.get("SUBS_BOT_PAGE_JUMP_MODE", "preserve")
+    page_jump_confirmation = os.environ.get("SUBS_BOT_PAGE_JUMP_CONFIRMATION", "")
+    page_jump_input = os.environ.get("SUBS_BOT_PAGE_JUMP_CHECKPOINT", "")
+    recovery = page_jump in ("pause", "drain")
+    activation = page_jump in ("activate", "reconcile", "pause-durable", "rollback", "open")
+    if recovery:
+        page_jump_checkpoint = recovery_inputs(page_jump, page_jump_confirmation, page_jump_input)
+    elif activation:
+        page_jump_checkpoint = activation_inputs(page_jump, page_jump_confirmation, page_jump_input)
+    else:
+        _, page_jump_checkpoint = stage_inputs(page_jump, page_jump_confirmation, page_jump_input)
+    if page_jump != "preserve" and any(mode is not None for mode in (
+            inline_search, provider_url_import, provider_url_documents, mixed_documents, group_share_cards,
+            provider_refresh, legacy_subscription_shorts, provider_batch, api_status)):
+        raise CloudflareError("Manage isolated page jump in a separate scoped operation.")
+    if recovery or activation:
+        run_id, attempt = hosted_run(os.environ)
+        target, data_token, deploy_token = isolation_credentials()
+        guard = lambda: require_current_main(revision)
+        guard()
+        worker_api, data_api = CloudflareClient(deploy_token), CloudflareClient(data_token)
+        telegram_config = isolated_telegram_config()
+        if recovery:
+            evidence = prepare_recovery(worker_api, data_api, target, revision, telegram_config, guard,
+                mode=page_jump, sources=page_jump_checkpoint, run_id=run_id, attempt=attempt)
+        elif page_jump == "pause-durable":
+            evidence = pause_durable(_Isolation(worker_api, data_api, target), telegram_config, guard,
+                epoch=page_jump_checkpoint["epoch"], stage_sha256=page_jump_checkpoint["stageSha256"],
+                revision=revision, run_id=run_id, attempt=attempt)
+        elif page_jump == "open":
+            evidence = open_admission(_Isolation(worker_api, data_api, target), telegram_config, guard,
+                epoch=page_jump_checkpoint["epoch"], stage_sha256=page_jump_checkpoint["stageSha256"],
+                revision=revision, run_id=run_id, attempt=attempt)
+        else:
+            scope = _Isolation(worker_api, data_api, target)
+            if page_jump == "activate":
+                record = activate_once(scope, page_jump_checkpoint["stage"], telegram_config, guard,
+                                       run_id=run_id, revision=revision,
+                                       bundle=Path(os.environ["RUNNER_TEMP"]) / "subs-bot-verified")
+            elif page_jump == "rollback":
+                record = rollback_once(scope, page_jump_checkpoint["pause"], telegram_config, guard, run_id=run_id)
+            else:
+                record = reconcile_activation(scope, telegram_config, guard, epoch=page_jump_checkpoint["epoch"],
+                                              stage_sha256=page_jump_checkpoint["stageSha256"])
+            phase = {"activate": "activation-confirmed", "rollback": "rollback-confirmed", "reconcile": "reconciled"}[page_jump]
+            evidence = {"version": 1, "phase": phase,
+                        "revision": revision, "operationRunId": run_id, "operationRunAttempt": attempt,
+                        "epoch": record.intent.epoch, "stageSha256": record.intent.stage_sha256,
+                        "journalSha256": _digest(asdict(record))}
+        guard()
+        write_evidence(Path(os.environ["RUNNER_TEMP"]), evidence)
+        print("Verified isolated page-jump operation evidence.", flush=True)
+        return
     if api_status is not None and any(mode is not None for mode in (
             inline_search, provider_url_import, provider_refresh, legacy_subscription_shorts, provider_batch,
             provider_url_documents, mixed_documents)):
@@ -186,15 +263,7 @@ def release():
             validate_private_share_key(private_share_key)
             if private_share_key == aggregate_key:
                 raise CloudflareError("The isolated private share key must be distinct from the aggregate key.")
-    target = json.loads(os.environ.get("SUBS_BOT_CF_ISOLATION_TARGET_JSON", "null"))
-    if not isinstance(target, dict) or set(target) != {
-        "accountId", "workerId", "workerCreatedOn", "d1Id", "d1CreatedAt", "r2CreatedOn", "namespace",
-    }:
-        raise ValueError("The isolation environment must contain the reviewed resource identities.")
-    data_token = os.environ.get("SUBS_BOT_CF_BOOTSTRAP_TOKEN")
-    deploy_token = os.environ.get("SUBS_BOT_CF_DEPLOY_TOKEN")
-    if not data_token or not deploy_token or data_token == deploy_token:
-        raise ValueError("Separate Cloudflare data and deployment credentials are required.")
+    target, data_token, deploy_token = isolation_credentials()
 
     def guard():
         require_current_main(revision)
@@ -207,6 +276,13 @@ def release():
     data_api = CloudflareClient(data_token)
     worker_api = CloudflareClient(deploy_token)
     guard()
+    if page_jump != "preserve":
+        run_id, attempt = hosted_run(os.environ)
+        evidence = prepare_stage(worker_api, data_api, target, bundle, manifest, telegram_config, aggregate_key,
+                                 private_share_key, guard, run_id=run_id, attempt=attempt, expected=page_jump_checkpoint)
+        write_evidence(bundle.parent, evidence)
+        print("Verified isolated page-jump stage evidence.", flush=True)
+        return
     provider_gate = load_provider_gate(os.environ.get(CONFIG_ENV, ""), target, deploy_token)
     provider_binding = provider_gate.binding if provider_gate is not None else None
     first_provider_proof = provider_gate.verify_first_binding if provider_gate is not None else None

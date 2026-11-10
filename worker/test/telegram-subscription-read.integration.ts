@@ -7,6 +7,7 @@ import { Miniflare } from "miniflare";
 import { createSubscription, publishNodeSnapshot } from "../src/storage.ts";
 import { trashOwnedSubscription } from "../src/subscriptions.ts";
 import { beginTelegramReply, claimTelegramReply, settleTelegramReply } from "../src/telegram/store.ts";
+import { acceptTelegramPageJump, telegramPageJumpEpoch } from "../src/telegram/page-jump.ts";
 import {
   acceptTelegramSubscriptionRead, confirmTelegramSubscriptionReadSend, renderTelegramSubscriptionRead,
 } from "../src/telegram/subscription-read.ts";
@@ -61,7 +62,7 @@ test("emitted Worker searches personal subscriptions and sends only guarded priv
     },
   };
   const runtime = new Miniflare({ workers: [
-    { ...fixture, name: "enabled", bindings: { ...fixture.bindings, TELEGRAM_PAGE_JUMP: "1" } },
+    { ...fixture, name: "enabled", bindings: { ...fixture.bindings, TELEGRAM_PAGE_JUMP: "v2:1" } },
     { ...fixture, name: "dormant" },
   ] });
   try {
@@ -242,12 +243,21 @@ test("emitted Worker searches personal subscriptions and sends only guarded priv
     await settleTelegramReply(db, policy, memberLease, { kind: "failed" });
 
     const jumpMigration = manifest.migrations.find((item: { name: string }) => item.name === "0042_telegram_page_jumps.sql");
-    assert.ok(jumpMigration);
+    const controlsMigration = manifest.migrations.find((item: { name: string }) => item.name === "0043_telegram_page_jump_controls.sql");
+    assert.ok(jumpMigration && controlsMigration);
     await db.batch([
       db.prepare("CREATE TABLE IF NOT EXISTS subs_bot_schema_migrations(position INTEGER PRIMARY KEY,name TEXT,sha256 TEXT,mode TEXT) STRICT"),
       db.prepare("INSERT INTO subs_bot_schema_migrations(position,name,sha256,mode) VALUES (42,?,?,'applied')")
         .bind(jumpMigration.name, jumpMigration.sha256),
+      db.prepare("INSERT INTO subs_bot_schema_migrations(position,name,sha256,mode) VALUES (43,?,?,'applied')")
+        .bind(controlsMigration.name, "0".repeat(64)),
+      db.prepare("INSERT INTO telegram_page_jump_controls(bot_id,epoch,enabled,origin_after_receipt) VALUES (?,1,1,0)")
+        .bind(policy.botId),
     ]);
+    const wrongPin = await waitForReply(policy.adminId, (await message("/list")).id);
+    assert.ok(!wrongPin.buttons.some(({ callback_data }) => callback_data === TELEGRAM_PAGE_JUMP_CALLBACK));
+    await noReceipt(await click(wrongPin, TELEGRAM_PAGE_JUMP_CALLBACK));
+    await db.prepare("UPDATE subs_bot_schema_migrations SET sha256=? WHERE position=43").bind(controlsMigration.sha256).run();
     const dormantUpdate = await message("/list", policy.adminId, policy.adminId, undefined, true);
     const dormantList = await waitForReply(policy.adminId, dormantUpdate.id);
     assert.ok(!dormantList.buttons.some(({ callback_data }) => callback_data === TELEGRAM_PAGE_JUMP_CALLBACK));
@@ -347,6 +357,61 @@ test("emitted Worker searches personal subscriptions and sends only guarded priv
     assert.match((await jumpTo("2501")).text, /最大 2500/u);
     await seedPageRange(19_990, 19_990);
     assert.equal((await jumpTo("2501")).text, "此页超出直接跳转上限，请使用“下一页”继续。");
+
+    assert.equal(telegramPageJumpEpoch("1"), null);
+    assert.equal(telegramPageJumpEpoch("v2:01"), null);
+    assert.equal(telegramPageJumpEpoch("v2:9007199254740992"), null);
+    const stalePrompt = await openJump(await waitForReply(policy.adminId, (await message("/list")).id));
+    const staleList = await waitForReply(policy.adminId, (await message("/list")).id);
+    const queuedList = await waitForReply(policy.groupId, (await message("/list", policy.adminId, policy.groupId, 88)).id);
+    const queuedPrompt = await openJump(queuedList);
+    const pendingList = await waitForReply(policy.adminId, (await message("/list")).id);
+    const scoped = (origin: Sent, updateId: number, messageId: number) => ({
+      actorId: policy.adminId, chatId: origin.chat, chatType: origin.chat === policy.groupId ? "supergroup" as const : "private" as const,
+      threadId: origin.threadId, updateId, messageId, messageDate: now(),
+    });
+    const queuedReplyId = ++sequence;
+    const queuedReplyMessageId = 2000 + queuedReplyId;
+    assert.equal(await acceptTelegramPageJump(db, policy, { ...scoped(queuedPrompt, queuedReplyId, queuedReplyMessageId),
+      kind: "reply", promptMessageId: queuedPrompt.id, page: 2, cancelled: false }, 1), true);
+
+    const pendingId = ++sequence;
+    const open = (origin: Sent, updateId: number) => ({
+      ...scoped(origin, updateId, origin.id), kind: "open" as const, callbackId: `fixture-jump-${updateId}`,
+    });
+    assert.equal(await acceptTelegramPageJump(db, policy, open(pendingList, pendingId), 1), true);
+    const racedId = ++sequence;
+    let batchEntered = false;
+    const raced = { prepare: db.prepare.bind(db), batch: async (statements: D1PreparedStatement[]) => {
+      batchEntered = true;
+      await db.prepare("UPDATE telegram_page_jump_controls SET enabled=0 WHERE bot_id=? AND epoch=1").bind(policy.botId).run();
+      return db.batch(statements);
+    } } as D1Database;
+    assert.equal(await acceptTelegramPageJump(raced, policy, open(staleList, racedId), 1), false);
+    assert.equal(batchEntered, true);
+    await noReceipt(racedId);
+    const wake = await message("/list", policy.adminId, policy.adminId, undefined, true);
+    await waitForReply(policy.adminId, wake.id);
+    const drained = await waitForReply(policy.groupId, queuedReplyMessageId);
+    assert.equal(drained.threadId, 88);
+    assert.equal(await db.prepare(`SELECT state FROM telegram_outbox JOIN telegram_inbox USING(receipt_id)
+      WHERE update_id=?`).bind(pendingId).first("state"), "failed");
+    assert.ok(!sent.some((entry) => entry.replyTo === pendingList.id));
+
+    await db.prepare(`UPDATE telegram_page_jump_controls SET epoch=2,enabled=1,origin_after_receipt=
+      (SELECT seq FROM sqlite_sequence WHERE name='telegram_inbox') WHERE bot_id=? AND epoch=1 AND enabled=0`).bind(policy.botId).run();
+    for (const epoch of [1, 2]) {
+      const id = ++sequence;
+      assert.equal(await acceptTelegramPageJump(db, policy, open(staleList, id), epoch), false);
+      await noReceipt(id);
+    }
+    const oldReply = ++sequence;
+    assert.equal(await acceptTelegramPageJump(db, policy, { ...scoped(stalePrompt, oldReply, 2000 + oldReply),
+      kind: "reply", promptMessageId: stalePrompt.id, page: 2, cancelled: false }, 2), false);
+    await noReceipt(oldReply);
+    const freshList = await waitForReply(policy.adminId, (await message("/list")).id);
+    assert.ok(!freshList.buttons.some(({ callback_data }) => callback_data === TELEGRAM_PAGE_JUMP_CALLBACK));
+    assert.equal(await acceptTelegramPageJump(db, policy, open(freshList, ++sequence), 2), true);
 
     for (const table of ["telegram_subscription_read", "telegram_subscription_read_ticket", "telegram_outbox", "telegram_inbox",
       "telegram_page_jumps"]) {

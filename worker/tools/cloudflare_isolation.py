@@ -23,6 +23,9 @@ PAGE_JUMP_BINDING = "TELEGRAM_PAGE_JUMP"
 PAGE_JUMP_MARKER = b"subs-bot:telegram-page-jump:v1"
 PAGE_JUMP_MIGRATION = "0042_telegram_page_jumps.sql"
 PAGE_JUMP_MIGRATION_SHA256 = "195fdd3611d9f380e86d9b30983fff306d4218c2ae7899d7dcf49fa275f9c288"
+PAGE_JUMP_CONTROL_MARKER = b"subs-bot:telegram-page-jump-epoch:v1"
+PAGE_JUMP_CONTROL_MIGRATION = "0043_telegram_page_jump_controls.sql"
+PAGE_JUMP_CONTROL_MIGRATION_SHA256 = "cad46bc0c6b296de85e8c77ce2cb71e8aef156b5e03e04628e0c1ee060649571"
 INLINE_SEARCH_BINDING = "TELEGRAM_INLINE_SEARCH"
 INLINE_SEARCH_MIGRATION = "0025_telegram_personal_inline.sql"
 INLINE_SEARCH_MIGRATION_SHA256 = "2c504b14ca94597925b1703d2f50d211d29addaff8f139b5411be5fd2306b122"
@@ -258,6 +261,8 @@ class _Version:
     telegram_group_share_cards: bool = False
     telegram_group_share_cards_capable: bool = False
     telegram_page_jump_capable: bool = False
+    telegram_page_jump_control_capable: bool = False
+    telegram_page_jump_epoch: int | None = None
 
 
 def _release_tag(revision, telegram_digest, aggregate_digest, private_share_digest, provider_binding):
@@ -310,6 +315,21 @@ def _telegram_feature_tag(tag, inline_search, provider_url_import, provider_refr
         batch_pin = f"{tag}:provider-batch:{int(provider_batch)}:{batch_module_sha256}:{PROVIDER_BATCH_SCHEMA_SHA256}"
         tag = prefix + sha256(batch_pin.encode("ascii")).hexdigest()
     return tag
+
+
+def _page_jump_binding(epoch):
+    _require(type(epoch) is int and 1 <= epoch <= 2**53 - 1, "Invalid isolated page-jump epoch.")
+    return {"name": PAGE_JUMP_BINDING, "type": "plain_text", "text": f"v2:{epoch}"}
+
+
+def _page_jump_tag(tag, epoch, module_sha):
+    if epoch is None:
+        return tag
+    # Batch readback identifies its independently reviewed capability by prefix.
+    prefix = next((value for value in (PROVIDER_BATCH_TAG_PREFIX, PROVIDER_BATCH_READY_TAG_PREFIX)
+                   if tag.startswith(value)), "page-jump-")
+    pin = f"{tag}:page-jump-v2:{epoch}:{module_sha}:{PAGE_JUMP_CONTROL_MIGRATION_SHA256}"
+    return prefix + sha256(pin.encode("ascii")).hexdigest()
 
 
 class _Isolation:
@@ -815,7 +835,8 @@ class _Isolation:
         annotations = _object(active.get("annotations") or {}, "deployment annotations")
         return _Deployment(active["id"], allocation["version_id"], annotations.get("workers/message"))
 
-    def version(self, version_id, *, with_legacy_selected=False, with_legacy_temp=False, with_legacy_dynamic_all=False):
+    def version(self, version_id, *, with_legacy_selected=False, with_legacy_temp=False, with_legacy_dynamic_all=False,
+                page_jump_epoch=None):
         _require(_matches(UUID, version_id), "Invalid isolated Worker version ID.")
         version = _object(self.worker_api("GET", f"{self.versions}/{version_id}?include=modules"), "Worker version")
         _require(version.get("id") == version_id and version.get("main_module") == "index.js"
@@ -827,12 +848,16 @@ class _Isolation:
                                                      {"enabled": False, "cross_version_cache": False}),
                  "Isolated Worker version runtime settings differ from the supported configuration.")
         rows = version.get("bindings")
-        _require(isinstance(rows, list) and 3 <= len(rows) <= 25
+        _require(isinstance(rows, list) and 3 <= len(rows) <= 25 + int(page_jump_epoch is not None)
                  and all(isinstance(row, dict) and isinstance(row.get("name"), str) for row in rows),
                  "Unexpected isolated Worker binding inventory.")
         bindings = {row["name"]: row for row in rows}
-        _require(PAGE_JUMP_BINDING not in bindings,
-                 "An admission-enabled page-jump release requires a separately reviewed pause and drain.")
+        if page_jump_epoch is None:
+            _require(PAGE_JUMP_BINDING not in bindings,
+                     "An admission-enabled page-jump release requires a separately reviewed pause and drain.")
+        else:
+            _require(bindings.pop(PAGE_JUMP_BINDING, None) == _page_jump_binding(page_jump_epoch),
+                     "The isolated staged page-jump epoch differs.")
         base_bindings = {"DB", "NODES", "BUILD_REVISION"}
         telegram_bindings = base_bindings | TELEGRAM_BINDINGS
         has_provider = bool(PROVIDER_BINDINGS & bindings.keys())
@@ -851,7 +876,7 @@ class _Isolation:
             PROVIDER_BATCH_BINDING, API_STATUS_BINDING, PROVIDER_URL_DOCUMENTS_BINDING, MIXED_DOCUMENTS_BINDING,
             GROUP_SHARE_CARDS_BINDING,
         }
-        _require(len(bindings) == len(rows) and binding_names in (base_bindings, telegram_bindings,
+        _require(len(bindings) + int(page_jump_epoch is not None) == len(rows) and binding_names in (base_bindings, telegram_bindings,
             telegram_bindings | AGGREGATE_BINDINGS, telegram_bindings | PRIVATE_SHARE_BINDINGS,
             telegram_bindings | AGGREGATE_BINDINGS | PRIVATE_SHARE_BINDINGS)
             and (not has_provider or PROVIDER_BINDINGS <= bindings.keys())
@@ -951,6 +976,12 @@ class _Isolation:
             api_status_binding = ProviderApiStatusBinding(*(pin["text"] for pin in pins))
         tag = annotations.get("workers/tag")
         module_sha256 = sha256(body).hexdigest()
+        _require(page_jump_epoch is None or (telegram_digest is not None and PAGE_JUMP_MARKER in body
+                 and PAGE_JUMP_CONTROL_MARKER in body), "The isolated Worker lacks staged page-jump capability.")
+
+        def tag_matches(expected):
+            return tag == _page_jump_tag(expected, page_jump_epoch, module_sha256)
+
         batch_capable = isinstance(tag, str) and tag.startswith((PROVIDER_BATCH_TAG_PREFIX, PROVIDER_BATCH_READY_TAG_PREFIX))
         _require(provider_url is not None or not (isinstance(tag, str) and tag.startswith(PROVIDER_URL_IMPORT_TAG_PREFIX)),
                  "Isolated Worker provider URL import release tag differs.")
@@ -966,7 +997,8 @@ class _Isolation:
         mixed_documents_capable = False
         group_share_cards_capable = False
         has_group_share_cards_marker = GROUP_SHARE_CARDS_MARKER in body
-        if batch_capable or has_api_status or any(binding is not None for binding in (inline, provider_url, refresh, legacy_shorts)):
+        if (batch_capable or has_api_status or page_jump_epoch is not None
+                or any(binding is not None for binding in (inline, provider_url, refresh, legacy_shorts))):
             release_tag = _release_tag(rev["text"], telegram_digest, aggregate_digest, private_share_digest, provider_binding)
             tag_inputs = (_api_status_tag(release_tag, api_status_binding, api_status is not None),
                           inline is not None, provider_url is not None, refresh is not None, legacy_shorts is not None,
@@ -974,12 +1006,12 @@ class _Isolation:
             expected = _telegram_feature_tag(*tag_inputs)
             document_tag_inputs = {"url_documents": provider_documents is not None, "url_documents_module_sha256": module_sha256}
             mixed_tag_inputs = {**document_tag_inputs, "mixed_documents": mixed_documents is not None}
-            group_share_cards_capable = batch_capable and has_group_share_cards_marker and tag == _telegram_feature_tag(
-                *tag_inputs, **mixed_tag_inputs, group_share_cards=group_share_cards is not None)
-            mixed_documents_capable = group_share_cards_capable or (batch_capable and tag == _telegram_feature_tag(
-                *tag_inputs, **mixed_tag_inputs))
-            documents_capable = mixed_documents_capable or (batch_capable and tag == _telegram_feature_tag(*tag_inputs,
-                **document_tag_inputs))
+            group_share_cards_capable = batch_capable and has_group_share_cards_marker and tag_matches(_telegram_feature_tag(
+                *tag_inputs, **mixed_tag_inputs, group_share_cards=group_share_cards is not None))
+            mixed_documents_capable = group_share_cards_capable or (batch_capable and tag_matches(_telegram_feature_tag(
+                *tag_inputs, **mixed_tag_inputs)))
+            documents_capable = mixed_documents_capable or (batch_capable and tag_matches(_telegram_feature_tag(
+                *tag_inputs, **document_tag_inputs)))
             feature = "API status" if has_api_status else "inline search"
             if batch_capable:
                 feature = "provider batch"
@@ -989,7 +1021,9 @@ class _Isolation:
                 feature = "provider refresh"
             elif provider_url is not None:
                 feature = "provider URL import"
-            _require(tag == expected or documents_capable, f"Isolated Worker {feature} release tag differs.")
+            elif page_jump_epoch is not None:
+                feature = "page-jump"
+            _require(tag_matches(expected) or documents_capable, f"Isolated Worker {feature} release tag differs.")
         _require(provider_documents is None or documents_capable, "Isolated Worker provider URL document release tag differs.")
         _require(mixed_documents is None or mixed_documents_capable, "Isolated Worker mixed document release tag differs.")
         _require(group_share_cards_capable == has_group_share_cards_marker
@@ -1001,7 +1035,9 @@ class _Isolation:
                         provider_batch is not None, batch_capable, api_status_binding, api_status is not None,
                         provider_documents is not None, documents_capable, mixed_documents is not None, mixed_documents_capable,
                         group_share_cards is not None, group_share_cards_capable,
-                        telegram_page_jump_capable=PAGE_JUMP_MARKER in body)
+                        telegram_page_jump_capable=PAGE_JUMP_MARKER in body,
+                        telegram_page_jump_control_capable=PAGE_JUMP_CONTROL_MARKER in body,
+                        telegram_page_jump_epoch=page_jump_epoch)
         capabilities = tuple(check(body) for requested, check in (
             (with_legacy_selected, _legacy_selected_module_capable),
             (with_legacy_temp, _legacy_temp_module_capable),
@@ -1015,7 +1051,7 @@ class _Isolation:
             if delay:
                 sleep(delay)
             try:
-                actual = self.version(candidate)
+                actual = self.version(candidate, page_jump_epoch=desired.telegram_page_jump_epoch)
             except CloudflareError as error:
                 if error.http_status != 404:
                     raise
@@ -1026,14 +1062,25 @@ class _Isolation:
                               uncertain=True, http_status=404)
 
     def staged(self, desired):
-        rows = self.worker_api("GET", self.versions + "?page=1&per_page=100")
-        _require(isinstance(rows, list), "Invalid Cloudflare Worker version list.")
         candidates = []
-        for row in rows:
-            item = _object(row, "listed Worker version")
-            annotations = _object(item.get("annotations") or {}, "version annotations")
-            if annotations.get("workers/tag") == desired.tag:
-                candidates.append(item.get("id"))
+        seen = set()
+        epoch_bound = desired.telegram_page_jump_epoch is not None
+        for page in range(1, 11 if epoch_bound else 2):
+            rows = self.worker_api("GET", f"{self.versions}?page={page}&per_page=100")
+            _require(isinstance(rows, list) and (not epoch_bound or len(rows) <= 100), "Invalid Cloudflare Worker version list.")
+            for row in rows:
+                item = _object(row, "listed Worker version")
+                version_id = item.get("id")
+                if epoch_bound:
+                    _require(_matches(UUID, version_id) and version_id not in seen, "Ambiguous isolated page-jump version listing.")
+                    seen.add(version_id)
+                annotations = _object(item.get("annotations") or {}, "version annotations")
+                if annotations.get("workers/tag") == desired.tag:
+                    candidates.append(version_id)
+            if not epoch_bound or not rows:
+                break
+        else:
+            raise CloudflareError("The isolated page-jump version listing exceeded its verified bound.")
         _require(len(candidates) <= 1, "More than one isolated Worker version claims the target revision.")
         if not candidates:
             return None
@@ -1087,6 +1134,8 @@ class _Isolation:
             ])
         if desired.telegram_api_status:
             bindings.append({"type": "plain_text", "name": API_STATUS_BINDING, "text": "1"})
+        if desired.telegram_page_jump_epoch is not None:
+            bindings.append(_page_jump_binding(desired.telegram_page_jump_epoch))
         message = "Reviewed isolated Worker release"
         if desired.provider_binding is not None:
             binding = desired.provider_binding
@@ -1127,31 +1176,42 @@ class _Isolation:
         raise CloudflareError("Isolated Worker upload could not be confirmed.", uncertain=True)
 
     def verify_page_jump_drain(self, current, target):
-        if not current.telegram_page_jump_capable or target.telegram_page_jump_capable:
+        downgrade = (current.telegram_page_jump_capable and not target.telegram_page_jump_capable
+                     or current.telegram_page_jump_control_capable and not target.telegram_page_jump_control_capable)
+        if not downgrade:
             return
+        markers = "'view-jump:v2'" if target.telegram_page_jump_capable else "'view-jump:v1','view-jump:v2'"
+        control_open = ("EXISTS (SELECT 1 FROM telegram_page_jump_controls WHERE enabled=1)"
+                        if current.telegram_page_jump_control_capable else "0")
         path = f"{self.account}/d1/database/{self.target['d1Id']}/query"
         error = "The isolated page-jump drain could not be verified."
         try:
             # Admission is off in every version accepted by version(). Concurrent
             # settlements may finish these receipts. They cannot create new ones.
-            result = self.data_api("POST", path, {"sql": """
+            result = self.data_api("POST", path, {"sql": f"""
                 SELECT EXISTS (SELECT 1 FROM telegram_outbox AS reply JOIN telegram_inbox AS inbox USING(receipt_id)
-                    WHERE inbox.receipt_nonce='view-jump:v1'
-                      AND reply.state IN ('pending','leased','sending')) AS pageJumpUnsettled
+                    WHERE inbox.receipt_nonce IN ({markers})
+                      AND reply.state IN ('pending','leased','sending')) AS pageJumpUnsettled, {control_open} AS pageJumpOpen
             """})
             _require(isinstance(result, list) and len(result) == 1 and result[0].get("success") is True, error)
             rows = result[0]["results"]
             _require(isinstance(rows, list) and len(rows) == 1
-                     and type(rows[0]["pageJumpUnsettled"]) is int and rows[0]["pageJumpUnsettled"] in (0, 1), error)
+                     and all(type(rows[0][field]) is int and rows[0][field] in (0, 1)
+                             for field in ("pageJumpUnsettled", "pageJumpOpen")), error)
         except (CloudflareError, AttributeError, KeyError, TypeError, ValueError):
             raise CloudflareError(error) from None
+        _require(rows[0]["pageJumpOpen"] == 0, "Close isolated page-jump admission before downgrading.")
         _require(rows[0]["pageJumpUnsettled"] == 0,
                  "Keep a Worker with verified page-jump delivery until isolated page-jump replies have drained.")
 
     def activate(self, previous, version_id, message, *, current_version, target_version, current_capable, target_capable, guard,
                  current_temp_capable=False, target_temp_capable=False,
                  current_dynamic_all_capable=False, target_dynamic_all_capable=False):
+        from page_jump_activation import require_clear_for_release
+
         # All tracked application deployment writes use this boundary, including rollback.
+        _require(current_version.telegram_page_jump_epoch is None and target_version.telegram_page_jump_epoch is None,
+                 "An epoch-bound isolated page-jump version may only be staged.")
         self.verify_legacy_selected_floor(allow_rows=current_capable and target_capable,
                                           require_schema=current_capable or target_capable)
         self.verify_legacy_temp_floor(allow_rows=current_temp_capable and target_temp_capable,
@@ -1159,6 +1219,7 @@ class _Isolation:
         self.verify_legacy_dynamic_all_floor(allow_rows=current_dynamic_all_capable and target_dynamic_all_capable,
                                              require_schema=current_dynamic_all_capable or target_dynamic_all_capable)
         self.verify_page_jump_drain(current_version, target_version)
+        require_clear_for_release(self)
         _require(self.active() == previous, "Active isolated Worker deployment changed before activation.")
         _guard_current(guard)
         try:
@@ -1297,19 +1358,24 @@ def legacy_dynamic_all_artifact(bundle_dir, manifest):
     return _legacy_dynamic_all_artifact_capable(_verified_module(bundle_dir, manifest.get("bundleSha256")), manifest)
 
 
-def _page_jump_artifact_capable(module, manifest):
+def _page_jump_artifact_capabilities(module, manifest):
     migrations = manifest.get("migrations")
     capable = PAGE_JUMP_MARKER in module
+    control_capable = PAGE_JUMP_CONTROL_MARKER in module
     _require(isinstance(migrations, list), "The verified Worker artifact lacks a migration chain.")
     if capable or len(migrations) >= 42:
         _require(capable and len(migrations) >= 42 and migrations[41] == {
             "name": PAGE_JUMP_MIGRATION, "sha256": PAGE_JUMP_MIGRATION_SHA256,
         }, "The verified Worker artifact does not pin the exact 0042 page-jump migration and runtime.")
-    return capable
+    if control_capable or len(migrations) >= 43:
+        _require(capable and control_capable and len(migrations) >= 43 and migrations[42] == {
+            "name": PAGE_JUMP_CONTROL_MIGRATION, "sha256": PAGE_JUMP_CONTROL_MIGRATION_SHA256,
+        }, "The verified Worker artifact does not pin the exact 0043 page-jump control migration and runtime.")
+    return capable, control_capable
 
 
 def verify_page_jump_artifact(bundle_dir, manifest):
-    _page_jump_artifact_capable(_verified_module(bundle_dir, manifest.get("bundleSha256")), manifest)
+    _page_jump_artifact_capabilities(_verified_module(bundle_dir, manifest.get("bundleSha256")), manifest)
 
 
 def _artifact(bundle_dir, manifest, telegram_config, aggregate_key=None, private_share_key=None, provider_binding=None):
@@ -1318,7 +1384,7 @@ def _artifact(bundle_dir, manifest, telegram_config, aggregate_key=None, private
              and _matches(DATE, manifest.get("compatibilityDate")) and isinstance(manifest.get("migrations"), list),
              "Invalid verified Worker release manifest.")
     module = _verified_module(bundle_dir, manifest["bundleSha256"])
-    page_jump_capable = _page_jump_artifact_capable(module, manifest)
+    page_jump_capable, page_jump_control_capable = _page_jump_artifact_capabilities(module, manifest)
     revision = manifest["revision"]
     telegram_digest = None
     aggregate_digest = None
@@ -1347,7 +1413,8 @@ def _artifact(bundle_dir, manifest, telegram_config, aggregate_key=None, private
     tag = _release_tag(revision, telegram_digest, aggregate_digest, private_share_digest, provider_binding)
     return module, _Version(revision, manifest["bundleSha256"], manifest["compatibilityDate"],
                             tag, telegram_digest, aggregate_digest, private_share_digest, provider_binding,
-                            telegram_page_jump_capable=page_jump_capable)
+                            telegram_page_jump_capable=page_jump_capable,
+                            telegram_page_jump_control_capable=page_jump_control_capable)
 
 
 def _read_health():
@@ -1613,10 +1680,13 @@ def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECI
                          mixed_documents=None, group_share_cards=None, group_share_cards_capable=None,
                          legacy_selected_capable=None, legacy_temp_capable=None, legacy_dynamic_all_capable=None):
     """Read ownership, privacy and active binding facts before any release writes."""
+    from page_jump_activation import require_clear_for_release
+
     scope = _Isolation(worker_api, data_api, target)
     scope.worker_config()
     had_cron = scope.cron_enabled()
     scope.verify_resources()
+    require_clear_for_release(scope)
     active = scope.active()
     version, active_selected_capable, active_temp_capable, active_dynamic_all_capable = scope.version(
         active.version, with_legacy_selected=True, with_legacy_temp=True, with_legacy_dynamic_all=True)
@@ -1732,6 +1802,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                    provider_url_documents: bool | None = None, mixed_documents: bool | None = None,
                    group_share_cards: bool | None = None):
     """Release the verified Worker and optionally configure its isolated Telegram schedule."""
+    from page_jump_activation import MIGRATION, require_clear_for_release
+
     _require((provider_binding is None and provider_guard is None) or (provider_binding is not None and callable(provider_guard)),
              "An isolated provider release requires a verified dependency guard.")
     module, desired = _artifact(bundle_dir, manifest, telegram_config, aggregate_key, private_share_key, provider_binding)
@@ -1742,6 +1814,7 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
     config = scope.worker_config()
     had_cron = scope.cron_enabled()
     scope.verify_resources()
+    require_clear_for_release(scope, required=any(entry["name"] == MIGRATION for entry in manifest["migrations"]))
     previous = scope.active()
     old_version, old_selected_capable, old_temp_capable, old_dynamic_all_capable = scope.version(
         previous.version, with_legacy_selected=True, with_legacy_temp=True, with_legacy_dynamic_all=True)
