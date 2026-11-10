@@ -130,7 +130,10 @@ test("closed general authorization replays a sealed candidate in a separate emit
   const claimsConfig = JSON.stringify({ ...JSON.parse(generalConfig),
     outbox: "shared-private-management-formats-temp-node-document-provider-claims" });
   const claimsPin = parseGeneralTelegramPin(claimsConfig, fixture.releaseRevision);
-  assert.ok(claimsPin?.privateClaims && claimsPin.privateProvider);
+  assert.ok(claimsPin?.privateClaims && claimsPin.privateProvider && !claimsPin.privateShareCreation);
+  const shareConfig = JSON.stringify({ ...JSON.parse(generalConfig),
+    outbox: "shared-private-management-formats-temp-node-document-provider-claims-share" });
+  assert.ok(parseGeneralTelegramPin(shareConfig, fixture.releaseRevision)?.privateShareCreation);
   const claimSends = new Map<number, { actorId: string; text?: string; body?: Buffer }>();
   for (const outbox of ["legacy", "shared-lifecycle", "shared-path", ["shared-private-management"]]) {
     assert.equal(parseGeneralTelegramPin(JSON.stringify({ ...JSON.parse(generalConfig), outbox }),
@@ -221,6 +224,10 @@ test("closed general authorization replays a sealed candidate in a separate emit
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: providerConfig,
         PROVIDER_REVISION: providerRevision, PROVIDER_IMAGE_SHA256: imageSha256,
         ...(enabled ? { TELEGRAM_PROVIDER_URL_IMPORT: "1", TELEGRAM_PROVIDER_REFRESH: "1" } : {}) } })),
+    { name: "share-creation", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
+      bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: shareConfig,
+        TELEGRAM_PRIVATE_SHARE_CREATION_KEY: Buffer.alloc(32, 0x61).toString("base64url") },
+      outboundService: privateTransport },
     { name: "claims", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: claimsConfig },
       outboundService: async (request: Request) => {
@@ -1314,6 +1321,52 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.match((await awaitClaim(7567)).text ?? "", /分享已过期/u);
   assert.equal(await countClaims(expiredDigest), 0);
 
+  const shareWorker = await runtime.getWorker("share-creation");
+  const shareText = "/share x2 id106 s5 -- Synthetic creation body";
+  const sharePost = (updateId: number, actor: number, text: string, options: PostOptions = {}) =>
+    post(actor, text, { worker: shareWorker, updateId, date: now + 19, ...options });
+  assert.equal((await sharePost(7570, 101, shareText, { worker: claimsWorker })).status, 204);
+  assert.equal((await sharePost(7571, 102, shareText)).status, 204);
+  assert.equal((await sharePost(7572, 101, shareText, groupEvent)).status, 204);
+  assert.equal((await sharePost(7573, 101, "/share x101 -- invalid")).status, 204);
+  assert.equal((await sharePost(7574, 101, "/share id104 -- revoked recipient")).status, 204);
+  assert.equal((await sharePost(7575, 101, shareText)).status, 200);
+  const created = await awaitLifecycle(7575).catch(async () => {
+    // Failure-only evidence. Inspect fixed state fields and never retry a send here.
+    const facts = await db.prepare(`SELECT creation.state AS creationState, reply.state AS replyState,
+      reply.attempts, CASE WHEN reply.due_at <= unixepoch() THEN 1 ELSE 0 END AS due,
+      CASE WHEN reply.lease_until > unixepoch() THEN 1 ELSE 0 END AS leaseActive
+      FROM telegram_inbox AS inbox
+      LEFT JOIN telegram_private_share_creations AS creation USING (receipt_id)
+      LEFT JOIN telegram_outbox AS reply USING (receipt_id)
+      WHERE inbox.bot_id=? AND inbox.update_id=? AND inbox.receipt_nonce='general-share-create:v1'`)
+      .bind(pin.botId, 7575).first<{ creationState: string | null; replyState: string | null;
+        attempts: number | null; due: number; leaseActive: number }>();
+    const creation = ["reserved", "published", "abandoned"].find((state) => state === facts?.creationState) ?? "absent-or-invalid";
+    const reply = ["pending", "leased", "sending", "sent", "failed", "uncertain"]
+      .find((state) => state === facts?.replyState) ?? "absent-or-invalid";
+    const attempts = [0, 1, 2, 3, 4].find((count) => count === facts?.attempts) ?? "absent-or-invalid";
+    assert.fail(`Synthetic share reply missing (creation=${creation}, outbox=${reply}, attempts=${attempts}, `
+      + `due=${facts?.due === 1}, leaseActive=${facts?.leaseActive === 1}).`);
+  });
+  assert.equal(created.message.chat_id, "101");
+  assert.equal(created.message.reply_markup, undefined);
+  assert.doesNotMatch(created.message.text, /Synthetic creation body/u);
+  const issued = /https:\/\/t\.me\/GeneralFixtureBot\?start=claim_([A-Za-z0-9_-]{22})/u.exec(created.message.text);
+  assert.ok(issued);
+  const issuedCode = issued[1];
+  assert.deepEqual(await db.prepare(`SELECT creation.state,creation.installation,share.target_user_id AS target,
+    share.max_claims AS portions,share.expire_at-share.created_at AS ttl,share.code_sha256 AS digest
+    FROM telegram_private_share_creations AS creation JOIN telegram_inbox AS inbox USING(receipt_id)
+    JOIN private_shares AS share ON share.id=creation.share_id WHERE inbox.bot_id=? AND inbox.update_id=7575
+      AND inbox.receipt_nonce='general-share-create:v1'`).bind(pin.botId).first(),
+  { state: "published", installation: "general-bot-105", target: "106", portions: 2, ttl: 300,
+    digest: await privateShareCodeDigest(issuedCode) });
+  assert.equal((await sharePost(7575, 101, shareText)).status, 200, "a confirmed replay reuses the same published receipt");
+  assert.equal(lifecycleSent.filter(({ reply_parameters }) => reply_parameters.message_id === 7575).length, 1);
+  assert.equal((await claimPost(7576, 106, issuedCode, { date: now + 20 })).status, 200);
+  assert.match((await awaitClaim(7576)).text ?? "", /Synthetic creation body/u);
+
   const rehearsal = await runtime.getWorker("rehearsal");
   const lanePost = (actor: number, command: string, options: PostOptions = {}) =>
     post(actor, command, { secret: isolation.webhookSecret, date: now - 3, ...options, worker: rehearsal });
@@ -1359,7 +1412,8 @@ test("closed general authorization replays a sealed candidate in a separate emit
   const open = await readGeneralReadLane(db, isolation, fixture.releaseRevision);
   assert.ok(open?.pin?.rehearsal && open.mode === "general");
   assert.deepEqual([open.pin.privateManagement, open.pin.privateFormats, open.pin.privateTemp,
-    open.pin.privateDocument, open.pin.privateProvider, open.pin.privateClaims], [false, false, false, false, false, false],
+    open.pin.privateDocument, open.pin.privateProvider, open.pin.privateClaims, open.pin.privateShareCreation],
+    [false, false, false, false, false, false, false],
     "the rehearsal enables only private reads");
   assert.equal((await lanePost(182, "/list", { updateId: 8102, date: now - 21 })).status, 503,
     "uncommitted pre-cutover delivery is held for the original lane");

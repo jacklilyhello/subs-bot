@@ -19,7 +19,7 @@ import { renderTelegramInlineConsent } from "./inline-search-consent.ts";
 import type { InlineSearchArticle, InlineSearchOutcome } from "./inline-search.ts";
 import { renderTelegramPath } from "./path-management.ts";
 import { beginTelegramPrivateClaim, prepareTelegramPrivateClaim } from "./private-claims.ts";
-import { resolveTelegramPrivateShareCreationReply } from "./private-share-creation.ts";
+import { renderTelegramPrivateShareLink, resolveTelegramPrivateShareCreationReply } from "./private-share-creation.ts";
 import { PRIVATE_SHARE_DISABLED, type TelegramPrivateShareRuntime } from "./private-share-runtime.ts";
 import { telegramGroupShareReady } from "./group-share-actions.ts";
 import { confirmTelegramShortLinkSend, prepareTelegramShortLinkReply, retireUnsentTelegramShortLink } from "./short-link-actions.ts";
@@ -697,7 +697,7 @@ export async function drainTelegramReplies(
       const groupButton = reply && privateShareRuntime.groupCardsEnabled && await telegramGroupShareReady(db)
         ? [[{ text: "发到指定群", callback_data: GROUP_SHARE_PUBLISH_CALLBACK }]] : undefined;
       if (reply && Date.now() < deadline && await beginTelegramPrivateShareCreationReply(db, policy, lease, reply)) {
-        const text = `私密分享已创建。\nhttps://t.me/${policy.botUsername}?start=claim_${reply.code}\n份数上限：${reply.maxClaims}\n到期时间（UTC）：${new Date(reply.expireAt * 1000).toISOString()}`;
+        const text = renderTelegramPrivateShareLink(policy.botUsername, reply);
         const outcome = await sendTelegramReply(policy, lease, text, Math.max(1, deadline - Date.now()), request, groupButton);
         await settleTelegramReply(db, policy, lease, outcome);
         continue;

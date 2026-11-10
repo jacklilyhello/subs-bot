@@ -2,9 +2,19 @@ import { MAX_PRIVATE_SHARE_BYTES, privateShareCodeDigest } from "../private-shar
 import { ISOLATION_PUBLIC_ORIGIN, type PublicOrigin } from "../public-origin.ts";
 import { checkOwnerId, digestHex, getOwnedSubscription, SUBSCRIPTION_LIFECYCLE_REVISION, validInteger,
   type SubscriptionMetadata } from "../storage.ts";
+import type { GeneralTelegramPin } from "./general-auth-runtime.ts";
+import { GENERAL_ACTOR_QUEUE_CAPACITY, GENERAL_LATEST_ACTOR_SQL, GENERAL_NO_LEGACY_WORK, GENERAL_POLICY_ACTORS_SQL,
+  GENERAL_POLICY_PIN_SQL, GENERAL_POLICY_SCHEMA, GENERAL_RECEIPT_SCHEMA, generalCurrentAuthoritySql, generalPolicyBindings,
+  generalRecordedOriginSql, prepareGeneralReceiptAuthority } from "./general-receipt.ts";
 import { inTelegramScope, type TelegramEventScope, type TelegramPolicy, type TelegramPrivateShareCreationUpdate } from "./protocol.ts";
 
 export const TELEGRAM_PRIVATE_SHARE_CREATION_MARKER = "share-create:v1";
+export const TELEGRAM_GENERAL_SHARE_CREATION_MARKER = "general-share-create:v1";
+export const GENERAL_SHARE_CREATION_SCHEMA = `EXISTS (
+  SELECT /* subs-bot:telegram-general-private-share-creation:v1 */ 1 FROM subs_bot_schema_migrations
+  WHERE position=16 AND name='0016_telegram_private_share_creation.sql' AND mode='applied'
+    AND sha256='ad8be2d0034f2272d873cb6accc2927f73199a512447858a8aecd23b2b696a78')`;
+type SharePolicy = TelegramPolicy | GeneralTelegramPin;
 const KEY_VERSION = 1;
 const MAX_CLAIMS = 100;
 const MAX_DURATION_MINUTES = 10_080;
@@ -170,8 +180,10 @@ async function deriveCode(context: TelegramPrivateShareCreationKey, botId: strin
   return base64Url(new Uint8Array(await crypto.subtle.sign("HMAC", context.key, value)).subarray(0, 16));
 }
 
-function privateScope(policy: TelegramPolicy, scope: Pick<TelegramEventScope, "actorId" | "chatId" | "chatType" | "threadId">): boolean {
-  return scope.chatType === "private" && scope.threadId === null && inTelegramScope(policy, scope);
+function privateScope(policy: SharePolicy, scope: Pick<TelegramEventScope, "actorId" | "chatId" | "chatType" | "threadId">): boolean {
+  return scope.chatType === "private" && scope.threadId === null && ("privateShareCreation" in policy
+    ? policy.privateShareCreation && !policy.rehearsal && scope.actorId !== policy.botId && scope.chatId === scope.actorId
+    : inTelegramScope(policy, scope));
 }
 
 function safeSenderName(value: string | undefined): string {
@@ -185,14 +197,37 @@ const fields = `creation.receipt_id AS receiptId, creation.bot_id AS botId, crea
   creation.sender_name AS senderName, creation.max_claims AS maxClaims, creation.target_user_id AS targetUserId,
   creation.duration_minutes AS durationMinutes, creation.installation, creation.key_version AS keyVersion`;
 const joinedReceipt = `FROM telegram_private_share_creations AS creation JOIN telegram_inbox AS inbox USING (receipt_id)`;
-const matchingInbox = `inbox.bot_id = creation.bot_id AND inbox.actor_id = creation.actor_id
+const exactInbox = `inbox.bot_id = creation.bot_id AND inbox.actor_id = creation.actor_id
   AND inbox.chat_id = creation.actor_id AND inbox.chat_type = 'private' AND inbox.thread_id IS NULL
-  AND inbox.message_date = creation.message_date AND inbox.message_id = creation.message_id
-  AND inbox.command = 'help' AND inbox.receipt_nonce = '${TELEGRAM_PRIVATE_SHARE_CREATION_MARKER}'`;
+  AND inbox.message_date = creation.message_date AND inbox.message_id = creation.message_id AND inbox.command = 'help'`;
 const authorized = `((creation.actor_id = ? AND creation.auth_message_date = 0 AND creation.auth_message_id = 0)
   OR (creation.actor_id = ? AND COALESCE((SELECT allowed = 1 AND message_date = creation.auth_message_date
     AND message_id = creation.auth_message_id FROM telegram_auth WHERE bot_id = creation.bot_id AND user_id = creation.actor_id
   ), creation.auth_message_date = 0 AND creation.auth_message_id = 0)))`;
+function currentTarget(target: "?" | "creation.target_user_id"): string {
+  return `COALESCE((SELECT recipient.role IN ('admin','member') AND recipient.effective_at<unixepoch() FROM telegram_general_actors AS recipient
+    WHERE recipient.bot_id=policy.bot_id AND recipient.generation=policy.generation AND recipient.actor_id=${target}
+    ORDER BY recipient.revision DESC LIMIT 1),0)=1`;
+}
+
+function creationAuthority(policy: SharePolicy) {
+  if ("privateShareCreation" in policy) {
+    const marker = TELEGRAM_GENERAL_SHARE_CREATION_MARKER;
+    const matchingInbox = `${exactInbox} AND inbox.receipt_nonce='${marker}'
+      AND creation.auth_message_date=0 AND creation.auth_message_id=0`;
+    const current = generalCurrentAuthoritySql("inbox",
+      `${GENERAL_SHARE_CREATION_SCHEMA} AND (creation.target_user_id IS NULL OR ${currentTarget("creation.target_user_id")})`);
+    const bindings = generalPolicyBindings(policy);
+    const recorded = `${GENERAL_POLICY_SCHEMA} AND ${GENERAL_RECEIPT_SCHEMA} AND ${GENERAL_SHARE_CREATION_SCHEMA}
+      AND ${generalRecordedOriginSql("inbox")}`;
+    return { marker, matchingInbox, current, bindings, recorded, recordedBindings: bindings };
+  }
+  return { marker: TELEGRAM_PRIVATE_SHARE_CREATION_MARKER,
+    matchingInbox: `${exactInbox} AND inbox.receipt_nonce='${TELEGRAM_PRIVATE_SHARE_CREATION_MARKER}'`,
+    current: authorized, bindings: [policy.adminId, policy.memberId],
+    recorded: "creation.actor_id IN (?, ?)", recordedBindings: [policy.adminId, policy.memberId] };
+}
+
 const activeReservation = `creation.state = 'reserved' AND creation.reservation_expires_at > unixepoch()
   AND NOT EXISTS (SELECT 1 FROM private_shares WHERE payload_id = creation.payload_id)`;
 const actorOrder = `NOT EXISTS (SELECT 1 FROM telegram_private_share_creations AS earlier
@@ -202,15 +237,16 @@ const fresh = "inbox.bot_id = ? AND inbox.update_id = ? AND inbox.receipt_nonce 
 const currentMember = `COALESCE((SELECT allowed = 1 AND message_date < ? FROM telegram_auth
   WHERE bot_id = ? AND user_id = ?), 1)`;
 
-async function readEvent(db: D1Database, policy: TelegramPolicy, event: TelegramPrivateShareCreationInput): Promise<CreationRow | null> {
+async function readEvent(db: D1Database, policy: SharePolicy, event: TelegramPrivateShareCreationInput): Promise<CreationRow | null> {
+  const { matchingInbox, recorded, recordedBindings } = creationAuthority(policy);
   return await db.prepare(`SELECT ${fields} ${joinedReceipt} WHERE ${matchingInbox} AND inbox.bot_id = ?
-    AND inbox.update_id = ? AND inbox.actor_id = ? AND inbox.message_date = ? AND inbox.message_id = ?
-  `).bind(policy.botId, event.updateId, event.actorId, event.messageDate, event.messageId).first<CreationRow>();
+    AND inbox.update_id = ? AND inbox.actor_id = ? AND inbox.message_date = ? AND inbox.message_id = ? AND (${recorded})
+  `).bind(policy.botId, event.updateId, event.actorId, event.messageDate, event.messageId, ...recordedBindings).first<CreationRow>();
 }
 
 async function reserve(
   db: D1Database,
-  policy: TelegramPolicy,
+  policy: SharePolicy,
   event: TelegramPrivateShareCreationInput,
   payloadSha256: string,
   payloadBytes: number,
@@ -223,13 +259,25 @@ async function reserve(
     AND token=? AND generation=? AND ${SUBSCRIPTION_LIFECYCLE_REVISION}=?)`;
   const sourceBindings = source ? [source.id, event.actorId, source.name, source.sourceUrl, source.token,
     source.generation, source.lifecycleRevision] : [];
+  const general = "privateShareCreation" in policy;
+  const authority = creationAuthority(policy);
+  const admit = general ? `EXISTS (SELECT 1 FROM ${GENERAL_POLICY_ACTORS_SQL}
+    WHERE ${GENERAL_POLICY_PIN_SQL} AND ${GENERAL_RECEIPT_SCHEMA} AND ${GENERAL_SHARE_CREATION_SCHEMA}
+      AND policy.active=1 AND ${GENERAL_NO_LEGACY_WORK} AND actor.actor_id=? AND ${GENERAL_LATEST_ACTOR_SQL}
+      AND ?>MAX(policy.cutover_at,actor.effective_at) AND (? IS NULL OR ${currentTarget("?")})
+      AND ${GENERAL_ACTOR_QUEUE_CAPACITY}
+      AND NOT EXISTS (SELECT 1 FROM telegram_general_replies WHERE bot_id=policy.bot_id AND update_id=?))`
+    : `(? = ? OR ${currentMember})`;
+  const admitBindings = general ? [...generalPolicyBindings(policy), event.actorId, event.messageDate,
+    event.targetUserId, event.targetUserId, event.updateId]
+    : [event.actorId, policy.adminId, event.messageDate, policy.botId, event.actorId];
   const steps = [
     db.prepare(`
       INSERT INTO telegram_inbox
         (bot_id, update_id, actor_id, chat_id, chat_type, message_id, message_date, thread_id, command, receipt_nonce)
       SELECT ?, ?, ?, ?, 'private', ?, ?, NULL, 'help', ?
       WHERE ? BETWEEN unixepoch() - ${RESERVATION_SECONDS} AND unixepoch() + 60
-        AND (? = ? OR ${currentMember})
+        AND (${admit})
         AND NOT EXISTS (SELECT 1 FROM telegram_private_share_creations AS newer WHERE newer.bot_id = ?
           AND newer.actor_id = ? AND (newer.message_date, newer.message_id) >= (?, ?))
         AND NOT EXISTS (SELECT 1 FROM telegram_private_share_creations AS pending WHERE pending.bot_id = ?
@@ -238,34 +286,36 @@ async function reserve(
         ${source ? `AND ${sourceMatches}` : ""}
       ON CONFLICT (bot_id, update_id) DO NOTHING
     `).bind(policy.botId, event.updateId, event.actorId, event.chatId, event.messageId, event.messageDate, receipt[2],
-      event.messageDate, event.actorId, policy.adminId, event.messageDate, policy.botId, event.actorId,
-      policy.botId, event.actorId, event.messageDate, event.messageId, policy.botId, event.actorId, ...sourceBindings),
+      event.messageDate, ...admitBindings, policy.botId, event.actorId, event.messageDate, event.messageId, policy.botId, event.actorId, ...sourceBindings),
+    ...(general ? [prepareGeneralReceiptAuthority(db, policy, receipt)] : []),
     db.prepare(`
       INSERT INTO telegram_private_share_creations (receipt_id, bot_id, actor_id, message_date, message_id,
         auth_message_date, auth_message_id, state, payload_id, payload_sha256, payload_bytes, sender_name,
         max_claims, target_user_id, duration_minutes, installation, key_version, reservation_expires_at, next_check_at, cleanup_after)
       SELECT inbox.receipt_id, inbox.bot_id, inbox.actor_id, inbox.message_date, inbox.message_id,
-        CASE WHEN inbox.actor_id = ? THEN 0 ELSE COALESCE(auth.message_date, 0) END,
-        CASE WHEN inbox.actor_id = ? THEN 0 ELSE COALESCE(auth.message_id, 0) END,
+        ${general ? "0,0" : `CASE WHEN inbox.actor_id = ? THEN 0 ELSE COALESCE(auth.message_date, 0) END,
+        CASE WHEN inbox.actor_id = ? THEN 0 ELSE COALESCE(auth.message_id, 0) END`},
         'reserved', ?, ?, ?, ?, ?, ?, ?, ?, ${KEY_VERSION}, inbox.received_at + ${RESERVATION_SECONDS},
         inbox.received_at, inbox.received_at + ${RESERVATION_SECONDS + CLEANUP_GRACE_SECONDS}
-      FROM telegram_inbox AS inbox LEFT JOIN telegram_auth AS auth ON auth.bot_id = inbox.bot_id AND auth.user_id = inbox.actor_id
+      FROM telegram_inbox AS inbox ${general ? "" : "LEFT JOIN telegram_auth AS auth ON auth.bot_id=inbox.bot_id AND auth.user_id=inbox.actor_id"}
       WHERE ${fresh}
-    `).bind(policy.adminId, policy.adminId, crypto.randomUUID(), payloadSha256, payloadBytes, senderName,
+    `).bind(...(general ? [] : [policy.adminId, policy.adminId]), crypto.randomUUID(), payloadSha256, payloadBytes, senderName,
       event.maxClaims, event.targetUserId, event.durationMinutes, installation, ...receipt),
     db.prepare(`UPDATE telegram_inbox AS inbox SET receipt_nonce = ?, command = CASE WHEN EXISTS (
       SELECT 1 FROM telegram_private_share_creations WHERE receipt_id = inbox.receipt_id
-    ) THEN command END WHERE ${fresh} RETURNING receipt_id`).bind(TELEGRAM_PRIVATE_SHARE_CREATION_MARKER, ...receipt),
+    ) ${general ? "AND EXISTS (SELECT 1 FROM telegram_general_receipt WHERE receipt_id=inbox.receipt_id)" : ""}
+      THEN command END WHERE ${fresh} RETURNING receipt_id`).bind(authority.marker, ...receipt),
   ];
   if (source) steps.push(db.prepare(`SELECT ${sourceMatches} AS matched`).bind(...sourceBindings));
   let refused = false;
   try {
     const results = await db.batch(steps);
-    if (results.length !== steps.length || results.some(({ success }) => !success) || results[2].results.length > 1) {
+    if (results.length !== steps.length || results.some(({ success }) => !success)
+      || results[source ? results.length - 2 : results.length - 1].results.length > 1) {
       throw new Error(safeError);
     }
     if (source) {
-      const rows = results[3].results as { matched: number }[];
+      const rows = results.at(-1)!.results as { matched: number }[];
       if (rows.length !== 1 || (rows[0].matched !== 0 && rows[0].matched !== 1)) throw new Error(safeError);
       refused = rows[0].matched === 0;
     }
@@ -326,13 +376,14 @@ const matchingPublishedShare = `share.id = creation.share_id AND share.bot_id = 
   AND share.sender_name = creation.sender_name AND share.max_claims = creation.max_claims
   AND share.target_user_id IS creation.target_user_id AND share.expire_at = share.created_at + 60 * creation.duration_minutes`;
 
-async function readOutcome(db: D1Database, policy: TelegramPolicy, row: CreationRow, codeSha256: string): Promise<PrivateShareCreationOutcome> {
+async function readOutcome(db: D1Database, policy: SharePolicy, row: CreationRow, codeSha256: string): Promise<PrivateShareCreationOutcome> {
+  const { matchingInbox, current, bindings } = creationAuthority(policy);
   const result = await db.prepare(`
-    SELECT creation.state, (${activeReservation} AND ${authorized}) AS active,
+    SELECT creation.state, (${activeReservation} AND (${current})) AS active,
       EXISTS (SELECT 1 FROM private_shares AS share JOIN telegram_outbox AS reply ON reply.receipt_id = creation.receipt_id
         WHERE ${matchingPublishedShare} AND share.code_sha256 = ?) AS published
     ${joinedReceipt} WHERE ${matchingInbox} AND ${matchingCreation}
-  `).bind(policy.adminId, policy.memberId, codeSha256, ...identity(row))
+  `).bind(...bindings, codeSha256, ...identity(row))
     .first<{ state: CreationState; active: number; published: number }>();
   if (!result) return "ignored";
   if (result.state === "published") {
@@ -344,19 +395,21 @@ async function readOutcome(db: D1Database, policy: TelegramPolicy, row: Creation
 
 async function publish(
   db: D1Database,
-  policy: TelegramPolicy,
+  policy: SharePolicy,
   row: CreationRow,
   codeSha256: string,
 ): Promise<PrivateShareCreationOutcome> {
+  const { matchingInbox, current, bindings } = creationAuthority(policy);
+  const target = "privateShareCreation" in policy ? [] : [policy.adminId, policy.memberId];
   const steps = [
     db.prepare(`
       INSERT INTO private_shares (bot_id, code_sha256, sender_id, sender_name, payload_id, payload_sha256, payload_bytes,
         max_claims, target_user_id, expire_at, created_at)
       SELECT creation.bot_id, ?, creation.actor_id, creation.sender_name, creation.payload_id, creation.payload_sha256,
         creation.payload_bytes, creation.max_claims, creation.target_user_id, unixepoch() + 60 * creation.duration_minutes, unixepoch()
-      ${joinedReceipt} WHERE ${matchingInbox} AND ${matchingCreation} AND ${activeReservation} AND ${authorized} AND ${actorOrder}
-        AND (creation.target_user_id IS NULL OR creation.target_user_id IN (?, ?))
-    `).bind(codeSha256, ...identity(row), policy.adminId, policy.memberId, policy.adminId, policy.memberId),
+      ${joinedReceipt} WHERE ${matchingInbox} AND ${matchingCreation} AND ${activeReservation} AND (${current}) AND ${actorOrder}
+        ${target.length ? "AND (creation.target_user_id IS NULL OR creation.target_user_id IN (?, ?))" : ""}
+    `).bind(codeSha256, ...identity(row), ...bindings, ...target),
     db.prepare(`
       UPDATE telegram_private_share_creations AS creation SET state = 'published', share_id = (
         SELECT id FROM private_shares WHERE payload_id = creation.payload_id AND bot_id = creation.bot_id
@@ -388,20 +441,21 @@ async function publish(
 }
 
 function validCreation(
-  policy: TelegramPolicy,
+  policy: SharePolicy,
   event: TelegramEventScope & PrivateShareOptions,
   context: TelegramPrivateShareCreationKey,
 ): boolean {
   return privateScope(policy, event) && validInteger(event.updateId, 1) && validInteger(event.messageId, 1) &&
     validInteger(event.messageDate, 1) && validInteger(event.maxClaims, 1, MAX_CLAIMS) &&
     validInteger(event.durationMinutes, 1, MAX_DURATION_MINUTES) && context.version === KEY_VERSION &&
-    (event.targetUserId === null || event.targetUserId === policy.adminId || event.targetUserId === policy.memberId);
+    (event.targetUserId === null || ("privateShareCreation" in policy
+      ? event.targetUserId !== policy.botId : event.targetUserId === policy.adminId || event.targetUserId === policy.memberId));
 }
 
 async function createShare(
   db: D1Database,
   bucket: R2Bucket,
-  policy: TelegramPolicy,
+  policy: SharePolicy,
   event: TelegramPrivateShareCreationInput,
   context: TelegramPrivateShareCreationKey,
   source?: SubscriptionMetadata,
@@ -450,7 +504,7 @@ async function createShare(
 export async function acceptTelegramPrivateShareCreation(
   db: D1Database,
   bucket: R2Bucket,
-  policy: TelegramPolicy,
+  policy: SharePolicy,
   event: TelegramPrivateShareCreationInput,
   context: TelegramPrivateShareCreationKey,
 ): Promise<PrivateShareCreationOutcome> {
@@ -486,16 +540,17 @@ export async function acceptTelegramSubscriptionShare(
 export async function recoverTelegramPrivateShareCreation(
   db: D1Database,
   bucket: R2Bucket,
-  policy: TelegramPolicy,
+  policy: SharePolicy,
   context: TelegramPrivateShareCreationKey,
 ): Promise<PrivateShareCreationOutcome> {
   if (context.version !== KEY_VERSION) return "ignored";
+  const { matchingInbox, current, bindings } = creationAuthority(policy);
   try {
     const row = await db.prepare(`SELECT ${fields} ${joinedReceipt} WHERE ${matchingInbox} AND creation.bot_id = ?
       AND creation.installation = ? AND creation.key_version = ? AND creation.next_check_at <= unixepoch()
-      AND ${activeReservation} AND ${authorized} AND ${actorOrder}
+      AND ${activeReservation} AND (${current}) AND ${actorOrder}
       ORDER BY creation.next_check_at, creation.receipt_id LIMIT 1
-    `).bind(policy.botId, context.installation, context.version, policy.adminId, policy.memberId).first<CreationRow>();
+    `).bind(policy.botId, context.installation, context.version, ...bindings).first<CreationRow>();
     if (!row) return "ignored";
     if (await inspectPayload(bucket, row) !== "verified") {
       await db.prepare(`UPDATE telegram_private_share_creations AS creation SET next_check_at = unixepoch() + ${CHECK_DELAY_SECONDS}
@@ -513,11 +568,12 @@ export async function recoverTelegramPrivateShareCreation(
 /** Resolve only the creator's link and return a predicate for the final outbox send transition. */
 export async function resolveTelegramPrivateShareCreationReply(
   db: D1Database,
-  policy: TelegramPolicy,
+  policy: SharePolicy,
   scope: ReceiptScope,
   context: TelegramPrivateShareCreationKey,
 ): Promise<TelegramPrivateShareCreationReply | null> {
   if (!privateScope(policy, scope) || !validInteger(scope.receiptId, 1) || context.version !== KEY_VERSION) return null;
+  const { matchingInbox, current, bindings } = creationAuthority(policy);
   try {
     const row = await db.prepare(`SELECT share.payload_id AS payloadId, share.code_sha256 AS codeSha256,
       share.id AS shareId, share.expire_at AS expireAt, share.max_claims AS maxClaims
@@ -525,8 +581,8 @@ export async function resolveTelegramPrivateShareCreationReply(
       JOIN telegram_outbox AS reply ON reply.receipt_id = creation.receipt_id
       WHERE ${matchingInbox} AND creation.receipt_id = ? AND creation.bot_id = ? AND creation.actor_id = ?
         AND creation.state = 'published' AND creation.installation = ? AND creation.key_version = ${KEY_VERSION}
-        AND share.expire_at >= unixepoch() AND ${authorized}
-    `).bind(scope.receiptId, policy.botId, scope.actorId, context.installation, policy.adminId, policy.memberId).first<ReplyRow>();
+        AND share.expire_at >= unixepoch() AND (${current})
+    `).bind(scope.receiptId, policy.botId, scope.actorId, context.installation, ...bindings).first<ReplyRow>();
     if (!row || !UUID.test(row.payloadId)) return null;
     const code = await deriveCode(context, policy.botId, scope.actorId, row.payloadId);
     if (await privateShareCodeDigest(code) !== row.codeSha256) return null;
@@ -538,15 +594,19 @@ export async function resolveTelegramPrivateShareCreationReply(
           WHERE creation.receipt_id = inbox.receipt_id AND ${matchingInbox} AND creation.state = 'published'
             AND creation.installation = ? AND creation.key_version = ${KEY_VERSION}
             AND share.id = ? AND share.payload_id = ? AND share.code_sha256 = ?
-            AND share.expire_at = ? AND share.expire_at >= unixepoch() AND ${authorized}
+            AND share.expire_at = ? AND share.expire_at >= unixepoch() AND (${current})
         )`,
         bindings: [scope.receiptId, policy.botId, scope.actorId, context.installation, row.shareId, row.payloadId, row.codeSha256, row.expireAt,
-          policy.adminId, policy.memberId],
+          ...bindings],
       },
     };
   } catch {
     throw new Error("Telegram private share creation reply could not be resolved.");
   }
+}
+
+export function renderTelegramPrivateShareLink(botUsername: string, reply: TelegramPrivateShareCreationReply): string {
+  return `私密分享已创建。\nhttps://t.me/${botUsername}?start=claim_${reply.code}\n份数上限：${reply.maxClaims}\n到期时间（UTC）：${new Date(reply.expireAt * 1000).toISOString()}`;
 }
 
 const cleanupReady = `creation.state = 'abandoned' AND creation.cleanup_after <= unixepoch()
@@ -556,20 +616,21 @@ const cleanupReady = `creation.state = 'abandoned' AND creation.cleanup_after <=
 export async function retireAbandonedTelegramPrivateShareCreation(
   db: D1Database,
   bucket: R2Bucket,
-  policy: TelegramPolicy,
+  policy: SharePolicy,
 ): Promise<"retired" | "blocked" | "ignored"> {
+  const { matchingInbox, current, bindings, recorded, recordedBindings } = creationAuthority(policy);
   try {
     const abandoned = await db.prepare(`UPDATE telegram_private_share_creations SET state = 'abandoned' WHERE receipt_id = (
       SELECT creation.receipt_id ${joinedReceipt} WHERE ${matchingInbox} AND creation.bot_id = ?
-        AND creation.actor_id IN (?, ?) AND creation.state = 'reserved'
-        AND (creation.reservation_expires_at <= unixepoch() OR NOT ${authorized})
+        AND (${recorded}) AND creation.state = 'reserved'
+        AND (creation.reservation_expires_at <= unixepoch() OR NOT (${current}))
       ORDER BY creation.reservation_expires_at, creation.receipt_id LIMIT 1
-    )`).bind(policy.botId, policy.adminId, policy.memberId, policy.adminId, policy.memberId).run();
+    )`).bind(policy.botId, ...recordedBindings, ...bindings).run();
     if (!abandoned.success) throw new Error(safeError);
     const row = await db.prepare(`SELECT ${fields} ${joinedReceipt} WHERE ${matchingInbox} AND creation.bot_id = ?
-      AND creation.actor_id IN (?, ?) AND ${cleanupReady} AND creation.next_check_at <= unixepoch()
+      AND (${recorded}) AND ${cleanupReady} AND creation.next_check_at <= unixepoch()
       ORDER BY creation.next_check_at, creation.receipt_id LIMIT 1
-    `).bind(policy.botId, policy.adminId, policy.memberId).first<CreationRow>();
+    `).bind(policy.botId, ...recordedBindings).first<CreationRow>();
     if (!row) return "ignored";
     const status = await inspectPayload(bucket, row);
     if (status === "unowned") {
@@ -582,8 +643,8 @@ export async function retireAbandonedTelegramPrivateShareCreation(
     }
     const eligible = await db.prepare(`UPDATE telegram_private_share_creations AS creation SET cleaned_at = NULL
       WHERE ${matchingCreation} AND ${cleanupReady} AND EXISTS (
-        SELECT 1 FROM telegram_inbox AS inbox WHERE inbox.receipt_id = creation.receipt_id AND ${matchingInbox}
-      )`).bind(...identity(row)).run();
+        SELECT 1 FROM telegram_inbox AS inbox WHERE inbox.receipt_id = creation.receipt_id AND ${matchingInbox} AND (${recorded})
+      )`).bind(...identity(row), ...recordedBindings).run();
     if (!eligible.success) throw new Error(safeError);
     if (eligible.meta.changes !== 1) return "ignored";
     const key = payloadKey(row);

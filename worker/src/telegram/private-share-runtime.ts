@@ -13,7 +13,9 @@ export interface TelegramPrivateShareRuntime {
 export const PRIVATE_SHARE_DISABLED: TelegramPrivateShareRuntime = Object.freeze({ schemaReady: false, context: null });
 
 /** Read once per invocation. Missing/old schemas and invalid keys disable only this feature. */
-export async function telegramPrivateShareRuntime(db: D1Database, encoded: unknown, groupCardsEnabled = false): Promise<TelegramPrivateShareRuntime> {
+export async function telegramPrivateShareRuntime(
+  db: D1Database, encoded: unknown, groupCardsEnabled = false, installation = PRIVATE_SHARE_CREATION_INSTALLATION,
+): Promise<TelegramPrivateShareRuntime> {
   let schemaReady = false;
   try {
     const ledger = await db.prepare(`SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'subs_bot_schema_migrations'`).first();
@@ -26,6 +28,6 @@ export async function telegramPrivateShareRuntime(db: D1Database, encoded: unkno
     throw new Error("Telegram private share readiness could not be confirmed.");
   }
   if (!schemaReady) return PRIVATE_SHARE_DISABLED;
-  const context = await importTelegramPrivateShareCreationKey(encoded, PRIVATE_SHARE_CREATION_INSTALLATION);
+  const context = await importTelegramPrivateShareCreationKey(encoded, installation);
   return Object.freeze({ schemaReady: true, context, ...(groupCardsEnabled ? { groupCardsEnabled: true } : {}) });
 }

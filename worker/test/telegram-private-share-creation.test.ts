@@ -4,6 +4,7 @@ import { readFile, readdir } from "node:fs/promises";
 import { after, before, test } from "node:test";
 import { Miniflare } from "miniflare";
 import { claimPrivateShare, createPrivateShare } from "../src/private-shares.ts";
+import { parseGeneralTelegramPin } from "../src/telegram/general-auth-runtime.ts";
 import type { TelegramPolicy } from "../src/telegram/protocol.ts";
 import {
   acceptTelegramPrivateShareCreation, importTelegramPrivateShareCreationKey, parseTelegramPrivateShareArgs,
@@ -311,4 +312,51 @@ test("a late unowned collision is retained without starving an older due candida
   assert.equal(await retireAbandonedTelegramPrivateShareCreation(db, bucket, config), "retired");
   assert.equal(await bucket.head(otherKey), null);
   assert.ok(await bucket.head(key));
+});
+
+
+test("a general recipient revoked after R2 upload cannot publish or authorize cross-family cleanup", async () => {
+  const config = policy("75250");
+  const revision = "a".repeat(40);
+  const messageDate = Number(await db.prepare("SELECT unixepoch() AS now").first<number>("now"));
+  const general = parseGeneralTelegramPin(JSON.stringify({
+    botId: config.botId, botUsername: config.botUsername, botToken: config.botToken, webhookSecret: config.webhookSecret,
+    generation: 1, cutoverAt: messageDate - 10, activationSha256: "b".repeat(64),
+    outbox: "shared-private-management-formats-temp-node-document-provider-claims-share",
+  }), revision);
+  assert.ok(general?.privateShareCreation);
+  await db.prepare(`CREATE TABLE IF NOT EXISTS subs_bot_schema_migrations
+    (position INTEGER PRIMARY KEY, name TEXT, sha256 TEXT, mode TEXT)`).run();
+  for (const name of ["0016_telegram_private_share_creation.sql", "0044_telegram_general_runtime.sql", "0046_telegram_general_receipts.sql"]) {
+    const bytes = await readFile(new URL("../migrations/" + name, import.meta.url));
+    await db.prepare("INSERT OR IGNORE INTO subs_bot_schema_migrations VALUES (?,?,?,'applied')")
+      .bind(Number(name.slice(0, 4)), name, createHash("sha256").update(bytes).digest("hex")).run();
+  }
+  await db.batch([
+    db.prepare("INSERT INTO telegram_general_policy VALUES (?,1,?,?,?,1)")
+      .bind(config.botId, revision, general.activationSha256, general.cutoverAt),
+    db.prepare("INSERT INTO telegram_general_actors VALUES (?,1,?,1,?,'admin'),(?,1,?,1,?,'member')")
+      .bind(config.botId, config.adminId, messageDate - 9, config.botId, config.memberId, messageDate - 9),
+  ]);
+  const upload = r2Put(async (key, bytes, options) => {
+    const object = await bucket.put(key, bytes, options);
+    await db.prepare("INSERT INTO telegram_general_actors VALUES (?,1,?,2,?,'denied')")
+      .bind(config.botId, config.memberId, messageDate).run();
+    return object;
+  });
+  assert.equal(await acceptTelegramPrivateShareCreation(db, upload, general, event(config, 1, { messageDate }), context), "ignored");
+  const stage = await stored(config, 1);
+  assert.ok(stage);
+  assert.equal(stage.marker, "general-share-create:v1");
+  assert.equal(stage.state, "reserved");
+  assert.equal(stage.share_id, null);
+  assert.equal(stage.reply_state, null);
+  const key = `private-shares/${stage.payload_id}.txt`;
+  assert.ok(await bucket.head(key));
+  await expire(stage.receipt_id);
+  assert.equal(await retireAbandonedTelegramPrivateShareCreation(db, bucket, config), "ignored");
+  assert.ok(await bucket.head(key), "isolation cleanup cannot adopt a general reservation");
+  assert.equal(await retireAbandonedTelegramPrivateShareCreation(db, bucket, general), "retired");
+  assert.equal(await bucket.head(key), null);
+  assert.ok((await stored(config, 1))?.cleaned_at);
 });

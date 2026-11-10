@@ -665,7 +665,9 @@ V11 合成原生演练在 `worker-isolation-legacy-candidate.yml` 选择 `synthe
 
 在同一通用模式中，`TELEGRAM_PROVIDER_REFRESH=1` 和确切登记的 `0028` 允许从本人私聊详情刷新一条远程订阅。一次性按钮绑定同一 Bot、账号、已确认消息、发送尝试和当前授权，并核对来源摘要、快照代次及生命周期。票据消费、回执和入队在同一 D1 批次内提交。静态文档没有刷新按钮。关闭入口后保留已接收任务的处理和回复；失败保留旧快照。批量刷新仍由单独入口处理。
 
-`outbox: "shared-private-management-formats-temp-node-document-provider-claims"` 另允许已有当前通用授权的用户在本人私聊打开 `/start claim_…`。旧码与新码共用现有私密分享记录、R2 正文校验、指定对象、到期与份数约束。收件只保存码的摘要。发送前再次核对同一 Bot、私聊、授权版本及领取回执。同一份分享的重复领取不增加份数。隔离 Bot 的领取规则和配置不变。通用分享创建、群卡和内联入口尚未启用。
+`outbox: "shared-private-management-formats-temp-node-document-provider-claims"` 另允许已有当前通用授权的用户在本人私聊打开 `/start claim_…`。旧码与新码共用现有私密分享记录、R2 正文校验、指定对象、到期与份数约束。收件只保存码的摘要。发送前再次核对同一 Bot、私聊、授权版本及领取回执。同一份分享的重复领取不增加份数。隔离 Bot 的领取规则和配置不变。群卡和内联入口另行验收。
+
+`outbox: "shared-private-management-formats-temp-node-document-provider-claims-share"` 加入私聊 `/share [选项] -- 正文`。创建密钥及确切登记的 `0016` 必须就绪。保存前确认当前发送者和指定领取人属于同一 Bot 的授权世代。正文沿用 R2 私有暂存、回读与恢复；发布和发送链接时再次核对当前授权。过期或撤权的候选只按原回执及对象摘要清理。切换授权世代前须关闭入口并排空本世代的暂存和回复。订阅分享、群卡及内联创建另行验收。
 
 #### V10 联合包原生恢复演练
 

@@ -269,6 +269,19 @@ export function readPrivateTelegramCommand(update: Record<string, unknown>, botU
   return command ? { actorId, messageId, messageDate, ...command } : null;
 }
 
+export function readGeneralPrivateShareCreation(
+  update: Record<string, unknown>, updateId: number, botId: string, botUsername: string,
+): TelegramPrivateShareCreationUpdate | null {
+  const command = readPrivateTelegramCommand(update, botUsername);
+  if (!command || command.actorId === botId || command.name !== "share" || command.remainder.length > 4096) return null;
+  const message = update.message;
+  const senderName = isRecord(message) && isRecord(message.from) ? [message.from.first_name, message.from.last_name]
+    .filter((part): part is string => typeof part === "string" && part.length <= 128).join(" ") : "";
+  const { actorId, messageId, messageDate, remainder } = command;
+  return { updateId, actorId, chatId: actorId, chatType: "private", threadId: null,
+    messageId, messageDate, args: remainder, ...(senderName ? { senderName } : {}) };
+}
+
 export function readGeneralPrivateShareClaim(
   update: Record<string, unknown>, updateId: number, botId: string, botUsername: string,
 ): TelegramPrivateClaimUpdate | null {
