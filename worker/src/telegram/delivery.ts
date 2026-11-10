@@ -4,7 +4,7 @@ import { PathRuleContentError } from "../path-rules.ts";
 import { ISOLATION_PUBLIC_ORIGIN, type PublicOrigin } from "../public-origin.ts";
 import { listOwnedSubscriptions } from "../subscriptions.ts";
 import { renderTelegramDocumentOutcome } from "./document-jobs.ts";
-import { resolveTelegramAggregateCode } from "./aggregate-actions.ts";
+import { renderTelegramAggregateResult, resolveTelegramAggregateCode } from "./aggregate-actions.ts";
 import { prepareSelectedLimitTickets, prepareSelectedRevokeTicket, renderTelegramSelected,
   resolveTelegramSelectedCode, retireUnsentSelectedLink } from "./selected-export.ts";
 import type { PrivateShareClaimResult } from "../private-shares.ts";
@@ -103,6 +103,13 @@ async function aggregateBase64Section(
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }
+}
+
+export async function renderTelegramAggregateLinks(
+  db: D1Database, bucket: R2Bucket, code: string, deadline: number, publicOrigin: PublicOrigin,
+): Promise<string> {
+  const base64 = await aggregateBase64Section(db, bucket, code, deadline, publicOrigin);
+  return `Clash 聚合订阅链接\n${publicOrigin}/agg/${code}/clash\n${base64}\n发送 /export revoke 可撤销链接。`;
 }
 
 async function readBotReply(response: Response): Promise<unknown> {
@@ -397,16 +404,7 @@ async function renderReply(
   }
   if (lease.privateShareCreation) return { text: "分享链接已失效或授权已变更，请重新创建。", access: "allowed" };
   if (lease.aggregate) {
-    const text = {
-      issued: "聚合链接已变更，请重新发送 /export。",
-      ready: "聚合链接已变更，请重新发送 /export。",
-      empty: "暂无可导出节点。",
-      limit: "聚合内容超过导出上限。",
-      revoked: "聚合导出链接已撤销。",
-      "already-revoked": "没有可撤销的聚合导出链接。",
-      stale: "这条聚合操作已失效。",
-    }[lease.aggregate.result];
-    return { text, access: "allowed" };
+    return { text: renderTelegramAggregateResult(lease.aggregate.result), access: "allowed" };
   }
   if (lease.lifecycle) {
     const { text, buttons, forceReply } = renderTelegramLifecycle(lease.lifecycle);
@@ -734,9 +732,8 @@ export async function drainTelegramReplies(
     if (lease.aggregate && lease.chatType === "private" && lease.threadId === null) {
       const code = await resolveTelegramAggregateCode(db, policy, { ...lease, aggregate: lease.aggregate }, aggregateKey);
       if (code !== null && Date.now() < deadline) {
-        const base64 = await aggregateBase64Section(db, bucket, code, deadline, publicOrigin);
+        const text = await renderTelegramAggregateLinks(db, bucket, code, deadline, publicOrigin);
         if (Date.now() < deadline && await beginTelegramAggregateLinkReply(db, policy, lease)) {
-          const text = `Clash 聚合订阅链接\n${publicOrigin}/agg/${code}/clash\n${base64}\n发送 /export revoke 可撤销链接。`;
           const remaining = deadline - Date.now();
           const outcome = remaining > 0 ? await sendTelegramReply(policy, lease, text, remaining, request) : { kind: "failed" as const };
           await settleTelegramReply(db, policy, lease, outcome);
