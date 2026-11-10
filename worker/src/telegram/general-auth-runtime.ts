@@ -18,6 +18,7 @@ export interface GeneralTelegramPin extends TelegramBotCredentials {
   privateDocument: boolean;
   privateProvider: boolean;
   privateClaims: boolean;
+  privateAuthorization?: boolean;
   rehearsal?: GeneralReadLaneScope;
 }
 
@@ -54,8 +55,11 @@ export function parseGeneralTelegramPin(input: unknown, releaseRevision: unknown
     const privateFormats = value.outbox === "shared-private-management-formats" || cumulative;
     const privateTemp = value.outbox === "shared-private-temp" || cumulative;
     const privateManagement = value.outbox === "shared-private-management" || privateFormats || privateTemp;
-    if (Object.keys(value).length !== (sharedOutbox ? 8 : 7)
-      || (sharedOutbox && value.outbox !== "shared" && !privateManagement)) return null;
+    const authorizationConfigured = Object.hasOwn(value, "authManagement");
+    const privateAuthorization = value.authManagement === true;
+    if (Object.keys(value).length !== 7 + Number(sharedOutbox) + Number(authorizationConfigured)
+      || (sharedOutbox && value.outbox !== "shared" && !privateManagement)
+      || (authorizationConfigured && (!privateManagement || !privateAuthorization))) return null;
     const credentials = readTelegramBotCredentials(value);
     const { generation, cutoverAt, activationSha256 } = value;
     if (!credentials || Number(credentials.botId) >= 2 ** 52 || typeof generation !== "number"
@@ -63,7 +67,7 @@ export function parseGeneralTelegramPin(input: unknown, releaseRevision: unknown
       || !Number.isSafeInteger(cutoverAt) || cutoverAt < 1 || typeof activationSha256 !== "string"
       || !/^[0-9a-f]{64}(?![\s\S])/u.test(activationSha256)) return null;
     return { ...credentials, generation, cutoverAt, activationSha256, releaseRevision, sharedOutbox, privateManagement,
-      privateFormats, privateTemp, privateDocument, privateProvider, privateClaims };
+      privateFormats, privateTemp, privateDocument, privateProvider, privateClaims, privateAuthorization };
   } catch {
     return null;
   }
