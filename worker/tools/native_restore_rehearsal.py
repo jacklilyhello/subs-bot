@@ -183,12 +183,13 @@ def listed_metadata(row):
     return validate_metadata({"custom": {} if custom is None else custom, "http": http})
 
 
-def signed_put_headers(host, path, token_id, token, raw, metadata, now):
+def signed_put_headers(host, path, token_id, token, raw, metadata, now, *, if_match=None):
     """One S3 SigV4 PUT using the verified account token's derived key."""
     timestamp = now.strftime("%Y%m%dT%H%M%SZ")
     day = timestamp[:8]
     payload_sha = digest(raw)
-    headers = {"host": host, "content-length": str(len(raw)), "if-none-match": "*",
+    condition = {"if-none-match": "*"} if if_match is None else {"if-match": if_match}
+    headers = {"host": host, "content-length": str(len(raw)), **condition,
                "x-amz-date": timestamp, "x-amz-content-sha256": payload_sha, "x-amz-storage-class": "STANDARD", **metadata["http"],
                **{f"x-amz-meta-{name}": value for name, value in metadata["custom"].items()}}
     signed_headers = ";".join(sorted(headers))
