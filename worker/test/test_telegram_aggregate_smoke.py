@@ -176,6 +176,69 @@ class AggregateAcceptanceTests(unittest.TestCase):
         self.assertIn('"nonce"', raw)
         self.assertNotIn(smoke.derive_code(KEY, POLICY, "member", checkpoint["capabilities"]["member-rotated"]["nonce"]), raw)
 
+    def test_readonly_inspection_requires_exact_confirmed_active_slot_but_no_fixture_inventory(self):
+        self.cloud.db.execute("INSERT INTO subscriptions(owner_id,name,source_url,token,created_at,updated_at) "
+                              "VALUES (?, 'another fixture', 'https://example.invalid/', 'another-synthetic-token', 1, 1)",
+                              (POLICY["adminId"],))
+        self.receipt("admin", "issued")
+        now, = self.cloud.db.execute("SELECT unixepoch()").fetchone()
+        pin = {"since": now - 10, "readSmallBodies": False}
+        calls = []
+
+        def probe(code, read_bodies):
+            calls.append((smoke.digest(code.encode()), read_bodies))
+            return {"clash": {"HEAD": {"status": 200, "elapsedMs": 12}}}
+
+        changes, puts = self.cloud.db.total_changes, self.cloud.puts.copy()
+        report = smoke.inspect_existing(self.cohort, pin, lambda: None, probe)
+        self.assertEqual(report, {"admin": {"state": "active", "formats": {"clash": {"HEAD": {"status": 200, "elapsedMs": 12}}}},
+                                  "member": {"state": "absent"}})
+        self.assertEqual(calls, [(self.cohort.slots()["admin"]["code_sha256"], False)])
+        self.assertEqual((self.cloud.db.total_changes, self.cloud.puts, self.cloud.deleted), (changes, puts, []))
+        self.cloud.db.execute("UPDATE telegram_inbox SET received_at=? WHERE actor_id=?", (now - 11, POLICY["adminId"]))
+        with self.assertRaisesRegex(FixtureError, "exact confirmed issuance"):
+            smoke.inspect_existing(self.cohort, pin, lambda: None, probe)
+        self.assertEqual(len(calls), 1)
+
+    def test_inspection_uses_head_without_length_and_hashes_only_bounded_get(self):
+        body = b"synthetic YAML"
+        calls = []
+
+        @contextmanager
+        def request(method, path, deadline, label):
+            calls.append((method, path))
+            fmt = path.rsplit("/", 1)[-1]
+            status = 200 if fmt == "clash" else 503
+            headers = {"Cache-Control": "private, no-store", "Referrer-Policy": "no-referrer",
+                       "X-Content-Type-Options": "nosniff", "Content-Type": "text/yaml"}
+            if method == "GET":
+                headers["Content-Length"] = str(len(body))
+
+            class Response(BytesIO):
+                def getheader(self, name, default=None):
+                    return headers.get(name, default)
+
+            response = Response(body if method == "GET" else b"")
+            response.status = status
+            yield response
+
+        code = "a" * 22
+        with patch.object(smoke, "_request", request):
+            report = smoke.inspect_capability(code, True)
+        self.assertEqual(calls, [("HEAD", f"/agg/{code}/clash"), ("GET", f"/agg/{code}/clash"), ("HEAD", f"/agg/{code}/base64")])
+        self.assertEqual(report["base64"]["HEAD"]["status"], 503)
+        self.assertEqual(report["clash"]["GET"]["bodyBytes"], len(body))
+        self.assertEqual(report["clash"]["GET"]["bodySha256"], smoke.digest(body))
+        self.assertNotIn(code, json.dumps(report))
+
+    def test_inspection_pin_is_separate_from_existing_workflow_inputs(self):
+        pin = {"revision": REVISION, "versionId": RELEASE_PIN["versionId"], "since": STAMP, "readSmallBodies": False}
+        event = {"inputs": {"action": "inspect-existing", "inspect_pin": json.dumps(pin)}}
+        self.assertEqual(smoke.parse_inputs(event), ("inspect-existing", None, pin))
+        event["inputs"]["cohort"] = COHORT
+        with self.assertRaisesRegex(FixtureError, "inspection inputs"):
+            smoke.parse_inputs(event)
+
     def test_prepare_reconciles_lost_d1_response_and_partial_conditional_uploads(self):
         self.cloud = FakeResources()
         self.addCleanup(self.cloud.db.close)
