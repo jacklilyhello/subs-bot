@@ -386,7 +386,11 @@ python3 -B worker/tools/legacy_general_auth_candidate.py \
   SOURCE_SHA256 INVENTORY_SHA256 CONFIG_SHA256 TARGET_SHA256 PREVIEW_SHA256 WORKER_MANIFEST_SHA256 REVISION APPLIED_AT
 ```
 
-工具重建并逐文件比对通用预览。仅接受默认拒绝、无阻断的封存结果。候选包包含 `restore.sql`、`manifest.json` 和 `manifest.sha256`。SQL 限 256 KiB，并在私有临时库重放核对完整 schema、外键及数据摘要。原授权覆盖和时间、管理员及白名单标记、群范围保存在三个候选专用表中。候选保持休眠，原 Worker 迁移登记保持原样。实际向新建未绑定 D1 导入另行验收。
+工具重建并逐文件比对通用预览。仅接受默认拒绝、无阻断的封存结果。候选包包含 `restore.sql`、`manifest.json` 和 `manifest.sha256`。SQL 限 256 KiB，并在私有临时库重放核对完整 schema、外键及数据摘要。原授权覆盖和时间、管理员及白名单标记、群范围保存在三个候选专用表中。候选保持休眠，原 Worker 迁移登记保持原样。
+
+在 `worker-isolation-legacy-candidate.yml` 选择 `synthetic-legacy-general-auth`。使用同一个新的 32 位小写十六进制 `cohort` 和同一次成功的 Worker CI，依次运行 `verify`、`prepare`、`create-restore-db`、`start-import` 和 `verify-restore`。受保护步骤独立重建固定合成输入，确认候选与同一次 Worker 构建的归档相符。创建结果不明时使用既有 `pin-resource` 核对本次 D1 的身份。
+
+每轮只新建一份未绑定的 D1，操作记录写入隔离 Worker 的私有 R2 专用前缀。最终读回核对原迁移登记、三个候选表、完整 schema、外键和数据摘要。固定样例含一份休眠安装、五位用户、两个群及三条原覆盖。通用授权启用需要另行核对运行时与目标环境。
 
 ### 普通短链双账号验收
 

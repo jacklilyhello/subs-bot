@@ -74,13 +74,19 @@ LEGACY_SELECTED_AGGREGATE_CANDIDATE_PROFILE = "synthetic-legacy-selected-aggrega
 LEGACY_TEMP_CANDIDATE_PROFILE = "synthetic-legacy-temp-nodes"
 LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE = "synthetic-legacy-dynamic-all"
 LEGACY_UNIFIED_SHARE_CANDIDATE_PROFILE = "synthetic-legacy-unified-shares"
+LEGACY_GENERAL_AUTH_CANDIDATE_PROFILE = "synthetic-legacy-general-auth"
+D1_ONLY_CANDIDATE_PROFILES = frozenset({LEGACY_TEMP_CANDIDATE_PROFILE, LEGACY_GENERAL_AUTH_CANDIDATE_PROFILE})
+PINNED_TARGET_CANDIDATE_PROFILES = D1_ONLY_CANDIDATE_PROFILES | {
+    LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE, LEGACY_UNIFIED_SHARE_CANDIDATE_PROFILE,
+}
 LEGACY_CANDIDATE_NAMES = {LEGACY_CANDIDATE_PROFILE: "legacy", LEGACY_PATH_CANDIDATE_PROFILE: "legacy-path",
                           LEGACY_EMPTY_CANDIDATE_PROFILE: "legacy-empty", LEGACY_PRIVATE_SHARE_CANDIDATE_PROFILE: "legacy-share",
                           LEGACY_TYPED_SHORT_CANDIDATE_PROFILE: "legacy-typed", LEGACY_MIXED_SHORT_CANDIDATE_PROFILE: "legacy-mixed",
                           LEGACY_SELECTED_AGGREGATE_CANDIDATE_PROFILE: "legacy-select",
                           LEGACY_TEMP_CANDIDATE_PROFILE: "legacy-temp",
                           LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE: "legacy-all",
-                          LEGACY_UNIFIED_SHARE_CANDIDATE_PROFILE: "legacy-unified"}
+                          LEGACY_UNIFIED_SHARE_CANDIDATE_PROFILE: "legacy-unified",
+                          LEGACY_GENERAL_AUTH_CANDIDATE_PROFILE: "legacy-auth"}
 ACCOUNT_SHA256 = "ffdbf3dd5d042c6edb68d7f628998a69a22320b0199775bfda9f97593136e508"
 
 
@@ -233,7 +239,7 @@ class RehearsalAPI:
         if profile in LEGACY_CANDIDATE_NAMES:
             label = LEGACY_CANDIDATE_NAMES[profile]
             self.names = {"database": f"subs-bot-cf-{label}-db-{cohort}"}
-            if profile != LEGACY_TEMP_CANDIDATE_PROFILE:
+            if profile not in D1_ONLY_CANDIDATE_PROFILES:
                 self.names["objects"] = f"subs-bot-cf-{label}-r2-{cohort}"
             self.journal_prefix = f"maintenance/{label}-candidate/{cohort}/journal/"
         self.buckets = {WORKER_NAME, *(self.names[kind] for kind in self.names if kind != "database")}
@@ -248,13 +254,11 @@ class RehearsalAPI:
         return self.json(method, path, payload)
 
     def allow_restore(self, database_id=None, keys=None, object_bucket=None):
-        temp_only = self.profile == LEGACY_TEMP_CANDIDATE_PROFILE
-        if temp_only:
+        if self.profile in D1_ONLY_CANDIDATE_PROFILES:
             require(object_bucket is None and (keys is None or not keys))
         if database_id is not None:
             require(matches(UUID, database_id) and database_id != self.target["d1Id"]
-                    and (self.profile not in (LEGACY_TEMP_CANDIDATE_PROFILE, LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE,
-                                              LEGACY_UNIFIED_SHARE_CANDIDATE_PROFILE)
+                    and (self.profile not in PINNED_TARGET_CANDIDATE_PROFILES
                          or database_id in self.databases))
             self.databases.add(database_id)
             self.restore_id = database_id
@@ -274,7 +278,7 @@ class RehearsalAPI:
     def json(self, method, path, payload=None, *, envelope=False):
         require(method in {"GET", "POST"} and path.startswith(self.root + "/") and not any(c in path for c in ("#", "\\", "\n", "\r")))
         route = path.partition("?")[0]
-        if self.profile == LEGACY_TEMP_CANDIDATE_PROFILE:
+        if self.profile in D1_ONLY_CANDIDATE_PROFILES:
             if method == "GET" and route == self.root + "/d1/database":
                 require(path == route + "?" + urlencode({"name": self.names["database"], "per_page": 100}))
             elif method == "GET":
@@ -328,8 +332,7 @@ class RehearsalAPI:
                 query = parse_qs(urlsplit(path).query, max_num_fields=3)
                 prefix = query.get("prefix", [])
                 require(len(prefix) == 1 and re.fullmatch(re.escape(self.journal_prefix) + r"(?:[0-9]{6}-)?", prefix[0]))
-                if self.profile in (LEGACY_TEMP_CANDIDATE_PROFILE, LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE,
-                                    LEGACY_UNIFIED_SHARE_CANDIDATE_PROFILE):
+                if self.profile in PINNED_TARGET_CANDIDATE_PROFILES:
                     require(set(query) <= {"prefix", "per_page", "cursor"}
                             and all(len(values) == 1 for values in query.values()))
             elif self.profile == LEGACY_UNIFIED_SHARE_CANDIDATE_PROFILE:
