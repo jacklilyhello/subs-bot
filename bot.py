@@ -5,6 +5,7 @@ import html
 import json
 import logging
 import re
+import signal
 import time
 from contextlib import suppress
 from typing import Any
@@ -2564,12 +2565,15 @@ def build_app() -> Application:
     return app
 
 
-async def amain() -> None:
+async def amain(stop: asyncio.Event | None = None) -> None:
     preserve_pending = config.preserve_pending_telegram_updates()
+    if stop is None:
+        stop = asyncio.Event()
     app = build_app()
     # 先把建表/迁移一次性做完，之后所有查询共享同一条连接
     await store.init()
     runner = await start_http(app)
+    polling_started = False
     try:
         log.info("Bot starting...")
         await app.initialize()
@@ -2584,24 +2588,48 @@ async def amain() -> None:
         except Exception as e:
             log.warning("Failed to calibrate bot username from API: %s", e)
 
+        if stop.is_set():
+            return
         await app.updater.start_polling(drop_pending_updates=not preserve_pending, allowed_updates=Update.ALL_TYPES)
-        # run forever
-        while True:
-            await asyncio.sleep(3600)
+        polling_started = True
+        await stop.wait()
     finally:
-        with suppress(Exception):
-            await app.updater.stop()
-        with suppress(Exception):
-            await app.stop()
-        with suppress(Exception):
-            await app.shutdown()
-        with suppress(Exception):
-            await runner.cleanup()
-        with suppress(Exception):
-            await store.close()
-        with suppress(Exception):
-            await close_session()
+        failures = []
+        # Stop fetching updates before waiting for the application's local work.
+        for stage, cleanup in (
+            ("polling", app.updater.stop),
+            ("application", app.stop),
+            ("telegram", app.shutdown),
+            ("http", runner.cleanup),
+            ("sqlite", store.close),
+            ("provider-session", close_session),
+        ):
+            try:
+                await cleanup()
+            except Exception:
+                failures.append(stage)
+        if stop.is_set():
+            if not polling_started:
+                log.warning("legacy-drain:v1 outcome=incomplete stages=startup")
+            elif failures:
+                log.warning("legacy-drain:v1 outcome=incomplete stages=%s", ",".join(failures))
+            else:
+                log.info("legacy-drain:v1 outcome=complete")
+
+
+async def run() -> None:
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    try:
+        loop.add_signal_handler(signal.SIGTERM, stop.set)
+    except NotImplementedError:
+        await amain()
+        return
+    try:
+        await amain(stop)
+    finally:
+        loop.remove_signal_handler(signal.SIGTERM)
 
 
 if __name__ == "__main__":
-    asyncio.run(amain())
+    asyncio.run(run())
