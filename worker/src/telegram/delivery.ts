@@ -11,7 +11,7 @@ import type { PrivateShareClaimResult } from "../private-shares.ts";
 import {
   prepareTelegramLifecycleTickets, renderTelegramLifecycle, type TelegramLifecycleButton,
 } from "./lifecycle-actions.ts";
-import { GROUP_SHARE_PUBLISH_CALLBACK, inTelegramScope, TELEGRAM_PAGE_JUMP_CALLBACK, type TelegramPolicy } from "./protocol.ts";
+import { GROUP_SHARE_PUBLISH_CALLBACK, inTelegramScope, TELEGRAM_PAGE_JUMP_CALLBACK, type TelegramBotCredentials, type TelegramPolicy } from "./protocol.ts";
 import { confirmTelegramPageJumpSend, currentTelegramPageJumpEpoch, renderTelegramPageJump, telegramPageJumpSendGuard } from "./page-jump.ts";
 import { closeUnsentTelegramBulkTrashReply, confirmTelegramBulkTrashSend, renderTelegramBulkTrash } from "./bulk-trash.ts";
 import { renderTelegramInlineSort } from "./inline-sort.ts";
@@ -345,7 +345,7 @@ export async function answerTelegramCallback(
 }
 
 export async function sendTelegramInlineAnswer(
-  policy: TelegramPolicy, queryId: string, results: readonly InlineSearchArticle[], timeoutMs: number,
+  policy: TelegramBotCredentials, queryId: string, results: readonly InlineSearchArticle[], timeoutMs: number,
 ): Promise<InlineSearchOutcome> {
   try {
     const response = await fetch(`${BOT_API}/bot${policy.botToken}/answerInlineQuery`, {

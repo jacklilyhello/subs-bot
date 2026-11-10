@@ -153,6 +153,10 @@ test("closed general authorization replays a sealed candidate in a separate emit
   const aggregateKeyRaw = Buffer.alloc(32, 17).toString("base64url");
   const shareKeyRaw = Buffer.alloc(32, 0x61).toString("base64url");
   const authConfig = JSON.stringify({ ...JSON.parse(shortConfig), authManagement: true });
+  const inlineConfig = JSON.stringify({ ...JSON.parse(authConfig), inlineSearch: true });
+  const inlinePin = parseGeneralTelegramPin(inlineConfig, fixture.releaseRevision);
+  assert.ok(inlinePin?.privateInline);
+  const inlineAnswers = new Map<string, { titles: string[]; messages: string[] }>();
   const authPin = parseGeneralTelegramPin(authConfig, fixture.releaseRevision);
   assert.ok(authPin?.privateAuthorization && authPin.privateShort && authPin.privateSelected && authPin.privateAggregate
     && authPin.privateShareCreation && authPin.privateClaims);
@@ -170,6 +174,18 @@ test("closed general authorization replays a sealed candidate in a separate emit
   const privateTransport = async (request: Request) => {
     const api = `https://api.telegram.org/bot${generalToken}/`;
     const files = `https://api.telegram.org/file/bot${generalToken}/documents/`;
+    if (request.url === api + "answerInlineQuery") {
+      const answer = await request.json() as { inline_query_id: string; is_personal: boolean; cache_time: number;
+        next_offset: string; results: { title: string; input_message_content: { message_text: string } }[] };
+      assert.equal(request.method, "POST");
+      assert.equal(answer.is_personal, true);
+      assert.equal(answer.cache_time, 0);
+      assert.equal(answer.next_offset, "");
+      assert.equal(inlineAnswers.has(answer.inline_query_id), false, "an inline query can send only once");
+      inlineAnswers.set(answer.inline_query_id, { titles: answer.results.map(({ title }) => title),
+        messages: answer.results.map(({ input_message_content }) => input_message_content.message_text) });
+      return Response.json({ ok: true, result: true });
+    }
     if (request.url === api + "getFile") {
       assert.equal(request.method, "POST");
       const { file_id: fileId } = await request.json() as { file_id: string };
@@ -253,6 +269,11 @@ test("closed general authorization replays a sealed candidate in a separate emit
     { name: "formats", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: documentConfig, PUBLIC_ORIGIN: PRODUCTION_PUBLIC_ORIGIN },
       outboundService: privateTransport },
+    ...[true, false].map((enabled) => ({ name: enabled ? "general-inline" : "general-inline-paused", modules: true,
+      script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"], outboundService: privateTransport,
+      bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: inlineConfig,
+        TELEGRAM_AGGREGATE_KEY: aggregateKeyRaw, TELEGRAM_PRIVATE_SHARE_CREATION_KEY: shareKeyRaw,
+        ...(enabled ? { TELEGRAM_INLINE_SEARCH: "1" } : {}) } })),
     { name: "auth", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: authConfig,
         TELEGRAM_AGGREGATE_KEY: aggregateKeyRaw, TELEGRAM_PRIVATE_SHARE_CREATION_KEY: shareKeyRaw }, outboundService: privateTransport },
@@ -1527,6 +1548,51 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.equal((await aggregateWorker.scheduled({ cron: "* * * * *" })).outcome, "ok");
   assert.equal((await findReply(7591))?.state, "failed");
   assert.ok(!lifecycleSent.some(({ reply_parameters }) => reply_parameters.message_id === 7591));
+
+  const inlineWorker = await runtime.getWorker("general-inline");
+  const inlinePaused = await runtime.getWorker("general-inline-paused");
+  // Use an independent member epoch. The short-link fixture uses actor 104 later.
+  const inlineActor = 103;
+  const inlineActorRevision = 5;
+  await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,?,?,?,'member')")
+    .bind(pin.botId, pin.generation, String(inlineActor), inlineActorRevision, now + 22).run();
+  const inlineCommand = (id: number, actor: number, text: string, options: PostOptions = {}) =>
+    post(actor, text, { worker: inlineWorker, updateId: id, date: now + 24, ...options });
+  const inlineQuery = (id: number, actor: number, query: string, chatType = "sender", worker = inlineWorker) =>
+    worker.fetch("https://app.fixture.invalid/telegram/webhook", { method: "POST",
+      headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": pin.webhookSecret },
+      body: JSON.stringify({ update_id: id, inline_query: { id: `synthetic-inline-${id}`,
+        from: { id: actor, is_bot: false }, chat_type: chatType, offset: "", query } }),
+    });
+  assert.equal((await inlineQuery(8850, 101, "Own")).status, 204);
+  assert.equal(inlineAnswers.size, 0);
+  assert.equal((await inlineCommand(8851, 101, "/inline on", { worker: inlinePaused })).status, 204);
+  assert.equal((await inlineCommand(8852, 101, "/inline on", groupEvent)).status, 204);
+  assert.equal((await inlineCommand(8853, 101, "/inline on")).status, 200);
+  assert.equal((await inlineCommand(8854, inlineActor, "/inline on")).status, 200);
+  assert.match((await awaitLifecycle(8853)).message.text, /15 分钟/u);
+  assert.match((await awaitLifecycle(8854)).message.text, /15 分钟/u);
+  assert.equal((await inlineQuery(8855, 101, "Own", "group")).status, 204);
+  assert.equal((await inlineQuery(8856, 102, "Own")).status, 204);
+  assert.equal((await inlineQuery(8857, 101, "Own", "sender", inlinePaused)).status, 204);
+  assert.equal(inlineAnswers.size, 0);
+  assert.equal((await inlineQuery(8858, 101, "Renamed current fixture")).status, 204);
+  assert.equal((await inlineQuery(8859, inlineActor, "Own 103")).status, 204);
+  assert.equal((await inlineQuery(8858, 101, "Renamed current fixture")).status, 204);
+  assert.equal(inlineAnswers.size, 2);
+  assert.ok(inlineAnswers.get("synthetic-inline-8858")?.titles.some((title) => title.startsWith("Renamed current fixture")));
+  assert.ok(inlineAnswers.get("synthetic-inline-8859")?.titles.some((title) => title.startsWith("Own 103")));
+  assert.doesNotMatch(JSON.stringify([...inlineAnswers.values()]), /https?:|fixture-token|source\.fixture/u);
+  assert.equal((await inlineCommand(8860, 101, "/inline off", { worker: inlinePaused, date: now + 25 })).status, 200);
+  assert.match((await awaitLifecycle(8860)).message.text, /已关闭/u);
+  await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,?,?,?,'denied')")
+    .bind(pin.botId, pin.generation, String(inlineActor), inlineActorRevision + 1, now + 25).run();
+  assert.equal((await inlineQuery(8861, 101, "Renamed current fixture")).status, 204);
+  assert.equal((await inlineQuery(8862, inlineActor, "Own 103")).status, 204);
+  assert.equal(inlineAnswers.size, 2, "opt-out and revocation independently fence delivery");
+  assert.deepEqual((await db.prepare(`SELECT actor_id AS actor,state,result_count AS n
+    FROM telegram_inline_search_receipts WHERE bot_id=? ORDER BY update_id`).bind(pin.botId).all()).results,
+    [{ actor: "101", state: "sent", n: 1 }, { actor: "103", state: "sent", n: 1 }]);
 
   const selectedWorker = await runtime.getWorker("selected");
   const selectedPost = (updateId: number, actor: number, query: string, options: PostOptions = {}) =>

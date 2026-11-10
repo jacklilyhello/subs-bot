@@ -23,6 +23,7 @@ export interface GeneralTelegramPin extends TelegramBotCredentials {
   privateSelected: boolean;
   privateShort: boolean;
   privateAuthorization?: boolean;
+  privateInline?: boolean;
   rehearsal?: GeneralReadLaneScope;
 }
 
@@ -65,9 +66,12 @@ export function parseGeneralTelegramPin(input: unknown, releaseRevision: unknown
     const privateManagement = value.outbox === "shared-private-management" || privateFormats || privateTemp;
     const authorizationConfigured = Object.hasOwn(value, "authManagement");
     const privateAuthorization = value.authManagement === true;
-    if (Object.keys(value).length !== 7 + Number(sharedOutbox) + Number(authorizationConfigured)
+    const inlineConfigured = Object.hasOwn(value, "inlineSearch");
+    const privateInline = value.inlineSearch === true;
+    if (Object.keys(value).length !== 7 + Number(sharedOutbox) + Number(authorizationConfigured) + Number(inlineConfigured)
       || (sharedOutbox && value.outbox !== "shared" && !privateManagement)
-      || (authorizationConfigured && (!privateManagement || !privateAuthorization))) return null;
+      || (authorizationConfigured && (!privateManagement || !privateAuthorization))
+      || (inlineConfigured && (!privateManagement || !privateInline))) return null;
     const credentials = readTelegramBotCredentials(value);
     const { generation, cutoverAt, activationSha256 } = value;
     if (!credentials || Number(credentials.botId) >= 2 ** 52 || typeof generation !== "number"
@@ -76,7 +80,7 @@ export function parseGeneralTelegramPin(input: unknown, releaseRevision: unknown
       || !/^[0-9a-f]{64}(?![\s\S])/u.test(activationSha256)) return null;
     return { ...credentials, generation, cutoverAt, activationSha256, releaseRevision, sharedOutbox, privateManagement,
       privateFormats, privateTemp, privateDocument, privateProvider, privateClaims, privateShareCreation, privateAggregate, privateSelected,
-      privateShort, privateAuthorization };
+      privateShort, privateAuthorization, privateInline };
   } catch {
     return null;
   }

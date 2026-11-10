@@ -1,8 +1,10 @@
 import { trimPathRuleWhitespace } from "../path-rules.ts";
 import { digestHex, SUBSCRIPTION_LIFECYCLE_REVISION, validInteger } from "../storage.ts";
-import { activeInlineConsent, TELEGRAM_INLINE_CONSENT_MARKER, TELEGRAM_INLINE_TEMP_CONSENT_MARKER } from "./inline-search-consent.ts";
+import type { GeneralTelegramPin } from "./general-auth-runtime.ts";
+import { activeInlineConsent, GENERAL_INLINE_CONSENT_MARKER, inlineSearchReceiptFamily,
+  TELEGRAM_INLINE_CONSENT_MARKER, TELEGRAM_INLINE_TEMP_CONSENT_MARKER } from "./inline-search-consent.ts";
 import { readTelegramInlineTempNodes } from "./inline-temp-nodes.ts";
-import type { TelegramInlineQuery, TelegramInlineSortMode, TelegramPolicy } from "./protocol.ts";
+import type { TelegramBotCredentials, TelegramInlineQuery, TelegramInlineSortMode, TelegramPolicy } from "./protocol.ts";
 import { unicode14Lower } from "./selected-search.ts";
 import { displayTelegramName } from "./views.ts";
 
@@ -26,7 +28,7 @@ export type InlineSearchArticle = {
   input_message_content: { message_text: string; link_preview_options: { is_disabled: true } };
 };
 export type InlineSearchOutcome = "sent" | "failed" | "uncertain";
-type SendAnswer = (policy: TelegramPolicy, id: string, results: readonly InlineSearchArticle[], timeoutMs: number) => Promise<InlineSearchOutcome>;
+type SendAnswer = (policy: TelegramBotCredentials, id: string, results: readonly InlineSearchArticle[], timeoutMs: number) => Promise<InlineSearchOutcome>;
 type Row = { id: number; name: string; sourceUrl: string; generation: number; revision: number;
   trafficUsed: number | null; trafficTotal: number | null; expireAt: number | null };
 type Match = Pick<Row, "id" | "name" | "trafficUsed" | "trafficTotal" | "expireAt">;
@@ -110,10 +112,13 @@ const inventoryGuard = `(SELECT count(*) FROM subscriptions WHERE owner_id=reque
 
 /** The authenticated request owns the raw query and answer ID until one bounded attempt ends. */
 export async function answerTelegramInlineSearch(
-  db: D1Database, policy: TelegramPolicy, event: TelegramInlineQuery, send: SendAnswer,
+  db: D1Database, policy: TelegramPolicy | GeneralTelegramPin, event: TelegramInlineQuery, send: SendAnswer,
 ): Promise<void> {
-  if (event.chatType !== "sender" || (event.actorId !== policy.adminId && event.actorId !== policy.memberId)
-    || !validInteger(event.updateId, 1)) return;
+  const isolated = "adminId" in policy ? policy : null;
+  const general = "privateManagement" in policy ? policy : null;
+  if (event.chatType !== "sender" || !validInteger(event.updateId, 1)
+    || (isolated ? event.actorId !== isolated.adminId && event.actorId !== isolated.memberId
+      : !general?.privateInline || general.rehearsal || event.actorId === general.botId)) return;
   const query = trimPathRuleWhitespace(event.query);
   const needle = unicode14Lower(query);
   if (/^share(?:\s|$)/u.test(needle)) return;
@@ -123,8 +128,9 @@ export async function answerTelegramInlineSearch(
   let state: "new" | "preflight" | "sending" = "new";
   try {
     const [cleanup, admitted] = await db.batch<{ mode: TelegramInlineSortMode; consentMarker: string; receivedAt: number }>([
-      db.prepare(`UPDATE telegram_inline_search_receipts SET state=${expiredState}
-        WHERE bot_id=? AND actor_id=? AND ${activeStates} AND lease_until<=unixepoch()`).bind(policy.botId, event.actorId),
+      db.prepare(`UPDATE telegram_inline_search_receipts AS request SET state=${expiredState}
+        WHERE bot_id=? AND actor_id=? AND ${activeStates} AND lease_until<=unixepoch()
+          AND (${inlineSearchReceiptFamily("request", Boolean(general))})`).bind(policy.botId, event.actorId),
       db.prepare(`INSERT INTO telegram_inline_search_receipts
         (bot_id,update_id,actor_id,query_id_sha256,consent_receipt_id,sort_mode,sort_update_id,received_at,lease_until,state)
         SELECT consent.bot_id,?,consent.actor_id,?,consent.receipt_id,COALESCE(pref.mode,'default'),COALESCE(pref.update_id,0),
@@ -145,27 +151,34 @@ export async function answerTelegramInlineSearch(
     if (!receipt) return;
     state = "preflight";
     const marker = receipt.consentMarker;
-    if (marker !== TELEGRAM_INLINE_CONSENT_MARKER && marker !== TELEGRAM_INLINE_TEMP_CONSENT_MARKER) throw new Error();
-    const sendConsent = activeInlineConsent(policy, marker);
+    const isolatedMarker = marker === TELEGRAM_INLINE_CONSENT_MARKER || marker === TELEGRAM_INLINE_TEMP_CONSENT_MARKER
+      ? marker : undefined;
+    if (general ? marker !== GENERAL_INLINE_CONSENT_MARKER : !isolatedMarker) throw new Error();
+    const sendConsent = activeInlineConsent(policy, isolatedMarker);
     const deadline = Date.now() + SCAN_MS;
     const scan = await scanOwned(db, event.actorId, needle, receipt.mode, deadline);
     const results = scan?.results ?? [];
-    const temp = marker === TELEGRAM_INLINE_TEMP_CONSENT_MARKER && scan && results.length < MAX_RESULTS
-      ? await readTelegramInlineTempNodes(db, policy, event, needle, MAX_RESULTS - results.length, deadline, receipt.receivedAt) : undefined;
+    const temp = isolated && marker === TELEGRAM_INLINE_TEMP_CONSENT_MARKER && scan && results.length < MAX_RESULTS
+      ? await readTelegramInlineTempNodes(db, isolated, event, needle, MAX_RESULTS - results.length, deadline, receipt.receivedAt) : undefined;
     if (temp === null) results.length = 0;
     else if (temp) results.push(...temp.results);
-    const begin = await db.prepare(`UPDATE telegram_inline_search_receipts AS request SET state='sending',result_count=?
+    const authorization = `EXISTS (SELECT 1 FROM telegram_inline_search_consent AS consent
+      WHERE consent.receipt_id=request.consent_receipt_id AND consent.bot_id=request.bot_id
+        AND consent.actor_id=request.actor_id AND consent.update_id<request.update_id AND (${sendConsent.sql}))`;
+    const proof = general ? `WITH eligible AS MATERIALIZED (
+      SELECT (${authorization}) AS allowed FROM telegram_inline_search_receipts AS request WHERE ${requestKey}
+    )` : "";
+    const begin = await db.prepare(`${proof} UPDATE telegram_inline_search_receipts AS request SET state='sending',result_count=?
       WHERE ${requestKey} AND request.state='preflight' AND request.lease_until>=unixepoch()+${ANSWER_SECONDS + 1}
-        AND EXISTS (SELECT 1 FROM telegram_inline_search_consent AS consent WHERE consent.receipt_id=request.consent_receipt_id
-          AND consent.bot_id=request.bot_id AND consent.actor_id=request.actor_id AND consent.update_id<request.update_id
-          AND ${sendConsent.sql})
+        AND ${general ? "EXISTS (SELECT 1 FROM eligible WHERE allowed)" : authorization}
         AND request.sort_mode=COALESCE((SELECT mode FROM telegram_inline_sort_preferences
           WHERE bot_id=request.bot_id AND actor_id=request.actor_id),'default')
         AND request.sort_update_id=COALESCE((SELECT update_id FROM telegram_inline_sort_preferences
           WHERE bot_id=request.bot_id AND actor_id=request.actor_id),0)
         ${scan ? `AND (${inventoryGuard})` : ""}
-        ${temp ? `AND (${temp.guard.sql})` : ""} RETURNING update_id`).bind(results.length, ...key, ...sendConsent.bindings,
-      ...(scan ? [scan.inventory, scan.inventory] : []), ...(temp?.guard.bindings ?? [])).first();
+        ${temp ? `AND (${temp.guard.sql})` : ""} RETURNING update_id`)
+      .bind(...(general ? [...sendConsent.bindings, ...key] : []), results.length, ...key,
+        ...(general ? [] : sendConsent.bindings), ...(scan ? [scan.inventory, scan.inventory] : []), ...(temp?.guard.bindings ?? [])).first();
     if (begin === null) {
       await finish(db, key, "preflight", "dropped");
       return;
@@ -189,13 +202,14 @@ async function finish(
   if (!result.success) throw new Error("Telegram inline search outcome could not be stored.");
 }
 
-export async function reapTelegramInlineSearch(db: D1Database, botId: string): Promise<void> {
+export async function reapTelegramInlineSearch(db: D1Database, botId: string, general = false): Promise<void> {
+  const family = inlineSearchReceiptFamily("request", general);
   const results = await db.batch([
-    db.prepare(`UPDATE telegram_inline_search_receipts SET state=${expiredState}
-      WHERE bot_id=? AND ${activeStates} AND lease_until<=unixepoch()`).bind(botId),
+    db.prepare(`UPDATE telegram_inline_search_receipts AS request SET state=${expiredState}
+      WHERE bot_id=? AND ${activeStates} AND lease_until<=unixepoch() AND (${family})`).bind(botId),
     db.prepare(`DELETE FROM telegram_inline_search_receipts WHERE bot_id=? AND update_id IN (
-      SELECT update_id FROM telegram_inline_search_receipts WHERE bot_id=? AND received_at<=unixepoch()-${RETENTION_SECONDS}
-        AND NOT (${activeStates}) ORDER BY received_at,update_id LIMIT ${REAP_LIMIT})`).bind(botId, botId),
+      SELECT update_id FROM telegram_inline_search_receipts AS request WHERE bot_id=? AND received_at<=unixepoch()-${RETENTION_SECONDS}
+        AND NOT (${activeStates}) AND (${family}) ORDER BY received_at,update_id LIMIT ${REAP_LIMIT})`).bind(botId, botId),
   ]);
   if (results.length !== 2 || results.some(({ success }) => !success)) throw new Error("Telegram inline search cleanup could not be confirmed.");
 }

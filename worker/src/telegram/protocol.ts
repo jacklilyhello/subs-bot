@@ -695,15 +695,23 @@ function normalizeCallback(
     : null;
 }
 
-function normalizeInlineQuery(value: Record<string, unknown>, updateId: number, policy: TelegramPolicy): NormalizedUpdate | null {
+function readSenderInlineQuery(value: Record<string, unknown>, updateId: number): TelegramInlineQuery | null {
   const { id, from, chat_type, offset, query } = value;
   if (chat_type !== "sender" || offset !== "" || !matches(id, CALLBACK_ID)
     || !isRecord(from) || from.is_bot !== false || !isPositiveInteger(from.id)
     || typeof query !== "string" || query.length > 512 || /[\u0000\ud800-\udfff]/u.test(query)
     || Array.from(query).length > 256 || new TextEncoder().encode(query).byteLength > 1024) return null;
-  const actorId = String(from.id);
-  return actorId === policy.adminId || actorId === policy.memberId
-    ? { inlineQuery: { updateId, actorId, chatType: "sender", queryId: id, query } } : null;
+  return { updateId, actorId: String(from.id), chatType: "sender", queryId: id, query };
+}
+
+function normalizeInlineQuery(value: Record<string, unknown>, updateId: number, policy: TelegramPolicy): NormalizedUpdate | null {
+  const query = readSenderInlineQuery(value, updateId);
+  return query && (query.actorId === policy.adminId || query.actorId === policy.memberId) ? { inlineQuery: query } : null;
+}
+
+export function readGeneralInlineQuery(update: Record<string, unknown>, updateId: number, botId: string): TelegramInlineQuery | null {
+  const query = Object.keys(update).length === 2 && isRecord(update.inline_query) ? readSenderInlineQuery(update.inline_query, updateId) : null;
+  return query && query.actorId !== botId ? query : null;
 }
 
 function normalizeUpdate(
