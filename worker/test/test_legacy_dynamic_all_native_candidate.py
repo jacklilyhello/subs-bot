@@ -88,6 +88,10 @@ class LegacyDynamicAllNativeCandidateTests(unittest.TestCase):
     def test_full_pinned_chain_may_extend_after_0040(self):
         path = self.worker / "isolation.json"
         manifest = json.loads(path.read_bytes())
+        # Exercise the first extension after 0040 within the fixed artifact budget.
+        for item in manifest["migrations"][40:]:
+            (self.worker / item["name"]).unlink()
+        del manifest["migrations"][40:]
         position = len(manifest["migrations"]) + 1
         migration = f"{position:04d}_future_v8_test.sql"
         ddl = b"CREATE TABLE future_v8_test (id INTEGER PRIMARY KEY) STRICT;\n"
