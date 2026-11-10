@@ -4,11 +4,11 @@ import { after, before, test } from "node:test";
 import { Miniflare } from "miniflare";
 import {
   acceptTelegramDocumentJob, claimTelegramDocumentJob, prepareTelegramDocumentJobLeaseGuard,
-  settleTelegramDocumentJob, TELEGRAM_DOCUMENT_JOB_MARKER, type TelegramDocumentJobInput,
+  settleTelegramDocumentJob, TELEGRAM_DOCUMENT_JOB_MARKER, TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER, type TelegramDocumentJobInput,
   type TelegramDocumentJobLease,
 } from "../src/telegram/document-jobs.ts";
 import type { TelegramPolicy } from "../src/telegram/protocol.ts";
-import { persistTelegramDocumentJob, retireTelegramDocumentStage } from "../src/telegram/document-persistence.ts";
+import { persistTelegramDocumentJob, reconcileTelegramDocumentJobReplies, retireTelegramDocumentStage } from "../src/telegram/document-persistence.ts";
 
 const miniflare = new Miniflare({ modules: true, compatibilityDate: "2026-07-30", d1Databases: ["DB"],
   r2Buckets: ["NODES"],
@@ -51,10 +51,11 @@ function stored(config: TelegramPolicy, updateId: number) {
   `).bind(config.botId, updateId).first<Record<string, unknown>>();
 }
 
-async function assertScrubbed(config: TelegramPolicy, updateId: number, reason: string, hasOutbox = 0) {
+async function assertScrubbed(config: TelegramPolicy, updateId: number, reason: string, hasOutbox = 0,
+  marker: string | null = TELEGRAM_DOCUMENT_JOB_MARKER) {
   const row = await stored(config, updateId);
   assert.ok(row);
-  assert.equal(row.marker, TELEGRAM_DOCUMENT_JOB_MARKER);
+  assert.equal(row.marker, marker);
   assert.equal(row.state, "done");
   assert.equal(row.result_code, reason);
   assert.ok(Number.isSafeInteger(row.finished_at));
@@ -62,6 +63,11 @@ async function assertScrubbed(config: TelegramPolicy, updateId: number, reason: 
   for (const field of ["file_id", "name", "suffix", "expected_size", "lease_id", "lease_until"]) {
     assert.equal(row[field], null);
   }
+}
+
+function setFixtureDocumentMarker(config: TelegramPolicy, updateId: number, marker: string | null) {
+  return db.prepare("UPDATE telegram_inbox SET receipt_nonce = ? WHERE bot_id = ? AND update_id = ?")
+    .bind(marker, config.botId, updateId);
 }
 
 async function checkLease(config: TelegramPolicy, lease: TelegramDocumentJobLease): Promise<number | null> {
@@ -311,6 +317,69 @@ test("terminalizes expired work and retains deduplication without retaining opaq
   await assertScrubbed(config, 1, "expired");
   assert.equal(await acceptTelegramDocumentJob(db, config, event(config, 1)), "ignored");
   assert.equal(await acceptTelegramDocumentJob(db, config, event(config, 2)), "accepted");
+});
+
+test("isolated reaping leaves the exact general document family alone and still scrubs isolated orphans", async () => {
+  const config = policy("76110");
+  const generalLease = await leaseDocument(config, 1, { fileName: "General leased.txt" });
+  for (const [updateId, name] of [[2, "General pending"], [3, "Null marker"], [4, "Unknown marker"]] as const) {
+    assert.equal(await acceptTelegramDocumentJob(db, config, event(config, updateId, { fileName: name + ".txt" })), "accepted");
+  }
+  assert.equal(await acceptTelegramDocumentJob(db, config, admin(config, 5, "Isolated expired.txt")), "accepted");
+  const unknown = "general-document-job:v2";
+  const expired = await stored(config, 5);
+  assert.ok(expired);
+  await db.batch([
+    setFixtureDocumentMarker(config, 1, TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER),
+    setFixtureDocumentMarker(config, 2, TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER),
+    setFixtureDocumentMarker(config, 3, null),
+    setFixtureDocumentMarker(config, 4, unknown),
+    db.prepare(`UPDATE telegram_document_jobs SET due_at = unixepoch() - 2, expires_at = unixepoch() - 1,
+      lease_until = CASE WHEN state = 'leased' THEN unixepoch() - 1 END WHERE receipt_id IN (?, ?)`)
+      .bind(generalLease.receiptId, expired.receipt_id),
+  ]);
+
+  const general = await Promise.all([1, 2].map((updateId) => stored(config, updateId)));
+  assert.ok(general[0] && general[1]);
+  assert.equal(await claimTelegramDocumentJob(db, config), null);
+  assert.deepEqual(await Promise.all([1, 2].map((updateId) => stored(config, updateId))), general);
+  await assertScrubbed(config, 3, "access-changed", 0, null);
+  await assertScrubbed(config, 4, "access-changed", 0, unknown);
+  await assertScrubbed(config, 5, "expired");
+});
+
+test("isolated cleanup retains general terminal reservations and R2 stages", async () => {
+  const config = policy("76111");
+  const journals = [];
+  for (const [updateId, subscriptionId, age] of [[1, 960001, 1], [2, 960002, 60]] as const) {
+    const lease = await leaseDocument(config, updateId);
+    assert.equal(await settleTelegramDocumentJob(db, config, lease, { kind: "failed", reason: "invalid-document" }), "done");
+    const snapshotId = crypto.randomUUID();
+    const key = `subscriptions/${subscriptionId}/${snapshotId}/manifest.json`;
+    await db.batch([
+      db.prepare(`INSERT INTO telegram_document_reservations
+        (receipt_id,subscription_id,generation,lifecycle_revision) VALUES (?,?,0,0)`).bind(lease.receiptId, subscriptionId),
+      db.prepare(`INSERT INTO telegram_document_stages
+        (snapshot_id,receipt_id,subscription_id,lease_id,cleanup_after) VALUES (?,?,?,?,unixepoch()-?)`)
+        .bind(snapshotId, lease.receiptId, subscriptionId, lease.leaseId, age),
+    ]);
+    await bucket.put(key, "synthetic-stage");
+    journals.push({ receiptId: lease.receiptId, key });
+  }
+  await setFixtureDocumentMarker(config, 2, TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER).run();
+  const [isolated, general] = journals;
+  assert.equal(await reconcileTelegramDocumentJobReplies(db, config), 1);
+  await assertScrubbed(config, 1, "invalid-document", 1);
+  await assertScrubbed(config, 2, "invalid-document", 0, TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER);
+  const remaining = async (table: "telegram_document_reservations" | "telegram_document_stages") =>
+    (await db.prepare(`SELECT receipt_id FROM ${table} WHERE receipt_id IN (?, ?) ORDER BY receipt_id`)
+      .bind(isolated.receiptId, general.receiptId).all<{ receipt_id: number }>()).results;
+  assert.deepEqual(await remaining("telegram_document_reservations"), [{ receipt_id: general.receiptId }]);
+  await retireTelegramDocumentStage(db, bucket, config);
+  await retireTelegramDocumentStage(db, bucket, config);
+  assert.equal(await bucket.head(isolated.key), null);
+  assert.equal(await (await bucket.get(general.key))?.text(), "synthetic-stage");
+  assert.deepEqual(await remaining("telegram_document_stages"), [{ receipt_id: general.receiptId }]);
 });
 
 test("first-seen pre-grant documents do not acquire the new epoch after revocation and regrant", async () => {

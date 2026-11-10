@@ -4,6 +4,7 @@ import { MAX_TELEGRAM_DOCUMENT_BYTES } from "./document-transport.ts";
 import { inTelegramScope, type TelegramEventScope, type TelegramPolicy } from "./protocol.ts";
 
 export const TELEGRAM_DOCUMENT_JOB_MARKER = "document-job:v1";
+export const TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER = "general-document-job:v1";
 const JOB_TTL_SECONDS = 600;
 const JOB_LEASE_SECONDS = 90;
 const MAX_ATTEMPTS = 3;
@@ -40,6 +41,13 @@ export type TelegramDocumentJobResult = "saved" | "invalid-document" | "download
 
 type JobGuard = { sql: string; bindings: readonly (string | number)[] };
 const freshReceipt = "incoming.bot_id = ? AND incoming.update_id = ? AND incoming.receipt_nonce = ?";
+
+// Reserve this exact marker for the general worker. Missing, NULL and unknown markers
+// must still follow the existing cleanup path for orphaned isolated jobs.
+export const ISOLATED_DOCUMENT_CLEANUP_SCOPE = `NOT EXISTS (
+  SELECT 1 FROM telegram_inbox AS origin WHERE origin.receipt_id = job.receipt_id
+    AND origin.receipt_nonce = '${TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER}'
+)`;
 
 // The member's current epoch must match, and the original message must postdate that grant.
 const eligibleJob = `(
@@ -182,6 +190,7 @@ function prepareReap(db: D1Database, policy: TelegramPolicy): D1PreparedStatemen
       END AS result_code
       FROM telegram_document_jobs AS job WHERE job.bot_id = ? AND job.state IN ('pending', 'leased')
         AND (job.state = 'pending' OR (job.state = 'leased' AND job.lease_until <= unixepoch()))
+        AND ${ISOLATED_DOCUMENT_CLEANUP_SCOPE}
     ), terminal AS (
       SELECT receipt_id, result_code FROM classified WHERE result_code IS NOT NULL
       ORDER BY (state = 'leased') DESC, expires_at, receipt_id LIMIT ${REAP_LIMIT}
