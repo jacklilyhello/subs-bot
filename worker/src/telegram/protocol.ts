@@ -40,6 +40,7 @@ export type TelegramLifecycleUpdate = TelegramEventScope & (
 );
 
 export type TelegramPrivateClaimUpdate = TelegramEventScope & { kind: "private-claim"; code: string };
+export type TelegramLegacyInlineClaim = { actorId: string; callbackId: string; code: string };
 export type TelegramAggregateUpdate = TelegramEventScope & { kind: "show" | "revoke" };
 export type TelegramSelectedUpdate = TelegramEventScope & (
   | { kind: "selected"; query: string }
@@ -123,8 +124,10 @@ type ProviderBatchUpdate = (SubscriptionRawFileUpdate & { providerBatch?: never 
   | ({ providerBatch: TelegramProviderBatchUpdate } & Partial<Record<keyof SubscriptionRawFileUpdate, never>>);
 type ApiStatusUpdate = (ProviderBatchUpdate & { apiStatus?: never })
   | ({ apiStatus: TelegramApiStatusUpdate } & Partial<Record<keyof ProviderBatchUpdate, never>>);
-type NormalizedUpdate = (ApiStatusUpdate & { groupShare?: never })
+type GroupShareUpdate = (ApiStatusUpdate & { groupShare?: never })
   | ({ groupShare: TelegramGroupShareUpdate } & Partial<Record<keyof ApiStatusUpdate, never>>);
+type NormalizedUpdate = (GroupShareUpdate & { legacyInlineClaim?: never })
+  | ({ legacyInlineClaim: TelegramLegacyInlineClaim } & Partial<Record<keyof GroupShareUpdate, never>>);
 
 type DecodedTelegramRequest =
   | ({ status: 200 } & NormalizedUpdate)
@@ -485,8 +488,15 @@ function normalizeCallback(
 ): NormalizedUpdate | null {
   const { id: callbackId, from: actor, message, data: ticket } = callback;
   if (!matches(callbackId, CALLBACK_ID) || typeof ticket !== "string" ||
-      !isRecord(actor) || actor.is_bot !== false || !isPositiveInteger(actor.id) ||
-      !ownBotMessage(message, policy) || "inline_message_id" in callback || "game_short_name" in callback) return null;
+      !isRecord(actor) || actor.is_bot !== false || !isPositiveInteger(actor.id) || "game_short_name" in callback) return null;
+  if ("inline_message_id" in callback) {
+    if ("message" in callback || !matches(callback.inline_message_id, /^[!-~]{1,256}(?![\s\S])/u)) return null;
+    const legacy = /^share:c:([A-Za-z0-9_-]{11})(?![\s\S])/u.exec(ticket);
+    const actorId = String(actor.id);
+    return legacy && (actorId === policy.adminId || actorId === policy.memberId)
+      ? { legacyInlineClaim: { actorId, callbackId, code: legacy[1] } } : null;
+  }
+  if (!ownBotMessage(message, policy)) return null;
   const scope = messageScope(message, String(actor.id), updateId, policy);
   if (!scope) return null;
   if (ticket === GROUP_SHARE_PUBLISH_CALLBACK) return scope.chatType === "private" && scope.threadId === null

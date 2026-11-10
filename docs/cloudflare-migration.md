@@ -273,6 +273,8 @@ Cron 完成后用同一 `cohort` 运行 `action=capture`，留空确认字段。
 
 两名获准测试者分别在内置浏览器中通过隔离 Bot 私聊提交单条 HTTP(S) 订阅链接，可使用 `名称 | URL` 指定名称。群组、未获准的账号和多行消息均不会创建远程导入任务。发布参数默认为 `preserve`。停止接收新链接时使用 `provider_url_import=disable` 及 `provider_url_import_confirmation=disable provider URL import for subs-bot-cf-dev-01`。关闭后 Cron 继续处理已接受的任务和回执。启用校验失败时，已有回滚守卫可恢复使用同一应用产物的关闭版本。 [Worker 回滚](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/)
 
+应用并登记 `0041` 迁移后，私聊提交的单条无名称链接若新建订阅，首个导入任务发布成功时会尝试采用提供方标题。标题优先取 `profile-title` 的普通文本、百分号编码或显式 `base64:` 内容，再取 `Content-Disposition` 的文件名。只保留符合显示规则的标题，去除末尾的常见订阅文件扩展名，最多 64 个字符。无可用标题时保留“远程订阅”。标题和快照、任务结果在同一 D1 批次内提交，订阅令牌保持原值。已存在的订阅、明确输入的名称、文件导入及刷新均沿用原有命名规则。首次发布前改名或失去授权会使旧任务无法发布。未完成的命名资格按任务有效期到期。
+
 独立的 URL 文件入口接受指定账号在私聊上传 UTF-8 TXT 或 LOG，每行一条 HTTP(S) URL。保留文件顺序和前 20 个不同链接，超限数会出现在私聊汇总里。无效 URL 文件或包含超过 4,096 个不同链接的文件会明确失败。接收时记录授权版本及入口状态。读取文件后先在同一 D1 事务内确认归属、保存新订阅及文件计划，再逐条把刷新工作交给现有提供方队列。原始 URL 只保存在私有订阅表，文件计划只保存归属、版本和摘要。队列满时延后，截止后报告超时。撤权或目标版本变化会阻止后续抓取或发布，已有有效快照由正常刷新规则保留。
 
 混合文件入口接受同一 UTF-8 TXT 或 LOG 中交错的独立节点 URI 和 HTTP(S) URL。节点保持文件顺序，最多 500 个，远程链接沿用纯 URL 文件的去重和超额计数。混合文件中的无效数据行会使整份文件拒绝。原始文本中的空行和注释会跳过。节点片段、结构化配置字段和 Base64 解码内容只作为节点数据处理。节点快照指针与远程刷新计划在同一 D1 事务中提交。同名节点文件版本冲突时，两个部分都回滚，未引用的暂存 R2 对象由现有清理流程回收。提交后远程任务独立完成，最终私聊汇总分别显示本地节点与远程订阅的结果。
@@ -469,6 +471,8 @@ python3 -B worker/tools/legacy_general_auth_candidate.py \
 在获准的托管 runner 上，运行 `worker/tools/legacy_private_share_candidate.py INVENTORY_DIR WORKER_ARTIFACT_DIR OUTPUT_DIR INVENTORY_MANIFEST_SHA WORKER_MANIFEST_SHA REVISION APPLIED_AT SOURCE_SQLITE_SHA LEGACY_BOT_ID LEGACY_BOT_USERNAME`。使用已核对的封存清单、原 SQLite 摘要和旧 Bot 身份作为独立输入。输出目录须尚未存在，封存盘点目录、Worker 产物目录和输出父目录仅供当前账号访问。
 
 `legacy-private-shares-v1` 仅填充准确的 0005 分享和领取表。封存程序逐行复核领取人与指定对象、份数和原时间，保留已到期记录的原到期秒，并逐对象核对原 UTF-8 正文的字节和摘要。私有正文存于 `objects/private-shares/`。内联消息标识留在封存盘点中，候选仅记录其数量。SQL 重放核对完整结构、外键、编号序列和对象闭包。每包最多 512 个正文对象，每个最多 64 KiB，SQL 重放上限为 4 MiB，所有数据库行仍受原生恢复上限约束。候选保持未绑定，旧 Bot 链接与内联卡片连续性需另行验收。
+
+同一 Bot 下的旧 `share:c:` 内联按钮可以引导获准用户打开机器人私聊。Worker 先用分享摘要核对 Bot、指定对象、到期和剩余份数。按钮点击只通过 Telegram 的回调应答返回本站 Bot 的私聊入口。用户打开私聊后，现有领取事务再次核对权限并交付正文。合成托管验收覆盖旧卡片到私聊的路径。历史卡片的真实连通性仍须在同一 Bot 与数据恢复后验收。 [Telegram 回调应答](https://core.telegram.org/bots/api#answercallbackquery)
 
 ### 旧单订阅短链盘点
 

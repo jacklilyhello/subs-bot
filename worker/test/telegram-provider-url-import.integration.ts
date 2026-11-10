@@ -17,6 +17,8 @@ const sourceUrl = "https://provider.example.invalid/path/%2F?z=synthetic-secret%
 const share = "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.10:8388#Synthetic";
 const providerRevision = "a".repeat(40);
 const imageSha256 = "b".repeat(64);
+const titleMigrationName = "0041_telegram_provider_initial_titles.sql";
+const explicitName = "manual.fixture.invalid";
 
 test("emitted Worker admits private provider URLs only after opt-in and delivers durable terminal replies", { timeout: 90_000 }, async (t) => {
   const directory = process.env.WORKER_TEST_BUNDLE_DIR;
@@ -32,7 +34,7 @@ test("emitted Worker admits private provider URLs only after opt-in and delivers
     outboundService: async (request: Request) => {
       assert.equal(request.url, `https://api.telegram.org/bot${policy.botToken}/sendMessage`);
       const body = await request.json() as { chat_id: string; reply_parameters: { message_id: number }; text: string };
-      assert.doesNotMatch(body.text, /provider\.example\.invalid|synthetic-secret|private label|ss:\/\//u);
+      assert.doesNotMatch(body.text, /provider\.example\.invalid|synthetic-secret|manual\.fixture\.invalid|港 Provider|ss:\/\//u);
       const message = { id: 1000 + sent.length, chat: body.chat_id, origin: body.reply_parameters.message_id, text: body.text };
       sent.push(message);
       return Response.json({ ok: true, result: { message_id: message.id, chat: { id: Number(message.chat) } } });
@@ -54,7 +56,8 @@ test("emitted Worker admits private provider URLs only after opt-in and delivers
             await this.env.DB.prepare('UPDATE provider_url_fixture SET calls=calls+1').run();
             const body = new TextEncoder().encode(${JSON.stringify(share)}).buffer;
             const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', body));
-            return {ok:true,body,bodySha256:Array.from(hash, byte => byte.toString(16).padStart(2,'0')).join('')};
+            return {ok:true,body,bodySha256:Array.from(hash, byte => byte.toString(16).padStart(2,'0')).join(''),
+              metadata:{'profile-title':'%E6%B8%AF%20Provider.yaml'}};
           }
         }
         export default {fetch(){return new Response(null,{status:404})}};` },
@@ -72,8 +75,11 @@ test("emitted Worker admits private provider URLs only after opt-in and delivers
   }
   const providerMigration = manifest.migrations.find((entry: { name: string }) => entry.name === "0023_telegram_provider_replies.sql");
   const journalMigration = manifest.migrations.find((entry: { name: string }) => entry.name === "0033_provider_snapshot_journal.sql");
-  assert.ok(providerMigration && journalMigration);
+  const titleMigration = manifest.migrations.find((entry: { name: string }) => entry.name === titleMigrationName);
+  assert.ok(providerMigration && journalMigration && titleMigration);
   for (const entry of manifest.migrations) if (entry !== providerMigration && entry !== journalMigration) await migration(entry);
+  await db.prepare("INSERT INTO subs_bot_schema_migrations (position,name,sha256,mode) VALUES (41,?,?,'applied')")
+    .bind(titleMigrationName, titleMigration.sha256).run();
   await db.batch([db.prepare("CREATE TABLE provider_url_fixture (calls INTEGER NOT NULL)"),
     db.prepare("INSERT INTO provider_url_fixture VALUES (0)")]);
 
@@ -81,6 +87,11 @@ test("emitted Worker admits private provider URLs only after opt-in and delivers
   const calls = () => db.prepare("SELECT calls FROM provider_url_fixture").first<number>("calls");
   const scopedCount = () => db.prepare("SELECT count(*) AS total FROM telegram_provider_jobs").first<number>("total");
   const originCount = () => db.prepare("SELECT count(*) AS total FROM telegram_provider_requests").first<number>("total");
+  const titleCount = () => db.prepare("SELECT count(*) AS total FROM telegram_provider_initial_titles").first<number>("total");
+  const subscription = (owner: string) => db.prepare(`SELECT source_url AS source,name,token,generation,
+    COALESCE((SELECT revision FROM subscription_lifecycle WHERE subscription_id=subscriptions.id),0) AS lifecycle
+    FROM subscriptions WHERE owner_id=?`).bind(owner)
+    .first<{ source: string; name: string; token: string; generation: number; lifecycle: number }>();
   const now = () => Math.floor(Date.now() / 1000);
   const message = (text: string, actor = policy.adminId, chatId = actor) => {
     const id = ++sequence;
@@ -117,6 +128,7 @@ test("emitted Worker admits private provider URLs only after opt-in and delivers
   assert.equal(generic.kind, "queued");
   await cron(disabled);
   assert.equal(await calls(), 1, "disabled Telegram intake keeps the generic consumer running");
+  assert.equal((await subscription("76205"))?.name, "provider.example.invalid");
 
   assert.equal((await post(message(sourceUrl, policy.adminId, policy.groupId))).status, 204);
   assert.equal((await post(message(sourceUrl, "76205"))).status, 204);
@@ -129,10 +141,13 @@ test("emitted Worker admits private provider URLs only after opt-in and delivers
   assert.equal(await originCount(), 0, "group, multiline text and explicit rename replies never admit provider work");
 
   const admin = message(sourceUrl);
-  const member = message(`private label | ${sourceUrl}`, policy.memberId);
+  const member = message(`${explicitName} | ${sourceUrl}`, policy.memberId);
   for (const update of [admin, admin, member]) assert.equal((await post(update)).status, 200);
   assert.equal(await originCount(), 2);
   assert.equal(await scopedCount(), 2);
+  assert.equal(await titleCount(), 1);
+  const adminBefore = await subscription(policy.adminId);
+  assert.equal(adminBefore?.name, "远程订阅");
   assert.equal(await calls(), 1, "webhook does not invoke the provider");
   assert.equal((await post(message(sourceUrl), disabled)).status, 200);
   assert.equal(await originCount(), 2, "switching off admission does not create another provider origin");
@@ -143,10 +158,13 @@ test("emitted Worker admits private provider URLs only after opt-in and delivers
   await cron(disabled);
   await expectSent(member.update_id, policy.memberId, "远程订阅已导入。发送 /list 查看。");
   assert.equal(await calls(), 3);
-  const sub = await db.prepare("SELECT source_url AS source,name,token FROM subscriptions WHERE owner_id=?")
-    .bind(policy.memberId).first<{ source: string; name: string; token: string }>();
+  assert.equal(await titleCount(), 0);
+  assert.deepEqual(await subscription(policy.adminId), { ...adminBefore, name: "港 Provider", generation: 1, lifecycle: 1 });
+  const sub = await subscription(policy.memberId);
   assert.equal(sub?.source, sourceUrl);
-  assert.equal(sub?.name, "private label");
+  assert.equal(sub?.name, explicitName);
+  assert.equal(sub?.generation, 1);
+  assert.equal(sub?.lifecycle, 0);
   const exported = await app.fetch(`https://worker.example.invalid/sub/${sub!.token}/base64`);
   assert.equal(exported.status, 200);
   assert.equal(await exported.text(), Buffer.from(share).toString("base64"));

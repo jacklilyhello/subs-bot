@@ -86,6 +86,38 @@ class EdgePreviewTests(unittest.TestCase):
         self.assertEqual(foreign.call_count, 6)
         self.assertTrue(all("method" not in call.kwargs for call in foreign.call_args_list))
 
+    def test_scoped_exchange_rejection_uses_initial_token_for_one_upload(self):
+        for exchange in (response(400, {"message": "untrusted"}), response(200, {"token": "invalid token"})):
+            with self.subTest(status=exchange[0]):
+                transport = Mock(side_effect=[
+                    cloudflare({"subdomain": probe.NAMESPACE}), ABSENT, response(404),
+                    cloudflare({"token": "initial", "exchange_url": EXCHANGE}), exchange,
+                    cloudflare({"preview_token": "preview"}), response(404),
+                    response(200, REPORT, {probe.IDENTITY_HEADER: REVISION, "Cache-Control": "private, no-store",
+                                           "Content-Type": "application/json"}),
+                    ABSENT, response(404),
+                ])
+                self.assertEqual(self.execute(transport), REPORT)
+                calls = transport.call_args_list
+                self.assertEqual(calls[4].kwargs, {})
+                uploads = [call for call in calls if call.args[0] == f"{SCRIPT}/edge-preview"]
+                self.assertEqual(len(uploads), 1)
+                self.assertEqual(uploads[0].kwargs["headers"]["CF-Preview-Upload-Config-Token"], "initial")
+                self.assertEqual(calls[7].kwargs["headers"], {"CF-Workers-Preview-Token": "preview"})
+
+    def test_exchange_redirect_access_denial_or_rate_limit_stops_before_upload(self):
+        for status in (302, 401, 403, 429):
+            with self.subTest(status=status):
+                transport = Mock(side_effect=[
+                    cloudflare({"subdomain": probe.NAMESPACE}), ABSENT, response(404),
+                    cloudflare({"token": "initial", "exchange_url": EXCHANGE}),
+                    response(status, headers={"Location": "https://outside.invalid/"}), ABSENT, response(404),
+                ])
+                with self.assertRaises(probe.ProbeError):
+                    self.execute(transport)
+                self.assertEqual(transport.call_count, 7)
+                self.assertTrue(all("method" not in call.kwargs for call in transport.call_args_list))
+
     def test_public_preview_is_never_invoked_with_credentials(self):
         transport = Mock(side_effect=[
             cloudflare({"subdomain": probe.NAMESPACE}), ABSENT, response(404),
