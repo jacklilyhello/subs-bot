@@ -1331,7 +1331,24 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.equal((await sharePost(7573, 101, "/share x101 -- invalid")).status, 204);
   assert.equal((await sharePost(7574, 101, "/share id104 -- revoked recipient")).status, 204);
   assert.equal((await sharePost(7575, 101, shareText)).status, 200);
-  const created = await awaitLifecycle(7575);
+  const created = await awaitLifecycle(7575).catch(async () => {
+    // Failure-only evidence. Inspect fixed state fields and never retry a send here.
+    const facts = await db.prepare(`SELECT creation.state AS creationState, reply.state AS replyState,
+      reply.attempts, CASE WHEN reply.due_at <= unixepoch() THEN 1 ELSE 0 END AS due,
+      CASE WHEN reply.lease_until > unixepoch() THEN 1 ELSE 0 END AS leaseActive
+      FROM telegram_inbox AS inbox
+      LEFT JOIN telegram_private_share_creations AS creation USING (receipt_id)
+      LEFT JOIN telegram_outbox AS reply USING (receipt_id)
+      WHERE inbox.bot_id=? AND inbox.update_id=? AND inbox.receipt_nonce='general-share-create:v1'`)
+      .bind(pin.botId, 7575).first<{ creationState: string | null; replyState: string | null;
+        attempts: number | null; due: number; leaseActive: number }>();
+    const creation = ["reserved", "published", "abandoned"].find((state) => state === facts?.creationState) ?? "absent-or-invalid";
+    const reply = ["pending", "leased", "sending", "sent", "failed", "uncertain"]
+      .find((state) => state === facts?.replyState) ?? "absent-or-invalid";
+    const attempts = [0, 1, 2, 3, 4].find((count) => count === facts?.attempts) ?? "absent-or-invalid";
+    assert.fail(`Synthetic share reply missing (creation=${creation}, outbox=${reply}, attempts=${attempts}, `
+      + `due=${facts?.due === 1}, leaseActive=${facts?.leaseActive === 1}).`);
+  });
   assert.equal(created.message.chat_id, "101");
   assert.equal(created.message.reply_markup, undefined);
   assert.doesNotMatch(created.message.text, /Synthetic creation body/u);

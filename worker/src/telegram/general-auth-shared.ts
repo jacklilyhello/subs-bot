@@ -348,7 +348,9 @@ export async function claimGeneralSharedTelegramReply(db: D1Database, pin: Gener
   return read.results[0] ?? null;
 }
 
-function selectLease(pin: GeneralTelegramPin, lease: SharedReadLease, authorizing: boolean, metadata?: MetadataReply) {
+function selectLease(
+  pin: GeneralTelegramPin, lease: SharedReadLease, authorizing: boolean, guard?: Pick<MetadataReply, "sql" | "bindings">,
+) {
   const group = !pin.rehearsal && lease.chatType !== "private";
   const claim = pin.privateClaims && lease.marker === TELEGRAM_GENERAL_PRIVATE_CLAIM_MARKER;
   const claimProof = claim ? ` AND EXISTS (SELECT 1 FROM telegram_private_claim
@@ -361,16 +363,17 @@ function selectLease(pin: GeneralTelegramPin, lease: SharedReadLease, authorizin
   const exactBindings = [pin.botId, lease.receiptId, lease.updateId, lease.actorId, lease.chatId, lease.chatType, lease.threadId,
     lease.messageId, lease.messageDate, lease.command, lease.marker, lease.actorRevision, lease.actorRole,
     ...generalPolicyBindings(pin, lease.generation), ...(claim ? [lease.claimCodeSha256] : [])];
-  const eligible = current("inbox", group, pin);
-  if (authorizing && metadata) {
-    // Keep the current grant and the origin/target proof separate inside the atomic begin.
+  const eligible = authorizing ? current("inbox", group, pin) : "1";
+  const eligibilityBindings = authorizing ? currentBindings(pin) : [];
+  if (guard) {
+    // Keep the origin, reply eligibility and payload guard separate inside the atomic begin.
     return { sql: `WITH candidate AS MATERIALIZED (
-      SELECT inbox.receipt_id,(${eligible}) AS eligible,(${metadata.sql}) AS prepared ${exact}
+      SELECT inbox.receipt_id,(${eligible}) AS eligible,(${guard.sql}) AS prepared ${exact}
     ) SELECT receipt_id FROM candidate WHERE eligible AND prepared`,
-    bindings: [...currentBindings(pin), ...metadata.bindings, ...exactBindings] };
+    bindings: [...eligibilityBindings, ...guard.bindings, ...exactBindings] };
   }
   return { sql: `SELECT inbox.receipt_id ${exact} ${authorizing ? `AND ${eligible}` : ""}`,
-    bindings: [...exactBindings, ...(authorizing ? currentBindings(pin) : [])] };
+    bindings: [...exactBindings, ...eligibilityBindings] };
 }
 
 export async function beginGeneralSharedTelegramReply(
@@ -421,10 +424,10 @@ export async function drainGeneralSharedTelegramReply(
     if (!pin.privateShareCreation || !share?.context) return false;
     const reply = await resolveTelegramPrivateShareCreationReply(db, pin, lease, share.context);
     const recorded = selectLease(pin, lease, false);
-    const selection = reply
-      ? { sql: `${recorded.sql} AND ${generalOrdinaryReplyEligibilitySql("inbox")} AND (${reply.guard.sql})`,
-        bindings: [...recorded.bindings, ...reply.guard.bindings] }
-      : selectLease(pin, lease, true);
+    const selection = reply ? selectLease(pin, lease, false, {
+      sql: `${generalOrdinaryReplyEligibilitySql("inbox")} AND (${reply.guard.sql})`,
+      bindings: reply.guard.bindings,
+    }) : selectLease(pin, lease, true);
     if (!await prepareTelegramOutboxBegin(db, lease, selection).first()) return false;
     const text = reply ? renderTelegramPrivateShareLink(pin.botUsername, reply) : "分享链接已失效或授权已变更，请重新创建。";
     const outcome = await sendGeneralTelegramPrivateReply(pin.botToken, lease.actorId, lease.messageId, text);
