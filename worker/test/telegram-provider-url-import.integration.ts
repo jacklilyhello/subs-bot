@@ -6,6 +6,8 @@ import { test } from "node:test";
 import { Miniflare } from "miniflare";
 
 import { enqueueProviderUrlImport } from "../src/provider-jobs.ts";
+import { createSubscription } from "../src/storage.ts";
+import { renameOwnedSubscription } from "../src/subscriptions.ts";
 import type { TelegramPolicy } from "../src/telegram/protocol.ts";
 import { recordTempFixtureMigration } from "./temp-migration-fixture.ts";
 
@@ -16,6 +18,12 @@ const policy: TelegramPolicy = {
 const sourceUrl = "https://provider.example.invalid/path/%2F?z=synthetic-secret%2Bvalue&a=1";
 const acceptedUrl = "https://provider.example.invalid/multi/%2F?z=synthetic-secret%2Bvalue";
 const rejectedUrl = "https://provider.example.invalid/multi/rejected";
+const namedUrl = "https://provider.example.invalid/multi/named";
+const existingUrl = "https://provider.example.invalid/multi/existing";
+const renamedUrl = "https://provider.example.invalid/multi/renamed";
+const hostname = "provider.example.invalid";
+const namedLine = "显式名称";
+const renamedLine = "已手动改名";
 const share = "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.10:8388#Synthetic";
 const providerRevision = "a".repeat(40);
 const imageSha256 = "b".repeat(64);
@@ -36,7 +44,7 @@ test("emitted Worker admits private provider URLs only after opt-in and delivers
     outboundService: async (request: Request) => {
       assert.equal(request.url, `https://api.telegram.org/bot${policy.botToken}/sendMessage`);
       const body = await request.json() as { chat_id: string; reply_parameters: { message_id: number }; text: string };
-      assert.doesNotMatch(body.text, /provider\.example\.invalid|synthetic-secret|manual\.fixture\.invalid|港 Provider|ss:\/\//u);
+      assert.doesNotMatch(body.text, /provider\.example\.invalid|synthetic-secret|manual\.fixture\.invalid|港 Provider|显式名称|已手动改名|ss:\/\//u);
       const message = { id: 1000 + sent.length, chat: body.chat_id, origin: body.reply_parameters.message_id, text: body.text };
       sent.push(message);
       return Response.json({ ok: true, result: { message_id: message.id, chat: { id: Number(message.chat) } } });
@@ -52,7 +60,7 @@ test("emitted Worker admits private provider URLs only after opt-in and delivers
       script: `import { WorkerEntrypoint } from 'cloudflare:workers';
         export class ProviderFetch extends WorkerEntrypoint {
           async fetchSubscription(input) {
-            if (Object.keys(input).length !== 3 || !${JSON.stringify([sourceUrl, acceptedUrl, rejectedUrl])}.includes(input.url)
+            if (Object.keys(input).length !== 3 || !${JSON.stringify([sourceUrl, acceptedUrl, rejectedUrl, namedUrl, existingUrl])}.includes(input.url)
                 || input.providerRevision !== ${JSON.stringify(providerRevision)} || input.imageSha256 !== ${JSON.stringify(imageSha256)}) {
               throw new Error('Unexpected synthetic provider input.');
             }
@@ -192,7 +200,8 @@ test("emitted Worker admits private provider URLs only after opt-in and delivers
   assert.ok(!sent.some(({ origin }) => origin === revoked.update_id));
   assert.equal(sent.filter(({ origin }) => origin === admin.update_id).length, 1);
 
-  const urls = `${acceptedUrl}\r\n\r\n${rejectedUrl}\r\n${acceptedUrl}`;
+  const urls = [acceptedUrl, "", rejectedUrl, `${namedLine} | ${namedUrl}`, existingUrl, renamedUrl,
+    `后续重复名称 | ${acceptedUrl}`].join("\r\n");
   const parentCount = () => db.prepare("SELECT count(*) AS total FROM telegram_provider_documents").first<number>("total");
   const receiptCount = (updateId: number) => db.prepare("SELECT count(*) AS total FROM telegram_inbox WHERE bot_id=? AND update_id=?")
     .bind(policy.botId, updateId).first<number>("total");
@@ -214,6 +223,8 @@ test("emitted Worker admits private provider URLs only after opt-in and delivers
   await expectSent(single.update_id, policy.adminId, "远程订阅已导入。发送 /list 查看。");
   assert.equal(await calls(), 4);
 
+  const existing = await createSubscription(db, { ownerId: policy.adminId, name: hostname, sourceUrl: existingUrl });
+
   const list = message(urls);
   for (const replay of [list, list]) assert.equal((await post(replay, multi)).status, 200);
   assert.equal(await parentCount(), 1);
@@ -226,24 +237,50 @@ test("emitted Worker admits private provider URLs only after opt-in and delivers
   const lines = () => db.prepare(`SELECT line.ordinal,line.source_sha256 AS digest,line.result_code AS result
     FROM telegram_provider_document_lines AS line JOIN telegram_inbox USING (receipt_id)
     WHERE bot_id=? AND update_id=? ORDER BY line.ordinal`).bind(policy.botId, list.update_id).all();
-  const expectedLines = [acceptedUrl, rejectedUrl].map((url, ordinal) => ({ ordinal,
+  const expectedLines = [acceptedUrl, rejectedUrl, namedUrl, existingUrl, renamedUrl].map((url, ordinal) => ({ ordinal,
     digest: createHash("sha256").update(url).digest("hex"), result: null }));
   assert.deepEqual((await lines()).results, expectedLines);
   assert.equal(await db.prepare(`SELECT count(*) AS total FROM telegram_document_jobs JOIN telegram_inbox USING (receipt_id)
     WHERE telegram_inbox.bot_id=? AND update_id=?`).bind(policy.botId, list.update_id).first("total"), 0);
 
-  await cron(disabled);
-  await cron(disabled);
-  await expectSent(list.update_id, policy.adminId, "订阅链接消息已处理。\n已保存 1 条\n已合并 0 条\n失败 1 条\n超出上限 0 条");
+  const bySource = (source: string) => db.prepare(`SELECT id,name,generation,token FROM subscriptions WHERE owner_id=? AND source_url=?`)
+    .bind(policy.adminId, source).first<{ id: number; name: string; generation: number; token: string }>();
+  const titleIntent = (source: string) => db.prepare(`SELECT initial.request_key AS key,initial.expires_at AS expiresAt
+    FROM telegram_provider_initial_titles AS initial JOIN subscriptions AS sub ON sub.id=initial.subscription_id
+    WHERE sub.owner_id=? AND sub.source_url=?`).bind(policy.adminId, source).first<{ key: string; expiresAt: number }>();
+  assert.equal(await titleCount(), 3, "only newly created bare rows own title intents");
+  const pending = await titleIntent(acceptedUrl);
+  assert.equal(pending?.key, createHash("sha256").update(
+    `subs-bot:telegram-provider-message-title-pending:v1\n${policy.botId}\n${list.update_id}\n0`).digest("hex"));
+  assert.equal((await bySource(acceptedUrl))?.name, hostname);
+  assert.equal((await bySource(namedUrl))?.name, namedLine);
+  const renamed = await bySource(renamedUrl);
+  assert.ok(renamed && await renameOwnedSubscription(db, { id: renamed.id, ownerId: policy.adminId,
+    expectedLifecycleRevision: 0 }, renamedLine));
+
+  for (let index = 0; index < expectedLines.length; index++) await cron(disabled);
+  await expectSent(list.update_id, policy.adminId, "订阅链接消息已处理。\n已保存 3 条\n已合并 0 条\n失败 2 条\n超出上限 0 条");
+  const results = ["saved", "fetch-rejected", "saved", "saved", "stale-target"];
   assert.deepEqual((await lines()).results, expectedLines.map((line, ordinal) => ({ ...line,
-    result: ordinal === 0 ? "saved" : "fetch-rejected" })));
-  assert.equal(await db.prepare("SELECT generation FROM subscriptions WHERE owner_id=? AND source_url=?")
-    .bind(policy.adminId, acceptedUrl).first("generation"), 1);
-  assert.equal(await db.prepare("SELECT count(*) AS total FROM subscriptions WHERE owner_id=? AND source_url=? AND generation>0")
-    .bind(policy.adminId, rejectedUrl).first("total"), 0);
+    result: results[ordinal] })));
+  assert.equal((await bySource(acceptedUrl))?.name, "港 Provider");
+  assert.equal((await bySource(acceptedUrl))?.generation, 1);
+  assert.equal(await titleIntent(acceptedUrl), null);
+  assert.equal((await bySource(namedUrl))?.name, namedLine);
+  assert.equal((await bySource(namedUrl))?.generation, 1);
+  assert.deepEqual(await bySource(existingUrl), { id: existing.id, name: hostname, generation: 1, token: existing.token });
+  assert.equal((await bySource(rejectedUrl))?.generation, 0);
+  assert.equal((await bySource(renamedUrl))?.name, renamedLine);
+  assert.equal((await bySource(renamedUrl))?.generation, 0);
+  const failedJob = await db.prepare(`SELECT job.request_key AS key,job.expires_at AS expiresAt
+    FROM telegram_provider_jobs AS job JOIN telegram_provider_document_lines AS line USING (job_id)
+    JOIN telegram_inbox AS inbox USING (receipt_id) WHERE inbox.bot_id=? AND inbox.update_id=? AND line.ordinal=1`)
+    .bind(policy.botId, list.update_id).first();
+  assert.ok(failedJob);
+  assert.deepEqual(await titleIntent(rejectedUrl), failedJob);
   assert.equal((await post(list, multi)).status, 200);
   await cron(disabled);
-  assert.equal(await calls(), 6);
+  assert.equal(await calls(), 8);
   assert.equal(await parentCount(), 1);
   assert.equal(sent.filter(({ origin }) => origin === list.update_id).length, 1);
 });

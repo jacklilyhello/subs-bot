@@ -57,10 +57,14 @@ test("leaves plain, structured, encoded, and mixed node documents to the node cl
 test("private URL messages keep standalone line order and report distinct overflow", () => {
   const urls = Array.from({ length: 22 }, (_, index) => `HtTpS://provider.example.invalid/%2F?value=x%7Cy&case=${index}`);
   assert.deepEqual(parseTelegramProviderUrlMessage(`\ufeff\r\n ${urls[0]}\r\n\r\n${[...urls, urls[20]].join("\r\n")}`), {
-    kind: "url-list", urls: urls.slice(0, 20), overflow: 2,
+    entries: urls.slice(0, 20).map((sourceUrl) => ({ sourceUrl })), overflow: 2,
+  });
+  assert.deepEqual(parseTelegramProviderUrlMessage(`套餐名 | ${source}\r\n${urls[1]}\nignored | ${source}\nignored | ${urls[1]}`), {
+    entries: [{ sourceUrl: source, name: "套餐名" }, { sourceUrl: urls[1] }], overflow: 0,
   });
   for (const invalid of [`${urls[0]}\n`, `${urls[0]} ${urls[1]}`, `${urls[0]}\n${node}`,
-    `名称 | ${urls[0]}\n${urls[1]}`, `${urls[0]}\n${source}`, `${urls[0]}\n${urls[1]}\ud800`,
+    ` | ${urls[0]}\n${urls[1]}`, `${node} | ${urls[0]}\n${urls[1]}`, `${urls[0]}\n${source}`,
+    `${urls[0]}\n${urls[1]}\ud800`, `${urls[0]}\n${urls[1]}\u00a0`, `${urls[0]}\n${"界".repeat(65)} | ${urls[1]}`,
     `${urls[0]}\nhttps://user@provider.example.invalid/`, `${urls[0]}\n${urls[1]}${"x".repeat(4096)}`]) {
     assert.equal(parseTelegramProviderUrlMessage(invalid), null);
   }
