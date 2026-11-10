@@ -111,6 +111,12 @@ scp /opt/subs-bot/data/subs.db 新机器:/opt/subs-bot/data/
 systemctl start subs-bot
 ```
 
+### 恢复旧轮询时保留待处理更新
+
+沿用原启动行为时，省略 `TELEGRAM_PRESERVE_PENDING_UPDATES` 或设为 `0`，启动轮询会清除 Telegram 的待处理更新。经批准恢复旧轮询时，先核对当前 Webhook 和旧 SQLite 的回放状态，再以 `TELEGRAM_PRESERVE_PENDING_UPDATES=1` 启动。其他显式值会阻止启动。
+
+轮询启动仍会移除该 Bot 的 Webhook。该选项只保留 Telegram 仍在排队的更新，已由 Cloudflare 接收的更新、已发送回复和生产数据写入须另行对账与恢复。 [轮询启动实现](https://github.com/python-telegram-bot/python-telegram-bot/blob/v21.10/telegram/ext/_updater.py#L713-L759) · [Telegram 更新接收方式](https://core.telegram.org/bots/api#getting-updates)
+
 ## 文件说明
 
 ```
