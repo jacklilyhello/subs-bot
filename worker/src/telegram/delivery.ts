@@ -137,6 +137,7 @@ async function postTelegram(
   body: Record<string, unknown> | FormData,
   timeoutMs: number,
   request: typeof fetch,
+  expectedThread?: number,
 ): Promise<TelegramReplyOutcome> {
   try {
     const multipart = body instanceof FormData;
@@ -153,7 +154,8 @@ async function postTelegram(
       const result = record(payload.result);
       const chat = record(result?.chat);
       if (positiveInteger(result?.message_id) && (method !== "editMessageText" || result.message_id === editId) &&
-          typeof chat?.id === "number" && Number.isSafeInteger(chat.id) && String(chat.id) === chatId) {
+          typeof chat?.id === "number" && Number.isSafeInteger(chat.id) && String(chat.id) === chatId &&
+          (expectedThread === undefined || result.message_thread_id === expectedThread)) {
         return { kind: "sent", messageId: result.message_id };
       }
     } else if (payload?.ok === false && payload.error_code === response.status &&
@@ -187,11 +189,22 @@ function sendTelegram(
 }
 
 export function sendGeneralTelegramPrivateReply(
-  botToken: string, actorId: string, messageId: number, text: string,
+  botToken: string, actorId: string, messageId: number, text: string, keyboard?: InlineKeyboard, forceReply = false,
 ): Promise<TelegramReplyOutcome> {
   return postTelegram(botToken, actorId, "sendMessage", {
     chat_id: actorId, text, reply_parameters: { message_id: messageId }, link_preview_options: { is_disabled: true },
+    ...(keyboard?.length ? { reply_markup: { inline_keyboard: keyboard } }
+      : forceReply ? { reply_markup: { force_reply: true } } : {}),
   }, 5_000, fetch);
+}
+
+export function sendGeneralTelegramGroupListReply(
+  botToken: string, chatId: string, messageId: number, threadId: number | null, text: string,
+): Promise<TelegramReplyOutcome> {
+  return postTelegram(botToken, chatId, "sendMessage", {
+    chat_id: chatId, text, ...(threadId === null ? {} : { message_thread_id: threadId }),
+    reply_parameters: { message_id: messageId, allow_sending_without_reply: false }, link_preview_options: { is_disabled: true },
+  }, 5_000, fetch, threadId ?? undefined);
 }
 
 export function sendTelegramGroupShareCard(
@@ -271,7 +284,7 @@ export async function sendTelegramPrivateClaimReply(
 }
 
 export async function answerTelegramCallback(
-  policy: TelegramPolicy, callbackId: string, answer?: string | { url: string },
+  policy: Pick<TelegramPolicy, "botToken">, callbackId: string, answer?: string | { url: string },
 ): Promise<void> {
   try {
     const response = await fetch(`${BOT_API}/bot${policy.botToken}/answerCallbackQuery`, {

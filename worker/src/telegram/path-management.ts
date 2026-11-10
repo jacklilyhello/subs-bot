@@ -1,8 +1,11 @@
 import { collapsePathRuleWhitespace, MAX_PATH_RULES, pathRuleText, type PathRuleRow } from "../path-rules.ts";
 import { SnapshotIntegrityError, validInteger } from "../storage.ts";
+import type { GeneralTelegramPin } from "./general-auth-runtime.ts";
+import { generalCurrentAuthoritySql, generalPolicyBindings } from "./general-receipt.ts";
 import { inTelegramScope, type TelegramPathUpdate, type TelegramPolicy } from "./protocol.ts";
 
 export const TELEGRAM_PATH_MARKER = "path:v1";
+export const GENERAL_PATH_MARKER = "general-path:v1";
 const PAGE_SIZE = 6;
 const MAX_MUTATION_AGE_SECONDS = 15 * 60;
 const FUTURE_SKEW_SECONDS = 30;
@@ -18,6 +21,7 @@ export interface TelegramPathReply {
 }
 
 type ReceiptKey = readonly [botId: string, updateId: number, nonce: string];
+type PathAuthority = { adminId: string } | { general: GeneralTelegramPin };
 const fresh = "incoming.bot_id = ? AND incoming.update_id = ? AND incoming.receipt_nonce = ?";
 const owner = "rule.owner_id = incoming.actor_id";
 const sameFence = "fence.bot_id = incoming.bot_id AND fence.actor_id = incoming.actor_id";
@@ -59,7 +63,12 @@ export function parseTelegramPathArgs(args: string): PathAction {
   return { kind: "upsert", keyword, remark };
 }
 
-function planMutation(db: D1Database, key: ReceiptKey, policy: TelegramPolicy, action: PathMutation) {
+function planMutation(db: D1Database, key: ReceiptKey, authority: PathAuthority, action: PathMutation) {
+  const isolationEpoch = "adminId" in authority ? `(incoming.actor_id <> ? AND EXISTS (
+    SELECT 1 FROM telegram_auth AS auth WHERE auth.bot_id = incoming.bot_id AND auth.user_id = incoming.actor_id
+    AND auth.message_date >= incoming.message_date
+  ))` : "0";
+  const current = "general" in authority ? generalCurrentAuthoritySql("incoming") : "1";
   const scope = `FROM telegram_inbox AS incoming JOIN telegram_path_reply AS reply USING (receipt_id)
     WHERE ${fresh} AND ${changesRules}`;
   let outcome: string;
@@ -107,18 +116,16 @@ function planMutation(db: D1Database, key: ReceiptKey, policy: TelegramPolicy, a
         (incoming.message_date <= unixepoch() - ${MAX_MUTATION_AGE_SECONDS}
           OR incoming.message_date > unixepoch() + ${FUTURE_SKEW_SECONDS}
           OR EXISTS (SELECT 1 FROM telegram_path_fence AS fence WHERE ${sameFence} AND ${fenceOrder} >= ${eventOrder})
-          OR (incoming.actor_id <> ? AND EXISTS (
-            SELECT 1 FROM telegram_auth AS auth WHERE auth.bot_id = incoming.bot_id AND auth.user_id = incoming.actor_id
-            AND auth.message_date >= incoming.message_date
-          ))) AS stale
-      FROM telegram_inbox AS incoming WHERE ${fresh}
+          OR ${isolationEpoch}) AS stale
+      FROM telegram_inbox AS incoming WHERE ${fresh} AND ${current}
     ), outcome AS (
       SELECT receipt_id, owner_count, CASE WHEN stale THEN 'stale' ELSE ${outcome} END AS kind FROM candidate
     )
     INSERT INTO telegram_path_reply (receipt_id, kind, affected_count)
     SELECT receipt_id, kind, CASE WHEN kind = 'cleared' THEN owner_count WHEN kind IN ('saved', 'deleted') THEN 1 ELSE 0 END
     FROM outcome
-  `).bind(policy.adminId, ...key, ...values), apply, db.prepare(`
+  `).bind(...("adminId" in authority ? [authority.adminId] : []), ...key,
+    ...("general" in authority ? generalPolicyBindings(authority.general) : []), ...values), apply, db.prepare(`
     INSERT INTO telegram_path_fence (bot_id, actor_id, message_date, message_id)
     SELECT incoming.bot_id, incoming.actor_id, incoming.message_date, incoming.message_id ${scope}
     ON CONFLICT (bot_id, actor_id) DO UPDATE SET message_date = excluded.message_date, message_id = excluded.message_id
@@ -127,6 +134,24 @@ function planMutation(db: D1Database, key: ReceiptKey, policy: TelegramPolicy, a
   return { statements, verify: `${verify} AND EXISTS (
     SELECT 1 FROM telegram_path_fence AS fence WHERE ${sameFence} AND ${fenceOrder} = ${eventOrder}
   )`, verification };
+}
+
+/** These steps run after the fresh inbox and any authority sidecar, in the same D1 batch. */
+export function prepareTelegramPathReceipt(db: D1Database, key: ReceiptKey, authority: PathAuthority, args: string) {
+  const action = parseTelegramPathArgs(args);
+  const current = "general" in authority ? generalCurrentAuthoritySql("incoming") : "1";
+  const plan = action.kind === "list" || action.kind === "usage" ? {
+    statements: [db.prepare(`
+      INSERT INTO telegram_path_reply (receipt_id, kind, after_id)
+      SELECT incoming.receipt_id, ?, ? FROM telegram_inbox AS incoming WHERE ${fresh} AND ${current}
+    `).bind(action.kind, action.kind === "list" ? action.afterId : null, ...key,
+      ...("general" in authority ? generalPolicyBindings(authority.general) : []))],
+    verify: "0",
+    verification: [],
+  } : planMutation(db, key, authority, action);
+  return { statements: plan.statements, verification: plan.verification, proof: `EXISTS (
+    SELECT 1 FROM telegram_path_reply AS reply WHERE reply.receipt_id=incoming.receipt_id
+    AND (NOT (${changesRules}) OR (${plan.verify})))` };
 }
 
 export async function acceptTelegramPath(
@@ -138,7 +163,6 @@ export async function acceptTelegramPath(
   try {
     const nonce = crypto.randomUUID();
     const key = [policy.botId, event.updateId, nonce] as const;
-    const action = parseTelegramPathArgs(event.args);
     const statements = [db.prepare(`
       INSERT INTO telegram_inbox
         (bot_id, update_id, actor_id, chat_id, chat_type, message_id, message_date, thread_id, command, receipt_nonce)
@@ -148,27 +172,14 @@ export async function acceptTelegramPath(
     `).bind(policy.botId, event.updateId, event.actorId, event.chatId, event.messageId, event.messageDate, nonce,
       event.actorId, policy.adminId, policy.botId, event.actorId)];
 
-    let verify = "0";
-    let verification: (number | string)[] = [];
-    if (action.kind === "list" || action.kind === "usage") {
-      statements.push(db.prepare(`
-        INSERT INTO telegram_path_reply (receipt_id, kind, after_id)
-        SELECT incoming.receipt_id, ?, ? FROM telegram_inbox AS incoming WHERE ${fresh}
-      `).bind(action.kind, action.kind === "list" ? action.afterId : null, ...key));
-    } else {
-      const mutation = planMutation(db, key, policy, action);
-      statements.push(...mutation.statements);
-      ({ verify, verification } = mutation);
-    }
-
-    statements.push(db.prepare(`
+    const path = prepareTelegramPathReceipt(db, key, policy, event.args);
+    statements.push(...path.statements, db.prepare(`
       INSERT INTO telegram_outbox (receipt_id) SELECT incoming.receipt_id FROM telegram_inbox AS incoming WHERE ${fresh}
     `).bind(...key), db.prepare(`
-      UPDATE telegram_inbox AS incoming SET receipt_nonce = ?, command = CASE WHEN EXISTS (
-        SELECT 1 FROM telegram_path_reply AS reply JOIN telegram_outbox USING (receipt_id)
-        WHERE reply.receipt_id = incoming.receipt_id AND (NOT (${changesRules}) OR (${verify}))
-      ) THEN command END WHERE ${fresh} RETURNING receipt_id
-    `).bind(TELEGRAM_PATH_MARKER, ...verification, ...key));
+      UPDATE telegram_inbox AS incoming SET receipt_nonce = ?, command = CASE WHEN ${path.proof}
+        AND EXISTS (SELECT 1 FROM telegram_outbox WHERE receipt_id = incoming.receipt_id)
+      THEN command END WHERE ${fresh} RETURNING receipt_id
+    `).bind(TELEGRAM_PATH_MARKER, ...path.verification, ...key));
 
     const results = await db.batch(statements);
     const receipt = results.at(-1);

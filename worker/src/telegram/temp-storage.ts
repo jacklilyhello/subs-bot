@@ -1,7 +1,9 @@
 import { digestHex, validInteger, type NodeRecord } from "../storage.ts";
 import { isValidStoredShare } from "../stored-share.ts";
+import { GENERAL_POLICY_SCHEMA, GENERAL_RECEIPT_SCHEMA } from "./general-receipt.ts";
 
 export const TELEGRAM_TEMP_MARKER = "temp:v1";
+export const TELEGRAM_GENERAL_TEMP_MARKER = "general-temp:v1";
 export const MAX_TEMP_BATCH_BYTES = 256 * 1024;
 export const MAX_TEMP_OWNER_NODES = 5_000;
 export const MAX_TEMP_OWNER_BYTES = 4 * 1024 * 1024;
@@ -16,6 +18,10 @@ const digest = /^[a-f0-9]{64}(?![\s\S])/u;
 const encoder = new TextEncoder();
 
 export type TempStorageMode = "live-only" | "legacy-ready";
+export interface VerifiedTempStorage {
+  mode: TempStorageMode;
+  generalReceipts: boolean;
+}
 
 export class TempStorageIntegrityError extends Error {}
 export class TempStorageLimitError extends Error {}
@@ -35,20 +41,32 @@ export interface TempBatchMeta {
 export interface TempBatchRow extends TempBatchMeta { json: string }
 
 /** Detect absent, current and partial schemas without preparing SQL against absent tables. */
-export async function readTempStorage(db: D1Database): Promise<TempStorageMode> {
+async function inspectTempStorage(db: D1Database, verifyLive: boolean): Promise<VerifiedTempStorage> {
+  const generalTables = "'telegram_general_actors','telegram_general_receipt'";
   const schema = await db.prepare(`SELECT count(CASE WHEN name IN (${tables}) THEN 1 END) AS objects,
     count(CASE WHEN name IN (${tables}) AND type='table' THEN 1 END) AS tables,
     count(CASE WHEN name='subs_bot_schema_migrations' AND type='table' THEN 1 END) AS ledger
-    FROM main.sqlite_schema WHERE name IN (${tables},'subs_bot_schema_migrations')`)
-    .first<{ objects: number; tables: number; ledger: number }>();
+    ${verifyLive ? `,count(CASE WHEN type='table' AND name IN (${generalTables}) THEN 1 END) AS generalTables` : ""}
+    FROM main.sqlite_schema WHERE name IN (${tables},'subs_bot_schema_migrations'${verifyLive ? `,${generalTables}` : ""})`)
+    .first<{ objects: number; tables: number; ledger: number; generalTables?: number }>();
   if (!schema || ![0, 2].includes(schema.tables) || schema.objects !== schema.tables
     || ![0, 1].includes(schema.ledger) || (schema.tables === 2 && schema.ledger !== 1)) throw new TempStorageIntegrityError();
-  if (schema.ledger === 0) return "live-only";
+  if (schema.ledger === 0) return { mode: "live-only", generalReceipts: false };
   const pin = await db.prepare(`SELECT count(*) AS pins,COALESCE(sum(${exactPin}),0) AS exact
-    FROM subs_bot_schema_migrations WHERE ${migration}`).first<{ pins: number; exact: number }>();
-  if (schema.tables === 0 && pin?.pins === 0) return "live-only";
-  if (schema.tables === 2 && pin?.pins === 1 && pin.exact === 1) return "legacy-ready";
+    ${schema.generalTables === 2 ? `,(${GENERAL_POLICY_SCHEMA} AND ${GENERAL_RECEIPT_SCHEMA}) AS generalReceipts` : ""}
+    FROM subs_bot_schema_migrations WHERE ${migration}`).first<{ pins: number; exact: number; generalReceipts?: number }>();
+  const generalReceipts = pin?.generalReceipts === 1;
+  if (schema.tables === 0 && pin?.pins === 0) return { mode: "live-only", generalReceipts };
+  if (schema.tables === 2 && pin?.pins === 1 && pin.exact === 1) return { mode: "legacy-ready", generalReceipts };
   throw new TempStorageIntegrityError();
+}
+
+export async function readTempStorage(db: D1Database): Promise<TempStorageMode> {
+  return (await inspectTempStorage(db, false)).mode;
+}
+
+export function readVerifiedTempStorage(db: D1Database): Promise<VerifiedTempStorage> {
+  return inspectTempStorage(db, true);
 }
 
 /** Same-snapshot readiness predicate for callers that prepared an optional branch. */
@@ -67,15 +85,25 @@ export function tempCutoverAllows(mode: TempStorageMode, botSql: string, dateSql
 
 /** The trusted scope CTE exposes bot_id, actor_id, before_receipt and visibility_epoch. */
 export function ownedTempRowsSql(mode: TempStorageMode, scopeCte: string, options: {
-  includePayload?: boolean; verifyLive?: boolean; keysCte?: string;
+  includePayload?: boolean; verifyLive?: boolean; keysCte?: string; generalReceipts?: boolean;
 } = {}): string {
   const payload = options.includePayload ? ",batch.nodes_json AS json" : "";
   const keyJoin = (source: 0 | 1, id: string) => options.keysCte
     ? `JOIN ${options.keysCte} AS keys ON keys.source=${source} AND keys.id=${id}` : "";
+  // A committed batch belongs to its original actor even after a newer grant or policy epoch.
+  // The requesting route still has to authorize its own current read or send.
+  const generalOrigin = options.generalReceipts ? `OR (paste.receipt_nonce='${TELEGRAM_GENERAL_TEMP_MARKER}'
+    AND EXISTS (SELECT /* subs-bot:telegram-general-temp-provenance:v1 */ 1
+      FROM telegram_general_receipt AS recorded JOIN telegram_general_actors AS original
+        ON original.bot_id=paste.bot_id AND original.actor_id=paste.actor_id AND original.generation=recorded.generation
+        AND original.revision=recorded.actor_revision AND original.role=recorded.actor_role
+      WHERE recorded.receipt_id=paste.receipt_id AND recorded.cutover_at<paste.message_date
+        AND original.effective_at<paste.message_date AND ${GENERAL_POLICY_SCHEMA} AND ${GENERAL_RECEIPT_SCHEMA}))` : "";
   const proof = options.verifyLive ? `LEFT JOIN telegram_inbox AS paste ON paste.receipt_id=batch.receipt_id
     AND paste.bot_id=batch.bot_id AND paste.actor_id=batch.actor_id AND paste.chat_id=batch.actor_id
     AND paste.chat_type='private' AND paste.thread_id IS NULL AND paste.command='help'
-    AND paste.message_date=batch.message_date AND paste.message_id=batch.message_id AND paste.receipt_nonce='${TELEGRAM_TEMP_MARKER}'
+    AND paste.message_date=batch.message_date AND paste.message_id=batch.message_id
+    AND (paste.receipt_nonce='${TELEGRAM_TEMP_MARKER}' ${generalOrigin})
     LEFT JOIN telegram_temp_reply AS added ON added.receipt_id=paste.receipt_id AND added.kind='added'
     AND added.node_count=batch.node_count` : "";
   const live = `SELECT 1 AS source,batch.receipt_id AS id,batch.receipt_id AS lastId,batch.message_date AS date,
@@ -141,11 +169,13 @@ export async function readTempBatchNodes(row: TempBatchRow, { requireStoredShare
 }
 
 /** Recheck the exact owner inventory before a private raw or inline send starts. */
-export function tempInventoryGuard(mode: TempStorageMode, scopeSelect: string, rows: readonly TempBatchMeta[]) {
+export function tempInventoryGuard(
+  { mode, generalReceipts }: VerifiedTempStorage, scopeSelect: string, rows: readonly TempBatchMeta[],
+) {
   const expected = JSON.stringify(rows.map((row) => [row.source, row.id, row.lastId, row.date, row.message, row.nodeCount, row.bytes, row.sha256]));
   return {
     sql: `(${tempSchemaGuard(mode)}) AND EXISTS (WITH temp_scope AS (${scopeSelect}),
-      temp_rows AS (${ownedTempRowsSql(mode, "temp_scope", { verifyLive: true })})
+      temp_rows AS (${ownedTempRowsSql(mode, "temp_scope", { verifyLive: true, generalReceipts })})
       SELECT 1 WHERE (SELECT count(*) FROM temp_rows)=? AND NOT EXISTS (SELECT 1 FROM json_each(?) AS expected
         LEFT JOIN temp_rows AS batch ON batch.source=json_extract(expected.value,'$[0]')
         AND batch.id=json_extract(expected.value,'$[1]') AND batch.lastId=json_extract(expected.value,'$[2]')

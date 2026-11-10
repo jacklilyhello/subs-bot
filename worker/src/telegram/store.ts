@@ -84,6 +84,7 @@ const LEASE_SECONDS = 30;
 const MAX_REPLY_AGE_SECONDS = 15 * 60;
 const MAX_ATTEMPTS = 4;
 const REAP_LIMIT = 40;
+export { LEASE_SECONDS as TELEGRAM_OUTBOX_LEASE_SECONDS, MAX_ATTEMPTS as TELEGRAM_OUTBOX_MAX_ATTEMPTS };
 const SUBSCRIPTION_SHARE_UNAVAILABLE_MARKER = "share-sub-unavailable:v1";
 
 type ReplyAccess = "allowed" | "denied" | "none";
@@ -517,6 +518,23 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
       ...(groupClaimMarker === 1 ? { group: true as const } : {}) } }) };
 }
 
+type TelegramOutboxLease = Pick<TelegramReplyLease, "leaseId" | "attempts">;
+
+interface TelegramOutboxSelection {
+  // A reviewed receipt-id SELECT from the caller's queue family.
+  sql: string;
+  bindings: readonly (string | number | null)[];
+}
+
+export function prepareTelegramOutboxBegin(
+  db: D1Database, lease: TelegramOutboxLease, selection: TelegramOutboxSelection,
+): D1PreparedStatement {
+  return db.prepare(`UPDATE telegram_outbox SET state = 'sending', lease_until = unixepoch() + ${LEASE_SECONDS}
+    WHERE state = 'leased' AND lease_id = ? AND attempts = ? AND lease_until > unixepoch()
+      AND receipt_id = (${selection.sql}) RETURNING receipt_id`)
+    .bind(lease.leaseId, lease.attempts, ...selection.bindings);
+}
+
 function beginReplyStatement(
   db: D1Database,
   policy: TelegramPolicy,
@@ -534,10 +552,7 @@ function beginReplyStatement(
       WHERE job.receipt_id = inbox.receipt_id AND job.result_code = 'saved'
         AND job.auth_message_date = COALESCE(auth.message_date, 0) AND job.auth_message_id = COALESCE(auth.message_id, 0)
     )` : "";
-  return db.prepare(`
-    UPDATE telegram_outbox SET state = 'sending', lease_until = unixepoch() + ${LEASE_SECONDS}
-    WHERE state = 'leased' AND lease_id = ? AND attempts = ? AND lease_until > unixepoch()
-      AND receipt_id = (
+  return prepareTelegramOutboxBegin(db, lease, { sql: `
         SELECT inbox.receipt_id FROM telegram_inbox AS inbox
         WHERE inbox.bot_id = ? AND inbox.update_id = ? AND inbox.receipt_id = ? AND inbox.actor_id = ? AND inbox.chat_id = ?
           AND inbox.chat_type = ? AND inbox.message_id = ? AND inbox.message_date = ? AND inbox.thread_id IS ?
@@ -564,12 +579,9 @@ function beginReplyStatement(
               )
             ))
           )
-      )
-    RETURNING receipt_id
-  `).bind(lease.leaseId, lease.attempts, policy.botId, lease.updateId, lease.receiptId, lease.actorId, lease.chatId, lease.chatType,
+  `, bindings: [policy.botId, lease.updateId, lease.receiptId, lease.actorId, lease.chatId, lease.chatType,
     lease.messageId, lease.messageDate, lease.threadId, lease.command, ...(provider?.bindings ?? []), ...(guard?.bindings ?? []),
-    access, lease.privateClaim?.codeSha256 ?? null,
-    access, policy.adminId, access);
+    access, lease.privateClaim?.codeSha256 ?? null, access, policy.adminId, access] });
 }
 
 export function prepareTelegramPrivateClaimBegin(
@@ -910,19 +922,27 @@ export async function settleTelegramReply(
   lease: TelegramReplyLease,
   outcome: TelegramReplyOutcome,
 ): Promise<void> {
-  const identity = [lease.leaseId, lease.attempts, policy.botId, lease.updateId, lease.receiptId] as const;
   const includeProvider = lease.providerOutcome !== undefined;
   const includeProviderBatch = lease.providerBatch === true;
   const includeApiStatus = lease.apiStatus === true;
   const includeProviderDocument = lease.providerDocument === true;
-  const sameReply = `lease_id = ? AND attempts = ? AND receipt_id = (
-    SELECT receipt_id FROM telegram_inbox AS inbox
+  const selection = { sql: `SELECT receipt_id FROM telegram_inbox AS inbox
     WHERE bot_id = ? AND update_id = ? AND receipt_id = ? AND ${supportedReceipt("inbox", lease.aggregate !== undefined || lease.selected !== undefined,
       lease.privateShareCreation === true, lease.subscriptionRead === true, lease.shortLink === true,
       lease.inlineSort !== undefined, lease.subscriptionNodes === true, includeProvider, lease.bulkTrash === true,
       lease.inlineConsent !== undefined, lease.githubSearch !== undefined, lease.subscriptionRawFile === true,
       includeProviderBatch, includeApiStatus, includeProviderDocument)}
-  )`;
+  `, bindings: [policy.botId, lease.updateId, lease.receiptId] };
+  await settleTelegramOutboxReply(db, lease, selection, outcome,
+    replyClock(includeProvider, "inbox", includeProviderBatch, includeApiStatus, includeProviderDocument));
+}
+
+export async function settleTelegramOutboxReply(
+  db: D1Database, lease: TelegramOutboxLease, selection: TelegramOutboxSelection,
+  outcome: TelegramReplyOutcome, retryClock?: string,
+): Promise<void> {
+  const identity = [lease.leaseId, lease.attempts, ...selection.bindings];
+  const sameReply = `lease_id = ? AND attempts = ? AND receipt_id = (${selection.sql})`;
   if (outcome.kind === "sent") {
     if (!Number.isSafeInteger(outcome.messageId) || outcome.messageId <= 0) {
       throw new RangeError("Telegram delivery confirmation is invalid.");
@@ -935,14 +955,13 @@ export async function settleTelegramReply(
     return;
   }
 
-  if (outcome.kind === "retry" && Number.isSafeInteger(outcome.delaySeconds) && outcome.delaySeconds > 0
+  if (retryClock && outcome.kind === "retry" && Number.isSafeInteger(outcome.delaySeconds) && outcome.delaySeconds > 0
       && outcome.delaySeconds < MAX_REPLY_AGE_SECONDS) {
     // Never shorten Telegram's requested wait to fit the retry lifetime.
     await db.prepare(`
       UPDATE telegram_outbox SET state = CASE
         WHEN attempts < ${MAX_ATTEMPTS} AND unixepoch() + ? < (
-          SELECT ${replyClock(includeProvider, "inbox", includeProviderBatch, includeApiStatus, includeProviderDocument)}
-          FROM telegram_inbox AS inbox WHERE inbox.receipt_id = telegram_outbox.receipt_id
+          SELECT ${retryClock} FROM telegram_inbox AS inbox WHERE inbox.receipt_id = telegram_outbox.receipt_id
         ) + ${MAX_REPLY_AGE_SECONDS} THEN 'pending' ELSE 'failed' END,
         due_at = unixepoch() + ?, lease_id = NULL, lease_until = NULL
       WHERE ${sameReply} AND state = 'sending'
