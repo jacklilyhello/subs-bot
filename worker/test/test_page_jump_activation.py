@@ -12,6 +12,7 @@ from unittest.mock import patch
 from test_page_jump_control import BOT, TARGET, WORKER, MemoryD1, current
 
 import cloudflare_isolation as cloudflare
+import general_read_rehearsal as general_reads
 import page_jump_activation as activation
 import page_jump_open as opening
 import page_jump_recovery as recovery
@@ -130,6 +131,14 @@ class PageJumpActivationTests(TestCase):
     def reconcile(self):
         return activation.reconcile_activation(
             self.scope, CONFIG, current, epoch=STAGE_RUN, stage_sha256=SOURCE["archiveSha256"])
+
+    def test_read_rehearsal_floor_fences_the_direct_deployment_post(self):
+        error = cloudflare.CloudflareError(general_reads.BLOCKED)
+        with patch.object(general_reads, "require_general_read_lane_clear", side_effect=[None, error]):
+            with self.assertRaisesRegex(cloudflare.CloudflareError, "Close and drain"):
+                self.activate()
+        self.assertEqual(self.scope.posts, [])
+        self.assertIsNone(self.journal.read(STAGE_RUN).deployment_id)
 
     def test_confirmed_closed_activation_and_same_stage_rerun_do_not_repeat(self):
         record = self.activate()

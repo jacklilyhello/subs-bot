@@ -2,8 +2,9 @@ import type { PublicOrigin } from "../public-origin.ts";
 import { sendGeneralTelegramGroupListReply, sendGeneralTelegramPrivateReply } from "./delivery.ts";
 import {
   generalReadEvent, renderGeneralReadReply,
-  type GeneralReadCommand, type GeneralTelegramPin,
+  type GeneralReadCommand, type GeneralReadEvent, type GeneralTelegramPin,
 } from "./general-auth-runtime.ts";
+import { GENERAL_READ_LANE_ROLE, generalReadLaneRoleBindings } from "./general-read-lane.ts";
 import { GENERAL_ACTOR_QUEUE_CAPACITY, GENERAL_LATEST_ACTOR_SQL, GENERAL_NO_LEGACY_WORK, GENERAL_POLICY_ACTORS_SQL, GENERAL_POLICY_PIN_SQL,
   GENERAL_RECEIPT_SCHEMA, GENERAL_REPLY_TTL, generalCurrentReceiptSql, generalPolicyBindings, generalRecordedOriginSql,
   prepareGeneralReceiptAuthority } from "./general-receipt.ts";
@@ -100,10 +101,16 @@ function queueMarkers(group: boolean, privateManagement: boolean): string {
   return markers.map((marker) => `'${marker}'`).join(",");
 }
 
-function current(alias: "inbox" | "earlier", group: boolean, privateManagement: boolean): string {
+function current(alias: "inbox" | "earlier", group: boolean, pin: GeneralTelegramPin): string {
+  const { privateManagement } = pin;
   const groupScope = group ? `(${alias}.receipt_nonce<>'${GROUP_MARKER}' OR (${approvedGroup(alias)}))` : "1";
   const pathScope = privateManagement ? `(${alias}.receipt_nonce<>'${GENERAL_PATH_MARKER}' OR ${PATH_SCHEMA})` : "1";
-  return generalCurrentReceiptSql(alias, `${groupScope} AND ${pathScope}`);
+  const scope = `${groupScope} AND ${pathScope}`;
+  return generalCurrentReceiptSql(alias, pin.rehearsal ? `${scope} AND ${GENERAL_READ_LANE_ROLE}` : scope);
+}
+
+function currentBindings(pin: GeneralTelegramPin) {
+  return [...generalPolicyBindings(pin), ...generalReadLaneRoleBindings(pin)];
 }
 
 export async function acceptGeneralSharedTelegramCommand(
@@ -111,7 +118,7 @@ export async function acceptGeneralSharedTelegramCommand(
 ): Promise<number> {
   const decoded = await readTelegramUpdate(request, pin.webhookSecret);
   if (decoded.status !== 200) return decoded.status;
-  if (!pin.sharedOutbox) return 204;
+  if (!pin.sharedOutbox || pin.rehearsal) return 204;
   const action = pin.privateManagement ? readGeneralPrivateLifecycleUpdate(decoded.update, decoded.updateId, pin.botId) : null;
   if (action) {
     const accepted = await acceptGeneralTelegramLifecycle(db, pin, action) === "accepted";
@@ -132,7 +139,21 @@ export async function acceptGeneralSharedTelegramCommand(
     chatId: pathCommand.actorId, chatType: "private" as const, threadId: null,
     messageId: pathCommand.messageId, messageDate: pathCommand.messageDate,
   } : generalReadEvent(pin, decoded.update, decoded.updateId, true);
-  if (!event) return 204;
+  return event ? acceptSharedRead(db, pin, event, pathCommand) : 204;
+}
+
+export function acceptGeneralReadLaneCommand(
+  db: D1Database, pin: GeneralTelegramPin, event: GeneralReadEvent, guard: D1PreparedStatement,
+): Promise<number> {
+  if (!pin.rehearsal || pin.privateManagement || pin.privateFormats || event.chatType !== "private" || event.chatId !== event.actorId
+    || event.threadId !== null || event.viewKind === "recycle") return Promise.resolve(204);
+  return acceptSharedRead(db, pin, event, null, guard);
+}
+
+async function acceptSharedRead(
+  db: D1Database, pin: GeneralTelegramPin, event: GeneralReadEvent,
+  pathCommand: ReturnType<typeof readPrivateTelegramCommand>, admissionGuard?: D1PreparedStatement,
+): Promise<number> {
   const group = event.chatType !== "private";
   if (group && !await groupSchemaReady(db)) return 204;
   const marker = pathCommand ? GENERAL_PATH_MARKER : group ? GROUP_MARKER
@@ -142,6 +163,7 @@ export async function acceptGeneralSharedTelegramCommand(
   const fresh = "incoming.bot_id=? AND incoming.update_id=? AND incoming.receipt_nonce=?";
   const path = pathCommand ? prepareTelegramPathReceipt(db, key, { general: pin }, pathCommand.remainder) : null;
   const steps = [
+    ...(admissionGuard ? [admissionGuard] : []),
     db.prepare(`INSERT INTO telegram_inbox
       (bot_id,update_id,actor_id,chat_id,chat_type,message_id,message_date,thread_id,command,receipt_nonce)
       SELECT policy.bot_id,?,actor.actor_id,?,?,?,?,?,?,?
@@ -151,11 +173,11 @@ export async function acceptGeneralSharedTelegramCommand(
         AND ?>MAX(policy.cutover_at,actor.effective_at,unixepoch()-${GENERAL_REPLY_TTL}) AND ?<=unixepoch()+60
         ${group ? `AND ${approvedGroup()}` : ""} ${path ? `AND ${PATH_SCHEMA}` : ""}
         AND NOT EXISTS (SELECT 1 FROM telegram_general_replies WHERE bot_id=policy.bot_id AND update_id=?)
-        AND ${GENERAL_ACTOR_QUEUE_CAPACITY}
+        AND ${GENERAL_ACTOR_QUEUE_CAPACITY} ${pin.rehearsal ? `AND ${GENERAL_READ_LANE_ROLE}` : ""}
       ON CONFLICT (bot_id,update_id) DO NOTHING`)
       .bind(event.updateId, event.chatId, event.chatType, event.messageId, event.messageDate, event.threadId, event.command,
         nonce, ...generalPolicyBindings(pin), event.actorId, event.messageDate, event.messageDate,
-        ...(group ? [event.chatId, event.chatType] : []), event.updateId),
+        ...(group ? [event.chatId, event.chatType] : []), event.updateId, ...generalReadLaneRoleBindings(pin)),
     prepareGeneralReceiptAuthority(db, pin, key),
     ...(path?.statements ?? [db.prepare(`INSERT INTO telegram_view (receipt_id,kind)
       SELECT incoming.receipt_id,? FROM telegram_inbox AS incoming WHERE ${fresh} AND incoming.command='list'`).bind(event.viewKind, ...key)]),
@@ -179,7 +201,7 @@ export async function acceptGeneralSharedTelegramCommand(
 
 export async function claimGeneralSharedTelegramReply(db: D1Database, pin: GeneralTelegramPin): Promise<SharedReadLease | null> {
   if (!pin.sharedOutbox) return null;
-  const group = await groupSchemaReady(db);
+  const group = !pin.rehearsal && await groupSchemaReady(db);
   const leaseId = crypto.randomUUID();
   // Evaluate authorization once per active row, outside the FIFO subquery's expression tree.
   const [claimed, read] = await db.batch<SharedReadLease>([
@@ -189,7 +211,7 @@ export async function claimGeneralSharedTelegramReply(db: D1Database, pin: Gener
         WITH active AS MATERIALIZED (
           SELECT inbox.receipt_id,inbox.actor_id,inbox.chat_id,reply.state,reply.attempts,reply.lease_until,reply.due_at,
             (${family("inbox", group, pin.privateManagement)}) AS supported,
-            (${current("inbox", group, pin.privateManagement)}) AS eligible
+            (${current("inbox", group, pin)}) AS eligible
           FROM telegram_inbox AS inbox JOIN telegram_outbox AS reply USING (receipt_id)
           WHERE inbox.bot_id=? AND reply.state IN ('pending','leased','sending')
         )
@@ -206,7 +228,7 @@ export async function claimGeneralSharedTelegramReply(db: D1Database, pin: Gener
                   earlier.receipt_id<candidate.receipt_id AND earlier.state IN ('pending','leased')
                   AND earlier.attempts<${TELEGRAM_OUTBOX_MAX_ATTEMPTS})))))
         ORDER BY candidate.receipt_id LIMIT 1)`)
-      .bind(leaseId, ...generalPolicyBindings(pin), pin.botId),
+      .bind(leaseId, ...currentBindings(pin), pin.botId),
     db.prepare(`SELECT inbox.receipt_id AS receiptId,inbox.update_id AS updateId,inbox.actor_id AS actorId,
       inbox.chat_id AS chatId,inbox.chat_type AS chatType,inbox.thread_id AS threadId,
       inbox.message_id AS messageId,inbox.message_date AS messageDate,inbox.command,inbox.receipt_nonce AS marker,authority.generation,
@@ -227,7 +249,7 @@ export async function claimGeneralSharedTelegramReply(db: D1Database, pin: Gener
 }
 
 function selectLease(pin: GeneralTelegramPin, lease: SharedReadLease, authorizing: boolean, metadata?: MetadataReply) {
-  const group = lease.chatType !== "private";
+  const group = !pin.rehearsal && lease.chatType !== "private";
   const exact = `FROM telegram_inbox AS inbox JOIN telegram_general_receipt AS authority USING (receipt_id)
     WHERE inbox.bot_id=? AND inbox.receipt_id=? AND inbox.update_id=? AND inbox.actor_id=?
       AND inbox.chat_id=? AND inbox.chat_type=? AND inbox.thread_id IS ? AND inbox.message_id=? AND inbox.message_date=?
@@ -236,16 +258,16 @@ function selectLease(pin: GeneralTelegramPin, lease: SharedReadLease, authorizin
   const exactBindings = [pin.botId, lease.receiptId, lease.updateId, lease.actorId, lease.chatId, lease.chatType, lease.threadId,
     lease.messageId, lease.messageDate, lease.command, lease.marker, lease.actorRevision, lease.actorRole,
     ...generalPolicyBindings(pin, lease.generation)];
-  const eligible = current("inbox", group, pin.privateManagement);
+  const eligible = current("inbox", group, pin);
   if (authorizing && metadata) {
     // Keep the current grant and the origin/target proof separate inside the atomic begin.
     return { sql: `WITH candidate AS MATERIALIZED (
       SELECT inbox.receipt_id,(${eligible}) AS eligible,(${metadata.sql}) AS prepared ${exact}
     ) SELECT receipt_id FROM candidate WHERE eligible AND prepared`,
-    bindings: [...generalPolicyBindings(pin), ...metadata.bindings, ...exactBindings] };
+    bindings: [...currentBindings(pin), ...metadata.bindings, ...exactBindings] };
   }
   return { sql: `SELECT inbox.receipt_id ${exact} ${authorizing ? `AND ${eligible}` : ""}`,
-    bindings: [...exactBindings, ...(authorizing ? generalPolicyBindings(pin) : [])] };
+    bindings: [...exactBindings, ...(authorizing ? currentBindings(pin) : [])] };
 }
 
 export async function beginGeneralSharedTelegramReply(
@@ -318,17 +340,17 @@ export async function recoverGeneralSharedTelegramReplies(
   db: D1Database, pin: GeneralTelegramPin, bucket: R2Bucket, publicOrigin: PublicOrigin,
 ): Promise<void> {
   if (!pin.sharedOutbox) return;
-  const group = await groupSchemaReady(db);
+  const group = !pin.rehearsal && await groupSchemaReady(db);
   const markers = queueMarkers(group, pin.privateManagement);
   await db.prepare(`UPDATE telegram_outbox SET state=CASE WHEN state='sending' THEN 'uncertain' ELSE 'failed' END,
       lease_id=CASE WHEN state='sending' THEN lease_id ELSE NULL END,lease_until=NULL
     WHERE receipt_id IN (SELECT inbox.receipt_id FROM telegram_inbox AS inbox JOIN telegram_outbox AS reply USING (receipt_id)
       WHERE inbox.bot_id=? AND inbox.receipt_nonce IN (${markers}) AND ((reply.state='sending' AND reply.lease_until<=unixepoch())
-        OR (reply.state IN ('pending','leased') AND (NOT (${current("inbox", group, pin.privateManagement)})
+        OR (reply.state IN ('pending','leased') AND (NOT (${current("inbox", group, pin)})
           OR (reply.attempts>=${TELEGRAM_OUTBOX_MAX_ATTEMPTS} AND (reply.state='pending' OR reply.lease_until<=unixepoch())))))
       ORDER BY inbox.receipt_id LIMIT 16)
       AND EXISTS (SELECT 1 FROM telegram_general_policy AS policy WHERE ${GENERAL_POLICY_PIN_SQL} AND ${GENERAL_RECEIPT_SCHEMA})`)
-    .bind(pin.botId, ...generalPolicyBindings(pin), ...generalPolicyBindings(pin)).run();
+    .bind(pin.botId, ...currentBindings(pin), ...generalPolicyBindings(pin)).run();
   if (pin.privateManagement) {
     await reapTelegramLifecycle(db, pin.botId);
     await reapTelegramSubscriptionReadTickets(db, pin.botId);

@@ -58,7 +58,7 @@ class MemoryD1:
                 self.fault = None
                 raise cloudflare.CloudflareError("synthetic transport failure", uncertain=True)
         with self.db:
-            rows = self.db.execute(sql, payload["params"]).fetchall()
+            rows = self.db.execute(sql, payload.get("params", ())).fetchall()
         if write and self.fault == "lost":
             self.fault = None
             raise cloudflare.CloudflareError("synthetic transport failure", uncertain=True)

@@ -223,6 +223,7 @@ export async function acceptTelegramCommand(
   policy: TelegramPolicy,
   command: TelegramCommand,
   reply?: "subscription-share-unavailable",
+  admissionGuard?: D1PreparedStatement,
 ): Promise<"accepted" | "duplicate"> {
   if (!inTelegramScope(policy, command)) throw new RangeError("Telegram command is outside the isolation scope.");
   if (reply && (command.command !== "help" || command.chatType !== "private" || command.threadId !== null)) {
@@ -238,6 +239,8 @@ export async function acceptTelegramCommand(
     ON CONFLICT (bot_id, update_id) DO NOTHING
   `).bind(policy.botId, command.updateId, command.actorId, command.chatId, command.chatType,
     command.messageId, command.messageDate, command.threadId, command.command, receipt)];
+
+  if (admissionGuard) steps.unshift(admissionGuard);
 
   if (command.command === "auth-add" || command.command === "auth-remove") {
     // Only the explicit admin's own private command can change the configured member.

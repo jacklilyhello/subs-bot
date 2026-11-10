@@ -40,6 +40,7 @@ export async function acceptTelegramView(
   db: D1Database,
   policy: TelegramPolicy,
   event: TelegramViewUpdate,
+  admissionGuard?: D1PreparedStatement,
 ): Promise<"accepted" | "ignored"> {
   if (!inTelegramScope(policy, event)) return "ignored";
 
@@ -52,7 +53,7 @@ export async function acceptTelegramView(
   const conflict = "ON CONFLICT (bot_id, update_id) DO NOTHING";
   const fresh = "bot_id = ? AND update_id = ? AND receipt_nonce = ?";
   try {
-    const steps: D1PreparedStatement[] = [];
+    const steps: D1PreparedStatement[] = admissionGuard ? [admissionGuard] : [];
     if (event.kind === "callback") {
       const digest = await ticketDigest(event.ticket);
       steps.push(

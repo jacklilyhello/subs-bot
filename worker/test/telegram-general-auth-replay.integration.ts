@@ -15,7 +15,9 @@ import { beginGeneralTelegramReply, claimGeneralTelegramReply, parseGeneralTeleg
 import { beginGeneralSharedTelegramReply, claimGeneralSharedTelegramReply } from "../src/telegram/general-auth-shared.ts";
 import { generalCurrentAuthoritySql, generalCurrentReceiptSql, generalOrdinaryReplyEligibilitySql, generalPolicyBindings,
   generalRecordedOriginSql } from "../src/telegram/general-receipt.ts";
-import { claimTelegramReply } from "../src/telegram/store.ts";
+import { acceptTelegramCommand, claimTelegramReply } from "../src/telegram/store.ts";
+import { acceptTelegramView } from "../src/telegram/views.ts";
+import { assertGeneralReadLane, readGeneralReadLane } from "../src/telegram/general-read-lane.ts";
 
 type Fixture = Omit<GeneralAuthReplayPin, "botUsername" | "webhookSecret" | "generation" | "cutoverAt"> & {
   bundleSha256: string; compatibilityDate: string; statements: string[];
@@ -51,6 +53,7 @@ test("closed general authorization replays a sealed candidate in a separate emit
     botToken: "151:fixture-isolation-token", adminId: "181", memberId: "182", groupId: "-100300" };
   const sent: GeneralAuthReplayMessage[] = [];
   const generalSent: GeneralAuthReplayMessage[] = [];
+  const laneSent: GeneralAuthReplayMessage[] = [];
   const sharedSent: (GeneralAuthReplayMessage & { message_thread_id?: number })[] = [];
   const lifecycleSent: (GeneralAuthReplayMessage & { reply_markup?: {
     force_reply?: boolean; inline_keyboard?: { text: string; callback_data: string }[][];
@@ -102,6 +105,15 @@ test("closed general authorization replays a sealed candidate in a separate emit
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_ISOLATION_CONFIG: JSON.stringify(isolation),
         TELEGRAM_GENERAL_CONFIG: generalConfig, REPLAY_PIN: pin },
       outboundService: () => { throw new Error("Unexpected serving transport."); } },
+    { name: "rehearsal", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
+      bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_ISOLATION_CONFIG: JSON.stringify(isolation) },
+      outboundService: async (request: Request) => {
+        assert.equal(request.url, `https://api.telegram.org/bot${isolation.botToken}/sendMessage`);
+        assert.equal(request.method, "POST");
+        const message = await request.json() as GeneralAuthReplayMessage;
+        laneSent.push(message);
+        return Response.json({ ok: true, result: { chat: { id: Number(message.chat_id) }, message_id: 9500 + laneSent.length } });
+      } },
     { name: "general", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: generalConfig },
       outboundService: async (request: Request) => {
@@ -718,4 +730,105 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.equal((await callback(7380, 101, origin(enabledDetail.messageId, 101), formatTicket("Clash Meta"), formats)).status, 204);
   assert.equal(await findReply(7380), null);
   assert.equal(await db.prepare("SELECT count(*) AS n FROM telegram_provider_jobs").first("n"), 0);
+
+  const rehearsal = await runtime.getWorker("rehearsal");
+  const lanePost = (actor: number, command: string, options: PostOptions = {}) =>
+    post(actor, command, { secret: isolation.webhookSecret, date: now - 3, ...options, worker: rehearsal });
+  const laneRow = (updateId: number) => db.prepare(`SELECT inbox.actor_id AS actor, inbox.receipt_nonce AS marker, reply.state
+      FROM telegram_inbox AS inbox JOIN telegram_outbox AS reply USING (receipt_id)
+      WHERE inbox.bot_id=? AND inbox.update_id=?`).bind(isolation.botId, updateId).first();
+  const waitForLane = async (updateId: number) => {
+    const end = Date.now() + 4000;
+    for (let row = await laneRow(updateId); Date.now() < end; row = await laneRow(updateId)) {
+      if (row?.state === "sent") return row;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.fail("The synthetic read rehearsal reply did not settle.");
+  };
+  await db.batch([
+    db.prepare(`INSERT INTO subscriptions (owner_id,name,source_url,token,created_at,updated_at)
+      VALUES (181,'Rehearsal admin only','https://source.fixture.invalid/hidden','rehearsal-admin-token',?,?),
+             (182,'Rehearsal member only','https://source.fixture.invalid/hidden','rehearsal-member-token',?,?)`).bind(now, now, now, now),
+    db.prepare("INSERT INTO telegram_general_read_lane (bot_id,epoch,mode) VALUES (?,1,'closed')").bind(isolation.botId),
+  ]);
+  const staleScope = { updateId: 8100, actorId: isolation.adminId, chatId: isolation.adminId,
+    chatType: "private" as const, threadId: null, messageId: 8100, messageDate: now - 3 };
+  await assert.rejects(acceptTelegramCommand(db, isolation, { ...staleScope, command: "help" }, undefined,
+    assertGeneralReadLane(db, isolation.botId, "isolated", null)));
+  await assert.rejects(acceptTelegramView(db, isolation, { ...staleScope, kind: "list" },
+    assertGeneralReadLane(db, isolation.botId, "isolated", null)));
+  assert.equal(await laneRow(8100), null, "a stale admission cannot commit on either isolation anchor");
+  assert.equal((await lanePost(181, "/help", { updateId: 8101 })).status, 503);
+  assert.equal((await lanePost(182, "/list", { updateId: 8102, date: now - 21 })).status, 503);
+  assert.equal((await lanePost(181, "/help", { updateId: 8103, secret: pin.webhookSecret })).status, 401);
+  assert.equal(await laneRow(8101), null);
+  assert.equal(await laneRow(8102), null);
+  assert.equal(laneSent.length, 0);
+
+  await db.batch([
+    db.prepare(`INSERT INTO telegram_general_policy (bot_id,generation,release_revision,activation_sha256,cutover_at,active)
+      VALUES (?,1,?,?,?,1)`).bind(isolation.botId, fixture.releaseRevision, pin.candidateManifestSha256, now - 20),
+    db.prepare("INSERT INTO telegram_general_actors VALUES (?,1,?,1,?,'admin'),(?,1,?,1,?,'member')")
+      .bind(isolation.botId, isolation.adminId, now - 20, isolation.botId, isolation.memberId, now - 20),
+    db.prepare("UPDATE telegram_general_read_lane SET mode='general',epoch=2,generation=1 WHERE bot_id=?")
+      .bind(isolation.botId),
+  ]);
+  const open = await readGeneralReadLane(db, isolation, fixture.releaseRevision);
+  assert.ok(open?.pin?.rehearsal && open.mode === "general");
+  assert.equal((await lanePost(182, "/list", { updateId: 8102, date: now - 21 })).status, 503,
+    "uncommitted pre-cutover delivery is held for the original lane");
+  assert.equal((await lanePost(183, "/list", { updateId: 8104 })).status, 204);
+  assert.equal(await laneRow(8104), null);
+  assert.equal((await lanePost(181, "/help", { updateId: 8105 })).status, 200);
+  assert.deepEqual(await waitForLane(8105), { actor: "181", marker: "general-read:v1", state: "sent" });
+  assert.equal((await lanePost(182, "/list", { updateId: 8106 })).status, 200);
+  assert.deepEqual(await waitForLane(8106), { actor: "182", marker: "general-read:v1", state: "sent" });
+  assert.equal((await lanePost(182, "/list", { updateId: 8106 })).status, 204);
+  assert.deepEqual(laneSent.map((message) => message.chat_id), ["181", "182"]);
+  assert.match(laneSent[1].text, /Rehearsal member only/u);
+  assert.doesNotMatch(laneSent[1].text, /Rehearsal admin only|fixture\.invalid|rehearsal-member-token/u);
+
+  const pending = await db.prepare(`INSERT INTO telegram_inbox
+    (bot_id,update_id,actor_id,chat_id,chat_type,message_id,message_date,command,receipt_nonce)
+    VALUES (?,8107,?,?,'private',8107,?,'help','general-read:v1') RETURNING receipt_id`)
+    .bind(isolation.botId, isolation.memberId, isolation.memberId, now - 3).first<number>("receipt_id");
+  assert.ok(pending);
+  await db.batch([
+    db.prepare("INSERT INTO telegram_general_receipt VALUES (?,1,1,'member',?,?,?)")
+      .bind(pending, fixture.releaseRevision, pin.candidateManifestSha256, now - 20),
+    db.prepare("INSERT INTO telegram_outbox (receipt_id) VALUES (?)").bind(pending),
+  ]);
+  const laneLease = await claimGeneralSharedTelegramReply(db, open.pin);
+  assert.ok(laneLease);
+  assert.equal(laneLease.receiptId, pending);
+  await db.batch([
+    db.prepare("UPDATE telegram_general_read_lane SET mode='closed',epoch=3 WHERE bot_id=?").bind(isolation.botId),
+    db.prepare("INSERT INTO telegram_auth VALUES (?,?,0,?,8108)").bind(isolation.botId, isolation.memberId, now - 2),
+  ]);
+  assert.equal(await beginGeneralSharedTelegramReply(db, open.pin, laneLease), false, "member revocation fences the send");
+  const draining = await db.prepare(`INSERT INTO telegram_inbox
+    (bot_id,update_id,actor_id,chat_id,chat_type,message_id,message_date,command,receipt_nonce)
+    VALUES (?,8110,?,?,'private',8110,?,'help','general-read:v1') RETURNING receipt_id`)
+    .bind(isolation.botId, isolation.adminId, isolation.adminId, now - 3).first<number>("receipt_id");
+  assert.ok(draining);
+  await db.batch([
+    db.prepare("INSERT INTO telegram_general_receipt VALUES (?,1,1,'admin',?,?,?)")
+      .bind(draining, fixture.releaseRevision, pin.candidateManifestSha256, now - 20),
+    db.prepare("INSERT INTO telegram_outbox (receipt_id) VALUES (?)").bind(draining),
+  ]);
+  assert.equal((await rehearsal.scheduled({ cron: "* * * * *" })).outcome, "ok");
+  assert.equal((await laneRow(8107))?.state, "failed");
+  assert.equal((await laneRow(8110))?.state, "sent", "closing ingress preserves the current grant for draining");
+  assert.equal((await lanePost(181, "/help", { updateId: 8105 })).status, 204, "known committed retries can settle while closed");
+  assert.equal((await lanePost(181, "/help", { updateId: 8109 })).status, 503);
+  assert.equal(laneSent.length, 3);
+
+  await db.batch([
+    db.prepare("UPDATE telegram_general_policy SET active=0 WHERE bot_id=? AND generation=1").bind(isolation.botId),
+    db.prepare("UPDATE telegram_general_read_lane SET mode='isolated',epoch=4,generation=NULL WHERE bot_id=?").bind(isolation.botId),
+  ]);
+  assert.equal((await lanePost(181, "/help", { updateId: 8109 })).status, 200);
+  assert.deepEqual(await waitForLane(8109), { actor: "181", marker: null, state: "sent" });
+  assert.equal((await lanePost(182, "/list", { updateId: 8102, date: now - 21 })).status, 200);
+  assert.equal((await laneRow(8102))?.marker, "view:v1", "the delayed delivery retains its original receipt family");
 });

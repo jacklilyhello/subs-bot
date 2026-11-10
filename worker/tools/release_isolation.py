@@ -16,6 +16,7 @@ from cloudflare_isolation import (
     verify_worker_target,
 )
 from d1_migrations import MigrationError, apply_migrations
+from general_read_rehearsal import verify_general_read_artifact
 from page_jump_activation import activate_once, activation_inputs, reconcile_activation
 from page_jump_open import open_admission
 from page_jump_recovery import prepare_recovery, recovery_inputs
@@ -266,6 +267,7 @@ def release():
     dynamic_all_capable = legacy_dynamic_all_artifact(bundle, manifest)
     typed_shorts_capable = subscription_shorts_artifact(bundle, manifest)
     verify_page_jump_artifact(bundle, manifest)
+    verify_general_read_artifact(bundle, manifest)
     telegram_config = telegram_release_config(manifest)
     aggregate_key = None
     if any(item["name"] == "0014_telegram_aggregate_issuance.sql" for item in manifest["migrations"]):
