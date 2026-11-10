@@ -146,9 +146,9 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.ok(parseGeneralTelegramPin(selectedConfig, fixture.releaseRevision)?.privateSelected);
   const aggregateKeyRaw = Buffer.alloc(32, 17).toString("base64url");
   const shareKeyRaw = Buffer.alloc(32, 0x61).toString("base64url");
-  const authConfig = JSON.stringify({ ...JSON.parse(aggregateConfig), authManagement: true });
+  const authConfig = JSON.stringify({ ...JSON.parse(selectedConfig), authManagement: true });
   const authPin = parseGeneralTelegramPin(authConfig, fixture.releaseRevision);
-  assert.ok(authPin?.privateAuthorization && authPin.privateAggregate && authPin.privateShareCreation && authPin.privateClaims);
+  assert.ok(authPin?.privateAuthorization && authPin.privateSelected && authPin.privateAggregate && authPin.privateShareCreation && authPin.privateClaims);
   assert.equal(parseGeneralTelegramPin(JSON.stringify({ ...JSON.parse(sharedConfig), authManagement: true }),
     fixture.releaseRevision), null);
   const claimSends = new Map<number, { actorId: string; text?: string; body?: Buffer }>();
@@ -1736,4 +1736,36 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.equal((await authPost(8218, 101, "/auth remove 108")).status, 200);
   assert.equal((await awaitLifecycle(8218)).message.text, "用户 108：已撤权。");
   assert.equal((await authState())?.revision, 6);
+
+  await db.batch(Array.from({ length: 25 }, (_, offset) => db.prepare(
+    "INSERT INTO telegram_general_actors VALUES (?,?,?,1,?,'member')",
+  ).bind(authPin.botId, authPin.generation, String(110 + offset), actionDate + 10)));
+  const listActionCount = () => db.prepare("SELECT count(*) AS n FROM telegram_general_auth_actions WHERE bot_id=?")
+    .bind(authPin.botId).first<number>("n");
+  const actionCount = await listActionCount();
+  assert.equal((await authPost(8220, 110, "/auth list", { date: actionDate + 11 })).status, 204);
+  assert.equal((await authPost(8220, 101, "/auth list", { chatType: "group", chatId: -100100 })).status, 204);
+  assert.equal((await authPost(8220, 101, "/auth list 110")).status, 204);
+  assert.equal(await findReply(8220), null);
+  assert.equal((await authPost(8221, 101, "/auth list")).status, 200);
+  const roster = (await awaitLifecycle(8221)).message;
+  assert.equal(roster.chat_id, "101");
+  const rosterLines = roster.text.split("\n");
+  assert.equal(rosterLines.length, 22);
+  assert.equal(rosterLines[0], "授权名单（默认拒绝）");
+  assert.equal(rosterLines[1], "101：管理员");
+  assert.ok(rosterLines.includes("108：已撤权"));
+  assert.match(rosterLines[7], /^110：(等待授权生效|已授权)$/u);
+  assert.equal(rosterLines.at(-1), "仅显示前 20 位，名单中还有其他用户。");
+  assert.doesNotMatch(roster.text, /124：|fixture\.invalid|https?:/u);
+  assert.equal((await authPost(8221, 101, "/auth list")).status, 204);
+  assert.equal(await listActionCount(), actionCount, "a roster read writes no authorization action or target revision");
+  assert.equal((await authState())?.revision, 6);
+
+  assert.equal(await directAuth(8222, 101, "/auth"), 200);
+  await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,'101',2,?,'denied')")
+    .bind(authPin.botId, authPin.generation, actionDate).run();
+  assert.equal((await authWorker.scheduled({ cron: "* * * * *" })).outcome, "ok");
+  assert.equal((await findReply(8222))?.state, "failed");
+  assert.equal(lifecycleSent.some(({ reply_parameters }) => reply_parameters.message_id === 8222), false);
 });
