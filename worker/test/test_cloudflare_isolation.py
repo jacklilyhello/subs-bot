@@ -20,6 +20,7 @@ from urllib.error import HTTPError
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import attest_api_status_container as attestation
 import cloudflare_isolation as cloudflare
+import general_read_rehearsal as general_reads
 import page_jump_activation
 import page_jump_control
 import page_jump_recovery
@@ -132,6 +133,7 @@ class FakeCloudflare:
         self.calls = []
         self.lose_upload = False
         self.page_jump_journal = "absent"
+        self.general_read_lane = "absent"
         self.lose_activation = False
         self.lose_activation_readback = False
         self.health_available = True
@@ -303,6 +305,19 @@ class FakeCloudflare:
                                         None if revoked else "clash", None if revoked else "A" * 22,
                                         2 if revoked else None))
                     return [{"success": True, "results": [dict(row) for row in db.execute(sql)]}]
+            if "AS laneTable," in sql:
+                present = self.general_read_lane not in ("absent", "registered-only")
+                file = Path(__file__).resolve().parents[1] / "migrations" / general_reads.MIGRATION
+                definition = file.read_text(encoding="utf-8").removesuffix(";\n") if present else None
+                return [{"success": True, "results": [{"definition": definition, "laneTable": int(present), "ledger": 1}]}]
+            if "AS laneRegistered" in sql:
+                return [{"success": True, "results": [{"laneRegistered": int(self.general_read_lane != "absent")}]}]
+            if "AS lanePinned" in sql:
+                return [{"success": True, "results": [{"lanePinned": int(self.general_read_lane != "table-only")}]}]
+            if "AS laneBusy" in sql:
+                busy = (self.general_read_lane == "busy" or
+                        self.general_read_lane == "busy-on-rollback" and self.active["id"] == NEW_DEPLOYMENT)
+                return [{"success": True, "results": [{"laneBusy": int(busy)}]}]
             if "AS pageJumpJournal," in sql:
                 return [{"success": True, "results": [{
                     "pageJumpJournal": int(self.page_jump_journal not in ("absent", "registered-only")), "ledger": 1,
@@ -914,6 +929,19 @@ class ReleaseTests(unittest.TestCase):
         self.set_page_jump_artifact()
         with self.assertRaisesRegex(cloudflare.CloudflareError, "exact 0043"):
             cloudflare.verify_page_jump_artifact(self.bundle, {**self.manifest, "migrations": original})
+
+    def test_read_rehearsal_floor_blocks_ordinary_release_and_automatic_rollback(self):
+        for state in ("busy", "registered-only", "table-only"):
+            self.api.general_read_lane = state
+            with self.subTest(state=state), self.assertRaises(cloudflare.CloudflareError):
+                self.release()
+            self.assertEqual(self.api.writes(), [])
+        self.api.general_read_lane = "busy-on-rollback"
+        self.api.health_available = False
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "safe rollback could not be confirmed"):
+            self.release()
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
+        self.assertEqual(self.api.active["id"], NEW_DEPLOYMENT)
 
     def test_ordinary_release_rejects_pending_and_partial_page_jump_journal_before_upload(self):
         for state in ("pending", "registered-only", "table-only"):

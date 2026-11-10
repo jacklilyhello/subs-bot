@@ -3,6 +3,7 @@ import { GENERAL_LATEST_ACTOR_SQL, GENERAL_POLICY_ACTORS_SQL, GENERAL_POLICY_PIN
   generalOrdinaryReplyEligibilitySql, generalPolicyBindings } from "./general-receipt.ts";
 import { readGeneralGroupListCommand, readPrivateTelegramCommand, readTelegramBotCredentials, readTelegramUpdate,
   type TelegramBotCredentials, type TelegramEventScope } from "./protocol.ts";
+import type { GeneralReadLaneScope } from "./general-read-lane.ts";
 import { renderTelegramView } from "./views.ts";
 
 export interface GeneralTelegramPin extends TelegramBotCredentials {
@@ -13,6 +14,7 @@ export interface GeneralTelegramPin extends TelegramBotCredentials {
   sharedOutbox: boolean;
   privateManagement: boolean;
   privateFormats: boolean;
+  rehearsal?: GeneralReadLaneScope;
 }
 
 interface Lease {
@@ -67,7 +69,8 @@ export type GeneralReadCommand = "help" | "list";
 export type GeneralReadEvent = TelegramEventScope & { command: GeneralReadCommand; viewKind: "list" | "recycle" | null };
 
 export function generalReadEvent(
-  pin: GeneralTelegramPin, update: Record<string, unknown>, updateId: number, shared = false,
+  pin: Pick<GeneralTelegramPin, "botUsername" | "botId" | "privateManagement">,
+  update: Record<string, unknown>, updateId: number, shared = false,
 ): GeneralReadEvent | null {
   const event = readPrivateTelegramCommand(update, pin.botUsername);
   if (event && event.actorId !== pin.botId && event.remainder.trim() === "") {

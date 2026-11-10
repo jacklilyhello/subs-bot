@@ -679,7 +679,12 @@ export async function readTelegramUpdate(request: Request, webhookSecret: string
 export async function decodeTelegramRequest(
   request: Request, policy: TelegramPolicy, inlineSearchEnabled = false,
 ): Promise<DecodedTelegramRequest> {
-  const decoded = await readTelegramUpdate(request, policy.webhookSecret);
+  return decodeAuthenticatedTelegramUpdate(await readTelegramUpdate(request, policy.webhookSecret), policy, inlineSearchEnabled);
+}
+
+export function decodeAuthenticatedTelegramUpdate(
+  decoded: Awaited<ReturnType<typeof readTelegramUpdate>>, policy: TelegramPolicy, inlineSearchEnabled = false,
+): DecodedTelegramRequest {
   if (decoded.status !== 200) return decoded;
   try {
     const event = normalizeUpdate(decoded.update, decoded.updateId, policy, inlineSearchEnabled);
