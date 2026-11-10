@@ -102,6 +102,8 @@ journalctl -u subs-bot -f
 
 ## 迁移数据
 
+旧版服务收到 systemd 的 `SIGTERM` 后，先停止拉取 Telegram 更新，再等待 Python 应用关闭，最后关闭 HTTP、SQLite 和上游会话。停止前记录该次 `subs-bot` 启动的 systemd `InvocationID`，仅在对应的 `_SYSTEMD_INVOCATION_ID` 日志中核对 `legacy-drain:v1 outcome=complete`。缺少此标记、出现 `outcome=incomplete` 或被强制终止时，应视为排空未获证实。标记仅证明本进程完成上述关闭步骤。迁移仍需单独核对 Telegram 待处理更新、逐条处理结果和切换后数据。
+
 订阅和动态授权均存放在 SQLite 中。先停止旧服务，再复制数据库，避免遗漏 WAL 中未合并的写入；迁移到新实例时保留 `.env` 中的管理员配置。
 
 ```bash
