@@ -8,6 +8,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import { Log, LogLevel, Miniflare } from "miniflare";
 import { parse as parseYaml } from "yaml";
 import { makeUnifiedClaimOracle } from "./legacy-unified-claim-oracle.ts";
+import { GENERAL_RUNTIME_MIGRATION, makeUnifiedAuthActivationOracle } from "./legacy-unified-auth-activation-oracle.ts";
 import { LEGACY_ALL_MIGRATION, LEGACY_ALL_MIGRATION_SHA256 } from "../src/legacy-all-aggregates.ts";
 import { LEGACY_SUBSCRIPTION_SHORT_MIGRATION, LEGACY_SUBSCRIPTION_SHORT_SHA256 } from "../src/short-links.ts";
 import { restoreOwnedSubscription } from "../src/subscriptions.ts";
@@ -24,6 +25,7 @@ const MIGRATION = "0038_legacy_selected_aggregates.sql";
 const MIGRATION_SHA = "29ddd93dc46120614c4837268ac2c0a0c5b4c48af9d7e4fe4de1e5e24451b74f";
 const DYNAMIC_PROFILE = "dynamic-all-v8";
 const UNIFIED_PROFILE = "unified-shares-v10";
+const UNIFIED_AUTH_PROFILE = "unified-auth-v11";
 const DYNAMIC_BOT = "74111";
 const DYNAMIC_OWNER = "74112";
 const DYNAMIC_FOREIGN = "74115";
@@ -58,11 +60,12 @@ type Migration = { name: string; sha256: string };
 type ProbeRequest = { method: "GET" | "HEAD"; route: "short" | "aggregate"; code: string; format: string | null };
 type DynamicPhase = (typeof DYNAMIC_PHASES)[number];
 type Stage = "sandbox" | "input" | "request-shape" | "artifact" | "sql-replay" | "d1-readback" | "r2-replay"
-  | "health" | "request" | "cutoff" | "restore" | "historical-claim" | "dispose";
+  | "health" | "request" | "cutoff" | "restore" | "historical-claim" | "general-auth" | "dispose";
 let stage: Stage = "sandbox";
 let caseNumber = 0;
 let dynamic = false;
 let unified = false;
+let unifiedAuth = false;
 
 function requireOracle(condition: unknown): asserts condition {
   if (!condition) throw new Error("Invalid isolated V6 oracle input or response.");
@@ -216,7 +219,7 @@ function statements(value: unknown, bytes: Buffer): string[] {
 function verifyDynamicManifest(manifest: RecordValue) {
   const links = manifest.dynamicAll, temp = manifest.legacyTempBaseline, summary = manifest.summary, source = manifest.source;
   const compatibility = manifest.shortLinkCompatibility;
-  requireOracle(manifest.version === (unified ? 10 : 8) && manifest.objectCount === (unified ? 10 : 8)
+  requireOracle(manifest.version === (unifiedAuth ? 11 : unified ? 10 : 8) && manifest.objectCount === (unified ? 10 : 8)
     && manifest.targetSequenceHighWater === DYNAMIC_TRASH
     && exact(compatibility, unified ? ["typed", "external", "selected", "dynamicAll"] : ["dynamicAll"])
     && compatibility.dynamicAll === "not-validated"
@@ -243,7 +246,8 @@ function verifyDynamicManifest(manifest: RecordValue) {
 
 async function load(input: RecordValue, uid: number) {
   dynamic = input.profile === DYNAMIC_PROFILE;
-  unified = input.profile === UNIFIED_PROFILE;
+  unifiedAuth = input.profile === UNIFIED_AUTH_PROFILE;
+  unified = input.profile === UNIFIED_PROFILE || unifiedAuth;
   requireOracle(exact(input, ["workerDir", "workerManifestSha256", "candidateDir", "candidateManifestSha256", "revision",
     "sqlStatements", ...(unified ? [] : ["requests"]), ...(dynamic || unified ? ["profile"] : [])]) && matches(REVISION, input.revision));
   stage = "request-shape";
@@ -255,6 +259,11 @@ async function load(input: RecordValue, uid: number) {
   requireOracle(build.version === 2 && build.ref === "refs/heads/main" && build.revision === input.revision
     && matches(DATE, build.compatibilityDate));
   const chain = migrations(build.migrations);
+  if (unifiedAuth) {
+    const migration = chain[43];
+    requireOracle(migration?.name === GENERAL_RUNTIME_MIGRATION.name && migration.sha256 === GENERAL_RUNTIME_MIGRATION.sha256);
+    await pinnedFile(join(worker, migration.name), 4096, migration.sha256, uid);
+  }
   const script = decoder.decode(await pinnedFile(join(worker, "index.js"), 1024 * 1024, build.bundleSha256, uid));
   requireOracle(script.includes("subs-bot:legacy-selected-http:v1") && script.includes("subs-bot:legacy-selected-retirement:v1"));
   const manifest = parsed(await pinnedFile(join(candidate, "manifest.json"), 256 * 1024, input.candidateManifestSha256, uid));
@@ -314,7 +323,9 @@ async function load(input: RecordValue, uid: number) {
   requireOracle(objectBytes === manifest.objectBytes);
   if (unified) requireOracle(inventory.size === 17 && [...objects.keys()].filter((key) => PRIVATE_SHARE_KEY.test(key)).length === 2);
   await checkInventory(candidate, inventory, uid);
-  return { script, revision: input.revision, compatibilityDate: build.compatibilityDate, chain, manifest, sql, objects, probes };
+  requireOracle(matches(DIGEST, input.workerManifestSha256) && matches(DIGEST, input.candidateManifestSha256));
+  return { script, revision: input.revision, compatibilityDate: build.compatibilityDate, chain, manifest, sql, objects, probes,
+    workerManifestSha256: input.workerManifestSha256, candidateManifestSha256: input.candidateManifestSha256 };
 }
 
 type Pointer = { id: number; generation: number; snapshot: string | null; manifest: string | null; nodes: number };
@@ -365,9 +376,9 @@ async function verifyReferences(db: D1Database, objects: Map<string, Buffer>): P
   requireOracle(referenced.size === objects.size);
 }
 
-async function replay(runtime: Miniflare, loaded: Awaited<ReturnType<typeof load>>): Promise<void> {
+async function replay(runtime: Miniflare, loaded: Awaited<ReturnType<typeof load>>, workerName?: string): Promise<void> {
   stage = "sql-replay";
-  const db = await runtime.getD1Database("DB");
+  const db = await runtime.getD1Database("DB", workerName);
   for (let index = 0; index < loaded.sql.length; index += 64) {
     const statements = loaded.sql.slice(index, index + 64);
     const results = await db.batch(statements.map((sql) => db.prepare(sql)));
@@ -404,7 +415,7 @@ async function replay(runtime: Miniflare, loaded: Awaited<ReturnType<typeof load
     && summary.tableCounts.telegram_inbox === 0);
   await verifyReferences(db, loaded.objects);
   stage = "r2-replay";
-  const bucket = await runtime.getR2Bucket("NODES");
+  const bucket = await runtime.getR2Bucket("NODES", workerName);
   for (const [key, body] of loaded.objects) {
     const object = await bucket.put(key, body, { onlyIf: { etagDoesNotMatch: "*" } });
     requireOracle(object && object.size === body.length);
@@ -602,19 +613,34 @@ async function main() {
   const uid = sandbox();
   stage = "input";
   const loaded = await load(await readInput(), uid);
-  const claim = unified ? makeUnifiedClaimOracle() : null;
-  const runtime = new Miniflare({
-    modules: true, script: loaded.script, compatibilityDate: loaded.compatibilityDate, host: "127.0.0.1",
-    log: new Log(LogLevel.NONE), d1Databases: ["DB"], r2Buckets: ["NODES"],
+  const claim = unified && !unifiedAuth ? makeUnifiedClaimOracle() : null;
+  const auth = unifiedAuth
+    ? makeUnifiedAuthActivationOracle(loaded.revision, loaded.workerManifestSha256, loaded.candidateManifestSha256) : null;
+  const shared = { modules: true, script: loaded.script, compatibilityDate: loaded.compatibilityDate };
+  const runtime = auth ? new Miniflare({ host: "127.0.0.1", log: new Log(LogLevel.NONE),
+    workers: [
+      { name: "general", isolation: undefined },
+      { name: "isolation", isolation: auth.isolationConfig },
+      { name: "malformed-isolation", isolation: "invalid" },
+    ].map(({ name, isolation }) => ({
+      ...shared, name, d1Databases: { DB: "v11-activation-fixture" }, r2Buckets: { NODES: "v11-activation-fixture" },
+      bindings: { BUILD_REVISION: loaded.revision, TELEGRAM_GENERAL_CONFIG: auth.generalConfig,
+        ...(isolation === undefined ? {} : { TELEGRAM_ISOLATION_CONFIG: isolation }) },
+      outboundService: auth.outboundService,
+    })),
+  }) : new Miniflare({
+    ...shared, host: "127.0.0.1", log: new Log(LogLevel.NONE), d1Databases: ["DB"], r2Buckets: ["NODES"],
     bindings: { BUILD_REVISION: loaded.revision, ...(claim ? { LEGACY_SUBSCRIPTION_SHORTS: "1",
       TELEGRAM_ISOLATION_CONFIG: JSON.stringify(claim.policy) } : {}) },
     outboundService: claim?.outboundService ?? (() => { throw new Error("Isolated restore oracle outbound denied."); }),
   });
   let responses: unknown;
   try {
-    await replay(runtime, loaded);
+    await replay(runtime, loaded, auth ? "general" : undefined);
     stage = "health";
-    const health = await runtime.dispatchFetch(ORIGIN + "/health", { redirect: "manual" });
+    const health = auth
+      ? await (await runtime.getWorker("general")).fetch(ORIGIN + "/health", { redirect: "manual" })
+      : await runtime.dispatchFetch(ORIGIN + "/health", { redirect: "manual" });
     const state = parsed(await bodyBytes(health, 1024));
     requireOracle(health.status === 200 && exact(state, ["ok", "service", "revision"]) && state.ok === true
       && state.service === "subs-bot" && state.revision === loaded.revision);
@@ -630,7 +656,10 @@ async function main() {
       }
       return results;
     };
-    if (loaded.probes === null) {
+    if (auth) {
+      stage = "general-auth";
+      responses = await auth.verify(runtime, ORIGIN, loaded.manifest);
+    } else if (loaded.probes === null) {
       requireOracle(claim);
       const routes = await verifyUnifiedRoutes(runtime, loaded.manifest);
       stage = "historical-claim";
@@ -654,7 +683,7 @@ async function main() {
       throw new Error("Could not dispose isolated V6 runtime.");
     }
   }
-  process.stdout.write(JSON.stringify(unified ? { continuity: responses } : { responses }) + "\n");
+  process.stdout.write(JSON.stringify(unifiedAuth ? { activation: responses } : unified ? { continuity: responses } : { responses }) + "\n");
 }
 
 try {
@@ -662,6 +691,6 @@ try {
 } catch {
   // Capability strings, package paths, SQL and body bytes stay off stderr.
   const detail = (stage as Stage) === "request" ? `request, case ${caseNumber}` : stage;
-  process.stderr.write(`The isolated ${unified ? "V10" : dynamic ? "V8" : "V6"} Worker oracle could not be confirmed (${detail}).\n`);
+  process.stderr.write(`The isolated ${unifiedAuth ? "V11" : unified ? "V10" : dynamic ? "V8" : "V6"} Worker oracle could not be confirmed (${detail}).\n`);
   process.exitCode = 2;
 }

@@ -88,19 +88,18 @@ function positiveInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
-async function sendTelegram(
-  policy: TelegramPolicy,
-  scope: Pick<TelegramReplyLease, "actorId" | "chatId" | "chatType">,
+async function postTelegram(
+  botToken: string,
+  chatId: string,
   method: "sendMessage" | "sendDocument" | "editMessageText",
   body: Record<string, unknown> | FormData,
   timeoutMs: number,
   request: typeof fetch,
 ): Promise<TelegramReplyOutcome> {
-  if (!inTelegramScope(policy, scope)) return { kind: "failed" };
   try {
     const multipart = body instanceof FormData;
     const editId = method === "editMessageText" && !multipart ? body.message_id : undefined;
-    const response = await request(`${BOT_API}/bot${policy.botToken}/${method}`, {
+    const response = await request(`${BOT_API}/bot${botToken}/${method}`, {
       method: "POST",
       redirect: "manual",
       signal: AbortSignal.timeout(Math.min(SEND_TIMEOUT_MS, timeoutMs)),
@@ -112,7 +111,7 @@ async function sendTelegram(
       const result = record(payload.result);
       const chat = record(result?.chat);
       if (positiveInteger(result?.message_id) && (method !== "editMessageText" || result.message_id === editId) &&
-          typeof chat?.id === "number" && Number.isSafeInteger(chat.id) && String(chat.id) === scope.chatId) {
+          typeof chat?.id === "number" && Number.isSafeInteger(chat.id) && String(chat.id) === chatId) {
         return { kind: "sent", messageId: result.message_id };
       }
     } else if (payload?.ok === false && payload.error_code === response.status &&
@@ -130,6 +129,27 @@ async function sendTelegram(
     // A transport or malformed response cannot prove Telegram did not deliver.
   }
   return { kind: "uncertain" };
+}
+
+function sendTelegram(
+  policy: TelegramPolicy,
+  scope: Pick<TelegramReplyLease, "actorId" | "chatId" | "chatType">,
+  method: "sendMessage" | "sendDocument" | "editMessageText",
+  body: Record<string, unknown> | FormData,
+  timeoutMs: number,
+  request: typeof fetch,
+): Promise<TelegramReplyOutcome> {
+  return inTelegramScope(policy, scope)
+    ? postTelegram(policy.botToken, scope.chatId, method, body, timeoutMs, request)
+    : Promise.resolve({ kind: "failed" });
+}
+
+export function sendGeneralTelegramPrivateReply(
+  botToken: string, actorId: string, messageId: number, text: string,
+): Promise<TelegramReplyOutcome> {
+  return postTelegram(botToken, actorId, "sendMessage", {
+    chat_id: actorId, text, reply_parameters: { message_id: messageId }, link_preview_options: { is_disabled: true },
+  }, 5_000, fetch);
 }
 
 export function sendTelegramGroupShareCard(
