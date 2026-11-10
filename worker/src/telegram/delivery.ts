@@ -1,3 +1,6 @@
+import { AggregateLimitError, getAggregateNodeSource } from "../aggregate.ts";
+import { ExportContentError, planBase64 } from "../base64-response.ts";
+import { PathRuleContentError } from "../path-rules.ts";
 import { listOwnedSubscriptions } from "../subscriptions.ts";
 import { resolveTelegramAggregateCode, TELEGRAM_AGGREGATE_ORIGIN } from "./aggregate-actions.ts";
 import { prepareSelectedLimitTickets, prepareSelectedRevokeTicket, renderTelegramSelected,
@@ -50,10 +53,49 @@ const BOT_API = "https://api.telegram.org";
 const MAX_RESPONSE_BYTES = 64 * 1024;
 const SEND_TIMEOUT_MS = 10_000;
 const CALLBACK_TIMEOUT_MS = 3_000;
+const AGGREGATE_BASE64_TIMEOUT_MS = 2_500;
 const LIST_LIMIT = 20;
 
 type ReplyAccess = "allowed" | "denied" | "none";
 type InlineKeyboard = ({ text: string; callback_data: string } | { text: string; url: string })[][];
+
+async function aggregateBase64Section(db: D1Database, bucket: R2Bucket, code: string, deadline: number): Promise<string> {
+  const unavailable = "Base64：暂时无法验证，请稍后重试。";
+  const start = Date.now();
+  const budget = Math.min(AGGREGATE_BASE64_TIMEOUT_MS, deadline - start - SEND_TIMEOUT_MS);
+  if (budget <= 0) return unavailable;
+  const controller = new AbortController();
+  const { signal } = controller;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  async function preflight(): Promise<string> {
+    try {
+      const source = await getAggregateNodeSource(db, bucket, code, false, signal);
+      if (!source) return unavailable;
+      await planBase64(source, signal);
+      if (Date.now() >= start + budget) return unavailable;
+      return `Base64 聚合订阅链接\n${TELEGRAM_AGGREGATE_ORIGIN}/agg/${code}/base64`;
+    } catch (error) {
+      return error instanceof ExportContentError || error instanceof PathRuleContentError || error instanceof AggregateLimitError
+        ? "Base64：订阅内容不支持此格式。" : unavailable;
+    }
+  }
+
+  // An in-flight binding read can outlast the timer. Cancel further reads without holding up the Clash reply.
+  try {
+    return await Promise.race([
+      preflight(),
+      new Promise<string>((resolve) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          resolve(unavailable);
+        }, budget);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
 
 async function readBotReply(response: Response): Promise<unknown> {
   if (!response.body) return null;
@@ -635,11 +677,15 @@ export async function drainTelegramReplies(
     }
     if (lease.aggregate && lease.chatType === "private" && lease.threadId === null) {
       const code = await resolveTelegramAggregateCode(db, policy, { ...lease, aggregate: lease.aggregate }, aggregateKey);
-      if (code !== null && Date.now() < deadline && await beginTelegramAggregateLinkReply(db, policy, lease)) {
-        const text = `Clash 聚合订阅链接\n${TELEGRAM_AGGREGATE_ORIGIN}/agg/${code}/clash\n发送 /export revoke 可撤销链接。`;
-        const outcome = await sendTelegramReply(policy, lease, text, Math.max(1, deadline - Date.now()), request);
-        await settleTelegramReply(db, policy, lease, outcome);
-        continue;
+      if (code !== null && Date.now() < deadline) {
+        const base64 = await aggregateBase64Section(db, bucket, code, deadline);
+        if (Date.now() < deadline && await beginTelegramAggregateLinkReply(db, policy, lease)) {
+          const text = `Clash 聚合订阅链接\n${TELEGRAM_AGGREGATE_ORIGIN}/agg/${code}/clash\n${base64}\n发送 /export revoke 可撤销链接。`;
+          const remaining = deadline - Date.now();
+          const outcome = remaining > 0 ? await sendTelegramReply(policy, lease, text, remaining, request) : { kind: "failed" as const };
+          await settleTelegramReply(db, policy, lease, outcome);
+          continue;
+        }
       }
     }
     if (lease.privateClaim) {
