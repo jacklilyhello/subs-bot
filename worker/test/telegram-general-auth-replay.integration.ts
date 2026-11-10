@@ -969,8 +969,9 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.equal(await db.prepare("SELECT count(*) AS n FROM telegram_temp_batch WHERE bot_id=? AND actor_id='106'")
     .bind(pin.botId).first("n"), 0);
 
-  const docFile = (updateId: number, actor: number, fileId: string, options: PostOptions = {}) =>
-    new Request("https://app.fixture.invalid/telegram/webhook", { method: "POST",
+  const documentWebhookUrl = "https://app.fixture.invalid/telegram/webhook";
+  const documentRequest = (updateId: number, actor: number, fileId: string, options: PostOptions = {}): RequestInit =>
+    ({ method: "POST",
       headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": pin.webhookSecret },
       body: JSON.stringify({ update_id: updateId, message: {
         from: { id: actor, is_bot: false }, chat: { id: options.chatId ?? actor, type: options.chatType ?? "private" },
@@ -979,7 +980,7 @@ test("closed general authorization replays a sealed candidate in a separate emit
       } }),
     });
   const submitDocument = (id: number, actor: number, file: string, options: PostOptions = {}) =>
-    formats.fetch(docFile(id, actor, file, options));
+    formats.fetch(documentWebhookUrl, documentRequest(id, actor, file, options));
   const documentRow = (id: number) => db.prepare(`SELECT inbox.receipt_nonce AS marker,job.state,job.result_code AS outcome,
     job.file_id IS NULL AS scrubbed,origin.actor_revision AS revision
     FROM telegram_document_jobs AS job JOIN telegram_inbox AS inbox USING (receipt_id)
@@ -993,7 +994,8 @@ test("closed general authorization replays a sealed candidate in a separate emit
   fixtureDocuments.set("fixture-doc-revoked", firstShare);
   await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,'104',10,?,'member')")
     .bind(pin.botId, pin.generation, now + 7).run();
-  assert.equal(await acceptGeneralSharedTelegramCommand(db, cumulativePin, docFile(7500, 101, "fixture-doc-admin")), 204);
+  assert.equal(await acceptGeneralSharedTelegramCommand(db, cumulativePin,
+    new Request(documentWebhookUrl, documentRequest(7500, 101, "fixture-doc-admin"))), 204);
   assert.equal((await submitDocument(7501, 102, "fixture-doc-admin")).status, 204);
   assert.equal((await submitDocument(7502, 101, "fixture-doc-admin", groupEvent)).status, 204);
   assert.equal((await submitDocument(7510, 101, "fixture-doc-admin")).status, 200);
