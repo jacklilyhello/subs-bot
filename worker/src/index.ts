@@ -20,6 +20,7 @@ import { acceptTelegramDocumentJob } from "./telegram/document-jobs.ts";
 import { reconcileTelegramDocumentJobReplies, retireTelegramDocumentStage } from "./telegram/document-persistence.ts";
 import { acceptTelegramLifecycle, reapTelegramLifecycle } from "./telegram/lifecycle-actions.ts";
 import { acceptTelegramGitHubSearch, recoverTelegramGitHubSearch, runTelegramGitHubSearch, telegramGitHubSearchReady } from "./telegram/github-search.ts";
+import { scopeGitHubSearchProof, writeGitHubSearchProof } from "./telegram/github-search-proof.ts";
 import { acceptTelegramGroupShare, telegramGroupShareReady } from "./telegram/group-share-actions.ts";
 import { drainTelegramGroupShareCards } from "./telegram/group-share-delivery.ts";
 import { acceptTelegramBulkTrash, telegramBulkTrashReady } from "./telegram/bulk-trash.ts";
@@ -61,6 +62,7 @@ export interface Env {
   NODES: R2Bucket;
   BUILD_REVISION?: string;
   TELEGRAM_ISOLATION_CONFIG?: string;
+  TELEGRAM_CONFIG_SHA256?: string;
   TELEGRAM_AGGREGATE_KEY?: string;
   TELEGRAM_PRIVATE_SHARE_CREATION_KEY?: string;
   TELEGRAM_GROUP_SHARE_CARDS?: string;
@@ -307,13 +309,19 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
       if (!inlineConsent) return new Response(null, { status: 204, headers: HEADERS });
       if (await acceptTelegramInlineConsent(env.DB, policy, decoded.inlineConsent) === "accepted") drain();
     } else if (decoded.githubSearch) {
+      const receivedAt = Date.now();
       if (!await githubSearch()) return new Response(null, { status: 204, headers: HEADERS });
       const admitted = await acceptTelegramGitHubSearch(env.DB, policy, decoded.githubSearch);
       if (admitted.kind === "ignored") return new Response(null, { status: 204, headers: HEADERS });
       if (admitted.kind === "reply") drain();
       if (admitted.kind === "lookup") {
+        const proof = scopeGitHubSearchProof(new URL(request.url).origin, env.BUILD_REVISION, env.TELEGRAM_CONFIG_SHA256,
+          admitted.query, policy, decoded.githubSearch, receivedAt);
         const lookup = async () => {
-          if (await runTelegramGitHubSearch(env.DB, policy, admitted)) await drainReplies();
+          if (!await runTelegramGitHubSearch(env.DB, policy, admitted, fetch, proof?.observation)) return;
+          const delivery = drainReplies();
+          if (proof) await Promise.all([delivery, writeGitHubSearchProof(env.NODES, proof, admitted.receiptId)]);
+          else await delivery;
         };
         if (ctx) ctx.waitUntil(lookup().catch(() => undefined));
         else await lookup();
