@@ -121,12 +121,19 @@ test("closed general authorization replays a sealed candidate in a separate emit
   const documentConfig = JSON.stringify({ ...JSON.parse(generalConfig), outbox: "shared-private-management-formats-temp-node-document" });
   const documentPin = parseGeneralTelegramPin(documentConfig, fixture.releaseRevision);
   assert.ok(documentPin?.sharedOutbox && documentPin.privateManagement && documentPin.privateFormats
-    && documentPin.privateTemp && documentPin.privateDocument);
+    && documentPin.privateTemp && documentPin.privateDocument && !documentPin.privateProvider);
+  const providerConfig = JSON.stringify({ ...JSON.parse(generalConfig),
+    outbox: "shared-private-management-formats-temp-node-document-provider" });
+  const generalProviderPin = parseGeneralTelegramPin(providerConfig, fixture.releaseRevision);
+  assert.ok(generalProviderPin?.privateProvider && generalProviderPin.privateDocument);
   for (const outbox of ["legacy", "shared-lifecycle", "shared-path", ["shared-private-management"]]) {
     assert.equal(parseGeneralTelegramPin(JSON.stringify({ ...JSON.parse(generalConfig), outbox }),
       fixture.releaseRevision), null);
   }
   const d1Databases = { DB: "sealed-general-auth-replay" };
+  const providerRevision = "a".repeat(40), imageSha256 = "b".repeat(64);
+  const sourceUrl = "https://provider.fixture.invalid/sub/%2f?fixture=signed%2Bvalue";
+  const providerShare = "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.10:8388#general-provider";
   const privateTransport = async (request: Request) => {
     const api = `https://api.telegram.org/bot${generalToken}/`;
     const files = `https://api.telegram.org/file/bot${generalToken}/documents/`;
@@ -202,6 +209,29 @@ test("closed general authorization replays a sealed candidate in a separate emit
     { name: "formats", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: documentConfig, PUBLIC_ORIGIN: PRODUCTION_PUBLIC_ORIGIN },
       outboundService: privateTransport },
+    ...[true, false].map((enabled) => ({ name: enabled ? "provider-open" : "provider-paused", modules: true,
+      script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"], outboundService: privateTransport,
+      serviceBindings: { PROVIDER_FETCH: { name: "provider-rpc", entrypoint: "ProviderFetch" } },
+      bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: providerConfig,
+        PROVIDER_REVISION: providerRevision, PROVIDER_IMAGE_SHA256: imageSha256,
+        ...(enabled ? { TELEGRAM_PROVIDER_URL_IMPORT: "1", TELEGRAM_PROVIDER_REFRESH: "1" } : {}) } })),
+    { name: "provider-rpc", modules: true, compatibilityDate, d1Databases,
+      script: `import { WorkerEntrypoint } from 'cloudflare:workers';
+        export class ProviderFetch extends WorkerEntrypoint {
+          async fetchSubscription(input) {
+            if (Object.keys(input).length !== 3 || input.url !== ${JSON.stringify(sourceUrl)} ||
+                input.providerRevision !== ${JSON.stringify(providerRevision)} || input.imageSha256 !== ${JSON.stringify(imageSha256)}) {
+              throw new Error('Unexpected synthetic provider request.');
+            }
+            const fail = await this.env.DB.prepare('UPDATE general_provider_fixture SET calls=calls+1 RETURNING fail').first('fail');
+            if (fail === 1) return {ok:false,code:'http-status',retryable:false,upstreamStatus:403};
+            const body = new TextEncoder().encode(${JSON.stringify(providerShare)}).buffer;
+            const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', body));
+            return {ok:true,body,bodySha256:Array.from(hash, byte => byte.toString(16).padStart(2,'0')).join(''),
+              metadata:{'profile-title':'General%20Provider.yaml'}};
+          }
+        }
+        export default {fetch(){throw new Error('Public provider transport was invoked.')}};` },
     { name: "replay", modules: true, script: entry.outputFiles[0].text, compatibilityDate, d1Databases, bindings: { REPLAY_PIN: pin },
       outboundService: async (request: Request) => {
         assert.equal(request.url, "https://transport.fixture.invalid/sendMessage");
@@ -1060,6 +1090,130 @@ test("closed general authorization replays a sealed candidate in a separate emit
     .bind(abandonedSnapshot).first(), null);
   assert.deepEqual((await uploaded()).results, original);
 
+  await db.batch([db.prepare("CREATE TABLE general_provider_fixture (calls INTEGER,fail INTEGER) STRICT"),
+    db.prepare("INSERT INTO general_provider_fixture VALUES (0,0)")]);
+  const providerOpen = await runtime.getWorker("provider-open");
+  const providerPaused = await runtime.getWorker("provider-paused");
+  const providerPost = (id: number, text: string, options: PostOptions = {}) => post(101, text, {
+    worker: providerOpen, updateId: id, date: now + 12, ...options, message: { entities: [], ...options.message },
+  });
+  const providerCalls = () => db.prepare("SELECT calls FROM general_provider_fixture").first<number>("calls");
+  const providerRow = () => db.prepare(`SELECT id,name,token,generation,snapshot_id AS snapshotId FROM subscriptions
+    WHERE owner_id='101' AND source_url=?`).bind(sourceUrl).first<{ id: number; name: string; token: string;
+      generation: number; snapshotId: string | null }>();
+  const providerCron = async () => assert.equal((await providerPaused.scheduled({ cron: "* * * * *" })).outcome, "ok");
+  assert.equal((await providerPost(7520, sourceUrl, { worker: providerPaused })).status, 204);
+  assert.equal((await providerPost(7521, sourceUrl, groupEvent)).status, 204);
+  assert.equal((await providerPost(7522, `${sourceUrl}|synthetic-api-key`)).status, 204);
+  assert.equal(await providerRow(), null);
+  assert.equal((await providerPost(7523, sourceUrl)).status, 200);
+  assert.equal((await providerPost(7523, sourceUrl)).status, 204);
+  assert.equal((await providerPost(7526, `Duplicate name | ${sourceUrl}`)).status, 200);
+  assert.equal(await db.prepare("SELECT count(*) AS n FROM telegram_provider_jobs WHERE state='pending'").first("n"), 1);
+  const shell = await providerRow();
+  assert.ok(shell && shell.generation === 0);
+  assert.equal(await providerCalls(), 0);
+  await db.prepare("UPDATE telegram_inbox SET received_at=unixepoch()-901 WHERE bot_id=? AND update_id=7523").bind(pin.botId).run();
+  await providerCron();
+  const saved = await awaitLifecycle(7523);
+  assert.deepEqual({ actor: saved.message.chat_id, text: saved.message.text }, { actor: "101", text: "远程订阅已导入。发送 /list 查看。" });
+  assert.equal((await awaitLifecycle(7526)).message.text, "相同订阅已在处理中。");
+  const published = await providerRow();
+  assert.ok(published?.snapshotId);
+  assert.deepEqual(published, { ...shell, name: "General Provider", generation: 1, snapshotId: published.snapshotId });
+  const downloaded = await providerPaused.fetch(`https://app.fixture.invalid/sub/${published.token}/base64`);
+  assert.equal(downloaded.status, 200);
+  assert.equal(await downloaded.text(), Buffer.from(providerShare).toString("base64"));
+  await db.prepare("UPDATE general_provider_fixture SET fail=1").run();
+  assert.equal((await providerPost(7524, `User name | ${sourceUrl}`)).status, 200);
+  await providerCron();
+  assert.equal((await awaitLifecycle(7524)).message.text, "无法获取远程订阅。");
+  assert.deepEqual(await providerRow(), published);
+  assert.equal((await providerPost(7525, "https://synthetic-user@provider.fixture.invalid/private")).status, 200);
+  await providerCron();
+  assert.equal((await awaitLifecycle(7525)).message.text, "订阅链接无效。请发送单条 HTTP 或 HTTPS 链接。");
+  assert.equal(await providerCalls(), 2);
+  assert.equal(await db.prepare(`SELECT count(*) AS n FROM telegram_inbox WHERE receipt_nonce='general-provider-request:v1'`).first("n"), 4);
+
+  const providerDetail = async (searchId: number, detailId: number, keyword: string, worker = providerOpen) => {
+    assert.equal((await post(101, `/s ${keyword}`, { worker, updateId: searchId, date: now + 12 })).status, 200);
+    const result = await awaitLifecycle(searchId);
+    assert.equal((await callback(detailId, 101, { ...origin(result.messageId, 101), date: now + 12 },
+      detailTicket(result.message), worker)).status, 200);
+    return await awaitLifecycle(detailId);
+  };
+  const refreshButton = (message: (typeof lifecycleSent)[number]) => message.reply_markup?.inline_keyboard?.flat()
+    .find(({ text }) => text === "刷新订阅")?.callback_data;
+  assert.equal(refreshButton((await providerDetail(7530, 7531, "General Provider", providerPaused)).message), undefined);
+  await db.prepare(`INSERT INTO subscriptions (owner_id,name,source_url,token,created_at,updated_at)
+    VALUES ('101','Refresh static fixture','uploaded://refresh-static','refresh-static-fixture-token',?,?)`).bind(now, now).run();
+  assert.equal(refreshButton((await providerDetail(7532, 7533, "Refresh static fixture")).message), undefined);
+
+  const ready = await providerDetail(7534, 7535, "General Provider");
+  const ticket = refreshButton(ready.message);
+  assert.ok(ticket && /^sbpr1_[A-Za-z0-9_-]{21}[AQgw]$/u.test(ticket));
+  const source = { ...origin(ready.messageId, 101), date: now + 12 };
+  assert.equal((await callback(7536, 101, source, ticket, providerPaused)).status, 204);
+  assert.equal((await callback(7537, 103, { ...source, chat: { id: 103, type: "private" } }, ticket, providerOpen)).status, 204);
+  assert.equal((await callback(7538, 101, { ...source, message_id: source.message_id + 1 }, ticket, providerOpen)).status, 204);
+  assert.equal((await callback(7539, 101, { ...source, chat: { id: -100100, type: "supergroup" } }, ticket, providerOpen)).status, 204);
+  await db.prepare("UPDATE subscriptions SET source_url='https://other.fixture.invalid/snapshot' WHERE id=?").bind(published.id).run();
+  assert.equal((await callback(7540, 101, source, ticket, providerOpen)).status, 204);
+  await db.prepare("UPDATE subscriptions SET source_url=? WHERE id=?").bind(sourceUrl, published.id).run();
+  await db.prepare("UPDATE subscriptions SET generation=2 WHERE id=?").bind(published.id).run();
+  assert.equal((await callback(7546, 101, source, ticket, providerOpen)).status, 204);
+  await db.prepare("UPDATE subscriptions SET generation=1 WHERE id=?").bind(published.id).run();
+  const lifecycleRevision = await db.prepare("SELECT revision FROM subscription_lifecycle WHERE subscription_id=?")
+    .bind(published.id).first<number>("revision");
+  assert.ok(lifecycleRevision === 1, "The automatic title performs a guarded rename.");
+  const changeLifecycle = (revision: number) => db.prepare("UPDATE subscription_lifecycle SET revision=? WHERE subscription_id=?")
+    .bind(revision, published.id).run();
+  assert.equal((await changeLifecycle(lifecycleRevision + 1)).meta.changes, 1);
+  try {
+    assert.equal((await callback(7547, 101, source, ticket, providerOpen)).status, 204);
+  } finally {
+    assert.equal((await changeLifecycle(lifecycleRevision)).meta.changes, 1);
+  }
+  await db.prepare(`CREATE TRIGGER fixture_refresh_consumption_abort BEFORE UPDATE OF used_by_receipt_id
+    ON telegram_provider_refresh_tickets BEGIN SELECT RAISE(IGNORE); END`).run();
+  try {
+    assert.equal((await callback(7548, 101, source, ticket, providerOpen)).status, 503);
+    assert.equal(await findReply(7548), null);
+    assert.equal(await db.prepare("SELECT count(*) AS n FROM telegram_provider_jobs WHERE kind='refresh'").first("n"), 0);
+  } finally {
+    await db.prepare("DROP TRIGGER fixture_refresh_consumption_abort").run();
+  }
+  await db.prepare("UPDATE general_provider_fixture SET fail=0").run();
+  assert.equal(await providerCalls(), 2);
+  const attempts = await Promise.all([callback(7541, 101, source, ticket, providerOpen), callback(7541, 101, source, ticket, providerOpen)]);
+  assert.deepEqual(attempts.map(({ status }) => status).sort(), [200, 204]);
+  assert.equal((await callback(7542, 101, source, ticket, providerOpen)).status, 204);
+  assert.deepEqual(await db.prepare(`SELECT job.kind,job.state,job.source_sha256=ticket.source_sha256 AS exactSource,
+    job.expected_generation=ticket.generation AS exactGeneration,job.expected_lifecycle_revision=ticket.lifecycle_revision AS exactLifecycle
+    FROM telegram_provider_refresh_tickets AS ticket JOIN telegram_provider_requests AS request ON request.receipt_id=ticket.used_by_receipt_id
+    JOIN telegram_provider_jobs AS job USING(job_id) JOIN telegram_inbox AS inbox ON inbox.receipt_id=request.receipt_id
+    WHERE inbox.bot_id=? AND inbox.update_id=7541`).bind(pin.botId).first(), {
+    kind: "refresh", state: "pending", exactSource: 1, exactGeneration: 1, exactLifecycle: 1,
+  });
+  await providerCron(); // Admission is off in this Worker, but the accepted refresh still settles.
+  assert.equal((await awaitLifecycle(7541)).message.text, "远程订阅已刷新。发送 /list 查看。");
+  const refreshed = await providerRow();
+  assert.ok(refreshed?.snapshotId && refreshed.snapshotId !== published.snapshotId);
+  assert.deepEqual(refreshed, { ...published, generation: 2, snapshotId: refreshed.snapshotId });
+
+  const next = await providerDetail(7543, 7544, "General Provider");
+  const nextTicket = refreshButton(next.message);
+  assert.ok(nextTicket);
+  const nextOrigin = { ...origin(next.messageId, 101), date: now + 12 };
+  await db.prepare("UPDATE general_provider_fixture SET fail=1").run();
+  assert.equal((await callback(7545, 101, nextOrigin, nextTicket, providerOpen)).status, 200);
+  await providerCron();
+  assert.equal((await awaitLifecycle(7545)).message.text, "无法获取远程订阅。");
+  assert.deepEqual(await providerRow(), refreshed);
+  assert.equal(await providerCalls(), 4);
+  assert.doesNotMatch(JSON.stringify(lifecycleSent.filter(({ reply_parameters }) => reply_parameters.message_id >= 7520)),
+    /provider\.fixture|signed%2Bvalue|synthetic-user|ss:\/\//u);
+
   const rehearsal = await runtime.getWorker("rehearsal");
   const lanePost = (actor: number, command: string, options: PostOptions = {}) =>
     post(actor, command, { secret: isolation.webhookSecret, date: now - 3, ...options, worker: rehearsal });
@@ -1104,8 +1258,9 @@ test("closed general authorization replays a sealed candidate in a separate emit
   ]);
   const open = await readGeneralReadLane(db, isolation, fixture.releaseRevision);
   assert.ok(open?.pin?.rehearsal && open.mode === "general");
-  assert.deepEqual([open.pin.privateManagement, open.pin.privateFormats, open.pin.privateTemp, open.pin.privateDocument],
-    [false, false, false, false], "the rehearsal enables only private reads");
+  assert.deepEqual([open.pin.privateManagement, open.pin.privateFormats, open.pin.privateTemp,
+    open.pin.privateDocument, open.pin.privateProvider], [false, false, false, false, false],
+    "the rehearsal enables only private reads");
   assert.equal((await lanePost(182, "/list", { updateId: 8102, date: now - 21 })).status, 503,
     "uncommitted pre-cutover delivery is held for the original lane");
   assert.equal((await lanePost(183, "/list", { updateId: 8104 })).status, 204);

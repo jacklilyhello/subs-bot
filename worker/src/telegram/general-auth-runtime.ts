@@ -16,6 +16,7 @@ export interface GeneralTelegramPin extends TelegramBotCredentials {
   privateFormats: boolean;
   privateTemp: boolean;
   privateDocument: boolean;
+  privateProvider: boolean;
   rehearsal?: GeneralReadLaneScope;
 }
 
@@ -45,7 +46,8 @@ export function parseGeneralTelegramPin(input: unknown, releaseRevision: unknown
     const value = JSON.parse(input) as Record<string, unknown> | null;
     if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
     const sharedOutbox = Object.hasOwn(value, "outbox");
-    const privateDocument = value.outbox === "shared-private-management-formats-temp-node-document";
+    const privateProvider = value.outbox === "shared-private-management-formats-temp-node-document-provider";
+    const privateDocument = value.outbox === "shared-private-management-formats-temp-node-document" || privateProvider;
     const cumulative = value.outbox === "shared-private-management-formats-temp" || privateDocument;
     const privateFormats = value.outbox === "shared-private-management-formats" || cumulative;
     const privateTemp = value.outbox === "shared-private-temp" || cumulative;
@@ -59,7 +61,7 @@ export function parseGeneralTelegramPin(input: unknown, releaseRevision: unknown
       || !Number.isSafeInteger(cutoverAt) || cutoverAt < 1 || typeof activationSha256 !== "string"
       || !/^[0-9a-f]{64}(?![\s\S])/u.test(activationSha256)) return null;
     return { ...credentials, generation, cutoverAt, activationSha256, releaseRevision, sharedOutbox, privateManagement,
-      privateFormats, privateTemp, privateDocument };
+      privateFormats, privateTemp, privateDocument, privateProvider };
   } catch {
     return null;
   }

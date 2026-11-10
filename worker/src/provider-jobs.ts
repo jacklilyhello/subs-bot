@@ -3,6 +3,8 @@ import { normalizeSubscriptionName } from "./subscriptions.ts";
 import { isolatedTelegramRoleEpochSql } from "./telegram/authorization-sql.ts";
 import { providerDocumentOrigin } from "./telegram/provider-document-origin.ts";
 import { providerInitialTitleReady } from "./provider-initial-title.ts";
+import { GENERAL_LATEST_ACTOR_SQL, GENERAL_NO_LEGACY_WORK, GENERAL_POLICY_SCHEMA, GENERAL_RECEIPT_SCHEMA,
+  generalPolicyBindings, type GeneralAuthorityPin } from "./telegram/general-receipt.ts";
 
 export const PROVIDER_JOB_TTL_SECONDS = 3600;
 const LEASE_SECONDS = 120;
@@ -13,6 +15,7 @@ export const MAX_PROVIDER_OWNER_SOURCES = 100;
 export const PROVIDER_TRASH_SECONDS = 2_592_000;
 const MAX_URL_BYTES = 8192;
 const SHA256 = /^[0-9a-f]{64}(?![\s\S])/u;
+const REVISION = /^[0-9a-f]{40}(?![\s\S])/u;
 const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}(?![\s\S])/u;
 const encoder = new TextEncoder();
 
@@ -21,12 +24,18 @@ type UrlImport = AdmissionKey & { sourceUrl: string; name?: string; initialTitle
 type Refresh = AdmissionKey & { id: number; expectedGeneration?: number; expectedLifecycleRevision?: number };
 
 export const TELEGRAM_PROVIDER_MARKER = "provider-request:v1";
+export const GENERAL_TELEGRAM_PROVIDER_MARKER = "general-provider-request:v1";
 export const TELEGRAM_PROVIDER_BATCH_PREVIEW_MARKER = "provider-batch-preview:v1";
 export const TELEGRAM_PROVIDER_BATCH_CONFIRM_MARKER = "provider-batch-confirm:v1";
 export type ProviderTelegramPolicy = {
   readonly botId: string; readonly adminId: string; readonly memberId: string; readonly includeDocuments?: true;
 };
-type JobScope = (ProviderTelegramPolicy & { readonly includeBatch?: true; readonly queue?: "batch" }) | "generic";
+export type GeneralProviderAuthority = Readonly<GeneralAuthorityPin> & {
+  readonly family: "general"; readonly includeDocuments?: never; readonly includeBatch?: never; readonly queue?: never;
+};
+export type ProviderQueuePolicy = ProviderTelegramPolicy | GeneralProviderAuthority;
+type JobScope = (ProviderTelegramPolicy & { readonly includeBatch?: true; readonly queue?: "batch" })
+  | GeneralProviderAuthority | "generic";
 // A rollback to the older Telegram consumer must never see batch rows or their leases.
 type JobTable = "subscription_provider_jobs" | "telegram_provider_jobs" | "telegram_provider_batch_jobs";
 
@@ -70,6 +79,11 @@ type SettlementRow = { state: "pending" | "done"; resultCode: string | null };
 const receiptFields = `job_id AS jobId, subscription_id AS subscriptionId, kind,
   source_sha256 AS sourceSha256, result_code AS resultCode`;
 const liveState = "state IN ('pending', 'leased')";
+export const GENERAL_PROVIDER_SCHEMA = `EXISTS (SELECT /* subs-bot:telegram-general-provider-authority:v1 */ 1
+  FROM subs_bot_schema_migrations WHERE position=21 AND name='0021_telegram_provider_admission.sql'
+    AND sha256='c0557767395697de2d9c3073b4493759104f0eabd399b7391ba9204b7e6527bc' AND mode='applied')
+  AND EXISTS (SELECT 1 FROM subs_bot_schema_migrations WHERE position=33 AND name='0033_provider_snapshot_journal.sql'
+    AND sha256='35873c62fd9482bc446fb2c80a675ddc22cf70d3f97d7632877b2ce28cbb3f7f' AND mode='applied')`;
 function jobTable(scope: JobScope): JobTable {
   return scope === "generic" ? "subscription_provider_jobs"
     : scope.queue === "batch" ? "telegram_provider_batch_jobs" : "telegram_provider_jobs";
@@ -147,35 +161,38 @@ function prepareAdmission(
 ): D1PreparedStatement {
   const table = jobTable(scope);
   const same = sameJob(scope, table);
+  const general = scope !== "generic" && "family" in scope;
   const activeJob = `EXISTS (SELECT 1 FROM (${activeJobs(scope)}) AS active
     WHERE active.owner_id = target.owner_id AND active.subscription_id = target.id)`;
+  const canStart = `NOT ${activeJob} AND ${jobCapacity("target.owner_id", scope)}`;
   return db.prepare(`
     WITH candidates AS (
       SELECT subscriptions.id, subscriptions.owner_id, subscriptions.generation,
         ${SUBSCRIPTION_LIFECYCLE_REVISION} AS lifecycle_revision
       FROM subscriptions WHERE ${target.sql} LIMIT 2
-    ), classified AS (
+    ), classified AS ${general ? "MATERIALIZED " : ""}(
       SELECT target.*, ${same.sql} AS coalesced
       FROM candidates AS target WHERE (SELECT count(*) FROM candidates) = 1
         AND target.generation < 9007199254740991
         AND NOT EXISTS (SELECT 1 FROM ${table} WHERE owner_id = target.owner_id AND request_key = ?)
-        AND (${same.sql} OR (NOT ${activeJob} AND ${jobCapacity("target.owner_id", scope)}))
+        ${general ? "" : `AND (${same.sql} OR (${canStart}))`}
     )
     INSERT INTO ${table}
       (owner_id, request_key, kind, subscription_id, source_sha256, expected_generation, expected_lifecycle_revision,
        state, created_at, due_at, expires_at, result_code, finished_at)
     SELECT owner_id, ?, ?, id, ?, generation, lifecycle_revision, CASE WHEN coalesced THEN 'done' ELSE 'pending' END,
       unixepoch(), unixepoch(), unixepoch() + ${PROVIDER_JOB_TTL_SECONDS}, CASE WHEN coalesced THEN 'coalesced' END,
-      CASE WHEN coalesced THEN unixepoch() END FROM classified WHERE 1
+      CASE WHEN coalesced THEN unixepoch() END FROM classified AS target WHERE ${general ? `coalesced OR (${canStart})` : "1"}
     ON CONFLICT (owner_id, request_key) DO NOTHING
     RETURNING ${receiptFields}
-  `).bind(...target.bindings, digest, ...same.bindings, key.requestKey, digest, ...same.bindings, key.requestKey, kind, digest);
+  `).bind(...target.bindings, digest, ...same.bindings, key.requestKey,
+    ...(general ? [] : [digest, ...same.bindings]), key.requestKey, kind, digest);
 }
 
 function prepareAdmissionPlan(
   db: D1Database, key: AdmissionKey, kind: ProviderJobLease["kind"], target: Guard, digest: string,
   refusal: Guard, create?: { sourceUrl: string; name: string; initialTitle?: boolean }, fence?: Guard,
-  authorization?: ProviderTelegramPolicy, includeBatch = false,
+  authorization?: ProviderQueuePolicy, includeBatch = false,
 ): AdmissionPlan {
   const steps: D1PreparedStatement[] = [];
   const scope = jobScope(authorization, includeBatch);
@@ -258,7 +275,7 @@ async function admit(
 }
 
 export async function prepareProviderUrlImport(
-  db: D1Database, input: UrlImport, fence?: Guard, authorization?: ProviderTelegramPolicy, includeBatch = false,
+  db: D1Database, input: UrlImport, fence?: Guard, authorization?: ProviderQueuePolicy, includeBatch = false,
 ): Promise<{ digest: string; plan: AdmissionPlan }> {
   validateKey(input);
   const host = providerHost(input.sourceUrl);
@@ -280,7 +297,7 @@ export async function prepareProviderUrlImport(
 }
 
 export async function prepareOwnedProviderRefresh(
-  db: D1Database, input: Refresh, fence?: Guard, readFence?: Guard, authorization?: ProviderTelegramPolicy, includeBatch = false,
+  db: D1Database, input: Refresh, fence?: Guard, readFence?: Guard, authorization?: ProviderQueuePolicy, includeBatch = false,
 ): Promise<{ digest: string; plan: AdmissionPlan } | null> {
   validateKey(input);
   const { id, expectedGeneration, expectedLifecycleRevision } = input;
@@ -372,8 +389,34 @@ export function telegramProviderBatchOrigin(policy: ProviderTelegramPolicy, forR
     bindings: [policy.botId, policy.adminId, policy.memberId] };
 }
 
+function generalJobAuthorization(scope: GeneralProviderAuthority, alias: "job" | "active", forRetirement: boolean): Guard {
+  // Join the one exact receipt and recorded actor directly. Nesting another
+  // authority subquery here exceeds D1's depth in the leased-source read.
+  const policyJoin = forRetirement ? "" : `JOIN telegram_general_policy AS policy
+    ON (policy.bot_id=inbox.bot_id AND policy.generation=recorded.generation)
+    AND (policy.release_revision=recorded.release_revision AND policy.activation_sha256=recorded.activation_sha256
+      AND policy.cutover_at=recorded.cutover_at)`;
+  const current = forRetirement ? "" : `AND (policy.active=1 AND (${GENERAL_NO_LEGACY_WORK}) AND (${GENERAL_LATEST_ACTOR_SQL}))`;
+  return { sql: `EXISTS (SELECT 1 FROM telegram_provider_requests AS origin
+    JOIN telegram_inbox AS inbox USING (receipt_id) JOIN telegram_general_receipt AS recorded USING (receipt_id)
+    JOIN telegram_general_actors AS actor ON (actor.bot_id=inbox.bot_id AND actor.actor_id=inbox.actor_id)
+      AND (actor.generation=recorded.generation AND actor.revision=recorded.actor_revision AND actor.role=recorded.actor_role)
+    ${policyJoin}
+    WHERE (origin.job_id=${alias}.job_id AND origin.kind=${alias}.kind AND origin.outcome='admitted'
+      AND inbox.actor_id=${alias}.owner_id AND origin.actor_role=recorded.actor_role
+      AND origin.auth_message_date=0 AND origin.auth_message_id=0)
+      AND (inbox.chat_type='private' AND inbox.chat_id=inbox.actor_id AND inbox.thread_id IS NULL
+        AND inbox.command='help' AND inbox.receipt_nonce='${GENERAL_TELEGRAM_PROVIDER_MARKER}')
+      AND (inbox.bot_id=? AND recorded.generation=? AND recorded.activation_sha256=?
+        AND recorded.release_revision=? AND recorded.cutover_at=?)
+      AND (actor.effective_at<inbox.message_date AND recorded.cutover_at<inbox.message_date)
+      AND (${GENERAL_PROVIDER_SCHEMA}) AND (${GENERAL_POLICY_SCHEMA} AND ${GENERAL_RECEIPT_SCHEMA}) ${current})`,
+    bindings: generalPolicyBindings(scope) };
+}
+
 function scopeAuthorization(scope: JobScope, alias: "job" | "active" = "job", forRetirement = false): Guard {
   if (scope === "generic") return { sql: "1", bindings: [] };
+  if ("family" in scope) return generalJobAuthorization(scope, alias, forRetirement);
   if (scope.queue === "batch") {
     const origin = telegramProviderBatchOrigin(scope, forRetirement);
     return { sql: `EXISTS (SELECT 1 FROM telegram_provider_batches AS batch WHERE batch.batch_id=${alias}.batch_id
@@ -402,10 +445,20 @@ function scopeAuthorization(scope: JobScope, alias: "job" | "active" = "job", fo
   ))`, bindings: [...direct.bindings, ...document.bindings] };
 }
 
-function jobScope(policy?: ProviderTelegramPolicy, includeBatch = false, queue?: "batch"): JobScope {
+function jobScope(policy?: ProviderQueuePolicy, includeBatch = false, queue?: "batch"): JobScope {
   if (!policy) {
     if (includeBatch || queue) throw new Error("Invalid provider authorization policy.");
     return "generic";
+  }
+  if ("family" in policy) {
+    const { botId, generation, releaseRevision, activationSha256, cutoverAt } = policy;
+    checkOwnerId(botId);
+    if (policy.family !== "general" || includeBatch || queue || !validInteger(generation, 1) || !validInteger(cutoverAt, 1)
+      || typeof releaseRevision !== "string" || !REVISION.test(releaseRevision)
+      || typeof activationSha256 !== "string" || !SHA256.test(activationSha256)) {
+      throw new Error("Invalid provider authorization policy.");
+    }
+    return Object.freeze({ family: "general" as const, botId, generation, releaseRevision, activationSha256, cutoverAt });
   }
   const { botId, adminId, memberId } = policy;
   [botId, adminId, memberId].forEach(checkOwnerId);
@@ -429,13 +482,15 @@ function validateClaim(row: ClaimedRow): void {
 
 function leaseGuard(lease: ClaimedRow, scope: JobScope, forRetirement = false): Guard {
   const authorization = scopeAuthorization(scope, "job", forRetirement);
+  const exact = ["job.job_id = ? AND job.owner_id = ? AND job.request_key = ? AND job.kind = ?",
+    "job.subscription_id = ? AND job.source_sha256 = ? AND job.expected_generation = ? AND job.expected_lifecycle_revision = ?",
+    "job.state = 'leased' AND job.lease_id = ? AND job.attempts = ? AND job.lease_until = ? AND job.expires_at = ?",
+    "job.lease_until > unixepoch() AND job.expires_at > unixepoch()"];
+  // Keep the exact lease identity from adding depth to the general grant predicate.
+  const fields = scope !== "generic" && "family" in scope ? exact.map((part) => `(${part})`) : exact;
   return {
     sql: `EXISTS (SELECT 1 FROM ${jobTable(scope)} AS job
-      WHERE job.job_id = ? AND job.owner_id = ? AND job.request_key = ? AND job.kind = ?
-        AND job.subscription_id = ? AND job.source_sha256 = ? AND job.expected_generation = ?
-        AND job.expected_lifecycle_revision = ? AND job.state = 'leased'
-        AND job.lease_id = ? AND job.attempts = ? AND job.lease_until = ? AND job.expires_at = ?
-        AND job.lease_until > unixepoch() AND job.expires_at > unixepoch() AND (${authorization.sql}))`,
+      WHERE ${fields.join(" AND ")} AND (${authorization.sql}))`,
     bindings: [lease.jobId, lease.ownerId, lease.requestKey, lease.kind, lease.id, lease.sourceSha256,
       lease.expectedGeneration, lease.expectedLifecycleRevision, lease.leaseId, lease.attempts,
       lease.leaseUntil, lease.expiresAt, ...authorization.bindings],
@@ -531,7 +586,7 @@ function claimCandidates(scopes: readonly JobScope[]): Guard {
 }
 
 /** Include batch scope on every Telegram-family admission and claim while batch work can be live. */
-export async function claimProviderJob(db: D1Database, policy?: ProviderTelegramPolicy, includeBatch = false): Promise<ProviderJobLease | null> {
+export async function claimProviderJob(db: D1Database, policy?: ProviderQueuePolicy, includeBatch = false): Promise<ProviderJobLease | null> {
   try {
     const single = jobScope(policy, includeBatch);
     const scopes = includeBatch ? [single, jobScope(policy, true, "batch")] : [single];
@@ -560,10 +615,16 @@ export async function claimProviderJob(db: D1Database, policy?: ProviderTelegram
     validateClaim(lease);
     if (lease.leaseId !== leaseId) throw new Error("Provider job claim could not be confirmed.");
     const live = leaseGuard(lease, scope);
-    const sourceUrl = await db.prepare(`SELECT source_url FROM subscriptions WHERE id = ? AND owner_id = ?
-      AND generation = ? AND ${SUBSCRIPTION_LIFECYCLE_REVISION} = ? AND ${live.sql}`)
-      .bind(lease.id, lease.ownerId, lease.expectedGeneration, lease.expectedLifecycleRevision, ...live.bindings)
-      .first<string>("source_url");
+    const sourceTarget = "id = ? AND owner_id = ? AND generation = ?";
+    const sourceBindings = [lease.id, lease.ownerId, lease.expectedGeneration, lease.expectedLifecycleRevision];
+    const source = scope !== "generic" && "family" in scope
+      ? db.prepare(`WITH lease_authority AS MATERIALIZED (SELECT (${live.sql}) AS allowed)
+        SELECT source_url FROM subscriptions CROSS JOIN lease_authority
+        WHERE (${sourceTarget} AND ${SUBSCRIPTION_LIFECYCLE_REVISION} = ?) AND lease_authority.allowed`)
+        .bind(...live.bindings, ...sourceBindings)
+      : db.prepare(`SELECT source_url FROM subscriptions WHERE ${sourceTarget}
+        AND ${SUBSCRIPTION_LIFECYCLE_REVISION} = ? AND ${live.sql}`).bind(...sourceBindings, ...live.bindings);
+    const sourceUrl = await source.first<string>("source_url");
     if (sourceUrl !== null && providerHost(sourceUrl) && await providerSourceDigest(sourceUrl) === lease.sourceSha256) {
       return Object.freeze({ ...lease, sourceUrl, scope });
     }

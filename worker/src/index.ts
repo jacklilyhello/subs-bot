@@ -26,6 +26,7 @@ import { acceptGeneralTelegramCommand, drainGeneralTelegramReply, generalReadEve
   recoverGeneralTelegramReplies } from "./telegram/general-auth-runtime.ts";
 import { acceptGeneralReadLaneCommand, acceptGeneralSharedTelegramCommand, drainGeneralSharedTelegramReply,
   recoverGeneralSharedTelegramReplies } from "./telegram/general-auth-shared.ts";
+import { generalProviderAuthority, generalProviderSchemaReady } from "./telegram/general-provider.ts";
 import { assertGeneralReadLane, readGeneralReadLane } from "./telegram/general-read-lane.ts";
 import { acceptTelegramGroupShare, telegramGroupShareReady } from "./telegram/group-share-actions.ts";
 import { drainTelegramGroupShareCards } from "./telegram/group-share-delivery.ts";
@@ -55,7 +56,7 @@ import {
   telegramProviderBatchControlsReady,
 } from "./telegram/provider-batch-controls.ts";
 import { parseTelegramProviderText, reconcileTelegramProviderReplies, telegramProviderRepliesReady } from "./telegram/provider-replies.ts";
-import { reapTelegramProviderRefreshTickets, telegramProviderRefreshReady } from "./telegram/provider-refresh.ts";
+import { generalProviderRefreshReady, reapTelegramProviderRefreshTickets, telegramProviderRefreshReady } from "./telegram/provider-refresh.ts";
 import { acceptTelegramCommand } from "./telegram/store.ts";
 import { acceptTelegramTemp } from "./telegram/temp-import.ts";
 import { acceptTelegramView, reapTelegramViewTickets } from "./telegram/views.ts";
@@ -181,6 +182,15 @@ function drainGroupShareCards(db: D1Database, policy: TelegramPolicy): Promise<v
   return drainTelegramGroupShareCards(db, policy, (actorId, method, body) => sendTelegramGroupShareCard(policy, actorId, method, body));
 }
 
+async function generalProviderAdmissionReady(env: Env): Promise<boolean> {
+  return await generalProviderSchemaReady(env.DB) && await telegramProviderQueueReady(env) && await providerSnapshotJournalReady(env.DB);
+}
+
+function generalProviderRefreshAvailability(env: Env, enabled: boolean) {
+  return enabled && env.TELEGRAM_PROVIDER_REFRESH === "1"
+    ? async () => await generalProviderRefreshReady(env.DB) && await generalProviderAdmissionReady(env) : undefined;
+}
+
 async function telegramWebhook(request: Request, env: Env, publicOrigin: PublicOrigin, ctx?: ExecutionContext): Promise<Response> {
   if (request.method !== "POST") {
     return plain("Method not allowed.", 405, request.method === "HEAD", { Allow: "POST" });
@@ -190,11 +200,14 @@ async function telegramWebhook(request: Request, env: Env, publicOrigin: PublicO
     const general = parseGeneralTelegramPin(env.TELEGRAM_GENERAL_CONFIG, env.BUILD_REVISION);
     if (!general) return plain("Service unavailable.", 503, false);
     try {
+      const providerAvailable = general.privateProvider && env.TELEGRAM_PROVIDER_URL_IMPORT === "1"
+        ? () => generalProviderAdmissionReady(env) : undefined;
+      const refreshAvailable = generalProviderRefreshAvailability(env, general.privateProvider);
       const status = general.sharedOutbox ? await acceptGeneralSharedTelegramCommand(env.DB, general, request,
-        (callbackId) => ctx?.waitUntil(answerTelegramCallback(general, callbackId)))
+        (callbackId) => ctx?.waitUntil(answerTelegramCallback(general, callbackId)), providerAvailable, refreshAvailable)
         : await acceptGeneralTelegramCommand(env.DB, general, request);
       if (status === 200) {
-        const delivery = general.sharedOutbox ? drainGeneralSharedTelegramReply(env.DB, general, env.NODES, publicOrigin)
+        const delivery = general.sharedOutbox ? drainGeneralSharedTelegramReply(env.DB, general, env.NODES, publicOrigin, refreshAvailable)
           : drainGeneralTelegramReply(env.DB, general);
         if (ctx) ctx.waitUntil(delivery.catch(() => undefined));
         else await delivery;
@@ -716,7 +729,21 @@ async function scheduled(_controller: ScheduledController, env: Env): Promise<vo
             }
           }
         } finally {
-          await recoverGeneralSharedTelegramReplies(env.DB, general, env.NODES, publicOrigin);
+          try {
+            if (general.privateProvider && await generalProviderSchemaReady(env.DB)) {
+              const authority = generalProviderAuthority(general);
+              try {
+                if (await telegramProviderQueueReady(env, pin)) {
+                  await runOneProviderJob(env.DB, env.NODES, env.PROVIDER_FETCH, pin, authority);
+                }
+              } finally {
+                await reconcileTelegramProviderReplies(env.DB, authority);
+              }
+            }
+          } finally {
+            await recoverGeneralSharedTelegramReplies(env.DB, general, env.NODES, publicOrigin,
+              generalProviderRefreshAvailability(env, general.privateProvider));
+          }
         }
       } else if (general) await recoverGeneralTelegramReplies(env.DB, general);
     }
