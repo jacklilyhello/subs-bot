@@ -110,6 +110,46 @@ def exchange_url(value):
     return value
 
 
+def preview_upload_token(session, transport, stage):
+    initial = header_token(session.get("token"))
+    if session.get("exchange_url") is None:
+        stage("exchange", outcome="initial-token-no-exchange")
+        return initial
+
+    try:
+        url = exchange_url(session["exchange_url"])
+    except ValueError:
+        stage("exchange", outcome="origin-refused")
+        raise
+
+    try:
+        code, _, raw = transport(url)
+    except (OSError, HTTPException):
+        stage("exchange", outcome="transport-refused")
+        raise
+    except ProbeError:
+        stage("exchange", outcome="response-refused")
+        raise
+
+    # Wrangler falls back to the initial session token when the exchange fails.
+    # Keep the verified project origin, and use that token only at the fixed
+    # Cloudflare preview-upload API. Only a 400 exchange rejection or an
+    # unusable 200 response qualifies for the fallback.
+    if code == 200:
+        try:
+            expanded = header_token(read_json(raw).get("token"))
+        except ValueError:
+            stage("exchange", http_status=code, outcome="initial-token-invalid-reply")
+            return initial
+        stage("exchange", http_status=code, outcome="exchanged")
+        return expanded
+    if code == 400:
+        stage("exchange", http_status=code, outcome="initial-token-http-rejection")
+        return initial
+    stage("exchange", http_status=code, outcome="status-refused")
+    raise ProbeError()
+
+
 def multipart(module):
     boundary = f"subsbot-{uuid4().hex}"
     metadata = {"main_module": MODULE, "bindings": [], "compatibility_date": COMPATIBILITY,
@@ -190,19 +230,15 @@ def run(stage, revision, module, account, deploy_token, *, guard=github.require_
         # The two edge-preview calls follow the official Wrangler legacy remote-dev
         # flow. Only this POST uploads code. No deployment, routes, settings or tail.
         code, _, raw = transport(f"{script}/subdomain/edge-preview", headers=api)
-        session = cf_result(code, raw)
-        token = header_token(session.get("token"))
-        if session.get("exchange_url") is not None:
-            stage("exchange")
-            code, _, raw = transport(exchange_url(session["exchange_url"]))
-            require(code == 200)
-            token = header_token(read_json(raw).get("token"))
+        stage("session", http_status=code)
+        token = preview_upload_token(cf_result(code, raw), transport, stage)
         stage("upload")
         content_type, body = multipart(module)
         guard(revision)
         code, _, raw = transport(f"{script}/edge-preview", method="POST", body=body, headers={
             **api, "Content-Type": content_type, "CF-Preview-Upload-Config-Token": token,
         })
+        stage("upload", http_status=code)
         # Discard tail_url and all other response values.
         preview_token = header_token(cf_result(code, raw, upload=True).get("preview_token"))
         stage("anonymous-denial")
@@ -228,10 +264,15 @@ def run(stage, revision, module, account, deploy_token, *, guard=github.require_
 
 def main():
     phase = "artifact"
+    phase_status = None
+    exchange = None
 
-    def stage(label):
-        nonlocal phase
+    def stage(label, *, http_status=None, outcome=None):
+        nonlocal phase, phase_status, exchange
         phase = label
+        phase_status = http_status if type(http_status) is int and 100 <= http_status <= 599 else None
+        if label == "exchange":
+            exchange = {"outcome": outcome, "httpStatus": phase_status}
 
     try:
         revision = os.environ.get("GITHUB_SHA", "")
@@ -249,9 +290,10 @@ def main():
         require(target.get("namespace") == NAMESPACE)
         result = run(stage, revision, module, target.get("accountId"), os.environ.get("SUBS_BOT_CF_DEPLOY_TOKEN"))
         print(json.dumps({"mode": "cloudflare-edge-preview", "moduleSha256": digest, "previewIsolated": True,
-                          "report": result}, separators=(",", ":")))
+                          "report": result, "exchange": exchange}, separators=(",", ":")))
     except (OSError, ValueError, HTTPException, BadZipFile):
         print(f"Cloudflare Grep edge preview could not be confirmed at {phase}.")
+        print(json.dumps({"stage": phase, "httpStatus": phase_status, "exchange": exchange}, separators=(",", ":")))
         return 2
     return 0
 
