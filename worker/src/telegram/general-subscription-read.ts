@@ -119,8 +119,10 @@ export async function renderGeneralSubscriptionRead(
       lease.receiptId, pin.botId, lease.actorId).first<number>("revision");
     if (!validInteger(revision, 0)) return { text: "订阅不存在或已被更改。", readGuard: guard };
     return renderGeneralSubscriptionMetadata(db, lease.actorId, row.subscriptionId, revision, {
-      sql: `(${guard.sql}) AND EXISTS (SELECT 1 ${DETAIL_PROOF} AND ticket.subscription_id=?
-        AND ticket.used_by_receipt_id=inbox.receipt_id AND origin.bot_id=inbox.bot_id AND origin.actor_id=inbox.actor_id)`,
+      sql: `CASE WHEN (${guard.sql}) IS NOT TRUE THEN 0
+        WHEN EXISTS (SELECT 1 ${DETAIL_PROOF} AND ticket.subscription_id=?
+          AND ticket.used_by_receipt_id=inbox.receipt_id AND origin.bot_id=inbox.bot_id AND origin.actor_id=inbox.actor_id)
+        THEN 1 ELSE 0 END`,
       bindings: [...guard.bindings, ...generalPolicyBindings(pin), row.subscriptionId],
     });
   }

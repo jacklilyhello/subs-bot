@@ -227,16 +227,24 @@ export async function claimGeneralSharedTelegramReply(db: D1Database, pin: Gener
 
 function selectLease(pin: GeneralTelegramPin, lease: SharedReadLease, authorizing: boolean, metadata?: MetadataReply) {
   const group = lease.chatType !== "private";
-  return { sql: `SELECT inbox.receipt_id FROM telegram_inbox AS inbox
-    JOIN telegram_general_receipt AS authority USING (receipt_id)
+  const exact = `FROM telegram_inbox AS inbox JOIN telegram_general_receipt AS authority USING (receipt_id)
     WHERE inbox.bot_id=? AND inbox.receipt_id=? AND inbox.update_id=? AND inbox.actor_id=?
       AND inbox.chat_id=? AND inbox.chat_type=? AND inbox.thread_id IS ? AND inbox.message_id=? AND inbox.message_date=?
       AND inbox.command=? AND inbox.receipt_nonce=? AND authority.actor_revision=? AND authority.actor_role=?
-      AND ${generalRecordedOriginSql("inbox")} AND ${family("inbox", group, pin.privateManagement)}
-      ${authorizing ? `AND ${current("inbox", group, pin.privateManagement)}` : ""} ${metadata ? `AND (${metadata.sql})` : ""}`,
-  bindings: [pin.botId, lease.receiptId, lease.updateId, lease.actorId, lease.chatId, lease.chatType, lease.threadId,
+      AND ${generalRecordedOriginSql("inbox")} AND ${family("inbox", group, pin.privateManagement)}`;
+  const exactBindings = [pin.botId, lease.receiptId, lease.updateId, lease.actorId, lease.chatId, lease.chatType, lease.threadId,
     lease.messageId, lease.messageDate, lease.command, lease.marker, lease.actorRevision, lease.actorRole,
-    ...generalPolicyBindings(pin, lease.generation), ...(authorizing ? generalPolicyBindings(pin) : []), ...(metadata?.bindings ?? [])] };
+    ...generalPolicyBindings(pin, lease.generation)];
+  const eligible = current("inbox", group, pin.privateManagement);
+  if (authorizing && metadata) {
+    // Keep the current grant and the origin/target proof separate inside the atomic begin.
+    return { sql: `WITH candidate AS MATERIALIZED (
+      SELECT inbox.receipt_id,(${eligible}) AS eligible,(${metadata.sql}) AS prepared ${exact}
+    ) SELECT receipt_id FROM candidate WHERE eligible AND prepared`,
+    bindings: [...generalPolicyBindings(pin), ...metadata.bindings, ...exactBindings] };
+  }
+  return { sql: `SELECT inbox.receipt_id ${exact} ${authorizing ? `AND ${eligible}` : ""}`,
+    bindings: [...exactBindings, ...(authorizing ? generalPolicyBindings(pin) : [])] };
 }
 
 export async function beginGeneralSharedTelegramReply(
