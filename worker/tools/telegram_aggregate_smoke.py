@@ -211,8 +211,9 @@ class Cohort:
     def __init__(self, resources, policy, cohort, encoded, identity):
         self.resources, self.policy, self.cohort, self.encoded, self.identity = resources, policy, cohort, encoded, identity
         self.actors = {role: policy[field] for role, field in ROLES.items()}
-        self.prefix = SOURCE + cohort + "/"
-        self.name = "CFAG-" + cohort
+        if cohort is not None:
+            self.prefix = SOURCE + cohort + "/"
+            self.name = "CFAG-" + cohort
 
     def read(self, sql, *params):
         return self.resources.query(sql, params)
