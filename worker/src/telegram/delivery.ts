@@ -609,8 +609,14 @@ export async function drainTelegramReplies(
     }
     if (lease.providerBatch) {
       const prepared = await renderTelegramProviderBatchReply(db, policy, lease);
-      if (Date.now() >= deadline || !await beginTelegramProviderBatchReply(db, policy, lease, prepared) || !prepared) continue;
-      const buttons = prepared.ticket ? [[{ text: "确认刷新", callback_data: prepared.ticket.value }]] : undefined;
+      if (Date.now() >= deadline) continue;
+      const begun = await beginTelegramProviderBatchReply(db, policy, lease, prepared);
+      if (begun === "closed" || !prepared) continue;
+      let buttons: InlineKeyboard | undefined;
+      if (prepared.ticket) buttons = [[{ text: "确认刷新", callback_data: prepared.ticket.value }]];
+      if (begun === "cleanup-installed" && prepared.cleanup) {
+        buttons = [[{ text: `确认将本批 ${prepared.cleanup.count} 条失败订阅移入回收站`, callback_data: prepared.cleanup.token }]];
+      }
       const outcome = await sendTelegramReply(policy, lease, prepared.text, Math.max(1, deadline - Date.now()), request, buttons);
       await settleTelegramReply(db, policy, lease, outcome);
       continue;

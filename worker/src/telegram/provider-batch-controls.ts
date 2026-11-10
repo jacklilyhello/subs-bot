@@ -3,6 +3,7 @@ import {
   TELEGRAM_PROVIDER_BATCH_CONFIRM_MARKER, TELEGRAM_PROVIDER_BATCH_PREVIEW_MARKER, type ProviderSql,
 } from "../provider-jobs.ts";
 import { SUBSCRIPTION_LIFECYCLE_REVISION, validInteger } from "../storage.ts";
+import { prepareFailedBatchTrashOffer, type FailedBatchTrashOffer } from "./bulk-trash.ts";
 import {
   prepareTelegramProviderBatchAdmission, PROVIDER_BATCH_MAX_TARGETS, readTelegramProviderBatchProgress,
   type TelegramProviderBatchInput, type TelegramProviderBatchProgress,
@@ -260,7 +261,9 @@ export async function acceptTelegramProviderBatchControl(
   }
 }
 
-export type TelegramProviderBatchDelivery = { text: string; guard: ProviderSql; ticket?: { value: string; sha256: string } };
+export type TelegramProviderBatchDelivery = { text: string; guard: ProviderSql } & (
+  { ticket?: { value: string; sha256: string }; cleanup?: never } | { ticket?: never; cleanup: FailedBatchTrashOffer }
+);
 
 const notices: Record<Exclude<Kind, "preview" | "status" | "terminal">, string> = {
   empty: "没有可远程刷新的订阅。",
@@ -289,9 +292,8 @@ const resultLabels = { saved: "已保存", failed: "失败", stale: "已变更",
 
 async function renderTerminalResults(
   db: D1Database, policy: TelegramPolicy, actorId: string, progress: TelegramProviderBatchProgress,
-): Promise<string> {
-  const unavailable = "\n暂时无法核对逐条结果。";
-  if (!validInteger(progress.targetCount, 1, PROVIDER_BATCH_MAX_TARGETS)) return unavailable;
+): Promise<string | null> {
+  if (!validInteger(progress.targetCount, 1, PROVIDER_BATCH_MAX_TARGETS)) return null;
   const origin = telegramProviderBatchOrigin(policy);
   try {
     const rows = await db.prepare(`SELECT job.ordinal,job.subscription_id AS id,job.result_code AS result,
@@ -305,21 +307,21 @@ async function renderTerminalResults(
         AND job.state='done' AND (${origin.sql}) ORDER BY job.ordinal LIMIT ${PROVIDER_BATCH_MAX_TARGETS + 1}`)
       .bind(progress.batchId, actorId, progress.finishedAt, ...origin.bindings)
       .all<{ ordinal: number; id: number; result: keyof typeof resultCategories; name: string | null }>();
-    if (!rows.success || rows.results.length !== progress.targetCount) return unavailable;
+    if (!rows.success || rows.results.length !== progress.targetCount) return null;
     const counts = { saved: 0, failed: 0, stale: 0, expired: 0 };
     const lines: string[] = [];
     for (const [index, { ordinal, id, result, name }] of rows.results.entries()) {
-      if (ordinal !== index + 1 || !validInteger(id, 1) || !Object.hasOwn(resultCategories, result)) return unavailable;
+      if (ordinal !== index + 1 || !validInteger(id, 1) || !Object.hasOwn(resultCategories, result)) return null;
       const category = resultCategories[result];
       counts[category] += 1;
       const label = typeof name === "string" ? ` · ${displayTelegramName(name)}` : "";
       lines.push(`订阅 ID ${id}${label}：${resultLabels[category]}`);
     }
     if (counts.saved !== progress.saved || counts.failed !== progress.failed
-      || counts.stale !== progress.stale || counts.expired !== progress.expired) return unavailable;
+      || counts.stale !== progress.stale || counts.expired !== progress.expired) return null;
     return `\n\n本次订阅结果\n${lines.join("\n")}`;
   } catch {
-    return unavailable;
+    return null;
   }
 }
 
@@ -350,11 +352,14 @@ export async function renderTelegramProviderBatchReply(
     const text = renderProgress(progress);
     if (progress.finishedAt === null) return { text, guard };
     const details = await renderTerminalResults(db, policy, lease.actorId, progress);
-    return { text: text + details, guard: {
+    const cleanup = reply.kind === "terminal" && details !== null && progress.failed > 0
+      ? await prepareFailedBatchTrashOffer(db, policy, lease) : null;
+    const presentation = { text: text + (details ?? "\n暂时无法核对逐条结果。"), guard: {
       sql: `(${guard.sql}) AND EXISTS (SELECT 1 FROM telegram_provider_batches AS batch
         WHERE batch.batch_id=? AND batch.bot_id=inbox.bot_id AND batch.actor_id=inbox.actor_id AND batch.finished_at=?)`,
       bindings: [...guard.bindings, progress.batchId, progress.finishedAt],
     } };
+    return cleanup !== null && cleanup.count === progress.failed ? { ...presentation, cleanup } : presentation;
   }
   if (reply.kind !== "preview") {
     const excluded = reply.kind === "empty" && reply.skippedCount > 0 ? `已跳过 ${reply.skippedCount} 条本地或不支持的订阅。` : "";

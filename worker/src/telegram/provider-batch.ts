@@ -155,10 +155,10 @@ export async function prepareTelegramProviderBatchAdmission(
   }
 }
 
-const FAILED = "('attempts-exhausted','invalid-document','fetch-rejected','storage-failed')";
+export const PROVIDER_BATCH_FAILED_RESULTS_SQL = "('attempts-exhausted','invalid-document','fetch-rejected','storage-failed')";
 const countState = (state: string) => `count(CASE WHEN job.state='${state}' THEN 1 END)`;
 const countResult = (predicate: string) => `count(CASE WHEN job.state='done' AND job.result_code ${predicate} THEN 1 END)`;
-const COUNTS = `${countResult("='saved'")} AS saved,${countResult("IN " + FAILED)} AS failed,
+const COUNTS = `${countResult("='saved'")} AS saved,${countResult("IN " + PROVIDER_BATCH_FAILED_RESULTS_SQL)} AS failed,
   ${countResult("='stale-target'")} AS stale,${countResult("='expired'")} AS expired`;
 
 export async function readTelegramProviderBatchProgress(

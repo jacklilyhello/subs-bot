@@ -7,6 +7,7 @@ import { Miniflare } from "miniflare";
 
 import { createSubscription, getSubscriptionSnapshot, publishNodeSnapshot } from "../src/storage.ts";
 import { renameOwnedSubscription } from "../src/subscriptions.ts";
+import { readFailedBatchTrash } from "../src/telegram/provider-batch-failed-trash.ts";
 import type { TelegramPolicy } from "../src/telegram/protocol.ts";
 
 const policy: TelegramPolicy = {
@@ -15,6 +16,7 @@ const policy: TelegramPolicy = {
 };
 const source = "https://provider.example.invalid/path/%2F?secret=synthetic-batch-source";
 const failing = source + "&fail=1";
+const secondFailing = source + "&fail=2";
 const oldShare = "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.10:8388#Initial";
 const newShare = oldShare.replace("#Initial", "#Refreshed");
 const providerRevision = "a".repeat(40);
@@ -93,12 +95,12 @@ test("emitted Worker confirms a private frozen batch and drains it after intake 
       script: `import { WorkerEntrypoint } from 'cloudflare:workers';
         export class ProviderFetch extends WorkerEntrypoint {
           async fetchSubscription(input) {
-            if (![ ${JSON.stringify(source)}, ${JSON.stringify(failing)} ].includes(input.url)
+            if (![ ${JSON.stringify(source)}, ${JSON.stringify(failing)}, ${JSON.stringify(secondFailing)} ].includes(input.url)
               || input.providerRevision !== ${JSON.stringify(providerRevision)} || input.imageSha256 !== ${JSON.stringify(imageSha256)}) {
               throw new Error('Unexpected synthetic batch provider input.');
             }
             await this.env.DB.prepare('UPDATE provider_batch_fixture SET calls=calls+1').run();
-            if (input.url === ${JSON.stringify(failing)}) return {ok:false,code:'http-status',retryable:false,upstreamStatus:404};
+            if (input.url !== ${JSON.stringify(source)}) return {ok:false,code:'http-status',retryable:false,upstreamStatus:404};
             const body = new TextEncoder().encode(${JSON.stringify(newShare)}).buffer;
             const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', body));
             return {ok:true,body,bodySha256:Array.from(hash, byte => byte.toString(16).padStart(2,'0')).join('')};
@@ -130,7 +132,8 @@ test("emitted Worker confirms a private frozen batch and drains it after intake 
   const ownerId = policy.memberId;
   const rows = [];
   for (const [actor, name, url] of [[ownerId, "Saved fixture", source], [ownerId, `Failed fixture ${failing}`, failing],
-    [ownerId, "Changed fixture", source + "&stale=1"], [ownerId, "Local fixture", "uploaded://fixture.txt"],
+    [ownerId, "Changed fixture", source + "&stale=1"], [ownerId, "Second failed fixture", secondFailing],
+    [ownerId, "Local fixture", "uploaded://fixture.txt"],
     [policy.adminId, "Foreign fixture", source]]) {
     const row = await createSubscription(db, { ownerId: actor, name, sourceUrl: url });
     rows.push(row);
@@ -138,8 +141,12 @@ test("emitted Worker confirms a private frozen batch and drains it after intake 
       id: row.id, ownerId: actor, expectedGeneration: 0, expectedLifecycleRevision: 0,
     }, [{ name: "Synthetic", share: oldShare }]), true);
   }
-  const [good, failed, stale, uploaded, foreign] = rows;
+  const [good, failed, stale, secondFailed, uploaded, foreign] = rows;
   const previous = await getSubscriptionSnapshot(db, failed.token);
+  assert.ok(previous);
+  const previousManifest = `subscriptions/${previous.id}/${previous.snapshotId}/manifest.json`;
+  const previousBytes = await (await bucket.get(previousManifest))?.text();
+  assert.ok(previousBytes);
   const date = Math.floor(Date.now() / 1000);
   const chat = (id: string) => ({ id: Number(id), type: id === policy.groupId ? "supergroup" : "private" });
   const post = (update: unknown, worker = app) => worker.fetch("https://fixture.invalid/telegram/webhook", {
@@ -201,7 +208,7 @@ test("emitted Worker confirms a private frozen batch and drains it after intake 
   const oldPreview = await reply(5);
   assert.equal((await message(6, "🔄 更新所有")).status, 200);
   const preview = await reply(6);
-  assert.match(preview.text, /确认刷新 3 条/u);
+  assert.match(preview.text, /确认刷新 4 条/u);
   assert.match(preview.text, /未纳入 1 条/u);
   const ticket = preview.buttons[0]?.callback_data;
   assert.ok(ticket);
@@ -227,13 +234,13 @@ test("emitted Worker confirms a private frozen batch and drains it after intake 
   assert.equal(await calls(), 0);
   assert.equal((await click(accepted, preview.id, ticket)).status, 200);
   const jobs = await db.prepare("SELECT subscription_id,state FROM telegram_provider_batch_jobs ORDER BY ordinal").all();
-  assert.deepEqual(jobs.results, [good, failed, stale].map(({ id }) => ({ subscription_id: id, state: "waiting" })));
+  assert.deepEqual(jobs.results, [good, failed, stale, secondFailed].map(({ id }) => ({ subscription_id: id, state: "waiting" })));
   await cron(journalFault);
   assert.equal(await calls(), 0);
-  assert.equal(await db.prepare("SELECT count(*) AS waiting FROM telegram_provider_batch_jobs WHERE state='waiting'").first("waiting"), 3);
+  assert.equal(await db.prepare("SELECT count(*) AS waiting FROM telegram_provider_batch_jobs WHERE state='waiting'").first("waiting"), 4);
   assert.equal((await message(13, "/updateall status", journalFault)).status, 200);
   const running = await reply(13);
-  assert.match(running.text, /进度：0\/3/u);
+  assert.match(running.text, /进度：0\/4/u);
   assert.doesNotMatch(running.text, /本次订阅结果/u);
   assert.equal(await renameOwnedSubscription(db, { id: stale.id, ownerId, expectedLifecycleRevision: 0 }, "New private name"), true);
   await cron(queueFault);
@@ -241,7 +248,7 @@ test("emitted Worker confirms a private frozen batch and drains it after intake 
   await cron(controlsFault);
   assert.equal(await calls(), 1);
   assert.equal((await message(14, "/updateall status", drainOnly)).status, 200);
-  assert.match((await reply(14)).text, /进度：2\/3/u);
+  assert.match((await reply(14)).text, /进度：2\/4/u);
 
   // Emulate a newer ordinary send already in flight when the older batch finishes.
   const newer = await db.prepare(`INSERT INTO telegram_inbox
@@ -254,22 +261,27 @@ test("emitted Worker confirms a private frozen batch and drains it after intake 
   ]);
   await cron();
   assert.equal(await calls(), 2);
+  await cron();
+  assert.equal(await calls(), 3);
   assert.equal(await db.prepare("SELECT state FROM telegram_outbox WHERE receipt_id=?").bind(batchId).first("state"), "pending");
   await db.prepare("UPDATE telegram_outbox SET state='failed',lease_id=NULL,lease_until=NULL WHERE receipt_id=?").bind(newer).run();
   await cron();
   const terminal = await reply(accepted);
-  assert.match(terminal.text, /完成：3\/3/u);
-  assert.match(terminal.text, /已保存 1 · 失败 1 · 已变更 1 · 超时 0/u);
-  assert.deepEqual(terminal.text.split("\n").slice(-4), ["本次订阅结果",
+  assert.match(terminal.text, /完成：4\/4/u);
+  assert.match(terminal.text, /已保存 1 · 失败 2 · 已变更 1 · 超时 0/u);
+  assert.deepEqual(terminal.text.split("\n").slice(-5), ["本次订阅结果",
     `订阅 ID ${good.id} · Saved fixture：已保存`,
     `订阅 ID ${failed.id} · Failed fixture [链接已省略]：失败`,
     `订阅 ID ${stale.id}：已变更`,
+    `订阅 ID ${secondFailed.id} · Second failed fixture：失败`,
   ]);
   assert.doesNotMatch(terminal.text, /New private name|Local fixture|Foreign fixture/u);
   await cron();
-  assert.equal(sent.filter(({ text }) => text.includes("完成：3/3")).length, 1);
+  assert.equal(sent.filter(({ text }) => text.includes("完成：4/4")).length, 1);
   assert.equal((await message(48, "/updateall status", drainOnly)).status, 200);
-  assert.equal((await reply(48)).text, terminal.text);
+  const historical = await reply(48);
+  assert.equal(historical.text, terminal.text);
+  assert.deepEqual(historical.buttons, []);
   assert.equal((await message(49, "/updateall status", app, policy.adminId)).status, 200);
   assert.equal((await reply(49)).text, "暂无批量刷新记录。");
   assert.equal((await getSubscriptionSnapshot(db, good.token))?.generation, 2);
@@ -279,6 +291,70 @@ test("emitted Worker confirms a private frozen batch and drains it after intake 
   assert.equal(exported.status, 200);
   assert.equal(await exported.text(), Buffer.from(newShare).toString("base64"));
   assert.equal(await db.prepare("SELECT count(*) AS count FROM subscription_provider_jobs").first("count"), 0);
+
+  // The terminal origin, rather than last_error or the status reply, owns this ticket.
+  await db.prepare("UPDATE subscriptions SET last_error='unrelated' WHERE id=?").bind(uploaded.id).run();
+  assert.equal(terminal.buttons.length, 1);
+  assert.equal(terminal.buttons[0].text, "确认将本批 2 条失败订阅移入回收站");
+  const cleanup = terminal.buttons[0].callback_data;
+  assert.match(cleanup, /^sbd1_[A-Za-z0-9_-]{22}$/u);
+  const storedTicket = () => db.prepare(`SELECT inbox.receipt_nonce AS marker,trash.targets,
+    trash.confirmed_by_receipt_id AS used FROM telegram_bulk_trash AS trash
+    JOIN telegram_inbox AS inbox USING(receipt_id) WHERE trash.token_sha256=?`)
+    .bind(digest(cleanup)).first<{ marker: string; targets: string; used: number | null }>();
+  const unused = { marker: "provider-batch-confirm:v1",
+    targets: JSON.stringify([[failed.id, 1, 0], [secondFailed.id, 1, 0]]), used: null };
+  assert.deepEqual(await storedTicket(), unused);
+  assert.equal((await click(52, terminal.id, cleanup, app, policy.adminId)).status, 200);
+  assert.equal((await click(53, terminal.id, cleanup, app, ownerId, policy.groupId)).status, 204);
+  assert.equal((await click(54, historical.id, cleanup)).status, 200);
+  for (const updateId of [52, 53, 54]) assert.equal(await receipt(updateId), null);
+  const expiry = await db.prepare("SELECT expires_at FROM telegram_bulk_trash WHERE receipt_id=?")
+    .bind(batchId).first<number>("expires_at");
+  assert.ok(expiry);
+  await db.prepare("UPDATE telegram_bulk_trash SET expires_at=1 WHERE receipt_id=?").bind(batchId).run();
+  assert.equal((await click(58, terminal.id, cleanup)).status, 200);
+  await db.prepare("UPDATE telegram_bulk_trash SET expires_at=? WHERE receipt_id=?").bind(expiry, batchId).run();
+  await db.prepare("INSERT INTO telegram_auth VALUES (?,?,0,unixepoch(),1)").bind(policy.botId, ownerId).run();
+  assert.equal((await click(59, terminal.id, cleanup)).status, 200);
+  await db.prepare("DELETE FROM telegram_auth WHERE bot_id=? AND user_id=?").bind(policy.botId, ownerId).run();
+  assert.equal(await receipt(58), null);
+  assert.equal(await receipt(59), null);
+  assert.deepEqual(await storedTicket(), unused);
+
+  const selection = await readFailedBatchTrash(db, policy, ownerId, batchId);
+  assert.ok(selection);
+  const stillExact = () => db.prepare(`SELECT ${selection.guard.sql} AS exact`)
+    .bind(...selection.guard.bindings).first<number>("exact");
+  assert.equal(await stillExact(), 1);
+  await db.prepare("UPDATE subscriptions SET source_url=? WHERE id=?").bind(secondFailing + "&changed=1", secondFailed.id).run();
+  assert.equal(await stillExact(), 0, "source-only drift must invalidate the exact in-transaction guard");
+  assert.equal(await readFailedBatchTrash(db, policy, ownerId, batchId), null);
+  await db.prepare("UPDATE subscriptions SET source_url=? WHERE id=?").bind(secondFailing, secondFailed.id).run();
+
+  // Suppress the second move after the first has run. The transaction assertion
+  // must undo both the first move and the ticket consumption.
+  await db.prepare(`CREATE TRIGGER ignore_fixture_second_failed_trash BEFORE INSERT ON subscription_trash
+    WHEN NEW.id=${secondFailed.id} BEGIN SELECT RAISE(IGNORE); END`).run();
+  try {
+    assert.equal((await click(55, terminal.id, cleanup)).status, 503);
+    assert.equal(await receipt(55), null);
+    assert.deepEqual(await storedTicket(), unused);
+    assert.deepEqual(await getSubscriptionSnapshot(db, failed.token), previous);
+    assert.equal((await getSubscriptionSnapshot(db, secondFailed.token))?.generation, 1);
+  } finally {
+    await db.prepare("DROP TRIGGER ignore_fixture_second_failed_trash").run();
+  }
+  assert.equal((await click(56, terminal.id, cleanup, drainOnly)).status, 200);
+  assert.match((await reply(56)).text, /已将 2 条订阅移入回收站/u);
+  assert.equal((await click(57, terminal.id, cleanup)).status, 200);
+  assert.equal(await receipt(57), null);
+  assert.equal((await storedTicket())?.used, await receipt(56));
+  const moved = await db.prepare("SELECT id,generation,lifecycle_revision FROM subscription_trash ORDER BY id").all();
+  assert.deepEqual(moved.results, [failed, secondFailed].map(({ id }) => ({ id, generation: 1, lifecycle_revision: 1 })));
+  assert.equal(await getSubscriptionSnapshot(db, failed.token), null);
+  assert.equal(await (await bucket.get(previousManifest))?.text(), previousBytes);
+  for (const row of [good, stale, uploaded, foreign]) assert.ok(await getSubscriptionSnapshot(db, row.token));
 
   assert.equal((await message(16, "/updateall")).status, 200);
   const revoked = await reply(16);
@@ -302,7 +378,7 @@ test("emitted Worker confirms a private frozen batch and drains it after intake 
   assert.equal((await message(50, "/updateall status", app, ownerId, ownerId, newEpoch + 1)).status, 200);
   assert.equal((await reply(50)).text, "暂无批量刷新记录。");
   await cron();
-  assert.equal(await calls(), 2);
+  assert.equal(await calls(), 3);
 
   await Promise.all(Array.from({ length: 16 }, (_, index) => createSubscription(db, {
     ownerId: policy.adminId, name: "Synthetic extra", sourceUrl: source + "&extra=" + index,

@@ -24,7 +24,7 @@ import { insertSelectedRevokeTickets, selectedDeliveryGuard, TELEGRAM_SELECTED_M
 import { TELEGRAM_SHORT_LINK_MARKER, type TelegramShortLinkGuard } from "./short-link-actions.ts";
 import { insertTelegramSubscriptionReadTickets, TELEGRAM_SUBSCRIPTION_READ_MARKER,
   type TelegramSubscriptionReadTicket } from "./subscription-read.ts";
-import { installTelegramBulkTrashTicket, TELEGRAM_BULK_TRASH_MARKER, type BulkTrashGuard } from "./bulk-trash.ts";
+import { installFailedBatchTrashTicket, installTelegramBulkTrashTicket, TELEGRAM_BULK_TRASH_MARKER, type BulkTrashGuard } from "./bulk-trash.ts";
 import { TELEGRAM_INLINE_SORT_MARKER, type TelegramInlineSortReply } from "./inline-sort.ts";
 import { insertTelegramNodePageTickets, TELEGRAM_SUBSCRIPTION_NODE_MARKER, type TelegramNodePageTicket } from "./subscription-node-pages.ts";
 import { telegramProviderReplyClock, telegramProviderReplyEligible, telegramProviderReplyMarker, telegramProviderReplySendGuard,
@@ -882,12 +882,22 @@ export async function beginTelegramGitHubSearchReply(
 
 export async function beginTelegramProviderBatchReply(
   db: D1Database, policy: TelegramPolicy, lease: TelegramReplyLease, prepared: TelegramProviderBatchDelivery | null,
-): Promise<boolean> {
-  if (!lease.providerBatch || !inTelegramScope(policy, lease) || lease.chatType !== "private" || lease.threadId !== null) return false;
+): Promise<"closed" | "begun" | "cleanup-installed"> {
+  if (!lease.providerBatch || !inTelegramScope(policy, lease) || lease.chatType !== "private" || lease.threadId !== null) return "closed";
   if (prepared) {
     const start = beginReplyStatement(db, policy, lease, "allowed", prepared.guard);
-    if (!prepared.ticket) {
-      if (await start.first() !== null) return true;
+    if (prepared.cleanup) {
+      const [state, ticket] = await db.batch<{ receipt_id: number }>([
+        start, installFailedBatchTrashTicket(db, lease, prepared.cleanup),
+      ]).catch(() => { throw new Error("Telegram provider batch cleanup ticket could not be confirmed."); });
+      const changed = state?.results.length;
+      if (!state?.success || (changed !== 0 && changed !== 1) || (changed === 1 && state.results[0].receipt_id !== lease.receiptId)
+        || !ticket?.success || (ticket.meta.changes !== 0 && ticket.meta.changes !== changed)) {
+        throw new Error("Telegram provider batch cleanup ticket could not be confirmed.");
+      }
+      if (changed === 1) return ticket.meta.changes === 1 ? "cleanup-installed" : "begun";
+    } else if (!prepared.ticket) {
+      if (await start.first() !== null) return "begun";
     } else {
       const [state, ticket, verified] = await db.batch<{ receipt_id: number }>([
         start, installTelegramProviderBatchTicket(db, lease, prepared.ticket.sha256),
@@ -900,7 +910,7 @@ export async function beginTelegramProviderBatchReply(
       if (!state?.success || (changed !== 0 && changed !== 1) || (changed === 1 && state.results[0].receipt_id !== lease.receiptId)
         || !ticket?.success || ticket.meta.changes !== changed
         || !verified?.success) throw new Error("Telegram provider batch reply could not begin.");
-      if (changed === 1) return true;
+      if (changed === 1) return "begun";
     }
   }
   // A superseded preview or revoked pre-send lease made no Telegram call.
@@ -909,7 +919,7 @@ export async function beginTelegramProviderBatchReply(
       WHERE inbox.receipt_id=? AND inbox.bot_id=? AND inbox.actor_id=? AND inbox.chat_id=? AND ${telegramProviderBatchReplyMarker("inbox")})`)
     .bind(lease.leaseId, lease.attempts, lease.receiptId, policy.botId, lease.actorId, lease.chatId).run();
   if (!closed.success) throw new Error("Telegram provider batch reply could not close.");
-  return false;
+  return "closed";
 }
 
 export async function beginTelegramApiStatusReply(
