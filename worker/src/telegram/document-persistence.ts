@@ -3,7 +3,8 @@ import {
   validInteger, type NodeRecord, type StagedNodeSnapshot,
 } from "../storage.ts";
 import {
-  prepareTelegramDocumentJobLeaseGuard, prepareTelegramDocumentJobSettlement, TELEGRAM_DOCUMENT_JOB_MARKER,
+  ISOLATED_DOCUMENT_CLEANUP_SCOPE, prepareTelegramDocumentJobLeaseGuard, prepareTelegramDocumentJobSettlement,
+  TELEGRAM_DOCUMENT_JOB_MARKER,
   type TelegramDocumentJobLease, type TelegramDocumentJobOutcome,
 } from "./document-jobs.ts";
 import { prepareTelegramProviderDocumentMarker, prepareTelegramProviderDocumentPlan,
@@ -239,6 +240,7 @@ export async function reconcileTelegramDocumentJobReplies(db: D1Database, policy
         DELETE FROM telegram_document_reservations WHERE receipt_id IN (
           SELECT reservation.receipt_id FROM telegram_document_reservations AS reservation
           JOIN telegram_document_jobs AS job USING (receipt_id) WHERE job.bot_id = ? AND job.state = 'done'
+            AND ${ISOLATED_DOCUMENT_CLEANUP_SCOPE}
           ORDER BY reservation.receipt_id LIMIT 16
         )
       `).bind(policy.botId),
@@ -260,7 +262,8 @@ export async function retireTelegramDocumentStage(db: D1Database, bucket: R2Buck
   try {
     const stage = await db.prepare(`SELECT stage.subscription_id AS id, stage.snapshot_id AS snapshotId
       FROM telegram_document_stages AS stage JOIN telegram_document_jobs AS job USING (receipt_id)
-      WHERE job.bot_id = ? AND ${unreferencedStage} ORDER BY stage.cleanup_after, stage.snapshot_id LIMIT 1`)
+      WHERE job.bot_id = ? AND ${unreferencedStage} AND ${ISOLATED_DOCUMENT_CLEANUP_SCOPE}
+      ORDER BY stage.cleanup_after, stage.snapshot_id LIMIT 1`)
       .bind(policy.botId).first<Stage>();
     if (!stage) return;
     if (!validInteger(stage.id, 1) || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/u.test(stage.snapshotId)) {
@@ -275,7 +278,8 @@ export async function retireTelegramDocumentStage(db: D1Database, bucket: R2Buck
     if (keys.length) await bucket.delete(keys);
     if ((await bucket.list({ prefix, limit: 1 })).objects.length !== 0) throw new Error("Document stage still exists.");
     await db.prepare(`DELETE FROM telegram_document_stages AS stage WHERE snapshot_id = ? AND subscription_id = ?
-      AND EXISTS (SELECT 1 FROM telegram_document_jobs WHERE receipt_id = stage.receipt_id AND bot_id = ?)
+      AND EXISTS (SELECT 1 FROM telegram_document_jobs AS job WHERE job.receipt_id = stage.receipt_id
+        AND job.bot_id = ? AND ${ISOLATED_DOCUMENT_CLEANUP_SCOPE})
       AND ${unreferencedStage}`).bind(stage.snapshotId, stage.id, policy.botId).run();
   } catch {
     throw new Error("Telegram document stage cleanup could not be confirmed.");
