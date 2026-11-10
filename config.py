@@ -33,6 +33,13 @@ def _env_int(name: str, default: int, minimum: int = 0, maximum: int | None = No
     return min(value, maximum) if maximum is not None else value
 
 
+def preserve_pending_telegram_updates() -> bool:
+    value = os.environ.get("TELEGRAM_PRESERVE_PENDING_UPDATES", "0").strip()
+    if value not in ("0", "1"):
+        raise SystemExit("TELEGRAM_PRESERVE_PENDING_UPDATES 只接受 0 或 1。")
+    return value == "1"
+
+
 TG_USER_ID_MAX = 2**63 - 1
 
 

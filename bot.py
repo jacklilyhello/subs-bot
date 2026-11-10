@@ -2565,6 +2565,7 @@ def build_app() -> Application:
 
 
 async def amain() -> None:
+    preserve_pending = config.preserve_pending_telegram_updates()
     app = build_app()
     # 先把建表/迁移一次性做完，之后所有查询共享同一条连接
     await store.init()
@@ -2583,7 +2584,7 @@ async def amain() -> None:
         except Exception as e:
             log.warning("Failed to calibrate bot username from API: %s", e)
 
-        await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+        await app.updater.start_polling(drop_pending_updates=not preserve_pending, allowed_updates=Update.ALL_TYPES)
         # run forever
         while True:
             await asyncio.sleep(3600)
