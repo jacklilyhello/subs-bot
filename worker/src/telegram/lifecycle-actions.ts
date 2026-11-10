@@ -1,7 +1,7 @@
 import { SUBSCRIPTION_LIFECYCLE_REVISION, validInteger } from "../storage.ts";
 import { normalizeSubscriptionName, prepareOwnedSubscriptionMutation, type SubscriptionMutation } from "../subscriptions.ts";
-import { inTelegramScope, type TelegramLifecycleUpdate, type TelegramPolicy } from "./protocol.ts";
-import { TELEGRAM_VIEW_MARKER } from "./views.ts";
+import { inTelegramScope, TELEGRAM_PAGE_JUMP_MARKER, type TelegramLifecycleUpdate, type TelegramPolicy } from "./protocol.ts";
+import { TELEGRAM_VIEW_RECEIPTS } from "./views.ts";
 
 export const TELEGRAM_LIFECYCLE_MARKER = "lifecycle:v1";
 
@@ -48,7 +48,7 @@ const MAX_BUTTONS = 16;
 const encoder = new TextEncoder();
 
 const actionOrigin = `(
-  (inbox.receipt_nonce = '${TELEGRAM_VIEW_MARKER}' AND EXISTS (
+  (inbox.receipt_nonce IN (${TELEGRAM_VIEW_RECEIPTS}) AND EXISTS (
     SELECT 1 FROM telegram_view AS view WHERE view.receipt_id = inbox.receipt_id
       AND ((view.kind IN ('list', 'expiry') AND ticket.action IN ('rename', 'trash-prompt'))
         OR (view.kind = 'recycle' AND ticket.action = 'restore'))
@@ -63,7 +63,8 @@ const actionOrigin = `(
 const eligibleOrigin = `inbox.bot_id = ? AND inbox.actor_id = ? AND inbox.chat_id = ?
   AND inbox.chat_type = ? AND inbox.thread_id IS ? AND reply.state = 'sent' AND reply.sent_message_id = ?
   AND (inbox.actor_id = ? OR COALESCE((
-    SELECT allowed FROM telegram_auth WHERE bot_id = inbox.bot_id AND user_id = inbox.actor_id
+    SELECT allowed=1 AND (inbox.receipt_nonce<>'${TELEGRAM_PAGE_JUMP_MARKER}' OR message_date<inbox.message_date)
+    FROM telegram_auth WHERE bot_id = inbox.bot_id AND user_id = inbox.actor_id
   ), 1) = 1)`;
 
 const freshReceipt = "incoming.bot_id = ? AND incoming.update_id = ? AND incoming.receipt_nonce = ?";

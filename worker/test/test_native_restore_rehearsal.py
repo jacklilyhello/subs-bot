@@ -131,7 +131,7 @@ class MemoryAPI:
                 if isinstance(self.response, Exception):
                     raise self.response
                 return deepcopy(self.response)
-            kind = "database" if path.endswith("/d1/database") else next(kind for kind in ("backup", "objects") if self.names[kind] == payload["name"])
+            kind = "database" if path.endswith("/d1/database") else next(kind for kind in ("backup", "objects") if self.names.get(kind) == payload["name"])
             value = {"name": self.names[kind], "created_at" if kind == "database" else "creation_date": STAMP}
             if kind == "database":
                 value["uuid"] = RESTORE_ID
@@ -745,6 +745,31 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT " + active).fetchone(), (0,))
         self.assertEqual(self.db.execute("SELECT " + expired).fetchone(), (1,))
         self.assertEqual(self.db.execute("SELECT " + older).fetchone(), (1,))
+
+    def test_quiet_waits_for_confirmed_unconsumed_page_jump_prompt(self):
+        self.db.executescript("""INSERT INTO telegram_inbox
+            (receipt_id,bot_id,update_id,actor_id,chat_id,chat_type,message_id,message_date,command,receipt_nonce)
+            VALUES (1,'881000',1,'881001','881001','private',1,1,'help','view:v1'),
+                   (2,'881000',2,'881001','881001','private',2,2,'help','view-jump:v1'),
+                   (3,'881000',3,'881001','881001','private',3,3,'help','view-jump:v1');
+            INSERT INTO telegram_page_jumps
+                (receipt_id,origin_receipt_id,kind,actor_role,auth_message_date,auth_message_id,expires_at)
+            VALUES (2,1,'prompt','admin',0,0,10);
+            INSERT INTO telegram_outbox(receipt_id,state,attempts,sent_message_id) VALUES (2,'sent',1,20);""")
+
+        def quiet(epoch, tables=self.source.tables):
+            return self.db.execute("SELECT " + native.quiet_expression(tables, epoch)).fetchone()
+
+        self.assertEqual(quiet(9), (0,))
+        self.assertEqual(quiet(10), (1,))
+        self.assertEqual(quiet(9, set(self.source.tables) - {"telegram_page_jumps"}), (1,))
+        self.db.execute("""INSERT INTO telegram_page_jumps
+            (receipt_id,origin_receipt_id,kind,actor_role,auth_message_date,auth_message_id,expires_at)
+            VALUES (3,2,'invalid','admin',0,0,11)""")
+        self.db.execute("INSERT INTO telegram_outbox(receipt_id) VALUES (3)")
+        self.assertEqual(quiet(9), (0,))
+        self.db.execute("UPDATE telegram_outbox SET state='sent',attempts=1,sent_message_id=30 WHERE receipt_id=3")
+        self.assertEqual(quiet(9), (1,))
 
     def test_quiet_blocks_unsettled_telegram_provider_jobs_on_new_schema(self):
         self.db.execute("""INSERT INTO telegram_provider_jobs

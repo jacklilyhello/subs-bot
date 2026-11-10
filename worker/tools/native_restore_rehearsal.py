@@ -75,10 +75,10 @@ LEGACY_TEMP_CANDIDATE_PROFILE = "synthetic-legacy-temp-nodes"
 LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE = "synthetic-legacy-dynamic-all"
 LEGACY_UNIFIED_SHARE_CANDIDATE_PROFILE = "synthetic-legacy-unified-shares"
 LEGACY_GENERAL_AUTH_CANDIDATE_PROFILE = "synthetic-legacy-general-auth"
+LEGACY_UNIFIED_AUTH_CANDIDATE_PROFILE = "synthetic-legacy-unified-auth"
 D1_ONLY_CANDIDATE_PROFILES = frozenset({LEGACY_TEMP_CANDIDATE_PROFILE, LEGACY_GENERAL_AUTH_CANDIDATE_PROFILE})
-PINNED_TARGET_CANDIDATE_PROFILES = D1_ONLY_CANDIDATE_PROFILES | {
-    LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE, LEGACY_UNIFIED_SHARE_CANDIDATE_PROFILE,
-}
+UNIFIED_CANDIDATE_PROFILES = frozenset({LEGACY_UNIFIED_SHARE_CANDIDATE_PROFILE, LEGACY_UNIFIED_AUTH_CANDIDATE_PROFILE})
+PINNED_TARGET_CANDIDATE_PROFILES = D1_ONLY_CANDIDATE_PROFILES | UNIFIED_CANDIDATE_PROFILES | {LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE}
 LEGACY_CANDIDATE_NAMES = {LEGACY_CANDIDATE_PROFILE: "legacy", LEGACY_PATH_CANDIDATE_PROFILE: "legacy-path",
                           LEGACY_EMPTY_CANDIDATE_PROFILE: "legacy-empty", LEGACY_PRIVATE_SHARE_CANDIDATE_PROFILE: "legacy-share",
                           LEGACY_TYPED_SHORT_CANDIDATE_PROFILE: "legacy-typed", LEGACY_MIXED_SHORT_CANDIDATE_PROFILE: "legacy-mixed",
@@ -86,6 +86,7 @@ LEGACY_CANDIDATE_NAMES = {LEGACY_CANDIDATE_PROFILE: "legacy", LEGACY_PATH_CANDID
                           LEGACY_TEMP_CANDIDATE_PROFILE: "legacy-temp",
                           LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE: "legacy-all",
                           LEGACY_UNIFIED_SHARE_CANDIDATE_PROFILE: "legacy-unified",
+                          LEGACY_UNIFIED_AUTH_CANDIDATE_PROFILE: "legacy-v11",
                           LEGACY_GENERAL_AUTH_CANDIDATE_PROFILE: "legacy-auth"}
 ACCOUNT_SHA256 = "ffdbf3dd5d042c6edb68d7f628998a69a22320b0199775bfda9f97593136e508"
 
@@ -267,7 +268,7 @@ class RehearsalAPI:
             require(len(keys) <= MAX_OBJECTS and all(matches(KEY, key) for key in keys))
             if self.profile == LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE:
                 require(all(key.startswith("subscriptions/") for key in keys))
-            if self.profile == LEGACY_UNIFIED_SHARE_CANDIDATE_PROFILE:
+            if self.profile in UNIFIED_CANDIDATE_PROFILES:
                 require(len(set(keys)) == len(keys) == 10
                         and sum(key.startswith("subscriptions/") for key in keys) == 8
                         and sum(key.startswith("private-shares/") for key in keys) == 2)
@@ -286,7 +287,7 @@ class RehearsalAPI:
                 require(route not in {self.root + "/r2/buckets", self.root + "/tokens/verify"})
             else:
                 require(path == route)
-        if self.profile in (LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE, LEGACY_UNIFIED_SHARE_CANDIDATE_PROFILE):
+        if self.profile in UNIFIED_CANDIDATE_PROFILES or self.profile == LEGACY_DYNAMIC_ALL_CANDIDATE_PROFILE:
             if method == "GET" and route == self.root + "/d1/database":
                 require(path == route + "?" + urlencode({"name": self.names["database"], "per_page": 100}))
             elif method == "GET" and route == self.root + "/r2/buckets":
@@ -336,7 +337,7 @@ class RehearsalAPI:
                 if self.profile in PINNED_TARGET_CANDIDATE_PROFILES:
                     require(set(query) <= {"prefix", "per_page", "cursor"}
                             and all(len(values) == 1 for values in query.values()))
-            elif self.profile == LEGACY_UNIFIED_SHARE_CANDIDATE_PROFILE:
+            elif self.profile in UNIFIED_CANDIDATE_PROFILES:
                 if route == self.root + f"/r2/buckets/{self.names['objects']}/objects":
                     query = parse_qs(urlsplit(path).query, keep_blank_values=True, max_num_fields=3)
                     prefix = query.get("prefix", [])
@@ -393,7 +394,7 @@ class RehearsalAPI:
             require(key == self.archive_prefix + "manifest.json" or re.fullmatch(re.escape(self.archive_prefix) + r"(?:sql/[0-9]{1,3}\.sql|blobs/[a-f0-9]{64})", key))
         else:
             require(method == "GET" and key in self.restore_keys)
-            if self.profile == LEGACY_UNIFIED_SHARE_CANDIDATE_PROFILE:
+            if self.profile in UNIFIED_CANDIDATE_PROFILES:
                 require(self.restore_bucket == bucket)
         require(method != "GET" or body is None)
         headers = {"Authorization": "Bearer " + self.token, "Accept": "application/octet-stream",
@@ -764,6 +765,12 @@ def quiet_expression(tables, observed_at=None):
         conditions.append("NOT EXISTS(SELECT 1 FROM telegram_selected_links AS selected JOIN aggregate_links AS link ON link.code_sha256=selected.code_sha256 WHERE link.revoked_at IS NULL)")
     if "telegram_subscription_read_ticket" in tables:
         waits.append("telegram_subscription_read_ticket")
+    if "telegram_page_jumps" in tables:
+        conditions.append(f"""NOT EXISTS(SELECT 1 FROM telegram_page_jumps AS prompt
+            JOIN telegram_inbox AS inbox USING(receipt_id) JOIN telegram_outbox AS reply USING(receipt_id)
+            WHERE prompt.kind='prompt' AND prompt.expires_at>{epoch} AND inbox.receipt_nonce='view-jump:v1'
+              AND reply.state='sent' AND NOT EXISTS(
+                SELECT 1 FROM telegram_page_jumps WHERE origin_receipt_id=prompt.receipt_id))""")
     conditions.extend(f"NOT EXISTS(SELECT 1 FROM {table} WHERE expires_at > {epoch} AND used_by_receipt_id IS NULL)" for table in waits)
     return "(" + " AND ".join(conditions) + ")"
 

@@ -53,6 +53,7 @@ import { acceptTelegramTemp } from "./telegram/temp-import.ts";
 import { acceptTelegramView, reapTelegramViewTickets } from "./telegram/views.ts";
 import { acceptTelegramShortLink, reapFailedTelegramShortLinks } from "./telegram/short-link-actions.ts";
 import { acceptTelegramSubscriptionRead, reapTelegramSubscriptionReadTickets, telegramSubscriptionReadReady } from "./telegram/subscription-read.ts";
+import { acceptTelegramPageJump } from "./telegram/page-jump.ts";
 import { acceptTelegramSubscriptionNodePage, reapTelegramSubscriptionNodeTickets, telegramSubscriptionNodePagesReady } from "./telegram/subscription-node-pages.ts";
 import { acceptTelegramSubscriptionRawFile, reapTelegramRawFileTickets,
   telegramSubscriptionRawFileReady } from "./telegram/subscription-raw-file.ts";
@@ -66,6 +67,7 @@ export interface Env {
   TELEGRAM_AGGREGATE_KEY?: string;
   TELEGRAM_PRIVATE_SHARE_CREATION_KEY?: string;
   TELEGRAM_GROUP_SHARE_CARDS?: string;
+  TELEGRAM_PAGE_JUMP?: string;
   TELEGRAM_INLINE_SEARCH?: string;
   PROVIDER_FETCH?: ProviderFetcher;
   PROVIDER_REVISION?: string;
@@ -185,6 +187,8 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
       ctx?.waitUntil(answerTelegramCallback(policy, legacyInlineClaim.callbackId, url ? { url } : "此旧卡片暂不可用。"));
       return new Response(null, { status: 204, headers: HEADERS });
     }
+    const pageJumpEnabled = env.TELEGRAM_PAGE_JUMP === "1";
+    if (decoded.pageJump && !pageJumpEnabled) return new Response(null, { status: 204, headers: HEADERS });
     if (decoded.inlineQuery) {
       if (await telegramInlineSearchReady(env.DB)) await answerTelegramInlineSearch(env.DB, policy, decoded.inlineQuery, sendTelegramInlineAnswer);
       return new Response(null, { status: 204, headers: HEADERS });
@@ -214,7 +218,7 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
     const drainReplies = async (budget = 20_000) => drainTelegramReplies(env.DB, env.NODES, policy, 4, budget, fetch, aggregateKey, privateShare,
       subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerQueueReady, bulkTrash, inlineConsent,
       await githubSearch().catch(() => "unavailable" as const), providerRefresh, subscriptionRawFile, providerBatch.controls, apiStatus,
-      statusProvider !== null, providerDocument, providerBatchAdmission);
+      statusProvider !== null, providerDocument, providerBatchAdmission, pageJumpEnabled);
     const drain = () => ctx?.waitUntil(drainReplies().catch(() => undefined));
     if (decoded.apiStatus) {
       if (!statusProvider || apiStatus !== true) return new Response(null, { status: 204, headers: HEADERS });
@@ -244,6 +248,10 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
       if (outcome === "accepted" || decoded.view.kind !== "callback") {
         drain();
       }
+    } else if (decoded.pageJump) {
+      const accepted = await acceptTelegramPageJump(env.DB, policy, decoded.pageJump);
+      if (decoded.pageJump.kind === "open") ctx?.waitUntil(answerTelegramCallback(policy, decoded.pageJump.callbackId));
+      if (accepted) drain();
     } else if (decoded.lifecycle) {
       const outcome = await acceptTelegramLifecycle(env.DB, policy, decoded.lifecycle);
       if (decoded.lifecycle.kind === "lifecycle-callback") {
@@ -521,7 +529,7 @@ async function recoverTelegramWork(env: Env, policy: TelegramPolicy, pin: Provid
     drainTelegramReplies(env.DB, env.NODES, policy, limit, budget, fetch, aggregateKey, privateShare,
       subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerQueueReady, bulkTrash, inlineConsent,
       await githubSearch().catch(() => "unavailable" as const), providerRefresh, subscriptionRawFile, providerBatch.controls, apiStatus,
-      apiStatusProvider(env) !== null, providerDocument, providerBatchAdmission);
+      apiStatusProvider(env) !== null, providerDocument, providerBatchAdmission, env.TELEGRAM_PAGE_JUMP === "1");
   const replies = async () => {
     await drain(10, 45_000);
     await reapTelegramViewTickets(env.DB);

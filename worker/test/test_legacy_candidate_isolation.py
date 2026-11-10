@@ -5,7 +5,7 @@ from io import BytesIO
 import json
 import os
 from pathlib import Path
-from shutil import rmtree
+from shutil import copytree, rmtree
 import sqlite3
 import sys
 from tempfile import TemporaryDirectory
@@ -741,6 +741,125 @@ class CandidateArtifactTests(unittest.TestCase):
         with self.assertRaises(tool.native.RehearsalError):
             self.verify(self.archive(), profile)
 
+    def test_unified_auth_dispatch_and_exact_unbound_restore(self):
+        import legacy_unified_auth_native_candidate as verifier
+        from test_legacy_unified_auth_native_candidate import LegacyUnifiedAuthNativeCandidateTests
+
+        support = LegacyUnifiedAuthNativeCandidateTests()
+        support.setUp()
+        self.addCleanup(support.doCleanups)
+        native, profile = tool.native, tool.UNIFIED_AUTH_PROFILE
+        self.assertEqual(profile, verifier.UNIFIED_AUTH_PROFILE)
+        runner = self.root / "unified-auth-runner"
+        runner.mkdir(mode=0o700)
+        worker = runner / tool.artifact.VERIFIED_DIRECTORY
+        copytree(support.worker, worker)
+        self.output = support.root
+        archive = self.archive()
+        archive_sha = native.digest(archive)
+        release = {key: support.worker_pin[key] for key in ("revision", "runId", "runAttempt")}
+        release.update(artifactId="24", archiveSha256="c" * 64)
+        revision, run_id = release["revision"], release["runId"]
+        for wrong in (tool.UNIFIED_SHARE_PROFILE, tool.GENERAL_AUTH_PROFILE):
+            target = runner / tool.candidate_directory(wrong)
+            with self.subTest(profile=wrong), self.assertRaises(native.RehearsalError):
+                tool.unpack_candidate(archive, archive_sha, target, profile=wrong)
+            self.assertFalse(target.exists())
+        with self.assertRaises(native.RehearsalError):
+            tool.build_synthetic_candidate(worker, runner / "blocked", revision, run_id, "1", profile=profile)
+
+        environment = {"SUBS_BOT_CI_RUN_ID": run_id, "SUBS_BOT_CF_ISOLATION_TARGET_JSON": "{}", "GITHUB_RUN_ID": "90",
+                       "GITHUB_RUN_ATTEMPT": "3", "SUBS_BOT_CF_BOOTSTRAP_TOKEN": "synthetic-data",
+                       "SUBS_BOT_CF_DEPLOY_TOKEN": "synthetic-worker"}
+        with patch.dict(os.environ, environment), patch.object(tool.artifact, "prepare", return_value=release), \
+             patch.object(tool.artifact, "_github_token", return_value="synthetic-gh"), \
+             patch.object(tool.artifact, "select_main_artifact", return_value=("2", "25", archive_sha)) as select, \
+             patch.object(tool.artifact, "_download", return_value=archive) as download, \
+             patch.object(tool.artifact, "_select_artifact", return_value=(release["runAttempt"], "24", "c" * 64)), \
+             patch.object(tool.artifact, "require_current_main"), \
+             patch.object(redirect_oracle, "seal_oracle", side_effect=AssertionError("Protected checkpoint started the oracle")):
+            with self.assertRaises(native.RehearsalError):
+                tool.preflight(runner, revision, run_id, profile=profile)
+            download.assert_not_called()
+            select.return_value = (release["runAttempt"], "25", archive_sha)
+            tool.preflight(runner, revision, run_id, profile=profile)
+            download.assert_called_once_with("25", "synthetic-gh")
+            self.assertTrue(all(call.kwargs["artifact_prefix"] == "subs-bot-legacy-unified-auth-candidate" for call in select.call_args_list))
+            provenance = json.loads((runner / tool.PROVENANCE).read_bytes())
+            self.assertEqual(provenance["worker"], release)
+            self.assertEqual(provenance["candidate"]["archiveSha256"], archive_sha)
+
+            with patch.object(native, "RehearsalAPI"), patch.object(tool, "CloudflareClient"), \
+                 patch.object(tool, "CandidateSource") as protected_source, patch.object(native, "Journal") as journal:
+                protected_source.return_value.verify.return_value = {"version": {"revision": revision,
+                    "digest": "e" * 64, "compatibility": support.worker_pin["compatibilityDate"]}}
+                with self.assertRaises(native.RehearsalError):
+                    tool.apply(runner, revision, {"profile": profile, "source_run_id": run_id, "cohort": native_tests.COHORT, "action": "verify"})
+                journal.assert_not_called()
+
+        with TemporaryDirectory(dir=runner) as scratch:
+            candidate = tool.verified_candidate(runner, provenance, Path(scratch), profile=profile)
+        self.assertIsInstance(candidate, verifier.UnifiedAuthCandidate)
+        api = self.schema_memory_api()
+        api.profile = profile
+        api.names = {"database": "synthetic-v11-db", "objects": "synthetic-v11-r2"}
+        api.journal_prefix = "maintenance/legacy-v11-candidate/synthetic/journal/"
+        source = object.__new__(tool.CandidateSource)
+        source.api, source.scope_sha256, source.before_write = api, "f" * 64, Mock()
+        chain, _ = tool.package.worker_artifact(worker, revision, support.worker_pin["manifestSha256"])
+        source.objects = tool.migrations._objects(chain, len(chain), managed=True)
+        journal = native.Journal(api, "1/1", guard=source.before_write)
+        engine = tool.CANDIDATE_ENGINES[profile](api, source, journal, candidate)
+
+        def observe(kind):
+            if kind not in api.resource:
+                return None
+            identity = native.resource_identity(kind, api.resource[kind], api.names[kind])
+            return {**identity, "storageClass": "Standard"} if kind == "objects" else identity
+
+        engine.observe = Mock(side_effect=observe)
+        pin = {**provenance, "profile": profile}
+        for action, phase, count in (("verify", "unprepared", 0), ("prepare", "prepared", 0),
+                                     ("create-restore-db", "prepared", 1), ("create-restore-bucket", "prepared", 2)):
+            result = tool.run_action(action, engine, pin)
+            self.assertEqual((result["phase"], result["resourceCount"], result["objectCount"]), (phase, count, 10))
+            self.assertIs(result["activationAllowed"], False)
+        with self.assertRaises(native.RehearsalError):
+            source.schema(native_tests.SOURCE_ID)
+
+        with closing(sqlite3.connect(":memory:")) as db:
+            api.db = db
+
+            def import_result(payload):
+                if payload["action"] == "init":
+                    return {"filename": "fixture.sql", "upload_url": "https://fixture.invalid/upload"}
+                self.assertEqual(payload["action"], "ingest")
+                self.assertEqual({key for bucket, key in api.objects if bucket == api.names["objects"]}, set(candidate.entries))
+                db.executescript(candidate.sql.read_text(encoding="utf-8"))
+                return {"success": True, "status": "complete"}
+
+            api.response = import_result
+            with patch.object(native, "signed_transfer") as transfer:
+                with self.assertRaises(native.RehearsalError):
+                    tool.run_action("start-import", engine, pin)
+                self.assertEqual(tool.run_action("restore-objects", engine, pin)["phase"], "objects-restored")
+                self.assertEqual(tool.run_action("start-import", engine, pin)["phase"], "verified")
+                transfer.assert_called_once_with("https://fixture.invalid/upload", upload=candidate.sql,
+                                                 expected_md5=candidate.document["sqlMd5"])
+            api.calls.clear()
+            result = tool.run_action("verify-restore", engine, pin)
+            self.assertEqual((result["verifiedRowCount"], result["foreignKeys"], result["r2Closure"], result["r2Metadata"]),
+                             (len(chain) + 38, "verified", "verified", "verified"))
+            self.assertEqual((result["verifiedGeneralAuthInstallationCount"], result["verifiedGeneralAuthPrincipalCount"],
+                              result["verifiedGeneralAuthGroupCount"], result["verifiedGeneralAuthOverrideCount"]), (1, 3, 2, 2))
+            self.assertEqual(result["verifiedDataSha256"], candidate.document["dataSha256"])
+            self.assertEqual(result["unifiedAuthOracleManifestSha256"], candidate.pin()["unifiedAuthOracleManifestSha256"])
+            self.assertNotIn("unifiedShareOracle", result)
+            db.execute("UPDATE general_auth_principals SET override_allowed=1 WHERE is_admin=1")
+            with self.assertRaises(native.RehearsalError):
+                tool.run_action("verify-restore", engine, pin)
+            self.assertFalse(any(method in {"POST", "PUT", "S3 PUT"} for method, _, _ in api.calls))
+
 
 class CandidateBoundaryTests(unittest.TestCase):
     def test_only_candidate_names_use_the_full_cohort(self):
@@ -1068,14 +1187,51 @@ class CandidateBoundaryTests(unittest.TestCase):
             api.r2("PUT", native.WORKER_NAME, api.journal_prefix + "000001-" + "a" * 32 + ".json", b"{}")
             self.assertEqual(send.call_count, 7)
 
-    def test_unified_share_live_pin_requires_all_three_legacy_capabilities(self):
+    def test_unified_auth_scope_cannot_reuse_v10_or_standalone_auth_resources(self):
+        native = tool.native
+        with patch.object(native, "ACCOUNT_SHA256", native.digest(native_tests.ACCOUNT.encode())), patch.object(native, "_response") as send:
+            api = native.RehearsalAPI(native_tests.TARGET, "synthetic-token", native_tests.COHORT, profile=tool.UNIFIED_AUTH_PROFILE)
+            v10 = native.RehearsalAPI(native_tests.TARGET, "synthetic-token", native_tests.COHORT, profile=tool.UNIFIED_SHARE_PROFILE)
+            standalone = native.RehearsalAPI(native_tests.TARGET, "synthetic-token", native_tests.COHORT, profile=tool.GENERAL_AUTH_PROFILE)
+            self.assertEqual(api.names, {"database": f"subs-bot-cf-legacy-v11-db-{api.cohort}",
+                                         "objects": f"subs-bot-cf-legacy-v11-r2-{api.cohort}"})
+            self.assertEqual(api.journal_prefix, f"maintenance/legacy-v11-candidate/{api.cohort}/journal/")
+            self.assertTrue(set(api.names.values()).isdisjoint({*v10.names.values(), *standalone.names.values()}))
+            self.assertNotIn(api.journal_prefix, {v10.journal_prefix, standalone.journal_prefix})
+            snapshots = {f"subscriptions/{identity}/{native_tests.SNAPSHOT}/{leaf}"
+                         for identity in range(1, 5) for leaf in ("manifest.json", "0.ndjson")}
+            share = f"private-shares/{native_tests.PAYLOAD}.txt"
+            keys = snapshots | {share, f"private-shares/{native_tests.SNAPSHOT}.txt"}
+            for refused in (
+                lambda: api.allow_restore(keys=snapshots),
+                lambda: api.allow_restore(native_tests.RESTORE_ID),
+                lambda: api.allow_restore(native_tests.SOURCE_ID),
+                lambda: api.rows(native_tests.SOURCE_ID, "SELECT id FROM subscriptions"),
+                lambda: api.json("POST", api.root + "/r2/buckets", {"name": v10.names["objects"], "storageClass": "Standard"}),
+                lambda: api.json("GET", api.root + "/d1/database?name=" + standalone.names["database"] + "&per_page=100"),
+                lambda: api.r2("PUT", native.WORKER_NAME, v10.journal_prefix + "000001-" + "a" * 32 + ".json", b"{}"),
+                lambda: api.r2("GET", api.names["objects"], share),
+            ):
+                with self.assertRaises(native.RehearsalError):
+                    refused()
+            api.allow_restore(keys=keys, object_bucket=api.names["objects"])
+            with self.assertRaises(native.RehearsalError):
+                api.list_objects(api.names["objects"], prefix="private-shares/", maximum=2)
+            send.assert_not_called()
+            send.return_value = native_tests.envelope([])
+            self.assertEqual(api.list_objects(api.names["objects"], maximum=10), [])
+            self.assertEqual(api.list_objects(api.names["objects"], prefix=share, maximum=2), [])
+            self.assertEqual(send.call_count, 2)
+
+    def test_unified_live_pin_requires_all_three_legacy_capabilities(self):
         source = object.__new__(tool.CandidateSource)
-        source.api = SimpleNamespace(profile=tool.UNIFIED_SHARE_PROFILE)
         source.scope = Mock()
-        for selected, temp, dynamic in ((False, True, True), (True, False, True), (True, True, False)):
-            source.scope.version.return_value = (None, selected, temp, dynamic)
-            with self.subTest(selected=selected, temp=temp, dynamic=dynamic), self.assertRaises(tool.native.RehearsalError):
-                source.live_pin()
+        for profile in (tool.UNIFIED_SHARE_PROFILE, tool.UNIFIED_AUTH_PROFILE):
+            source.api = SimpleNamespace(profile=profile)
+            for selected, temp, dynamic in ((False, True, True), (True, False, True), (True, True, False)):
+                source.scope.version.return_value = (None, selected, temp, dynamic)
+                with self.subTest(profile=profile, selected=selected, temp=temp, dynamic=dynamic), self.assertRaises(tool.native.RehearsalError):
+                    source.live_pin()
         source.scope.version.assert_called_with(source.scope.active.return_value.version, with_legacy_selected=True,
                                                 with_legacy_temp=True, with_legacy_dynamic_all=True)
 
