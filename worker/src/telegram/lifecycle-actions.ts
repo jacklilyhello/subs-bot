@@ -2,8 +2,14 @@ import { SUBSCRIPTION_LIFECYCLE_REVISION, validInteger } from "../storage.ts";
 import { normalizeSubscriptionName, prepareOwnedSubscriptionMutation, type SubscriptionMutation } from "../subscriptions.ts";
 import { inTelegramScope, TELEGRAM_PAGE_JUMP_RECEIPTS, type TelegramLifecycleUpdate, type TelegramPolicy } from "./protocol.ts";
 import { TELEGRAM_VIEW_RECEIPTS } from "./views.ts";
+import type { GeneralTelegramPin } from "./general-auth-runtime.ts";
+import { GENERAL_ACTOR_QUEUE_CAPACITY, GENERAL_REPLY_TTL, generalCurrentReceiptSql, generalPolicyBindings, prepareGeneralReceiptAuthority } from "./general-receipt.ts";
 
 export const TELEGRAM_LIFECYCLE_MARKER = "lifecycle:v1";
+export const GENERAL_LIFECYCLE_MARKER = "general-lifecycle:v1";
+export const GENERAL_LIFECYCLE_VIEW_MARKER = "general-lifecycle-view:v1";
+
+type LifecyclePolicy = TelegramPolicy | GeneralTelegramPin;
 
 type Action = "rename" | "trash-prompt" | "trash" | "restore";
 type ReplyKind = "rename-prompt" | "trash-prompt" | "renamed" | "trashed" | "restored" | "cancelled" | "invalid" | "stale";
@@ -47,22 +53,25 @@ const REAP_LIMIT = 40;
 const MAX_BUTTONS = 16;
 const encoder = new TextEncoder();
 
-const actionOrigin = `(
-  (inbox.receipt_nonce IN (${TELEGRAM_VIEW_RECEIPTS}) AND EXISTS (
+function actionOrigin(general: boolean): string {
+  const viewOrigin = general ? `= '${GENERAL_LIFECYCLE_VIEW_MARKER}'` : `IN (${TELEGRAM_VIEW_RECEIPTS})`;
+  return `(
+  (inbox.receipt_nonce ${viewOrigin} AND EXISTS (
     SELECT 1 FROM telegram_view AS view WHERE view.receipt_id = inbox.receipt_id
-      AND ((view.kind IN ('list', 'expiry') AND ticket.action IN ('rename', 'trash-prompt'))
+      AND ((view.kind ${general ? "= 'list'" : "IN ('list', 'expiry')"} AND ticket.action IN ('rename', 'trash-prompt'))
         OR (view.kind = 'recycle' AND ticket.action = 'restore'))
   )) OR
-  (inbox.receipt_nonce = '${TELEGRAM_LIFECYCLE_MARKER}' AND ticket.action = 'trash' AND EXISTS (
+  (inbox.receipt_nonce = '${general ? GENERAL_LIFECYCLE_MARKER : TELEGRAM_LIFECYCLE_MARKER}' AND ticket.action = 'trash' AND EXISTS (
     SELECT 1 FROM telegram_lifecycle_action AS prompt WHERE prompt.receipt_id = inbox.receipt_id
       AND prompt.kind = 'trash-prompt' AND prompt.subscription_id = ticket.subscription_id
       AND prompt.expected_revision = ticket.expected_revision
   ))
 )`;
+}
 
-const eligibleOrigin = `inbox.bot_id = ? AND inbox.actor_id = ? AND inbox.chat_id = ?
-  AND inbox.chat_type = ? AND inbox.thread_id IS ? AND reply.state = 'sent' AND reply.sent_message_id = ?
-  AND (inbox.actor_id = ? OR COALESCE((
+const originScope = `inbox.bot_id = ? AND inbox.actor_id = ? AND inbox.chat_id = ?
+  AND inbox.chat_type = ? AND inbox.thread_id IS ? AND reply.state = 'sent' AND reply.sent_message_id = ?`;
+const isolationOrigin = `(inbox.actor_id = ? OR COALESCE((
     SELECT allowed=1 AND (inbox.receipt_nonce NOT IN (${TELEGRAM_PAGE_JUMP_RECEIPTS}) OR message_date<inbox.message_date)
     FROM telegram_auth WHERE bot_id = inbox.bot_id AND user_id = inbox.actor_id
   ), 1) = 1)`;
@@ -75,19 +84,26 @@ async function digestTicket(ticket: string): Promise<string> {
 }
 
 function actionSource(
-  policy: TelegramPolicy,
+  policy: LifecyclePolicy,
   event: TelegramLifecycleUpdate,
   digest: string | null,
 ): AdmissionSource {
   const messageId = event.kind === "lifecycle-callback" ? event.messageId : event.promptMessageId;
-  const origin = [policy.botId, event.actorId, event.chatId, event.chatType, event.threadId, messageId, policy.adminId];
+  const general = "privateManagement" in policy;
+  const marker = general ? GENERAL_LIFECYCLE_MARKER : TELEGRAM_LIFECYCLE_MARKER;
+  const origin = [policy.botId, event.actorId, event.chatId, event.chatType, event.threadId, messageId,
+    ...(general ? [...generalPolicyBindings(policy), event.messageDate, event.messageDate, event.messageDate, event.updateId]
+      : [policy.adminId])];
+  const eligibleOrigin = `${originScope} AND ${general ? `(${generalCurrentReceiptSql("inbox", GENERAL_ACTOR_QUEUE_CAPACITY)})
+    AND ?>=inbox.message_date AND ?>unixepoch()-${GENERAL_REPLY_TTL} AND ?<=unixepoch()+60
+    AND NOT EXISTS (SELECT 1 FROM telegram_general_replies WHERE bot_id=inbox.bot_id AND update_id=?)` : isolationOrigin}`;
   if (event.kind === "lifecycle-callback") {
     return {
       sql: `FROM telegram_lifecycle_ticket AS ticket
         JOIN telegram_inbox AS inbox ON inbox.receipt_id = ticket.origin_receipt_id
         JOIN telegram_outbox AS reply ON reply.receipt_id = inbox.receipt_id
         WHERE ticket.token_sha256 = ? AND ticket.used_by_receipt_id IS NULL AND ticket.expires_at > unixepoch()
-          AND reply.attempts = ticket.origin_attempt AND ${actionOrigin} AND ${eligibleOrigin}
+          AND reply.attempts = ticket.origin_attempt AND ${actionOrigin(general)} AND ${eligibleOrigin}
           AND (ticket.action <> 'rename' OR NOT EXISTS (
             SELECT 1 FROM telegram_rename_wait AS wait
             WHERE wait.bot_id = inbox.bot_id AND wait.actor_id = inbox.actor_id AND wait.chat_id = inbox.chat_id
@@ -105,7 +121,7 @@ function actionSource(
       JOIN telegram_inbox AS inbox ON inbox.receipt_id = prompt.receipt_id
       JOIN telegram_outbox AS reply ON reply.receipt_id = inbox.receipt_id
       WHERE wait.used_by_receipt_id IS NULL AND wait.expires_at > unixepoch() AND wait.last_update_id < ?
-        AND prompt.kind = 'rename-prompt' AND inbox.receipt_nonce = '${TELEGRAM_LIFECYCLE_MARKER}'
+        AND prompt.kind = 'rename-prompt' AND inbox.receipt_nonce = '${marker}'
         AND wait.bot_id = inbox.bot_id AND wait.actor_id = inbox.actor_id AND wait.chat_id = inbox.chat_id
         AND wait.chat_type = inbox.chat_type AND wait.thread_key = COALESCE(inbox.thread_id, 0)
         AND ${eligibleOrigin}`,
@@ -189,6 +205,7 @@ async function mutationSteps(
   ownerId: string,
   candidate: Candidate,
   mutation: SubscriptionMutation,
+  general: GeneralTelegramPin | null,
 ): Promise<D1PreparedStatement[]> {
   const prepared = await prepareOwnedSubscriptionMutation(db, {
     id: candidate.subscriptionId, ownerId, expectedLifecycleRevision: candidate.expectedLifecycleRevision,
@@ -196,8 +213,10 @@ async function mutationSteps(
     sql: `EXISTS (SELECT 1 FROM telegram_inbox AS incoming
       JOIN telegram_lifecycle_action AS action USING (receipt_id)
       WHERE ${freshReceipt} AND incoming.actor_id = ? AND action.kind = 'stale'
-        AND action.subscription_id = ? AND action.expected_revision = ?)`,
-    bindings: [...key, ownerId, candidate.subscriptionId, candidate.expectedLifecycleRevision],
+        AND action.subscription_id = ? AND action.expected_revision = ?
+        ${general ? `AND ${generalCurrentReceiptSql("incoming")}` : ""})`,
+    bindings: [...key, ownerId, candidate.subscriptionId, candidate.expectedLifecycleRevision,
+      ...(general ? generalPolicyBindings(general) : [])],
   });
   const outcome = { rename: "renamed", trash: "trashed", restore: "restored" }[mutation.kind];
   return [
@@ -217,6 +236,21 @@ export async function acceptTelegramLifecycle(
   event: TelegramLifecycleUpdate,
 ): Promise<"accepted" | "ignored"> {
   if (!inTelegramScope(policy, event)) return "ignored";
+  return acceptLifecycle(db, policy, event);
+}
+
+export async function acceptGeneralTelegramLifecycle(
+  db: D1Database, pin: GeneralTelegramPin, event: TelegramLifecycleUpdate,
+): Promise<"accepted" | "ignored"> {
+  if (!pin.privateManagement || event.actorId === pin.botId || event.chatType !== "private"
+    || event.chatId !== event.actorId || event.threadId !== null) return "ignored";
+  return acceptLifecycle(db, pin, event);
+}
+
+async function acceptLifecycle(
+  db: D1Database, policy: LifecyclePolicy, event: TelegramLifecycleUpdate,
+): Promise<"accepted" | "ignored"> {
+  const general = "privateManagement" in policy ? policy : null;
   if (event.kind === "lifecycle-callback" && !TICKET_PATTERN.test(event.ticket)) return "ignored";
 
   try {
@@ -240,6 +274,7 @@ export async function acceptTelegramLifecycle(
     `).bind(policy.botId, event.updateId, event.actorId, event.chatId, event.chatType, event.messageId,
       event.messageDate, event.threadId, nonce, ...source.bindings, candidate.action, candidate.subscriptionId,
       candidate.expectedLifecycleRevision, candidate.originReceiptId)];
+    if (general) steps.push(prepareGeneralReceiptAuthority(db, general, key));
 
     let mutation: SubscriptionMutation | undefined;
     if (digest !== null) {
@@ -258,7 +293,7 @@ export async function acceptTelegramLifecycle(
       }
       steps.push(...renameReceiptSteps(db, key, candidate, kind));
     }
-    if (mutation) steps.push(...await mutationSteps(db, key, event.actorId, candidate, mutation));
+    if (mutation) steps.push(...await mutationSteps(db, key, event.actorId, candidate, mutation, general));
     steps.push(
       db.prepare(`
         INSERT INTO telegram_outbox (receipt_id)
@@ -271,6 +306,7 @@ export async function acceptTelegramLifecycle(
           SELECT 1 FROM telegram_lifecycle_action AS action
           JOIN telegram_outbox AS reply USING (receipt_id)
           WHERE action.receipt_id = incoming.receipt_id
+            ${general ? `AND ${generalCurrentReceiptSql("incoming")}` : ""}
             AND (action.kind <> 'rename-prompt' OR EXISTS (
               SELECT 1 FROM telegram_rename_wait WHERE origin_receipt_id = incoming.receipt_id
             ))
@@ -288,7 +324,8 @@ export async function acceptTelegramLifecycle(
         ) THEN command END
         WHERE ${freshReceipt}
         RETURNING receipt_id
-      `).bind(TELEGRAM_LIFECYCLE_MARKER, ...key),
+      `).bind(general ? GENERAL_LIFECYCLE_MARKER : TELEGRAM_LIFECYCLE_MARKER,
+        ...(general ? generalPolicyBindings(general) : []), ...key),
     );
     const results = await db.batch(steps);
     const receipt = results.at(-1);
@@ -347,6 +384,7 @@ export function insertTelegramLifecycleTickets(
   leaseId: string,
   tickets: readonly TelegramLifecycleTicket[],
   previousChanges = 1,
+  general = false,
 ): D1PreparedStatement {
   if (!validInteger(tickets.length, 1, MAX_BUTTONS) || !validInteger(previousChanges, 1, 2)) {
     throw new RangeError("Invalid Telegram lifecycle ticket count.");
@@ -357,7 +395,7 @@ export function insertTelegramLifecycleTickets(
     )
     INSERT INTO telegram_lifecycle_ticket
       (token_sha256, origin_receipt_id, origin_attempt, action, subscription_id, expected_revision, expires_at)
-    SELECT ticket.token_sha256, reply.receipt_id, reply.attempts, CASE WHEN ${actionOrigin} THEN ticket.action END,
+    SELECT ticket.token_sha256, reply.receipt_id, reply.attempts, CASE WHEN ${actionOrigin(general)} THEN ticket.action END,
       ticket.subscription_id, ticket.expected_revision, unixepoch() + ${TICKET_SECONDS}
     FROM telegram_outbox AS reply JOIN telegram_inbox AS inbox USING (receipt_id)
     CROSS JOIN tickets AS ticket
@@ -367,21 +405,25 @@ export function insertTelegramLifecycleTickets(
     [sha256, action, subscriptionId, expectedLifecycleRevision]), previousChanges, receiptId, attempt, leaseId);
 }
 
-export async function reapTelegramLifecycle(db: D1Database): Promise<void> {
+export async function reapTelegramLifecycle(db: D1Database, generalBotId?: string): Promise<void> {
+  const scope = generalBotId === undefined ? "" : `AND EXISTS (SELECT 1 FROM telegram_inbox AS origin
+    WHERE origin.receipt_id=expired.origin_receipt_id AND origin.bot_id=?
+      AND origin.receipt_nonce IN ('${GENERAL_LIFECYCLE_VIEW_MARKER}','${GENERAL_LIFECYCLE_MARKER}'))`;
+  const bindings = generalBotId === undefined ? [] : [generalBotId];
   try {
     const results = await db.batch([
       db.prepare(`
         DELETE FROM telegram_lifecycle_ticket WHERE token_sha256 IN (
-          SELECT token_sha256 FROM telegram_lifecycle_ticket
-          WHERE expires_at <= unixepoch() ORDER BY expires_at, token_sha256 LIMIT ${REAP_LIMIT}
+          SELECT token_sha256 FROM telegram_lifecycle_ticket AS expired
+          WHERE expires_at <= unixepoch() ${scope} ORDER BY expires_at, token_sha256 LIMIT ${REAP_LIMIT}
         )
-      `),
+      `).bind(...bindings),
       db.prepare(`
         DELETE FROM telegram_rename_wait WHERE origin_receipt_id IN (
-          SELECT origin_receipt_id FROM telegram_rename_wait
-          WHERE expires_at <= unixepoch() - ${WAIT_SECONDS} ORDER BY expires_at, origin_receipt_id LIMIT ${REAP_LIMIT}
+          SELECT origin_receipt_id FROM telegram_rename_wait AS expired
+          WHERE expires_at <= unixepoch() - ${WAIT_SECONDS} ${scope} ORDER BY expires_at, origin_receipt_id LIMIT ${REAP_LIMIT}
         )
-      `),
+      `).bind(...bindings),
     ]);
     if (results.length === 2 && results.every((result) => result.success)) return;
   } catch {

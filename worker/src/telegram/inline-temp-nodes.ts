@@ -4,7 +4,7 @@ import type { TelegramInlineQuery, TelegramPolicy } from "./protocol.ts";
 import { unicode14Lower } from "./selected-search.ts";
 import { MAX_TEMP_OWNER_BYTES, MAX_TEMP_OWNER_NODES } from "./temp-import.ts";
 import {
-  ownedTempRowsSql, readTempBatchNodes, readTempStorage, tempInventoryGuard, verifyTempInventory,
+  ownedTempRowsSql, readTempBatchNodes, readVerifiedTempStorage, tempInventoryGuard, verifyTempInventory,
   type TempBatchMeta,
 } from "./temp-storage.ts";
 import { displayTelegramName } from "./views.ts";
@@ -33,10 +33,11 @@ export async function readTelegramInlineTempNodes(
     || !validInteger(event.updateId, 1) || !validInteger(limit, 1, 50) || !validInteger(receivedAt, 1) || Date.now() >= deadline) return null;
 
   try {
-    const mode = await readTempStorage(db);
+    const storage = await readVerifiedTempStorage(db);
+    const { mode, generalReceipts } = storage;
     const scopeArgs = [policy.botId, event.actorId, receivedAt] as const;
     const [inventory, clear] = await db.batch<TempBatchMeta | Fence>([
-      db.prepare(`WITH temp_scope AS (${scope}), owned AS (${ownedTempRowsSql(mode, "temp_scope", { verifyLive: true })})
+      db.prepare(`WITH temp_scope AS (${scope}), owned AS (${ownedTempRowsSql(mode, "temp_scope", { verifyLive: true, generalReceipts })})
         SELECT * FROM owned ORDER BY source,id LIMIT ?`).bind(...scopeArgs, MAX_TEMP_OWNER_NODES + 1),
       db.prepare(`SELECT message_date AS date,message_id AS message FROM telegram_temp_clear_fence
         WHERE bot_id=? AND actor_id=?`).bind(policy.botId, event.actorId),
@@ -64,7 +65,7 @@ export async function readTelegramInlineTempNodes(
       const expected = rows.slice(start, end);
       const page = await db.prepare(`WITH temp_scope AS (${scope}), page_keys AS (
         SELECT json_extract(value,'$[0]') AS source,json_extract(value,'$[1]') AS id FROM json_each(?)
-      ), owned AS (${ownedTempRowsSql(mode, "temp_scope", { includePayload: true, verifyLive: true, keysCte: "page_keys" })})
+      ), owned AS (${ownedTempRowsSql(mode, "temp_scope", { includePayload: true, verifyLive: true, generalReceipts, keysCte: "page_keys" })})
       SELECT * FROM owned WHERE accepted=1 ORDER BY source,id`)
         .bind(...scopeArgs, JSON.stringify(expected.map(({ source, id }) => [source, id]))).all<BatchContent>();
       if (!page.success || page.results.length !== expected.length) return null;
@@ -95,7 +96,7 @@ export async function readTelegramInlineTempNodes(
       start = end;
     }
     if (Date.now() >= deadline) return null;
-    const inventoryGuard = tempInventoryGuard(mode, sendScope, rows);
+    const inventoryGuard = tempInventoryGuard(storage, sendScope, rows);
     return { results, guard: {
       sql: `(${inventoryGuard.sql}) AND COALESCE((SELECT json_array(message_date,message_id) FROM telegram_temp_clear_fence
         WHERE bot_id=request.bot_id AND actor_id=request.actor_id),'[0,0]')=?`,

@@ -24,6 +24,8 @@ import { acceptTelegramGitHubSearch, recoverTelegramGitHubSearch, runTelegramGit
 import { scopeGitHubSearchProof, writeGitHubSearchProof } from "./telegram/github-search-proof.ts";
 import { acceptGeneralTelegramCommand, drainGeneralTelegramReply, parseGeneralTelegramPin,
   recoverGeneralTelegramReplies } from "./telegram/general-auth-runtime.ts";
+import { acceptGeneralSharedTelegramCommand, drainGeneralSharedTelegramReply,
+  recoverGeneralSharedTelegramReplies } from "./telegram/general-auth-shared.ts";
 import { acceptTelegramGroupShare, telegramGroupShareReady } from "./telegram/group-share-actions.ts";
 import { drainTelegramGroupShareCards } from "./telegram/group-share-delivery.ts";
 import { acceptTelegramBulkTrash, telegramBulkTrashReady } from "./telegram/bulk-trash.ts";
@@ -185,9 +187,12 @@ async function telegramWebhook(request: Request, env: Env, publicOrigin: PublicO
     const general = parseGeneralTelegramPin(env.TELEGRAM_GENERAL_CONFIG, env.BUILD_REVISION);
     if (!general) return plain("Service unavailable.", 503, false);
     try {
-      const status = await acceptGeneralTelegramCommand(env.DB, general, request);
+      const status = general.sharedOutbox ? await acceptGeneralSharedTelegramCommand(env.DB, general, request,
+        (callbackId) => ctx?.waitUntil(answerTelegramCallback(general, callbackId)))
+        : await acceptGeneralTelegramCommand(env.DB, general, request);
       if (status === 200) {
-        const delivery = drainGeneralTelegramReply(env.DB, general);
+        const delivery = general.sharedOutbox ? drainGeneralSharedTelegramReply(env.DB, general)
+          : drainGeneralTelegramReply(env.DB, general);
         if (ctx) ctx.waitUntil(delivery.catch(() => undefined));
         else await delivery;
       }
@@ -652,7 +657,8 @@ async function scheduled(_controller: ScheduledController, env: Env): Promise<vo
     if (policy) await recoverTelegramWork(env, policy, pin, await telegramProviderQueueReady(env, pin), publicOrigin);
     else if (env.TELEGRAM_ISOLATION_CONFIG === undefined) {
       const general = parseGeneralTelegramPin(env.TELEGRAM_GENERAL_CONFIG, env.BUILD_REVISION);
-      if (general) await recoverGeneralTelegramReplies(env.DB, general);
+      if (general?.sharedOutbox) await recoverGeneralSharedTelegramReplies(env.DB, general);
+      else if (general) await recoverGeneralTelegramReplies(env.DB, general);
     }
   } finally {
     await runOneProviderJob(env.DB, env.NODES, env.PROVIDER_FETCH, pin);

@@ -2,8 +2,8 @@ import { validInteger } from "../storage.ts";
 import { inTelegramScope, type TelegramCommand, type TelegramPolicy } from "./protocol.ts";
 import { renderTelegramTemp, tempRawStamp, type TelegramTempReply } from "./temp-import.ts";
 import {
-  MAX_TEMP_OWNER_BYTES, MAX_TEMP_OWNER_NODES, ownedTempRowsSql, readTempBatchNodes, readTempStorage, tempInventoryGuard,
-  tempSchemaGuard, verifyTempInventory, type TempBatchMeta, type TempBatchRow, type TempStorageMode,
+  MAX_TEMP_OWNER_BYTES, MAX_TEMP_OWNER_NODES, ownedTempRowsSql, readTempBatchNodes, readVerifiedTempStorage, tempInventoryGuard,
+  tempSchemaGuard, verifyTempInventory, type TempBatchMeta, type TempBatchRow, type VerifiedTempStorage,
 } from "./temp-storage.ts";
 
 const PAGE_BYTES = 512 * 1024;
@@ -45,8 +45,8 @@ function readyScope(policy: TelegramPolicy, lease: RawLease): lease is RawLease 
     && lease.threadId === null && inTelegramScope(policy, lease);
 }
 
-function exactInventory(policy: TelegramPolicy, mode: TempStorageMode, rows: readonly TempBatchMeta[], nodeCount: number): TelegramTempRawGuard {
-  const inventory = tempInventoryGuard(mode, tempScope, rows);
+function exactInventory(policy: TelegramPolicy, storage: VerifiedTempStorage, rows: readonly TempBatchMeta[], nodeCount: number): TelegramTempRawGuard {
+  const inventory = tempInventoryGuard(storage, tempScope, rows);
   return {
     sql: `(${eligible}) AND EXISTS (SELECT 1 FROM telegram_temp_reply
       WHERE receipt_id=inbox.receipt_id AND kind='summary' AND total_count=?)
@@ -55,13 +55,16 @@ function exactInventory(policy: TelegramPolicy, mode: TempStorageMode, rows: rea
   };
 }
 
-async function readPage(db: D1Database, policy: TelegramPolicy, lease: RawLease, mode: TempStorageMode, expected: readonly TempBatchMeta[]) {
+async function readPage(
+  db: D1Database, policy: TelegramPolicy, lease: RawLease, { mode, generalReceipts }: VerifiedTempStorage,
+  expected: readonly TempBatchMeta[],
+) {
   return db.prepare(`WITH authorized AS (
     ${tempScope} FROM telegram_inbox AS inbox JOIN telegram_outbox AS reply USING(receipt_id)
     WHERE ${scope} AND reply.state='leased' AND (${eligible}) AND (${tempSchemaGuard(mode)})
   ), wanted AS (
     SELECT json_extract(value,'$[0]') AS source,json_extract(value,'$[1]') AS id FROM json_each(?)
-  ) SELECT * FROM (${ownedTempRowsSql(mode, "authorized", { includePayload: true, verifyLive: true, keysCte: "wanted" })})
+  ) SELECT * FROM (${ownedTempRowsSql(mode, "authorized", { includePayload: true, verifyLive: true, generalReceipts, keysCte: "wanted" })})
     ORDER BY source,id`)
     .bind(...scopeArgs(policy, lease), policy.adminId, policy.adminId,
       JSON.stringify(expected.map(({ source, id }) => [source, id]))).all<TempBatchRow>();
@@ -72,7 +75,8 @@ export async function prepareTelegramTempRawReply(
 ): Promise<TelegramTempRawReply> {
   if (!readyScope(policy, lease)) return { kind: "stale" };
   try {
-    const mode = await readTempStorage(db);
+    const storage = await readVerifiedTempStorage(db);
+    const { mode, generalReceipts } = storage;
     // The first transaction reads only identities and declared byte counts. A
     // later retry sees the same immutable batches or refuses the old request.
     const [receipt, metadataRows] = await db.batch<TempBatchMeta | { totalCount: number }>([
@@ -82,7 +86,7 @@ export async function prepareTelegramTempRawReply(
         .bind(...scopeArgs(policy, lease), policy.adminId, policy.adminId),
       db.prepare(`WITH owned AS (
         SELECT ? AS bot_id,? AS actor_id,? AS before_receipt,? AS visibility_epoch
-      ) SELECT * FROM (${ownedTempRowsSql(mode, "owned", { verifyLive: true })}) ORDER BY source,id LIMIT ?`)
+      ) SELECT * FROM (${ownedTempRowsSql(mode, "owned", { verifyLive: true, generalReceipts })}) ORDER BY source,id LIMIT ?`)
         .bind(policy.botId, lease.actorId, lease.receiptId, lease.messageDate, MAX_TEMP_OWNER_NODES + 1),
     ]);
     if (!receipt?.success || !metadataRows?.success) return { kind: "unavailable" };
@@ -107,7 +111,7 @@ export async function prepareTelegramTempRawReply(
         size += rows[end++].bytes;
       }
       const expected = rows.slice(start, end);
-      const page = await readPage(db, policy, lease, mode, expected);
+      const page = await readPage(db, policy, lease, storage, expected);
       if (!page.success) return { kind: "unavailable" };
       if (page.results.length !== expected.length) return { kind: "stale" };
       for (const [index, batch] of page.results.entries()) {
@@ -132,7 +136,7 @@ export async function prepareTelegramTempRawReply(
     }
     if (lines.length !== nodes || Date.now() >= deadline) return { kind: "unavailable" };
     const caption = renderTelegramTemp(lease.temp);
-    const guard = exactInventory(policy, mode, rows, nodes);
+    const guard = exactInventory(policy, storage, rows, nodes);
     if (!document && caption.length + (nodes ? 2 + units : 0) <= TEXT_UNITS) {
       return { kind: "text", text: nodes ? caption + "\n\n" + lines.join("\n") : caption, guard };
     }

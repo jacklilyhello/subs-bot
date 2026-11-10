@@ -236,7 +236,7 @@ function humanSender(message: Record<string, unknown>): string | null {
   return isRecord(actor) && actor.is_bot === false && isPositiveInteger(actor.id) ? String(actor.id) : null;
 }
 
-function readLeadingTelegramCommand(message: Record<string, unknown>, botUsername: string): {
+function readLeadingTelegramCommand(message: Record<string, unknown>, botUsername: string, requireAddress = false): {
   name: string; remainder: string;
 } | null {
   const { text, entities } = message;
@@ -249,7 +249,7 @@ function readLeadingTelegramCommand(message: Record<string, unknown>, botUsernam
   const entity = BOT_COMMAND.exec(text.slice(0, length));
   if (!entity) return null;
   const [, name, addressedTo] = entity;
-  if (addressedTo && addressedTo.toLowerCase() !== botUsername.toLowerCase()) return null;
+  if ((requireAddress && !addressedTo) || (addressedTo && addressedTo.toLowerCase() !== botUsername.toLowerCase())) return null;
   return { name: name.toLowerCase(), remainder: text.slice(length) };
 }
 
@@ -265,6 +265,24 @@ export function readPrivateTelegramCommand(update: Record<string, unknown>, botU
     || String(chat.id) !== actorId || !isPositiveInteger(messageId) || !isPositiveInteger(messageDate)) return null;
   const command = readLeadingTelegramCommand(message, botUsername);
   return command ? { actorId, messageId, messageDate, ...command } : null;
+}
+
+export function readGeneralGroupListCommand(update: Record<string, unknown>, botUsername: string):
+  Omit<TelegramEventScope, "updateId"> | null {
+  const { message } = update;
+  if (Object.keys(update).length !== 2 || !isRecord(message) || "edit_date" in message || "document" in message) return null;
+  const actorId = humanSender(message);
+  const { chat, message_id: messageId, date: messageDate, message_thread_id: thread } = message;
+  if (!actorId || !isRecord(chat) || (chat.type !== "group" && chat.type !== "supergroup")
+    || typeof chat.id !== "number" || !Number.isSafeInteger(chat.id) || chat.id >= 0 || chat.id <= -(2 ** 52)
+    || !isPositiveInteger(messageId) || !isPositiveInteger(messageDate)) return null;
+  const topic = message.is_topic_message === true;
+  if (thread === undefined ? topic : (!topic || chat.type !== "supergroup" || !isPositiveInteger(thread))) return null;
+  const command = readLeadingTelegramCommand(message, botUsername, true);
+  return command?.name === "list" && command.remainder.trim() === "" ? {
+    actorId, chatId: String(chat.id), chatType: chat.type, messageId, messageDate,
+    threadId: typeof thread === "number" ? thread : null,
+  } : null;
 }
 
 function authCommand(args: string[], reply: unknown, memberId: string): TelegramCommand["command"] {
@@ -359,8 +377,8 @@ function messageCommand(
   }
 }
 
-function messageScope(
-  message: Record<string, unknown>, actorId: string, updateId: number, policy: TelegramPolicy,
+function telegramMessageScope(
+  message: Record<string, unknown>, actorId: string, updateId: number,
 ): TelegramEventScope | null {
   const { chat, message_id: messageId, date: messageDate, message_thread_id: threadId } = message;
   if (
@@ -371,18 +389,24 @@ function messageScope(
   const chatId = String(chat.id);
   const chatType = chat.type;
   if (chatType !== "private" && chatType !== "group" && chatType !== "supergroup") return null;
-  const scope: TelegramEventScope = { updateId, actorId, chatId, chatType, messageId, messageDate, threadId: threadId ?? null };
-  return inTelegramScope(policy, scope) ? scope : null;
+  return { updateId, actorId, chatId, chatType, messageId, messageDate, threadId: threadId ?? null };
 }
 
-function ownBotMessage(value: unknown, policy: TelegramPolicy): value is Record<string, unknown> {
+function messageScope(
+  message: Record<string, unknown>, actorId: string, updateId: number, policy: TelegramPolicy,
+): TelegramEventScope | null {
+  const scope = telegramMessageScope(message, actorId, updateId);
+  return scope && inTelegramScope(policy, scope) ? scope : null;
+}
+
+function ownBotMessage(value: unknown, policy: Pick<TelegramPolicy, "botId">): value is Record<string, unknown> {
   if (!isRecord(value)) return false;
   const bot = value.from;
   return isRecord(bot) && bot.is_bot === true && isPositiveInteger(bot.id) && String(bot.id) === policy.botId;
 }
 
 function renameReply(
-  message: Record<string, unknown>, scope: TelegramEventScope, policy: TelegramPolicy,
+  message: Record<string, unknown>, scope: TelegramEventScope, policy: Pick<TelegramPolicy, "botId">,
 ): TelegramLifecycleUpdate | null {
   const { reply_to_message: repliedTo, text, entities } = message;
   if (typeof text !== "string" || text.length === 0 || !ownBotMessage(repliedTo, policy)) return null;
@@ -390,12 +414,54 @@ function renameReply(
     isRecord(entity) && entity.type === "bot_command" && entity.offset === 0) && !RENAME_CANCEL.test(text.trim())) {
     return null;
   }
-  const prompt = messageScope(repliedTo, scope.actorId, scope.updateId, policy);
+  const prompt = telegramMessageScope(repliedTo, scope.actorId, scope.updateId);
   if (!prompt || prompt.chatId !== scope.chatId || prompt.chatType !== scope.chatType ||
       prompt.threadId !== scope.threadId || prompt.messageId >= scope.messageId || prompt.messageDate > scope.messageDate) {
     return null;
   }
   return { ...scope, kind: "rename-reply", promptMessageId: prompt.messageId, text };
+}
+
+function readGeneralPrivateTicket(
+  callback: Record<string, unknown>, updateId: number, botId: string, pattern: RegExp,
+): (TelegramEventScope & { callbackId: string; ticket: string }) | null {
+  const { id: callbackId, from: actor, message: origin, data: ticket } = callback;
+  if ("inline_message_id" in callback || "game_short_name" in callback || !matches(callbackId, CALLBACK_ID)
+    || !matches(ticket, pattern) || !isRecord(actor) || actor.is_bot !== false || !isPositiveInteger(actor.id)
+    || !ownBotMessage(origin, { botId })) return null;
+  const scope = telegramMessageScope(origin, String(actor.id), updateId);
+  return scope && scope.chatType === "private" && scope.chatId === scope.actorId && scope.threadId === null
+    ? { ...scope, callbackId, ticket } : null;
+}
+
+export function readGeneralPrivateSubscriptionRead(
+  update: Record<string, unknown>, updateId: number, botId: string, botUsername: string,
+): Extract<TelegramSubscriptionReadUpdate, { kind: "search" | "callback" }> | null {
+  if (Object.keys(update).length !== 2) return null;
+  if (isRecord(update.callback_query)) {
+    const ticket = readGeneralPrivateTicket(update.callback_query, updateId, botId, SUBSCRIPTION_READ_TICKET);
+    return ticket ? { ...ticket, kind: "callback" } : null;
+  }
+  const command = readPrivateTelegramCommand(update, botUsername);
+  if (!command || command.actorId === botId || command.name !== "s") return null;
+  return { kind: "search", actorId: command.actorId, chatId: command.actorId, chatType: "private", threadId: null,
+    updateId, messageId: command.messageId, messageDate: command.messageDate, query: command.remainder };
+}
+
+export function readGeneralPrivateLifecycleUpdate(
+  update: Record<string, unknown>, updateId: number, botId: string,
+): TelegramLifecycleUpdate | null {
+  if (Object.keys(update).length !== 2) return null;
+  const { callback_query: callback, message } = update;
+  if (isRecord(callback)) {
+    const ticket = readGeneralPrivateTicket(callback, updateId, botId, LIFECYCLE_TICKET);
+    return ticket ? { ...ticket, kind: "lifecycle-callback" } : null;
+  }
+  if (!isRecord(message) || "edit_date" in message || "document" in message) return null;
+  const actorId = humanSender(message);
+  const scope = actorId ? telegramMessageScope(message, actorId, updateId) : null;
+  return scope && scope.chatType === "private" && scope.chatId === scope.actorId && scope.threadId === null
+    ? renameReply(message, scope, { botId }) : null;
 }
 
 function normalizeDocument(message: Record<string, unknown>, scope: TelegramEventScope): NormalizedUpdate | null {

@@ -13,8 +13,10 @@ import { displayTelegramName, displayTelegramDate, TELEGRAM_VIEW_RECEIPTS } from
 import { TELEGRAM_SUBSCRIPTION_NODE_MARKER, type TelegramNodePageButton } from "./subscription-node-pages.ts";
 
 export const TELEGRAM_SUBSCRIPTION_READ_MARKER = SUBSCRIPTION_READ_RECEIPT_MARKER;
+export const GENERAL_SUBSCRIPTION_READ_MARKER = "general-subscription-read:v1";
 export const MAX_SUBSCRIPTION_SEARCH_ROWS = 512;
 const MAX_SCAN_BYTES = 8 * 1024 * 1024;
+const MAX_MATCHES_BYTES = 16_384;
 const PAGE_SIZE = 8;
 const SCAN_PAGE_SIZE = 16;
 const MAX_BUTTONS = PAGE_SIZE + 2;
@@ -33,7 +35,7 @@ export type TelegramSubscriptionReadButton = ReadTarget & { text: string };
 export type TelegramSubscriptionReadTicket = ReadTarget & { sha256: string };
 
 type ReadKind = ReadTarget["kind"] | "usage" | "limit" | "missing" | "stale";
-type Receipt = {
+export type TelegramSubscriptionReadReceipt = {
   kind: ReadKind;
   subscriptionId: number | null;
   format: Format | null;
@@ -73,31 +75,39 @@ async function digestTicket(ticket: string): Promise<string> {
 
 type SearchScan = { kind: "usage" | "limit" } | { kind: "search"; matches: string; inventory: string };
 
-async function scanSearch(db: D1Database, ownerId: string, query: string): Promise<SearchScan> {
+export async function scanTelegramSubscriptionSearch(
+  db: D1Database, ownerId: string, query: string, namesOnly = false,
+): Promise<SearchScan> {
   const needle = selectedQuery(query);
   if (needle === "") return { kind: "usage" };
   if (needle === null) return { kind: "limit" };
   const deadline = Date.now() + READ_BUDGET_MS;
   const inventory: [number, number][] = [];
-  const matches: [number, number][] = [];
+  const matches: ([number, number] | [number, number, number])[] = [];
   let afterId = 0;
   let bytes = 0;
   for (;;) {
     if (Date.now() >= deadline) return { kind: "limit" };
-    const result = await db.prepare(`SELECT id,name,source_url AS sourceUrl,${SUBSCRIPTION_LIFECYCLE_REVISION} AS revision
-      FROM subscriptions WHERE owner_id=? AND id>? ORDER BY id LIMIT ?`).bind(ownerId, afterId, SCAN_PAGE_SIZE)
-      .all<{ id: number; name: string; sourceUrl: string; revision: number }>();
+    const result = await db.prepare(`SELECT id,name,${namesOnly ? "NULL" : "source_url"} AS sourceUrl,
+      ${SUBSCRIPTION_LIFECYCLE_REVISION} AS revision FROM subscriptions WHERE owner_id=? AND id>? ORDER BY id LIMIT ?`)
+      .bind(ownerId, afterId, SCAN_PAGE_SIZE).all<{ id: number; name: string; sourceUrl: string | null; revision: number }>();
     if (!result.success) throw new Error("Telegram subscription search could not be read.");
     for (const row of result.results) {
       if (!validInteger(row.id, afterId + 1) || !validInteger(row.revision, 0) || typeof row.name !== "string"
-        || typeof row.sourceUrl !== "string") throw new Error("Telegram subscription metadata is invalid.");
-      bytes += encoder.encode(row.name).byteLength + encoder.encode(row.sourceUrl).byteLength;
+        || (!namesOnly && typeof row.sourceUrl !== "string")) throw new Error("Telegram subscription metadata is invalid.");
+      bytes += encoder.encode(row.name).byteLength + encoder.encode(row.sourceUrl ?? "").byteLength;
       if (inventory.length === MAX_SUBSCRIPTION_SEARCH_ROWS || bytes > MAX_SCAN_BYTES || Date.now() >= deadline) return { kind: "limit" };
       afterId = row.id;
       inventory.push([row.id, row.revision]);
-      if (unicode14Lower(`${row.name} ${row.sourceUrl}`).includes(needle)) matches.push([row.id, inventory.length]);
+      if (unicode14Lower(namesOnly ? row.name : `${row.name} ${row.sourceUrl}`).includes(needle)) {
+        matches.push(namesOnly ? [row.id, inventory.length, row.revision] : [row.id, inventory.length]);
+      }
     }
-    if (result.results.length < SCAN_PAGE_SIZE) return { kind: "search", matches: JSON.stringify(matches), inventory: JSON.stringify(inventory) };
+    if (result.results.length < SCAN_PAGE_SIZE) {
+      const encoded = JSON.stringify(matches);
+      if (namesOnly && encoder.encode(encoded).byteLength > MAX_MATCHES_BYTES) return { kind: "limit" };
+      return { kind: "search", matches: encoded, inventory: JSON.stringify(inventory) };
+    }
   }
 }
 
@@ -105,6 +115,31 @@ const authEpochFields = `CASE WHEN incoming.actor_id=? THEN 0 ELSE COALESCE(auth
   CASE WHEN incoming.actor_id=? THEN 0 ELSE COALESCE(auth.message_id,0) END`;
 const receiptFields = "receipt_id,kind,subscription_id,format,search_receipt_id,search_offset,matches,auth_message_date,auth_message_id";
 const authJoin = "LEFT JOIN telegram_auth AS auth ON auth.bot_id=incoming.bot_id AND auth.user_id=incoming.actor_id";
+const freshSearch = "incoming.bot_id=? AND incoming.update_id=? AND incoming.receipt_nonce=?";
+
+export function prepareTelegramSubscriptionSearchReceipt(
+  db: D1Database, key: readonly [string, number, string], scan: SearchScan, adminId?: string,
+): D1PreparedStatement {
+  // The general marker uses its 0046 sidecar for auth. The old pair stays a schema-compatible zero sentinel.
+  const epoch = adminId === undefined ? "0,0" : authEpochFields;
+  const join = adminId === undefined ? "" : authJoin;
+  const bindings = adminId === undefined ? [] : [adminId, adminId];
+  if (scan.kind !== "search") return db.prepare(`INSERT INTO telegram_subscription_read(${receiptFields})
+    SELECT incoming.receipt_id,?,NULL,NULL,NULL,NULL,NULL,${epoch}
+    FROM telegram_inbox AS incoming ${join} WHERE ${freshSearch}`).bind(scan.kind, ...bindings, ...key);
+  return db.prepare(`WITH checked(receipt_id,stable,authDate,authId) AS (
+    SELECT incoming.receipt_id,(
+      (SELECT count(*) FROM subscriptions WHERE owner_id=incoming.actor_id)=json_array_length(?)
+      AND NOT EXISTS (SELECT 1 FROM json_each(?) AS expected LEFT JOIN subscriptions AS sub
+        ON sub.owner_id=incoming.actor_id AND sub.id=json_extract(expected.value,'$[0]')
+        LEFT JOIN subscription_lifecycle AS lifecycle ON lifecycle.subscription_id=sub.id
+        WHERE sub.id IS NULL OR COALESCE(lifecycle.revision,0)<>json_extract(expected.value,'$[1]'))
+    ),${epoch} FROM telegram_inbox AS incoming ${join} WHERE ${freshSearch}
+  ) INSERT INTO telegram_subscription_read(${receiptFields})
+  SELECT receipt_id,CASE WHEN stable THEN 'search' ELSE 'stale' END,NULL,NULL,NULL,
+    CASE WHEN stable THEN 0 END,CASE WHEN stable THEN ? END,authDate,authId FROM checked`)
+    .bind(scan.inventory, scan.inventory, ...bindings, ...key, scan.matches);
+}
 
 export async function acceptTelegramSubscriptionRead(
   db: D1Database, policy: TelegramPolicy, event: TelegramSubscriptionReadUpdate, nodePagesEnabled = false,
@@ -118,7 +153,7 @@ export async function acceptTelegramSubscriptionRead(
         .bind(policy.botId, event.actorId).first<{ allowed: number; date: number }>();
       if (auth && (auth.allowed !== 1 || auth.date >= event.messageDate)) return "ignored";
     }
-    const scan = event.kind === "search" ? await scanSearch(db, event.actorId, event.query) : null;
+    const scan = event.kind === "search" ? await scanTelegramSubscriptionSearch(db, event.actorId, event.query) : null;
     const key = [policy.botId, event.updateId, crypto.randomUUID()] as const;
     const fresh = "incoming.bot_id=? AND incoming.update_id=? AND incoming.receipt_nonce=?";
     const fields = "(bot_id,update_id,actor_id,chat_id,chat_type,message_id,message_date,thread_id,command,receipt_nonce)";
@@ -165,22 +200,8 @@ export async function acceptTelegramSubscriptionRead(
         ${authJoin} WHERE ${fresh}`).bind(policy.adminId, policy.adminId, ...key));
     } else {
       steps.push(db.prepare(`INSERT INTO telegram_inbox ${fields} SELECT ${values} WHERE ${timeAndAuth} ${conflict}`).bind(...scope, ...auth));
-      if (scan?.kind === "search") {
-        steps.push(db.prepare(`WITH checked AS (
-          SELECT incoming.receipt_id,(
-            (SELECT count(*) FROM subscriptions WHERE owner_id=incoming.actor_id)=json_array_length(?)
-            AND NOT EXISTS (SELECT 1 FROM json_each(?) AS expected LEFT JOIN subscriptions AS sub
-              ON sub.owner_id=incoming.actor_id AND sub.id=json_extract(expected.value,'$[0]')
-              LEFT JOIN subscription_lifecycle AS lifecycle ON lifecycle.subscription_id=sub.id
-              WHERE sub.id IS NULL OR COALESCE(lifecycle.revision,0)<>json_extract(expected.value,'$[1]'))
-          ) AS stable,
-          CASE WHEN incoming.actor_id=? THEN 0 ELSE COALESCE(auth.message_date,0) END AS authDate,
-          CASE WHEN incoming.actor_id=? THEN 0 ELSE COALESCE(auth.message_id,0) END AS authId
-          FROM telegram_inbox AS incoming ${authJoin} WHERE ${fresh}
-        ) INSERT INTO telegram_subscription_read(${receiptFields})
-        SELECT receipt_id,CASE WHEN stable THEN 'search' ELSE 'stale' END,NULL,NULL,NULL,
-          CASE WHEN stable THEN 0 END,CASE WHEN stable THEN ? END,authDate,authId FROM checked`)
-          .bind(scan.inventory, scan.inventory, policy.adminId, policy.adminId, ...key, scan.matches));
+      if (scan) {
+        steps.push(prepareTelegramSubscriptionSearchReceipt(db, key, scan, policy.adminId));
       } else if (event.kind === "number" && validInteger(event.position, 1, MAX_SUBSCRIPTION_SEARCH_ROWS)) {
         steps.push(db.prepare(`INSERT INTO telegram_subscription_read(${receiptFields})
           SELECT incoming.receipt_id,CASE WHEN sub.id IS NULL THEN 'missing' ELSE 'detail' END,
@@ -192,7 +213,7 @@ export async function acceptTelegramSubscriptionRead(
         steps.push(db.prepare(`INSERT INTO telegram_subscription_read(${receiptFields})
           SELECT incoming.receipt_id,?,NULL,NULL,NULL,NULL,NULL,${authEpochFields}
           FROM telegram_inbox AS incoming ${authJoin} WHERE ${fresh}`)
-          .bind(scan?.kind ?? (event.kind === "number" && event.position === 0 ? "missing" : "limit"), policy.adminId, policy.adminId, ...key));
+          .bind(event.kind === "number" && event.position === 0 ? "missing" : "limit", policy.adminId, policy.adminId, ...key));
       }
     }
     steps.push(
@@ -227,11 +248,11 @@ function leaseScopeSql(state: "leased" | "sending"): string {
     AND inbox.receipt_id=? AND inbox.bot_id=? AND inbox.actor_id=? AND inbox.chat_id=? AND inbox.chat_type=? AND inbox.thread_id IS ?`;
 }
 
-function leaseScopeArgs(policy: TelegramPolicy, lease: ReadLease) {
+function leaseScopeArgs(policy: Pick<TelegramPolicy, "botId">, lease: ReadLease) {
   return [lease.leaseId, lease.attempts, lease.receiptId, policy.botId, lease.actorId, lease.chatId, lease.chatType, lease.threadId] as const;
 }
 
-export async function confirmTelegramSubscriptionReadSend(db: D1Database, policy: TelegramPolicy, lease: ReadLease, guard: Guard): Promise<boolean> {
+export async function confirmTelegramSubscriptionReadSend(db: D1Database, policy: Pick<TelegramPolicy, "botId">, lease: ReadLease, guard: Guard): Promise<boolean> {
   try {
     const row = await db.prepare(`SELECT 1 FROM telegram_inbox AS inbox JOIN telegram_outbox AS reply USING(receipt_id)
       WHERE ${leaseScopeSql("sending")} AND (${guard.sql})`).bind(...leaseScopeArgs(policy, lease), ...guard.bindings).first();
@@ -280,8 +301,8 @@ function expiry(value: number | null): string {
   return value === null ? "未知" : displayTelegramDate(value);
 }
 
-async function renderSearch(
-  db: D1Database, policy: TelegramPolicy, lease: ReadLease, receipt: Receipt, guard: Guard,
+export async function renderTelegramSearchResults(
+  db: D1Database, policy: Pick<TelegramPolicy, "botId">, lease: ReadLease, receipt: TelegramSubscriptionReadReceipt, guard: Guard, general = false,
 ): Promise<RenderedRead> {
   const root = receipt.searchReceiptId ?? lease.receiptId;
   const showPrivate = privateScope(lease);
@@ -289,31 +310,43 @@ async function renderSearch(
     ? "sub.traffic_used AS trafficUsed,sub.traffic_total AS trafficTotal,sub.expire_at AS expireAt"
     : "NULL AS trafficUsed,NULL AS trafficTotal,NULL AS expireAt";
   const rows = await db.prepare(`SELECT CAST(item.key AS INTEGER) AS position,json_extract(item.value,'$[1]') AS rank,
-    sub.id,sub.name,${metadata}
+    sub.id,sub.name,${metadata},sub.generation,${general ? "COALESCE(lifecycle.revision,0)" : "NULL"} AS revision
     FROM telegram_subscription_read AS search JOIN telegram_inbox AS origin USING(receipt_id)
     JOIN json_each(search.matches) AS item JOIN subscriptions AS sub
       ON sub.id=json_extract(item.value,'$[0]') AND sub.owner_id=origin.actor_id
+    ${general ? "LEFT JOIN subscription_lifecycle AS lifecycle ON lifecycle.subscription_id=sub.id" : ""}
     WHERE search.receipt_id=? AND search.kind='search' AND search.matches IS NOT NULL
+      ${general ? `AND origin.receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MARKER}'
+        AND COALESCE(lifecycle.revision,0)=json_extract(item.value,'$[2]')` : ""}
       AND origin.bot_id=? AND origin.actor_id=? AND origin.chat_id=? AND origin.chat_type=? AND origin.thread_id IS ?
       AND CAST(item.key AS INTEGER)>=? ORDER BY CAST(item.key AS INTEGER) LIMIT ?`)
     .bind(root, policy.botId, lease.actorId, lease.chatId, lease.chatType, lease.threadId, receipt.searchOffset, PAGE_SIZE + 1)
-    .all<{ position: number; rank: number; id: number; name: string; expireAt: number | null; trafficUsed: number | null; trafficTotal: number | null }>();
+    .all<{ position: number; rank: number; id: number; name: string; expireAt: number | null; trafficUsed: number | null;
+      trafficTotal: number | null; generation: number; revision: number | null }>();
   if (!rows.success) throw new Error("Telegram subscription search results could not be read.");
   const items = rows.results.slice(0, PAGE_SIZE);
   const lines = items.map((row) => `#${row.rank} ${displayTelegramName(row.name)}` +
     (showPrivate ? ` · 剩余 ${remaining(row.trafficUsed, row.trafficTotal)} · 到期 ${expiry(row.expireAt)}` : ""));
   const readButtons: TelegramSubscriptionReadButton[] = showPrivate
     ? items.map((row) => ({ text: `#${row.rank} 详情`, kind: "detail", subscriptionId: row.id })) : [];
+  if (general) {
+    if (rows.results.length > PAGE_SIZE) lines.push(`仅显示前 ${PAGE_SIZE} 条，请缩小搜索范围。`);
+    const displayed = JSON.stringify(items.map(({ id, revision, generation }) => [id, revision, generation]));
+    return { text: lines.length ? ["搜索结果", ...lines].join("\n") : "没有匹配订阅。", readButtons,
+      readGuard: { sql: `(${guard.sql}) AND NOT EXISTS (
+        SELECT 1 FROM json_each(?) AS expected LEFT JOIN subscriptions AS sub
+          ON sub.id=json_extract(expected.value,'$[0]') AND sub.owner_id=inbox.actor_id
+        LEFT JOIN subscription_lifecycle AS lifecycle ON lifecycle.subscription_id=sub.id
+        WHERE sub.id IS NULL OR COALESCE(lifecycle.revision,0)<>json_extract(expected.value,'$[1]')
+          OR sub.generation<>json_extract(expected.value,'$[2]'))`, bindings: [...guard.bindings, displayed] } };
+  }
   if (rows.results.length > PAGE_SIZE) readButtons.push({ text: "下一页", kind: "search", searchReceiptId: root,
     searchOffset: items[items.length - 1].position + 1 });
   if (receipt.searchOffset) readButtons.push({ text: "第一页", kind: "search", searchReceiptId: root, searchOffset: 0 });
   return { text: lines.length ? ["搜索结果", ...lines].join("\n") : "没有匹配订阅。", readButtons, readGuard: guard };
 }
 
-async function renderDetail(
-  bucket: R2Bucket, row: Metadata, guard: Guard, deadline: number, nodePagesEnabled: boolean, rawFileEnabled: boolean,
-  subscriptionShareEnabled: boolean,
-): Promise<RenderedRead> {
+function subscriptionMetadataLines(row: Metadata): string[] {
   const lines = [
     `配置名称：${displayTelegramName(row.name)}`,
     `流量详情：${gb(row.trafficUsed)} / ${gb(row.trafficTotal)}`,
@@ -322,6 +355,26 @@ async function renderDetail(
     `节点数量：${row.nodeCount}`,
   ];
   if (row.refreshFailed === 1) lines.push("上次刷新未成功。");
+  return lines;
+}
+
+export async function renderGeneralSubscriptionMetadata(
+  db: D1Database, ownerId: string, subscriptionId: number, expectedRevision: number, guard: Guard,
+): Promise<RenderedRead> {
+  const row = await db.prepare(`SELECT id,name,expire_at AS expireAt,traffic_used AS trafficUsed,traffic_total AS trafficTotal,
+    (last_error IS NOT NULL) AS refreshFailed,generation,${SUBSCRIPTION_LIFECYCLE_REVISION} AS lifecycleRevision,
+    node_count AS nodeCount,snapshot_id AS snapshotId,manifest_sha256 AS manifestSha256,NULL AS token,NULL AS sourceUrl
+    FROM subscriptions WHERE id=? AND owner_id=? AND ${SUBSCRIPTION_LIFECYCLE_REVISION}=?`)
+    .bind(subscriptionId, ownerId, expectedRevision).first<Metadata>();
+  if (!row) return { text: "订阅不存在或已被更改。", readGuard: guard };
+  return { text: subscriptionMetadataLines(row).join("\n"), readGuard: subscriptionGuard(guard, row) };
+}
+
+async function renderDetail(
+  bucket: R2Bucket, row: Metadata, guard: Guard, deadline: number, nodePagesEnabled: boolean, rawFileEnabled: boolean,
+  subscriptionShareEnabled: boolean,
+): Promise<RenderedRead> {
+  const lines = subscriptionMetadataLines(row);
   const readButtons: TelegramSubscriptionReadButton[] = [];
   const nodeButtons: TelegramNodePageButton[] = [];
   let rawFileTarget: TelegramRawFileTarget | undefined;
@@ -393,12 +446,12 @@ export async function renderTelegramSubscriptionRead(
       FROM telegram_inbox AS inbox JOIN telegram_outbox AS reply USING(receipt_id)
       JOIN telegram_subscription_read AS action USING(receipt_id)
       WHERE ${leaseScopeSql("leased")} AND (${guard.sql})`)
-      .bind(...leaseScopeArgs(policy, lease), ...guard.bindings).first<Receipt>();
+      .bind(...leaseScopeArgs(policy, lease), ...guard.bindings).first<TelegramSubscriptionReadReceipt>();
     if (!receipt || receipt.kind === "stale") return { text: "订阅或授权状态已变更，请重新查询。" };
     if (receipt.kind === "usage") return { text: "用法：/s 关键词", readGuard: guard };
     if (receipt.kind === "limit") return { text: "查询达到处理上限，请缩短关键词或从 /list 选择订阅。", readGuard: guard };
     if (receipt.kind === "missing") return { text: "编号不存在。", readGuard: guard };
-    if (receipt.kind === "search") return await renderSearch(db, policy, lease, receipt, guard);
+    if (receipt.kind === "search") return await renderTelegramSearchResults(db, policy, lease, receipt, guard);
     if (!privateScope(lease)) return { text: "请在私聊查看订阅详情。" };
     const row = await db.prepare(`SELECT id,name,expire_at AS expireAt,traffic_used AS trafficUsed,traffic_total AS trafficTotal,
       (last_error IS NOT NULL) AS refreshFailed,generation,${SUBSCRIPTION_LIFECYCLE_REVISION} AS lifecycleRevision,
@@ -431,20 +484,26 @@ export async function prepareTelegramSubscriptionReadTickets(buttons: readonly T
 }
 
 export function insertTelegramSubscriptionReadTickets(
-  db: D1Database, lease: ReadLease, tickets: readonly TelegramSubscriptionReadTicket[], previousChanges: number, nodePageOrigin = false,
+  db: D1Database, lease: ReadLease, tickets: readonly TelegramSubscriptionReadTicket[], previousChanges: number,
+  nodePageOrigin = false, general = false,
 ): D1PreparedStatement {
   if (!validInteger(tickets.length, 1, MAX_BUTTONS) || !validInteger(previousChanges, 1, 16)) {
     throw new RangeError("Invalid Telegram subscription read ticket count.");
   }
+  const origin = general ? `(inbox.receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MARKER}' AND ticket.kind='detail'
+    AND EXISTS (SELECT 1 FROM telegram_subscription_read AS search
+      JOIN json_each(search.matches) AS item WHERE search.receipt_id=inbox.receipt_id AND search.kind='search'
+      AND search.search_receipt_id IS NULL AND json_extract(item.value,'$[0]')=ticket.subscription_id))`
+    : `((inbox.receipt_nonce IN (${TELEGRAM_VIEW_RECEIPTS}) AND ticket.kind='detail') OR inbox.receipt_nonce=?
+      ${nodePageOrigin ? `OR (inbox.receipt_nonce='${TELEGRAM_SUBSCRIPTION_NODE_MARKER}' AND ticket.kind='detail'
+        AND EXISTS (SELECT 1 FROM telegram_subscription_node_page AS page
+          WHERE page.receipt_id=inbox.receipt_id AND page.subscription_id=ticket.subscription_id))` : ""})`;
   return db.prepare(`WITH tickets (sha256,kind,subscription_id,format,search_receipt_id,search_offset) AS (
     VALUES ${tickets.map(() => "(?,?,?,?,?,?)").join(",")}
   ) INSERT INTO telegram_subscription_read_ticket
     (token_sha256,origin_receipt_id,origin_attempt,kind,subscription_id,format,search_receipt_id,search_offset,expires_at)
     SELECT ticket.sha256,inbox.receipt_id,reply.attempts,
-      CASE WHEN ((inbox.receipt_nonce IN (${TELEGRAM_VIEW_RECEIPTS}) AND ticket.kind='detail') OR inbox.receipt_nonce=?
-        ${nodePageOrigin ? `OR (inbox.receipt_nonce='${TELEGRAM_SUBSCRIPTION_NODE_MARKER}' AND ticket.kind='detail'
-          AND EXISTS (SELECT 1 FROM telegram_subscription_node_page AS page
-            WHERE page.receipt_id=inbox.receipt_id AND page.subscription_id=ticket.subscription_id))` : ""})
+      CASE WHEN ${origin}
         AND (ticket.kind='search' OR (inbox.chat_type='private' AND inbox.chat_id=inbox.actor_id AND inbox.thread_id IS NULL))
         THEN ticket.kind END,
       ticket.subscription_id,ticket.format,ticket.search_receipt_id,ticket.search_offset,unixepoch()+${TICKET_SECONDS}
@@ -453,14 +512,17 @@ export function insertTelegramSubscriptionReadTickets(
     .bind(...tickets.flatMap((ticket) => [ticket.sha256, ticket.kind, "subscriptionId" in ticket ? ticket.subscriptionId : null,
       ticket.kind === "format" ? ticket.format : null, ticket.kind === "search" ? ticket.searchReceiptId : null,
       ticket.kind === "search" ? ticket.searchOffset : null]),
-    TELEGRAM_SUBSCRIPTION_READ_MARKER, previousChanges, lease.receiptId, lease.leaseId, lease.attempts);
+    ...(general ? [] : [TELEGRAM_SUBSCRIPTION_READ_MARKER]),
+    previousChanges, lease.receiptId, lease.leaseId, lease.attempts);
 }
 
-export async function reapTelegramSubscriptionReadTickets(db: D1Database): Promise<void> {
+export async function reapTelegramSubscriptionReadTickets(db: D1Database, generalBotId?: string): Promise<void> {
+  const scope = generalBotId === undefined ? "" : `AND EXISTS (SELECT 1 FROM telegram_inbox AS origin
+    WHERE origin.receipt_id=ticket.origin_receipt_id AND origin.bot_id=? AND origin.receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MARKER}')`;
   try {
     const result = await db.prepare(`DELETE FROM telegram_subscription_read_ticket WHERE token_sha256 IN (
-      SELECT token_sha256 FROM telegram_subscription_read_ticket WHERE expires_at<=unixepoch()
-      ORDER BY expires_at,token_sha256 LIMIT 40)`).run();
+      SELECT token_sha256 FROM telegram_subscription_read_ticket AS ticket WHERE expires_at<=unixepoch() ${scope}
+      ORDER BY expires_at,token_sha256 LIMIT 40)`).bind(...(generalBotId === undefined ? [] : [generalBotId])).run();
     if (result.success) return;
   } catch {
     // D1 errors may include private state.
