@@ -72,9 +72,13 @@ const noConflicts = `NOT EXISTS(SELECT 1 FROM normal_short_links WHERE code_sha2
   AND NOT EXISTS(SELECT 1 FROM legacy_subscription_short_links WHERE code_sha256=link.code_sha256)
   AND NOT EXISTS(SELECT 1 FROM aggregate_links WHERE code_sha256=link.code_sha256)`;
 
-export function subscriptionShortRevocationOrigin(link: "link" | "typed", general: boolean): string {
-  if (!general) return `NOT EXISTS (SELECT 1 FROM telegram_inbox AS origin WHERE origin.receipt_id=${link}.origin_receipt_id
+export function isolatedSubscriptionShortOrigin(link: "link" | "typed"): string {
+  return `NOT EXISTS (SELECT 1 FROM telegram_inbox AS origin WHERE origin.receipt_id=${link}.origin_receipt_id
     AND origin.receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MARKER}')`;
+}
+
+export function subscriptionShortRevocationOrigin(link: "link" | "typed", general: boolean): string {
+  if (!general) return isolatedSubscriptionShortOrigin(link);
   return `EXISTS (SELECT 1 FROM telegram_inbox AS inbox JOIN telegram_subscription_read AS action USING(receipt_id)
     WHERE inbox.receipt_id=${link}.origin_receipt_id AND inbox.bot_id=${link}.bot_id AND inbox.actor_id=${link}.owner_id
       AND action.subscription_id=${link}.subscription_id AND action.format=${link}.format AND (${generalReceiptScope}))`;
