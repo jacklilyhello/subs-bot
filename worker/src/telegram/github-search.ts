@@ -308,6 +308,10 @@ async function searchPublicCode(query: string, request: typeof fetch, signal: Ab
   stillAuthorized: () => Promise<boolean>, repositories: Promise<RepositorySearch>): Promise<CodeMatch[]> {
   const code = codeQuery(query);
   if (!code || signal.aborted) return [];
+  const publicFromSearch = new Set<string>();
+  const repositoryProof = repositories.then(({ repos }) => {
+    for (const { name } of repos) publicFromSearch.add(name);
+  });
   const matches = new Map<string, CodeMatch>();
   for (const item of await grepCodeContent(request, signal, code.query, code.repo, stillAuthorized)) {
     const candidate = grepMatch(item, code.repo);
@@ -315,10 +319,11 @@ async function searchPublicCode(query: string, request: typeof fetch, signal: Ab
     if (matches.size === MAX_CODE_MATCHES) break;
   }
   if (!matches.size || signal.aborted) return [];
-  const verified = new Map<string, Promise<boolean>>((await repositories).repos.map(({ name }) => [name, Promise.resolve(true)] as const));
+  const verified = new Map<string, Promise<boolean>>();
   const codeMatches = [...matches.values()];
+  // A slow repository search must not consume the file visibility check's time budget.
   for (const { repo } of codeMatches) {
-    if (!verified.has(repo)) verified.set(repo, (async () => {
+    if (!publicFromSearch.has(repo) && !verified.has(repo)) verified.set(repo, (async () => {
       try {
         if (signal.aborted) return false;
         const response = await request(GITHUB_REPO_API + repo, {
@@ -333,7 +338,8 @@ async function searchPublicCode(query: string, request: typeof fetch, signal: Ab
     })());
   }
   const allowed = await Promise.all(codeMatches.map(({ repo }) => verified.get(repo)));
-  return codeMatches.filter((_, index) => allowed[index]);
+  await repositoryProof;
+  return codeMatches.filter(({ repo }, index) => allowed[index] || publicFromSearch.has(repo));
 }
 
 function packSearchReply(repositorySearch: RepositorySearch, code: CodeMatch[]): TelegramGitHubReply {
