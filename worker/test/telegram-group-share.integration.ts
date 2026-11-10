@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { Miniflare } from "miniflare";
+import { createPrivateShare } from "../src/private-shares.ts";
 import type { TelegramPolicy } from "../src/telegram/protocol.ts";
 
 const policy: TelegramPolicy = {
@@ -24,7 +25,7 @@ type WireMessage = {
   reply_markup?: { inline_keyboard: Array<Array<{ text: string; callback_data?: string; url?: string }>> };
 };
 type Delivery = { method: "sendMessage" | "editMessageText"; body: WireMessage; id: number };
-type CallbackAnswer = { callback_query_id: string; text?: string; cache_time?: number };
+type CallbackAnswer = { callback_query_id: string; text?: string; url?: string; cache_time?: number };
 
 async function fixture(t: TestContext, enabled: boolean) {
   const directory = process.env.WORKER_TEST_BUNDLE_DIR;
@@ -120,11 +121,61 @@ async function fixture(t: TestContext, enabled: boolean) {
     }
     assert.fail("Expected a settled group card.");
   };
-  return { db, bucket, messages, answers, tick, message, callback, count, groupDeliveries, privateDelivery, waitForCard,
+  return { db, bucket, messages, answers, tick, post, message, callback, count, groupDeliveries, privateDelivery, waitForCard,
     makeNextPublicationAmbiguous() { ambiguousNextCard = true; } };
 }
 
 const draft = `/share x1 id${policy.memberId} s10 --\n${privateBody}`;
+
+test("the emitted Worker hands off old inline cards to the existing private claim without claiming on click", { timeout: 45_000 }, async (t) => {
+  const f = await fixture(t, false);
+  const code = "legacyCode8";
+  const created = await createPrivateShare(f.db, f.bucket, { botId: policy.botId, senderId: policy.adminId, senderName: "Synthetic sender",
+    content: privateBody, maxClaims: 1, targetUserId: policy.memberId, durationMinutes: 10 });
+  const updated = await f.db.prepare("UPDATE private_shares SET code_sha256=? WHERE bot_id=? AND code_sha256=?")
+    .bind(hash(Buffer.from(code)), policy.botId, hash(Buffer.from(created.code))).run();
+  assert.equal(updated.meta.changes, 1);
+  const inline = (id: number, actor: string, shareCode: string, inlineId = "legacy-inline-fixture") => f.post({
+    update_id: id, callback_query: { id: `legacy-${id}`, from: { id: Number(actor), is_bot: false },
+      inline_message_id: inlineId, data: `share:c:${shareCode}` },
+  });
+  const answer = async (id: number) => {
+    for (let attempt = 0; attempt < 50; attempt++) {
+      const result = f.answers.find(({ callback_query_id }) => callback_query_id === `legacy-${id}`);
+      if (result) return result;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.fail("Expected a legacy card acknowledgement.");
+  };
+  assert.equal((await inline(1, policy.memberId, code)).status, 204);
+  assert.deepEqual(await answer(1), { callback_query_id: "legacy-1", cache_time: 0,
+    url: `https://t.me/${policy.botUsername}?start=claim_${code}` });
+  assert.equal((await inline(2, policy.adminId, code)).status, 204);
+  assert.equal((await inline(3, policy.memberId, "unknown0000")).status, 204);
+  for (const id of [2, 3]) assert.deepEqual(await answer(id), {
+    callback_query_id: `legacy-${id}`, text: "此旧卡片暂不可用。", cache_time: 0,
+  });
+  assert.equal((await inline(4, "75309", code)).status, 204);
+  assert.equal((await inline(5, policy.memberId, created.code)).status, 204);
+  assert.equal((await inline(6, policy.memberId, code, "x".repeat(257))).status, 204);
+  assert.equal(await f.count("telegram_private_claim"), 0);
+  assert.equal(await f.count("private_share_claims"), 0);
+  assert.equal(f.messages.length, 0);
+  assert.equal(f.answers.length, 3);
+
+  assert.equal((await f.message(7, policy.memberId, `/start claim_${code}`)).status, 200);
+  const delivery = await f.privateDelivery(7);
+  assert.equal(delivery.body.chat_id, policy.memberId);
+  assert.ok(delivery.body.text.includes(privateBody));
+  assert.equal(await f.count("private_share_claims"), 1);
+  await inline(8, policy.memberId, code);
+  assert.equal((await answer(8)).url, `https://t.me/${policy.botUsername}?start=claim_${code}`);
+  assert.equal(await f.count("private_share_claims"), 1);
+  await f.db.prepare("UPDATE private_shares SET expire_at=created_at-1, created_at=created_at-2").run();
+  await inline(9, policy.memberId, code);
+  assert.deepEqual(await answer(9), { callback_query_id: "legacy-9", text: "此旧卡片暂不可用。", cache_time: 0 });
+  assert.equal(f.groupDeliveries().length, 0);
+});
 
 test("the emitted Worker does not offer or publish group cards while disabled", { timeout: 45_000 }, async (t) => {
   const f = await fixture(t, false);

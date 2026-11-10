@@ -186,6 +186,11 @@ function shareLookup(db: D1Database, { botId, actorId, codeSha256 }: PrivateShar
   `).bind(actorId, actorId, botId, codeSha256);
 }
 
+export async function legacyPrivateShareAvailable(db: D1Database, key: PrivateShareClaimKey): Promise<boolean> {
+  const share = await shareLookup(db, key).first<ShareRow>().catch(() => null);
+  return share !== null && denial(share) === null;
+}
+
 export async function preparePrivateShareClaim(
   db: D1Database,
   bucket: R2Bucket,

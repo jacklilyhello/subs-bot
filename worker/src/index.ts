@@ -27,7 +27,7 @@ import { acceptTelegramInlineSort, telegramInlineSortReady } from "./telegram/in
 import { acceptTelegramInlineConsent, telegramInlineSearchReady } from "./telegram/inline-search-consent.ts";
 import { answerTelegramInlineSearch, reapTelegramInlineSearch } from "./telegram/inline-search.ts";
 import { acceptTelegramPath } from "./telegram/path-management.ts";
-import { acceptTelegramPrivateClaim } from "./telegram/private-claims.ts";
+import { acceptTelegramPrivateClaim, legacyInlineClaimUrl } from "./telegram/private-claims.ts";
 import {
   acceptTelegramPrivateShareCreation, acceptTelegramSubscriptionShare, parseTelegramPrivateShareArgs,
   parseTelegramSubscriptionShareArgs, recoverTelegramPrivateShareCreation, retireAbandonedTelegramPrivateShareCreation,
@@ -177,6 +177,12 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
     const inlineSearchEnabled = env.TELEGRAM_INLINE_SEARCH === "1";
     const decoded = await decodeTelegramRequest(request, policy, inlineSearchEnabled);
     if (decoded.status !== 200) return new Response(null, { status: decoded.status, headers: HEADERS });
+    if (decoded.legacyInlineClaim) {
+      const { legacyInlineClaim } = decoded;
+      const url = await legacyInlineClaimUrl(env.DB, policy, legacyInlineClaim);
+      ctx?.waitUntil(answerTelegramCallback(policy, legacyInlineClaim.callbackId, url ? { url } : "此旧卡片暂不可用。"));
+      return new Response(null, { status: 204, headers: HEADERS });
+    }
     if (decoded.inlineQuery) {
       if (await telegramInlineSearchReady(env.DB)) await answerTelegramInlineSearch(env.DB, policy, decoded.inlineQuery, sendTelegramInlineAnswer);
       return new Response(null, { status: 204, headers: HEADERS });
