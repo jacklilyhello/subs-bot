@@ -1,8 +1,9 @@
-"""Protected acceptance checkpoints; real Telegram commands are sent only in IAB.
+"""Protected acceptance checkpoints and a read-only probe of confirmed aggregate slots.
 
 The two fixed synthetic subscriptions are the only mutable application data here.
 Inbox/outbox, aggregate slots, and revoked links remain as replay/order tombstones.
-No Bot API method is called. Secrets and capabilities never enter checkpoints.
+Real Telegram commands are sent only in IAB. No Bot API method is called.
+Secrets and capabilities never enter checkpoints or inspection output.
 """
 
 from base64 import b64encode, urlsafe_b64decode, urlsafe_b64encode
@@ -48,6 +49,8 @@ DECIMAL = re.compile(r"[1-9][0-9]{0,19}")
 NONCE = re.compile(r"[A-Za-z0-9_-]{22}")
 MAX_ID = 9_007_199_254_740_991
 MAX_CHECKPOINT = 16384
+MAX_INSPECT_BODY_BYTES = 1024 * 1024
+INSPECT_RECEIPT_AGE_SECONDS = 86_400
 ROLES = {"admin": "adminId", "member": "memberId"}
 OBJECTS = ("0.ndjson", "manifest.json")
 SUBSCRIPTION_FIELDS = ("id,owner_id,name,source_url,token,expire_at,traffic_used,traffic_total,last_error,"
@@ -123,11 +126,21 @@ class SnapshotObjects(R2Objects):
 
 def parse_inputs(event):
     inputs = event.get("inputs")
-    require(isinstance(inputs, dict) and set(inputs) <= {"action", "cohort", "source_run_id", "confirm_retire"},
+    require(isinstance(inputs, dict) and set(inputs) <= {"action", "cohort", "source_run_id", "confirm_retire", "inspect_pin"},
             "Aggregate workflow inputs differ.")
     action, cohort = inputs.get("action"), inputs.get("cohort")
     source, confirm = inputs.get("source_run_id", ""), inputs.get("confirm_retire", "")
-    require(action in PHASES and matches(COHORT, cohort) and (source == "" if action == "prepare" else matches(DECIMAL, source))
+    inspect = inputs.get("inspect_pin", "")
+    if action == "inspect-existing":
+        require(cohort in (None, "") and source == confirm == "" and isinstance(inspect, str) and len(inspect) <= 512,
+                "Aggregate inspection inputs differ.")
+        pin = _parse_object(inspect, "Aggregate inspection pin differs.")
+        require(set(pin) == {"revision", "versionId", "since", "readSmallBodies"} and matches(REVISION, pin["revision"])
+                and matches(UUID, pin["versionId"]) and integer(pin["since"], 1, MAX_ID)
+                and type(pin["readSmallBodies"]) is bool, "Aggregate inspection pin differs.")
+        return action, None, pin
+    require(inspect == "" and action in PHASES and matches(COHORT, cohort)
+            and (source == "" if action == "prepare" else matches(DECIMAL, source))
             and confirm == (f"retire {cohort}" if action == "retire" else ""), "Aggregate action or confirmation differs.")
     return action, cohort, source
 
@@ -454,6 +467,73 @@ def probe_capability(cohort, role, recovery, *, active):
     return probe_fixture_exports(code, recovery["sha256"], expected_exports(cohort, role), role, active=active)
 
 
+def inspect_capability(code, read_small_bodies):
+    report = {}
+    for fmt in ("clash", "base64"):
+        sample = {}
+        report[fmt] = sample
+        for method in ("HEAD", "GET"):
+            if method == "GET" and (not read_small_bodies or sample["HEAD"]["status"] != 200):
+                continue
+            status, size, body_digest = None, None, None
+            start = monotonic()
+            try:
+                with _request(method, f"/agg/{code}/{fmt}", start + 15, "aggregate inspection") as response:
+                    status = response.status
+                    if status == 200:
+                        _check_headers(response, 200, "aggregate inspection", "text/yaml" if fmt == "clash" else "text/plain")
+                        if method == "GET":
+                            length = response.getheader("Content-Length")
+                            if (isinstance(length, str) and re.fullmatch(r"[1-9][0-9]{0,6}", length)
+                                    and int(length) <= MAX_INSPECT_BODY_BYTES and response.getheader("Transfer-Encoding") is None):
+                                body = response.read(int(length) + 1)
+                                require(len(body) == int(length), "Aggregate inspection response length differs.")
+                                size, body_digest = len(body), digest(body)
+            except ProbeError:
+                if status is not None:
+                    raise
+            sample[method] = {"status": status, "elapsedMs": round((monotonic() - start) * 1000)}
+            if method == "GET":
+                sample[method].update({"bodyBytes": size, "bodySha256": body_digest})
+    return report
+
+
+def inspect_existing(cohort, pin, guard, probe=inspect_capability):
+    clock, = cohort.read("SELECT unixepoch() AS now")
+    require(integer(clock.get("now"), pin["since"], pin["since"] + INSPECT_RECEIPT_AGE_SECONDS),
+            "Aggregate inspection receipt window differs.")
+    guard()
+    slots, auth = cohort.slots(), cohort.auth()
+    codes = {}
+    for role in ROLES:
+        slot = slots.get(role)
+        if not slot or slot["code_sha256"] is None:
+            continue
+        proof = cohort.read("""SELECT a.auth_message_date AS date,a.auth_message_id AS message
+          FROM telegram_inbox AS i JOIN telegram_aggregate_actions AS a USING(receipt_id)
+          JOIN telegram_outbox AS o USING(receipt_id) JOIN aggregate_links AS link ON link.code_sha256=a.code_sha256
+          WHERE i.bot_id=? AND i.actor_id=? AND i.chat_type='private' AND i.chat_id=i.actor_id AND i.thread_id IS NULL
+            AND i.command='help' AND i.receipt_nonce=? AND i.received_at>=? AND i.message_date=? AND i.message_id=?
+            AND a.result='issued' AND a.revision=? AND a.code_sha256=? AND o.state='sent' AND o.sent_message_id>0
+            AND link.kind='all' AND link.bot_id=i.bot_id AND link.owner_id=i.actor_id AND link.revoked_at IS NULL LIMIT 2""",
+            cohort.policy["botId"], cohort.actors[role], MARKER, pin["since"], slot["message_date"], slot["message_id"],
+            slot["revision"], slot["code_sha256"])
+        require(len(proof) == 1, "Aggregate inspection slot has no exact confirmed issuance in the receipt window.")
+        date, message = proof[0].get("date"), proof[0].get("message")
+        require((date, message) == (0, 0) if role == "admin"
+                else digest(canonical({"allowed": 1, "date": date, "message": message}).encode()) == auth,
+                "Aggregate inspection receipt authorization differs.")
+        code = derive_code(cohort.encoded, cohort.policy, role, slot["nonce"])
+        require(digest(code.encode("ascii")) == slot["code_sha256"], "Aggregate inspection capability digest differs.")
+        codes[role] = code
+    require(len(set(codes.values())) == len(codes), "Aggregate inspection capabilities overlap.")
+    report = {role: {"state": "active", "formats": probe(codes[role], pin["readSmallBodies"])}
+              if role in codes else {"state": "absent"} for role in ROLES}
+    require(cohort.slots() == slots and cohort.auth() == auth, "Aggregate inspection slot or authorization changed.")
+    guard()
+    return report
+
+
 def probe_fixture_exports(code, code_sha256, exports, label, *, active):
     deadline = monotonic() + 60
     report = {}
@@ -587,7 +667,9 @@ def run():
     with Path(os.environ["GITHUB_EVENT_PATH"]).open("rb") as event:
         body = event.read(65537)
     require(len(body) <= 65536, "Aggregate workflow event exceeds the limit.")
-    action, cohort_key, source_run = parse_inputs(_parse_object(body, "Aggregate workflow event differs."))
+    action, cohort_key, source = parse_inputs(_parse_object(body, "Aggregate workflow event differs."))
+    inspect = source if action == "inspect-existing" else None
+    source_run = None if inspect is not None else source
     require_current_main(revision)
     source_revision = _get_json(f"/actions/runs/{source_run}", os.environ["GH_TOKEN"]).get("head_sha") if action == "retire" else revision
     require(matches(REVISION, source_revision), "Aggregate checkpoint revision differs.")
@@ -608,10 +690,12 @@ def run():
                    "moduleSha256": version.digest, "compatibilityDate": version.compatibility}
     validate_release_pin(release_pin)
     policy_sha = digest(raw_policy.encode("utf-8"))
-    require(scope.cron_enabled() and version.revision == revision and version.telegram_config_sha256 == policy_sha
+    live_revision = revision if inspect is None else inspect["revision"]
+    require((inspect is None or active.version == inspect["versionId"])
+            and scope.cron_enabled() and version.revision == live_revision and version.telegram_config_sha256 == policy_sha
             and getattr(version, "telegram_aggregate_key_sha256", None) == digest(encoded.encode("ascii")),
             "Active Worker, Telegram policy, or aggregate key differs.")
-    _verify_health(revision)
+    _verify_health(live_revision)
     resources = Resources(target, data, SnapshotObjects(target["accountId"], data_token))
     identity = digest(f"{resources.scope_hash}/{policy_sha}/{digest(encoded.encode())}".encode("ascii"))
     expected = digest((Path(__file__).resolve().parents[1] / "migrations" / MIGRATION).read_bytes())
@@ -624,6 +708,11 @@ def run():
                 and scope.cron_enabled(), "Isolation release changed during aggregate acceptance.")
 
     cohort = Cohort(resources, policy, cohort_key, encoded, identity)
+    if inspect is not None:
+        report = inspect_existing(cohort, inspect, guard)
+        _verify_health(live_revision)
+        print(json.dumps({"phase": "inspected", "roles": report}, sort_keys=True))
+        return
     report = {}
     if checkpoint is None:
         checkpoint = prepare(cohort, revision, guard, release_pin)
