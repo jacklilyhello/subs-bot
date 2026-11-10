@@ -1,7 +1,7 @@
 import type { ProviderMetadata } from "./provider-fetch-contract.ts";
 
 export const PROVIDER_INITIAL_TITLE_MIGRATION = "0041_telegram_provider_initial_titles.sql";
-export const PROVIDER_INITIAL_TITLE_SHA256 = "d33cb6fec460eda6bb0fd2d56232d512e25a06d3d8452f0ee9e99dca9fa70286";
+export const PROVIDER_INITIAL_TITLE_SHA256 = "e3b73a4584b38b0fa6fb9a4fe86705aa47193b1410094e740a771f977df410bf";
 export const UNNAMED_PROVIDER_SUBSCRIPTION = "远程订阅";
 
 const forbidden = /[\p{Cc}\p{Cf}\p{Cs}\u2028\u2029/\\]/u;

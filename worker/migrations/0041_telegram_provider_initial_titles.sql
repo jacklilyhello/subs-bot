@@ -5,4 +5,4 @@ CREATE TABLE telegram_provider_initial_titles (
     expires_at INTEGER NOT NULL CHECK (expires_at BETWEEN 1 AND 9007199254740991)
 ) STRICT;
 
-CREATE INDEX telegram_provider_initial_titles_expiry ON telegram_provider_initial_titles(expires_at,subscription_id);
+CREATE INDEX telegram_provider_initial_titles_expiry ON telegram_provider_initial_titles (expires_at,subscription_id);
