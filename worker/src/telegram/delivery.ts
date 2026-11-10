@@ -207,14 +207,17 @@ export async function sendTelegramPrivateClaimReply(
   return sendTelegram(policy, lease, "sendDocument", form, timeoutMs, request);
 }
 
-export async function answerTelegramCallback(policy: TelegramPolicy, callbackId: string, text?: string): Promise<void> {
+export async function answerTelegramCallback(
+  policy: TelegramPolicy, callbackId: string, answer?: string | { url: string },
+): Promise<void> {
   try {
     const response = await fetch(`${BOT_API}/bot${policy.botToken}/answerCallbackQuery`, {
       method: "POST",
       redirect: "manual",
       signal: AbortSignal.timeout(CALLBACK_TIMEOUT_MS),
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ callback_query_id: callbackId, ...(text === undefined ? {} : { text, cache_time: 0 }) }),
+      body: JSON.stringify({ callback_query_id: callbackId,
+        ...(answer === undefined ? {} : { ...(typeof answer === "string" ? { text: answer } : answer), cache_time: 0 }) }),
     });
     await response.body?.cancel();
   } catch {

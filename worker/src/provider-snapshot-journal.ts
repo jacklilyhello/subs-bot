@@ -1,8 +1,10 @@
 import { prepareProviderJobLeaseGuard, prepareProviderJobSettlement, providerJobLeaseTable, type ProviderJobLease } from "./provider-jobs.ts";
+import { providerInitialTitleReady, UNNAMED_PROVIDER_SUBSCRIPTION } from "./provider-initial-title.ts";
 import {
   prepareNodeSnapshotPublication, SNAPSHOT_MANIFEST_ORDINAL, stageNodeSnapshot,
   type NodeRecord, type SnapshotMetadataUpdate, type StagedNodeSnapshot,
 } from "./storage.ts";
+import { prepareOwnedSubscriptionMutation } from "./subscriptions.ts";
 
 const identityColumns = `snapshot_id,queue,job_id,job_attempt,subscription_id,owner_id,request_key,source_sha256,
   expected_generation,expected_lifecycle_revision,lease_until,bot_id`;
@@ -82,6 +84,7 @@ async function confirmPublished(db: D1Database, lease: ProviderJobLease, binding
 /** The pointer, job result and permanent publication marker commit together. */
 export async function publishProviderSnapshot(
   db: D1Database, lease: ProviderJobLease, staged: StagedNodeSnapshot, metadata: SnapshotMetadataUpdate,
+  initialTitle?: string | null,
 ): Promise<"saved" | "stale" | "uncertain"> {
   if (staged.id !== lease.id || staged.snapshotId !== lease.leaseId) throw new Error(failure);
   const bindings = [...attemptBindings(lease), staged.manifestSha256, staged.nodeCount, staged.objectCount];
@@ -106,6 +109,27 @@ export async function publishProviderSnapshot(
         SELECT 1 FROM provider_snapshot_attempts WHERE ${identity} AND ${summary} AND state='published')`)
         .bind(lease.leaseId, ...bindings),
     ];
+    if (initialTitle !== undefined && lease.scope !== "generic" && lease.scope.queue !== "batch"
+        && lease.kind === "url-import" && lease.expectedGeneration === 0 && lease.expectedLifecycleRevision === 0
+        && await providerInitialTitleReady(db)) {
+      const target = "id=? AND owner_id=? AND generation=1 AND snapshot_id=?";
+      const targetBindings = [lease.id, lease.ownerId, staged.snapshotId];
+      const intent = "subscription_id=? AND request_key=? AND source_sha256=? AND expires_at=?";
+      const intentBindings = [lease.id, lease.requestKey, lease.sourceSha256, lease.expiresAt];
+      const published = `EXISTS (SELECT 1 FROM provider_snapshot_attempts WHERE ${identity} AND ${summary} AND state='published')`;
+      if (initialTitle && initialTitle !== UNNAMED_PROVIDER_SUBSCRIPTION) {
+        // Settlement still verifies the original revision. Bump it only after the
+        // pointer, job, and journal transitions, so a successful title invalidates old name tickets.
+        const rename = await prepareOwnedSubscriptionMutation(db, lease, { kind: "rename", name: initialTitle }, {
+          sql: `changes()=? AND generation=1 AND snapshot_id=? AND name=? AND ${published}
+            AND EXISTS (SELECT 1 FROM telegram_provider_initial_titles WHERE ${intent})`,
+          bindings: [staged.objectCount, staged.snapshotId, UNNAMED_PROVIDER_SUBSCRIPTION, ...bindings, ...intentBindings],
+        });
+        steps.push(rename.first, ...rename.followups);
+      }
+      steps.push(db.prepare(`DELETE FROM telegram_provider_initial_titles WHERE ${intent} AND ${published}
+        AND EXISTS (SELECT 1 FROM subscriptions WHERE ${target})`).bind(...intentBindings, ...bindings, ...targetBindings));
+    }
     const results = await db.batch(steps);
     if (results.length === steps.length && results.every(({ success }) => success)) {
       const [publication, settlement, journal, , compacted] = results;

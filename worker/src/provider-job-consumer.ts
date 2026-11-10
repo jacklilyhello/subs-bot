@@ -7,6 +7,7 @@ import {
   type ProviderFailureOutcome, type ProviderJobLease, type ProviderTelegramPolicy,
 } from "./provider-jobs.ts";
 import { providerSnapshotJournalReady, publishProviderSnapshot, stageProviderSnapshot } from "./provider-snapshot-journal.ts";
+import { initialProviderTitle } from "./provider-initial-title.ts";
 import { digestHex, type SnapshotMetadataUpdate, type StagedNodeSnapshot } from "./storage.ts";
 import { parseSubscriptionDocument } from "./subscription-document.ts";
 
@@ -144,8 +145,11 @@ export async function runOneProviderJob(
   } catch {
     return settleProviderJob(db, lease, { kind: "retry", reason: "storage-failed" });
   }
+  const initialTitle = lease.scope !== "generic" && lease.kind === "url-import"
+    && lease.expectedGeneration === 0 && lease.expectedLifecycleRevision === 0
+    ? initialProviderTitle(fetched.metadata, lease.sourceUrl) : undefined;
   const outcome = staged
-    ? await publishProviderSnapshot(db, lease, staged, subscriptionMetadata(fetched.metadata?.["subscription-userinfo"]))
+    ? await publishProviderSnapshot(db, lease, staged, subscriptionMetadata(fetched.metadata?.["subscription-userinfo"]), initialTitle)
     : "stale";
   if (outcome === "stale") await retireStaleProviderJob(db, lease);
   return outcome;
