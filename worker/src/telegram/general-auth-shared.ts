@@ -37,6 +37,8 @@ import { generalProviderReplyEligibility, generalProviderReplyScope, parseTelegr
 import { acceptTelegramSelected, GENERAL_SELECTED_SCHEMA, GENERAL_TELEGRAM_SELECTED_MARKER, insertSelectedRevokeTickets,
   prepareSelectedLimitTickets, prepareSelectedRevokeTicket, reapTelegramSelected, renderTelegramSelected, resolveTelegramSelectedCode,
   retireUnsentSelectedLink, selectedTicketTargetGuard, type TelegramSelectedReply } from "./selected-export.ts";
+import { acceptTelegramShortLink, GENERAL_SHORT_SCHEMA, GENERAL_TELEGRAM_SHORT_MARKER, prepareTelegramShortLinkReply,
+  reapFailedTelegramShortLinks, retireUnsentTelegramShortLink } from "./short-link-actions.ts";
 import { readGeneralPrivateDocumentUpdate, readGeneralPrivateLifecycleUpdate, readGeneralPrivateSubscriptionRead,
   readGeneralPrivateProviderRefresh, readGeneralPrivateSelectedRevoke, readGeneralPrivateShareClaim, readGeneralPrivateShareCreation,
   readGeneralPrivateTempUpdate, readPrivateTelegramCommand, readTelegramUpdate } from "./protocol.ts";
@@ -123,6 +125,14 @@ function selectedFamily(alias: "inbox" | "earlier"): string {
     AND (${GENERAL_SELECTED_SCHEMA})`;
 }
 
+function shortFamily(alias: "inbox" | "earlier"): string {
+  return `${alias}.receipt_nonce='${GENERAL_TELEGRAM_SHORT_MARKER}' AND ${alias}.command='help'
+    AND (${alias}.chat_type='private' AND ${alias}.chat_id=${alias}.actor_id AND ${alias}.thread_id IS NULL)
+    AND EXISTS (SELECT 1 FROM telegram_short_link_actions
+      WHERE receipt_id=${alias}.receipt_id AND auth_message_date=0 AND auth_message_id=0)
+    AND (${GENERAL_SHORT_SCHEMA})`;
+}
+
 function family(alias: "inbox" | "earlier", group: boolean, pin: GeneralTelegramPin, includeExports = true): string {
   const privateScope = `${alias}.chat_type='private' AND ${alias}.chat_id=${alias}.actor_id AND ${alias}.thread_id IS NULL`;
   const groupScope = group ? ` OR (${alias}.receipt_nonce='${GROUP_MARKER}' AND ${alias}.chat_type IN ('group','supergroup')
@@ -159,6 +169,8 @@ function family(alias: "inbox" | "earlier", group: boolean, pin: GeneralTelegram
     THEN (${aggregateFamily(alias)})` : ""}
     ${includeExports && pin.privateSelected ? `WHEN ${alias}.receipt_nonce='${GENERAL_TELEGRAM_SELECTED_MARKER}'
     THEN (${selectedFamily(alias)})` : ""}
+    ${includeExports && pin.privateShort ? `WHEN ${alias}.receipt_nonce='${GENERAL_TELEGRAM_SHORT_MARKER}'
+    THEN (${shortFamily(alias)})` : ""}
     ELSE (${management}) END)`;
 }
 
@@ -174,6 +186,7 @@ function queueMarkers(group: boolean, pin: GeneralTelegramPin): string {
   if (pin.privateShareCreation) markers.push(TELEGRAM_GENERAL_SHARE_CREATION_MARKER);
   if (pin.privateAggregate) markers.push(GENERAL_TELEGRAM_AGGREGATE_MARKER);
   if (pin.privateSelected) markers.push(GENERAL_TELEGRAM_SELECTED_MARKER);
+  if (pin.privateShort) markers.push(GENERAL_TELEGRAM_SHORT_MARKER);
   if (!pin.rehearsal) markers.push(GENERAL_AUTH_ACTION_MARKER);
   return markers.map((marker) => `'${marker}'`).join(",");
 }
@@ -268,6 +281,13 @@ export async function acceptGeneralSharedTelegramCommand(
     }
   }
   const command = pin.privateManagement && !tempEvent ? readPrivateTelegramCommand(decoded.update, pin.botUsername) : null;
+  if (pin.privateShort && command?.name === "short") {
+    if (command.remainder !== "" && !/^ /u.test(command.remainder)) return 204;
+    const { actorId, messageId, messageDate, remainder: args } = command;
+    const accepted = await acceptTelegramShortLink(db, pin, { args, updateId: decoded.updateId,
+      actorId, chatId: actorId, chatType: "private", threadId: null, messageId, messageDate }, aggregateKey ?? null);
+    return accepted === "accepted" ? 200 : 204;
+  }
   if (pin.privateSelected && command?.name === "o") {
     if (!aggregateKey || (command.remainder !== "" && !/^\s/u.test(command.remainder))) return 204;
     const { actorId, messageId, messageDate, remainder: query } = command;
@@ -298,7 +318,7 @@ export function acceptGeneralReadLaneCommand(
   db: D1Database, pin: GeneralTelegramPin, event: GeneralReadEvent, guard: D1PreparedStatement,
 ): Promise<number> {
   if (!pin.rehearsal || pin.privateManagement || pin.privateFormats || pin.privateTemp || pin.privateDocument || pin.privateProvider
-    || pin.privateClaims || pin.privateShareCreation || pin.privateAggregate || pin.privateSelected || pin.privateAuthorization
+    || pin.privateClaims || pin.privateShareCreation || pin.privateAggregate || pin.privateSelected || pin.privateShort || pin.privateAuthorization
     || event.chatType !== "private" || event.chatId !== event.actorId
     || event.threadId !== null || event.viewKind === "recycle") return Promise.resolve(204);
   return acceptSharedRead(db, pin, event, null, null, guard);
@@ -426,7 +446,9 @@ function selectLease(
   const claim = pin.privateClaims && lease.marker === TELEGRAM_GENERAL_PRIVATE_CLAIM_MARKER;
   const aggregate = pin.privateAggregate && lease.marker === GENERAL_TELEGRAM_AGGREGATE_MARKER;
   const selected = pin.privateSelected && lease.marker === GENERAL_TELEGRAM_SELECTED_MARKER;
-  const supported = aggregate ? aggregateFamily("inbox") : selected ? selectedFamily("inbox") : family("inbox", group, pin, false);
+  const short = pin.privateShort && lease.marker === GENERAL_TELEGRAM_SHORT_MARKER;
+  const supported = aggregate ? aggregateFamily("inbox") : selected ? selectedFamily("inbox") : short ? shortFamily("inbox")
+    : family("inbox", group, pin, false);
   const claimProof = claim ? ` AND EXISTS (SELECT 1 FROM telegram_private_claim
     WHERE receipt_id=inbox.receipt_id AND code_sha256=?)` : "";
   const exact = `FROM telegram_inbox AS inbox JOIN telegram_general_receipt AS authority USING (receipt_id)
@@ -437,7 +459,7 @@ function selectLease(
   const exactBindings = [pin.botId, lease.receiptId, lease.updateId, lease.actorId, lease.chatId, lease.chatType, lease.threadId,
     lease.messageId, lease.messageDate, lease.command, lease.marker, lease.actorRevision, lease.actorRole,
     ...generalPolicyBindings(pin, lease.generation), ...(claim ? [lease.claimCodeSha256] : [])];
-  const eligible = !authorizing ? "1" : aggregate || selected
+  const eligible = !authorizing ? "1" : aggregate || selected || short
     ? `${generalOrdinaryReplyEligibilitySql("inbox")} AND ${generalCurrentAuthoritySql("inbox")}` : current("inbox", group, pin);
   const eligibilityBindings = authorizing ? currentBindings(pin) : [];
   if (guard) {
@@ -449,6 +471,13 @@ function selectLease(
   }
   return { sql: `SELECT inbox.receipt_id ${exact} ${authorizing ? `AND ${eligible}` : ""}`,
     bindings: [...exactBindings, ...eligibilityBindings] };
+}
+
+async function confirmGuardedGeneralSend(db: D1Database, lease: SharedReadLease, scope: ReplyGuard): Promise<boolean> {
+  return await db.prepare(`WITH allowed AS MATERIALIZED (${scope.sql})
+    SELECT 1 FROM allowed JOIN telegram_outbox AS reply USING(receipt_id)
+    WHERE reply.state='sending' AND reply.attempts=? AND reply.lease_id=? AND reply.lease_until>unixepoch()`)
+    .bind(...scope.bindings, lease.attempts, lease.leaseId).first().catch(() => null) !== null;
 }
 
 export async function beginGeneralSharedTelegramReply(
@@ -538,6 +567,19 @@ export async function drainGeneralSharedTelegramReply(
 ): Promise<boolean> {
   const lease = await claimGeneralSharedTelegramReply(db, pin);
   if (!lease) return false;
+  if (lease.marker === GENERAL_TELEGRAM_SHORT_MARKER) {
+    if (!pin.privateShort) return false;
+    const short = { ...lease, shortLink: true as const };
+    const reply = await prepareTelegramShortLinkReply(db, pin, short, aggregateKey, publicOrigin);
+    if (reply.kind === "notice") await retireUnsentTelegramShortLink(db, pin, short);
+    const scope = selectLease(pin, lease, true, reply.kind === "link" ? reply.guard : undefined);
+    if (await prepareTelegramOutboxBegin(db, lease, scope).first() === null) return false;
+    const confirmed = reply.kind === "notice" || await confirmGuardedGeneralSend(db, lease, scope);
+    const outcome = confirmed ? await sendGeneralTelegramPrivateReply(pin.botToken, lease.actorId, lease.messageId, reply.text)
+      : { kind: "failed" as const };
+    await settleTelegramOutboxReply(db, lease, selectLease(pin, lease, false), outcome);
+    return true;
+  }
   if (lease.marker === GENERAL_TELEGRAM_SELECTED_MARKER) {
     return drainGeneralSelectedReply(db, pin, lease, publicOrigin, aggregateKey);
   }
@@ -579,10 +621,7 @@ export async function drainGeneralSharedTelegramReply(
       : renderTelegramAggregateResult(aggregate.result);
     const scope = selectLease(pin, lease, true, prepared?.guard);
     if (await prepareTelegramOutboxBegin(db, lease, scope).first() === null) return false;
-    const confirmed = !prepared || await db.prepare(`WITH allowed AS MATERIALIZED (${scope.sql})
-      SELECT 1 FROM allowed JOIN telegram_outbox AS reply USING(receipt_id)
-      WHERE reply.state='sending' AND reply.attempts=? AND reply.lease_id=? AND reply.lease_until>unixepoch()`)
-      .bind(...scope.bindings, lease.attempts, lease.leaseId).first().catch(() => null) !== null;
+    const confirmed = !prepared || await confirmGuardedGeneralSend(db, lease, scope);
     const outcome = confirmed ? await sendGeneralTelegramPrivateReply(pin.botToken, lease.actorId, lease.messageId, text)
       : { kind: "failed" as const };
     await settleTelegramOutboxReply(db, lease, selectLease(pin, lease, false), outcome);
@@ -702,6 +741,7 @@ export async function recoverGeneralSharedTelegramReplies(
     // Bound scheduled work and preserve the ordinary outbox's lease and settlement semantics.
   }
   if (pin.privateSelected) await reapTelegramSelected(db, pin.botId);
+  if (pin.privateShort) await reapFailedTelegramShortLinks(db, pin.botId, true);
   if (pin.privateProvider && await generalProviderRefreshReady(db).catch(() => false)) {
     await reapTelegramProviderRefreshTickets(db, pin.botId);
   }

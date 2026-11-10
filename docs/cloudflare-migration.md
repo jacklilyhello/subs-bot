@@ -673,6 +673,8 @@ V11 合成原生演练在 `worker-isolation-legacy-candidate.yml` 选择 `synthe
 
 `outbox: "shared-private-management-formats-temp-node-document-provider-claims-share-aggregate-selected"` 加入私聊 `/o [关键词]`。它需要同一聚合密钥和准确登记的 `0017`，按原有顺序匹配本人订阅名称与来源，搜索内容只用于本次匹配。选定链接沿用现有 `/agg` 路由及一次性撤销按钮。按钮限于同一 Bot、本人私聊、已确认消息、发送尝试和当前授权。选定链接不包含临时节点。触及现有数量上限时可在私聊刷新撤销按钮。隔离发布不启用此模式，启用前沿用聚合入口的暂停、排空及撤销要求。
 
+`outbox: "shared-private-management-formats-temp-node-document-provider-claims-share-aggregate-selected-short"` 加入本人私聊的普通 `/short` 帮助、签发和撤销。签发使用现有聚合密钥和确切登记的 `0019`。目标沿用现有公开 HTTP(S) 地址校验，`/s` 只返回跳转。撤销核对 Bot 和所有者，并清除保存的目标。通用及隔离的失败回执分别清理各自来源的短链。订阅详情短链和旧站内订阅短链由各自入口处理。现有隔离发布不启用此模式。启用前须有入口暂停、回执排空和保留本人撤销的办法。
+
 `0050` 为通用授权准备私聊 `/auth add <用户ID>` 和 `/auth remove <用户ID>`。通用私聊管理配置仅在显式包含 `authManagement: true` 时接收这些指令。只允许当前管理员处理本世代已登记的普通用户。同一 Bot 如有 `0049` 演练记录，通用授权入口关闭。授权修改和回复回执在同一 D1 事务内提交。按 Telegram 消息时间及同秒更新编号判定先后。撤权立即拒绝成员权限，重新授权要求新消息晚于新的时间界限。管理员可用 `/auth` 或 `/auth list` 私下查看本世代最多 20 位主体的最新角色；名单还有其他用户时会明确提示。暂停接收后仍可发送已接收的私聊回复。现有受保护发布流程保持此入口关闭。引用消息选择用户及增加新主体另行接入。
 
 #### V10 联合包原生恢复演练
