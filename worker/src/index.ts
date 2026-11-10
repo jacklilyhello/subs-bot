@@ -205,12 +205,14 @@ async function telegramWebhook(request: Request, env: Env, publicOrigin: PublicO
       const refreshAvailable = generalProviderRefreshAvailability(env, general.privateProvider);
       const share = general.privateShareCreation ? await telegramPrivateShareRuntime(env.DB,
         env.TELEGRAM_PRIVATE_SHARE_CREATION_KEY, false, `general-bot-${general.botId}`) : undefined;
+      const aggregateKey = general.privateAggregate ? await parseTelegramAggregateKey(env.TELEGRAM_AGGREGATE_KEY) : null;
       const status = general.sharedOutbox ? await acceptGeneralSharedTelegramCommand(env.DB, general, request,
         (callbackId) => ctx?.waitUntil(answerTelegramCallback(general, callbackId)), providerAvailable, refreshAvailable,
-        share ? { bucket: env.NODES, runtime: share } : undefined)
+        share ? { bucket: env.NODES, runtime: share } : undefined, aggregateKey)
         : await acceptGeneralTelegramCommand(env.DB, general, request);
       if (status === 200) {
-        const delivery = general.sharedOutbox ? drainGeneralSharedTelegramReply(env.DB, general, env.NODES, publicOrigin, refreshAvailable, share)
+        const delivery = general.sharedOutbox
+          ? drainGeneralSharedTelegramReply(env.DB, general, env.NODES, publicOrigin, refreshAvailable, share, aggregateKey)
           : drainGeneralTelegramReply(env.DB, general);
         if (ctx) ctx.waitUntil(delivery.catch(() => undefined));
         else await delivery;
@@ -747,7 +749,8 @@ async function scheduled(_controller: ScheduledController, env: Env): Promise<vo
             const share = general.privateShareCreation ? await telegramPrivateShareRuntime(env.DB,
               env.TELEGRAM_PRIVATE_SHARE_CREATION_KEY, false, `general-bot-${general.botId}`) : undefined;
             await recoverGeneralSharedTelegramReplies(env.DB, general, env.NODES, publicOrigin,
-              generalProviderRefreshAvailability(env, general.privateProvider), share);
+              generalProviderRefreshAvailability(env, general.privateProvider), share,
+              general.privateAggregate ? await parseTelegramAggregateKey(env.TELEGRAM_AGGREGATE_KEY) : null);
           }
         }
       } else if (general) await recoverGeneralTelegramReplies(env.DB, general);

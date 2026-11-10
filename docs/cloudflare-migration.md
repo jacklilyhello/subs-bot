@@ -669,6 +669,8 @@ V11 合成原生演练在 `worker-isolation-legacy-candidate.yml` 选择 `synthe
 
 `outbox: "shared-private-management-formats-temp-node-document-provider-claims-share"` 加入私聊 `/share [选项] -- 正文`。创建密钥及确切登记的 `0016` 必须就绪。保存前确认当前发送者和指定领取人属于同一 Bot 的授权世代。正文沿用 R2 私有暂存、回读与恢复；发布和发送链接时再次核对当前授权。过期或撤权的候选只按原回执及对象摘要清理。切换授权世代前须关闭入口并排空本世代的暂存和回复。订阅分享、群卡及内联创建另行验收。
 
+`outbox: "shared-private-management-formats-temp-node-document-provider-claims-share-aggregate"` 增加本人私聊的 `/export` 和 `/export revoke`，并要求现有 `TELEGRAM_AGGREGATE_KEY` 及准确登记的 `0009` 和 `0014`。聚合与分享创建分别核对各自的密钥和存储。聚合复用同一 Bot 和所有者的全量槽位。回复关闭链接预览，Base64 链接只在相同聚合码通过现有预检时显示。当前授权和所记录的授权版本必须在发送前一致。已交付的链接按现有 `/agg` 规则继续有效，直至本人撤销或按受保护流程回收。隔离发布不启用此模式。启用前须提供暂停及排空措施，并在切回不支持通用聚合命令的版本之前确认所有待发送回执和仍需撤销的槽位都已处理。
+
 #### V10 联合包原生恢复演练
 
 托管 Worker CI 从一份固定合成 SQLite 生成联合候选，并用实际旧 Python 和同一提交的编译后 Worker 核对外部短链跳转。受信的 `main` 构建发布准确候选和三份外部跳转证明文件。证明绑定源 SQLite、短链盘点和 Worker 构建。受保护步骤独立重建候选，核对完整归档、SQL、两类 R2 对象和摘要，并确认隔离 Worker 正在运行同一提交的构建，具备旧所选聚合、临时节点和全量聚合的读写能力。
