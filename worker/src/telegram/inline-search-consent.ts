@@ -141,11 +141,20 @@ export function activeInlineConsent(
   if (general) {
     return { sql: `(${latest}) AND (${GENERAL_INLINE_SCHEMA}) AND EXISTS (
       SELECT 1 FROM telegram_inbox AS origin JOIN telegram_general_receipt AS recorded USING(receipt_id)
+      JOIN telegram_general_actors AS actor
+        ON (actor.bot_id=origin.bot_id AND actor.actor_id=origin.actor_id AND actor.generation=recorded.generation)
+        AND (actor.revision=recorded.actor_revision AND actor.role=recorded.actor_role)
+      JOIN telegram_general_policy AS policy
+        ON (policy.bot_id=origin.bot_id AND policy.generation=recorded.generation)
+        AND (policy.release_revision=recorded.release_revision AND policy.activation_sha256=recorded.activation_sha256
+          AND policy.cutover_at=recorded.cutover_at)
       WHERE (origin.receipt_id=consent.receipt_id AND origin.bot_id=consent.bot_id AND origin.actor_id=consent.actor_id)
         AND (origin.chat_id=origin.actor_id AND origin.chat_type='private' AND origin.thread_id IS NULL AND origin.command='help')
         AND (origin.receipt_nonce='${GENERAL_INLINE_CONSENT_MARKER}' AND origin.update_id=consent.update_id AND origin.message_date=consent.message_date)
         AND (recorded.actor_role=consent.actor_role AND consent.auth_message_date=0 AND consent.auth_message_id=0)
-        AND (${generalCurrentAuthoritySql("origin")})
+        AND (${GENERAL_POLICY_PIN_SQL}) AND (${GENERAL_RECEIPT_SCHEMA})
+        AND (policy.active=1 AND ${GENERAL_NO_LEGACY_WORK}) AND (${GENERAL_LATEST_ACTOR_SQL})
+        AND origin.message_date>MAX(policy.cutover_at,actor.effective_at)
     )`, bindings: generalPolicyBindings(policy) };
   }
   return { sql: `(${latest})

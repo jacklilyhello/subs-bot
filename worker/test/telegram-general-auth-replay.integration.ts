@@ -11,6 +11,7 @@ import { Log, LogLevel, Miniflare } from "miniflare";
 import { PRODUCTION_PUBLIC_ORIGIN } from "../src/public-origin.ts";
 import { createPrivateShare, privateShareCodeDigest } from "../src/private-shares.ts";
 import { publishNodeSnapshot } from "../src/storage.ts";
+import { answerTelegramInlineSearch } from "../src/telegram/inline-search.ts";
 import { parseSubscriptionDocument } from "../src/subscription-document.ts";
 import { claimTelegramDocumentJob } from "../src/telegram/document-jobs.ts";
 import { persistTelegramDocumentJob, reconcileTelegramDocumentJobReplies, retireTelegramDocumentStage } from "../src/telegram/document-persistence.ts";
@@ -154,7 +155,8 @@ test("closed general authorization replays a sealed candidate in a separate emit
   const shareKeyRaw = Buffer.alloc(32, 0x61).toString("base64url");
   const authConfig = JSON.stringify({ ...JSON.parse(shortConfig), authManagement: true });
   const inlineConfig = JSON.stringify({ ...JSON.parse(authConfig), inlineSearch: true });
-  assert.ok(parseGeneralTelegramPin(inlineConfig, fixture.releaseRevision)?.privateInline);
+  const inlinePin = parseGeneralTelegramPin(inlineConfig, fixture.releaseRevision);
+  assert.ok(inlinePin?.privateInline);
   const inlineAnswers = new Map<string, { titles: string[]; messages: string[] }>();
   const authPin = parseGeneralTelegramPin(authConfig, fixture.releaseRevision);
   assert.ok(authPin?.privateAuthorization && authPin.privateShort && authPin.privateSelected && authPin.privateAggregate
@@ -1665,7 +1667,48 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.equal((await inlineQuery(8856, 102, "Own")).status, 204);
   assert.equal((await inlineQuery(8857, 101, "Own", "sender", inlinePaused)).status, 204);
   assert.equal(inlineAnswers.size, 0);
-  assert.equal((await inlineQuery(8858, 101, "Renamed current fixture")).status, 204);
+  const firstInline = await inlineQuery(8858, 101, "Renamed current fixture");
+  if (firstInline.status !== 204) {
+    const state = await db.prepare(`SELECT state FROM telegram_inline_search_receipts
+      WHERE bot_id=? AND update_id=8858`).bind(pin.botId).first<string>("state");
+    let phase = "admission";
+    let cause = "unclassified";
+    // Run a new synthetic query with no outbound transport to classify its first failure.
+    const observed = {
+      prepare(sql: string) {
+        const query = db.prepare(sql);
+        if (!sql.startsWith("WITH eligible AS MATERIALIZED")) return query;
+        return { bind(...values: unknown[]) {
+          const bound = query.bind(...values);
+          return { async first() {
+            phase = "begin";
+            try { return await bound.first(); } catch (error) {
+              cause = diagnosticError(error);
+              throw error;
+            }
+          } };
+        } };
+      },
+      async batch(statements: D1PreparedStatement[]) {
+        try {
+          const results = await db.batch(statements);
+          phase = "inventory";
+          return results;
+        } catch (error) {
+          cause = diagnosticError(error);
+          throw error;
+        }
+      },
+    } as D1Database;
+    try {
+      await answerTelegramInlineSearch(observed, inlinePin, { updateId: 8869, actorId: "101", chatType: "sender",
+        queryId: "synthetic-inline-probe", query: "Renamed current fixture" }, async () => "failed");
+    } catch (error) {
+      if (cause === "unclassified") cause = diagnosticError(error);
+    }
+    assert.fail(`Synthetic inline reply failed (state=${state}, ${phase}=${cause}).`);
+  }
+  assert.equal(firstInline.status, 204);
   assert.equal((await inlineQuery(8859, inlineActor, "Own 104")).status, 204);
   assert.equal((await inlineQuery(8858, 101, "Renamed current fixture")).status, 204);
   assert.equal(inlineAnswers.size, 2);
