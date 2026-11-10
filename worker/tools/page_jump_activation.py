@@ -11,7 +11,7 @@ import json
 
 from cloudflare_isolation import (
     CloudflareError, DIGEST, READBACK_DELAYS, UUID, WORKER_NAME, _guard_current, _matches, _page_jump_tag, _require,
-    _verify_health, sleep,
+    _verify_health, sleep, version_evidence,
 )
 from d1_migrations import _load_migrations, _read_state
 from page_jump_control import CONTROL, PINNED, PageJumpControl, _integer
@@ -271,7 +271,7 @@ def _reconcile(scope, journal, record, policy_sha256, current, ack=None):
             break
         version = scope.version(active.version, page_jump_epoch=intent.target_epoch)
         _require_confirmed(version.telegram_config_sha256 == policy_sha256
-                           and _digest({"versionId": active.version, "version": asdict(version)}) == intent.candidate_sha256
+                           and _digest({"versionId": active.version, "version": version_evidence(version)}) == intent.candidate_sha256
                            and current() and scope.active() == active)
         confirmed = journal.confirm(record, active)
         _require_confirmed(current() and scope.active() == active)
@@ -321,12 +321,12 @@ def activate_once(scope, source, telegram_config, guard, *, run_id, revision, bu
     _require(active.telegram_page_jump_control_capable and active.telegram_page_jump_epoch is None
              and (active.revision, active.digest, active.telegram_config_sha256)
              == (stage["revision"], stage["bundleSha256"], policy_sha256)
-             and _digest({"scope": scope.target, "deployment": asdict(previous), "version": asdict(active)})
+             and _digest({"scope": scope.target, "deployment": asdict(previous), "version": version_evidence(active)})
              == stage["checkpoint"]["activeSha256"], STALE)
     desired = replace(active, tag=_page_jump_tag(active.tag, stage["epoch"], active.digest),
                       telegram_page_jump_epoch=stage["epoch"])
     candidate = scope.staged(desired)
-    _require(candidate is not None and _digest({"versionId": candidate, "version": asdict(desired)})
+    _require(candidate is not None and _digest({"versionId": candidate, "version": version_evidence(desired)})
              == stage["candidateSha256"], STALE)
     intent = ActivationIntent(stage["epoch"], run_id, source["archiveSha256"], stage["checkpoint"]["activeSha256"],
                               stage["candidateSha256"], previous.id, previous.version, candidate)

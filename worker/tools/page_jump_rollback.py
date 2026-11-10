@@ -2,7 +2,7 @@
 
 from dataclasses import asdict, replace
 
-from cloudflare_isolation import _page_jump_tag, _require
+from cloudflare_isolation import _page_jump_tag, _require, version_evidence
 from page_jump_activation import (
     ActivationIntent, _deploy_once, _reconcile, _release, _reverses,
 )
@@ -14,7 +14,7 @@ STALE = "The isolated page-jump recovery checkpoint changed."
 
 
 def _active_sha(scope, deployment, version):
-    return _digest({"scope": scope.target, "deployment": asdict(deployment), "version": asdict(version)})
+    return _digest({"scope": scope.target, "deployment": asdict(deployment), "version": version_evidence(version)})
 
 
 def _active_activation(scope, journal, policy_sha256, current, epoch, stage_sha256, *, allow_unconfirmed=False):
@@ -27,7 +27,7 @@ def _active_activation(scope, journal, policy_sha256, current, epoch, stage_sha2
             and active.id != intent.prior_deployment_id
             and (record.deployment_id == active.id or allow_unconfirmed and record.deployment_id is None)):
         version = scope.version(active.version, page_jump_epoch=epoch)
-        _require(_digest({"versionId": active.version, "version": asdict(version)}) == intent.candidate_sha256, STALE)
+        _require(_digest({"versionId": active.version, "version": version_evidence(version)}) == intent.candidate_sha256, STALE)
     else:
         _require(allow_unconfirmed and record.deployment_id is None
                  and (active.id, active.version) == (intent.prior_deployment_id, intent.prior_version_id), STALE)
@@ -82,7 +82,7 @@ def rollback_once(scope, source, telegram_config, guard, *, run_id):
              and _digest(_gate_document(gate)) == paused["pausedGateSha256"], STALE)
     journal.control.verify_drained(gate, unchanged)
     intent = ActivationIntent(gate.epoch, run_id, stage_sha256, paused["activeSha256"],
-                              _digest({"versionId": previous, "version": asdict(predecessor)}),
+                              _digest({"versionId": previous, "version": version_evidence(predecessor)}),
                               active.id, active.version, previous, restores_epoch=epoch)
     _require(_reverses(intent, original), STALE)
     # _deploy_once rechecks the current deployment before POST.

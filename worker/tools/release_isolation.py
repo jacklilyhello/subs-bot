@@ -10,9 +10,9 @@ from pathlib import Path
 
 from attest_api_status_container import ATTESTATION_ENV
 from cloudflare_isolation import (
-    CloudflareClient, CloudflareError, WORKER_NAME, group_share_cards_artifact, legacy_dynamic_all_artifact,
-    legacy_selected_artifact, legacy_temp_artifact,
-    _Isolation, release_worker, validate_aggregate_key, validate_private_share_key, verify_page_jump_artifact,
+    CloudflareClient, CloudflareError, SUBSCRIPTION_SHORTS_SHA256, WORKER_NAME, group_share_cards_artifact,
+    legacy_dynamic_all_artifact, legacy_selected_artifact, legacy_temp_artifact,
+    _Isolation, release_worker, subscription_shorts_artifact, validate_aggregate_key, validate_private_share_key, verify_page_jump_artifact,
     verify_worker_target,
 )
 from d1_migrations import MigrationError, apply_migrations
@@ -136,6 +136,16 @@ def legacy_subscription_shorts_release_mode():
     raise CloudflareError("The isolated legacy subscription short-link release mode or confirmation is invalid.")
 
 
+def subscription_shorts_release_mode():
+    mode = os.environ.get("SUBS_BOT_SUBSCRIPTION_SHORTS_MODE", "preserve")
+    confirmation = os.environ.get("SUBS_BOT_SUBSCRIPTION_SHORTS_CONFIRMATION", "")
+    if mode == "preserve" and confirmation == "":
+        return None
+    if mode in ("enable", "disable") and confirmation == f"{mode} typed subscription shorts for {WORKER_NAME}":
+        return mode == "enable"
+    raise CloudflareError("The isolated typed subscription short-link release mode or confirmation is invalid.")
+
+
 def provider_batch_release_mode():
     mode = os.environ.get("SUBS_BOT_PROVIDER_BATCH_MODE", "preserve")
     confirmation = os.environ.get("SUBS_BOT_PROVIDER_BATCH_CONFIRMATION", "")
@@ -171,8 +181,13 @@ def release():
     group_share_cards = group_share_cards_release_mode()
     provider_refresh = provider_refresh_release_mode()
     legacy_subscription_shorts = legacy_subscription_shorts_release_mode()
+    subscription_shorts = subscription_shorts_release_mode()
     provider_batch = provider_batch_release_mode()
     api_status = api_status_release_mode()
+    if subscription_shorts is not None and any(mode is not None for mode in (
+            inline_search, provider_url_import, provider_refresh, legacy_subscription_shorts, provider_batch,
+            api_status, provider_url_documents, mixed_documents, group_share_cards)):
+        raise CloudflareError("Change typed subscription short-link issuance in a separate scoped release.")
     page_jump = os.environ.get("SUBS_BOT_PAGE_JUMP_MODE", "preserve")
     page_jump_confirmation = os.environ.get("SUBS_BOT_PAGE_JUMP_CONFIRMATION", "")
     page_jump_input = os.environ.get("SUBS_BOT_PAGE_JUMP_CHECKPOINT", "")
@@ -186,7 +201,7 @@ def release():
         _, page_jump_checkpoint = stage_inputs(page_jump, page_jump_confirmation, page_jump_input)
     if page_jump != "preserve" and any(mode is not None for mode in (
             inline_search, provider_url_import, provider_url_documents, mixed_documents, group_share_cards,
-            provider_refresh, legacy_subscription_shorts, provider_batch, api_status)):
+            provider_refresh, legacy_subscription_shorts, subscription_shorts, provider_batch, api_status)):
         raise CloudflareError("Manage isolated page jump in a separate scoped operation.")
     if recovery or activation:
         run_id, attempt = hosted_run(os.environ)
@@ -249,6 +264,7 @@ def release():
     selected_capable = legacy_selected_artifact(bundle, manifest)
     temp_capable = legacy_temp_artifact(bundle, manifest)
     dynamic_all_capable = legacy_dynamic_all_artifact(bundle, manifest)
+    typed_shorts_capable = subscription_shorts_artifact(bundle, manifest)
     verify_page_jump_artifact(bundle, manifest)
     telegram_config = telegram_release_config(manifest)
     aggregate_key = None
@@ -298,7 +314,13 @@ def release():
                                     provider_url_documents=provider_url_documents, mixed_documents=mixed_documents,
                                     group_share_cards=group_share_cards, group_share_cards_capable=group_cards_capable,
                                     legacy_selected_capable=selected_capable, legacy_temp_capable=temp_capable,
-                                    legacy_dynamic_all_capable=dynamic_all_capable)
+                                    legacy_dynamic_all_capable=dynamic_all_capable, subscription_shorts=subscription_shorts,
+                                    subscription_shorts_capable=typed_shorts_capable)
+    if subscription_shorts is True:
+        print(json.dumps({"subscriptionShortsPreflight": "verified", "revision": revision,
+                          "previousVersionId": starting["versionId"], "previousDeploymentId": starting["deploymentId"],
+                          "moduleSha256": manifest["bundleSha256"], "compatibilityDate": manifest["compatibilityDate"],
+                          "migrationSha256": SUBSCRIPTION_SHORTS_SHA256}, sort_keys=True), flush=True)
     if provider_gate is not None:
         provider_gate.verify()
     migrations = apply_migrations(data_api, target, bundle, manifest, guard)
@@ -313,7 +335,7 @@ def release():
                             legacy_subscription_shorts=legacy_subscription_shorts, provider_batch=provider_batch,
                             api_status=api_status, api_status_gate=api_status_gate,
                             provider_url_documents=provider_url_documents, mixed_documents=mixed_documents,
-                            group_share_cards=group_share_cards)
+                            group_share_cards=group_share_cards, subscription_shorts=subscription_shorts)
     guard()
     print(json.dumps(result, sort_keys=True), flush=True)
 

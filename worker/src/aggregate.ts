@@ -13,6 +13,7 @@ import {
   type ShortLinkNamespaces,
 } from "./short-links.ts";
 import { LEGACY_EMPTY_EXPORT_PIN } from "./legacy-empty-export.ts";
+import { SUBSCRIPTION_SHORT_CODE } from "./telegram/subscription-shorts.ts";
 
 const EMPTY_TOKEN = /^[A-Za-z0-9_-]{16,128}(?![\s\S])/u;
 export const MAX_AGGREGATE_MEMBERS = 128;
@@ -55,7 +56,7 @@ interface AggregateNodeSource extends ExportNodeSource { readonly legacyAggregat
 export class AggregateLimitError extends Error {}
 
 async function codeDigest(code: string): Promise<string | null> {
-  return typeof code === "string" && SHORT_CODE.test(code) ? shortCodeDigest(code) : null;
+  return typeof code === "string" && SHORT_CODE.test(code) && !SUBSCRIPTION_SHORT_CODE.test(code) ? shortCodeDigest(code) : null;
 }
 
 export async function hasAggregateLink(db: D1Database, code: string): Promise<boolean> {

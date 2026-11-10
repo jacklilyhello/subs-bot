@@ -11,6 +11,7 @@ import { inTelegramScope, SUBSCRIPTION_READ_RECEIPT_MARKER, SUBSCRIPTION_READ_TI
 import { selectedQuery, unicode14Lower } from "./selected-search.ts";
 import { displayTelegramName, displayTelegramDate, TELEGRAM_VIEW_RECEIPTS } from "./views.ts";
 import { TELEGRAM_SUBSCRIPTION_NODE_MARKER, type TelegramNodePageButton } from "./subscription-node-pages.ts";
+import type { SubscriptionShortTarget } from "./subscription-shorts.ts";
 
 export const TELEGRAM_SUBSCRIPTION_READ_MARKER = SUBSCRIPTION_READ_RECEIPT_MARKER;
 export const GENERAL_SUBSCRIPTION_READ_MARKER = "general-subscription-read:v1";
@@ -54,6 +55,7 @@ interface RenderedRead {
   nodeButtons?: TelegramNodePageButton[];
   refreshTarget?: TelegramProviderRefreshTarget;
   rawFileTarget?: TelegramRawFileTarget;
+  shortTarget?: SubscriptionShortTarget & { label: string };
 }
 
 const privateScope = (event: Pick<ReadLease, "actorId" | "chatId" | "chatType" | "threadId">): boolean =>
@@ -431,7 +433,7 @@ async function renderFormat(
     }
   }
   return { text: `${FORMAT_LABELS[format]}\n${publicOrigin}/sub/${row.token}/${format}`,
-    readGuard: subscriptionGuard(guard, row, row.token) };
+    readGuard: subscriptionGuard(guard, row, row.token), shortTarget: { id: row.id, format, token: row.token, label: FORMAT_LABELS[format] } };
 }
 
 export async function renderTelegramSubscriptionRead(

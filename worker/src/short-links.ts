@@ -2,6 +2,7 @@ import { digestHex } from "./storage.ts";
 import { LEGACY_SELECTED_RETIREMENT_PIN } from "./subscriptions.ts";
 import { legacyAllActiveMarkerSql } from "./legacy-all-aggregates.ts";
 import { ISOLATION_PUBLIC_ORIGIN, PRODUCTION_PUBLIC_ORIGIN } from "./public-origin.ts";
+import { resolveSubscriptionShortLocation, SUBSCRIPTION_SHORT_CODE } from "./telegram/subscription-shorts.ts";
 
 export { ISOLATION_PUBLIC_ORIGIN };
 export const SHORT_CODE = /^(?:[A-Za-z0-9_-]{12}|[A-Za-z0-9_-]{22})(?![\s\S])/u;
@@ -167,6 +168,7 @@ type ShortRow = {
 /** Even a disabled compatibility namespace reserves its digests. */
 export async function resolveShortLocation(db: D1Database, code: string, serveLegacy = false): Promise<string | null> {
   if (!SHORT_CODE.test(code)) return null;
+  if (SUBSCRIPTION_SHORT_CODE.test(code)) return resolveSubscriptionShortLocation(db, code);
   const namespaces = await readShortLinkNamespaces(db);
   const digest = await shortCodeDigest(code);
   const legacyEnabled = serveLegacy && code.length === 12 && namespaces.normal && namespaces.legacySubscription && namespaces.migrationLedger;

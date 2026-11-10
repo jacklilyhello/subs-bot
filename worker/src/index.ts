@@ -59,6 +59,7 @@ import { acceptTelegramCommand } from "./telegram/store.ts";
 import { acceptTelegramTemp } from "./telegram/temp-import.ts";
 import { acceptTelegramView, reapTelegramViewTickets } from "./telegram/views.ts";
 import { acceptTelegramShortLink, reapFailedTelegramShortLinks } from "./telegram/short-link-actions.ts";
+import { reapFailedTelegramSubscriptionShorts } from "./telegram/subscription-shorts.ts";
 import { acceptTelegramSubscriptionRead, reapTelegramSubscriptionReadTickets, telegramSubscriptionReadReady } from "./telegram/subscription-read.ts";
 import { acceptTelegramPageJump, telegramPageJumpEpoch } from "./telegram/page-jump.ts";
 import { acceptTelegramSubscriptionNodePage, reapTelegramSubscriptionNodeTickets, telegramSubscriptionNodePagesReady } from "./telegram/subscription-node-pages.ts";
@@ -86,6 +87,7 @@ export interface Env {
   TELEGRAM_MIXED_DOCUMENTS?: string;
   TELEGRAM_PROVIDER_REFRESH?: string;
   LEGACY_SUBSCRIPTION_SHORTS?: string;
+  TELEGRAM_SUBSCRIPTION_SHORTS?: string;
   TELEGRAM_PROVIDER_BATCH_REFRESH?: string;
   TELEGRAM_API_STATUS?: string;
   PROVIDER_API_STATUS?: ProviderApiStatusV2Prober;
@@ -244,7 +246,8 @@ async function telegramWebhook(request: Request, env: Env, publicOrigin: PublicO
     const drainReplies = async (budget = 20_000) => drainTelegramReplies(env.DB, env.NODES, policy, 4, budget, fetch, aggregateKey, privateShare,
       subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerQueueReady, bulkTrash, inlineConsent,
       await githubSearch().catch(() => "unavailable" as const), providerRefresh, subscriptionRawFile, providerBatch.controls, apiStatus,
-      statusProvider !== null, providerDocument, providerBatchAdmission, pageJumpEpoch, publicOrigin);
+      statusProvider !== null, providerDocument, providerBatchAdmission, pageJumpEpoch, publicOrigin,
+      env.TELEGRAM_SUBSCRIPTION_SHORTS === "1");
     const drain = () => ctx?.waitUntil(drainReplies().catch(() => undefined));
     if (decoded.apiStatus) {
       if (!statusProvider || apiStatus !== true) return new Response(null, { status: 204, headers: HEADERS });
@@ -571,13 +574,17 @@ async function recoverTelegramWork(
     drainTelegramReplies(env.DB, env.NODES, policy, limit, budget, fetch, aggregateKey, privateShare,
       subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerQueueReady, bulkTrash, inlineConsent,
       await githubSearch().catch(() => "unavailable" as const), providerRefresh, subscriptionRawFile, providerBatch.controls, apiStatus,
-      apiStatusProvider(env) !== null, providerDocument, providerBatchAdmission, telegramPageJumpEpoch(env.TELEGRAM_PAGE_JUMP), publicOrigin);
+      apiStatusProvider(env) !== null, providerDocument, providerBatchAdmission, telegramPageJumpEpoch(env.TELEGRAM_PAGE_JUMP), publicOrigin,
+      env.TELEGRAM_SUBSCRIPTION_SHORTS === "1");
   const replies = async () => {
     await drain(10, 45_000);
     await reapTelegramViewTickets(env.DB);
     await reapTelegramLifecycle(env.DB);
     if (aggregateKey) await reapTelegramSelected(env.DB);
-    if (subscriptionRead) await reapTelegramSubscriptionReadTickets(env.DB);
+    if (subscriptionRead) {
+      await reapTelegramSubscriptionReadTickets(env.DB);
+      await reapFailedTelegramSubscriptionShorts(env.DB, policy.botId);
+    }
     if (subscriptionNodes) await reapTelegramSubscriptionNodeTickets(env.DB);
     if (providerRefreshSchema) await reapTelegramProviderRefreshTickets(env.DB);
     if (subscriptionRawFile === true) await reapTelegramRawFileTickets(env.DB);

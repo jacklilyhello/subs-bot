@@ -3,7 +3,7 @@
 import base64
 from contextlib import closing
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from hashlib import sha256
 from http.client import IncompleteRead
 from io import BytesIO
@@ -189,6 +189,8 @@ class FakeCloudflare:
         self.dynamic_all_reads = 0
         self.page_jump_replies = []
         self.page_jump_control_open = False
+        self.subscription_shorts_schema = "absent"
+        self.subscription_shorts_state = None
 
     def worker_api(self, method, path, payload=None):
         self.calls.append((method, path))
@@ -265,6 +267,42 @@ class FakeCloudflare:
     def data_api(self, method, path, payload=None):
         if method == "POST" and path == DATABASE + "/query":
             sql = payload["sql"]
+            if any(alias in sql for alias in ("AS typedShortObjects", "AS typedShortRegistered", "AS autoIndexes")):
+                schema = self.subscription_shorts_schema
+                if schema == "absent":
+                    return [{"success": True, "results": [{"typedShortObjects": 0, "ledger": 0}]}]
+                migrations = Path(__file__).resolve().parents[1] / "migrations"
+                with closing(sqlite3.connect(":memory:")) as db:
+                    db.row_factory = sqlite3.Row
+                    db.execute("PRAGMA foreign_keys=ON")
+                    db.execute("CREATE TABLE subs_bot_schema_migrations(position INTEGER PRIMARY KEY,name TEXT,sha256 TEXT,mode TEXT)")
+                    digest = "0" * 64 if schema == "bad-ledger" else cloudflare.SUBSCRIPTION_SHORTS_SHA256
+                    db.execute("INSERT INTO subs_bot_schema_migrations VALUES (48,?,?,'applied')",
+                               (cloudflare.SUBSCRIPTION_SHORTS_MIGRATION, digest))
+                    if schema != "missing-schema":
+                        for name in ("0002_telegram.sql", "0018_telegram_subscription_reads.sql"):
+                            db.executescript((migrations / name).read_text(encoding="utf-8"))
+                        ddl = (migrations / cloudflare.SUBSCRIPTION_SHORTS_MIGRATION).read_text(encoding="utf-8")
+                        if schema == "bad-index":
+                            ddl = ddl.replace("(bot_id, owner_id) WHERE", "(owner_id, bot_id) WHERE")
+                        db.executescript(ddl)
+                        if self.subscription_shorts_state is not None:
+                            revoked, state = self.subscription_shorts_state
+                            db.execute("""INSERT INTO telegram_inbox
+                                (receipt_id,bot_id,update_id,actor_id,chat_id,chat_type,message_id,message_date,command)
+                                VALUES (1,'123',1,'456','456','private',1,1,'help')""")
+                            db.execute("""INSERT INTO telegram_subscription_read
+                                (receipt_id,kind,subscription_id,format,auth_message_date,auth_message_id)
+                                VALUES (1,'format',1,'clash',0,0)""")
+                            db.execute("INSERT INTO telegram_outbox(receipt_id,state,sent_message_id) VALUES (1,?,?)",
+                                       (state, 1 if state == "sent" else None))
+                            db.execute("""INSERT INTO telegram_subscription_short_links
+                                (code_sha256,origin_receipt_id,bot_id,owner_id,subscription_id,token_sha256,format,nonce,
+                                 key_version,created_at,revoked_at) VALUES (?,1,'123','456',?,?,?,?,1,1,?)""",
+                                       ("1" * 64, None if revoked else 1, None if revoked else "2" * 64,
+                                        None if revoked else "clash", None if revoked else "A" * 22,
+                                        2 if revoked else None))
+                    return [{"success": True, "results": [dict(row) for row in db.execute(sql)]}]
             if "AS pageJumpJournal," in sql:
                 return [{"success": True, "results": [{
                     "pageJumpJournal": int(self.page_jump_journal not in ("absent", "registered-only")), "ledger": 1,
@@ -1014,7 +1052,7 @@ class ReleaseTests(unittest.TestCase):
         self.api.versions[OLD_VERSION]["bindings"].append(cloudflare._page_jump_binding(700))
         scope = cloudflare._Isolation(self.api.worker_api, self.api.data_api, TARGET)
         bound = scope.version(OLD_VERSION, page_jump_epoch=700)
-        archived = {"epoch": 700, "candidateSha256": page_stage._digest({"versionId": OLD_VERSION, "version": asdict(bound)}),
+        archived = {"epoch": 700, "candidateSha256": page_stage._digest({"versionId": OLD_VERSION, "version": cloudflare.version_evidence(bound)}),
                     "bundleSha256": bound.digest, "ciManifestSha256": "1" * 64, "ciRunId": "100", "ciRunAttempt": "1",
                     "ciArtifactId": "200", "ciArchiveSha256": "2" * 64}
         sources = {"stage": {"runId": "700", "runAttempt": "1", "revision": OLD_REVISION, "archiveSha256": "3" * 64}}
@@ -1046,6 +1084,138 @@ class ReleaseTests(unittest.TestCase):
             with self.assertRaisesRegex(cloudflare.CloudflareError, "paused gate changed"):
                 page_jump_recovery.prepare_recovery(self.api.worker_api, self.api.data_api, TARGET, NEW_REVISION,
                     INLINE_CONFIG, self.api.guard, mode="drain", sources=sources, run_id=704, attempt=1)
+        self.assertEqual(self.api.writes(), [])
+
+    def test_typed_subscription_short_mode_and_first_enable_require_exact_off_release(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(release_entry.subscription_shorts_release_mode())
+        for mode, enabled in (("enable", True), ("disable", False)):
+            with self.subTest(mode=mode), patch.dict(os.environ, {
+                    "SUBS_BOT_SUBSCRIPTION_SHORTS_MODE": mode,
+                    "SUBS_BOT_SUBSCRIPTION_SHORTS_CONFIRMATION": f"{mode} typed subscription shorts for {cloudflare.WORKER_NAME}",
+            }, clear=True):
+                self.assertIs(release_entry.subscription_shorts_release_mode(), enabled)
+        with patch.dict(os.environ, {"SUBS_BOT_SUBSCRIPTION_SHORTS_MODE": "enable"}, clear=True), \
+             self.assertRaisesRegex(cloudflare.CloudflareError, "mode or confirmation"):
+            release_entry.subscription_shorts_release_mode()
+
+        digest = self.manifest["bundleSha256"]
+        active = cloudflare._Version(NEW_REVISION, digest, COMPATIBILITY, None, "a" * 64, "b" * 64,
+                                    telegram_subscription_shorts_capable=True)
+        target = cloudflare._subscription_shorts_target
+        self.assertFalse(target(active, None, self.manifest, True, "a" * 64, "b" * 64, True))
+        self.assertTrue(target(active, True, self.manifest, True, "a" * 64, "b" * 64, True))
+        for drift in (replace(active, revision=OLD_REVISION), replace(active, digest="0" * 64),
+                      replace(active, compatibility="2026-01-01"),
+                      replace(active, telegram_subscription_shorts_capable=False)):
+            with self.subTest(drift=drift), self.assertRaisesRegex(cloudflare.CloudflareError, "same Worker artifact"):
+                target(drift, True, self.manifest, True, "a" * 64, "b" * 64, True)
+        for telegram, key, cron in (("0" * 64, "b" * 64, True), ("a" * 64, None, True), ("a" * 64, "b" * 64, False)):
+            with self.subTest(telegram=telegram, key=key, cron=cron), \
+                 self.assertRaisesRegex(cloudflare.CloudflareError, "existing Telegram policy, aggregate key and Cron"):
+                target(active, True, self.manifest, True, telegram, key, cron)
+        enabled = replace(active, telegram_subscription_shorts=True)
+        self.assertTrue(target(enabled, None, self.manifest, True, "a" * 64, "b" * 64, True))
+        self.assertFalse(target(enabled, False, self.manifest, True, "a" * 64, "b" * 64, True))
+
+    def test_typed_subscription_short_artifact_requires_complete_runtime_and_exact_migration(self):
+        markers = cloudflare.SUBSCRIPTION_SHORTS_MARKERS
+        module = b" ".join((NEW_MODULE, *markers))
+        entries = [{}] * 47 + [{"name": cloudflare.SUBSCRIPTION_SHORTS_MIGRATION, "sha256": cloudflare.SUBSCRIPTION_SHORTS_SHA256}]
+        capable = cloudflare._subscription_shorts_artifact_capable
+        self.assertTrue(capable(module, {"migrations": entries}))
+        self.assertFalse(capable(OLD_MODULE, {"migrations": []}))
+        for candidate, chain in ((NEW_MODULE + markers[0], entries), (module, entries[:-1]),
+                                 (module, entries[:-1] + [{**entries[-1], "sha256": "0" * 64}])):
+            with self.subTest(candidate=candidate, count=len(chain)), self.assertRaisesRegex(cloudflare.CloudflareError, "exact 0048"):
+                capable(candidate, {"migrations": chain})
+
+    def test_typed_subscription_short_floor_pins_schema_and_keeps_off_recovery(self):
+        scope = cloudflare._Isolation(self.api.worker_api, self.api.data_api, TARGET)
+        old = cloudflare._Version(OLD_REVISION, "0" * 64, COMPATIBILITY, None)
+        capable = replace(old, telegram_subscription_shorts_capable=True)
+        check = scope.verify_subscription_shorts_floor
+        check(old, False)
+        check(old, True)  # Preflight for the first dormant migration.
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "schema or ledger"):
+            check(old, True, require_schema=True)
+        for schema in ("missing-schema", "bad-ledger", "bad-index"):
+            self.api.subscription_shorts_schema = schema
+            with self.subTest(schema=schema), self.assertRaisesRegex(cloudflare.CloudflareError, "schema or ledger"):
+                check(old, True)
+        self.api.subscription_shorts_schema = "exact"
+        check(old, True, require_schema=True)
+        check(capable, False, initial_off_rollback=True)
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "after its first dormant release"):
+            check(capable, False)
+        for state in ((False, "sent"), (True, "pending")):
+            self.api.subscription_shorts_state = state
+            with self.subTest(state=state), self.assertRaisesRegex(cloudflare.CloudflareError, "active or unsettled"):
+                check(capable, False, initial_off_rollback=True)
+            check(capable, True, require_schema=True)
+        self.api.subscription_shorts_state = (True, "failed")
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "after its first dormant release"):
+            check(capable, False, initial_off_rollback=True)
+        self.assertEqual(self.api.writes(), [])
+
+    def test_typed_subscription_short_readback_composes_all_existing_feature_bindings(self):
+        active = self.set_group_share_cards_baseline(enabled=True, api_status=True,
+            prior_markers=(*cloudflare.SUBSCRIPTION_SHORTS_MARKERS, cloudflare.PAGE_JUMP_MARKER, cloudflare.PAGE_JUMP_CONTROL_MARKER))
+        aggregate_digest = sha256(AGGREGATE_KEY.encode()).hexdigest()
+        typed = {"type": "plain_text", "name": cloudflare.SUBSCRIPTION_SHORTS_BINDING, "text": "1"}
+        active["bindings"].extend([
+            {"type": "secret_text", "name": cloudflare.AGGREGATE_KEY_BINDING},
+            {"type": "plain_text", "name": cloudflare.AGGREGATE_DIGEST_BINDING, "text": aggregate_digest},
+            LEGACY_SHORT_BINDING,
+            {"type": "plain_text", "name": cloudflare.MIXED_DOCUMENTS_BINDING, "text": "1"},
+            typed,
+        ])
+        digest = sha256(base64.b64decode(active["modules"][0]["content_base64"])).hexdigest()
+        tag = cloudflare._release_tag(NEW_REVISION, sha256(INLINE_CONFIG.encode()).hexdigest(), aggregate_digest,
+                                     sha256(PRIVATE_SHARE_KEY.encode()).hexdigest(), PROVIDER_BINDING)
+        active["annotations"]["workers/tag"] = cloudflare._telegram_feature_tag(
+            cloudflare._api_status_tag(tag, API_STATUS_PIN, True), True, True, True, True, True, digest,
+            url_documents=True, url_documents_module_sha256=digest, mixed_documents=True, group_share_cards=True,
+            subscription_shorts=True, short_module_sha256=digest)
+        scope = cloudflare._Isolation(self.api.worker_api, self.api.data_api, TARGET)
+        verified = scope.version(OLD_VERSION)
+        self.assertTrue(verified.telegram_subscription_shorts)
+        self.assertTrue(verified.telegram_subscription_shorts_capable)
+        self.assertTrue(verified.telegram_group_share_cards)
+        self.assertTrue(verified.telegram_api_status)
+        epoch = 701
+        active["bindings"].append(cloudflare._page_jump_binding(epoch))
+        active["annotations"]["workers/tag"] = cloudflare._page_jump_tag(verified.tag, epoch, digest)
+        self.assertEqual(scope.version(OLD_VERSION, page_jump_epoch=epoch), replace(verified,
+            tag=active["annotations"]["workers/tag"], telegram_page_jump_epoch=epoch))
+        active["bindings"].pop()
+        active["annotations"]["workers/tag"] = verified.tag
+        active["bindings"].pop()
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "release tag differs"):
+            scope.version(OLD_VERSION)
+        active["bindings"].append({**typed, "text": "0"})
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "typed subscription short-link binding"):
+            scope.version(OLD_VERSION)
+        self.assertEqual(self.api.writes(), [])
+
+    def test_pre_0048_version_evidence_keeps_the_historical_document(self):
+        prior = cloudflare._Version(OLD_REVISION, "0" * 64, COMPATIBILITY, None, telegram_page_jump_epoch=42)
+        expected = asdict(prior)
+        del expected["telegram_subscription_shorts"]
+        del expected["telegram_subscription_shorts_capable"]
+        self.assertEqual(cloudflare.version_evidence(prior), expected)
+        capable = replace(prior, telegram_subscription_shorts_capable=True)
+        self.assertEqual(cloudflare.version_evidence(capable), asdict(capable))
+
+    def test_typed_subscription_short_activation_cannot_implicitly_reopen_withdrawn_issuance(self):
+        scope = cloudflare._Isolation(self.api.worker_api, self.api.data_api, TARGET)
+        current = cloudflare._Version(NEW_REVISION, self.manifest["bundleSha256"], COMPATIBILITY, None,
+                                     telegram_subscription_shorts_capable=True)
+        old = replace(current, telegram_subscription_shorts=True)
+        self.api.subscription_shorts_schema = "exact"
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "only in a protected enable release"):
+            scope.activate(scope.active(), NEW_VERSION, None, current_version=current, target_version=old,
+                           current_capable=False, target_capable=False, guard=self.api.guard)
         self.assertEqual(self.api.writes(), [])
 
     def set_inline_baseline(self):

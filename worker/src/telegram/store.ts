@@ -1,4 +1,6 @@
 import { readShortLinkNamespaces } from "../short-links.ts";
+import { installTelegramSubscriptionShort, subscriptionShortPublicationGuard, subscriptionShortSendGuard,
+  type SubscriptionShortCandidate } from "./subscription-shorts.ts";
 import { inTelegramScope, TELEGRAM_PAGE_JUMP_RECEIPTS, type TelegramCommand, type TelegramPolicy } from "./protocol.ts";
 import {
   insertTelegramViewTickets, TELEGRAM_VIEW_RECEIPTS, type TelegramView, type TelegramViewTicket,
@@ -619,6 +621,31 @@ export async function beginTelegramShortLinkReply(
 ): Promise<boolean> {
   if (!lease.shortLink || lease.chatType !== "private" || lease.threadId !== null || !inTelegramScope(policy, lease)) return false;
   return await beginReplyStatement(db, policy, lease, "allowed", guard).first() !== null;
+}
+
+export async function beginTelegramSubscriptionShortReply(
+  db: D1Database, policy: TelegramPolicy, lease: TelegramReplyLease, candidate: SubscriptionShortCandidate,
+  read: { sql: string; bindings: readonly (string | number | null)[] },
+): Promise<boolean> {
+  if (!lease.subscriptionRead || !inTelegramScope(policy, lease) || lease.chatType !== "private" || lease.threadId !== null) return false;
+  const guard = subscriptionShortSendGuard(candidate, read);
+  try {
+    const [begun, inserted, confirmed] = await db.batch<{ receipt_id: number }>([
+      beginReplyStatement(db, policy, lease, "allowed", subscriptionShortPublicationGuard(candidate, read)),
+      installTelegramSubscriptionShort(db, lease, candidate),
+      db.prepare(`SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM telegram_outbox
+        WHERE receipt_id=? AND lease_id=? AND attempts=? AND state='sending') OR EXISTS (
+          SELECT 1 FROM telegram_inbox AS inbox WHERE inbox.receipt_id=? AND (${guard.sql})
+        ) THEN 1 ELSE json_extract('subscription short guard failed','$') END`)
+        .bind(lease.receiptId, lease.leaseId, lease.attempts, lease.receiptId, ...guard.bindings),
+    ]);
+    const count = begun?.results.length;
+    if (!begun?.success || (count !== 0 && count !== 1) || (count === 1 && begun.results[0].receipt_id !== lease.receiptId)
+      || !inserted?.success || !validInteger(inserted.meta.changes, 0, count) || !confirmed?.success) throw new Error();
+    return count === 1;
+  } catch {
+    throw new Error("Telegram subscription short link reply could not begin.");
+  }
 }
 
 export async function beginTelegramTempRawReply(
