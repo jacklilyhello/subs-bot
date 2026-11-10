@@ -34,7 +34,7 @@ export interface GeneralAuthReplayMessage {
   link_preview_options: { is_disabled: true };
 }
 
-const ROLE = `CASE WHEN principal.is_admin=1 THEN 'admin'
+export const GENERAL_AUTH_LEGACY_ROLE = `CASE WHEN principal.is_admin=1 THEN 'admin'
   WHEN principal.override_allowed=1 THEN 'member'
   WHEN principal.override_allowed IS NULL AND principal.is_allowlisted=1 THEN 'member' END`;
 const INSTALLATION = `general_auth_replay_fence AS fence
@@ -63,9 +63,9 @@ export async function acceptGeneralAuthReplay(db: D1Database, pin: GeneralAuthRe
   const row = await db.prepare(`
     INSERT INTO general_auth_replay_receipts
       (bot_id,update_id,generation,actor_id,chat_id,message_id,message_date,role,command,received_at)
-    SELECT fence.bot_id,?,fence.generation,principal.user_id,principal.user_id,?,?,${ROLE},?,unixepoch()
+    SELECT fence.bot_id,?,fence.generation,principal.user_id,principal.user_id,?,?,${GENERAL_AUTH_LEGACY_ROLE},?,unixepoch()
     FROM ${INSTALLATION}
-    WHERE ${PIN} AND principal.user_id=? AND (${ROLE}) IS NOT NULL
+    WHERE ${PIN} AND principal.user_id=? AND (${GENERAL_AUTH_LEGACY_ROLE}) IS NOT NULL
       AND ?>MAX(fence.cutover_at,unixepoch()-${TTL}) AND ?<=unixepoch()+60
     ON CONFLICT (bot_id,update_id) DO NOTHING RETURNING update_id
   `).bind(decoded.updateId, event.messageId, event.messageDate, event.name, ...pinBindings(pin), event.actorId,
@@ -74,7 +74,7 @@ export async function acceptGeneralAuthReplay(db: D1Database, pin: GeneralAuthRe
 }
 
 const CURRENT = `receipt.bot_id=fence.bot_id AND receipt.generation=fence.generation
-  AND receipt.actor_id=principal.user_id AND receipt.chat_id=receipt.actor_id AND receipt.role=(${ROLE})
+  AND receipt.actor_id=principal.user_id AND receipt.chat_id=receipt.actor_id AND receipt.role=(${GENERAL_AUTH_LEGACY_ROLE})
   AND receipt.message_date>fence.cutover_at AND receipt.received_at+${TTL}>unixepoch()`;
 
 export async function drainGeneralAuthReplay(

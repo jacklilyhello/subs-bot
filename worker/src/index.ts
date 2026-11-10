@@ -21,6 +21,8 @@ import { reconcileTelegramDocumentJobReplies, retireTelegramDocumentStage } from
 import { acceptTelegramLifecycle, reapTelegramLifecycle } from "./telegram/lifecycle-actions.ts";
 import { acceptTelegramGitHubSearch, recoverTelegramGitHubSearch, runTelegramGitHubSearch, telegramGitHubSearchReady } from "./telegram/github-search.ts";
 import { scopeGitHubSearchProof, writeGitHubSearchProof } from "./telegram/github-search-proof.ts";
+import { acceptGeneralTelegramCommand, drainGeneralTelegramReply, parseGeneralTelegramPin,
+  recoverGeneralTelegramReplies } from "./telegram/general-auth-runtime.ts";
 import { acceptTelegramGroupShare, telegramGroupShareReady } from "./telegram/group-share-actions.ts";
 import { drainTelegramGroupShareCards } from "./telegram/group-share-delivery.ts";
 import { acceptTelegramBulkTrash, telegramBulkTrashReady } from "./telegram/bulk-trash.ts";
@@ -63,6 +65,7 @@ export interface Env {
   NODES: R2Bucket;
   BUILD_REVISION?: string;
   TELEGRAM_ISOLATION_CONFIG?: string;
+  TELEGRAM_GENERAL_CONFIG?: string;
   TELEGRAM_CONFIG_SHA256?: string;
   TELEGRAM_AGGREGATE_KEY?: string;
   TELEGRAM_PRIVATE_SHARE_CREATION_KEY?: string;
@@ -174,6 +177,21 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
     return plain("Method not allowed.", 405, request.method === "HEAD", { Allow: "POST" });
   }
   if (new URL(request.url).protocol !== "https:") return plain("Not found.", 404, false);
+  if (env.TELEGRAM_ISOLATION_CONFIG === undefined && env.TELEGRAM_GENERAL_CONFIG !== undefined) {
+    const general = parseGeneralTelegramPin(env.TELEGRAM_GENERAL_CONFIG, env.BUILD_REVISION);
+    if (!general) return plain("Service unavailable.", 503, false);
+    try {
+      const status = await acceptGeneralTelegramCommand(env.DB, general, request);
+      if (status === 200) {
+        const delivery = drainGeneralTelegramReply(env.DB, general);
+        if (ctx) ctx.waitUntil(delivery.catch(() => undefined));
+        else await delivery;
+      }
+      return new Response(null, { status, headers: HEADERS });
+    } catch {
+      return plain("Service unavailable.", 503, false);
+    }
+  }
   const policy = parseTelegramPolicy(env.TELEGRAM_ISOLATION_CONFIG);
   if (!policy) return plain("Service unavailable.", 503, false);
 
@@ -611,6 +629,10 @@ async function scheduled(_controller: ScheduledController, env: Env): Promise<vo
   try {
     const policy = parseTelegramPolicy(env.TELEGRAM_ISOLATION_CONFIG);
     if (policy) await recoverTelegramWork(env, policy, pin, await telegramProviderQueueReady(env, pin));
+    else if (env.TELEGRAM_ISOLATION_CONFIG === undefined) {
+      const general = parseGeneralTelegramPin(env.TELEGRAM_GENERAL_CONFIG, env.BUILD_REVISION);
+      if (general) await recoverGeneralTelegramReplies(env.DB, general);
+    }
   } finally {
     await runOneProviderJob(env.DB, env.NODES, env.PROVIDER_FETCH, pin);
   }

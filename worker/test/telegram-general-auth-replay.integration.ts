@@ -8,7 +8,8 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { build } from "esbuild";
 import { Log, LogLevel, Miniflare } from "miniflare";
-import type { GeneralAuthReplayMessage, GeneralAuthReplayPin } from "../src/telegram/general-auth-replay.ts";
+import { GENERAL_AUTH_LEGACY_ROLE, type GeneralAuthReplayMessage, type GeneralAuthReplayPin } from "../src/telegram/general-auth-replay.ts";
+import { beginGeneralTelegramReply, claimGeneralTelegramReply, parseGeneralTelegramPin } from "../src/telegram/general-auth-runtime.ts";
 
 type Fixture = Omit<GeneralAuthReplayPin, "botUsername" | "webhookSecret" | "generation" | "cutoverAt"> & {
   bundleSha256: string; compatibilityDate: string; statements: string[];
@@ -43,12 +44,32 @@ test("closed general authorization replays a sealed candidate in a separate emit
   const isolation = { botId: "151", botUsername: "IsolationFixtureBot", webhookSecret: "fixture-isolation-only",
     botToken: "151:fixture-isolation-token", adminId: "181", memberId: "182", groupId: "-100300" };
   const sent: GeneralAuthReplayMessage[] = [];
+  const generalSent: GeneralAuthReplayMessage[] = [];
   let failTransport = false;
+  let failGeneralTransport = false;
+  const generalToken = `${fixture.botId}:fixture-general-token`;
+  const generalConfig = JSON.stringify({ botId: pin.botId, botUsername: pin.botUsername,
+    webhookSecret: pin.webhookSecret, botToken: generalToken, generation: pin.generation, cutoverAt: pin.cutoverAt,
+    activationSha256: pin.candidateManifestSha256 });
+  const generalPin = parseGeneralTelegramPin(generalConfig, fixture.releaseRevision);
+  assert.ok(generalPin);
   const d1Databases = { DB: "sealed-general-auth-replay" };
   const runtime = new Miniflare({ log: new Log(LogLevel.NONE), workers: [
     { name: "serving", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
-      bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_ISOLATION_CONFIG: JSON.stringify(isolation), REPLAY_PIN: pin },
+      bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_ISOLATION_CONFIG: JSON.stringify(isolation),
+        TELEGRAM_GENERAL_CONFIG: generalConfig, REPLAY_PIN: pin },
       outboundService: () => { throw new Error("Unexpected serving transport."); } },
+    { name: "general", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
+      bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: generalConfig },
+      outboundService: async (request: Request) => {
+        assert.equal(request.url, `https://api.telegram.org/bot${generalToken}/sendMessage`);
+        assert.equal(request.method, "POST");
+        const message = await request.json() as GeneralAuthReplayMessage;
+        generalSent.push(message);
+        return failGeneralTransport ? new Response(null, { status: 503 }) : Response.json({
+          ok: true, result: { chat: { id: Number(message.chat_id) }, message_id: generalSent.length },
+        });
+      } },
     { name: "replay", modules: true, script: entry.outputFiles[0].text, compatibilityDate, d1Databases, bindings: { REPLAY_PIN: pin },
       outboundService: async (request: Request) => {
         assert.equal(request.url, "https://transport.fixture.invalid/sendMessage");
@@ -91,6 +112,7 @@ test("closed general authorization replays a sealed candidate in a separate emit
 
   const replay = await runtime.getWorker("replay");
   const serving = await runtime.getWorker("serving");
+  const general = await runtime.getWorker("general");
   let sequence = 1000;
   type PostOptions = { updateId?: number; chatId?: number; chatType?: string; date?: number; secret?: string;
     message?: Record<string, unknown>; worker?: typeof replay };
@@ -108,6 +130,74 @@ test("closed general authorization replays a sealed candidate in a separate emit
     assert.equal(response.status, 200);
     return (await response.json() as { outcome: string }).outcome;
   };
+  const generalPost = (actor: number, text: string, options: PostOptions = {}) => post(actor, text, { ...options, worker: general });
+  const generalState = (updateId: number) =>
+    db.prepare("SELECT state FROM telegram_general_replies WHERE update_id=?").bind(updateId).first<string>("state");
+  const waitForGeneral = async (updateId: number, expected: string) => {
+    const end = Date.now() + 4000;
+    while (await generalState(updateId) !== expected && Date.now() < end) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(await generalState(updateId), expected);
+  };
+  assert.equal((await generalPost(101, "/help")).status, 204);
+  await db.batch([
+    db.prepare(`INSERT INTO telegram_general_policy (bot_id,generation,release_revision,activation_sha256,cutover_at)
+      VALUES (?,?,?,?,?)`).bind(generalPin.botId, generalPin.generation, generalPin.releaseRevision,
+      generalPin.activationSha256, generalPin.cutoverAt),
+    db.prepare(`INSERT INTO telegram_general_actors (bot_id,generation,actor_id,revision,effective_at,role)
+      SELECT principal.bot_id,?,principal.user_id,1,?,COALESCE((${GENERAL_AUTH_LEGACY_ROLE}),'denied')
+      FROM general_auth_principals AS principal WHERE principal.bot_id=?`)
+      .bind(generalPin.generation, generalPin.cutoverAt, generalPin.botId),
+  ]);
+  assert.equal((await generalPost(101, "/help")).status, 204, "seeded roles are closed before activation");
+  await db.prepare("UPDATE telegram_general_policy SET active=1,cutover_at=cutover_at+1 WHERE bot_id=?").bind(pin.botId).run();
+  assert.equal((await generalPost(101, "/help")).status, 204, "a different cutover cannot activate the binding");
+  await db.prepare("UPDATE telegram_general_policy SET cutover_at=? WHERE bot_id=?").bind(pin.cutoverAt, pin.botId).run();
+  assert.equal((await post(101, "/help", { worker: serving, secret: isolation.webhookSecret })).status, 204,
+    "existing isolation policy wins even when the general policy is active");
+  assert.equal((await generalPost(102, "/list")).status, 204);
+  assert.equal((await generalPost(107, "/list")).status, 204);
+  assert.equal((await generalPost(104, "/list", { chatType: "supergroup", chatId: -100100 })).status, 204);
+  assert.equal((await generalPost(104, "/list", { date: pin.cutoverAt })).status, 204);
+  assert.equal((await generalPost(104, "/auth")).status, 204);
+  assert.equal(generalSent.length, 0);
+  assert.equal((await generalPost(104, "/list", { updateId: 7001 })).status, 200);
+  await waitForGeneral(7001, "sent");
+  assert.deepEqual(generalSent[0], { chat_id: "104", text: "你的订阅\n1. Own 104 [链接已省略]",
+    reply_parameters: { message_id: 7001 }, link_preview_options: { is_disabled: true } });
+  assert.equal((await generalPost(104, "/list", { updateId: 7001 })).status, 204);
+
+  failGeneralTransport = true;
+  assert.equal((await generalPost(103, "/help", { updateId: 7002 })).status, 200);
+  await waitForGeneral(7002, "uncertain");
+  assert.equal((await generalPost(103, "/help", { updateId: 7002 })).status, 204);
+
+  await db.prepare(`INSERT INTO telegram_general_replies
+    (bot_id,generation,actor_id,actor_revision,update_id,message_id,message_date,command)
+    VALUES (?,?,'104',1,7003,7003,?,'list')`).bind(pin.botId, pin.generation, now - 5).run();
+  const lease = await claimGeneralTelegramReply(db, generalPin);
+  assert.ok(lease);
+  await db.batch([
+    db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,'104',2,?,'denied')").bind(pin.botId, pin.generation, now - 4),
+    db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,'104',3,?,'member')").bind(pin.botId, pin.generation, now - 3),
+  ]);
+  assert.equal(await beginGeneralTelegramReply(db, generalPin, lease), false, "same-role regrant cannot inherit an old lease");
+  assert.equal((await generalPost(104, "/list", { date: now - 3 })).status, 204, "a grant's exact second stays closed");
+  await db.prepare(`INSERT INTO telegram_general_replies
+    (bot_id,generation,actor_id,actor_revision,update_id,message_id,message_date,command)
+    VALUES (?,?,'104',3,7004,7004,?,'list')`).bind(pin.botId, pin.generation, now - 2).run();
+  const interruptedSend = await claimGeneralTelegramReply(db, generalPin);
+  assert.ok(interruptedSend);
+  assert.equal(await beginGeneralTelegramReply(db, generalPin, interruptedSend), true);
+  await db.prepare("UPDATE telegram_general_replies SET lease_until=unixepoch()-1 WHERE update_id=7004").run();
+  assert.equal((await general.scheduled({ cron: "* * * * *" })).outcome, "ok");
+  assert.equal(await generalState(7003), "discarded");
+  assert.equal(await generalState(7004), "uncertain", "expired sending work cannot be delivered twice");
+  await db.prepare("UPDATE telegram_general_policy SET generation=generation+1 WHERE bot_id=?").bind(pin.botId).run();
+  assert.equal((await generalPost(101, "/help")).status, 204, "a stale configured generation cannot admit");
+  assert.equal(generalSent.length, 2);
+
   assert.equal((await post(101, "/help")).status, 204);
   assert.equal(await drain(), "empty");
   assert.equal((await post(101, "/help", { secret: "wrong" })).status, 401);
