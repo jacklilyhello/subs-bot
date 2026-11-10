@@ -1789,6 +1789,35 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.equal((await awaitLifecycle(7748)).message.text, "没有可撤销的短链。");
   assert.equal(await db.prepare("SELECT revoked_at IS NULL AS active FROM telegram_subscription_short_links WHERE code_sha256=?")
     .bind(reservedTypedDigest).first("active"), 1);
+  const typedPath = `https://app.fixture.invalid/s/${reservedTypedCode}`;
+  for (const method of ["GET", "HEAD"]) {
+    const response = await formats.fetch(typedPath, { method, redirect: "manual" });
+    assert.equal(response.status, 302);
+    assert.equal(response.headers.get("Location"), `/sub/${initial.token}/base64`);
+  }
+  const originReceipt = await db.prepare("SELECT receipt_id FROM telegram_inbox WHERE bot_id=? AND update_id=7378")
+    .bind(pin.botId).first<number>("receipt_id");
+  assert.ok(originReceipt);
+  const originalRevision = await db.prepare("SELECT actor_revision FROM telegram_general_receipt WHERE receipt_id=?")
+    .bind(originReceipt).first<number>("actor_revision");
+  assert.ok(originalRevision);
+  const setArchivedGrant = (revision: number) => db.prepare("UPDATE telegram_general_receipt SET actor_revision=? WHERE receipt_id=?")
+    .bind(revision, originReceipt).run();
+  await setArchivedGrant(9007199254740991);
+  assert.equal((await formats.fetch(typedPath, { redirect: "manual" })).status, 404);
+  await setArchivedGrant(originalRevision);
+  const setTypedReply = (state: "uncertain" | "failed") => db.prepare(`UPDATE telegram_outbox
+    SET state=?,lease_id=?,lease_until=NULL,sent_message_id=NULL WHERE receipt_id=?`)
+    .bind(state, state === "uncertain" ? "fixture-general-typed-uncertain" : null, originReceipt).run();
+  await setTypedReply("uncertain");
+  assert.equal((await formats.scheduled({ cron: "* * * * *" })).outcome, "ok");
+  assert.equal((await formats.fetch(typedPath, { redirect: "manual" })).status, 302);
+  await setTypedReply("failed");
+  assert.equal((await formats.fetch(typedPath, { redirect: "manual" })).status, 404);
+  assert.equal((await formats.scheduled({ cron: "* * * * *" })).outcome, "ok");
+  assert.equal(await db.prepare(`SELECT revoked_at IS NOT NULL AND subscription_id IS NULL AND token_sha256 IS NULL
+    AND format IS NULL AND nonce IS NULL AS retired FROM telegram_subscription_short_links WHERE code_sha256=? AND origin_receipt_id=?`)
+    .bind(reservedTypedDigest, originReceipt).first("retired"), 1);
 
   await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,'104',16,?,'member')")
     .bind(pin.botId, pin.generation, now + 23).run();

@@ -50,6 +50,7 @@ import { GROUP_SHARE_PUBLISH_CALLBACK, readGeneralGroupShare, readGeneralPrivate
 import { confirmTelegramSubscriptionReadSend, GENERAL_SUBSCRIPTION_READ_MARKER, insertTelegramSubscriptionReadTickets,
   prepareTelegramSubscriptionReadTickets, reapTelegramSubscriptionReadTickets,
   type TelegramSubscriptionReadTicket } from "./subscription-read.ts";
+import { reapFailedTelegramSubscriptionShorts } from "./subscription-shorts.ts";
 import { GENERAL_TEMP_SCHEMA, generalTempRawMarker, generalTempRawStamp, prepareGeneralTelegramTempReceipt, renderTelegramTemp,
   TELEGRAM_GENERAL_TEMP_RAW_PREFIX, type TelegramTempReply } from "./temp-import.ts";
 import { confirmTelegramTempRawSend, prepareTelegramTempRawReply } from "./temp-raw.ts";
@@ -819,6 +820,7 @@ export async function recoverGeneralSharedTelegramReplies(
     // Bound scheduled work and preserve the ordinary outbox's lease and settlement semantics.
   }
   if (pin.privateSelected) await reapTelegramSelected(db, pin.botId);
+  if (pin.privateFormats) await reapFailedTelegramSubscriptionShorts(db, pin.botId, true);
   if (pin.privateShort) await reapFailedTelegramShortLinks(db, pin.botId, true);
   if (pin.privateProvider && await generalProviderRefreshReady(db).catch(() => false)) {
     await reapTelegramProviderRefreshTickets(db, pin.botId);
