@@ -193,6 +193,7 @@ class FakeCloudflare:
         self.page_jump_control_open = False
         self.subscription_shorts_schema = "absent"
         self.subscription_shorts_state = None
+        self.subscription_shorts_origin = None
 
     def worker_api(self, method, path, payload=None):
         self.calls.append((method, path))
@@ -291,8 +292,8 @@ class FakeCloudflare:
                         if self.subscription_shorts_state is not None:
                             revoked, state = self.subscription_shorts_state
                             db.execute("""INSERT INTO telegram_inbox
-                                (receipt_id,bot_id,update_id,actor_id,chat_id,chat_type,message_id,message_date,command)
-                                VALUES (1,'123',1,'456','456','private',1,1,'help')""")
+                                (receipt_id,bot_id,update_id,actor_id,chat_id,chat_type,message_id,message_date,command,receipt_nonce)
+                                VALUES (1,'123',1,'456','456','private',1,1,'help',?)""", (self.subscription_shorts_origin,))
                             db.execute("""INSERT INTO telegram_subscription_read
                                 (receipt_id,kind,subscription_id,format,auth_message_date,auth_message_id)
                                 VALUES (1,'format',1,'clash',0,0)""")
@@ -1186,9 +1187,49 @@ class ReleaseTests(unittest.TestCase):
             check(capable, False, initial_off_rollback=True)
         self.assertEqual(self.api.writes(), [])
 
+    def test_general_typed_subscription_short_artifact_pins_both_markers_and_exact_dependencies(self):
+        ordinary = b" ".join((NEW_MODULE, *cloudflare.SUBSCRIPTION_SHORTS_MARKERS))
+        read, retire = cloudflare.GENERAL_SUBSCRIPTION_SHORTS_MARKERS
+        entries = [{}] * 48
+        for position, name, digest in cloudflare.GENERAL_SUBSCRIPTION_SHORTS_MIGRATIONS:
+            entries[position - 1] = {"name": name, "sha256": digest}
+        capabilities = cloudflare._subscription_shorts_artifact_capabilities
+        self.assertEqual(capabilities(ordinary, {"migrations": entries}), (True, False))
+        self.assertEqual(capabilities(ordinary + read + retire, {"migrations": entries}), (True, True))
+        for incomplete in (ordinary + read, ordinary + retire, NEW_MODULE + read + retire):
+            with self.subTest(module=incomplete), self.assertRaisesRegex(cloudflare.CloudflareError, "typed subscription short-link"):
+                capabilities(incomplete, {"migrations": entries})
+        for position in (18, 44, 46):
+            changed = deepcopy(entries)
+            changed[position - 1]["sha256"] = "0" * 64
+            with self.subTest(position=position), self.assertRaisesRegex(cloudflare.CloudflareError, "exact general-origin"):
+                capabilities(ordinary + read + retire, {"migrations": changed})
+
+    def test_general_typed_subscription_short_floor_preserves_old_rollback_until_general_history(self):
+        scope = cloudflare._Isolation(self.api.worker_api, self.api.data_api, TARGET)
+        ordinary = cloudflare._Version(OLD_REVISION, "0" * 64, COMPATIBILITY, None,
+                                      telegram_subscription_shorts_capable=True)
+        capable = replace(ordinary, telegram_general_subscription_shorts_capable=True)
+        key = "telegram_general_subscription_shorts_capable"
+        self.assertNotIn(key, cloudflare.version_evidence(ordinary))
+        self.assertIs(cloudflare.version_evidence(capable)[key], True)
+        self.api.subscription_shorts_schema = "exact"
+        for state in ((False, "sent"), (True, "failed")):
+            with self.subTest(state=state):
+                self.api.subscription_shorts_state = state
+                self.api.subscription_shorts_origin = "subread:v1"
+                scope.verify_subscription_shorts_floor(capable, True)
+                self.api.subscription_shorts_origin = "general-subscription-read:v1"
+                for current, target in ((ordinary, True), (capable, False)):
+                    with self.assertRaisesRegex(cloudflare.CloudflareError, "general-origin typed subscription short-link"):
+                        scope.verify_subscription_shorts_floor(current, True, target_general_capable=target)
+                scope.verify_subscription_shorts_floor(capable, True, target_general_capable=True)
+        self.assertEqual(self.api.writes(), [])
+
     def test_typed_subscription_short_readback_composes_all_existing_feature_bindings(self):
         active = self.set_group_share_cards_baseline(enabled=True, api_status=True,
-            prior_markers=(*cloudflare.SUBSCRIPTION_SHORTS_MARKERS, cloudflare.PAGE_JUMP_MARKER, cloudflare.PAGE_JUMP_CONTROL_MARKER))
+            prior_markers=(*cloudflare.SUBSCRIPTION_SHORTS_MARKERS, *cloudflare.GENERAL_SUBSCRIPTION_SHORTS_MARKERS,
+                           cloudflare.PAGE_JUMP_MARKER, cloudflare.PAGE_JUMP_CONTROL_MARKER))
         aggregate_digest = sha256(AGGREGATE_KEY.encode()).hexdigest()
         typed = {"type": "plain_text", "name": cloudflare.SUBSCRIPTION_SHORTS_BINDING, "text": "1"}
         active["bindings"].extend([
@@ -1209,6 +1250,7 @@ class ReleaseTests(unittest.TestCase):
         verified = scope.version(OLD_VERSION)
         self.assertTrue(verified.telegram_subscription_shorts)
         self.assertTrue(verified.telegram_subscription_shorts_capable)
+        self.assertTrue(verified.telegram_general_subscription_shorts_capable)
         self.assertTrue(verified.telegram_group_share_cards)
         self.assertTrue(verified.telegram_api_status)
         epoch = 701
@@ -1231,9 +1273,11 @@ class ReleaseTests(unittest.TestCase):
         expected = asdict(prior)
         del expected["telegram_subscription_shorts"]
         del expected["telegram_subscription_shorts_capable"]
+        del expected["telegram_general_subscription_shorts_capable"]
         self.assertEqual(cloudflare.version_evidence(prior), expected)
         capable = replace(prior, telegram_subscription_shorts_capable=True)
-        self.assertEqual(cloudflare.version_evidence(capable), asdict(capable))
+        self.assertEqual(cloudflare.version_evidence(capable),
+                         {**expected, "telegram_subscription_shorts": False, "telegram_subscription_shorts_capable": True})
 
     def test_typed_subscription_short_activation_cannot_implicitly_reopen_withdrawn_issuance(self):
         scope = cloudflare._Isolation(self.api.worker_api, self.api.data_api, TARGET)

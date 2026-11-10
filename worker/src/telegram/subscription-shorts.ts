@@ -1,6 +1,8 @@
 import { digestHex, validInteger } from "../storage.ts";
 import { ISOLATION_PUBLIC_ORIGIN } from "../public-origin.ts";
-import { inTelegramScope, SUBSCRIPTION_READ_RECEIPT_MARKER, type TelegramEventScope, type TelegramPolicy } from "./protocol.ts";
+import { GENERAL_POLICY_SCHEMA, GENERAL_RECEIPT_SCHEMA } from "./general-receipt.ts";
+import { GENERAL_SUBSCRIPTION_READ_MARKER, inTelegramScope, SUBSCRIPTION_READ_RECEIPT_MARKER,
+  type TelegramEventScope, type TelegramPolicy } from "./protocol.ts";
 
 export const SUBSCRIPTION_SHORT_CODE = /^[A-Za-z0-9_-]{21}t(?![\s\S])/u;
 export const SUBSCRIPTION_SHORT_MIGRATION = "0048_telegram_subscription_short_links.sql";
@@ -41,8 +43,21 @@ function privateRead(lease: Lease, policy: TelegramPolicy): boolean {
   return lease.subscriptionRead === true && lease.chatType === "private" && lease.threadId === null && inTelegramScope(policy, lease);
 }
 
-const receiptScope = `inbox.receipt_nonce='${SUBSCRIPTION_READ_RECEIPT_MARKER}' AND inbox.chat_type='private'
-  AND inbox.chat_id=inbox.actor_id AND inbox.thread_id IS NULL AND action.kind='format'`;
+const privateFormat = `inbox.chat_type='private' AND inbox.chat_id=inbox.actor_id
+  AND inbox.thread_id IS NULL AND action.kind='format'`;
+const receiptScope = `inbox.receipt_nonce='${SUBSCRIPTION_READ_RECEIPT_MARKER}' AND ${privateFormat}`;
+const generalReadSchema = `${GENERAL_POLICY_SCHEMA} AND ${GENERAL_RECEIPT_SCHEMA}
+  AND EXISTS (SELECT 1 FROM subs_bot_schema_migrations WHERE position=18 AND mode='applied'
+    AND name='0018_telegram_subscription_reads.sql' AND sha256='382e9e5e7a850e4f38aece8c2a9f0e98fd890203edf7aa83c37212f5ab038e62')`;
+
+// A published bearer relies on its historical grant, including after a later grant changes.
+const generalReceiptScope = `inbox.receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MARKER}' AND ${privateFormat}
+  AND inbox.command='help' AND action.auth_message_date=0 AND action.auth_message_id=0 AND ${generalReadSchema}
+  AND EXISTS (SELECT 1 FROM telegram_general_receipt AS recorded JOIN telegram_general_actors AS original
+    ON original.bot_id=inbox.bot_id AND original.actor_id=inbox.actor_id
+      AND original.generation=recorded.generation AND original.revision=recorded.actor_revision
+      AND original.role=recorded.actor_role
+    WHERE recorded.receipt_id=inbox.receipt_id AND inbox.message_date>MAX(recorded.cutover_at,original.effective_at))`;
 const targetScope = `${receiptScope} AND action.subscription_id=? AND action.format=?`;
 const matchesRow = `link.origin_receipt_id=inbox.receipt_id AND link.bot_id=inbox.bot_id AND link.owner_id=inbox.actor_id
   AND link.code_sha256=? AND link.nonce=? AND link.subscription_id=? AND link.format=? AND link.token_sha256=?
@@ -50,6 +65,11 @@ const matchesRow = `link.origin_receipt_id=inbox.receipt_id AND link.bot_id=inbo
 const noConflicts = `NOT EXISTS(SELECT 1 FROM normal_short_links WHERE code_sha256=link.code_sha256)
   AND NOT EXISTS(SELECT 1 FROM legacy_subscription_short_links WHERE code_sha256=link.code_sha256)
   AND NOT EXISTS(SELECT 1 FROM aggregate_links WHERE code_sha256=link.code_sha256)`;
+
+export function isolatedSubscriptionShortOrigin(link: "link" | "typed"): string {
+  return `NOT EXISTS (SELECT 1 FROM telegram_inbox AS origin WHERE origin.receipt_id=${link}.origin_receipt_id
+    AND origin.receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MARKER}')`;
+}
 
 /** Preflight the format before calling. Only the normalized target and the exact read guard cross this boundary. */
 export async function prepareTelegramSubscriptionShort(
@@ -127,17 +147,24 @@ export async function resolveSubscriptionShortLocation(db: D1Database, code: str
   if (!SUBSCRIPTION_SHORT_CODE.test(code)) return null;
   try {
     if (!await telegramSubscriptionShortsReady(db)) return null;
-    const row = await db.prepare(`SELECT /* subs-bot:subscription-short-read:v1 */ sub.token,link.token_sha256 AS tokenDigest,link.format
+    const digest = await hash(code);
+    const lookup = (marker: string, scope: string) => db.prepare(`SELECT ${marker}
+        sub.token,link.token_sha256 AS tokenDigest,link.format,inbox.receipt_nonce AS origin
       FROM telegram_subscription_short_links AS link JOIN subscriptions AS sub
         ON sub.id=link.subscription_id AND sub.owner_id=link.owner_id AND sub.generation>0
       JOIN telegram_inbox AS inbox ON inbox.receipt_id=link.origin_receipt_id AND inbox.bot_id=link.bot_id AND inbox.actor_id=link.owner_id
       JOIN telegram_subscription_read AS action ON action.receipt_id=inbox.receipt_id
       JOIN telegram_outbox AS reply ON reply.receipt_id=inbox.receipt_id AND reply.state<>'failed'
       WHERE link.code_sha256=? AND link.key_version=1 AND link.revoked_at IS NULL AND ${SUBSCRIPTION_SHORT_PIN}
-        AND inbox.receipt_nonce='${SUBSCRIPTION_READ_RECEIPT_MARKER}' AND inbox.chat_type='private' AND inbox.chat_id=inbox.actor_id
-        AND inbox.thread_id IS NULL AND action.kind='format' AND action.subscription_id=link.subscription_id AND action.format=link.format
+        AND (${scope}) AND action.subscription_id=link.subscription_id AND action.format=link.format
         AND NOT EXISTS (SELECT 1 FROM subscription_trash WHERE id=sub.id OR token=sub.token)
-        AND (${noConflicts})`).bind(await hash(code)).first<{ token: string; tokenDigest: string; format: string }>();
+        AND (${noConflicts})`).bind(digest).first<{ token: string; tokenDigest: string; format: string; origin: string }>();
+    let row = await lookup("/* subs-bot:subscription-short-read:v1 */",
+      `${privateFormat} AND inbox.receipt_nonce IN ('${SUBSCRIPTION_READ_RECEIPT_MARKER}','${GENERAL_SUBSCRIPTION_READ_MARKER}')`);
+    if (row?.origin === GENERAL_SUBSCRIPTION_READ_MARKER) {
+      row = await lookup("/* subs-bot:general-subscription-short-read:v1 */",
+        `${generalReceiptScope} AND reply.state IN ('sending','sent','uncertain')`);
+    }
     if (!row || !TOKEN.test(row.token) || !SUBSCRIPTION_SHORT_FORMATS.has(row.format) || await hash(row.token) !== row.tokenDigest) return null;
     return `/sub/${row.token}/${row.format}`;
   } catch {
@@ -173,14 +200,16 @@ export async function closeUnsentTelegramSubscriptionShort(db: D1Database, polic
 export const REVOKE_SUBSCRIPTION_SHORT = `/* subs-bot:subscription-short-retire:v1 */
   revoked_at=max(created_at,unixepoch()),subscription_id=NULL,token_sha256=NULL,format=NULL,nonce=NULL`;
 
-export async function reapFailedTelegramSubscriptionShorts(db: D1Database, botId: string): Promise<void> {
+export async function reapFailedTelegramSubscriptionShorts(db: D1Database, botId: string, general = false): Promise<void> {
   try {
     if (!await telegramSubscriptionShortsReady(db)) return;
-    const result = await db.prepare(`UPDATE telegram_subscription_short_links SET ${REVOKE_SUBSCRIPTION_SHORT}
+    const marker = general ? "/* subs-bot:general-subscription-short-retire:v1 */" : "";
+    const scope = general ? generalReceiptScope : receiptScope;
+    const result = await db.prepare(`UPDATE ${marker} telegram_subscription_short_links SET ${REVOKE_SUBSCRIPTION_SHORT}
       WHERE code_sha256 IN (SELECT link.code_sha256 FROM telegram_subscription_short_links AS link
         JOIN telegram_inbox AS inbox ON inbox.receipt_id=link.origin_receipt_id AND inbox.bot_id=link.bot_id AND inbox.actor_id=link.owner_id
         JOIN telegram_subscription_read AS action USING(receipt_id) JOIN telegram_outbox AS reply USING(receipt_id)
-        WHERE link.bot_id=? AND link.revoked_at IS NULL AND reply.state='failed' AND ${receiptScope}
+        WHERE link.bot_id=? AND link.revoked_at IS NULL AND reply.state='failed' AND ${scope}
           AND action.subscription_id=link.subscription_id AND action.format=link.format AND ${SUBSCRIPTION_SHORT_PIN}
         ORDER BY link.origin_receipt_id LIMIT 40)`).bind(botId).run();
     if (result.success) return;

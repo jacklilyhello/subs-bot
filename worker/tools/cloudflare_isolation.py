@@ -54,8 +54,11 @@ GROUP_SHARE_CARDS_MIGRATION_SHA256 = "064f461428f244f780e5655528fb0dc7e35676d1f8
 GROUP_SHARE_CARDS_SCHEMA_SHA256 = "66ea7065ed9ce609e30c330e0214c296afac91c7648d2cae71f1907eb82f34c7"
 PROVIDER_REFRESH_BINDING = "TELEGRAM_PROVIDER_REFRESH"
 PROVIDER_REFRESH_TAG_PREFIX = "provider-rf-"
+SUBSCRIPTION_READ_MIGRATION = (
+    18, "0018_telegram_subscription_reads.sql", "382e9e5e7a850e4f38aece8c2a9f0e98fd890203edf7aa83c37212f5ab038e62",
+)
 PROVIDER_REFRESH_MIGRATIONS = (
-    (18, "0018_telegram_subscription_reads.sql", "382e9e5e7a850e4f38aece8c2a9f0e98fd890203edf7aa83c37212f5ab038e62"),
+    SUBSCRIPTION_READ_MIGRATION,
     *PROVIDER_URL_IMPORT_MIGRATIONS,
     (28, "0028_telegram_provider_refresh_tickets.sql", "ccbfe6d71864608b9a6d680d955c11af083aa34280b55845edef1296d87dab2e"),
 )
@@ -81,6 +84,14 @@ SUBSCRIPTION_SHORTS_TABLE_SHA256 = "568f2a1abbde5c2ab3aed4ee1fd33955b87395106823
 SUBSCRIPTION_SHORTS_INDEX_SHA256 = "141a835b48d7a3dfa12e9c71bf3e044649d6ba2b02495fd6f3963eb66247a14e"
 SUBSCRIPTION_SHORTS_MARKERS = (b"subs-bot:subscription-short-read:v1", b"subs-bot:subscription-short-write:v1",
                                b"subs-bot:subscription-short-retire:v1")
+GENERAL_SUBSCRIPTION_SHORTS_MARKERS = (b"subs-bot:general-subscription-short-read:v1",
+                                       b"subs-bot:general-subscription-short-retire:v1")
+GENERAL_SUBSCRIPTION_SHORTS_MIGRATIONS = (
+    SUBSCRIPTION_READ_MIGRATION,
+    (44, "0044_telegram_general_runtime.sql", "99ae19a1a0296bcf78598752c323571b3194c7b1e4bd1241c6f4960650fea75d"),
+    (46, "0046_telegram_general_receipts.sql", "1f06d33b9cec5d7cd55c9d859ae04950a86484db92a17d49733defb116a47667"),
+    (48, SUBSCRIPTION_SHORTS_MIGRATION, SUBSCRIPTION_SHORTS_SHA256),
+)
 LEGACY_SELECTED_MIGRATION = "0038_legacy_selected_aggregates.sql"
 LEGACY_SELECTED_MIGRATION_SHA256 = "29ddd93dc46120614c4837268ac2c0a0c5b4c48af9d7e4fe4de1e5e24451b74f"
 LEGACY_SELECTED_HTTP_MARKER = b"subs-bot:legacy-selected-http:v1"
@@ -274,14 +285,17 @@ class _Version:
     telegram_page_jump_epoch: int | None = None
     telegram_subscription_shorts: bool = False
     telegram_subscription_shorts_capable: bool = False
+    telegram_general_subscription_shorts_capable: bool = False
 
 
 def version_evidence(version):
-    """Preserve the exact version document of pre-0048 protected checkpoints."""
+    """Preserve the exact version document of earlier protected checkpoints."""
     result = asdict(version)
     if not result["telegram_subscription_shorts_capable"] and not result["telegram_subscription_shorts"]:
         del result["telegram_subscription_shorts_capable"]
         del result["telegram_subscription_shorts"]
+    if not result["telegram_general_subscription_shorts_capable"]:
+        del result["telegram_general_subscription_shorts_capable"]
     return result
 
 
@@ -1026,6 +1040,7 @@ class _Isolation:
         group_share_cards_capable = False
         has_group_share_cards_marker = GROUP_SHARE_CARDS_MARKER in body
         short_capable = _subscription_shorts_module_capable(body)
+        general_short_capable = _general_subscription_shorts_module_capable(body, short_capable)
         _require(subscription_shorts is None or short_capable, "Isolated Worker lacks typed subscription short-link recovery.")
         if (short_capable or batch_capable or has_api_status or page_jump_epoch is not None
                 or any(binding is not None for binding in (inline, provider_url, refresh, legacy_shorts))):
@@ -1072,7 +1087,8 @@ class _Isolation:
                         telegram_page_jump_control_capable=PAGE_JUMP_CONTROL_MARKER in body,
                         telegram_page_jump_epoch=page_jump_epoch,
                         telegram_subscription_shorts=subscription_shorts is not None,
-                        telegram_subscription_shorts_capable=short_capable)
+                        telegram_subscription_shorts_capable=short_capable,
+                        telegram_general_subscription_shorts_capable=general_short_capable)
         capabilities = tuple(check(body) for requested, check in (
             (with_legacy_selected, _legacy_selected_module_capable),
             (with_legacy_temp, _legacy_temp_module_capable),
@@ -1242,7 +1258,8 @@ class _Isolation:
         _require(rows[0]["pageJumpUnsettled"] == 0,
                  "Keep a Worker with verified page-jump delivery until isolated page-jump replies have drained.")
 
-    def verify_subscription_shorts_floor(self, current, target_capable, *, require_schema=False, initial_off_rollback=False):
+    def verify_subscription_shorts_floor(self, current, target_capable, *, target_general_capable=False,
+                                         require_schema=False, initial_off_rollback=False):
         table = "telegram_subscription_short_links"
         path = f"{self.account}/d1/database/{self.target['d1Id']}/query"
         error = "The isolated typed subscription short-link schema or ledger could not be verified."
@@ -1277,18 +1294,25 @@ class _Isolation:
                 EXISTS(SELECT 1 FROM subs_bot_schema_migrations WHERE position=48 AND name='{SUBSCRIPTION_SHORTS_MIGRATION}'
                     AND sha256='{SUBSCRIPTION_SHORTS_SHA256}' AND mode='applied') AS pinned,
                 EXISTS(SELECT 1 FROM {table}) AS hasHistory,
+                EXISTS(SELECT 1 FROM {table} AS link JOIN telegram_inbox AS inbox ON inbox.receipt_id=link.origin_receipt_id
+                    WHERE inbox.receipt_nonce='general-subscription-read:v1') AS hasGeneralOrigin,
                 EXISTS(SELECT 1 FROM {table} WHERE revoked_at IS NULL) AS activeLinks,
                 EXISTS(SELECT 1 FROM {table} AS link JOIN telegram_outbox AS reply ON reply.receipt_id=link.origin_receipt_id
                     WHERE reply.state IN ('pending','leased','sending')) AS unsettled""",
-                ("tableSql", "indexSql", "autoIndexes", "pins", "pinned", "hasHistory", "activeLinks", "unsettled"))
+                ("tableSql", "indexSql", "autoIndexes", "pins", "pinned", "hasHistory", "activeLinks", "unsettled", "hasGeneralOrigin"))
             _require(all(type(state[key]) is int and state[key] == expected for key, expected in
                          (("autoIndexes", 2), ("pins", 1), ("pinned", 1)))
-                     and all(type(state[key]) is int and state[key] in (0, 1) for key in ("hasHistory", "activeLinks", "unsettled"))
+                     and all(type(state[key]) is int and state[key] in (0, 1)
+                             for key in ("hasHistory", "activeLinks", "unsettled", "hasGeneralOrigin"))
+                     and state["hasGeneralOrigin"] <= state["hasHistory"]
                      and all(isinstance(state[key], str) and sha256(state[key].encode("ascii")).hexdigest() == expected
                              for key, expected in (("tableSql", SUBSCRIPTION_SHORTS_TABLE_SHA256),
                                                    ("indexSql", SUBSCRIPTION_SHORTS_INDEX_SHA256))), error)
         except (CloudflareError, AttributeError, KeyError, TypeError, ValueError):
             raise CloudflareError(error) from None
+        _require(not state["hasGeneralOrigin"]
+                 or (current.telegram_general_subscription_shorts_capable and target_general_capable),
+                 "Keep verified general-origin typed subscription short-link recovery while its history exists.")
         _require(not (state["activeLinks"] or state["unsettled"]) or (current.telegram_subscription_shorts_capable and target_capable),
                  "Keep typed subscription short-link recovery while isolated links are active or unsettled.")
         _require(current.telegram_subscription_shorts_capable or not state["hasHistory"],
@@ -1320,6 +1344,7 @@ class _Isolation:
         _require(not target_version.telegram_subscription_shorts or current_version.telegram_subscription_shorts
                  or allow_subscription_shorts_enable, "Reopen typed subscription short-link issuance only in a protected enable release.")
         self.verify_subscription_shorts_floor(current_version, target_version.telegram_subscription_shorts_capable,
+            target_general_capable=target_version.telegram_general_subscription_shorts_capable,
             require_schema=target_version.telegram_subscription_shorts_capable, initial_off_rollback=initial_subscription_shorts_rollback)
         require_general_read_lane_clear(self)
         _require(self.active() == previous, "Active isolated Worker deployment changed before activation.")
@@ -1495,8 +1520,27 @@ def _subscription_shorts_artifact_capable(module, manifest):
     return capable
 
 
-def subscription_shorts_artifact(bundle_dir, manifest):
-    return _subscription_shorts_artifact_capable(_verified_module(bundle_dir, manifest.get("bundleSha256")), manifest)
+def _general_subscription_shorts_module_capable(module, ordinary_capable):
+    markers = [marker in module for marker in GENERAL_SUBSCRIPTION_SHORTS_MARKERS]
+    _require(not any(markers) or (all(markers) and ordinary_capable),
+             "The Worker module lacks complete general-origin typed subscription short-link recovery.")
+    return all(markers)
+
+
+def _subscription_shorts_artifact_capabilities(module, manifest):
+    ordinary = _subscription_shorts_artifact_capable(module, manifest)
+    general = _general_subscription_shorts_module_capable(module, ordinary)
+    if general:
+        entries = manifest["migrations"]
+        _require(all(position <= len(entries) and entries[position - 1] == {"name": name, "sha256": digest}
+                     for position, name, digest in GENERAL_SUBSCRIPTION_SHORTS_MIGRATIONS),
+                 "The verified Worker artifact lacks the exact general-origin typed subscription short-link migration chain.")
+    return ordinary, general
+
+
+def subscription_shorts_artifact(bundle_dir, manifest, *, with_general=False):
+    capabilities = _subscription_shorts_artifact_capabilities(_verified_module(bundle_dir, manifest.get("bundleSha256")), manifest)
+    return capabilities if with_general else capabilities[0]
 
 
 def _artifact(bundle_dir, manifest, telegram_config, aggregate_key=None, private_share_key=None, provider_binding=None):
@@ -1508,7 +1552,7 @@ def _artifact(bundle_dir, manifest, telegram_config, aggregate_key=None, private
              "Invalid verified Worker release manifest.")
     module = _verified_module(bundle_dir, manifest["bundleSha256"])
     page_jump_capable, page_jump_control_capable = _page_jump_artifact_capabilities(module, manifest)
-    short_capable = _subscription_shorts_artifact_capable(module, manifest)
+    short_capable, general_short_capable = _subscription_shorts_artifact_capabilities(module, manifest)
     general_read_artifact(module, manifest)
     revision = manifest["revision"]
     telegram_digest = None
@@ -1540,7 +1584,8 @@ def _artifact(bundle_dir, manifest, telegram_config, aggregate_key=None, private
                             tag, telegram_digest, aggregate_digest, private_share_digest, provider_binding,
                             telegram_page_jump_capable=page_jump_capable,
                             telegram_page_jump_control_capable=page_jump_control_capable,
-                            telegram_subscription_shorts_capable=short_capable)
+                            telegram_subscription_shorts_capable=short_capable,
+                            telegram_general_subscription_shorts_capable=general_short_capable)
 
 
 def _read_health():
@@ -1822,7 +1867,8 @@ def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECI
                          api_status=None, api_status_gate=_UNSPECIFIED_API_STATUS_GATE, provider_url_documents=None,
                          mixed_documents=None, group_share_cards=None, group_share_cards_capable=None,
                          legacy_selected_capable=None, legacy_temp_capable=None, legacy_dynamic_all_capable=None,
-                         subscription_shorts=None, subscription_shorts_capable=None):
+                         subscription_shorts=None, subscription_shorts_capable=None,
+                         general_subscription_shorts_capable=False):
     """Read ownership, privacy and active binding facts before any release writes."""
     from general_read_rehearsal import require_general_read_lane_clear
     from page_jump_activation import require_clear_for_release
@@ -1872,7 +1918,8 @@ def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECI
     if subscription_shorts_capable is not None or subscription_shorts is not None:
         typed_enabled = _subscription_shorts_target(version, subscription_shorts, release_manifest, subscription_shorts_capable,
                                                      desired_digest, aggregate_digest, had_cron)
-        scope.verify_subscription_shorts_floor(version, subscription_shorts_capable)
+        scope.verify_subscription_shorts_floor(version, subscription_shorts_capable,
+                                               target_general_capable=general_subscription_shorts_capable)
         typed_toggle = typed_enabled != version.telegram_subscription_shorts
         if typed_toggle:
             _require(provider_binding == version.provider_binding and private_share_key is not _UNSPECIFIED_PRIVATE_SHARE_KEY
@@ -1995,6 +2042,7 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                                          require_schema=old_dynamic_all_capable or desired_dynamic_all_capable)
     scope.verify_page_jump_drain(old_version, desired)
     scope.verify_subscription_shorts_floor(old_version, desired.telegram_subscription_shorts_capable,
+                                           target_general_capable=desired.telegram_general_subscription_shorts_capable,
                                            require_schema=desired.telegram_subscription_shorts_capable)
     _require(old_version.compatibility == desired.compatibility, "Worker compatibility date change requires separate approval.")
     _require_telegram_config_continuity(old_version, desired.telegram_config_sha256)
@@ -2139,6 +2187,7 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
         scope.verify_legacy_dynamic_all_floor(allow_rows=old_dynamic_all_capable and desired_dynamic_all_capable,
                                              require_schema=old_dynamic_all_capable or desired_dynamic_all_capable)
         scope.verify_subscription_shorts_floor(old_version, desired.telegram_subscription_shorts_capable,
+                                               target_general_capable=desired.telegram_general_subscription_shorts_capable,
                                                require_schema=desired.telegram_subscription_shorts_capable)
         _guard_current(guard)
         candidate = scope.upload(module, desired, telegram_config, aggregate_key, private_share_key)
@@ -2180,7 +2229,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
         scope.verify_legacy_selected_floor(allow_rows=desired_selected_capable, require_schema=desired_selected_capable)
         scope.verify_legacy_temp_floor(allow_rows=desired_temp_capable, require_schema=desired_temp_capable)
         scope.verify_legacy_dynamic_all_floor(allow_rows=desired_dynamic_all_capable, require_schema=desired_dynamic_all_capable)
-        scope.verify_subscription_shorts_floor(desired, desired.telegram_subscription_shorts_capable)
+        scope.verify_subscription_shorts_floor(desired, desired.telegram_subscription_shorts_capable,
+                                               target_general_capable=desired.telegram_general_subscription_shorts_capable)
         _verify_health(desired.revision)
         if inline_bot is not None:
             scope.verify_inline_search(inline_bot)
@@ -2233,7 +2283,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
             scope.verify_legacy_selected_floor(allow_rows=old_selected_capable, require_schema=old_selected_capable)
             scope.verify_legacy_temp_floor(allow_rows=old_temp_capable, require_schema=old_temp_capable)
             scope.verify_legacy_dynamic_all_floor(allow_rows=old_dynamic_all_capable, require_schema=old_dynamic_all_capable)
-            scope.verify_subscription_shorts_floor(old_version, old_version.telegram_subscription_shorts_capable)
+            scope.verify_subscription_shorts_floor(old_version, old_version.telegram_subscription_shorts_capable,
+                                                   target_general_capable=old_version.telegram_general_subscription_shorts_capable)
             if (inline_bot is not None or verify_provider_schema is not None or verify_legacy_shorts or batch_capable
                     or api_status_capable or documents_capable or verify_group_schema or desired.telegram_subscription_shorts_capable):
                 _require(scope.version(restored.version) == old_version, "Isolated Worker Telegram rollback state differs.")
