@@ -20,6 +20,7 @@ export interface GeneralTelegramPin extends TelegramBotCredentials {
   privateClaims: boolean;
   privateShareCreation: boolean;
   privateAggregate: boolean;
+  privateSelected: boolean;
   privateAuthorization?: boolean;
   rehearsal?: GeneralReadLaneScope;
 }
@@ -50,7 +51,8 @@ export function parseGeneralTelegramPin(input: unknown, releaseRevision: unknown
     const value = JSON.parse(input) as Record<string, unknown> | null;
     if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
     const sharedOutbox = Object.hasOwn(value, "outbox");
-    const privateAggregate = value.outbox === "shared-private-management-formats-temp-node-document-provider-claims-share-aggregate";
+    const privateSelected = value.outbox === "shared-private-management-formats-temp-node-document-provider-claims-share-aggregate-selected";
+    const privateAggregate = value.outbox === "shared-private-management-formats-temp-node-document-provider-claims-share-aggregate" || privateSelected;
     const privateShareCreation = value.outbox === "shared-private-management-formats-temp-node-document-provider-claims-share" || privateAggregate;
     const privateClaims = value.outbox === "shared-private-management-formats-temp-node-document-provider-claims" || privateShareCreation;
     const privateProvider = value.outbox === "shared-private-management-formats-temp-node-document-provider" || privateClaims;
@@ -71,7 +73,7 @@ export function parseGeneralTelegramPin(input: unknown, releaseRevision: unknown
       || !Number.isSafeInteger(cutoverAt) || cutoverAt < 1 || typeof activationSha256 !== "string"
       || !/^[0-9a-f]{64}(?![\s\S])/u.test(activationSha256)) return null;
     return { ...credentials, generation, cutoverAt, activationSha256, releaseRevision, sharedOutbox, privateManagement,
-      privateFormats, privateTemp, privateDocument, privateProvider, privateClaims, privateShareCreation, privateAggregate, privateAuthorization };
+      privateFormats, privateTemp, privateDocument, privateProvider, privateClaims, privateShareCreation, privateAggregate, privateSelected, privateAuthorization };
   } catch {
     return null;
   }

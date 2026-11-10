@@ -19,7 +19,7 @@ import { aggregateLinkDeliveryGuard, TELEGRAM_AGGREGATE_MARKER, type TelegramAgg
 import { TELEGRAM_PATH_MARKER, type TelegramPathReply } from "./path-management.ts";
 import { TELEGRAM_DOCUMENT_JOB_MARKER, type TelegramDocumentJobResult } from "./document-jobs.ts";
 import { TELEGRAM_PRIVATE_SHARE_CREATION_MARKER, type TelegramPrivateShareCreationReply } from "./private-share-creation.ts";
-import { insertSelectedRevokeTickets, selectedDeliveryGuard, TELEGRAM_SELECTED_MARKER,
+import { insertSelectedRevokeTickets, selectedTicketTargetGuard, TELEGRAM_SELECTED_MARKER,
   type SelectedRevokeTicket, type TelegramSelectedReply } from "./selected-export.ts";
 import { TELEGRAM_SHORT_LINK_MARKER, type TelegramShortLinkGuard } from "./short-link-actions.ts";
 import { insertTelegramSubscriptionReadTickets, TELEGRAM_SUBSCRIPTION_READ_MARKER,
@@ -716,27 +716,11 @@ export async function beginTelegramSelectedLinkReply(
   db: D1Database, policy: TelegramPolicy, lease: TelegramReplyLease, tickets: readonly SelectedRevokeTicket[],
 ): Promise<boolean> {
   if (!inTelegramScope(policy, lease) || lease.chatType !== "private" || lease.threadId !== null || !lease.selected) return false;
-  const guard = selectedDeliveryGuard(policy, lease.selected);
-  if (guard === null || (lease.selected.result === "issued" && tickets.length !== 1)) return false;
+  const guard = selectedTicketTargetGuard(policy, lease.selected, tickets);
+  if (guard === null) return false;
   const insertTickets = insertSelectedRevokeTickets(db, lease.receiptId, lease.attempts, lease.leaseId, tickets);
-  const targets = JSON.stringify(tickets.map(({ codeSha256 }) => codeSha256));
-  const exactTargets = {
-    sql: `(${guard.sql}) AND ? = (
-      SELECT count(*) FROM json_each(?) AS item JOIN telegram_selected_links AS selected ON selected.code_sha256=item.value
-      JOIN aggregate_links AS link USING(code_sha256)
-      JOIN telegram_selected_actions AS action ON action.receipt_id=inbox.receipt_id
-      WHERE selected.bot_id=inbox.bot_id AND selected.actor_id=inbox.actor_id
-        AND link.owner_id=inbox.actor_id AND link.kind='selected' AND link.bot_id IS NULL AND link.revoked_at IS NULL
-        AND (action.result='limit' OR (action.result='issued' AND action.code_sha256=selected.code_sha256))
-    ) ${lease.selected.result === "limit" ? `AND ? = (
-      SELECT count(*) FROM telegram_selected_links AS selected JOIN aggregate_links AS link USING(code_sha256)
-      WHERE selected.bot_id=inbox.bot_id AND selected.actor_id=inbox.actor_id AND link.revoked_at IS NULL
-        AND link.owner_id=inbox.actor_id AND link.kind='selected' AND link.bot_id IS NULL
-    )` : ""}`,
-    bindings: [...guard.bindings, tickets.length, targets, ...(lease.selected.result === "limit" ? [tickets.length] : [])],
-  };
   const [state, ticket] = await db.batch<{ receipt_id: number }>([
-    beginReplyStatement(db, policy, lease, "allowed", exactTargets),
+    beginReplyStatement(db, policy, lease, "allowed", guard),
     insertTickets,
   ]);
   const changed = state?.results.length;
