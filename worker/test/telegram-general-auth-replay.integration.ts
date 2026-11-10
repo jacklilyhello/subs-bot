@@ -15,6 +15,7 @@ import { parseSubscriptionDocument } from "../src/subscription-document.ts";
 import { claimTelegramDocumentJob } from "../src/telegram/document-jobs.ts";
 import { persistTelegramDocumentJob, reconcileTelegramDocumentJobReplies, retireTelegramDocumentStage } from "../src/telegram/document-persistence.ts";
 import { parseTelegramAggregateKey } from "../src/telegram/aggregate-actions.ts";
+import { reapFailedTelegramShortLinks } from "../src/telegram/short-link-actions.ts";
 import { GENERAL_AUTH_LEGACY_ROLE, type GeneralAuthReplayMessage, type GeneralAuthReplayPin } from "../src/telegram/general-auth-replay.ts";
 import { beginGeneralTelegramReply, claimGeneralTelegramReply, parseGeneralTelegramPin } from "../src/telegram/general-auth-runtime.ts";
 import { acceptGeneralSharedTelegramCommand, beginGeneralSharedTelegramReply, claimGeneralSharedTelegramReply,
@@ -144,6 +145,10 @@ test("closed general authorization replays a sealed candidate in a separate emit
   const selectedConfig = JSON.stringify({ ...JSON.parse(generalConfig),
     outbox: "shared-private-management-formats-temp-node-document-provider-claims-share-aggregate-selected" });
   assert.ok(parseGeneralTelegramPin(selectedConfig, fixture.releaseRevision)?.privateSelected);
+  const shortConfig = JSON.stringify({ ...JSON.parse(generalConfig),
+    outbox: "shared-private-management-formats-temp-node-document-provider-claims-share-aggregate-selected-short" });
+  const shortPin = parseGeneralTelegramPin(shortConfig, fixture.releaseRevision);
+  assert.ok(shortPin?.privateShort && shortPin.privateSelected && !shortPin.privateAuthorization);
   const aggregateKeyRaw = Buffer.alloc(32, 17).toString("base64url");
   const shareKeyRaw = Buffer.alloc(32, 0x61).toString("base64url");
   const authConfig = JSON.stringify({ ...JSON.parse(selectedConfig), authManagement: true });
@@ -244,6 +249,9 @@ test("closed general authorization replays a sealed candidate in a separate emit
         ...(withKey ? { TELEGRAM_AGGREGATE_KEY: aggregateKeyRaw } : { TELEGRAM_PRIVATE_SHARE_CREATION_KEY: shareKeyRaw }) } })),
     { name: "selected", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: selectedConfig,
+        PUBLIC_ORIGIN: PRODUCTION_PUBLIC_ORIGIN, TELEGRAM_AGGREGATE_KEY: aggregateKeyRaw }, outboundService: privateTransport },
+    { name: "ordinary-short", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
+      bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: shortConfig,
         PUBLIC_ORIGIN: PRODUCTION_PUBLIC_ORIGIN, TELEGRAM_AGGREGATE_KEY: aggregateKeyRaw }, outboundService: privateTransport },
     ...[true, false].map((enabled) => ({ name: enabled ? "provider-open" : "provider-paused", modules: true,
       script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"], outboundService: privateTransport,
@@ -1562,6 +1570,79 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.equal((await callback(7718, 101, limitOrigin, menuTicket, selectedWorker)).status, 204);
   assert.equal((await getAggregate(selectedCode)).status, 404);
 
+  const ordinaryShortWorker = await runtime.getWorker("ordinary-short");
+  const ordinaryShortPost = (updateId: number, actor: number, text: string, options: PostOptions = {}) =>
+    post(actor, text, { updateId, worker: ordinaryShortWorker, date: now + 25, ...options });
+  const ordinaryShortTarget = "https://example.net/a%20b?mode=synthetic#keep";
+  assert.equal((await ordinaryShortPost(7740, 101, "/short", { worker: selectedWorker })).status, 204);
+  assert.equal((await ordinaryShortPost(7741, 101, `/short ${ordinaryShortTarget}`, groupEvent)).status, 204);
+  assert.equal((await ordinaryShortPost(7742, 104, `/short ${ordinaryShortTarget}`)).status, 204);
+  assert.equal((await ordinaryShortPost(7743, 101, "/short")).status, 200);
+  assert.match((await awaitLifecycle(7743)).message.text, /\/short https:\/\/example\.com\/xxx/u);
+  assert.equal((await ordinaryShortPost(7744, 101, "/short http://synthetic-user@127.0.0.1/private")).status, 200);
+  const invalidShortNotice = (await awaitLifecycle(7744)).message.text;
+  assert.match(invalidShortNotice, /^短链目标或撤销参数无效。/u);
+  assert.doesNotMatch(invalidShortNotice, /synthetic-user|127\.0\.0\.1/u);
+  assert.equal((await ordinaryShortPost(7745, 101, `/short ${ordinaryShortTarget}`)).status, 200);
+  const ordinaryShortMessage = (await awaitLifecycle(7745)).message;
+  assert.equal(ordinaryShortMessage.chat_id, "101");
+  assert.deepEqual(ordinaryShortMessage.link_preview_options, { is_disabled: true });
+  assert.equal((await findReply(7745))?.marker, "general-short:v1");
+  assert.ok(!ordinaryShortMessage.text.includes(ordinaryShortTarget));
+  const ordinaryShortUrl = new URL(ordinaryShortMessage.text.split("\n")[1]);
+  assert.equal(ordinaryShortUrl.origin, PRODUCTION_PUBLIC_ORIGIN);
+  const ordinaryShortCode = /^\/s\/([A-Za-z0-9_-]{21}s)$/u.exec(ordinaryShortUrl.pathname)?.[1];
+  assert.ok(ordinaryShortCode);
+  const ordinaryShortPath = `https://app.fixture.invalid/s/${ordinaryShortCode}`;
+  for (const method of ["GET", "HEAD"]) {
+    const response = await ordinaryShortWorker.fetch(ordinaryShortPath, { method, redirect: "manual" });
+    assert.equal(response.status, 302);
+    assert.equal(response.headers.get("Location"), ordinaryShortTarget);
+  }
+  assert.equal((await ordinaryShortPost(7745, 101, `/short ${ordinaryShortTarget}`)).status, 204);
+  assert.equal((await ordinaryShortPost(7746, 106, `/short revoke ${ordinaryShortCode}`)).status, 200);
+  assert.equal((await awaitLifecycle(7746)).message.text, "没有可撤销的短链。");
+  assert.equal((await ordinaryShortWorker.fetch(ordinaryShortPath, { redirect: "manual" })).status, 302);
+  assert.equal((await ordinaryShortPost(7747, 101, `/short revoke ${ordinaryShortUrl.href}`)).status, 200);
+  assert.equal((await awaitLifecycle(7747)).message.text, "短链已撤销。");
+  assert.equal((await ordinaryShortWorker.fetch(ordinaryShortPath, { redirect: "manual" })).status, 404);
+  assert.equal(await db.prepare("SELECT target_url IS NULL AS scrubbed FROM normal_short_links WHERE code_sha256=?")
+    .bind(createHash("sha256").update(ordinaryShortCode).digest("hex")).first("scrubbed"), 1);
+
+  const reservedTypedCode = "A".repeat(21) + "t";
+  const reservedTypedDigest = createHash("sha256").update(reservedTypedCode).digest("hex");
+  await db.prepare(`INSERT INTO telegram_subscription_short_links
+    (code_sha256,origin_receipt_id,bot_id,owner_id,subscription_id,token_sha256,format,nonce,key_version)
+    SELECT ?,inbox.receipt_id,inbox.bot_id,inbox.actor_id,?,?,'base64',?,1 FROM telegram_inbox AS inbox
+    JOIN telegram_subscription_read AS read USING(receipt_id) WHERE inbox.bot_id=? AND inbox.update_id=7378`)
+    .bind(reservedTypedDigest, initial.id, createHash("sha256").update(initial.token).digest("hex"), "A".repeat(22), pin.botId).run();
+  assert.equal((await ordinaryShortPost(7748, 101, `/short revoke ${reservedTypedCode}`)).status, 200);
+  assert.equal((await awaitLifecycle(7748)).message.text, "没有可撤销的短链。");
+  assert.equal(await db.prepare("SELECT revoked_at IS NULL AS active FROM telegram_subscription_short_links WHERE code_sha256=?")
+    .bind(reservedTypedDigest).first("active"), 1);
+
+  await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,'104',16,?,'member')")
+    .bind(pin.botId, pin.generation, now + 23).run();
+  assert.equal(await acceptGeneralSharedTelegramCommand(db, shortPin, new Request("https://app.fixture.invalid/telegram/webhook", {
+    method: "POST", headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": pin.webhookSecret },
+    body: JSON.stringify({ update_id: 7749, message: { text: `/short ${ordinaryShortTarget}`, message_id: 7749, date: now + 25,
+      from: { id: 104, is_bot: false }, chat: { id: 104, type: "private" }, entities: [{ type: "bot_command", offset: 0, length: 6 }] } }),
+  }), undefined, undefined, undefined, undefined, aggregateKey), 200);
+  const queuedShort = await claimGeneralSharedTelegramReply(db, shortPin);
+  assert.ok(queuedShort?.updateId === 7749);
+  await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,'104',17,?,'denied')")
+    .bind(pin.botId, pin.generation, now + 26).run();
+  assert.equal(await beginGeneralSharedTelegramReply(db, shortPin, queuedShort), false);
+  assert.equal((await db.prepare(`UPDATE telegram_outbox SET state='failed',lease_id=NULL,lease_until=NULL
+    WHERE receipt_id=? AND lease_id=? AND state='leased'`).bind(queuedShort.receiptId, queuedShort.leaseId).run()).meta.changes, 1);
+  await reapFailedTelegramShortLinks(db, pin.botId);
+  const shortCandidateScrubbed = () => db.prepare("SELECT target_url IS NULL AS scrubbed FROM normal_short_links WHERE origin_receipt_id=?")
+    .bind(queuedShort.receiptId).first("scrubbed");
+  assert.equal(await shortCandidateScrubbed(), 0);
+  assert.equal((await ordinaryShortWorker.scheduled({ cron: "* * * * *" })).outcome, "ok");
+  assert.equal(await shortCandidateScrubbed(), 1);
+  assert.ok(!lifecycleSent.some(({ reply_parameters }) => reply_parameters.message_id === 7749));
+
   const rehearsal = await runtime.getWorker("rehearsal");
   const lanePost = (actor: number, command: string, options: PostOptions = {}) =>
     post(actor, command, { secret: isolation.webhookSecret, date: now - 3, ...options, worker: rehearsal });
@@ -1608,7 +1689,7 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.ok(open?.pin?.rehearsal && open.mode === "general");
   assert.deepEqual([open.pin.privateManagement, open.pin.privateFormats, open.pin.privateTemp,
     open.pin.privateDocument, open.pin.privateProvider, open.pin.privateClaims, open.pin.privateShareCreation, open.pin.privateAggregate,
-    open.pin.privateSelected], [false, false, false, false, false, false, false, false, false],
+    open.pin.privateSelected, open.pin.privateShort], [false, false, false, false, false, false, false, false, false, false],
     "the rehearsal enables only private reads");
   assert.equal((await lanePost(182, "/list", { updateId: 8102, date: now - 21 })).status, 503,
     "uncommitted pre-cutover delivery is held for the original lane");

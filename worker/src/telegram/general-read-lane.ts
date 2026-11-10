@@ -63,7 +63,7 @@ export async function readGeneralReadLane(
   return { epoch: row.epoch, mode: row.mode, pin: { botId, botUsername, webhookSecret, botToken, generation,
     cutoverAt, releaseRevision, activationSha256, sharedOutbox: true, privateManagement: false, privateFormats: false,
     privateTemp: false, privateDocument: false, privateProvider: false, privateClaims: false, privateShareCreation: false,
-    privateAggregate: false, privateSelected: false,
+    privateAggregate: false, privateSelected: false, privateShort: false,
     rehearsal: { adminId, memberId } } };
 }
 
