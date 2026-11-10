@@ -85,4 +85,6 @@ def rollback_once(scope, source, telegram_config, guard, *, run_id):
                               _digest({"versionId": previous, "version": asdict(predecessor)}),
                               active.id, active.version, previous, restores_epoch=epoch)
     _require(_reverses(intent, original), STALE)
-    return _deploy_once(scope, journal, intent, observed, active, policy_sha256, unchanged)
+    # _deploy_once rechecks the current deployment before POST.
+    # Reconciliation must allow the expected deployment change.
+    return _deploy_once(scope, journal, intent, observed, active, policy_sha256, current)
