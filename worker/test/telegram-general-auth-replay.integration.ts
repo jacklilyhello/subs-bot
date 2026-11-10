@@ -1873,12 +1873,12 @@ test("closed general authorization replays a sealed candidate in a separate emit
   typedRetry = retry;
   const typedSource = origin(shortDetail.messageId, 101);
   assert.equal((await callback(7752, 101, typedSource, shortTicket, typedIssue)).status, 200);
-  const pending = () => db.prepare(`SELECT reply.state FROM telegram_outbox AS reply JOIN telegram_inbox AS inbox USING(receipt_id)
+  const typedRetryState = () => db.prepare(`SELECT reply.state FROM telegram_outbox AS reply JOIN telegram_inbox AS inbox USING(receipt_id)
     WHERE inbox.bot_id=? AND inbox.update_id=7752 AND reply.attempts=1`).bind(pin.botId).first("state");
-  for (const end = Date.now() + 4000; await pending() !== "pending" && Date.now() < end;) {
+  for (const end = Date.now() + 4000; await typedRetryState() !== "pending" && Date.now() < end;) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  assert.equal(await pending(), "pending");
+  assert.equal(await typedRetryState(), "pending");
   assert.equal(retry.attempts.length, 1);
   await db.prepare(`UPDATE telegram_outbox SET due_at=unixepoch() WHERE receipt_id IN (
     SELECT receipt_id FROM telegram_inbox WHERE bot_id=? AND update_id=7752)`).bind(pin.botId).run();
