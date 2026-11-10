@@ -3,6 +3,17 @@ const PROTOCOL = "2025-06-18";
 const MAX_SSE_BYTES = 256 * 1024;
 const MAX_SSE_CHUNKS = 512;
 
+export interface GrepSearchObservation {
+  phase: "not-started" | "initialize" | "initialize-response" | "initialized" | "initialized-response"
+    | "authorization" | "authorization-denied" | "tool" | "tool-response" | "tool-shape" | "complete";
+  initializeStatus: number | null;
+  initializedStatus: number | null;
+  toolStatus: number | null;
+  timedOut: boolean;
+  contentBlocks: number;
+}
+
+
 async function readEvent(response: Response, id: number): Promise<Record<string, unknown> | null> {
   if (response.status !== 200 || response.redirected || response.headers.has("Mcp-Session-Id") || !response.body
     || !/^text\/event-stream(?:\s*;|$)/iu.test(response.headers.get("Content-Type") ?? "")) {
@@ -57,7 +68,7 @@ async function readEvent(response: Response, id: number): Promise<Record<string,
 /** Only the stateless SSE handshake observed in the hosted capability probe is supported. */
 export async function grepCodeContent(
   request: typeof fetch, signal: AbortSignal, query: string, repo: string | undefined,
-  stillAuthorized: () => Promise<boolean>,
+  stillAuthorized: () => Promise<boolean>, observation?: GrepSearchObservation,
 ): Promise<unknown[]> {
   const post = (message: Record<string, unknown>, initialized: boolean) => request(ENDPOINT, {
     method: "POST", redirect: "manual", cache: "no-store", signal,
@@ -66,10 +77,21 @@ export async function grepCodeContent(
     body: JSON.stringify({ jsonrpc: "2.0", ...message }),
   });
   try {
-    const initial = await readEvent(await post({ id: 1, method: "initialize", params: { protocolVersion: PROTOCOL,
-      capabilities: {}, clientInfo: { name: "subs-bot-public-search", version: "1.0.0" } } }, false), 1);
+    if (observation) observation.phase = "initialize";
+    const initialResponse = await post({ id: 1, method: "initialize", params: { protocolVersion: PROTOCOL,
+      capabilities: {}, clientInfo: { name: "subs-bot-public-search", version: "1.0.0" } } }, false);
+    if (observation) {
+      observation.phase = "initialize-response";
+      observation.initializeStatus = initialResponse.status;
+    }
+    const initial = await readEvent(initialResponse, 1);
     if (initial?.protocolVersion !== PROTOCOL || signal.aborted) return [];
+    if (observation) observation.phase = "initialized";
     const notice = await post({ method: "notifications/initialized" }, true);
+    if (observation) {
+      observation.phase = "initialized-response";
+      observation.initializedStatus = notice.status;
+    }
     if (notice.status !== 202 || notice.redirected || notice.headers.has("Mcp-Session-Id")) {
       void notice.body?.cancel().catch(() => {});
       return [];
@@ -83,13 +105,35 @@ export async function grepCodeContent(
         reader.releaseLock();
       }
     }
-    if (signal.aborted || !await stillAuthorized() || signal.aborted) return [];
-    const result = await readEvent(await post({ id: 2, method: "tools/call", params: {
+    if (signal.aborted) return [];
+    if (observation) observation.phase = "authorization";
+    if (!await stillAuthorized()) {
+      if (observation) observation.phase = "authorization-denied";
+      return [];
+    }
+    if (signal.aborted) return [];
+    if (observation) observation.phase = "tool";
+    const toolResponse = await post({ id: 2, method: "tools/call", params: {
       name: "searchGitHub", arguments: { query, ...(repo ? { repo } : {}), useRegexp: false },
-    } }, true), 2);
-    return result && (result.isError === undefined || result.isError === false) && !Object.hasOwn(result, "structuredContent")
-      && Array.isArray(result.content) && result.content.length <= 20 ? result.content : [];
+    } }, true);
+    if (observation) {
+      observation.phase = "tool-response";
+      observation.toolStatus = toolResponse.status;
+    }
+    const result = await readEvent(toolResponse, 2);
+    if (result && (result.isError === undefined || result.isError === false) && !Object.hasOwn(result, "structuredContent")
+      && Array.isArray(result.content) && result.content.length <= 20) {
+      if (observation) {
+        observation.phase = "complete";
+        observation.contentBlocks = result.content.length;
+      }
+      return result.content;
+    }
+    if (observation && result) observation.phase = "tool-shape";
+    return [];
   } catch {
     return [];
+  } finally {
+    if (observation) observation.timedOut = signal.aborted;
   }
 }

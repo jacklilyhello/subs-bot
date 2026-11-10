@@ -1,5 +1,5 @@
 import { validInteger } from "../storage.ts";
-import { grepCodeContent } from "./grep-search.ts";
+import { grepCodeContent, type GrepSearchObservation } from "./grep-search.ts";
 import { inTelegramScope, type TelegramGitHubSearchUpdate, type TelegramPolicy } from "./protocol.ts";
 
 export const TELEGRAM_GITHUB_SEARCH_MARKER = "github-search:v1";
@@ -36,6 +36,30 @@ type RepositorySearch = { state: "found" | "empty" | "unavailable"; repos: Repos
 type CodeMatch = { repo: string; ref: string; path: string };
 type Admission = { kind: "ignored" | "reply" } | { kind: "lookup"; receiptId: number; nonce: string; query: string };
 type Receipt = { receiptId: number; state: "looking" | "usage" | "limited" };
+
+interface VisibilityObservation {
+  status: number | null;
+  outcome: "pending" | "public" | "unconfirmed" | "deadline" | "transport-or-body";
+}
+
+export interface GitHubSearchObservation {
+  remainingMs: number;
+  repositoryStatus: number | null;
+  repositoryState: RepositorySearch["state"] | null;
+  grep: GrepSearchObservation;
+  candidates: number;
+  codeTimedOut: boolean;
+  visibility: VisibilityObservation[];
+  verifiedFiles: number;
+  settled: ReplyState | null;
+}
+
+export function newGitHubSearchObservation(): GitHubSearchObservation {
+  return { remainingMs: 0, repositoryStatus: null, repositoryState: null,
+    grep: { phase: "not-started", initializeStatus: null, initializedStatus: null, toolStatus: null, timedOut: false, contentBlocks: 0 },
+    candidates: 0, codeTimedOut: false, visibility: [], verifiedFiles: 0, settled: null };
+}
+
 
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
@@ -236,7 +260,8 @@ async function readGitHubResponse(response: Response): Promise<unknown> {
   }
 }
 
-async function searchPublicRepositories(query: string, request: typeof fetch, timeoutMs: number): Promise<RepositorySearch> {
+async function searchPublicRepositories(query: string, request: typeof fetch, timeoutMs: number,
+  observation?: GitHubSearchObservation): Promise<RepositorySearch> {
   const unavailable: RepositorySearch = { state: "unavailable", repos: [] };
   try {
     const url = new URL(GITHUB_API);
@@ -244,6 +269,7 @@ async function searchPublicRepositories(query: string, request: typeof fetch, ti
     const response = await request(url, {
       method: "GET", redirect: "manual", signal: AbortSignal.timeout(timeoutMs), cache: "no-store", headers: GITHUB_HEADERS,
     });
+    if (observation) observation.repositoryStatus = response.status;
     const data = record(await readGitHubResponse(response));
     if (!data || !Array.isArray(data.items) || data.items.length > MAX_REPOSITORIES) return unavailable;
     const repos: Repository[] = [];
@@ -305,7 +331,8 @@ function grepMatch(raw: unknown, repoFilter: string | undefined): CodeMatch | nu
 }
 
 async function searchPublicCode(query: string, request: typeof fetch, signal: AbortSignal,
-  stillAuthorized: () => Promise<boolean>, repositories: Promise<RepositorySearch>): Promise<CodeMatch[]> {
+  stillAuthorized: () => Promise<boolean>, repositories: Promise<RepositorySearch>,
+  observation?: GitHubSearchObservation): Promise<CodeMatch[]> {
   const code = codeQuery(query);
   if (!code || signal.aborted) return [];
   const publicFromSearch = new Set<string>();
@@ -313,26 +340,36 @@ async function searchPublicCode(query: string, request: typeof fetch, signal: Ab
     for (const { name } of repos) publicFromSearch.add(name);
   });
   const matches = new Map<string, CodeMatch>();
-  for (const item of await grepCodeContent(request, signal, code.query, code.repo, stillAuthorized)) {
+  for (const item of await grepCodeContent(request, signal, code.query, code.repo, stillAuthorized, observation?.grep)) {
     const candidate = grepMatch(item, code.repo);
     if (candidate) matches.set(codeUrl(candidate), candidate);
     if (matches.size === MAX_CODE_MATCHES) break;
   }
+  if (observation) observation.candidates = matches.size;
   if (!matches.size || signal.aborted) return [];
   const verified = new Map<string, Promise<boolean>>();
   const codeMatches = [...matches.values()];
   // A slow repository search must not consume the file visibility check's time budget.
   for (const { repo } of codeMatches) {
     if (!publicFromSearch.has(repo) && !verified.has(repo)) verified.set(repo, (async () => {
+      const check: VisibilityObservation | undefined = observation && { status: null, outcome: "pending" };
+      if (check) observation?.visibility.push(check);
       try {
-        if (signal.aborted) return false;
+        if (signal.aborted) {
+          if (check) check.outcome = "deadline";
+          return false;
+        }
         const response = await request(GITHUB_REPO_API + repo, {
           method: "GET", redirect: "manual", cache: "no-store", signal, headers: GITHUB_HEADERS,
         });
+        if (check) check.status = response.status;
         const data = record(await readGitHubResponse(response));
-        return data?.private === false && data.visibility === "public" && data.full_name === repo
+        const confirmed = data?.private === false && data.visibility === "public" && data.full_name === repo
           && data.html_url === `${GITHUB_ORIGIN}/${repo}`;
+        if (check) check.outcome = confirmed ? "public" : "unconfirmed";
+        return confirmed;
       } catch {
+        if (check) check.outcome = signal.aborted ? "deadline" : "transport-or-body";
         return false;
       }
     })());
@@ -357,7 +394,7 @@ function packSearchReply(repositorySearch: RepositorySearch, code: CodeMatch[]):
 /** The winning webhook owns the ephemeral query. A recovered lookup sends the fixed fallback instead of replaying egress. */
 export async function runTelegramGitHubSearch(
   db: D1Database, policy: TelegramPolicy, admission: Extract<Admission, { kind: "lookup" }>,
-  request: typeof fetch = fetch,
+  request: typeof fetch = fetch, observation?: GitHubSearchObservation,
 ): Promise<boolean> {
   const current = epoch(policy);
   const lookup = `SELECT 1 FROM telegram_inbox AS inbox
@@ -373,12 +410,20 @@ export async function runTelegramGitHubSearch(
     if (claimed?.receiptId !== admission.receiptId) return false;
     const remaining = Math.min(CODE_LOOKUP_TIMEOUT_MS, claimed.lookupUntil * 1000 - Date.now() - 500);
     if (remaining <= 0) return false;
+    if (observation) observation.remainingMs = remaining;
     const bindings = [admission.receiptId, fetchNonce, policy.botId, ...current.bindings];
     const stillAuthorized = async () => await db.prepare(`SELECT 1 FROM telegram_github_search AS search WHERE ${active}`)
       .bind(...bindings).first() !== null;
-    const repositorySearch = searchPublicRepositories(admission.query, request, Math.min(LOOKUP_TIMEOUT_MS, remaining));
-    const code = await searchPublicCode(admission.query, request, AbortSignal.timeout(remaining), stillAuthorized, repositorySearch);
-    const result = packSearchReply(await repositorySearch, code);
+    const repositorySearch = searchPublicRepositories(admission.query, request, Math.min(LOOKUP_TIMEOUT_MS, remaining), observation);
+    const codeSignal = AbortSignal.timeout(remaining);
+    const code = await searchPublicCode(admission.query, request, codeSignal, stillAuthorized, repositorySearch, observation);
+    if (observation) {
+      observation.codeTimedOut = codeSignal.aborted;
+      observation.verifiedFiles = code.length;
+    }
+    const repository = await repositorySearch;
+    if (observation) observation.repositoryState = repository.state;
+    const result = packSearchReply(repository, code);
     const [updated, queued] = await db.batch([
       db.prepare(`UPDATE telegram_github_search AS search
         SET state = ?, public_results = ?, lookup_nonce = NULL, lookup_until = NULL WHERE ${active}`)
@@ -387,6 +432,7 @@ export async function runTelegramGitHubSearch(
         SELECT receipt_id FROM telegram_github_search WHERE receipt_id = ? AND changes() = 1`).bind(admission.receiptId),
     ]);
     if (!updated?.success || !queued?.success || updated.meta.changes !== queued.meta.changes) throw new Error();
+    if (observation && queued.meta.changes === 1) observation.settled = result.state;
     return queued.meta.changes === 1;
   } catch {
     throw new Error("Telegram GitHub search completion could not be confirmed.");

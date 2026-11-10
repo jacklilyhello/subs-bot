@@ -136,6 +136,10 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 Cloudflare 边缘诊断使用独立的 `worker-grep-edge-preview.yml`。仅在 `main` 手动运行，输入 `probe Grep in the isolated Cloudflare preview`。无凭据构建步骤生成固定公开夹具，受保护步骤核对同次运行的提交、归档和模块摘要，再用隔离 Worker 部署凭据申请临时预览。临时脚本没有业务绑定。探针先确认固定名称不存在且匿名请求无法执行，随后只调用一次固定夹具，并回读该名称仍无已部署脚本。预览凭据由 Cloudflare 管理有效期，任务不会创建常驻 Worker 或启用日志。报告仅含阶段、状态、耗时及结构计数，采用合成授权检查。若临时预览不可用，任务停止。 [Cloudflare 远程开发](https://developers.cloudflare.com/workers/local-development/#wrangler-dev---remote-legacy)
 
+同一隔离版本出现不同 Grep 结果时，可在受保护的 `worker-isolation-grep-outcome.yml` 核对这两次实际私聊。先确认精确活动 Worker、私有 R2、D1、Telegram 配置和本次 Worker CI。使用新的 32 位小写十六进制 `cohort` 运行 `arm`，确认词为 `arm Grep diagnostic <cohort>`。两位已批准账号在十分钟窗口内各发送一次固定公开夹具 `/g addClass repo:jquery/jquery`。用同一 cohort 和 Worker CI 运行号执行 `inspect`，确认字段留空。报告仅输出按角色关联的固定阶段、HTTP 状态、计数和已送达状态。未就绪时可重查同一 cohort，避免重复发命令。
+
+窗口结束后，用 `retire Grep diagnostic <cohort>` 执行 `retire`。工具以同一 ETag 的条件 PUT 把已确认结果和当前 arm 替换为小型墓碑，并保留不含内容的预留记录。墓碑阻止迟到写入重建结果。三步期间固定当前主分支和活动版本。arm 写入结果不明时，只用同一 cohort 回读，发现仍未确认时停止。整个过程不输出查询、文件路径、头值、账号 ID 或 Bot 凭据。 [R2 条件写入](https://developers.cloudflare.com/r2/reference/consistency/#conditional-writes)
+
 ### 订阅搜索、详情和格式链接
 
 `/s 关键词` 按当前用户的活动订阅搜索名称和来源，沿用旧版的 Unicode 小写子串匹配。每页最多显示 8 项，搜索限于 512 条订阅及 8 MiB 元数据。群聊只显示用户自己的匹配名称和编号。普通私聊可通过搜索结果、`/list`、`/expire` 的详情按钮，或直接发送活动列表顺序编号查看详情。详情显示流量、到期、节点数量及最多 8 个已校验的节点名称。来源 URL、节点凭据和刷新错误原文不进入回复。
