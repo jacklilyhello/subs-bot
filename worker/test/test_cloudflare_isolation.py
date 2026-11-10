@@ -20,6 +20,7 @@ from urllib.error import HTTPError
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import attest_api_status_container as attestation
 import cloudflare_isolation as cloudflare
+import page_jump_activation
 import page_jump_control
 import page_jump_recovery
 import release_isolation as release_entry
@@ -130,6 +131,7 @@ class FakeCloudflare:
         }
         self.calls = []
         self.lose_upload = False
+        self.page_jump_journal = "absent"
         self.lose_activation = False
         self.lose_activation_readback = False
         self.health_available = True
@@ -263,6 +265,21 @@ class FakeCloudflare:
     def data_api(self, method, path, payload=None):
         if method == "POST" and path == DATABASE + "/query":
             sql = payload["sql"]
+            if "AS pageJumpJournal," in sql:
+                return [{"success": True, "results": [{
+                    "pageJumpJournal": int(self.page_jump_journal not in ("absent", "registered-only")), "ledger": 1,
+                }]}]
+            if "AS pageJumpJournalRegistered" in sql:
+                return [{"success": True, "results": [{"pageJumpJournalRegistered": int(self.page_jump_journal != "absent")}]}]
+            if "AS schema_sql" in sql and page_jump_activation.JOURNAL in sql:
+                migration = Path(__file__).resolve().parents[1] / "migrations" / page_jump_activation.MIGRATION
+                pending = (self.page_jump_journal == "pending" or
+                           self.page_jump_journal == "pending-on-rollback" and self.active["id"] == NEW_DEPLOYMENT)
+                return [{"success": True, "results": [{
+                    "pinned": int(self.page_jump_journal != "table-only"),
+                    "schema_sql": migration.read_text(encoding="utf-8").removesuffix(";\n"),
+                    "pending": int(pending),
+                }]}]
             if "AS pageJumpUnsettled" in sql:
                 # Verify the guard works against baseline inbox/outbox alone, before 0042 exists.
                 with closing(sqlite3.connect(":memory:")) as db:
@@ -859,6 +876,23 @@ class ReleaseTests(unittest.TestCase):
         self.set_page_jump_artifact()
         with self.assertRaisesRegex(cloudflare.CloudflareError, "exact 0043"):
             cloudflare.verify_page_jump_artifact(self.bundle, {**self.manifest, "migrations": original})
+
+    def test_ordinary_release_rejects_pending_and_partial_page_jump_journal_before_upload(self):
+        for state in ("pending", "registered-only", "table-only"):
+            self.api.page_jump_journal = state
+            with self.subTest(state=state), self.assertRaisesRegex(cloudflare.CloudflareError, "journal|unresolved"):
+                self.release()
+            self.assertEqual(self.api.writes(), [])
+        self.api.page_jump_journal = "clear"
+        self.assertTrue(self.release()["changed"])
+
+    def test_automatic_rollback_rechecks_page_jump_journal_before_post(self):
+        self.api.page_jump_journal = "pending-on-rollback"
+        self.api.health_available = False
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "safe rollback could not be confirmed"):
+            self.release()
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
+        self.assertEqual(self.api.active["id"], NEW_DEPLOYMENT)
 
     def test_page_jump_epoch_downgrade_checks_closed_gate_and_only_unrecognized_receipts(self):
         self.set_page_jump_artifact()

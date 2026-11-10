@@ -70,6 +70,17 @@ def _unpack(raw):
 
 
 def _validate_source(value, source, kind):
+    if kind == "pause-durable":
+        _require(set(value) == {"version", "phase", "revision", "operationRunId", "operationRunAttempt",
+                                "epoch", "stageEpoch", "stageSha256", "pausedGateSha256", "activeSha256"}
+                 and type(value["version"]) is int and value["version"] == 1 and value["phase"] == "paused-durable"
+                 and value["revision"] == source["revision"]
+                 and all(type(value[key]) is int for key in ("operationRunId", "operationRunAttempt", "epoch", "stageEpoch"))
+                 and value["epoch"] == value["operationRunId"] == int(source["runId"])
+                 and value["operationRunAttempt"] == int(source["runAttempt"])
+                 and 0 < value["stageEpoch"] < value["epoch"]
+                 and all(_matches(PIN, value[key]) for key in ("stageSha256", "pausedGateSha256", "activeSha256")), PROOF_ERROR)
+        return value
     fields = ({"checkpoint", "epoch", "reservedGateSha256", "candidateSha256"} if kind == "stage" else
               {"stage", "epoch", "pausedGateSha256", "activeSha256"})
     _require(set(value) == COMMON_FIELDS | fields and type(value["version"]) is int and value["version"] == 1
@@ -94,7 +105,7 @@ def _validate_source(value, source, kind):
 
 
 def read_source(source, kind):
-    _require(_source(source) and kind in ("stage", "pause"), PROOF_ERROR)
+    _require(_source(source) and kind in ("stage", "pause", "pause-durable"), PROOF_ERROR)
     token = _github_token()
     workflow = _get_json("/actions/workflows/worker-isolation-deploy.yml", token)
     workflow_id = workflow.get("id")

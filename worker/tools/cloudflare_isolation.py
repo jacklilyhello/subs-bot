@@ -1207,6 +1207,8 @@ class _Isolation:
     def activate(self, previous, version_id, message, *, current_version, target_version, current_capable, target_capable, guard,
                  current_temp_capable=False, target_temp_capable=False,
                  current_dynamic_all_capable=False, target_dynamic_all_capable=False):
+        from page_jump_activation import require_clear_for_release
+
         # All tracked application deployment writes use this boundary, including rollback.
         _require(current_version.telegram_page_jump_epoch is None and target_version.telegram_page_jump_epoch is None,
                  "An epoch-bound isolated page-jump version may only be staged.")
@@ -1217,6 +1219,7 @@ class _Isolation:
         self.verify_legacy_dynamic_all_floor(allow_rows=current_dynamic_all_capable and target_dynamic_all_capable,
                                              require_schema=current_dynamic_all_capable or target_dynamic_all_capable)
         self.verify_page_jump_drain(current_version, target_version)
+        require_clear_for_release(self)
         _require(self.active() == previous, "Active isolated Worker deployment changed before activation.")
         _guard_current(guard)
         try:
@@ -1677,10 +1680,13 @@ def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECI
                          mixed_documents=None, group_share_cards=None, group_share_cards_capable=None,
                          legacy_selected_capable=None, legacy_temp_capable=None, legacy_dynamic_all_capable=None):
     """Read ownership, privacy and active binding facts before any release writes."""
+    from page_jump_activation import require_clear_for_release
+
     scope = _Isolation(worker_api, data_api, target)
     scope.worker_config()
     had_cron = scope.cron_enabled()
     scope.verify_resources()
+    require_clear_for_release(scope)
     active = scope.active()
     version, active_selected_capable, active_temp_capable, active_dynamic_all_capable = scope.version(
         active.version, with_legacy_selected=True, with_legacy_temp=True, with_legacy_dynamic_all=True)
@@ -1796,6 +1802,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                    provider_url_documents: bool | None = None, mixed_documents: bool | None = None,
                    group_share_cards: bool | None = None):
     """Release the verified Worker and optionally configure its isolated Telegram schedule."""
+    from page_jump_activation import MIGRATION, require_clear_for_release
+
     _require((provider_binding is None and provider_guard is None) or (provider_binding is not None and callable(provider_guard)),
              "An isolated provider release requires a verified dependency guard.")
     module, desired = _artifact(bundle_dir, manifest, telegram_config, aggregate_key, private_share_key, provider_binding)
@@ -1806,6 +1814,7 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
     config = scope.worker_config()
     had_cron = scope.cron_enabled()
     scope.verify_resources()
+    require_clear_for_release(scope, required=any(entry["name"] == MIGRATION for entry in manifest["migrations"]))
     previous = scope.active()
     old_version, old_selected_capable, old_temp_capable, old_dynamic_all_capable = scope.version(
         previous.version, with_legacy_selected=True, with_legacy_temp=True, with_legacy_dynamic_all=True)
