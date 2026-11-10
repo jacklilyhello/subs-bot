@@ -147,11 +147,13 @@ function verifyTemp(totals: TempTotals, rows: TempBatchRow[]): void {
 }
 
 export async function getAggregateNodeSource(
-  db: D1Database, bucket: R2Bucket, code: string, legacyOnly = false,
+  db: D1Database, bucket: R2Bucket, code: string, legacyOnly = false, signal?: AbortSignal,
 ): Promise<AggregateNodeSource | null> {
   const digest = await codeDigest(code);
   if (digest === null) return null;
+  if (signal?.aborted) throw new SnapshotIntegrityError();
   const [schema, tempStorage] = await Promise.all([readShortLinkNamespaces(db), readTempStorage(db).catch(() => null)]);
+  if (signal?.aborted) throw new SnapshotIntegrityError();
   const withLink = `WITH link AS (SELECT owner_id, kind, bot_id, selected_ids,
     ${legacySelectedStatusSql(schema)} AS legacySelected,${legacyAllStatusSql(schema)} AS legacyAll ${aggregateLinkSql(schema)})`;
   const readLegacy = code.length === 12 && schema.selectedMarker && schema.selectedMembers
@@ -215,6 +217,7 @@ export async function getAggregateNodeSource(
       WHERE link.legacySelected=1 AND member.type='integer'
       ORDER BY CAST(member.key AS INTEGER) LIMIT ?`).bind(digest, MAX_AGGREGATE_MEMBERS + 1)] : []),
   ]);
+  if (signal?.aborted) throw new SnapshotIntegrityError();
   if (results.length !== (readLegacy ? 7 : 6) || results.some(({ success }) => !success)) throw new SnapshotIntegrityError();
   const [linkResult, allResult, selectedResult, totalsResult, tempResult, ruleResult, legacyResult] = results;
   const link = linkResult.results[0] as LinkRow | undefined;
@@ -249,12 +252,14 @@ export async function getAggregateNodeSource(
   let bytes = totals.bytes;
   let chunks = 0;
   for (const snapshot of snapshots) {
+    if (signal?.aborted) throw new SnapshotIntegrityError();
     const plan = await planSnapshotRead(bucket, snapshot);
     bytes += plan.bytes;
     chunks += plan.chunks.length;
     if (bytes > MAX_SNAPSHOT_BYTES || chunks > MAX_SNAPSHOT_CHUNKS) throw new AggregateLimitError();
     plans.push(plan);
   }
+  if (signal?.aborted) throw new SnapshotIntegrityError();
 
   return {
     nodeCount,

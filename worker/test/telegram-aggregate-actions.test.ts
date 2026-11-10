@@ -212,6 +212,43 @@ test("rechecks the exact access epoch at the link send boundary and keeps notice
   assert.ok(sent.every(({ chatId }) => chatId === config.memberId));
 });
 
+test("a stalled aggregate preflight leaves time for the private Clash reply", { timeout: 12_000 }, async (t) => {
+  const config = policy("82012", "83201", "83202");
+  await seed(db, bucket, config.memberId, "slow-preflight");
+  assert.equal(await acceptTelegramAggregate(db, config, event(config, 1, 10), key), "accepted");
+  const stalled = Promise.withResolvers<null>();
+  t.after(() => stalled.resolve(null));
+  let reads = 0;
+  const slowBucket = { get: () => { reads += 1; return stalled.promise; } } as unknown as R2Bucket;
+  const { sent, request } = telegramReplies(config);
+  await drainTelegramReplies(db, slowBucket, config, 1, 15_000, request, key);
+  assert.equal(reads, 1);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].chatId, config.memberId);
+  assert.match(sent[0].text, /\/agg\/[^\s]+\/clash/u);
+  assert.match(sent[0].text, /Base64：暂时无法验证/u);
+  assert.doesNotMatch(sent[0].text, /\/base64/u);
+});
+
+test("revocation during aggregate preflight withholds both capability links", async () => {
+  const config = policy("82013", "83301", "83302");
+  await seed(db, bucket, config.memberId, "revoke-preflight");
+  assert.equal(await acceptTelegramAggregate(db, config, event(config, 1, 10), key), "accepted");
+  let revoked = false;
+  const revokingBucket = { get: async (path: string) => {
+    if (!revoked) {
+      assert.equal(await acceptTelegramAggregate(db, config, event(config, 2, 11, "revoke"), key), "accepted");
+      assert.equal((await action(config, 2))?.result, "revoked");
+      revoked = true;
+    }
+    return bucket.get(path);
+  } } as unknown as R2Bucket;
+  const { sent, request } = telegramReplies(config);
+  await drainTelegramReplies(db, revokingBucket, config, 1, 15_000, request, key);
+  assert.equal(revoked, true);
+  assert.deepEqual(sent, [{ chatId: config.memberId, text: "聚合链接已变更，请重新发送 /export。" }]);
+});
+
 test("excludes marked legacy digests from native slot revocation and final delivery", async () => {
   const config = policy("82044", "82441", "82442");
   await seed(db, bucket, config.memberId, "native-only");
@@ -305,7 +342,7 @@ test("path and terminal document replies survive aggregate gating without head-o
   }
 });
 
-test("the bundled Worker gates private issuance by the optional key and pins the link origin", { timeout: 60_000 }, async () => {
+test("the bundled Worker gates private issuance and advertises Base64 only for compatible aggregate content", { timeout: 60_000 }, async () => {
   const result = await build({ entryPoints: [fileURLToPath(new URL("../src/index.ts", import.meta.url))],
     bundle: true, format: "esm", platform: "browser", target: "es2022", write: false });
   const script = result.outputFiles[0].text;
@@ -355,22 +392,38 @@ test("the bundled Worker gates private issuance by the optional key and pins the
       }
       await scheduled();
       await waitForSent(3);
+      assert.equal(sent[0]?.chatId, config.memberId);
       const url = sent[0]?.text.match(/https:\/\/[^\s]+\/clash/u)?.[0];
       assert.ok(url?.startsWith(`${TELEGRAM_AGGREGATE_ORIGIN}/agg/`));
-      assert.doesNotMatch(sent[0].text, /\/base64|fixture\.invalid|203\.0\.113\.10/u);
-      const base64 = url.replace(/\/clash$/u, "/base64");
+      const base64 = sent[0]?.text.match(/https:\/\/[^\s]+\/base64/u)?.[0];
+      assert.equal(base64, url.replace(/\/clash$/u, "/base64"));
+      assert.ok(base64);
+      assert.doesNotMatch(sent[0].text, /fixture\.invalid|203\.0\.113\.10/u);
       const response = await worker.dispatchFetch(base64);
       assert.equal(response.status, 200);
       assert.equal(response.headers.get("Cache-Control"), "private, no-store");
       assert.equal(await response.text(), Buffer.from(share).toString("base64"));
 
-      assert.equal((await post(4, "/export revoke")).status, 200);
+      const extra = await createSubscription(database, { ownerId: config.memberId, name: "http fixture",
+        sourceUrl: "https://provider.example.invalid/" });
+      assert.equal(await publishNodeSnapshot(database, nodes, { id: extra.id, ownerId: config.memberId, expectedGeneration: 0,
+        expectedLifecycleRevision: 0 }, [{ name: "HTTPS", type: "http", server: "proxy.example.invalid", port: 443, tls: true }]), true);
+      assert.equal((await post(4, "/export")).status, 200);
+      await waitForSent(4);
+      assert.equal(sent[1]?.chatId, config.memberId);
+      assert.ok(sent[1].text.includes(url));
+      assert.match(sent[1].text, /Base64：订阅内容不支持此格式。/u);
+      assert.doesNotMatch(sent[1].text, /\/base64|proxy\.example\.invalid/u);
+      assert.equal((await worker.dispatchFetch(url, { method: "HEAD" })).status, 200);
+      assert.equal((await worker.dispatchFetch(base64, { method: "HEAD" })).status, 422);
+
+      assert.equal((await post(5, "/export revoke")).status, 200);
       assert.equal((await worker.dispatchFetch(base64, { method: "HEAD" })).status, 404);
       const shortcut = new URL(url);
       shortcut.pathname = `/s/${shortcut.pathname.split("/")[2]}`;
       assert.equal((await worker.dispatchFetch(shortcut, { redirect: "manual" })).status, 404);
       await scheduled();
-      await waitForSent(4);
+      await waitForSent(5);
       assert.equal(sent.at(-1)?.text, "聚合导出链接已撤销。");
     } finally {
       await worker.dispose();
