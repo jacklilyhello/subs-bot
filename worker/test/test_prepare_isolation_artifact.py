@@ -205,6 +205,12 @@ class PrepareIsolationArtifactTests(unittest.TestCase):
                 self.use_archive({**self.manifest, key: value}, self.files)
                 self.assert_rejected("invalid provenance or file metadata")
 
+    def test_accepts_a_verified_worker_at_the_module_budget(self):
+        module = b" " * release.MAX_MODULE_BYTES
+        self.use_archive({**self.manifest, "bundleSha256": digest(module)}, {**self.files, "index.js": module})
+        self.assertEqual(release.prepare()["archiveSha256"], digest(self.archive))
+        self.assertEqual((self.destination / "index.js").read_bytes(), module)
+
     def test_rejects_an_empty_or_oversized_worker_with_matching_digest(self):
         for length in (0, release.MAX_MODULE_BYTES + 1):
             with self.subTest(length=length):

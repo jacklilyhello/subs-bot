@@ -264,7 +264,7 @@ async function load(input: RecordValue, uid: number) {
     requireOracle(migration?.name === GENERAL_RUNTIME_MIGRATION.name && migration.sha256 === GENERAL_RUNTIME_MIGRATION.sha256);
     await pinnedFile(join(worker, migration.name), 4096, migration.sha256, uid);
   }
-  const script = decoder.decode(await pinnedFile(join(worker, "index.js"), 1024 * 1024, build.bundleSha256, uid));
+  const script = decoder.decode(await pinnedFile(join(worker, "index.js"), 1152 * 1024, build.bundleSha256, uid));
   requireOracle(script.includes("subs-bot:legacy-selected-http:v1") && script.includes("subs-bot:legacy-selected-retirement:v1"));
   const manifest = parsed(await pinnedFile(join(candidate, "manifest.json"), 256 * 1024, input.candidateManifestSha256, uid));
   const marker = await privateFile(join(candidate, "manifest.sha256"), 65, uid);
