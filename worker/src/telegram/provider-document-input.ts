@@ -5,6 +5,7 @@ export const TELEGRAM_PROVIDER_DOCUMENT_MAX_URLS = 20;
 const MAX_DISTINCT_URLS = 4096;
 const HTTP_START = /^https?:\/\//iu;
 const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
+const encoder = new TextEncoder();
 
 export type TelegramProviderDocumentInput =
   | { kind: "url-list"; urls: string[]; overflow: number }
@@ -54,4 +55,12 @@ export function parseTelegramProviderDocument(bytes: Uint8Array, suffix: string)
   }
   if (invalid) return { kind: "invalid-url-list" };
   return urls.length === 0 ? { kind: "not-url-list" } : { kind: "url-list", urls, overflow: seen.size - urls.length };
+}
+
+/** Multi-URL chat input uses the same standalone-line rules as a text document. */
+export function parseTelegramProviderUrlMessage(text: string): Extract<TelegramProviderDocumentInput, { kind: "url-list" }> | null {
+  if (text.length > 4096 || !text.includes("\n") || /[|\ud800-\udfff]/u.test(text)) return null;
+  if (text.replace(/^\ufeff/u, "").split(/\r?\n/u).filter((line) => /[^ \t]/u.test(line)).length < 2) return null;
+  const parsed = parseTelegramProviderDocument(encoder.encode(text), "txt");
+  return parsed.kind === "url-list" ? parsed : null;
 }
