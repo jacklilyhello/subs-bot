@@ -241,6 +241,8 @@ Cron 完成后用同一 `cohort` 运行 `action=capture`，留空确认字段。
 
 ### 隔离环境发布
 
+Worker 的可选部署绑定 `PUBLIC_ORIGIN` 决定 Telegram 回复中订阅、聚合和普通短链的域名，以及新订阅分享正文中的 Clash 链接。省略时使用隔离域名。显式值只接受完整的 `https://subs-bot-cf-dev-01.lilyya.workers.dev` 或 `https://subs-bot.lilyya.top`，其他值会让 HTTP 返回 503 并停止该版本的 Cron 处理。请求的 Host 不参与链接生成。`/export` 的 Clash 链接和通过预检后附带的 Base64 链接使用同一域名和能力码。原有能力码派生和已保存的分享正文保留原值。若需要改变已有环境的域名，先处理完待发回复及尚未完成的私密分享创建任务，并核对已发出的旧链接仍可访问。
+
 1. 在 GitHub 建立仅允许 `main` 的 `subs-bot-isolation` Environment。将核对过的资源标识保存为此环境的 Secret `SUBS_BOT_CF_ISOLATION_TARGET_JSON`，包含 `accountId`、`workerId`、`workerCreatedOn`、`d1Id`、`d1CreatedAt`、`r2CreatedOn` 和 `namespace`。把数据和 Worker 部署凭据分别保存在此环境的 `SUBS_BOT_CF_BOOTSTRAP_TOKEN`、`SUBS_BOT_CF_DEPLOY_TOKEN`。普通 PR CI 和构建产物不使用这些凭据。 [GitHub Environment 保护规则](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)
 2. 查找当前 `main` 的成功 `Worker CI` 运行。若该提交只改动旧 Python 服务，先手动对 `main` 运行 `Worker CI` 生成同一 SHA 的产物。以该运行 ID 启动 `gh workflow run worker-isolation-deploy.yml --ref main -f source_run_id=<run-id>`。
 3. 发布流程重新核对运行、提交、ZIP 摘要、包内文件清单及独立摘要，验证已登记的资源身份。D1 只接管结构完全一致且已清理合成数据的 `0001` 基线，使用 `subs_bot_schema_migrations` 记录已核对的摘要。后续通过同一流程应用增量建表和建索引。涉及现有数据或表结构变更时单独审查迁移和恢复步骤。 [D1 迁移](https://developers.cloudflare.com/d1/reference/migrations/)
