@@ -1,0 +1,60 @@
+name: Verify isolated Telegram Grep outcomes
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Protected diagnostic phase
+        required: true
+        type: choice
+        options: [arm, inspect, retire]
+      cohort:
+        description: New 32-character lowercase hex cohort, reused for every phase
+        required: true
+        type: string
+      worker_ci_run_id:
+        description: Successful Worker CI run for the exact current main revision
+        required: true
+        type: string
+      confirm:
+        description: For writes, enter "arm Grep diagnostic <cohort>" or "retire Grep diagnostic <cohort>"
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: subs-bot-isolation-deploy
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && github.run_attempt == '1'
+    environment: subs-bot-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify the exact trusted Worker artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CI_RUN_ID: ${{ inputs.worker_ci_run_id }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 -B worker/tools/prepare_isolation_artifact.py > /dev/null
+      - name: Verify only the scoped Grep diagnostic cohort
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_GREP_ACTION: ${{ inputs.action }}
+          SUBS_BOT_GREP_COHORT: ${{ inputs.cohort }}
+          SUBS_BOT_GREP_CONFIRM: ${{ inputs.confirm }}
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
+          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPLOY_TOKEN }}
+          SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
+        run: |
+          python3 -B worker/tools/grep_outcome_isolation.py
