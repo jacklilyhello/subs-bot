@@ -1,5 +1,6 @@
-import { prepareProviderJobLeaseGuard, prepareProviderJobSettlement, providerJobLeaseTable, type ProviderJobLease } from "./provider-jobs.ts";
-import { providerInitialTitleReady, UNNAMED_PROVIDER_SUBSCRIPTION } from "./provider-initial-title.ts";
+import { prepareProviderJobLeaseGuard, prepareProviderJobSettlement, providerHost, providerJobLeaseTable,
+  type ProviderJobLease } from "./provider-jobs.ts";
+import { providerHostnameLabel, providerInitialTitleReady, UNNAMED_PROVIDER_SUBSCRIPTION } from "./provider-initial-title.ts";
 import {
   prepareNodeSnapshotPublication, SNAPSHOT_MANIFEST_ORDINAL, stageNodeSnapshot,
   type NodeRecord, type SnapshotMetadataUpdate, type StagedNodeSnapshot,
@@ -109,21 +110,35 @@ export async function publishProviderSnapshot(
         SELECT 1 FROM provider_snapshot_attempts WHERE ${identity} AND ${summary} AND state='published')`)
         .bind(lease.leaseId, ...bindings),
     ];
+    let titlePlaceholder: string | null = null;
     if (initialTitle !== undefined && lease.scope !== "generic" && lease.scope.queue !== "batch"
-        && lease.kind === "url-import" && lease.expectedGeneration === 0 && lease.expectedLifecycleRevision === 0
-        && await providerInitialTitleReady(db)) {
+        && lease.expectedGeneration === 0 && lease.expectedLifecycleRevision === 0) {
+      if (lease.kind === "url-import" && await providerInitialTitleReady(db)) {
+        titlePlaceholder = UNNAMED_PROVIDER_SUBSCRIPTION;
+      } else if (lease.kind === "refresh" && lease.scope.includeDocuments && await db.prepare(`SELECT 1 AS confirmed
+        FROM telegram_provider_document_lines AS line JOIN telegram_provider_documents AS origin USING (receipt_id)
+        WHERE line.job_id=? AND line.subscription_id=? AND line.source_sha256=? AND line.expected_generation=0
+          AND line.expected_lifecycle_revision=0 AND origin.bot_id=? AND origin.actor_id=?
+          AND NOT EXISTS (SELECT 1 FROM telegram_document_jobs WHERE receipt_id=origin.receipt_id)`)
+        .bind(lease.jobId, lease.id, lease.sourceSha256, lease.scope.botId, lease.ownerId).first<number>("confirmed") === 1
+        && await providerInitialTitleReady(db, true)) {
+        const host = providerHost(lease.sourceUrl);
+        if (host) titlePlaceholder = providerHostnameLabel(host);
+      }
+    }
+    if (titlePlaceholder !== null) {
       const target = "id=? AND owner_id=? AND generation=1 AND snapshot_id=?";
       const targetBindings = [lease.id, lease.ownerId, staged.snapshotId];
       const intent = "subscription_id=? AND request_key=? AND source_sha256=? AND expires_at=?";
       const intentBindings = [lease.id, lease.requestKey, lease.sourceSha256, lease.expiresAt];
       const published = `EXISTS (SELECT 1 FROM provider_snapshot_attempts WHERE ${identity} AND ${summary} AND state='published')`;
-      if (initialTitle && initialTitle !== UNNAMED_PROVIDER_SUBSCRIPTION) {
+      if (initialTitle && initialTitle !== titlePlaceholder) {
         // Settlement still verifies the original revision. Bump it only after the
         // pointer, job, and journal transitions, so a successful title invalidates old name tickets.
         const rename = await prepareOwnedSubscriptionMutation(db, lease, { kind: "rename", name: initialTitle }, {
           sql: `changes()=? AND generation=1 AND snapshot_id=? AND name=? AND ${published}
             AND EXISTS (SELECT 1 FROM telegram_provider_initial_titles WHERE ${intent})`,
-          bindings: [staged.objectCount, staged.snapshotId, UNNAMED_PROVIDER_SUBSCRIPTION, ...bindings, ...intentBindings],
+          bindings: [staged.objectCount, staged.snapshotId, titlePlaceholder, ...bindings, ...intentBindings],
         });
         steps.push(rename.first, ...rename.followups);
       }

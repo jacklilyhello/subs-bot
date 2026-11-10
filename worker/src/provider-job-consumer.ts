@@ -145,7 +145,8 @@ export async function runOneProviderJob(
   } catch {
     return settleProviderJob(db, lease, { kind: "retry", reason: "storage-failed" });
   }
-  const initialTitle = lease.scope !== "generic" && lease.kind === "url-import"
+  const initialTitle = lease.scope !== "generic" && lease.scope.queue !== "batch"
+    && (lease.kind === "url-import" || lease.scope.includeDocuments)
     && lease.expectedGeneration === 0 && lease.expectedLifecycleRevision === 0
     ? initialProviderTitle(fetched.metadata, lease.sourceUrl) : undefined;
   const outcome = staged

@@ -5,6 +5,7 @@ import { after, before, test } from "node:test";
 
 import { Miniflare } from "miniflare";
 
+import { readTelegramInlineTempNodes } from "../src/telegram/inline-temp-nodes.ts";
 import type { TelegramPolicy, TelegramTempUpdate } from "../src/telegram/protocol.ts";
 import {
   acceptTelegramTemp, MAX_TEMP_BATCH_BYTES, MAX_TEMP_OWNER_BYTES, MAX_TEMP_OWNER_NODES, renderTelegramTemp,
@@ -12,7 +13,7 @@ import {
 } from "../src/telegram/temp-import.ts";
 import { beginTelegramReply, beginTelegramTempRawReply, claimTelegramReply, settleTelegramReply } from "../src/telegram/store.ts";
 import { confirmTelegramTempRawSend, prepareTelegramTempRawReply } from "../src/telegram/temp-raw.ts";
-import { LEGACY_TEMP_MIGRATION_NAME, LEGACY_TEMP_MIGRATION_SHA256 } from "../src/telegram/temp-storage.ts";
+import { LEGACY_TEMP_MIGRATION_NAME, LEGACY_TEMP_MIGRATION_SHA256, TELEGRAM_GENERAL_TEMP_MARKER } from "../src/telegram/temp-storage.ts";
 
 const miniflare = new Miniflare({
   modules: true,
@@ -473,4 +474,94 @@ test("first-seen pre-grant clears cannot delete nodes or advance the clear fence
   assert.equal((await storedReply(config, 5))?.kind, "cleared");
   assert.deepEqual(await db.prepare("SELECT message_date,message_id FROM telegram_temp_clear_fence WHERE bot_id=? AND actor_id=?")
     .bind(config.botId, config.memberId).first(), { message_date: grantDate + 1, message_id: 1 });
+});
+
+test("verifies committed general batches after revoke and clears them with the original atomic owner watermark", async () => {
+  const config = policy("97014");
+  const now = Math.floor(Date.now() / 1000);
+  const digest = "a".repeat(64);
+  const release = "b".repeat(40);
+  await db.prepare("CREATE TABLE subs_bot_schema_migrations(position INTEGER PRIMARY KEY,name TEXT,sha256 TEXT,mode TEXT)").run();
+  const generalMigrations = [[44, "0044_telegram_general_runtime.sql"], [46, "0046_telegram_general_receipts.sql"]] as const;
+  for (const [position, name] of generalMigrations) {
+    const bytes = await readFile(new URL(name, migrationDir));
+    await db.prepare("INSERT INTO subs_bot_schema_migrations VALUES (?,?,?,'applied')")
+      .bind(position, name, createHash("sha256").update(bytes).digest("hex")).run();
+  }
+  await db.batch([
+    db.prepare("INSERT INTO telegram_general_policy VALUES (?,1,?,?,?,1)").bind(config.botId, release, digest, now - 60),
+    db.prepare("INSERT INTO telegram_general_actors VALUES (?,1,?,1,?,'member')").bind(config.botId, config.memberId, now - 60),
+  ]);
+  const current = (updateId: number, messageId: number, date = now - 2, actorId = config.memberId) =>
+    ({ ...event(config, updateId, messageId, actorId), messageDate: date });
+  for (const [updateId, messageId, text] of [[1, 10, firstShare], [2, 20, secondShare], [3, 40, firstShare]] as const) {
+    assert.equal(await submit(config, { ...current(updateId, messageId), kind: "temp-text", text }), "accepted");
+  }
+
+  // Model future atomically committed provenance. This patch adds no general ingress.
+  const record = await db.prepare("SELECT receipt_id FROM telegram_inbox WHERE bot_id=? AND update_id=2")
+    .bind(config.botId).first<number>("receipt_id");
+  assert.ok(record);
+  const marked = await db.batch([
+    db.prepare("UPDATE telegram_inbox SET receipt_nonce=? WHERE bot_id=? AND update_id IN (2,3)")
+      .bind(TELEGRAM_GENERAL_TEMP_MARKER, config.botId),
+    db.prepare(`INSERT INTO telegram_general_receipt
+      SELECT receipt_id,1,1,'member',?,?,? FROM telegram_inbox WHERE bot_id=? AND update_id IN (2,3)`)
+      .bind(release, digest, now - 60, config.botId),
+    db.prepare(`UPDATE telegram_outbox SET state='sent',sent_message_id=100+receipt_id
+      WHERE receipt_id IN (SELECT receipt_id FROM telegram_inbox WHERE bot_id=? AND update_id IN (1,2,3))`).bind(config.botId),
+  ]);
+  assert.ok(marked.every(({ success }) => success));
+  await db.batch([
+    db.prepare("INSERT INTO telegram_general_actors VALUES (?,1,?,2,?,'denied')").bind(config.botId, config.memberId, now - 1),
+    db.prepare("UPDATE telegram_general_policy SET active=0,generation=2,activation_sha256=? WHERE bot_id=?")
+      .bind("c".repeat(64), config.botId),
+  ]);
+  const inline = await readTelegramInlineTempNodes(db, config, {
+    updateId: 9, actorId: config.memberId, chatType: "sender", queryId: "fixture-inline", query: "",
+  }, "", 3, Date.now() + 5_000, now);
+  assert.ok(inline);
+  assert.equal(inline.results.length, 3);
+  assert.match(inline.results[1].title, /synthetic-second/u);
+  assert.doesNotMatch(JSON.stringify(inline.results), /ssr:\/\//u);
+
+  assert.equal(await submit(config, { ...current(4, 50, now), kind: "temp-raw" }), "accepted");
+  const lease = await claimTelegramReply(db, config.botId);
+  assert.ok(lease?.tempRaw);
+  const prepared = await prepareTelegramTempRawReply(db, config, lease, Date.now() + 5_000);
+  assert.equal(prepared.kind, "text");
+  if (prepared.kind !== "text") return;
+  assert.match(prepared.text, /ssr:\/\/synthetic-opaque-share/u);
+
+  const schemaDigest = createHash("sha256").update(await readFile(new URL(generalMigrations[1][1], migrationDir))).digest("hex");
+  await db.prepare("UPDATE subs_bot_schema_migrations SET sha256=? WHERE position=46").bind("0".repeat(64)).run();
+  assert.equal(await beginTelegramTempRawReply(db, config, lease, prepared.guard), false);
+  assert.deepEqual(await prepareTelegramTempRawReply(db, config, lease, Date.now() + 5_000), { kind: "unavailable" });
+  await db.prepare("UPDATE subs_bot_schema_migrations SET sha256=? WHERE position=46").bind(schemaDigest).run();
+  await db.prepare("UPDATE telegram_general_receipt SET actor_revision=2 WHERE receipt_id=?").bind(record).run();
+  assert.equal(await beginTelegramTempRawReply(db, config, lease, prepared.guard), false, "a denied historical row cannot prove ownership");
+  await db.prepare("UPDATE telegram_general_receipt SET actor_revision=1 WHERE receipt_id=?").bind(record).run();
+  assert.equal(await beginTelegramTempRawReply(db, config, lease, prepared.guard), true);
+
+  assert.equal(await submit(config, { ...current(6, 15, now - 2, config.adminId), kind: "temp-text", text: firstShare }), "accepted");
+  const clear = { ...current(5, 30), kind: "temp-clear" } as const;
+  await db.prepare(`CREATE TRIGGER fixture_general_temp_clear_abort BEFORE INSERT ON telegram_outbox
+    WHEN EXISTS (SELECT 1 FROM telegram_inbox WHERE receipt_id=NEW.receipt_id AND bot_id='97014' AND update_id=5)
+    BEGIN SELECT RAISE(IGNORE); END`).run();
+  try {
+    await assert.rejects(submit(config, clear), /receipt could not be confirmed/u);
+    assert.equal((await totals(config))?.nodes, 3);
+    assert.equal(await db.prepare("SELECT message_id FROM telegram_temp_clear_fence WHERE bot_id=? AND actor_id=?")
+      .bind(config.botId, config.memberId).first("message_id"), null);
+  } finally {
+    await db.prepare("DROP TRIGGER fixture_general_temp_clear_abort").run();
+  }
+  assert.equal(await submit(config, clear), "accepted");
+  assert.equal(await submit(config, clear), "ignored");
+  const cleared = await storedReply(config, 5);
+  assert.deepEqual([cleared?.kind, cleared?.nodeCount, cleared?.totalCount], ["cleared", 2, 1]);
+  assert.equal(await confirmTelegramTempRawSend(db, config, lease, prepared.guard), false);
+  assert.deepEqual((await db.prepare(`SELECT actor_id,message_id FROM telegram_temp_batch
+    WHERE bot_id=? ORDER BY actor_id`).bind(config.botId).all()).results,
+    [{ actor_id: config.adminId, message_id: 15 }, { actor_id: config.memberId, message_id: 40 }]);
 });

@@ -1,4 +1,5 @@
 import type { ProviderMetadata } from "./provider-fetch-contract.ts";
+import { normalizeSubscriptionName } from "./subscriptions.ts";
 
 export const PROVIDER_INITIAL_TITLE_MIGRATION = "0041_telegram_provider_initial_titles.sql";
 export const PROVIDER_INITIAL_TITLE_SHA256 = "e3b73a4584b38b0fa6fb9a4fe86705aa47193b1410094e740a771f977df410bf";
@@ -6,7 +7,11 @@ export const UNNAMED_PROVIDER_SUBSCRIPTION = "远程订阅";
 
 const forbidden = /[\p{Cc}\p{Cf}\p{Cs}\u2028\u2029/\\]/u;
 
-export async function providerInitialTitleReady(db: D1Database): Promise<boolean> {
+export function providerHostnameLabel(hostname: string): string {
+  return normalizeSubscriptionName(Array.from(hostname).slice(0, 64).join(""));
+}
+
+export async function providerInitialTitleReady(db: D1Database, retryUnconfirmed = false): Promise<boolean> {
   try {
     return await db.prepare(`SELECT 1 AS ready FROM subs_bot_schema_migrations
       WHERE position=41 AND name=? AND sha256=? AND mode='applied'
@@ -15,6 +20,10 @@ export async function providerInitialTitleReady(db: D1Database): Promise<boolean
           (type='index' AND name='telegram_provider_initial_titles_expiry')))=2`)
       .bind(PROVIDER_INITIAL_TITLE_MIGRATION, PROVIDER_INITIAL_TITLE_SHA256).first<number>("ready") === 1;
   } catch {
+    if (retryUnconfirmed && await db.prepare(`SELECT 1 AS present FROM sqlite_schema
+      WHERE type='table' AND name='subs_bot_schema_migrations'`).first<number>("present") === 1) {
+      throw new Error("Provider title readiness could not be confirmed.");
+    }
     return false;
   }
 }

@@ -1,0 +1,133 @@
+import { digestHex, validInteger } from "../storage.ts";
+import type { GeneralTelegramPin } from "./general-auth-runtime.ts";
+import { GENERAL_ACTOR_QUEUE_CAPACITY, GENERAL_LATEST_ACTOR_SQL, GENERAL_NO_LEGACY_WORK, GENERAL_POLICY_ACTORS_SQL, GENERAL_POLICY_PIN_SQL,
+  GENERAL_RECEIPT_SCHEMA, GENERAL_REPLY_TTL, generalCurrentReceiptSql, generalPolicyBindings,
+  prepareGeneralReceiptAuthority } from "./general-receipt.ts";
+import { SUBSCRIPTION_READ_TICKET, type TelegramSubscriptionReadUpdate } from "./protocol.ts";
+import { GENERAL_SUBSCRIPTION_READ_MARKER, prepareTelegramSubscriptionSearchReceipt, renderGeneralSubscriptionMetadata,
+  renderTelegramSearchResults, scanTelegramSubscriptionSearch, type TelegramSubscriptionReadReceipt } from "./subscription-read.ts";
+
+type ReadEvent = Extract<TelegramSubscriptionReadUpdate, { kind: "search" | "callback" }>;
+type ReadLease = {
+  receiptId: number; actorId: string; chatId: string; chatType: string; threadId: number | null;
+  leaseId: string; attempts: number;
+};
+
+const freshness = "incoming.bot_id=? AND incoming.update_id=? AND incoming.receipt_nonce=?";
+const DETAIL_PROOF = `FROM telegram_subscription_read_ticket AS ticket
+  JOIN telegram_inbox AS origin ON origin.receipt_id=ticket.origin_receipt_id
+  JOIN telegram_outbox AS delivered ON delivered.receipt_id=origin.receipt_id
+  JOIN telegram_subscription_read AS root ON root.receipt_id=origin.receipt_id
+  JOIN json_each(root.matches) AS item
+  JOIN subscriptions AS sub ON sub.id=ticket.subscription_id AND sub.owner_id=origin.actor_id
+  LEFT JOIN subscription_lifecycle AS lifecycle ON lifecycle.subscription_id=sub.id
+  WHERE ticket.kind='detail' AND ticket.expires_at>unixepoch() AND root.kind='search' AND root.search_receipt_id IS NULL
+    AND delivered.state='sent' AND delivered.attempts=ticket.origin_attempt AND origin.receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MARKER}'
+    AND origin.chat_type='private' AND origin.actor_id=origin.chat_id AND origin.thread_id IS NULL
+    AND json_extract(item.value,'$[0]')=ticket.subscription_id
+    AND json_extract(item.value,'$[2]')=COALESCE(lifecycle.revision,0)
+    AND ${generalCurrentReceiptSql("origin")}`;
+
+function eventAuthorization(pin: GeneralTelegramPin, event: ReadEvent) {
+  return { sql: `FROM ${GENERAL_POLICY_ACTORS_SQL}
+    WHERE ${GENERAL_POLICY_PIN_SQL} AND ${GENERAL_RECEIPT_SCHEMA} AND policy.active=1 AND ${GENERAL_NO_LEGACY_WORK}
+      AND actor.actor_id=? AND ${GENERAL_LATEST_ACTOR_SQL}
+      AND ?>MAX(policy.cutover_at,actor.effective_at,unixepoch()-${GENERAL_REPLY_TTL}) AND ?<=unixepoch()+60
+      AND NOT EXISTS (SELECT 1 FROM telegram_general_replies WHERE bot_id=policy.bot_id AND update_id=?)
+      AND NOT EXISTS (SELECT 1 FROM telegram_inbox WHERE bot_id=policy.bot_id AND update_id=?)
+      AND ${GENERAL_ACTOR_QUEUE_CAPACITY}`,
+  bindings: [...generalPolicyBindings(pin), event.actorId, event.messageDate, event.messageDate, event.updateId, event.updateId] };
+}
+
+export async function acceptGeneralTelegramSubscriptionRead(
+  db: D1Database, pin: GeneralTelegramPin, event: ReadEvent,
+): Promise<boolean> {
+  if (!pin.privateManagement || event.actorId === pin.botId || event.chatType !== "private" || event.chatId !== event.actorId
+    || event.threadId !== null || (event.kind === "callback" && !SUBSCRIPTION_READ_TICKET.test(event.ticket))) return false;
+  try {
+    const auth = eventAuthorization(pin, event);
+    const key = [pin.botId, event.updateId, crypto.randomUUID()] as const;
+    if (event.kind === "search" && !await db.prepare(`SELECT 1 ${auth.sql}`).bind(...auth.bindings).first()) return false;
+    const scan = event.kind === "search" ? await scanTelegramSubscriptionSearch(db, event.actorId, event.query, true) : null;
+    const digest = event.kind === "callback"
+      ? digestHex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(event.ticket))) : null;
+    const steps = [
+      db.prepare(`INSERT INTO telegram_inbox
+        (bot_id,update_id,actor_id,chat_id,chat_type,message_id,message_date,thread_id,command,receipt_nonce)
+        SELECT policy.bot_id,?,actor.actor_id,actor.actor_id,'private',?,?,NULL,'help',? ${auth.sql}
+        ${digest === null ? "" : `AND EXISTS (SELECT 1 ${DETAIL_PROOF} AND ticket.token_sha256=?
+          AND ticket.used_by_receipt_id IS NULL AND origin.bot_id=policy.bot_id AND origin.actor_id=actor.actor_id
+          AND delivered.sent_message_id=? AND ?>=origin.message_date)`}
+        ON CONFLICT(bot_id,update_id) DO NOTHING`).bind(event.updateId, event.messageId, event.messageDate, key[2], ...auth.bindings,
+        ...(digest === null ? [] : [...generalPolicyBindings(pin), digest, event.messageId, event.messageDate])),
+      prepareGeneralReceiptAuthority(db, pin, key),
+    ];
+    if (scan) steps.push(prepareTelegramSubscriptionSearchReceipt(db, key, scan));
+    else {
+      steps.push(
+        db.prepare(`UPDATE telegram_subscription_read_ticket AS ticket SET used_by_receipt_id=incoming.receipt_id
+          FROM telegram_inbox AS incoming WHERE ticket.token_sha256=? AND ticket.used_by_receipt_id IS NULL AND ${freshness}`)
+          .bind(digest, ...key),
+        db.prepare(`INSERT INTO telegram_subscription_read (receipt_id,kind,subscription_id,auth_message_date,auth_message_id)
+          SELECT incoming.receipt_id,'detail',ticket.subscription_id,0,0
+          FROM telegram_inbox AS incoming JOIN telegram_subscription_read_ticket AS ticket ON ticket.used_by_receipt_id=incoming.receipt_id
+          WHERE ${freshness}`).bind(...key),
+      );
+    }
+    steps.push(
+      db.prepare(`INSERT INTO telegram_outbox (receipt_id)
+        SELECT incoming.receipt_id FROM telegram_inbox AS incoming WHERE ${freshness}`).bind(...key),
+      db.prepare(`UPDATE telegram_inbox AS incoming SET receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MARKER}',command=CASE WHEN
+        EXISTS (SELECT 1 FROM telegram_subscription_read AS detail JOIN telegram_outbox AS reply USING (receipt_id)
+          WHERE detail.receipt_id=incoming.receipt_id AND detail.kind<>'format')
+        AND ${generalCurrentReceiptSql("incoming")} THEN command END WHERE ${freshness} RETURNING receipt_id`)
+        .bind(...generalPolicyBindings(pin), ...key),
+    );
+    const results = await db.batch(steps);
+    const receipt = results.at(-1);
+    if (receipt && results.length === steps.length && results.every(({ success }) => success) && receipt.results.length <= 1) {
+      return receipt.results.length === 1;
+    }
+  } catch {
+    // Binding diagnostics can include private data.
+  }
+  throw new Error("General Telegram subscription read could not be confirmed.");
+}
+
+export async function renderGeneralSubscriptionRead(
+  db: D1Database, pin: GeneralTelegramPin, lease: ReadLease,
+): Promise<Awaited<ReturnType<typeof renderTelegramSearchResults>> | null> {
+  const guard = { sql: `inbox.receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MARKER}' AND ${generalCurrentReceiptSql("inbox")}`,
+    bindings: generalPolicyBindings(pin) };
+  const row = await db.prepare(`SELECT detail.kind,detail.subscription_id AS subscriptionId,detail.format,
+      detail.search_receipt_id AS searchReceiptId,detail.search_offset AS searchOffset
+    FROM telegram_inbox AS inbox JOIN telegram_subscription_read AS detail USING (receipt_id)
+    JOIN telegram_outbox AS reply USING (receipt_id)
+    WHERE inbox.receipt_id=? AND inbox.bot_id=? AND inbox.actor_id=? AND inbox.chat_id=inbox.actor_id
+      AND inbox.chat_type='private' AND inbox.thread_id IS NULL AND reply.state='leased'
+      AND reply.lease_id=? AND reply.attempts=? AND reply.lease_until>unixepoch() AND ${guard.sql}`)
+    .bind(lease.receiptId, pin.botId, lease.actorId, lease.leaseId, lease.attempts, ...guard.bindings)
+    .first<TelegramSubscriptionReadReceipt>();
+  if (!row || row.kind === "format") return null;
+  if (row.kind === "search" && row.searchReceiptId === null && row.searchOffset === 0) {
+    return renderTelegramSearchResults(db, pin, lease, row, guard, true);
+  }
+  if (row.kind === "detail" && row.subscriptionId !== null) {
+    const proof = `SELECT COALESCE(lifecycle.revision,0) AS revision ${DETAIL_PROOF}
+      AND ticket.subscription_id=? AND ticket.used_by_receipt_id=? AND origin.bot_id=? AND origin.actor_id=?`;
+    const revision = await db.prepare(proof).bind(...generalPolicyBindings(pin), row.subscriptionId,
+      lease.receiptId, pin.botId, lease.actorId).first<number>("revision");
+    if (!validInteger(revision, 0)) return { text: "订阅不存在或已被更改。", readGuard: guard };
+    return renderGeneralSubscriptionMetadata(db, lease.actorId, row.subscriptionId, revision, {
+      sql: `CASE WHEN (${guard.sql}) IS NOT TRUE THEN 0
+        WHEN EXISTS (SELECT 1 ${DETAIL_PROOF} AND ticket.subscription_id=?
+          AND ticket.used_by_receipt_id=inbox.receipt_id AND origin.bot_id=inbox.bot_id AND origin.actor_id=inbox.actor_id)
+        THEN 1 ELSE 0 END`,
+      bindings: [...guard.bindings, ...generalPolicyBindings(pin), row.subscriptionId],
+    });
+  }
+  const text = row.kind === "usage" ? "用法：/s 名称关键词"
+    : row.kind === "limit" ? "查询达到处理上限，请缩短关键词或从 /list 选择订阅。"
+    : "订阅或授权状态已变更，请重新查询。";
+  return { text, readGuard: guard };
+}
