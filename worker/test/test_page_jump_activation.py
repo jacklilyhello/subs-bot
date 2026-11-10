@@ -108,9 +108,9 @@ class PageJumpActivationTests(TestCase):
             "revision": self.scope.prior.revision,
             "bundleSha256": self.scope.prior.digest,
             "checkpoint": {"activeSha256": _digest({"scope": TARGET, "deployment": asdict(self.scope.previous),
-                                                    "version": asdict(self.scope.prior)})},
+                                                    "version": cloudflare.version_evidence(self.scope.prior)})},
             "reservedGateSha256": _digest(asdict(self.reserved)),
-            "candidateSha256": _digest({"versionId": CANDIDATE, "version": asdict(self.scope.desired)}),
+            "candidateSha256": _digest({"versionId": CANDIDATE, "version": cloudflare.version_evidence(self.scope.desired)}),
         }
         reader = patch.object(activation, "read_source", return_value=self.stage)
         self.read_source = reader.start()

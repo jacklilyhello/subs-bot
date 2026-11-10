@@ -9,7 +9,7 @@ import stat
 
 from cloudflare_isolation import (
     CloudflareError, WORKER_NAME, _Isolation, _api_status_tag, _artifact, _page_jump_tag,
-    _require, _telegram_feature_tag, _verify_health,
+    _require, _telegram_feature_tag, _verify_health, version_evidence,
 )
 from d1_migrations import _load_migrations, _read_state
 from page_jump_control import MAX_SAFE_INTEGER, PageJumpControl, PageJumpGate
@@ -90,6 +90,8 @@ def _ordinary_tag(base, active):
         url_documents_module_sha256=active.digest if active.telegram_provider_url_documents_capable else None,
         mixed_documents=active.telegram_mixed_documents if active.telegram_mixed_documents_capable else None,
         group_share_cards=active.telegram_group_share_cards if active.telegram_group_share_cards_capable else None,
+        subscription_shorts=active.telegram_subscription_shorts if active.telegram_subscription_shorts_capable else None,
+        short_module_sha256=active.digest if active.telegram_subscription_shorts_capable else None,
     )
 
 
@@ -130,7 +132,7 @@ def prepare_stage(worker_api, data_api, target, bundle, manifest, telegram_confi
         guard()
         return scope.active() == deployment and scope.version(deployment.version) == active
 
-    active_pin = _digest({"scope": target, "deployment": asdict(deployment), "version": asdict(active)})
+    active_pin = _digest({"scope": target, "deployment": asdict(deployment), "version": version_evidence(active)})
     observed = control.observe()
     current = observed.gate
     _require((current is None or not current.enabled) and not observed.unsettled,
@@ -171,7 +173,7 @@ def prepare_stage(worker_api, data_api, target, bundle, manifest, telegram_confi
     control.verify_drained(reserved, current_release)
     return {**evidence, "phase": "staged", "checkpoint": expected, "epoch": run_id,
             "reservedGateSha256": _digest(_gate_document(reserved)),
-            "candidateSha256": _digest({"versionId": candidate, "version": asdict(desired)})}
+            "candidateSha256": _digest({"versionId": candidate, "version": version_evidence(desired)})}
 
 
 def write_evidence(directory, value):

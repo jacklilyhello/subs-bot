@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { Miniflare } from "miniflare";
 import { createSubscription, publishNodeSnapshot } from "../src/storage.ts";
 import { trashOwnedSubscription } from "../src/subscriptions.ts";
-import { beginTelegramReply, claimTelegramReply, settleTelegramReply } from "../src/telegram/store.ts";
+import { parseTelegramAggregateKey, TELEGRAM_AGGREGATE_ORIGIN } from "../src/telegram/aggregate-actions.ts";
+import { beginTelegramReply, beginTelegramSubscriptionShortReply, claimTelegramReply, settleTelegramReply } from "../src/telegram/store.ts";
+import { prepareTelegramSubscriptionShort, SUBSCRIPTION_SHORT_CODE, SUBSCRIPTION_SHORT_MIGRATION,
+  subscriptionShortSendGuard } from "../src/telegram/subscription-shorts.ts";
 import { acceptTelegramPageJump, telegramPageJumpEpoch } from "../src/telegram/page-jump.ts";
 import {
   acceptTelegramSubscriptionRead, confirmTelegramSubscriptionReadSend, renderTelegramSubscriptionRead,
@@ -19,6 +22,7 @@ const policy: TelegramPolicy = {
 };
 const share = "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.10:8388#Synthetic";
 const needle = "STRAẞE-Aς";
+const configuredOrigin = "https://subs-bot.lilyya.top";
 const expectedFormats = { "Clash Meta": "clash", "Sing-box": "singbox", Base64: "base64", Surge: "surge", QX: "qx" };
 
 type Sent = {
@@ -38,6 +42,9 @@ test("emitted Worker searches personal subscriptions and sends only guarded priv
   const script = await readFile(join(directory, "index.js"));
   assert.equal(createHash("sha256").update(script).digest("hex"), manifest.bundleSha256);
   const sent: Sent[] = [];
+  const encodedKey = Buffer.alloc(32, 63).toString("base64url");
+  let throttleReplyTo: number | null = null;
+  let uncertainReplyTo: number | null = null;
   const fixture = {
     modules: true, script: script.toString("utf8"), compatibilityDate: manifest.compatibilityDate,
     d1Databases: { DB: "telegram-read-fixture" }, r2Buckets: { NODES: "telegram-read-fixture" },
@@ -58,37 +65,50 @@ test("emitted Worker searches personal subscriptions and sends only guarded priv
         buttons: body.reply_markup?.inline_keyboard?.flat() ?? [], threadId: body.message_thread_id ?? null,
         forceReply: body.reply_markup?.force_reply === true };
       sent.push(entry);
+      if (entry.replyTo === throttleReplyTo) {
+        throttleReplyTo = null;
+        return Response.json({ ok: false, error_code: 429, parameters: { retry_after: 1 } }, { status: 429 });
+      }
+      if (entry.replyTo === uncertainReplyTo) return new Response(null, { status: 502 });
       return Response.json({ ok: true, result: { message_id: entry.id, chat: { id: Number(entry.chat) } } });
     },
   };
   const runtime = new Miniflare({ workers: [
     { ...fixture, name: "enabled", bindings: { ...fixture.bindings, TELEGRAM_PAGE_JUMP: "v2:1" } },
     { ...fixture, name: "dormant" },
+    { ...fixture, name: "typed", bindings: { ...fixture.bindings, TELEGRAM_AGGREGATE_KEY: encodedKey,
+      TELEGRAM_SUBSCRIPTION_SHORTS: "1", PUBLIC_ORIGIN: configuredOrigin } },
+    { ...fixture, name: "typed-drain", bindings: { ...fixture.bindings, TELEGRAM_AGGREGATE_KEY: encodedKey } },
   ] });
   try {
     const db = await runtime.getD1Database("DB", "enabled");
     const bucket = await runtime.getR2Bucket("NODES", "enabled");
     const enabled = await runtime.getWorker("enabled");
     const dormant = await runtime.getWorker("dormant");
+    const typed = await runtime.getWorker("typed");
+    const typedDrain = await runtime.getWorker("typed-drain");
     async function applyMigration(migration: { name: string; sha256: string }) {
       const bytes = await readFile(join(directory!, migration.name));
       assert.equal(createHash("sha256").update(bytes).digest("hex"), migration.sha256);
       await db.batch(bytes.toString("utf8").trim().split(/;\s*/u).filter(Boolean).map((sql) => db.prepare(sql)));
     }
     const readMigration = manifest.migrations.find((item: { name: string }) => item.name === "0018_telegram_subscription_reads.sql");
-    assert.ok(readMigration);
-    for (const migration of manifest.migrations) if (migration !== readMigration) await applyMigration(migration);
+    const typedMigration = manifest.migrations.find((item: { name: string }) => item.name === SUBSCRIPTION_SHORT_MIGRATION);
+    assert.ok(readMigration && typedMigration);
+    for (const migration of manifest.migrations) if (migration !== readMigration && migration !== typedMigration) await applyMigration(migration);
     let sequence = 0;
     const now = () => Math.floor(Date.now() / 1000);
     const chat = (id: string) => ({ id: Number(id), type: id === policy.groupId ? "supergroup" : "private" });
     const actor = (id: string) => ({ id: Number(id), is_bot: false });
-    const post = (update: unknown, inactive = false) => {
+    type Mode = boolean | "typed" | "typed-drain";
+    const post = (update: unknown, inactive: Mode = false) => {
       const url = "https://worker.example.invalid/telegram/webhook";
       const options = {
         method: "POST", headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": policy.webhookSecret },
         body: JSON.stringify(update),
       };
-      return (inactive ? dormant : enabled).fetch(url, options);
+      const worker = inactive === "typed" ? typed : inactive === "typed-drain" ? typedDrain : inactive ? dormant : enabled;
+      return worker.fetch(url, options);
     };
     async function message(text: string, owner = policy.adminId, chatId = owner, threadId?: number, inactive = false) {
       const id = ++sequence;
@@ -100,7 +120,8 @@ test("emitted Worker searches personal subscriptions and sends only guarded priv
       } }, inactive);
       return { id, response };
     }
-    async function click(origin: Sent, ticket: string, owner = policy.adminId, chatId = owner, threadId = origin.threadId, inactive = false) {
+    async function click(origin: Sent, ticket: string, owner = policy.adminId, chatId = owner, threadId = origin.threadId,
+      inactive: Mode = false) {
       const updateId = ++sequence;
       const response = await post({ update_id: updateId, callback_query: {
         id: `synthetic-read-${updateId}`, data: ticket, from: actor(owner), message: {
@@ -108,7 +129,7 @@ test("emitted Worker searches personal subscriptions and sends only guarded priv
           ...(threadId === null ? {} : { message_thread_id: threadId }),
         },
       } }, inactive);
-      assert.equal(response.status, inactive ? 204 : 200);
+      assert.equal(response.status, inactive === true ? 204 : 200);
       return updateId;
     }
     async function waitForReply(chatId: string, replyTo: number, after = 0): Promise<Sent> {
@@ -134,6 +155,7 @@ test("emitted Worker searches personal subscriptions and sends only guarded priv
     assert.equal(preMigration.response.status, 204);
     await noReceipt(preMigration.id);
     await applyMigration(readMigration);
+    await applyMigration(typedMigration);
     async function seed(ownerId: string, name: string, sourceUrl: string, nodes: Record<string, unknown>[] = []) {
       const sub = await createSubscription(db, { ownerId, name, sourceUrl });
       if (nodes.length) {
@@ -189,6 +211,137 @@ test("emitted Worker searches personal subscriptions and sends only guarded priv
     assert.equal(encoded.status, 200);
     assert.equal(await encoded.text(), Buffer.from(share).toString("base64"));
 
+    const typedDetail = await waitForReply(policy.adminId, (await message("١")).id);
+    const aggregateKey = await parseTelegramAggregateKey(encodedKey);
+    assert.ok(aggregateKey);
+    async function leaseTyped(origin: Sent, label: string, owner = policy.adminId) {
+      const input = { kind: "callback" as const, callbackId: "synthetic-typed-short", ticket: ticket(origin, label), updateId: ++sequence,
+        actorId: owner, chatId: owner, chatType: "private", threadId: null, messageId: origin.id, messageDate: now() };
+      assert.equal(await acceptTelegramSubscriptionRead(db, policy, input), "accepted");
+      assert.equal(await acceptTelegramSubscriptionRead(db, policy, input), "ignored");
+      const lease = await claimTelegramReply(db, policy.botId, false, false, true);
+      assert.ok(lease?.subscriptionRead);
+      const rendered = await renderTelegramSubscriptionRead(db, bucket, policy, lease, Date.now() + 5_000);
+      assert.ok(rendered.readGuard && rendered.shortTarget);
+      return { lease, read: rendered.readGuard, target: rendered.shortTarget };
+    }
+    const typedCodes: string[] = [];
+    for (const [label, format] of Object.entries(expectedFormats)) {
+      const { lease, read, target } = await leaseTyped(typedDetail, label);
+      const prepare = (current: typeof lease, enabled: boolean) =>
+        prepareTelegramSubscriptionShort(db, policy, current, target, read, aggregateKey, enabled);
+      assert.equal(await prepare(lease, false), null);
+      if (typedCodes.length === 0) {
+        assert.equal(await prepare(lease, true), null, "table without exact migration ledger must not mint");
+        await db.batch([
+          db.prepare("CREATE TABLE IF NOT EXISTS subs_bot_schema_migrations(position INTEGER PRIMARY KEY,name TEXT,sha256 TEXT,mode TEXT) STRICT"),
+          db.prepare("INSERT INTO subs_bot_schema_migrations(position,name,sha256,mode) VALUES (48,?,?,'applied')")
+            .bind(typedMigration.name, typedMigration.sha256),
+        ]);
+      }
+      const candidate = await prepare(lease, true);
+      assert.ok(candidate && SUBSCRIPTION_SHORT_CODE.test(candidate.code));
+      const origin = "https://worker.example.invalid";
+      assert.equal((await enabled.fetch(`${origin}/s/${candidate.code}`, { redirect: "manual" })).status, 404);
+      if (typedCodes.length === 0) {
+        const tokenDigest = createHash("sha256").update(ready.token).digest("hex");
+        const signature = createHmac("sha256", Buffer.from(encodedKey, "base64url")).update(JSON.stringify([
+          "subs-bot/telegram-short/subscription", 1, TELEGRAM_AGGREGATE_ORIGIN,
+          policy.botId, policy.adminId, ready.id, format, tokenDigest, candidate.nonce,
+        ])).digest();
+        assert.equal(candidate.code, signature.subarray(0, 16).toString("base64url").slice(0, 21) + "t");
+        const wrongActor = { ...lease, actorId: policy.memberId, chatId: policy.memberId };
+        assert.equal(await prepare(wrongActor, true), null);
+        await db.prepare("INSERT INTO aggregate_links (code_sha256,owner_id,kind,bot_id) VALUES (?,?,'all',?)")
+          .bind(candidate.digest, policy.adminId, policy.botId).run();
+        assert.equal(await beginTelegramSubscriptionShortReply(db, policy, lease, candidate, read), false);
+        assert.equal((await enabled.fetch(`${origin}/agg/${candidate.code}/clash`)).status, 404);
+        await db.prepare("DELETE FROM aggregate_links WHERE code_sha256=?").bind(candidate.digest).run();
+      }
+      assert.equal(await beginTelegramSubscriptionShortReply(db, policy, lease, candidate, read), true);
+      const guard = subscriptionShortSendGuard(candidate, read);
+      assert.equal(await confirmTelegramSubscriptionReadSend(db, policy, lease, guard), true);
+      let sending = lease;
+      if (typedCodes.length === 0) {
+        await settleTelegramReply(db, policy, lease, { kind: "retry", delaySeconds: 1 });
+        await db.prepare("UPDATE telegram_outbox SET due_at=unixepoch() WHERE receipt_id=?").bind(lease.receiptId).run();
+        const retry = await claimTelegramReply(db, policy.botId, false, false, true);
+        assert.ok(retry?.subscriptionRead);
+        assert.deepEqual(await prepare(retry, false), candidate, "existing receipt survives admission opt-out");
+        assert.equal(await beginTelegramSubscriptionShortReply(db, policy, retry, candidate, read), true);
+        assert.equal(await confirmTelegramSubscriptionReadSend(db, policy, retry, guard), true);
+        sending = retry;
+      }
+      await settleTelegramReply(db, policy, sending, { kind: "sent", messageId: 30_000 + sequence });
+      for (const method of ["GET", "HEAD"]) {
+        const redirect = await enabled.fetch(`${origin}/s/${candidate.code}`, { method, redirect: "manual" });
+        assert.equal(redirect.status, 302);
+        assert.equal(redirect.headers.get("Location"), `/sub/${ready.token}/${format}`);
+        assert.equal(redirect.headers.get("Cache-Control"), "private, no-store");
+        assert.equal(redirect.headers.get("Referrer-Policy"), "no-referrer");
+        assert.equal(await redirect.text(), "");
+      }
+      typedCodes.push(candidate.code);
+    }
+    const typedRows = JSON.stringify((await db.prepare("SELECT * FROM telegram_subscription_short_links").all()).results);
+    assert.ok(!typedRows.includes(ready.token));
+    assert.ok(typedCodes.every((code) => !typedRows.includes(code)));
+
+    async function waitForState(updateId: number, state: string): Promise<number> {
+      for (let i = 0; i < 50; i++) {
+        const receipt = await db.prepare(`SELECT inbox.receipt_id AS id FROM telegram_inbox AS inbox
+          JOIN telegram_outbox AS reply USING(receipt_id) WHERE inbox.bot_id=? AND inbox.update_id=? AND reply.state=?`)
+          .bind(policy.botId, updateId, state).first<number>("id");
+        if (receipt !== null) return receipt;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      assert.fail("Expected synthetic short-link state did not settle.");
+    }
+    const defaultDetail = await waitForReply(policy.adminId, (await message("١")).id);
+    const defaultClick = await click(defaultDetail, ticket(defaultDetail, "Base64"), policy.adminId, policy.adminId, null, "typed-drain");
+    const defaultReceipt = await waitForState(defaultClick, "sent");
+    assert.equal((await waitForReply(policy.adminId, defaultDetail.id)).text,
+      `Base64\n${TELEGRAM_AGGREGATE_ORIGIN}/sub/${ready.token}/base64`);
+    assert.equal(await db.prepare("SELECT 1 FROM telegram_subscription_short_links WHERE origin_receipt_id=?").bind(defaultReceipt).first(), null);
+    const wireDetail = await waitForReply(policy.adminId, (await message("١")).id);
+    throttleReplyTo = wireDetail.id;
+    const wireClick = await click(wireDetail, ticket(wireDetail, "Base64"), policy.adminId, policy.adminId, null, "typed");
+    const wireReceipt = await waitForState(wireClick, "pending");
+    const firstAttempt = sent.find(({ replyTo }) => replyTo === wireDetail.id);
+    const url = firstAttempt?.text.match(/https:\/\/[^\s]+\/s\/[A-Za-z0-9_-]{21}t/u)?.[0];
+    assert.ok(url);
+    assert.equal(new URL(url).origin, configuredOrigin);
+    assert.doesNotMatch(firstAttempt!.text, /\/sub\//u);
+    await db.prepare("UPDATE telegram_outbox SET due_at=unixepoch() WHERE receipt_id=?").bind(wireReceipt).run();
+    const afterAttempt = sent.length;
+    assert.equal((await typedDrain.scheduled({ cron: "* * * * *" })).outcome, "ok");
+    assert.equal((await waitForReply(policy.adminId, wireDetail.id, afterAttempt)).text,
+      firstAttempt!.text.replace(configuredOrigin, TELEGRAM_AGGREGATE_ORIGIN));
+    const local = `https://worker.example.invalid${new URL(url).pathname}`;
+    assert.equal((await enabled.fetch(local, { redirect: "manual" })).headers.get("Location"), `/sub/${ready.token}/base64`);
+    const foreignRevoke = await message(`/short revoke ${url}`, policy.memberId);
+    assert.equal((await waitForReply(policy.memberId, foreignRevoke.id)).text, "没有可撤销的短链。");
+    assert.equal((await enabled.fetch(local, { redirect: "manual" })).status, 302);
+    const ownedRevoke = await message(`/short revoke ${url}`);
+    assert.equal((await waitForReply(policy.adminId, ownedRevoke.id)).text, "短链已撤销。");
+    assert.equal((await enabled.fetch(local, { redirect: "manual" })).status, 404);
+    assert.deepEqual(await db.prepare(`SELECT revoked_at IS NOT NULL AS revoked,subscription_id,token_sha256,format,nonce
+      FROM telegram_subscription_short_links WHERE origin_receipt_id=?`).bind(wireReceipt).first(),
+    { revoked: 1, subscription_id: null, token_sha256: null, format: null, nonce: null });
+
+    const uncertainDetail = await waitForReply(policy.adminId, (await message("١")).id);
+    uncertainReplyTo = uncertainDetail.id;
+    const uncertainClick = await click(uncertainDetail, ticket(uncertainDetail, "Clash Meta"), policy.adminId, policy.adminId, null, "typed");
+    const uncertainReceipt = await waitForState(uncertainClick, "uncertain");
+    assert.equal((await typedDrain.scheduled({ cron: "* * * * *" })).outcome, "ok");
+    const uncertainAttempts = sent.filter(({ replyTo }) => replyTo === uncertainDetail.id);
+    assert.equal(uncertainAttempts.length, 1);
+    const uncertainUrl = uncertainAttempts[0].text.match(/https:\/\/[^\s]+\/s\/[A-Za-z0-9_-]{21}t/u)?.[0];
+    assert.ok(uncertainUrl);
+    assert.equal((await enabled.fetch(`https://worker.example.invalid${new URL(uncertainUrl).pathname}`, { redirect: "manual" })).status, 302);
+    assert.equal(await db.prepare("SELECT revoked_at FROM telegram_subscription_short_links WHERE origin_receipt_id=?")
+      .bind(uncertainReceipt).first("revoked_at"), null);
+
     await click(search, ticket(search, "#3 详情"));
     const unsupported = await waitForReply(policy.adminId, search.id);
     const unavailable = ticket(unsupported, "Base64");
@@ -223,6 +376,7 @@ test("emitted Worker searches personal subscriptions and sends only guarded priv
     assert.equal(await confirmTelegramSubscriptionReadSend(db, policy, lease, prepared.readGuard), false);
     await settleTelegramReply(db, policy, lease, { kind: "failed" });
     assert.equal((await enabled.fetch(`https://worker.example.invalid/sub/${ready.token}/base64`, { method: "HEAD" })).status, 404);
+    assert.equal((await enabled.fetch(`https://worker.example.invalid/s/${typedCodes[0]}`, { redirect: "manual" })).status, 404);
 
     const memberNumber = await message("1", policy.memberId);
     const memberDetail = await waitForReply(policy.memberId, memberNumber.id);
@@ -235,12 +389,21 @@ test("emitted Worker searches personal subscriptions and sends only guarded priv
     assert.ok(memberLease?.subscriptionRead);
     const memberLink = await renderTelegramSubscriptionRead(db, bucket, policy, memberLease, Date.now() + 5_000);
     assert.match(memberLink.text, /\/sub\/[A-Za-z0-9_-]+\/clash/u);
-    assert.ok(memberLink.readGuard);
-    assert.equal(await beginTelegramReply(db, policy, memberLease, "allowed", [], [], [], memberLink.readGuard), true);
+    assert.ok(memberLink.readGuard && memberLink.shortTarget);
+    const memberShort = await prepareTelegramSubscriptionShort(db, policy, memberLease, memberLink.shortTarget,
+      memberLink.readGuard, aggregateKey, true);
+    assert.ok(memberShort);
+    assert.equal(await beginTelegramSubscriptionShortReply(db, policy, memberLease, memberShort, memberLink.readGuard), true);
     await db.prepare("INSERT INTO telegram_auth(bot_id,user_id,allowed,message_date,message_id) VALUES (?,?,0,unixepoch(),1)")
       .bind(policy.botId, policy.memberId).run();
-    assert.equal(await confirmTelegramSubscriptionReadSend(db, policy, memberLease, memberLink.readGuard), false);
+    assert.equal(await confirmTelegramSubscriptionReadSend(db, policy, memberLease,
+      subscriptionShortSendGuard(memberShort, memberLink.readGuard)), false);
     await settleTelegramReply(db, policy, memberLease, { kind: "failed" });
+    assert.equal((await enabled.fetch(`https://worker.example.invalid/s/${memberShort.code}`, { redirect: "manual" })).status, 404);
+    assert.equal((await typedDrain.scheduled({ cron: "* * * * *" })).outcome, "ok");
+    assert.deepEqual(await db.prepare(`SELECT revoked_at IS NOT NULL AS revoked,subscription_id,token_sha256,format,nonce
+      FROM telegram_subscription_short_links WHERE origin_receipt_id=?`).bind(memberLease.receiptId).first(),
+    { revoked: 1, subscription_id: null, token_sha256: null, format: null, nonce: null });
 
     const jumpMigration = manifest.migrations.find((item: { name: string }) => item.name === "0042_telegram_page_jumps.sql");
     const controlsMigration = manifest.migrations.find((item: { name: string }) => item.name === "0043_telegram_page_jump_controls.sql");

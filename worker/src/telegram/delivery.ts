@@ -26,6 +26,9 @@ import {
   confirmTelegramSubscriptionReadSend, prepareTelegramSubscriptionReadTickets, renderTelegramSubscriptionRead,
   type TelegramSubscriptionReadButton,
 } from "./subscription-read.ts";
+import { closeUnsentTelegramSubscriptionShort, hasTelegramSubscriptionShort, prepareTelegramSubscriptionShort,
+  subscriptionShortSendGuard, telegramSubscriptionShortsReady, type SubscriptionShortCandidate,
+  type SubscriptionShortTarget } from "./subscription-shorts.ts";
 import { prepareTelegramNodePageTickets, renderTelegramSubscriptionNodePage, type TelegramNodePageButton } from "./subscription-node-pages.ts";
 import { renderTelegramGitHubReply } from "./github-search.ts";
 import { confirmTelegramSubscriptionRawFileSend, prepareTelegramRawFileButton, prepareTelegramSubscriptionRawFile,
@@ -34,7 +37,7 @@ import {
   beginTelegramAggregateLinkReply, beginTelegramBulkTrashReply, beginTelegramInlineConsentReply, beginTelegramInlineSortReply,
   beginTelegramPrivateShareCreationReply,
   beginTelegramSelectedLinkReply, beginTelegramShortLinkReply, beginTelegramReply, claimTelegramReply, closeUnsentTelegramPageJump, isTelegramMemberAllowed,
-  readTelegramAuthChangeOutcome,
+  beginTelegramSubscriptionShortReply, readTelegramAuthChangeOutcome,
   beginTelegramGitHubSearchReply, beginTelegramTempRawReply,
   beginTelegramSubscriptionRawFileReply, failLeasedTelegramSubscriptionRawFileReply,
   beginTelegramApiStatusReply, beginTelegramProviderBatchReply, beginTelegramProviderDocumentReply,
@@ -346,6 +349,7 @@ async function renderReply(
   refreshTarget?: TelegramProviderRefreshTarget;
   rawFileTarget?: TelegramRawFileTarget;
   readGuard?: { sql: string; bindings: readonly (string | number | null)[] };
+  shortTarget?: SubscriptionShortTarget & { label: string };
   forceReply?: boolean;
   mainMenu?: TelegramMainMenuFeatures;
 }> {
@@ -567,8 +571,10 @@ export async function drainTelegramReplies(
   providerBatchAdmissionEnabled = false,
   pageJumpEpoch: number | null = null,
   publicOrigin: PublicOrigin = ISOLATION_PUBLIC_ORIGIN,
+  subscriptionShortsEnabled = false,
 ): Promise<void> {
   const deadline = Date.now() + budgetMs;
+  let subscriptionShortsReady: Promise<boolean> | undefined;
   const privateShareEnabled = privateShareRuntime.schemaReady && privateShareRuntime.context !== null;
   const gitHubSearchEnabled = gitHubSearchReadiness === true;
   const gitHubSearch = gitHubSearchEnabled ? policy : gitHubSearchReadiness === "unavailable" ? "unavailable" : undefined;
@@ -755,6 +761,45 @@ export async function drainTelegramReplies(
     const reply: Awaited<ReturnType<typeof renderReply>> = jump && jump !== "page" ? { ...jump, access: "allowed" }
       : await renderReply(db, bucket, policy, lease, deadline, menuFeatures, publicOrigin, privateShareEnabled, subscriptionReadEnabled,
         subscriptionNodesEnabled, providerRefreshEnabled, subscriptionRawFileEnabled);
+    // A default-off first attempt cannot already own a typed short. A retry can.
+    if (lease.subscriptionRead && lease.chatType === "private" && lease.threadId === null
+      && (lease.attempts > 1 || (subscriptionShortsEnabled && reply.shortTarget))) {
+      const { readGuard, shortTarget } = reply;
+      let started: SubscriptionShortCandidate | null = null;
+      let beginning = false;
+      try {
+        subscriptionShortsReady ??= telegramSubscriptionShortsReady(db);
+        if (await subscriptionShortsReady) {
+          if (readGuard && shortTarget && aggregateKey) {
+            const candidate = await prepareTelegramSubscriptionShort(db, policy, lease, shortTarget, readGuard,
+              aggregateKey, subscriptionShortsEnabled);
+            if (Date.now() >= deadline) continue;
+            if (candidate) {
+              beginning = true;
+              if (await beginTelegramSubscriptionShortReply(db, policy, lease, candidate, readGuard)) started = candidate;
+            }
+          }
+          if (!started && await hasTelegramSubscriptionShort(db, policy, lease)) {
+            await closeUnsentTelegramSubscriptionShort(db, policy, lease);
+            continue;
+          }
+        }
+      } catch {
+        if (beginning) await closeUnsentTelegramSubscriptionShort(db, policy, lease);
+        continue;
+      }
+      if (started && readGuard && shortTarget) {
+        const guard = subscriptionShortSendGuard(started, readGuard);
+        const confirmed = await confirmTelegramSubscriptionReadSend(db, policy, lease, guard).catch(() => false);
+        const remaining = deadline - Date.now();
+        const outcome = confirmed && remaining > 0
+          ? await sendTelegramReply(policy, lease, `${shortTarget.label}\n${publicOrigin}/s/${started.code}`, remaining, request)
+          : { kind: "failed" as const };
+        await settleTelegramReply(db, policy, lease, outcome);
+        continue;
+      }
+      if (subscriptionShortsEnabled && shortTarget) reply.text = "暂时无法生成订阅短链，请重新打开订阅详情后重试。";
+    }
     const jumpButton = pageJumpEpoch !== null && lease.view?.kind === "list" && (!jump || jump === "page") && reply.access === "allowed"
       && await currentTelegramPageJumpEpoch(db, policy.botId, lease.receiptId) === pageJumpEpoch;
     const [view, lifecycle, read, nodes, refresh, rawFile] = await Promise.all([

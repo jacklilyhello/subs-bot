@@ -1,7 +1,6 @@
 """Build and apply only the reviewed synthetic legacy fixture on hosted runners."""
 
 from contextlib import closing
-from dataclasses import asdict
 import io
 import json
 import os
@@ -22,7 +21,7 @@ import legacy_short_namespace_inventory as short_namespace
 import legacy_snapshot_convert as converter
 import native_restore_rehearsal as native
 import prepare_isolation_artifact as artifact
-from cloudflare_isolation import CloudflareClient
+from cloudflare_isolation import CloudflareClient, version_evidence
 
 
 PROFILE = native.LEGACY_CANDIDATE_PROFILE
@@ -615,7 +614,7 @@ class CandidateSource(native.Source):
             require(selected_capable is True and temp_capable is True and dynamic_capable is True)
         else:
             version = self.scope.version(active.version)
-        return {"deploymentId": active.id, "versionId": active.version, "version": asdict(version),
+        return {"deploymentId": active.id, "versionId": active.version, "version": version_evidence(version),
                 "configurationSha256": native.digest(native.canonical(config)), "cronEnabled": self.scope.cron_enabled()}
 
     def verify(self, expected=None):

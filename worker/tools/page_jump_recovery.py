@@ -9,7 +9,7 @@ import stat
 from zipfile import BadZipFile, ZIP_DEFLATED, ZIP_STORED, ZipFile
 import zlib
 
-from cloudflare_isolation import CloudflareError, WORKER_NAME, _Isolation, _require
+from cloudflare_isolation import CloudflareError, WORKER_NAME, _Isolation, _require, version_evidence
 from page_jump_control import MAX_SAFE_INTEGER, PageJumpControl, PageJumpGate
 from prepare_isolation_artifact import _download, _get_json, _github_token, _parse_object, select_main_artifact
 from stage_page_jump_isolation import EVIDENCE_NAME, PIN, RUN, _canonical, _digest, _gate_document, _unique_fields
@@ -142,11 +142,11 @@ def prepare_recovery(worker_api, data_api, target, revision, telegram_config, gu
         active = scope.version(deployment.version, page_jump_epoch=stage["epoch"])
     except CloudflareError:
         active = scope.version(deployment.version)
-    active_pin = _digest({"scope": target, "deployment": asdict(deployment), "version": asdict(active)})
+    active_pin = _digest({"scope": target, "deployment": asdict(deployment), "version": version_evidence(active)})
     if active.telegram_page_jump_epoch is None:
         _require(active_pin == stage["checkpoint"]["activeSha256"], "The isolated dormant predecessor differs from the stage.")
     else:
-        _require(_digest({"versionId": deployment.version, "version": asdict(active)}) == stage["candidateSha256"],
+        _require(_digest({"versionId": deployment.version, "version": version_evidence(active)}) == stage["candidateSha256"],
                  "The isolated active page-jump version differs from the stage.")
     _require(telegram_config is not None and sha256(telegram_config.encode("utf-8")).hexdigest() == active.telegram_config_sha256,
              "The isolated Telegram policy differs from the staged release.")

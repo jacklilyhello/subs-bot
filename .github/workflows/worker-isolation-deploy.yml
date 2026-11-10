@@ -80,6 +80,16 @@ on:
         description: Exact isolation confirmation for legacy subscription short-link enable or disable
         required: false
         type: string
+      subscription_shorts:
+        description: Preserve, enable, or disable new private typed subscription short links
+        required: true
+        default: preserve
+        type: choice
+        options: [preserve, enable, disable]
+      subscription_shorts_confirmation:
+        description: Exact isolation confirmation for a typed subscription short-link change
+        required: false
+        type: string
       provider_batch:
         description: Preserve, enable, or disable new private Telegram batch refreshes
         required: true
@@ -218,6 +228,8 @@ jobs:
           SUBS_BOT_PROVIDER_REFRESH_CONFIRMATION: ${{ inputs.provider_refresh_confirmation }}
           SUBS_BOT_LEGACY_SUBSCRIPTION_SHORTS_MODE: ${{ inputs.legacy_subscription_shorts }}
           SUBS_BOT_LEGACY_SUBSCRIPTION_SHORTS_CONFIRMATION: ${{ inputs.legacy_subscription_shorts_confirmation }}
+          SUBS_BOT_SUBSCRIPTION_SHORTS_MODE: ${{ inputs.subscription_shorts }}
+          SUBS_BOT_SUBSCRIPTION_SHORTS_CONFIRMATION: ${{ inputs.subscription_shorts_confirmation }}
           SUBS_BOT_PROVIDER_BATCH_MODE: ${{ inputs.provider_batch }}
           SUBS_BOT_PROVIDER_BATCH_CONFIRMATION: ${{ inputs.provider_batch_confirmation }}
           SUBS_BOT_API_STATUS_MODE: ${{ inputs.api_status }}
@@ -253,6 +265,8 @@ jobs:
           SUBS_BOT_PROVIDER_REFRESH_CONFIRMATION: ${{ inputs.provider_refresh_confirmation }}
           SUBS_BOT_LEGACY_SUBSCRIPTION_SHORTS_MODE: ${{ inputs.legacy_subscription_shorts }}
           SUBS_BOT_LEGACY_SUBSCRIPTION_SHORTS_CONFIRMATION: ${{ inputs.legacy_subscription_shorts_confirmation }}
+          SUBS_BOT_SUBSCRIPTION_SHORTS_MODE: ${{ inputs.subscription_shorts }}
+          SUBS_BOT_SUBSCRIPTION_SHORTS_CONFIRMATION: ${{ inputs.subscription_shorts_confirmation }}
           SUBS_BOT_PROVIDER_BATCH_MODE: ${{ inputs.provider_batch }}
           SUBS_BOT_PROVIDER_BATCH_CONFIRMATION: ${{ inputs.provider_batch_confirmation }}
           SUBS_BOT_API_STATUS_MODE: ${{ inputs.api_status }}

@@ -427,6 +427,12 @@ python3 -B worker/tools/legacy_general_auth_candidate.py \
 
 启用后，`/s/{code}` 只会跳到当前站点上仍由原所有者持有、令牌摘要一致的订阅。支持原格式按钮及现有 Base64、Sing-box、QX 别名，也保留省略格式的形式。目标移入回收站时返回 `404`，恢复同一订阅与令牌后可再次跳转。私聊 `/short revoke 短码` 可在公开跳转关闭时撤销自己的记录。撤销清除目标字段并保留摘要占用。旧库转换、真实旧域名和外部短链包装另行验收。
 
+### 新签发的单订阅短链
+
+隔离发布工作流 `worker-isolation-deploy.yml` 的 `subscription_shorts` 默认使用 `preserve`。首次发布保持签发关闭。首次启用使用同一提交、Worker 模块与兼容日期，指定 `subscription_shorts=enable` 和 `subscription_shorts_confirmation=enable typed subscription shorts for subs-bot-cf-dev-01`。发布前核对现有 Telegram 策略、聚合密钥摘要、Cron 和 `0048` 的迁移及数据库结构。保护步骤记录核对过的版本与摘要，部署后回读 `subscriptionShortsEnabled` 和 `subscriptionShortsCapable`。
+
+关闭签发使用 `subscription_shorts=disable` 和 `subscription_shorts_confirmation=disable typed subscription shorts for subs-bot-cf-dev-01`。已签发的链接仍按原所有者、订阅令牌摘要和格式解析，所有者仍可撤销，已开始的发送可以完成。Telegram 回复的短链域名使用经验证的 `PUBLIC_ORIGIN`，能力码派生使用固定安装来源。之后的发布与回滚均须保留读、写和撤销能力，即使表目前为空。关闭后的自动回滚也不能重新打开签发。
+
 ### 隔离合成旧订阅候选应用
 
 在受保护的 `main` 运行 `worker-isolation-legacy-candidate.yml`。所有步骤使用同一组全长 32 位小写十六进制 `cohort`、同一次成功的 Worker CI `source_run_id` 和同一已核对的隔离 Worker。开始前确认本轮可在产物保留期内完成，并保持 `main` 和隔离部署稳定。此流程从 CI 的固定合成候选包恢复，目标 D1 和 R2 的名称包含完整 `cohort`。只在源私有 R2 写入本组操作记录。

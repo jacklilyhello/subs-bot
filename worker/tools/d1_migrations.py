@@ -27,8 +27,9 @@ SHA256 = re.compile(r"[a-f0-9]{64}")
 UUID = re.compile(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}")
 TABLE = re.compile(r"CREATE TABLE ([a-z][a-z0-9_]*) \(")
 INDEX = re.compile(r"CREATE (?:UNIQUE )?INDEX ([a-z][a-z0-9_]*) ON ([a-z][a-z0-9_]*)[ \t\n]+\(")
-# Cumulative verified artifact SQL. Generated D1 statements are bounded separately.
-MAX_MIGRATION_BYTES = 82 * 1024
+# The additive migration chain through 0048 fits in 84 KiB. Generated D1
+# statements retain their separate 100 KB cap.
+MAX_MIGRATION_BYTES = 84 * 1024
 MAX_D1_STATEMENT_BYTES = 100_000
 
 
