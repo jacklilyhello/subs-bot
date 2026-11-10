@@ -1,5 +1,6 @@
 import { AggregateLimitError, getAggregateNodeSource } from "./aggregate.ts";
 import { normalShortLinksReady, readShortLinkNamespaces, resolveShortLocation } from "./short-links.ts";
+import { parsePublicOrigin, type PublicOrigin } from "./public-origin.ts";
 import { getSubscriptionNodeSource, PathRuleContentError } from "./path-rules.ts";
 import { legacyEmptyExportResponse, legacyEmptyExportState } from "./legacy-empty-export.ts";
 import { base64Chunks, ExportContentError, planBase64 } from "./base64-response.ts";
@@ -66,6 +67,7 @@ export interface Env {
   DB: D1Database;
   NODES: R2Bucket;
   BUILD_REVISION?: string;
+  PUBLIC_ORIGIN?: string;
   TELEGRAM_ISOLATION_CONFIG?: string;
   TELEGRAM_GENERAL_CONFIG?: string;
   TELEGRAM_CONFIG_SHA256?: string;
@@ -174,7 +176,7 @@ function drainGroupShareCards(db: D1Database, policy: TelegramPolicy): Promise<v
   return drainTelegramGroupShareCards(db, policy, (actorId, method, body) => sendTelegramGroupShareCard(policy, actorId, method, body));
 }
 
-async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
+async function telegramWebhook(request: Request, env: Env, publicOrigin: PublicOrigin, ctx?: ExecutionContext): Promise<Response> {
   if (request.method !== "POST") {
     return plain("Method not allowed.", 405, request.method === "HEAD", { Allow: "POST" });
   }
@@ -240,7 +242,7 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
     const drainReplies = async (budget = 20_000) => drainTelegramReplies(env.DB, env.NODES, policy, 4, budget, fetch, aggregateKey, privateShare,
       subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerQueueReady, bulkTrash, inlineConsent,
       await githubSearch().catch(() => "unavailable" as const), providerRefresh, subscriptionRawFile, providerBatch.controls, apiStatus,
-      statusProvider !== null, providerDocument, providerBatchAdmission, pageJumpEpoch);
+      statusProvider !== null, providerDocument, providerBatchAdmission, pageJumpEpoch, publicOrigin);
     const drain = () => ctx?.waitUntil(drainReplies().catch(() => undefined));
     if (decoded.apiStatus) {
       if (!statusProvider || apiStatus !== true) return new Response(null, { status: 204, headers: HEADERS });
@@ -415,7 +417,7 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
         const targetAllowed = selection?.targetUserId === null || selection?.targetUserId === policy.adminId
           || selection?.targetUserId === policy.memberId;
         const outcome = selection && targetAllowed ? await acceptTelegramSubscriptionShare(env.DB, env.NODES, policy,
-          { ...input, ...selection }, privateShare.context) : "unavailable";
+          { ...input, ...selection }, privateShare.context, publicOrigin) : "unavailable";
         if (outcome === "unavailable") {
           await acceptTelegramCommand(env.DB, policy, { ...input, command: "help" }, "subscription-share-unavailable");
         }
@@ -438,13 +440,15 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
 }
 
 async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
+  const publicOrigin = parsePublicOrigin(env.PUBLIC_ORIGIN);
+  const head = request.method === "HEAD";
+  if (publicOrigin === null) return plain("Service unavailable.", 503, head);
   const path = new URL(request.url).pathname;
-  if (path === "/telegram/webhook") return telegramWebhook(request, env, ctx);
+  if (path === "/telegram/webhook") return telegramWebhook(request, env, publicOrigin, ctx);
   const subscription = SUBSCRIPTION_PATH.exec(path);
   const aggregate = AGGREGATE_PATH.exec(path);
   const short = SHORT_PATH.exec(path);
   const matchedExport = subscription ?? aggregate;
-  const head = request.method === "HEAD";
   if (path !== "/health" && !matchedExport && !short) return plain("Not found.", 404, head);
   if (request.method !== "GET" && !head) return plain("Method not allowed.", 405, false, { Allow: "GET, HEAD" });
 
@@ -527,7 +531,9 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
   }
 }
 
-async function recoverTelegramWork(env: Env, policy: TelegramPolicy, pin: ProviderPin, providerQueueReady: boolean): Promise<void> {
+async function recoverTelegramWork(
+  env: Env, policy: TelegramPolicy, pin: ProviderPin, providerQueueReady: boolean, publicOrigin: PublicOrigin,
+): Promise<void> {
   const aggregateKey = await parseTelegramAggregateKey(env.TELEGRAM_AGGREGATE_KEY);
   const privateShare = await telegramPrivateShareRuntime(env.DB, env.TELEGRAM_PRIVATE_SHARE_CREATION_KEY,
     env.TELEGRAM_GROUP_SHARE_CARDS === "1");
@@ -552,7 +558,7 @@ async function recoverTelegramWork(env: Env, policy: TelegramPolicy, pin: Provid
     drainTelegramReplies(env.DB, env.NODES, policy, limit, budget, fetch, aggregateKey, privateShare,
       subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerQueueReady, bulkTrash, inlineConsent,
       await githubSearch().catch(() => "unavailable" as const), providerRefresh, subscriptionRawFile, providerBatch.controls, apiStatus,
-      apiStatusProvider(env) !== null, providerDocument, providerBatchAdmission, telegramPageJumpEpoch(env.TELEGRAM_PAGE_JUMP));
+      apiStatusProvider(env) !== null, providerDocument, providerBatchAdmission, telegramPageJumpEpoch(env.TELEGRAM_PAGE_JUMP), publicOrigin);
   const replies = async () => {
     await drain(10, 45_000);
     await reapTelegramViewTickets(env.DB);
@@ -630,10 +636,12 @@ async function recoverTelegramWork(env: Env, policy: TelegramPolicy, pin: Provid
 }
 
 async function scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+  const publicOrigin = parsePublicOrigin(env.PUBLIC_ORIGIN);
+  if (publicOrigin === null) return;
   const pin = providerPin(env);
   try {
     const policy = parseTelegramPolicy(env.TELEGRAM_ISOLATION_CONFIG);
-    if (policy) await recoverTelegramWork(env, policy, pin, await telegramProviderQueueReady(env, pin));
+    if (policy) await recoverTelegramWork(env, policy, pin, await telegramProviderQueueReady(env, pin), publicOrigin);
     else if (env.TELEGRAM_ISOLATION_CONFIG === undefined) {
       const general = parseGeneralTelegramPin(env.TELEGRAM_GENERAL_CONFIG, env.BUILD_REVISION);
       if (general?.sharedOutbox) await recoverGeneralSharedTelegramReplies(env.DB, general);

@@ -5,7 +5,7 @@ import { planSingBox } from "../singbox-response.ts";
 import { digestHex, readSnapshotNodes, SUBSCRIPTION_LIFECYCLE_REVISION, validInteger, type SubscriptionSnapshot } from "../storage.ts";
 import { providerRefreshTarget, type TelegramProviderRefreshTarget } from "./provider-refresh.ts";
 import type { TelegramRawFileTarget } from "./subscription-raw-file.ts";
-import { TELEGRAM_AGGREGATE_ORIGIN } from "./aggregate-actions.ts";
+import { ISOLATION_PUBLIC_ORIGIN, type PublicOrigin } from "../public-origin.ts";
 import { inTelegramScope, SUBSCRIPTION_READ_RECEIPT_MARKER, SUBSCRIPTION_READ_TICKET,
   type TelegramPolicy, type TelegramSubscriptionReadUpdate } from "./protocol.ts";
 import { selectedQuery, unicode14Lower } from "./selected-search.ts";
@@ -410,7 +410,9 @@ async function renderDetail(
     ...(nodeButtons.length ? { nodeButtons } : {}) };
 }
 
-async function renderFormat(db: D1Database, bucket: R2Bucket, row: Metadata, format: Format, guard: Guard, deadline: number): Promise<RenderedRead> {
+async function renderFormat(
+  db: D1Database, bucket: R2Bucket, row: Metadata, format: Format, guard: Guard, deadline: number, publicOrigin: PublicOrigin,
+): Promise<RenderedRead> {
   const baseGuard = subscriptionGuard(guard, row);
   if (row.generation === 0) return { text: "当前没有已发布的节点。", readGuard: baseGuard };
   if (!row.token || !TOKEN.test(row.token) || !Object.hasOwn(FORMAT_LABELS, format)) {
@@ -428,13 +430,14 @@ async function renderFormat(db: D1Database, bucket: R2Bucket, row: Metadata, for
       return { text: unsupported ? "订阅内容不支持此格式。" : "暂时无法验证此格式，请稍后重试。", readGuard: baseGuard };
     }
   }
-  return { text: `${FORMAT_LABELS[format]}\n${TELEGRAM_AGGREGATE_ORIGIN}/sub/${row.token}/${format}`,
+  return { text: `${FORMAT_LABELS[format]}\n${publicOrigin}/sub/${row.token}/${format}`,
     readGuard: subscriptionGuard(guard, row, row.token) };
 }
 
 export async function renderTelegramSubscriptionRead(
   db: D1Database, bucket: R2Bucket, policy: TelegramPolicy, lease: ReadLease, deadline: number, nodePagesEnabled = false,
   providerRefreshEnabled = false, rawFileEnabled = false, subscriptionShareEnabled = false,
+  publicOrigin: PublicOrigin = ISOLATION_PUBLIC_ORIGIN,
 ): Promise<RenderedRead> {
   const guard = receiptGuard(policy);
   try {
@@ -459,7 +462,7 @@ export async function renderTelegramSubscriptionRead(
     if (!row) return { text: "订阅不存在或已被删除。", readGuard: guard };
     if (receipt.kind === "detail") return await renderDetail(bucket, row, guard, deadline, nodePagesEnabled, rawFileEnabled,
       subscriptionShareEnabled);
-    if (receipt.format) return await renderFormat(db, bucket, row, receipt.format, guard, deadline);
+    if (receipt.format) return await renderFormat(db, bucket, row, receipt.format, guard, deadline, publicOrigin);
   } catch {
     // Do not expose source URLs, node data, tokens or D1/R2 diagnostics.
     throw new Error("Telegram subscription read reply could not be rendered.");

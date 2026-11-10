@@ -9,6 +9,7 @@ import {
 } from "./temp-storage.ts";
 
 export const TELEGRAM_AGGREGATE_MARKER = "aggregate:v1";
+// This label is part of the persisted v1 capability derivation.
 export const TELEGRAM_AGGREGATE_ORIGIN = ISOLATION_PUBLIC_ORIGIN;
 const KEY_VERSION = 1;
 const MAX_COMMAND_AGE_SECONDS = 900;

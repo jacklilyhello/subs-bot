@@ -1,5 +1,5 @@
 import { MAX_PRIVATE_SHARE_BYTES, privateShareCodeDigest } from "../private-shares.ts";
-import { ISOLATION_PUBLIC_ORIGIN } from "../short-links.ts";
+import { ISOLATION_PUBLIC_ORIGIN, type PublicOrigin } from "../public-origin.ts";
 import { checkOwnerId, digestHex, getOwnedSubscription, SUBSCRIPTION_LIFECYCLE_REVISION, validInteger,
   type SubscriptionMetadata } from "../storage.ts";
 import { inTelegramScope, type TelegramEventScope, type TelegramPolicy, type TelegramPrivateShareCreationUpdate } from "./protocol.ts";
@@ -122,7 +122,7 @@ export function parseTelegramSubscriptionShareArgs(args: string): TelegramSubscr
   return options ? { subscriptionId, ...options } : null;
 }
 
-function subscriptionShareBody(row: SubscriptionMetadata): string | null {
+function subscriptionShareBody(row: SubscriptionMetadata, publicOrigin: PublicOrigin): string | null {
   if (typeof row.token !== "string" || !SUBSCRIPTION_TOKEN.test(row.token) ||
       typeof row.name !== "string" || row.name.length > 512 ||
       typeof row.sourceUrl !== "string" || row.sourceUrl.length > MAX_SOURCE_BYTES ||
@@ -141,7 +141,7 @@ function subscriptionShareBody(row: SubscriptionMetadata): string | null {
     }
     sourceLine = `🌐 原始链接：${source}`;
   }
-  return `🏷️ 订阅名称：${name}\n${sourceLine}\n⚡ Clash 配置：${ISOLATION_PUBLIC_ORIGIN}/sub/${row.token}/clash`;
+  return `🏷️ 订阅名称：${name}\n${sourceLine}\n⚡ Clash 配置：${publicOrigin}/sub/${row.token}/clash`;
 }
 
 function base64Url(bytes: Uint8Array): string {
@@ -465,6 +465,7 @@ export async function acceptTelegramSubscriptionShare(
   policy: TelegramPolicy,
   event: TelegramPrivateShareCreationUpdate & TelegramSubscriptionShareSelection,
   context: TelegramPrivateShareCreationKey,
+  publicOrigin: PublicOrigin = ISOLATION_PUBLIC_ORIGIN,
 ): Promise<TelegramSubscriptionShareOutcome> {
   if (!validCreation(policy, event, context) || !validInteger(event.subscriptionId, 1)) return "ignored";
   try {
@@ -473,7 +474,7 @@ export async function acceptTelegramSubscriptionShare(
     const row = await getOwnedSubscription(db, event.actorId, event.subscriptionId);
     if (!row || row.id !== event.subscriptionId || row.ownerId !== event.actorId ||
         !validInteger(row.generation, 0) || !validInteger(row.lifecycleRevision, 0)) return "unavailable";
-    const content = subscriptionShareBody(row);
+    const content = subscriptionShareBody(row, publicOrigin);
     if (content === null) return "unavailable";
     return await createShare(db, bucket, policy, { ...event, content }, context, row);
   } catch {

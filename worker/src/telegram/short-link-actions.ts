@@ -1,7 +1,8 @@
 import {
-  canonicalShortDestination, ISOLATION_PUBLIC_ORIGIN, LEGACY_SUBSCRIPTION_SHORT_PIN, NORMAL_CODE_SUFFIX, readShortLinkNamespaces,
+  canonicalShortDestination, LEGACY_SUBSCRIPTION_SHORT_PIN, NORMAL_CODE_SUFFIX, readShortLinkNamespaces,
   SHORT_CODE, shortCodeDigest, type ShortLinkNamespaces,
 } from "../short-links.ts";
+import { ISOLATION_PUBLIC_ORIGIN, PRODUCTION_PUBLIC_ORIGIN, type PublicOrigin } from "../public-origin.ts";
 import { validInteger } from "../storage.ts";
 import { inTelegramScope, type TelegramCommand, type TelegramPolicy, type TelegramShortLinkUpdate } from "./protocol.ts";
 
@@ -10,7 +11,7 @@ const MAX_ACTIVE_LINKS = 128;
 const ENCODER = new TextEncoder();
 const NONCE = /^[A-Za-z0-9_-]{21}[AQgw](?![\s\S])/u;
 const DIGEST = /^[a-f0-9]{64}(?![\s\S])/u;
-const SHORT_PREFIXES = [ISOLATION_PUBLIC_ORIGIN + "/s/", "https://subs-bot.lilyya.top/s/"];
+const SHORT_PREFIXES = [ISOLATION_PUBLIC_ORIGIN + "/s/", PRODUCTION_PUBLIC_ORIGIN + "/s/"];
 const HELP = "短链用法：发送「短链 https://example.com/xxx」或 /short 加链接。撤销时发送 /short revoke 加短码或本地短链。";
 const fresh = "inbox.bot_id=? AND inbox.update_id=? AND inbox.receipt_nonce=?";
 
@@ -44,6 +45,7 @@ function base64Url(bytes: Uint8Array): string {
 }
 
 async function deriveCode(key: CryptoKey, botId: string, actorId: string, nonce: string): Promise<string> {
+  // Existing v1 short codes retain their original derivation label.
   const material = ENCODER.encode(JSON.stringify([
     "subs-bot/telegram-short/external", 1, ISOLATION_PUBLIC_ORIGIN, botId, actorId, nonce,
   ]));
@@ -187,6 +189,7 @@ const notices: Record<Result, string> = {
 
 export async function prepareTelegramShortLinkReply(
   db: D1Database, policy: TelegramPolicy, lease: ShortLease, key: CryptoKey | null,
+  publicOrigin: PublicOrigin = ISOLATION_PUBLIC_ORIGIN,
 ): Promise<TelegramShortLinkReply> {
   if (!privateScope(policy, lease)) return { kind: "notice", text: notices.issued };
   try {
@@ -206,7 +209,7 @@ export async function prepareTelegramShortLinkReply(
     const code = await deriveCode(key, policy.botId, lease.actorId, row.nonce);
     if (await shortCodeDigest(code) !== row.digest) return { kind: "notice", text: notices.issued };
     return {
-      kind: "link", text: `短链已生成。\n${ISOLATION_PUBLIC_ORIGIN}/s/${code}`,
+      kind: "link", text: `短链已生成。\n${publicOrigin}/s/${code}`,
       guard: { sql: `inbox.receipt_nonce='${TELEGRAM_SHORT_LINK_MARKER}' AND EXISTS (
         SELECT 1 FROM telegram_short_link_actions AS action JOIN normal_short_links AS link ON ${ownedIssuedLink}
         WHERE action.receipt_id=inbox.receipt_id AND action.result='issued' AND action.code_sha256=?

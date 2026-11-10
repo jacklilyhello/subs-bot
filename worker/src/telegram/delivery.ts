@@ -1,8 +1,9 @@
 import { AggregateLimitError, getAggregateNodeSource } from "../aggregate.ts";
 import { ExportContentError, planBase64 } from "../base64-response.ts";
 import { PathRuleContentError } from "../path-rules.ts";
+import { ISOLATION_PUBLIC_ORIGIN, type PublicOrigin } from "../public-origin.ts";
 import { listOwnedSubscriptions } from "../subscriptions.ts";
-import { resolveTelegramAggregateCode, TELEGRAM_AGGREGATE_ORIGIN } from "./aggregate-actions.ts";
+import { resolveTelegramAggregateCode } from "./aggregate-actions.ts";
 import { prepareSelectedLimitTickets, prepareSelectedRevokeTicket, renderTelegramSelected,
   resolveTelegramSelectedCode, retireUnsentSelectedLink } from "./selected-export.ts";
 import type { PrivateShareClaimResult } from "../private-shares.ts";
@@ -60,7 +61,9 @@ const LIST_LIMIT = 20;
 type ReplyAccess = "allowed" | "denied" | "none";
 type InlineKeyboard = ({ text: string; callback_data: string } | { text: string; url: string })[][];
 
-async function aggregateBase64Section(db: D1Database, bucket: R2Bucket, code: string, deadline: number): Promise<string> {
+async function aggregateBase64Section(
+  db: D1Database, bucket: R2Bucket, code: string, deadline: number, publicOrigin: PublicOrigin,
+): Promise<string> {
   const unavailable = "Base64：暂时无法验证，请稍后重试。";
   const start = Date.now();
   const budget = Math.min(AGGREGATE_BASE64_TIMEOUT_MS, deadline - start - SEND_TIMEOUT_MS);
@@ -75,7 +78,7 @@ async function aggregateBase64Section(db: D1Database, bucket: R2Bucket, code: st
       if (!source) return unavailable;
       await planBase64(source, signal);
       if (Date.now() >= start + budget) return unavailable;
-      return `Base64 聚合订阅链接\n${TELEGRAM_AGGREGATE_ORIGIN}/agg/${code}/base64`;
+      return `Base64 聚合订阅链接\n${publicOrigin}/agg/${code}/base64`;
     } catch (error) {
       return error instanceof ExportContentError || error instanceof PathRuleContentError || error instanceof AggregateLimitError
         ? "Base64：订阅内容不支持此格式。" : unavailable;
@@ -327,6 +330,7 @@ async function renderReply(
   lease: TelegramReplyLease,
   deadline: number,
   menuFeatures: TelegramMainMenuFeatures,
+  publicOrigin: PublicOrigin,
   privateShareEnabled = false,
   subscriptionReadEnabled = false,
   subscriptionNodesEnabled = false,
@@ -367,7 +371,7 @@ async function renderReply(
   if (!allowed) return { text: "当前账号没有使用权限。", access: "denied" };
   if (lease.subscriptionShareUnavailable) return { text: "无法分享此订阅。请在私聊打开自己的订阅详情后重试。", access: "allowed" };
   if (lease.subscriptionRead) return { ...await renderTelegramSubscriptionRead(db, bucket, policy, lease, deadline,
-    subscriptionNodesEnabled, providerRefreshEnabled, subscriptionRawFileEnabled, privateShareEnabled), access: "allowed" };
+    subscriptionNodesEnabled, providerRefreshEnabled, subscriptionRawFileEnabled, privateShareEnabled, publicOrigin), access: "allowed" };
   if (lease.subscriptionNodes) {
     const { backId, ...page } = await renderTelegramSubscriptionNodePage(db, bucket, policy, lease, deadline);
     return { ...page, access: "allowed", ...(backId === undefined ? {} : {
@@ -442,10 +446,11 @@ async function renderReply(
 
 async function deliverTelegramShortLink(
   db: D1Database, policy: TelegramPolicy, lease: TelegramReplyLease, key: CryptoKey | null, deadline: number, request: typeof fetch,
+  publicOrigin: PublicOrigin,
 ): Promise<void> {
   if (lease.chatType !== "private" || lease.threadId !== null || !inTelegramScope(policy, lease)) return;
   const allowed = lease.actorId === policy.adminId || await isTelegramMemberAllowed(db, policy);
-  const reply = allowed ? await prepareTelegramShortLinkReply(db, policy, lease, key)
+  const reply = allowed ? await prepareTelegramShortLinkReply(db, policy, lease, key, publicOrigin)
     : { kind: "notice" as const, text: "当前账号没有使用权限。" };
   if (Date.now() >= deadline) return;
   if (reply.kind === "link") {
@@ -561,6 +566,7 @@ export async function drainTelegramReplies(
   providerDocumentReadiness: boolean | "unavailable" = false,
   providerBatchAdmissionEnabled = false,
   pageJumpEpoch: number | null = null,
+  publicOrigin: PublicOrigin = ISOLATION_PUBLIC_ORIGIN,
 ): Promise<void> {
   const deadline = Date.now() + budgetMs;
   const privateShareEnabled = privateShareRuntime.schemaReady && privateShareRuntime.context !== null;
@@ -643,7 +649,7 @@ export async function drainTelegramReplies(
       continue;
     }
     if (lease.shortLink) {
-      await deliverTelegramShortLink(db, policy, lease, aggregateKey, deadline, request);
+      await deliverTelegramShortLink(db, policy, lease, aggregateKey, deadline, request, publicOrigin);
       continue;
     }
     if (lease.inlineSort) {
@@ -692,7 +698,7 @@ export async function drainTelegramReplies(
           const confirmed = await resolveTelegramSelectedCode(db, policy, scope, aggregateKey, true);
           if (confirmed !== code) await retireUnsentSelectedLink(db, policy, lease, "sending");
           const outcome = confirmed === code && Date.now() < deadline
-            ? await sendTelegramReply(policy, lease, `Clash 所选订阅聚合链接\n${TELEGRAM_AGGREGATE_ORIGIN}/agg/${code}/clash`,
+            ? await sendTelegramReply(policy, lease, `Clash 所选订阅聚合链接\n${publicOrigin}/agg/${code}/clash`,
               Math.max(1, deadline - Date.now()), request, [[{ text: "撤销此链接", callback_data: ticket.token }]])
             : { kind: "failed" as const };
           await settleTelegramReply(db, policy, lease, outcome);
@@ -714,9 +720,9 @@ export async function drainTelegramReplies(
     if (lease.aggregate && lease.chatType === "private" && lease.threadId === null) {
       const code = await resolveTelegramAggregateCode(db, policy, { ...lease, aggregate: lease.aggregate }, aggregateKey);
       if (code !== null && Date.now() < deadline) {
-        const base64 = await aggregateBase64Section(db, bucket, code, deadline);
+        const base64 = await aggregateBase64Section(db, bucket, code, deadline, publicOrigin);
         if (Date.now() < deadline && await beginTelegramAggregateLinkReply(db, policy, lease)) {
-          const text = `Clash 聚合订阅链接\n${TELEGRAM_AGGREGATE_ORIGIN}/agg/${code}/clash\n${base64}\n发送 /export revoke 可撤销链接。`;
+          const text = `Clash 聚合订阅链接\n${publicOrigin}/agg/${code}/clash\n${base64}\n发送 /export revoke 可撤销链接。`;
           const remaining = deadline - Date.now();
           const outcome = remaining > 0 ? await sendTelegramReply(policy, lease, text, remaining, request) : { kind: "failed" as const };
           await settleTelegramReply(db, policy, lease, outcome);
@@ -747,7 +753,7 @@ export async function drainTelegramReplies(
       continue;
     }
     const reply: Awaited<ReturnType<typeof renderReply>> = jump && jump !== "page" ? { ...jump, access: "allowed" }
-      : await renderReply(db, bucket, policy, lease, deadline, menuFeatures, privateShareEnabled, subscriptionReadEnabled,
+      : await renderReply(db, bucket, policy, lease, deadline, menuFeatures, publicOrigin, privateShareEnabled, subscriptionReadEnabled,
         subscriptionNodesEnabled, providerRefreshEnabled, subscriptionRawFileEnabled);
     const jumpButton = pageJumpEpoch !== null && lease.view?.kind === "list" && (!jump || jump === "page") && reply.access === "allowed"
       && await currentTelegramPageJumpEpoch(db, policy.botId, lease.receiptId) === pageJumpEpoch;

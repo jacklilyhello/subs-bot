@@ -32,6 +32,7 @@ import "./telegram-subscription-node-pages.integration.ts";
 import "./telegram-subscription-raw-file.integration.ts";
 import "./telegram-temp-raw.integration.ts";
 import "./telegram-short-links.integration.ts";
+import "./public-origin.integration.ts";
 import "./telegram-inline-sort.integration.ts";
 import "./telegram-bulk-trash.integration.ts";
 import "./telegram-personal-inline.integration.ts";
