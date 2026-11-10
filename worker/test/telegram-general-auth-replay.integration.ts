@@ -23,6 +23,7 @@ import { acceptGeneralSharedTelegramCommand, beginGeneralSharedTelegramReply, cl
 import { generalCurrentAuthoritySql, generalCurrentReceiptSql, generalOrdinaryReplyEligibilitySql, generalPolicyBindings,
   generalRecordedOriginSql } from "../src/telegram/general-receipt.ts";
 import { acceptTelegramCommand, claimTelegramReply } from "../src/telegram/store.ts";
+import { acceptTelegramProviderBatchControl } from "../src/telegram/provider-batch-controls.ts";
 import { acceptTelegramView } from "../src/telegram/views.ts";
 import { assertGeneralReadLane, readGeneralReadLane } from "../src/telegram/general-read-lane.ts";
 import { MAX_TEMP_BATCH_NODES, MAX_TEMP_OWNER_NODES } from "../src/telegram/temp-storage.ts";
@@ -2286,7 +2287,54 @@ test("closed general authorization replays a sealed candidate in a separate emit
   const batchOrigin = { ...origin(batchPreview.messageId, batchActor), date: batchDate };
   assert.equal((await callback(7782, batchActor, batchOrigin, batchTicket, batchPaused)).status, 204);
   assert.equal((await callback(7783, 110, { ...batchOrigin, chat: { id: 110, type: "private" } }, batchTicket, batchOpen)).status, 204);
-  assert.equal((await callback(7784, batchActor, batchOrigin, batchTicket, batchOpen)).status, 200);
+  const confirmedBatch = await callback(7784, batchActor, batchOrigin, batchTicket, batchOpen);
+  if (confirmedBatch.status !== 200) {
+    const batchPin = parseGeneralTelegramPin(batchConfig, fixture.releaseRevision);
+    assert.ok(batchPin);
+    let phase = "lookup";
+    let cause = "unclassified";
+    const statements = new Map<D1PreparedStatement, { sql: string; values: unknown[]; bound: D1PreparedStatement }>();
+    const observed = {
+      prepare(sql: string) {
+        return { bind(...values: unknown[]) {
+          const bound = db.prepare(sql).bind(...values);
+          const wrapped = { async first() {
+            phase = sql.startsWith("SELECT actor.role") ? "grant" : "ticket";
+            try { return await bound.first(); } catch (error) {
+              cause = diagnosticError(error);
+              throw error;
+            }
+          } } as D1PreparedStatement;
+          statements.set(wrapped, { sql, values, bound });
+          return wrapped;
+        } };
+      },
+      async batch(prepared: D1PreparedStatement[]) {
+        const entries = prepared.map((statement) => statements.get(statement)!);
+        phase = entries[0].sql.startsWith("SELECT source_url") ? "source" : "confirmation";
+        try { return await db.batch(entries.map(({ bound }) => bound)); } catch (error) {
+          cause = diagnosticError(error);
+          for (const [index, { sql, values }] of entries.entries()) {
+            try { await db.prepare("EXPLAIN " + sql).bind(...values).all(); } catch (error) {
+              phase += "-" + (index + 1);
+              cause = diagnosticError(error);
+              break;
+            }
+          }
+          throw error;
+        }
+      },
+    } as D1Database;
+    try {
+      const result = await acceptTelegramProviderBatchControl(observed, batchPin, { kind: "confirm", updateId: 7784,
+        actorId: String(batchActor), chatId: String(batchActor), chatType: "private", threadId: null,
+        messageId: batchPreview.messageId, messageDate: batchDate, callbackId: "synthetic-confirm-probe", ticket: batchTicket }, true);
+      cause = result;
+    } catch (error) {
+      if (cause === "unclassified") cause = diagnosticError(error);
+    }
+    assert.fail(`Synthetic provider batch confirmation failed (${phase}=${cause}).`);
+  }
   assert.equal((await callback(7784, batchActor, batchOrigin, batchTicket, batchOpen)).status, 204);
   assert.equal(await db.prepare(`SELECT count(*) AS n FROM telegram_provider_batches WHERE bot_id=? AND actor_id=?`)
     .bind(pin.botId, String(batchActor)).first<number>("n"), 1);

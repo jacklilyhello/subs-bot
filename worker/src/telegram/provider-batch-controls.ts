@@ -246,10 +246,12 @@ async function acceptMessage(
 const ticketFrom = `FROM telegram_provider_batch_interactions AS interaction
   JOIN telegram_inbox AS preview USING(receipt_id) JOIN telegram_outbox AS sent USING(receipt_id)`;
 
-function ticketScope(policy: BatchPolicy, event: Confirmation, digest: string): ProviderSql {
+function ticketScope(policy: BatchPolicy, event: Confirmation, digest: string, core = false): ProviderSql {
   const general = "privateProvider" in policy;
   const marker = batchMarkers(general);
-  const epoch = epochScope(policy, "preview");
+  // The batch core already checks current authority for this exact preview row.
+  const epoch = general && core ? { sql: "interaction.auth_message_date=0 AND interaction.auth_message_id=0", bindings: [] }
+    : epochScope(policy, "preview");
   return { sql: `interaction.token_sha256=? AND interaction.kind='preview' AND interaction.used_by_receipt_id IS NULL
     AND interaction.expires_at>unixepoch() AND preview.receipt_nonce='${marker.preview}'
     AND ${privateInbox("preview")} AND preview.actor_id=? AND sent.state='sent' AND sent.sent_message_id=?
@@ -274,18 +276,22 @@ async function acceptConfirmation(db: D1Database, policy: BatchPolicy, event: Co
     interaction.auth_message_id AS messageId ${ticketFrom} WHERE ${ticket.sql}`)
     .bind(...ticket.bindings).first<{ previewReceiptId: number; targets: string; skippedCount: number; originAttempt: number } & Epoch>();
   if (!origin || (epoch && origin.role !== epoch.role)) return "ignored";
-  const guard = { sql: `EXISTS(SELECT 1 ${ticketFrom} WHERE ${ticket.sql} AND preview.receipt_id=? AND interaction.targets=?
-    AND interaction.skipped_count=? AND interaction.origin_attempt=? AND interaction.actor_role=?
-    AND interaction.auth_message_date=? AND interaction.auth_message_id=?)`,
-    bindings: [...ticket.bindings, origin.previewReceiptId, origin.targets, origin.skippedCount, origin.originAttempt,
-      origin.role, origin.messageDate, origin.messageId] };
+  const exactTicket = (scope: ProviderSql): ProviderSql => ({
+    sql: `EXISTS(SELECT 1 ${ticketFrom} WHERE ${scope.sql} AND preview.receipt_id=? AND interaction.targets=?
+      AND interaction.skipped_count=? AND interaction.origin_attempt=? AND interaction.actor_role=?
+      AND interaction.auth_message_date=? AND interaction.auth_message_id=?)`,
+    bindings: [...scope.bindings, origin.previewReceiptId, origin.targets, origin.skippedCount, origin.originAttempt,
+      origin.role, origin.messageDate, origin.messageId],
+  });
+  const guard = exactTicket(ticket);
+  const coreGuard = general ? exactTicket(ticketScope(policy, event, digest, true)) : guard;
   const admission = current ? { sql: `(${guard.sql}) AND (${current.sql})`,
     bindings: [...guard.bindings, ...current.bindings] } : guard;
   const core = await prepareTelegramProviderBatchAdmission(db, general ? generalProviderAuthority(policy, true) : policy, {
     previewReceiptId: origin.previewReceiptId, confirmation: event, originAttempt: origin.originAttempt,
     epoch: { role: origin.role, messageDate: origin.messageDate, messageId: origin.messageId },
     targets: targetsFrom(origin.targets), skippedCount: origin.skippedCount,
-  }, { read: guard, commit: { sql: `changes()=1 AND ${guard.sql}`, bindings: guard.bindings },
+  }, { read: coreGuard, commit: { sql: `changes()=1 AND ${coreGuard.sql}`, bindings: coreGuard.bindings },
     ...(general ? { confirmationNonce: nonce } : {}) });
   const exact = `inbox.bot_id=? AND inbox.update_id=? AND inbox.actor_id=? AND inbox.chat_id=?
     AND inbox.message_id=? AND inbox.message_date=? AND ${privateInbox("inbox")}
