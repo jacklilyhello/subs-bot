@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { networkInterfaces } from "node:os";
 import { join } from "node:path";
@@ -26,6 +26,21 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.equal(process.platform, "linux");
   assert.notEqual(process.getuid?.(), 0);
   assert.deepEqual(Object.keys(networkInterfaces()), ["lo"]);
+  // Direct admission calls let the test revoke a leased reply before the emitted Worker drains it.
+  // Keep the Worker comparison semantics when those calls run in the Node fixture process.
+  const oldComparison = Object.getOwnPropertyDescriptor(crypto.subtle, "timingSafeEqual");
+  Object.defineProperty(crypto.subtle, "timingSafeEqual", {
+    configurable: true,
+    value: (received: ArrayBuffer, expected: ArrayBuffer) => {
+      assert.equal(received.byteLength, 32);
+      assert.equal(expected.byteLength, 32);
+      return timingSafeEqual(new Uint8Array(received), new Uint8Array(expected));
+    },
+  });
+  t.after(() => {
+    if (oldComparison) Object.defineProperty(crypto.subtle, "timingSafeEqual", oldComparison);
+    else Reflect.deleteProperty(crypto.subtle, "timingSafeEqual");
+  });
   const { SUBS_BOT_LEGACY_PYTHON, WORKER_TEST_BUNDLE_DIR, WORKER_TEST_REVISION } = process.env;
   assert.ok(SUBS_BOT_LEGACY_PYTHON && WORKER_TEST_BUNDLE_DIR && WORKER_TEST_REVISION);
   const generated = spawnSync(SUBS_BOT_LEGACY_PYTHON, ["-B", fileURLToPath(new URL("./telegram-general-auth-replay-fixture.py", import.meta.url))], {
