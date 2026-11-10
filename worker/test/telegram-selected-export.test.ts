@@ -10,7 +10,7 @@ import { createSubscription, publishNodeSnapshot } from "../src/storage.ts";
 import { renameOwnedSubscription, restoreOwnedSubscription, trashOwnedSubscription } from "../src/subscriptions.ts";
 import { parseTelegramAggregateKey, TELEGRAM_AGGREGATE_ORIGIN } from "../src/telegram/aggregate-actions.ts";
 import { drainTelegramReplies } from "../src/telegram/delivery.ts";
-import { acceptTelegramSelected, MAX_SELECTED_LINKS, prepareSelectedLimitTickets, prepareSelectedRevokeTicket,
+import { acceptTelegramSelected, GENERAL_TELEGRAM_SELECTED_MARKER, MAX_SELECTED_LINKS, prepareSelectedLimitTickets, prepareSelectedRevokeTicket,
   reapTelegramSelected, resolveTelegramSelectedCode, retireUnsentSelectedLink, TELEGRAM_SELECTED_MARKER } from "../src/telegram/selected-export.ts";
 import { beginTelegramSelectedLinkReply, claimTelegramReply, reapExpiredTelegramReplies, settleTelegramReply } from "../src/telegram/store.ts";
 import type { TelegramPolicy, TelegramSelectedUpdate } from "../src/telegram/protocol.ts";
@@ -324,6 +324,31 @@ test("uncertain sends retain their capability while expired unsent receipts rele
   assert.equal(await db.prepare("SELECT revoked_at IS NOT NULL AS revoked FROM aggregate_links WHERE code_sha256=?")
     .bind(second!.codeSha256).first<number>("revoked"), 1);
   assert.equal(await claimTelegramReply(db, config.botId, true), null);
+});
+
+test("ordinary selected cleanup leaves general-origin links and tickets for their own recovery", async () => {
+  const config = policy("15");
+  await seed(config, "scoped retirement");
+  const ordinary = await issued(config, 1);
+  const general = await issued(config, 2);
+  await db.batch([
+    db.prepare("UPDATE telegram_inbox SET receipt_nonce=? WHERE receipt_id=?")
+      .bind(GENERAL_TELEGRAM_SELECTED_MARKER, general.lease.receiptId),
+    db.prepare("UPDATE telegram_outbox SET state='failed',sent_message_id=NULL WHERE receipt_id IN (?,?)")
+      .bind(ordinary.lease.receiptId, general.lease.receiptId),
+    db.prepare("UPDATE telegram_selected_revoke_ticket SET expires_at=unixepoch()-1 WHERE token_sha256 IN (?,?)")
+      .bind(ordinary.ticket.sha256, general.ticket.sha256),
+  ]);
+  const ticketExists = (digest: string) => db.prepare("SELECT 1 FROM telegram_selected_revoke_ticket WHERE token_sha256=?")
+    .bind(digest).first().then((row) => row !== null);
+  await reapTelegramSelected(db);
+  assert.equal(await hasAggregateLink(db, ordinary.code), false);
+  assert.equal(await ticketExists(ordinary.ticket.sha256), false);
+  assert.equal(await hasAggregateLink(db, general.code), true);
+  assert.equal(await ticketExists(general.ticket.sha256), true);
+  await reapTelegramSelected(db, config.botId);
+  assert.equal(await hasAggregateLink(db, general.code), false);
+  assert.equal(await ticketExists(general.ticket.sha256), false);
 });
 
 test("the normal webhook issues only private selected subscriptions and serves/revokes their existing HTTP exports", { timeout: 60_000 }, async () => {
