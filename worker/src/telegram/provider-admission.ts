@@ -5,6 +5,7 @@ import { digestHex, validInteger } from "../storage.ts";
 import { normalizeSubscriptionName } from "../subscriptions.ts";
 import { inTelegramScope, type TelegramEventScope, type TelegramPolicy, type TelegramProviderRefreshUpdate } from "./protocol.ts";
 import { readTelegramProviderRefreshAdmission } from "./provider-refresh.ts";
+import { UNNAMED_PROVIDER_SUBSCRIPTION } from "../provider-initial-title.ts";
 
 export type TelegramProviderEvent = TelegramEventScope & (
   | { kind: "url-import"; sourceUrl: string; name?: string }
@@ -37,7 +38,7 @@ function fixedRefusal(kind: Refusal): ProviderSql {
 
 function cleanName(value: string | undefined): string | null {
   try {
-    return normalizeSubscriptionName(value ?? "远程订阅");
+    return normalizeSubscriptionName(value ?? UNNAMED_PROVIDER_SUBSCRIPTION);
   } catch {
     return null;
   }
@@ -70,7 +71,8 @@ export async function acceptTelegramProviderRequest(
       if (!name || !providerHost(event.sourceUrl)) {
         refusal = fixedRefusal("invalid-url");
       } else {
-        const { plan } = await prepareProviderUrlImport(db, { ...input, sourceUrl: event.sourceUrl, name }, fence, policy, includeBatch);
+        const { plan } = await prepareProviderUrlImport(db,
+          { ...input, sourceUrl: event.sourceUrl, name, initialTitle: event.name === undefined }, fence, policy, includeBatch);
         admission = plan.statements;
         refusal = plan.refusal;
       }

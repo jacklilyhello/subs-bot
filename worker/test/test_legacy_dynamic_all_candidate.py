@@ -85,7 +85,9 @@ class LegacyDynamicAllCandidateTests(unittest.TestCase):
         self.assertEqual(manifest["source"]["sqliteSha256"], result.source_sha256)
         self.assertEqual(manifest["workerArtifact"]["manifestSha256"], self.worker_sha)
         self.assertEqual(manifest["objectCount"], 8)
-        self.assertEqual((manifest["summary"]["rowCount"], manifest["summary"]["tableCounts"]["subs_bot_schema_migrations"]), (60, 40))
+        ledger_count = len(self.base.chain)
+        self.assertEqual((manifest["summary"]["rowCount"], manifest["summary"]["tableCounts"]["subs_bot_schema_migrations"]),
+                         (20 + ledger_count, ledger_count))
         self.assertEqual({key: manifest["dynamicAll"][key] for key in ("rows", "markers", "orderRows", "state")},
                          {"rows": 3, "markers": 3, "orderRows": 0, "state": "dormant"})
         self.assertEqual({key: manifest["legacyTempBaseline"][key] for key in ("installations", "batches", "nodes", "owners", "state")},
