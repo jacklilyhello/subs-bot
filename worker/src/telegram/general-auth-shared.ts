@@ -6,9 +6,9 @@ import { acceptTelegramDocumentJob, generalDocumentReplyEligibility, generalDocu
   TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER, type TelegramDocumentJobResult } from "./document-jobs.ts";
 import { renderTelegramAggregateLinks, sendGeneralTelegramGroupListReply, sendGeneralTelegramPrivateReply,
   sendPrivateShareClaimResult } from "./delivery.ts";
-import { acceptGeneralAuthAction, GENERAL_AUTH_ACTION_MARKER, GENERAL_AUTH_ACTION_SCHEMA,
+import { acceptGeneralAuthAction, GENERAL_AUTH_ACTION_MARKER, GENERAL_AUTH_ACTION_SCHEMA, GENERAL_AUTH_LIST_LIMIT,
   prepareGeneralAuthActionReply, readGeneralAuthAction, renderGeneralAuthActionReply,
-  type GeneralAuthActionReply } from "./general-auth-actions.ts";
+  type GeneralAuthReply } from "./general-auth-actions.ts";
 import {
   generalReadEvent, renderGeneralReadReply,
   type GeneralReadCommand, type GeneralReadEvent, type GeneralTelegramPin,
@@ -76,7 +76,7 @@ interface SharedReadLease {
   generation: number;
   actorRevision: number;
   actorRole: "admin" | "member";
-  command: GeneralReadCommand | "auth-add" | "auth-remove";
+  command: GeneralReadCommand | "auth-add" | "auth-remove" | "auth-list";
   marker: string;
   viewKind: "list" | "recycle" | null;
   actionKind: TelegramLifecycleReply["kind"] | null;
@@ -147,7 +147,7 @@ function family(alias: "inbox" | "earlier", group: boolean, pin: GeneralTelegram
       AND EXISTS (SELECT 1 FROM telegram_path_reply WHERE receipt_id=${alias}.receipt_id)) ${temp} ${document} ${provider})))` : ordinary;
   if (pin.rehearsal) return management;
   return `(CASE WHEN ${alias}.receipt_nonce='${GENERAL_AUTH_ACTION_MARKER}'
-    THEN (${privateScope} AND ${alias}.command IN ('auth-add','auth-remove') AND ${GENERAL_AUTH_ACTION_SCHEMA})
+    THEN (${privateScope} AND ${alias}.command IN ('auth-add','auth-remove','auth-list') AND ${GENERAL_AUTH_ACTION_SCHEMA})
     ${pin.privateClaims ? `WHEN ${alias}.receipt_nonce='${TELEGRAM_GENERAL_PRIVATE_CLAIM_MARKER}'
       THEN (${privateScope} AND ${alias}.command='help'
         AND EXISTS (SELECT 1 FROM telegram_private_claim WHERE receipt_id=${alias}.receipt_id))` : ""}
@@ -542,14 +542,15 @@ export async function drainGeneralSharedTelegramReply(
     return drainGeneralSelectedReply(db, pin, lease, publicOrigin, aggregateKey);
   }
   if (lease.marker === GENERAL_AUTH_ACTION_MARKER) {
-    const [begun, reply] = await db.batch<GeneralAuthActionReply>([
+    const [begun, reply] = await db.batch<GeneralAuthReply>([
       prepareTelegramOutboxBegin(db, lease, selectLease(pin, lease, true)), prepareGeneralAuthActionReply(db, lease),
     ]);
-    if (!begun?.success || !reply?.success || begun.results.length > 1 || reply.results.length > begun.results.length) {
+    const limit = lease.command === "auth-list" ? GENERAL_AUTH_LIST_LIMIT + 1 : 1;
+    if (!begun?.success || !reply?.success || begun.results.length > 1 || reply.results.length > begun.results.length * limit) {
       throw new Error("General Telegram authorization reply could not be confirmed.");
     }
     if (!begun.results.length) return false;
-    const text = reply.results[0] && renderGeneralAuthActionReply(reply.results[0], lease.command);
+    const text = renderGeneralAuthActionReply(reply.results, lease.command);
     const outcome = text ? await sendGeneralTelegramPrivateReply(pin.botToken, lease.actorId, lease.messageId, text)
       : { kind: "failed" as const };
     await settleTelegramOutboxReply(db, lease, selectLease(pin, lease, false), outcome);
@@ -649,7 +650,7 @@ export async function drainGeneralSharedTelegramReply(
     if (!reply) throw new Error("General Telegram provider reply could not be confirmed.");
     presentation = { text: renderTelegramProviderReply(reply.outcome, reply.kind), buttons: [], forceReply: false };
   } else {
-    if (lease.command === "auth-add" || lease.command === "auth-remove") return false;
+    if (lease.command !== "help" && lease.command !== "list") return false;
     const text = await renderGeneralReadReply(db, lease.actorId, lease.command);
     const privateHelp = pin.privateManagement && lease.command === "help";
     const help = privateHelp ? text + "\n/recycle 查看你的回收站\n/s 名称关键词 搜索你的订阅\n/path 管理你的路径规则" : text;
