@@ -2,6 +2,7 @@ import { checkOwnerId, digestHex, SUBSCRIPTION_LIFECYCLE_REVISION, validInteger 
 import { normalizeSubscriptionName } from "./subscriptions.ts";
 import { isolatedTelegramRoleEpochSql } from "./telegram/authorization-sql.ts";
 import { providerDocumentOrigin } from "./telegram/provider-document-origin.ts";
+import { providerInitialTitleReady } from "./provider-initial-title.ts";
 
 export const PROVIDER_JOB_TTL_SECONDS = 3600;
 const LEASE_SECONDS = 120;
@@ -16,7 +17,7 @@ const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}(?![\s\S])/u;
 const encoder = new TextEncoder();
 
 type AdmissionKey = { ownerId: string; requestKey: string };
-type UrlImport = AdmissionKey & { sourceUrl: string; name?: string };
+type UrlImport = AdmissionKey & { sourceUrl: string; name?: string; initialTitle?: boolean };
 type Refresh = AdmissionKey & { id: number; expectedGeneration?: number; expectedLifecycleRevision?: number };
 
 export const TELEGRAM_PROVIDER_MARKER = "provider-request:v1";
@@ -173,7 +174,8 @@ function prepareAdmission(
 
 function prepareAdmissionPlan(
   db: D1Database, key: AdmissionKey, kind: ProviderJobLease["kind"], target: Guard, digest: string,
-  refusal: Guard, create?: { sourceUrl: string; name: string }, fence?: Guard, authorization?: ProviderTelegramPolicy, includeBatch = false,
+  refusal: Guard, create?: { sourceUrl: string; name: string; initialTitle?: boolean }, fence?: Guard,
+  authorization?: ProviderTelegramPolicy, includeBatch = false,
 ): AdmissionPlan {
   const steps: D1PreparedStatement[] = [];
   const scope = jobScope(authorization, includeBatch);
@@ -200,11 +202,26 @@ function prepareAdmissionPlan(
   steps.push(prepareAdmission(db, key, kind, fence ? { sql: `(${target.sql}) AND (${fence.sql})`,
     bindings: [...target.bindings, ...fence.bindings] } : target, digest, scope));
   if (token) {
+    if (create?.initialTitle) {
+      steps.push(db.prepare(`DELETE FROM telegram_provider_initial_titles WHERE subscription_id IN (
+        SELECT subscription_id FROM telegram_provider_initial_titles WHERE expires_at<=unixepoch()
+        ORDER BY expires_at,subscription_id LIMIT 16)
+        AND EXISTS (SELECT 1 FROM subscriptions WHERE token=?)`).bind(token),
+      db.prepare(`INSERT INTO telegram_provider_initial_titles (subscription_id,request_key,source_sha256,expires_at)
+        SELECT sub.id,job.request_key,job.source_sha256,job.expires_at FROM subscriptions AS sub
+        JOIN ${table} AS job ON job.subscription_id=sub.id AND job.owner_id=sub.owner_id
+        WHERE sub.token=? AND job.owner_id=? AND job.request_key=? AND job.source_sha256=? AND job.state='pending'
+          AND job.kind='url-import' AND job.expected_generation=0 AND job.expected_lifecycle_revision=0`)
+        .bind(token, key.ownerId, key.requestKey, digest));
+    }
     // A new shell and its job must either both commit or both roll back.
     steps.push(db.prepare(`
       SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM subscriptions WHERE token = ?)
         OR EXISTS (SELECT 1 FROM ${table} AS job JOIN subscriptions AS sub ON sub.id = job.subscription_id
-          WHERE sub.token = ? AND job.owner_id = ? AND job.request_key = ? AND job.state = 'pending')
+          WHERE sub.token = ? AND job.owner_id = ? AND job.request_key = ? AND job.state = 'pending'
+          ${create?.initialTitle ? `AND EXISTS (SELECT 1 FROM telegram_provider_initial_titles AS initial
+            WHERE initial.subscription_id=sub.id AND initial.request_key=job.request_key
+              AND initial.source_sha256=job.source_sha256 AND initial.expires_at=job.expires_at)` : ""})
         THEN 1 ELSE json_extract('provider admission guard failed', '$') END
     `).bind(token, token, key.ownerId, key.requestKey));
   }
@@ -257,8 +274,9 @@ export async function prepareProviderUrlImport(
       ) THEN 'unavailable' ELSE 'capacity' END`,
     bindings: [...target.bindings, ...target.bindings, input.ownerId, input.sourceUrl],
   };
-  return { digest, plan: prepareAdmissionPlan(db, input, "url-import", target, digest, refusal, { sourceUrl: input.sourceUrl, name },
-    fence, authorization, includeBatch) };
+  const initialTitle = input.initialTitle === true && authorization !== undefined && await providerInitialTitleReady(db);
+  return { digest, plan: prepareAdmissionPlan(db, input, "url-import", target, digest, refusal,
+    { sourceUrl: input.sourceUrl, name, initialTitle }, fence, authorization, includeBatch) };
 }
 
 export async function prepareOwnedProviderRefresh(
