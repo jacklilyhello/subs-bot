@@ -1,9 +1,9 @@
 import {
-  preparePrivateShareClaim, privateShareClaimStatements, privateShareCodeDigest, readPrivateShareClaimResult,
+  legacyPrivateShareAvailable, preparePrivateShareClaim, privateShareClaimStatements, privateShareCodeDigest, readPrivateShareClaimResult,
   type PreparedPrivateShareClaim, type PrivateShareClaimResult,
 } from "../private-shares.ts";
 import {
-  inTelegramScope, type TelegramEventScope, type TelegramPolicy, type TelegramPrivateClaimUpdate,
+  inTelegramScope, type TelegramEventScope, type TelegramLegacyInlineClaim, type TelegramPolicy, type TelegramPrivateClaimUpdate,
 } from "./protocol.ts";
 import { groupShareClaimGuard, TELEGRAM_GROUP_CLAIM_MARKER } from "./group-share-actions.ts";
 
@@ -22,6 +22,15 @@ const deliveryError = "Telegram private claim delivery could not be confirmed.";
 
 function inPrivateScope(policy: TelegramPolicy, event: TelegramEventScope): boolean {
   return event.chatType === "private" && event.threadId === null && inTelegramScope(policy, event);
+}
+
+export async function legacyInlineClaimUrl(
+  db: D1Database, policy: TelegramPolicy, { actorId, code }: TelegramLegacyInlineClaim,
+): Promise<string | undefined> {
+  if (code.length !== 11 || (actorId !== policy.adminId && actorId !== policy.memberId)) return;
+  const codeSha256 = await privateShareCodeDigest(code);
+  if (codeSha256 === null || !await legacyPrivateShareAvailable(db, { botId: policy.botId, actorId, codeSha256 })) return;
+  return `https://t.me/${policy.botUsername}?start=claim_${code}`;
 }
 
 export async function acceptTelegramPrivateClaim(
