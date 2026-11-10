@@ -140,6 +140,8 @@ Cloudflare 边缘诊断使用独立的 `worker-grep-edge-preview.yml`。仅在 `
 
 窗口结束后，用 `retire Grep diagnostic <cohort>` 执行 `retire`。工具以同一 ETag 的条件 PUT 把已确认结果和当前 arm 替换为小型墓碑，并保留不含内容的预留记录。墓碑阻止迟到写入重建结果。三步期间固定当前主分支和活动版本。arm 写入结果不明时，只用同一 cohort 回读，发现仍未确认时停止。整个过程不输出查询、文件路径、头值、账号 ID 或 Bot 凭据。 [R2 条件写入](https://developers.cloudflare.com/r2/reference/consistency/#conditional-writes)
 
+管理 API 下载返回弱 ETag 时，工具用精确对象键查列表元数据，核对存储 ETag、大小和下载字节。条件写入使用已核对的存储 ETag。列表或内容不一致会停止操作。 [R2 对象列表](https://developers.cloudflare.com/api/resources/r2/subresources/buckets/subresources/objects/methods/list/)
+
 ### 订阅搜索、详情和格式链接
 
 `/s 关键词` 按当前用户的活动订阅搜索名称和来源，沿用旧版的 Unicode 小写子串匹配。每页最多显示 8 项，搜索限于 512 条订阅及 8 MiB 元数据。群聊只显示用户自己的匹配名称和编号。普通私聊可通过搜索结果、`/list`、`/expire` 的详情按钮，或直接发送活动列表顺序编号查看详情。详情显示流量、到期、节点数量及最多 8 个已校验的节点名称。来源 URL、节点凭据和刷新错误原文不进入回复。
