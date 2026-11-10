@@ -265,6 +265,18 @@ export async function sendTelegramPrivateClaimReply(
   if (!lease.privateClaim || !inTelegramScope(policy, lease) || lease.chatType !== "private" || lease.threadId !== null) {
     return { kind: "failed" };
   }
+  return sendPrivateShareClaimResult(policy.botToken, lease.chatId, lease.messageId, result, timeoutMs, request);
+}
+
+/** Transport for a claim already fenced to the exact private actor and receipt. */
+export async function sendPrivateShareClaimResult(
+  botToken: string, actorId: string, messageId: number, result: PrivateShareClaimResult,
+  timeoutMs: number, request: typeof fetch = fetch,
+): Promise<TelegramReplyOutcome> {
+  const reply = { message_id: messageId, allow_sending_without_reply: true };
+  const sendText = (text: string) => postTelegram(botToken, actorId, "sendMessage", {
+    chat_id: actorId, reply_parameters: reply, link_preview_options: { is_disabled: true }, text,
+  }, timeoutMs, request);
   if (!("content" in result)) {
     const reason = {
       unavailable: "分享不可用。",
@@ -272,22 +284,22 @@ export async function sendTelegramPrivateClaimReply(
       target: "此分享指定了其他领取人。",
       exhausted: "分享份数已领完。",
     }[result.kind];
-    return sendTelegramReply(policy, lease, `私密分享领取失败。\n${reason}`, timeoutMs, request);
+    return sendText(`私密分享领取失败。\n${reason}`);
   }
   const sender = result.senderName.replace(/[\p{Cc}\p{Cf}\p{Cs}\u2028\u2029]/gu, " ")
     .replace(/[a-z][a-z0-9+.-]*:\/\/\S+/giu, "[链接已省略]").trim() || "用户";
   const caption = `私密分享\n来自：${sender}\n领取进度：${result.claimCount}/${result.maxClaims}`;
   const text = `${caption}\n\n${result.content}`;
   if (text.length <= 3800 && !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(result.content)) {
-    return sendTelegramReply(policy, lease, text, timeoutMs, request);
+    return sendText(text);
   }
 
   const form = new FormData();
-  form.set("chat_id", lease.chatId);
-  form.set("reply_parameters", JSON.stringify(replyParameters(lease)));
+  form.set("chat_id", actorId);
+  form.set("reply_parameters", JSON.stringify(reply));
   form.set("caption", caption);
   form.set("document", new Blob([result.content], { type: "text/plain;charset=utf-8" }), "private-share.txt");
-  return sendTelegram(policy, lease, "sendDocument", form, timeoutMs, request);
+  return postTelegram(botToken, actorId, "sendDocument", form, timeoutMs, request);
 }
 
 export async function answerTelegramCallback(
