@@ -14,6 +14,7 @@ import { publishNodeSnapshot } from "../src/storage.ts";
 import { parseSubscriptionDocument } from "../src/subscription-document.ts";
 import { claimTelegramDocumentJob } from "../src/telegram/document-jobs.ts";
 import { persistTelegramDocumentJob, reconcileTelegramDocumentJobReplies, retireTelegramDocumentStage } from "../src/telegram/document-persistence.ts";
+import { parseTelegramAggregateKey } from "../src/telegram/aggregate-actions.ts";
 import { GENERAL_AUTH_LEGACY_ROLE, type GeneralAuthReplayMessage, type GeneralAuthReplayPin } from "../src/telegram/general-auth-replay.ts";
 import { beginGeneralTelegramReply, claimGeneralTelegramReply, parseGeneralTelegramPin } from "../src/telegram/general-auth-runtime.ts";
 import { acceptGeneralSharedTelegramCommand, beginGeneralSharedTelegramReply, claimGeneralSharedTelegramReply,
@@ -130,10 +131,20 @@ test("closed general authorization replays a sealed candidate in a separate emit
   const claimsConfig = JSON.stringify({ ...JSON.parse(generalConfig),
     outbox: "shared-private-management-formats-temp-node-document-provider-claims" });
   const claimsPin = parseGeneralTelegramPin(claimsConfig, fixture.releaseRevision);
-  assert.ok(claimsPin?.privateClaims && claimsPin.privateProvider);
-  const authConfig = JSON.stringify({ ...JSON.parse(claimsConfig), authManagement: true });
+  assert.ok(claimsPin?.privateClaims && claimsPin.privateProvider && !claimsPin.privateShareCreation && !claimsPin.privateAggregate);
+  const shareConfig = JSON.stringify({ ...JSON.parse(generalConfig),
+    outbox: "shared-private-management-formats-temp-node-document-provider-claims-share" });
+  const sharePin = parseGeneralTelegramPin(shareConfig, fixture.releaseRevision);
+  assert.ok(sharePin?.privateShareCreation && !sharePin.privateAggregate);
+  const aggregateConfig = JSON.stringify({ ...JSON.parse(generalConfig),
+    outbox: "shared-private-management-formats-temp-node-document-provider-claims-share-aggregate" });
+  const aggregatePin = parseGeneralTelegramPin(aggregateConfig, fixture.releaseRevision);
+  assert.ok(aggregatePin?.privateAggregate && aggregatePin.privateShareCreation && aggregatePin.privateClaims);
+  const aggregateKeyRaw = Buffer.alloc(32, 17).toString("base64url");
+  const shareKeyRaw = Buffer.alloc(32, 0x61).toString("base64url");
+  const authConfig = JSON.stringify({ ...JSON.parse(aggregateConfig), authManagement: true });
   const authPin = parseGeneralTelegramPin(authConfig, fixture.releaseRevision);
-  assert.ok(authPin?.privateAuthorization && authPin.privateClaims);
+  assert.ok(authPin?.privateAuthorization && authPin.privateAggregate && authPin.privateShareCreation && authPin.privateClaims);
   assert.equal(parseGeneralTelegramPin(JSON.stringify({ ...JSON.parse(sharedConfig), authManagement: true }),
     fixture.releaseRevision), null);
   const claimSends = new Map<number, { actorId: string; text?: string; body?: Buffer }>();
@@ -221,13 +232,22 @@ test("closed general authorization replays a sealed candidate in a separate emit
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: documentConfig, PUBLIC_ORIGIN: PRODUCTION_PUBLIC_ORIGIN },
       outboundService: privateTransport },
     { name: "auth", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
-      bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: authConfig }, outboundService: privateTransport },
+      bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: authConfig,
+        TELEGRAM_AGGREGATE_KEY: aggregateKeyRaw, TELEGRAM_PRIVATE_SHARE_CREATION_KEY: shareKeyRaw }, outboundService: privateTransport },
+    ...[true, false].map((withKey) => ({ name: withKey ? "aggregate" : "aggregate-no-key", modules: true,
+      script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"], outboundService: privateTransport,
+      bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: aggregateConfig, PUBLIC_ORIGIN: PRODUCTION_PUBLIC_ORIGIN,
+        ...(withKey ? { TELEGRAM_AGGREGATE_KEY: aggregateKeyRaw } : { TELEGRAM_PRIVATE_SHARE_CREATION_KEY: shareKeyRaw }) } })),
     ...[true, false].map((enabled) => ({ name: enabled ? "provider-open" : "provider-paused", modules: true,
       script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"], outboundService: privateTransport,
       serviceBindings: { PROVIDER_FETCH: { name: "provider-rpc", entrypoint: "ProviderFetch" } },
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: providerConfig,
         PROVIDER_REVISION: providerRevision, PROVIDER_IMAGE_SHA256: imageSha256,
         ...(enabled ? { TELEGRAM_PROVIDER_URL_IMPORT: "1", TELEGRAM_PROVIDER_REFRESH: "1" } : {}) } })),
+    { name: "share-creation", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
+      bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: shareConfig,
+        TELEGRAM_PRIVATE_SHARE_CREATION_KEY: shareKeyRaw },
+      outboundService: privateTransport },
     { name: "claims", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: claimsConfig },
       outboundService: async (request: Request) => {
@@ -1321,6 +1341,144 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.match((await awaitClaim(7567)).text ?? "", /分享已过期/u);
   assert.equal(await countClaims(expiredDigest), 0);
 
+  const shareWorker = await runtime.getWorker("share-creation");
+  const shareText = "/share x2 id106 s5 -- Synthetic creation body";
+  const sharePost = (updateId: number, actor: number, text: string, options: PostOptions = {}) =>
+    post(actor, text, { worker: shareWorker, updateId, date: now + 19, ...options });
+  assert.equal((await sharePost(7570, 101, shareText, { worker: claimsWorker })).status, 204);
+  assert.equal((await sharePost(7571, 102, shareText)).status, 204);
+  assert.equal((await sharePost(7572, 101, shareText, groupEvent)).status, 204);
+  assert.equal((await sharePost(7573, 101, "/share x101 -- invalid")).status, 204);
+  assert.equal((await sharePost(7574, 101, "/share id104 -- revoked recipient")).status, 204);
+  assert.equal((await sharePost(7575, 101, shareText)).status, 200);
+  const created = await awaitLifecycle(7575).catch(async () => {
+    // Failure-only evidence. Inspect fixed state fields and never retry a send here.
+    const facts = await db.prepare(`SELECT creation.state AS creationState, reply.state AS replyState,
+      reply.attempts, CASE WHEN reply.due_at <= unixepoch() THEN 1 ELSE 0 END AS due,
+      CASE WHEN reply.lease_until > unixepoch() THEN 1 ELSE 0 END AS leaseActive
+      FROM telegram_inbox AS inbox
+      LEFT JOIN telegram_private_share_creations AS creation USING (receipt_id)
+      LEFT JOIN telegram_outbox AS reply USING (receipt_id)
+      WHERE inbox.bot_id=? AND inbox.update_id=? AND inbox.receipt_nonce='general-share-create:v1'`)
+      .bind(pin.botId, 7575).first<{ creationState: string | null; replyState: string | null;
+        attempts: number | null; due: number; leaseActive: number }>();
+    const creation = ["reserved", "published", "abandoned"].find((state) => state === facts?.creationState) ?? "absent-or-invalid";
+    const reply = ["pending", "leased", "sending", "sent", "failed", "uncertain"]
+      .find((state) => state === facts?.replyState) ?? "absent-or-invalid";
+    const attempts = [0, 1, 2, 3, 4].find((count) => count === facts?.attempts) ?? "absent-or-invalid";
+    assert.fail(`Synthetic share reply missing (creation=${creation}, outbox=${reply}, attempts=${attempts}, `
+      + `due=${facts?.due === 1}, leaseActive=${facts?.leaseActive === 1}).`);
+  });
+  assert.equal(created.message.chat_id, "101");
+  assert.equal(created.message.reply_markup, undefined);
+  assert.doesNotMatch(created.message.text, /Synthetic creation body/u);
+  const issued = /https:\/\/t\.me\/GeneralFixtureBot\?start=claim_([A-Za-z0-9_-]{22})/u.exec(created.message.text);
+  assert.ok(issued);
+  const issuedCode = issued[1];
+  assert.deepEqual(await db.prepare(`SELECT creation.state,creation.installation,share.target_user_id AS target,
+    share.max_claims AS portions,share.expire_at-share.created_at AS ttl,share.code_sha256 AS digest
+    FROM telegram_private_share_creations AS creation JOIN telegram_inbox AS inbox USING(receipt_id)
+    JOIN private_shares AS share ON share.id=creation.share_id WHERE inbox.bot_id=? AND inbox.update_id=7575
+      AND inbox.receipt_nonce='general-share-create:v1'`).bind(pin.botId).first(),
+  { state: "published", installation: "general-bot-105", target: "106", portions: 2, ttl: 300,
+    digest: await privateShareCodeDigest(issuedCode) });
+  assert.equal((await sharePost(7575, 101, shareText)).status, 200, "a confirmed replay reuses the same published receipt");
+  assert.equal(lifecycleSent.filter(({ reply_parameters }) => reply_parameters.message_id === 7575).length, 1);
+  assert.equal((await claimPost(7576, 106, issuedCode, { date: now + 20 })).status, 200);
+  assert.match((await awaitClaim(7576)).text ?? "", /Synthetic creation body/u);
+
+  const aggregateWorker = await runtime.getWorker("aggregate");
+  const aggregateNoKey = await runtime.getWorker("aggregate-no-key");
+  const aggregateKey = await parseTelegramAggregateKey(aggregateKeyRaw);
+  assert.ok(aggregateKey);
+  const exportPost = (id: number, actor: number, text = "/export", options: PostOptions = {}) =>
+    post(actor, text, { worker: aggregateWorker, updateId: id, date: now + 20, ...options });
+  const slot = (actorId: string) => db.prepare(`SELECT revision,code_sha256 AS digest FROM telegram_aggregate_slots
+    WHERE bot_id=? AND actor_id=?`).bind(pin.botId, actorId).first<{ revision: number; digest: string | null }>();
+  const exportReply = async (id: number, actorId: string) => {
+    const { message } = await awaitLifecycle(id);
+    assert.equal(message.chat_id, actorId);
+    assert.deepEqual(message.link_preview_options, { is_disabled: true });
+    assert.equal((await findReply(id))?.marker, "general-aggregate:v1");
+    return message.text;
+  };
+  const aggregateCode = async (id: number, actorId: string) => {
+    const text = await exportReply(id, actorId);
+    const clash = text.split("\n")[1];
+    const url = new URL(clash);
+    assert.equal(url.origin, PRODUCTION_PUBLIC_ORIGIN);
+    const code = /^\/agg\/([A-Za-z0-9_-]{22})\/clash$/u.exec(url.pathname)?.[1];
+    assert.ok(code);
+    assert.ok(text.includes(`${PRODUCTION_PUBLIC_ORIGIN}/agg/${code}/base64`));
+    assert.equal((await slot(actorId))?.digest, createHash("sha256").update(code).digest("hex"));
+    return code;
+  };
+  const getAggregate = (code: string, format = "base64") => aggregateWorker.fetch(`https://app.fixture.invalid/agg/${code}/${format}`);
+  assert.equal((await exportPost(7580, 101, "/export", { worker: claimsWorker })).status, 204);
+  assert.equal((await exportPost(7581, 101, "/export", { worker: aggregateNoKey })).status, 204);
+  assert.equal((await exportPost(7579, 101, "/share -- Synthetic cross-key control")).status, 204);
+  assert.equal((await exportPost(7582, 101, "/export@GeneralFixtureBot", groupEvent)).status, 204);
+  assert.equal((await exportPost(7583, 102)).status, 204);
+  assert.equal((await exportPost(7584, 101, "/export someone-else")).status, 204);
+  assert.equal(await slot("101"), null);
+  assert.equal((await exportPost(7585, 101)).status, 200);
+  const adminAggregate = await aggregateCode(7585, "101");
+  assert.equal((await exportPost(7585, 101)).status, 204);
+  assert.equal((await exportPost(7586, 101)).status, 200);
+  assert.equal(await aggregateCode(7586, "101"), adminAggregate);
+
+  await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,'104',14,?,'member')")
+    .bind(pin.botId, pin.generation, now + 19).run();
+  assert.equal((await exportPost(7587, 104)).status, 200);
+  const memberAggregate = await aggregateCode(7587, "104");
+  assert.notEqual(adminAggregate, memberAggregate);
+  const readAggregate = async (code: string) => {
+    const response = await getAggregate(code);
+    assert.equal(response.status, 200);
+    return Buffer.from(await response.text(), "base64").toString("utf8").split("\n");
+  };
+  const adminRows = await readAggregate(adminAggregate), memberRows = await readAggregate(memberAggregate);
+  assert.ok(adminRows.includes(providerShare) && adminRows.includes(fixtureShare) && !adminRows.includes(secondShare));
+  assert.ok(memberRows.includes(secondShare) && !memberRows.includes(providerShare) && !memberRows.includes(fixtureShare));
+
+  const unsupported = await db.prepare(`SELECT id FROM subscriptions WHERE owner_id='101' AND token='refresh-static-fixture-token'`)
+    .first<number>("id");
+  assert.ok(unsupported);
+  assert.equal(await publishNodeSnapshot(db, bucket, { id: unsupported, ownerId: "101", expectedGeneration: 0,
+    expectedLifecycleRevision: 0 }, [{ type: "wireguard", name: "Fixture unsupported share" }]), true);
+  assert.equal((await exportPost(7588, 101)).status, 200);
+  const limited = await exportReply(7588, "101");
+  assert.ok(limited.includes(`${PRODUCTION_PUBLIC_ORIGIN}/agg/${adminAggregate}/clash`));
+  assert.match(limited, /Base64：订阅内容不支持此格式。/u);
+  assert.doesNotMatch(limited, /\/base64/u);
+  assert.equal((await getAggregate(adminAggregate)).status, 422);
+
+  assert.equal((await exportPost(7589, 104, "/export revoke")).status, 200);
+  assert.equal(await exportReply(7589, "104"), "聚合导出链接已撤销。");
+  assert.equal((await getAggregate(memberAggregate)).status, 404);
+  assert.equal((await getAggregate(adminAggregate)).status, 422);
+  assert.equal((await slot("104"))?.digest, null);
+  assert.equal((await exportPost(7590, 101, "/export revoke")).status, 200);
+  assert.equal(await exportReply(7590, "101"), "聚合导出链接已撤销。");
+  assert.equal((await getAggregate(adminAggregate)).status, 404);
+  assert.equal((await exportPost(7592, 101, "/export", { date: now + 19 })).status, 200);
+  assert.equal(await exportReply(7592, "101"), "这条聚合操作已失效。");
+  assert.equal((await slot("101"))?.digest, null);
+
+  assert.equal(await acceptGeneralSharedTelegramCommand(db, aggregatePin, new Request("https://app.fixture.invalid/telegram/webhook", {
+    method: "POST", headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": pin.webhookSecret },
+    body: JSON.stringify({ update_id: 7591, message: { text: "/export", message_id: 7591, date: now + 21,
+      from: { id: 104, is_bot: false }, chat: { id: 104, type: "private" }, entities: [{ type: "bot_command", offset: 0, length: 7 }] } }),
+  }), undefined, undefined, undefined, undefined, aggregateKey), 200);
+  const queuedAggregate = await claimGeneralSharedTelegramReply(db, aggregatePin);
+  assert.ok(queuedAggregate?.updateId === 7591);
+  await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,'104',15,?,'denied')")
+    .bind(pin.botId, pin.generation, now + 22).run();
+  assert.equal(await beginGeneralSharedTelegramReply(db, aggregatePin, queuedAggregate), false);
+  assert.equal((await aggregateWorker.scheduled({ cron: "* * * * *" })).outcome, "ok");
+  assert.equal((await findReply(7591))?.state, "failed");
+  assert.ok(!lifecycleSent.some(({ reply_parameters }) => reply_parameters.message_id === 7591));
+
   const rehearsal = await runtime.getWorker("rehearsal");
   const lanePost = (actor: number, command: string, options: PostOptions = {}) =>
     post(actor, command, { secret: isolation.webhookSecret, date: now - 3, ...options, worker: rehearsal });
@@ -1366,7 +1524,8 @@ test("closed general authorization replays a sealed candidate in a separate emit
   const open = await readGeneralReadLane(db, isolation, fixture.releaseRevision);
   assert.ok(open?.pin?.rehearsal && open.mode === "general");
   assert.deepEqual([open.pin.privateManagement, open.pin.privateFormats, open.pin.privateTemp,
-    open.pin.privateDocument, open.pin.privateProvider, open.pin.privateClaims], [false, false, false, false, false, false],
+    open.pin.privateDocument, open.pin.privateProvider, open.pin.privateClaims, open.pin.privateShareCreation, open.pin.privateAggregate],
+    [false, false, false, false, false, false, false, false],
     "the rehearsal enables only private reads");
   assert.equal((await lanePost(182, "/list", { updateId: 8102, date: now - 21 })).status, 503,
     "uncommitted pre-cutover delivery is held for the original lane");
