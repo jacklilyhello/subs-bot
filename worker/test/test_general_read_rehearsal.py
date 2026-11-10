@@ -1,5 +1,6 @@
 """Synthetic SQLite and immutable Worker tests for protected private read rehearsal."""
 
+from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
 import json
 import sqlite3
@@ -149,6 +150,26 @@ class GeneralReadRehearsalTests(TestCase):
             self.action("open", closed)
         self.assertEqual(self.action()["mode"], "closed")
         self.assertEqual(self.api.db.execute("SELECT count(*) FROM telegram_general_policy").fetchone()[0], 0)
+
+    def test_recovery_keeps_exact_active_pin_across_version_reader_changes(self):
+        closed = self.action("close", self.action())
+        opened = self.action("open", closed)
+
+        @dataclass(frozen=True)
+        class FutureVersion(cloudflare._Version):
+            future_feature_flag: bool = True
+
+        self.scope.version_pin = FutureVersion(**asdict(self.scope.version_pin))
+        self.scope.version_pin = replace(self.scope.version_pin, digest="c" * 64)
+        with self.assertRaises(cloudflare.CloudflareError):
+            self.action("inspect", opened, artifact=None)
+        self.scope.version_pin = replace(self.scope.version_pin, digest=MODULE)
+        current = self.action("inspect", opened, artifact=None)
+        self.assertEqual(current["activeSha256"], opened["activeSha256"])
+        closed = self.action("close", current, artifact=None)
+        self.assertEqual(closed["activeSha256"], opened["activeSha256"])
+        restored = self.action("restore", closed, artifact=None)
+        self.assertEqual(restored["mode"], "isolated")
 
     def test_manifest_requires_exact_position_and_compiled_capability(self):
         prior = [{}] * 48

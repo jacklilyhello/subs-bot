@@ -1,6 +1,5 @@
 """Control the two existing isolated actors' private general read rehearsal."""
 
-from dataclasses import asdict
 from hashlib import sha256
 import json
 import os
@@ -203,6 +202,19 @@ def _transition(action, state, sql, principals, active_sha, version):
     return ";\n".join(batch) + ";", len(batch), (epoch, next_mode, next_generation)
 
 
+def _active_sha256(target, deployment, version):
+    # Recovery runs may use newer control source. Hash only the stable v1
+    # identity, rather than future fields added to the version reader.
+    ownership = {name: target[name] for name in (
+        "accountId", "workerId", "workerCreatedOn", "d1Id", "d1CreatedAt", "r2CreatedOn", "namespace",
+    )}
+    return _digest({
+        "identityVersion": 1, "target": ownership, "deploymentId": deployment.id, "versionId": deployment.version,
+        "revision": version.revision, "moduleSha256": version.digest, "compatibilityDate": version.compatibility,
+        "telegramConfigSha256": version.telegram_config_sha256,
+    })
+
+
 def run(scope, config, guard, *, action, expected_active, expected_state, artifact=None):
     scope.verify_resources()
     settings = scope.worker_config()
@@ -212,7 +224,7 @@ def run(scope, config, guard, *, action, expected_active, expected_state, artifa
     deployment = scope.active()
     version, capable = scope.version(deployment.version, with_general_read_lane=True)
     _require(capable and version.telegram_config_sha256 == sha256(config.encode("utf-8")).hexdigest(), ERROR)
-    active_sha = _digest({"target": scope.target, "deployment": asdict(deployment), "version": asdict(version)})
+    active_sha = _active_sha256(scope.target, deployment, version)
     _require(expected_active in ("", active_sha), ERROR)
     if artifact is not None:
         _require((version.revision, version.digest, version.compatibility) == artifact, ERROR)
