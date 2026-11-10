@@ -17,10 +17,10 @@ type ProviderEvent = (TelegramEventScope & { kind: "url-import"; sourceUrl: stri
 const fresh = "incoming.bot_id=? AND incoming.update_id=? AND incoming.receipt_nonce=?";
 const encoder = new TextEncoder();
 
-export function generalProviderAuthority(pin: GeneralTelegramPin): GeneralProviderAuthority {
+export function generalProviderAuthority(pin: GeneralTelegramPin, includeBatch = false): GeneralProviderAuthority {
   const { botId, generation, cutoverAt, activationSha256, releaseRevision } = pin;
   return { family: "general", botId, generation, cutoverAt, activationSha256, releaseRevision,
-    ...(pin.providerDocumentReplies ? { includeDocuments: true as const } : {}) };
+    ...(pin.providerDocumentReplies ? { includeDocuments: true as const } : {}), ...(includeBatch ? { includeBatch: true as const } : {}) };
 }
 
 export async function generalProviderSchemaReady(db: D1Database): Promise<boolean> {
@@ -29,7 +29,7 @@ export async function generalProviderSchemaReady(db: D1Database): Promise<boolea
 }
 
 /** Admit one private provider request without performing any egress in the webhook. */
-export async function acceptGeneralProviderRequest(db: D1Database, pin: GeneralTelegramPin, event: ProviderEvent): Promise<boolean> {
+export async function acceptGeneralProviderRequest(db: D1Database, pin: GeneralTelegramPin, event: ProviderEvent, includeBatch = false): Promise<boolean> {
   if (!pin.privateProvider || event.actorId === pin.botId || event.chatType !== "private" || event.actorId !== event.chatId
     || event.threadId !== null || !validInteger(event.updateId, 1) || !validInteger(event.messageId, 1)
     || !validInteger(event.messageDate, 1)) return false;
@@ -40,7 +40,7 @@ export async function acceptGeneralProviderRequest(db: D1Database, pin: GeneralT
     const key = [pin.botId, event.updateId, nonce] as const;
     const fence = { sql: `EXISTS (SELECT 1 FROM telegram_inbox AS incoming WHERE ${fresh})`, bindings: key };
     const documents = pin.providerDocumentReplies || await telegramGeneralProviderDocumentsReady(db, pin.botId, false).catch(() => false);
-    const authority = generalProviderAuthority(documents ? { ...pin, providerDocumentReplies: true } : pin);
+    const authority = generalProviderAuthority(documents ? { ...pin, providerDocumentReplies: true } : pin, includeBatch);
     const input = { ownerId: event.actorId, requestKey };
     const refresh = event.kind === "refresh" ? await readGeneralProviderRefreshAdmission(db, pin, event) : null;
     let plan: Awaited<ReturnType<typeof prepareProviderUrlImport>>["plan"] | null = null;

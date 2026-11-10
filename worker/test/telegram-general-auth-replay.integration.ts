@@ -23,6 +23,7 @@ import { acceptGeneralSharedTelegramCommand, beginGeneralSharedTelegramReply, cl
 import { generalCurrentAuthoritySql, generalCurrentReceiptSql, generalOrdinaryReplyEligibilitySql, generalPolicyBindings,
   generalRecordedOriginSql } from "../src/telegram/general-receipt.ts";
 import { acceptTelegramCommand, claimTelegramReply } from "../src/telegram/store.ts";
+import { reapTelegramProviderBatchTickets } from "../src/telegram/provider-batch-controls.ts";
 import { acceptTelegramView } from "../src/telegram/views.ts";
 import { assertGeneralReadLane, readGeneralReadLane } from "../src/telegram/general-read-lane.ts";
 import { MAX_TEMP_BATCH_NODES, MAX_TEMP_OWNER_NODES } from "../src/telegram/temp-storage.ts";
@@ -179,6 +180,9 @@ test("closed general authorization replays a sealed candidate in a separate emit
       fixture.releaseRevision), null);
   }
   const d1Databases = { DB: "sealed-general-auth-replay" };
+  const batchConfig = JSON.stringify({ ...JSON.parse(providerConfig), providerBatch: true });
+  assert.equal(parseGeneralTelegramPin(batchConfig, fixture.releaseRevision)?.providerBatch, true);
+  const batchSources = ["https://provider.fixture.invalid/batch/saved", "https://provider.fixture.invalid/batch/rejected"] as const;
   const providerRevision = "a".repeat(40), imageSha256 = "b".repeat(64);
   const sourceUrl = "https://provider.fixture.invalid/sub/%2f?fixture=signed%2Bvalue";
   const goodLineUrl = "https://provider.fixture.invalid/multiline/%2f?fixture=signed%7Cline";
@@ -322,6 +326,12 @@ test("closed general authorization replays a sealed candidate in a separate emit
         PROVIDER_REVISION: providerRevision, PROVIDER_IMAGE_SHA256: imageSha256,
         ...(name === "provider-paused" ? {} : { TELEGRAM_PROVIDER_URL_IMPORT: "1", TELEGRAM_PROVIDER_REFRESH: "1" }),
         ...(name === "provider-multiline" ? { TELEGRAM_PROVIDER_URL_DOCUMENTS: "1" } : {}) } })),
+    ...[true, false].map((enabled) => ({ name: enabled ? "batch-open" : "batch-paused", modules: true,
+      script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"], outboundService: privateTransport,
+      serviceBindings: { PROVIDER_FETCH: { name: "batch-rpc", entrypoint: "ProviderFetch" } },
+      bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: batchConfig,
+        PROVIDER_REVISION: providerRevision, PROVIDER_IMAGE_SHA256: imageSha256,
+        ...(enabled ? { TELEGRAM_PROVIDER_BATCH_REFRESH: "1" } : {}) } })),
     { name: "share-creation", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: shareConfig,
         TELEGRAM_PRIVATE_SHARE_CREATION_KEY: shareKeyRaw, PUBLIC_ORIGIN: PRODUCTION_PUBLIC_ORIGIN },
@@ -382,6 +392,21 @@ test("closed general authorization replays a sealed candidate in a separate emit
           }
         }
         export default {fetch(){throw new Error('Public provider transport was invoked.')}};` },
+    { name: "batch-rpc", modules: true, compatibilityDate,
+      script: `import { WorkerEntrypoint } from 'cloudflare:workers';
+        export class ProviderFetch extends WorkerEntrypoint {
+          async fetchSubscription(input) {
+            if (input.providerRevision !== ${JSON.stringify(providerRevision)} || input.imageSha256 !== ${JSON.stringify(imageSha256)}) {
+              throw new Error('Unexpected synthetic batch provider pin.');
+            }
+            if (input.url === ${JSON.stringify(batchSources[1])}) return {ok:false,code:'http-status',retryable:false,upstreamStatus:403};
+            if (input.url !== ${JSON.stringify(batchSources[0])}) throw new Error('Unexpected synthetic batch provider source.');
+            const body = new TextEncoder().encode(${JSON.stringify(providerShare)}).buffer;
+            const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', body));
+            return {ok:true,body,bodySha256:Array.from(hash, byte => byte.toString(16).padStart(2,'0')).join('')};
+          }
+        }
+        export default {fetch(){throw new Error('Public batch provider transport was invoked.')}};` },
     { name: "replay", modules: true, script: entry.outputFiles[0].text, compatibilityDate, d1Databases, bindings: { REPLAY_PIN: pin },
       outboundService: async (request: Request) => {
         assert.equal(request.url, "https://transport.fixture.invalid/sendMessage");
@@ -2230,4 +2255,80 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.deepEqual((await lineOutcomes(8403)).results, [{ ordinal: 0, result: "access-changed" }, { ordinal: 1, result: "access-changed" }]);
   assert.equal(await findReply(8403), null);
   assert.equal(await providerCalls(), priorCalls + 2);
+
+  const batchOpen = await runtime.getWorker("batch-open");
+  const batchPaused = await runtime.getWorker("batch-paused");
+  const batchActor = 193;
+  const batchDate = Math.floor(Date.now() / 1000);
+  await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,?,?,?,'member')")
+    .bind(pin.botId, pin.generation, String(batchActor), 1, batchDate - 1).run();
+  const batchSubscriptions: { id: number; token: string }[] = [];
+  for (const [i, source] of batchSources.entries()) {
+    const inserted = await db.prepare(`INSERT INTO subscriptions(owner_id,name,source_url,token,created_at,updated_at)
+      VALUES (?,?,?,?,?,?) RETURNING id,token`).bind(String(batchActor), `Synthetic batch ${i + 1}`, source,
+      crypto.randomUUID().replaceAll("-", ""), batchDate, batchDate).first<{ id: number; token: string }>();
+    assert.ok(inserted);
+    assert.equal(await publishNodeSnapshot(db, bucket, { id: inserted.id, ownerId: String(batchActor),
+      expectedGeneration: 0, expectedLifecycleRevision: 0 }, [{ type: "temp", name: "Previous", share: fixtureShare }]), true);
+    batchSubscriptions.push(inserted);
+  }
+  const snapshot = (id: number) => db.prepare(`SELECT generation,snapshot_id AS snapshotId FROM subscriptions
+    WHERE id=? AND owner_id=?`).bind(id, String(batchActor)).first<{ generation: number; snapshotId: string }>();
+  const lastGood = await snapshot(batchSubscriptions[1].id);
+  const batchPost = (id: number, text = "/updateall", worker = batchOpen, actor = batchActor) =>
+    post(actor, text, { worker, updateId: id, date: batchDate });
+  assert.equal((await batchPost(7780, "/updateall", batchPaused)).status, 204);
+  assert.equal((await batchPost(7781)).status, 200);
+  const batchPreview = await awaitLifecycle(7781);
+  assert.equal(batchPreview.message.chat_id, String(batchActor));
+  assert.match(batchPreview.message.text, /确认刷新 2 条/u);
+  const batchTicket = batchPreview.message.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data;
+  assert.ok(batchTicket && /^sbpb1_[A-Za-z0-9_-]{22}$/u.test(batchTicket));
+  const batchOrigin = { ...origin(batchPreview.messageId, batchActor), date: batchDate };
+  assert.equal((await callback(7782, batchActor, batchOrigin, batchTicket, batchPaused)).status, 204);
+  assert.equal((await callback(7783, 110, { ...batchOrigin, chat: { id: 110, type: "private" } }, batchTicket, batchOpen)).status, 204);
+  assert.equal((await callback(7784, batchActor, batchOrigin, batchTicket, batchOpen)).status, 200);
+  assert.equal((await callback(7784, batchActor, batchOrigin, batchTicket, batchOpen)).status, 204);
+  assert.equal(await db.prepare(`SELECT count(*) AS n FROM telegram_provider_batches WHERE bot_id=? AND actor_id=?`)
+    .bind(pin.botId, String(batchActor)).first<number>("n"), 1);
+  assert.equal((await batchPost(7785, "/updateall status", batchPaused)).status, 200);
+  assert.match((await awaitLifecycle(7785)).message.text, /等待 2 · 排队 0 · 处理中 0/u);
+  // Closing admission preserves both queued children and sends their original terminal receipt.
+  for (let i = 0; i < 2; i++) assert.equal((await batchPaused.scheduled({ cron: "* * * * *" })).outcome, "ok");
+  const terminal = (await awaitLifecycle(7784)).message;
+  assert.equal(terminal.chat_id, String(batchActor));
+  assert.match(terminal.text, /已保存 1 · 失败 1 · 已变更 0 · 超时 0/u);
+  assert.doesNotMatch(terminal.text, /https?:|provider\.fixture|sbpb1_/u);
+  assert.equal((await snapshot(batchSubscriptions[0].id))?.generation, 2);
+  assert.deepEqual(await snapshot(batchSubscriptions[1].id), lastGood);
+  const failedExport = await batchPaused.fetch(`https://app.fixture.invalid/sub/${batchSubscriptions[1].token}/base64`);
+  assert.equal(failedExport.status, 200);
+  assert.equal(await failedExport.text(), Buffer.from(fixtureShare).toString("base64"));
+  assert.equal((await batchPost(7786, "/updateall status", batchPaused)).status, 200);
+  assert.equal((await awaitLifecycle(7786)).message.text, terminal.text);
+  assert.equal(terminal.reply_parameters.message_id, batchPreview.messageId);
+  assert.equal(lifecycleSent.filter(({ reply_parameters }) => reply_parameters.message_id === batchPreview.messageId).length, 1);
+
+  const scopedBatchPin = parseGeneralTelegramPin(batchConfig, fixture.releaseRevision);
+  assert.ok(scopedBatchPin);
+  const retiredTickets = [];
+  for (const [updateId, marker] of [[7787, "provider-batch-preview:v1"], [7788, "general-provider-batch-preview:v1"]] as const) {
+    const receiptId = await db.prepare(`INSERT INTO telegram_inbox
+      (bot_id,update_id,actor_id,chat_id,chat_type,message_id,message_date,command,receipt_nonce)
+      VALUES (?,?,'193','193','private',?,?,'help',?) RETURNING receipt_id`)
+      .bind(pin.botId, updateId, updateId, batchDate, marker).first<number>("receipt_id");
+    assert.ok(receiptId);
+    await db.prepare(`INSERT INTO telegram_provider_batch_interactions
+      (receipt_id,kind,actor_role,auth_message_date,auth_message_id,ready_at,targets,token_sha256,origin_attempt,expires_at)
+      VALUES (?,'preview','member',0,0,unixepoch(),?,?,1,unixepoch()-1)`)
+      .bind(receiptId, JSON.stringify([[batchSubscriptions[0].id, 2, 0, createHash("sha256").update(batchSources[0]).digest("hex")]]),
+        createHash("sha256").update(String(updateId)).digest("hex")).run();
+    retiredTickets.push(receiptId);
+  }
+  const armedTickets = async () => (await db.prepare(`SELECT token_sha256 IS NOT NULL AS armed
+    FROM telegram_provider_batch_interactions WHERE receipt_id IN (?,?) ORDER BY receipt_id`).bind(...retiredTickets).all()).results;
+  await reapTelegramProviderBatchTickets(db, { ...isolation, botId: pin.botId });
+  assert.deepEqual(await armedTickets(), [{ armed: 0 }, { armed: 1 }]);
+  await reapTelegramProviderBatchTickets(db, scopedBatchPin);
+  assert.deepEqual(await armedTickets(), [{ armed: 0 }, { armed: 0 }]);
 });

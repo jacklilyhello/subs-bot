@@ -1,6 +1,6 @@
 import type { GeneralTelegramPin } from "./general-auth-runtime.ts";
 
-type ReceiptAlias = "inbox" | "earlier" | "incoming" | "origin" | "pick";
+type ReceiptAlias = "inbox" | "earlier" | "incoming" | "origin" | "pick" | "preview";
 
 function pinIdentity(botColumn: string, row: "policy" | "recorded"): string {
   return `${botColumn}=? AND ${row}.generation=? AND ${row}.activation_sha256=? AND ${row}.release_revision=? AND ${row}.cutover_at=?`;
