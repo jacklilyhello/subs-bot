@@ -1,13 +1,16 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { after, before, beforeEach, test } from "node:test";
 
 import { Miniflare } from "miniflare";
 
 import type { ProviderFetcher } from "../src/provider-fetch-contract.ts";
+import { initialProviderTitle, PROVIDER_INITIAL_TITLE_MIGRATION, PROVIDER_INITIAL_TITLE_SHA256 } from "../src/provider-initial-title.ts";
 import { runOneProviderJob } from "../src/provider-job-consumer.ts";
 import { claimProviderJob, enqueueProviderUrlImport } from "../src/provider-jobs.ts";
 import { digestHex, getOwnedSubscription, getSubscriptionSnapshot, SUBSCRIPTION_LIFECYCLE_REVISION } from "../src/storage.ts";
+import { renameOwnedSubscription } from "../src/subscriptions.ts";
 import {
   acceptTelegramProviderRequest, type TelegramProviderAdmission, type TelegramProviderEvent,
 } from "../src/telegram/provider-admission.ts";
@@ -54,21 +57,30 @@ const provider: ProviderFetcher = { async fetchSubscription(input) {
   assert.deepEqual(input, { url: sourceUrl, ...pin });
   const body = new TextEncoder().encode("ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.10:8388#fixture").buffer;
   return { ok: true, body, bodySha256: digestHex(await crypto.subtle.digest("SHA-256", body)),
-    metadata: { "subscription-userinfo": "upload=1073741824; download=0; total=2147483648; expire=1900000000" } };
+    metadata: { "subscription-userinfo": "upload=1073741824; download=0; total=2147483648; expire=1900000000",
+      "profile-title": "Example%20Provider.yaml" } };
 } };
+
+const titleCount = () => db.prepare("SELECT count(*) AS count FROM telegram_provider_initial_titles").first<number>("count");
+const pinTitle = () => db.prepare("INSERT INTO subs_bot_schema_migrations VALUES (41,?,?,'applied')")
+  .bind(PROVIDER_INITIAL_TITLE_MIGRATION, PROVIDER_INITIAL_TITLE_SHA256).run();
 
 before(async () => {
   db = await miniflare.getD1Database("DB");
   bucket = await miniflare.getR2Bucket("NODES");
   for (const file of ["0001_subscriptions.sql", "0002_telegram.sql", "0003_subscription_lifecycle.sql",
-    "0015_subscription_provider_jobs.sql", "0021_telegram_provider_admission.sql", "0033_provider_snapshot_journal.sql"]) {
+    "0015_subscription_provider_jobs.sql", "0021_telegram_provider_admission.sql", "0033_provider_snapshot_journal.sql",
+    PROVIDER_INITIAL_TITLE_MIGRATION]) {
     const sql = await readFile(new URL(`../migrations/${file}`, import.meta.url), "utf8");
+    if (file === PROVIDER_INITIAL_TITLE_MIGRATION) assert.equal(createHash("sha256").update(sql).digest("hex"), PROVIDER_INITIAL_TITLE_SHA256);
     await db.batch(sql.trim().split(/;\s*/u).filter(Boolean).map((statement) => db.prepare(statement)));
   }
+  await db.prepare("CREATE TABLE subs_bot_schema_migrations(position INTEGER PRIMARY KEY,name TEXT,sha256 TEXT,mode TEXT) STRICT").run();
 });
 
 beforeEach(async () => {
   await db.batch(["provider_snapshot_object_intents", "provider_snapshot_attempts",
+    "telegram_provider_initial_titles", "subs_bot_schema_migrations",
     "telegram_provider_requests", "telegram_provider_jobs", "telegram_inbox", "telegram_auth",
     "subscription_provider_jobs", "subscriptions", "subscription_trash", "subscription_lifecycle"]
     .map((table) => db.prepare(`DELETE FROM ${table}`)));
@@ -202,9 +214,11 @@ test("authorized terminal refresh failure updates only the fixed warning and pre
 });
 
 test("authorization changing after R2 staging prevents publication and preserves the journaled candidate", async () => {
+  await pinTitle();
   const initial = job(await admit(source()));
+  assert.equal(await titleCount(), 1);
   const injected = { prepare: db.prepare.bind(db), batch: async (statements: D1PreparedStatement[]) => {
-    if (statements.length === 5) {
+    if (statements.length === 8) {
       assert.equal((await bucket.list()).objects.length, 2);
       await auth(0, now(), 900);
     }
@@ -213,10 +227,87 @@ test("authorization changing after R2 staging prevents publication and preserves
   assert.equal(await runOneProviderJob(injected, bucket, provider, pin, policy), "stale");
   const row = await getOwnedSubscription(db, policy.memberId, initial.subscriptionId);
   assert.equal(row?.generation, 0);
+  assert.equal(row?.name, "远程订阅");
+  assert.equal(row?.lifecycleRevision, 0);
   assert.equal(row?.lastError, null);
   assert.equal(await db.prepare("SELECT result_code FROM telegram_provider_jobs WHERE job_id=?").bind(initial.jobId).first("result_code"), "stale-target");
   assert.equal((await bucket.list()).objects.length, 2);
   assert.equal(await db.prepare("SELECT state FROM provider_snapshot_attempts WHERE queue='telegram_provider_jobs' AND job_id=?")
     .bind(initial.jobId).first("state"), "sealed");
   assert.equal(await db.prepare("SELECT count(*) AS count FROM provider_snapshot_object_intents").first("count"), 2);
+});
+
+test("an explicit rename racing initial publication wins the lifecycle CAS", async () => {
+  await pinTitle();
+  const initial = job(await admit(source()));
+  const injected = { prepare: db.prepare.bind(db), batch: async (statements: D1PreparedStatement[]) => {
+    if (statements.length === 8) {
+      assert.equal(await renameOwnedSubscription(db, { id: initial.subscriptionId, ownerId: policy.memberId,
+        expectedLifecycleRevision: 0 }, "Manual choice"), true);
+    }
+    return db.batch(statements);
+  } } as D1Database;
+  assert.equal(await runOneProviderJob(injected, bucket, provider, pin, policy), "stale");
+  const row = await getOwnedSubscription(db, policy.memberId, initial.subscriptionId);
+  assert.equal(row?.name, "Manual choice");
+  assert.equal(row?.generation, 0);
+  assert.equal(row?.lifecycleRevision, 1);
+  assert.equal(await titleCount(), 1);
+});
+
+test("a lost publication reply still commits one first title, stable token, snapshot and settlement", async () => {
+  await pinTitle();
+  const event = source();
+  const initial = job(await admit(event));
+  const before = await getOwnedSubscription(db, policy.memberId, initial.subscriptionId);
+  assert.equal(before?.name, "远程订阅");
+  let unconfirmedWrites = 0;
+  const injected = { prepare: db.prepare.bind(db), batch: async (statements: D1PreparedStatement[]) => {
+    const result = await db.batch(statements);
+    if (statements.length === 8) {
+      unconfirmedWrites++;
+      throw new Error("Unconfirmed synthetic transaction.");
+    }
+    return result;
+  } } as D1Database;
+  assert.equal(await runOneProviderJob(injected, bucket, provider, pin, policy), "saved");
+  assert.equal(unconfirmedWrites, 1);
+  const saved = await getOwnedSubscription(db, policy.memberId, initial.subscriptionId);
+  assert.equal(saved?.name, "Example Provider");
+  assert.equal(saved?.generation, 1);
+  assert.equal(saved?.lifecycleRevision, 1);
+  assert.equal(saved?.token, before?.token);
+  assert.equal(await titleCount(), 0);
+  assert.deepEqual(await admit(event), { kind: "duplicate" });
+  assert.equal(await runOneProviderJob(db, bucket, provider, pin, policy), "idle");
+  assert.equal((await bucket.list()).objects.length, 2);
+  assert.deepEqual(await getOwnedSubscription(db, policy.memberId, initial.subscriptionId), saved);
+});
+
+test("first publication with unusable title consumes eligibility and leaves the name alone", async () => {
+  await pinTitle();
+  const initial = job(await admit(source()));
+  assert.equal(await titleCount(), 1);
+  const malformed: ProviderFetcher = { async fetchSubscription(input) {
+    const fetched = await provider.fetchSubscription(input);
+    assert.ok(fetched.ok);
+    return { ...fetched, metadata: { "profile-title": "opaque%2Bfixture" } };
+  } };
+  assert.equal(await runOneProviderJob(db, bucket, malformed, pin, policy), "saved");
+  assert.equal(await titleCount(), 0);
+  const saved = await getOwnedSubscription(db, policy.memberId, initial.subscriptionId);
+  assert.equal(saved?.name, "远程订阅");
+  assert.equal(saved?.generation, 1);
+  assert.equal(saved?.lifecycleRevision, 0);
+});
+
+test("provider titles use bounded display metadata and never copy URL components or malformed filenames", () => {
+  assert.equal(initialProviderTitle({ "profile-title": "base64:5rivIFBsYW4ueW1s",
+    "content-disposition": "attachment; filename=unused.txt" }, sourceUrl), "港 Plan");
+  assert.equal(initialProviderTitle({ "profile-title": "opaque%2Bfixture", "content-disposition":
+    "attachment; filename*=UTF-8''%E6%B8%AF%20Provider.txt; filename=fallback.yaml" }, sourceUrl), "港 Provider");
+  assert.equal(initialProviderTitle({ "profile-title": "https%3A%2F%2Fprovider.example.invalid",
+    "content-disposition": 'attachment; filename="cut;truncated.txt"' }, sourceUrl), null);
+  assert.equal(initialProviderTitle({ "profile-title": "Hidden%E2%80%AEText" }, sourceUrl), null);
+  assert.equal(initialProviderTitle({ "profile-title": "港".repeat(65) }, sourceUrl), "港".repeat(64));
 });
