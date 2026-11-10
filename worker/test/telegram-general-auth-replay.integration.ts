@@ -246,7 +246,7 @@ test("closed general authorization replays a sealed candidate in a separate emit
         ...(enabled ? { TELEGRAM_PROVIDER_URL_IMPORT: "1", TELEGRAM_PROVIDER_REFRESH: "1" } : {}) } })),
     { name: "share-creation", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: shareConfig,
-        TELEGRAM_PRIVATE_SHARE_CREATION_KEY: shareKeyRaw },
+        TELEGRAM_PRIVATE_SHARE_CREATION_KEY: shareKeyRaw, PUBLIC_ORIGIN: PRODUCTION_PUBLIC_ORIGIN },
       outboundService: privateTransport },
     { name: "claims", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: claimsConfig },
@@ -1342,6 +1342,7 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.equal(await countClaims(expiredDigest), 0);
 
   const shareWorker = await runtime.getWorker("share-creation");
+  const shareLink = /https:\/\/t\.me\/GeneralFixtureBot\?start=claim_([A-Za-z0-9_-]{22})/u;
   const shareText = "/share x2 id106 s5 -- Synthetic creation body";
   const sharePost = (updateId: number, actor: number, text: string, options: PostOptions = {}) =>
     post(actor, text, { worker: shareWorker, updateId, date: now + 19, ...options });
@@ -1372,7 +1373,7 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.equal(created.message.chat_id, "101");
   assert.equal(created.message.reply_markup, undefined);
   assert.doesNotMatch(created.message.text, /Synthetic creation body/u);
-  const issued = /https:\/\/t\.me\/GeneralFixtureBot\?start=claim_([A-Za-z0-9_-]{22})/u.exec(created.message.text);
+  const issued = shareLink.exec(created.message.text);
   assert.ok(issued);
   const issuedCode = issued[1];
   assert.deepEqual(await db.prepare(`SELECT creation.state,creation.installation,share.target_user_id AS target,
@@ -1386,6 +1387,26 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.equal(lifecycleSent.filter(({ reply_parameters }) => reply_parameters.message_id === 7575).length, 1);
   assert.equal((await claimPost(7576, 106, issuedCode, { date: now + 20 })).status, 200);
   assert.match((await awaitClaim(7576)).text ?? "", /Synthetic creation body/u);
+
+  const subscriptionDetail = (await providerDetail(7568, 7569, "Renamed current fixture", shareWorker)).message;
+  assert.ok(subscriptionDetail.text.split("\n").includes(`私密分享此订阅：/share sub ${initial.id}`));
+  const subscriptionCommand = `/share sub ${initial.id} x1 id106 s5`;
+  assert.equal((await sharePost(7577, 106, subscriptionCommand)).status, 204, "a current actor cannot share another owner's subscription");
+  assert.equal(await findReply(7577), null);
+  assert.equal((await sharePost(7578, 101, subscriptionCommand)).status, 200);
+  const subscriptionShare = (await awaitLifecycle(7578)).message;
+  assert.equal(subscriptionShare.chat_id, "101");
+  assert.doesNotMatch(subscriptionShare.text, /source\.fixture|\/sub\//u);
+  const subscriptionCode = shareLink.exec(subscriptionShare.text)?.[1];
+  assert.ok(subscriptionCode);
+  assert.equal((await claimPost(7599, 106, subscriptionCode, { date: now + 20 })).status, 200);
+  const receivedSubscription = await awaitClaim(7599);
+  assert.equal(receivedSubscription.actorId, "106");
+  assert.ok(receivedSubscription.text?.endsWith([
+    "🏷️ 订阅名称：Renamed current fixture",
+    "🌐 原始链接：https://source.fixture.invalid/hidden",
+    `⚡ Clash 配置：${PRODUCTION_PUBLIC_ORIGIN}/sub/${initial.token}/clash`,
+  ].join("\n")));
 
   const aggregateWorker = await runtime.getWorker("aggregate");
   const aggregateNoKey = await runtime.getWorker("aggregate-no-key");

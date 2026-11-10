@@ -516,14 +516,14 @@ export async function acceptTelegramPrivateShareCreation(
 export async function acceptTelegramSubscriptionShare(
   db: D1Database,
   bucket: R2Bucket,
-  policy: TelegramPolicy,
+  policy: SharePolicy,
   event: TelegramPrivateShareCreationUpdate & TelegramSubscriptionShareSelection,
   context: TelegramPrivateShareCreationKey,
   publicOrigin: PublicOrigin = ISOLATION_PUBLIC_ORIGIN,
 ): Promise<TelegramSubscriptionShareOutcome> {
   if (!validCreation(policy, event, context) || !validInteger(event.subscriptionId, 1)) return "ignored";
   try {
-    if (event.actorId !== policy.adminId && await db.prepare(`SELECT ${currentMember} AS allowed`)
+    if (!("privateShareCreation" in policy) && event.actorId !== policy.adminId && await db.prepare(`SELECT ${currentMember} AS allowed`)
       .bind(event.messageDate, policy.botId, event.actorId).first<number>("allowed") !== 1) return "ignored";
     const row = await getOwnedSubscription(db, event.actorId, event.subscriptionId);
     if (!row || row.id !== event.subscriptionId || row.ownerId !== event.actorId ||

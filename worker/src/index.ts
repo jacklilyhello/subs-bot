@@ -208,7 +208,7 @@ async function telegramWebhook(request: Request, env: Env, publicOrigin: PublicO
       const aggregateKey = general.privateAggregate ? await parseTelegramAggregateKey(env.TELEGRAM_AGGREGATE_KEY) : null;
       const status = general.sharedOutbox ? await acceptGeneralSharedTelegramCommand(env.DB, general, request,
         (callbackId) => ctx?.waitUntil(answerTelegramCallback(general, callbackId)), providerAvailable, refreshAvailable,
-        share ? { bucket: env.NODES, runtime: share } : undefined, aggregateKey)
+        share ? { bucket: env.NODES, runtime: share, publicOrigin } : undefined, aggregateKey)
         : await acceptGeneralTelegramCommand(env.DB, general, request);
       if (status === 200) {
         const delivery = general.sharedOutbox
