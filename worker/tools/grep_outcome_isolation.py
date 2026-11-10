@@ -132,10 +132,11 @@ class Objects:
         result = parsed(body)
         rows, info = result.get("result"), result.get("result_info", {})
         require(result.get("success") is True and result.get("errors") in (None, [])
-                and isinstance(info, dict) and not any(info.get(field) for field in ("cursor", "next_page_token", "is_truncated"))
+                and isinstance(info, dict) and all(info.get(field) in (None, "") for field in ("cursor", "next_page_token"))
+                and (info.get("is_truncated") is None or info["is_truncated"] is False)
                 and isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict), error)
         row = rows[0]
-        require(row.get("key") == key and row.get("size") == len(raw)
+        require(row.get("key") == key and type(row.get("size")) is int and row["size"] == len(raw)
                 and row.get("etag") == validator == md5(raw, usedforsecurity=False).hexdigest(), error)
         return f'"{validator}"'
 

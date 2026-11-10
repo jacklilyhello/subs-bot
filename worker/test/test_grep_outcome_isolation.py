@@ -74,7 +74,9 @@ class ObjectReadbackTests(unittest.TestCase):
         self.assertEqual(parse_qs(urlsplit(listing.full_url).query), {"prefix": [self.key], "per_page": ["2"]})
 
     def test_weak_download_rejects_mismatched_key_size_tag_or_content(self):
-        for field, value in (("key", probe.ARM), ("size", len(self.body) + 1), ("etag", "c" * 32)):
+        mismatches = (("key", probe.ARM), ("size", len(self.body) + 1),
+                      ("size", float(len(self.body))), ("etag", "c" * 32))
+        for field, value in mismatches:
             with self.subTest(field=field):
                 self.client.opener.open.side_effect = [ObjectResponse(self.body, f'W/"{self.etag}"'),
                                                        ObjectResponse(self.metadata(**{field: value}))]
@@ -84,6 +86,16 @@ class ObjectReadbackTests(unittest.TestCase):
                                                ObjectResponse(self.metadata())]
         with self.assertRaisesRegex(probe.ProofError, "stored ETag could not be confirmed"):
             self.client.get(self.key)
+
+    def test_weak_download_rejects_malformed_or_continued_listing(self):
+        for field, value in (("is_truncated", 0), ("is_truncated", True), ("cursor", []), ("next_page_token", "next")):
+            with self.subTest(field=field, value=value):
+                metadata = probe.parsed(self.metadata())
+                metadata["result_info"][field] = value
+                self.client.opener.open.side_effect = [ObjectResponse(self.body, f'W/"{self.etag}"'),
+                                                       ObjectResponse(probe.canonical(metadata))]
+                with self.assertRaisesRegex(probe.ProofError, "stored ETag could not be confirmed"):
+                    self.client.get(self.key)
 
     def test_weak_download_listing_refusal_is_never_an_absent_object(self):
         refusal = HTTPError("https://example.invalid", 404, "synthetic", {}, BytesIO())
@@ -98,6 +110,25 @@ class ObjectReadbackTests(unittest.TestCase):
         self.client.opener.open.return_value = ObjectResponse(self.body, f'W/"{self.etag}"', f'"{self.etag}"')
         with self.assertRaisesRegex(probe.ProofError, "missing exact content or its validator"):
             self.client.get(self.key)
+
+    def test_intervening_replacement_preserves_exact_conditional_fence(self):
+        changed = b'{"state":"other-writer"}'
+        changed_tag = md5(changed, usedforsecurity=False).hexdigest()
+        self.client.opener.open.side_effect = [
+            ObjectResponse(self.body, f'W/"{self.etag}"'), ObjectResponse(self.metadata(key=probe.ARM)),
+            ObjectResponse(changed, f'"{changed_tag}"'),
+        ]
+        previous = self.client.get(probe.ARM)
+        conflict = ObjectResponse(b"")
+        conflict.status = 412
+        connection = Mock()
+        connection.getresponse.return_value = conflict
+        with patch.object(probe, "HTTPSConnection", return_value=connection):
+            with self.assertRaisesRegex(probe.ProofError, "conditional Grep R2 write was not confirmed"):
+                self.client.write(probe.ARM, b'{"state":"retired"}', previous)
+        connection.request.assert_called_once()
+        self.assertEqual(connection.request.call_args.args[0], "PUT")
+        self.assertEqual(connection.request.call_args.kwargs["headers"]["if-match"], f'"{self.etag}"')
 
 
 def report(role, state="empty"):
