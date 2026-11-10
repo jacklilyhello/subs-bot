@@ -9,6 +9,17 @@ import { claimProviderJob, GENERAL_TELEGRAM_PROVIDER_MARKER, providerSourceDiges
   TELEGRAM_PROVIDER_MARKER, type GeneralProviderAuthority } from "../src/provider-jobs.ts";
 import { createSubscription, digestHex, getOwnedSubscription, getSubscriptionSnapshot, readSnapshotNodes } from "../src/storage.ts";
 
+function backendClass(error: unknown): string {
+  for (let depth = 0; depth < 4 && error instanceof Error; depth++, error = error.cause) {
+    if (/expression tree is too large|maximum (expression )?depth/iu.test(error.message)) return "expression-depth";
+    if (/too many (sql )?variables|wrong number of parameter bindings|wrong number of arguments/iu.test(error.message)) return "bindings";
+    if (/no such (table|column)|ambiguous column/iu.test(error.message)) return "schema";
+    if (/near .*syntax error/iu.test(error.message)) return "syntax";
+    if (/constraint failed/iu.test(error.message)) return "constraint";
+  }
+  return "unclassified";
+}
+
 test("general provider leases are isolated by receipt family and exact authority through publication and retirement", async (t) => {
   const runtime = new Miniflare({ modules: true, script: "export default {fetch(){return new Response(null)}}",
     compatibilityDate: "2026-07-30", d1Databases: ["DB"], r2Buckets: ["NODES"] });
@@ -87,7 +98,46 @@ test("general provider leases are isolated by receipt family and exact authority
     const body = new TextEncoder().encode(share).buffer;
     return { ok: true, body, bodySha256: digestHex(await crypto.subtle.digest("SHA-256", body)) };
   } };
-  assert.equal(await runOneProviderJob(db, bucket, provider, pin, general), "saved", "job outlives the ordinary reply clock");
+  let phase = "before-claim";
+  let failure = "none";
+  const observed = {
+    prepare(sql: string) {
+      const statement = db.prepare(sql);
+      if (!sql.includes("lease_authority AS MATERIALIZED")) return statement;
+      phase = "source-prepare";
+      return { bind(...values: unknown[]) {
+        const query = statement.bind(...values);
+        return { async first(column: string) {
+          phase = "source-reload";
+          try {
+            const value = await query.first(column);
+            phase = value === null ? "source-missing" : "source-loaded";
+            return value;
+          } catch (error) {
+            failure = backendClass(error);
+            throw error;
+          }
+        } };
+      } };
+    },
+    async batch(statements: D1PreparedStatement[]) {
+      phase = phase === "before-claim" ? "claim-batch" : "later-batch";
+      try {
+        const rows = await db.batch(statements);
+        if (phase === "claim-batch") phase = "lease-result";
+        return rows;
+      } catch (error) {
+        failure = backendClass(error);
+        throw error;
+      }
+    },
+  } as D1Database;
+  const first = await runOneProviderJob(observed, bucket, provider, pin, general).catch(async () => {
+    const result = await state(firstJob);
+    const status = result?.state === "leased" ? "leased" : result?.state === "pending" ? "pending" : "other";
+    assert.fail(`Synthetic provider claim failed (${phase}, ${failure}, ${status}).`);
+  });
+  assert.equal(first, "saved", `job outlives the ordinary reply clock (${phase}, ${failure})`);
   assert.equal(calls, 1);
   assert.deepEqual(await state(firstJob), { state: "done", result: "saved", attempts: 1 });
   const snapshot = await getSubscriptionSnapshot(db, sub.token);
