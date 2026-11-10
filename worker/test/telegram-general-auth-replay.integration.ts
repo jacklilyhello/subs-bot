@@ -8,6 +8,8 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { build } from "esbuild";
 import { Log, LogLevel, Miniflare } from "miniflare";
+import { PRODUCTION_PUBLIC_ORIGIN } from "../src/public-origin.ts";
+import { publishNodeSnapshot } from "../src/storage.ts";
 import { GENERAL_AUTH_LEGACY_ROLE, type GeneralAuthReplayMessage, type GeneralAuthReplayPin } from "../src/telegram/general-auth-replay.ts";
 import { beginGeneralTelegramReply, claimGeneralTelegramReply, parseGeneralTelegramPin } from "../src/telegram/general-auth-runtime.ts";
 import { beginGeneralSharedTelegramReply, claimGeneralSharedTelegramReply } from "../src/telegram/general-auth-shared.ts";
@@ -69,12 +71,32 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.ok(sharedPin?.sharedOutbox && !sharedPin.privateManagement);
   const lifecycleConfig = JSON.stringify({ ...JSON.parse(generalConfig), outbox: "shared-private-management" });
   const privatePin = parseGeneralTelegramPin(lifecycleConfig, fixture.releaseRevision);
-  assert.ok(privatePin?.sharedOutbox && privatePin.privateManagement);
+  assert.ok(privatePin?.sharedOutbox && privatePin.privateManagement && !privatePin.privateFormats);
+  const formatsConfig = JSON.stringify({ ...JSON.parse(generalConfig), outbox: "shared-private-management-formats" });
+  const formatsPin = parseGeneralTelegramPin(formatsConfig, fixture.releaseRevision);
+  assert.ok(formatsPin?.sharedOutbox && formatsPin.privateManagement && formatsPin.privateFormats);
   for (const outbox of ["legacy", "shared-lifecycle", "shared-path", ["shared-private-management"]]) {
     assert.equal(parseGeneralTelegramPin(JSON.stringify({ ...JSON.parse(generalConfig), outbox }),
       fixture.releaseRevision), null);
   }
   const d1Databases = { DB: "sealed-general-auth-replay" };
+  const privateTransport = async (request: Request) => {
+    assert.equal(request.method, "POST");
+    const api = `https://api.telegram.org/bot${generalToken}/`;
+    if (request.url === api + "answerCallbackQuery") {
+      lifecycleAckCalls++;
+      const ack = await request.json() as { callback_query_id: string };
+      assert.ok(/^fixture-7[0-9]{3}$/u.test(ack.callback_query_id) && !lifecycleAcks.has(ack.callback_query_id));
+      lifecycleAcks.add(ack.callback_query_id);
+      return Response.json({ ok: true, result: true });
+    }
+    assert.equal(request.url, api + "sendMessage");
+    const message = await request.json() as (typeof lifecycleSent)[number];
+    lifecycleSent.push(message);
+    const messageId = 9400 + lifecycleSent.length;
+    lifecycleMessagesById.set(messageId, message);
+    return Response.json({ ok: true, result: { chat: { id: Number(message.chat_id) }, message_id: messageId } });
+  };
   const runtime = new Miniflare({ log: new Log(LogLevel.NONE), workers: [
     { name: "serving", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_ISOLATION_CONFIG: JSON.stringify(isolation),
@@ -103,23 +125,10 @@ test("closed general authorization replays a sealed candidate in a separate emit
       } },
     { name: "lifecycle", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: lifecycleConfig },
-      outboundService: async (request: Request) => {
-        assert.equal(request.method, "POST");
-        const api = `https://api.telegram.org/bot${generalToken}/`;
-        if (request.url === api + "answerCallbackQuery") {
-          lifecycleAckCalls++;
-          const ack = await request.json() as { callback_query_id: string };
-          assert.ok(/^fixture-7[0-9]{3}$/u.test(ack.callback_query_id) && !lifecycleAcks.has(ack.callback_query_id));
-          lifecycleAcks.add(ack.callback_query_id);
-          return Response.json({ ok: true, result: true });
-        }
-        assert.equal(request.url, api + "sendMessage");
-        const message = await request.json() as (typeof lifecycleSent)[number];
-        lifecycleSent.push(message);
-        const messageId = 9400 + lifecycleSent.length;
-        lifecycleMessagesById.set(messageId, message);
-        return Response.json({ ok: true, result: { chat: { id: Number(message.chat_id) }, message_id: messageId } });
-      } },
+      outboundService: privateTransport },
+    { name: "formats", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
+      bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: formatsConfig, PUBLIC_ORIGIN: PRODUCTION_PUBLIC_ORIGIN },
+      outboundService: privateTransport },
     { name: "replay", modules: true, script: entry.outputFiles[0].text, compatibilityDate, d1Databases, bindings: { REPLAY_PIN: pin },
       outboundService: async (request: Request) => {
         assert.equal(request.url, "https://transport.fixture.invalid/sendMessage");
@@ -485,7 +494,7 @@ test("closed general authorization replays a sealed candidate in a separate emit
   const origin = (id: number, chatId: number, chatType = "private", botId = Number(pin.botId)) => ({
     message_id: id, date: now, chat: { id: chatId, type: chatType }, from: { id: botId, is_bot: true },
   });
-  const callback = (id: number, actor: number, source: ReturnType<typeof origin>, ticket: string) => lifecycle.fetch(
+  const callback = (id: number, actor: number, source: ReturnType<typeof origin>, ticket: string, worker = lifecycle) => worker.fetch(
     "https://app.fixture.invalid/telegram/webhook", { method: "POST",
       headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": pin.webhookSecret },
       body: JSON.stringify({ update_id: id, callback_query: {
@@ -665,4 +674,48 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.equal((await lifecycle.scheduled({ cron: "* * * * *" })).outcome, "ok");
   assert.equal((await findReply(7346))?.state, "failed");
   assert.equal(pathSent().length, 5);
+
+  const formats = await runtime.getWorker("formats");
+  const bucket = await runtime.getR2Bucket("NODES", "formats");
+  const fixtureShare = "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.10:8388#fixture";
+  assert.equal(await publishNodeSnapshot(db, bucket, { id: initial.id, ownerId: "101", expectedGeneration: 0,
+    expectedLifecycleRevision: 4 }, [{ type: "temp", name: "fixture", share: fixtureShare }]), true);
+  const formatDetail = async (firstId: number, worker = formats) => {
+    assert.equal((await post(101, "/s Renamed", { updateId: firstId, date: now, worker })).status, 200);
+    const search = await awaitLifecycle(firstId);
+    assert.equal((await callback(firstId + 1, 101, origin(search.messageId, 101), detailTicket(search.message), worker)).status, 200);
+    return awaitLifecycle(firstId + 1);
+  };
+  const disabledDetail = await formatDetail(7370, lifecycle);
+  assert.equal(disabledDetail.message.reply_markup, undefined);
+  const enabledDetail = await formatDetail(7372);
+  assert.match(enabledDetail.message.text, /节点数量：1/u);
+  assert.doesNotMatch(enabledDetail.message.text, /https?:|fixture-token|source\.fixture/u);
+  const choices = enabledDetail.message.reply_markup?.inline_keyboard?.flat();
+  assert.deepEqual(choices?.map(({ text }) => text), ["Clash Meta", "Sing-box", "Base64", "Surge", "QX"]);
+  const formatTicket = (label: string) => {
+    const ticket = choices?.find(({ text }) => text === label)?.callback_data;
+    assert.ok(ticket && /^sbr1_[A-Za-z0-9_-]{22}$/u.test(ticket));
+    return ticket;
+  };
+  const base64 = formatTicket("Base64");
+  assert.equal((await callback(7374, 101, origin(enabledDetail.messageId, 101), base64)).status, 204, "old private mode stays closed");
+  assert.equal((await callback(7375, 101, origin(enabledDetail.messageId, -100100, "supergroup"), base64, formats)).status, 204);
+  await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,'104',7,?,'member')")
+    .bind(pin.botId, pin.generation, now + 1).run();
+  assert.equal((await callback(7376, 104, { ...origin(enabledDetail.messageId, 104), date: now + 2 }, base64, formats)).status, 204);
+  assert.equal((await callback(7377, 101, origin(disabledDetail.messageId, 101), base64, formats)).status, 204);
+  assert.equal((await callback(7378, 101, origin(enabledDetail.messageId, 101), base64, formats)).status, 200);
+  const exported = await awaitLifecycle(7378);
+  assert.deepEqual(exported.message, { chat_id: "101", text: `Base64\n${PRODUCTION_PUBLIC_ORIGIN}/sub/${initial.token}/base64`,
+    reply_parameters: { message_id: enabledDetail.messageId }, link_preview_options: { is_disabled: true } });
+  const served = await formats.fetch(`https://app.fixture.invalid/sub/${initial.token}/base64`);
+  assert.equal(served.status, 200);
+  assert.equal(await served.text(), Buffer.from(fixtureShare).toString("base64"));
+  assert.equal((await callback(7378, 101, origin(enabledDetail.messageId, 101), base64, formats)).status, 204);
+  assert.equal((await callback(7379, 101, origin(enabledDetail.messageId, 101), base64, formats)).status, 204);
+  await db.prepare("UPDATE subscription_lifecycle SET revision=5 WHERE subscription_id=? AND revision=4").bind(initial.id).run();
+  assert.equal((await callback(7380, 101, origin(enabledDetail.messageId, 101), formatTicket("Clash Meta"), formats)).status, 204);
+  assert.equal(await findReply(7380), null);
+  assert.equal(await db.prepare("SELECT count(*) AS n FROM telegram_provider_jobs").first("n"), 0);
 });

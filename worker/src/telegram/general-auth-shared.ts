@@ -1,3 +1,4 @@
+import type { PublicOrigin } from "../public-origin.ts";
 import { sendGeneralTelegramGroupListReply, sendGeneralTelegramPrivateReply } from "./delivery.ts";
 import {
   generalReadEvent, renderGeneralReadReply,
@@ -86,7 +87,7 @@ function family(alias: "inbox" | "earlier", group: boolean, privateManagement: b
       AND EXISTS (SELECT 1 FROM telegram_lifecycle_action WHERE receipt_id=${alias}.receipt_id))
     OR (${alias}.receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MARKER}' AND ${alias}.command='help'
       AND EXISTS (SELECT /* subs-bot:telegram-general-subscription-read:v1 */ 1 FROM telegram_subscription_read
-        WHERE receipt_id=${alias}.receipt_id AND kind<>'format'))
+        WHERE receipt_id=${alias}.receipt_id))
     OR (${alias}.receipt_nonce='${GENERAL_PATH_MARKER}' AND ${alias}.command='help'
       AND EXISTS (SELECT 1 FROM telegram_path_reply WHERE receipt_id=${alias}.receipt_id)))))` : ordinary;
 }
@@ -253,6 +254,7 @@ export async function beginGeneralSharedTelegramReply(
 ): Promise<boolean> {
   if (!pin.sharedOutbox || Boolean(metadata) !== (lease.marker === GENERAL_SUBSCRIPTION_READ_MARKER)) return false;
   if ((tickets.length > 0 || metadata) && (!pin.privateManagement || lease.chatType !== "private" || lease.threadId !== null)) return false;
+  if (!pin.privateFormats && metadata?.tickets.some(({ kind }) => kind === "format")) return false;
   const begin = prepareTelegramOutboxBegin(db, lease, selectLease(pin, lease, true, metadata));
   const count = metadata?.tickets.length ?? tickets.length;
   if (count === 0) return await begin.first() !== null;
@@ -266,11 +268,13 @@ export async function beginGeneralSharedTelegramReply(
   return changed === 1;
 }
 
-export async function drainGeneralSharedTelegramReply(db: D1Database, pin: GeneralTelegramPin): Promise<boolean> {
+export async function drainGeneralSharedTelegramReply(
+  db: D1Database, pin: GeneralTelegramPin, bucket: R2Bucket, publicOrigin: PublicOrigin,
+): Promise<boolean> {
   const lease = await claimGeneralSharedTelegramReply(db, pin);
   if (!lease) return false;
   if (lease.marker === GENERAL_SUBSCRIPTION_READ_MARKER) {
-    const presentation = await renderGeneralSubscriptionRead(db, pin, lease);
+    const presentation = await renderGeneralSubscriptionRead(db, pin, lease, bucket, publicOrigin);
     if (!presentation?.readGuard) return false;
     const prepared = presentation.readButtons?.length ? await prepareTelegramSubscriptionReadTickets(presentation.readButtons) : undefined;
     if (!await beginGeneralSharedTelegramReply(db, pin, lease, [], { ...presentation.readGuard, tickets: prepared?.tickets ?? [] })) return false;
@@ -310,7 +314,9 @@ export async function drainGeneralSharedTelegramReply(db: D1Database, pin: Gener
   return true;
 }
 
-export async function recoverGeneralSharedTelegramReplies(db: D1Database, pin: GeneralTelegramPin): Promise<void> {
+export async function recoverGeneralSharedTelegramReplies(
+  db: D1Database, pin: GeneralTelegramPin, bucket: R2Bucket, publicOrigin: PublicOrigin,
+): Promise<void> {
   if (!pin.sharedOutbox) return;
   const group = await groupSchemaReady(db);
   const markers = queueMarkers(group, pin.privateManagement);
@@ -327,7 +333,7 @@ export async function recoverGeneralSharedTelegramReplies(db: D1Database, pin: G
     await reapTelegramLifecycle(db, pin.botId);
     await reapTelegramSubscriptionReadTickets(db, pin.botId);
   }
-  for (let i = 0; i < 4 && await drainGeneralSharedTelegramReply(db, pin); i++) {
+  for (let i = 0; i < 4 && await drainGeneralSharedTelegramReply(db, pin, bucket, publicOrigin); i++) {
     // Bound scheduled work and preserve the ordinary outbox's lease and settlement semantics.
   }
 }

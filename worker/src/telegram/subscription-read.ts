@@ -279,8 +279,9 @@ type Metadata = {
   token: string | null;
   sourceUrl: string | null;
 };
+type FormatMetadata = Pick<Metadata, "id" | "generation" | "lifecycleRevision" | "nodeCount" | "snapshotId" | "manifestSha256" | "token">;
 
-function subscriptionGuard(guard: Guard, row: Metadata, token?: string, refreshSource?: string | null): Guard {
+function subscriptionGuard(guard: Guard, row: FormatMetadata, token?: string, refreshSource?: string | null): Guard {
   return { sql: `(${guard.sql}) AND EXISTS (SELECT 1 FROM subscriptions
     WHERE id=? AND owner_id=inbox.actor_id AND generation=? AND ${SUBSCRIPTION_LIFECYCLE_REVISION}=?
       AND snapshot_id IS ? AND manifest_sha256 IS ? AND node_count=? ${token ? "AND token=?" : ""}
@@ -360,8 +361,14 @@ function subscriptionMetadataLines(row: Metadata): string[] {
   return lines;
 }
 
+function subscriptionFormatButtons(subscriptionId: number): TelegramSubscriptionReadButton[] {
+  return (Object.keys(FORMAT_LABELS) as Format[]).map((format) => ({
+    text: FORMAT_LABELS[format], kind: "format", subscriptionId, format,
+  }));
+}
+
 export async function renderGeneralSubscriptionMetadata(
-  db: D1Database, ownerId: string, subscriptionId: number, expectedRevision: number, guard: Guard,
+  db: D1Database, ownerId: string, subscriptionId: number, expectedRevision: number, guard: Guard, offerFormats = false,
 ): Promise<RenderedRead> {
   const row = await db.prepare(`SELECT id,name,expire_at AS expireAt,traffic_used AS trafficUsed,traffic_total AS trafficTotal,
     (last_error IS NOT NULL) AS refreshFailed,generation,${SUBSCRIPTION_LIFECYCLE_REVISION} AS lifecycleRevision,
@@ -369,7 +376,21 @@ export async function renderGeneralSubscriptionMetadata(
     FROM subscriptions WHERE id=? AND owner_id=? AND ${SUBSCRIPTION_LIFECYCLE_REVISION}=?`)
     .bind(subscriptionId, ownerId, expectedRevision).first<Metadata>();
   if (!row) return { text: "订阅不存在或已被更改。", readGuard: guard };
-  return { text: subscriptionMetadataLines(row).join("\n"), readGuard: subscriptionGuard(guard, row) };
+  const readButtons = offerFormats && row.generation > 0 && row.nodeCount > 0
+    && row.snapshotId !== null && row.manifestSha256 !== null ? subscriptionFormatButtons(row.id) : undefined;
+  return { text: subscriptionMetadataLines(row).join("\n"), readGuard: subscriptionGuard(guard, row), readButtons };
+}
+
+export async function renderGeneralSubscriptionFormat(
+  db: D1Database, bucket: R2Bucket, ownerId: string, subscriptionId: number, expectedRevision: number,
+  format: Format, guard: Guard, publicOrigin: PublicOrigin,
+): Promise<RenderedRead> {
+  const row = await db.prepare(`SELECT id,generation,${SUBSCRIPTION_LIFECYCLE_REVISION} AS lifecycleRevision,
+    node_count AS nodeCount,snapshot_id AS snapshotId,manifest_sha256 AS manifestSha256,token
+    FROM subscriptions WHERE id=? AND owner_id=? AND ${SUBSCRIPTION_LIFECYCLE_REVISION}=?`)
+    .bind(subscriptionId, ownerId, expectedRevision).first<FormatMetadata>();
+  if (!row) return { text: "订阅不存在或已被更改。", readGuard: guard };
+  return renderFormat(db, bucket, row, format, guard, Date.now() + READ_BUDGET_MS, publicOrigin);
 }
 
 async function renderDetail(
@@ -394,9 +415,7 @@ async function renderDetail(
       if (signal.aborted || preview.length !== Math.min(PREVIEW_NODES, row.nodeCount)) throw new Error();
       lines.push("节点预览", ...preview.map((name) => `• ${name}`));
       if (row.nodeCount > PREVIEW_NODES) lines.push(`仅展示前 ${PREVIEW_NODES} 个节点名称。`);
-      for (const format of Object.keys(FORMAT_LABELS) as Format[]) {
-        readButtons.push({ text: FORMAT_LABELS[format], kind: "format", subscriptionId: row.id, format });
-      }
+      readButtons.push(...subscriptionFormatButtons(row.id));
       if (nodePagesEnabled) nodeButtons.push({ ...snapshot, lifecycleRevision: row.lifecycleRevision, pageOffset: 0, text: "浏览全部节点" });
       if (rawFileEnabled) rawFileTarget = { ...snapshot, lifecycleRevision: row.lifecycleRevision };
     } catch {
@@ -413,7 +432,7 @@ async function renderDetail(
 }
 
 async function renderFormat(
-  db: D1Database, bucket: R2Bucket, row: Metadata, format: Format, guard: Guard, deadline: number, publicOrigin: PublicOrigin,
+  db: D1Database, bucket: R2Bucket, row: FormatMetadata, format: Format, guard: Guard, deadline: number, publicOrigin: PublicOrigin,
 ): Promise<RenderedRead> {
   const baseGuard = subscriptionGuard(guard, row);
   if (row.generation === 0) return { text: "当前没有已发布的节点。", readGuard: baseGuard };
@@ -492,10 +511,12 @@ export function insertTelegramSubscriptionReadTickets(
   if (!validInteger(tickets.length, 1, MAX_BUTTONS) || !validInteger(previousChanges, 1, 16)) {
     throw new RangeError("Invalid Telegram subscription read ticket count.");
   }
-  const origin = general ? `(inbox.receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MARKER}' AND ticket.kind='detail'
-    AND EXISTS (SELECT 1 FROM telegram_subscription_read AS search
+  const origin = general ? `(inbox.receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MARKER}' AND (
+    (ticket.kind='detail' AND EXISTS (SELECT 1 FROM telegram_subscription_read AS search
       JOIN json_each(search.matches) AS item WHERE search.receipt_id=inbox.receipt_id AND search.kind='search'
-      AND search.search_receipt_id IS NULL AND json_extract(item.value,'$[0]')=ticket.subscription_id))`
+      AND search.search_receipt_id IS NULL AND json_extract(item.value,'$[0]')=ticket.subscription_id))
+    OR (ticket.kind='format' AND EXISTS (SELECT 1 FROM telegram_subscription_read AS detail
+      WHERE detail.receipt_id=inbox.receipt_id AND detail.kind='detail' AND detail.subscription_id=ticket.subscription_id))))`
     : `((inbox.receipt_nonce IN (${TELEGRAM_VIEW_RECEIPTS}) AND ticket.kind='detail') OR inbox.receipt_nonce=?
       ${nodePageOrigin ? `OR (inbox.receipt_nonce='${TELEGRAM_SUBSCRIPTION_NODE_MARKER}' AND ticket.kind='detail'
         AND EXISTS (SELECT 1 FROM telegram_subscription_node_page AS page

@@ -193,7 +193,7 @@ async function telegramWebhook(request: Request, env: Env, publicOrigin: PublicO
         (callbackId) => ctx?.waitUntil(answerTelegramCallback(general, callbackId)))
         : await acceptGeneralTelegramCommand(env.DB, general, request);
       if (status === 200) {
-        const delivery = general.sharedOutbox ? drainGeneralSharedTelegramReply(env.DB, general)
+        const delivery = general.sharedOutbox ? drainGeneralSharedTelegramReply(env.DB, general, env.NODES, publicOrigin)
           : drainGeneralTelegramReply(env.DB, general);
         if (ctx) ctx.waitUntil(delivery.catch(() => undefined));
         else await delivery;
@@ -664,7 +664,7 @@ async function scheduled(_controller: ScheduledController, env: Env): Promise<vo
     if (policy) await recoverTelegramWork(env, policy, pin, await telegramProviderQueueReady(env, pin), publicOrigin);
     else if (env.TELEGRAM_ISOLATION_CONFIG === undefined) {
       const general = parseGeneralTelegramPin(env.TELEGRAM_GENERAL_CONFIG, env.BUILD_REVISION);
-      if (general?.sharedOutbox) await recoverGeneralSharedTelegramReplies(env.DB, general);
+      if (general?.sharedOutbox) await recoverGeneralSharedTelegramReplies(env.DB, general, env.NODES, publicOrigin);
       else if (general) await recoverGeneralTelegramReplies(env.DB, general);
     }
   } finally {

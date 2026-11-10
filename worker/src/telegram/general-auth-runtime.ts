@@ -12,6 +12,7 @@ export interface GeneralTelegramPin extends TelegramBotCredentials {
   releaseRevision: string;
   sharedOutbox: boolean;
   privateManagement: boolean;
+  privateFormats: boolean;
 }
 
 interface Lease {
@@ -40,7 +41,8 @@ export function parseGeneralTelegramPin(input: unknown, releaseRevision: unknown
     const value = JSON.parse(input) as Record<string, unknown> | null;
     if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
     const sharedOutbox = Object.hasOwn(value, "outbox");
-    const privateManagement = value.outbox === "shared-private-management";
+    const privateFormats = value.outbox === "shared-private-management-formats";
+    const privateManagement = value.outbox === "shared-private-management" || privateFormats;
     if (Object.keys(value).length !== (sharedOutbox ? 8 : 7)
       || (sharedOutbox && value.outbox !== "shared" && !privateManagement)) return null;
     const credentials = readTelegramBotCredentials(value);
@@ -49,7 +51,7 @@ export function parseGeneralTelegramPin(input: unknown, releaseRevision: unknown
       || !Number.isSafeInteger(generation) || generation < 1 || typeof cutoverAt !== "number"
       || !Number.isSafeInteger(cutoverAt) || cutoverAt < 1 || typeof activationSha256 !== "string"
       || !/^[0-9a-f]{64}(?![\s\S])/u.test(activationSha256)) return null;
-    return { ...credentials, generation, cutoverAt, activationSha256, releaseRevision, sharedOutbox, privateManagement };
+    return { ...credentials, generation, cutoverAt, activationSha256, releaseRevision, sharedOutbox, privateManagement, privateFormats };
   } catch {
     return null;
   }
