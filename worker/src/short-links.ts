@@ -1,8 +1,9 @@
 import { digestHex } from "./storage.ts";
 import { LEGACY_SELECTED_RETIREMENT_PIN } from "./subscriptions.ts";
 import { legacyAllActiveMarkerSql } from "./legacy-all-aggregates.ts";
+import { ISOLATION_PUBLIC_ORIGIN, PRODUCTION_PUBLIC_ORIGIN } from "./public-origin.ts";
 
-export const ISOLATION_PUBLIC_ORIGIN = "https://subs-bot-cf-dev-01.lilyya.workers.dev";
+export { ISOLATION_PUBLIC_ORIGIN };
 export const SHORT_CODE = /^(?:[A-Za-z0-9_-]{12}|[A-Za-z0-9_-]{22})(?![\s\S])/u;
 export const NORMAL_CODE_SUFFIX = "s";
 export const LEGACY_SUBSCRIPTION_SHORT_MIGRATION = "0029_legacy_subscription_short_links.sql";
@@ -18,7 +19,7 @@ const MAX_TARGET_BYTES = 2048;
 const HOST_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
 const LOCAL_SUFFIXES = [".localhost", ".localdomain", ".local", ".internal", ".home.arpa", ".test", ".invalid", ".example",
   ".onion", ".lan", ".home", ".corp", ".svc"];
-const PROJECT_HOSTS = new Set([new URL(ISOLATION_PUBLIC_ORIGIN).hostname, "subs-bot.lilyya.top"]);
+const PROJECT_HOSTS = new Set([new URL(ISOLATION_PUBLIC_ORIGIN).hostname, new URL(PRODUCTION_PUBLIC_ORIGIN).hostname]);
 const CONTROL_OR_BACKSLASH = /[\p{Cc}\p{Cf}\p{Cs}\u2028\u2029\\]/u;
 const encoder = new TextEncoder();
 
