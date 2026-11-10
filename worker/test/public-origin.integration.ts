@@ -80,7 +80,7 @@ test("emitted Worker changes only the configured public host and retains existin
     await db.prepare("INSERT INTO subs_bot_schema_migrations VALUES (?,?,?,'applied')")
       .bind(index + 1, migration.name, migration.sha256).run();
   }
-  const sub = await createSubscription(db, { ownerId: policy.adminId, name: "Origin fixture", sourceUrl: "uploaded://origin-fixture" });
+  const sub = await createSubscription(db, { ownerId: policy.adminId, name: "Origin fixture", sourceUrl: "uploaded://telegram-document" });
   assert.equal(await publishNodeSnapshot(db, bucket, { id: sub.id, ownerId: policy.adminId, expectedGeneration: 0,
     expectedLifecycleRevision: 0 }, [{ name: "Origin node", type: "temp", share }]), true);
 
@@ -167,7 +167,9 @@ test("emitted Worker changes only the configured public host and retains existin
   assert.equal(link(await reply(7)).href, `${production}/sub/${sub.token}/clash`);
 
   assert.equal((await message(configured, 8, `/share sub ${sub.id}`)).status, 200);
-  assert.equal(link(await reply(8)).hostname, "t.me");
+  const claim = link(await reply(8));
+  assert.ok(claim, "Expected the private share claim link.");
+  assert.equal(claim.hostname, "t.me");
   const payloadId = await db.prepare("SELECT payload_id FROM private_shares WHERE sender_id=?").bind(policy.adminId).first<string>("payload_id");
   assert.ok(payloadId);
   const payload = await bucket.get(`private-shares/${payloadId}.txt`);
