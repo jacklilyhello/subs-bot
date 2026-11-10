@@ -374,6 +374,18 @@ PY
 
 预览最多完整列出 20,000 名已配置或已有覆盖记录的用户。清单记录精确目标拓扑、输入及输出摘要、旧默认权限和阻断项。原始允许及拒绝覆盖逐字节保留。旧白名单为空时记录旧公开默认，并标记 `public-default-requires-approval`。Bot 不同、保留身份及越界用户也会记录阻断。预览始终封存为 `activationAllowed: false`，部署仍由原有隔离流程管理。
 
+#### 通用授权 D1 候选包
+
+使用同一份封存输入及其独立摘要，在获准的私有托管目录生成候选包。
+
+```sh
+python3 -B worker/tools/legacy_general_auth_candidate.py \
+  BACKUP INVENTORY CONFIG TARGET PREVIEW WORKER OUTPUT \
+  SOURCE_SHA256 INVENTORY_SHA256 CONFIG_SHA256 TARGET_SHA256 PREVIEW_SHA256 WORKER_MANIFEST_SHA256 REVISION APPLIED_AT
+```
+
+工具重建并逐文件比对通用预览。仅接受默认拒绝、无阻断的封存结果。候选包包含 `restore.sql`、`manifest.json` 和 `manifest.sha256`。SQL 限 256 KiB，并在私有临时库重放核对完整 schema、外键及数据摘要。原授权覆盖和时间、管理员及白名单标记、群范围保存在三个候选专用表中。候选保持休眠，原 Worker 迁移登记保持原样。实际向新建未绑定 D1 导入另行验收。
+
 ### 普通短链双账号验收
 
 受保护的 `worker-isolation-telegram-short-links-smoke.yml` 对同一活动版本执行 `prepare`、`issued` 和 `retired`。使用同一个 `cohort` 和 Worker CI 运行 ID。后两步引用前一步的成功运行。两名获准用户只在指定内置浏览器私聊分别签发 `https://example.com/subs-bot-normal-short/<cohort>/admin` 和 `https://example.org/subs-bot-normal-short/<cohort>/member`。管理员先尝试撤销普通用户的测试短码，随后各自撤销自己的短链。提交的浏览器证据只包含三项摘要。
