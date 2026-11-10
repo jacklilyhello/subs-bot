@@ -12,10 +12,11 @@ import { PRODUCTION_PUBLIC_ORIGIN } from "../src/public-origin.ts";
 import { publishNodeSnapshot } from "../src/storage.ts";
 import { GENERAL_AUTH_LEGACY_ROLE, type GeneralAuthReplayMessage, type GeneralAuthReplayPin } from "../src/telegram/general-auth-replay.ts";
 import { beginGeneralTelegramReply, claimGeneralTelegramReply, parseGeneralTelegramPin } from "../src/telegram/general-auth-runtime.ts";
-import { beginGeneralSharedTelegramReply, claimGeneralSharedTelegramReply } from "../src/telegram/general-auth-shared.ts";
+import { acceptGeneralSharedTelegramCommand, beginGeneralSharedTelegramReply, claimGeneralSharedTelegramReply } from "../src/telegram/general-auth-shared.ts";
 import { generalCurrentAuthoritySql, generalCurrentReceiptSql, generalOrdinaryReplyEligibilitySql, generalPolicyBindings,
   generalRecordedOriginSql } from "../src/telegram/general-receipt.ts";
 import { claimTelegramReply } from "../src/telegram/store.ts";
+import { MAX_TEMP_BATCH_NODES, MAX_TEMP_OWNER_NODES } from "../src/telegram/temp-storage.ts";
 
 type Fixture = Omit<GeneralAuthReplayPin, "botUsername" | "webhookSecret" | "generation" | "cutoverAt"> & {
   bundleSha256: string; compatibilityDate: string; statements: string[];
@@ -57,6 +58,8 @@ test("closed general authorization replays a sealed candidate in a separate emit
   } })[] = [];
   const lifecycleMessagesById = new Map<number, (typeof lifecycleSent)[number]>();
   const lifecycleAcks = new Set<string>();
+  const fixtureDocuments = new Map<string, string>();
+  const fileRequests: string[] = [];
   let lifecycleAckCalls = 0;
   let failTransport = false;
   let failGeneralTransport = false;
@@ -71,18 +74,46 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.ok(sharedPin?.sharedOutbox && !sharedPin.privateManagement);
   const lifecycleConfig = JSON.stringify({ ...JSON.parse(generalConfig), outbox: "shared-private-management" });
   const privatePin = parseGeneralTelegramPin(lifecycleConfig, fixture.releaseRevision);
-  assert.ok(privatePin?.sharedOutbox && privatePin.privateManagement && !privatePin.privateFormats);
+  assert.ok(privatePin?.sharedOutbox && privatePin.privateManagement && !privatePin.privateFormats && !privatePin.privateTemp);
   const formatsConfig = JSON.stringify({ ...JSON.parse(generalConfig), outbox: "shared-private-management-formats" });
   const formatsPin = parseGeneralTelegramPin(formatsConfig, fixture.releaseRevision);
-  assert.ok(formatsPin?.sharedOutbox && formatsPin.privateManagement && formatsPin.privateFormats);
+  assert.ok(formatsPin?.sharedOutbox && formatsPin.privateManagement && formatsPin.privateFormats && !formatsPin.privateTemp);
+  const tempConfig = JSON.stringify({ ...JSON.parse(generalConfig), outbox: "shared-private-temp" });
+  const tempPin = parseGeneralTelegramPin(tempConfig, fixture.releaseRevision);
+  assert.ok(tempPin?.sharedOutbox && tempPin.privateManagement && tempPin.privateTemp && !tempPin.privateFormats && !tempPin.privateDocument);
+  const cumulativeConfig = JSON.stringify({ ...JSON.parse(generalConfig), outbox: "shared-private-management-formats-temp" });
+  const cumulativePin = parseGeneralTelegramPin(cumulativeConfig, fixture.releaseRevision);
+  assert.ok(cumulativePin?.sharedOutbox && cumulativePin.privateManagement && cumulativePin.privateFormats
+    && cumulativePin.privateTemp && !cumulativePin.privateDocument);
+  const documentConfig = JSON.stringify({ ...JSON.parse(generalConfig), outbox: "shared-private-management-formats-temp-node-document" });
+  const documentPin = parseGeneralTelegramPin(documentConfig, fixture.releaseRevision);
+  assert.ok(documentPin?.sharedOutbox && documentPin.privateManagement && documentPin.privateFormats
+    && documentPin.privateTemp && documentPin.privateDocument);
   for (const outbox of ["legacy", "shared-lifecycle", "shared-path", ["shared-private-management"]]) {
     assert.equal(parseGeneralTelegramPin(JSON.stringify({ ...JSON.parse(generalConfig), outbox }),
       fixture.releaseRevision), null);
   }
   const d1Databases = { DB: "sealed-general-auth-replay" };
   const privateTransport = async (request: Request) => {
-    assert.equal(request.method, "POST");
     const api = `https://api.telegram.org/bot${generalToken}/`;
+    const files = `https://api.telegram.org/file/bot${generalToken}/documents/`;
+    if (request.url === api + "getFile") {
+      assert.equal(request.method, "POST");
+      const { file_id: fileId } = await request.json() as { file_id: string };
+      const fixture = fixtureDocuments.get(fileId);
+      assert.ok(fixture);
+      fileRequests.push(fileId);
+      return Response.json({ ok: true, result: { file_path: `documents/${fileId}`, file_size: Buffer.byteLength(fixture) } });
+    }
+    if (request.url.startsWith(files)) {
+      assert.equal(request.method, "GET");
+      const fileId = request.url.slice(files.length);
+      const fixture = fixtureDocuments.get(fileId);
+      assert.ok(fixture);
+      fileRequests.push(fileId);
+      return new Response(fixture);
+    }
+    assert.equal(request.method, "POST");
     if (request.url === api + "answerCallbackQuery") {
       lifecycleAckCalls++;
       const ack = await request.json() as { callback_query_id: string };
@@ -127,7 +158,7 @@ test("closed general authorization replays a sealed candidate in a separate emit
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: lifecycleConfig },
       outboundService: privateTransport },
     { name: "formats", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
-      bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: formatsConfig, PUBLIC_ORIGIN: PRODUCTION_PUBLIC_ORIGIN },
+      bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: documentConfig, PUBLIC_ORIGIN: PRODUCTION_PUBLIC_ORIGIN },
       outboundService: privateTransport },
     { name: "replay", modules: true, script: entry.outputFiles[0].text, compatibilityDate, d1Databases, bindings: { REPLAY_PIN: pin },
       outboundService: async (request: Request) => {
@@ -718,4 +749,198 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.equal((await callback(7380, 101, origin(enabledDetail.messageId, 101), formatTicket("Clash Meta"), formats)).status, 204);
   assert.equal(await findReply(7380), null);
   assert.equal(await db.prepare("SELECT count(*) AS n FROM telegram_provider_jobs").first("n"), 0);
+
+  const firstShare = "hy2://first.example.invalid#synthetic-temp-first";
+  const secondShare = "ssr://synthetic-temp-opaque#synthetic-temp-second";
+  const tempPost = (id: number, actor: number, text: string, options: PostOptions = {}) => post(actor, text, {
+    worker: formats, updateId: id, date: now + 4, ...options,
+    message: text.startsWith("/") ? options.message : { entities: [], ...options.message },
+  });
+  await db.batch([
+    db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,'104',8,?,'member')")
+      .bind(pin.botId, pin.generation, now + 3),
+    db.prepare("INSERT INTO legacy_temp_installations VALUES (?,?,?)").bind(pin.botId, "d".repeat(64), now + 3),
+  ]);
+  const legacy = JSON.stringify([{ name: "Fixture baseline", type: "temp", share: firstShare }]);
+  await db.prepare("INSERT INTO legacy_temp_batches VALUES (?,'104',1,1,?,1,?,?)")
+    .bind(pin.botId, legacy, Buffer.byteLength(legacy), createHash("sha256").update(legacy).digest("hex")).run();
+  assert.equal((await sharedPost(101, "/temp summary")).status, 204);
+  assert.equal((await tempPost(7400, 101, "/temp clear", { date: now + 3 })).status, 204,
+    "the restored baseline cutoff is strict even for an administrator");
+  assert.equal((await tempPost(7401, 102, firstShare)).status, 204);
+  assert.equal((await tempPost(7402, 101, firstShare, groupEvent)).status, 204);
+  assert.equal((await tempPost(7403, 101, firstShare, { message: { reply_to_message: origin(10, 101) } })).status, 204);
+  assert.equal((await tempPost(7404, 101, "ordinary fixture text")).status, 204);
+  assert.equal((await tempPost(7405, 101, "https://provider.fixture.invalid/ordinary")).status, 204);
+  const tempMigration = await db.prepare("SELECT sha256 FROM subs_bot_schema_migrations WHERE position=8").first<string>("sha256");
+  assert.ok(tempMigration);
+  await db.prepare("UPDATE subs_bot_schema_migrations SET sha256=? WHERE position=8").bind("0".repeat(64)).run();
+  assert.equal((await tempPost(7406, 101, firstShare)).status, 204);
+  await db.prepare("UPDATE subs_bot_schema_migrations SET sha256=? WHERE position=8").bind(tempMigration).run();
+  assert.equal(await db.prepare("SELECT count(*) AS n FROM telegram_temp_reply").first("n"), 0);
+
+  assert.equal((await tempPost(7410, 101, firstShare)).status, 200);
+  const administrator = await awaitLifecycle(7410);
+  assert.equal(administrator.message.text, "已加入临时列表 1 条节点，当前共有 1 条。");
+  assert.equal((await tempPost(7410, 101, secondShare)).status, 204);
+  const tempBase64 = Buffer.from(secondShare, "utf8").toString("base64");
+  assert.equal((await tempPost(7411, 104, tempBase64)).status, 200);
+  assert.equal((await awaitLifecycle(7411)).message.text, "已加入临时列表 1 条节点，当前共有 2 条。");
+  assert.deepEqual(await db.prepare(`SELECT inbox.receipt_nonce AS marker,authority.actor_role AS role,
+    authority.actor_revision AS revision,reply.kind AS kind
+    FROM telegram_inbox AS inbox JOIN telegram_general_receipt AS authority USING (receipt_id)
+    JOIN telegram_temp_reply AS reply USING (receipt_id) JOIN telegram_temp_batch AS batch USING (receipt_id)
+    WHERE inbox.bot_id=? AND inbox.update_id=7411 AND batch.bot_id=inbox.bot_id AND batch.actor_id=inbox.actor_id`)
+    .bind(pin.botId).first(), { marker: "general-temp:v1", role: "member", revision: 8, kind: "added" });
+
+  assert.equal((await tempPost(7412, 104, "/temp")).status, 200);
+  const summary = await awaitLifecycle(7412);
+  assert.equal(summary.message.text, "临时列表共有 2 条节点。发送 /temp clear 清空。");
+  assert.equal(summary.message.reply_markup, undefined);
+  assert.equal((await tempPost(7413, 104, firstShare + "\nhy2://")).status, 200);
+  assert.match((await awaitLifecycle(7413)).message.text, /^本批未写入。/u);
+  assert.equal((await tempPost(7415, 104, firstShare, { date: now + 5 })).status, 200);
+  await awaitLifecycle(7415);
+  const totals = () => db.prepare(`SELECT actor_id AS owner,count(*) AS batches FROM telegram_temp_batch
+    WHERE bot_id=? GROUP BY actor_id ORDER BY actor_id`).bind(pin.botId).all();
+  await db.prepare(`CREATE TRIGGER fixture_general_temp_intake_abort BEFORE INSERT ON telegram_outbox
+    WHEN EXISTS (SELECT 1 FROM telegram_inbox WHERE receipt_id=NEW.receipt_id AND bot_id='105' AND update_id=7414)
+    BEGIN SELECT RAISE(IGNORE); END`).run();
+  try {
+    assert.equal((await tempPost(7414, 104, "/temp clear")).status, 503);
+    assert.deepEqual((await totals()).results, [{ owner: "101", batches: 1 }, { owner: "104", batches: 2 }]);
+    assert.equal(await db.prepare("SELECT count(*) AS n FROM legacy_temp_batches").first("n"), 1);
+    assert.equal(await db.prepare("SELECT count(*) AS n FROM telegram_temp_clear_fence").first("n"), 0);
+    assert.equal(await findReply(7414), null);
+  } finally {
+    await db.prepare("DROP TRIGGER fixture_general_temp_intake_abort").run();
+  }
+  assert.equal((await tempPost(7414, 104, "/temp clear")).status, 200);
+  assert.equal((await awaitLifecycle(7414)).message.text, "已移除 2 条临时节点，当前共有 1 条。");
+  assert.equal((await tempPost(7414, 104, "/temp clear")).status, 204);
+  assert.deepEqual((await totals()).results, [{ owner: "101", batches: 1 }, { owner: "104", batches: 1 }]);
+  assert.equal(await db.prepare("SELECT count(*) AS n FROM legacy_temp_batches").first("n"), 0);
+  assert.equal((await tempPost(7416, 104, firstShare, { message: { message_id: 7413 } })).status, 200);
+  assert.match((await awaitLifecycle(7416)).message.text, /^该操作早于最近一次清空/u);
+  assert.doesNotMatch(JSON.stringify(lifecycleSent.filter(({ reply_parameters }) => reply_parameters.message_id >= 7410)),
+    /(?:hy2|ssr):|synthetic-temp-/u);
+
+  const queuedSummary = new Request("https://app.fixture.invalid/telegram/webhook", {
+    method: "POST", headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": pin.webhookSecret },
+    body: JSON.stringify({ update_id: 7417, message: {
+      from: { id: 104, is_bot: false }, chat: { id: 104, type: "private" }, date: now + 5, message_id: 7417,
+      text: "/temp summary", entities: [{ type: "bot_command", offset: 0, length: 5 }],
+    } }),
+  });
+  assert.equal(await acceptGeneralSharedTelegramCommand(db, formatsPin, queuedSummary.clone()), 204);
+  assert.equal(await acceptGeneralSharedTelegramCommand(db, cumulativePin, queuedSummary), 200);
+  const tempLease = await claimGeneralSharedTelegramReply(db, cumulativePin);
+  assert.equal(tempLease?.updateId, 7417);
+  assert.ok(tempLease);
+  await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,'104',9,?,'denied')")
+    .bind(pin.botId, pin.generation, now + 6).run();
+  assert.equal(await beginGeneralSharedTelegramReply(db, cumulativePin, tempLease), false);
+  assert.equal((await formats.scheduled({ cron: "* * * * *" })).outcome, "ok");
+  assert.equal((await findReply(7417))?.state, "failed");
+  assert.equal((await tempPost(7418, 104, "/temp clear", { date: now + 7 })).status, 204);
+  assert.deepEqual((await totals()).results, [{ owner: "101", batches: 1 }, { owner: "104", batches: 1 }]);
+
+  const quotaRows = JSON.stringify(Array.from({ length: MAX_TEMP_BATCH_NODES }, () =>
+    ({ name: "Fixture quota", type: "temp", share: firstShare })));
+  const quotaSha = createHash("sha256").update(quotaRows).digest("hex");
+  const quotaSteps = [];
+  for (let start = 1; start <= MAX_TEMP_OWNER_NODES; start += MAX_TEMP_BATCH_NODES) {
+    quotaSteps.push(db.prepare("INSERT INTO legacy_temp_batches VALUES (?,'106',?,?,?,?,?,?)")
+      .bind(pin.botId, start, start + MAX_TEMP_BATCH_NODES - 1, quotaRows, MAX_TEMP_BATCH_NODES,
+        Buffer.byteLength(quotaRows), quotaSha));
+  }
+  assert.ok((await db.batch(quotaSteps)).every(({ success }) => success));
+  assert.equal((await tempPost(7419, 106, firstShare)).status, 200);
+  assert.match((await awaitLifecycle(7419)).message.text, new RegExp(`达到数量或大小限制.*${MAX_TEMP_OWNER_NODES}`, "u"));
+  assert.equal(await db.prepare("SELECT count(*) AS n FROM telegram_temp_batch WHERE bot_id=? AND actor_id='106'")
+    .bind(pin.botId).first("n"), 0);
+
+  const docFile = (updateId: number, actor: number, fileId: string, options: PostOptions = {}) =>
+    new Request("https://app.fixture.invalid/telegram/webhook", { method: "POST",
+      headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": pin.webhookSecret },
+      body: JSON.stringify({ update_id: updateId, message: {
+        from: { id: actor, is_bot: false }, chat: { id: options.chatId ?? actor, type: options.chatType ?? "private" },
+        message_id: updateId, date: options.date ?? now + 8,
+        document: { file_id: fileId, file_name: "Fixture node upload.txt", file_size: Buffer.byteLength(fixtureDocuments.get(fileId)!) },
+      } }),
+    });
+  const submitDocument = (id: number, actor: number, file: string, options: PostOptions = {}) =>
+    formats.fetch(docFile(id, actor, file, options));
+  const documentRow = (id: number) => db.prepare(`SELECT inbox.receipt_nonce AS marker,job.state,job.result_code AS outcome,
+    job.file_id IS NULL AS scrubbed,origin.actor_revision AS revision
+    FROM telegram_document_jobs AS job JOIN telegram_inbox AS inbox USING (receipt_id)
+    JOIN telegram_general_receipt AS origin USING (receipt_id) WHERE inbox.bot_id=? AND inbox.update_id=?`)
+    .bind(pin.botId, id).first();
+  const uploaded = () => db.prepare(`SELECT owner_id AS owner,generation,token FROM subscriptions
+    WHERE name='Fixture node upload' AND source_url='uploaded://telegram-document' ORDER BY owner_id`).all<{ owner: string; generation: number; token: string }>();
+  fixtureDocuments.set("fixture-doc-admin", firstShare);
+  fixtureDocuments.set("fixture-doc-member", secondShare);
+  fixtureDocuments.set("fixture-doc-mixed", firstShare + "\nhttps://provider.fixture.invalid/private");
+  fixtureDocuments.set("fixture-doc-revoked", firstShare);
+  await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,'104',10,?,'member')")
+    .bind(pin.botId, pin.generation, now + 7).run();
+  assert.equal(await acceptGeneralSharedTelegramCommand(db, cumulativePin, docFile(7500, 101, "fixture-doc-admin")), 204);
+  assert.equal((await submitDocument(7501, 102, "fixture-doc-admin")).status, 204);
+  assert.equal((await submitDocument(7502, 101, "fixture-doc-admin", groupEvent)).status, 204);
+  assert.equal((await submitDocument(7510, 101, "fixture-doc-admin")).status, 200);
+  assert.equal((await submitDocument(7510, 101, "fixture-doc-admin")).status, 204);
+  assert.equal((await submitDocument(7511, 104, "fixture-doc-member")).status, 200);
+  assert.equal((await documentRow(7510))?.state, "pending");
+  assert.equal(await findReply(7510), null);
+  assert.deepEqual(fileRequests, [], "webhook admission cannot download files");
+
+  for (const [id, actor] of [[7510, 101], [7511, 104]] as const) {
+    assert.equal((await formats.scheduled({ cron: "* * * * *" })).outcome, "ok");
+    const saved = await awaitLifecycle(id);
+    assert.equal(saved.message.chat_id, String(actor));
+    assert.equal(saved.message.text, "文件已导入，共 1 个节点。");
+    assert.deepEqual(await documentRow(id), { marker: "general-document-job:v1", state: "done",
+      outcome: "saved", scrubbed: 1, revision: actor === 101 ? 1 : 10 });
+  }
+  assert.deepEqual(fileRequests, ["fixture-doc-admin", "fixture-doc-admin", "fixture-doc-member", "fixture-doc-member"]);
+  const original = (await uploaded()).results;
+  assert.deepEqual(original.map(({ owner, generation }) => ({ owner, generation })),
+    [{ owner: "101", generation: 1 }, { owner: "104", generation: 1 }]);
+  for (const [index, share] of [firstShare, secondShare].entries()) {
+    const response = await formats.fetch(`https://app.fixture.invalid/sub/${original[index].token}/base64`);
+    assert.equal(response.status, 200);
+    assert.equal(Buffer.from(await response.text(), "base64").toString("utf8"), share);
+  }
+
+  assert.equal((await submitDocument(7512, 104, "fixture-doc-mixed", { date: now + 9 })).status, 200);
+  assert.equal((await formats.scheduled({ cron: "* * * * *" })).outcome, "ok");
+  assert.equal((await awaitLifecycle(7512)).message.text, "文件未导入。请检查文件类型、大小和节点格式。已有订阅保持原样。");
+  assert.deepEqual((await uploaded()).results, original);
+  assert.equal(await db.prepare("SELECT count(*) AS n FROM telegram_provider_documents").first("n"), 0);
+  assert.equal(await db.prepare("SELECT count(*) AS n FROM telegram_provider_jobs").first("n"), 0);
+
+  assert.equal((await submitDocument(7513, 104, "fixture-doc-revoked", { date: now + 9 })).status, 200);
+  await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,'104',11,?,'denied')")
+    .bind(pin.botId, pin.generation, now + 10).run();
+  assert.equal((await formats.scheduled({ cron: "* * * * *" })).outcome, "ok");
+  assert.deepEqual(await documentRow(7513), { marker: "general-document-job:v1", state: "done",
+    outcome: "access-changed", scrubbed: 1, revision: 10 });
+  assert.equal((await findReply(7513))?.state, "failed");
+  assert.equal(fileRequests.includes("fixture-doc-revoked"), false);
+  assert.deepEqual((await uploaded()).results, original);
+
+  const abandonedSnapshot = "33333333-3333-4333-8333-333333333333";
+  const memberSubscriptionId = await db.prepare("SELECT id FROM subscriptions WHERE owner_id='104' AND token=?")
+    .bind(original[1].token).first<number>("id");
+  assert.ok(memberSubscriptionId);
+  const abandonedObject = `subscriptions/${memberSubscriptionId}/${abandonedSnapshot}/0.ndjson`;
+  await db.prepare(`INSERT INTO telegram_document_stages (snapshot_id,receipt_id,subscription_id,lease_id,cleanup_after)
+    SELECT ?,receipt_id,?,'44444444-4444-4444-8444-444444444444',unixepoch()-1
+    FROM telegram_inbox WHERE bot_id=? AND update_id=7513`).bind(abandonedSnapshot, memberSubscriptionId, pin.botId).run();
+  await bucket.put(abandonedObject, "synthetic retired document object");
+  assert.equal((await formats.scheduled({ cron: "* * * * *" })).outcome, "ok");
+  assert.equal(await bucket.head(abandonedObject), null);
+  assert.equal(await db.prepare("SELECT snapshot_id FROM telegram_document_stages WHERE snapshot_id=?")
+    .bind(abandonedSnapshot).first(), null);
+  assert.deepEqual((await uploaded()).results, original);
 });

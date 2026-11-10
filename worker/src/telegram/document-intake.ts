@@ -1,11 +1,11 @@
 import { parseSubscriptionDocument } from "../subscription-document.ts";
-import { claimTelegramDocumentJob, prepareTelegramDocumentJobLeaseGuard } from "./document-jobs.ts";
+import { claimTelegramDocumentJob, isGeneralDocumentPolicy, prepareTelegramDocumentJobLeaseGuard,
+  type TelegramDocumentPolicy } from "./document-jobs.ts";
 import { finishTelegramDocumentJob, MAX_TELEGRAM_DOCUMENT_NODES, persistTelegramDocumentJob } from "./document-persistence.ts";
 import { downloadTelegramDocument } from "./document-transport.ts";
 import { stageTelegramProviderDocument } from "./provider-document.ts";
 import { parseTelegramProviderDocument } from "./provider-document-input.ts";
 import { parseTelegramMixedDocument } from "./mixed-document-input.ts";
-import type { TelegramPolicy } from "./protocol.ts";
 
 const DOWNLOAD_BUDGET_MS = 20_000;
 const MIN_FINISH_WINDOW_MS = 5_000;
@@ -20,7 +20,7 @@ export async function telegramMixedDocumentReady(db: D1Database): Promise<boolea
 export async function runTelegramDocumentIntake(
   db: D1Database,
   bucket: R2Bucket,
-  policy: TelegramPolicy,
+  policy: TelegramDocumentPolicy,
   providerDocumentsReady = false,
   mixedDocumentsReady = false,
 ): Promise<boolean> {
@@ -44,7 +44,7 @@ export async function runTelegramDocumentIntake(
   }
 
   let mixed: Extract<ReturnType<typeof parseTelegramMixedDocument>, { kind: "mixed" }> | undefined;
-  if (providerDocumentsReady && (lease.suffix === "txt" || lease.suffix === "log") &&
+  if (!isGeneralDocumentPolicy(policy) && providerDocumentsReady && (lease.suffix === "txt" || lease.suffix === "log") &&
       await db.prepare("SELECT 1 AS opted FROM telegram_provider_document_opt_in WHERE receipt_id=?")
         .bind(lease.receiptId).first<number>("opted") === 1) {
     if (mixedDocumentsReady && await db.prepare("SELECT 1 AS opted FROM telegram_mixed_document_opt_in WHERE receipt_id=?")

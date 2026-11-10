@@ -1,5 +1,5 @@
 import { parseNodeText } from "../text-import.ts";
-import { inTelegramScope, type TelegramPolicy, type TelegramTempUpdate } from "./protocol.ts";
+import { inTelegramScope, type TelegramGeneralTempUpdate, type TelegramPolicy, type TelegramTempUpdate } from "./protocol.ts";
 import {
   MAX_TEMP_BATCH_BYTES, MAX_TEMP_BATCH_NODES, MAX_TEMP_OWNER_BYTES, MAX_TEMP_OWNER_NODES, TELEGRAM_TEMP_MARKER,
   ownedTempRowsSql, readTempStorage, tempCutoverAllows, tempSchemaGuard, type TempStorageMode,
@@ -152,6 +152,38 @@ function clearSteps(db: D1Database, key: ReceiptKey, mode: TempStorageMode): D1P
   ];
 }
 
+function prepareTempReceipt(
+  db: D1Database, key: ReceiptKey, mode: TempStorageMode, kind: TelegramTempUpdate["kind"], text: TextPlan | null,
+) {
+  const ownerTotal = tempOwnerQuery(mode, "COALESCE(sum(nodeCount),0)");
+  const statements = text ? textSteps(db, key, text, mode) : kind === "temp-clear" ? clearSteps(db, key, mode) : [db.prepare(`
+    INSERT INTO telegram_temp_reply (receipt_id, kind, node_count)
+    SELECT incoming.receipt_id, 'summary', 0 FROM telegram_inbox AS incoming WHERE ${freshReceipt}
+  `).bind(...key)];
+  statements.push(db.prepare(`
+    UPDATE telegram_temp_reply AS reply SET total_count = (${ownerTotal})
+    FROM telegram_inbox AS incoming WHERE reply.receipt_id = incoming.receipt_id AND ${freshReceipt}
+  `).bind(...key));
+
+  return { statements, proof: `EXISTS (
+    SELECT 1 FROM telegram_temp_reply AS reply JOIN telegram_outbox USING (receipt_id)
+    WHERE reply.receipt_id = incoming.receipt_id AND reply.total_count = (${ownerTotal})
+      AND (reply.kind <> 'added' OR EXISTS (
+        SELECT 1 FROM telegram_temp_batch AS temp
+        WHERE temp.receipt_id = incoming.receipt_id AND ${sameOwner} AND temp.node_count = reply.node_count
+      ))
+      AND (reply.kind <> 'cleared' OR NOT EXISTS (${tempOwnerQuery(mode, "1", visibleAtOrBefore)}))
+  )` };
+}
+
+/** Build the same atomic write and count proof for a fresh general private receipt. */
+export function prepareGeneralTelegramTempReceipt(
+  db: D1Database, key: ReceiptKey, mode: TempStorageMode, event: TelegramGeneralTempUpdate,
+) {
+  const text = event.kind === "temp-text" ? planText(event.text) : null;
+  return text?.kind === "no-nodes" ? null : prepareTempReceipt(db, key, mode, event.kind, text);
+}
+
 export async function acceptTelegramTemp(
   db: D1Database,
   policy: TelegramPolicy,
@@ -161,7 +193,6 @@ export async function acceptTelegramTemp(
 
   try {
     const mode = await readTempStorage(db);
-    const ownerTotal = tempOwnerQuery(mode, "COALESCE(sum(nodeCount),0)");
     const raw = event.kind === "temp-raw";
     const nonce = crypto.randomUUID();
     const key = [policy.botId, event.updateId, nonce] as const;
@@ -181,40 +212,15 @@ export async function acceptTelegramTemp(
       event.actorId, policy.adminId, event.messageDate, policy.botId, event.actorId,
       ...(mode === "legacy-ready" ? [policy.botId, event.messageDate] : []),
       ...(raw ? [event.messageDate, policy.botId, event.actorId, event.messageDate, event.messageId] : []))];
-    if (event.kind === "temp-text") {
-      steps.push(...textSteps(db, key, planText(event.text), mode));
-    } else if (event.kind === "temp-clear") {
-      steps.push(...clearSteps(db, key, mode));
-    } else {
-      steps.push(db.prepare(`
-        INSERT INTO telegram_temp_reply (receipt_id, kind, node_count)
-        SELECT incoming.receipt_id, 'summary', 0 FROM telegram_inbox AS incoming WHERE ${freshReceipt}
-      `).bind(...key));
-    }
-    steps.push(
-      db.prepare(`
-        UPDATE telegram_temp_reply AS reply SET total_count = (${ownerTotal})
-        FROM telegram_inbox AS incoming WHERE reply.receipt_id = incoming.receipt_id AND ${freshReceipt}
-      `).bind(...key),
-      db.prepare(`
-        INSERT INTO telegram_outbox (receipt_id)
-        SELECT incoming.receipt_id FROM telegram_inbox AS incoming WHERE ${freshReceipt}
-      `).bind(...key),
-      // Missing companions or an incomplete write make command NULL and abort the batch.
-      db.prepare(`
-        UPDATE telegram_inbox AS incoming SET receipt_nonce = ${raw ? tempRawStamp("incoming") : "?"}, command = CASE WHEN EXISTS (
-          SELECT 1 FROM telegram_temp_reply AS reply JOIN telegram_outbox USING (receipt_id)
-          WHERE reply.receipt_id = incoming.receipt_id AND reply.total_count = (${ownerTotal})
-            AND (reply.kind <> 'added' OR EXISTS (
-              SELECT 1 FROM telegram_temp_batch AS temp
-              WHERE temp.receipt_id = incoming.receipt_id AND ${sameOwner} AND temp.node_count = reply.node_count
-            ))
-            AND (reply.kind <> 'cleared' OR NOT EXISTS (${tempOwnerQuery(mode, "1", visibleAtOrBefore)}))
-        ) THEN command END
-        WHERE ${freshReceipt}
-        RETURNING receipt_id
-      `).bind(raw ? policy.adminId : TELEGRAM_TEMP_MARKER, ...key),
-    );
+    const temp = prepareTempReceipt(db, key, mode, event.kind, event.kind === "temp-text" ? planText(event.text) : null);
+    steps.push(...temp.statements, db.prepare(`
+      INSERT INTO telegram_outbox (receipt_id)
+      SELECT incoming.receipt_id FROM telegram_inbox AS incoming WHERE ${freshReceipt}
+    `).bind(...key), db.prepare(`
+      UPDATE telegram_inbox AS incoming SET receipt_nonce = ${raw ? tempRawStamp("incoming") : "?"},
+        command = CASE WHEN ${temp.proof} THEN command END
+      WHERE ${freshReceipt} RETURNING receipt_id
+    `).bind(raw ? policy.adminId : TELEGRAM_TEMP_MARKER, ...key));
     const results = await db.batch(steps);
     const receipt = results.at(-1);
     if (receipt && results.length === steps.length && receipt.results.length <= 1
