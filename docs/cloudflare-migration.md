@@ -464,6 +464,8 @@ python3 -B worker/tools/legacy_general_auth_candidate.py \
 
 `legacy-private-shares-v1` 仅填充准确的 0005 分享和领取表。封存程序逐行复核领取人与指定对象、份数和原时间，保留已到期记录的原到期秒，并逐对象核对原 UTF-8 正文的字节和摘要。私有正文存于 `objects/private-shares/`。内联消息标识留在封存盘点中，候选仅记录其数量。SQL 重放核对完整结构、外键、编号序列和对象闭包。每包最多 512 个正文对象，每个最多 64 KiB，SQL 重放上限为 4 MiB，所有数据库行仍受原生恢复上限约束。候选保持未绑定，旧 Bot 链接与内联卡片连续性需另行验收。
 
+同一 Bot 下的旧 `share:c:` 内联按钮可以引导获准用户打开机器人私聊。Worker 先用分享摘要核对 Bot、指定对象、到期和剩余份数。按钮点击只通过 Telegram 的回调应答返回本站 Bot 的私聊入口。用户打开私聊后，现有领取事务再次核对权限并交付正文。合成托管验收覆盖旧卡片到私聊的路径。历史卡片的真实连通性仍须在同一 Bot 与数据恢复后验收。 [Telegram 回调应答](https://core.telegram.org/bots/api#answercallbackquery)
+
 ### 旧单订阅短链盘点
 
 在获准的受保护托管运行中，对同一份封存 SQLite 使用 `python3 -B worker/tools/legacy_typed_short_inventory.py BACKUP OUTPUT SOURCE_SHA256 OWNER_MAP_JSON OWNER_MAP_SHA256 OLD_HTTPS_ORIGIN LEGACY_BOT_ID`。备份和新输出目录的父目录须仅供当前账号访问。独立核对源文件摘要、规范化归属映射摘要、原 Bot ID 和旧 HTTPS 来源。旧来源使用小写域名，省略端口和尾部斜线。
