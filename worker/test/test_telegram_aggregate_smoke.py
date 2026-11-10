@@ -189,15 +189,16 @@ class AggregateAcceptanceTests(unittest.TestCase):
             calls.append((smoke.digest(code.encode()), read_bodies))
             return {"clash": {"HEAD": {"status": 200, "elapsedMs": 12}}}
 
+        inspection = smoke.Cohort(self.cloud, POLICY, None, KEY, IDENTITY)
         changes, puts = self.cloud.db.total_changes, self.cloud.puts.copy()
-        report = smoke.inspect_existing(self.cohort, pin, lambda: None, probe)
+        report = smoke.inspect_existing(inspection, pin, lambda: None, probe)
         self.assertEqual(report, {"admin": {"state": "active", "formats": {"clash": {"HEAD": {"status": 200, "elapsedMs": 12}}}},
                                   "member": {"state": "absent"}})
         self.assertEqual(calls, [(self.cohort.slots()["admin"]["code_sha256"], False)])
         self.assertEqual((self.cloud.db.total_changes, self.cloud.puts, self.cloud.deleted), (changes, puts, []))
         self.cloud.db.execute("UPDATE telegram_inbox SET received_at=? WHERE actor_id=?", (now - 11, POLICY["adminId"]))
         with self.assertRaisesRegex(FixtureError, "exact confirmed issuance"):
-            smoke.inspect_existing(self.cohort, pin, lambda: None, probe)
+            smoke.inspect_existing(inspection, pin, lambda: None, probe)
         self.assertEqual(len(calls), 1)
 
     def test_inspection_uses_head_without_length_and_hashes_only_bounded_get(self):
