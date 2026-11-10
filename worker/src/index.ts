@@ -208,7 +208,7 @@ async function telegramWebhook(request: Request, env: Env, publicOrigin: PublicO
       const aggregateKey = general.privateAggregate ? await parseTelegramAggregateKey(env.TELEGRAM_AGGREGATE_KEY) : null;
       const status = general.sharedOutbox ? await acceptGeneralSharedTelegramCommand(env.DB, general, request,
         (callbackId) => ctx?.waitUntil(answerTelegramCallback(general, callbackId)), providerAvailable, refreshAvailable,
-        share ? { bucket: env.NODES, runtime: share, publicOrigin } : undefined, aggregateKey)
+        share ? { bucket: env.NODES, runtime: share, publicOrigin } : undefined, aggregateKey, env.TELEGRAM_INLINE_SEARCH === "1")
         : await acceptGeneralTelegramCommand(env.DB, general, request);
       if (status === 200) {
         const delivery = general.sharedOutbox
@@ -751,6 +751,7 @@ async function scheduled(_controller: ScheduledController, env: Env): Promise<vo
             await recoverGeneralSharedTelegramReplies(env.DB, general, env.NODES, publicOrigin,
               generalProviderRefreshAvailability(env, general.privateProvider), share,
               general.privateAggregate ? await parseTelegramAggregateKey(env.TELEGRAM_AGGREGATE_KEY) : null);
+            if (general.privateInline && await telegramInlineSearchReady(env.DB)) await reapTelegramInlineSearch(env.DB, general.botId, true);
           }
         }
       } else if (general) await recoverGeneralTelegramReplies(env.DB, general);
