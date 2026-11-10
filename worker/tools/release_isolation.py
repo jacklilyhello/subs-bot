@@ -1,5 +1,6 @@
 """Release only the verified main artifact to the dedicated isolation resources."""
 
+from dataclasses import asdict
 import json
 import os
 import re
@@ -11,14 +12,18 @@ from attest_api_status_container import ATTESTATION_ENV
 from cloudflare_isolation import (
     CloudflareClient, CloudflareError, WORKER_NAME, group_share_cards_artifact, legacy_dynamic_all_artifact,
     legacy_selected_artifact, legacy_temp_artifact,
-    release_worker, validate_aggregate_key, validate_private_share_key, verify_page_jump_artifact, verify_worker_target,
+    _Isolation, release_worker, validate_aggregate_key, validate_private_share_key, verify_page_jump_artifact,
+    verify_worker_target,
 )
 from d1_migrations import MigrationError, apply_migrations
+from page_jump_activation import activate_once, activation_inputs, reconcile_activation
+from page_jump_open import open_admission
 from page_jump_recovery import prepare_recovery, recovery_inputs
+from page_jump_rollback import pause_durable, rollback_once
 from prepare_isolation_artifact import ArtifactError, require_current_main
 from provider_api_status_binding_gate import CONFIG_ENV as API_STATUS_CONFIG_ENV, load_api_status_gate
 from provider_binding_gate import CONFIG_ENV, load_provider_gate
-from stage_page_jump_isolation import hosted_run, prepare_stage, stage_inputs, write_evidence
+from stage_page_jump_isolation import _digest, hosted_run, prepare_stage, stage_inputs, write_evidence
 
 
 def telegram_release_config(manifest):
@@ -172,23 +177,54 @@ def release():
     page_jump_confirmation = os.environ.get("SUBS_BOT_PAGE_JUMP_CONFIRMATION", "")
     page_jump_input = os.environ.get("SUBS_BOT_PAGE_JUMP_CHECKPOINT", "")
     recovery = page_jump in ("pause", "drain")
+    activation = page_jump in ("activate", "reconcile", "pause-durable", "rollback", "open")
     if recovery:
         page_jump_checkpoint = recovery_inputs(page_jump, page_jump_confirmation, page_jump_input)
+    elif activation:
+        page_jump_checkpoint = activation_inputs(page_jump, page_jump_confirmation, page_jump_input)
     else:
         _, page_jump_checkpoint = stage_inputs(page_jump, page_jump_confirmation, page_jump_input)
     if page_jump != "preserve" and any(mode is not None for mode in (
             inline_search, provider_url_import, provider_url_documents, mixed_documents, group_share_cards,
             provider_refresh, legacy_subscription_shorts, provider_batch, api_status)):
         raise CloudflareError("Manage isolated page jump in a separate scoped operation.")
-    if recovery:
+    if recovery or activation:
         run_id, attempt = hosted_run(os.environ)
         target, data_token, deploy_token = isolation_credentials()
         guard = lambda: require_current_main(revision)
         guard()
-        evidence = prepare_recovery(CloudflareClient(deploy_token), CloudflareClient(data_token), target, revision,
-            isolated_telegram_config(), guard, mode=page_jump, sources=page_jump_checkpoint, run_id=run_id, attempt=attempt)
+        worker_api, data_api = CloudflareClient(deploy_token), CloudflareClient(data_token)
+        telegram_config = isolated_telegram_config()
+        if recovery:
+            evidence = prepare_recovery(worker_api, data_api, target, revision, telegram_config, guard,
+                mode=page_jump, sources=page_jump_checkpoint, run_id=run_id, attempt=attempt)
+        elif page_jump == "pause-durable":
+            evidence = pause_durable(_Isolation(worker_api, data_api, target), telegram_config, guard,
+                epoch=page_jump_checkpoint["epoch"], stage_sha256=page_jump_checkpoint["stageSha256"],
+                revision=revision, run_id=run_id, attempt=attempt)
+        elif page_jump == "open":
+            evidence = open_admission(_Isolation(worker_api, data_api, target), telegram_config, guard,
+                epoch=page_jump_checkpoint["epoch"], stage_sha256=page_jump_checkpoint["stageSha256"],
+                revision=revision, run_id=run_id, attempt=attempt)
+        else:
+            scope = _Isolation(worker_api, data_api, target)
+            if page_jump == "activate":
+                record = activate_once(scope, page_jump_checkpoint["stage"], telegram_config, guard,
+                                       run_id=run_id, revision=revision,
+                                       bundle=Path(os.environ["RUNNER_TEMP"]) / "subs-bot-verified")
+            elif page_jump == "rollback":
+                record = rollback_once(scope, page_jump_checkpoint["pause"], telegram_config, guard, run_id=run_id)
+            else:
+                record = reconcile_activation(scope, telegram_config, guard, epoch=page_jump_checkpoint["epoch"],
+                                              stage_sha256=page_jump_checkpoint["stageSha256"])
+            phase = {"activate": "activation-confirmed", "rollback": "rollback-confirmed", "reconcile": "reconciled"}[page_jump]
+            evidence = {"version": 1, "phase": phase,
+                        "revision": revision, "operationRunId": run_id, "operationRunAttempt": attempt,
+                        "epoch": record.intent.epoch, "stageSha256": record.intent.stage_sha256,
+                        "journalSha256": _digest(asdict(record))}
+        guard()
         write_evidence(Path(os.environ["RUNNER_TEMP"]), evidence)
-        print("Verified isolated page-jump recovery evidence.", flush=True)
+        print("Verified isolated page-jump operation evidence.", flush=True)
         return
     if api_status is not None and any(mode is not None for mode in (
             inline_search, provider_url_import, provider_refresh, legacy_subscription_shorts, provider_batch,

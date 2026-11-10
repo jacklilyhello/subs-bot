@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       source_run_id:
-        description: Successful Worker CI run for exact main (required for release, plan and stage)
+        description: Successful Worker CI run for exact main (required for release, plan, stage and activate)
         required: false
         type: string
       inline_search:
@@ -101,17 +101,17 @@ on:
         required: false
         type: string
       page_jump:
-        description: Preserve ordinary deployment, plan or stage closed, pause, or verify page-jump drain
+        description: Preserve ordinary deployment, or manage the isolated page-jump release
         required: true
         default: preserve
         type: choice
-        options: [preserve, plan, stage, pause, drain]
+        options: [preserve, plan, stage, activate, reconcile, open, pause, pause-durable, drain, rollback]
       page_jump_confirmation:
         description: Exact isolation confirmation for the page-jump operation
         required: false
         type: string
       page_jump_checkpoint:
-        description: Exact plan checkpoint or source stage and pause artifact pins
+        description: Exact plan, stage, journal or pause checkpoint for this operation
         required: false
         type: string
 
@@ -190,7 +190,7 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Verify merged artifact provenance and digests
-        if: inputs.page_jump != 'pause' && inputs.page_jump != 'drain'
+        if: contains(fromJSON('["preserve","plan","stage","activate"]'), inputs.page_jump)
         env:
           GH_TOKEN: ${{ github.token }}
           SUBS_BOT_CI_RUN_ID: ${{ inputs.source_run_id }}
@@ -201,7 +201,7 @@ jobs:
           python3 -B worker/tools/prepare_isolation_artifact.py > "$worker_artifact_proof"
           cat "$worker_artifact_proof"
       - name: Release the verified Worker or stage page jump closed
-        if: inputs.page_jump != 'pause' && inputs.page_jump != 'drain'
+        if: contains(fromJSON('["preserve","plan","stage"]'), inputs.page_jump)
         env:
           GH_TOKEN: ${{ github.token }}
           SUBS_BOT_INLINE_SEARCH_MODE: ${{ inputs.inline_search }}
@@ -235,8 +235,8 @@ jobs:
           SUBS_BOT_CF_PROVIDER_BINDING_JSON: ${{ secrets.SUBS_BOT_CF_PROVIDER_BINDING_JSON }}
           SUBS_BOT_CF_PROVIDER_API_STATUS_BINDING_JSON: ${{ secrets.SUBS_BOT_CF_PROVIDER_API_STATUS_BINDING_JSON }}
         run: python3 -B worker/tools/release_isolation.py
-      - name: Pause isolated page jump or verify its drain
-        if: inputs.page_jump == 'pause' || inputs.page_jump == 'drain'
+      - name: Activate closed or recover the exact isolated page-jump stage
+        if: contains(fromJSON('["activate","reconcile","open","pause","pause-durable","drain","rollback"]'), inputs.page_jump)
         env:
           GH_TOKEN: ${{ github.token }}
           SUBS_BOT_INLINE_SEARCH_MODE: ${{ inputs.inline_search }}
