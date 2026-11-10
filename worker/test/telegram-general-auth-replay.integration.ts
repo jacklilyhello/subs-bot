@@ -11,7 +11,6 @@ import { Log, LogLevel, Miniflare } from "miniflare";
 import { PRODUCTION_PUBLIC_ORIGIN } from "../src/public-origin.ts";
 import { createPrivateShare, privateShareCodeDigest } from "../src/private-shares.ts";
 import { publishNodeSnapshot } from "../src/storage.ts";
-import { answerTelegramInlineSearch } from "../src/telegram/inline-search.ts";
 import { parseSubscriptionDocument } from "../src/subscription-document.ts";
 import { claimTelegramDocumentJob } from "../src/telegram/document-jobs.ts";
 import { persistTelegramDocumentJob, reconcileTelegramDocumentJobReplies, retireTelegramDocumentStage } from "../src/telegram/document-persistence.ts";
@@ -1552,9 +1551,9 @@ test("closed general authorization replays a sealed candidate in a separate emit
 
   const inlineWorker = await runtime.getWorker("general-inline");
   const inlinePaused = await runtime.getWorker("general-inline-paused");
-  // Use a fresh allowed epoch after the earlier revoked aggregate case. Later fixtures keep 104 denied.
-  const inlineActor = 104;
-  const inlineActorRevision = 16;
+  // Use an independent member epoch. The short-link fixture uses actor 104 later.
+  const inlineActor = 103;
+  const inlineActorRevision = 5;
   await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,?,?,?,'member')")
     .bind(pin.botId, pin.generation, String(inlineActor), inlineActorRevision, now + 22).run();
   const inlineCommand = (id: number, actor: number, text: string, options: PostOptions = {}) =>
@@ -1577,64 +1576,23 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.equal((await inlineQuery(8856, 102, "Own")).status, 204);
   assert.equal((await inlineQuery(8857, 101, "Own", "sender", inlinePaused)).status, 204);
   assert.equal(inlineAnswers.size, 0);
-  const firstInline = await inlineQuery(8858, 101, "Renamed current fixture");
-  if (firstInline.status !== 204) {
-    const state = await db.prepare(`SELECT state FROM telegram_inline_search_receipts
-      WHERE bot_id=? AND update_id=8858`).bind(pin.botId).first<string>("state");
-    let phase = "admission";
-    let cause = "unclassified";
-    // Run a new synthetic query with no outbound transport to classify its first failure.
-    const observed = {
-      prepare(sql: string) {
-        const query = db.prepare(sql);
-        if (!sql.startsWith("WITH eligible AS MATERIALIZED")) return query;
-        return { bind(...values: unknown[]) {
-          const bound = query.bind(...values);
-          return { async first() {
-            phase = "begin";
-            try { return await bound.first(); } catch (error) {
-              cause = diagnosticError(error);
-              throw error;
-            }
-          } };
-        } };
-      },
-      async batch(statements: D1PreparedStatement[]) {
-        try {
-          const results = await db.batch(statements);
-          phase = "inventory";
-          return results;
-        } catch (error) {
-          cause = diagnosticError(error);
-          throw error;
-        }
-      },
-    } as D1Database;
-    try {
-      await answerTelegramInlineSearch(observed, inlinePin, { updateId: 8869, actorId: "101", chatType: "sender",
-        queryId: "synthetic-inline-probe", query: "Renamed current fixture" }, async () => "failed");
-    } catch (error) {
-      if (cause === "unclassified") cause = diagnosticError(error);
-    }
-    assert.fail(`Synthetic inline reply failed (state=${state}, ${phase}=${cause}).`);
-  }
-  assert.equal(firstInline.status, 204);
-  assert.equal((await inlineQuery(8859, inlineActor, "Own 104")).status, 204);
+  assert.equal((await inlineQuery(8858, 101, "Renamed current fixture")).status, 204);
+  assert.equal((await inlineQuery(8859, inlineActor, "Own 103")).status, 204);
   assert.equal((await inlineQuery(8858, 101, "Renamed current fixture")).status, 204);
   assert.equal(inlineAnswers.size, 2);
   assert.ok(inlineAnswers.get("synthetic-inline-8858")?.titles.some((title) => title.startsWith("Renamed current fixture")));
-  assert.ok(inlineAnswers.get("synthetic-inline-8859")?.titles.some((title) => title.startsWith("Own 104")));
+  assert.ok(inlineAnswers.get("synthetic-inline-8859")?.titles.some((title) => title.startsWith("Own 103")));
   assert.doesNotMatch(JSON.stringify([...inlineAnswers.values()]), /https?:|fixture-token|source\.fixture/u);
   assert.equal((await inlineCommand(8860, 101, "/inline off", { worker: inlinePaused, date: now + 25 })).status, 200);
   assert.match((await awaitLifecycle(8860)).message.text, /已关闭/u);
   await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,?,?,?,'denied')")
     .bind(pin.botId, pin.generation, String(inlineActor), inlineActorRevision + 1, now + 25).run();
   assert.equal((await inlineQuery(8861, 101, "Renamed current fixture")).status, 204);
-  assert.equal((await inlineQuery(8862, inlineActor, "Own 104")).status, 204);
+  assert.equal((await inlineQuery(8862, inlineActor, "Own 103")).status, 204);
   assert.equal(inlineAnswers.size, 2, "opt-out and revocation independently fence delivery");
   assert.deepEqual((await db.prepare(`SELECT actor_id AS actor,state,result_count AS n
     FROM telegram_inline_search_receipts WHERE bot_id=? ORDER BY update_id`).bind(pin.botId).all()).results,
-    [{ actor: "101", state: "sent", n: 1 }, { actor: "104", state: "sent", n: 1 }]);
+    [{ actor: "101", state: "sent", n: 1 }, { actor: "103", state: "sent", n: 1 }]);
 
   const selectedWorker = await runtime.getWorker("selected");
   const selectedPost = (updateId: number, actor: number, query: string, options: PostOptions = {}) =>
