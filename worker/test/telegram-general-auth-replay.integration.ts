@@ -1163,9 +1163,17 @@ test("closed general authorization replays a sealed candidate in a separate emit
   await db.prepare("UPDATE subscriptions SET generation=2 WHERE id=?").bind(published.id).run();
   assert.equal((await callback(7546, 101, source, ticket, providerOpen)).status, 204);
   await db.prepare("UPDATE subscriptions SET generation=1 WHERE id=?").bind(published.id).run();
-  await db.prepare("INSERT INTO subscription_lifecycle VALUES (?,1)").bind(published.id).run();
-  assert.equal((await callback(7547, 101, source, ticket, providerOpen)).status, 204);
-  await db.prepare("DELETE FROM subscription_lifecycle WHERE subscription_id=?").bind(published.id).run();
+  const lifecycleRevision = await db.prepare("SELECT revision FROM subscription_lifecycle WHERE subscription_id=?")
+    .bind(published.id).first<number>("revision");
+  assert.ok(lifecycleRevision === 1, "The automatic title performs a guarded rename.");
+  const changeLifecycle = (revision: number) => db.prepare("UPDATE subscription_lifecycle SET revision=? WHERE subscription_id=?")
+    .bind(revision, published.id).run();
+  assert.equal((await changeLifecycle(lifecycleRevision + 1)).meta.changes, 1);
+  try {
+    assert.equal((await callback(7547, 101, source, ticket, providerOpen)).status, 204);
+  } finally {
+    assert.equal((await changeLifecycle(lifecycleRevision)).meta.changes, 1);
+  }
   await db.prepare(`CREATE TRIGGER fixture_refresh_consumption_abort BEFORE UPDATE OF used_by_receipt_id
     ON telegram_provider_refresh_tickets BEGIN SELECT RAISE(IGNORE); END`).run();
   try {
