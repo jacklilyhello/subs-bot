@@ -404,9 +404,10 @@ export function selectedTicketTargetGuard(policy: SelectedPolicy, reply: Telegra
 }
 
 export async function reapTelegramSelected(db: D1Database, generalBotId?: string): Promise<void> {
-  const scope = generalBotId === undefined ? "" : `AND selected.bot_id=? AND EXISTS (SELECT 1 FROM telegram_inbox AS inbox
-    WHERE inbox.receipt_id=selected.origin_receipt_id AND inbox.bot_id=selected.bot_id AND inbox.actor_id=selected.actor_id
-      AND inbox.receipt_nonce='${GENERAL_TELEGRAM_SELECTED_MARKER}')`;
+  const generalOrigin = `SELECT 1 FROM telegram_inbox AS inbox WHERE inbox.receipt_id=selected.origin_receipt_id
+    AND inbox.receipt_nonce='${GENERAL_TELEGRAM_SELECTED_MARKER}'`;
+  const scope = generalBotId === undefined ? `AND NOT EXISTS (${generalOrigin})`
+    : `AND selected.bot_id=? AND EXISTS (${generalOrigin} AND inbox.bot_id=selected.bot_id AND inbox.actor_id=selected.actor_id)`;
   const retire = db.prepare(`UPDATE aggregate_links SET revoked_at=max(created_at,unixepoch()) WHERE revoked_at IS NULL
     AND code_sha256 IN (SELECT selected.code_sha256 FROM telegram_selected_links AS selected
       JOIN telegram_outbox AS reply ON reply.receipt_id=selected.origin_receipt_id
@@ -423,7 +424,10 @@ export async function reapTelegramSelected(db: D1Database, generalBotId?: string
       WHERE inbox.bot_id=? AND inbox.receipt_nonce='${GENERAL_TELEGRAM_SELECTED_MARKER}' AND ticket.expires_at<=unixepoch()
       ORDER BY ticket.expires_at LIMIT 40)`).bind(generalBotId).run();
   } else await db.prepare(`DELETE FROM telegram_selected_revoke_ticket WHERE token_sha256 IN (
-    SELECT token_sha256 FROM telegram_selected_revoke_ticket WHERE expires_at<=unixepoch() ORDER BY expires_at LIMIT 40
+    SELECT ticket.token_sha256 FROM telegram_selected_revoke_ticket AS ticket WHERE ticket.expires_at<=unixepoch()
+      AND NOT EXISTS (SELECT 1 FROM telegram_inbox AS inbox WHERE inbox.receipt_id=ticket.origin_receipt_id
+        AND inbox.receipt_nonce='${GENERAL_TELEGRAM_SELECTED_MARKER}')
+    ORDER BY ticket.expires_at LIMIT 40
   )`).run();
 }
 
