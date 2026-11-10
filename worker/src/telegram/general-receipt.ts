@@ -43,7 +43,12 @@ export function generalPolicyBindings(pin: GeneralAuthorityPin, generation = pin
 /** Pair the recorded identity with the caller's receipt family, actor, and destination. */
 export function generalRecordedOriginSql(alias: ReceiptAlias): string {
   return `EXISTS (SELECT 1 FROM telegram_general_receipt AS recorded
-    WHERE recorded.receipt_id=${alias}.receipt_id AND ${pinIdentity(`${alias}.bot_id`, "recorded")})`;
+    WHERE recorded.receipt_id=${alias}.receipt_id AND ${generalRecordedIdentitySql(alias)})`;
+}
+
+/** The same recorded pin when the caller already joined the exact receipt. */
+export function generalRecordedIdentitySql(alias: ReceiptAlias): string {
+  return pinIdentity(`${alias}.bot_id`, "recorded");
 }
 
 /** The active grant must still match the recorded actor epoch. Feature clocks are separate. */

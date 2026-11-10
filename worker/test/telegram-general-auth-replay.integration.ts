@@ -11,8 +11,9 @@ import { Log, LogLevel, Miniflare } from "miniflare";
 import { PRODUCTION_PUBLIC_ORIGIN } from "../src/public-origin.ts";
 import { createPrivateShare, privateShareCodeDigest } from "../src/private-shares.ts";
 import { publishNodeSnapshot } from "../src/storage.ts";
+import { parseSubscriptionDocument } from "../src/subscription-document.ts";
 import { claimTelegramDocumentJob } from "../src/telegram/document-jobs.ts";
-import { reconcileTelegramDocumentJobReplies, retireTelegramDocumentStage } from "../src/telegram/document-persistence.ts";
+import { persistTelegramDocumentJob, reconcileTelegramDocumentJobReplies, retireTelegramDocumentStage } from "../src/telegram/document-persistence.ts";
 import { GENERAL_AUTH_LEGACY_ROLE, type GeneralAuthReplayMessage, type GeneralAuthReplayPin } from "../src/telegram/general-auth-replay.ts";
 import { beginGeneralTelegramReply, claimGeneralTelegramReply, parseGeneralTelegramPin } from "../src/telegram/general-auth-runtime.ts";
 import { acceptGeneralSharedTelegramCommand, beginGeneralSharedTelegramReply, claimGeneralSharedTelegramReply,
@@ -1037,6 +1038,40 @@ test("closed general authorization replays a sealed candidate in a separate emit
 
   for (const [id, actor] of [[7510, 101], [7511, 104]] as const) {
     assert.equal((await formats.scheduled({ cron: "* * * * *" })).outcome, "ok");
+    if (await findReply(id) === null) {
+      const failed = await documentRow(id);
+      const requestCount = fileRequests.filter((file) => file === (actor === 101 ? "fixture-doc-admin" : "fixture-doc-member")).length;
+      let cause = "unclassified";
+      let phase = "none";
+      if (failed?.state === "pending" && requestCount === 2) {
+        // Reproduce the storage path only in this disposable fixture. Never send or download again.
+        await db.prepare(`UPDATE telegram_document_jobs SET due_at=unixepoch()
+          WHERE receipt_id=(SELECT receipt_id FROM telegram_inbox WHERE bot_id=? AND update_id=?)
+          AND state='pending'`).bind(pin.botId, id).run();
+        const lease = await claimTelegramDocumentJob(db, documentPin);
+        assert.ok(lease && lease.actorId === String(actor));
+        const parsed = parseSubscriptionDocument(new TextEncoder().encode(actor === 101 ? firstShare : secondShare));
+        assert.equal(parsed.kind, "parsed");
+        const storageDb = {
+          prepare: db.prepare.bind(db),
+          async batch(statements: D1PreparedStatement[]) {
+            phase = phase === "none" ? "reserve" : "publish";
+            try { return await db.batch(statements); } catch (error) {
+              cause = diagnosticError(error);
+              throw error;
+            }
+          },
+        } as D1Database;
+        try {
+          const result = await persistTelegramDocumentJob(storageDb, bucket, documentPin, lease, parsed.nodes,
+            { parsed: parsed.nodes.length });
+          cause = result;
+        } catch (error) {
+          if (cause === "unclassified") cause = diagnosticError(error);
+        }
+      }
+      assert.fail(`Synthetic document reply missing (state=${failed?.state}, outcome=${failed?.outcome}, fetches=${requestCount}, ${phase}=${cause}).`);
+    }
     const saved = await awaitLifecycle(id);
     assert.equal(saved.message.chat_id, String(actor));
     assert.equal(saved.message.text, "文件已导入，共 1 个节点。");

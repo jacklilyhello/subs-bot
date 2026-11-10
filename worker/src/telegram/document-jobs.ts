@@ -3,7 +3,7 @@ import { normalizeSubscriptionName } from "../subscriptions.ts";
 import type { GeneralTelegramPin } from "./general-auth-runtime.ts";
 import { GENERAL_ACTOR_QUEUE_CAPACITY, GENERAL_LATEST_ACTOR_SQL, GENERAL_NO_LEGACY_WORK, GENERAL_POLICY_ACTORS_SQL,
   GENERAL_POLICY_PIN_SQL, GENERAL_POLICY_SCHEMA, GENERAL_RECEIPT_SCHEMA, GENERAL_REPLY_TTL, generalCurrentAuthoritySql,
-  generalPolicyBindings, generalRecordedOriginSql, prepareGeneralReceiptAuthority } from "./general-receipt.ts";
+  generalPolicyBindings, generalRecordedIdentitySql, prepareGeneralReceiptAuthority } from "./general-receipt.ts";
 import { MAX_TELEGRAM_DOCUMENT_BYTES } from "./document-transport.ts";
 import { inTelegramScope, type TelegramEventScope, type TelegramPolicy } from "./protocol.ts";
 
@@ -112,19 +112,25 @@ export function telegramDocumentJobOrigin(policy: TelegramDocumentPolicy, curren
     ? { sql: isolatedEligibleJob, bindings: [policy.adminId, policy.memberId] }
     : { sql: ISOLATED_DOCUMENT_CLEANUP_SCOPE, bindings: [] };
   if (!policy.privateDocument) return { sql: "0", bindings: [] };
-  const authority = current ? generalCurrentAuthoritySql("inbox") : generalRecordedOriginSql("inbox");
+  // Join the receipt and actor directly so publication and cleanup don't nest
+  // the general authority lookup inside a second correlated receipt lookup.
+  const policyJoin = current ? `JOIN telegram_general_policy AS policy ON policy.bot_id=inbox.bot_id
+    AND policy.generation=recorded.generation AND policy.release_revision=recorded.release_revision
+    AND policy.activation_sha256=recorded.activation_sha256 AND policy.cutover_at=recorded.cutover_at` : "";
+  const authority = current ? `(${GENERAL_POLICY_PIN_SQL}) AND (policy.active=1 AND ${GENERAL_NO_LEGACY_WORK})
+    AND (${GENERAL_LATEST_ACTOR_SQL})` : `(${generalRecordedIdentitySql("inbox")}) AND (${GENERAL_POLICY_SCHEMA})`;
   return { sql: `EXISTS (
-    SELECT 1 FROM telegram_inbox AS inbox WHERE (inbox.receipt_id=job.receipt_id AND inbox.bot_id=job.bot_id
+    SELECT 1 FROM telegram_inbox AS inbox JOIN telegram_general_receipt AS recorded USING(receipt_id)
+    JOIN telegram_general_actors AS actor ON actor.bot_id=inbox.bot_id AND actor.actor_id=inbox.actor_id
+      AND actor.generation=recorded.generation AND actor.revision=recorded.actor_revision AND actor.role=recorded.actor_role
+    ${policyJoin}
+    WHERE (inbox.receipt_id=job.receipt_id AND inbox.bot_id=job.bot_id
       AND inbox.actor_id=job.actor_id AND inbox.chat_id=job.actor_id)
       AND (inbox.chat_type='private' AND inbox.thread_id IS NULL AND inbox.command='help'
         AND inbox.receipt_nonce='${TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER}')
-      AND (job.auth_message_date=0 AND job.auth_message_id=0 AND (${GENERAL_DOCUMENT_SCHEMA}))
-      AND (${authority})
-      ${current ? "" : `AND (${GENERAL_POLICY_SCHEMA} AND ${GENERAL_RECEIPT_SCHEMA})
-        AND EXISTS (SELECT 1 FROM telegram_general_receipt AS recorded JOIN telegram_general_actors AS original
-          ON original.bot_id=inbox.bot_id AND original.actor_id=inbox.actor_id AND original.generation=recorded.generation
-          AND original.revision=recorded.actor_revision AND original.role=recorded.actor_role
-          WHERE recorded.receipt_id=inbox.receipt_id AND original.effective_at<inbox.message_date AND recorded.cutover_at<inbox.message_date)`}
+      AND (job.auth_message_date=0 AND job.auth_message_id=0)
+      AND (${GENERAL_DOCUMENT_SCHEMA} AND ${GENERAL_RECEIPT_SCHEMA})
+      AND (inbox.message_date>MAX(recorded.cutover_at,actor.effective_at) AND (${authority}))
   )`, bindings: generalPolicyBindings(policy) };
 }
 
@@ -344,10 +350,11 @@ export function prepareTelegramDocumentJobLeaseGuard(policy: TelegramDocumentPol
     throw new RangeError("Invalid Telegram document job lease.");
   }
   const eligible = telegramDocumentJobOrigin(policy, true);
+  const identity = "job.receipt_id = ? AND job.bot_id = ? AND job.actor_id = ?";
+  const active = "job.lease_id = ? AND job.state = 'leased' AND job.lease_until > unixepoch() AND job.expires_at > unixepoch()";
   return {
     sql: `EXISTS (
-      SELECT 1 FROM telegram_document_jobs AS job WHERE job.receipt_id = ? AND job.bot_id = ? AND job.actor_id = ?
-        AND job.lease_id = ? AND job.state = 'leased' AND job.lease_until > unixepoch() AND job.expires_at > unixepoch()
+      SELECT 1 FROM telegram_document_jobs AS job WHERE (${identity}) AND (${active})
         AND (${eligible.sql})
     )`,
     bindings: [lease.receiptId, policy.botId, lease.actorId, lease.leaseId, ...eligible.bindings],
