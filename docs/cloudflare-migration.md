@@ -615,7 +615,9 @@ python3 -B worker/tools/legacy_restore_package.py \
 
 将 V10 命令中的配置名称改为 `legacy-unified-auth-v11`，末尾追加私有 `PRIVATE_AUTH_INPUT_JSON`。此 JSON 只含四个绝对路径 `inventoryDir`、`configPath`、`targetPath`、`previewDir`，以及对应的独立摘要 `inventorySha256`、`configSha256`、`targetSha256`、`previewSha256`。这些输入沿用通用授权盘点和休眠预览的格式。
 
-封存工具从同一 SQLite 重建通用预览，核对旧 Bot 和覆盖记录数量，再将休眠授权表与 V10 数据写入同一次 SQL 回放。授权主体使用原 Telegram 用户 ID。所有者映射继续按各数据域的原规则处理。清单记录授权行数、结构和逐表摘要。V11 仅生成私有、未绑定候选包；原有 V10 和独立授权原生流程仍各自要求本配置的封存包。V11 的 Cloudflare 原生恢复及授权启用另行验收。
+封存工具从同一 SQLite 重建通用预览，核对旧 Bot 和覆盖记录数量，再将休眠授权表与 V10 数据写入同一次 SQL 回放。授权主体使用原 Telegram 用户 ID。所有者映射继续按各数据域的原规则处理。清单记录授权行数、结构和逐表摘要。原有 V10 和独立授权原生流程仍各自要求本配置的封存包。
+
+V11 合成原生演练在 `worker-isolation-legacy-candidate.yml` 选择 `synthetic-legacy-unified-auth`，沿用 V10 的七个检查点。所有步骤固定同一个成功的 `main` Worker CI 运行及同一 `cohort`，目标使用新的未绑定 D1 和私有 R2。按同一封存包核对 10 个对象、完整数据摘要、外键、休眠授权三表和原迁移登记。受保护流程只接受固定合成候选。生产授权启用仍由单独流程处理。
 
 #### V10 联合包原生恢复演练
 
