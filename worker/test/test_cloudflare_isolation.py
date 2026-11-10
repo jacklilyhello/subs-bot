@@ -267,7 +267,7 @@ class FakeCloudflare:
     def data_api(self, method, path, payload=None):
         if method == "POST" and path == DATABASE + "/query":
             sql = payload["sql"]
-            if any(alias in sql for alias in ("AS typedShortObjects", "AS typedShortRegistered", "AS autoIndexes")):
+            if any(alias in sql for alias in ("AS typedShortObjects", "AS typedShortRegistered", "AS hasHistory")):
                 schema = self.subscription_shorts_schema
                 if schema == "absent":
                     return [{"success": True, "results": [{"typedShortObjects": 0, "ledger": 0}]}]
