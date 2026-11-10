@@ -154,12 +154,21 @@ test("Grep verifies file visibility without waiting for the parallel repository 
     const repo = "public-fixture/Code";
     const url = `https://github.com/${repo}`;
     const publicRepo = { full_name: repo, html_url: url, private: false, visibility: "public", stargazers_count: 1 };
+    const exactProof = { total_count: 1, incomplete_results: false, items: [publicRepo] };
     const cases = [
-      { laterRepositoryProof: false, status: 200, files: 2, state: "found" },
-      { laterRepositoryProof: true, status: 429, files: 2, state: "found" },
-      { laterRepositoryProof: false, status: 403, files: 0, state: "empty" },
+      { laterRepositoryProof: false, status: 200, body: exactProof, files: 2, state: "found", outcome: "public" },
+      { laterRepositoryProof: true, status: 429, files: 2, state: "found", outcome: "unconfirmed" },
+      { laterRepositoryProof: false, status: 403, files: 0, state: "unavailable", outcome: "unconfirmed" },
+      ...[
+        { ...exactProof, incomplete_results: true },
+        { ...exactProof, total_count: 2 },
+        { ...exactProof, items: [{ ...publicRepo, private: true }] },
+        { ...exactProof, items: [{ ...publicRepo, visibility: undefined }] },
+        { ...exactProof, items: [{ ...publicRepo, full_name: "unrelated/Code" }] },
+        { ...exactProof, items: [{ ...publicRepo, html_url: "https://unexpected.invalid/file" }] },
+      ].map((body) => ({ laterRepositoryProof: false, status: 200, body, files: 0, state: "unavailable", outcome: "unconfirmed" })),
     ];
-    for (const [index, { laterRepositoryProof, status, files, state }] of cases.entries()) {
+    for (const [index, { laterRepositoryProof, status, body, files, state, outcome }] of cases.entries()) {
       await db.prepare("UPDATE telegram_github_search SET started_at=unixepoch()-16 WHERE started_at IS NOT NULL").run();
       const admission = await acceptTelegramGitHubSearch(db, policy, {
         ...event(index + 1, now), args: `synthetic-code repo:${repo}`,
@@ -171,11 +180,20 @@ test("Grep verifies file visibility without waiting for the parallel repository 
       const verificationOrder: boolean[] = [];
       const request: typeof fetch = async (input, init) => {
         const requested = new URL(String(input));
-        if (requested.pathname === "/search/repositories") return pendingSearch;
-        if (requested.pathname === `/repos/${repo}`) {
+        if (requested.origin === "https://api.github.com") {
+          assert.equal(requested.pathname, "/search/repositories");
+          if (requested.searchParams.get("per_page") === "5") {
+            assert.equal(requested.searchParams.get("q"), `synthetic-code repo:${repo} is:public`);
+            return pendingSearch;
+          }
+          assert.deepEqual([...requested.searchParams], [["q", `repo:${repo} is:public fork:true`], ["per_page", "1"]]);
+          assert.equal(init?.method, "GET");
+          assert.equal(init?.redirect, "manual");
+          assert.equal(init?.cache, "no-store");
+          assert.equal(new Headers(init?.headers).get("Authorization"), null);
           verificationOrder.push(repoSearchReleased);
           if (repoSearchReleased) throw new DOMException("Synthetic visibility deadline elapsed", "TimeoutError");
-          return status === 200 ? Response.json(publicRepo) : new Response(null, { status });
+          return status === 200 ? Response.json(body) : new Response(null, { status });
         }
         assert.equal(requested.href, "https://mcp.grep.app/");
         const rpc = JSON.parse(String(init?.body)) as { method: string; id?: number };
@@ -200,7 +218,7 @@ synthetic excerpt` })),
       };
       const observation = newGitHubSearchObservation();
       assert.equal(await runTelegramGitHubSearch(db, policy, admission, request, observation), true);
-      assert.deepEqual(observation.visibility, [{ status, outcome: status === 200 ? "public" : "unconfirmed" }]);
+      assert.deepEqual(observation.visibility, [{ status, outcome }]);
       assert.equal(observation.grep.phase, "complete");
       assert.equal(observation.candidates, 2);
       assert.equal(observation.repositoryState, laterRepositoryProof ? "found" : "empty");
@@ -213,6 +231,54 @@ synthetic excerpt` })),
       if (files) assert.deepEqual(JSON.parse(row.public_results).code.map(({ path }: { path: string }) => path), ["first.ts", "second.ts"]);
       else assert.equal(row.public_results, null);
       assert.deepEqual(verificationOrder, [false], "verify the shared repository once while search is still pending");
+    }
+  });
+});
+
+test("a reported search limit stops further identity requests without losing a verified result", async () => {
+  await withDatabase(async (db, now) => {
+    const repos = ["public-fixture/First", "public-fixture/Second"];
+    const cases: { keyword?: ResponseInit; exact?: ResponseInit; requests: number; files: number; noCandidates?: true }[] = [
+      { keyword: { status: 403 }, requests: 0, files: 0 },
+      { keyword: { status: 429 }, requests: 0, files: 0 },
+      { keyword: { headers: { "Retry-After": "30" } }, requests: 0, files: 0 },
+      { keyword: { headers: { "X-RateLimit-Remaining": "0" } }, requests: 0, files: 0 },
+      { exact: { status: 403 }, requests: 1, files: 0 },
+      { exact: { status: 429 }, requests: 1, files: 0 },
+      { exact: { headers: { "X-RateLimit-Remaining": "0" } }, requests: 1, files: 1 },
+      { requests: 0, files: 0, noCandidates: true },
+    ];
+    for (const [index, sample] of cases.entries()) {
+      await db.prepare("UPDATE telegram_github_search SET started_at=unixepoch()-16 WHERE started_at IS NOT NULL").run();
+      const admission = await acceptTelegramGitHubSearch(db, policy, { ...event(index + 1, now), args: "synthetic-code" });
+      assert.ok(admission.kind === "lookup");
+      const exactQueries: string[] = [];
+      const request: typeof fetch = async (input, init) => {
+        const url = new URL(String(input));
+        if (url.origin === "https://api.github.com") {
+          assert.equal(url.pathname, "/search/repositories");
+          if (url.searchParams.get("per_page") === "5") return Response.json({ items: [], incomplete_results: false }, sample.keyword);
+          exactQueries.push(url.searchParams.get("q") ?? "");
+          const repo = repos[exactQueries.length - 1];
+          return Response.json({ total_count: 1, incomplete_results: false, items: [
+            { full_name: repo, html_url: `https://github.com/${repo}`, visibility: "public", private: false },
+          ] }, sample.exact);
+        }
+        assert.equal(url.href, "https://mcp.grep.app/");
+        const rpc = JSON.parse(String(init?.body)) as { method: string; id?: number };
+        if (rpc.method === "notifications/initialized") return new Response(null, { status: 202 });
+        const content = sample.noCandidates ? [] : repos.map((repo) => ({ type: "text",
+          text: `Repository: ${repo}\nPath: fixture.ts\nURL: https://github.com/${repo}/blob/main/fixture.ts\nLicense: MIT\nSnippets:\nfixture` }));
+        const result = rpc.method === "initialize" ? { protocolVersion: "2025-06-18" } : { content };
+        return new Response(`data: ${JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result })}\n\n`,
+          { headers: { "Content-Type": "text/event-stream" } });
+      };
+      const observation = newGitHubSearchObservation();
+      assert.equal(await runTelegramGitHubSearch(db, policy, admission, request, observation), true);
+      assert.deepEqual(exactQueries, repos.slice(0, sample.requests).map((repo) => `repo:${repo} is:public fork:true`));
+      assert.equal(observation.candidates, sample.noCandidates ? 0 : 2);
+      assert.equal(observation.verifiedFiles, sample.files);
+      assert.equal(observation.settled, sample.files ? "found" : sample.noCandidates ? "empty" : "unavailable");
     }
   });
 });
