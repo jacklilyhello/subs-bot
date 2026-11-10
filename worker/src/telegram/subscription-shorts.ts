@@ -1,6 +1,6 @@
 import { digestHex, validInteger } from "../storage.ts";
 import { ISOLATION_PUBLIC_ORIGIN } from "../public-origin.ts";
-import { inTelegramScope, SUBSCRIPTION_READ_RECEIPT_MARKER, type TelegramPolicy } from "./protocol.ts";
+import { inTelegramScope, SUBSCRIPTION_READ_RECEIPT_MARKER, type TelegramEventScope, type TelegramPolicy } from "./protocol.ts";
 
 export const SUBSCRIPTION_SHORT_CODE = /^[A-Za-z0-9_-]{21}t(?![\s\S])/u;
 export const SUBSCRIPTION_SHORT_MIGRATION = "0048_telegram_subscription_short_links.sql";
@@ -14,7 +14,7 @@ const NONCE = /^[A-Za-z0-9_-]{21}[AQgw](?![\s\S])/u;
 const encoder = new TextEncoder();
 
 type Guard = { sql: string; bindings: readonly (string | number | null)[] };
-type Lease = { receiptId: number; actorId: string; chatId: string; chatType: string; threadId: number | null;
+type Lease = { receiptId: number; actorId: string; chatId: string; chatType: TelegramEventScope["chatType"]; threadId: number | null;
   leaseId: string; attempts: number; subscriptionRead?: true };
 export type SubscriptionShortTarget = { id: number; format: string; token: string };
 export type SubscriptionShortCandidate = {

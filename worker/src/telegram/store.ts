@@ -1,3 +1,4 @@
+import { validInteger } from "../storage.ts";
 import { readShortLinkNamespaces } from "../short-links.ts";
 import { installTelegramSubscriptionShort, subscriptionShortPublicationGuard, subscriptionShortSendGuard,
   type SubscriptionShortCandidate } from "./subscription-shorts.ts";
