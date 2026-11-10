@@ -14,6 +14,8 @@ const policy: TelegramPolicy = {
   botUsername: "FixtureProviderBot", botToken: "76201:synthetic-token", webhookSecret: "synthetic-provider-webhook",
 };
 const sourceUrl = "https://provider.example.invalid/path/%2F?z=synthetic-secret%2Bvalue&a=1";
+const acceptedUrl = "https://provider.example.invalid/multi/%2F?z=synthetic-secret%2Bvalue";
+const rejectedUrl = "https://provider.example.invalid/multi/rejected";
 const share = "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.10:8388#Synthetic";
 const providerRevision = "a".repeat(40);
 const imageSha256 = "b".repeat(64);
@@ -44,16 +46,20 @@ test("emitted Worker admits private provider URLs only after opt-in and delivers
     PROVIDER_REVISION: providerRevision, PROVIDER_IMAGE_SHA256: imageSha256 };
   const runtime = new Miniflare({ workers: [
     { ...common, name: "app", bindings: { ...bindings, TELEGRAM_PROVIDER_URL_IMPORT: "1" } },
+    { ...common, name: "multi", bindings: { ...bindings, TELEGRAM_PROVIDER_URL_IMPORT: "1", TELEGRAM_PROVIDER_URL_DOCUMENTS: "1" } },
     { ...common, name: "disabled", bindings },
     { name: "provider", modules: true, compatibilityDate: manifest.compatibilityDate, d1Databases: common.d1Databases,
       script: `import { WorkerEntrypoint } from 'cloudflare:workers';
         export class ProviderFetch extends WorkerEntrypoint {
           async fetchSubscription(input) {
-            if (Object.keys(input).length !== 3 || input.url !== ${JSON.stringify(sourceUrl)}
+            if (Object.keys(input).length !== 3 || !${JSON.stringify([sourceUrl, acceptedUrl, rejectedUrl])}.includes(input.url)
                 || input.providerRevision !== ${JSON.stringify(providerRevision)} || input.imageSha256 !== ${JSON.stringify(imageSha256)}) {
               throw new Error('Unexpected synthetic provider input.');
             }
             await this.env.DB.prepare('UPDATE provider_url_fixture SET calls=calls+1').run();
+            if (input.url === ${JSON.stringify(rejectedUrl)}) {
+              return {ok:false,code:'http-status',retryable:false,upstreamStatus:403};
+            }
             const body = new TextEncoder().encode(${JSON.stringify(share)}).buffer;
             const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', body));
             return {ok:true,body,bodySha256:Array.from(hash, byte => byte.toString(16).padStart(2,'0')).join(''),
@@ -66,6 +72,7 @@ test("emitted Worker admits private provider URLs only after opt-in and delivers
 
   const db = await runtime.getD1Database("DB", "app");
   const app = await runtime.getWorker("app");
+  const multi = await runtime.getWorker("multi");
   const disabled = await runtime.getWorker("disabled");
   async function migration(entry: { name: string; sha256: string }) {
     const sql = await readFile(join(directory!, entry.name), "utf8");
@@ -184,4 +191,59 @@ test("emitted Worker admits private provider URLs only after opt-in and delivers
     JOIN telegram_provider_jobs AS job USING (job_id) WHERE update_id=?`).bind(revoked.update_id).first("result_code"), "stale-target");
   assert.ok(!sent.some(({ origin }) => origin === revoked.update_id));
   assert.equal(sent.filter(({ origin }) => origin === admin.update_id).length, 1);
+
+  const urls = `${acceptedUrl}\r\n\r\n${rejectedUrl}\r\n${acceptedUrl}`;
+  const parentCount = () => db.prepare("SELECT count(*) AS total FROM telegram_provider_documents").first<number>("total");
+  const receiptCount = (updateId: number) => db.prepare("SELECT count(*) AS total FROM telegram_inbox WHERE bot_id=? AND update_id=?")
+    .bind(policy.botId, updateId).first<number>("total");
+  assert.equal((await post(message(urls))).status, 200);
+  assert.equal((await post(message(urls, policy.adminId, policy.groupId), multi)).status, 204);
+  assert.equal((await post(message(urls, "76205"), multi)).status, 204);
+  const revokedList = message(urls, policy.memberId);
+  assert.equal((await post(revokedList, multi)).status, 200);
+  assert.equal(await receiptCount(revokedList.update_id), 0);
+  assert.equal((await post(message(`${acceptedUrl}\n${share}`), multi)).status, 200);
+  assert.equal(await parentCount(), 0);
+
+  const single = message(sourceUrl);
+  const singleOrigins = await originCount();
+  assert.equal((await post(single, multi)).status, 200);
+  assert.equal(await originCount(), singleOrigins! + 1, "the single-link path still wins with both flags enabled");
+  assert.equal(await parentCount(), 0);
+  await cron(disabled);
+  await expectSent(single.update_id, policy.adminId, "远程订阅已导入。发送 /list 查看。");
+  assert.equal(await calls(), 4);
+
+  const list = message(urls);
+  for (const replay of [list, list]) assert.equal((await post(replay, multi)).status, 200);
+  assert.equal(await parentCount(), 1);
+  assert.equal(await receiptCount(list.update_id), 1);
+  assert.equal(await originCount(), singleOrigins! + 1);
+  assert.equal(await calls(), 4, "webhook persists the plan without starting egress");
+  const busy = message(urls);
+  assert.equal((await post(busy, multi)).status, 503);
+  assert.equal(await receiptCount(busy.update_id), 0, "retryable backpressure does not consume the update");
+  const lines = () => db.prepare(`SELECT line.ordinal,line.source_sha256 AS digest,line.result_code AS result
+    FROM telegram_provider_document_lines AS line JOIN telegram_inbox USING (receipt_id)
+    WHERE bot_id=? AND update_id=? ORDER BY line.ordinal`).bind(policy.botId, list.update_id).all();
+  const expectedLines = [acceptedUrl, rejectedUrl].map((url, ordinal) => ({ ordinal,
+    digest: createHash("sha256").update(url).digest("hex"), result: null }));
+  assert.deepEqual((await lines()).results, expectedLines);
+  assert.equal(await db.prepare(`SELECT count(*) AS total FROM telegram_document_jobs JOIN telegram_inbox USING (receipt_id)
+    WHERE telegram_inbox.bot_id=? AND update_id=?`).bind(policy.botId, list.update_id).first("total"), 0);
+
+  await cron(disabled);
+  await cron(disabled);
+  await expectSent(list.update_id, policy.adminId, "订阅链接消息已处理。\n已保存 1 条\n已合并 0 条\n失败 1 条\n超出上限 0 条");
+  assert.deepEqual((await lines()).results, expectedLines.map((line, ordinal) => ({ ...line,
+    result: ordinal === 0 ? "saved" : "fetch-rejected" })));
+  assert.equal(await db.prepare("SELECT generation FROM subscriptions WHERE owner_id=? AND source_url=?")
+    .bind(policy.adminId, acceptedUrl).first("generation"), 1);
+  assert.equal(await db.prepare("SELECT count(*) AS total FROM subscriptions WHERE owner_id=? AND source_url=? AND generation>0")
+    .bind(policy.adminId, rejectedUrl).first("total"), 0);
+  assert.equal((await post(list, multi)).status, 200);
+  await cron(disabled);
+  assert.equal(await calls(), 6);
+  assert.equal(await parentCount(), 1);
+  assert.equal(sent.filter(({ origin }) => origin === list.update_id).length, 1);
 });

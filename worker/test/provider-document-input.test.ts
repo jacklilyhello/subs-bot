@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { parseTelegramProviderDocument } from "../src/telegram/provider-document-input.ts";
+import { parseTelegramProviderDocument, parseTelegramProviderUrlMessage } from "../src/telegram/provider-document-input.ts";
 import { MAX_TELEGRAM_DOCUMENT_BYTES } from "../src/telegram/document-transport.ts";
 
 const encoder = new TextEncoder();
@@ -52,4 +52,16 @@ test("leaves plain, structured, encoded, and mixed node documents to the node cl
   for (const suffix of ["json", "yaml", "yml"]) assert.deepEqual(parse(source, suffix), { kind: "not-url-list" });
   assert.deepEqual(parseTelegramProviderDocument(new Uint8Array([0xef, 0xbb, 0xbf, 0xff]), "txt"), { kind: "not-url-list" });
   assert.deepEqual(parseTelegramProviderDocument(new Uint8Array(MAX_TELEGRAM_DOCUMENT_BYTES + 1), "log"), { kind: "not-url-list" });
+});
+
+test("private URL messages keep standalone line order and report distinct overflow", () => {
+  const urls = Array.from({ length: 22 }, (_, index) => `HtTpS://provider.example.invalid/%2F?value=x%7Cy&case=${index}`);
+  assert.deepEqual(parseTelegramProviderUrlMessage(`\ufeff\r\n ${urls[0]}\r\n\r\n${[...urls, urls[20]].join("\r\n")}`), {
+    kind: "url-list", urls: urls.slice(0, 20), overflow: 2,
+  });
+  for (const invalid of [`${urls[0]}\n`, `${urls[0]} ${urls[1]}`, `${urls[0]}\n${node}`,
+    `名称 | ${urls[0]}\n${urls[1]}`, `${urls[0]}\n${source}`, `${urls[0]}\n${urls[1]}\ud800`,
+    `${urls[0]}\nhttps://user@provider.example.invalid/`, `${urls[0]}\n${urls[1]}${"x".repeat(4096)}`]) {
+    assert.equal(parseTelegramProviderUrlMessage(invalid), null);
+  }
 });

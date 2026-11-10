@@ -41,7 +41,9 @@ import {
 import { telegramPrivateShareRuntime } from "./telegram/private-share-runtime.ts";
 import { decodeTelegramRequest, parseTelegramPolicy, type TelegramPolicy } from "./telegram/protocol.ts";
 import { acceptTelegramProviderRequest } from "./telegram/provider-admission.ts";
-import { promoteTelegramProviderDocument, settleTelegramProviderDocuments, telegramProviderDocumentReady } from "./telegram/provider-document.ts";
+import { acceptTelegramProviderUrlMessage, promoteTelegramProviderDocument,
+  settleTelegramProviderDocuments, telegramProviderDocumentReady } from "./telegram/provider-document.ts";
+import { parseTelegramProviderUrlMessage } from "./telegram/provider-document-input.ts";
 import { reconcileTelegramProviderDocumentReplies } from "./telegram/provider-document-replies.ts";
 import {
   acceptTelegramApiStatusPrompt, acceptTelegramApiStatusReply, reconcileTelegramApiStatus, runTelegramApiStatus, telegramApiStatusReady,
@@ -303,16 +305,27 @@ async function telegramWebhook(request: Request, env: Env, publicOrigin: PublicO
         drain();
       }
     } else if (decoded.temp) {
-      const candidate = env.TELEGRAM_PROVIDER_URL_IMPORT === "1" && providerQueueReady && decoded.temp.kind === "temp-text"
-        ? parseTelegramProviderText(decoded.temp.text) : null;
-      if (candidate) {
-        if (!providerIntakeReady || providerBatch.queue === "unavailable" || providerDocument === "unavailable") {
+      const text = env.TELEGRAM_PROVIDER_URL_IMPORT === "1" && providerQueueReady && decoded.temp.kind === "temp-text"
+        ? decoded.temp.text : null;
+      const candidate = text === null ? null : parseTelegramProviderText(text);
+      const urlList = text !== null && candidate === null && env.TELEGRAM_PROVIDER_URL_DOCUMENTS === "1"
+        ? parseTelegramProviderUrlMessage(text) : null;
+      if (candidate || urlList) {
+        if (!providerIntakeReady || providerBatch.queue === "unavailable" || providerDocument === "unavailable"
+            || (urlList !== null && providerDocument !== true)) {
           return new Response(null, { status: 503, headers: HEADERS });
         }
-        const outcome = await acceptTelegramProviderRequest(env.DB, providerPolicy, { ...decoded.temp, ...candidate, kind: "url-import" }, providerBatch.queue);
-        if (outcome.kind !== "queued" && outcome.kind !== "ignored") {
-          await reconcileTelegramProviderReplies(env.DB, policy);
-          drain();
+        if (urlList !== null) {
+          if (await acceptTelegramProviderUrlMessage(env.DB, policy, decoded.temp, urlList) === "busy") {
+            return new Response(null, { status: 503, headers: HEADERS });
+          }
+        } else if (candidate !== null) {
+          const outcome = await acceptTelegramProviderRequest(env.DB, providerPolicy,
+            { ...decoded.temp, ...candidate, kind: "url-import" }, providerBatch.queue);
+          if (outcome.kind !== "queued" && outcome.kind !== "ignored") {
+            await reconcileTelegramProviderReplies(env.DB, policy);
+            drain();
+          }
         }
       } else if (await acceptTelegramTemp(env.DB, policy, decoded.temp) === "accepted") {
         drain();
