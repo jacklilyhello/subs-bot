@@ -59,8 +59,12 @@ def unified_share_object_limit(key):
 
 def unified_share_candidate_files(document):
     """Enumerate this profile's exact archive members without trusting its descriptors."""
-    require(isinstance(document, dict) and native.integer(document.get("version"), 10, 10)
-            and document.get("scope") == "fresh-unbound-d1-r2" and native.integer(document.get("objectCount"), 10, 10))
+    require(isinstance(document, dict) and native.integer(document.get("version"), 10, 10))
+    return _unified_candidate_files(document)
+
+
+def _unified_candidate_files(document):
+    require(document.get("scope") == "fresh-unbound-d1-r2" and native.integer(document.get("objectCount"), 10, 10))
     objects = document.get("objects")
     require(isinstance(objects, list) and len(objects) == 10)
     paths = set(PACKAGE_LIMITS)
@@ -107,15 +111,27 @@ def _oracle_pin(root, source, worker_pin):
     return digest
 
 
-class UnifiedShareCandidate(isolation.Candidate):
+class _UnifiedCandidate(isolation.Candidate):
+    profile = UNIFIED_SHARE_PROFILE
+    error_message = ERROR
+    archive_files = staticmethod(unified_share_candidate_files)
+    expected_nonempty = EXPECTED_NONEMPTY
+
+    @staticmethod
+    def _rebuild(root, worker, revision, oracle):
+        return fixture.build_unified_share_fixture(root, worker, revision, oracle=oracle)
+
+    @staticmethod
+    def _schema_objects(chain):
+        return migrations._objects(chain, len(chain), managed=True)
+
     def __init__(self, root, worker, worker_pin, scratch):
-        self.profile = UNIFIED_SHARE_PROFILE
         try:
             self.root = package.private_path(root, directory=True)
             self.sql = self.root / package.SQL
             raw = package.read_private(self.root / package.MANIFEST, PACKAGE_LIMITS[package.MANIFEST])
             document = native.parsed(raw, PACKAGE_LIMITS[package.MANIFEST])
-            paths = unified_share_candidate_files(document)
+            paths = self.archive_files(document)
             _verify_tree(self.root, paths)
             require(sum((self.root / path).lstat().st_size for path in paths) <= ARCHIVE_LIMIT)
             chain, pinned_worker = package.worker_artifact(worker, worker_pin["revision"], worker_pin["manifestSha256"])
@@ -124,8 +140,7 @@ class UnifiedShareCandidate(isolation.Candidate):
             self.oracle_manifest_sha = _oracle_pin(self.root, document["source"], worker_pin)
             parent = package.private_path(scratch, directory=True)
             with TemporaryDirectory(prefix="expected-unified-share-", dir=parent) as temporary:
-                rebuilt = fixture.build_unified_share_fixture(
-                    Path(temporary), worker, worker_pin["revision"], oracle=self.root / ORACLE_DIRECTORY)
+                rebuilt = self._rebuild(Path(temporary), worker, worker_pin["revision"], self.root / ORACLE_DIRECTORY)
                 require(self.manifest_sha == rebuilt.candidate_sha256 and document["source"]["sqliteSha256"] == rebuilt.source_sha256)
                 for path in sorted(paths - ORACLE_FILES):
                     maximum = _member_limit(path)
@@ -136,10 +151,10 @@ class UnifiedShareCandidate(isolation.Candidate):
         except (package.PackageError, package.converter.ConversionError, migrations.MigrationError, artifact.ArtifactError,
                 dynamic.namespace.InventoryError, dynamic.temp.InventoryError, shares.inventory.InventoryError,
                 native.RehearsalError, OSError, sqlite3.Error, ValueError, TypeError, KeyError, RecursionError, OverflowError):
-            raise native.RehearsalError(ERROR) from None
+            raise native.RehearsalError(self.error_message) from None
 
     def _verify_replay(self, chain, document, scratch):
-        objects = migrations._objects(chain, len(chain), managed=True)
+        objects = self._schema_objects(chain)
         schema = SimpleNamespace(objects=objects, tables=sorted(obj.name for obj in objects if obj.type == "table"))
         require(document["schemaSha256"] == native._schema_digest(objects))
         sql = self.read_file(document["sql"], package.SQL, SQL_LIMIT, extra={"md5"})
@@ -201,9 +216,9 @@ class UnifiedShareCandidate(isolation.Candidate):
         document = self.document
         counts, hashes = summary["tableCounts"], summary["tableSha256"]
         ledger_count = len(document["workerArtifact"]["migrations"])
-        total = ledger_count + sum(EXPECTED_NONEMPTY.values())
+        total = ledger_count + sum(self.expected_nonempty.values())
         require(ledger_count >= 40 and native.integer(summary["rowCount"], total, total)
-                and {table: count for table, count in counts.items() if count} == {**EXPECTED_NONEMPTY, migrations.LEDGER: ledger_count}
+                and {table: count for table, count in counts.items() if count} == {**self.expected_nonempty, migrations.LEDGER: ledger_count}
                 and all(native.integer(count) for count in counts.values()) and native.integer(counts[dynamic.ORDER], 0, 0))
         selected, all_links, temp, private = (document[key] for key in (
             "selectedAggregateLinks", "dynamicAll", "legacyTempBaseline", "privateShares"))
@@ -246,3 +261,7 @@ class UnifiedShareCandidate(isolation.Candidate):
                 "verifiedPrivateShareCount": 2, "verifiedPrivateShareClaimCount": 1, "verifiedShareSequenceHighWater": 2,
                 "sourceInlineMessageRows": 1, "verifiedShortNamespaceCount": 7, "activeLineageSha256": pins["activeLineageSha256"],
                 **{key: pins[key] for key in (*MIGRATION_PINS, *TABLE_PINS.values())}}
+
+
+class UnifiedShareCandidate(_UnifiedCandidate):
+    """Verify only the existing V10 archive and native replay contract."""

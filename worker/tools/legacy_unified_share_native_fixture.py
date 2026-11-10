@@ -1,4 +1,4 @@
-"""Fixed synthetic source for the unbound V10 native restore rehearsal."""
+"""Fixed synthetic sources for the unbound unified restore packages."""
 
 from contextlib import closing
 from dataclasses import dataclass, field
@@ -36,6 +36,12 @@ EXPIRED_PAYLOAD = "expired share — fixture\r\n"
 INLINE_ID = "synthetic-old-inline-message-reference"
 SENDER_NAME = "  合成发送者  "
 TARGET_EXPIRES_AT, EXPIRED_AT = 2_100_000_000, dynamic.CREATED_AT + 30
+AUTH_ARTIFACT_PREFIX = "subs-bot-legacy-unified-auth-candidate"
+AUTH_COUNTS = {"installations": 1, "principals": 3, "groups": 2, "overrides": 2}
+AUTH_OVERRIDES = ((int(dynamic.OWNER), 0, 10, 20), (int(dynamic.TEMP_ONLY_OWNER), 1, 11, 30))
+AUTH_GROUPS = ("-100200", "-100100")
+AUTH_SQL_LIMIT = 256 * 1024
+AUTH_ARCHIVE_LIMIT = 512 * 1024
 
 
 @dataclass(frozen=True)
@@ -97,19 +103,59 @@ def _verify_files(staged, report, *, with_oracle):
             require(stat.S_IMODE(info.st_mode) == 0o700 and stat.S_ISDIR(info.st_mode))
         else:
             require(stat.S_IMODE(info.st_mode) == 0o600 and stat.S_ISREG(info.st_mode) and info.st_nlink == 1)
+    if manifest["version"] == 11:
+        require(0 < entries[Path(package.SQL)].st_size <= AUTH_SQL_LIMIT
+                and sum(entries[path].st_size for path in files) <= AUTH_ARCHIVE_LIMIT)
+
+
+def _add_authorization(source):
+    with closing(sqlite3.connect(source)) as db, db:
+        db.execute("""CREATE TABLE auth_overrides (
+            user_id INTEGER PRIMARY KEY, allowed INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)""")
+        db.executemany("INSERT INTO auth_overrides VALUES (?,?,?,?)", AUTH_OVERRIDES)
+
+
+def _seal_authorization(source, source_sha, scratch):
+    import legacy_general_auth_candidate as auth
+
+    inventory, config, target, preview = (scratch / name for name in ("auth-inventory", "auth-config.json", "auth-target.json", "auth-preview"))
+    auth.inventory.seal_inventory(source, inventory, source_sha)
+    with native.private_file(config) as file:
+        file.write(auth.inventory._canonical_line({"version": 1, "source": {"botId": dynamic.BOT_ID, "revision": "a" * 40,
+            "deploymentSha256": "b" * 64, "sqliteSha256": source_sha}, "allowedUserIds": [dynamic.FOREIGN_OWNER],
+            "adminUserIds": [dynamic.OWNER]}))
+    with native.private_file(target) as file:
+        file.write(auth.inventory._canonical_line({"version": 1, "scope": auth.preview.GENERAL_TARGET_SCOPE, "botId": dynamic.BOT_ID,
+                                                  "groupChatIds": list(AUTH_GROUPS)}))
+    pins = {"inventory_sha256": native.file_hash(inventory / package.MANIFEST)[1], "config_sha256": native.file_hash(config)[1],
+            "target_sha256": native.file_hash(target)[1]}
+    auth.preview.seal_reconciliation(source, inventory, config, target, preview, source_sha256=source_sha, general_preview=True, **pins)
+    return auth.UnifiedAuthInput(inventory, config, target, preview, **pins, preview_sha256=native.file_hash(preview / package.MANIFEST)[1])
 
 
 def build_unified_share_fixture(root: Path, worker: Path, revision: str, *,
                                 produce_oracle: bool = False, oracle: Path | None = None) -> UnifiedShareFixture:
     """Build from real offline comparison, or from its exact seal during protected verification."""
+    return _build_fixture(root, worker, revision, produce_oracle=produce_oracle, oracle=oracle, include_auth=False)
+
+
+def build_unified_auth_fixture(root: Path, worker: Path, revision: str, *,
+                               produce_oracle: bool = False, oracle: Path | None = None) -> UnifiedShareFixture:
+    """Rebuild V11 using its own same-source authorization and external redirect proof."""
+    return _build_fixture(root, worker, revision, produce_oracle=produce_oracle, oracle=oracle, include_auth=True)
+
+
+def _build_fixture(root, worker, revision, *, produce_oracle, oracle, include_auth):
     root, worker = package.private_path(root, directory=True), package.private_path(worker, directory=True)
     require(not root.is_relative_to(worker) and not worker.is_relative_to(root)
             and type(produce_oracle) is bool and produce_oracle == (oracle is None))
     source, candidate = root / "legacy.sqlite", root / "candidate"
     require(not os.path.lexists(source) and not os.path.lexists(candidate))
     worker_sha = native.file_hash(worker / "isolation.json")[1]
-    package.worker_artifact(worker, revision, worker_sha)
+    chain, _ = package.worker_artifact(worker, revision, worker_sha)
     make_synthetic_source(source)
+    if include_auth:
+        _add_authorization(source)
     source_sha = native.file_hash(source)[1]
     owners = native.canonical({})
     owner_sha = native.digest(owners)
@@ -124,6 +170,7 @@ def build_unified_share_fixture(root: Path, worker: Path, revision: str, *,
             owner_map_sha256=owner_sha, old_origin=dynamic.OLD_ORIGIN, legacy_bot_id=dynamic.BOT_ID)
         shares.seal_inventory(source, share_dir, source_sha, dynamic.BOT_ID, BOT_USERNAME)
         private_shares = UnifiedShareInput(share_dir, native.file_hash(share_dir / shares.MANIFEST)[1], BOT_USERNAME)
+        general_auth = _seal_authorization(source, source_sha, scratch) if include_auth else None
         if produce_oracle:
             from legacy_short_redirect_oracle import seal_oracle
 
@@ -139,9 +186,10 @@ def build_unified_share_fixture(root: Path, worker: Path, revision: str, *,
                                 baseline.namespace_sha256, oracle, oracle_sha, PYTHON_VERSION, YARL_VERSION)
         report = package.build_candidate(conversion, worker, staged,
             converter_manifest_sha=native.file_hash(conversion / package.MANIFEST)[1], worker_manifest_sha=worker_sha,
-            revision=revision, applied_at=APPLIED_AT, profile=package.UNIFIED_SHARES_PROFILE, source_sqlite_sha=source_sha,
-            owner_map_sha=owner_sha, mixed_short=mixed, dynamic_all=baseline, private_shares=private_shares)
-        require(report["version"] == 10 and report["scope"] == "fresh-unbound-d1-r2"
+            revision=revision, applied_at=APPLIED_AT, profile=package.UNIFIED_AUTH_PROFILE if include_auth else package.UNIFIED_SHARES_PROFILE,
+            source_sqlite_sha=source_sha, owner_map_sha=owner_sha, mixed_short=mixed, dynamic_all=baseline,
+            private_shares=private_shares, general_auth=general_auth)
+        require(report["version"] == (11 if include_auth else 10) and report["scope"] == "fresh-unbound-d1-r2"
                 and report["targetSequenceHighWater"] == dynamic.TARGET_TRASH_ID and report["objectCount"] == 10
                 and report["shortLinkCompatibility"] == {"typed": "not-validated", "external": "offline-equivalent",
                                                           "selected": "not-validated", "dynamicAll": "not-validated"}
@@ -150,6 +198,14 @@ def build_unified_share_fixture(root: Path, worker: Path, revision: str, *,
                     == [2, 1, 1, 3]
                 and [report["legacyTempBaseline"][key] for key in ("installations", "batches", "nodes")] == [1, 3, 4]
                 and [report["privateShares"][key] for key in ("rows", "claimRows", "inlineMessageRows", "objectCount")] == [2, 1, 1, 2])
+        if include_auth:
+            manifest = native.parsed(package.read_pinned(staged / package.MANIFEST, native.MANIFEST_BYTES, report["manifestSha256"]),
+                                     native.MANIFEST_BYTES)
+            auth = report["generalAuthorization"]
+            require(auth["activationAllowed"] is False and auth["counts"] == AUTH_COUNTS
+                    and manifest["summary"]["rowCount"] == len(chain) + 38
+                    and manifest["source"]["generalAuthorization"]["sourceSha256"] == source_sha
+                    and manifest["source"]["oracleManifestSha256"] == oracle_sha)
         if produce_oracle:
             oracle.rename(staged / ORACLE_DIRECTORY)
         _verify_files(staged, report, with_oracle=produce_oracle)
