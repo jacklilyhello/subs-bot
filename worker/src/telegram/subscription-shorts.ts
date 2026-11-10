@@ -1,5 +1,6 @@
 import { digestHex, validInteger } from "../storage.ts";
 import { ISOLATION_PUBLIC_ORIGIN } from "../public-origin.ts";
+import type { GeneralTelegramPin } from "./general-auth-runtime.ts";
 import { GENERAL_POLICY_SCHEMA, GENERAL_RECEIPT_SCHEMA } from "./general-receipt.ts";
 import { GENERAL_SUBSCRIPTION_READ_MARKER, inTelegramScope, SUBSCRIPTION_READ_RECEIPT_MARKER,
   type TelegramEventScope, type TelegramPolicy } from "./protocol.ts";
@@ -16,6 +17,7 @@ const NONCE = /^[A-Za-z0-9_-]{21}[AQgw](?![\s\S])/u;
 const encoder = new TextEncoder();
 
 type Guard = { sql: string; bindings: readonly (string | number | null)[] };
+type Policy = TelegramPolicy | GeneralTelegramPin;
 type Lease = { receiptId: number; actorId: string; chatId: string; chatType: TelegramEventScope["chatType"]; threadId: number | null;
   leaseId: string; attempts: number; subscriptionRead?: true };
 export type SubscriptionShortTarget = { id: number; format: string; token: string };
@@ -39,8 +41,10 @@ export async function telegramSubscriptionShortsReady(db: D1Database): Promise<b
   return count === 7 && await db.prepare(`SELECT ${SUBSCRIPTION_SHORT_PIN} AS ready`).first<number>("ready") === 1;
 }
 
-function privateRead(lease: Lease, policy: TelegramPolicy): boolean {
-  return lease.subscriptionRead === true && lease.chatType === "private" && lease.threadId === null && inTelegramScope(policy, lease);
+function privateRead(lease: Lease, policy: Policy): boolean {
+  return lease.subscriptionRead === true && lease.chatType === "private" && lease.threadId === null
+    && ("adminId" in policy ? inTelegramScope(policy, lease)
+      : policy.privateFormats && !policy.rehearsal && lease.chatId === lease.actorId && lease.actorId !== policy.botId);
 }
 
 const privateFormat = `inbox.chat_type='private' AND inbox.chat_id=inbox.actor_id
@@ -58,7 +62,9 @@ const generalReceiptScope = `inbox.receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MA
       AND original.generation=recorded.generation AND original.revision=recorded.actor_revision
       AND original.role=recorded.actor_role
     WHERE recorded.receipt_id=inbox.receipt_id AND inbox.message_date>MAX(recorded.cutover_at,original.effective_at))`;
-const targetScope = `${receiptScope} AND action.subscription_id=? AND action.format=?`;
+function targetScope(general: boolean): string {
+  return `${general ? generalReceiptScope : receiptScope} AND action.subscription_id=? AND action.format=?`;
+}
 const matchesRow = `link.origin_receipt_id=inbox.receipt_id AND link.bot_id=inbox.bot_id AND link.owner_id=inbox.actor_id
   AND link.code_sha256=? AND link.nonce=? AND link.subscription_id=? AND link.format=? AND link.token_sha256=?
   AND link.key_version=1 AND link.revoked_at IS NULL`;
@@ -66,13 +72,23 @@ const noConflicts = `NOT EXISTS(SELECT 1 FROM normal_short_links WHERE code_sha2
   AND NOT EXISTS(SELECT 1 FROM legacy_subscription_short_links WHERE code_sha256=link.code_sha256)
   AND NOT EXISTS(SELECT 1 FROM aggregate_links WHERE code_sha256=link.code_sha256)`;
 
+export function subscriptionShortRevocationOrigin(link: "link" | "typed", general: boolean): string {
+  if (!general) return `NOT EXISTS (SELECT 1 FROM telegram_inbox AS origin WHERE origin.receipt_id=${link}.origin_receipt_id
+    AND origin.receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MARKER}')`;
+  return `EXISTS (SELECT 1 FROM telegram_inbox AS inbox JOIN telegram_subscription_read AS action USING(receipt_id)
+    WHERE inbox.receipt_id=${link}.origin_receipt_id AND inbox.bot_id=${link}.bot_id AND inbox.actor_id=${link}.owner_id
+      AND action.subscription_id=${link}.subscription_id AND action.format=${link}.format AND (${generalReceiptScope}))`;
+}
+
 /** Preflight the format before calling. Only the normalized target and the exact read guard cross this boundary. */
 export async function prepareTelegramSubscriptionShort(
-  db: D1Database, policy: TelegramPolicy, lease: Lease, target: SubscriptionShortTarget, guard: Guard,
+  db: D1Database, policy: Policy, lease: Lease, target: SubscriptionShortTarget, guard: Guard,
   key: CryptoKey | null, admissionEnabled: boolean,
 ): Promise<SubscriptionShortCandidate | null> {
   if (!key || !privateRead(lease, policy) || !validInteger(target.id, 1) || !TOKEN.test(target.token)
     || !SUBSCRIPTION_SHORT_FORMATS.has(target.format)) return null;
+  const general = !("adminId" in policy);
+  const canIssue = admissionEnabled && ("adminId" in policy || policy.subscriptionShorts === "issue");
   try {
     if (!await telegramSubscriptionShortsReady(db)) return null;
     const row = await db.prepare(`SELECT link.nonce, link.code_sha256 AS digest
@@ -82,10 +98,10 @@ export async function prepareTelegramSubscriptionShort(
       LEFT JOIN telegram_subscription_short_links AS link ON link.origin_receipt_id=inbox.receipt_id
       WHERE inbox.receipt_id=? AND inbox.bot_id=? AND inbox.actor_id=? AND inbox.chat_id=?
         AND reply.state='leased' AND reply.lease_id=? AND reply.attempts=? AND reply.lease_until>unixepoch()
-        AND ${targetScope} AND (${guard.sql})`)
+        AND ${targetScope(general)} AND (${guard.sql})`)
       .bind(target.token, lease.receiptId, policy.botId, lease.actorId, lease.chatId, lease.leaseId, lease.attempts,
         target.id, target.format, ...guard.bindings).first<{ nonce: string | null; digest: string | null }>();
-    if (!row || (row.digest === null && !admissionEnabled) || (row.digest !== null && (row.nonce === null || !NONCE.test(row.nonce)))) return null;
+    if (!row || (row.digest === null && !canIssue) || (row.digest !== null && (row.nonce === null || !NONCE.test(row.nonce)))) return null;
     const nonce = row.nonce ?? base64Url(crypto.getRandomValues(new Uint8Array(16)));
     const tokenDigest = await hash(target.token);
     const material = encoder.encode(JSON.stringify([
@@ -106,10 +122,10 @@ function pins(link: SubscriptionShortCandidate) {
   return [link.digest, link.nonce, link.id, link.format, link.tokenDigest] as const;
 }
 
-export function subscriptionShortPublicationGuard(candidate: SubscriptionShortCandidate, read: Guard): Guard {
+export function subscriptionShortPublicationGuard(candidate: SubscriptionShortCandidate, read: Guard, general = false): Guard {
   const { digest, id, format } = candidate;
-  return { sql: `(${read.sql}) AND (${SUBSCRIPTION_SHORT_PIN}) AND EXISTS (
-    SELECT 1 FROM telegram_subscription_read AS action WHERE action.receipt_id=inbox.receipt_id AND ${targetScope})
+  return { sql: `${general ? "/* subs-bot:general-subscription-short-issue:v1 */ " : ""}(${read.sql}) AND (${SUBSCRIPTION_SHORT_PIN}) AND EXISTS (
+    SELECT 1 FROM telegram_subscription_read AS action WHERE action.receipt_id=inbox.receipt_id AND ${targetScope(general)})
     AND CASE
       WHEN EXISTS(SELECT 1 FROM telegram_subscription_short_links AS link WHERE ${matchesRow} AND ${noConflicts}) THEN 1
       WHEN EXISTS(SELECT 1 FROM telegram_subscription_short_links WHERE origin_receipt_id=inbox.receipt_id OR code_sha256=?) THEN 0
@@ -121,9 +137,9 @@ export function subscriptionShortPublicationGuard(candidate: SubscriptionShortCa
   bindings: [...read.bindings, id, format, ...pins(candidate), digest, digest, digest, digest] };
 }
 
-export function subscriptionShortSendGuard(candidate: SubscriptionShortCandidate, read: Guard): Guard {
+export function subscriptionShortSendGuard(candidate: SubscriptionShortCandidate, read: Guard, general = false): Guard {
   return { sql: `(${read.sql}) AND (${SUBSCRIPTION_SHORT_PIN}) AND EXISTS (
-    SELECT 1 FROM telegram_subscription_read AS action WHERE action.receipt_id=inbox.receipt_id AND ${targetScope}) AND EXISTS (
+    SELECT 1 FROM telegram_subscription_read AS action WHERE action.receipt_id=inbox.receipt_id AND ${targetScope(general)}) AND EXISTS (
     SELECT 1 FROM telegram_subscription_short_links AS link WHERE ${matchesRow} AND ${noConflicts})`,
   bindings: [...read.bindings, candidate.id, candidate.format, ...pins(candidate)] };
 }
@@ -136,6 +152,27 @@ export function installTelegramSubscriptionShort(db: D1Database, lease: Lease, c
     JOIN telegram_outbox AS reply USING(receipt_id) WHERE changes()=1 AND inbox.receipt_id=?
       AND reply.lease_id=? AND reply.attempts=? AND reply.state='sending'
     ON CONFLICT(origin_receipt_id) DO NOTHING`).bind(...pins(candidate), lease.receiptId, lease.leaseId, lease.attempts);
+}
+
+export async function beginSubscriptionShortDelivery(
+  db: D1Database, lease: Lease, candidate: SubscriptionShortCandidate, begin: D1PreparedStatement, guard: Guard,
+): Promise<boolean> {
+  try {
+    const [begun, inserted, confirmed] = await db.batch<{ receipt_id: number }>([
+      begin, installTelegramSubscriptionShort(db, lease, candidate),
+      db.prepare(`SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM telegram_outbox
+        WHERE receipt_id=? AND lease_id=? AND attempts=? AND state='sending') OR EXISTS (
+          SELECT 1 FROM telegram_inbox AS inbox WHERE inbox.receipt_id=? AND (${guard.sql})
+        ) THEN 1 ELSE json_extract('subscription short guard failed','$') END`)
+        .bind(lease.receiptId, lease.leaseId, lease.attempts, lease.receiptId, ...guard.bindings),
+    ]);
+    const count = begun?.results.length;
+    if (!begun?.success || (count !== 0 && count !== 1) || (count === 1 && begun.results[0].receipt_id !== lease.receiptId)
+      || !inserted?.success || !validInteger(inserted.meta.changes, 0, count) || !confirmed?.success) throw new Error();
+    return count === 1;
+  } catch {
+    throw new Error("Telegram subscription short link reply could not begin.");
+  }
 }
 
 export async function resolveSubscriptionShortLocation(db: D1Database, code: string): Promise<string | null> {
@@ -167,7 +204,7 @@ export async function resolveSubscriptionShortLocation(db: D1Database, code: str
   }
 }
 
-export async function hasTelegramSubscriptionShort(db: D1Database, policy: TelegramPolicy, lease: Lease): Promise<boolean> {
+export async function hasTelegramSubscriptionShort(db: D1Database, policy: Policy, lease: Lease): Promise<boolean> {
   if (!privateRead(lease, policy)) return false;
   return await db.prepare(`SELECT 1 FROM telegram_subscription_short_links AS link
     JOIN telegram_outbox AS reply ON reply.receipt_id=link.origin_receipt_id
@@ -177,13 +214,14 @@ export async function hasTelegramSubscriptionShort(db: D1Database, policy: Teleg
 }
 
 /** Use only when this exact attempt has made no Telegram request. */
-export async function closeUnsentTelegramSubscriptionShort(db: D1Database, policy: TelegramPolicy, lease: Lease): Promise<void> {
+export async function closeUnsentTelegramSubscriptionShort(db: D1Database, policy: Policy, lease: Lease): Promise<void> {
   if (!privateRead(lease, policy)) return;
   try {
     const result = await db.prepare(`UPDATE telegram_outbox SET state='failed',lease_id=NULL,lease_until=NULL
       WHERE receipt_id=? AND lease_id=? AND attempts=? AND state IN ('leased','sending') AND EXISTS (
         SELECT 1 FROM telegram_inbox AS inbox JOIN telegram_subscription_read AS action USING(receipt_id)
-        WHERE inbox.receipt_id=telegram_outbox.receipt_id AND inbox.bot_id=? AND inbox.actor_id=? AND ${receiptScope})`)
+        WHERE inbox.receipt_id=telegram_outbox.receipt_id AND inbox.bot_id=? AND inbox.actor_id=?
+          AND ${"adminId" in policy ? receiptScope : generalReceiptScope})`)
       .bind(lease.receiptId, lease.leaseId, lease.attempts, policy.botId, lease.actorId).run();
     if (result.success && validInteger(result.meta.changes, 0, 1)) return;
   } catch {

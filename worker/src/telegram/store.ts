@@ -1,6 +1,6 @@
 import { validInteger } from "../storage.ts";
 import { readShortLinkNamespaces } from "../short-links.ts";
-import { installTelegramSubscriptionShort, subscriptionShortPublicationGuard, subscriptionShortSendGuard,
+import { beginSubscriptionShortDelivery, subscriptionShortPublicationGuard, subscriptionShortSendGuard,
   type SubscriptionShortCandidate } from "./subscription-shorts.ts";
 import { inTelegramScope, TELEGRAM_PAGE_JUMP_RECEIPTS, type TelegramCommand, type TelegramPolicy } from "./protocol.ts";
 import {
@@ -633,23 +633,8 @@ export async function beginTelegramSubscriptionShortReply(
 ): Promise<boolean> {
   if (!lease.subscriptionRead || !inTelegramScope(policy, lease) || lease.chatType !== "private" || lease.threadId !== null) return false;
   const guard = subscriptionShortSendGuard(candidate, read);
-  try {
-    const [begun, inserted, confirmed] = await db.batch<{ receipt_id: number }>([
-      beginReplyStatement(db, policy, lease, "allowed", subscriptionShortPublicationGuard(candidate, read)),
-      installTelegramSubscriptionShort(db, lease, candidate),
-      db.prepare(`SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM telegram_outbox
-        WHERE receipt_id=? AND lease_id=? AND attempts=? AND state='sending') OR EXISTS (
-          SELECT 1 FROM telegram_inbox AS inbox WHERE inbox.receipt_id=? AND (${guard.sql})
-        ) THEN 1 ELSE json_extract('subscription short guard failed','$') END`)
-        .bind(lease.receiptId, lease.leaseId, lease.attempts, lease.receiptId, ...guard.bindings),
-    ]);
-    const count = begun?.results.length;
-    if (!begun?.success || (count !== 0 && count !== 1) || (count === 1 && begun.results[0].receipt_id !== lease.receiptId)
-      || !inserted?.success || !validInteger(inserted.meta.changes, 0, count) || !confirmed?.success) throw new Error();
-    return count === 1;
-  } catch {
-    throw new Error("Telegram subscription short link reply could not begin.");
-  }
+  const begin = beginReplyStatement(db, policy, lease, "allowed", subscriptionShortPublicationGuard(candidate, read));
+  return beginSubscriptionShortDelivery(db, lease, candidate, begin, guard);
 }
 
 export async function beginTelegramTempRawReply(
@@ -964,7 +949,7 @@ export async function settleTelegramReply(
 
 export async function settleTelegramOutboxReply(
   db: D1Database, lease: TelegramOutboxLease, selection: TelegramOutboxSelection,
-  outcome: TelegramReplyOutcome, retryClock?: string,
+  outcome: TelegramReplyOutcome, retryClock?: string, retryWindow = MAX_REPLY_AGE_SECONDS,
 ): Promise<void> {
   const identity = [lease.leaseId, lease.attempts, ...selection.bindings];
   const sameReply = `lease_id = ? AND attempts = ? AND receipt_id = (${selection.sql})`;
@@ -981,13 +966,13 @@ export async function settleTelegramOutboxReply(
   }
 
   if (retryClock && outcome.kind === "retry" && Number.isSafeInteger(outcome.delaySeconds) && outcome.delaySeconds > 0
-      && outcome.delaySeconds < MAX_REPLY_AGE_SECONDS) {
+      && outcome.delaySeconds < retryWindow) {
     // Never shorten Telegram's requested wait to fit the retry lifetime.
     await db.prepare(`
       UPDATE telegram_outbox SET state = CASE
         WHEN attempts < ${MAX_ATTEMPTS} AND unixepoch() + ? < (
           SELECT ${retryClock} FROM telegram_inbox AS inbox WHERE inbox.receipt_id = telegram_outbox.receipt_id
-        ) + ${MAX_REPLY_AGE_SECONDS} THEN 'pending' ELSE 'failed' END,
+        ) + ${retryWindow} THEN 'pending' ELSE 'failed' END,
         due_at = unixepoch() + ?, lease_id = NULL, lease_until = NULL
       WHERE ${sameReply} AND state = 'sending'
     `).bind(outcome.delaySeconds, outcome.delaySeconds, ...identity).run();

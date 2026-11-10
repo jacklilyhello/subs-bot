@@ -150,6 +150,11 @@ test("closed general authorization replays a sealed candidate in a separate emit
     outbox: "shared-private-management-formats-temp-node-document-provider-claims-share-aggregate-selected-short" });
   const shortPin = parseGeneralTelegramPin(shortConfig, fixture.releaseRevision);
   assert.ok(shortPin?.privateShort && shortPin.privateSelected && !shortPin.privateAuthorization);
+  const typedConfig = (mode: "issue" | "drain") => JSON.stringify({ ...JSON.parse(shortConfig), subscriptionShorts: mode });
+  assert.equal(shortPin.subscriptionShorts, undefined);
+  assert.equal(parseGeneralTelegramPin(typedConfig("issue"), fixture.releaseRevision)?.subscriptionShorts, "issue");
+  assert.equal(parseGeneralTelegramPin(JSON.stringify({ ...JSON.parse(formatsConfig), subscriptionShorts: "issue" }),
+    fixture.releaseRevision), null);
   const aggregateKeyRaw = Buffer.alloc(32, 17).toString("base64url");
   const shareKeyRaw = Buffer.alloc(32, 0x61).toString("base64url");
   const authConfig = JSON.stringify({ ...JSON.parse(shortConfig), authManagement: true });
@@ -177,6 +182,7 @@ test("closed general authorization replays a sealed candidate in a separate emit
   const providerRevision = "a".repeat(40), imageSha256 = "b".repeat(64);
   const sourceUrl = "https://provider.fixture.invalid/sub/%2f?fixture=signed%2Bvalue";
   const providerShare = "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.10:8388#general-provider";
+  let typedRetry: { messageId: number; attempts: string[] } | null = null;
   const privateTransport = async (request: Request) => {
     const api = `https://api.telegram.org/bot${generalToken}/`;
     const files = `https://api.telegram.org/file/bot${generalToken}/documents/`;
@@ -229,6 +235,12 @@ test("closed general authorization replays a sealed candidate in a separate emit
     }
     assert.equal(request.url, api + "sendMessage");
     const message = await request.json() as (typeof lifecycleSent)[number];
+    if (typedRetry && message.reply_parameters.message_id === typedRetry.messageId && message.text.includes("/s/")) {
+      typedRetry.attempts.push(message.text);
+      if (typedRetry.attempts.length === 1) {
+        return Response.json({ ok: false, error_code: 429, parameters: { retry_after: 60 } }, { status: 429 });
+      }
+    }
     lifecycleSent.push(message);
     const messageId = 9400 + lifecycleSent.length;
     lifecycleMessagesById.set(messageId, message);
@@ -293,6 +305,10 @@ test("closed general authorization replays a sealed candidate in a separate emit
     { name: "ordinary-short", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: shortConfig,
         PUBLIC_ORIGIN: PRODUCTION_PUBLIC_ORIGIN, TELEGRAM_AGGREGATE_KEY: aggregateKeyRaw }, outboundService: privateTransport },
+    ...(["issue", "drain"] as const).map((mode) => ({ name: `typed-short-${mode}`, modules: true, script: servingScript.toString(),
+      compatibilityDate, d1Databases, r2Buckets: ["NODES"], outboundService: privateTransport,
+      bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: typedConfig(mode),
+        PUBLIC_ORIGIN: PRODUCTION_PUBLIC_ORIGIN, TELEGRAM_AGGREGATE_KEY: aggregateKeyRaw } })),
     ...[true, false].map((enabled) => ({ name: enabled ? "provider-open" : "provider-paused", modules: true,
       script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"], outboundService: privateTransport,
       serviceBindings: { PROVIDER_FETCH: { name: "provider-rpc", entrypoint: "ProviderFetch" } },
@@ -1818,6 +1834,57 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.equal(await db.prepare(`SELECT revoked_at IS NOT NULL AND subscription_id IS NULL AND token_sha256 IS NULL
     AND format IS NULL AND nonce IS NULL AS retired FROM telegram_subscription_short_links WHERE code_sha256=? AND origin_receipt_id=?`)
     .bind(reservedTypedDigest, originReceipt).first("retired"), 1);
+
+  const typedIssue = await runtime.getWorker("typed-short-issue");
+  const typedDrain = await runtime.getWorker("typed-short-drain");
+  const shortDetail = await formatDetail(7750, typedIssue);
+  const shortTicket = shortDetail.message.reply_markup?.inline_keyboard?.flat().find(({ text }) => text === "Clash Meta")?.callback_data;
+  assert.ok(shortTicket);
+  const retry = { messageId: shortDetail.messageId, attempts: [] as string[] };
+  typedRetry = retry;
+  const typedSource = origin(shortDetail.messageId, 101);
+  assert.equal((await callback(7752, 101, typedSource, shortTicket, typedIssue)).status, 200);
+  const pending = () => db.prepare(`SELECT reply.state FROM telegram_outbox AS reply JOIN telegram_inbox AS inbox USING(receipt_id)
+    WHERE inbox.bot_id=? AND inbox.update_id=7752 AND reply.attempts=1`).bind(pin.botId).first("state");
+  for (const end = Date.now() + 4000; await pending() !== "pending" && Date.now() < end;) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(await pending(), "pending");
+  assert.equal(retry.attempts.length, 1);
+  await db.prepare(`UPDATE telegram_outbox SET due_at=unixepoch() WHERE receipt_id IN (
+    SELECT receipt_id FROM telegram_inbox WHERE bot_id=? AND update_id=7752)`).bind(pin.botId).run();
+  assert.equal((await typedDrain.scheduled({ cron: "* * * * *" })).outcome, "ok");
+  const issuedTyped = (await awaitLifecycle(7752)).message;
+  assert.deepEqual(retry.attempts, [issuedTyped.text, issuedTyped.text]);
+  typedRetry = null;
+  assert.equal(issuedTyped.chat_id, "101");
+  assert.deepEqual(issuedTyped.link_preview_options, { is_disabled: true });
+  const issuedTypedCode = issuedTyped.text.split("\n")[1]?.split("/").at(-1);
+  assert.ok(issuedTypedCode && /^[A-Za-z0-9_-]{21}t$/u.test(issuedTypedCode));
+  assert.equal(issuedTyped.text, `Clash Meta\n${PRODUCTION_PUBLIC_ORIGIN}/s/${issuedTypedCode}`);
+  const issuedTypedPath = `https://app.fixture.invalid/s/${issuedTypedCode}`;
+  assert.equal((await typedDrain.fetch(issuedTypedPath, { method: "HEAD", redirect: "manual" })).headers.get("Location"),
+    `/sub/${initial.token}/clash`);
+  assert.equal((await callback(7752, 101, typedSource, shortTicket, typedIssue)).status, 204);
+  const scopedRevoke = `/short revoke ${PRODUCTION_PUBLIC_ORIGIN}/s/${issuedTypedCode}`;
+  assert.equal((await ordinaryShortPost(7753, 106, scopedRevoke, { worker: typedDrain })).status, 200);
+  assert.equal((await awaitLifecycle(7753)).message.text, "没有可撤销的短链。");
+  assert.equal((await ordinaryShortPost(7754, 101, scopedRevoke, { ...groupEvent, worker: typedDrain })).status, 204);
+  assert.equal((await typedDrain.fetch(issuedTypedPath, { redirect: "manual" })).status, 302);
+  assert.equal((await ordinaryShortPost(7755, 101, scopedRevoke, { worker: typedDrain })).status, 200);
+  assert.equal((await awaitLifecycle(7755)).message.text, "短链已撤销。");
+  assert.equal((await typedDrain.fetch(issuedTypedPath, { redirect: "manual" })).status, 404);
+  const pausedDetail = await formatDetail(7756, typedDrain);
+  const pausedTicket = pausedDetail.message.reply_markup?.inline_keyboard?.flat().find(({ text }) => text === "Clash Meta")?.callback_data;
+  assert.ok(pausedTicket);
+  assert.equal((await callback(7758, 101, origin(pausedDetail.messageId, 101), pausedTicket, typedDrain)).status, 200);
+  assert.equal((await awaitLifecycle(7758)).message.text, `Clash Meta\n${PRODUCTION_PUBLIC_ORIGIN}/sub/${initial.token}/clash`);
+  const typedRows = await db.prepare(`SELECT link.code_sha256 AS digest,link.revoked_at IS NOT NULL AS retired
+    FROM telegram_subscription_short_links AS link JOIN telegram_inbox AS inbox
+      ON inbox.receipt_id=link.origin_receipt_id AND inbox.bot_id=link.bot_id AND inbox.actor_id=link.owner_id
+    WHERE inbox.bot_id=? AND inbox.update_id BETWEEN 7750 AND 7758`)
+    .bind(pin.botId).all();
+  assert.deepEqual(typedRows.results, [{ digest: createHash("sha256").update(issuedTypedCode).digest("hex"), retired: 1 }]);
 
   await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,'104',16,?,'member')")
     .bind(pin.botId, pin.generation, now + 23).run();
