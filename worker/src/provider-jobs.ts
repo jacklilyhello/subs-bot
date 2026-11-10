@@ -3,8 +3,8 @@ import { normalizeSubscriptionName } from "./subscriptions.ts";
 import { isolatedTelegramRoleEpochSql } from "./telegram/authorization-sql.ts";
 import { providerDocumentOrigin } from "./telegram/provider-document-origin.ts";
 import { providerInitialTitleReady } from "./provider-initial-title.ts";
-import { GENERAL_POLICY_SCHEMA, GENERAL_RECEIPT_SCHEMA, generalCurrentAuthoritySql,
-  generalPolicyBindings, generalRecordedOriginSql, type GeneralAuthorityPin } from "./telegram/general-receipt.ts";
+import { GENERAL_LATEST_ACTOR_SQL, GENERAL_NO_LEGACY_WORK, GENERAL_POLICY_SCHEMA, GENERAL_RECEIPT_SCHEMA,
+  generalPolicyBindings, type GeneralAuthorityPin } from "./telegram/general-receipt.ts";
 
 export const PROVIDER_JOB_TTL_SECONDS = 3600;
 const LEASE_SECONDS = 120;
@@ -390,21 +390,28 @@ export function telegramProviderBatchOrigin(policy: ProviderTelegramPolicy, forR
 }
 
 function generalJobAuthorization(scope: GeneralProviderAuthority, alias: "job" | "active", forRetirement: boolean): Guard {
-  // Job authority is independent of the shorter ordinary outbox reply clock.
-  const epoch = forRetirement ? `(${generalRecordedOriginSql("inbox")}) AND ${GENERAL_POLICY_SCHEMA} AND ${GENERAL_RECEIPT_SCHEMA}
-    AND EXISTS (SELECT 1 FROM telegram_general_actors AS original
-      WHERE original.bot_id=inbox.bot_id AND original.actor_id=inbox.actor_id AND original.generation=recorded.generation
-        AND original.revision=recorded.actor_revision AND original.role=recorded.actor_role
-        AND original.effective_at<inbox.message_date AND recorded.cutover_at<inbox.message_date)`
-    : generalCurrentAuthoritySql("inbox");
+  // Join the one exact receipt and recorded actor directly. Nesting another
+  // authority subquery here exceeds D1's depth in the leased-source read.
+  const policyJoin = forRetirement ? "" : `JOIN telegram_general_policy AS policy
+    ON (policy.bot_id=inbox.bot_id AND policy.generation=recorded.generation)
+    AND (policy.release_revision=recorded.release_revision AND policy.activation_sha256=recorded.activation_sha256
+      AND policy.cutover_at=recorded.cutover_at)`;
+  const current = forRetirement ? "" : `AND (policy.active=1 AND (${GENERAL_NO_LEGACY_WORK}) AND (${GENERAL_LATEST_ACTOR_SQL}))`;
   return { sql: `EXISTS (SELECT 1 FROM telegram_provider_requests AS origin
     JOIN telegram_inbox AS inbox USING (receipt_id) JOIN telegram_general_receipt AS recorded USING (receipt_id)
+    JOIN telegram_general_actors AS actor ON (actor.bot_id=inbox.bot_id AND actor.actor_id=inbox.actor_id)
+      AND (actor.generation=recorded.generation AND actor.revision=recorded.actor_revision AND actor.role=recorded.actor_role)
+    ${policyJoin}
     WHERE (origin.job_id=${alias}.job_id AND origin.kind=${alias}.kind AND origin.outcome='admitted'
       AND inbox.actor_id=${alias}.owner_id AND origin.actor_role=recorded.actor_role
       AND origin.auth_message_date=0 AND origin.auth_message_id=0)
       AND (inbox.chat_type='private' AND inbox.chat_id=inbox.actor_id AND inbox.thread_id IS NULL
         AND inbox.command='help' AND inbox.receipt_nonce='${GENERAL_TELEGRAM_PROVIDER_MARKER}')
-      AND (${GENERAL_PROVIDER_SCHEMA}) AND (${epoch}))`, bindings: generalPolicyBindings(scope) };
+      AND (inbox.bot_id=? AND recorded.generation=? AND recorded.activation_sha256=?
+        AND recorded.release_revision=? AND recorded.cutover_at=?)
+      AND (actor.effective_at<inbox.message_date AND recorded.cutover_at<inbox.message_date)
+      AND (${GENERAL_PROVIDER_SCHEMA}) AND (${GENERAL_POLICY_SCHEMA} AND ${GENERAL_RECEIPT_SCHEMA}) ${current})`,
+    bindings: generalPolicyBindings(scope) };
 }
 
 function scopeAuthorization(scope: JobScope, alias: "job" | "active" = "job", forRetirement = false): Guard {
