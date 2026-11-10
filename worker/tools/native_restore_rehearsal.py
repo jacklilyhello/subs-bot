@@ -764,6 +764,12 @@ def quiet_expression(tables, observed_at=None):
         conditions.append("NOT EXISTS(SELECT 1 FROM telegram_selected_links AS selected JOIN aggregate_links AS link ON link.code_sha256=selected.code_sha256 WHERE link.revoked_at IS NULL)")
     if "telegram_subscription_read_ticket" in tables:
         waits.append("telegram_subscription_read_ticket")
+    if "telegram_page_jumps" in tables:
+        conditions.append(f"""NOT EXISTS(SELECT 1 FROM telegram_page_jumps AS prompt
+            JOIN telegram_inbox AS inbox USING(receipt_id) JOIN telegram_outbox AS reply USING(receipt_id)
+            WHERE prompt.kind='prompt' AND prompt.expires_at>{epoch} AND inbox.receipt_nonce='view-jump:v1'
+              AND reply.state='sent' AND NOT EXISTS(
+                SELECT 1 FROM telegram_page_jumps WHERE origin_receipt_id=prompt.receipt_id))""")
     conditions.extend(f"NOT EXISTS(SELECT 1 FROM {table} WHERE expires_at > {epoch} AND used_by_receipt_id IS NULL)" for table in waits)
     return "(" + " AND ".join(conditions) + ")"
 

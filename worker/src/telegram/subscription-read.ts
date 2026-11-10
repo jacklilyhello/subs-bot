@@ -9,7 +9,7 @@ import { TELEGRAM_AGGREGATE_ORIGIN } from "./aggregate-actions.ts";
 import { inTelegramScope, SUBSCRIPTION_READ_RECEIPT_MARKER, SUBSCRIPTION_READ_TICKET,
   type TelegramPolicy, type TelegramSubscriptionReadUpdate } from "./protocol.ts";
 import { selectedQuery, unicode14Lower } from "./selected-search.ts";
-import { displayTelegramName, displayTelegramDate, TELEGRAM_VIEW_MARKER } from "./views.ts";
+import { displayTelegramName, displayTelegramDate, TELEGRAM_VIEW_RECEIPTS } from "./views.ts";
 import { TELEGRAM_SUBSCRIPTION_NODE_MARKER, type TelegramNodePageButton } from "./subscription-node-pages.ts";
 
 export const TELEGRAM_SUBSCRIPTION_READ_MARKER = SUBSCRIPTION_READ_RECEIPT_MARKER;
@@ -147,14 +147,14 @@ export async function acceptTelegramSubscriptionRead(
         WHERE ticket.token_sha256=? AND ticket.used_by_receipt_id IS NULL AND ticket.expires_at>unixepoch()
           AND origin.bot_id=? AND origin.actor_id=? AND origin.chat_id=? AND origin.chat_type=? AND origin.thread_id IS ?
           AND reply.state='sent' AND reply.sent_message_id=? AND reply.attempts=ticket.origin_attempt
-          AND ((origin.receipt_nonce=? AND ticket.kind='detail') OR (origin.receipt_nonce=? AND (
+          AND ((origin.receipt_nonce IN (${TELEGRAM_VIEW_RECEIPTS}) AND ticket.kind='detail') OR (origin.receipt_nonce=? AND (
             (read_origin.kind='search' AND ticket.kind IN ('search','detail'))
             OR (read_origin.kind='detail' AND ticket.kind='format' AND ticket.subscription_id=read_origin.subscription_id))) ${nodePageOrigin})
           AND (ticket.kind='search' OR (origin.chat_type='private' AND origin.chat_id=origin.actor_id AND origin.thread_id IS NULL))
           AND (origin.actor_id=? OR COALESCE((SELECT allowed=1 AND message_date<origin.message_date
             FROM telegram_auth WHERE bot_id=origin.bot_id AND user_id=origin.actor_id),1))
           AND ${timeAndAuth} ${conflict}`).bind(...scope, digest, policy.botId, event.actorId, event.chatId, event.chatType, event.threadId,
-        event.messageId, TELEGRAM_VIEW_MARKER, TELEGRAM_SUBSCRIPTION_READ_MARKER, policy.adminId, ...auth));
+        event.messageId, TELEGRAM_SUBSCRIPTION_READ_MARKER, policy.adminId, ...auth));
       steps.push(db.prepare(`UPDATE telegram_subscription_read_ticket AS ticket SET used_by_receipt_id=incoming.receipt_id
         FROM telegram_inbox AS incoming WHERE ticket.token_sha256=? AND ticket.used_by_receipt_id IS NULL AND ${fresh}`)
         .bind(digest, ...key));
@@ -438,7 +438,7 @@ export function insertTelegramSubscriptionReadTickets(
   ) INSERT INTO telegram_subscription_read_ticket
     (token_sha256,origin_receipt_id,origin_attempt,kind,subscription_id,format,search_receipt_id,search_offset,expires_at)
     SELECT ticket.sha256,inbox.receipt_id,reply.attempts,
-      CASE WHEN ((inbox.receipt_nonce=? AND ticket.kind='detail') OR inbox.receipt_nonce=?
+      CASE WHEN ((inbox.receipt_nonce IN (${TELEGRAM_VIEW_RECEIPTS}) AND ticket.kind='detail') OR inbox.receipt_nonce=?
         ${nodePageOrigin ? `OR (inbox.receipt_nonce='${TELEGRAM_SUBSCRIPTION_NODE_MARKER}' AND ticket.kind='detail'
           AND EXISTS (SELECT 1 FROM telegram_subscription_node_page AS page
             WHERE page.receipt_id=inbox.receipt_id AND page.subscription_id=ticket.subscription_id))` : ""})
@@ -450,7 +450,7 @@ export function insertTelegramSubscriptionReadTickets(
     .bind(...tickets.flatMap((ticket) => [ticket.sha256, ticket.kind, "subscriptionId" in ticket ? ticket.subscriptionId : null,
       ticket.kind === "format" ? ticket.format : null, ticket.kind === "search" ? ticket.searchReceiptId : null,
       ticket.kind === "search" ? ticket.searchOffset : null]),
-    TELEGRAM_VIEW_MARKER, TELEGRAM_SUBSCRIPTION_READ_MARKER, previousChanges, lease.receiptId, lease.leaseId, lease.attempts);
+    TELEGRAM_SUBSCRIPTION_READ_MARKER, previousChanges, lease.receiptId, lease.leaseId, lease.attempts);
 }
 
 export async function reapTelegramSubscriptionReadTickets(db: D1Database): Promise<void> {

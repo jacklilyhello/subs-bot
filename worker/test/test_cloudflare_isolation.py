@@ -181,6 +181,7 @@ class FakeCloudflare:
         self.dynamic_all_occupancy = None
         self.dynamic_all_occupancy_at = {}
         self.dynamic_all_reads = 0
+        self.page_jump_replies = []
 
     def worker_api(self, method, path, payload=None):
         self.calls.append((method, path))
@@ -255,6 +256,22 @@ class FakeCloudflare:
     def data_api(self, method, path, payload=None):
         if method == "POST" and path == DATABASE + "/query":
             sql = payload["sql"]
+            if "AS pageJumpUnsettled" in sql:
+                # Verify the guard works against baseline inbox/outbox alone, before 0042 exists.
+                with closing(sqlite3.connect(":memory:")) as db:
+                    db.row_factory = sqlite3.Row
+                    migration = Path(__file__).resolve().parents[1] / "migrations" / "0002_telegram.sql"
+                    db.executescript(migration.read_text(encoding="utf-8"))
+                    for receipt, (marker, state) in enumerate(self.page_jump_replies, 1):
+                        db.execute("""INSERT INTO telegram_inbox
+                            (receipt_id,bot_id,update_id,actor_id,chat_id,chat_type,message_id,message_date,command,receipt_nonce)
+                            VALUES (?,'123',?,'456','456','private',?,1,'help',?)""", (receipt, receipt, receipt, marker))
+                        lease = f"synthetic-{receipt}" if state in ("leased", "sending", "uncertain") else None
+                        expiry = 1 if state in ("leased", "sending") else None
+                        db.execute("""INSERT INTO telegram_outbox
+                            (receipt_id,state,attempts,lease_id,lease_until,sent_message_id) VALUES (?,?,1,?,?,?)""",
+                                   (receipt, state, lease, expiry, receipt if state == "sent" else None))
+                    return [{"success": True, "results": [dict(row) for row in db.execute(sql)]}]
             if any(field in sql for field in ("AS dynamicAllTables", "AS dynamicAllRegistered", "AS dynamicAllMarkerSql")):
                 if "AS dynamicAllMarkerSql" in sql:
                     self.dynamic_all_reads += 1
@@ -531,7 +548,7 @@ class ReleaseTests(unittest.TestCase):
         self.set_group_share_cards_baseline(same_artifact=False, prior_markers=active, next_markers=desired)
         migrations = Path(__file__).resolve().parents[1] / "migrations"
         self.manifest["migrations"] = [{"name": file.name, "sha256": sha256(file.read_bytes()).hexdigest()}
-                                      for file in sorted(migrations.glob("*.sql"))]
+                                      for file in sorted(migrations.glob("*.sql"))[:40]]
         if not exact_pin:
             self.manifest["migrations"][37]["sha256"] = "0" * 64
 
@@ -759,6 +776,64 @@ class ReleaseTests(unittest.TestCase):
             {"type": "plain_text", "name": cloudflare.TELEGRAM_DIGEST_BINDING,
              "text": sha256(config.encode("utf-8")).hexdigest()},
         ])
+
+    def set_page_jump_artifact(self):
+        module = NEW_MODULE + b"\n/* " + cloudflare.PAGE_JUMP_MARKER + b" */\n"
+        self.api.upload_module = module
+        (self.bundle / "index.js").write_bytes(module)
+        self.manifest["bundleSha256"] = sha256(module).hexdigest()
+        migrations = Path(__file__).resolve().parents[1] / "migrations"
+        self.manifest["migrations"] = [{"name": file.name, "sha256": sha256(file.read_bytes()).hexdigest()}
+                                      for file in sorted(migrations.glob("*.sql"))[:42]]
+
+    def test_page_jump_marker_requires_the_exact_0042_artifact(self):
+        self.set_page_jump_artifact()
+        cloudflare.verify_page_jump_artifact(self.bundle, self.manifest)
+        for entries in ([], self.manifest["migrations"][:-1], self.manifest["migrations"][:-1] + [
+                {"name": cloudflare.PAGE_JUMP_MIGRATION, "sha256": "0" * 64}]):
+            with self.subTest(count=len(entries)), self.assertRaisesRegex(cloudflare.CloudflareError, "exact 0042"):
+                cloudflare.verify_page_jump_artifact(self.bundle, {**self.manifest, "migrations": entries})
+        (self.bundle / "index.js").write_bytes(NEW_MODULE)
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "exact 0042"):
+            cloudflare.verify_page_jump_artifact(self.bundle, {**self.manifest, "bundleSha256": sha256(NEW_MODULE).hexdigest()})
+        self.assertEqual(self.api.writes(), [])
+
+    def test_page_jump_first_release_is_dormant_and_rolls_back_without_active_receipts(self):
+        self.set_page_jump_artifact()
+        self.set_old_telegram_config()
+        self.api.worker_responses[SCHEDULES] = {"schedules": [CRON]}
+        self.api.page_jump_replies = [("view:v1", "pending"), ("view-jump:v1", "uncertain"), ("view-jump:v1", "sent")]
+        self.api.health_available = False
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "prior version was restored"):
+            self.release(TELEGRAM_CONFIG)
+        self.assertEqual(self.api.active["versions"][0]["version_id"], OLD_VERSION)
+        self.assertNotIn(cloudflare.PAGE_JUMP_BINDING, {row["name"] for row in self.api.versions[NEW_VERSION]["bindings"]})
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS, DEPLOYMENTS])
+
+    def test_page_jump_downgrade_refuses_pending_or_unresolved_delivery(self):
+        previous = self.api.versions[OLD_VERSION]
+        previous["modules"][0]["content_base64"] = base64.b64encode(OLD_MODULE + cloudflare.PAGE_JUMP_MARKER).decode("ascii")
+        for state in ("pending", "leased", "sending"):
+            self.api.page_jump_replies = [("view-jump:v1", state)]
+            with self.subTest(state=state), self.assertRaisesRegex(cloudflare.CloudflareError, "page-jump replies have drained"):
+                self.release()
+        self.assertEqual(self.api.writes(), [])
+
+    def test_page_jump_rollback_rechecks_after_activation(self):
+        self.set_page_jump_artifact()
+        self.api.health_available = False
+        self.api.page_jump_replies = [("view-jump:v1", "sending")]
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "safe rollback could not be confirmed"):
+            self.release()
+        self.assertEqual(self.api.active["versions"][0]["version_id"], NEW_VERSION)
+        self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS])
+
+    def test_page_jump_enabled_version_is_outside_this_release_contract(self):
+        self.set_old_telegram_config()
+        self.api.versions[OLD_VERSION]["bindings"].append({"name": cloudflare.PAGE_JUMP_BINDING, "type": "plain_text", "text": "1"})
+        with self.assertRaisesRegex(cloudflare.CloudflareError, "separately reviewed pause and drain"):
+            self.release(TELEGRAM_CONFIG)
+        self.assertEqual(self.api.writes(), [])
 
     def set_inline_baseline(self):
         self.manifest["migrations"] = [{"name": f"{position:04d}_fixture.sql", "sha256": "a" * 64}
