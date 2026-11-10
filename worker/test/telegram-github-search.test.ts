@@ -148,6 +148,61 @@ test("GitHub lookup failures use a fixed fallback without retrying or retaining 
   });
 });
 
+test("Grep verifies file visibility without waiting for the parallel repository search", async () => {
+  await withDatabase(async (db, now) => {
+    const repo = "public-fixture/Code";
+    const url = `https://github.com/${repo}`;
+    const publicRepo = { full_name: repo, html_url: url, private: false, visibility: "public", stargazers_count: 1 };
+    for (const laterRepositoryProof of [false, true]) {
+      await db.prepare("UPDATE telegram_github_search SET started_at=unixepoch()-16 WHERE started_at IS NOT NULL").run();
+      const admission = await acceptTelegramGitHubSearch(db, policy, {
+        ...event(laterRepositoryProof ? 2 : 1, now), args: `synthetic-code repo:${repo}`,
+      });
+      assert.ok(admission.kind === "lookup");
+      let releaseRepositorySearch!: (response: Response) => void;
+      const pendingSearch = new Promise<Response>((resolve) => { releaseRepositorySearch = resolve; });
+      let repoSearchReleased = false;
+      const verificationOrder: boolean[] = [];
+      const request: typeof fetch = async (input, init) => {
+        const requested = new URL(String(input));
+        if (requested.pathname === "/search/repositories") return pendingSearch;
+        if (requested.pathname === `/repos/${repo}`) {
+          verificationOrder.push(repoSearchReleased);
+          if (repoSearchReleased) throw new DOMException("Synthetic visibility deadline elapsed", "TimeoutError");
+          return laterRepositoryProof ? new Response(null, { status: 429 }) : Response.json(publicRepo);
+        }
+        assert.equal(requested.href, "https://mcp.grep.app/");
+        const rpc = JSON.parse(String(init?.body)) as { method: string; id?: number };
+        if (rpc.method === "notifications/initialized") return new Response(null, { status: 202 });
+        const result = rpc.method === "initialize" ? { protocolVersion: "2025-06-18" } : {
+          content: ["first.ts", "second.ts"].map((path) => ({ type: "text",
+            text: `Repository: ${repo}
+Path: ${path}
+URL: ${url}/blob/main/${path}
+License: MIT
+Snippets:
+synthetic excerpt` })),
+        };
+        if (rpc.method === "tools/call") setImmediate(() => {
+          repoSearchReleased = true;
+          releaseRepositorySearch(Response.json({ items: laterRepositoryProof ? [publicRepo] : [], incomplete_results: false }));
+        });
+        return new Response(`data: ${JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result })}
+
+`,
+          { headers: { "Content-Type": "text/event-stream" } });
+      };
+      assert.equal(await runTelegramGitHubSearch(db, policy, admission, request), true);
+      const row = await db.prepare("SELECT state,public_results FROM telegram_github_search WHERE receipt_id=?")
+        .bind(admission.receiptId).first<{ state: string; public_results: string }>();
+      assert.ok(row);
+      assert.equal(row.state, "found");
+      assert.deepEqual(JSON.parse(row.public_results).code.map(({ path }: { path: string }) => path), ["first.ts", "second.ts"]);
+      assert.deepEqual(verificationOrder, [false], "verify the shared repository once while search is still pending");
+    }
+  });
+});
+
 test("Grep handshake cannot send the query after the member authorization changes", async () => {
   await withDatabase(async (db, now) => {
     const admission = await acceptTelegramGitHubSearch(db, policy, { ...event(1, now), args: "synthetic-lookup repo:octocat/Hello-World" });
