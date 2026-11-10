@@ -61,7 +61,7 @@ export async function readGeneralReadLane(
     || activationSha256 === null || !/^[0-9a-f]{64}$/u.test(activationSha256)) throw new Error(error);
   const { botId, botUsername, webhookSecret, botToken, adminId, memberId } = policy;
   return { epoch: row.epoch, mode: row.mode, pin: { botId, botUsername, webhookSecret, botToken, generation,
-    cutoverAt, releaseRevision, activationSha256, sharedOutbox: true, privateManagement: false, privateFormats: false, privateTemp: false, privateDocument: false,
+    cutoverAt, releaseRevision, activationSha256, sharedOutbox: true, privateManagement: false, privateFormats: false, privateTemp: false, privateDocument: false, privateProvider: false,
     rehearsal: { adminId, memberId } } };
 }
 

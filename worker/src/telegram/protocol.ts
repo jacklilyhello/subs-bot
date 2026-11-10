@@ -160,6 +160,7 @@ const SELECTED_TICKET = /^sbo1_[A-Za-z0-9_-]{22}(?![\s\S])/;
 export const SUBSCRIPTION_READ_TICKET = /^sbr1_[A-Za-z0-9_-]{22}(?![\s\S])/;
 export const BULK_TRASH_TICKET = /^sbd1_[A-Za-z0-9_-]{22}(?![\s\S])/;
 export const SUBSCRIPTION_READ_RECEIPT_MARKER = "subread:v1";
+export const GENERAL_SUBSCRIPTION_READ_MARKER = "general-subscription-read:v1";
 export const SUBSCRIPTION_NODE_TICKET = /^sbn1_[A-Za-z0-9_-]{22}(?![\s\S])/;
 export const PROVIDER_REFRESH_TICKET = /^sbpr1_[A-Za-z0-9_-]{21}[AQgw](?![\s\S])/;
 export const SUBSCRIPTION_RAW_FILE_TICKET = /^sbnf1_[A-Za-z0-9_-]{21}[AQgw](?![\s\S])/;
@@ -472,6 +473,13 @@ export function readGeneralPrivateTempUpdate(
   return !hasCommand && typeof text === "string" && text.trim() !== "" && !text.trimStart().startsWith("/")
     && classifyTelegramApiStatusInput({ kind: "ordinary", text }).kind === "pass-through"
     ? { ...scope, kind: "temp-text", text } : null;
+}
+
+export function readGeneralPrivateProviderRefresh(
+  update: Record<string, unknown>, updateId: number, botId: string,
+): TelegramProviderRefreshUpdate | null {
+  return Object.keys(update).length === 2 && isRecord(update.callback_query)
+    ? readGeneralPrivateTicket(update.callback_query, updateId, botId, PROVIDER_REFRESH_TICKET) : null;
 }
 
 export function readGeneralPrivateLifecycleUpdate(

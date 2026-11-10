@@ -33,8 +33,10 @@ export const GENERAL_ACTOR_QUEUE_CAPACITY = `NOT EXISTS (
     AND ${generalOrdinaryReplyEligibilitySql("queued")}
   LIMIT 1 OFFSET 3)`;
 
+export type GeneralAuthorityPin = Pick<GeneralTelegramPin, "botId" | "generation" | "activationSha256" | "releaseRevision" | "cutoverAt">;
+
 // Keep this order aligned with both exact pin predicates.
-export function generalPolicyBindings(pin: GeneralTelegramPin, generation = pin.generation) {
+export function generalPolicyBindings(pin: GeneralAuthorityPin, generation = pin.generation) {
   return [pin.botId, generation, pin.activationSha256, pin.releaseRevision, pin.cutoverAt] as const;
 }
 

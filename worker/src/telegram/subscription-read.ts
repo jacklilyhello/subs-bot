@@ -6,7 +6,7 @@ import { digestHex, readSnapshotNodes, SUBSCRIPTION_LIFECYCLE_REVISION, validInt
 import { providerRefreshTarget, type TelegramProviderRefreshTarget } from "./provider-refresh.ts";
 import type { TelegramRawFileTarget } from "./subscription-raw-file.ts";
 import { ISOLATION_PUBLIC_ORIGIN, type PublicOrigin } from "../public-origin.ts";
-import { inTelegramScope, SUBSCRIPTION_READ_RECEIPT_MARKER, SUBSCRIPTION_READ_TICKET,
+import { GENERAL_SUBSCRIPTION_READ_MARKER, inTelegramScope, SUBSCRIPTION_READ_RECEIPT_MARKER, SUBSCRIPTION_READ_TICKET,
   type TelegramPolicy, type TelegramSubscriptionReadUpdate } from "./protocol.ts";
 import { selectedQuery, unicode14Lower } from "./selected-search.ts";
 import { displayTelegramName, displayTelegramDate, TELEGRAM_VIEW_RECEIPTS } from "./views.ts";
@@ -14,7 +14,7 @@ import { TELEGRAM_SUBSCRIPTION_NODE_MARKER, type TelegramNodePageButton } from "
 import type { SubscriptionShortTarget } from "./subscription-shorts.ts";
 
 export const TELEGRAM_SUBSCRIPTION_READ_MARKER = SUBSCRIPTION_READ_RECEIPT_MARKER;
-export const GENERAL_SUBSCRIPTION_READ_MARKER = "general-subscription-read:v1";
+export { GENERAL_SUBSCRIPTION_READ_MARKER } from "./protocol.ts";
 export const MAX_SUBSCRIPTION_SEARCH_ROWS = 512;
 const MAX_SCAN_BYTES = 8 * 1024 * 1024;
 const MAX_MATCHES_BYTES = 16_384;
@@ -368,17 +368,20 @@ function subscriptionFormatButtons(subscriptionId: number): TelegramSubscription
 }
 
 export async function renderGeneralSubscriptionMetadata(
-  db: D1Database, ownerId: string, subscriptionId: number, expectedRevision: number, guard: Guard, offerFormats = false,
+  db: D1Database, ownerId: string, subscriptionId: number, expectedRevision: number, guard: Guard, offerFormats = false, offerRefresh = false,
 ): Promise<RenderedRead> {
   const row = await db.prepare(`SELECT id,name,expire_at AS expireAt,traffic_used AS trafficUsed,traffic_total AS trafficTotal,
     (last_error IS NOT NULL) AS refreshFailed,generation,${SUBSCRIPTION_LIFECYCLE_REVISION} AS lifecycleRevision,
-    node_count AS nodeCount,snapshot_id AS snapshotId,manifest_sha256 AS manifestSha256,NULL AS token,NULL AS sourceUrl
+    node_count AS nodeCount,snapshot_id AS snapshotId,manifest_sha256 AS manifestSha256,NULL AS token,
+    ${offerRefresh ? "source_url" : "NULL"} AS sourceUrl
     FROM subscriptions WHERE id=? AND owner_id=? AND ${SUBSCRIPTION_LIFECYCLE_REVISION}=?`)
     .bind(subscriptionId, ownerId, expectedRevision).first<Metadata>();
   if (!row) return { text: "订阅不存在或已被更改。", readGuard: guard };
   const readButtons = offerFormats && row.generation > 0 && row.nodeCount > 0
     && row.snapshotId !== null && row.manifestSha256 !== null ? subscriptionFormatButtons(row.id) : undefined;
-  return { text: subscriptionMetadataLines(row).join("\n"), readGuard: subscriptionGuard(guard, row), readButtons };
+  const refreshTarget = await providerRefreshTarget(row, row.sourceUrl);
+  return { text: subscriptionMetadataLines(row).join("\n"), readButtons, refreshTarget,
+    readGuard: subscriptionGuard(guard, row, undefined, refreshTarget ? row.sourceUrl : null) };
 }
 
 export async function renderGeneralSubscriptionFormat(

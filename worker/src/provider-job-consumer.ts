@@ -4,7 +4,7 @@ import {
 } from "./provider-fetch-contract.ts";
 import {
   claimProviderJob, isProviderJobCurrent, retireStaleProviderJob, settleProviderJob,
-  type ProviderFailureOutcome, type ProviderJobLease, type ProviderTelegramPolicy,
+  type ProviderFailureOutcome, type ProviderJobLease, type ProviderQueuePolicy,
 } from "./provider-jobs.ts";
 import { providerSnapshotJournalReady, publishProviderSnapshot, stageProviderSnapshot } from "./provider-snapshot-journal.ts";
 import { initialProviderTitle } from "./provider-initial-title.ts";
@@ -104,7 +104,7 @@ function subscriptionMetadata(userinfo: string | undefined): SnapshotMetadataUpd
 
 /** Run at most one lease from the selected queue and use the named binding for its source URL. */
 export async function runOneProviderJob(
-  db: D1Database, bucket: R2Bucket, provider: ProviderFetcher | undefined, pin: ProviderPin, policy?: ProviderTelegramPolicy,
+  db: D1Database, bucket: R2Bucket, provider: ProviderFetcher | undefined, pin: ProviderPin, policy?: ProviderQueuePolicy,
   includeBatch = false,
 ): Promise<ConsumerOutcome> {
   if (!provider || typeof pin.providerRevision !== "string" || !PROVIDER_REVISION.test(pin.providerRevision) ||

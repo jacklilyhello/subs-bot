@@ -1,9 +1,15 @@
-import { PROVIDER_JOB_TTL_SECONDS, TELEGRAM_PROVIDER_MARKER, type ProviderSql } from "../provider-jobs.ts";
+import { GENERAL_PROVIDER_SCHEMA, GENERAL_TELEGRAM_PROVIDER_MARKER, PROVIDER_JOB_TTL_SECONDS,
+  TELEGRAM_PROVIDER_MARKER, type GeneralProviderAuthority, type ProviderSql } from "../provider-jobs.ts";
 import { isolatedTelegramRoleEpochSql } from "./authorization-sql.ts";
+import { generalCurrentAuthoritySql, generalPolicyBindings } from "./general-receipt.ts";
 import type { TelegramProviderEvent } from "./provider-admission.ts";
 import type { TelegramPolicy } from "./protocol.ts";
 
 const REPLY_SECONDS = 900;
+export const GENERAL_PROVIDER_REPLY_SCHEMA = `(${GENERAL_PROVIDER_SCHEMA}) AND EXISTS (
+  SELECT /* subs-bot:telegram-general-provider-reply:v1 */ 1 FROM subs_bot_schema_migrations
+  WHERE position=23 AND name='0023_telegram_provider_replies.sql'
+    AND sha256='67b4f625259bdef325fc70ef1042a1b33aa73d8396261ba79c85763c2e1c7c14' AND mode='applied')`;
 const RECONCILE_LIMIT = 16;
 const URL_TOKEN = /^https?:\/\/\S*(?![\s\S])/iu;
 const LINE_BREAK = /[\n\r\v\f\u001c-\u001e\u0085\u2028\u2029]/u;
@@ -85,6 +91,32 @@ function exactProviderEpoch(policy: TelegramPolicy, alias: InboxAlias = "inbox")
     bindings: epoch.bindings };
 }
 
+function generalProviderPrivateInbox(alias: InboxAlias): string {
+  return `${alias}.receipt_nonce='${GENERAL_TELEGRAM_PROVIDER_MARKER}' AND ${alias}.command='help'
+    AND ${alias}.chat_type='private' AND ${alias}.chat_id=${alias}.actor_id AND ${alias}.thread_id IS NULL`;
+}
+
+export function generalProviderReplyScope(alias: InboxAlias): string {
+  return `(${generalProviderPrivateInbox(alias)}) AND EXISTS (
+    SELECT 1 FROM telegram_provider_replies AS provider JOIN telegram_provider_requests AS origin USING(receipt_id)
+    JOIN telegram_general_receipt AS recorded USING(receipt_id)
+    WHERE provider.receipt_id=${alias}.receipt_id AND origin.kind IN ('url-import','refresh') AND origin.actor_role=recorded.actor_role
+      AND origin.auth_message_date=0 AND origin.auth_message_id=0)`;
+}
+
+export function generalProviderReplyEligibility(alias: InboxAlias): string {
+  return `(${GENERAL_PROVIDER_REPLY_SCHEMA}) AND EXISTS (SELECT 1 FROM telegram_provider_replies
+    WHERE receipt_id=${alias}.receipt_id AND ready_at>unixepoch()-${REPLY_SECONDS})`;
+}
+
+function generalProviderEpoch(policy: GeneralProviderAuthority): ProviderSql {
+  return { sql: `(${generalProviderPrivateInbox("inbox")}) AND (${GENERAL_PROVIDER_REPLY_SCHEMA})
+    AND (${generalCurrentAuthoritySql("inbox")}) AND origin.kind IN ('url-import','refresh')
+    AND origin.auth_message_date=0 AND origin.auth_message_id=0
+    AND EXISTS (SELECT 1 FROM telegram_general_receipt AS recorded WHERE recorded.receipt_id=inbox.receipt_id
+      AND recorded.actor_role=origin.actor_role)`, bindings: generalPolicyBindings(policy) };
+}
+
 export function telegramProviderReplyEligible(policy: TelegramPolicy | undefined, alias: InboxAlias): ProviderSql {
   if (!policy) return { sql: "1", bindings: [] };
   const epoch = exactProviderEpoch(policy, alias);
@@ -104,8 +136,8 @@ export function telegramProviderReplySendGuard(
 }
 
 /** Repair notification after an ambiguous or delayed terminal commit without making an outbound call. */
-export async function reconcileTelegramProviderReplies(db: D1Database, policy: TelegramPolicy): Promise<number> {
-  const epoch = exactProviderEpoch(policy);
+export async function reconcileTelegramProviderReplies(db: D1Database, policy: TelegramPolicy | GeneralProviderAuthority): Promise<number> {
+  const epoch = "family" in policy ? generalProviderEpoch(policy) : exactProviderEpoch(policy);
   try {
     const results = await db.batch([
       db.prepare(`WITH terminal AS (
