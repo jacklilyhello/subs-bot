@@ -8,6 +8,7 @@ import { GENERAL_ACTOR_QUEUE_CAPACITY, GENERAL_LATEST_ACTOR_SQL, GENERAL_NO_LEGA
   GENERAL_POLICY_PIN_SQL, GENERAL_POLICY_SCHEMA, GENERAL_RECEIPT_SCHEMA, GENERAL_REPLY_TTL, generalCurrentAuthoritySql,
   generalPolicyBindings, prepareGeneralReceiptAuthority } from "./general-receipt.ts";
 import type { TelegramEventScope, TelegramProviderRefreshUpdate } from "./protocol.ts";
+import { telegramGeneralProviderDocumentsReady } from "./provider-document.ts";
 import { readGeneralProviderRefreshAdmission } from "./provider-refresh.ts";
 import { GENERAL_PROVIDER_REPLY_SCHEMA } from "./provider-replies.ts";
 
@@ -18,7 +19,8 @@ const encoder = new TextEncoder();
 
 export function generalProviderAuthority(pin: GeneralTelegramPin): GeneralProviderAuthority {
   const { botId, generation, cutoverAt, activationSha256, releaseRevision } = pin;
-  return { family: "general", botId, generation, cutoverAt, activationSha256, releaseRevision };
+  return { family: "general", botId, generation, cutoverAt, activationSha256, releaseRevision,
+    ...(pin.providerDocumentReplies ? { includeDocuments: true as const } : {}) };
 }
 
 export async function generalProviderSchemaReady(db: D1Database): Promise<boolean> {
@@ -37,7 +39,8 @@ export async function acceptGeneralProviderRequest(db: D1Database, pin: GeneralT
     const nonce = crypto.randomUUID();
     const key = [pin.botId, event.updateId, nonce] as const;
     const fence = { sql: `EXISTS (SELECT 1 FROM telegram_inbox AS incoming WHERE ${fresh})`, bindings: key };
-    const authority = generalProviderAuthority(pin);
+    const documents = pin.providerDocumentReplies || await telegramGeneralProviderDocumentsReady(db, pin.botId, false).catch(() => false);
+    const authority = generalProviderAuthority(documents ? { ...pin, providerDocumentReplies: true } : pin);
     const input = { ownerId: event.actorId, requestKey };
     const refresh = event.kind === "refresh" ? await readGeneralProviderRefreshAdmission(db, pin, event) : null;
     let plan: Awaited<ReturnType<typeof prepareProviderUrlImport>>["plan"] | null = null;
