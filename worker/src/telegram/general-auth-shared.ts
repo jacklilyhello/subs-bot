@@ -24,7 +24,8 @@ import { acceptGeneralTelegramSubscriptionRead, renderGeneralSubscriptionRead } 
 import { acceptGeneralProviderRequest } from "./general-provider.ts";
 import { acceptTelegramPrivateClaim, beginTelegramPrivateClaim, GENERAL_PRIVATE_CLAIM_SCHEMA,
   prepareTelegramPrivateClaim, TELEGRAM_GENERAL_PRIVATE_CLAIM_MARKER } from "./private-claims.ts";
-import { acceptTelegramPrivateShareCreation, GENERAL_SHARE_CREATION_SCHEMA, parseTelegramPrivateShareArgs,
+import { acceptTelegramPrivateShareCreation, acceptTelegramSubscriptionShare, GENERAL_SHARE_CREATION_SCHEMA,
+  parseTelegramPrivateShareArgs, parseTelegramSubscriptionShareArgs,
   recoverTelegramPrivateShareCreation, renderTelegramPrivateShareLink, resolveTelegramPrivateShareCreationReply,
   retireAbandonedTelegramPrivateShareCreation, TELEGRAM_GENERAL_SHARE_CREATION_MARKER } from "./private-share-creation.ts";
 import type { TelegramPrivateShareRuntime } from "./private-share-runtime.ts";
@@ -185,7 +186,7 @@ function currentBindings(pin: GeneralTelegramPin) {
 export async function acceptGeneralSharedTelegramCommand(
   db: D1Database, pin: GeneralTelegramPin, request: Request, acknowledge?: (callbackId: string) => void,
   providerAvailable?: () => Promise<boolean>, refreshAvailable?: () => Promise<boolean>,
-  share?: { bucket: R2Bucket; runtime: TelegramPrivateShareRuntime }, aggregateKey?: CryptoKey | null,
+  share?: { bucket: R2Bucket; runtime: TelegramPrivateShareRuntime; publicOrigin: PublicOrigin }, aggregateKey?: CryptoKey | null,
 ): Promise<number> {
   const decoded = await readTelegramUpdate(request, pin.webhookSecret);
   if (decoded.status !== 200) return decoded.status;
@@ -196,6 +197,12 @@ export async function acceptGeneralSharedTelegramCommand(
     ? readGeneralPrivateShareCreation(decoded.update, decoded.updateId, pin.botId, pin.botUsername) : null;
   if (creation) {
     if (!share?.runtime.context) return 204;
+    const selection = parseTelegramSubscriptionShareArgs(creation.args);
+    if (selection) {
+      const outcome = await acceptTelegramSubscriptionShare(db, share.bucket, pin, { ...creation, ...selection },
+        share.runtime.context, share.publicOrigin);
+      return outcome === "published" || outcome === "pending" ? 200 : 204;
+    }
     const draft = parseTelegramPrivateShareArgs(creation.args);
     if (!draft) return 204;
     const outcome = await acceptTelegramPrivateShareCreation(db, share.bucket, pin, { ...creation, ...draft }, share.runtime.context);
@@ -515,7 +522,8 @@ export async function drainGeneralSharedTelegramReply(
     return true;
   }
   if (lease.marker === GENERAL_SUBSCRIPTION_READ_MARKER) {
-    const presentation = await renderGeneralSubscriptionRead(db, pin, lease, bucket, publicOrigin, refreshAvailable);
+    const presentation = await renderGeneralSubscriptionRead(db, pin, lease, bucket, publicOrigin, refreshAvailable,
+      pin.privateShareCreation && Boolean(share?.context));
     if (!presentation?.readGuard) return false;
     const prepared = presentation.readButtons?.length ? await prepareTelegramSubscriptionReadTickets(presentation.readButtons) : undefined;
     const refresh = presentation.refreshTarget ? await prepareTelegramProviderRefreshButton(presentation.refreshTarget) : undefined;

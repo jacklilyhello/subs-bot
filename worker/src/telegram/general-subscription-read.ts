@@ -134,7 +134,7 @@ export async function acceptGeneralTelegramSubscriptionRead(
 
 export async function renderGeneralSubscriptionRead(
   db: D1Database, pin: GeneralTelegramPin, lease: ReadLease, bucket: R2Bucket, publicOrigin: PublicOrigin,
-  refreshAvailable?: () => Promise<boolean>,
+  refreshAvailable?: () => Promise<boolean>, offerShare = false,
 ): Promise<Awaited<ReturnType<typeof renderTelegramSearchResults>> | null> {
   const guard = { sql: `inbox.receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MARKER}' AND ${generalCurrentReceiptSql("inbox")}`,
     bindings: generalPolicyBindings(pin) };
@@ -181,7 +181,7 @@ export async function renderGeneralSubscriptionRead(
           AND ticket.used_by_receipt_id=inbox.receipt_id AND origin.bot_id=inbox.bot_id AND origin.actor_id=inbox.actor_id)
         THEN 1 ELSE 0 END`,
       bindings: [...guard.bindings, ...generalPolicyBindings(pin), row.subscriptionId],
-    }, formats, refresh);
+    }, formats, refresh, offerShare);
   }
   const text = row.kind === "usage" ? "用法：/s 名称关键词"
     : row.kind === "limit" ? "查询达到处理上限，请缩短关键词或从 /list 选择订阅。"

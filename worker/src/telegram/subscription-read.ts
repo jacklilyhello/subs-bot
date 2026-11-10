@@ -367,8 +367,13 @@ function subscriptionFormatButtons(subscriptionId: number): TelegramSubscription
   }));
 }
 
+function subscriptionShareHint(subscriptionId: number): string {
+  return `私密分享此订阅：/share sub ${subscriptionId}`;
+}
+
 export async function renderGeneralSubscriptionMetadata(
   db: D1Database, ownerId: string, subscriptionId: number, expectedRevision: number, guard: Guard, offerFormats = false, offerRefresh = false,
+  offerShare = false,
 ): Promise<RenderedRead> {
   const row = await db.prepare(`SELECT id,name,expire_at AS expireAt,traffic_used AS trafficUsed,traffic_total AS trafficTotal,
     (last_error IS NOT NULL) AS refreshFailed,generation,${SUBSCRIPTION_LIFECYCLE_REVISION} AS lifecycleRevision,
@@ -380,7 +385,9 @@ export async function renderGeneralSubscriptionMetadata(
   const readButtons = offerFormats && row.generation > 0 && row.nodeCount > 0
     && row.snapshotId !== null && row.manifestSha256 !== null ? subscriptionFormatButtons(row.id) : undefined;
   const refreshTarget = await providerRefreshTarget(row, row.sourceUrl);
-  return { text: subscriptionMetadataLines(row).join("\n"), readButtons, refreshTarget,
+  const lines = subscriptionMetadataLines(row);
+  if (offerShare) lines.push(subscriptionShareHint(row.id));
+  return { text: lines.join("\n"), readButtons, refreshTarget,
     readGuard: subscriptionGuard(guard, row, undefined, refreshTarget ? row.sourceUrl : null) };
 }
 
@@ -427,7 +434,7 @@ async function renderDetail(
   } else {
     lines.push("当前没有已发布的节点。");
   }
-  if (subscriptionShareEnabled) lines.push(`私密分享此订阅：/share sub ${row.id}`);
+  if (subscriptionShareEnabled) lines.push(subscriptionShareHint(row.id));
   const refreshTarget = await providerRefreshTarget(row, row.sourceUrl);
   return { text: lines.join("\n"), readButtons, refreshTarget, rawFileTarget,
     readGuard: subscriptionGuard(guard, row, undefined, refreshTarget ? row.sourceUrl : null),
