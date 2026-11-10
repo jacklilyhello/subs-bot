@@ -265,7 +265,7 @@ def release():
     selected_capable = legacy_selected_artifact(bundle, manifest)
     temp_capable = legacy_temp_artifact(bundle, manifest)
     dynamic_all_capable = legacy_dynamic_all_artifact(bundle, manifest)
-    typed_shorts_capable = subscription_shorts_artifact(bundle, manifest)
+    typed_shorts_capable, general_typed_shorts_capable = subscription_shorts_artifact(bundle, manifest, with_general=True)
     verify_page_jump_artifact(bundle, manifest)
     verify_general_read_artifact(bundle, manifest)
     telegram_config = telegram_release_config(manifest)
@@ -317,7 +317,8 @@ def release():
                                     group_share_cards=group_share_cards, group_share_cards_capable=group_cards_capable,
                                     legacy_selected_capable=selected_capable, legacy_temp_capable=temp_capable,
                                     legacy_dynamic_all_capable=dynamic_all_capable, subscription_shorts=subscription_shorts,
-                                    subscription_shorts_capable=typed_shorts_capable)
+                                    subscription_shorts_capable=typed_shorts_capable,
+                                    general_subscription_shorts_capable=general_typed_shorts_capable)
     if subscription_shorts is True:
         print(json.dumps({"subscriptionShortsPreflight": "verified", "revision": revision,
                           "previousVersionId": starting["versionId"], "previousDeploymentId": starting["deploymentId"],

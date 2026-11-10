@@ -434,6 +434,10 @@ python3 -B worker/tools/legacy_general_auth_candidate.py \
 
 关闭签发使用 `subscription_shorts=disable` 和 `subscription_shorts_confirmation=disable typed subscription shorts for subs-bot-cf-dev-01`。已签发的链接仍按原所有者、订阅令牌摘要和格式解析，所有者仍可撤销，已开始的发送可以完成。Telegram 回复的短链域名使用经验证的 `PUBLIC_ORIGIN`，能力码派生使用固定安装来源。之后的发布与回滚均须保留读、写和撤销能力，即使表目前为空。关闭后的自动回滚也不能重新打开签发。
 
+通用私聊格式回执的兼容层按原 Bot、所有者、订阅、格式及当时的授权版本解析已有短链，跳转目标仍为本站相对路径。通用格式模式只清理确认失败的回执，保留发送结果不确定的链接。通用来源一旦留下记录，包括撤销后的摘要占位，受保护的发布和回滚必须保留相应的读和清理能力。
+
+通用私聊普通短链模式可额外配置 `subscriptionShorts: "issue"`。它复用原聚合签名密钥和独立的订阅短码签名域，只为核验后的本人格式回执签发。回复采用验证过的公开来源并关闭链接预览。改为 `subscriptionShorts: "drain"` 后，新格式回复使用原直接链接，已受理的发送重试可继续使用原短码，本人仍可用 `/short revoke` 撤销通用来源的短码。现有发布流程保持此配置未设置。启用和降级须通过另行受保护的切换与排空，尤其在回退到无法识别该配置的版本前。
+
 ### 隔离合成旧订阅候选应用
 
 在受保护的 `main` 运行 `worker-isolation-legacy-candidate.yml`。所有步骤使用同一组全长 32 位小写十六进制 `cohort`、同一次成功的 Worker CI `source_run_id` 和同一已核对的隔离 Worker。开始前确认本轮可在产物保留期内完成，并保持 `main` 和隔离部署稳定。此流程从 CI 的固定合成候选包恢复，目标 D1 和 R2 的名称包含完整 `cohort`。只在源私有 R2 写入本组操作记录。
