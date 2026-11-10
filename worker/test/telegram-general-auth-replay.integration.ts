@@ -1545,15 +1545,15 @@ test("closed general authorization replays a sealed candidate in a separate emit
     JOIN telegram_inbox AS origin ON origin.receipt_id=selected.origin_receipt_id WHERE link.code_sha256=?`)
     .bind(selectedDigest).first(), { ids: JSON.stringify(selectedIds), marker: "general-selected:v1" });
   assert.equal((await selectedPost(7713, 101, keyword)).status, 204);
-  const firstTicket = selection.message.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data;
-  assert.ok(firstTicket && /^sbo1_[A-Za-z0-9_-]{22}$/u.test(firstTicket));
+  const firstSelectedTicket = selection.message.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data;
+  assert.ok(firstSelectedTicket && /^sbo1_[A-Za-z0-9_-]{22}$/u.test(firstSelectedTicket));
   const privateOrigin = { ...origin(selection.messageId, 101), date: now + 25 };
-  assert.equal((await callback(7714, 106, { ...privateOrigin, chat: { id: 106, type: "private" } }, firstTicket, selectedWorker)).status, 204);
-  assert.equal((await callback(7715, 101, { ...privateOrigin, message_id: selection.messageId + 1 }, firstTicket, selectedWorker)).status, 204);
+  assert.equal((await callback(7714, 106, { ...privateOrigin, chat: { id: 106, type: "private" } }, firstSelectedTicket, selectedWorker)).status, 204);
+  assert.equal((await callback(7715, 101, { ...privateOrigin, message_id: selection.messageId + 1 }, firstSelectedTicket, selectedWorker)).status, 204);
   assert.equal((await selectedPost(7716, 101, "x".repeat(257))).status, 200);
   const limit = await awaitLifecycle(7716);
   const menuTicket = limit.message.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data;
-  assert.ok(menuTicket && menuTicket !== firstTicket && /^sbo1_[A-Za-z0-9_-]{22}$/u.test(menuTicket));
+  assert.ok(menuTicket && menuTicket !== firstSelectedTicket && /^sbo1_[A-Za-z0-9_-]{22}$/u.test(menuTicket));
   const limitOrigin = { ...origin(limit.messageId, 101), date: now + 26 };
   assert.equal((await callback(7717, 101, limitOrigin, menuTicket, selectedWorker)).status, 200);
   const revokedSelection = await awaitLifecycle(7717);
