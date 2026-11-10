@@ -127,6 +127,8 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 `worker-runtime-shape` 模式在 Node 24 直接运行同一提交的 Worker Grep 适配器，使用固定公开查询 `addClass repo:jquery/jquery`，复现运行时握手和查找参数，并在同一时间预算内核对匿名 GitHub 仓库可见性。报告只包含阶段、状态、耗时和结构计数。该模式使用 GitHub runner 的网络，并以合成检查替代 D1 授权查询。
 
+Cloudflare 边缘诊断使用独立的 `worker-grep-edge-preview.yml`。仅在 `main` 手动运行，输入 `probe Grep in the isolated Cloudflare preview`。无凭据构建步骤生成固定公开夹具，受保护步骤核对同次运行的提交、归档和模块摘要，再用隔离 Worker 部署凭据申请临时预览。临时脚本没有业务绑定。探针先确认固定名称不存在且匿名请求无法执行，随后只调用一次固定夹具，并回读该名称仍无已部署脚本。预览凭据由 Cloudflare 管理有效期，任务不会创建常驻 Worker 或启用日志。报告仅含阶段、状态、耗时及结构计数，采用合成授权检查。若临时预览不可用，任务停止。 [Cloudflare 远程开发](https://developers.cloudflare.com/workers/local-development/#wrangler-dev---remote-legacy)
+
 ### 订阅搜索、详情和格式链接
 
 `/s 关键词` 按当前用户的活动订阅搜索名称和来源，沿用旧版的 Unicode 小写子串匹配。每页最多显示 8 项，搜索限于 512 条订阅及 8 MiB 元数据。群聊只显示用户自己的匹配名称和编号。普通私聊可通过搜索结果、`/list`、`/expire` 的详情按钮，或直接发送活动列表顺序编号查看详情。详情显示流量、到期、节点数量及最多 8 个已校验的节点名称。来源 URL、节点凭据和刷新错误原文不进入回复。
@@ -384,7 +386,11 @@ python3 -B worker/tools/legacy_general_auth_candidate.py \
   SOURCE_SHA256 INVENTORY_SHA256 CONFIG_SHA256 TARGET_SHA256 PREVIEW_SHA256 WORKER_MANIFEST_SHA256 REVISION APPLIED_AT
 ```
 
-工具重建并逐文件比对通用预览。仅接受默认拒绝、无阻断的封存结果。候选包包含 `restore.sql`、`manifest.json` 和 `manifest.sha256`。SQL 限 256 KiB，并在私有临时库重放核对完整 schema、外键及数据摘要。原授权覆盖和时间、管理员及白名单标记、群范围保存在三个候选专用表中。候选保持休眠，原 Worker 迁移登记保持原样。实际向新建未绑定 D1 导入另行验收。
+工具重建并逐文件比对通用预览。仅接受默认拒绝、无阻断的封存结果。候选包包含 `restore.sql`、`manifest.json` 和 `manifest.sha256`。SQL 限 256 KiB，并在私有临时库重放核对完整 schema、外键及数据摘要。原授权覆盖和时间、管理员及白名单标记、群范围保存在三个候选专用表中。候选保持休眠，原 Worker 迁移登记保持原样。
+
+在 `worker-isolation-legacy-candidate.yml` 选择 `synthetic-legacy-general-auth`。使用同一个新的 32 位小写十六进制 `cohort` 和同一次成功的 Worker CI，依次运行 `verify`、`prepare`、`create-restore-db`、`start-import` 和 `verify-restore`。受保护步骤独立重建固定合成输入，确认候选与同一次 Worker 构建的归档相符。创建结果不明时使用既有 `pin-resource` 核对本次 D1 的身份。
+
+每轮只新建一份未绑定的 D1，操作记录写入隔离 Worker 的私有 R2 专用前缀。最终读回核对原迁移登记、三个候选表、完整 schema、外键和数据摘要。固定样例含一份休眠安装、五位用户、两个群及三条原覆盖。通用授权启用需要另行核对运行时与目标环境。
 
 ### 普通短链双账号验收
 

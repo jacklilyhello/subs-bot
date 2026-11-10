@@ -114,6 +114,24 @@ class CandidateArtifactTests(unittest.TestCase):
         (self.output / tool.package.MANIFEST).write_bytes(body)
         (self.output / tool.package.MARKER).write_text(tool.native.digest(body) + "\n", encoding="ascii")
 
+    def schema_memory_api(self):
+        native = tool.native
+
+        class SchemaMemoryAPI(native_tests.MemoryAPI):
+            def __call__(api, method, path, payload):
+                self.assertEqual((method, path), ("POST", api.root + f"/d1/database/{native_tests.RESTORE_ID}/query"))
+                self.assertEqual(set(payload), {"sql"})
+                sql = payload["sql"]
+                if native.readonly_sql(sql):
+                    self.assertLessEqual(len(sql.encode("utf-8")), tool.migrations.MAX_D1_STATEMENT_BYTES)
+                    statements = (sql,)
+                else:
+                    statements = native.readonly_schema_batch(sql)
+                    self.assertIsNotNone(statements)
+                return [{"success": True, "results": api.rows(native_tests.RESTORE_ID, statement)} for statement in statements]
+
+        return SchemaMemoryAPI()
+
     def test_sealed_synthetic_archive_and_exact_fixture_contents(self):
         report = self.build()
         candidate = self.verify(self.archive())
@@ -599,25 +617,12 @@ class CandidateArtifactTests(unittest.TestCase):
         pin = {"profile": tool.TEMP_PROFILE, "worker": self.release,
                "candidate": {**candidate.pin(), "artifactId": "123", "archiveSha256": native.digest(archive)}}
 
-        class TempMemoryAPI(native_tests.MemoryAPI):
-            def __call__(api, method, path, payload):
-                self.assertEqual((method, path), ("POST", api.root + f"/d1/database/{native_tests.RESTORE_ID}/query"))
-                self.assertEqual(set(payload), {"sql"})
-                sql = payload["sql"]
-                if native.readonly_sql(sql):
-                    self.assertLessEqual(len(sql.encode("utf-8")), tool.migrations.MAX_D1_STATEMENT_BYTES)
-                    statements = (sql,)
-                else:
-                    statements = native.readonly_schema_batch(sql)
-                    self.assertIsNotNone(statements)
-                return [{"success": True, "results": api.rows(native_tests.RESTORE_ID, statement)} for statement in statements]
-
-        api = TempMemoryAPI()
+        api = self.schema_memory_api()
         api.names = {"database": "synthetic-temp-db"}
         api.journal_prefix = "maintenance/legacy-temp-candidate/synthetic/journal/"
         source = native_tests.fake_source()
         journal = native.Journal(api, "1/1", guard=source.before_write)
-        engine = tool.TempCandidateRehearsal(api, source, journal, candidate)
+        engine = tool.D1OnlyCandidateRehearsal(api, source, journal, candidate)
         engine.observe = Mock(side_effect=lambda kind: None if kind not in api.resource else
                               native.resource_identity(kind, api.resource[kind], api.names[kind]))
         self.assertEqual(tool.run_action("prepare", engine, pin)["resourceCount"], 0)
@@ -653,6 +658,88 @@ class CandidateArtifactTests(unittest.TestCase):
             with self.assertRaises(native.RehearsalError):
                 tool.run_action("verify-restore", engine, pin)
             self.assertFalse(any(method in {"POST", "PUT", "S3 PUT"} for method, _, _ in api.calls))
+
+    def test_general_auth_profile_imports_exact_overlay_to_one_unbound_database(self):
+        native = tool.native
+        profile = tool.GENERAL_AUTH_PROFILE
+        runner = self.root / "hosted-runner-temp"
+        runner.mkdir(mode=0o755)
+        self.output = runner / tool.ARTIFACT_PREFIXES[profile]
+        report = self.build(profile)
+        self.assertEqual(set(runner.iterdir()), {self.output})
+        self.assertEqual({item.name for item in self.output.iterdir()}, {"manifest.json", "manifest.sha256", "restore.sql"})
+        archive = self.archive()
+        for other in (tool.PROFILE, tool.SHARE_PROFILE, tool.TEMP_PROFILE):
+            with self.subTest(profile=other), self.assertRaises(native.RehearsalError):
+                self.verify(archive, other)
+        candidate = self.verify(archive, profile)
+        self.assertEqual(candidate.manifest_sha, report["manifestSha256"])
+        pin = {"profile": profile, "worker": self.release,
+               "candidate": {**candidate.pin(), "artifactId": "123", "archiveSha256": native.digest(archive)}}
+
+        api = self.schema_memory_api()
+        api.profile = profile
+        api.names = {"database": "synthetic-auth-db"}
+        api.journal_prefix = "maintenance/legacy-auth-candidate/synthetic/journal/"
+        source = object.__new__(tool.CandidateSource)
+        source.api, source.scope_sha256, source.before_write = api, "f" * 64, Mock()
+        chain = tool.package.worker_artifact(self.worker, self.release["revision"],
+                                             native.file_hash(self.worker / "isolation.json")[1])[0]
+        source.objects = tool.migrations._objects(chain, len(chain), managed=True)
+        journal = native.Journal(api, "1/1", guard=source.before_write)
+        engine = tool.D1OnlyCandidateRehearsal(api, source, journal, candidate)
+        engine.observe = Mock(side_effect=lambda kind: None if kind not in api.resource else
+                              native.resource_identity(kind, api.resource[kind], api.names[kind]))
+        self.assertEqual(tool.run_action("prepare", engine, pin)["resourceCount"], 0)
+        self.assertEqual(tool.run_action("create-restore-db", engine, pin)["resourceCount"], 1)
+        self.assertEqual(set(journal.value["resources"]), {"database"})
+        with self.assertRaises(native.RehearsalError):
+            source.schema(native_tests.SOURCE_ID)
+
+        with closing(sqlite3.connect(":memory:")) as db:
+            api.db = db
+
+            def import_result(payload):
+                if payload["action"] == "init":
+                    return {"filename": "fixture.sql", "upload_url": "https://fixture.invalid/upload"}
+                self.assertEqual(payload["action"], "ingest")
+                db.executescript(candidate.sql.read_text(encoding="utf-8"))
+                return {"success": True, "status": "complete"}
+
+            api.response = import_result
+            with patch.object(native, "signed_transfer") as transfer:
+                result = tool.run_action("start-import", engine, pin)
+                transfer.assert_called_once_with("https://fixture.invalid/upload", upload=candidate.sql,
+                                                 expected_md5=candidate.document["sqlMd5"])
+            self.assertEqual((result["phase"], result["objectCount"], result["r2Closure"], result["verifiedRowCount"]),
+                             ("verified", 0, "not-applicable", len(chain) + 8))
+            self.assertIs(result["activationAllowed"], False)
+            self.assertEqual((result["verifiedGeneralAuthInstallationCount"], result["verifiedGeneralAuthPrincipalCount"],
+                              result["verifiedGeneralAuthGroupCount"], result["verifiedGeneralAuthOverrideCount"]), (1, 5, 2, 3))
+            self.assertTrue(all(bucket == native.WORKER_NAME and key.startswith(api.journal_prefix) for bucket, key in api.objects))
+            api.calls.clear()
+            self.assertEqual(tool.run_action("verify-restore", engine, pin)["verifiedDataSha256"], result["verifiedDataSha256"])
+            db.execute("CREATE TABLE unexpected_auth_overlay (id INTEGER PRIMARY KEY) STRICT")
+            with self.assertRaises(native.RehearsalError):
+                tool.run_action("verify-restore", engine, pin)
+            db.execute("DROP TABLE unexpected_auth_overlay")
+            db.execute("UPDATE general_auth_principals SET override_allowed=1 WHERE user_id='102'")
+            with self.assertRaises(native.RehearsalError):
+                tool.run_action("verify-restore", engine, pin)
+            self.assertFalse(any(method in {"POST", "PUT", "S3 PUT"} for method, _, _ in api.calls))
+
+    def test_general_auth_profile_rejects_extra_archive_members_and_resealed_sql(self):
+        profile = tool.GENERAL_AUTH_PROFILE
+        self.build(profile)
+        with self.assertRaises(tool.native.RehearsalError):
+            self.verify(self.archive(extra=True), profile)
+        sql = self.output / tool.package.SQL
+        sql.write_bytes(sql.read_bytes() + b"SELECT 1;\n")
+        document = json.loads((self.output / tool.package.MANIFEST).read_bytes())
+        document["sql"].update(bytes=sql.stat().st_size, sha256=tool.native.file_hash(sql)[1], md5=tool.native.file_hash(sql, "md5")[1])
+        self.reseal(document)
+        with self.assertRaises(tool.native.RehearsalError):
+            self.verify(self.archive(), profile)
 
 
 class CandidateBoundaryTests(unittest.TestCase):
@@ -830,13 +917,35 @@ class CandidateBoundaryTests(unittest.TestCase):
             api.r2("PUT", native.WORKER_NAME, own_journal, b"{}")
             self.assertEqual(response.call_count, 2)
 
-    def test_temp_profile_rejects_r2_checkpoints_before_reading_or_claiming_journal(self):
-        engine = Mock(resource_kinds=tool.TempCandidateRehearsal.resource_kinds)
+    def test_d1_only_profiles_reject_r2_checkpoints_before_reading_or_claiming_journal(self):
+        engine = Mock(resource_kinds=tool.D1OnlyCandidateRehearsal.resource_kinds)
         for action, resource in (("create-restore-bucket", None), ("restore-objects", None), ("pin-resource", "objects")):
             with self.subTest(action=action), self.assertRaises(tool.native.RehearsalError):
                 tool.run_action(action, engine, {}, resource=resource, identity_sha="a" * 64)
         engine.journal.load.assert_not_called()
         engine.journal.claim.assert_not_called()
+
+    def test_general_auth_scope_denies_serving_d1_other_candidates_and_snapshot_access(self):
+        native = tool.native
+        with patch.object(native, "ACCOUNT_SHA256", native.digest(native_tests.ACCOUNT.encode())), patch.object(native, "_response") as send:
+            api = native.RehearsalAPI(native_tests.TARGET, "synthetic-token", native_tests.COHORT, profile=tool.GENERAL_AUTH_PROFILE)
+            self.assertEqual(api.names, {"database": f"subs-bot-cf-legacy-auth-db-{api.cohort}"})
+            self.assertEqual(api.buckets, {native.WORKER_NAME})
+            self.assertEqual(api.journal_prefix, f"maintenance/legacy-auth-candidate/{api.cohort}/journal/")
+            d1, r2 = api.root + "/d1/database", api.root + "/r2/buckets"
+            temp_journal = f"maintenance/legacy-temp-candidate/{api.cohort}/journal/000001-" + "a" * 32 + ".json"
+            for request in (
+                lambda: api.json("GET", d1 + "?name=foreign&per_page=100"),
+                lambda: api.json("POST", api.source + "/query", {"sql": "SELECT id FROM subscriptions"}),
+                lambda: api.json("POST", api.source + "/import", {"action": "init", "etag": "a" * 32}),
+                lambda: api.json("POST", r2, {"name": "foreign", "storageClass": "Standard"}),
+                lambda: api.allow_restore(native_tests.RESTORE_ID),
+                lambda: api.r2("PUT", native.WORKER_NAME, temp_journal, b"{}"),
+                lambda: api.list_objects(native.WORKER_NAME, prefix="subscriptions/", maximum=1),
+            ):
+                with self.assertRaises(native.RehearsalError):
+                    request()
+            send.assert_not_called()
 
     def test_temp_profile_rejects_incomplete_active_worker_capability(self):
         source = object.__new__(tool.CandidateSource)
