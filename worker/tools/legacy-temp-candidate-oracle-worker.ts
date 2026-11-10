@@ -116,7 +116,7 @@ async function load(uid: number) {
   requireOracle(worker?.version === 2 && worker.revision === input.revision
     && typeof worker.compatibilityDate === "string" && /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/u.test(worker.compatibilityDate)
     && worker.migrations?.[38]?.name === MIGRATION_NAME && worker.migrations[38].sha256 === MIGRATION_SHA);
-  const script = decoder.decode(await pinnedFile(workerDir, "index.js", worker.bundleSha256, 1024 * 1024, uid));
+  const script = decoder.decode(await pinnedFile(workerDir, "index.js", worker.bundleSha256, 1152 * 1024, uid));
   const candidateDir = await pinnedDirectory(input.candidateDir, uid);
   const candidate = JSON.parse(decoder.decode(await pinnedFile(candidateDir, "manifest.json", input.candidateManifestSha256, MAX_SQL, uid)));
   const sql = await pinnedFile(candidateDir, "restore.sql", input.sqlSha256, MAX_SQL, uid);

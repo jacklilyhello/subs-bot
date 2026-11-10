@@ -141,7 +141,7 @@ async function readInputs(uid: number) {
   const manifest = JSON.parse(decoder.decode(await pinnedFile(join(directory, "isolation.json"), input.workerManifestSha256, 256 * 1024, uid)));
   requireOracle(manifest?.version === 2 && manifest.revision === input.revision && matches(DATE, manifest.compatibilityDate)
     && Array.isArray(manifest.migrations) && integer(manifest.migrations.length, 38, 100));
-  const script = decoder.decode(await pinnedFile(join(directory, "index.js"), manifest.bundleSha256, 1024 * 1024, uid));
+  const script = decoder.decode(await pinnedFile(join(directory, "index.js"), manifest.bundleSha256, 1152 * 1024, uid));
   stage = "migrations";
   let bytes = 0;
   const migrations = [];
