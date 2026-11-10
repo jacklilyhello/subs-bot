@@ -53,6 +53,7 @@ test("closed general authorization replays a sealed candidate in a separate emit
   const lifecycleSent: (GeneralAuthReplayMessage & { reply_markup?: {
     force_reply?: boolean; inline_keyboard?: { text: string; callback_data: string }[][];
   } })[] = [];
+  const lifecycleMessagesById = new Map<number, (typeof lifecycleSent)[number]>();
   const lifecycleAcks = new Set<string>();
   let lifecycleAckCalls = 0;
   let failTransport = false;
@@ -115,7 +116,9 @@ test("closed general authorization replays a sealed candidate in a separate emit
         assert.equal(request.url, api + "sendMessage");
         const message = await request.json() as (typeof lifecycleSent)[number];
         lifecycleSent.push(message);
-        return Response.json({ ok: true, result: { chat: { id: Number(message.chat_id) }, message_id: 9400 + lifecycleSent.length } });
+        const messageId = 9400 + lifecycleSent.length;
+        lifecycleMessagesById.set(messageId, message);
+        return Response.json({ ok: true, result: { chat: { id: Number(message.chat_id) }, message_id: messageId } });
       } },
     { name: "replay", modules: true, script: entry.outputFiles[0].text, compatibilityDate, d1Databases, bindings: { REPLAY_PIN: pin },
       outboundService: async (request: Request) => {
@@ -468,10 +471,11 @@ test("closed general authorization replays a sealed candidate in a separate emit
       row = await findReply(id);
     }
     assert.equal(row?.state, "sent");
-    assert.equal(typeof row?.messageId, "number");
-    const message = lifecycleSent.find(({ reply_parameters }) => reply_parameters.message_id === id);
+    const messageId = row?.messageId;
+    assert.ok(typeof messageId === "number");
+    const message = lifecycleMessagesById.get(messageId);
     assert.ok(message);
-    return { message, messageId: row!.messageId as number };
+    return { message, messageId };
   };
   const button = (message: (typeof lifecycleSent)[number], label: string) => {
     const ticket = message.reply_markup?.inline_keyboard?.flat().find(({ text }) => text.includes(label))?.callback_data;
@@ -501,6 +505,7 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.equal((await callback(7302, 101, origin(listed.messageId, 101), rename)).status, 200);
   assert.equal((await callback(7302, 101, origin(listed.messageId, 101), rename)).status, 204);
   const prompt = await awaitLifecycle(7302);
+  assert.equal(prompt.message.reply_parameters.message_id, listed.messageId);
   assert.deepEqual(prompt.message.reply_markup, { force_reply: true });
   assert.equal((await lifecyclePost(7303, 101, "Renamed lifecycle fixture", { message_id: 20_001,
     reply_to_message: origin(prompt.messageId, 101), entities: [] })).status, 200);
