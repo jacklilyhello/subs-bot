@@ -1,30 +1,48 @@
 import {
+  GENERAL_PROVIDER_BATCH_SCHEMA, GENERAL_TELEGRAM_PROVIDER_BATCH_CONFIRM_MARKER, GENERAL_TELEGRAM_PROVIDER_BATCH_PREVIEW_MARKER,
   providerHost, providerSourceDigest, telegramProviderBatchOrigin,
   TELEGRAM_PROVIDER_BATCH_CONFIRM_MARKER, TELEGRAM_PROVIDER_BATCH_PREVIEW_MARKER, type ProviderSql,
 } from "../provider-jobs.ts";
 import { SUBSCRIPTION_LIFECYCLE_REVISION, validInteger } from "../storage.ts";
 import { prepareFailedBatchTrashOffer, type FailedBatchTrashOffer } from "./bulk-trash.ts";
 import {
-  prepareTelegramProviderBatchAdmission, PROVIDER_BATCH_MAX_TARGETS, readTelegramProviderBatchProgress,
+  prepareTelegramProviderBatchAdmission, PROVIDER_BATCH_MAX_TARGETS, readTelegramProviderBatchProgress, telegramProviderBatchReady,
   type TelegramProviderBatchInput, type TelegramProviderBatchProgress,
 } from "./provider-batch.ts";
 import {
   inTelegramScope, PROVIDER_BATCH_TICKET, type TelegramEventScope, type TelegramPolicy, type TelegramProviderBatchUpdate,
 } from "./protocol.ts";
+import type { GeneralTelegramPin } from "./general-auth-runtime.ts";
+import { generalProviderAuthority } from "./general-provider.ts";
+import { GENERAL_ACTOR_QUEUE_CAPACITY, GENERAL_LATEST_ACTOR_SQL, GENERAL_NO_LEGACY_WORK, GENERAL_POLICY_ACTORS_SQL,
+  GENERAL_POLICY_PIN_SQL, GENERAL_RECEIPT_SCHEMA, generalCurrentAuthoritySql, generalPolicyBindings,
+  prepareGeneralReceiptAuthority } from "./general-receipt.ts";
 import { displayTelegramName } from "./views.ts";
 
 const STATUS_MARKER = "provider-batch-status:v1";
+const GENERAL_STATUS_MARKER = "general-provider-batch-status:v1";
 const MAX_INVENTORY = 100;
 const TICKET_SECONDS = 600;
-const REPLY_SECONDS = 900;
+export const PROVIDER_BATCH_REPLY_SECONDS = 900;
+const REPLY_SECONDS = PROVIDER_BATCH_REPLY_SECONDS;
 const RECONCILE_LIMIT = 8;
 const DIGEST = /^[0-9a-f]{64}(?![\s\S])/u;
 export const TELEGRAM_PROVIDER_BATCH_REPLY_MARKERS = [TELEGRAM_PROVIDER_BATCH_PREVIEW_MARKER, TELEGRAM_PROVIDER_BATCH_CONFIRM_MARKER, STATUS_MARKER]
   .map((marker) => `'${marker}'`).join(",");
+export const GENERAL_TELEGRAM_PROVIDER_BATCH_REPLY_MARKERS = [GENERAL_TELEGRAM_PROVIDER_BATCH_PREVIEW_MARKER,
+  GENERAL_TELEGRAM_PROVIDER_BATCH_CONFIRM_MARKER, GENERAL_STATUS_MARKER].map((marker) => `'${marker}'`).join(",");
 const markers = TELEGRAM_PROVIDER_BATCH_REPLY_MARKERS;
+type BatchPolicy = TelegramPolicy | GeneralTelegramPin;
+
+function batchMarkers(general: boolean) {
+  return general
+    ? { preview: GENERAL_TELEGRAM_PROVIDER_BATCH_PREVIEW_MARKER, confirm: GENERAL_TELEGRAM_PROVIDER_BATCH_CONFIRM_MARKER,
+      status: GENERAL_STATUS_MARKER, all: GENERAL_TELEGRAM_PROVIDER_BATCH_REPLY_MARKERS }
+    : { preview: TELEGRAM_PROVIDER_BATCH_PREVIEW_MARKER, confirm: TELEGRAM_PROVIDER_BATCH_CONFIRM_MARKER, status: STATUS_MARKER, all: markers };
+}
 type InboxAlias = "inbox" | "earlier";
 type Kind = "preview" | "empty" | "limit" | "usage" | "idle" | "status" | "terminal" | "unavailable";
-type Epoch = TelegramProviderBatchInput["epoch"];
+type Epoch = TelegramProviderBatchInput["epoch"] & { revision?: number };
 type Targets = TelegramProviderBatchInput["targets"];
 type Confirmation = Extract<TelegramProviderBatchUpdate, { kind: "confirm" }>;
 type Lease = Pick<TelegramEventScope, "actorId" | "chatId" | "chatType" | "threadId"> &
@@ -45,18 +63,36 @@ export async function telegramProviderBatchControlsReady(db: D1Database): Promis
   }
 }
 
+export async function generalTelegramProviderBatchReady(db: D1Database): Promise<boolean> {
+  return Boolean(await db.prepare(`SELECT 1 WHERE ${GENERAL_PROVIDER_BATCH_SCHEMA}`).first())
+    && await telegramProviderBatchReady(db) && await telegramProviderBatchControlsReady(db);
+}
+
+export function isGeneralProviderBatchReply(marker: string): boolean {
+  return marker === GENERAL_TELEGRAM_PROVIDER_BATCH_PREVIEW_MARKER || marker === GENERAL_TELEGRAM_PROVIDER_BATCH_CONFIRM_MARKER
+    || marker === GENERAL_STATUS_MARKER;
+}
+
+export function generalProviderBatchReplyEligible(alias: InboxAlias): string {
+  return `(${GENERAL_PROVIDER_BATCH_SCHEMA}) AND ${telegramProviderBatchReplyClock(alias, "0", true)}+ ${REPLY_SECONDS}>unixepoch()`;
+}
+
 function privateInbox(alias: InboxAlias | "preview"): string {
   return `${alias}.command='help' AND ${alias}.chat_type='private' AND ${alias}.chat_id=${alias}.actor_id AND ${alias}.thread_id IS NULL`;
 }
 
-function replyScope(alias: InboxAlias): string {
+function replyScope(alias: InboxAlias, general = false): string {
+  const marker = batchMarkers(general);
   return `(${privateInbox(alias)} AND interaction.receipt_id=${alias}.receipt_id AND (
-    (${alias}.receipt_nonce='${TELEGRAM_PROVIDER_BATCH_PREVIEW_MARKER}' AND interaction.kind IN ('preview','empty','limit'))
-    OR (${alias}.receipt_nonce='${STATUS_MARKER}' AND interaction.kind IN ('status','idle','usage'))
-    OR (${alias}.receipt_nonce='${TELEGRAM_PROVIDER_BATCH_CONFIRM_MARKER}' AND interaction.kind IN ('terminal','unavailable'))))`;
+    (${alias}.receipt_nonce='${marker.preview}' AND interaction.kind IN ('preview','empty','limit'))
+    OR (${alias}.receipt_nonce='${marker.status}' AND interaction.kind IN ('status','idle','usage'))
+    OR (${alias}.receipt_nonce='${marker.confirm}' AND interaction.kind IN ('terminal','unavailable'))))`;
 }
 
-function epochScope(policy: TelegramPolicy, alias: InboxAlias | "preview"): ProviderSql {
+function epochScope(policy: BatchPolicy, alias: InboxAlias | "preview"): ProviderSql {
+  if ("privateProvider" in policy) return { sql: generalCurrentAuthoritySql(alias, `${GENERAL_PROVIDER_BATCH_SCHEMA}
+    AND interaction.actor_role=authority.actor_role AND interaction.auth_message_date=0 AND interaction.auth_message_id=0`),
+    bindings: generalPolicyBindings(policy) };
   return { sql: `${alias}.bot_id=? AND ((${alias}.actor_id=? AND interaction.actor_role='admin'
     AND interaction.auth_message_date=0 AND interaction.auth_message_id=0) OR (${alias}.actor_id=?
     AND interaction.actor_role='member' AND ${alias}.message_date>interaction.auth_message_date AND COALESCE((
@@ -66,14 +102,14 @@ function epochScope(policy: TelegramPolicy, alias: InboxAlias | "preview"): Prov
   bindings: [policy.botId, policy.adminId, policy.memberId] };
 }
 
-export function telegramProviderBatchReplyMarker(alias: InboxAlias): string {
-  return `(${alias}.receipt_nonce IN (${markers}) AND EXISTS (
-    SELECT 1 FROM telegram_provider_batch_interactions AS interaction WHERE ${replyScope(alias)}))`;
+export function telegramProviderBatchReplyMarker(alias: InboxAlias, general = false): string {
+  return `(${alias}.receipt_nonce IN (${batchMarkers(general).all}) AND EXISTS (
+    SELECT 1 FROM telegram_provider_batch_interactions AS interaction WHERE ${replyScope(alias, general)}))`;
 }
 
-export function telegramProviderBatchReplyClock(alias: InboxAlias, fallback: string): string {
+export function telegramProviderBatchReplyClock(alias: InboxAlias, fallback: string, general = false): string {
   return `COALESCE((SELECT ready_at FROM telegram_provider_batch_interactions AS interaction
-    WHERE ${alias}.receipt_nonce IN (${markers}) AND ${replyScope(alias)}),${fallback})`;
+    WHERE ${alias}.receipt_nonce IN (${batchMarkers(general).all}) AND ${replyScope(alias, general)}),${fallback})`;
 }
 
 export function telegramProviderBatchReplyEligible(policy: TelegramPolicy | undefined, alias: InboxAlias): ProviderSql {
@@ -84,14 +120,29 @@ export function telegramProviderBatchReplyEligible(policy: TelegramPolicy | unde
   bindings: epoch.bindings };
 }
 
-function latestPreview(alias: InboxAlias | "preview"): string {
+function latestPreview(alias: InboxAlias | "preview", general = false): string {
   return `NOT EXISTS(SELECT 1 FROM telegram_inbox AS newer WHERE newer.bot_id=${alias}.bot_id AND newer.actor_id=${alias}.actor_id
-    AND newer.chat_id=${alias}.chat_id AND newer.receipt_nonce='${TELEGRAM_PROVIDER_BATCH_PREVIEW_MARKER}'
+    AND newer.chat_id=${alias}.chat_id AND newer.receipt_nonce='${batchMarkers(general).preview}'
     AND (newer.message_date,newer.message_id,newer.receipt_id)>(${alias}.message_date,${alias}.message_id,${alias}.receipt_id))`;
 }
 
-function activeEpoch(policy: TelegramPolicy, event: TelegramEventScope, epoch: Epoch): ProviderSql {
+function generalEventAuthority(policy: GeneralTelegramPin, event: TelegramEventScope): ProviderSql {
+  return { sql: `FROM ${GENERAL_POLICY_ACTORS_SQL}
+    WHERE (${GENERAL_POLICY_PIN_SQL}) AND (${GENERAL_RECEIPT_SCHEMA}) AND (${GENERAL_PROVIDER_BATCH_SCHEMA})
+      AND policy.active=1 AND (${GENERAL_NO_LEGACY_WORK}) AND actor.actor_id=? AND (${GENERAL_LATEST_ACTOR_SQL})
+      AND ?>MAX(policy.cutover_at,actor.effective_at) AND ? BETWEEN unixepoch()-900 AND unixepoch()+30
+      AND NOT EXISTS (SELECT 1 FROM telegram_general_replies WHERE bot_id=policy.bot_id AND update_id=?)`,
+    bindings: [...generalPolicyBindings(policy), event.actorId, event.messageDate, event.messageDate, event.updateId] };
+}
+
+function activeEpoch(policy: BatchPolicy, event: TelegramEventScope, epoch: Epoch): ProviderSql {
   const fresh = "? BETWEEN unixepoch()-900 AND unixepoch()+30";
+  if ("privateProvider" in policy) {
+    if (!validInteger(epoch.revision, 1)) return { sql: "0", bindings: [] };
+    const origin = generalEventAuthority(policy, event);
+    return { sql: `EXISTS (SELECT 1 ${origin.sql} AND actor.revision=? AND actor.role=? AND (${GENERAL_ACTOR_QUEUE_CAPACITY}))`,
+      bindings: [...origin.bindings, epoch.revision, epoch.role] };
+  }
   if (epoch.role === "admin") return { sql: fresh, bindings: [event.messageDate] };
   return { sql: `${fresh} AND ?>? AND COALESCE((
     SELECT allowed=1 AND message_date=? AND message_id=? FROM telegram_auth WHERE bot_id=? AND user_id=?
@@ -99,7 +150,12 @@ function activeEpoch(policy: TelegramPolicy, event: TelegramEventScope, epoch: E
     policy.botId, event.actorId, epoch.messageDate, epoch.messageId] };
 }
 
-async function readEpoch(db: D1Database, policy: TelegramPolicy, event: TelegramEventScope): Promise<Epoch | null> {
+async function readEpoch(db: D1Database, policy: BatchPolicy, event: TelegramEventScope): Promise<Epoch | null> {
+  if ("privateProvider" in policy) {
+    const origin = generalEventAuthority(policy, event);
+    return await db.prepare(`SELECT actor.role,actor.revision,0 AS messageDate,0 AS messageId ${origin.sql}`)
+      .bind(...origin.bindings).first<Epoch>();
+  }
   if (event.actorId === policy.adminId) return { role: "admin", messageDate: 0, messageId: 0 };
   const auth = await db.prepare("SELECT allowed,message_date AS messageDate,message_id AS messageId FROM telegram_auth WHERE bot_id=? AND user_id=?")
     .bind(policy.botId, event.actorId).first<{ allowed: number; messageDate: number; messageId: number }>();
@@ -109,7 +165,7 @@ async function readEpoch(db: D1Database, policy: TelegramPolicy, event: Telegram
   } : null;
 }
 
-function inbox(db: D1Database, policy: TelegramPolicy, event: TelegramEventScope, nonce: string, guard: ProviderSql): D1PreparedStatement {
+function inbox(db: D1Database, policy: BatchPolicy, event: TelegramEventScope, nonce: string, guard: ProviderSql): D1PreparedStatement {
   return db.prepare(`INSERT INTO telegram_inbox
     (bot_id,update_id,actor_id,chat_id,chat_type,message_id,message_date,thread_id,command,receipt_nonce)
     SELECT ?,?,?,?,'private',?,?,NULL,'help',? WHERE ${guard.sql}
@@ -149,15 +205,17 @@ async function capturePreview(db: D1Database, event: TelegramEventScope, guard: 
 }
 
 async function acceptMessage(
-  db: D1Database, policy: TelegramPolicy, event: TelegramProviderBatchUpdate, admissionEnabled: boolean,
+  db: D1Database, policy: BatchPolicy, event: TelegramProviderBatchUpdate, admissionEnabled: boolean,
 ): Promise<"accepted" | "ignored"> {
   if (!admissionEnabled && event.kind !== "status") return "ignored";
+  const general = "privateProvider" in policy;
+  const marker = batchMarkers(general);
   const epoch = await readEpoch(db, policy, event);
   if (!epoch) return "ignored";
   const guard = activeEpoch(policy, event, epoch);
   let reply: Presentation;
   if (event.kind === "status") {
-    const progress = await readTelegramProviderBatchProgress(db, policy, event.actorId);
+    const progress = await readTelegramProviderBatchProgress(db, general ? generalProviderAuthority(policy, true) : policy, event.actorId);
     if (!progress && !admissionEnabled) return "ignored";
     reply = { kind: progress ? "status" : "idle", batchId: progress?.batchId ?? null, targets: null, skippedCount: 0 };
   } else {
@@ -169,6 +227,7 @@ async function acceptMessage(
   const fresh = "bot_id=? AND update_id=? AND receipt_nonce=?";
   const result = await db.batch([
     inbox(db, policy, event, nonce, guard),
+    ...(general ? [prepareGeneralReceiptAuthority(db, policy, key)] : []),
     db.prepare(`INSERT INTO telegram_provider_batch_interactions
       (receipt_id,kind,batch_id,actor_role,auth_message_date,auth_message_id,ready_at,targets,skipped_count)
       SELECT receipt_id,?,?,?,?,?,received_at,?,? FROM telegram_inbox WHERE ${fresh}`)
@@ -176,9 +235,10 @@ async function acceptMessage(
     db.prepare(`INSERT INTO telegram_outbox (receipt_id) SELECT receipt_id FROM telegram_inbox WHERE ${fresh}`).bind(...key),
     db.prepare(`UPDATE telegram_inbox AS inbox SET receipt_nonce=?,command=CASE WHEN EXISTS (
       SELECT 1 FROM telegram_provider_batch_interactions JOIN telegram_outbox USING(receipt_id) WHERE receipt_id=inbox.receipt_id
-    ) THEN command END WHERE ${fresh}`).bind(event.kind === "preview" ? TELEGRAM_PROVIDER_BATCH_PREVIEW_MARKER : STATUS_MARKER, ...key),
+    ) ${general ? "AND EXISTS (SELECT 1 FROM telegram_general_receipt WHERE receipt_id=inbox.receipt_id)" : ""}
+      THEN command END WHERE ${fresh}`).bind(event.kind === "preview" ? marker.preview : marker.status, ...key),
   ]);
-  if (result.length !== 4 || result.some(({ success, meta }) => !success || meta.changes !== result[0].meta.changes)
+  if (result.length !== (general ? 5 : 4) || result.some(({ success, meta }) => !success || meta.changes !== result[0].meta.changes)
     || !validInteger(result[0].meta.changes, 0, 1)) throw new Error("Telegram provider batch receipt could not be recorded.");
   return result[0].meta.changes === 1 ? "accepted" : "ignored";
 }
@@ -186,41 +246,54 @@ async function acceptMessage(
 const ticketFrom = `FROM telegram_provider_batch_interactions AS interaction
   JOIN telegram_inbox AS preview USING(receipt_id) JOIN telegram_outbox AS sent USING(receipt_id)`;
 
-function ticketScope(policy: TelegramPolicy, event: Confirmation, digest: string): ProviderSql {
+function ticketScope(policy: BatchPolicy, event: Confirmation, digest: string): ProviderSql {
+  const general = "privateProvider" in policy;
+  const marker = batchMarkers(general);
   const epoch = epochScope(policy, "preview");
   return { sql: `interaction.token_sha256=? AND interaction.kind='preview' AND interaction.used_by_receipt_id IS NULL
-    AND interaction.expires_at>unixepoch() AND preview.receipt_nonce='${TELEGRAM_PROVIDER_BATCH_PREVIEW_MARKER}'
+    AND interaction.expires_at>unixepoch() AND preview.receipt_nonce='${marker.preview}'
     AND ${privateInbox("preview")} AND preview.actor_id=? AND sent.state='sent' AND sent.sent_message_id=?
-    AND sent.attempts=interaction.origin_attempt AND ${latestPreview("preview")}
+    AND sent.attempts=interaction.origin_attempt AND ${latestPreview("preview", general)}
     AND ? BETWEEN unixepoch()-900 AND unixepoch()+30 AND ?>interaction.auth_message_date AND (${epoch.sql})`,
   bindings: [digest, event.actorId, event.messageId, event.messageDate, event.messageDate, ...epoch.bindings] };
 }
 
-async function acceptConfirmation(db: D1Database, policy: TelegramPolicy, event: Confirmation): Promise<"accepted" | "ignored"> {
+async function acceptConfirmation(db: D1Database, policy: BatchPolicy, event: Confirmation): Promise<"accepted" | "ignored"> {
   if (!PROVIDER_BATCH_TICKET.test(event.ticket)) return "ignored";
+  const general = "privateProvider" in policy;
+  const marker = batchMarkers(general);
+  const epoch = general ? await readEpoch(db, policy, event) : null;
+  if (general && !epoch) return "ignored";
+  const current = epoch ? activeEpoch(policy, event, epoch) : null;
+  const nonce = general ? crypto.randomUUID() : marker.confirm;
+  const fresh = [policy.botId, event.updateId, nonce] as const;
   const digest = await providerSourceDigest(event.ticket);
   const ticket = ticketScope(policy, event, digest);
   const origin = await db.prepare(`SELECT preview.receipt_id AS previewReceiptId,interaction.targets,interaction.skipped_count AS skippedCount,
     interaction.origin_attempt AS originAttempt,interaction.actor_role AS role,interaction.auth_message_date AS messageDate,
     interaction.auth_message_id AS messageId ${ticketFrom} WHERE ${ticket.sql}`)
     .bind(...ticket.bindings).first<{ previewReceiptId: number; targets: string; skippedCount: number; originAttempt: number } & Epoch>();
-  if (!origin) return "ignored";
+  if (!origin || (epoch && origin.role !== epoch.role)) return "ignored";
   const guard = { sql: `EXISTS(SELECT 1 ${ticketFrom} WHERE ${ticket.sql} AND preview.receipt_id=? AND interaction.targets=?
     AND interaction.skipped_count=? AND interaction.origin_attempt=? AND interaction.actor_role=?
     AND interaction.auth_message_date=? AND interaction.auth_message_id=?)`,
     bindings: [...ticket.bindings, origin.previewReceiptId, origin.targets, origin.skippedCount, origin.originAttempt,
       origin.role, origin.messageDate, origin.messageId] };
-  const core = await prepareTelegramProviderBatchAdmission(db, policy, {
+  const admission = current ? { sql: `(${guard.sql}) AND (${current.sql})`,
+    bindings: [...guard.bindings, ...current.bindings] } : guard;
+  const core = await prepareTelegramProviderBatchAdmission(db, general ? generalProviderAuthority(policy, true) : policy, {
     previewReceiptId: origin.previewReceiptId, confirmation: event, originAttempt: origin.originAttempt,
     epoch: { role: origin.role, messageDate: origin.messageDate, messageId: origin.messageId },
     targets: targetsFrom(origin.targets), skippedCount: origin.skippedCount,
-  }, { read: guard, commit: { sql: `changes()=1 AND ${guard.sql}`, bindings: guard.bindings } });
+  }, { read: guard, commit: { sql: `changes()=1 AND ${guard.sql}`, bindings: guard.bindings },
+    ...(general ? { confirmationNonce: nonce } : {}) });
   const exact = `inbox.bot_id=? AND inbox.update_id=? AND inbox.actor_id=? AND inbox.chat_id=?
     AND inbox.message_id=? AND inbox.message_date=? AND ${privateInbox("inbox")}
-    AND inbox.receipt_nonce='${TELEGRAM_PROVIDER_BATCH_CONFIRM_MARKER}'`;
-  const key = [policy.botId, event.updateId, event.actorId, event.chatId, event.messageId, event.messageDate];
+    AND inbox.receipt_nonce=?`;
+  const key = [policy.botId, event.updateId, event.actorId, event.chatId, event.messageId, event.messageDate, nonce];
   const result = await db.batch([
-    inbox(db, policy, event, TELEGRAM_PROVIDER_BATCH_CONFIRM_MARKER, guard),
+    inbox(db, policy, event, nonce, admission),
+    ...(general ? [prepareGeneralReceiptAuthority(db, policy, fresh)] : []),
     ...(core ?? []),
     db.prepare(`UPDATE telegram_provider_batch_interactions SET used_by_receipt_id=(
       SELECT inbox.receipt_id FROM telegram_inbox AS inbox WHERE ${exact}
@@ -242,16 +315,21 @@ async function acceptConfirmation(db: D1Database, policy: TelegramPolicy, event:
           WHERE receipt_id=inbox.receipt_id AND kind='unavailable'))
     )) THEN 1 ELSE json_extract('batch confirmation guard failed','$') END`)
       .bind(...key, origin.previewReceiptId, origin.previewReceiptId),
+    ...(general ? [db.prepare(`UPDATE telegram_inbox AS inbox SET receipt_nonce=?,command=CASE WHEN EXISTS (
+      SELECT 1 FROM telegram_general_receipt WHERE receipt_id=inbox.receipt_id AND actor_role=?
+    ) THEN command END WHERE ${exact}`).bind(marker.confirm, origin.role, ...key)] : []),
   ]);
-  if (result.length !== (core?.length ?? 0) + 5 || result.some(({ success }) => !success)
+  if (result.length !== (core?.length ?? 0) + (general ? 7 : 5) || result.some(({ success }) => !success)
     || !validInteger(result[0].meta.changes, 0, 1)) throw new Error("Telegram provider batch confirmation could not be recorded.");
   return result[0].meta.changes === 1 ? "accepted" : "ignored";
 }
 
 export async function acceptTelegramProviderBatchControl(
-  db: D1Database, policy: TelegramPolicy, event: TelegramProviderBatchUpdate, admissionEnabled: boolean,
+  db: D1Database, policy: BatchPolicy, event: TelegramProviderBatchUpdate, admissionEnabled: boolean,
 ): Promise<"accepted" | "ignored"> {
-  if (!inTelegramScope(policy, event) || event.chatType !== "private" || event.threadId !== null || event.chatId !== event.actorId
+  const scoped = "privateProvider" in policy ? policy.privateProvider && policy.providerBatch === true
+    && !policy.rehearsal && event.actorId !== policy.botId : inTelegramScope(policy, event);
+  if (!scoped || event.chatType !== "private" || event.threadId !== null || event.chatId !== event.actorId
     || ![event.updateId, event.messageId, event.messageDate].every((value) => validInteger(value, 1))) return "ignored";
   try {
     if (event.kind === "confirm") return admissionEnabled ? await acceptConfirmation(db, policy, event) : "ignored";
@@ -291,10 +369,10 @@ const resultCategories = {
 const resultLabels = { saved: "已保存", failed: "失败", stale: "已变更", expired: "超时" } as const;
 
 async function renderTerminalResults(
-  db: D1Database, policy: TelegramPolicy, actorId: string, progress: TelegramProviderBatchProgress,
+  db: D1Database, policy: BatchPolicy, actorId: string, progress: TelegramProviderBatchProgress,
 ): Promise<string | null> {
   if (!validInteger(progress.targetCount, 1, PROVIDER_BATCH_MAX_TARGETS)) return null;
-  const origin = telegramProviderBatchOrigin(policy);
+  const origin = telegramProviderBatchOrigin("privateProvider" in policy ? generalProviderAuthority(policy, true) : policy);
   try {
     const rows = await db.prepare(`SELECT job.ordinal,job.subscription_id AS id,job.result_code AS result,
       CASE WHEN job.result_code<>'stale-target' AND COALESCE(lifecycle.revision,0)=job.expected_lifecycle_revision
@@ -326,33 +404,35 @@ async function renderTerminalResults(
 }
 
 export async function renderTelegramProviderBatchReply(
-  db: D1Database, policy: TelegramPolicy, lease: Lease,
+  db: D1Database, policy: BatchPolicy, lease: Lease,
 ): Promise<TelegramProviderBatchDelivery | null> {
-  if (!inTelegramScope(policy, lease) || lease.chatType !== "private" || lease.threadId !== null) return null;
+  const general = "privateProvider" in policy;
+  if (!(general ? policy.providerBatch === true && !policy.rehearsal && lease.actorId !== policy.botId : inTelegramScope(policy, lease))
+    || lease.chatType !== "private" || lease.chatId !== lease.actorId || lease.threadId !== null) return null;
   const epoch = epochScope(policy, "inbox");
   const reply = await db.prepare(`SELECT interaction.kind,interaction.targets,interaction.batch_id AS batchId,
-    interaction.skipped_count AS skippedCount,(${latestPreview("inbox")}) AS newest
+    interaction.skipped_count AS skippedCount,(${latestPreview("inbox", general)}) AS newest
     FROM telegram_inbox AS inbox JOIN telegram_outbox AS delivery USING(receipt_id)
     JOIN telegram_provider_batch_interactions AS interaction USING(receipt_id)
     WHERE inbox.receipt_id=? AND inbox.actor_id=? AND inbox.chat_id=? AND delivery.state='leased'
       AND delivery.lease_id=? AND delivery.attempts=? AND delivery.lease_until>unixepoch()
-      AND ${replyScope("inbox")} AND (${epoch.sql})`)
+      AND ${replyScope("inbox", general)} AND (${epoch.sql})`)
     .bind(lease.receiptId, lease.actorId, lease.chatId, lease.leaseId, lease.attempts, ...epoch.bindings)
     .first<Presentation & { newest: number }>();
   if (!reply || (reply.kind === "preview" && reply.newest !== 1)) return null;
   const guard = { sql: `EXISTS(SELECT 1 FROM telegram_provider_batch_interactions AS interaction
-    WHERE ${replyScope("inbox")} AND (${epoch.sql}) AND interaction.kind=? AND COALESCE(interaction.batch_id,-1)=?
+    WHERE ${replyScope("inbox", general)} AND (${epoch.sql}) AND interaction.kind=? AND COALESCE(interaction.batch_id,-1)=?
       AND interaction.skipped_count=?
-      ${reply.kind === "preview" ? `AND interaction.targets=? AND interaction.used_by_receipt_id IS NULL AND ${latestPreview("inbox")}` : ""})`,
+      ${reply.kind === "preview" ? `AND interaction.targets=? AND interaction.used_by_receipt_id IS NULL AND ${latestPreview("inbox", general)}` : ""})`,
     bindings: [...epoch.bindings, reply.kind, reply.batchId ?? -1, reply.skippedCount,
       ...(reply.kind === "preview" ? [reply.targets!] : [])] };
   if (reply.kind === "status" || reply.kind === "terminal") {
-    const progress = await readTelegramProviderBatchProgress(db, policy, lease.actorId, reply.batchId!);
+    const progress = await readTelegramProviderBatchProgress(db, general ? generalProviderAuthority(policy, true) : policy, lease.actorId, reply.batchId!);
     if (!progress || (reply.kind === "terminal" && progress.finishedAt === null)) return null;
     const text = renderProgress(progress);
     if (progress.finishedAt === null) return { text, guard };
     const details = await renderTerminalResults(db, policy, lease.actorId, progress);
-    const cleanup = reply.kind === "terminal" && details !== null && progress.failed > 0
+    const cleanup = !general && reply.kind === "terminal" && details !== null && progress.failed > 0
       ? await prepareFailedBatchTrashOffer(db, policy, lease) : null;
     const presentation = { text: text + (details ?? "\n暂时无法核对逐条结果。"), guard: {
       sql: `(${guard.sql}) AND EXISTS (SELECT 1 FROM telegram_provider_batches AS batch
@@ -380,8 +460,9 @@ export function installTelegramProviderBatchTicket(db: D1Database, lease: Lease,
     .bind(sha256, lease.attempts, lease.receiptId, lease.receiptId, lease.leaseId, lease.attempts);
 }
 
-export async function reconcileTelegramProviderBatchReplies(db: D1Database, policy: TelegramPolicy): Promise<number> {
-  const origin = telegramProviderBatchOrigin(policy);
+export async function reconcileTelegramProviderBatchReplies(db: D1Database, policy: BatchPolicy): Promise<number> {
+  const general = "privateProvider" in policy;
+  const origin = telegramProviderBatchOrigin(general ? generalProviderAuthority(policy, true) : policy);
   const epoch = epochScope(policy, "inbox");
   try {
     const steps = [
@@ -395,7 +476,7 @@ export async function reconcileTelegramProviderBatchReplies(db: D1Database, poli
       db.prepare(`INSERT INTO telegram_outbox (receipt_id)
         SELECT inbox.receipt_id FROM telegram_inbox AS inbox JOIN telegram_provider_batch_interactions AS interaction USING(receipt_id)
         WHERE interaction.kind='terminal' AND interaction.ready_at>unixepoch()-${REPLY_SECONDS}
-          AND ${replyScope("inbox")} AND (${epoch.sql}) AND NOT EXISTS(SELECT 1 FROM telegram_outbox WHERE receipt_id=inbox.receipt_id)
+          AND ${replyScope("inbox", general)} AND (${epoch.sql}) AND NOT EXISTS(SELECT 1 FROM telegram_outbox WHERE receipt_id=inbox.receipt_id)
         ORDER BY interaction.ready_at,inbox.receipt_id LIMIT ${RECONCILE_LIMIT}`).bind(...epoch.bindings),
     ];
     const result = await db.batch(steps);
@@ -406,12 +487,14 @@ export async function reconcileTelegramProviderBatchReplies(db: D1Database, poli
   }
 }
 
-export async function reapTelegramProviderBatchTickets(db: D1Database): Promise<void> {
+export async function reapTelegramProviderBatchTickets(db: D1Database, general?: GeneralTelegramPin): Promise<void> {
   try {
+    const scope = general ? `AND EXISTS (SELECT 1 FROM telegram_inbox WHERE receipt_id=interaction.receipt_id
+      AND bot_id=? AND receipt_nonce='${GENERAL_TELEGRAM_PROVIDER_BATCH_PREVIEW_MARKER}')` : "";
     const result = await db.prepare(`UPDATE telegram_provider_batch_interactions SET token_sha256=NULL,origin_attempt=NULL,expires_at=NULL
-      WHERE receipt_id IN (SELECT receipt_id FROM telegram_provider_batch_interactions
-        WHERE token_sha256 IS NOT NULL AND used_by_receipt_id IS NULL AND expires_at<=unixepoch()
-        ORDER BY expires_at,receipt_id LIMIT 40)`).run();
+      WHERE receipt_id IN (SELECT receipt_id FROM telegram_provider_batch_interactions AS interaction
+        WHERE token_sha256 IS NOT NULL AND used_by_receipt_id IS NULL AND expires_at<=unixepoch() ${scope}
+        ORDER BY expires_at,receipt_id LIMIT 40)`).bind(...(general ? [general.botId] : [])).run();
     if (result.success) return;
   } catch {
     // Diagnostics do not expose capability or backend values.

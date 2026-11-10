@@ -53,7 +53,7 @@ import {
 } from "./telegram/api-status.ts";
 import { reconcileTelegramProviderBatches, telegramProviderBatchReady } from "./telegram/provider-batch.ts";
 import {
-  acceptTelegramProviderBatchControl, reapTelegramProviderBatchTickets, reconcileTelegramProviderBatchReplies,
+  acceptTelegramProviderBatchControl, generalTelegramProviderBatchReady, reapTelegramProviderBatchTickets, reconcileTelegramProviderBatchReplies,
   telegramProviderBatchControlsReady,
 } from "./telegram/provider-batch-controls.ts";
 import { parseTelegramProviderText, reconcileTelegramProviderReplies, telegramProviderRepliesReady } from "./telegram/provider-replies.ts";
@@ -223,10 +223,13 @@ async function telegramWebhook(request: Request, env: Env, publicOrigin: PublicO
       const share = general.privateShareCreation ? await telegramPrivateShareRuntime(env.DB,
         env.TELEGRAM_PRIVATE_SHARE_CREATION_KEY, false, `general-bot-${general.botId}`) : undefined;
       const aggregateKey = general.privateAggregate ? await parseTelegramAggregateKey(env.TELEGRAM_AGGREGATE_KEY) : null;
+      if (general.providerBatch && !await generalTelegramProviderBatchReady(env.DB)) return plain("Service unavailable.", 503, false);
+      const batchAdmission = general.providerBatch === true && env.TELEGRAM_PROVIDER_BATCH_REFRESH === "1"
+        && await generalProviderAdmissionReady(env);
       const status = general.sharedOutbox ? await acceptGeneralSharedTelegramCommand(env.DB, general, request,
         (callbackId, answer) => ctx?.waitUntil(answerTelegramCallback(general, callbackId, answer)), providerAvailable, refreshAvailable,
         share ? { bucket: env.NODES, runtime: share, publicOrigin } : undefined, aggregateKey, env.TELEGRAM_INLINE_SEARCH === "1",
-        generalProviderDocumentsEnabled(env))
+        generalProviderDocumentsEnabled(env), batchAdmission)
         : await acceptGeneralTelegramCommand(env.DB, general, request);
       if (status === 200) {
         const delivery = general.sharedOutbox
@@ -757,13 +760,16 @@ async function scheduled(_controller: ScheduledController, env: Env): Promise<vo
         } finally {
           try {
             if (general.privateProvider && await generalProviderSchemaReady(env.DB)) {
-              const authority = generalProviderAuthority(general);
+              const batch = general.providerBatch === true;
+              if (batch && !await generalTelegramProviderBatchReady(env.DB)) throw new Error("General provider batch schema is unavailable.");
+              const authority = generalProviderAuthority(general, batch);
+              const queueReady = await telegramProviderQueueReady(env, pin);
               try {
-                if (await telegramProviderQueueReady(env, pin)) {
+                const journalReady = queueReady && await providerSnapshotJournalReady(env.DB);
+                if (batch) await reconcileTelegramProviderBatches(env.DB, authority, journalReady);
+                if (queueReady) {
                   try {
-                    if (authority.includeDocuments && await providerSnapshotJournalReady(env.DB)) {
-                      await promoteTelegramProviderDocument(env.DB, authority, false);
-                    }
+                    if (authority.includeDocuments && journalReady) await promoteTelegramProviderDocument(env.DB, authority, batch);
                   } finally {
                     await runOneProviderJob(env.DB, env.NODES, env.PROVIDER_FETCH, pin, authority);
                   }
@@ -772,9 +778,17 @@ async function scheduled(_controller: ScheduledController, env: Env): Promise<vo
                 try {
                   await reconcileTelegramProviderReplies(env.DB, authority);
                 } finally {
-                  if (authority.includeDocuments) {
-                    await settleTelegramProviderDocuments(env.DB, authority);
-                    await reconcileTelegramProviderDocumentReplies(env.DB, authority);
+                  try {
+                    if (authority.includeDocuments) {
+                      await settleTelegramProviderDocuments(env.DB, authority);
+                      await reconcileTelegramProviderDocumentReplies(env.DB, authority);
+                    }
+                  } finally {
+                    if (batch) {
+                      await reconcileTelegramProviderBatches(env.DB, authority, false);
+                      await reconcileTelegramProviderBatchReplies(env.DB, general);
+                      await reapTelegramProviderBatchTickets(env.DB, general);
+                    }
                   }
                 }
               }

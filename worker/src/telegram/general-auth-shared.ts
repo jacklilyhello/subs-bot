@@ -40,6 +40,9 @@ import { parseTelegramProviderUrlMessage } from "./provider-document-input.ts";
 import { GENERAL_TELEGRAM_PROVIDER_DOCUMENT_MARKER } from "./provider-document-origin.ts";
 import { generalProviderDocumentReplyEligibility, generalProviderDocumentReplyScope,
   renderTelegramProviderDocumentReply } from "./provider-document-replies.ts";
+import { acceptTelegramProviderBatchControl, GENERAL_TELEGRAM_PROVIDER_BATCH_REPLY_MARKERS, generalProviderBatchReplyEligible,
+  installTelegramProviderBatchTicket, isGeneralProviderBatchReply, renderTelegramProviderBatchReply,
+  telegramProviderBatchReplyMarker } from "./provider-batch-controls.ts";
 import { generalProviderRefreshReady, insertTelegramProviderRefreshTicket, prepareTelegramProviderRefreshButton,
   reapTelegramProviderRefreshTickets, type TelegramProviderRefreshTicket } from "./provider-refresh.ts";
 import { generalProviderReplyEligibility, generalProviderReplyScope, parseTelegramProviderText, renderTelegramProviderReply,
@@ -50,7 +53,7 @@ import { acceptTelegramSelected, GENERAL_SELECTED_SCHEMA, GENERAL_TELEGRAM_SELEC
 import { acceptTelegramShortLink, GENERAL_SHORT_SCHEMA, GENERAL_TELEGRAM_SHORT_MARKER, prepareTelegramShortLinkReply,
   reapFailedTelegramShortLinks, retireUnsentTelegramShortLink } from "./short-link-actions.ts";
 import { GROUP_SHARE_PUBLISH_CALLBACK, readGeneralGroupShare, readGeneralPrivateDocumentUpdate, readGeneralPrivateLifecycleUpdate, readGeneralPrivateSubscriptionRead,
-  readGeneralInlineQuery, readGeneralPrivateProviderRefresh, readGeneralPrivateSelectedRevoke, readGeneralPrivateShareClaim, readGeneralPrivateShareCreation,
+  readGeneralInlineQuery, readGeneralPrivateProviderBatch, readGeneralPrivateProviderRefresh, readGeneralPrivateSelectedRevoke, readGeneralPrivateShareClaim, readGeneralPrivateShareCreation,
   readGeneralPrivateTempUpdate, readPrivateTelegramCommand, readTelegramUpdate } from "./protocol.ts";
 import { confirmTelegramSubscriptionReadSend, GENERAL_SUBSCRIPTION_READ_MARKER, insertTelegramSubscriptionReadTickets,
   prepareTelegramSubscriptionReadTickets, reapTelegramSubscriptionReadTickets,
@@ -159,6 +162,8 @@ function family(alias: "inbox" | "earlier", group: boolean, pin: GeneralTelegram
     THEN (${privateScope} AND ${alias}.command IN ('auth-add','auth-remove','auth-list') AND ${GENERAL_AUTH_ACTION_SCHEMA})
     ${pin.providerDocumentReplies ? `WHEN ${alias}.receipt_nonce='${GENERAL_TELEGRAM_PROVIDER_DOCUMENT_MARKER}'
     THEN (${generalProviderDocumentReplyScope(alias)})` : ""}
+    ${pin.providerBatch ? `WHEN ${alias}.receipt_nonce IN (${GENERAL_TELEGRAM_PROVIDER_BATCH_REPLY_MARKERS})
+      THEN (${telegramProviderBatchReplyMarker(alias, true)})` : ""}
     ${pin.privateInline ? `WHEN ${alias}.receipt_nonce='${GENERAL_INLINE_CONSENT_MARKER}'
     THEN (${privateScope} AND ${alias}.command='help' AND (${GENERAL_INLINE_SCHEMA})
       AND EXISTS (SELECT 1 FROM telegram_inline_search_consent AS consent
@@ -198,7 +203,8 @@ function queueMarkers(group: boolean, pin: GeneralTelegramPin): string {
   if (pin.privateShort) markers.push(GENERAL_TELEGRAM_SHORT_MARKER);
   if (pin.privateInline) markers.push(GENERAL_INLINE_CONSENT_MARKER);
   if (!pin.rehearsal) markers.push(GENERAL_AUTH_ACTION_MARKER);
-  return markers.map((marker) => `'${marker}'`).join(",");
+  const regular = markers.map((marker) => `'${marker}'`).join(",");
+  return pin.providerBatch ? `${regular},${GENERAL_TELEGRAM_PROVIDER_BATCH_REPLY_MARKERS}` : regular;
 }
 
 function current(alias: "inbox" | "earlier", group: boolean, pin: GeneralTelegramPin): string {
@@ -217,15 +223,20 @@ function current(alias: "inbox" | "earlier", group: boolean, pin: GeneralTelegra
     ${pin.providerDocumentReplies ? `WHEN ${alias}.receipt_nonce='${GENERAL_TELEGRAM_PROVIDER_DOCUMENT_MARKER}'
     THEN (${generalProviderDocumentReplyEligibility(alias)})` : ""} ELSE (${ordinaryClock}) END)` : ordinaryClock;
   const ordinary = `${clock} AND ${generalCurrentAuthoritySql(alias, `${groupScope} AND ${pathScope}${tempScope}${laneScope}${claimScope}${authScope}`)}`;
-  return hasGeneralGroupShare(pin) ? `(CASE WHEN ${alias}.receipt_nonce='${TELEGRAM_GENERAL_GROUP_CLAIM_MARKER}'
+  const card = hasGeneralGroupShare(pin) ? `WHEN ${alias}.receipt_nonce='${TELEGRAM_GENERAL_GROUP_CLAIM_MARKER}'
     THEN (${ordinaryClock} AND ${generalCurrentAuthoritySql(alias,
-      `${GENERAL_PRIVATE_CLAIM_SCHEMA} AND ${GENERAL_GROUP_CARD_SCHEMA} AND ${approvedGroup()}`)})
-    ELSE (${ordinary}) END)` : ordinary;
+      `${GENERAL_PRIVATE_CLAIM_SCHEMA} AND ${GENERAL_GROUP_CARD_SCHEMA} AND ${approvedGroup()}`)})` : "";
+  const batch = pin.providerBatch ? `WHEN ${alias}.receipt_nonce IN (${GENERAL_TELEGRAM_PROVIDER_BATCH_REPLY_MARKERS})
+    THEN (${generalProviderBatchReplyEligible(alias)} AND ${generalCurrentAuthoritySql(alias)})` : "";
+  return card || batch ? `(CASE ${card} ${batch} ELSE (${ordinary}) END)` : ordinary;
 }
 
 function currentBindings(pin: GeneralTelegramPin) {
-  const ordinary = [...generalPolicyBindings(pin), ...generalReadLaneRoleBindings(pin)];
-  return hasGeneralGroupShare(pin) ? [...generalPolicyBindings(pin), ...generalGroupShareBindings(pin), ...ordinary] : ordinary;
+  return [
+    ...(hasGeneralGroupShare(pin) ? [...generalPolicyBindings(pin), ...generalGroupShareBindings(pin)] : []),
+    ...(pin.providerBatch ? generalPolicyBindings(pin) : []),
+    ...generalPolicyBindings(pin), ...generalReadLaneRoleBindings(pin),
+  ];
 }
 
 function readGeneralTempReply(db: D1Database, receiptId: number) {
@@ -238,7 +249,7 @@ export async function acceptGeneralSharedTelegramCommand(
   db: D1Database, pin: GeneralTelegramPin, request: Request, acknowledge?: (callbackId: string, answer?: string) => void,
   providerAvailable?: () => Promise<boolean>, refreshAvailable?: () => Promise<boolean>,
   share?: { bucket: R2Bucket; runtime: TelegramPrivateShareRuntime; publicOrigin: PublicOrigin }, aggregateKey?: CryptoKey | null,
-  inlineEnabled = false, providerDocumentsEnabled = false,
+  inlineEnabled = false, providerDocumentsEnabled = false, batchAdmission = false,
 ): Promise<number> {
   const decoded = await readTelegramUpdate(request, pin.webhookSecret);
   if (decoded.status !== 200) return decoded.status;
@@ -292,11 +303,17 @@ export async function acceptGeneralSharedTelegramCommand(
   const claim = pin.privateClaims
     ? readGeneralPrivateShareClaim(decoded.update, decoded.updateId, pin.botId, pin.botUsername) : null;
   if (claim) return await acceptTelegramPrivateClaim(db, pin, claim) === "accepted" ? 200 : 204;
+  const batch = pin.providerBatch ? readGeneralPrivateProviderBatch(decoded.update, decoded.updateId, pin.botId, pin.botUsername) : null;
+  if (batch) {
+    const accepted = await acceptTelegramProviderBatchControl(db, pin, batch, batchAdmission) === "accepted";
+    if (batch.kind === "confirm" && accepted) acknowledge?.(batch.callbackId);
+    return accepted ? 200 : 204;
+  }
   const refresh = pin.privateProvider ? readGeneralPrivateProviderRefresh(decoded.update, decoded.updateId, pin.botId) : null;
   if (refresh) {
     if (!refreshAvailable) return 204;
     if (!await refreshAvailable()) return 503;
-    const accepted = await acceptGeneralProviderRequest(db, pin, { ...refresh, kind: "refresh" });
+    const accepted = await acceptGeneralProviderRequest(db, pin, { ...refresh, kind: "refresh" }, pin.providerBatch === true);
     if (accepted) acknowledge?.(refresh.callbackId);
     return accepted ? 200 : 204;
   }
@@ -323,7 +340,7 @@ export async function acceptGeneralSharedTelegramCommand(
       // A bare pipe can be a compact URL/key pair. An escaped pipe is part of the URL.
       if (url.name === undefined && url.sourceUrl.includes("|")) return 204;
       if (!await providerAvailable()) return 503;
-      return await acceptGeneralProviderRequest(db, pin, { ...event, ...url, kind: "url-import" }) ? 200 : 204;
+      return await acceptGeneralProviderRequest(db, pin, { ...event, ...url, kind: "url-import" }, pin.providerBatch === true) ? 200 : 204;
     }
     const urls = providerDocumentsEnabled ? parseTelegramProviderUrlMessage(text) : null;
     if (urls) {
@@ -506,7 +523,8 @@ function selectLease(
   const selected = pin.privateSelected && lease.marker === GENERAL_TELEGRAM_SELECTED_MARKER;
   const short = pin.privateShort && lease.marker === GENERAL_TELEGRAM_SHORT_MARKER;
   const providerDocument = pin.providerDocumentReplies && lease.marker === GENERAL_TELEGRAM_PROVIDER_DOCUMENT_MARKER;
-  const supported = groupClaim ? groupClaimFamily("inbox") : aggregate ? aggregateFamily("inbox")
+  const batch = pin.providerBatch && isGeneralProviderBatchReply(lease.marker);
+  const supported = batch ? telegramProviderBatchReplyMarker("inbox", true) : groupClaim ? groupClaimFamily("inbox") : aggregate ? aggregateFamily("inbox")
     : selected ? selectedFamily("inbox") : short ? shortFamily("inbox")
     : providerDocument ? generalProviderDocumentReplyScope("inbox") : typedShort
       ? `inbox.receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MARKER}' AND inbox.command='help'
@@ -522,9 +540,10 @@ function selectLease(
   const exactBindings = [pin.botId, lease.receiptId, lease.updateId, lease.actorId, lease.chatId, lease.chatType, lease.threadId,
     lease.messageId, lease.messageDate, lease.command, lease.marker, lease.actorRevision, lease.actorRole,
     ...generalPolicyBindings(pin, lease.generation), ...(claim ? [lease.claimCodeSha256] : [])];
-  const simpleAuthority = aggregate || selected || short || groupClaim || typedShort !== undefined;
+  const simpleAuthority = aggregate || selected || short || groupClaim || batch || typedShort !== undefined;
   const eligible = !authorizing ? "1" : simpleAuthority
-    ? `${generalOrdinaryReplyEligibilitySql("inbox")} AND ${generalCurrentAuthoritySql("inbox")}` : current("inbox", group, pin);
+    ? `${batch ? generalProviderBatchReplyEligible("inbox") : generalOrdinaryReplyEligibilitySql("inbox")}
+      AND ${generalCurrentAuthoritySql("inbox")}` : current("inbox", group, pin);
   const eligibilityBindings = !authorizing ? [] : simpleAuthority ? generalPolicyBindings(pin) : currentBindings(pin);
   if (guard) {
     // Keep the origin, reply eligibility and payload guard separate inside the atomic begin.
@@ -549,7 +568,7 @@ export async function beginGeneralSharedTelegramReply(
   db: D1Database, pin: GeneralTelegramPin, lease: SharedReadLease, tickets: readonly TelegramLifecycleTicket[] = [],
   metadata?: MetadataReply,
 ): Promise<boolean> {
-  if (!pin.sharedOutbox || lease.marker === TELEGRAM_GENERAL_GROUP_CLAIM_MARKER
+  if (!pin.sharedOutbox || lease.marker === TELEGRAM_GENERAL_GROUP_CLAIM_MARKER || isGeneralProviderBatchReply(lease.marker)
     || Boolean(metadata) !== (lease.marker === GENERAL_SUBSCRIPTION_READ_MARKER)) return false;
   if ((tickets.length > 0 || metadata) && (!pin.privateManagement || lease.chatType !== "private" || lease.threadId !== null)) return false;
   if (!pin.privateFormats && metadata?.tickets.some(({ kind }) => kind === "format")) return false;
@@ -695,6 +714,31 @@ export async function drainGeneralSharedTelegramReply(
     if (!begun.results.length) return false;
     const text = renderGeneralAuthActionReply(reply.results, lease.command);
     const outcome = text ? await sendGeneralTelegramPrivateReply(pin.botToken, lease.actorId, lease.messageId, text)
+      : { kind: "failed" as const };
+    await settleTelegramOutboxReply(db, lease, selectLease(pin, lease, false), outcome);
+    return true;
+  }
+  if (isGeneralProviderBatchReply(lease.marker)) {
+    if (!pin.providerBatch) return false;
+    const prepared = await renderTelegramProviderBatchReply(db, pin, lease);
+    if (!prepared) return false;
+    const scope = selectLease(pin, lease, true, prepared.guard);
+    const begin = prepareTelegramOutboxBegin(db, lease, scope);
+    if (prepared.ticket) {
+      const [started, installed] = await db.batch([begin, installTelegramProviderBatchTicket(db, lease, prepared.ticket.sha256),
+        db.prepare(`SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM telegram_outbox WHERE receipt_id=? AND attempts=?
+          AND lease_id=? AND state='sending') OR EXISTS (SELECT 1 FROM telegram_provider_batch_interactions
+          WHERE receipt_id=? AND origin_attempt=? AND token_sha256=?) THEN 1
+          ELSE json_extract('general batch ticket missing','$') END`)
+          .bind(lease.receiptId, lease.attempts, lease.leaseId, lease.receiptId, lease.attempts, prepared.ticket.sha256)]);
+      if (!started?.success || !installed?.success || started.results.length > 1 || installed.meta.changes !== started.results.length) {
+        throw new Error("General Telegram provider batch reply could not begin.");
+      }
+      if (!started.results.length) return false;
+    } else if (await begin.first() === null) return false;
+    const keyboard = prepared.ticket ? [[{ text: "确认刷新", callback_data: prepared.ticket.value }]] : undefined;
+    const outcome = await confirmGuardedGeneralSend(db, lease, scope)
+      ? await sendGeneralTelegramPrivateReply(pin.botToken, lease.actorId, lease.messageId, prepared.text, keyboard)
       : { kind: "failed" as const };
     await settleTelegramOutboxReply(db, lease, selectLease(pin, lease, false), outcome);
     return true;

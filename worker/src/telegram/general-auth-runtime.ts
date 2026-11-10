@@ -26,6 +26,7 @@ export interface GeneralTelegramPin extends TelegramBotCredentials {
   subscriptionShorts?: "issue" | "drain";
   privateAuthorization?: boolean;
   privateInline?: boolean;
+  providerBatch?: boolean;
   groupShare?: TelegramGroupShareDestination;
   rehearsal?: GeneralReadLaneScope;
 }
@@ -71,6 +72,8 @@ export function parseGeneralTelegramPin(input: unknown, releaseRevision: unknown
     const privateAuthorization = value.authManagement === true;
     const inlineConfigured = Object.hasOwn(value, "inlineSearch");
     const privateInline = value.inlineSearch === true;
+    const batchConfigured = Object.hasOwn(value, "providerBatch");
+    const providerBatch = value.providerBatch === true;
     const groupConfigured = Object.hasOwn(value, "groupShare");
     const typedConfigured = Object.hasOwn(value, "subscriptionShorts");
     const subscriptionShorts = value.subscriptionShorts;
@@ -84,10 +87,11 @@ export function parseGeneralTelegramPin(input: unknown, releaseRevision: unknown
       groupShare = { chatId, chatType };
     }
     if (Object.keys(value).length !== 7 + Number(sharedOutbox) + Number(authorizationConfigured) + Number(inlineConfigured)
-        + Number(groupConfigured) + Number(typedConfigured)
+        + Number(groupConfigured) + Number(typedConfigured) + Number(batchConfigured)
       || (sharedOutbox && value.outbox !== "shared" && !privateManagement)
       || (authorizationConfigured && (!privateManagement || !privateAuthorization))
       || (inlineConfigured && (!privateManagement || !privateInline))
+      || (batchConfigured && (!privateProvider || !providerBatch))
       || (typedConfigured && (!privateShort || (subscriptionShorts !== "issue" && subscriptionShorts !== "drain")))) return null;
     const credentials = readTelegramBotCredentials(value);
     const { generation, cutoverAt, activationSha256 } = value;
@@ -97,7 +101,7 @@ export function parseGeneralTelegramPin(input: unknown, releaseRevision: unknown
       || !/^[0-9a-f]{64}(?![\s\S])/u.test(activationSha256)) return null;
     return { ...credentials, generation, cutoverAt, activationSha256, releaseRevision, sharedOutbox, privateManagement,
       privateFormats, privateTemp, privateDocument, privateProvider, privateClaims, privateShareCreation, privateAggregate, privateSelected,
-      privateShort, privateAuthorization, privateInline, ...(groupShare ? { groupShare } : {}),
+      privateShort, privateAuthorization, privateInline, ...(providerBatch ? { providerBatch } : {}), ...(groupShare ? { groupShare } : {}),
       ...(subscriptionShorts === "issue" || subscriptionShorts === "drain" ? { subscriptionShorts } : {}) };
   } catch {
     return null;

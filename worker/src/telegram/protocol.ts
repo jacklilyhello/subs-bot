@@ -490,6 +490,23 @@ function readGeneralPrivateTicket(
     ? { ...scope, callbackId, ticket } : null;
 }
 
+export function readGeneralPrivateProviderBatch(
+  update: Record<string, unknown>, updateId: number, botId: string, botUsername: string,
+): TelegramProviderBatchUpdate | null {
+  if (Object.keys(update).length !== 2) return null;
+  if (isRecord(update.callback_query)) {
+    const ticket = readGeneralPrivateTicket(update.callback_query, updateId, botId, PROVIDER_BATCH_TICKET);
+    return ticket && ticket.actorId !== botId ? { ...ticket, kind: "confirm" } : null;
+  }
+  const command = readPrivateTelegramCommand(update, botUsername);
+  if (!command || command.actorId === botId || command.name !== "updateall"
+    || (command.remainder && !/^[ \t]/u.test(command.remainder))) return null;
+  const { actorId, messageId, messageDate, remainder } = command;
+  const mode = remainder.trim().toLowerCase();
+  return { updateId, actorId, chatId: actorId, chatType: "private", threadId: null, messageId, messageDate,
+    kind: mode === "" ? "preview" : mode === "status" ? "status" : "usage" };
+}
+
 export function readGeneralPrivateSubscriptionRead(
   update: Record<string, unknown>, updateId: number, botId: string, botUsername: string,
 ): Extract<TelegramSubscriptionReadUpdate, { kind: "search" | "callback" }> | null {

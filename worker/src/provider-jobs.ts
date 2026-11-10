@@ -27,15 +27,22 @@ export const TELEGRAM_PROVIDER_MARKER = "provider-request:v1";
 export const GENERAL_TELEGRAM_PROVIDER_MARKER = "general-provider-request:v1";
 export const TELEGRAM_PROVIDER_BATCH_PREVIEW_MARKER = "provider-batch-preview:v1";
 export const TELEGRAM_PROVIDER_BATCH_CONFIRM_MARKER = "provider-batch-confirm:v1";
+export const GENERAL_TELEGRAM_PROVIDER_BATCH_PREVIEW_MARKER = "general-provider-batch-preview:v1";
+export const GENERAL_TELEGRAM_PROVIDER_BATCH_CONFIRM_MARKER = "general-provider-batch-confirm:v1";
+export const GENERAL_PROVIDER_BATCH_SCHEMA = `(SELECT /* subs-bot:telegram-general-provider-batch:v1 */ count(*)
+  FROM subs_bot_schema_migrations WHERE mode='applied' AND (
+    (position=31 AND name='0031_telegram_provider_batch_queue.sql' AND sha256='82a3f86930692de873ae30354608b49d8671ff9562bbd15d5893110fa9992e63')
+    OR (position=32 AND name='0032_telegram_provider_batch_controls.sql' AND sha256='9b4318878f29b531010ff7fb0d77d1e0b802add09607829ce8aac886a2b6f666')
+  ))=2`;
 export type ProviderTelegramPolicy = {
   readonly botId: string; readonly adminId: string; readonly memberId: string; readonly includeDocuments?: true;
 };
 export type GeneralProviderAuthority = Readonly<GeneralAuthorityPin> & {
-  readonly family: "general"; readonly includeDocuments?: true; readonly includeBatch?: never; readonly queue?: never;
+  readonly family: "general"; readonly includeDocuments?: true; readonly includeBatch?: true;
 };
 export type ProviderQueuePolicy = ProviderTelegramPolicy | GeneralProviderAuthority;
 type JobScope = (ProviderTelegramPolicy & { readonly includeBatch?: true; readonly queue?: "batch" })
-  | GeneralProviderAuthority | "generic";
+  | (GeneralProviderAuthority & { readonly queue?: "batch" }) | "generic";
 // A rollback to the older Telegram consumer must never see batch rows or their leases.
 type JobTable = "subscription_provider_jobs" | "telegram_provider_jobs" | "telegram_provider_batch_jobs";
 
@@ -359,8 +366,44 @@ const currentTarget = `EXISTS (
     AND ${SUBSCRIPTION_LIFECYCLE_REVISION} = job.expected_lifecycle_revision
 )`;
 
+function generalProviderBatchOrigin(policy: GeneralProviderAuthority, forRetirement: boolean): ProviderSql {
+  const live = forRetirement ? "" : `JOIN telegram_general_policy AS policy ON policy.bot_id=batch.bot_id
+    AND policy.generation=recorded.generation AND policy.release_revision=recorded.release_revision
+    AND policy.activation_sha256=recorded.activation_sha256 AND policy.cutover_at=recorded.cutover_at`;
+  const current = forRetirement ? "1" : `policy.active=1 AND (${GENERAL_NO_LEGACY_WORK}) AND (${GENERAL_LATEST_ACTOR_SQL})`;
+  return { sql: `batch.bot_id=? AND EXISTS (SELECT 1 FROM telegram_inbox AS confirmation
+    JOIN telegram_inbox AS preview ON preview.receipt_id=batch.preview_receipt_id
+    JOIN telegram_outbox AS sent ON sent.receipt_id=preview.receipt_id
+    JOIN telegram_provider_batch_interactions AS ticket ON ticket.receipt_id=preview.receipt_id AND ticket.kind='preview'
+      AND ticket.used_by_receipt_id=confirmation.receipt_id AND ticket.origin_attempt=batch.origin_attempt
+      AND ticket.actor_role=batch.actor_role AND ticket.auth_message_date=0 AND ticket.auth_message_id=0
+    JOIN telegram_general_receipt AS recorded ON recorded.receipt_id=confirmation.receipt_id
+    JOIN telegram_general_receipt AS earlier ON earlier.receipt_id=preview.receipt_id
+      AND earlier.generation=recorded.generation AND earlier.actor_revision=recorded.actor_revision AND earlier.actor_role=recorded.actor_role
+      AND earlier.release_revision=recorded.release_revision AND earlier.activation_sha256=recorded.activation_sha256
+      AND earlier.cutover_at=recorded.cutover_at
+    JOIN telegram_general_actors AS actor ON (actor.bot_id=batch.bot_id AND actor.actor_id=batch.actor_id)
+      AND (actor.generation=recorded.generation AND actor.revision=recorded.actor_revision AND actor.role=recorded.actor_role)
+    ${live}
+    WHERE confirmation.receipt_id=batch.batch_id AND CASE
+      WHEN (confirmation.bot_id=batch.bot_id AND confirmation.actor_id=batch.actor_id
+        AND confirmation.chat_type='private' AND confirmation.chat_id=batch.actor_id AND confirmation.thread_id IS NULL
+        AND confirmation.command='help' AND confirmation.receipt_nonce='${GENERAL_TELEGRAM_PROVIDER_BATCH_CONFIRM_MARKER}') IS NOT TRUE THEN 0
+      WHEN (preview.bot_id=batch.bot_id AND preview.actor_id=batch.actor_id
+        AND preview.chat_type='private' AND preview.chat_id=batch.actor_id AND preview.thread_id IS NULL
+        AND preview.command='help' AND preview.receipt_nonce='${GENERAL_TELEGRAM_PROVIDER_BATCH_PREVIEW_MARKER}') IS NOT TRUE THEN 0
+      WHEN (sent.state='sent' AND sent.sent_message_id=confirmation.message_id AND sent.attempts=batch.origin_attempt) IS NOT TRUE THEN 0
+      WHEN (recorded.generation=? AND recorded.activation_sha256=? AND recorded.release_revision=? AND recorded.cutover_at=?
+        AND recorded.actor_role=batch.actor_role AND batch.auth_message_date=0 AND batch.auth_message_id=0) IS NOT TRUE THEN 0
+      WHEN (preview.message_date>MAX(actor.effective_at,recorded.cutover_at)
+        AND confirmation.message_date>MAX(actor.effective_at,recorded.cutover_at)) IS NOT TRUE THEN 0
+      WHEN ((${GENERAL_PROVIDER_BATCH_SCHEMA}) AND (${GENERAL_POLICY_SCHEMA}) AND (${GENERAL_RECEIPT_SCHEMA})) IS NOT TRUE THEN 0
+      ELSE (${current}) END)`, bindings: generalPolicyBindings(policy) };
+}
+
 /** The batch alias is fixed so the same provenance fence can protect work and readback. */
-export function telegramProviderBatchOrigin(policy: ProviderTelegramPolicy, forRetirement = false): ProviderSql {
+export function telegramProviderBatchOrigin(policy: ProviderQueuePolicy, forRetirement = false): ProviderSql {
+  if ("family" in policy) return generalProviderBatchOrigin(policy, forRetirement);
   // Only retirement may classify an old role of a still-approved actor as stale.
   const role = forRetirement ? `batch.actor_id IN (?,?) AND (
     (batch.actor_role='admin' AND batch.auth_message_date=0 AND batch.auth_message_id=0)
@@ -427,17 +470,17 @@ function documentJobAuthorization(scope: ProviderDocumentPolicy, alias: "job" | 
 
 function scopeAuthorization(scope: JobScope, alias: "job" | "active" = "job", forRetirement = false): Guard {
   if (scope === "generic") return { sql: "1", bindings: [] };
-  if ("family" in scope) {
-    const direct = generalJobAuthorization(scope, alias, forRetirement);
-    if (!scope.includeDocuments) return direct;
-    const document = documentJobAuthorization(scope, alias, forRetirement);
-    return { sql: `CASE WHEN (${direct.sql}) THEN 1 ELSE (${document.sql}) END`, bindings: [...direct.bindings, ...document.bindings] };
-  }
   if (scope.queue === "batch") {
     const origin = telegramProviderBatchOrigin(scope, forRetirement);
     return { sql: `EXISTS (SELECT 1 FROM telegram_provider_batches AS batch WHERE batch.batch_id=${alias}.batch_id
       AND batch.actor_id=${alias}.owner_id AND batch.finished_at IS NULL AND batch.expires_at=${alias}.expires_at
       AND ${alias}.kind='refresh' AND (${origin.sql}))`, bindings: origin.bindings };
+  }
+  if ("family" in scope) {
+    const direct = generalJobAuthorization(scope, alias, forRetirement);
+    if (!scope.includeDocuments) return direct;
+    const document = documentJobAuthorization(scope, alias, forRetirement);
+    return { sql: `CASE WHEN (${direct.sql}) THEN 1 ELSE (${document.sql}) END`, bindings: [...direct.bindings, ...document.bindings] };
   }
   const epoch = isolatedTelegramRoleEpochSql(scope, "inbox", forRetirement ? "recorded" : "current");
   const direct = { sql: `EXISTS (SELECT 1 FROM telegram_provider_requests AS origin
@@ -460,13 +503,14 @@ function jobScope(policy?: ProviderQueuePolicy, includeBatch = false, queue?: "b
   if ("family" in policy) {
     const { botId, generation, releaseRevision, activationSha256, cutoverAt } = policy;
     checkOwnerId(botId);
-    if (policy.family !== "general" || includeBatch || queue || !validInteger(generation, 1) || !validInteger(cutoverAt, 1)
+    if (policy.family !== "general" || ((includeBatch || queue) && policy.includeBatch !== true) || !validInteger(generation, 1) || !validInteger(cutoverAt, 1)
       || typeof releaseRevision !== "string" || !REVISION.test(releaseRevision)
       || typeof activationSha256 !== "string" || !SHA256.test(activationSha256)) {
       throw new Error("Invalid provider authorization policy.");
     }
     return Object.freeze({ family: "general" as const, botId, generation, releaseRevision, activationSha256, cutoverAt,
-      ...(policy.includeDocuments ? { includeDocuments: true as const } : {}) });
+      ...(policy.includeDocuments ? { includeDocuments: true as const } : {}),
+      ...(policy.includeBatch ? { includeBatch: true as const } : {}), ...(queue ? { queue } : {}) });
   }
   const { botId, adminId, memberId } = policy;
   [botId, adminId, memberId].forEach(checkOwnerId);
@@ -558,7 +602,7 @@ function terminalJobs(db: D1Database, scope: JobScope, includeWaiting = false): 
 }
 
 /** Prepare a sweep and at most one quota-checked promotion for the Telegram family. */
-export function prepareTelegramProviderBatchQueue(db: D1Database, policy: ProviderTelegramPolicy, promote: boolean): D1PreparedStatement[] {
+export function prepareTelegramProviderBatchQueue(db: D1Database, policy: ProviderQueuePolicy, promote: boolean): D1PreparedStatement[] {
   const scope = jobScope(policy, true, "batch");
   const steps = [terminalJobs(db, scope, true)];
   if (promote) {
@@ -596,8 +640,9 @@ function claimCandidates(scopes: readonly JobScope[]): Guard {
 /** Include batch scope on every Telegram-family admission and claim while batch work can be live. */
 export async function claimProviderJob(db: D1Database, policy?: ProviderQueuePolicy, includeBatch = false): Promise<ProviderJobLease | null> {
   try {
-    const single = jobScope(policy, includeBatch);
-    const scopes = includeBatch ? [single, jobScope(policy, true, "batch")] : [single];
+    const batch = includeBatch || Boolean(policy && "family" in policy && policy.includeBatch);
+    const single = jobScope(policy, batch);
+    const scopes = batch ? [single, jobScope(policy, true, "batch")] : [single];
     const leaseId = crypto.randomUUID();
     const candidates = claimCandidates(scopes);
     const steps = [...scopes.map((scope) => terminalJobs(db, scope)), ...scopes.map((scope) => {
