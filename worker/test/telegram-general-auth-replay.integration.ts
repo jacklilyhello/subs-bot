@@ -95,6 +95,7 @@ test("closed general authorization replays a sealed candidate in a separate emit
   const lifecycleMessagesById = new Map<number, (typeof lifecycleSent)[number]>();
   const lifecycleAcks = new Set<string>();
   const fixtureDocuments = new Map<string, string>();
+  const tempRawDocuments = new Map<number, { actorId: string; caption: string; body: string }>();
   const fileRequests: string[] = [];
   let lifecycleAckCalls = 0;
   let failTransport = false;
@@ -151,9 +152,10 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.ok(shortPin?.privateShort && shortPin.privateSelected && !shortPin.privateAuthorization);
   const aggregateKeyRaw = Buffer.alloc(32, 17).toString("base64url");
   const shareKeyRaw = Buffer.alloc(32, 0x61).toString("base64url");
-  const authConfig = JSON.stringify({ ...JSON.parse(selectedConfig), authManagement: true });
+  const authConfig = JSON.stringify({ ...JSON.parse(shortConfig), authManagement: true });
   const authPin = parseGeneralTelegramPin(authConfig, fixture.releaseRevision);
-  assert.ok(authPin?.privateAuthorization && authPin.privateSelected && authPin.privateAggregate && authPin.privateShareCreation && authPin.privateClaims);
+  assert.ok(authPin?.privateAuthorization && authPin.privateShort && authPin.privateSelected && authPin.privateAggregate
+    && authPin.privateShareCreation && authPin.privateClaims);
   assert.equal(parseGeneralTelegramPin(JSON.stringify({ ...JSON.parse(sharedConfig), authManagement: true }),
     fixture.releaseRevision), null);
   const claimSends = new Map<number, { actorId: string; text?: string; body?: Buffer }>();
@@ -191,6 +193,17 @@ test("closed general authorization replays a sealed candidate in a separate emit
       assert.ok(/^fixture-7[0-9]{3}$/u.test(ack.callback_query_id) && !lifecycleAcks.has(ack.callback_query_id));
       lifecycleAcks.add(ack.callback_query_id);
       return Response.json({ ok: true, result: true });
+    }
+    if (request.url === api + "sendDocument") {
+      const form = await request.formData();
+      const file = form.get("document");
+      assert.ok(file && typeof file !== "string" && file.name === "temporary-nodes.txt");
+      const { message_id: id } = JSON.parse(String(form.get("reply_parameters"))) as { message_id: number };
+      assert.equal(id, 8306);
+      assert.ok(!tempRawDocuments.has(id));
+      const actorId = String(form.get("chat_id"));
+      tempRawDocuments.set(id, { actorId, caption: String(form.get("caption")), body: await file.text() });
+      return Response.json({ ok: true, result: { chat: { id: Number(actorId) }, message_id: 19_800 } });
     }
     assert.equal(request.url, api + "sendMessage");
     const message = await request.json() as (typeof lifecycleSent)[number];
@@ -1849,4 +1862,49 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.equal((await authWorker.scheduled({ cron: "* * * * *" })).outcome, "ok");
   assert.equal((await findReply(8222))?.state, "failed");
   assert.equal(lifecycleSent.some(({ reply_parameters }) => reply_parameters.message_id === 8222), false);
+
+  const rawDate = actionDate + 11;
+  const rawPost = (id: number, actor: number, text: string, options: PostOptions = {}) =>
+    tempPost(id, actor, text, { worker: authWorker, date: rawDate, ...options });
+  const legacyRaw = JSON.stringify([{ name: "Synthetic raw baseline", type: "temp", share: firstShare }]);
+  await db.prepare("INSERT INTO legacy_temp_batches VALUES (?,'110',2,2,?,1,?,?)")
+    .bind(pin.botId, legacyRaw, Buffer.byteLength(legacyRaw), createHash("sha256").update(legacyRaw).digest("hex")).run();
+  assert.equal((await rawPost(8300, 110, "/temp raw", { worker: shared })).status, 204);
+  assert.equal((await rawPost(8300, 110, "/temp raw", { chatType: "group", chatId: -100100 })).status, 204);
+  assert.equal((await rawPost(8301, 110, secondShare)).status, 200);
+  await awaitLifecycle(8301);
+  assert.equal((await rawPost(8302, 110, "/temp raw")).status, 200);
+  assert.equal((await findReply(8302))?.marker, "general-temp-raw:v1:[0,0]");
+  const rawReply = (await awaitLifecycle(8302)).message;
+  assert.equal(rawReply.chat_id, "110");
+  assert.equal(rawReply.text, `临时列表共有 2 条节点。发送 /temp clear 清空。\n\n${firstShare}\n${secondShare}`);
+  assert.deepEqual(rawReply.link_preview_options, { is_disabled: true });
+  assert.equal((await rawPost(8302, 110, "/temp raw")).status, 204);
+
+  const long = Array.from({ length: 30 }, () => secondShare + "-" + "X".repeat(48));
+  for (const id of [8304, 8305]) {
+    assert.equal((await rawPost(id, 111, long.join("\n"))).status, 200);
+    await awaitLifecycle(id);
+  }
+  assert.equal((await rawPost(8306, 111, "/temp raw")).status, 200);
+  const rawEnd = Date.now() + 4000;
+  while ((await findReply(8306))?.state !== "sent" && Date.now() < rawEnd) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal((await findReply(8306))?.state, "sent");
+  assert.deepEqual(tempRawDocuments.get(8306), { actorId: "111", caption: "临时列表共有 60 条节点。发送 /temp clear 清空。",
+    body: [...long, ...long].join("\n") });
+
+  const pendingRaw = (id: number, actor: number) => new Request("https://app.fixture.invalid/telegram/webhook", { method: "POST",
+    headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": pin.webhookSecret },
+    body: JSON.stringify({ update_id: id, message: { text: "/temp raw", message_id: id, date: rawDate,
+      from: { id: actor, is_bot: false }, chat: { id: actor, type: "private" }, entities: [{ type: "bot_command", offset: 0, length: 5 }] } }) });
+  assert.equal(await acceptGeneralSharedTelegramCommand(db, authPin, pendingRaw(8310, 110)), 200);
+  assert.equal((await rawPost(8311, 110, "/temp clear", { date: rawDate + 1 })).status, 200);
+  assert.equal((await awaitLifecycle(8310)).message.text, "临时列表或授权已变更，请重新发送 /temp raw。");
+  assert.equal((await rawPost(8309, 110, "/temp raw")).status, 204);
+  assert.equal(await acceptGeneralSharedTelegramCommand(db, authPin, pendingRaw(8312, 111)), 200);
+  await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,'111',2,?,'denied')")
+    .bind(pin.botId, pin.generation, rawDate + 1).run();
+  assert.equal((await authWorker.scheduled({ cron: "* * * * *" })).outcome, "ok");
+  assert.equal((await findReply(8312))?.state, "failed");
+  assert.equal(lifecycleSent.some(({ reply_parameters }) => reply_parameters.message_id === 8312), false);
 });

@@ -657,7 +657,7 @@ V11 合成原生演练在 `worker-isolation-legacy-candidate.yml` 选择 `synthe
 
 通用运行时的 `outbox: "shared-private-management-formats"` 另外允许订阅所有者从私聊详情获取已发布订阅的格式链接。需要确切登记的 `0018` 迁移。详情按钮只包含一次性票据。领取时核对同一 Bot、私聊、已确认的原消息和发送尝试，以及仍有效的搜索和详情授权。订阅改名、移入回收站或授权版本变化后，需要重新搜索。发送前再次核对当前订阅、快照和链接令牌。Base64 与 Sing-box 沿用原有格式预检。链接使用核准的公开来源，关闭 Telegram 链接预览。现有发布流程没有启用这个模式。未来启用前须明确受保护的授权世代切换和排空步骤，再验证隔离真人流程。
 
-通用运行时的 `outbox: "shared-private-temp"` 在私聊管理上增加临时节点粘贴、`/temp` 数量汇总和 `/temp clear`。`outbox: "shared-private-management-formats-temp"` 同时启用格式链接和这些临时节点操作。临时入口核对确切登记的 `0008`、`0039` 和通用回执迁移，按 Bot 和所有者计算历史及新增节点上限。清空只处理该消息时点或之前的节点。私聊回复只显示计数。
+通用运行时的 `outbox: "shared-private-temp"` 在私聊管理上增加临时节点粘贴、`/temp` 数量汇总和 `/temp clear`。`outbox: "shared-private-management-formats-temp"` 同时启用格式链接和这些临时节点操作。临时入口核对确切登记的 `0008`、`0039` 和通用回执迁移，按 Bot 和所有者计算历史及新增节点上限。清空只处理该消息时点或之前的节点。显式发送 `/temp raw` 才会在本人私聊返回原始节点链接，较长的内容使用 UTF-8 TXT。读取及发送前复核当前授权、清空界限和当时的节点清单。
 
 `outbox: "shared-private-management-formats-temp-node-document"` 再加入私聊的纯节点文档导入，沿用现有格式、大小和节点数限制。通用文档不提交远程 URL 或混合文档任务。Cron 在下载、发布和发送回复前复核当前授权。已失效任务和未发布暂存的清理只按准确的通用回执与记录授权执行，隔离清理继续保留 `general-document-job:v1` 任务、订阅预留和 R2 暂存。两类任务共用每个 Bot 的租约约束。现有发布流程不启用这些模式。未来启用前须确认受保护的授权世代切换和排空步骤，并验证隔离真人流程。
 

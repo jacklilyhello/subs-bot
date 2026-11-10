@@ -47,7 +47,7 @@ import {
 } from "./store.ts";
 import { prepareTelegramViewTickets, renderTelegramView, type TelegramViewButton } from "./views.ts";
 import { renderTelegramTemp } from "./temp-import.ts";
-import { confirmTelegramTempRawSend, prepareTelegramTempRawReply } from "./temp-raw.ts";
+import { confirmTelegramTempRawSend, prepareTelegramTempRawReply, type TelegramTempRawReply } from "./temp-raw.ts";
 import { renderTelegramProviderReply } from "./provider-replies.ts";
 import { prepareTelegramProviderRefreshButton, type TelegramProviderRefreshTarget } from "./provider-refresh.ts";
 import { renderTelegramProviderBatchReply } from "./provider-batch-controls.ts";
@@ -210,6 +210,23 @@ export function sendGeneralTelegramPrivateReply(
     ...(keyboard?.length ? { reply_markup: { inline_keyboard: keyboard } }
       : forceReply ? { reply_markup: { force_reply: true } } : {}),
   }, 5_000, fetch);
+}
+
+export function sendGeneralTelegramTempRawReply(
+  botToken: string, actorId: string, messageId: number,
+  result: Extract<TelegramTempRawReply, { kind: "text" | "document" }>, timeoutMs: number,
+): Promise<TelegramReplyOutcome> {
+  const reply = { message_id: messageId };
+  if (result.kind === "text") {
+    return postTelegram(botToken, actorId, "sendMessage", { chat_id: actorId, text: result.text,
+      reply_parameters: reply, link_preview_options: { is_disabled: true } }, timeoutMs, fetch);
+  }
+  const form = new FormData();
+  form.set("chat_id", actorId);
+  form.set("reply_parameters", JSON.stringify(reply));
+  form.set("caption", result.caption);
+  form.set("document", result.file, "temporary-nodes.txt");
+  return postTelegram(botToken, actorId, "sendDocument", form, timeoutMs, fetch);
 }
 
 export function sendGeneralTelegramGroupListReply(
