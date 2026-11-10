@@ -142,6 +142,11 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.ok(aggregatePin?.privateAggregate && aggregatePin.privateShareCreation && aggregatePin.privateClaims);
   const aggregateKeyRaw = Buffer.alloc(32, 17).toString("base64url");
   const shareKeyRaw = Buffer.alloc(32, 0x61).toString("base64url");
+  const authConfig = JSON.stringify({ ...JSON.parse(aggregateConfig), authManagement: true });
+  const authPin = parseGeneralTelegramPin(authConfig, fixture.releaseRevision);
+  assert.ok(authPin?.privateAuthorization && authPin.privateAggregate && authPin.privateShareCreation && authPin.privateClaims);
+  assert.equal(parseGeneralTelegramPin(JSON.stringify({ ...JSON.parse(sharedConfig), authManagement: true }),
+    fixture.releaseRevision), null);
   const claimSends = new Map<number, { actorId: string; text?: string; body?: Buffer }>();
   for (const outbox of ["legacy", "shared-lifecycle", "shared-path", ["shared-private-management"]]) {
     assert.equal(parseGeneralTelegramPin(JSON.stringify({ ...JSON.parse(generalConfig), outbox }),
@@ -226,6 +231,9 @@ test("closed general authorization replays a sealed candidate in a separate emit
     { name: "formats", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: documentConfig, PUBLIC_ORIGIN: PRODUCTION_PUBLIC_ORIGIN },
       outboundService: privateTransport },
+    { name: "auth", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
+      bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: authConfig,
+        TELEGRAM_AGGREGATE_KEY: aggregateKeyRaw, TELEGRAM_PRIVATE_SHARE_CREATION_KEY: shareKeyRaw }, outboundService: privateTransport },
     ...[true, false].map((withKey) => ({ name: withKey ? "aggregate" : "aggregate-no-key", modules: true,
       script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"], outboundService: privateTransport,
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: aggregateConfig, PUBLIC_ORIGIN: PRODUCTION_PUBLIC_ORIGIN,
@@ -1575,4 +1583,74 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.deepEqual(await waitForLane(8109), { actor: "181", marker: null, state: "sent" });
   assert.equal((await lanePost(182, "/list", { updateId: 8102, date: now - 21 })).status, 200);
   assert.equal((await laneRow(8102))?.marker, "view:v1", "the delayed delivery retains its original receipt family");
+
+  const authWorker = await runtime.getWorker("auth");
+  const actionDate = Math.floor(Date.now() / 1000);
+  await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,'108',1,?,'member')")
+    .bind(authPin.botId, authPin.generation, authPin.cutoverAt).run();
+  const authPost = (id: number, actor: number, text: string, options: PostOptions = {}) =>
+    post(actor, text, { worker: authWorker, updateId: id, date: actionDate, ...options });
+  const directAuth = (id: number, actor: number, text: string, messageId = id) => acceptGeneralSharedTelegramCommand(db, authPin,
+    new Request("https://app.fixture.invalid/telegram/webhook", { method: "POST",
+      headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": authPin.webhookSecret },
+      body: JSON.stringify({ update_id: id, message: { text, date: actionDate, message_id: messageId,
+        from: { id: actor, is_bot: false }, chat: { id: actor, type: "private" },
+        entities: [{ type: "bot_command", offset: 0, length: 5 }] } }) }));
+  const authState = () => db.prepare(`SELECT revision,role,effective_at AS effectiveAt FROM telegram_general_actors
+    WHERE bot_id=? AND generation=? AND actor_id='108' ORDER BY revision DESC LIMIT 1`)
+    .bind(authPin.botId, authPin.generation).first<{ revision: number; role: string; effectiveAt: number }>();
+
+  assert.equal((await authPost(8200, 101, "/auth remove 108", { worker: claimsWorker })).status, 204);
+  assert.equal((await authPost(8200, 108, "/auth remove 108")).status, 204);
+  assert.equal((await authPost(8200, 101, "/auth remove 108", { chatType: "group", chatId: -100100 })).status, 204);
+  assert.equal((await authPost(8200, 101, "/auth remove 108", { date: authPin.cutoverAt })).status, 204);
+  await db.prepare("UPDATE subs_bot_schema_migrations SET sha256=? WHERE position=50").bind("0".repeat(64)).run();
+  assert.equal((await authPost(8200, 101, "/auth remove 108")).status, 204);
+  await db.prepare("UPDATE subs_bot_schema_migrations SET sha256=? WHERE position=50")
+    .bind("369be22ccf8c0a30dfb7823e8ac2c402c65e2c404d655af360d7e88806aa0fe0").run();
+  assert.equal(await findReply(8200), null);
+  await db.prepare("INSERT INTO telegram_general_read_lane (bot_id,epoch,mode) VALUES (?,1,'isolated')").bind(authPin.botId).run();
+  assert.equal((await authPost(8200, 101, "/auth remove 108")).status, 204, "a same-Bot rehearsal target is closed to general writes");
+  await db.prepare("DELETE FROM telegram_general_read_lane WHERE bot_id=?").bind(authPin.botId).run();
+
+  assert.equal(await directAuth(8202, 106, "/auth add 108", 10), 200, "a no-op grant orders later arrivals");
+  assert.equal(await directAuth(8201, 101, "/auth remove 108", 900), 200);
+  assert.equal((await authState())?.revision, 1, "the stale same-second revoke cannot win across private chats");
+  assert.equal(await directAuth(8203, 101, "/auth remove 108"), 200);
+  assert.equal(await directAuth(8203, 101, "/auth remove 108"), 204, "duplicate delivery cannot append another revision");
+  assert.equal((await authState())?.role, "denied");
+  assert.equal((await authPost(8290, 108, "/list")).status, 204);
+  assert.equal(await directAuth(8204, 106, "/auth add 108"), 200);
+  const regrant = await authState();
+  assert.ok(regrant);
+  assert.equal(regrant.revision, 3);
+  assert.equal(regrant.role, "member");
+  assert.ok(regrant.effectiveAt >= actionDate + 60);
+  assert.equal((await authPost(8290, 108, "/list")).status, 204, "an update from before regrant cannot inherit the new role");
+
+  assert.equal((await claimsWorker.scheduled({ cron: "* * * * *" })).outcome, "ok", "paused admission still drains accepted work");
+  assert.deepEqual(claimSends.get(8204), { actorId: "106", text: "用户 108：已授权。", body: undefined });
+  assert.equal(claimSends.get(8203)?.text, "这次授权操作已被较新的状态取代。");
+  assert.equal(claimSends.get(900)?.text, "这次授权操作已被较新的状态取代。");
+  assert.equal((await authPost(8210, 101, "/auth remove 108")).status, 200);
+  assert.equal((await awaitLifecycle(8210)).message.text, "用户 108：已撤权。");
+  assert.equal((await authState())?.revision, 4);
+  assert.equal((await authState())?.role, "denied");
+  assert.equal((await authPost(8211, 101, "/auth remove 106")).status, 200);
+  assert.equal((await awaitLifecycle(8211)).message.text, "只能管理已登记的普通用户。");
+  assert.equal((await authPost(8212, 101, "/auth add 109")).status, 200);
+  assert.equal((await awaitLifecycle(8212)).message.text, "只能管理已登记的普通用户。");
+  assert.equal(await directAuth(8213, 106, "/auth add 108"), 200);
+  await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,'106',2,?,'denied')")
+    .bind(authPin.botId, authPin.generation, actionDate).run();
+  assert.equal((await authWorker.scheduled({ cron: "* * * * *" })).outcome, "ok");
+  assert.equal((await findReply(8213))?.state, "failed", "an old admin grant cannot deliver its queued acknowledgement");
+  assert.equal(lifecycleSent.some(({ reply_parameters }) => reply_parameters.message_id === 8213), false);
+  for (const id of [8214, 8215, 8216, 8217]) assert.equal(await directAuth(id, 101, "/auth add 108"), 200);
+  assert.equal((await authPost(8218, 101, "/auth remove 108")).status, 503, "an authorized command can retry after queue backpressure");
+  assert.equal(await findReply(8218), null);
+  assert.equal((await authWorker.scheduled({ cron: "* * * * *" })).outcome, "ok");
+  assert.equal((await authPost(8218, 101, "/auth remove 108")).status, 200);
+  assert.equal((await awaitLifecycle(8218)).message.text, "用户 108：已撤权。");
+  assert.equal((await authState())?.revision, 6);
 });
