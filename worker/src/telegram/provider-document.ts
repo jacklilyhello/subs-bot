@@ -2,13 +2,15 @@ import {
   MAX_PROVIDER_OWNER_SOURCES, prepareOwnedProviderRefresh, providerHost, providerSourceDigest, PROVIDER_TRASH_SECONDS,
   type ProviderSql,
 } from "../provider-jobs.ts";
+import { providerHostnameLabel, providerInitialTitleReady } from "../provider-initial-title.ts";
 import { digestHex, SUBSCRIPTION_LIFECYCLE_REVISION, validInteger } from "../storage.ts";
 import { normalizeSubscriptionName } from "../subscriptions.ts";
 import {
   prepareTelegramDocumentJobLeaseGuard, prepareTelegramDocumentJobSettlement, TELEGRAM_DOCUMENT_JOB_MARKER,
   type TelegramDocumentJobLease,
 } from "./document-jobs.ts";
-import { TELEGRAM_PROVIDER_DOCUMENT_MAX_URLS, type TelegramProviderDocumentInput } from "./provider-document-input.ts";
+import { TELEGRAM_PROVIDER_DOCUMENT_MAX_URLS, type TelegramProviderDocumentInput,
+  type TelegramProviderUrlMessage } from "./provider-document-input.ts";
 import { providerDocumentOrigin, TELEGRAM_PROVIDER_DOCUMENT_MARKER } from "./provider-document-origin.ts";
 import { telegramProviderMessageAdmission } from "./provider-admission.ts";
 import { inTelegramScope, type TelegramEventScope, type TelegramPolicy } from "./protocol.ts";
@@ -23,7 +25,13 @@ export type TelegramProviderDocumentSources = Pick<UrlList, "urls" | "overflow">
 type WaitingLine = {
   receiptId: number; ordinal: number; sourceSha256: string; ownerId: string;
   subscriptionId: number; expectedGeneration: number; expectedLifecycleRevision: number;
+  updateId: number; message: number; parentExpiresAt: number;
 };
+
+async function pendingMessageTitleKey(botId: string, updateId: number, ordinal: number): Promise<string> {
+  return digestHex(await crypto.subtle.digest("SHA-256", encoder.encode(
+    `subs-bot:telegram-provider-message-title-pending:v1\n${botId}\n${updateId}\n${ordinal}`)));
+}
 
 function assertBatch(result: readonly D1Result[], steps: readonly D1PreparedStatement[]): void {
   if (result.length !== steps.length || result.some(({ success }) => !success)) {
@@ -40,15 +48,15 @@ export async function telegramProviderDocumentReady(db: D1Database): Promise<boo
 }
 
 async function prepareProviderLines(
-  db: D1Database, ownerId: string, input: TelegramProviderDocumentSources, receipt: ProviderSql, staged: ProviderSql,
+  db: D1Database, ownerId: string, entries: TelegramProviderUrlMessage["entries"], receipt: ProviderSql, staged: ProviderSql,
 ) {
-  if (input.urls.length < 1 || input.urls.length > TELEGRAM_PROVIDER_DOCUMENT_MAX_URLS) {
+  if (entries.length < 1 || entries.length > TELEGRAM_PROVIDER_DOCUMENT_MAX_URLS) {
     throw new RangeError("Invalid provider document line count.");
   }
-  const inputs = await Promise.all(input.urls.map(async (sourceUrl) => {
+  const inputs = await Promise.all(entries.map(async ({ sourceUrl, name }) => {
     const host = providerHost(sourceUrl);
     if (!host) throw new Error();
-    return { sourceUrl, name: normalizeSubscriptionName(Array.from(host).slice(0, 64).join("")),
+    return { sourceUrl, name: name === undefined ? providerHostnameLabel(host) : normalizeSubscriptionName(name),
       digest: await providerSourceDigest(sourceUrl), token: crypto.randomUUID().replaceAll("-", "") };
   }));
   const steps = [
@@ -104,12 +112,12 @@ export async function prepareTelegramProviderDocumentPlan(
       AND NOT EXISTS (SELECT 1 FROM telegram_provider_documents AS active WHERE active.bot_id=source.bot_id
         AND active.actor_id=source.actor_id AND active.finished_at IS NULL)`)
     .bind(lease.actorId === policy.adminId ? "admin" : "member", input.urls.length, input.overflow, lease.receiptId, ...guard.bindings);
-  const lines = await prepareProviderLines(db, lease.actorId, input, receipt, staged);
+  const lines = await prepareProviderLines(db, lease.actorId, input.urls.map((sourceUrl) => ({ sourceUrl })), receipt, staged);
   return { ...lines, steps: [parent, ...lines.steps], exists, staged };
 }
 
 export async function acceptTelegramProviderUrlMessage(
-  db: D1Database, policy: TelegramPolicy, event: TelegramEventScope, input: UrlList,
+  db: D1Database, policy: TelegramPolicy, event: TelegramEventScope, input: TelegramProviderUrlMessage,
 ): Promise<"queued" | "busy" | "ignored"> {
   if (!inTelegramScope(policy, event) || event.chatType !== "private" || event.threadId !== null || event.chatId !== event.actorId ||
       !validInteger(event.updateId, 1) || !validInteger(event.messageId, 1) || !validInteger(event.messageDate, 1)) return "ignored";
@@ -122,7 +130,30 @@ export async function acceptTelegramProviderUrlMessage(
   const activeBindings = [policy.botId, event.actorId] as const;
   const role = event.actorId === policy.adminId ? "admin" : "member";
   try {
-    const lines = await prepareProviderLines(db, event.actorId, input, receipt, staged);
+    const lines = await prepareProviderLines(db, event.actorId, input.entries, receipt, staged);
+    const titleChecks: D1PreparedStatement[] = [];
+    const titles: D1PreparedStatement[] = [];
+    if (input.entries.some(({ name }) => name === undefined) && await providerInitialTitleReady(db, true)) {
+      const candidates = JSON.stringify(await Promise.all(input.entries.flatMap(({ name }, ordinal) => name === undefined
+        ? [pendingMessageTitleKey(policy.botId, event.updateId, ordinal).then((key) => [ordinal, lines.newShellTokens[ordinal], key])]
+        : [])));
+      // A candidate token must be absent before the shell INSERT, so its presence
+      // afterward proves this exact batch created the row, even on a token collision.
+      titleChecks.push(db.prepare(`SELECT CASE WHEN NOT (${staged.sql}) OR NOT EXISTS (
+        SELECT 1 FROM json_each(?) AS candidate JOIN subscriptions AS sub ON sub.token=json_extract(candidate.value,'$[1]'))
+        THEN 1 ELSE json_extract('provider title token guard failed','$') END`).bind(...staged.bindings, candidates));
+      titles.push(db.prepare(`DELETE FROM telegram_provider_initial_titles WHERE subscription_id IN (
+        SELECT subscription_id FROM telegram_provider_initial_titles WHERE expires_at<=unixepoch()
+        ORDER BY expires_at,subscription_id LIMIT 16) AND (${staged.sql})`).bind(...staged.bindings),
+      db.prepare(`INSERT INTO telegram_provider_initial_titles (subscription_id,request_key,source_sha256,expires_at)
+        SELECT sub.id,json_extract(candidate.value,'$[2]'),line.source_sha256,origin.expires_at
+        FROM json_each(?) AS candidate JOIN telegram_provider_document_lines AS line ON line.ordinal=json_extract(candidate.value,'$[0]')
+        JOIN telegram_provider_documents AS origin USING (receipt_id)
+        JOIN subscriptions AS sub ON sub.id=line.subscription_id AND sub.owner_id=origin.actor_id
+          AND sub.token=json_extract(candidate.value,'$[1]') AND sub.generation=0
+        WHERE line.receipt_id=${receipt.sql} AND line.expected_generation=0 AND line.expected_lifecycle_revision=0
+          AND line.job_id IS NULL AND line.result_code IS NULL`).bind(candidates, ...receipt.bindings));
+    }
     const steps = [
       db.prepare(`INSERT INTO telegram_inbox
         (bot_id,update_id,actor_id,chat_id,chat_type,message_id,message_date,thread_id,command,receipt_nonce)
@@ -138,8 +169,10 @@ export async function acceptTelegramProviderUrlMessage(
           unixepoch()+${PARENT_TTL_SECONDS},?,?
         FROM telegram_inbox AS inbox LEFT JOIN telegram_auth AS auth ON auth.bot_id=inbox.bot_id AND auth.user_id=inbox.actor_id
         WHERE ${fresh}`)
-        .bind(role, role, role, input.urls.length, input.overflow, ...origin),
+        .bind(role, role, role, input.entries.length, input.overflow, ...origin),
+      ...titleChecks,
       ...lines.steps,
+      ...titles,
       db.prepare(`UPDATE telegram_inbox AS inbox SET receipt_nonce=? WHERE ${fresh} AND ${staged.sql}`)
         .bind(TELEGRAM_PROVIDER_DOCUMENT_MARKER, ...origin, ...staged.bindings),
       db.prepare(`SELECT CASE WHEN ${receipt.sql} IS NULL THEN 1 ELSE json_extract('provider message marker failed','$') END`)
@@ -205,7 +238,9 @@ export async function promoteTelegramProviderDocument(db: D1Database, policy: Te
   try {
     const line = await db.prepare(`SELECT line.receipt_id AS receiptId,line.ordinal,line.source_sha256 AS sourceSha256,
       origin.actor_id AS ownerId,line.subscription_id AS subscriptionId,
-      line.expected_generation AS expectedGeneration,line.expected_lifecycle_revision AS expectedLifecycleRevision
+      line.expected_generation AS expectedGeneration,line.expected_lifecycle_revision AS expectedLifecycleRevision,
+      inbox.update_id AS updateId,origin.expires_at AS parentExpiresAt,
+      NOT EXISTS(SELECT 1 FROM telegram_document_jobs WHERE receipt_id=inbox.receipt_id) AS message
       FROM telegram_provider_document_lines AS line JOIN telegram_provider_documents AS origin USING (receipt_id)
       JOIN telegram_inbox AS inbox USING (receipt_id)
       WHERE ${waiting} AND line.due_at<=unixepoch() AND origin.finished_at IS NULL
@@ -229,6 +264,21 @@ export async function promoteTelegramProviderDocument(db: D1Database, policy: Te
       AND job.source_sha256=? AND job.expected_generation=? AND job.expected_lifecycle_revision=?`;
     const jobBindings = [line.ownerId, requestKey, line.subscriptionId, line.sourceSha256,
       line.expectedGeneration, line.expectedLifecycleRevision];
+    const titles: D1PreparedStatement[] = [];
+    if (line.message === 1 && line.expectedGeneration === 0 && line.expectedLifecycleRevision === 0
+        && await providerInitialTitleReady(db, true)) {
+      const pending = "initial.subscription_id=? AND initial.request_key=? AND initial.source_sha256=? AND initial.expires_at=?";
+      const pendingBindings = [line.subscriptionId, await pendingMessageTitleKey(policy.botId, line.updateId, line.ordinal),
+        line.sourceSha256, line.parentExpiresAt];
+      const linked = `job.state='pending' AND (${exactJob}) AND EXISTS (SELECT 1 FROM telegram_provider_document_lines AS linked_line
+        WHERE linked_line.receipt_id=? AND linked_line.ordinal=? AND linked_line.job_id=job.job_id)`;
+      const linkedBindings = [...jobBindings, line.receiptId, line.ordinal];
+      titles.push(db.prepare(`UPDATE telegram_provider_initial_titles AS initial SET request_key=job.request_key,expires_at=job.expires_at
+        FROM telegram_provider_jobs AS job WHERE ${pending} AND ${linked}`).bind(...pendingBindings, ...linkedBindings),
+      db.prepare(`SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM telegram_provider_initial_titles AS initial
+        WHERE ${pending}) OR NOT EXISTS (SELECT 1 FROM telegram_provider_jobs AS job WHERE ${linked})
+        THEN 1 ELSE json_extract('provider title promotion guard failed','$') END`).bind(...pendingBindings, ...linkedBindings));
+    }
     const steps = [
       ...prepared.plan.statements,
       db.prepare(`UPDATE telegram_provider_document_lines AS line SET job_id=(
@@ -242,6 +292,7 @@ export async function promoteTelegramProviderDocument(db: D1Database, policy: Te
           WHERE line.receipt_id=? AND line.ordinal=? AND ${exactJob})
         THEN 1 ELSE json_extract('provider document job linkage failed','$') END`)
         .bind(line.ownerId, requestKey, line.receiptId, line.ordinal, ...jobBindings),
+      ...titles,
       db.prepare(`UPDATE telegram_provider_document_lines AS line
         SET due_at=unixepoch()+${BACKPRESSURE_SECONDS},
           result_code=CASE WHEN (${prepared.plan.refusal.sql})='unavailable' THEN 'stale-target' END
