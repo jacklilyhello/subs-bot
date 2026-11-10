@@ -60,7 +60,7 @@ export type TelegramTempUpdate = TelegramEventScope & (
   | { kind: "temp-text"; text: string }
   | { kind: "temp-raw" | "temp-summary" | "temp-clear" }
 );
-export type TelegramGeneralTempUpdate = TelegramTempUpdate & { kind: "temp-text" | "temp-summary" | "temp-clear" };
+export type TelegramGeneralTempUpdate = TelegramTempUpdate;
 
 export type TelegramPathUpdate = TelegramEventScope & { kind: "path"; args: string };
 export type TelegramPrivateShareCreationUpdate = TelegramEventScope & { args: string; senderName?: string };
@@ -490,6 +490,7 @@ export function readGeneralPrivateTempUpdate(
     if (command.name !== "temp") return null;
     const argument = command.remainder.trim().toLowerCase();
     if (argument === "clear") return { ...scope, kind: "temp-clear" };
+    if (argument === "raw") return { ...scope, kind: "temp-raw" };
     return argument === "" || argument === "summary" ? { ...scope, kind: "temp-summary" } : null;
   }
 

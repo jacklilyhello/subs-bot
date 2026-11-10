@@ -7,6 +7,10 @@ import {
 
 export { MAX_TEMP_BATCH_BYTES, MAX_TEMP_BATCH_NODES, MAX_TEMP_OWNER_BYTES, MAX_TEMP_OWNER_NODES, TELEGRAM_TEMP_MARKER };
 export const TELEGRAM_TEMP_RAW_PREFIX = "temp-raw:v1:";
+export const TELEGRAM_GENERAL_TEMP_RAW_PREFIX = "general-temp-raw:v1:";
+export const GENERAL_TEMP_SCHEMA = `EXISTS (SELECT /* subs-bot:telegram-general-temp-intake:v1 */ 1 FROM subs_bot_schema_migrations
+  WHERE position=8 AND name='0008_telegram_temp_nodes.sql'
+    AND sha256='87ae872d0b04e49649e102adea9b00a2e5a24cd58b5236e561d0c85634c0a0ea' AND mode='applied')`;
 const MAX_TEMP_TEXT_BYTES = 64 * 1024;
 
 type TempReplyKind = "added" | "rejected" | "no-nodes" | "invalid-encoding" | "limit"
@@ -67,6 +71,15 @@ export function tempRawStamp(alias: "incoming" | "inbox"): string {
 
 export function tempRawMarker(alias: "inbox" | "earlier"): string {
   return `substr(${alias}.receipt_nonce,1,${TELEGRAM_TEMP_RAW_PREFIX.length})='${TELEGRAM_TEMP_RAW_PREFIX}'`;
+}
+
+export function generalTempRawStamp(alias: "incoming" | "inbox"): string {
+  return `'${TELEGRAM_GENERAL_TEMP_RAW_PREFIX}' || COALESCE((SELECT json_array(fence.message_date,fence.message_id)
+    FROM telegram_temp_clear_fence AS fence WHERE fence.bot_id=${alias}.bot_id AND fence.actor_id=${alias}.actor_id),'[0,0]')`;
+}
+
+export function generalTempRawMarker(alias: "inbox" | "earlier"): string {
+  return `substr(${alias}.receipt_nonce,1,${TELEGRAM_GENERAL_TEMP_RAW_PREFIX.length})='${TELEGRAM_GENERAL_TEMP_RAW_PREFIX}'`;
 }
 
 function planText(text: string): TextPlan {
