@@ -767,9 +767,11 @@ def quiet_expression(tables, observed_at=None):
     if "telegram_page_jumps" in tables:
         conditions.append(f"""NOT EXISTS(SELECT 1 FROM telegram_page_jumps AS prompt
             JOIN telegram_inbox AS inbox USING(receipt_id) JOIN telegram_outbox AS reply USING(receipt_id)
-            WHERE prompt.kind='prompt' AND prompt.expires_at>{epoch} AND inbox.receipt_nonce='view-jump:v1'
+            WHERE prompt.kind='prompt' AND prompt.expires_at>{epoch} AND inbox.receipt_nonce IN ('view-jump:v1','view-jump:v2')
               AND reply.state='sent' AND NOT EXISTS(
                 SELECT 1 FROM telegram_page_jumps WHERE origin_receipt_id=prompt.receipt_id))""")
+    if "telegram_page_jump_controls" in tables:
+        conditions.append("NOT EXISTS(SELECT 1 FROM telegram_page_jump_controls WHERE enabled=1)")
     conditions.extend(f"NOT EXISTS(SELECT 1 FROM {table} WHERE expires_at > {epoch} AND used_by_receipt_id IS NULL)" for table in waits)
     return "(" + " AND ".join(conditions) + ")"
 

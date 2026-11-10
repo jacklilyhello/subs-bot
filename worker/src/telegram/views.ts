@@ -2,10 +2,10 @@ import { checkOwnerId, SUBSCRIPTION_LIFECYCLE_REVISION, validInteger } from "../
 import { listDeletedSubscriptions, listOwnedSubscriptions } from "../subscriptions.ts";
 import type { TelegramLifecycleButton } from "./lifecycle-actions.ts";
 import type { TelegramSubscriptionReadButton } from "./subscription-read.ts";
-import { inTelegramScope, TELEGRAM_PAGE_JUMP_MARKER, type TelegramPolicy, type TelegramViewKind, type TelegramViewUpdate } from "./protocol.ts";
+import { inTelegramScope, TELEGRAM_PAGE_JUMP_RECEIPTS, type TelegramPolicy, type TelegramViewKind, type TelegramViewUpdate } from "./protocol.ts";
 
 export const TELEGRAM_VIEW_MARKER = "view:v1";
-export const TELEGRAM_VIEW_RECEIPTS = `'${TELEGRAM_VIEW_MARKER}','${TELEGRAM_PAGE_JUMP_MARKER}'`;
+export const TELEGRAM_VIEW_RECEIPTS = `'${TELEGRAM_VIEW_MARKER}',${TELEGRAM_PAGE_JUMP_RECEIPTS}`;
 
 interface ViewCursor {
   afterId: number | null;

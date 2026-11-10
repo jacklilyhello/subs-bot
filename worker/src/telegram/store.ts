@@ -1,5 +1,5 @@
 import { readShortLinkNamespaces } from "../short-links.ts";
-import { inTelegramScope, TELEGRAM_PAGE_JUMP_MARKER, type TelegramCommand, type TelegramPolicy } from "./protocol.ts";
+import { inTelegramScope, TELEGRAM_PAGE_JUMP_RECEIPTS, type TelegramCommand, type TelegramPolicy } from "./protocol.ts";
 import {
   insertTelegramViewTickets, TELEGRAM_VIEW_RECEIPTS, type TelegramView, type TelegramViewTicket,
 } from "./views.ts";
@@ -406,7 +406,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
         inbox.message_id AS messageId, inbox.message_date AS messageDate, inbox.thread_id AS threadId,
         inbox.command, reply.lease_id AS leaseId, reply.attempts,
         page.kind AS viewKind, page.after_id AS afterId, page.after_epoch AS afterEpoch,
-        CASE WHEN inbox.receipt_nonce='${TELEGRAM_PAGE_JUMP_MARKER}' THEN 1 ELSE 0 END AS pageJumpMarker,
+        CASE WHEN inbox.receipt_nonce IN (${TELEGRAM_PAGE_JUMP_RECEIPTS}) THEN 1 ELSE 0 END AS pageJumpMarker,
         action.kind AS lifecycleKind, action.subscription_id AS lifecycleSubscriptionId,
         action.expected_revision AS lifecycleExpectedRevision, claim.code_sha256 AS privateClaimCodeSha256,
         CASE WHEN inbox.receipt_nonce='${TELEGRAM_GROUP_CLAIM_MARKER}' THEN 1 ELSE 0 END AS groupClaimMarker,
@@ -779,7 +779,7 @@ export async function closeUnsentTelegramPageJump(db: D1Database, policy: Telegr
     WHERE receipt_id=? AND state='leased' AND lease_id=? AND attempts=? AND EXISTS (
       SELECT 1 FROM telegram_inbox AS inbox WHERE inbox.receipt_id=telegram_outbox.receipt_id
         AND inbox.bot_id=? AND inbox.update_id=? AND inbox.actor_id=? AND inbox.chat_id=? AND inbox.chat_type=?
-        AND inbox.thread_id IS ? AND inbox.receipt_nonce='${TELEGRAM_PAGE_JUMP_MARKER}')`)
+        AND inbox.thread_id IS ? AND inbox.receipt_nonce IN (${TELEGRAM_PAGE_JUMP_RECEIPTS}))`)
     .bind(lease.receiptId, lease.leaseId, lease.attempts, policy.botId, lease.updateId, lease.actorId,
       lease.chatId, lease.chatType, lease.threadId).run();
   if (!closed.success) throw new Error("Telegram page jump reply could not close.");

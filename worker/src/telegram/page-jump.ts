@@ -1,13 +1,15 @@
 import { validInteger } from "../storage.ts";
 import { isolatedTelegramRoleEpochSql } from "./authorization-sql.ts";
 import {
-  inTelegramScope, TELEGRAM_PAGE_JUMP_MARKER, TELEGRAM_PAGE_JUMP_PROMPT,
+  inTelegramScope, TELEGRAM_PAGE_JUMP_MARKER, TELEGRAM_PAGE_JUMP_PROMPT, TELEGRAM_PAGE_JUMP_RECEIPTS,
   type TelegramPageJumpUpdate, type TelegramPolicy,
 } from "./protocol.ts";
 import { TELEGRAM_VIEW_PAGE_SIZE, TELEGRAM_VIEW_RECEIPTS } from "./views.ts";
 
 const MIGRATION = "0042_telegram_page_jumps.sql";
 const MIGRATION_SHA256 = "195fdd3611d9f380e86d9b30983fff306d4218c2ae7899d7dcf49fa275f9c288";
+const CONTROL_MIGRATION = "0043_telegram_page_jump_controls.sql";
+const CONTROL_MIGRATION_SHA256 = "cad46bc0c6b296de85e8c77ce2cb71e8aef156b5e03e04628e0c1ee060649571";
 const TTL_SECONDS = 600;
 // Cover every subscription count admitted by the sealed legacy restore package.
 const MAX_ROWS = 20_000;
@@ -17,15 +19,45 @@ type Guard = { sql: string; bindings: readonly (string | number | null)[] };
 type Kind = "prompt" | "page" | "invalid" | "range" | "limit" | "cancelled";
 type Presentation = { kind: Kind; maximum: number | null };
 
-export async function telegramPageJumpReady(db: D1Database): Promise<boolean> {
+const basePin = `EXISTS (
+  SELECT /* subs-bot:telegram-page-jump:v1 */ 1 FROM subs_bot_schema_migrations
+  WHERE position=42 AND name='${MIGRATION}' AND sha256='${MIGRATION_SHA256}' AND mode='applied'
+    AND (SELECT count(*) FROM sqlite_schema WHERE tbl_name='telegram_page_jumps' AND (
+      (type='table' AND name='telegram_page_jumps') OR (type='index' AND name='telegram_page_jumps_expiry')))=2
+)`;
+
+async function telegramPageJumpReady(db: D1Database): Promise<boolean> {
   try {
-    return await db.prepare(`SELECT /* subs-bot:telegram-page-jump:v1 */ 1 AS ready FROM subs_bot_schema_migrations
-      WHERE position=42 AND name=? AND sha256=? AND mode='applied'
-        AND (SELECT count(*) FROM sqlite_schema WHERE tbl_name='telegram_page_jumps' AND (
-          (type='table' AND name='telegram_page_jumps') OR (type='index' AND name='telegram_page_jumps_expiry')))=2`)
-      .bind(MIGRATION, MIGRATION_SHA256).first<number>("ready") === 1;
+    return await db.prepare(`SELECT ${basePin} AS ready`).first<number>("ready") === 1;
   } catch {
     return false;
+  }
+}
+
+export function telegramPageJumpEpoch(binding: string | undefined): number | null {
+  const value = /^v2:([1-9][0-9]{0,15})(?![\s\S])/u.exec(binding ?? "")?.[1];
+  const epoch = value === undefined ? null : Number(value);
+  return validInteger(epoch, 1) ? epoch : null;
+}
+
+const controlPin = `EXISTS (
+  SELECT /* subs-bot:telegram-page-jump-epoch:v1 */ 1 FROM subs_bot_schema_migrations
+  WHERE position=43 AND name='${CONTROL_MIGRATION}' AND sha256='${CONTROL_MIGRATION_SHA256}' AND mode='applied'
+) AND ${basePin}`;
+const currentOrigin = `EXISTS (
+  SELECT 1 FROM telegram_page_jump_controls AS gate WHERE gate.bot_id=inbox.bot_id
+    AND gate.epoch=? AND gate.enabled=1 AND inbox.receipt_id>gate.origin_after_receipt AND ${controlPin}
+)`;
+
+export async function currentTelegramPageJumpEpoch(db: D1Database, botId: string, receiptId?: number): Promise<number | null> {
+  try {
+    const epoch = await db.prepare(`SELECT epoch FROM telegram_page_jump_controls AS gate
+      WHERE gate.bot_id=? AND gate.enabled=1 AND ${controlPin}
+        ${receiptId === undefined ? "" : "AND ?>gate.origin_after_receipt"}`)
+      .bind(botId, ...(receiptId === undefined ? [] : [receiptId])).first<number>("epoch");
+    return validInteger(epoch, 1) ? epoch : null;
+  } catch {
+    return null;
   }
 }
 
@@ -34,15 +66,17 @@ const newerPrompt = `EXISTS (
   SELECT 1 FROM telegram_inbox AS newer JOIN telegram_page_jumps AS pending USING(receipt_id)
   WHERE newer.bot_id=inbox.bot_id AND newer.actor_id=inbox.actor_id AND newer.chat_id=inbox.chat_id
     AND newer.chat_type=inbox.chat_type AND newer.thread_id IS inbox.thread_id
+    AND newer.receipt_id>(SELECT origin_after_receipt FROM telegram_page_jump_controls WHERE bot_id=inbox.bot_id)
     AND newer.update_id>inbox.update_id AND pending.kind='prompt'
 )`;
 
-function candidateSource(policy: TelegramPolicy, event: TelegramPageJumpUpdate): Guard {
+function candidateSource(policy: TelegramPolicy, event: TelegramPageJumpUpdate, admissionEpoch: number): Guard {
   const matchScope = `inbox.bot_id=? AND inbox.actor_id=? AND inbox.chat_id=? AND inbox.chat_type=? AND inbox.thread_id IS ?
     AND inbox.update_id<? AND reply.state='sent' AND reply.sent_message_id=?
+    AND ${currentOrigin}
     AND NOT EXISTS (SELECT 1 FROM telegram_page_jumps WHERE origin_receipt_id=inbox.receipt_id)`;
   const scope = [policy.botId, event.actorId, event.chatId, event.chatType, event.threadId, event.updateId,
-    event.kind === "open" ? event.messageId : event.promptMessageId];
+    event.kind === "open" ? event.messageId : event.promptMessageId, admissionEpoch];
   if (event.kind === "open") {
     return {
       sql: `SELECT inbox.receipt_id,CASE WHEN inbox.actor_id=? THEN 'admin' ELSE 'member' END AS actor_role,
@@ -52,7 +86,7 @@ function candidateSource(policy: TelegramPolicy, event: TelegramPageJumpUpdate):
         LEFT JOIN telegram_page_jumps AS prior USING(receipt_id)
         LEFT JOIN telegram_auth AS auth ON auth.bot_id=inbox.bot_id AND auth.user_id=inbox.actor_id
         WHERE ${matchScope} AND view.kind='list' AND inbox.receipt_nonce IN (${TELEGRAM_VIEW_RECEIPTS})
-          AND (CASE WHEN inbox.receipt_nonce='${TELEGRAM_PAGE_JUMP_MARKER}' THEN prior.kind='page'
+          AND (CASE WHEN inbox.receipt_nonce IN (${TELEGRAM_PAGE_JUMP_RECEIPTS}) THEN prior.kind='page'
             AND prior.actor_role=CASE WHEN inbox.actor_id=? THEN 'admin' ELSE 'member' END
             AND prior.auth_message_date=CASE WHEN inbox.actor_id=? THEN 0 ELSE COALESCE(auth.message_date,0) END
             AND prior.auth_message_id=CASE WHEN inbox.actor_id=? THEN 0 ELSE COALESCE(auth.message_id,0) END
@@ -81,10 +115,14 @@ function candidateSource(policy: TelegramPolicy, event: TelegramPageJumpUpdate):
 }
 
 /** A normal list receipt authorizes one prompt, and only its exact confirmed reply is consumable. */
-export async function acceptTelegramPageJump(db: D1Database, policy: TelegramPolicy, event: TelegramPageJumpUpdate): Promise<boolean> {
+export async function acceptTelegramPageJump(
+  db: D1Database, policy: TelegramPolicy, event: TelegramPageJumpUpdate, admissionEpoch: number,
+): Promise<boolean> {
   if (event.kind === "reply" && event.page !== null && !validInteger(event.page, 1)) return false;
-  if (!inTelegramScope(policy, event) || !await telegramPageJumpReady(db)) return false;
-  const source = candidateSource(policy, event);
+  if (!validInteger(admissionEpoch, 1) || !inTelegramScope(policy, event)
+      || await currentTelegramPageJumpEpoch(db, policy.botId) !== admissionEpoch) return false;
+  // The advisory read above never substitutes for the control predicate inside the inbox transaction.
+  const source = candidateSource(policy, event, admissionEpoch);
   const key = [policy.botId, event.updateId, crypto.randomUUID()] as const;
   const requested = event.kind === "reply" && !event.cancelled ? event.page : null;
   const fixedKind = event.kind === "open" ? "prompt" : event.cancelled ? "cancelled" : "invalid";
@@ -133,17 +171,20 @@ export async function acceptTelegramPageJump(db: D1Database, policy: TelegramPol
   throw new Error(failure);
 }
 
-export function telegramPageJumpSendGuard(policy: TelegramPolicy): Guard {
+export function telegramPageJumpSendGuard(policy: TelegramPolicy, promptEpoch: number | null = null): Guard {
   const epoch = isolatedTelegramRoleEpochSql(policy, "inbox");
+  const kind = promptEpoch === null ? "origin.kind<>'prompt'" : `origin.kind='prompt'
+    AND inbox.receipt_nonce='${TELEGRAM_PAGE_JUMP_MARKER}' AND NOT ${newerPrompt} AND ${currentOrigin}`;
   return { sql: `EXISTS (SELECT 1 FROM telegram_page_jumps AS origin WHERE origin.receipt_id=inbox.receipt_id
-    AND origin.expires_at>unixepoch() AND (origin.kind<>'prompt' OR NOT ${newerPrompt}) AND ${epoch.sql})`, bindings: epoch.bindings };
+    AND origin.expires_at>unixepoch() AND ${kind} AND ${epoch.sql})`,
+    bindings: promptEpoch === null ? epoch.bindings : [promptEpoch, ...epoch.bindings] };
 }
 
 export async function confirmTelegramPageJumpSend(db: D1Database, policy: TelegramPolicy,
   lease: { receiptId: number; leaseId: string; attempts: number }, guard: Guard): Promise<boolean> {
   try {
     return await db.prepare(`SELECT 1 AS confirmed FROM telegram_inbox AS inbox JOIN telegram_outbox AS reply USING(receipt_id)
-      WHERE inbox.receipt_id=? AND inbox.bot_id=? AND inbox.receipt_nonce='${TELEGRAM_PAGE_JUMP_MARKER}'
+      WHERE inbox.receipt_id=? AND inbox.bot_id=? AND inbox.receipt_nonce IN (${TELEGRAM_PAGE_JUMP_RECEIPTS})
         AND reply.state='sending' AND reply.lease_id=? AND reply.attempts=? AND reply.lease_until>unixepoch()
         AND ${guard.sql}`).bind(lease.receiptId, policy.botId, lease.leaseId, lease.attempts, ...guard.bindings)
       .first<number>("confirmed") === 1;
