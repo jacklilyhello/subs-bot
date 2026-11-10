@@ -9,6 +9,7 @@ import { test } from "node:test";
 import { build } from "esbuild";
 import { Log, LogLevel, Miniflare } from "miniflare";
 import { PRODUCTION_PUBLIC_ORIGIN } from "../src/public-origin.ts";
+import { createPrivateShare, privateShareCodeDigest } from "../src/private-shares.ts";
 import { publishNodeSnapshot } from "../src/storage.ts";
 import { claimTelegramDocumentJob } from "../src/telegram/document-jobs.ts";
 import { reconcileTelegramDocumentJobReplies, retireTelegramDocumentStage } from "../src/telegram/document-persistence.ts";
@@ -124,7 +125,12 @@ test("closed general authorization replays a sealed candidate in a separate emit
   const providerConfig = JSON.stringify({ ...JSON.parse(generalConfig),
     outbox: "shared-private-management-formats-temp-node-document-provider" });
   const generalProviderPin = parseGeneralTelegramPin(providerConfig, fixture.releaseRevision);
-  assert.ok(generalProviderPin?.privateProvider && generalProviderPin.privateDocument);
+  assert.ok(generalProviderPin?.privateProvider && generalProviderPin.privateDocument && !generalProviderPin.privateClaims);
+  const claimsConfig = JSON.stringify({ ...JSON.parse(generalConfig),
+    outbox: "shared-private-management-formats-temp-node-document-provider-claims" });
+  const claimsPin = parseGeneralTelegramPin(claimsConfig, fixture.releaseRevision);
+  assert.ok(claimsPin?.privateClaims && claimsPin.privateProvider);
+  const claimSends = new Map<number, { actorId: string; text?: string; body?: Buffer }>();
   for (const outbox of ["legacy", "shared-lifecycle", "shared-path", ["shared-private-management"]]) {
     assert.equal(parseGeneralTelegramPin(JSON.stringify({ ...JSON.parse(generalConfig), outbox }),
       fixture.releaseRevision), null);
@@ -214,6 +220,30 @@ test("closed general authorization replays a sealed candidate in a separate emit
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: providerConfig,
         PROVIDER_REVISION: providerRevision, PROVIDER_IMAGE_SHA256: imageSha256,
         ...(enabled ? { TELEGRAM_PROVIDER_URL_IMPORT: "1", TELEGRAM_PROVIDER_REFRESH: "1" } : {}) } })),
+    { name: "claims", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
+      bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: claimsConfig },
+      outboundService: async (request: Request) => {
+        const api = `https://api.telegram.org/bot${generalToken}/`;
+        assert.equal(request.method, "POST");
+        let actorId: string, replyId: number, text: string | undefined, body: Buffer | undefined;
+        if (request.url === api + "sendDocument") {
+          const form = await request.formData();
+          actorId = String(form.get("chat_id"));
+          replyId = JSON.parse(String(form.get("reply_parameters"))).message_id as number;
+          const document = form.get("document");
+          assert.ok(document && typeof document !== "string" && document.name === "private-share.txt");
+          body = Buffer.from(await document.arrayBuffer());
+        } else {
+          assert.equal(request.url, api + "sendMessage");
+          const message = await request.json() as GeneralAuthReplayMessage;
+          actorId = message.chat_id;
+          replyId = message.reply_parameters.message_id;
+          text = message.text;
+        }
+        assert.ok(!claimSends.has(replyId));
+        claimSends.set(replyId, { actorId, text, body });
+        return Response.json({ ok: true, result: { chat: { id: Number(actorId) }, message_id: replyId + 3000 } });
+      } },
     { name: "provider-rpc", modules: true, compatibilityDate, d1Databases,
       script: `import { WorkerEntrypoint } from 'cloudflare:workers';
         export class ProviderFetch extends WorkerEntrypoint {
@@ -1171,6 +1201,76 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.doesNotMatch(JSON.stringify(lifecycleSent.filter(({ reply_parameters }) => reply_parameters.message_id >= 7520)),
     /provider\.fixture|signed%2Bvalue|synthetic-user|ss:\/\//u);
 
+  const claimsWorker = await runtime.getWorker("claims");
+  const claimBucket = await runtime.getR2Bucket("NODES", "claims");
+  await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,'104',12,?,'member')")
+    .bind(pin.botId, pin.generation, now + 15).run();
+  const claimPost = (id: number, actor: number, code: string, options: PostOptions = {}) =>
+    post(actor, "/start claim_" + code, { worker: claimsWorker, updateId: id, date: now + 16, ...options });
+  const awaitClaim = async (id: number) => {
+    const end = Date.now() + 4000;
+    for (let row = await findReply(id); Date.now() < end; row = await findReply(id)) {
+      if (row?.state === "sent") {
+        assert.equal(row.marker, "general-private-claim:v1");
+        const sent = claimSends.get(id);
+        assert.ok(sent);
+        return sent;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.fail("The synthetic private claim did not settle.");
+  };
+  const shareBody = "\uFEFFSynthetic archived body\r\nwith NUL\0";
+  const share = await createPrivateShare(db, claimBucket, { botId: pin.botId, senderId: "101",
+    senderName: "Synthetic share sender", content: shareBody, targetUserId: "104", maxClaims: 1, durationMinutes: 5 });
+  const legacyCode = "legacyShare";
+  const legacyDigest = await privateShareCodeDigest(legacyCode);
+  await db.prepare("UPDATE private_shares SET code_sha256=? WHERE bot_id=? AND code_sha256=?")
+    .bind(legacyDigest, pin.botId, await privateShareCodeDigest(share.code)).run();
+  const countClaims = (digest: string | null) => db.prepare(`SELECT count(*) AS n FROM private_share_claims AS claim
+    JOIN private_shares AS share ON share.id=claim.share_id WHERE share.bot_id=? AND share.code_sha256=?`)
+    .bind(pin.botId, digest).first<number>("n");
+  assert.equal((await claimPost(7560, 104, legacyCode, { worker: providerPaused })).status, 204);
+  assert.equal((await claimPost(7561, 102, legacyCode)).status, 204);
+  assert.equal((await claimPost(7562, 104, legacyCode, groupEvent)).status, 204);
+  assert.equal((await claimPost(7563, 101, legacyCode)).status, 200);
+  assert.match((await awaitClaim(7563)).text ?? "", /指定了其他领取人/u);
+  assert.equal(await countClaims(legacyDigest), 0);
+  assert.equal((await claimPost(7564, 104, legacyCode)).status, 200);
+  assert.deepEqual(await awaitClaim(7564), { actorId: "104", text: undefined, body: Buffer.from(shareBody, "utf8") });
+  assert.equal((await claimPost(7564, 104, legacyCode)).status, 204);
+  assert.equal((await claimPost(7565, 104, legacyCode)).status, 200);
+  assert.deepEqual(await awaitClaim(7565), { actorId: "104", text: undefined, body: Buffer.from(shareBody, "utf8") });
+  assert.equal(await countClaims(legacyDigest), 1);
+  assert.equal(await db.prepare(`SELECT claim.code_sha256 AS digest FROM telegram_private_claim AS claim
+    JOIN telegram_inbox AS inbox USING(receipt_id) WHERE inbox.bot_id=? AND inbox.update_id=7564`)
+    .bind(pin.botId).first("digest"), legacyDigest);
+
+  const revoked = await createPrivateShare(db, claimBucket, { botId: pin.botId, senderId: "101", senderName: "Fixture",
+    content: "Synthetic revoked body", targetUserId: "104", maxClaims: 1, durationMinutes: 5 });
+  assert.equal(await acceptGeneralSharedTelegramCommand(db, claimsPin, new Request("https://app.fixture.invalid/telegram/webhook", {
+    method: "POST", headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": pin.webhookSecret },
+    body: JSON.stringify({ update_id: 7566, message: { text: "/start claim_" + revoked.code, message_id: 7566, date: now + 16,
+      from: { id: 104, is_bot: false }, chat: { id: 104, type: "private" }, entities: [{ type: "bot_command", offset: 0, length: 6 }] } }),
+  })), 200);
+  const queuedClaim = await claimGeneralSharedTelegramReply(db, claimsPin);
+  assert.equal(queuedClaim?.updateId, 7566);
+  await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,'104',13,?,'denied')")
+    .bind(pin.botId, pin.generation, now + 17).run();
+  assert.equal((await claimsWorker.scheduled({ cron: "* * * * *" })).outcome, "ok");
+  assert.equal((await findReply(7566))?.state, "failed");
+  assert.equal(await countClaims(await privateShareCodeDigest(revoked.code)), 0);
+  assert.equal(claimSends.has(7566), false);
+
+  const expired = await createPrivateShare(db, claimBucket, { botId: pin.botId, senderId: "101", senderName: "Fixture",
+    content: "Synthetic expired body", targetUserId: null, maxClaims: 1, durationMinutes: 5 });
+  const expiredDigest = await privateShareCodeDigest(expired.code);
+  await db.prepare("UPDATE private_shares SET created_at=unixepoch()-2,expire_at=unixepoch()-1 WHERE bot_id=? AND code_sha256=?")
+    .bind(pin.botId, expiredDigest).run();
+  assert.equal((await claimPost(7567, 101, expired.code)).status, 200);
+  assert.match((await awaitClaim(7567)).text ?? "", /分享已过期/u);
+  assert.equal(await countClaims(expiredDigest), 0);
+
   const rehearsal = await runtime.getWorker("rehearsal");
   const lanePost = (actor: number, command: string, options: PostOptions = {}) =>
     post(actor, command, { secret: isolation.webhookSecret, date: now - 3, ...options, worker: rehearsal });
@@ -1216,7 +1316,7 @@ test("closed general authorization replays a sealed candidate in a separate emit
   const open = await readGeneralReadLane(db, isolation, fixture.releaseRevision);
   assert.ok(open?.pin?.rehearsal && open.mode === "general");
   assert.deepEqual([open.pin.privateManagement, open.pin.privateFormats, open.pin.privateTemp,
-    open.pin.privateDocument, open.pin.privateProvider], [false, false, false, false, false],
+    open.pin.privateDocument, open.pin.privateProvider, open.pin.privateClaims], [false, false, false, false, false, false],
     "the rehearsal enables only private reads");
   assert.equal((await lanePost(182, "/list", { updateId: 8102, date: now - 21 })).status, 503,
     "uncommitted pre-cutover delivery is held for the original lane");

@@ -2,7 +2,7 @@ import type { PublicOrigin } from "../public-origin.ts";
 import { GENERAL_TELEGRAM_PROVIDER_MARKER } from "../provider-jobs.ts";
 import { acceptTelegramDocumentJob, generalDocumentReplyEligibility, generalDocumentReplyScope, renderTelegramDocumentOutcome,
   TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER, type TelegramDocumentJobResult } from "./document-jobs.ts";
-import { sendGeneralTelegramGroupListReply, sendGeneralTelegramPrivateReply } from "./delivery.ts";
+import { sendGeneralTelegramGroupListReply, sendGeneralTelegramPrivateReply, sendPrivateShareClaimResult } from "./delivery.ts";
 import {
   generalReadEvent, renderGeneralReadReply,
   type GeneralReadCommand, type GeneralReadEvent, type GeneralTelegramPin,
@@ -16,13 +16,15 @@ import { acceptGeneralTelegramLifecycle, GENERAL_LIFECYCLE_MARKER, GENERAL_LIFEC
   type TelegramLifecycleReply, type TelegramLifecycleTicket } from "./lifecycle-actions.ts";
 import { acceptGeneralTelegramSubscriptionRead, renderGeneralSubscriptionRead } from "./general-subscription-read.ts";
 import { acceptGeneralProviderRequest } from "./general-provider.ts";
+import { acceptTelegramPrivateClaim, beginTelegramPrivateClaim, GENERAL_PRIVATE_CLAIM_SCHEMA,
+  prepareTelegramPrivateClaim, TELEGRAM_GENERAL_PRIVATE_CLAIM_MARKER } from "./private-claims.ts";
 import { GENERAL_PATH_MARKER, prepareTelegramPathReceipt, renderTelegramPath, type TelegramPathReply } from "./path-management.ts";
 import { generalProviderRefreshReady, insertTelegramProviderRefreshTicket, prepareTelegramProviderRefreshButton,
   reapTelegramProviderRefreshTickets, type TelegramProviderRefreshTicket } from "./provider-refresh.ts";
 import { generalProviderReplyEligibility, generalProviderReplyScope, parseTelegramProviderText, renderTelegramProviderReply,
   type TelegramProviderReply, type TelegramProviderRequestKind } from "./provider-replies.ts";
 import { readGeneralPrivateDocumentUpdate, readGeneralPrivateLifecycleUpdate, readGeneralPrivateSubscriptionRead,
-  readGeneralPrivateProviderRefresh, readGeneralPrivateTempUpdate, readPrivateTelegramCommand, readTelegramUpdate } from "./protocol.ts";
+  readGeneralPrivateProviderRefresh, readGeneralPrivateShareClaim, readGeneralPrivateTempUpdate, readPrivateTelegramCommand, readTelegramUpdate } from "./protocol.ts";
 import { confirmTelegramSubscriptionReadSend, GENERAL_SUBSCRIPTION_READ_MARKER, insertTelegramSubscriptionReadTickets,
   prepareTelegramSubscriptionReadTickets, reapTelegramSubscriptionReadTickets,
   type TelegramSubscriptionReadTicket } from "./subscription-read.ts";
@@ -64,6 +66,7 @@ interface SharedReadLease {
   actionKind: TelegramLifecycleReply["kind"] | null;
   actionSubscriptionId: number | null;
   actionRevision: number | null;
+  claimCodeSha256: string | null;
   leaseId: string;
   attempts: number;
 }
@@ -101,7 +104,7 @@ function family(alias: "inbox" | "earlier", group: boolean, pin: GeneralTelegram
     AND EXISTS (SELECT 1 FROM telegram_temp_reply WHERE receipt_id=${alias}.receipt_id))` : "";
   const document = pin.privateDocument ? `OR (${generalDocumentReplyScope(alias)})` : "";
   const provider = pin.privateProvider ? `OR (${generalProviderReplyScope(alias)})` : "";
-  return pin.privateManagement ? `((${ordinary}) OR (/* subs-bot:telegram-general-private-lifecycle:v1 */ ${privateScope} AND (
+  const management = pin.privateManagement ? `((${ordinary}) OR (/* subs-bot:telegram-general-private-lifecycle:v1 */ ${privateScope} AND (
     (${alias}.receipt_nonce='${GENERAL_LIFECYCLE_VIEW_MARKER}' AND ${alias}.command='list' AND ${view} IN ('list','recycle')))
     OR (${alias}.receipt_nonce='${GENERAL_LIFECYCLE_MARKER}' AND ${alias}.command='help'
       AND EXISTS (SELECT 1 FROM telegram_lifecycle_action WHERE receipt_id=${alias}.receipt_id))
@@ -110,6 +113,10 @@ function family(alias: "inbox" | "earlier", group: boolean, pin: GeneralTelegram
         WHERE receipt_id=${alias}.receipt_id))
     OR (${alias}.receipt_nonce='${GENERAL_PATH_MARKER}' AND ${alias}.command='help'
       AND EXISTS (SELECT 1 FROM telegram_path_reply WHERE receipt_id=${alias}.receipt_id)) ${temp} ${document} ${provider})))` : ordinary;
+  return pin.privateClaims ? `(CASE WHEN ${alias}.receipt_nonce='${TELEGRAM_GENERAL_PRIVATE_CLAIM_MARKER}'
+    THEN (${privateScope} AND ${alias}.command='help'
+      AND EXISTS (SELECT 1 FROM telegram_private_claim WHERE receipt_id=${alias}.receipt_id))
+    ELSE (${management}) END)` : management;
 }
 
 function queueMarkers(group: boolean, pin: GeneralTelegramPin): string {
@@ -120,6 +127,7 @@ function queueMarkers(group: boolean, pin: GeneralTelegramPin): string {
   if (pin.privateTemp) markers.push(TELEGRAM_GENERAL_TEMP_MARKER);
   if (pin.privateDocument) markers.push(TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER);
   if (pin.privateProvider) markers.push(GENERAL_TELEGRAM_PROVIDER_MARKER);
+  if (pin.privateClaims) markers.push(TELEGRAM_GENERAL_PRIVATE_CLAIM_MARKER);
   return markers.map((marker) => `'${marker}'`).join(",");
 }
 
@@ -129,11 +137,13 @@ function current(alias: "inbox" | "earlier", group: boolean, pin: GeneralTelegra
   const tempScope = pin.privateTemp ? ` AND (${alias}.receipt_nonce<>'${TELEGRAM_GENERAL_TEMP_MARKER}' OR (${TEMP_SCHEMA}
     AND ${tempSchemaGuard("legacy-ready")}))` : "";
   const laneScope = pin.rehearsal ? ` AND ${GENERAL_READ_LANE_ROLE}` : "";
+  const claimScope = pin.privateClaims ? ` AND (${alias}.receipt_nonce<>'${TELEGRAM_GENERAL_PRIVATE_CLAIM_MARKER}'
+    OR ${GENERAL_PRIVATE_CLAIM_SCHEMA})` : "";
   const ordinaryClock = generalOrdinaryReplyEligibilitySql(alias);
   const clock = pin.privateDocument ? `(CASE WHEN ${alias}.receipt_nonce='${TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER}'
     THEN (${generalDocumentReplyEligibility(alias)}) ${pin.privateProvider ? `WHEN ${alias}.receipt_nonce='${GENERAL_TELEGRAM_PROVIDER_MARKER}'
     THEN (${generalProviderReplyEligibility(alias)})` : ""} ELSE (${ordinaryClock}) END)` : ordinaryClock;
-  return `${clock} AND ${generalCurrentAuthoritySql(alias, `${groupScope} AND ${pathScope}${tempScope}${laneScope}`)}`;
+  return `${clock} AND ${generalCurrentAuthoritySql(alias, `${groupScope} AND ${pathScope}${tempScope}${laneScope}${claimScope}`)}`;
 }
 
 function currentBindings(pin: GeneralTelegramPin) {
@@ -147,6 +157,9 @@ export async function acceptGeneralSharedTelegramCommand(
   const decoded = await readTelegramUpdate(request, pin.webhookSecret);
   if (decoded.status !== 200) return decoded.status;
   if (!pin.sharedOutbox || pin.rehearsal) return 204;
+  const claim = pin.privateClaims
+    ? readGeneralPrivateShareClaim(decoded.update, decoded.updateId, pin.botId, pin.botUsername) : null;
+  if (claim) return await acceptTelegramPrivateClaim(db, pin, claim) === "accepted" ? 200 : 204;
   const refresh = pin.privateProvider ? readGeneralPrivateProviderRefresh(decoded.update, decoded.updateId, pin.botId) : null;
   if (refresh) {
     if (!refreshAvailable) return 204;
@@ -195,7 +208,7 @@ export async function acceptGeneralSharedTelegramCommand(
 export function acceptGeneralReadLaneCommand(
   db: D1Database, pin: GeneralTelegramPin, event: GeneralReadEvent, guard: D1PreparedStatement,
 ): Promise<number> {
-  if (!pin.rehearsal || pin.privateManagement || pin.privateFormats || pin.privateTemp || pin.privateDocument || pin.privateProvider
+  if (!pin.rehearsal || pin.privateManagement || pin.privateFormats || pin.privateTemp || pin.privateDocument || pin.privateProvider || pin.privateClaims
     || event.chatType !== "private" || event.chatId !== event.actorId
     || event.threadId !== null || event.viewKind === "recycle") return Promise.resolve(204);
   return acceptSharedRead(db, pin, event, null, null, guard);
@@ -300,7 +313,9 @@ export async function claimGeneralSharedTelegramReply(db: D1Database, pin: Gener
       inbox.message_id AS messageId,inbox.message_date AS messageDate,inbox.command,inbox.receipt_nonce AS marker,authority.generation,
       authority.actor_revision AS actorRevision,authority.actor_role AS actorRole,reply.attempts,reply.lease_id AS leaseId,
       page.kind AS viewKind,action.kind AS actionKind,action.subscription_id AS actionSubscriptionId,
-      action.expected_revision AS actionRevision
+      action.expected_revision AS actionRevision,
+      ${pin.privateClaims ? `(SELECT code_sha256 FROM telegram_private_claim WHERE receipt_id=inbox.receipt_id
+        AND inbox.receipt_nonce='${TELEGRAM_GENERAL_PRIVATE_CLAIM_MARKER}')` : "NULL"} AS claimCodeSha256
       FROM telegram_outbox AS reply JOIN telegram_inbox AS inbox USING (receipt_id)
       JOIN telegram_general_receipt AS authority USING (receipt_id)
       LEFT JOIN telegram_view AS page USING (receipt_id)
@@ -316,14 +331,17 @@ export async function claimGeneralSharedTelegramReply(db: D1Database, pin: Gener
 
 function selectLease(pin: GeneralTelegramPin, lease: SharedReadLease, authorizing: boolean, metadata?: MetadataReply) {
   const group = !pin.rehearsal && lease.chatType !== "private";
+  const claim = pin.privateClaims && lease.marker === TELEGRAM_GENERAL_PRIVATE_CLAIM_MARKER;
+  const claimProof = claim ? ` AND EXISTS (SELECT 1 FROM telegram_private_claim
+    WHERE receipt_id=inbox.receipt_id AND code_sha256=?)` : "";
   const exact = `FROM telegram_inbox AS inbox JOIN telegram_general_receipt AS authority USING (receipt_id)
     WHERE inbox.bot_id=? AND inbox.receipt_id=? AND inbox.update_id=? AND inbox.actor_id=?
       AND inbox.chat_id=? AND inbox.chat_type=? AND inbox.thread_id IS ? AND inbox.message_id=? AND inbox.message_date=?
       AND inbox.command=? AND inbox.receipt_nonce=? AND authority.actor_revision=? AND authority.actor_role=?
-      AND ${generalRecordedOriginSql("inbox")} AND ${family("inbox", group, pin)}`;
+      AND ${generalRecordedOriginSql("inbox")} AND ${family("inbox", group, pin)}${claimProof}`;
   const exactBindings = [pin.botId, lease.receiptId, lease.updateId, lease.actorId, lease.chatId, lease.chatType, lease.threadId,
     lease.messageId, lease.messageDate, lease.command, lease.marker, lease.actorRevision, lease.actorRole,
-    ...generalPolicyBindings(pin, lease.generation)];
+    ...generalPolicyBindings(pin, lease.generation), ...(claim ? [lease.claimCodeSha256] : [])];
   const eligible = current("inbox", group, pin);
   if (authorizing && metadata) {
     // Keep the current grant and the origin/target proof separate inside the atomic begin.
@@ -380,6 +398,17 @@ export async function drainGeneralSharedTelegramReply(
 ): Promise<boolean> {
   const lease = await claimGeneralSharedTelegramReply(db, pin);
   if (!lease) return false;
+  if (lease.marker === TELEGRAM_GENERAL_PRIVATE_CLAIM_MARKER) {
+    if (!pin.privateClaims || !lease.claimCodeSha256) return false;
+    const claim = { ...lease, privateClaim: { codeSha256: lease.claimCodeSha256 } };
+    const prepared = await prepareTelegramPrivateClaim(db, bucket, pin, claim);
+    const result = await beginTelegramPrivateClaim(db, pin, claim, prepared,
+      prepareTelegramOutboxBegin(db, lease, selectLease(pin, lease, true)));
+    if (!result) return false;
+    const outcome = await sendPrivateShareClaimResult(pin.botToken, lease.actorId, lease.messageId, result, 5_000);
+    await settleTelegramOutboxReply(db, lease, selectLease(pin, lease, false), outcome);
+    return true;
+  }
   if (lease.marker === GENERAL_SUBSCRIPTION_READ_MARKER) {
     const presentation = await renderGeneralSubscriptionRead(db, pin, lease, bucket, publicOrigin, refreshAvailable);
     if (!presentation?.readGuard) return false;

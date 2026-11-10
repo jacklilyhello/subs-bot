@@ -269,6 +269,18 @@ export function readPrivateTelegramCommand(update: Record<string, unknown>, botU
   return command ? { actorId, messageId, messageDate, ...command } : null;
 }
 
+export function readGeneralPrivateShareClaim(
+  update: Record<string, unknown>, updateId: number, botId: string, botUsername: string,
+): TelegramPrivateClaimUpdate | null {
+  const command = readPrivateTelegramCommand(update, botUsername);
+  if (!command || command.actorId === botId || command.name !== "start") return null;
+  const match = PRIVATE_CLAIM.exec(command.remainder.trim());
+  if (!match) return null;
+  const { actorId, messageId, messageDate } = command;
+  return { kind: "private-claim", updateId, actorId, chatId: actorId, chatType: "private", threadId: null,
+    messageId, messageDate, code: match[1] };
+}
+
 export function readGeneralGroupListCommand(update: Record<string, unknown>, botUsername: string):
   Omit<TelegramEventScope, "updateId"> | null {
   const { message } = update;
