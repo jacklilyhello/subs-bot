@@ -2,9 +2,10 @@ import { checkOwnerId, SUBSCRIPTION_LIFECYCLE_REVISION, validInteger } from "../
 import { listDeletedSubscriptions, listOwnedSubscriptions } from "../subscriptions.ts";
 import type { TelegramLifecycleButton } from "./lifecycle-actions.ts";
 import type { TelegramSubscriptionReadButton } from "./subscription-read.ts";
-import { inTelegramScope, type TelegramPolicy, type TelegramViewKind, type TelegramViewUpdate } from "./protocol.ts";
+import { inTelegramScope, TELEGRAM_PAGE_JUMP_MARKER, type TelegramPolicy, type TelegramViewKind, type TelegramViewUpdate } from "./protocol.ts";
 
 export const TELEGRAM_VIEW_MARKER = "view:v1";
+export const TELEGRAM_VIEW_RECEIPTS = `'${TELEGRAM_VIEW_MARKER}','${TELEGRAM_PAGE_JUMP_MARKER}'`;
 
 interface ViewCursor {
   afterId: number | null;
@@ -23,7 +24,8 @@ export interface TelegramViewTicket extends ViewCursor {
   sha256: string;
 }
 
-const PAGE_SIZE = 8;
+export const TELEGRAM_VIEW_PAGE_SIZE = 8;
+const PAGE_SIZE = TELEGRAM_VIEW_PAGE_SIZE;
 const EXPIRY_SECONDS = 14 * 24 * 60 * 60;
 const TICKET_SECONDS = 10 * 60;
 const TICKET_REAP_LIMIT = 40;
@@ -62,14 +64,15 @@ export async function acceptTelegramView(
           JOIN telegram_inbox AS inbox ON inbox.receipt_id = origin.receipt_id
           JOIN telegram_outbox AS reply ON reply.receipt_id = inbox.receipt_id
           WHERE ticket.token_sha256 = ? AND ticket.used_by_receipt_id IS NULL AND ticket.expires_at > unixepoch()
-            AND inbox.receipt_nonce = ? AND inbox.bot_id = ? AND inbox.actor_id = ?
+            AND inbox.receipt_nonce IN (${TELEGRAM_VIEW_RECEIPTS}) AND inbox.bot_id = ? AND inbox.actor_id = ?
             AND inbox.chat_id = ? AND inbox.chat_type = ? AND inbox.thread_id IS ?
             AND reply.state = 'sent' AND reply.sent_message_id = ? AND reply.attempts = ticket.origin_attempt
             AND (inbox.actor_id = ? OR COALESCE((
-              SELECT allowed FROM telegram_auth WHERE bot_id = inbox.bot_id AND user_id = inbox.actor_id
+              SELECT allowed=1 AND (inbox.receipt_nonce='${TELEGRAM_VIEW_MARKER}' OR message_date<inbox.message_date)
+              FROM telegram_auth WHERE bot_id = inbox.bot_id AND user_id = inbox.actor_id
             ), 1) = 1)
           ${conflict}
-        `).bind(...scope, digest, TELEGRAM_VIEW_MARKER, policy.botId, event.actorId, event.chatId,
+        `).bind(...scope, digest, policy.botId, event.actorId, event.chatId,
           event.chatType, event.threadId, event.messageId, policy.adminId),
         db.prepare(`
           UPDATE telegram_view_ticket AS ticket SET used_by_receipt_id = incoming.receipt_id
@@ -155,6 +158,7 @@ export async function renderTelegramView(
   ownerId: string,
   view: TelegramView,
   includeReadButtons = false,
+  absoluteOrdinals = includeReadButtons,
 ): Promise<{ text: string; buttons: TelegramViewButton[]; lifecycleButtons: TelegramLifecycleButton[];
   readButtons?: TelegramSubscriptionReadButton[] }> {
   if ((view.afterId !== null && !validInteger(view.afterId, 1))
@@ -196,7 +200,7 @@ export async function renderTelegramView(
   }
 
   let preceding = 0;
-  if (includeReadButtons && view.kind === "list" && view.afterId !== null && items.length > 0) {
+  if (absoluteOrdinals && view.kind === "list" && view.afterId !== null && items.length > 0) {
     const row = await db.prepare("SELECT count(*) AS preceding FROM subscriptions WHERE owner_id=? AND id<?")
       .bind(ownerId, items[0].id).first<{ preceding: number }>().catch(() => null);
     if (!row || !validInteger(row.preceding, 0)) throw new Error("Telegram subscription position could not be read.");
@@ -255,9 +259,9 @@ export function insertTelegramViewTickets(
     JOIN telegram_view AS origin USING (receipt_id)
     CROSS JOIN tickets
     WHERE changes() = 1 AND reply.receipt_id = ? AND reply.attempts = ? AND reply.lease_id = ?
-      AND reply.state = 'sending' AND inbox.receipt_nonce = ?
+      AND reply.state = 'sending' AND inbox.receipt_nonce IN (${TELEGRAM_VIEW_RECEIPTS})
   `).bind(...tickets.flatMap(({ sha256, afterId, afterEpoch }) => [sha256, afterId, afterEpoch]),
-    receiptId, attempt, leaseId, TELEGRAM_VIEW_MARKER);
+    receiptId, attempt, leaseId);
 }
 
 export async function reapTelegramViewTickets(db: D1Database): Promise<void> {

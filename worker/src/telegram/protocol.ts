@@ -34,6 +34,14 @@ export type TelegramViewUpdate = TelegramEventScope & (
   | { kind: "callback"; callbackId: string; ticket: string }
 );
 
+export const TELEGRAM_PAGE_JUMP_CALLBACK = "list:jump:v1";
+export const TELEGRAM_PAGE_JUMP_PROMPT = "🔢 请回复这条消息，输入要跳转的页码数字（如 2）。";
+export const TELEGRAM_PAGE_JUMP_MARKER = "view-jump:v1";
+export type TelegramPageJumpUpdate = TelegramEventScope & (
+  | { kind: "open"; callbackId: string }
+  | { kind: "reply"; promptMessageId: number; page: number | null; cancelled: boolean }
+);
+
 export type TelegramLifecycleUpdate = TelegramEventScope & (
   | { kind: "lifecycle-callback"; callbackId: string; ticket: string }
   | { kind: "rename-reply"; promptMessageId: number; text: string }
@@ -126,8 +134,10 @@ type ApiStatusUpdate = (ProviderBatchUpdate & { apiStatus?: never })
   | ({ apiStatus: TelegramApiStatusUpdate } & Partial<Record<keyof ProviderBatchUpdate, never>>);
 type GroupShareUpdate = (ApiStatusUpdate & { groupShare?: never })
   | ({ groupShare: TelegramGroupShareUpdate } & Partial<Record<keyof ApiStatusUpdate, never>>);
-type NormalizedUpdate = (GroupShareUpdate & { legacyInlineClaim?: never })
+type LegacyInlineClaimUpdate = (GroupShareUpdate & { legacyInlineClaim?: never })
   | ({ legacyInlineClaim: TelegramLegacyInlineClaim } & Partial<Record<keyof GroupShareUpdate, never>>);
+type NormalizedUpdate = (LegacyInlineClaimUpdate & { pageJump?: never })
+  | ({ pageJump: TelegramPageJumpUpdate } & Partial<Record<keyof LegacyInlineClaimUpdate, never>>);
 
 type DecodedTelegramRequest =
   | ({ status: 200 } & NormalizedUpdate)
@@ -439,6 +449,14 @@ function normalizeMessage(
   }
   if (command === "list" || command === "expiry" || command === "recycle") return { view: { ...scope, kind: command } };
   if (command) return { command: { ...scope, command } };
+  if (ownBotMessage(origin, policy) && origin.text === TELEGRAM_PAGE_JUMP_PROMPT) {
+    const prompt = messageScope(origin, actorId, updateId, policy);
+    if (typeof text !== "string" || prompt?.chatId !== scope.chatId || prompt.chatType !== scope.chatType
+        || prompt.threadId !== scope.threadId || prompt.messageId >= scope.messageId || prompt.messageDate > scope.messageDate) return null;
+    const position = subscriptionPosition(text);
+    return { pageJump: { ...scope, kind: "reply", promptMessageId: prompt.messageId,
+      page: position === null ? null : Math.max(1, position), cancelled: RENAME_CANCEL.test(text.trim()) } };
+  }
   if (typeof text === "string" && classifyTelegramApiStatusInput({ kind: "ordinary", text }).kind !== "pass-through") return null;
   const lifecycle = renameReply(message, scope, policy);
   if (lifecycle) return { lifecycle };
@@ -478,6 +496,7 @@ function normalizeCallback(
   if (!ownBotMessage(message, policy)) return null;
   const scope = messageScope(message, String(actor.id), updateId, policy);
   if (!scope) return null;
+  if (ticket === TELEGRAM_PAGE_JUMP_CALLBACK) return { pageJump: { ...scope, kind: "open", callbackId } };
   if (ticket === GROUP_SHARE_PUBLISH_CALLBACK) return scope.chatType === "private" && scope.threadId === null
     ? { groupShare: { ...scope, kind: "publish", callbackId } } : null;
   if (ticket === GROUP_SHARE_PICK_CALLBACK) return scope.chatType !== "private" && scope.threadId === null

@@ -11,7 +11,7 @@ from attest_api_status_container import ATTESTATION_ENV
 from cloudflare_isolation import (
     CloudflareClient, CloudflareError, WORKER_NAME, group_share_cards_artifact, legacy_dynamic_all_artifact,
     legacy_selected_artifact, legacy_temp_artifact,
-    release_worker, validate_aggregate_key, validate_private_share_key, verify_worker_target,
+    release_worker, validate_aggregate_key, validate_private_share_key, verify_page_jump_artifact, verify_worker_target,
 )
 from d1_migrations import MigrationError, apply_migrations
 from prepare_isolation_artifact import ArtifactError, require_current_main
@@ -172,6 +172,7 @@ def release():
     selected_capable = legacy_selected_artifact(bundle, manifest)
     temp_capable = legacy_temp_artifact(bundle, manifest)
     dynamic_all_capable = legacy_dynamic_all_artifact(bundle, manifest)
+    verify_page_jump_artifact(bundle, manifest)
     telegram_config = telegram_release_config(manifest)
     aggregate_key = None
     if any(item["name"] == "0014_telegram_aggregate_issuance.sql" for item in manifest["migrations"]):

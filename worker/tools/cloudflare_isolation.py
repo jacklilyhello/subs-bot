@@ -19,6 +19,10 @@ WORKER_NAME = "subs-bot-cf-dev-01"
 NAMESPACE = "lilyya"
 TELEGRAM_CONFIG_BINDING = "TELEGRAM_ISOLATION_CONFIG"
 TELEGRAM_DIGEST_BINDING = "TELEGRAM_CONFIG_SHA256"
+PAGE_JUMP_BINDING = "TELEGRAM_PAGE_JUMP"
+PAGE_JUMP_MARKER = b"subs-bot:telegram-page-jump:v1"
+PAGE_JUMP_MIGRATION = "0042_telegram_page_jumps.sql"
+PAGE_JUMP_MIGRATION_SHA256 = "195fdd3611d9f380e86d9b30983fff306d4218c2ae7899d7dcf49fa275f9c288"
 INLINE_SEARCH_BINDING = "TELEGRAM_INLINE_SEARCH"
 INLINE_SEARCH_MIGRATION = "0025_telegram_personal_inline.sql"
 INLINE_SEARCH_MIGRATION_SHA256 = "2c504b14ca94597925b1703d2f50d211d29addaff8f139b5411be5fd2306b122"
@@ -253,6 +257,7 @@ class _Version:
     telegram_mixed_documents_capable: bool = False
     telegram_group_share_cards: bool = False
     telegram_group_share_cards_capable: bool = False
+    telegram_page_jump_capable: bool = False
 
 
 def _release_tag(revision, telegram_digest, aggregate_digest, private_share_digest, provider_binding):
@@ -826,6 +831,8 @@ class _Isolation:
                  and all(isinstance(row, dict) and isinstance(row.get("name"), str) for row in rows),
                  "Unexpected isolated Worker binding inventory.")
         bindings = {row["name"]: row for row in rows}
+        _require(PAGE_JUMP_BINDING not in bindings,
+                 "An admission-enabled page-jump release requires a separately reviewed pause and drain.")
         base_bindings = {"DB", "NODES", "BUILD_REVISION"}
         telegram_bindings = base_bindings | TELEGRAM_BINDINGS
         has_provider = bool(PROVIDER_BINDINGS & bindings.keys())
@@ -993,7 +1000,8 @@ class _Isolation:
                         provider_url is not None, refresh is not None, legacy_shorts is not None,
                         provider_batch is not None, batch_capable, api_status_binding, api_status is not None,
                         provider_documents is not None, documents_capable, mixed_documents is not None, mixed_documents_capable,
-                        group_share_cards is not None, group_share_cards_capable)
+                        group_share_cards is not None, group_share_cards_capable,
+                        telegram_page_jump_capable=PAGE_JUMP_MARKER in body)
         capabilities = tuple(check(body) for requested, check in (
             (with_legacy_selected, _legacy_selected_module_capable),
             (with_legacy_temp, _legacy_temp_module_capable),
@@ -1118,7 +1126,29 @@ class _Isolation:
                 return candidate
         raise CloudflareError("Isolated Worker upload could not be confirmed.", uncertain=True)
 
-    def activate(self, previous, version_id, message, *, current_capable, target_capable, guard,
+    def verify_page_jump_drain(self, current, target):
+        if not current.telegram_page_jump_capable or target.telegram_page_jump_capable:
+            return
+        path = f"{self.account}/d1/database/{self.target['d1Id']}/query"
+        error = "The isolated page-jump drain could not be verified."
+        try:
+            # Admission is off in every version accepted by version(). Concurrent
+            # settlements may finish these receipts. They cannot create new ones.
+            result = self.data_api("POST", path, {"sql": """
+                SELECT EXISTS (SELECT 1 FROM telegram_outbox AS reply JOIN telegram_inbox AS inbox USING(receipt_id)
+                    WHERE inbox.receipt_nonce='view-jump:v1'
+                      AND reply.state IN ('pending','leased','sending')) AS pageJumpUnsettled
+            """})
+            _require(isinstance(result, list) and len(result) == 1 and result[0].get("success") is True, error)
+            rows = result[0]["results"]
+            _require(isinstance(rows, list) and len(rows) == 1
+                     and type(rows[0]["pageJumpUnsettled"]) is int and rows[0]["pageJumpUnsettled"] in (0, 1), error)
+        except (CloudflareError, AttributeError, KeyError, TypeError, ValueError):
+            raise CloudflareError(error) from None
+        _require(rows[0]["pageJumpUnsettled"] == 0,
+                 "Keep a Worker with verified page-jump delivery until isolated page-jump replies have drained.")
+
+    def activate(self, previous, version_id, message, *, current_version, target_version, current_capable, target_capable, guard,
                  current_temp_capable=False, target_temp_capable=False,
                  current_dynamic_all_capable=False, target_dynamic_all_capable=False):
         # All tracked application deployment writes use this boundary, including rollback.
@@ -1128,6 +1158,7 @@ class _Isolation:
                                       require_schema=current_temp_capable or target_temp_capable)
         self.verify_legacy_dynamic_all_floor(allow_rows=current_dynamic_all_capable and target_dynamic_all_capable,
                                              require_schema=current_dynamic_all_capable or target_dynamic_all_capable)
+        self.verify_page_jump_drain(current_version, target_version)
         _require(self.active() == previous, "Active isolated Worker deployment changed before activation.")
         _guard_current(guard)
         try:
@@ -1266,12 +1297,28 @@ def legacy_dynamic_all_artifact(bundle_dir, manifest):
     return _legacy_dynamic_all_artifact_capable(_verified_module(bundle_dir, manifest.get("bundleSha256")), manifest)
 
 
+def _page_jump_artifact_capable(module, manifest):
+    migrations = manifest.get("migrations")
+    capable = PAGE_JUMP_MARKER in module
+    _require(isinstance(migrations, list), "The verified Worker artifact lacks a migration chain.")
+    if capable or len(migrations) >= 42:
+        _require(capable and len(migrations) >= 42 and migrations[41] == {
+            "name": PAGE_JUMP_MIGRATION, "sha256": PAGE_JUMP_MIGRATION_SHA256,
+        }, "The verified Worker artifact does not pin the exact 0042 page-jump migration and runtime.")
+    return capable
+
+
+def verify_page_jump_artifact(bundle_dir, manifest):
+    _page_jump_artifact_capable(_verified_module(bundle_dir, manifest.get("bundleSha256")), manifest)
+
+
 def _artifact(bundle_dir, manifest, telegram_config, aggregate_key=None, private_share_key=None, provider_binding=None):
     _require(isinstance(manifest, dict) and manifest.get("version") == 2
              and _matches(REVISION, manifest.get("revision")) and _matches(DIGEST, manifest.get("bundleSha256"))
              and _matches(DATE, manifest.get("compatibilityDate")) and isinstance(manifest.get("migrations"), list),
              "Invalid verified Worker release manifest.")
     module = _verified_module(bundle_dir, manifest["bundleSha256"])
+    page_jump_capable = _page_jump_artifact_capable(module, manifest)
     revision = manifest["revision"]
     telegram_digest = None
     aggregate_digest = None
@@ -1299,7 +1346,8 @@ def _artifact(bundle_dir, manifest, telegram_config, aggregate_key=None, private
     # Distinct configuration releases can share a Git revision.
     tag = _release_tag(revision, telegram_digest, aggregate_digest, private_share_digest, provider_binding)
     return module, _Version(revision, manifest["bundleSha256"], manifest["compatibilityDate"],
-                            tag, telegram_digest, aggregate_digest, private_share_digest, provider_binding)
+                            tag, telegram_digest, aggregate_digest, private_share_digest, provider_binding,
+                            telegram_page_jump_capable=page_jump_capable)
 
 
 def _read_health():
@@ -1706,6 +1754,7 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                                    require_schema=old_temp_capable or desired_temp_capable)
     scope.verify_legacy_dynamic_all_floor(allow_rows=old_dynamic_all_capable and desired_dynamic_all_capable,
                                          require_schema=old_dynamic_all_capable or desired_dynamic_all_capable)
+    scope.verify_page_jump_drain(old_version, desired)
     _require(old_version.compatibility == desired.compatibility, "Worker compatibility date change requires separate approval.")
     _require_telegram_config_continuity(old_version, desired.telegram_config_sha256)
     _require(telegram_config is not None or (not had_cron and old_version.telegram_config_sha256 is None),
@@ -1856,6 +1905,7 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
     if verify_group_schema:
         scope.verify_group_share_cards(drained=not group_capable)
     activated = scope.activate(previous, candidate, f"Isolated Worker release {desired.revision} {uuid4()}",
+                               current_version=old_version, target_version=desired,
                                current_capable=old_selected_capable, target_capable=desired_selected_capable, guard=guard,
                                current_temp_capable=old_temp_capable, target_temp_capable=desired_temp_capable,
                                current_dynamic_all_capable=old_dynamic_all_capable, target_dynamic_all_capable=desired_dynamic_all_capable)
@@ -1907,6 +1957,7 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
             if verify_group_schema:
                 scope.verify_group_share_cards(drained=not old_version.telegram_group_share_cards_capable)
             restored = scope.activate(activated, previous.version, f"Isolated Worker rollback {uuid4()}",
+                                      current_version=desired, target_version=old_version,
                                       current_capable=desired_selected_capable, target_capable=old_selected_capable, guard=guard,
                                       current_temp_capable=desired_temp_capable, target_temp_capable=old_temp_capable,
                                       current_dynamic_all_capable=desired_dynamic_all_capable, target_dynamic_all_capable=old_dynamic_all_capable)
