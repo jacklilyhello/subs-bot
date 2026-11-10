@@ -3,18 +3,16 @@ import {
   validInteger, type NodeRecord, type StagedNodeSnapshot,
 } from "../storage.ts";
 import {
-  ISOLATED_DOCUMENT_CLEANUP_SCOPE, prepareTelegramDocumentJobLeaseGuard, prepareTelegramDocumentJobSettlement,
-  TELEGRAM_DOCUMENT_JOB_MARKER,
-  type TelegramDocumentJobLease, type TelegramDocumentJobOutcome,
+  isGeneralDocumentPolicy, prepareTelegramDocumentJobLeaseGuard, prepareTelegramDocumentJobSettlement, telegramDocumentJobOrigin,
+  TELEGRAM_DOCUMENT_JOB_MARKER, TELEGRAM_DOCUMENT_REPLY_TTL,
+  type TelegramDocumentJobLease, type TelegramDocumentJobOutcome, type TelegramDocumentPolicy,
 } from "./document-jobs.ts";
 import { prepareTelegramProviderDocumentMarker, prepareTelegramProviderDocumentPlan,
   type TelegramProviderDocumentSources } from "./provider-document.ts";
-import type { TelegramPolicy } from "./protocol.ts";
 import { prepareLegacyAllAppend } from "../legacy-all-aggregates.ts";
 
 export const MAX_TELEGRAM_DOCUMENT_NODES = 500;
 const UPLOADED_SOURCE = "uploaded://telegram-document";
-const MAX_REPLY_AGE_SECONDS = 900;
 // A Cron invocation can run for 15 minutes. Never retire an abandoned candidate during that window.
 const STAGE_CLEANUP_GRACE_SECONDS = 20 * 60;
 const NO_NEWER_DOCUMENT = `NOT EXISTS (
@@ -39,7 +37,7 @@ function verifyBatch(results: readonly D1Result[], expected: number): void {
   }
 }
 
-async function reserveSubscription(db: D1Database, policy: TelegramPolicy, lease: TelegramDocumentJobLease): Promise<Reservation | null> {
+async function reserveSubscription(db: D1Database, policy: TelegramDocumentPolicy, lease: TelegramDocumentJobLease): Promise<Reservation | null> {
   const guard = prepareTelegramDocumentJobLeaseGuard(policy, lease);
   const missing = `NOT EXISTS (SELECT 1 FROM telegram_document_reservations WHERE receipt_id = ?)`;
   const token = crypto.randomUUID().replaceAll("-", "");
@@ -76,28 +74,32 @@ async function reserveSubscription(db: D1Database, policy: TelegramPolicy, lease
   return results[5].results[0] ?? null;
 }
 
-function prepareTerminalOutbox(db: D1Database, receiptId: number): D1PreparedStatement {
+function prepareTerminalOutbox(db: D1Database, policy: TelegramDocumentPolicy, receiptId: number): D1PreparedStatement {
+  const origin = isGeneralDocumentPolicy(policy) ? telegramDocumentJobOrigin(policy, false)
+    : { sql: "inbox.receipt_nonce=?", bindings: [TELEGRAM_DOCUMENT_JOB_MARKER] };
   return db.prepare(`
     INSERT INTO telegram_outbox (receipt_id)
     SELECT job.receipt_id FROM telegram_document_jobs AS job JOIN telegram_inbox AS inbox USING (receipt_id)
-    WHERE job.receipt_id = ? AND job.state = 'done' AND job.result_code <> 'saved' AND inbox.receipt_nonce = ?
+    WHERE job.receipt_id=? AND job.bot_id=? AND job.state='done' AND job.result_code<>'saved' AND (${origin.sql})
     ON CONFLICT (receipt_id) DO NOTHING
-  `).bind(receiptId, TELEGRAM_DOCUMENT_JOB_MARKER);
+  `).bind(receiptId, policy.botId, ...origin.bindings);
 }
 
 export async function finishTelegramDocumentJob(
   db: D1Database,
-  policy: TelegramPolicy,
+  policy: TelegramDocumentPolicy,
   lease: TelegramDocumentJobLease,
   outcome: Exclude<TelegramDocumentJobOutcome, { kind: "saved" }>,
 ): Promise<"retry" | "done" | "stale"> {
   try {
+    const recorded = telegramDocumentJobOrigin(policy, false);
     const results = await db.batch<{ state: "done" | "pending" }>([
       prepareTelegramDocumentJobSettlement(db, policy, lease, outcome),
-      prepareTerminalOutbox(db, lease.receiptId),
+      prepareTerminalOutbox(db, policy, lease.receiptId),
       db.prepare(`DELETE FROM telegram_document_reservations WHERE receipt_id = ?
-        AND EXISTS (SELECT 1 FROM telegram_document_jobs WHERE receipt_id = ? AND state = 'done')`)
-        .bind(lease.receiptId, lease.receiptId),
+        AND EXISTS (SELECT 1 FROM telegram_document_jobs AS job WHERE job.receipt_id=? AND job.bot_id=? AND job.actor_id=?
+          AND job.state='done' AND (${recorded.sql}))`)
+        .bind(lease.receiptId, lease.receiptId, policy.botId, lease.actorId, ...recorded.bindings),
     ]);
     verifyBatch(results, 3);
     const row = results[0].results[0];
@@ -109,7 +111,7 @@ export async function finishTelegramDocumentJob(
 
 function preparePublication(
   db: D1Database,
-  policy: TelegramPolicy,
+  policy: TelegramDocumentPolicy,
   lease: TelegramDocumentJobLease,
   reservation: Reservation,
   staged: StagedNodeSnapshot,
@@ -145,13 +147,14 @@ function preparePublication(
 export async function persistTelegramDocumentJob(
   db: D1Database,
   bucket: R2Bucket,
-  policy: TelegramPolicy,
+  policy: TelegramDocumentPolicy,
   lease: TelegramDocumentJobLease,
   nodes: readonly NodeRecord[],
   counts: { parsed: number },
   mixed?: TelegramProviderDocumentSources,
 ): Promise<"saved" | "stale"> {
-  if (!validInteger(counts.parsed, 1, MAX_TELEGRAM_DOCUMENT_NODES) || counts.parsed !== nodes.length) {
+  if ((mixed && isGeneralDocumentPolicy(policy)) || !validInteger(counts.parsed, 1, MAX_TELEGRAM_DOCUMENT_NODES)
+    || counts.parsed !== nodes.length) {
     throw new RangeError("Invalid Telegram document node count.");
   }
   try {
@@ -174,7 +177,7 @@ export async function persistTelegramDocumentJob(
     if (journal !== snapshotId) return "stale";
 
     const staged = await stageNodeSnapshot(bucket, reservation.id, nodes, snapshotId);
-    const plan = mixed ? await prepareTelegramProviderDocumentPlan(db, policy, lease, mixed, true) : null;
+    const plan = mixed && !isGeneralDocumentPolicy(policy) ? await prepareTelegramProviderDocumentPlan(db, policy, lease, mixed, true) : null;
     const pointer = "EXISTS (SELECT 1 FROM subscriptions WHERE id = ? AND owner_id = ? AND snapshot_id = ?)";
     const pointerKey = [reservation.id, lease.actorId, snapshotId] as const;
     const saved = "EXISTS (SELECT 1 FROM telegram_document_jobs WHERE receipt_id = ? AND state = 'done' AND result_code = 'saved')";
@@ -223,27 +226,30 @@ export async function persistTelegramDocumentJob(
   }
 }
 
-export async function reconcileTelegramDocumentJobReplies(db: D1Database, policy: TelegramPolicy): Promise<number> {
+export async function reconcileTelegramDocumentJobReplies(db: D1Database, policy: TelegramDocumentPolicy): Promise<number> {
   try {
+    const recorded = telegramDocumentJobOrigin(policy, false);
+    const origin = isGeneralDocumentPolicy(policy) ? recorded : {
+      sql: `inbox.receipt_nonce=? AND inbox.chat_type='private' AND inbox.chat_id=job.actor_id
+        AND inbox.thread_id IS NULL AND job.actor_id IN (?,?)`,
+      bindings: [TELEGRAM_DOCUMENT_JOB_MARKER, policy.adminId, policy.memberId],
+    };
     const results = await db.batch([
       db.prepare(`
         INSERT INTO telegram_outbox (receipt_id)
         SELECT job.receipt_id FROM telegram_document_jobs AS job JOIN telegram_inbox AS inbox USING (receipt_id)
-        WHERE job.bot_id = ? AND job.state = 'done' AND job.finished_at > unixepoch() - ${MAX_REPLY_AGE_SECONDS}
-          AND inbox.received_at > unixepoch() - ${MAX_REPLY_AGE_SECONDS} AND inbox.receipt_nonce = ?
-          AND inbox.chat_type = 'private' AND inbox.chat_id = job.actor_id AND inbox.thread_id IS NULL
-          AND job.actor_id IN (?, ?) AND job.result_code <> 'saved'
-          AND NOT EXISTS (SELECT 1 FROM telegram_outbox WHERE receipt_id = job.receipt_id)
-        ORDER BY job.finished_at, job.receipt_id LIMIT 16
-      `).bind(policy.botId, TELEGRAM_DOCUMENT_JOB_MARKER, policy.adminId, policy.memberId),
+        WHERE job.bot_id=? AND job.state='done' AND job.finished_at>unixepoch()-${TELEGRAM_DOCUMENT_REPLY_TTL}
+          AND inbox.received_at>unixepoch()-${TELEGRAM_DOCUMENT_REPLY_TTL} AND (${origin.sql})
+          AND job.result_code<>'saved' AND NOT EXISTS (SELECT 1 FROM telegram_outbox WHERE receipt_id=job.receipt_id)
+        ORDER BY job.finished_at,job.receipt_id LIMIT 16
+      `).bind(policy.botId, ...origin.bindings),
       db.prepare(`
         DELETE FROM telegram_document_reservations WHERE receipt_id IN (
           SELECT reservation.receipt_id FROM telegram_document_reservations AS reservation
-          JOIN telegram_document_jobs AS job USING (receipt_id) WHERE job.bot_id = ? AND job.state = 'done'
-            AND ${ISOLATED_DOCUMENT_CLEANUP_SCOPE}
-          ORDER BY reservation.receipt_id LIMIT 16
+          JOIN telegram_document_jobs AS job USING (receipt_id) WHERE job.bot_id=? AND job.state='done'
+            AND (${recorded.sql}) ORDER BY reservation.receipt_id LIMIT 16
         )
-      `).bind(policy.botId),
+      `).bind(policy.botId, ...recorded.bindings),
     ]);
     verifyBatch(results, 2);
     return results[0].meta.changes;
@@ -258,13 +264,14 @@ const unreferencedStage = `stage.cleanup_after <= unixepoch()
   AND NOT EXISTS (SELECT 1 FROM telegram_document_jobs WHERE receipt_id = stage.receipt_id
     AND state = 'leased' AND lease_id = stage.lease_id AND lease_until > unixepoch())`;
 
-export async function retireTelegramDocumentStage(db: D1Database, bucket: R2Bucket, policy: TelegramPolicy): Promise<void> {
+export async function retireTelegramDocumentStage(db: D1Database, bucket: R2Bucket, policy: TelegramDocumentPolicy): Promise<void> {
   try {
+    const recorded = telegramDocumentJobOrigin(policy, false);
     const stage = await db.prepare(`SELECT stage.subscription_id AS id, stage.snapshot_id AS snapshotId
       FROM telegram_document_stages AS stage JOIN telegram_document_jobs AS job USING (receipt_id)
-      WHERE job.bot_id = ? AND ${unreferencedStage} AND ${ISOLATED_DOCUMENT_CLEANUP_SCOPE}
-      ORDER BY stage.cleanup_after, stage.snapshot_id LIMIT 1`)
-      .bind(policy.botId).first<Stage>();
+      WHERE job.bot_id=? AND ${unreferencedStage} AND (${recorded.sql})
+      ORDER BY stage.cleanup_after,stage.snapshot_id LIMIT 1`)
+      .bind(policy.botId, ...recorded.bindings).first<Stage>();
     if (!stage) return;
     if (!validInteger(stage.id, 1) || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/u.test(stage.snapshotId)) {
       throw new Error("Invalid document stage identity.");
@@ -279,8 +286,8 @@ export async function retireTelegramDocumentStage(db: D1Database, bucket: R2Buck
     if ((await bucket.list({ prefix, limit: 1 })).objects.length !== 0) throw new Error("Document stage still exists.");
     await db.prepare(`DELETE FROM telegram_document_stages AS stage WHERE snapshot_id = ? AND subscription_id = ?
       AND EXISTS (SELECT 1 FROM telegram_document_jobs AS job WHERE job.receipt_id = stage.receipt_id
-        AND job.bot_id = ? AND ${ISOLATED_DOCUMENT_CLEANUP_SCOPE})
-      AND ${unreferencedStage}`).bind(stage.snapshotId, stage.id, policy.botId).run();
+        AND job.bot_id=? AND (${recorded.sql}))
+      AND ${unreferencedStage}`).bind(stage.snapshotId, stage.id, policy.botId, ...recorded.bindings).run();
   } catch {
     throw new Error("Telegram document stage cleanup could not be confirmed.");
   }

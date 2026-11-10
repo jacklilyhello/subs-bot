@@ -60,6 +60,7 @@ export type TelegramTempUpdate = TelegramEventScope & (
   | { kind: "temp-text"; text: string }
   | { kind: "temp-raw" | "temp-summary" | "temp-clear" }
 );
+export type TelegramGeneralTempUpdate = TelegramTempUpdate & { kind: "temp-text" | "temp-summary" | "temp-clear" };
 
 export type TelegramPathUpdate = TelegramEventScope & { kind: "path"; args: string };
 export type TelegramPrivateShareCreationUpdate = TelegramEventScope & { args: string; senderName?: string };
@@ -448,6 +449,31 @@ export function readGeneralPrivateSubscriptionRead(
     updateId, messageId: command.messageId, messageDate: command.messageDate, query: command.remainder };
 }
 
+export function readGeneralPrivateTempUpdate(
+  update: Record<string, unknown>, updateId: number, botId: string, botUsername: string,
+): TelegramGeneralTempUpdate | null {
+  const { message } = update;
+  if (Object.keys(update).length !== 2 || !isRecord(message) || "edit_date" in message || "document" in message
+    || "message_thread_id" in message || "reply_to_message" in message || message.is_topic_message === true) return null;
+  const actorId = humanSender(message);
+  const scope = actorId && actorId !== botId ? telegramMessageScope(message, actorId, updateId) : null;
+  if (!scope || scope.chatType !== "private" || scope.chatId !== scope.actorId || scope.threadId !== null) return null;
+
+  const command = readLeadingTelegramCommand(message, botUsername);
+  if (command) {
+    if (command.name !== "temp") return null;
+    const argument = command.remainder.trim().toLowerCase();
+    if (argument === "clear") return { ...scope, kind: "temp-clear" };
+    return argument === "" || argument === "summary" ? { ...scope, kind: "temp-summary" } : null;
+  }
+
+  const { text, entities } = message;
+  const hasCommand = Array.isArray(entities) && entities.some((entity) => isRecord(entity) && entity.type === "bot_command");
+  return !hasCommand && typeof text === "string" && text.trim() !== "" && !text.trimStart().startsWith("/")
+    && classifyTelegramApiStatusInput({ kind: "ordinary", text }).kind === "pass-through"
+    ? { ...scope, kind: "temp-text", text } : null;
+}
+
 export function readGeneralPrivateLifecycleUpdate(
   update: Record<string, unknown>, updateId: number, botId: string,
 ): TelegramLifecycleUpdate | null {
@@ -464,15 +490,25 @@ export function readGeneralPrivateLifecycleUpdate(
     ? renameReply(message, scope, { botId }) : null;
 }
 
-function normalizeDocument(message: Record<string, unknown>, scope: TelegramEventScope): NormalizedUpdate | null {
+function documentInput(message: Record<string, unknown>, scope: TelegramEventScope): TelegramDocumentJobInput | null {
   if (scope.chatType !== "private" || scope.threadId !== null || !isRecord(message.document) ||
       "text" in message || "entities" in message || "animation" in message) return null;
   const { file_id: fileId, file_name: reportedName, file_size: fileSize } = message.document;
   if (!matches(fileId, DOCUMENT_FILE_ID) || (reportedName !== undefined && typeof reportedName !== "string") ||
       (fileSize !== undefined && fileSize !== 0 && !isPositiveInteger(fileSize))) return null;
-  // Preserve a durable rejection without carrying the unbounded filename into admission.
   const fileName = reportedName !== undefined && reportedName.length > MAX_DOCUMENT_FILENAME ? "." : reportedName;
-  return { document: { ...scope, fileId, fileName, fileSize } };
+  return { ...scope, fileId, fileName, fileSize };
+}
+
+export function readGeneralPrivateDocumentUpdate(
+  update: Record<string, unknown>, updateId: number, botId: string,
+): TelegramDocumentJobInput | null {
+  const { message } = update;
+  if (Object.keys(update).length !== 2 || !isRecord(message) || "edit_date" in message || !("document" in message)
+    || "reply_to_message" in message || "message_thread_id" in message || message.is_topic_message === true) return null;
+  const actorId = humanSender(message);
+  const scope = actorId && actorId !== botId ? telegramMessageScope(message, actorId, updateId) : null;
+  return scope && scope.chatId === scope.actorId ? documentInput(message, scope) : null;
 }
 
 const DECIMAL_DIGIT = /^\p{Nd}$/u;
@@ -510,7 +546,10 @@ function normalizeMessage(
       || prompt.messageId >= scope.messageId || prompt.messageDate > scope.messageDate) return null;
     return { apiStatus: { ...scope, kind: "reply", promptMessageId: prompt.messageId, text } };
   }
-  if ("document" in message) return normalizeDocument(message, scope);
+  if ("document" in message) {
+    const document = documentInput(message, scope);
+    return document ? { document } : null;
+  }
   const command = messageCommand(message, policy);
   if (command && typeof command === "object") {
     if ("subscriptionQuery" in command) return { subscriptionRead: { ...scope, kind: "search", query: command.subscriptionQuery } };

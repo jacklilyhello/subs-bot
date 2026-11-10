@@ -702,8 +702,23 @@ async function scheduled(_controller: ScheduledController, env: Env): Promise<vo
       if (recovery.some(({ status }) => status === "rejected")) throw new Error("Telegram scheduled recovery could not finish.");
     } else if (env.TELEGRAM_ISOLATION_CONFIG === undefined) {
       const general = parseGeneralTelegramPin(env.TELEGRAM_GENERAL_CONFIG, env.BUILD_REVISION);
-      if (general?.sharedOutbox) await recoverGeneralSharedTelegramReplies(env.DB, general, env.NODES, publicOrigin);
-      else if (general) await recoverGeneralTelegramReplies(env.DB, general);
+      if (general?.sharedOutbox) {
+        try {
+          if (general.privateDocument) {
+            try {
+              await runTelegramDocumentIntake(env.DB, env.NODES, general);
+            } finally {
+              try {
+                await reconcileTelegramDocumentJobReplies(env.DB, general);
+              } finally {
+                await retireTelegramDocumentStage(env.DB, env.NODES, general);
+              }
+            }
+          }
+        } finally {
+          await recoverGeneralSharedTelegramReplies(env.DB, general, env.NODES, publicOrigin);
+        }
+      } else if (general) await recoverGeneralTelegramReplies(env.DB, general);
     }
   } finally {
     await runOneProviderJob(env.DB, env.NODES, env.PROVIDER_FETCH, pin);
