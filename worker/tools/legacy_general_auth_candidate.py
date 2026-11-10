@@ -1,6 +1,7 @@
 """Build a sealed, dormant general authorization candidate for a fresh D1."""
 
 from contextlib import closing
+from dataclasses import dataclass
 from itertools import islice
 import os
 from pathlib import Path
@@ -86,6 +87,39 @@ _DDL = {
 SCHEMA = tuple(migrations.SchemaObject("table", name, name, sql) for name, sql in _DDL.items())
 
 
+@dataclass(frozen=True)
+class UnifiedAuthInput:
+    inventory_dir: Path
+    config_path: Path
+    target_path: Path
+    preview_dir: Path
+    inventory_sha256: str
+    config_sha256: str
+    target_sha256: str
+    preview_sha256: str
+
+
+def read_unified_auth_input(path):
+    fields = ("inventoryDir", "configPath", "targetPath", "previewDir", "inventorySha256", "configSha256",
+              "targetSha256", "previewSha256")
+    try:
+        document = native.parsed(package.read_private(path, 16 * 1024), 16 * 1024)
+        require(set(document) == set(fields)
+                and all(isinstance(document[key], str) and Path(document[key]).is_absolute() for key in fields[:4])
+                and all(native.matches(native.DIGEST, document[key]) for key in fields[4:]))
+        return UnifiedAuthInput(*(Path(document[key]) for key in fields[:4]), *(document[key] for key in fields[4:]))
+    except (package.PackageError, package.converter.ConversionError, native.RehearsalError, OSError, ValueError, TypeError):
+        raise native.RehearsalError(ERROR) from None
+
+
+@dataclass(frozen=True)
+class VerifiedGeneralAuth:
+    domain: dict
+    provenance: dict
+    rows: dict
+    counts: dict
+
+
 def _read_preview(root, manifest_sha):
     root, parents = inventory._private_parent(root)
     state = inventory._directory_identity(root)
@@ -127,7 +161,40 @@ def _projection(files, manifest_sha):
     rows = {INSTALLATION: [(bot, *(provenance[key] for key in PROVENANCE.values()), report["adminMode"], "denied")],
             PRINCIPALS: principals, GROUPS: groups}
     counts = {"installations": 1, "principals": len(principals), "groups": len(groups), "overrides": len(overrides)}
-    return provenance, rows, counts
+    present = report["overrideTablePresent"]
+    require(type(present) is bool and (present or not overrides))
+    return VerifiedGeneralAuth({"present": present, "rows": len(overrides)}, provenance, rows, counts)
+
+
+def verify_unified_auth_source(pins: UnifiedAuthInput, *, source: Path, source_sha: str, working_parent: Path,
+                               legacy_bot_id=None):
+    """Rebuild the closed general preview against the candidate's exact SQLite and Bot."""
+    try:
+        supplied = _read_preview(pins.preview_dir, pins.preview_sha256)
+        with TemporaryDirectory(prefix="general-auth-preview-", dir=working_parent) as temporary:
+            rebuilt = Path(temporary) / "preview"
+            preview.seal_reconciliation(source, pins.inventory_dir, pins.config_path, pins.target_path, rebuilt,
+                                        general_preview=True, source_sha256=source_sha, inventory_sha256=pins.inventory_sha256,
+                                        config_sha256=pins.config_sha256, target_sha256=pins.target_sha256)
+            require(supplied == _read_preview(rebuilt, pins.preview_sha256))
+        result = _projection(supplied, pins.preview_sha256)
+        require(result.provenance["sourceSha256"] == source_sha
+                and (legacy_bot_id is None or result.rows[INSTALLATION][0][0] == legacy_bot_id))
+        return result
+    except (inventory.InventoryError, native.RehearsalError, package.PackageError, package.converter.ConversionError,
+            OSError, sqlite3.Error, ValueError, TypeError, KeyError, RecursionError, OverflowError):
+        raise native.RehearsalError(ERROR) from None
+
+
+def load_general_auth(db, rows):
+    for table, columns in COLUMNS.items():
+        marks = ",".join("?" for _ in columns)
+        db.executemany(f"INSERT INTO {table} VALUES ({marks})", rows[table])
+
+
+def verify_general_auth_replay(db, projection):
+    for table in COLUMNS:
+        require(sorted(db.execute(f"SELECT * FROM {table}").fetchall()) == sorted(projection.rows[table]))
 
 
 def _write_and_replay(sql, chain, rows, applied_at):
@@ -141,9 +208,7 @@ def _write_and_replay(sql, chain, rows, applied_at):
                 db.execute(obj.sql)
         db.executemany(f"INSERT INTO {migrations.LEDGER} VALUES (?,?,?,?,?)",
                        ((index, item.name, item.sha256, "applied", applied_at) for index, item in enumerate(chain, 1)))
-        for table, values in rows.items():
-            marks = ",".join("?" for _ in COLUMNS[table])
-            db.executemany(f"INSERT INTO {table} VALUES ({marks})", values)
+        load_general_auth(db, rows)
         layout = native.table_layout(db, source.tables)
         summary = package.db_summary(db, layout)
         package.write_sql(db, schema, 0, sql, extra_tables=COLUMNS)
@@ -167,20 +232,16 @@ def build_candidate(backup, inventory_dir, config, target, preview_dir, worker, 
         inventory_dir, preview_dir, worker = (package.private_path(path, directory=True) for path in (inventory_dir, preview_dir, worker))
         require(not destination.exists() and not destination.is_symlink()
                 and all(not destination.is_relative_to(path) for path in (inventory_dir, preview_dir, worker)))
-        supplied = _read_preview(preview_dir, preview_sha256)
+        pins = UnifiedAuthInput(inventory_dir, config, target, preview_dir, inventory_sha256,
+                                config_sha256, target_sha256, preview_sha256)
         chain, worker_pin = package.worker_artifact(worker, revision, worker_manifest_sha256)
+        verified = verify_unified_auth_source(pins, source=backup, source_sha=source_sha256, working_parent=destination.parent)
         with TemporaryDirectory(prefix="general-auth-candidate-", dir=destination.parent) as temporary:
             scratch = Path(temporary)
-            rebuilt = scratch / "preview"
-            preview.seal_reconciliation(backup, inventory_dir, config, target, rebuilt, general_preview=True,
-                                        source_sha256=source_sha256, inventory_sha256=inventory_sha256,
-                                        config_sha256=config_sha256, target_sha256=target_sha256)
-            require(supplied == _read_preview(rebuilt, preview_sha256))
-            provenance, rows, counts = _projection(supplied, preview_sha256)
             sql = scratch / package.SQL
-            body, schema, layout, summary = _write_and_replay(sql, chain, rows, applied_at)
+            body, schema, layout, summary = _write_and_replay(sql, chain, verified.rows, applied_at)
             document = {"version": 1, "profile": PROFILE, "scope": SCOPE, "activationAllowed": False,
-                        "counts": counts, "source": provenance, "workerArtifact": worker_pin,
+                        "counts": verified.counts, "source": verified.provenance, "workerArtifact": worker_pin,
                         "candidateSchemaSha256": native._schema_digest(SCHEMA), "schemaSha256": native._schema_digest(schema),
                         "layout": layout, "summary": summary, "dataSha256": summary["dataSha256"],
                         "sql": {**package.describe(sql), "md5": native.file_hash(sql, "md5")[1]},
