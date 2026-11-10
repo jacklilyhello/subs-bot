@@ -17,6 +17,7 @@ export interface GeneralTelegramPin extends TelegramBotCredentials {
   privateTemp: boolean;
   privateDocument: boolean;
   privateProvider: boolean;
+  providerDocumentReplies?: boolean;
   privateClaims: boolean;
   privateShareCreation: boolean;
   privateAggregate: boolean;

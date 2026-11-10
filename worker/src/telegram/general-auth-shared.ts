@@ -26,7 +26,7 @@ import { acceptGeneralTelegramLifecycle, GENERAL_LIFECYCLE_MARKER, GENERAL_LIFEC
   insertTelegramLifecycleTickets, prepareTelegramLifecycleTickets, reapTelegramLifecycle, renderTelegramLifecycle,
   type TelegramLifecycleReply, type TelegramLifecycleTicket } from "./lifecycle-actions.ts";
 import { acceptGeneralTelegramSubscriptionRead, renderGeneralSubscriptionRead } from "./general-subscription-read.ts";
-import { acceptGeneralProviderRequest } from "./general-provider.ts";
+import { acceptGeneralProviderRequest, generalProviderAuthority } from "./general-provider.ts";
 import { acceptTelegramPrivateClaim, beginTelegramPrivateClaim, GENERAL_PRIVATE_CLAIM_SCHEMA,
   prepareTelegramPrivateClaim, TELEGRAM_GENERAL_PRIVATE_CLAIM_MARKER } from "./private-claims.ts";
 import { acceptTelegramPrivateShareCreation, acceptTelegramSubscriptionShare, GENERAL_SHARE_CREATION_SCHEMA,
@@ -35,6 +35,11 @@ import { acceptTelegramPrivateShareCreation, acceptTelegramSubscriptionShare, GE
   retireAbandonedTelegramPrivateShareCreation, TELEGRAM_GENERAL_SHARE_CREATION_MARKER } from "./private-share-creation.ts";
 import type { TelegramPrivateShareRuntime } from "./private-share-runtime.ts";
 import { GENERAL_PATH_MARKER, prepareTelegramPathReceipt, renderTelegramPath, type TelegramPathReply } from "./path-management.ts";
+import { acceptTelegramProviderUrlMessage, telegramGeneralProviderDocumentsReady } from "./provider-document.ts";
+import { parseTelegramProviderUrlMessage } from "./provider-document-input.ts";
+import { GENERAL_TELEGRAM_PROVIDER_DOCUMENT_MARKER } from "./provider-document-origin.ts";
+import { generalProviderDocumentReplyEligibility, generalProviderDocumentReplyScope,
+  renderTelegramProviderDocumentReply } from "./provider-document-replies.ts";
 import { generalProviderRefreshReady, insertTelegramProviderRefreshTicket, prepareTelegramProviderRefreshButton,
   reapTelegramProviderRefreshTickets, type TelegramProviderRefreshTicket } from "./provider-refresh.ts";
 import { generalProviderReplyEligibility, generalProviderReplyScope, parseTelegramProviderText, renderTelegramProviderReply,
@@ -149,6 +154,8 @@ function family(alias: "inbox" | "earlier", group: boolean, pin: GeneralTelegram
   if (pin.rehearsal) return management;
   return `(CASE WHEN ${alias}.receipt_nonce='${GENERAL_AUTH_ACTION_MARKER}'
     THEN (${privateScope} AND ${alias}.command IN ('auth-add','auth-remove','auth-list') AND ${GENERAL_AUTH_ACTION_SCHEMA})
+    ${pin.providerDocumentReplies ? `WHEN ${alias}.receipt_nonce='${GENERAL_TELEGRAM_PROVIDER_DOCUMENT_MARKER}'
+    THEN (${generalProviderDocumentReplyScope(alias)})` : ""}
     ${pin.privateInline ? `WHEN ${alias}.receipt_nonce='${GENERAL_INLINE_CONSENT_MARKER}'
     THEN (${privateScope} AND ${alias}.command='help' AND (${GENERAL_INLINE_SCHEMA})
       AND EXISTS (SELECT 1 FROM telegram_inline_search_consent AS consent
@@ -179,6 +186,7 @@ function queueMarkers(group: boolean, pin: GeneralTelegramPin): string {
   if (pin.privateTemp) markers.push(TELEGRAM_GENERAL_TEMP_MARKER);
   if (pin.privateDocument) markers.push(TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER);
   if (pin.privateProvider) markers.push(GENERAL_TELEGRAM_PROVIDER_MARKER);
+  if (pin.providerDocumentReplies) markers.push(GENERAL_TELEGRAM_PROVIDER_DOCUMENT_MARKER);
   if (pin.privateClaims) markers.push(TELEGRAM_GENERAL_PRIVATE_CLAIM_MARKER);
   if (hasGeneralGroupShare(pin)) markers.push(TELEGRAM_GENERAL_GROUP_CLAIM_MARKER);
   if (pin.privateShareCreation) markers.push(TELEGRAM_GENERAL_SHARE_CREATION_MARKER);
@@ -202,7 +210,9 @@ function current(alias: "inbox" | "earlier", group: boolean, pin: GeneralTelegra
   const ordinaryClock = generalOrdinaryReplyEligibilitySql(alias);
   const clock = pin.privateDocument ? `(CASE WHEN ${alias}.receipt_nonce='${TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER}'
     THEN (${generalDocumentReplyEligibility(alias)}) ${pin.privateProvider ? `WHEN ${alias}.receipt_nonce='${GENERAL_TELEGRAM_PROVIDER_MARKER}'
-    THEN (${generalProviderReplyEligibility(alias)})` : ""} ELSE (${ordinaryClock}) END)` : ordinaryClock;
+    THEN (${generalProviderReplyEligibility(alias)})` : ""}
+    ${pin.providerDocumentReplies ? `WHEN ${alias}.receipt_nonce='${GENERAL_TELEGRAM_PROVIDER_DOCUMENT_MARKER}'
+    THEN (${generalProviderDocumentReplyEligibility(alias)})` : ""} ELSE (${ordinaryClock}) END)` : ordinaryClock;
   const ordinary = `${clock} AND ${generalCurrentAuthoritySql(alias, `${groupScope} AND ${pathScope}${tempScope}${laneScope}${claimScope}${authScope}`)}`;
   return hasGeneralGroupShare(pin) ? `(CASE WHEN ${alias}.receipt_nonce='${TELEGRAM_GENERAL_GROUP_CLAIM_MARKER}'
     THEN (${ordinaryClock} AND ${generalCurrentAuthoritySql(alias,
@@ -225,7 +235,7 @@ export async function acceptGeneralSharedTelegramCommand(
   db: D1Database, pin: GeneralTelegramPin, request: Request, acknowledge?: (callbackId: string, answer?: string) => void,
   providerAvailable?: () => Promise<boolean>, refreshAvailable?: () => Promise<boolean>,
   share?: { bucket: R2Bucket; runtime: TelegramPrivateShareRuntime; publicOrigin: PublicOrigin }, aggregateKey?: CryptoKey | null,
-  inlineEnabled = false,
+  inlineEnabled = false, providerDocumentsEnabled = false,
 ): Promise<number> {
   const decoded = await readTelegramUpdate(request, pin.webhookSecret);
   if (decoded.status !== 200) return decoded.status;
@@ -311,6 +321,12 @@ export async function acceptGeneralSharedTelegramCommand(
       if (url.name === undefined && url.sourceUrl.includes("|")) return 204;
       if (!await providerAvailable()) return 503;
       return await acceptGeneralProviderRequest(db, pin, { ...event, ...url, kind: "url-import" }) ? 200 : 204;
+    }
+    const urls = providerDocumentsEnabled ? parseTelegramProviderUrlMessage(text) : null;
+    if (urls) {
+      if (!await providerAvailable() || !await telegramGeneralProviderDocumentsReady(db, pin.botId, true).catch(() => false)) return 503;
+      const result = await acceptTelegramProviderUrlMessage(db, { ...pin, providerDocumentReplies: true }, event, urls);
+      return result === "queued" ? 200 : result === "busy" ? 503 : 204;
     }
   }
   const command = pin.privateManagement && !tempEvent ? readPrivateTelegramCommand(decoded.update, pin.botUsername) : null;
@@ -486,8 +502,10 @@ function selectLease(
   const aggregate = pin.privateAggregate && lease.marker === GENERAL_TELEGRAM_AGGREGATE_MARKER;
   const selected = pin.privateSelected && lease.marker === GENERAL_TELEGRAM_SELECTED_MARKER;
   const short = pin.privateShort && lease.marker === GENERAL_TELEGRAM_SHORT_MARKER;
+  const providerDocument = pin.providerDocumentReplies && lease.marker === GENERAL_TELEGRAM_PROVIDER_DOCUMENT_MARKER;
   const supported = groupClaim ? groupClaimFamily("inbox") : aggregate ? aggregateFamily("inbox")
-    : selected ? selectedFamily("inbox") : short ? shortFamily("inbox") : family("inbox", group, pin, false);
+    : selected ? selectedFamily("inbox") : short ? shortFamily("inbox")
+      : providerDocument ? generalProviderDocumentReplyScope("inbox") : family("inbox", group, pin, false);
   const claimProof = claim ? ` AND EXISTS (SELECT 1 FROM telegram_private_claim
     WHERE receipt_id=inbox.receipt_id AND code_sha256=?)` : "";
   const exact = `FROM telegram_inbox AS inbox JOIN telegram_general_receipt AS authority USING (receipt_id)
@@ -608,6 +626,17 @@ export async function drainGeneralSharedTelegramReply(
 ): Promise<boolean> {
   const lease = await claimGeneralSharedTelegramReply(db, pin);
   if (!lease) return false;
+  if (lease.marker === GENERAL_TELEGRAM_PROVIDER_DOCUMENT_MARKER) {
+    const reply = await renderTelegramProviderDocumentReply(db, generalProviderAuthority(pin), { ...lease, providerDocument: true });
+    if (!reply) return false;
+    const scope = selectLease(pin, lease, false, reply.guard);
+    if (await prepareTelegramOutboxBegin(db, lease, scope).first() === null) return false;
+    const confirmed = await confirmGuardedGeneralSend(db, lease, scope);
+    const outcome = confirmed ? await sendGeneralTelegramPrivateReply(pin.botToken, lease.actorId, lease.messageId, reply.text)
+      : { kind: "failed" as const };
+    await settleTelegramOutboxReply(db, lease, selectLease(pin, lease, false), outcome);
+    return true;
+  }
   if (lease.marker === GENERAL_TELEGRAM_SHORT_MARKER) {
     if (!pin.privateShort) return false;
     const short = { ...lease, shortLink: true as const };

@@ -1,16 +1,18 @@
 import { validInteger } from "../storage.ts";
-import type { ProviderSql } from "../provider-jobs.ts";
+import type { GeneralProviderAuthority, ProviderSql } from "../provider-jobs.ts";
 import { MAX_TELEGRAM_DOCUMENT_NODES } from "./document-persistence.ts";
 import { MAX_TELEGRAM_DOCUMENT_BYTES } from "./document-transport.ts";
-import { providerDocumentOrigin, TELEGRAM_PROVIDER_DOCUMENT_MARKER } from "./provider-document-origin.ts";
+import { GENERAL_TELEGRAM_PROVIDER_DOCUMENT_MARKER, PROVIDER_DOCUMENT_REPLY_SECONDS, providerDocumentOrigin,
+  TELEGRAM_PROVIDER_DOCUMENT_MARKER } from "./provider-document-origin.ts";
 import { inTelegramScope, type TelegramPolicy } from "./protocol.ts";
 import type { TelegramReplyLease } from "./store.ts";
 
 type Alias = "inbox" | "earlier";
 type Summary = { lineCount: number; overflow: number; finishedAt: number; saved: number; coalesced: number; localNodes: number; fromFile: number };
-const REPLY_SECONDS = 900;
 const RECONCILE_LIMIT = 16;
-const ready = `origin.finished_at > unixepoch() - ${REPLY_SECONDS} AND origin.finished_at <= unixepoch()`;
+const ready = `origin.finished_at > unixepoch() - ${PROVIDER_DOCUMENT_REPLY_SECONDS} AND origin.finished_at <= unixepoch()`;
+type ReplyPolicy = TelegramPolicy | GeneralProviderAuthority;
+type Lease = Pick<TelegramReplyLease, "receiptId" | "actorId" | "chatId" | "chatType" | "threadId" | "leaseId" | "attempts" | "providerDocument">;
 
 function finishedOrigin(alias: Alias): string {
   return `origin.receipt_id=${alias}.receipt_id AND origin.bot_id=${alias}.bot_id
@@ -30,9 +32,21 @@ const terminalLines = `${countLines()}=origin.line_count AND NOT EXISTS (
     AND (line.result_code IS NULL OR line.ordinal>=origin.line_count))`;
 
 export function telegramProviderDocumentReplyMarker(alias: Alias): string {
-  return `(${alias}.receipt_nonce='${TELEGRAM_PROVIDER_DOCUMENT_MARKER}' AND ${alias}.command='help'
+  return documentReplyScope(alias, TELEGRAM_PROVIDER_DOCUMENT_MARKER);
+}
+
+export function generalProviderDocumentReplyScope(alias: Alias): string {
+  return documentReplyScope(alias, GENERAL_TELEGRAM_PROVIDER_DOCUMENT_MARKER);
+}
+
+function documentReplyScope(alias: Alias, marker: string): string {
+  return `(${alias}.receipt_nonce='${marker}' AND ${alias}.command='help'
     AND ${alias}.chat_type='private' AND ${alias}.chat_id=${alias}.actor_id AND ${alias}.thread_id IS NULL
     AND EXISTS (SELECT 1 FROM telegram_provider_documents AS origin WHERE ${finishedOrigin(alias)}))`;
+}
+
+export function generalProviderDocumentReplyEligibility(alias: Alias): string {
+  return `EXISTS (SELECT 1 FROM telegram_provider_documents AS origin WHERE ${finishedOrigin(alias)} AND ${ready})`;
 }
 
 export function telegramProviderDocumentReplyClock(alias: Alias, fallback: string): string {
@@ -50,7 +64,7 @@ export function telegramProviderDocumentReplyEligible(policy: TelegramPolicy | u
 }
 
 /** Recover only the private terminal reply, using the original receipt as the outbox key. */
-export async function reconcileTelegramProviderDocumentReplies(db: D1Database, policy: TelegramPolicy): Promise<number> {
+export async function reconcileTelegramProviderDocumentReplies(db: D1Database, policy: ReplyPolicy): Promise<number> {
   const origin = providerDocumentOrigin(policy);
   try {
     const result = await db.prepare(`INSERT INTO telegram_outbox (receipt_id)
@@ -67,9 +81,10 @@ export async function reconcileTelegramProviderDocumentReplies(db: D1Database, p
 }
 
 export async function renderTelegramProviderDocumentReply(
-  db: D1Database, policy: TelegramPolicy, lease: TelegramReplyLease,
+  db: D1Database, policy: ReplyPolicy, lease: Lease,
 ): Promise<{ text: string; guard: ProviderSql } | null> {
-  if (!lease.providerDocument || !inTelegramScope(policy, lease) || lease.chatType !== "private" || lease.threadId !== null) return null;
+  const scope = "family" in policy ? lease.actorId === lease.chatId && lease.actorId !== policy.botId : inTelegramScope(policy, lease);
+  if (!lease.providerDocument || !scope || lease.chatType !== "private" || lease.threadId !== null) return null;
   const origin = providerDocumentOrigin(policy);
   const exact = `origin.receipt_id=inbox.receipt_id AND ${origin.sql} AND ${ready} AND ${terminalLines}`;
   const summary = await db.prepare(`SELECT origin.line_count AS lineCount,origin.overflow_count AS overflow,

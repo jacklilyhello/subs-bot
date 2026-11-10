@@ -1,7 +1,7 @@
 import { checkOwnerId, digestHex, SUBSCRIPTION_LIFECYCLE_REVISION, validInteger } from "./storage.ts";
 import { normalizeSubscriptionName } from "./subscriptions.ts";
 import { isolatedTelegramRoleEpochSql } from "./telegram/authorization-sql.ts";
-import { providerDocumentOrigin } from "./telegram/provider-document-origin.ts";
+import { providerDocumentOrigin, type ProviderDocumentPolicy } from "./telegram/provider-document-origin.ts";
 import { providerInitialTitleReady } from "./provider-initial-title.ts";
 import { GENERAL_LATEST_ACTOR_SQL, GENERAL_NO_LEGACY_WORK, GENERAL_POLICY_SCHEMA, GENERAL_RECEIPT_SCHEMA,
   generalPolicyBindings, type GeneralAuthorityPin } from "./telegram/general-receipt.ts";
@@ -31,7 +31,7 @@ export type ProviderTelegramPolicy = {
   readonly botId: string; readonly adminId: string; readonly memberId: string; readonly includeDocuments?: true;
 };
 export type GeneralProviderAuthority = Readonly<GeneralAuthorityPin> & {
-  readonly family: "general"; readonly includeDocuments?: never; readonly includeBatch?: never; readonly queue?: never;
+  readonly family: "general"; readonly includeDocuments?: true; readonly includeBatch?: never; readonly queue?: never;
 };
 export type ProviderQueuePolicy = ProviderTelegramPolicy | GeneralProviderAuthority;
 type JobScope = (ProviderTelegramPolicy & { readonly includeBatch?: true; readonly queue?: "batch" })
@@ -414,9 +414,25 @@ function generalJobAuthorization(scope: GeneralProviderAuthority, alias: "job" |
     bindings: generalPolicyBindings(scope) };
 }
 
+function documentJobAuthorization(scope: ProviderDocumentPolicy, alias: "job" | "active", forRetirement: boolean): Guard {
+  const document = providerDocumentOrigin(scope, forRetirement ? "recorded" : "current");
+  return { sql: `EXISTS (SELECT 1 FROM telegram_provider_document_lines AS line
+    JOIN telegram_provider_documents AS origin USING (receipt_id) JOIN telegram_inbox AS inbox USING (receipt_id)
+    WHERE (line.job_id=${alias}.job_id AND line.result_code IS NULL AND origin.finished_at IS NULL)
+      AND (line.subscription_id=${alias}.subscription_id AND line.source_sha256=${alias}.source_sha256
+        AND line.expected_generation=${alias}.expected_generation AND line.expected_lifecycle_revision=${alias}.expected_lifecycle_revision)
+      AND (origin.actor_id=${alias}.owner_id AND ${alias}.kind='refresh')
+      ${forRetirement ? "" : "AND origin.expires_at>unixepoch()"} AND (${document.sql}))`, bindings: document.bindings };
+}
+
 function scopeAuthorization(scope: JobScope, alias: "job" | "active" = "job", forRetirement = false): Guard {
   if (scope === "generic") return { sql: "1", bindings: [] };
-  if ("family" in scope) return generalJobAuthorization(scope, alias, forRetirement);
+  if ("family" in scope) {
+    const direct = generalJobAuthorization(scope, alias, forRetirement);
+    if (!scope.includeDocuments) return direct;
+    const document = documentJobAuthorization(scope, alias, forRetirement);
+    return { sql: `CASE WHEN (${direct.sql}) THEN 1 ELSE (${document.sql}) END`, bindings: [...direct.bindings, ...document.bindings] };
+  }
   if (scope.queue === "batch") {
     const origin = telegramProviderBatchOrigin(scope, forRetirement);
     return { sql: `EXISTS (SELECT 1 FROM telegram_provider_batches AS batch WHERE batch.batch_id=${alias}.batch_id
@@ -432,17 +448,8 @@ function scopeAuthorization(scope: JobScope, alias: "job" | "active" = "job", fo
       AND ${epoch.sql})`,
     bindings: [scope.botId, ...epoch.bindings] };
   if (!scope.includeDocuments) return direct;
-  const document = providerDocumentOrigin(scope, forRetirement ? "recorded" : "current");
-  return { sql: `(${direct.sql} OR EXISTS (
-    SELECT 1 FROM telegram_provider_document_lines AS line
-    JOIN telegram_provider_documents AS origin USING (receipt_id) JOIN telegram_inbox AS inbox USING (receipt_id)
-    WHERE line.job_id=${alias}.job_id AND line.result_code IS NULL AND origin.finished_at IS NULL
-      AND line.subscription_id=${alias}.subscription_id AND line.source_sha256=${alias}.source_sha256
-      AND line.expected_generation=${alias}.expected_generation
-      AND line.expected_lifecycle_revision=${alias}.expected_lifecycle_revision
-      AND origin.actor_id=${alias}.owner_id AND ${alias}.kind='refresh'
-      ${forRetirement ? "" : "AND origin.expires_at>unixepoch()"} AND (${document.sql})
-  ))`, bindings: [...direct.bindings, ...document.bindings] };
+  const document = documentJobAuthorization(scope, alias, forRetirement);
+  return { sql: `(${direct.sql} OR ${document.sql})`, bindings: [...direct.bindings, ...document.bindings] };
 }
 
 function jobScope(policy?: ProviderQueuePolicy, includeBatch = false, queue?: "batch"): JobScope {
@@ -458,7 +465,8 @@ function jobScope(policy?: ProviderQueuePolicy, includeBatch = false, queue?: "b
       || typeof activationSha256 !== "string" || !SHA256.test(activationSha256)) {
       throw new Error("Invalid provider authorization policy.");
     }
-    return Object.freeze({ family: "general" as const, botId, generation, releaseRevision, activationSha256, cutoverAt });
+    return Object.freeze({ family: "general" as const, botId, generation, releaseRevision, activationSha256, cutoverAt,
+      ...(policy.includeDocuments ? { includeDocuments: true as const } : {}) });
   }
   const { botId, adminId, memberId } = policy;
   [botId, adminId, memberId].forEach(checkOwnerId);

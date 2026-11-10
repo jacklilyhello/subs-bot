@@ -11,9 +11,15 @@ import {
 } from "./document-jobs.ts";
 import { TELEGRAM_PROVIDER_DOCUMENT_MAX_URLS, type TelegramProviderDocumentInput,
   type TelegramProviderUrlMessage } from "./provider-document-input.ts";
-import { providerDocumentOrigin, TELEGRAM_PROVIDER_DOCUMENT_MARKER } from "./provider-document-origin.ts";
+import { GENERAL_PROVIDER_DOCUMENT_SCHEMA, GENERAL_TELEGRAM_PROVIDER_DOCUMENT_MARKER, PROVIDER_DOCUMENT_REPLY_SECONDS, providerDocumentOrigin,
+  TELEGRAM_PROVIDER_DOCUMENT_MARKER, type ProviderDocumentPolicy } from "./provider-document-origin.ts";
 import { telegramProviderMessageAdmission } from "./provider-admission.ts";
 import { inTelegramScope, type TelegramEventScope, type TelegramPolicy } from "./protocol.ts";
+import type { GeneralTelegramPin } from "./general-auth-runtime.ts";
+import { GENERAL_ACTOR_QUEUE_CAPACITY, GENERAL_LATEST_ACTOR_SQL, GENERAL_NO_LEGACY_WORK, GENERAL_POLICY_ACTORS_SQL,
+  GENERAL_POLICY_PIN_SQL, GENERAL_POLICY_SCHEMA, GENERAL_RECEIPT_SCHEMA, GENERAL_REPLY_TTL, generalPolicyBindings,
+  prepareGeneralReceiptAuthority } from "./general-receipt.ts";
+import { GENERAL_PROVIDER_REPLY_SCHEMA } from "./provider-replies.ts";
 
 const PARENT_TTL_SECONDS = 7_200;
 const BACKPRESSURE_SECONDS = 60;
@@ -45,6 +51,21 @@ export async function telegramProviderDocumentReady(db: D1Database): Promise<boo
     .first<number>("present");
   if (present === 0 || present === 3) return present === 3;
   throw new Error("Telegram provider document schema could not be confirmed.");
+}
+
+export async function telegramGeneralProviderDocumentsReady(db: D1Database, botId: string, admission: boolean): Promise<boolean> {
+  if (!await telegramProviderDocumentReady(db)) return false;
+  return Boolean(await db.prepare(`SELECT 1 WHERE (${GENERAL_PROVIDER_DOCUMENT_SCHEMA}) AND (${GENERAL_POLICY_SCHEMA})
+    AND (${GENERAL_RECEIPT_SCHEMA}) AND (${GENERAL_PROVIDER_REPLY_SCHEMA})
+    AND (SELECT count(*) FROM sqlite_schema WHERE type='index' AND (
+      (tbl_name='telegram_provider_documents' AND name IN ('telegram_provider_documents_active_actor',
+        'telegram_provider_documents_pending','telegram_provider_documents_finished'))
+      OR (tbl_name='telegram_provider_document_lines' AND name='telegram_provider_document_lines_waiting')))=4
+    AND (?=1 OR EXISTS (SELECT 1 FROM telegram_provider_documents AS origin JOIN telegram_inbox AS inbox USING(receipt_id)
+      WHERE origin.bot_id=? AND inbox.receipt_nonce='${GENERAL_TELEGRAM_PROVIDER_DOCUMENT_MARKER}'
+        AND (origin.finished_at IS NULL OR origin.finished_at>unixepoch()-${PROVIDER_DOCUMENT_REPLY_SECONDS}
+          OR EXISTS (SELECT 1 FROM telegram_outbox AS reply WHERE reply.receipt_id=origin.receipt_id
+            AND reply.state IN ('pending','leased','sending')))))`).bind(admission ? 1 : 0, botId).first());
 }
 
 async function prepareProviderLines(
@@ -116,19 +137,34 @@ export async function prepareTelegramProviderDocumentPlan(
   return { ...lines, steps: [parent, ...lines.steps], exists, staged };
 }
 
+function generalMessageAdmission(pin: GeneralTelegramPin, event: TelegramEventScope, capacity: boolean): ProviderSql {
+  return { sql: `EXISTS (SELECT 1 FROM ${GENERAL_POLICY_ACTORS_SQL}
+    WHERE (${GENERAL_POLICY_PIN_SQL}) AND (${GENERAL_RECEIPT_SCHEMA}) AND (${GENERAL_PROVIDER_REPLY_SCHEMA})
+      AND (${GENERAL_PROVIDER_DOCUMENT_SCHEMA}) AND policy.active=1 AND (${GENERAL_NO_LEGACY_WORK})
+      AND actor.actor_id=? AND (${GENERAL_LATEST_ACTOR_SQL})
+      AND ?>MAX(policy.cutover_at,actor.effective_at,unixepoch()-${GENERAL_REPLY_TTL}) AND ?<=unixepoch()+60
+      AND NOT EXISTS (SELECT 1 FROM telegram_general_replies WHERE bot_id=policy.bot_id AND update_id=?)
+      ${capacity ? `AND (${GENERAL_ACTOR_QUEUE_CAPACITY})` : ""})`,
+    bindings: [...generalPolicyBindings(pin), event.actorId, event.messageDate, event.messageDate, event.updateId] };
+}
+
 export async function acceptTelegramProviderUrlMessage(
-  db: D1Database, policy: TelegramPolicy, event: TelegramEventScope, input: TelegramProviderUrlMessage,
+  db: D1Database, policy: TelegramPolicy | GeneralTelegramPin, event: TelegramEventScope, input: TelegramProviderUrlMessage,
 ): Promise<"queued" | "busy" | "ignored"> {
-  if (!inTelegramScope(policy, event) || event.chatType !== "private" || event.threadId !== null || event.chatId !== event.actorId ||
+  const general = "privateProvider" in policy;
+  const allowed = general ? policy.privateProvider && policy.providerDocumentReplies && policy.sharedOutbox && !policy.rehearsal
+    && event.actorId !== policy.botId : inTelegramScope(policy, event);
+  if (!allowed || event.chatType !== "private" || event.threadId !== null || event.chatId !== event.actorId ||
       !validInteger(event.updateId, 1) || !validInteger(event.messageId, 1) || !validInteger(event.messageDate, 1)) return "ignored";
-  const current = telegramProviderMessageAdmission(policy, event);
+  const current = general ? generalMessageAdmission(policy, event, true) : telegramProviderMessageAdmission(policy, event);
+  const retry = general ? generalMessageAdmission(policy, event, false) : current;
   const origin = [policy.botId, event.updateId, crypto.randomUUID()] as const;
   const fresh = "inbox.bot_id=? AND inbox.update_id=? AND inbox.receipt_nonce=?";
   const receipt = { sql: `(SELECT inbox.receipt_id FROM telegram_inbox AS inbox WHERE ${fresh})`, bindings: origin };
   const staged = { sql: `EXISTS (SELECT 1 FROM telegram_provider_documents WHERE receipt_id=${receipt.sql})`, bindings: origin };
   const active = "EXISTS (SELECT 1 FROM telegram_provider_documents WHERE bot_id=? AND actor_id=? AND finished_at IS NULL)";
   const activeBindings = [policy.botId, event.actorId] as const;
-  const role = event.actorId === policy.adminId ? "admin" : "member";
+  const role = !general && event.actorId === policy.adminId ? "admin" : "member";
   try {
     const lines = await prepareProviderLines(db, event.actorId, input.entries, receipt, staged);
     const titleChecks: D1PreparedStatement[] = [];
@@ -161,7 +197,12 @@ export async function acceptTelegramProviderUrlMessage(
         ON CONFLICT (bot_id,update_id) DO NOTHING`)
         .bind(policy.botId, event.updateId, event.actorId, event.chatId, event.messageId, event.messageDate, origin[2],
           ...current.bindings, ...activeBindings),
-      db.prepare(`INSERT INTO telegram_provider_documents
+      ...(general ? [prepareGeneralReceiptAuthority(db, policy, origin)] : []),
+      general ? db.prepare(`INSERT INTO telegram_provider_documents
+        (receipt_id,bot_id,actor_id,actor_role,auth_message_date,auth_message_id,expires_at,line_count,overflow_count)
+        SELECT inbox.receipt_id,inbox.bot_id,inbox.actor_id,recorded.actor_role,0,0,unixepoch()+${PARENT_TTL_SECONDS},?,?
+        FROM telegram_inbox AS inbox JOIN telegram_general_receipt AS recorded USING(receipt_id) WHERE ${fresh}`)
+        .bind(input.entries.length, input.overflow, ...origin) : db.prepare(`INSERT INTO telegram_provider_documents
         (receipt_id,bot_id,actor_id,actor_role,auth_message_date,auth_message_id,expires_at,line_count,overflow_count)
         SELECT inbox.receipt_id,inbox.bot_id,inbox.actor_id,?,
           CASE WHEN ?='admin' THEN 0 ELSE COALESCE(auth.message_date,0) END,
@@ -174,11 +215,12 @@ export async function acceptTelegramProviderUrlMessage(
       ...lines.steps,
       ...titles,
       db.prepare(`UPDATE telegram_inbox AS inbox SET receipt_nonce=? WHERE ${fresh} AND ${staged.sql}`)
-        .bind(TELEGRAM_PROVIDER_DOCUMENT_MARKER, ...origin, ...staged.bindings),
+        .bind(general ? GENERAL_TELEGRAM_PROVIDER_DOCUMENT_MARKER : TELEGRAM_PROVIDER_DOCUMENT_MARKER, ...origin, ...staged.bindings),
       db.prepare(`SELECT CASE WHEN ${receipt.sql} IS NULL THEN 1 ELSE json_extract('provider message marker failed','$') END`)
         .bind(...receipt.bindings),
       db.prepare(`SELECT NOT EXISTS (SELECT 1 FROM telegram_inbox WHERE bot_id=? AND update_id=?)
-        AND (${current.sql}) AND ${active} AS busy`).bind(policy.botId, event.updateId, ...current.bindings, ...activeBindings),
+        AND (${retry.sql}) ${general ? "" : `AND ${active}`} AS busy`)
+        .bind(policy.botId, event.updateId, ...retry.bindings, ...(general ? [] : activeBindings)),
     ];
     const results = await db.batch(steps);
     assertBatch(results, steps);
@@ -223,7 +265,7 @@ export async function stageTelegramProviderDocument(
 
 const waiting = "line.job_id IS NULL AND line.result_code IS NULL";
 
-function promotionFence(policy: TelegramPolicy, line: WaitingLine): ProviderSql {
+function promotionFence(policy: ProviderDocumentPolicy, line: WaitingLine): ProviderSql {
   const current = providerDocumentOrigin(policy);
   return { sql: `EXISTS (SELECT 1 FROM telegram_provider_document_lines AS line
     JOIN telegram_provider_documents AS origin USING (receipt_id) JOIN telegram_inbox AS inbox USING (receipt_id)
@@ -233,7 +275,7 @@ function promotionFence(policy: TelegramPolicy, line: WaitingLine): ProviderSql 
     bindings: [line.receiptId, line.ordinal, line.sourceSha256, ...current.bindings] };
 }
 
-export async function promoteTelegramProviderDocument(db: D1Database, policy: TelegramPolicy, includeBatch: boolean): Promise<void> {
+export async function promoteTelegramProviderDocument(db: D1Database, policy: ProviderDocumentPolicy, includeBatch: boolean): Promise<void> {
   const current = providerDocumentOrigin(policy);
   try {
     const line = await db.prepare(`SELECT line.receipt_id AS receiptId,line.ordinal,line.source_sha256 AS sourceSha256,
@@ -305,7 +347,7 @@ export async function promoteTelegramProviderDocument(db: D1Database, policy: Te
   }
 }
 
-export async function settleTelegramProviderDocuments(db: D1Database, policy: TelegramPolicy): Promise<void> {
+export async function settleTelegramProviderDocuments(db: D1Database, policy: ProviderDocumentPolicy): Promise<void> {
   const current = providerDocumentOrigin(policy);
   const recorded = providerDocumentOrigin(policy, "recorded");
   const steps = [
@@ -326,10 +368,10 @@ export async function settleTelegramProviderDocuments(db: D1Database, policy: Te
       FROM telegram_inbox AS inbox WHERE inbox.receipt_id=origin.receipt_id AND origin.finished_at IS NULL
         AND (${recorded.sql}) AND NOT EXISTS (SELECT 1 FROM telegram_provider_document_lines AS line
           WHERE line.receipt_id=origin.receipt_id AND line.result_code IS NULL)`).bind(...recorded.bindings),
-    db.prepare(`DELETE FROM telegram_provider_document_opt_in WHERE receipt_id IN (
+    ...("family" in policy ? [] : [db.prepare(`DELETE FROM telegram_provider_document_opt_in WHERE receipt_id IN (
       SELECT opted.receipt_id FROM telegram_provider_document_opt_in AS opted
       JOIN telegram_document_jobs AS document USING (receipt_id)
-      WHERE document.bot_id=? AND document.state='done' ORDER BY opted.receipt_id LIMIT 16)`).bind(policy.botId),
+      WHERE document.bot_id=? AND document.state='done' ORDER BY opted.receipt_id LIMIT 16)`).bind(policy.botId)]),
   ];
   try {
     assertBatch(await db.batch(steps), steps);

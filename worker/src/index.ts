@@ -45,7 +45,7 @@ import { telegramPrivateShareRuntime } from "./telegram/private-share-runtime.ts
 import { decodeAuthenticatedTelegramUpdate, parseTelegramPolicy, readTelegramUpdate, type TelegramPolicy } from "./telegram/protocol.ts";
 import { acceptTelegramProviderRequest } from "./telegram/provider-admission.ts";
 import { acceptTelegramProviderUrlMessage, promoteTelegramProviderDocument,
-  settleTelegramProviderDocuments, telegramProviderDocumentReady } from "./telegram/provider-document.ts";
+  settleTelegramProviderDocuments, telegramGeneralProviderDocumentsReady, telegramProviderDocumentReady } from "./telegram/provider-document.ts";
 import { parseTelegramProviderUrlMessage } from "./telegram/provider-document-input.ts";
 import { reconcileTelegramProviderDocumentReplies } from "./telegram/provider-document-replies.ts";
 import {
@@ -193,6 +193,16 @@ async function generalProviderAdmissionReady(env: Env): Promise<boolean> {
   return await generalProviderSchemaReady(env.DB) && await telegramProviderQueueReady(env) && await providerSnapshotJournalReady(env.DB);
 }
 
+function generalProviderDocumentsEnabled(env: Env): boolean {
+  return env.TELEGRAM_PROVIDER_URL_IMPORT === "1" && env.TELEGRAM_PROVIDER_URL_DOCUMENTS === "1";
+}
+
+async function withGeneralProviderDocuments(env: Env, pin: NonNullable<ReturnType<typeof parseGeneralTelegramPin>>) {
+  const ready = pin.privateProvider && await telegramGeneralProviderDocumentsReady(
+    env.DB, pin.botId, generalProviderDocumentsEnabled(env)).catch(() => false);
+  return ready ? { ...pin, providerDocumentReplies: true } : pin;
+}
+
 function generalProviderRefreshAvailability(env: Env, enabled: boolean) {
   return enabled && env.TELEGRAM_PROVIDER_REFRESH === "1"
     ? async () => await generalProviderRefreshReady(env.DB) && await generalProviderAdmissionReady(env) : undefined;
@@ -215,11 +225,13 @@ async function telegramWebhook(request: Request, env: Env, publicOrigin: PublicO
       const aggregateKey = general.privateAggregate ? await parseTelegramAggregateKey(env.TELEGRAM_AGGREGATE_KEY) : null;
       const status = general.sharedOutbox ? await acceptGeneralSharedTelegramCommand(env.DB, general, request,
         (callbackId, answer) => ctx?.waitUntil(answerTelegramCallback(general, callbackId, answer)), providerAvailable, refreshAvailable,
-        share ? { bucket: env.NODES, runtime: share, publicOrigin } : undefined, aggregateKey, env.TELEGRAM_INLINE_SEARCH === "1")
+        share ? { bucket: env.NODES, runtime: share, publicOrigin } : undefined, aggregateKey, env.TELEGRAM_INLINE_SEARCH === "1",
+        generalProviderDocumentsEnabled(env))
         : await acceptGeneralTelegramCommand(env.DB, general, request);
       if (status === 200) {
         const delivery = general.sharedOutbox
-          ? drainGeneralSharedTelegramReply(env.DB, general, env.NODES, publicOrigin, refreshAvailable, share, aggregateKey)
+          ? withGeneralProviderDocuments(env, general)
+            .then((scoped) => drainGeneralSharedTelegramReply(env.DB, scoped, env.NODES, publicOrigin, refreshAvailable, share, aggregateKey))
             .finally(() => drainGeneralGroupShareCards(env.DB, general))
           : drainGeneralTelegramReply(env.DB, general);
         if (ctx) ctx.waitUntil(delivery.catch(() => undefined));
@@ -727,7 +739,8 @@ async function scheduled(_controller: ScheduledController, env: Env): Promise<vo
       ]);
       if (recovery.some(({ status }) => status === "rejected")) throw new Error("Telegram scheduled recovery could not finish.");
     } else if (env.TELEGRAM_ISOLATION_CONFIG === undefined) {
-      const general = parseGeneralTelegramPin(env.TELEGRAM_GENERAL_CONFIG, env.BUILD_REVISION);
+      const configured = parseGeneralTelegramPin(env.TELEGRAM_GENERAL_CONFIG, env.BUILD_REVISION);
+      const general = configured ? await withGeneralProviderDocuments(env, configured) : null;
       if (general?.sharedOutbox) {
         try {
           if (general.privateDocument) {
@@ -747,10 +760,23 @@ async function scheduled(_controller: ScheduledController, env: Env): Promise<vo
               const authority = generalProviderAuthority(general);
               try {
                 if (await telegramProviderQueueReady(env, pin)) {
-                  await runOneProviderJob(env.DB, env.NODES, env.PROVIDER_FETCH, pin, authority);
+                  try {
+                    if (authority.includeDocuments && await providerSnapshotJournalReady(env.DB)) {
+                      await promoteTelegramProviderDocument(env.DB, authority, false);
+                    }
+                  } finally {
+                    await runOneProviderJob(env.DB, env.NODES, env.PROVIDER_FETCH, pin, authority);
+                  }
                 }
               } finally {
-                await reconcileTelegramProviderReplies(env.DB, authority);
+                try {
+                  await reconcileTelegramProviderReplies(env.DB, authority);
+                } finally {
+                  if (authority.includeDocuments) {
+                    await settleTelegramProviderDocuments(env.DB, authority);
+                    await reconcileTelegramProviderDocumentReplies(env.DB, authority);
+                  }
+                }
               }
             }
           } finally {

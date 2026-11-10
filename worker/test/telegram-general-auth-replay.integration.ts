@@ -176,6 +176,8 @@ test("closed general authorization replays a sealed candidate in a separate emit
   const d1Databases = { DB: "sealed-general-auth-replay" };
   const providerRevision = "a".repeat(40), imageSha256 = "b".repeat(64);
   const sourceUrl = "https://provider.fixture.invalid/sub/%2f?fixture=signed%2Bvalue";
+  const goodLineUrl = "https://provider.fixture.invalid/multiline/%2f?fixture=signed%7Cline";
+  const failedLineUrl = "https://provider.fixture.invalid/multiline/failed?fixture=signed%2Bline";
   const providerShare = "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.10:8388#general-provider";
   const privateTransport = async (request: Request) => {
     const api = `https://api.telegram.org/bot${generalToken}/`;
@@ -293,12 +295,13 @@ test("closed general authorization replays a sealed candidate in a separate emit
     { name: "ordinary-short", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: shortConfig,
         PUBLIC_ORIGIN: PRODUCTION_PUBLIC_ORIGIN, TELEGRAM_AGGREGATE_KEY: aggregateKeyRaw }, outboundService: privateTransport },
-    ...[true, false].map((enabled) => ({ name: enabled ? "provider-open" : "provider-paused", modules: true,
+    ...["provider-open", "provider-paused", "provider-multiline"].map((name) => ({ name, modules: true,
       script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"], outboundService: privateTransport,
       serviceBindings: { PROVIDER_FETCH: { name: "provider-rpc", entrypoint: "ProviderFetch" } },
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: providerConfig,
         PROVIDER_REVISION: providerRevision, PROVIDER_IMAGE_SHA256: imageSha256,
-        ...(enabled ? { TELEGRAM_PROVIDER_URL_IMPORT: "1", TELEGRAM_PROVIDER_REFRESH: "1" } : {}) } })),
+        ...(name === "provider-paused" ? {} : { TELEGRAM_PROVIDER_URL_IMPORT: "1", TELEGRAM_PROVIDER_REFRESH: "1" }),
+        ...(name === "provider-multiline" ? { TELEGRAM_PROVIDER_URL_DOCUMENTS: "1" } : {}) } })),
     { name: "share-creation", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: shareConfig,
         TELEGRAM_PRIVATE_SHARE_CREATION_KEY: shareKeyRaw, PUBLIC_ORIGIN: PRODUCTION_PUBLIC_ORIGIN },
@@ -344,12 +347,14 @@ test("closed general authorization replays a sealed candidate in a separate emit
       script: `import { WorkerEntrypoint } from 'cloudflare:workers';
         export class ProviderFetch extends WorkerEntrypoint {
           async fetchSubscription(input) {
-            if (Object.keys(input).length !== 3 || input.url !== ${JSON.stringify(sourceUrl)} ||
+            if (Object.keys(input).length !== 3 || !${JSON.stringify([sourceUrl, goodLineUrl, failedLineUrl])}.includes(input.url) ||
                 input.providerRevision !== ${JSON.stringify(providerRevision)} || input.imageSha256 !== ${JSON.stringify(imageSha256)}) {
               throw new Error('Unexpected synthetic provider request.');
             }
             const fail = await this.env.DB.prepare('UPDATE general_provider_fixture SET calls=calls+1 RETURNING fail').first('fail');
-            if (fail === 1) return {ok:false,code:'http-status',retryable:false,upstreamStatus:403};
+            if (fail === 1 || input.url === ${JSON.stringify(failedLineUrl)}) {
+              return {ok:false,code:'http-status',retryable:false,upstreamStatus:403};
+            }
             const body = new TextEncoder().encode(${JSON.stringify(providerShare)}).buffer;
             const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', body));
             return {ok:true,body,bodySha256:Array.from(hash, byte => byte.toString(16).padStart(2,'0')).join(''),
@@ -2063,4 +2068,52 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.equal((await authWorker.scheduled({ cron: "* * * * *" })).outcome, "ok");
   assert.equal((await findReply(8312))?.state, "failed");
   assert.equal(lifecycleSent.some(({ reply_parameters }) => reply_parameters.message_id === 8312), false);
+
+  const multiline = await runtime.getWorker("provider-multiline");
+  const multiText = `First line name | ${goodLineUrl}\n${failedLineUrl}\nIgnored duplicate | ${goodLineUrl}`;
+  const multiPost = (id: number, actor: number, text = multiText, options: PostOptions = {}) => post(actor, text, {
+    worker: multiline, updateId: id, date: rawDate, ...options, message: { entities: [], ...options.message },
+  });
+  const lineOutcomes = (updateId: number) => db.prepare(`SELECT line.ordinal,line.result_code AS result
+    FROM telegram_provider_document_lines AS line JOIN telegram_inbox AS inbox USING(receipt_id)
+    WHERE inbox.bot_id=? AND inbox.update_id=? ORDER BY line.ordinal`).bind(pin.botId, updateId).all();
+  await db.prepare("UPDATE general_provider_fixture SET fail=0").run();
+  const priorCalls = await providerCalls();
+  assert.ok(priorCalls !== null);
+  const oldLine = await db.prepare(`INSERT INTO subscriptions (owner_id,name,source_url,token,created_at,updated_at)
+    VALUES ('110','Existing subscription',?,'fixture-multiline-retained',unixepoch(),unixepoch()) RETURNING id`)
+    .bind(failedLineUrl).first<number>("id");
+  assert.ok(oldLine);
+  assert.equal(await publishNodeSnapshot(db, bucket, { id: oldLine, ownerId: "110", expectedGeneration: 0,
+    expectedLifecycleRevision: 0 }, [{ share: fixtureShare }]), true);
+  const retainedSnapshot = () => db.prepare("SELECT generation,snapshot_id AS snapshotId FROM subscriptions WHERE id=? AND owner_id='110'")
+    .bind(oldLine).first();
+  const oldSnapshot = await retainedSnapshot();
+  assert.equal((await multiPost(8400, 110, multiText, { worker: providerOpen })).status, 204);
+  assert.equal((await multiPost(8400, 110, multiText, { chatType: "group", chatId: -100100 })).status, 204);
+  assert.equal((await multiPost(8400, 110, `${goodLineUrl}|fixture-key\n${failedLineUrl}`)).status, 204);
+  assert.equal((await multiPost(8401, 110)).status, 200);
+  assert.equal((await multiPost(8401, 110)).status, 204);
+  assert.equal((await multiPost(8402, 110)).status, 503);
+  assert.equal(await providerCalls(), priorCalls, "admission performs no provider egress");
+  assert.deepEqual((await lineOutcomes(8401)).results, [{ ordinal: 0, result: null }, { ordinal: 1, result: null }]);
+  await providerCron();
+  assert.equal(await findReply(8401), null, "no terminal reply before all lines finish");
+  await providerCron();
+  const multiReply = (await awaitLifecycle(8401)).message;
+  assert.equal(multiReply.chat_id, "110");
+  assert.equal(multiReply.text, "订阅链接消息已处理。\n已保存 1 条\n已合并 0 条\n失败 1 条\n超出上限 0 条");
+  assert.deepEqual((await lineOutcomes(8401)).results, [{ ordinal: 0, result: "saved" }, { ordinal: 1, result: "fetch-rejected" }]);
+  assert.deepEqual(await db.prepare("SELECT name,generation FROM subscriptions WHERE owner_id='110' AND source_url=?")
+    .bind(goodLineUrl).first(), { name: "First line name", generation: 1 });
+  assert.deepEqual(await retainedSnapshot(), oldSnapshot);
+  assert.equal(await providerCalls(), priorCalls + 2);
+
+  assert.equal((await multiPost(8403, 112)).status, 200);
+  await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,'112',2,?,'denied')")
+    .bind(pin.botId, pin.generation, rawDate + 1).run();
+  await providerCron();
+  assert.deepEqual((await lineOutcomes(8403)).results, [{ ordinal: 0, result: "access-changed" }, { ordinal: 1, result: "access-changed" }]);
+  assert.equal(await findReply(8403), null);
+  assert.equal(await providerCalls(), priorCalls + 2);
 });
