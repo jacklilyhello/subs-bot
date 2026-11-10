@@ -15,7 +15,7 @@ import { runOneProviderJob } from "./provider-job-consumer.ts";
 import { providerSnapshotJournalReady } from "./provider-snapshot-journal.ts";
 import { acceptTelegramAggregate, parseTelegramAggregateKey } from "./telegram/aggregate-actions.ts";
 import { acceptTelegramSelected, reapTelegramSelected } from "./telegram/selected-export.ts";
-import { answerTelegramCallback, drainTelegramReplies, sendTelegramGroupShareCard, sendTelegramInlineAnswer } from "./telegram/delivery.ts";
+import { answerTelegramCallback, drainTelegramReplies, sendGeneralTelegramGroupShareCard, sendTelegramGroupShareCard, sendTelegramInlineAnswer } from "./telegram/delivery.ts";
 import { runTelegramDocumentIntake, telegramMixedDocumentReady } from "./telegram/document-intake.ts";
 import { acceptTelegramDocumentJob } from "./telegram/document-jobs.ts";
 import { reconcileTelegramDocumentJobReplies, retireTelegramDocumentStage } from "./telegram/document-persistence.ts";
@@ -23,12 +23,13 @@ import { acceptTelegramLifecycle, reapTelegramLifecycle } from "./telegram/lifec
 import { acceptTelegramGitHubSearch, recoverTelegramGitHubSearch, runTelegramGitHubSearch, telegramGitHubSearchReady } from "./telegram/github-search.ts";
 import { scopeGitHubSearchProof, writeGitHubSearchProof } from "./telegram/github-search-proof.ts";
 import { acceptGeneralTelegramCommand, drainGeneralTelegramReply, generalReadEvent, parseGeneralTelegramPin,
-  recoverGeneralTelegramReplies } from "./telegram/general-auth-runtime.ts";
+  recoverGeneralTelegramReplies, type GeneralTelegramPin } from "./telegram/general-auth-runtime.ts";
 import { acceptGeneralReadLaneCommand, acceptGeneralSharedTelegramCommand, drainGeneralSharedTelegramReply,
   recoverGeneralSharedTelegramReplies } from "./telegram/general-auth-shared.ts";
 import { generalProviderAuthority, generalProviderSchemaReady } from "./telegram/general-provider.ts";
 import { assertGeneralReadLane, readGeneralReadLane } from "./telegram/general-read-lane.ts";
-import { acceptTelegramGroupShare, telegramGroupShareReady } from "./telegram/group-share-actions.ts";
+import { groupSchemaReady } from "./telegram/general-receipt.ts";
+import { acceptTelegramGroupShare, hasGeneralGroupShare, telegramGroupShareReady } from "./telegram/group-share-actions.ts";
 import { drainTelegramGroupShareCards } from "./telegram/group-share-delivery.ts";
 import { acceptTelegramBulkTrash, telegramBulkTrashReady } from "./telegram/bulk-trash.ts";
 import { acceptTelegramInlineSort, telegramInlineSortReady } from "./telegram/inline-sort.ts";
@@ -182,6 +183,12 @@ function drainGroupShareCards(db: D1Database, policy: TelegramPolicy): Promise<v
   return drainTelegramGroupShareCards(db, policy, (actorId, method, body) => sendTelegramGroupShareCard(policy, actorId, method, body));
 }
 
+async function drainGeneralGroupShareCards(db: D1Database, pin: GeneralTelegramPin): Promise<void> {
+  if (!hasGeneralGroupShare(pin) || !await telegramGroupShareReady(db) || !await groupSchemaReady(db)) return;
+  await drainTelegramGroupShareCards(db, pin, (_actorId, method, body) =>
+    sendGeneralTelegramGroupShareCard(pin.botToken, pin.groupShare, method, body));
+}
+
 async function generalProviderAdmissionReady(env: Env): Promise<boolean> {
   return await generalProviderSchemaReady(env.DB) && await telegramProviderQueueReady(env) && await providerSnapshotJournalReady(env.DB);
 }
@@ -207,12 +214,13 @@ async function telegramWebhook(request: Request, env: Env, publicOrigin: PublicO
         env.TELEGRAM_PRIVATE_SHARE_CREATION_KEY, false, `general-bot-${general.botId}`) : undefined;
       const aggregateKey = general.privateAggregate ? await parseTelegramAggregateKey(env.TELEGRAM_AGGREGATE_KEY) : null;
       const status = general.sharedOutbox ? await acceptGeneralSharedTelegramCommand(env.DB, general, request,
-        (callbackId) => ctx?.waitUntil(answerTelegramCallback(general, callbackId)), providerAvailable, refreshAvailable,
+        (callbackId, answer) => ctx?.waitUntil(answerTelegramCallback(general, callbackId, answer)), providerAvailable, refreshAvailable,
         share ? { bucket: env.NODES, runtime: share, publicOrigin } : undefined, aggregateKey, env.TELEGRAM_INLINE_SEARCH === "1")
         : await acceptGeneralTelegramCommand(env.DB, general, request);
       if (status === 200) {
         const delivery = general.sharedOutbox
           ? drainGeneralSharedTelegramReply(env.DB, general, env.NODES, publicOrigin, refreshAvailable, share, aggregateKey)
+            .finally(() => drainGeneralGroupShareCards(env.DB, general))
           : drainGeneralTelegramReply(env.DB, general);
         if (ctx) ctx.waitUntil(delivery.catch(() => undefined));
         else await delivery;
@@ -748,10 +756,14 @@ async function scheduled(_controller: ScheduledController, env: Env): Promise<vo
           } finally {
             const share = general.privateShareCreation ? await telegramPrivateShareRuntime(env.DB,
               env.TELEGRAM_PRIVATE_SHARE_CREATION_KEY, false, `general-bot-${general.botId}`) : undefined;
-            await recoverGeneralSharedTelegramReplies(env.DB, general, env.NODES, publicOrigin,
-              generalProviderRefreshAvailability(env, general.privateProvider), share,
-              general.privateAggregate ? await parseTelegramAggregateKey(env.TELEGRAM_AGGREGATE_KEY) : null);
-            if (general.privateInline && await telegramInlineSearchReady(env.DB)) await reapTelegramInlineSearch(env.DB, general.botId, true);
+            try {
+              await recoverGeneralSharedTelegramReplies(env.DB, general, env.NODES, publicOrigin,
+                generalProviderRefreshAvailability(env, general.privateProvider), share,
+                general.privateAggregate ? await parseTelegramAggregateKey(env.TELEGRAM_AGGREGATE_KEY) : null);
+              if (general.privateInline && await telegramInlineSearchReady(env.DB)) await reapTelegramInlineSearch(env.DB, general.botId, true);
+            } finally {
+              await drainGeneralGroupShareCards(env.DB, general);
+            }
           }
         }
       } else if (general) await recoverGeneralTelegramReplies(env.DB, general);

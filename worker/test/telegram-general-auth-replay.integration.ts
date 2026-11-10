@@ -161,6 +161,12 @@ test("closed general authorization replays a sealed candidate in a separate emit
     && authPin.privateShareCreation && authPin.privateClaims);
   assert.equal(parseGeneralTelegramPin(JSON.stringify({ ...JSON.parse(sharedConfig), authManagement: true }),
     fixture.releaseRevision), null);
+  const groupShareDestination = { chatId: "-100600", chatType: "supergroup" };
+  const groupShareConfig = JSON.stringify({ ...JSON.parse(authConfig), groupShare: groupShareDestination });
+  assert.deepEqual(parseGeneralTelegramPin(groupShareConfig, fixture.releaseRevision)?.groupShare, groupShareDestination);
+  assert.equal(parseGeneralTelegramPin(JSON.stringify({ ...JSON.parse(shareConfig),
+    groupShare: { ...groupShareDestination, threadId: 17 } }), fixture.releaseRevision), null);
+  const groupCards: { id: number; method: string; body: (typeof lifecycleSent)[number] }[] = [];
   const claimSends = new Map<number, { actorId: string; text?: string; body?: Buffer }>();
   for (const outbox of ["legacy", "shared-lifecycle", "shared-path", ["shared-private-management"]]) {
     assert.equal(parseGeneralTelegramPin(JSON.stringify({ ...JSON.parse(generalConfig), outbox }),
@@ -296,6 +302,19 @@ test("closed general authorization replays a sealed candidate in a separate emit
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: shareConfig,
         TELEGRAM_PRIVATE_SHARE_CREATION_KEY: shareKeyRaw, PUBLIC_ORIGIN: PRODUCTION_PUBLIC_ORIGIN },
       outboundService: privateTransport },
+    { name: "group-share", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
+      bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: groupShareConfig,
+        TELEGRAM_PRIVATE_SHARE_CREATION_KEY: shareKeyRaw },
+      outboundService: async (request: Request) => {
+        const method = request.url.split("/").at(-1);
+        if (method !== "sendMessage" && method !== "editMessageText") return privateTransport(request);
+        const body = await request.clone().json() as (typeof lifecycleSent)[number] & { message_id?: number };
+        if (body.chat_id !== groupShareDestination.chatId) return privateTransport(request);
+        const id = method === "editMessageText" ? body.message_id! : 9901;
+        groupCards.push({ id, method, body });
+        return Response.json({ ok: true, result: { message_id: id,
+          chat: { id: Number(groupShareDestination.chatId), type: groupShareDestination.chatType } } });
+      } },
     { name: "claims", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: claimsConfig },
       outboundService: async (request: Request) => {
@@ -1455,6 +1474,77 @@ test("closed general authorization replays a sealed candidate in a separate emit
     "🌐 原始链接：https://source.fixture.invalid/hidden",
     `⚡ Clash 配置：${PRODUCTION_PUBLIC_ORIGIN}/sub/${initial.token}/clash`,
   ].join("\n")));
+
+  const groupShareWorker = await runtime.getWorker("group-share");
+  const decoyGroup = "-100601";
+  await db.prepare(`INSERT INTO telegram_general_groups (bot_id,generation,chat_id,chat_type)
+    VALUES (?,?,?,'supergroup'),(?,?,?,'supergroup')`)
+    .bind(pin.botId, pin.generation, groupShareDestination.chatId, pin.botId, pin.generation, decoyGroup).run();
+  const groupSharePost = (updateId: number, actor: number, text: string) =>
+    post(actor, text, { worker: groupShareWorker, updateId, date: now + 22 });
+  const groupShareBody = "Synthetic body from the confirmed group card";
+  assert.equal((await groupSharePost(7660, 101, `/share x1 id106 s5 -- ${groupShareBody}`)).status, 200);
+  const groupCreation = await awaitLifecycle(7660);
+  const publishCard = groupCreation.message.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data;
+  assert.equal(publishCard, "group-share:publish:v1");
+  const creationOrigin = { ...origin(groupCreation.messageId, 101), date: now + 22 };
+  assert.equal((await callback(7661, 101, creationOrigin, publishCard!, groupShareWorker)).status, 200);
+  assert.equal((await callback(7661, 101, creationOrigin, publishCard!, groupShareWorker)).status, 204);
+  const readGroupCard = () => db.prepare(`SELECT state,message_id AS messageId,shown FROM telegram_group_share_cards AS card
+    JOIN telegram_inbox AS inbox USING(receipt_id) WHERE inbox.bot_id=? AND inbox.update_id=7660`)
+    .bind(pin.botId).first<{ state: string; messageId: number | null; shown: number }>();
+  const awaitGroupCard = async (shown: number) => {
+    const end = Date.now() + 4000;
+    for (let row = await readGroupCard(); Date.now() < end; row = await readGroupCard()) {
+      if (row?.state === "sent" && row.shown === shown) {
+        assert.equal(row.messageId, 9901);
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.fail("The synthetic group card did not settle.");
+  };
+  await awaitGroupCard(0);
+  assert.equal(groupCards.length, 1);
+  const [publishedGroupCard] = groupCards;
+  assert.deepEqual(publishedGroupCard, { id: 9901, method: "sendMessage", body: {
+    chat_id: groupShareDestination.chatId, text: "私密分享\n领取进度：0/1", link_preview_options: { is_disabled: true },
+    reply_markup: { inline_keyboard: [[{ text: "领取", callback_data: "group-share:pick:v1" }],
+      [{ text: "打开 Bot 私聊", url: "https://t.me/GeneralFixtureBot?start=group" }]] },
+  } });
+  const cardOrigin = { ...origin(publishedGroupCard.id, Number(groupShareDestination.chatId), "supergroup"), date: now + 22 };
+  const pick = "group-share:pick:v1";
+  assert.equal((await callback(7662, 101, cardOrigin, pick, groupShareWorker)).status, 204);
+  assert.equal((await callback(7663, 106, { ...cardOrigin, chat: { id: Number(decoyGroup), type: "supergroup" } },
+    pick, groupShareWorker)).status, 204);
+  assert.equal((await callback(7664, 106, { ...cardOrigin, message_thread_id: 42 }, pick, groupShareWorker)).status, 204);
+  assert.equal((await callback(7665, 106, cardOrigin, pick, groupShareWorker)).status, 200);
+  assert.equal((await callback(7665, 106, cardOrigin, pick, groupShareWorker)).status, 204);
+  const groupClaimCount = () => db.prepare(`SELECT count(*) AS n FROM private_share_claims AS claim
+    JOIN telegram_private_share_creations AS creation ON creation.share_id=claim.share_id
+    JOIN telegram_inbox AS inbox USING(receipt_id) WHERE inbox.bot_id=? AND inbox.update_id=7660`)
+    .bind(pin.botId).first<number>("n");
+  assert.equal(await groupClaimCount(), 0, "the group click does not reserve a private portion");
+  for (const id of [7666, 7667]) {
+    assert.equal((await groupSharePost(id, 106, "/start group")).status, 200);
+    const delivery = (await awaitLifecycle(id)).message;
+    assert.equal(delivery.chat_id, "106");
+    assert.ok(delivery.text.endsWith(groupShareBody));
+    assert.equal((await findReply(id))?.marker, "general-group-claim:v1");
+  }
+  assert.equal(await groupClaimCount(), 1);
+  assert.equal((await groupShareWorker.scheduled({ cron: "* * * * *" })).outcome, "ok");
+  await awaitGroupCard(1);
+  assert.deepEqual(groupCards.map(({ method, body }) => [method, body.text]), [
+    ["sendMessage", "私密分享\n领取进度：0/1"], ["editMessageText", "私密分享\n领取进度：1/1"],
+  ]);
+  await db.prepare("DELETE FROM telegram_general_groups WHERE bot_id=? AND generation=? AND chat_id=?")
+    .bind(pin.botId, pin.generation, groupShareDestination.chatId).run();
+  assert.equal((await groupSharePost(7668, 106, "/start group")).status, 204);
+  assert.equal(await findReply(7668), null);
+  assert.equal(await groupClaimCount(), 1);
+  await db.prepare("DELETE FROM telegram_general_groups WHERE bot_id=? AND generation=? AND chat_id=?")
+    .bind(pin.botId, pin.generation, decoyGroup).run();
 
   const aggregateWorker = await runtime.getWorker("aggregate");
   const aggregateNoKey = await runtime.getWorker("aggregate-no-key");

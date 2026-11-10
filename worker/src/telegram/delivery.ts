@@ -11,7 +11,7 @@ import type { PrivateShareClaimResult } from "../private-shares.ts";
 import {
   prepareTelegramLifecycleTickets, renderTelegramLifecycle, type TelegramLifecycleButton,
 } from "./lifecycle-actions.ts";
-import { GROUP_SHARE_PUBLISH_CALLBACK, inTelegramScope, TELEGRAM_PAGE_JUMP_CALLBACK, type TelegramBotCredentials, type TelegramPolicy } from "./protocol.ts";
+import { GROUP_SHARE_PUBLISH_CALLBACK, inTelegramScope, TELEGRAM_PAGE_JUMP_CALLBACK, type TelegramBotCredentials, type TelegramGroupShareDestination, type TelegramPolicy } from "./protocol.ts";
 import { confirmTelegramPageJumpSend, currentTelegramPageJumpEpoch, renderTelegramPageJump, telegramPageJumpSendGuard } from "./page-jump.ts";
 import { closeUnsentTelegramBulkTrashReply, confirmTelegramBulkTrashSend, renderTelegramBulkTrash } from "./bulk-trash.ts";
 import { renderTelegramInlineSort } from "./inline-sort.ts";
@@ -151,7 +151,8 @@ async function postTelegram(
   body: Record<string, unknown> | FormData,
   timeoutMs: number,
   request: typeof fetch,
-  expectedThread?: number,
+  expectedThread?: number | null,
+  expectedChatType?: "group" | "supergroup",
 ): Promise<TelegramReplyOutcome> {
   try {
     const multipart = body instanceof FormData;
@@ -169,7 +170,10 @@ async function postTelegram(
       const chat = record(result?.chat);
       if (positiveInteger(result?.message_id) && (method !== "editMessageText" || result.message_id === editId) &&
           typeof chat?.id === "number" && Number.isSafeInteger(chat.id) && String(chat.id) === chatId &&
-          (expectedThread === undefined || result.message_thread_id === expectedThread)) {
+          (expectedChatType === undefined || chat.type === expectedChatType) &&
+          (expectedThread === undefined || (expectedThread === null
+            ? result.message_thread_id === undefined && result.is_topic_message !== true
+            : result.message_thread_id === expectedThread))) {
         return { kind: "sent", messageId: result.message_id };
       }
     } else if (payload?.ok === false && payload.error_code === response.status &&
@@ -236,6 +240,15 @@ export function sendGeneralTelegramGroupListReply(
     chat_id: chatId, text, ...(threadId === null ? {} : { message_thread_id: threadId }),
     reply_parameters: { message_id: messageId, allow_sending_without_reply: false }, link_preview_options: { is_disabled: true },
   }, 5_000, fetch, threadId ?? undefined);
+}
+
+export function sendGeneralTelegramGroupShareCard(
+  botToken: string, destination: TelegramGroupShareDestination,
+  method: "sendMessage" | "editMessageText", body: Record<string, unknown>,
+): Promise<TelegramReplyOutcome> {
+  if (body.chat_id !== destination.chatId || "message_thread_id" in body
+    || (method === "editMessageText" && !positiveInteger(body.message_id))) return Promise.resolve({ kind: "failed" });
+  return postTelegram(botToken, destination.chatId, method, body, 5_000, fetch, null, destination.chatType);
 }
 
 export function sendTelegramGroupShareCard(
