@@ -114,12 +114,13 @@ export function telegramDocumentJobOrigin(policy: TelegramDocumentPolicy, curren
   if (!policy.privateDocument) return { sql: "0", bindings: [] };
   const authority = current ? generalCurrentAuthoritySql("inbox") : generalRecordedOriginSql("inbox");
   return { sql: `EXISTS (
-    SELECT 1 FROM telegram_inbox AS inbox WHERE inbox.receipt_id=job.receipt_id AND inbox.bot_id=job.bot_id
-      AND inbox.actor_id=job.actor_id AND inbox.chat_id=job.actor_id AND inbox.chat_type='private'
-      AND inbox.thread_id IS NULL AND inbox.command='help' AND inbox.receipt_nonce='${TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER}'
-      AND job.auth_message_date=0 AND job.auth_message_id=0 AND ${GENERAL_DOCUMENT_SCHEMA}
+    SELECT 1 FROM telegram_inbox AS inbox WHERE (inbox.receipt_id=job.receipt_id AND inbox.bot_id=job.bot_id
+      AND inbox.actor_id=job.actor_id AND inbox.chat_id=job.actor_id)
+      AND (inbox.chat_type='private' AND inbox.thread_id IS NULL AND inbox.command='help'
+        AND inbox.receipt_nonce='${TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER}')
+      AND (job.auth_message_date=0 AND job.auth_message_id=0 AND (${GENERAL_DOCUMENT_SCHEMA}))
       AND (${authority})
-      ${current ? "" : `AND ${GENERAL_POLICY_SCHEMA} AND ${GENERAL_RECEIPT_SCHEMA}
+      ${current ? "" : `AND (${GENERAL_POLICY_SCHEMA} AND ${GENERAL_RECEIPT_SCHEMA})
         AND EXISTS (SELECT 1 FROM telegram_general_receipt AS recorded JOIN telegram_general_actors AS original
           ON original.bot_id=inbox.bot_id AND original.actor_id=inbox.actor_id AND original.generation=recorded.generation
           AND original.revision=recorded.actor_revision AND original.role=recorded.actor_role
@@ -269,16 +270,24 @@ export async function acceptTelegramDocumentJob(
 function prepareReap(db: D1Database, policy: TelegramDocumentPolicy): D1PreparedStatement {
   const eligible = telegramDocumentJobOrigin(policy, true);
   const recorded = telegramDocumentJobOrigin(policy, false);
+  const general = isGeneralDocumentPolicy(policy);
+  const reapable = `job.bot_id = ? AND job.state IN ('pending', 'leased')
+    AND (job.state = 'pending' OR (job.state = 'leased' AND job.lease_until <= unixepoch()))`;
+  // Keep both exact authority predicates out of the terminal decision expression.
+  const scoped = general ? `scoped AS MATERIALIZED (
+    SELECT job.receipt_id,job.state,job.expires_at,job.attempts,
+      (${eligible.sql}) AS eligible,(${recorded.sql}) AS recorded
+    FROM telegram_document_jobs AS job WHERE ${reapable}
+  ),` : "";
   return db.prepare(`
-    WITH classified AS (
+    WITH ${scoped} classified AS (
       SELECT job.receipt_id, job.state, job.expires_at, CASE
         WHEN job.expires_at <= unixepoch() THEN 'expired'
-        WHEN NOT (${eligible.sql}) THEN 'access-changed'
+        WHEN NOT (${general ? "job.eligible" : eligible.sql}) THEN 'access-changed'
         WHEN job.attempts >= ${MAX_ATTEMPTS} THEN 'attempts-exhausted'
       END AS result_code
-      FROM telegram_document_jobs AS job WHERE job.bot_id = ? AND job.state IN ('pending', 'leased')
-        AND (job.state = 'pending' OR (job.state = 'leased' AND job.lease_until <= unixepoch()))
-        AND (${recorded.sql})
+      ${general ? "FROM scoped AS job WHERE job.recorded"
+        : `FROM telegram_document_jobs AS job WHERE ${reapable} AND (${recorded.sql})`}
     ), terminal AS (
       SELECT receipt_id, result_code FROM classified WHERE result_code IS NOT NULL
       ORDER BY (state = 'leased') DESC, expires_at, receipt_id LIMIT ${REAP_LIMIT}
@@ -286,18 +295,27 @@ function prepareReap(db: D1Database, policy: TelegramDocumentPolicy): D1Prepared
     UPDATE telegram_document_jobs SET state = 'done', result_code = terminal.result_code, finished_at = unixepoch(),
       lease_id = NULL, lease_until = NULL, file_id = NULL, name = NULL, suffix = NULL, expected_size = NULL
     FROM terminal WHERE telegram_document_jobs.receipt_id = terminal.receipt_id
-  `).bind(...eligible.bindings, policy.botId, ...recorded.bindings);
+  `).bind(...eligible.bindings, ...(general ? [...recorded.bindings, policy.botId] : [policy.botId, ...recorded.bindings]));
 }
 
 export async function claimTelegramDocumentJob(db: D1Database, policy: TelegramDocumentPolicy): Promise<TelegramDocumentJobLease | null> {
   try {
     const eligible = telegramDocumentJobOrigin(policy, true);
+    const general = isGeneralDocumentPolicy(policy);
+    const scope = `job.bot_id = ? AND job.state IN ('pending', 'leased')
+      AND job.expires_at > unixepoch() AND job.attempts < ${MAX_ATTEMPTS}`;
+    // The shared live-lease exclusion remains on the physical queue, regardless of family.
+    const scoped = general ? `WITH scoped AS MATERIALIZED (
+      SELECT job.receipt_id,job.bot_id,job.state,job.lease_until,job.due_at,(${eligible.sql}) AS eligible
+      FROM telegram_document_jobs AS job WHERE ${scope}
+    )` : "";
     const steps = [prepareReap(db, policy), db.prepare(`
+      ${scoped}
       UPDATE telegram_document_jobs SET state = 'leased', attempts = attempts + 1, lease_id = ?,
         lease_until = min(unixepoch() + ${JOB_LEASE_SECONDS}, expires_at)
       WHERE receipt_id = (
-        SELECT job.receipt_id FROM telegram_document_jobs AS job WHERE job.bot_id = ? AND job.state IN ('pending', 'leased')
-          AND job.expires_at > unixepoch() AND job.attempts < ${MAX_ATTEMPTS} AND (${eligible.sql})
+        SELECT job.receipt_id ${general ? "FROM scoped AS job WHERE job.eligible"
+          : `FROM telegram_document_jobs AS job WHERE ${scope} AND (${eligible.sql})`}
           AND ((job.state = 'leased' AND job.lease_until <= unixepoch()) OR (
             job.state = 'pending' AND job.due_at <= unixepoch() AND NOT EXISTS (
               SELECT 1 FROM telegram_document_jobs AS active WHERE active.bot_id = job.bot_id AND active.state = 'leased'
@@ -306,7 +324,8 @@ export async function claimTelegramDocumentJob(db: D1Database, policy: TelegramD
       )
       RETURNING receipt_id AS receiptId, actor_id AS actorId, lease_id AS leaseId, lease_until AS leaseUntil,
         expires_at AS expiresAt, attempts, file_id AS fileId, name, suffix, expected_size AS expectedSize
-    `).bind(crypto.randomUUID(), policy.botId, ...eligible.bindings)];
+    `).bind(...(general ? [...eligible.bindings, policy.botId, crypto.randomUUID()]
+      : [crypto.randomUUID(), policy.botId, ...eligible.bindings]))];
     const results = await db.batch<TelegramDocumentJobLease>(steps);
     if (results.length === steps.length && results.every(({ success }) => success) && results[1].results.length <= 1) {
       return results[1].results[0] ?? null;
