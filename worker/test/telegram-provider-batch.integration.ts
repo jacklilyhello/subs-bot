@@ -6,6 +6,7 @@ import { test } from "node:test";
 import { Miniflare } from "miniflare";
 
 import { createSubscription, getSubscriptionSnapshot, publishNodeSnapshot } from "../src/storage.ts";
+import { renameOwnedSubscription } from "../src/subscriptions.ts";
 import type { TelegramPolicy } from "../src/telegram/protocol.ts";
 
 const policy: TelegramPolicy = {
@@ -28,6 +29,14 @@ const readinessFaultModule = `
       prepare(sql) {
         if (sql.includes('sqlite_schema') && sql.includes(env.READINESS_FAULT)) {
           return {async first() { throw new Error('Synthetic provider batch readiness failure.'); }};
+        }
+        if (env.READINESS_FAULT === 'report-grant' && sql.includes('SELECT job.ordinal,job.subscription_id AS id')) {
+          return {bind(...args) { return {async all() {
+            const result = await db.prepare(sql).bind(...args).all();
+            const {botId,memberId} = JSON.parse(env.TELEGRAM_ISOLATION_CONFIG);
+            await db.prepare('INSERT INTO telegram_auth VALUES (?,?,0,unixepoch(),1)').bind(botId,memberId).run();
+            return result;
+          }}; }};
         }
         return db.prepare(sql);
       },
@@ -76,7 +85,7 @@ test("emitted Worker confirms a private frozen batch and drains it after intake 
     { ...common, name: "app", modules: true, script, bindings: { ...bindings, TELEGRAM_PROVIDER_BATCH_REFRESH: "1" } },
     { ...common, name: "drain", modules: true, script, bindings },
     ...([["jobs", "telegram_provider_batch_jobs"], ["interactions", "telegram_provider_batch_interactions"],
-      ["journal", "provider_snapshot_attempts"]] as const).map(([name, table]) => ({
+      ["journal", "provider_snapshot_attempts"], ["report-grant", "report-grant"]] as const).map(([name, table]) => ({
       ...common, name: `fault-${name}`, modules: faultModules,
       bindings: { ...bindings, TELEGRAM_PROVIDER_BATCH_REFRESH: "1", READINESS_FAULT: table },
     })),
@@ -103,6 +112,7 @@ test("emitted Worker confirms a private frozen batch and drains it after intake 
   const queueFault = await runtime.getWorker("fault-jobs");
   const controlsFault = await runtime.getWorker("fault-interactions");
   const journalFault = await runtime.getWorker("fault-journal");
+  const reportGrantFault = await runtime.getWorker("fault-report-grant");
   const db = await runtime.getD1Database("DB", "app");
   const bucket = await runtime.getR2Bucket("NODES", "app");
   const migrations = manifest.migrations as { name: string; sha256: string }[];
@@ -119,14 +129,16 @@ test("emitted Worker confirms a private frozen batch and drains it after intake 
     db.prepare("INSERT INTO provider_batch_fixture VALUES (0)")]);
   const ownerId = policy.memberId;
   const rows = [];
-  for (const [actor, url] of [[ownerId, source], [ownerId, failing], [ownerId, "uploaded://fixture.txt"], [policy.adminId, source]]) {
-    const row = await createSubscription(db, { ownerId: actor, name: "Synthetic", sourceUrl: url });
+  for (const [actor, name, url] of [[ownerId, "Saved fixture", source], [ownerId, `Failed fixture ${failing}`, failing],
+    [ownerId, "Changed fixture", source + "&stale=1"], [ownerId, "Local fixture", "uploaded://fixture.txt"],
+    [policy.adminId, "Foreign fixture", source]]) {
+    const row = await createSubscription(db, { ownerId: actor, name, sourceUrl: url });
     rows.push(row);
     assert.equal(await publishNodeSnapshot(db, bucket, {
       id: row.id, ownerId: actor, expectedGeneration: 0, expectedLifecycleRevision: 0,
     }, [{ name: "Synthetic", share: oldShare }]), true);
   }
-  const [good, failed, uploaded, foreign] = rows;
+  const [good, failed, stale, uploaded, foreign] = rows;
   const previous = await getSubscriptionSnapshot(db, failed.token);
   const date = Math.floor(Date.now() / 1000);
   const chat = (id: string) => ({ id: Number(id), type: id === policy.groupId ? "supergroup" : "private" });
@@ -134,8 +146,8 @@ test("emitted Worker confirms a private frozen batch and drains it after intake 
     method: "POST", headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": policy.webhookSecret },
     body: JSON.stringify(update),
   });
-  const message = (updateId: number, text: string, worker = app, actor = ownerId, chatId = actor) =>
-    post({ update_id: updateId, message: { message_id: updateId, date, chat: chat(chatId),
+  const message = (updateId: number, text: string, worker = app, actor = ownerId, chatId = actor, messageDate = date) =>
+    post({ update_id: updateId, message: { message_id: updateId, date: messageDate, chat: chat(chatId),
       from: { id: Number(actor), is_bot: false }, text,
       ...(text.startsWith("/") ? { entities: [{ type: "bot_command", offset: 0, length: text.split(" ", 1)[0].length }] } : {}) } }, worker);
   const click = (updateId: number, sentId: number, ticket: string, worker = app, actor = ownerId, chatId = actor) =>
@@ -189,7 +201,7 @@ test("emitted Worker confirms a private frozen batch and drains it after intake 
   const oldPreview = await reply(5);
   assert.equal((await message(6, "🔄 更新所有")).status, 200);
   const preview = await reply(6);
-  assert.match(preview.text, /确认刷新 2 条/u);
+  assert.match(preview.text, /确认刷新 3 条/u);
   assert.match(preview.text, /未纳入 1 条/u);
   const ticket = preview.buttons[0]?.callback_data;
   assert.ok(ticket);
@@ -215,18 +227,21 @@ test("emitted Worker confirms a private frozen batch and drains it after intake 
   assert.equal(await calls(), 0);
   assert.equal((await click(accepted, preview.id, ticket)).status, 200);
   const jobs = await db.prepare("SELECT subscription_id,state FROM telegram_provider_batch_jobs ORDER BY ordinal").all();
-  assert.deepEqual(jobs.results, [{ subscription_id: good.id, state: "waiting" }, { subscription_id: failed.id, state: "waiting" }]);
+  assert.deepEqual(jobs.results, [good, failed, stale].map(({ id }) => ({ subscription_id: id, state: "waiting" })));
   await cron(journalFault);
   assert.equal(await calls(), 0);
-  assert.equal(await db.prepare("SELECT count(*) AS waiting FROM telegram_provider_batch_jobs WHERE state='waiting'").first("waiting"), 2);
+  assert.equal(await db.prepare("SELECT count(*) AS waiting FROM telegram_provider_batch_jobs WHERE state='waiting'").first("waiting"), 3);
   assert.equal((await message(13, "/updateall status", journalFault)).status, 200);
-  assert.match((await reply(13)).text, /进度：0\/2/u);
+  const running = await reply(13);
+  assert.match(running.text, /进度：0\/3/u);
+  assert.doesNotMatch(running.text, /本次订阅结果/u);
+  assert.equal(await renameOwnedSubscription(db, { id: stale.id, ownerId, expectedLifecycleRevision: 0 }, "New private name"), true);
   await cron(queueFault);
   assert.equal(await calls(), 0);
   await cron(controlsFault);
   assert.equal(await calls(), 1);
   assert.equal((await message(14, "/updateall status", drainOnly)).status, 200);
-  assert.match((await reply(14)).text, /进度：1\/2/u);
+  assert.match((await reply(14)).text, /进度：2\/3/u);
 
   // Emulate a newer ordinary send already in flight when the older batch finishes.
   const newer = await db.prepare(`INSERT INTO telegram_inbox
@@ -243,13 +258,23 @@ test("emitted Worker confirms a private frozen batch and drains it after intake 
   await db.prepare("UPDATE telegram_outbox SET state='failed',lease_id=NULL,lease_until=NULL WHERE receipt_id=?").bind(newer).run();
   await cron();
   const terminal = await reply(accepted);
-  assert.match(terminal.text, /完成：2\/2/u);
-  assert.match(terminal.text, /已保存 1 · 失败 1/u);
+  assert.match(terminal.text, /完成：3\/3/u);
+  assert.match(terminal.text, /已保存 1 · 失败 1 · 已变更 1 · 超时 0/u);
+  assert.deepEqual(terminal.text.split("\n").slice(-4), ["本次订阅结果",
+    `订阅 ID ${good.id} · Saved fixture：已保存`,
+    `订阅 ID ${failed.id} · Failed fixture [链接已省略]：失败`,
+    `订阅 ID ${stale.id}：已变更`,
+  ]);
+  assert.doesNotMatch(terminal.text, /New private name|Local fixture|Foreign fixture/u);
   await cron();
-  assert.equal(sent.filter(({ text }) => text.includes("完成：2/2")).length, 1);
+  assert.equal(sent.filter(({ text }) => text.includes("完成：3/3")).length, 1);
+  assert.equal((await message(48, "/updateall status", drainOnly)).status, 200);
+  assert.equal((await reply(48)).text, terminal.text);
+  assert.equal((await message(49, "/updateall status", app, policy.adminId)).status, 200);
+  assert.equal((await reply(49)).text, "暂无批量刷新记录。");
   assert.equal((await getSubscriptionSnapshot(db, good.token))?.generation, 2);
   assert.deepEqual(await getSubscriptionSnapshot(db, failed.token), previous);
-  for (const row of [uploaded, foreign]) assert.equal((await getSubscriptionSnapshot(db, row.token))?.generation, 1);
+  for (const row of [stale, uploaded, foreign]) assert.equal((await getSubscriptionSnapshot(db, row.token))?.generation, 1);
   const exported = await app.fetch(`https://fixture.invalid/sub/${good.token}/base64`);
   assert.equal(exported.status, 200);
   assert.equal(await exported.text(), Buffer.from(newShare).toString("base64"));
@@ -258,10 +283,24 @@ test("emitted Worker confirms a private frozen batch and drains it after intake 
   assert.equal((await message(16, "/updateall")).status, 200);
   const revoked = await reply(16);
   assert.ok(revoked.buttons[0]);
-  await db.prepare("INSERT INTO telegram_auth VALUES (?,?,0,?,1)").bind(policy.botId, ownerId, date).run();
+  const priorSends = sent.length;
+  assert.equal((await message(51, "/updateall status", reportGrantFault)).status, 200);
+  const revokedReport = await receipt(51);
+  assert.ok(revokedReport);
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    if (await db.prepare("SELECT state FROM telegram_outbox WHERE receipt_id=?").bind(revokedReport).first("state") === "failed") break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  assert.equal(await db.prepare("SELECT state FROM telegram_outbox WHERE receipt_id=?").bind(revokedReport).first("state"), "failed");
+  assert.equal(sent.length, priorSends);
   assert.equal((await click(17, revoked.id, revoked.buttons[0].callback_data)).status, 200);
   assert.equal(await receipt(17), null);
   assert.equal((await message(18, "/updateall status", drainOnly)).status, 204);
+  const newEpoch = await db.prepare(`UPDATE telegram_auth SET allowed=1,message_id=2 WHERE bot_id=? AND user_id=?
+    RETURNING message_date`).bind(policy.botId, ownerId).first<number>("message_date");
+  assert.ok(newEpoch);
+  assert.equal((await message(50, "/updateall status", app, ownerId, ownerId, newEpoch + 1)).status, 200);
+  assert.equal((await reply(50)).text, "暂无批量刷新记录。");
   await cron();
   assert.equal(await calls(), 2);
 

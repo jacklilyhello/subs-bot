@@ -10,6 +10,7 @@ import {
 import {
   inTelegramScope, PROVIDER_BATCH_TICKET, type TelegramEventScope, type TelegramPolicy, type TelegramProviderBatchUpdate,
 } from "./protocol.ts";
+import { displayTelegramName } from "./views.ts";
 
 const STATUS_MARKER = "provider-batch-status:v1";
 const MAX_INVENTORY = 100;
@@ -280,6 +281,48 @@ function renderProgress(progress: TelegramProviderBatchProgress): string {
   ].join("\n");
 }
 
+const resultCategories = {
+  saved: "saved", "stale-target": "stale", expired: "expired", "attempts-exhausted": "failed",
+  "invalid-document": "failed", "fetch-rejected": "failed", "storage-failed": "failed",
+} as const;
+const resultLabels = { saved: "已保存", failed: "失败", stale: "已变更", expired: "超时" } as const;
+
+async function renderTerminalResults(
+  db: D1Database, policy: TelegramPolicy, actorId: string, progress: TelegramProviderBatchProgress,
+): Promise<string> {
+  const unavailable = "\n暂时无法核对逐条结果。";
+  if (!validInteger(progress.targetCount, 1, PROVIDER_BATCH_MAX_TARGETS)) return unavailable;
+  const origin = telegramProviderBatchOrigin(policy);
+  try {
+    const rows = await db.prepare(`SELECT job.ordinal,job.subscription_id AS id,job.result_code AS result,
+      CASE WHEN job.result_code<>'stale-target' AND COALESCE(lifecycle.revision,0)=job.expected_lifecycle_revision
+        AND sub.generation=job.expected_generation+CASE WHEN job.result_code='saved' THEN 1 ELSE 0 END
+        THEN sub.name END AS name
+      FROM telegram_provider_batches AS batch JOIN telegram_provider_batch_jobs AS job USING(batch_id)
+      LEFT JOIN subscriptions AS sub ON sub.id=job.subscription_id AND sub.owner_id=batch.actor_id
+      LEFT JOIN subscription_lifecycle AS lifecycle ON lifecycle.subscription_id=sub.id
+      WHERE batch.batch_id=? AND batch.actor_id=? AND batch.finished_at=? AND job.owner_id=batch.actor_id
+        AND job.state='done' AND (${origin.sql}) ORDER BY job.ordinal LIMIT ${PROVIDER_BATCH_MAX_TARGETS + 1}`)
+      .bind(progress.batchId, actorId, progress.finishedAt, ...origin.bindings)
+      .all<{ ordinal: number; id: number; result: keyof typeof resultCategories; name: string | null }>();
+    if (!rows.success || rows.results.length !== progress.targetCount) return unavailable;
+    const counts = { saved: 0, failed: 0, stale: 0, expired: 0 };
+    const lines: string[] = [];
+    for (const [index, { ordinal, id, result, name }] of rows.results.entries()) {
+      if (ordinal !== index + 1 || !validInteger(id, 1) || !Object.hasOwn(resultCategories, result)) return unavailable;
+      const category = resultCategories[result];
+      counts[category] += 1;
+      const label = typeof name === "string" ? ` · ${displayTelegramName(name)}` : "";
+      lines.push(`订阅 ID ${id}${label}：${resultLabels[category]}`);
+    }
+    if (counts.saved !== progress.saved || counts.failed !== progress.failed
+      || counts.stale !== progress.stale || counts.expired !== progress.expired) return unavailable;
+    return `\n\n本次订阅结果\n${lines.join("\n")}`;
+  } catch {
+    return unavailable;
+  }
+}
+
 export async function renderTelegramProviderBatchReply(
   db: D1Database, policy: TelegramPolicy, lease: Lease,
 ): Promise<TelegramProviderBatchDelivery | null> {
@@ -304,7 +347,14 @@ export async function renderTelegramProviderBatchReply(
   if (reply.kind === "status" || reply.kind === "terminal") {
     const progress = await readTelegramProviderBatchProgress(db, policy, lease.actorId, reply.batchId!);
     if (!progress || (reply.kind === "terminal" && progress.finishedAt === null)) return null;
-    return { text: renderProgress(progress), guard };
+    const text = renderProgress(progress);
+    if (progress.finishedAt === null) return { text, guard };
+    const details = await renderTerminalResults(db, policy, lease.actorId, progress);
+    return { text: text + details, guard: {
+      sql: `(${guard.sql}) AND EXISTS (SELECT 1 FROM telegram_provider_batches AS batch
+        WHERE batch.batch_id=? AND batch.bot_id=inbox.bot_id AND batch.actor_id=inbox.actor_id AND batch.finished_at=?)`,
+      bindings: [...guard.bindings, progress.batchId, progress.finishedAt],
+    } };
   }
   if (reply.kind !== "preview") {
     const excluded = reply.kind === "empty" && reply.skippedCount > 0 ? `已跳过 ${reply.skippedCount} 条本地或不支持的订阅。` : "";
