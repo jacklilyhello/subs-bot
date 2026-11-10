@@ -2,7 +2,7 @@ import { sendGeneralTelegramPrivateReply } from "./delivery.ts";
 import { GENERAL_LATEST_ACTOR_SQL, GENERAL_POLICY_ACTORS_SQL, GENERAL_POLICY_PIN_SQL, GENERAL_REPLY_TTL,
   generalOrdinaryReplyEligibilitySql, generalPolicyBindings } from "./general-receipt.ts";
 import { readGeneralGroupListCommand, readPrivateTelegramCommand, readTelegramBotCredentials, readTelegramUpdate,
-  type TelegramBotCredentials, type TelegramEventScope } from "./protocol.ts";
+  type TelegramBotCredentials, type TelegramEventScope, type TelegramGroupShareDestination } from "./protocol.ts";
 import type { GeneralReadLaneScope } from "./general-read-lane.ts";
 import { renderTelegramView } from "./views.ts";
 
@@ -24,6 +24,7 @@ export interface GeneralTelegramPin extends TelegramBotCredentials {
   privateShort: boolean;
   privateAuthorization?: boolean;
   privateInline?: boolean;
+  groupShare?: TelegramGroupShareDestination;
   rehearsal?: GeneralReadLaneScope;
 }
 
@@ -68,7 +69,17 @@ export function parseGeneralTelegramPin(input: unknown, releaseRevision: unknown
     const privateAuthorization = value.authManagement === true;
     const inlineConfigured = Object.hasOwn(value, "inlineSearch");
     const privateInline = value.inlineSearch === true;
-    if (Object.keys(value).length !== 7 + Number(sharedOutbox) + Number(authorizationConfigured) + Number(inlineConfigured)
+    const groupConfigured = Object.hasOwn(value, "groupShare");
+    let groupShare: TelegramGroupShareDestination | undefined;
+    if (groupConfigured) {
+      if (!privateShareCreation || value.groupShare === null || typeof value.groupShare !== "object"
+        || Array.isArray(value.groupShare) || Object.keys(value.groupShare).length !== 2) return null;
+      const { chatId, chatType } = value.groupShare as Record<string, unknown>;
+      if (typeof chatId !== "string" || !/^-[1-9][0-9]{0,15}(?![\s\S])/u.test(chatId)
+        || -Number(chatId) >= 2 ** 52 || (chatType !== "group" && chatType !== "supergroup")) return null;
+      groupShare = { chatId, chatType };
+    }
+    if (Object.keys(value).length !== 7 + Number(sharedOutbox) + Number(authorizationConfigured) + Number(inlineConfigured) + Number(groupConfigured)
       || (sharedOutbox && value.outbox !== "shared" && !privateManagement)
       || (authorizationConfigured && (!privateManagement || !privateAuthorization))
       || (inlineConfigured && (!privateManagement || !privateInline))) return null;
@@ -80,7 +91,7 @@ export function parseGeneralTelegramPin(input: unknown, releaseRevision: unknown
       || !/^[0-9a-f]{64}(?![\s\S])/u.test(activationSha256)) return null;
     return { ...credentials, generation, cutoverAt, activationSha256, releaseRevision, sharedOutbox, privateManagement,
       privateFormats, privateTemp, privateDocument, privateProvider, privateClaims, privateShareCreation, privateAggregate, privateSelected,
-      privateShort, privateAuthorization, privateInline };
+      privateShort, privateAuthorization, privateInline, ...(groupShare ? { groupShare } : {}) };
   } catch {
     return null;
   }

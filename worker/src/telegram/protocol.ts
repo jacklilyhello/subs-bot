@@ -67,6 +67,7 @@ export type TelegramPrivateShareCreationUpdate = TelegramEventScope & { args: st
 export type TelegramGroupShareUpdate = TelegramEventScope & (
   { kind: "publish"; callbackId: string } | { kind: "pick"; callbackId: string } | { kind: "handoff" }
 );
+export type TelegramGroupShareDestination = { chatId: string; chatType: "group" | "supergroup" };
 export const GROUP_SHARE_PUBLISH_CALLBACK = "group-share:publish:v1";
 export const GROUP_SHARE_PICK_CALLBACK = "group-share:pick:v1";
 export type TelegramShortLinkUpdate = TelegramEventScope & { args: string };
@@ -280,6 +281,34 @@ export function readGeneralPrivateShareCreation(
   const { actorId, messageId, messageDate, remainder } = command;
   return { updateId, actorId, chatId: actorId, chatType: "private", threadId: null,
     messageId, messageDate, args: remainder, ...(senderName ? { senderName } : {}) };
+}
+
+export function readGeneralGroupShare(
+  update: Record<string, unknown>, updateId: number, botId: string, botUsername: string,
+  destination: TelegramGroupShareDestination,
+): TelegramGroupShareUpdate | null {
+  if (Object.keys(update).length !== 2) return null;
+  const callback = update.callback_query;
+  if (isRecord(callback)) {
+    const { id: callbackId, from: actor, message, data } = callback;
+    if ("inline_message_id" in callback || "game_short_name" in callback || !matches(callbackId, CALLBACK_ID)
+        || !isRecord(actor) || actor.is_bot !== false || !isPositiveInteger(actor.id)
+        || String(actor.id) === botId || !ownBotMessage(message, { botId })) return null;
+    const scope = telegramMessageScope(message, String(actor.id), updateId);
+    if (!scope || scope.threadId !== null || message.is_topic_message === true) return null;
+    if (data === GROUP_SHARE_PUBLISH_CALLBACK && scope.chatType === "private" && scope.chatId === scope.actorId) {
+      return { ...scope, kind: "publish", callbackId };
+    }
+    if (data === GROUP_SHARE_PICK_CALLBACK && scope.chatId === destination.chatId && scope.chatType === destination.chatType) {
+      return { ...scope, kind: "pick", callbackId };
+    }
+    return null;
+  }
+  const command = readPrivateTelegramCommand(update, botUsername);
+  if (!command || command.actorId === botId || command.name !== "start"
+    || !/^[ \t]+group[ \t]*(?![\s\S])/u.test(command.remainder)) return null;
+  const { actorId, messageId, messageDate } = command;
+  return { updateId, actorId, chatId: actorId, chatType: "private", threadId: null, messageId, messageDate, kind: "handoff" };
 }
 
 export function readGeneralPrivateShareClaim(

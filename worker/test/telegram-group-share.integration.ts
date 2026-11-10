@@ -291,3 +291,29 @@ test("the emitted Worker records an unconfirmed publication and does not publish
   assert.equal(await f.count("telegram_group_share_scopes"), 0);
   assert.equal(await f.count("private_share_claims"), 0);
 });
+
+test("the isolated card reaper only settles isolated creation receipts in the same group", { timeout: 45_000 }, async (t) => {
+  const f = await fixture(t, true);
+  for (const updateId of [1, 2]) {
+    assert.equal((await f.message(updateId, policy.adminId, draft)).status, 200);
+    await f.privateDelivery(updateId);
+  }
+  const results = await f.db.batch([
+    // Model a distinct receipt family sharing this bot, group, actor and storage tables.
+    f.db.prepare(`UPDATE telegram_inbox SET receipt_nonce='general-share-create:v1' WHERE bot_id=? AND update_id=2`)
+      .bind(policy.botId),
+    f.db.prepare(`INSERT INTO telegram_group_share_cards(receipt_id,group_id,state,due_at,attempts,lease_id,lease_until)
+      SELECT receipt_id,?,'sending',unixepoch()-1,1,'fixture-lease-' || update_id,unixepoch()-1
+      FROM telegram_inbox WHERE bot_id=? AND update_id IN (1,2)`).bind(policy.groupId, policy.botId),
+  ]);
+  assert.deepEqual(results.map(({ meta }) => meta.changes), [1, 2]);
+  await f.tick();
+  const cards = await f.db.prepare(`SELECT card.state,card.attempts,card.lease_id AS leaseId
+    FROM telegram_group_share_cards AS card JOIN telegram_inbox AS inbox USING(receipt_id)
+    WHERE inbox.bot_id=? ORDER BY inbox.update_id`).bind(policy.botId).all();
+  assert.deepEqual(cards.results, [
+    { state: "uncertain", attempts: 1, leaseId: "fixture-lease-1" },
+    { state: "sending", attempts: 1, leaseId: "fixture-lease-2" },
+  ]);
+  assert.equal(f.groupDeliveries().length, 0);
+});

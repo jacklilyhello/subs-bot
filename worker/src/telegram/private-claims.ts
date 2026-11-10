@@ -9,7 +9,8 @@ import type { GeneralTelegramPin } from "./general-auth-runtime.ts";
 import { GENERAL_ACTOR_QUEUE_CAPACITY, GENERAL_LATEST_ACTOR_SQL, GENERAL_NO_LEGACY_WORK, GENERAL_POLICY_ACTORS_SQL,
   GENERAL_POLICY_PIN_SQL, GENERAL_RECEIPT_SCHEMA, GENERAL_REPLY_TTL, generalCurrentReceiptSql, generalPolicyBindings,
   prepareGeneralReceiptAuthority } from "./general-receipt.ts";
-import { groupShareClaimGuard, TELEGRAM_GROUP_CLAIM_MARKER } from "./group-share-actions.ts";
+import { generalGroupShareClaimGuard, groupShareClaimGuard, hasGeneralGroupShare, TELEGRAM_GENERAL_GROUP_CLAIM_MARKER,
+  TELEGRAM_GROUP_CLAIM_MARKER } from "./group-share-actions.ts";
 
 export const TELEGRAM_PRIVATE_CLAIM_MARKER = "claim:v1";
 export const TELEGRAM_GENERAL_PRIVATE_CLAIM_MARKER = "general-private-claim:v1";
@@ -120,7 +121,9 @@ export async function prepareTelegramPrivateClaim(
     throw new Error(deliveryError);
   }
   if ("privateClaims" in policy) {
-    if (lease.privateClaim?.group) throw new Error(deliveryError);
+    const group = lease.privateClaim?.group;
+    if (group && !hasGeneralGroupShare(policy)) throw new Error(deliveryError);
+    const marker = group ? TELEGRAM_GENERAL_GROUP_CLAIM_MARKER : TELEGRAM_GENERAL_PRIVATE_CLAIM_MARKER;
     const allowed = await db.prepare(`SELECT 1 FROM telegram_inbox AS inbox
       JOIN telegram_outbox AS reply USING (receipt_id) JOIN telegram_private_claim AS claim USING(receipt_id)
       WHERE inbox.receipt_id=? AND inbox.bot_id=? AND inbox.update_id=? AND inbox.actor_id=? AND inbox.chat_id=inbox.actor_id
@@ -129,8 +132,15 @@ export async function prepareTelegramPrivateClaim(
         AND reply.attempts=? AND reply.lease_until>unixepoch() AND ${GENERAL_PRIVATE_CLAIM_SCHEMA}
         AND ${generalCurrentReceiptSql("inbox")}`)
       .bind(lease.receiptId, policy.botId, lease.updateId, lease.actorId, lease.messageId, lease.messageDate,
-        TELEGRAM_GENERAL_PRIVATE_CLAIM_MARKER, codeSha256, lease.leaseId, lease.attempts, ...generalPolicyBindings(policy)).first();
-    if (allowed === null) return { kind: "unavailable", botId: policy.botId, actorId: lease.actorId, codeSha256 };
+        marker, codeSha256, lease.leaseId, lease.attempts, ...generalPolicyBindings(policy)).first();
+    let groupAllowed = true;
+    if (allowed && group && hasGeneralGroupShare(policy)) {
+      const guard = generalGroupShareClaimGuard(policy);
+      groupAllowed = Boolean(await db.prepare(`SELECT 1 FROM telegram_inbox AS inbox
+        WHERE inbox.receipt_id=? AND inbox.bot_id=? AND inbox.actor_id=? AND inbox.receipt_nonce=? AND (${guard.sql})`)
+        .bind(lease.receiptId, policy.botId, lease.actorId, marker, ...guard.bindings).first());
+    }
+    if (!allowed || !groupAllowed) return { kind: "unavailable", botId: policy.botId, actorId: lease.actorId, codeSha256 };
   } else if (lease.privateClaim?.group) {
     const guard = groupShareClaimGuard(policy);
     const allowed = await db.prepare(`SELECT 1 FROM telegram_inbox AS inbox WHERE inbox.receipt_id=?
@@ -149,7 +159,7 @@ export async function beginTelegramPrivateClaim(
   begin: D1PreparedStatement,
 ): Promise<PrivateShareClaimResult | null> {
   const general = "privateClaims" in policy;
-  if (!inPrivateScope(policy, lease) || !lease.privateClaim || (general && lease.privateClaim.group)
+  if (!inPrivateScope(policy, lease) || !lease.privateClaim || (general && lease.privateClaim.group && !hasGeneralGroupShare(policy))
     || prepared.botId !== policy.botId || prepared.actorId !== lease.actorId || prepared.codeSha256 !== lease.privateClaim.codeSha256) return null;
 
   try {
@@ -161,7 +171,8 @@ export async function beginTelegramPrivateClaim(
         AND inbox.thread_id IS ? AND inbox.message_id = ? AND inbox.message_date = ?
         AND inbox.receipt_nonce = ? AND claim.code_sha256 = ?
         AND reply.state = 'sending' AND reply.lease_id = ? AND reply.attempts = ?`;
-    const marker = general ? TELEGRAM_GENERAL_PRIVATE_CLAIM_MARKER
+    const marker = general
+      ? lease.privateClaim.group ? TELEGRAM_GENERAL_GROUP_CLAIM_MARKER : TELEGRAM_GENERAL_PRIVATE_CLAIM_MARKER
       : lease.privateClaim.group ? TELEGRAM_GROUP_CLAIM_MARKER : TELEGRAM_PRIVATE_CLAIM_MARKER;
     const bindings = [lease.receiptId, policy.botId, lease.updateId, lease.actorId, lease.threadId, lease.messageId,
       lease.messageDate, marker, prepared.codeSha256, lease.leaseId, lease.attempts] as const;

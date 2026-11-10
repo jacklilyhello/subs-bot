@@ -204,7 +204,7 @@ const authorized = `((creation.actor_id = ? AND creation.auth_message_date = 0 A
   OR (creation.actor_id = ? AND COALESCE((SELECT allowed = 1 AND message_date = creation.auth_message_date
     AND message_id = creation.auth_message_id FROM telegram_auth WHERE bot_id = creation.bot_id AND user_id = creation.actor_id
   ), creation.auth_message_date = 0 AND creation.auth_message_id = 0)))`;
-function currentTarget(target: "?" | "creation.target_user_id"): string {
+export function currentGeneralShareTargetSql(target: "?" | "creation.target_user_id"): string {
   return `COALESCE((SELECT recipient.role IN ('admin','member') AND recipient.effective_at<unixepoch() FROM telegram_general_actors AS recipient
     WHERE recipient.bot_id=policy.bot_id AND recipient.generation=policy.generation AND recipient.actor_id=${target}
     ORDER BY recipient.revision DESC LIMIT 1),0)=1`;
@@ -216,7 +216,7 @@ function creationAuthority(policy: SharePolicy) {
     const matchingInbox = `${exactInbox} AND inbox.receipt_nonce='${marker}'
       AND creation.auth_message_date=0 AND creation.auth_message_id=0`;
     const current = generalCurrentAuthoritySql("inbox",
-      `${GENERAL_SHARE_CREATION_SCHEMA} AND (creation.target_user_id IS NULL OR ${currentTarget("creation.target_user_id")})`);
+      `${GENERAL_SHARE_CREATION_SCHEMA} AND (creation.target_user_id IS NULL OR ${currentGeneralShareTargetSql("creation.target_user_id")})`);
     const bindings = generalPolicyBindings(policy);
     const recorded = `${GENERAL_POLICY_SCHEMA} AND ${GENERAL_RECEIPT_SCHEMA} AND ${GENERAL_SHARE_CREATION_SCHEMA}
       AND ${generalRecordedOriginSql("inbox")}`;
@@ -264,7 +264,7 @@ async function reserve(
   const admit = general ? `EXISTS (SELECT 1 FROM ${GENERAL_POLICY_ACTORS_SQL}
     WHERE ${GENERAL_POLICY_PIN_SQL} AND ${GENERAL_RECEIPT_SCHEMA} AND ${GENERAL_SHARE_CREATION_SCHEMA}
       AND policy.active=1 AND ${GENERAL_NO_LEGACY_WORK} AND actor.actor_id=? AND ${GENERAL_LATEST_ACTOR_SQL}
-      AND ?>MAX(policy.cutover_at,actor.effective_at) AND (? IS NULL OR ${currentTarget("?")})
+      AND ?>MAX(policy.cutover_at,actor.effective_at) AND (? IS NULL OR ${currentGeneralShareTargetSql("?")})
       AND ${GENERAL_ACTOR_QUEUE_CAPACITY}
       AND NOT EXISTS (SELECT 1 FROM telegram_general_replies WHERE bot_id=policy.bot_id AND update_id=?))`
     : `(? = ? OR ${currentMember})`;

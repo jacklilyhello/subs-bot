@@ -1,6 +1,6 @@
 import type { GeneralTelegramPin } from "./general-auth-runtime.ts";
 
-type ReceiptAlias = "inbox" | "earlier" | "incoming" | "origin";
+type ReceiptAlias = "inbox" | "earlier" | "incoming" | "origin" | "pick";
 
 function pinIdentity(botColumn: string, row: "policy" | "recorded"): string {
   return `${botColumn}=? AND ${row}.generation=? AND ${row}.activation_sha256=? AND ${row}.release_revision=? AND ${row}.cutover_at=?`;
@@ -82,4 +82,28 @@ export function prepareGeneralReceiptAuthority(
       ON actor.bot_id=inbox.bot_id AND actor.actor_id=inbox.actor_id AND actor.generation=?
     WHERE inbox.bot_id=? AND inbox.update_id=? AND inbox.receipt_nonce=? AND ${GENERAL_LATEST_ACTOR_SQL}`)
     .bind(pin.releaseRevision, pin.activationSha256, pin.cutoverAt, pin.generation, ...key);
+}
+
+const GROUP_SCHEMA_SHA256 = "442b9f1e52ad961aac41ee9416760863984646a96570bd22f26474d329ee626e";
+const GROUP_SCHEMA = `EXISTS (SELECT /* subs-bot:telegram-general-group-reads:v1 */ 1 FROM subs_bot_schema_migrations
+  WHERE position=47 AND name='0047_telegram_general_groups.sql' AND sha256='${GROUP_SCHEMA_SHA256}' AND mode='applied')`;
+
+export async function groupSchemaReady(db: D1Database): Promise<boolean> {
+  try {
+    const definition = await db.prepare(`SELECT sql FROM sqlite_schema
+      WHERE name='telegram_general_groups' AND type='table' AND ${GROUP_SCHEMA}`).first<string>("sql");
+    if (typeof definition !== "string" || definition.length > 400) return false;
+    const bytes = new TextEncoder().encode(definition + ";\n");
+    const hash = await crypto.subtle.digest("SHA-256", bytes);
+    return Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, "0")).join("") === GROUP_SCHEMA_SHA256;
+  } catch {
+    // The private family can still operate when the optional group schema cannot be confirmed.
+    return false;
+  }
+}
+
+export function approvedGroup(alias?: "inbox" | "earlier"): string {
+  return `${GROUP_SCHEMA} AND EXISTS (SELECT 1 FROM telegram_general_groups AS approved
+    WHERE approved.bot_id=policy.bot_id AND approved.generation=policy.generation
+      AND approved.chat_id=${alias ? alias + ".chat_id" : "?"} AND approved.chat_type=${alias ? alias + ".chat_type" : "?"})`;
 }
