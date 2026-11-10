@@ -36,7 +36,8 @@ export type TelegramViewUpdate = TelegramEventScope & (
 
 export const TELEGRAM_PAGE_JUMP_CALLBACK = "list:jump:v1";
 export const TELEGRAM_PAGE_JUMP_PROMPT = "🔢 请回复这条消息，输入要跳转的页码数字（如 2）。";
-export const TELEGRAM_PAGE_JUMP_MARKER = "view-jump:v1";
+export const TELEGRAM_PAGE_JUMP_MARKER = "view-jump:v2";
+export const TELEGRAM_PAGE_JUMP_RECEIPTS = `'view-jump:v1','${TELEGRAM_PAGE_JUMP_MARKER}'`;
 export type TelegramPageJumpUpdate = TelegramEventScope & (
   | { kind: "open"; callbackId: string }
   | { kind: "reply"; promptMessageId: number; page: number | null; cancelled: boolean }

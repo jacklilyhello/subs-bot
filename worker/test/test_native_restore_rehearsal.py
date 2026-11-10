@@ -771,6 +771,12 @@ class SnapshotTests(unittest.TestCase):
         self.db.execute("UPDATE telegram_outbox SET state='sent',attempts=1,sent_message_id=30 WHERE receipt_id=3")
         self.assertEqual(quiet(9), (1,))
 
+    def test_quiet_requires_the_page_jump_gate_closed(self):
+        self.db.execute("INSERT INTO telegram_page_jump_controls VALUES ('881000',1,1,0)")
+        self.assertEqual(self.db.execute("SELECT " + native.quiet_expression(self.source.tables, 9)).fetchone(), (0,))
+        self.db.execute("UPDATE telegram_page_jump_controls SET enabled=0 WHERE bot_id='881000'")
+        self.assertEqual(self.db.execute("SELECT " + native.quiet_expression(self.source.tables, 9)).fetchone(), (1,))
+
     def test_quiet_blocks_unsettled_telegram_provider_jobs_on_new_schema(self):
         self.db.execute("""INSERT INTO telegram_provider_jobs
             (owner_id,request_key,kind,subscription_id,source_sha256,expected_generation,expected_lifecycle_revision,
