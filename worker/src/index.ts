@@ -658,7 +658,7 @@ async function recoverTelegramWork(
     if (subscriptionNodes) await reapTelegramSubscriptionNodeTickets(env.DB);
     if (providerRefreshSchema) await reapTelegramProviderRefreshTickets(env.DB);
     if (subscriptionRawFile === true) await reapTelegramRawFileTickets(env.DB);
-    if (providerBatch.controls === true) await reapTelegramProviderBatchTickets(env.DB);
+    if (providerBatch.controls === true) await reapTelegramProviderBatchTickets(env.DB, policy);
     if (shortLinks) await reapFailedTelegramShortLinks(env.DB, policy.botId);
   };
   const documents = async () => {

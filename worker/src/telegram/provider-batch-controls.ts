@@ -493,14 +493,15 @@ export async function reconcileTelegramProviderBatchReplies(db: D1Database, poli
   }
 }
 
-export async function reapTelegramProviderBatchTickets(db: D1Database, general?: GeneralTelegramPin): Promise<void> {
+export async function reapTelegramProviderBatchTickets(db: D1Database, policy: BatchPolicy): Promise<void> {
   try {
-    const scope = general ? `AND EXISTS (SELECT 1 FROM telegram_inbox WHERE receipt_id=interaction.receipt_id
-      AND bot_id=? AND receipt_nonce='${GENERAL_TELEGRAM_PROVIDER_BATCH_PREVIEW_MARKER}')` : "";
+    const marker = batchMarkers("privateProvider" in policy);
     const result = await db.prepare(`UPDATE telegram_provider_batch_interactions SET token_sha256=NULL,origin_attempt=NULL,expires_at=NULL
-      WHERE receipt_id IN (SELECT receipt_id FROM telegram_provider_batch_interactions AS interaction
-        WHERE token_sha256 IS NOT NULL AND used_by_receipt_id IS NULL AND expires_at<=unixepoch() ${scope}
-        ORDER BY expires_at,receipt_id LIMIT 40)`).bind(...(general ? [general.botId] : [])).run();
+      WHERE receipt_id IN (SELECT interaction.receipt_id FROM telegram_provider_batch_interactions AS interaction
+        JOIN telegram_inbox AS inbox USING(receipt_id)
+        WHERE inbox.bot_id=? AND inbox.receipt_nonce=? AND ${privateInbox("inbox")}
+          AND interaction.token_sha256 IS NOT NULL AND interaction.used_by_receipt_id IS NULL AND interaction.expires_at<=unixepoch()
+        ORDER BY interaction.expires_at,interaction.receipt_id LIMIT 40)`).bind(policy.botId, marker.preview).run();
     if (result.success) return;
   } catch {
     // Diagnostics do not expose capability or backend values.
