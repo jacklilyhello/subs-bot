@@ -20,6 +20,9 @@ import { acceptTelegramDocumentJob } from "./telegram/document-jobs.ts";
 import { reconcileTelegramDocumentJobReplies, retireTelegramDocumentStage } from "./telegram/document-persistence.ts";
 import { acceptTelegramLifecycle, reapTelegramLifecycle } from "./telegram/lifecycle-actions.ts";
 import { acceptTelegramGitHubSearch, recoverTelegramGitHubSearch, runTelegramGitHubSearch, telegramGitHubSearchReady } from "./telegram/github-search.ts";
+import { scopeGitHubSearchProof, writeGitHubSearchProof } from "./telegram/github-search-proof.ts";
+import { acceptGeneralTelegramCommand, drainGeneralTelegramReply, parseGeneralTelegramPin,
+  recoverGeneralTelegramReplies } from "./telegram/general-auth-runtime.ts";
 import { acceptTelegramGroupShare, telegramGroupShareReady } from "./telegram/group-share-actions.ts";
 import { drainTelegramGroupShareCards } from "./telegram/group-share-delivery.ts";
 import { acceptTelegramBulkTrash, telegramBulkTrashReady } from "./telegram/bulk-trash.ts";
@@ -52,6 +55,7 @@ import { acceptTelegramTemp } from "./telegram/temp-import.ts";
 import { acceptTelegramView, reapTelegramViewTickets } from "./telegram/views.ts";
 import { acceptTelegramShortLink, reapFailedTelegramShortLinks } from "./telegram/short-link-actions.ts";
 import { acceptTelegramSubscriptionRead, reapTelegramSubscriptionReadTickets, telegramSubscriptionReadReady } from "./telegram/subscription-read.ts";
+import { acceptTelegramPageJump, telegramPageJumpEpoch } from "./telegram/page-jump.ts";
 import { acceptTelegramSubscriptionNodePage, reapTelegramSubscriptionNodeTickets, telegramSubscriptionNodePagesReady } from "./telegram/subscription-node-pages.ts";
 import { acceptTelegramSubscriptionRawFile, reapTelegramRawFileTickets,
   telegramSubscriptionRawFileReady } from "./telegram/subscription-raw-file.ts";
@@ -61,9 +65,12 @@ export interface Env {
   NODES: R2Bucket;
   BUILD_REVISION?: string;
   TELEGRAM_ISOLATION_CONFIG?: string;
+  TELEGRAM_GENERAL_CONFIG?: string;
+  TELEGRAM_CONFIG_SHA256?: string;
   TELEGRAM_AGGREGATE_KEY?: string;
   TELEGRAM_PRIVATE_SHARE_CREATION_KEY?: string;
   TELEGRAM_GROUP_SHARE_CARDS?: string;
+  TELEGRAM_PAGE_JUMP?: string;
   TELEGRAM_INLINE_SEARCH?: string;
   PROVIDER_FETCH?: ProviderFetcher;
   PROVIDER_REVISION?: string;
@@ -170,6 +177,21 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
     return plain("Method not allowed.", 405, request.method === "HEAD", { Allow: "POST" });
   }
   if (new URL(request.url).protocol !== "https:") return plain("Not found.", 404, false);
+  if (env.TELEGRAM_ISOLATION_CONFIG === undefined && env.TELEGRAM_GENERAL_CONFIG !== undefined) {
+    const general = parseGeneralTelegramPin(env.TELEGRAM_GENERAL_CONFIG, env.BUILD_REVISION);
+    if (!general) return plain("Service unavailable.", 503, false);
+    try {
+      const status = await acceptGeneralTelegramCommand(env.DB, general, request);
+      if (status === 200) {
+        const delivery = drainGeneralTelegramReply(env.DB, general);
+        if (ctx) ctx.waitUntil(delivery.catch(() => undefined));
+        else await delivery;
+      }
+      return new Response(null, { status, headers: HEADERS });
+    } catch {
+      return plain("Service unavailable.", 503, false);
+    }
+  }
   const policy = parseTelegramPolicy(env.TELEGRAM_ISOLATION_CONFIG);
   if (!policy) return plain("Service unavailable.", 503, false);
 
@@ -183,6 +205,7 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
       ctx?.waitUntil(answerTelegramCallback(policy, legacyInlineClaim.callbackId, url ? { url } : "此旧卡片暂不可用。"));
       return new Response(null, { status: 204, headers: HEADERS });
     }
+    const pageJumpEpoch = telegramPageJumpEpoch(env.TELEGRAM_PAGE_JUMP);
     if (decoded.inlineQuery) {
       if (await telegramInlineSearchReady(env.DB)) await answerTelegramInlineSearch(env.DB, policy, decoded.inlineQuery, sendTelegramInlineAnswer);
       return new Response(null, { status: 204, headers: HEADERS });
@@ -212,7 +235,7 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
     const drainReplies = async (budget = 20_000) => drainTelegramReplies(env.DB, env.NODES, policy, 4, budget, fetch, aggregateKey, privateShare,
       subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerQueueReady, bulkTrash, inlineConsent,
       await githubSearch().catch(() => "unavailable" as const), providerRefresh, subscriptionRawFile, providerBatch.controls, apiStatus,
-      statusProvider !== null, providerDocument, providerBatchAdmission);
+      statusProvider !== null, providerDocument, providerBatchAdmission, pageJumpEpoch);
     const drain = () => ctx?.waitUntil(drainReplies().catch(() => undefined));
     if (decoded.apiStatus) {
       if (!statusProvider || apiStatus !== true) return new Response(null, { status: 204, headers: HEADERS });
@@ -242,6 +265,11 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
       if (outcome === "accepted" || decoded.view.kind !== "callback") {
         drain();
       }
+    } else if (decoded.pageJump) {
+      if (pageJumpEpoch === null) return new Response(null, { status: 204, headers: HEADERS });
+      const accepted = await acceptTelegramPageJump(env.DB, policy, decoded.pageJump, pageJumpEpoch);
+      if (decoded.pageJump.kind === "open") ctx?.waitUntil(answerTelegramCallback(policy, decoded.pageJump.callbackId));
+      if (accepted) drain();
     } else if (decoded.lifecycle) {
       const outcome = await acceptTelegramLifecycle(env.DB, policy, decoded.lifecycle);
       if (decoded.lifecycle.kind === "lifecycle-callback") {
@@ -307,13 +335,19 @@ async function telegramWebhook(request: Request, env: Env, ctx?: ExecutionContex
       if (!inlineConsent) return new Response(null, { status: 204, headers: HEADERS });
       if (await acceptTelegramInlineConsent(env.DB, policy, decoded.inlineConsent) === "accepted") drain();
     } else if (decoded.githubSearch) {
+      const receivedAt = Date.now();
       if (!await githubSearch()) return new Response(null, { status: 204, headers: HEADERS });
       const admitted = await acceptTelegramGitHubSearch(env.DB, policy, decoded.githubSearch);
       if (admitted.kind === "ignored") return new Response(null, { status: 204, headers: HEADERS });
       if (admitted.kind === "reply") drain();
       if (admitted.kind === "lookup") {
+        const proof = scopeGitHubSearchProof(new URL(request.url).origin, env.BUILD_REVISION, env.TELEGRAM_CONFIG_SHA256,
+          admitted.query, policy, decoded.githubSearch, receivedAt);
         const lookup = async () => {
-          if (await runTelegramGitHubSearch(env.DB, policy, admitted)) await drainReplies();
+          if (!await runTelegramGitHubSearch(env.DB, policy, admitted, fetch, proof?.observation)) return;
+          const delivery = drainReplies();
+          if (proof) await Promise.all([delivery, writeGitHubSearchProof(env.NODES, proof, admitted.receiptId)]);
+          else await delivery;
         };
         if (ctx) ctx.waitUntil(lookup().catch(() => undefined));
         else await lookup();
@@ -513,7 +547,7 @@ async function recoverTelegramWork(env: Env, policy: TelegramPolicy, pin: Provid
     drainTelegramReplies(env.DB, env.NODES, policy, limit, budget, fetch, aggregateKey, privateShare,
       subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerQueueReady, bulkTrash, inlineConsent,
       await githubSearch().catch(() => "unavailable" as const), providerRefresh, subscriptionRawFile, providerBatch.controls, apiStatus,
-      apiStatusProvider(env) !== null, providerDocument, providerBatchAdmission);
+      apiStatusProvider(env) !== null, providerDocument, providerBatchAdmission, telegramPageJumpEpoch(env.TELEGRAM_PAGE_JUMP));
   const replies = async () => {
     await drain(10, 45_000);
     await reapTelegramViewTickets(env.DB);
@@ -595,6 +629,10 @@ async function scheduled(_controller: ScheduledController, env: Env): Promise<vo
   try {
     const policy = parseTelegramPolicy(env.TELEGRAM_ISOLATION_CONFIG);
     if (policy) await recoverTelegramWork(env, policy, pin, await telegramProviderQueueReady(env, pin));
+    else if (env.TELEGRAM_ISOLATION_CONFIG === undefined) {
+      const general = parseGeneralTelegramPin(env.TELEGRAM_GENERAL_CONFIG, env.BUILD_REVISION);
+      if (general) await recoverGeneralTelegramReplies(env.DB, general);
+    }
   } finally {
     await runOneProviderJob(env.DB, env.NODES, env.PROVIDER_FETCH, pin);
   }

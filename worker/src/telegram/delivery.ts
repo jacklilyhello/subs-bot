@@ -9,7 +9,8 @@ import type { PrivateShareClaimResult } from "../private-shares.ts";
 import {
   prepareTelegramLifecycleTickets, renderTelegramLifecycle, type TelegramLifecycleButton,
 } from "./lifecycle-actions.ts";
-import { GROUP_SHARE_PUBLISH_CALLBACK, inTelegramScope, type TelegramPolicy } from "./protocol.ts";
+import { GROUP_SHARE_PUBLISH_CALLBACK, inTelegramScope, TELEGRAM_PAGE_JUMP_CALLBACK, type TelegramPolicy } from "./protocol.ts";
+import { confirmTelegramPageJumpSend, currentTelegramPageJumpEpoch, renderTelegramPageJump, telegramPageJumpSendGuard } from "./page-jump.ts";
 import { closeUnsentTelegramBulkTrashReply, confirmTelegramBulkTrashSend, renderTelegramBulkTrash } from "./bulk-trash.ts";
 import { renderTelegramInlineSort } from "./inline-sort.ts";
 import { renderTelegramInlineConsent } from "./inline-search-consent.ts";
@@ -31,7 +32,7 @@ import { confirmTelegramSubscriptionRawFileSend, prepareTelegramRawFileButton, p
 import {
   beginTelegramAggregateLinkReply, beginTelegramBulkTrashReply, beginTelegramInlineConsentReply, beginTelegramInlineSortReply,
   beginTelegramPrivateShareCreationReply,
-  beginTelegramSelectedLinkReply, beginTelegramShortLinkReply, beginTelegramReply, claimTelegramReply, isTelegramMemberAllowed,
+  beginTelegramSelectedLinkReply, beginTelegramShortLinkReply, beginTelegramReply, claimTelegramReply, closeUnsentTelegramPageJump, isTelegramMemberAllowed,
   readTelegramAuthChangeOutcome,
   beginTelegramGitHubSearchReply, beginTelegramTempRawReply,
   beginTelegramSubscriptionRawFileReply, failLeasedTelegramSubscriptionRawFileReply,
@@ -129,19 +130,18 @@ function positiveInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
-async function sendTelegram(
-  policy: TelegramPolicy,
-  scope: Pick<TelegramReplyLease, "actorId" | "chatId" | "chatType">,
+async function postTelegram(
+  botToken: string,
+  chatId: string,
   method: "sendMessage" | "sendDocument" | "editMessageText",
   body: Record<string, unknown> | FormData,
   timeoutMs: number,
   request: typeof fetch,
 ): Promise<TelegramReplyOutcome> {
-  if (!inTelegramScope(policy, scope)) return { kind: "failed" };
   try {
     const multipart = body instanceof FormData;
     const editId = method === "editMessageText" && !multipart ? body.message_id : undefined;
-    const response = await request(`${BOT_API}/bot${policy.botToken}/${method}`, {
+    const response = await request(`${BOT_API}/bot${botToken}/${method}`, {
       method: "POST",
       redirect: "manual",
       signal: AbortSignal.timeout(Math.min(SEND_TIMEOUT_MS, timeoutMs)),
@@ -153,7 +153,7 @@ async function sendTelegram(
       const result = record(payload.result);
       const chat = record(result?.chat);
       if (positiveInteger(result?.message_id) && (method !== "editMessageText" || result.message_id === editId) &&
-          typeof chat?.id === "number" && Number.isSafeInteger(chat.id) && String(chat.id) === scope.chatId) {
+          typeof chat?.id === "number" && Number.isSafeInteger(chat.id) && String(chat.id) === chatId) {
         return { kind: "sent", messageId: result.message_id };
       }
     } else if (payload?.ok === false && payload.error_code === response.status &&
@@ -171,6 +171,27 @@ async function sendTelegram(
     // A transport or malformed response cannot prove Telegram did not deliver.
   }
   return { kind: "uncertain" };
+}
+
+function sendTelegram(
+  policy: TelegramPolicy,
+  scope: Pick<TelegramReplyLease, "actorId" | "chatId" | "chatType">,
+  method: "sendMessage" | "sendDocument" | "editMessageText",
+  body: Record<string, unknown> | FormData,
+  timeoutMs: number,
+  request: typeof fetch,
+): Promise<TelegramReplyOutcome> {
+  return inTelegramScope(policy, scope)
+    ? postTelegram(policy.botToken, scope.chatId, method, body, timeoutMs, request)
+    : Promise.resolve({ kind: "failed" });
+}
+
+export function sendGeneralTelegramPrivateReply(
+  botToken: string, actorId: string, messageId: number, text: string,
+): Promise<TelegramReplyOutcome> {
+  return postTelegram(botToken, actorId, "sendMessage", {
+    chat_id: actorId, text, reply_parameters: { message_id: messageId }, link_preview_options: { is_disabled: true },
+  }, 5_000, fetch);
 }
 
 export function sendTelegramGroupShareCard(
@@ -359,7 +380,8 @@ async function renderReply(
   }
   if (lease.view) {
     const privateDetails = subscriptionReadEnabled && lease.chatType === "private" && lease.threadId === null;
-    return { ...await renderTelegramView(db, lease.actorId, lease.view, privateDetails), access: "allowed" };
+    return { ...await renderTelegramView(db, lease.actorId, lease.view, privateDetails, privateDetails || lease.pageJump === true),
+      access: "allowed" };
   }
   if (lease.temp) return { text: renderTelegramTemp(lease.temp), access: "allowed" };
   if (lease.path && lease.chatType === "private" && lease.threadId === null) {
@@ -525,6 +547,7 @@ export async function drainTelegramReplies(
   apiStatusPromptsEnabled = false,
   providerDocumentReadiness: boolean | "unavailable" = false,
   providerBatchAdmissionEnabled = false,
+  pageJumpEpoch: number | null = null,
 ): Promise<void> {
   const deadline = Date.now() + budgetMs;
   const privateShareEnabled = privateShareRuntime.schemaReady && privateShareRuntime.context !== null;
@@ -703,8 +726,18 @@ export async function drainTelegramReplies(
       await settleTelegramReply(db, policy, lease, outcome);
       continue;
     }
-    const reply = await renderReply(db, bucket, policy, lease, deadline, menuFeatures, privateShareEnabled, subscriptionReadEnabled,
-      subscriptionNodesEnabled, providerRefreshEnabled, subscriptionRawFileEnabled);
+    const jump = lease.pageJump ? await renderTelegramPageJump(db, lease.receiptId) : null;
+    const prompt = jump !== null && jump !== "page" && jump.forceReply;
+    const promptEpoch = prompt ? await currentTelegramPageJumpEpoch(db, policy.botId, lease.receiptId) : null;
+    if (lease.pageJump && (!jump || (prompt && promptEpoch === null))) {
+      await closeUnsentTelegramPageJump(db, policy, lease);
+      continue;
+    }
+    const reply: Awaited<ReturnType<typeof renderReply>> = jump && jump !== "page" ? { ...jump, access: "allowed" }
+      : await renderReply(db, bucket, policy, lease, deadline, menuFeatures, privateShareEnabled, subscriptionReadEnabled,
+        subscriptionNodesEnabled, providerRefreshEnabled, subscriptionRawFileEnabled);
+    const jumpButton = pageJumpEpoch !== null && lease.view?.kind === "list" && (!jump || jump === "page") && reply.access === "allowed"
+      && await currentTelegramPageJumpEpoch(db, policy.botId, lease.receiptId) === pageJumpEpoch;
     const [view, lifecycle, read, nodes, refresh, rawFile] = await Promise.all([
       reply.buttons?.length ? prepareTelegramViewTickets(reply.buttons) : undefined,
       reply.lifecycleButtons?.length ? prepareTelegramLifecycleTickets(reply.lifecycleButtons) : undefined,
@@ -713,9 +746,17 @@ export async function drainTelegramReplies(
       reply.refreshTarget ? prepareTelegramProviderRefreshButton(reply.refreshTarget) : undefined,
       reply.rawFileTarget ? prepareTelegramRawFileButton(reply.rawFileTarget) : undefined,
     ]);
-    if (Date.now() >= deadline ||
-      !await beginTelegramReply(db, policy, lease, reply.access, view?.tickets, lifecycle?.tickets, read?.tickets, reply.readGuard,
-        nodes?.tickets, refresh?.ticket, rawFile?.ticket)) continue;
+    if (Date.now() >= deadline) continue;
+    const jumpGuard = jump ? telegramPageJumpSendGuard(policy, promptEpoch) : undefined;
+    if (!await beginTelegramReply(db, policy, lease, reply.access, view?.tickets, lifecycle?.tickets, read?.tickets, reply.readGuard,
+      nodes?.tickets, refresh?.ticket, rawFile?.ticket, jumpGuard)) {
+      if (jump) await closeUnsentTelegramPageJump(db, policy, lease);
+      continue;
+    }
+    if (jumpGuard && (!await confirmTelegramPageJumpSend(db, policy, lease, jumpGuard) || Date.now() >= deadline)) {
+      await settleTelegramReply(db, policy, lease, { kind: "failed" });
+      continue;
+    }
     if (reply.readGuard) {
       const confirmed = await confirmTelegramSubscriptionReadSend(db, policy, lease, reply.readGuard).catch(() => false);
       if (!confirmed || Date.now() >= deadline) {
@@ -723,7 +764,8 @@ export async function drainTelegramReplies(
         continue;
       }
     }
-    const keyboard = [...(view?.keyboard ?? []), ...(lifecycle?.keyboard ?? []), ...(nodes?.keyboard ?? []), ...(read?.keyboard ?? []),
+    const keyboard = [...(view?.keyboard ?? []), ...(jumpButton ? [[{ text: "🔢 跳转页", callback_data: TELEGRAM_PAGE_JUMP_CALLBACK }]] : []),
+      ...(lifecycle?.keyboard ?? []), ...(nodes?.keyboard ?? []), ...(read?.keyboard ?? []),
       ...(refresh ? [[refresh.button]] : []), ...(rawFile ? [[rawFile.button]] : [])];
     const outcome = await sendTelegramReply(policy, lease, reply.text, Math.max(1, deadline - Date.now()), request,
       keyboard, reply.forceReply, reply.mainMenu);

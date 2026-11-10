@@ -34,6 +34,15 @@ export type TelegramViewUpdate = TelegramEventScope & (
   | { kind: "callback"; callbackId: string; ticket: string }
 );
 
+export const TELEGRAM_PAGE_JUMP_CALLBACK = "list:jump:v1";
+export const TELEGRAM_PAGE_JUMP_PROMPT = "🔢 请回复这条消息，输入要跳转的页码数字（如 2）。";
+export const TELEGRAM_PAGE_JUMP_MARKER = "view-jump:v2";
+export const TELEGRAM_PAGE_JUMP_RECEIPTS = `'view-jump:v1','${TELEGRAM_PAGE_JUMP_MARKER}'`;
+export type TelegramPageJumpUpdate = TelegramEventScope & (
+  | { kind: "open"; callbackId: string }
+  | { kind: "reply"; promptMessageId: number; page: number | null; cancelled: boolean }
+);
+
 export type TelegramLifecycleUpdate = TelegramEventScope & (
   | { kind: "lifecycle-callback"; callbackId: string; ticket: string }
   | { kind: "rename-reply"; promptMessageId: number; text: string }
@@ -126,8 +135,10 @@ type ApiStatusUpdate = (ProviderBatchUpdate & { apiStatus?: never })
   | ({ apiStatus: TelegramApiStatusUpdate } & Partial<Record<keyof ProviderBatchUpdate, never>>);
 type GroupShareUpdate = (ApiStatusUpdate & { groupShare?: never })
   | ({ groupShare: TelegramGroupShareUpdate } & Partial<Record<keyof ApiStatusUpdate, never>>);
-type NormalizedUpdate = (GroupShareUpdate & { legacyInlineClaim?: never })
+type LegacyInlineClaimUpdate = (GroupShareUpdate & { legacyInlineClaim?: never })
   | ({ legacyInlineClaim: TelegramLegacyInlineClaim } & Partial<Record<keyof GroupShareUpdate, never>>);
+type NormalizedUpdate = (LegacyInlineClaimUpdate & { pageJump?: never })
+  | ({ pageJump: TelegramPageJumpUpdate } & Partial<Record<keyof LegacyInlineClaimUpdate, never>>);
 
 type DecodedTelegramRequest =
   | ({ status: 200 } & NormalizedUpdate)
@@ -176,6 +187,15 @@ function canonicalId(value: unknown, negative = false): value is string {
   return matches(value, pattern) && Number.isSafeInteger(Number(value)) && String(Number(value)) === value;
 }
 
+export type TelegramBotCredentials = Pick<TelegramPolicy, "botId" | "botUsername" | "webhookSecret" | "botToken">;
+
+export function readTelegramBotCredentials(value: Record<string, unknown>): TelegramBotCredentials | null {
+  const { botId, botUsername, webhookSecret, botToken } = value;
+  return canonicalId(botId) && matches(botUsername, USERNAME) && matches(webhookSecret, WEBHOOK_SECRET)
+    && matches(botToken, BOT_TOKEN) && botToken.startsWith(`${botId}:`)
+    ? { botId, botUsername, webhookSecret, botToken } : null;
+}
+
 export function parseTelegramPolicy(input: unknown): TelegramPolicy | null {
   if (typeof input !== "string" || input.length > 4096) return null;
   let value: unknown;
@@ -185,14 +205,11 @@ export function parseTelegramPolicy(input: unknown): TelegramPolicy | null {
     return null;
   }
   if (!isRecord(value) || Object.keys(value).length !== 7) return null;
-  const { botId, botUsername, adminId, memberId, groupId, webhookSecret, botToken } = value;
-  if (
-    !canonicalId(botId) || !canonicalId(adminId) || !canonicalId(memberId) || !canonicalId(groupId, true)
-    || new Set([botId, adminId, memberId]).size !== 3
-    || !matches(botUsername, USERNAME) || !matches(webhookSecret, WEBHOOK_SECRET)
-    || !matches(botToken, BOT_TOKEN) || !botToken.startsWith(`${botId}:`)
-  ) return null;
-  return { botId, botUsername, adminId, memberId, groupId, webhookSecret, botToken };
+  const credentials = readTelegramBotCredentials(value);
+  const { adminId, memberId, groupId } = value;
+  if (!credentials || !canonicalId(adminId) || !canonicalId(memberId) || !canonicalId(groupId, true)
+    || new Set([credentials.botId, adminId, memberId]).size !== 3) return null;
+  return { ...credentials, adminId, memberId, groupId };
 }
 
 export function inTelegramScope(policy: TelegramPolicy, event: Pick<TelegramEventScope, "actorId" | "chatId" | "chatType">): boolean {
@@ -460,6 +477,14 @@ function normalizeMessage(
   }
   if (command === "list" || command === "expiry" || command === "recycle") return { view: { ...scope, kind: command } };
   if (command) return { command: { ...scope, command } };
+  if (ownBotMessage(origin, policy) && origin.text === TELEGRAM_PAGE_JUMP_PROMPT) {
+    const prompt = messageScope(origin, actorId, updateId, policy);
+    if (typeof text !== "string" || prompt?.chatId !== scope.chatId || prompt.chatType !== scope.chatType
+        || prompt.threadId !== scope.threadId || prompt.messageId >= scope.messageId || prompt.messageDate > scope.messageDate) return null;
+    const position = subscriptionPosition(text);
+    return { pageJump: { ...scope, kind: "reply", promptMessageId: prompt.messageId,
+      page: position === null ? null : Math.max(1, position), cancelled: RENAME_CANCEL.test(text.trim()) } };
+  }
   if (typeof text === "string" && classifyTelegramApiStatusInput({ kind: "ordinary", text }).kind !== "pass-through") return null;
   const lifecycle = renameReply(message, scope, policy);
   if (lifecycle) return { lifecycle };
@@ -499,6 +524,7 @@ function normalizeCallback(
   if (!ownBotMessage(message, policy)) return null;
   const scope = messageScope(message, String(actor.id), updateId, policy);
   if (!scope) return null;
+  if (ticket === TELEGRAM_PAGE_JUMP_CALLBACK) return { pageJump: { ...scope, kind: "open", callbackId } };
   if (ticket === GROUP_SHARE_PUBLISH_CALLBACK) return scope.chatType === "private" && scope.threadId === null
     ? { groupShare: { ...scope, kind: "publish", callbackId } } : null;
   if (ticket === GROUP_SHARE_PICK_CALLBACK) return scope.chatType !== "private" && scope.threadId === null

@@ -3,10 +3,11 @@ import { readFile, readdir } from "node:fs/promises";
 import { test } from "node:test";
 import { Miniflare } from "miniflare";
 import {
-  acceptTelegramGitHubSearch, normalizeGitHubSearchQuery, recoverTelegramGitHubSearch, renderTelegramGitHubReply,
+  acceptTelegramGitHubSearch, newGitHubSearchObservation, normalizeGitHubSearchQuery, recoverTelegramGitHubSearch, renderTelegramGitHubReply,
   runTelegramGitHubSearch,
 } from "../src/telegram/github-search.ts";
 import { grepCodeContent } from "../src/telegram/grep-search.ts";
+import { GITHUB_SEARCH_PROOF_ARM, scopeGitHubSearchProof, writeGitHubSearchProof } from "../src/telegram/github-search-proof.ts";
 import type { TelegramGitHubSearchUpdate, TelegramPolicy } from "../src/telegram/protocol.ts";
 import { acceptTelegramCommand, beginTelegramGitHubSearchReply, claimTelegramReply } from "../src/telegram/store.ts";
 
@@ -153,10 +154,24 @@ test("Grep verifies file visibility without waiting for the parallel repository 
     const repo = "public-fixture/Code";
     const url = `https://github.com/${repo}`;
     const publicRepo = { full_name: repo, html_url: url, private: false, visibility: "public", stargazers_count: 1 };
-    for (const laterRepositoryProof of [false, true]) {
+    const exactProof = { total_count: 1, incomplete_results: false, items: [publicRepo] };
+    const cases = [
+      { laterRepositoryProof: false, status: 200, body: exactProof, files: 2, state: "found", outcome: "public" },
+      { laterRepositoryProof: true, status: 429, files: 2, state: "found", outcome: "unconfirmed" },
+      { laterRepositoryProof: false, status: 403, files: 0, state: "unavailable", outcome: "unconfirmed" },
+      ...[
+        { ...exactProof, incomplete_results: true },
+        { ...exactProof, total_count: 2 },
+        { ...exactProof, items: [{ ...publicRepo, private: true }] },
+        { ...exactProof, items: [{ ...publicRepo, visibility: undefined }] },
+        { ...exactProof, items: [{ ...publicRepo, full_name: "unrelated/Code" }] },
+        { ...exactProof, items: [{ ...publicRepo, html_url: "https://unexpected.invalid/file" }] },
+      ].map((body) => ({ laterRepositoryProof: false, status: 200, body, files: 0, state: "unavailable", outcome: "unconfirmed" })),
+    ];
+    for (const [index, { laterRepositoryProof, status, body, files, state, outcome }] of cases.entries()) {
       await db.prepare("UPDATE telegram_github_search SET started_at=unixepoch()-16 WHERE started_at IS NOT NULL").run();
       const admission = await acceptTelegramGitHubSearch(db, policy, {
-        ...event(laterRepositoryProof ? 2 : 1, now), args: `synthetic-code repo:${repo}`,
+        ...event(index + 1, now), args: `synthetic-code repo:${repo}`,
       });
       assert.ok(admission.kind === "lookup");
       let releaseRepositorySearch!: (response: Response) => void;
@@ -165,11 +180,20 @@ test("Grep verifies file visibility without waiting for the parallel repository 
       const verificationOrder: boolean[] = [];
       const request: typeof fetch = async (input, init) => {
         const requested = new URL(String(input));
-        if (requested.pathname === "/search/repositories") return pendingSearch;
-        if (requested.pathname === `/repos/${repo}`) {
+        if (requested.origin === "https://api.github.com") {
+          assert.equal(requested.pathname, "/search/repositories");
+          if (requested.searchParams.get("per_page") === "5") {
+            assert.equal(requested.searchParams.get("q"), `synthetic-code repo:${repo} is:public`);
+            return pendingSearch;
+          }
+          assert.deepEqual([...requested.searchParams], [["q", `repo:${repo} is:public fork:true`], ["per_page", "1"]]);
+          assert.equal(init?.method, "GET");
+          assert.equal(init?.redirect, "manual");
+          assert.equal(init?.cache, "no-store");
+          assert.equal(new Headers(init?.headers).get("Authorization"), null);
           verificationOrder.push(repoSearchReleased);
           if (repoSearchReleased) throw new DOMException("Synthetic visibility deadline elapsed", "TimeoutError");
-          return laterRepositoryProof ? new Response(null, { status: 429 }) : Response.json(publicRepo);
+          return status === 200 ? Response.json(body) : new Response(null, { status });
         }
         assert.equal(requested.href, "https://mcp.grep.app/");
         const rpc = JSON.parse(String(init?.body)) as { method: string; id?: number };
@@ -192,13 +216,69 @@ synthetic excerpt` })),
 `,
           { headers: { "Content-Type": "text/event-stream" } });
       };
-      assert.equal(await runTelegramGitHubSearch(db, policy, admission, request), true);
+      const observation = newGitHubSearchObservation();
+      assert.equal(await runTelegramGitHubSearch(db, policy, admission, request, observation), true);
+      assert.deepEqual(observation.visibility, [{ status, outcome }]);
+      assert.equal(observation.grep.phase, "complete");
+      assert.equal(observation.candidates, 2);
+      assert.equal(observation.repositoryState, laterRepositoryProof ? "found" : "empty");
+      assert.equal(observation.verifiedFiles, files);
+      assert.equal(observation.settled, state);
       const row = await db.prepare("SELECT state,public_results FROM telegram_github_search WHERE receipt_id=?")
         .bind(admission.receiptId).first<{ state: string; public_results: string }>();
       assert.ok(row);
-      assert.equal(row.state, "found");
-      assert.deepEqual(JSON.parse(row.public_results).code.map(({ path }: { path: string }) => path), ["first.ts", "second.ts"]);
+      assert.equal(row.state, state);
+      if (files) assert.deepEqual(JSON.parse(row.public_results).code.map(({ path }: { path: string }) => path), ["first.ts", "second.ts"]);
+      else assert.equal(row.public_results, null);
       assert.deepEqual(verificationOrder, [false], "verify the shared repository once while search is still pending");
+    }
+  });
+});
+
+test("a reported search limit stops further identity requests without losing a verified result", async () => {
+  await withDatabase(async (db, now) => {
+    const repos = ["public-fixture/First", "public-fixture/Second"];
+    const cases: { keyword?: ResponseInit; exact?: ResponseInit; requests: number; files: number; noCandidates?: true }[] = [
+      { keyword: { status: 403 }, requests: 0, files: 0 },
+      { keyword: { status: 429 }, requests: 0, files: 0 },
+      { keyword: { headers: { "Retry-After": "30" } }, requests: 0, files: 0 },
+      { keyword: { headers: { "X-RateLimit-Remaining": "0" } }, requests: 0, files: 0 },
+      { exact: { status: 403 }, requests: 1, files: 0 },
+      { exact: { status: 429 }, requests: 1, files: 0 },
+      { exact: { headers: { "X-RateLimit-Remaining": "0" } }, requests: 1, files: 1 },
+      { requests: 0, files: 0, noCandidates: true },
+    ];
+    for (const [index, sample] of cases.entries()) {
+      await db.prepare("UPDATE telegram_github_search SET started_at=unixepoch()-16 WHERE started_at IS NOT NULL").run();
+      const admission = await acceptTelegramGitHubSearch(db, policy, { ...event(index + 1, now), args: "synthetic-code" });
+      assert.ok(admission.kind === "lookup");
+      const exactQueries: string[] = [];
+      const request: typeof fetch = async (input, init) => {
+        const url = new URL(String(input));
+        if (url.origin === "https://api.github.com") {
+          assert.equal(url.pathname, "/search/repositories");
+          if (url.searchParams.get("per_page") === "5") return Response.json({ items: [], incomplete_results: false }, sample.keyword);
+          exactQueries.push(url.searchParams.get("q") ?? "");
+          const repo = repos[exactQueries.length - 1];
+          return Response.json({ total_count: 1, incomplete_results: false, items: [
+            { full_name: repo, html_url: `https://github.com/${repo}`, visibility: "public", private: false },
+          ] }, sample.exact);
+        }
+        assert.equal(url.href, "https://mcp.grep.app/");
+        const rpc = JSON.parse(String(init?.body)) as { method: string; id?: number };
+        if (rpc.method === "notifications/initialized") return new Response(null, { status: 202 });
+        const content = sample.noCandidates ? [] : repos.map((repo) => ({ type: "text",
+          text: `Repository: ${repo}\nPath: fixture.ts\nURL: https://github.com/${repo}/blob/main/fixture.ts\nLicense: MIT\nSnippets:\nfixture` }));
+        const result = rpc.method === "initialize" ? { protocolVersion: "2025-06-18" } : { content };
+        return new Response(`data: ${JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result })}\n\n`,
+          { headers: { "Content-Type": "text/event-stream" } });
+      };
+      const observation = newGitHubSearchObservation();
+      assert.equal(await runTelegramGitHubSearch(db, policy, admission, request, observation), true);
+      assert.deepEqual(exactQueries, repos.slice(0, sample.requests).map((repo) => `repo:${repo} is:public fork:true`));
+      assert.equal(observation.candidates, sample.noCandidates ? 0 : 2);
+      assert.equal(observation.verifiedFiles, sample.files);
+      assert.equal(observation.settled, sample.files ? "found" : sample.noCandidates ? "empty" : "unavailable");
     }
   });
 });
@@ -221,7 +301,10 @@ test("Grep handshake cannot send the query after the member authorization change
         .bind(policy.botId, policy.memberId, now).run();
       return new Response(null, { status: 202 });
     };
-    assert.equal(await runTelegramGitHubSearch(db, policy, admission, request), false);
+    const observation = newGitHubSearchObservation();
+    assert.equal(await runTelegramGitHubSearch(db, policy, admission, request, observation), false);
+    assert.equal(observation.grep.phase, "authorization-denied");
+    assert.equal(observation.settled, null);
     assert.deepEqual(methods, ["initialize", "notifications/initialized"]);
     assert.equal(await claim(db), null);
   });
@@ -234,13 +317,72 @@ test("Grep refuses redirects and a session contract not verified by the hosted p
       { headers: { "Content-Type": "text/event-stream", "Mcp-Session-Id": "unexpected-session" } }),
   ]) {
     const requests: Array<{ url: string; init?: RequestInit }> = [];
+    const observation = newGitHubSearchObservation().grep;
     assert.deepEqual(await grepCodeContent(async (input, init) => {
       requests.push({ url: String(input), init });
       return response;
-    }, AbortSignal.timeout(1000), "synthetic-lookup", undefined, async () => true), []);
+    }, AbortSignal.timeout(1000), "synthetic-lookup", undefined, async () => true, observation), []);
+    assert.equal(observation.phase, "initialize-response");
+    assert.equal(observation.initializeStatus, response.status);
+    assert.equal(observation.toolStatus, null);
     assert.equal(requests.length, 1);
     assert.equal(requests[0].url, "https://mcp.grep.app/");
     assert.equal(requests[0].init?.redirect, "manual");
     assert.doesNotMatch(String(requests[0].init?.body), /synthetic-lookup/u);
+  }
+});
+
+test("Grep proof accepts only the scoped fixture and writes once per role after a settled lookup", async () => {
+  const runtime = new Miniflare({ modules: true, script: "export default { fetch() { return new Response() } }",
+    r2Buckets: ["NODES"], compatibilityDate: "2026-06-01" });
+  try {
+    const bucket = await runtime.getR2Bucket("NODES");
+    const now = Math.floor(Date.now() / 1000);
+    const origin = "https://subs-bot-cf-dev-01.lilyya.workers.dev";
+    const revision = "a".repeat(40);
+    const cohort = "b".repeat(32);
+    const policySha256 = "d".repeat(64);
+    const query = "addClass repo:jquery/jquery";
+    const fixturePolicy = { ...policy, botUsername: "test_cfsubs_bot" };
+    const fixture = { ...event(1, now), args: query };
+    assert.equal(scopeGitHubSearchProof("https://other.invalid", revision, policySha256, query, fixturePolicy, fixture, Date.now()), null);
+    assert.equal(scopeGitHubSearchProof(origin, revision, policySha256, "unrelated", fixturePolicy, fixture, Date.now()), null);
+    assert.equal(scopeGitHubSearchProof(origin, revision, policySha256, query, policy, fixture, Date.now()), null);
+    assert.equal(scopeGitHubSearchProof(origin, revision, policySha256, query, fixturePolicy,
+      { ...fixture, chatType: "group", chatId: policy.groupId }, Date.now()), null);
+    const scoped = (receivedAt = Date.now()) => {
+      const proof = scopeGitHubSearchProof(origin, revision, policySha256, query, fixturePolicy, fixture, receivedAt);
+      assert.ok(proof);
+      return proof;
+    };
+    assert.equal(await writeGitHubSearchProof(bucket, scoped(), 20), false);
+    const settled = (receivedAt?: number) => {
+      const proof = scoped(receivedAt);
+      proof.observation.settled = "empty";
+      return proof;
+    };
+    assert.equal(await writeGitHubSearchProof(bucket, settled(), 20), false, "an unarmed request writes nothing");
+    const unavailable = { get() { throw new Error("synthetic storage failure"); } } as unknown as R2Bucket;
+    assert.equal(await writeGitHubSearchProof(unavailable, settled(), 20), false);
+    const arm = { version: 1, revision, policySha256, cohort, opensAt: now - 5, expiresAt: now + 30 };
+    await bucket.put(GITHUB_SEARCH_PROOF_ARM, JSON.stringify({ ...arm, policySha256: "e".repeat(64) }));
+    assert.equal(await writeGitHubSearchProof(bucket, settled(), 20), false);
+    await bucket.put(GITHUB_SEARCH_PROOF_ARM, JSON.stringify({ ...arm, opensAt: now - 2, expiresAt: now - 1 }));
+    assert.equal(await writeGitHubSearchProof(bucket, settled(), 20), false);
+    await bucket.put(GITHUB_SEARCH_PROOF_ARM, JSON.stringify(arm));
+    assert.equal(await writeGitHubSearchProof(bucket, settled((now - 2) * 1000), 20), false, "late arming cannot capture an old receipt");
+    assert.equal(await writeGitHubSearchProof(bucket, settled(), 20), true);
+    assert.equal(await writeGitHubSearchProof(bucket, settled(), 21), false);
+    const item = await bucket.get(`diagnostics/telegram-github-search/v1/${cohort}/member.json`);
+    assert.ok(item);
+    const payload = await item.text();
+    const record = JSON.parse(payload);
+    assert.equal(record.role, "member");
+    assert.equal(record.receiptId, 20);
+    assert.equal(record.settled, "empty");
+    assert.doesNotMatch(payload, /addClass|jquery|77603|fixture-isolation|synthetic-token/u);
+    assert.equal(item.httpMetadata?.cacheControl, "private, no-store");
+  } finally {
+    await runtime.dispose();
   }
 });

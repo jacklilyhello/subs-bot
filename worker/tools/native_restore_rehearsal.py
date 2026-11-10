@@ -184,12 +184,13 @@ def listed_metadata(row):
     return validate_metadata({"custom": {} if custom is None else custom, "http": http})
 
 
-def signed_put_headers(host, path, token_id, token, raw, metadata, now):
+def signed_put_headers(host, path, token_id, token, raw, metadata, now, *, if_match=None):
     """One S3 SigV4 PUT using the verified account token's derived key."""
     timestamp = now.strftime("%Y%m%dT%H%M%SZ")
     day = timestamp[:8]
     payload_sha = digest(raw)
-    headers = {"host": host, "content-length": str(len(raw)), "if-none-match": "*",
+    condition = {"if-none-match": "*"} if if_match is None else {"if-match": if_match}
+    headers = {"host": host, "content-length": str(len(raw)), **condition,
                "x-amz-date": timestamp, "x-amz-content-sha256": payload_sha, "x-amz-storage-class": "STANDARD", **metadata["http"],
                **{f"x-amz-meta-{name}": value for name, value in metadata["custom"].items()}}
     signed_headers = ";".join(sorted(headers))
@@ -764,6 +765,14 @@ def quiet_expression(tables, observed_at=None):
         conditions.append("NOT EXISTS(SELECT 1 FROM telegram_selected_links AS selected JOIN aggregate_links AS link ON link.code_sha256=selected.code_sha256 WHERE link.revoked_at IS NULL)")
     if "telegram_subscription_read_ticket" in tables:
         waits.append("telegram_subscription_read_ticket")
+    if "telegram_page_jumps" in tables:
+        conditions.append(f"""NOT EXISTS(SELECT 1 FROM telegram_page_jumps AS prompt
+            JOIN telegram_inbox AS inbox USING(receipt_id) JOIN telegram_outbox AS reply USING(receipt_id)
+            WHERE prompt.kind='prompt' AND prompt.expires_at>{epoch} AND inbox.receipt_nonce IN ('view-jump:v1','view-jump:v2')
+              AND reply.state='sent' AND NOT EXISTS(
+                SELECT 1 FROM telegram_page_jumps WHERE origin_receipt_id=prompt.receipt_id))""")
+    if "telegram_page_jump_controls" in tables:
+        conditions.append("NOT EXISTS(SELECT 1 FROM telegram_page_jump_controls WHERE enabled=1)")
     conditions.extend(f"NOT EXISTS(SELECT 1 FROM {table} WHERE expires_at > {epoch} AND used_by_receipt_id IS NULL)" for table in waits)
     return "(" + " AND ".join(conditions) + ")"
 

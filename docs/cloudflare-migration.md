@@ -73,7 +73,7 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 | 旧入口与行为 | 隔离 Worker 与独立验收项 |
 | --- | --- |
 | `/start`、`/help`、中文回复菜单、`/auth` 列表及增删，支持输入 ID 或回复目标用户。 | 已接入基础欢迎、帮助和私聊管理员授权。核对两账号和测试群的权限隔离、撤权及重投。中文菜单、生产管理员及白名单配置、历史授权覆盖另行核对。 |
-| `/list`、`/expire`、回收站菜单、翻页和跳页。 | `/list`、未来 14 天内到期的 `/expire` 及新增的 `/recycle` 已支持按所有者翻页。核对边界日期、旧票据、跨用户回调和重命名、确认删除、30 天内恢复。菜单、任意页跳转和详情入口分开接入。 |
+| `/list`、`/expire`、回收站菜单、翻页和跳页。 | `/list`、未来 14 天内到期的 `/expire` 及新增的 `/recycle` 支持按所有者翻页。`0042` 为 `/list` 准备数字跳页，隔离发布默认关闭入口。 |
 | 数字或列表按钮打开详情，浏览节点和流量，单条重命名、刷新、删除、格式链接、短链和节点文件。`/s` 按名称及原始 URL 搜索，`/d` 批量删除匹配项。`/renumber` 只返回当前订阅计数。 | 已有生命周期操作、元数据和快照读取。`0022` 在私聊详情中接入每页 15 条的节点浏览，只展示序号、协议和名称。翻页固定到原快照，返回详情可打开同一订阅的当前版本。`0024` 增加私聊 `/d 关键词或订阅链接`，最多预览 16 条匹配项，使用十分钟内一次性按钮确认。任一目标变更时整批停止，已回收订阅可在 30 天内恢复。`0030` 为私聊详情增加原始 URI 附件。详情、搜索、各格式链接及原始 URI 附件分别验收。展示编号由列表计算。原始 URL、节点及能力链接限定在私聊。 |
 | 粘贴节点加入临时列表，`/temp` 查看原文，`/temp clear` 清空。 | 私聊核对导入、计数、原文、TXT 附件和清空。验收包含顺序、重复、整批拒绝、迟到清空和清空后的旧请求。 |
 | 上传 `.txt`、`.log`、`.yaml`、`.yml`、`.json`，识别节点或订阅 URL，同名文件更新旧导入。 | 已接入私聊节点文档及同名上传替换。验收同一账号保留订阅 ID 和令牌、另一账号同名文件独立、失败保留旧快照。URL 列表和混合文档随提供方导入接入。 |
@@ -98,8 +98,17 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 - Webhook 仅接收指定路径上的 HTTPS POST，以恒定时间比较核对 `X-Telegram-Bot-Api-Secret-Token`，限制请求大小及允许的 update 类型。用 `(bot_id, update_id)` 唯一键持久记录更新。提交后返回 `2xx`，已持久化的重复更新也返回 `2xx`。暂时无法持久化时返回可重试错误。接受乱序更新，去重保留期覆盖重投窗口。 [Telegram `Update`](https://core.telegram.org/bots/api#update) · [Telegram `setWebhook`](https://core.telegram.org/bots/api#setwebhook)
 - 收件记录只保留归属、消息 ID 和已识别的命令。授权变更和回复意图与收件记录在同一 D1 事务提交。同一用户和聊天的回复按入库顺序处理。发送前复核授权，已经发起的外部请求无法撤回。只有明确的 Telegram 限流拒绝可在到期前重试。超时和无法确认的发送标记为 `uncertain`，保留以供核对。 [D1 事务批处理](https://developers.cloudflare.com/d1/worker-api/d1-database/#batch) · [Telegram `ResponseParameters`](https://core.telegram.org/bots/api#responseparameters)
 - 私聊管理员的 `/auth add` 和 `/auth remove` 回执核对当前授权行的消息时间、消息 ID 及授权值。对应变更确认后显示授权或撤权结果。已有更新的操作或无法核对时，回执提示用 `/auth list` 查询当前状态。
-- 只读视图每页至多八条，按订阅 ID、到期时间或删除时间翻页。按钮只传随机值，D1 仅存摘要，绑定原发起人、聊天、话题、已确认发送的消息和尝试号，十分钟内只能消费一次。回调去重、按钮消费和下一页回复同批提交。回滚至支持回执标记的版本时，普通命令继续处理，视图回执留待新版处理。 [Telegram `CallbackQuery`](https://core.telegram.org/bots/api#callbackquery)
+- 只读视图每页至多八条，按订阅 ID、到期时间或删除时间翻页。上一页或下一页使用随机票据，D1 仅存摘要，绑定原发起人、聊天、话题、已确认发送的消息和尝试号，十分钟内只能消费一次。回调去重、按钮消费和下一页回复同批提交。回滚至支持回执标记的版本时，普通命令继续处理，视图回执留待新版处理。 [Telegram `CallbackQuery`](https://core.telegram.org/bots/api#callbackquery)
 - 同一用户的私聊和群聊读取相同的个人数据。重命名和翻页绑定用户、聊天与话题。受保护的写入以 D1 里的当前授权和对象版本为条件。生产授权迁移需要核对管理员、初始白名单及显式允许和拒绝覆盖。
+- 点击 `/list` 中的“跳转页”后，回复实际收到的提示并输入页码。提示绑定 Bot、发起人、会话、话题、已确认发送的消息和授权版本，十分钟内只消费一次。每页八条，页码 0 跳到第一页。直接跳转覆盖前 20,000 条订阅，之后使用“下一页”继续浏览。直接在私聊发送数字仍用于打开对应订阅详情。原生备份的静止检查等待已发送且尚未回答的提示被消费或过期。
+- 普通隔离发布核对产物中的跳页能力标记与 `0042` 摘要，并部署未绑定跳页世代的版本。受保护的启用流程使用同一构建产物。退回不识别跳页回执的版本前，须确认跳页回复均已结束。
+- `0043` 为隔离 Bot 增加 D1 跳页开关。新版回执与旧版分开，入口在接收回执的同一批次核对部署世代、开关状态及来源回执水位。暂停同时关闭新提示和新答复，已接收的页码结果继续投递，尚未开始投递的提示关闭。旧世代的请求、按钮及提示在下次启用后失效。原生备份和退回不识别新版回执的 Worker 前需确认开关已关闭。
+- 保留和暂停操作各使用其受保护 GitHub 运行 ID 作为新世代，写入前验证新值大于当前世代。同一运行重试可回读自己的确切世代。暂停即使遇到已关闭的开关也会推进世代，延迟到达的旧启用写入因此失去条件。降级前使用同一发布串行锁核对暂停回执及该 Bot 的待投递、租用和发送中回复。 [GitHub Actions 默认变量](https://docs.github.com/en/actions/reference/workflows-and-actions/variables#default-environment-variables)
+- 先用普通隔离发布使当前受信产物以关闭状态运行。对同一产物用 `page_jump=plan` 生成摘要检查点，再用 `page_jump=stage`、该检查点和 `stage page jump for subs-bot-cf-dev-01` 确认串预留世代并上传关闭候选版本。阶段证据包含确切的 Worker CI 归档摘要、当前部署摘要和候选版本摘要。若重试时世代已保留但仍找不到唯一且已核验的候选版本，使用新运行和新计划推进世代。启用仍需独立的保护步骤读取原始阶段证据、激活并回读关闭候选版本，最后在 D1 打开入口。
+- `page_jump=activate` 使用阶段证据的同一 Worker CI 运行、`{"stage":{...}}` 阶段归档凭据和 `activate page jump for subs-bot-cf-dev-01` 确认串。受保护任务核对当前 `main`、精确归档、完整 D1 迁移及关闭世代。只有 `0045` 新日志得到确认后才可发送一次部署请求。普通发布、自动回滚和新阶段会拒绝未确认日志。请求结果不明时，用 `page_jump=reconcile`、`{"epoch":世代,"stageSha256":"阶段归档摘要"}` 和 `reconcile page jump for subs-bot-cf-dev-01` 回读同一部署。此步骤不依赖阶段归档仍然可下载。无法确认时保留日志，等待准确回读。此版本的激活保持入口关闭。实际启用前还需保护暂停、排空和恢复上一版本的完整路径。
+- 使用 `page_jump=pause` 时提交阶段归档的运行 ID、尝试号、提交和 SHA-256，确认串为 `pause page jump for subs-bot-cf-dev-01`。受保护任务回读当前部署，核对归档中的原关闭版本或同一候选版本后关闭对应世代。历史阶段归档仍可用于核对当前部署，执行任务本身始终核对最新 `main`。用 `page_jump=drain` 和 `drain page jump for subs-bot-cf-dev-01` 提交同一阶段及成功暂停归档，核对暂停后的精确部署、开关和该 Bot 的未完成回复。启用前需有能够在阶段归档到期后继续执行暂停的持久凭据。
+- `page_jump=pause-durable` 用原激活世代和阶段摘要核对 `0045` 日志并推进到关闭的新世代。确认串为 `pause-durable page jump for subs-bot-cf-dev-01`。即使原归档到期或当前 Worker 不健康，此操作仍可使用。用 `page_jump=rollback`、`{"pause":{...}}` 新暂停归档凭据及 `rollback page jump for subs-bot-cf-dev-01` 核对部署、已关闭的世代和已排空的回复，然后恢复精确的上一版本。恢复请求未确认时，`reconcile` 使用暂停世代和同一个原阶段摘要，只做回读。
+- `page_jump=open` 使用原激活世代和阶段摘要及 `open page jump for subs-bot-cf-dev-01` 确认串。仅当已确认部署仍对应当前 `main` 的健康候选版本、原关闭世代未被推进，且没有未确认部署或待处理跳页回复时，D1 才在同一写入打开入口并记录收件水位。重复操作回读已有水位。若需要关闭或恢复，使用上述持久暂停与回滚步骤。
 - 私密领取保留现有的分享能力语义。`0005` 按 Bot 存储分享码摘要，使用独立的私有 R2 对象保存最多 64 KiB 的私密正文。`0007` 将指定账号在普通私聊发出的 `/start claim_<code>` 记为持久领取意图，回执只存码的摘要。这个入口沿用单次领取授权，普通订阅操作仍检查白名单。领取前核对正文长度、摘要和 UTF-8，D1 在同一事务复核到期、指定用户及剩余份数，同时将回复切换到发送中。份数以 `(share_id, actor_id)` 唯一领取记录计数，已领取的用户在有效期内可再次查看。
 - 私聊短正文以纯文本送达，超过消息长度或含有不适合直接显示的控制字符时使用一个固定文件名的 UTF-8 附件。发送结果不明时保留回执和领取记录，避免自动重复发送。 [Telegram `sendMessage`](https://core.telegram.org/bots/api#sendmessage) · [Telegram `sendDocument`](https://core.telegram.org/bots/api#senddocument)
 - 私聊 `/share [x份数] [id领取人ID] [s分钟] -- 正文` 接入 `0016` 的私密创建。份数默认 1、上限 100，时长默认 10 分钟、上限 10,080 分钟。指定领取人限当前隔离策略的两个账号。命令参数最多 4,096 个 UTF-16 单位，分隔符后的正文保留原空格和换行。此入口在私聊签发领取链接。
@@ -119,7 +128,7 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 ### 私聊 GitHub 搜索
 
-现有隔离 Telegram 策略与 `0027` 的准确迁移登记共同启用 `/g 关键词`。命令向 GitHub 发送最多 120 个字符和 256 字节的关键词及受支持限定词。每个账号每 15 秒最多发起一次查找。匿名仓库搜索限时 5 秒，按星标显示至多五个已验证的公开仓库。纯关键词或只带一个 `repo:` 限定词的查询也由 Vercel Grep MCP 查找公开代码，最多显示两个经 GitHub 核对为公开仓库的文件链接。Grep 限时 8 秒，并受同一查找租约约束。请求关闭重定向，不发送凭据。接口故障或无法识别的 Grep 文本保留仓库结果和固定 GitHub 网页入口。 [GitHub 仓库搜索](https://docs.github.com/en/rest/search/search#search-repositories) · [Grep MCP](https://vercel.com/blog/grep-a-million-github-repositories-via-mcp)
+现有隔离 Telegram 策略与 `0027` 的准确迁移登记共同启用 `/g 关键词`。命令向 GitHub 发送最多 120 个字符和 256 字节的关键词及受支持限定词。每个账号每 15 秒最多发起一次查找。匿名仓库搜索限时 5 秒，按星标显示至多五个已验证的公开仓库。纯关键词或只带一个 `repo:` 限定词的查询也由 Vercel Grep MCP 查找公开代码，最多显示两个经 GitHub 核对为公开仓库的文件链接。若关键词搜索尚未核对候选仓库，每个仓库最多再发一次精确的公开仓库搜索。两类搜索均关闭重定向，不发送凭据。观察到限流响应时停止后续核对。Grep 及仓库核对共用 8 秒和原查找租约。若有代码候选但无法核验，且无可展示的仓库结果，回复暂时无法获取结果，保留固定 GitHub 网页入口。 [GitHub 仓库搜索](https://docs.github.com/en/rest/search/search#search-repositories) · [GitHub 搜索限定词](https://docs.github.com/en/search-github/searching-on-github/searching-for-repositories) · [Grep MCP](https://vercel.com/blog/grep-a-million-github-repositories-via-mcp)
 
 查找期间只保留去重回执、短租约和授权版本。关键词只在当前调用中使用，查找结果仅暂存回复所需的公开仓库名称、星标和已核对的文件链接元数据。代码片段不进入回复或数据库。定时恢复清理已送达、已失效或超过回复窗口的结果。中断的查找由 Cron 提供固定网页入口，已接收的其他命令可继续发送。发送前复核当前授权，明确限流后可重试，结果不明时保留回执。托管测试使用合成的 GitHub、Grep 和 Bot 响应。真人验收另用两名指定账号和测试 Bot 各执行一次公开关键词查询，并在已批准群确认同一命令不会产生查找。
 
@@ -128,6 +137,12 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 `worker-runtime-shape` 模式在 Node 24 直接运行同一提交的 Worker Grep 适配器，使用固定公开查询 `addClass repo:jquery/jquery`，复现运行时握手和查找参数，并在同一时间预算内核对匿名 GitHub 仓库可见性。报告只包含阶段、状态、耗时和结构计数。该模式使用 GitHub runner 的网络，并以合成检查替代 D1 授权查询。
 
 Cloudflare 边缘诊断使用独立的 `worker-grep-edge-preview.yml`。仅在 `main` 手动运行，输入 `probe Grep in the isolated Cloudflare preview`。无凭据构建步骤生成固定公开夹具，受保护步骤核对同次运行的提交、归档和模块摘要，再用隔离 Worker 部署凭据申请临时预览。临时脚本没有业务绑定。探针先确认固定名称不存在且匿名请求无法执行，随后只调用一次固定夹具，并回读该名称仍无已部署脚本。预览凭据由 Cloudflare 管理有效期，任务不会创建常驻 Worker 或启用日志。报告仅含阶段、状态、耗时及结构计数，采用合成授权检查。若临时预览不可用，任务停止。 [Cloudflare 远程开发](https://developers.cloudflare.com/workers/local-development/#wrangler-dev---remote-legacy)
+
+同一隔离版本出现不同 Grep 结果时，可在受保护的 `worker-isolation-grep-outcome.yml` 核对这两次实际私聊。先确认精确活动 Worker、私有 R2、D1、Telegram 配置和本次 Worker CI。使用新的 32 位小写十六进制 `cohort` 运行 `arm`，确认词为 `arm Grep diagnostic <cohort>`。两位已批准账号在十分钟窗口内各发送一次固定公开夹具 `/g addClass repo:jquery/jquery`。用同一 cohort 和 Worker CI 运行号执行 `inspect`，确认字段留空。报告仅输出按角色关联的固定阶段、HTTP 状态、计数和已送达状态。未就绪时可重查同一 cohort，避免重复发命令。
+
+窗口结束后，用 `retire Grep diagnostic <cohort>` 执行 `retire`。工具以同一 ETag 的条件 PUT 把已确认结果和当前 arm 替换为小型墓碑，并保留不含内容的预留记录。墓碑阻止迟到写入重建结果。三步期间固定当前主分支和活动版本。arm 写入结果不明时，只用同一 cohort 回读，发现仍未确认时停止。整个过程不输出查询、文件路径、头值、账号 ID 或 Bot 凭据。 [R2 条件写入](https://developers.cloudflare.com/r2/reference/consistency/#conditional-writes)
+
+管理 API 下载返回弱 ETag 时，工具用精确对象键查列表元数据，核对存储 ETag、大小和下载字节。条件写入使用已核对的存储 ETag。列表或内容不一致会停止操作。 [R2 对象列表](https://developers.cloudflare.com/api/resources/r2/subresources/buckets/subresources/objects/methods/list/)
 
 ### 订阅搜索、详情和格式链接
 
@@ -618,6 +633,12 @@ python3 -B worker/tools/legacy_restore_package.py \
 封存工具从同一 SQLite 重建通用预览，核对旧 Bot 和覆盖记录数量，再将休眠授权表与 V10 数据写入同一次 SQL 回放。授权主体使用原 Telegram 用户 ID。所有者映射继续按各数据域的原规则处理。清单记录授权行数、结构和逐表摘要。原有 V10 和独立授权原生流程仍各自要求本配置的封存包。
 
 V11 合成原生演练在 `worker-isolation-legacy-candidate.yml` 选择 `synthetic-legacy-unified-auth`，沿用 V10 的七个检查点。所有步骤固定同一个成功的 `main` Worker CI 运行及同一 `cohort`，目标使用新的未绑定 D1 和私有 R2。按同一封存包核对 10 个对象、完整数据摘要、外键、休眠授权三表和原迁移登记。受保护流程只接受固定合成候选。生产授权启用仍由单独流程处理。
+
+#### 默认关闭的通用私聊授权
+
+`0044` 为通用授权建立独立的策略世代、主体修订和私聊回执。只有运行配置同时匹配 Bot、构建提交、世代、启用摘要和切换时刻，且 D1 中有对应的当前允许主体时，Worker 才接收私聊 `/help` 和 `/list`。发送前复核同一策略和主体修订。撤权或停用后，已排队但未发送的回执会被结算。发送结果不明的回执保留为不确定，避免重复发送。
+
+现有隔离配置优先。隔离发布保持同一个测试 Bot 和受限账号，发布流程不配置 `TELEGRAM_GENERAL_CONFIG`。托管 CI 将封存的 V11 合成候选载入独立临时 Worker，用两位合成主体和模拟 Bot API 验证休眠、启用、撤权及停用排空。该演练保持原授权盘点和真实隔离 Webhook 独立。群聊和其他命令按各自授权与发送边界接入。
 
 #### V10 联合包原生恢复演练
 

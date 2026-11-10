@@ -1,7 +1,7 @@
 import { readShortLinkNamespaces } from "../short-links.ts";
-import { inTelegramScope, type TelegramCommand, type TelegramPolicy } from "./protocol.ts";
+import { inTelegramScope, TELEGRAM_PAGE_JUMP_RECEIPTS, type TelegramCommand, type TelegramPolicy } from "./protocol.ts";
 import {
-  insertTelegramViewTickets, TELEGRAM_VIEW_MARKER, type TelegramView, type TelegramViewTicket,
+  insertTelegramViewTickets, TELEGRAM_VIEW_RECEIPTS, type TelegramView, type TelegramViewTicket,
 } from "./views.ts";
 import {
   insertTelegramLifecycleTickets, TELEGRAM_LIFECYCLE_MARKER,
@@ -49,6 +49,7 @@ export interface TelegramReplyLease extends TelegramCommand {
   leaseId: string;
   attempts: number;
   view: TelegramView | null;
+  pageJump?: true;
   lifecycle?: TelegramLifecycleReply;
   privateClaim?: { codeSha256: string; group?: true };
   temp?: TelegramTempReply;
@@ -88,10 +89,11 @@ const SUBSCRIPTION_SHARE_UNAVAILABLE_MARKER = "share-sub-unavailable:v1";
 type ReplyAccess = "allowed" | "denied" | "none";
 
 type ReplyRow = Omit<TelegramReplyLease,
-  "view" | "lifecycle" | "privateClaim" | "temp" | "tempRaw" | "aggregate" | "selected" | "path" | "document" |
+  "view" | "pageJump" | "lifecycle" | "privateClaim" | "temp" | "tempRaw" | "aggregate" | "selected" | "path" | "document" |
   "privateShareCreation" | "subscriptionShareUnavailable" | "subscriptionRead" | "shortLink" | "inlineSort" | "subscriptionNodes" | "providerOutcome" | "providerRequestKind" |
   "bulkTrash" | "inlineConsent" | "githubSearch" | "subscriptionRawFile" | "providerBatch" | "apiStatus" | "providerDocument"> & {
   viewKind: TelegramView["kind"] | null;
+  pageJumpMarker: number;
   afterId: number | null;
   afterEpoch: number | null;
   lifecycleKind: TelegramLifecycleReply["kind"] | null;
@@ -141,7 +143,7 @@ function supportedReceipt(alias: "inbox" | "earlier", includeAggregate = false, 
   includeRawFile = false, includeProviderBatch = false, includeApiStatus = false, includeProviderDocument = false): string {
   // Keep feature predicates within D1's expression depth limit in the claim query.
   return `(CASE WHEN ${alias}.receipt_nonce IS NULL THEN 1
-    WHEN (${alias}.receipt_nonce = '${TELEGRAM_VIEW_MARKER}'
+    WHEN (${alias}.receipt_nonce IN (${TELEGRAM_VIEW_RECEIPTS})
       AND EXISTS (SELECT 1 FROM telegram_view WHERE receipt_id = ${alias}.receipt_id)) THEN 1
     WHEN (${alias}.receipt_nonce = '${TELEGRAM_LIFECYCLE_MARKER}'
       AND EXISTS (SELECT 1 FROM telegram_lifecycle_action WHERE receipt_id = ${alias}.receipt_id)) THEN 1
@@ -404,6 +406,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
         inbox.message_id AS messageId, inbox.message_date AS messageDate, inbox.thread_id AS threadId,
         inbox.command, reply.lease_id AS leaseId, reply.attempts,
         page.kind AS viewKind, page.after_id AS afterId, page.after_epoch AS afterEpoch,
+        CASE WHEN inbox.receipt_nonce IN (${TELEGRAM_PAGE_JUMP_RECEIPTS}) THEN 1 ELSE 0 END AS pageJumpMarker,
         action.kind AS lifecycleKind, action.subscription_id AS lifecycleSubscriptionId,
         action.expected_revision AS lifecycleExpectedRevision, claim.code_sha256 AS privateClaimCodeSha256,
         CASE WHEN inbox.receipt_nonce='${TELEGRAM_GROUP_CLAIM_MARKER}' THEN 1 ELSE 0 END AS groupClaimMarker,
@@ -432,7 +435,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
         CASE WHEN inbox.receipt_nonce='${TELEGRAM_API_STATUS_MARKER}' THEN 1 ELSE 0 END AS apiStatusMarker,
         CASE WHEN inbox.receipt_nonce='${TELEGRAM_PROVIDER_DOCUMENT_MARKER}' THEN 1 ELSE 0 END AS providerDocumentMarker
       FROM telegram_outbox AS reply JOIN telegram_inbox AS inbox USING (receipt_id)
-      LEFT JOIN telegram_view AS page ON page.receipt_id = inbox.receipt_id AND inbox.receipt_nonce = '${TELEGRAM_VIEW_MARKER}'
+      LEFT JOIN telegram_view AS page ON page.receipt_id = inbox.receipt_id AND inbox.receipt_nonce IN (${TELEGRAM_VIEW_RECEIPTS})
       LEFT JOIN telegram_lifecycle_action AS action ON action.receipt_id = inbox.receipt_id
         AND inbox.receipt_nonce = '${TELEGRAM_LIFECYCLE_MARKER}'
       LEFT JOIN telegram_private_claim AS claim ON claim.receipt_id = inbox.receipt_id
@@ -471,7 +474,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
   if (!write?.success || !read?.success) throw new Error("Telegram reply claim could not be confirmed.");
   const row = read.results[0];
   if (!row) return null;
-  const { viewKind, afterId, afterEpoch, lifecycleKind, lifecycleSubscriptionId, lifecycleExpectedRevision,
+  const { viewKind, afterId, afterEpoch, pageJumpMarker, lifecycleKind, lifecycleSubscriptionId, lifecycleExpectedRevision,
     privateClaimCodeSha256, groupClaimMarker, tempKind, tempNodeCount, tempTotalCount, tempMalformedCount,
     tempUnsupportedCount, tempIgnoredCount, tempRawMarker: rawMarker, aggregateResult, aggregateRevision, aggregateCodeSha256,
     selectedResult, selectedCodeSha256,
@@ -486,6 +489,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
   const temp = tempKind === null ? undefined : { kind: tempKind, nodeCount: tempNodeCount!, totalCount: tempTotalCount!,
     malformedCount: tempMalformedCount!, unsupportedCount: tempUnsupportedCount!, ignoredCount: tempIgnoredCount! };
   return { ...lease, view: viewKind === null ? null : { kind: viewKind, afterId, afterEpoch },
+    ...(pageJumpMarker === 1 ? { pageJump: true as const } : {}),
     ...(lifecycle ? { lifecycle } : {}),
     ...(temp ? { temp } : {}),
     ...(rawMarker === 1 ? { tempRaw: true as const } : {}),
@@ -710,6 +714,7 @@ export async function beginTelegramReply(
   nodeTickets: readonly TelegramNodePageTicket[] = [],
   refreshTicket?: TelegramProviderRefreshTicket,
   rawFileTicket?: TelegramRawFileTicket,
+  pageJumpGuard?: { sql: string; bindings: readonly (string | number | null)[] },
 ): Promise<boolean> {
   if (!inTelegramScope(policy, lease) || lease.privateClaim || lease.inlineSort || lease.bulkTrash || lease.inlineConsent || lease.githubSearch
     || lease.subscriptionRawFile || lease.providerBatch || lease.apiStatus || lease.providerDocument
@@ -717,6 +722,7 @@ export async function beginTelegramReply(
     || lease.tempRaw || lease.shortLink || lease.subscriptionNodes || lease.providerOutcome !== undefined)
     && (lease.chatType !== "private" || lease.threadId !== null))
     || (lease.providerOutcome !== undefined && access !== "allowed")
+    || (Boolean(lease.pageJump) !== Boolean(pageJumpGuard)) || (pageJumpGuard && (access !== "allowed" || readGuard))
     || (tickets.length > 0 && (!lease.view || access !== "allowed"))
     || (lifecycleTickets.length > 0 && (!(lease.view || lease.lifecycle) || access !== "allowed"))
     || (readTickets.length > 0 && (!(lease.view || lease.subscriptionRead || lease.subscriptionNodes) || access !== "allowed"))
@@ -724,7 +730,7 @@ export async function beginTelegramReply(
     || (nodeTickets.length > 0 && (!readGuard || !(lease.subscriptionRead || lease.subscriptionNodes) || access !== "allowed"))
     || ((refreshTicket || rawFileTicket) && (!readGuard || !lease.subscriptionRead || access !== "allowed"))) return false;
 
-  const begin = beginReplyStatement(db, policy, lease, access, readGuard);
+  const begin = beginReplyStatement(db, policy, lease, access, pageJumpGuard ?? readGuard);
   if (tickets.length === 0 && lifecycleTickets.length === 0 && readTickets.length === 0 && nodeTickets.length === 0
     && !refreshTicket && !rawFileTicket) {
     return await begin.first() !== null;
@@ -765,6 +771,18 @@ export async function beginTelegramReply(
     throw new Error("Telegram reply tickets could not be confirmed.");
   }
   return changed === 1;
+}
+
+export async function closeUnsentTelegramPageJump(db: D1Database, policy: TelegramPolicy, lease: TelegramReplyLease): Promise<void> {
+  if (!lease.pageJump || !inTelegramScope(policy, lease)) return;
+  const closed = await db.prepare(`UPDATE telegram_outbox SET state='failed',lease_id=NULL,lease_until=NULL
+    WHERE receipt_id=? AND state='leased' AND lease_id=? AND attempts=? AND EXISTS (
+      SELECT 1 FROM telegram_inbox AS inbox WHERE inbox.receipt_id=telegram_outbox.receipt_id
+        AND inbox.bot_id=? AND inbox.update_id=? AND inbox.actor_id=? AND inbox.chat_id=? AND inbox.chat_type=?
+        AND inbox.thread_id IS ? AND inbox.receipt_nonce IN (${TELEGRAM_PAGE_JUMP_RECEIPTS}))`)
+    .bind(lease.receiptId, lease.leaseId, lease.attempts, policy.botId, lease.updateId, lease.actorId,
+      lease.chatId, lease.chatType, lease.threadId).run();
+  if (!closed.success) throw new Error("Telegram page jump reply could not close.");
 }
 
 export async function beginTelegramInlineSortReply(db: D1Database, policy: TelegramPolicy, lease: TelegramReplyLease): Promise<boolean> {

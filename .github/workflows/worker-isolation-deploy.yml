@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       source_run_id:
-        description: Successful Worker CI run for this exact main commit
-        required: true
+        description: Successful Worker CI run for exact main (required for release, plan, stage and activate)
+        required: false
         type: string
       inline_search:
         description: Preserve, enable, or disable inline search on the isolated Worker
@@ -100,6 +100,20 @@ on:
         description: Exact isolation confirmation for API status enable or disable
         required: false
         type: string
+      page_jump:
+        description: Preserve ordinary deployment, or manage the isolated page-jump release
+        required: true
+        default: preserve
+        type: choice
+        options: [preserve, plan, stage, activate, reconcile, open, pause, pause-durable, drain, rollback]
+      page_jump_confirmation:
+        description: Exact isolation confirmation for the page-jump operation
+        required: false
+        type: string
+      page_jump_checkpoint:
+        description: Exact plan, stage, journal or pause checkpoint for this operation
+        required: false
+        type: string
 
 permissions:
   actions: read
@@ -111,7 +125,7 @@ concurrency:
 
 jobs:
   inspect-api-status:
-    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && inputs.api_status == 'preserve' && inputs.api_status_confirmation == ''
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && inputs.page_jump == 'preserve' && inputs.api_status == 'preserve' && inputs.api_status_confirmation == ''
     environment: subs-bot-isolation
     permissions:
       contents: read
@@ -137,7 +151,7 @@ jobs:
   attest-api-status:
     needs: inspect-api-status
     if: >-
-      ${{ !cancelled() && github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' &&
+      ${{ !cancelled() && github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && inputs.page_jump == 'preserve' &&
           ((inputs.api_status == 'enable' && inputs.api_status_confirmation == 'enable API status for subs-bot-cf-dev-01') ||
            needs.inspect-api-status.outputs.required == 'true') }}
     environment: subs-bot-provider-api-status-isolation
@@ -176,13 +190,18 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Verify merged artifact provenance and digests
+        if: contains(fromJSON('["preserve","plan","stage","activate"]'), inputs.page_jump)
         env:
           GH_TOKEN: ${{ github.token }}
           SUBS_BOT_CI_RUN_ID: ${{ inputs.source_run_id }}
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          python3 -B worker/tools/prepare_isolation_artifact.py
-      - name: Apply isolated D1 migrations and release verified Worker
+          umask 077
+          worker_artifact_proof="$RUNNER_TEMP/subs-bot-isolation-artifact-proof.json"
+          python3 -B worker/tools/prepare_isolation_artifact.py > "$worker_artifact_proof"
+          cat "$worker_artifact_proof"
+      - name: Release the verified Worker or stage page jump closed
+        if: contains(fromJSON('["preserve","plan","stage"]'), inputs.page_jump)
         env:
           GH_TOKEN: ${{ github.token }}
           SUBS_BOT_INLINE_SEARCH_MODE: ${{ inputs.inline_search }}
@@ -203,6 +222,9 @@ jobs:
           SUBS_BOT_PROVIDER_BATCH_CONFIRMATION: ${{ inputs.provider_batch_confirmation }}
           SUBS_BOT_API_STATUS_MODE: ${{ inputs.api_status }}
           SUBS_BOT_API_STATUS_CONFIRMATION: ${{ inputs.api_status_confirmation }}
+          SUBS_BOT_PAGE_JUMP_MODE: ${{ inputs.page_jump }}
+          SUBS_BOT_PAGE_JUMP_CONFIRMATION: ${{ inputs.page_jump_confirmation }}
+          SUBS_BOT_PAGE_JUMP_CHECKPOINT: ${{ inputs.page_jump_checkpoint }}
           SUBS_BOT_API_STATUS_CONTAINER_ATTESTATION: ${{ needs.attest-api-status.outputs.attestation }}
           SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
           SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
@@ -213,3 +235,42 @@ jobs:
           SUBS_BOT_CF_PROVIDER_BINDING_JSON: ${{ secrets.SUBS_BOT_CF_PROVIDER_BINDING_JSON }}
           SUBS_BOT_CF_PROVIDER_API_STATUS_BINDING_JSON: ${{ secrets.SUBS_BOT_CF_PROVIDER_API_STATUS_BINDING_JSON }}
         run: python3 -B worker/tools/release_isolation.py
+      - name: Activate closed or recover the exact isolated page-jump stage
+        if: contains(fromJSON('["activate","reconcile","open","pause","pause-durable","drain","rollback"]'), inputs.page_jump)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_INLINE_SEARCH_MODE: ${{ inputs.inline_search }}
+          SUBS_BOT_INLINE_SEARCH_CONFIRMATION: ${{ inputs.inline_search_confirmation }}
+          SUBS_BOT_PROVIDER_URL_IMPORT_MODE: ${{ inputs.provider_url_import }}
+          SUBS_BOT_PROVIDER_URL_IMPORT_CONFIRMATION: ${{ inputs.provider_url_import_confirmation }}
+          SUBS_BOT_PROVIDER_URL_DOCUMENTS_MODE: ${{ inputs.provider_url_documents }}
+          SUBS_BOT_PROVIDER_URL_DOCUMENTS_CONFIRMATION: ${{ inputs.provider_url_documents_confirmation }}
+          SUBS_BOT_MIXED_DOCUMENTS_MODE: ${{ inputs.mixed_documents }}
+          SUBS_BOT_MIXED_DOCUMENTS_CONFIRMATION: ${{ inputs.mixed_documents_confirmation }}
+          SUBS_BOT_GROUP_SHARE_CARDS_MODE: ${{ inputs.group_share_cards }}
+          SUBS_BOT_GROUP_SHARE_CARDS_CONFIRMATION: ${{ inputs.group_share_cards_confirmation }}
+          SUBS_BOT_PROVIDER_REFRESH_MODE: ${{ inputs.provider_refresh }}
+          SUBS_BOT_PROVIDER_REFRESH_CONFIRMATION: ${{ inputs.provider_refresh_confirmation }}
+          SUBS_BOT_LEGACY_SUBSCRIPTION_SHORTS_MODE: ${{ inputs.legacy_subscription_shorts }}
+          SUBS_BOT_LEGACY_SUBSCRIPTION_SHORTS_CONFIRMATION: ${{ inputs.legacy_subscription_shorts_confirmation }}
+          SUBS_BOT_PROVIDER_BATCH_MODE: ${{ inputs.provider_batch }}
+          SUBS_BOT_PROVIDER_BATCH_CONFIRMATION: ${{ inputs.provider_batch_confirmation }}
+          SUBS_BOT_API_STATUS_MODE: ${{ inputs.api_status }}
+          SUBS_BOT_API_STATUS_CONFIRMATION: ${{ inputs.api_status_confirmation }}
+          SUBS_BOT_PAGE_JUMP_MODE: ${{ inputs.page_jump }}
+          SUBS_BOT_PAGE_JUMP_CONFIRMATION: ${{ inputs.page_jump_confirmation }}
+          SUBS_BOT_PAGE_JUMP_CHECKPOINT: ${{ inputs.page_jump_checkpoint }}
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
+          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPLOY_TOKEN }}
+          SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 -B worker/tools/release_isolation.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: inputs.page_jump != 'preserve'
+        with:
+          name: subs-bot-page-jump-${{ inputs.page_jump }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/subs-bot-page-jump-evidence.json
+          retention-days: 7
+          if-no-files-found: error
