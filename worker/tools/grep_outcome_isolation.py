@@ -2,13 +2,14 @@
 
 from contextlib import closing
 from datetime import datetime, timezone
-from hashlib import sha256
+from hashlib import md5, sha256
 from http.client import HTTPSConnection, HTTPException
 import json
 import os
 from pathlib import Path
 import re
 from urllib.error import HTTPError
+from urllib.parse import urlencode
 from urllib.request import ProxyHandler, Request, build_opener
 
 from cloudflare_isolation import API_ORIGIN, DATE, DIGEST, HEX_ID, REVISION, UUID, WORKER_NAME, CloudflareClient, _Isolation, _verify_health
@@ -23,7 +24,9 @@ ARM = f"{PREFIX}/arm.json"
 ROLES = ("admin", "member")
 COHORT = re.compile(r"[0-9a-f]{32}")
 ETAG = re.compile(r'"[0-9a-f]{32}"')
+WEAK_ETAG = re.compile(r'W/"([0-9a-f]{32})"')
 MAX_BYTES = 1024
+MAX_LIST_BYTES = 8192
 MAX_ID = 9007199254740991
 WINDOW = 600
 MIGRATION = "0027_telegram_github_search.sql"
@@ -89,22 +92,52 @@ class Objects:
         self.token, self.token_id, self.cohort = token, token_id, cohort
         self.keys = {ARM, control_key(cohort), *(result_key(cohort, role) for role in ROLES)}
         self.opener = build_opener(ProxyHandler({}), _NoRedirect())
+        self.headers = {"Authorization": f"Bearer {token}", "cf-r2-jurisdiction": "default",
+                        "Accept-Encoding": "identity", "Cache-Control": "no-cache"}
 
     def get(self, key, *, prior_control=False):
         old = re.fullmatch(re.escape(PREFIX) + r"/[0-9a-f]{32}/control\.json", key)
         require(key in self.keys or prior_control and old is not None)
-        request = Request(self.base + key, headers={"Authorization": f"Bearer {self.token}",
-                          "cf-r2-jurisdiction": "default", "Accept-Encoding": "identity", "Cache-Control": "no-cache"})
         try:
-            with self.opener.open(request, timeout=20) as response:
-                raw, etag = response.read(MAX_BYTES + 1), response.headers.get("ETag")
-                require(response.status == 200 and 0 < len(raw) <= MAX_BYTES and matches(ETAG, etag))
-                return raw, etag
+            with self.opener.open(Request(self.base + key, headers=self.headers), timeout=20) as response:
+                raw = response.read(MAX_BYTES + 1)
+                validators = response.headers.get_all("ETag", [])
+                require(response.status == 200 and 0 < len(raw) <= MAX_BYTES and len(validators) == 1,
+                        "The scoped Grep R2 download is missing exact content or its validator.")
         except HTTPError as error:
             error.close()
             if error.code == 404:
                 return None
             raise ProofError("The scoped Grep R2 read was refused.") from None
+        etag = validators[0]
+        if matches(ETAG, etag):
+            return raw, etag
+        weak = WEAK_ETAG.fullmatch(etag)
+        require(weak is not None, "The scoped Grep R2 validator is unsupported.")
+        return raw, self.confirm_weak_validator(key, raw, weak[1])
+
+    def confirm_weak_validator(self, key, raw, validator):
+        # The REST gateway can wrap the stored tag as a weak HTTP validator. Use
+        # only the exact stored ETag from object metadata for a conditional PUT.
+        error = "The scoped Grep R2 stored ETag could not be confirmed."
+        query = urlencode({"prefix": key, "per_page": 2})
+        request = Request(self.base.removesuffix("/") + "?" + query, headers=self.headers)
+        try:
+            with self.opener.open(request, timeout=20) as response:
+                body = response.read(MAX_LIST_BYTES + 1)
+                require(response.status == 200 and 0 < len(body) <= MAX_LIST_BYTES, error)
+        except HTTPError as refusal:
+            refusal.close()
+            raise ProofError(error) from None
+        result = parsed(body)
+        rows, info = result.get("result"), result.get("result_info", {})
+        require(result.get("success") is True and result.get("errors") in (None, [])
+                and isinstance(info, dict) and not any(info.get(field) for field in ("cursor", "next_page_token", "is_truncated"))
+                and isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict), error)
+        row = rows[0]
+        require(row.get("key") == key and row.get("size") == len(raw)
+                and row.get("etag") == validator == md5(raw, usedforsecurity=False).hexdigest(), error)
+        return f'"{validator}"'
 
     def write(self, key, body, previous):
         require(key in self.keys and isinstance(body, bytes) and 0 < len(body) <= MAX_BYTES

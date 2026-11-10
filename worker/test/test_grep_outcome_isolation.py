@@ -1,10 +1,15 @@
 """Protected Grep cohort replay and failure checks with no external requests."""
 
 from datetime import datetime, timezone
+from email.message import Message
+from hashlib import md5
+from io import BytesIO
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
+from urllib.error import HTTPError
+from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import grep_outcome_isolation as probe
@@ -34,6 +39,65 @@ class Objects:
         if self.fail == key:
             raise probe.ProofError("Synthetic unknown write")
         self.objects[key] = (body, f'"{len(self.writes):032x}"')
+
+
+class ObjectResponse(BytesIO):
+    status = 200
+
+    def __init__(self, body, *validators):
+        super().__init__(body)
+        self.headers = Message()
+        for validator in validators:
+            self.headers["ETag"] = validator
+
+
+class ObjectReadbackTests(unittest.TestCase):
+    def setUp(self):
+        account = "a" * 32
+        with patch.object(probe, "ACCOUNT_SHA256", probe.digest(account.encode("ascii"))):
+            self.client = probe.Objects({"accountId": account}, "synthetic-token", "b" * 32, COHORT)
+        self.client.opener = Mock()
+        self.key = probe.control_key(COHORT)
+        self.body = probe.canonical({"state": "synthetic"})
+        self.etag = md5(self.body, usedforsecurity=False).hexdigest()
+
+    def metadata(self, **changes):
+        return probe.canonical({"success": True, "result": [
+            {"key": self.key, "size": len(self.body), "etag": self.etag} | changes], "result_info": {}})
+
+    def test_weak_download_uses_only_exact_verified_stored_etag(self):
+        self.client.opener.open.side_effect = [ObjectResponse(self.body, f'W/"{self.etag}"'), ObjectResponse(self.metadata())]
+        self.assertEqual(self.client.get(self.key), (self.body, f'"{self.etag}"'))
+        download, listing = [call.args[0] for call in self.client.opener.open.call_args_list]
+        self.assertEqual(urlsplit(download.full_url).path.rsplit("/objects/", 1)[1], self.key)
+        self.assertTrue(urlsplit(listing.full_url).path.endswith("/objects"))
+        self.assertEqual(parse_qs(urlsplit(listing.full_url).query), {"prefix": [self.key], "per_page": ["2"]})
+
+    def test_weak_download_rejects_mismatched_key_size_tag_or_content(self):
+        for field, value in (("key", probe.ARM), ("size", len(self.body) + 1), ("etag", "c" * 32)):
+            with self.subTest(field=field):
+                self.client.opener.open.side_effect = [ObjectResponse(self.body, f'W/"{self.etag}"'),
+                                                       ObjectResponse(self.metadata(**{field: value}))]
+                with self.assertRaisesRegex(probe.ProofError, "stored ETag could not be confirmed"):
+                    self.client.get(self.key)
+        self.client.opener.open.side_effect = [ObjectResponse(b"x" * len(self.body), f'W/"{self.etag}"'),
+                                               ObjectResponse(self.metadata())]
+        with self.assertRaisesRegex(probe.ProofError, "stored ETag could not be confirmed"):
+            self.client.get(self.key)
+
+    def test_weak_download_listing_refusal_is_never_an_absent_object(self):
+        refusal = HTTPError("https://example.invalid", 404, "synthetic", {}, BytesIO())
+        self.client.opener.open.side_effect = [ObjectResponse(self.body, f'W/"{self.etag}"'), refusal]
+        with self.assertRaisesRegex(probe.ProofError, "stored ETag could not be confirmed"):
+            self.client.get(self.key)
+
+    def test_exact_strong_download_does_not_list_and_ambiguous_header_is_refused(self):
+        self.client.opener.open.return_value = ObjectResponse(self.body, f'"{self.etag}"')
+        self.assertEqual(self.client.get(self.key), (self.body, f'"{self.etag}"'))
+        self.client.opener.open.assert_called_once()
+        self.client.opener.open.return_value = ObjectResponse(self.body, f'W/"{self.etag}"', f'"{self.etag}"')
+        with self.assertRaisesRegex(probe.ProofError, "missing exact content or its validator"):
+            self.client.get(self.key)
 
 
 def report(role, state="empty"):
