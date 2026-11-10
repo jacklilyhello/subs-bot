@@ -50,7 +50,9 @@ import { GROUP_SHARE_PUBLISH_CALLBACK, readGeneralGroupShare, readGeneralPrivate
 import { confirmTelegramSubscriptionReadSend, GENERAL_SUBSCRIPTION_READ_MARKER, insertTelegramSubscriptionReadTickets,
   prepareTelegramSubscriptionReadTickets, reapTelegramSubscriptionReadTickets,
   type TelegramSubscriptionReadTicket } from "./subscription-read.ts";
-import { reapFailedTelegramSubscriptionShorts } from "./subscription-shorts.ts";
+import { beginSubscriptionShortDelivery, closeUnsentTelegramSubscriptionShort, hasTelegramSubscriptionShort,
+  prepareTelegramSubscriptionShort, reapFailedTelegramSubscriptionShorts, subscriptionShortPublicationGuard,
+  subscriptionShortSendGuard, telegramSubscriptionShortsReady, type SubscriptionShortCandidate } from "./subscription-shorts.ts";
 import { GENERAL_TEMP_SCHEMA, generalTempRawMarker, generalTempRawStamp, prepareGeneralTelegramTempReceipt, renderTelegramTemp,
   TELEGRAM_GENERAL_TEMP_RAW_PREFIX, type TelegramTempReply } from "./temp-import.ts";
 import { confirmTelegramTempRawSend, prepareTelegramTempRawReply } from "./temp-raw.ts";
@@ -479,7 +481,7 @@ export async function claimGeneralSharedTelegramReply(db: D1Database, pin: Gener
 }
 
 function selectLease(
-  pin: GeneralTelegramPin, lease: SharedReadLease, authorizing: boolean, guard?: ReplyGuard,
+  pin: GeneralTelegramPin, lease: SharedReadLease, authorizing: boolean, guard?: ReplyGuard, typedShort?: ReplyGuard,
 ) {
   const group = !pin.rehearsal && lease.chatType !== "private";
   const groupClaim = hasGeneralGroupShare(pin) && lease.marker === TELEGRAM_GENERAL_GROUP_CLAIM_MARKER;
@@ -488,7 +490,10 @@ function selectLease(
   const selected = pin.privateSelected && lease.marker === GENERAL_TELEGRAM_SELECTED_MARKER;
   const short = pin.privateShort && lease.marker === GENERAL_TELEGRAM_SHORT_MARKER;
   const supported = groupClaim ? groupClaimFamily("inbox") : aggregate ? aggregateFamily("inbox")
-    : selected ? selectedFamily("inbox") : short ? shortFamily("inbox") : family("inbox", group, pin, false);
+    : selected ? selectedFamily("inbox") : short ? shortFamily("inbox") : typedShort
+      ? `inbox.receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MARKER}' AND inbox.command='help'
+        AND inbox.chat_type='private' AND inbox.chat_id=inbox.actor_id AND inbox.thread_id IS NULL`
+      : family("inbox", group, pin, false);
   const claimProof = claim ? ` AND EXISTS (SELECT 1 FROM telegram_private_claim
     WHERE receipt_id=inbox.receipt_id AND code_sha256=?)` : "";
   const exact = `FROM telegram_inbox AS inbox JOIN telegram_general_receipt AS authority USING (receipt_id)
@@ -499,16 +504,17 @@ function selectLease(
   const exactBindings = [pin.botId, lease.receiptId, lease.updateId, lease.actorId, lease.chatId, lease.chatType, lease.threadId,
     lease.messageId, lease.messageDate, lease.command, lease.marker, lease.actorRevision, lease.actorRole,
     ...generalPolicyBindings(pin, lease.generation), ...(claim ? [lease.claimCodeSha256] : [])];
-  const simpleAuthority = aggregate || selected || short || groupClaim;
+  const simpleAuthority = aggregate || selected || short || groupClaim || typedShort !== undefined;
   const eligible = !authorizing ? "1" : simpleAuthority
     ? `${generalOrdinaryReplyEligibilitySql("inbox")} AND ${generalCurrentAuthoritySql("inbox")}` : current("inbox", group, pin);
   const eligibilityBindings = !authorizing ? [] : simpleAuthority ? generalPolicyBindings(pin) : currentBindings(pin);
   if (guard) {
     // Keep the origin, reply eligibility and payload guard separate inside the atomic begin.
     return { sql: `WITH candidate AS MATERIALIZED (
-      SELECT inbox.receipt_id,(${eligible}) AS eligible,(${guard.sql}) AS prepared ${exact}
-    ) SELECT receipt_id FROM candidate WHERE eligible AND prepared`,
-    bindings: [...eligibilityBindings, ...guard.bindings, ...exactBindings] };
+      SELECT inbox.receipt_id,(${eligible}) AS eligible,(${guard.sql}) AS prepared
+        ${typedShort ? `,(${typedShort.sql}) AS typed_short` : ""} ${exact}
+    ) SELECT receipt_id FROM candidate WHERE eligible AND prepared ${typedShort ? "AND typed_short" : ""}`,
+    bindings: [...eligibilityBindings, ...guard.bindings, ...(typedShort?.bindings ?? []), ...exactBindings] };
   }
   return { sql: `SELECT inbox.receipt_id ${exact} ${authorizing ? `AND ${eligible}` : ""}`,
     bindings: [...exactBindings, ...eligibilityBindings] };
@@ -713,6 +719,47 @@ export async function drainGeneralSharedTelegramReply(
     const presentation = await renderGeneralSubscriptionRead(db, pin, lease, bucket, publicOrigin, refreshAvailable,
       pin.privateShareCreation && Boolean(share?.context));
     if (!presentation?.readGuard) return false;
+    const { readGuard, shortTarget } = presentation;
+    const issueShort = pin.subscriptionShorts === "issue";
+    if (pin.privateFormats && !pin.rehearsal && (lease.attempts > 1 || (issueShort && shortTarget))) {
+      const typedLease = { ...lease, subscriptionRead: true as const };
+      const exactOnly = { sql: "1", bindings: [] };
+      let started: SubscriptionShortCandidate | null = null;
+      let beginning = false;
+      try {
+        if (await telegramSubscriptionShortsReady(db)) {
+          if (shortTarget && aggregateKey) {
+            const candidate = await prepareTelegramSubscriptionShort(db, pin, typedLease, shortTarget, exactOnly, aggregateKey, issueShort);
+            if (candidate) {
+              const publication = subscriptionShortPublicationGuard(candidate, exactOnly, true);
+              const begin = prepareTelegramOutboxBegin(db, lease, selectLease(pin, lease, true, readGuard, publication));
+              beginning = true;
+              if (await beginSubscriptionShortDelivery(db, typedLease, candidate, begin,
+                subscriptionShortSendGuard(candidate, exactOnly, true))) started = candidate;
+            }
+          }
+          if (!started && await hasTelegramSubscriptionShort(db, pin, typedLease)) {
+            await closeUnsentTelegramSubscriptionShort(db, pin, typedLease);
+            return true;
+          }
+        }
+      } catch {
+        // No Telegram request can have started in this block.
+        if (beginning) await closeUnsentTelegramSubscriptionShort(db, pin, typedLease);
+        return false;
+      }
+      if (started && shortTarget) {
+        const target = subscriptionShortSendGuard(started, exactOnly, true);
+        const confirmed = await confirmGuardedGeneralSend(db, lease, selectLease(pin, lease, true, readGuard, target));
+        const outcome = confirmed
+          ? await sendGeneralTelegramPrivateReply(pin.botToken, lease.actorId, lease.messageId,
+            `${shortTarget.label}\n${publicOrigin}/s/${started.code}`)
+          : { kind: "failed" as const };
+        await settleTelegramOutboxReply(db, lease, selectLease(pin, lease, false), outcome, "inbox.received_at", GENERAL_REPLY_TTL);
+        return true;
+      }
+      if (issueShort && shortTarget) presentation.text = "暂时无法生成订阅短链，请重新打开订阅详情后重试。";
+    }
     const prepared = presentation.readButtons?.length ? await prepareTelegramSubscriptionReadTickets(presentation.readButtons) : undefined;
     const refresh = presentation.refreshTarget ? await prepareTelegramProviderRefreshButton(presentation.refreshTarget) : undefined;
     if (!await beginGeneralSharedTelegramReply(db, pin, lease, [], { ...presentation.readGuard, tickets: prepared?.tickets ?? [],
