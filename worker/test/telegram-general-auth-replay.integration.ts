@@ -1490,7 +1490,7 @@ test("closed general authorization replays a sealed candidate in a separate emit
   const creationOrigin = { ...origin(groupCreation.messageId, 101), date: now + 22 };
   assert.equal((await callback(7661, 101, creationOrigin, publishCard!, groupShareWorker)).status, 200);
   assert.equal((await callback(7661, 101, creationOrigin, publishCard!, groupShareWorker)).status, 204);
-  const readGroupCard = () => db.prepare(`SELECT state,message_id AS messageId,shown FROM telegram_group_share_cards AS card
+  const readGroupCard = () => db.prepare(`SELECT card.state,card.message_id AS messageId,card.shown FROM telegram_group_share_cards AS card
     JOIN telegram_inbox AS inbox USING(receipt_id) WHERE inbox.bot_id=? AND inbox.update_id=7660`)
     .bind(pin.botId).first<{ state: string; messageId: number | null; shown: number }>();
   const awaitGroupCard = async (shown: number) => {
