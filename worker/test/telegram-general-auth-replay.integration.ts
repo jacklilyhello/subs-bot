@@ -329,18 +329,7 @@ test("closed general authorization replays a sealed candidate in a separate emit
   while ((await findReply(7101))?.state !== "sent" && Date.now() < sharedEnd) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  const sharedReply = await findReply(7101);
-  if (sharedReply?.state === "pending") {
-    const facts = await db.prepare(`SELECT reply.attempts,reply.due_at<=unixepoch() AS due,
-      (${generalCurrentReceiptSql("inbox")}) AS authorized,
-      EXISTS (SELECT 1 FROM telegram_view WHERE receipt_id=inbox.receipt_id AND kind='list'
-        AND after_id IS NULL AND after_epoch IS NULL) AS view
-      FROM telegram_inbox AS inbox JOIN telegram_outbox AS reply USING (receipt_id)
-      WHERE inbox.bot_id=? AND inbox.update_id=7101`).bind(...generalPolicyBindings(sharedPin), pin.botId).first();
-    const claimed = await claimGeneralSharedTelegramReply(db, sharedPin);
-    assert.fail(`Shared fixture reply remained pending; facts=${JSON.stringify(facts)}; claim=${claimed === null ? "idle" : "leased"}.`);
-  }
-  assert.deepEqual(sharedReply, { marker: "general-read:v1", state: "sent", messageId: 9301,
+  assert.deepEqual(await findReply(7101), { marker: "general-read:v1", state: "sent", messageId: 9301,
     generation: pin.generation, actorRevision: 3, kind: "list" });
   assert.deepEqual(sharedSent, [{ chat_id: "104", text: "你的订阅\n1. Own 104 [链接已省略]",
     reply_parameters: { message_id: 7101 }, link_preview_options: { is_disabled: true } }]);

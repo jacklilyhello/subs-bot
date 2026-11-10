@@ -180,21 +180,32 @@ export async function claimGeneralSharedTelegramReply(db: D1Database, pin: Gener
   if (!pin.sharedOutbox) return null;
   const group = await groupSchemaReady(db);
   const leaseId = crypto.randomUUID();
+  // Evaluate authorization once per active row, outside the FIFO subquery's expression tree.
   const [claimed, read] = await db.batch<SharedReadLease>([
     db.prepare(`UPDATE telegram_outbox
       SET state='leased',attempts=attempts+1,lease_id=?,lease_until=unixepoch()+${TELEGRAM_OUTBOX_LEASE_SECONDS}
-      WHERE receipt_id=(SELECT inbox.receipt_id FROM telegram_inbox AS inbox JOIN telegram_outbox AS reply USING (receipt_id)
-        WHERE inbox.bot_id=? AND ${family("inbox", group, pin.privateManagement)} AND ${current("inbox", group, pin.privateManagement)} AND reply.attempts<${TELEGRAM_OUTBOX_MAX_ATTEMPTS}
-          AND ((reply.state='pending' AND reply.due_at<=unixepoch()) OR (reply.state='leased' AND reply.lease_until<=unixepoch()))
+      WHERE receipt_id=(
+        WITH active AS MATERIALIZED (
+          SELECT inbox.receipt_id,inbox.actor_id,inbox.chat_id,reply.state,reply.attempts,reply.lease_until,reply.due_at,
+            (${family("inbox", group, pin.privateManagement)}) AS supported,
+            (${current("inbox", group, pin.privateManagement)}) AS eligible
+          FROM telegram_inbox AS inbox JOIN telegram_outbox AS reply USING (receipt_id)
+          WHERE inbox.bot_id=? AND reply.state IN ('pending','leased','sending')
+        )
+        SELECT candidate.receipt_id FROM active AS candidate
+        WHERE candidate.supported AND candidate.eligible AND candidate.attempts<${TELEGRAM_OUTBOX_MAX_ATTEMPTS}
+          AND ((candidate.state='pending' AND candidate.due_at<=unixepoch())
+            OR (candidate.state='leased' AND candidate.lease_until<=unixepoch()))
           AND NOT EXISTS (
-            SELECT 1 FROM telegram_inbox AS earlier JOIN telegram_outbox AS other USING (receipt_id)
-            WHERE earlier.bot_id=inbox.bot_id AND earlier.actor_id=inbox.actor_id AND earlier.chat_id=inbox.chat_id
-              AND earlier.receipt_id<>inbox.receipt_id AND ${family("earlier", group, pin.privateManagement)}
-              AND ((other.state='sending' AND other.lease_until>unixepoch()) OR (${current("earlier", group, pin.privateManagement)}
-                AND ((other.state='leased' AND other.lease_until>unixepoch()) OR (
-                  earlier.receipt_id<inbox.receipt_id AND other.state IN ('pending','leased') AND other.attempts<${TELEGRAM_OUTBOX_MAX_ATTEMPTS})))))
-        ORDER BY inbox.receipt_id LIMIT 1)`)
-      .bind(leaseId, pin.botId, ...generalPolicyBindings(pin), ...generalPolicyBindings(pin)),
+            SELECT 1 FROM active AS earlier
+            WHERE earlier.actor_id=candidate.actor_id AND earlier.chat_id=candidate.chat_id
+              AND earlier.receipt_id<>candidate.receipt_id AND earlier.supported
+              AND ((earlier.state='sending' AND earlier.lease_until>unixepoch()) OR (earlier.eligible
+                AND ((earlier.state='leased' AND earlier.lease_until>unixepoch()) OR (
+                  earlier.receipt_id<candidate.receipt_id AND earlier.state IN ('pending','leased')
+                  AND earlier.attempts<${TELEGRAM_OUTBOX_MAX_ATTEMPTS})))))
+        ORDER BY candidate.receipt_id LIMIT 1)`)
+      .bind(leaseId, ...generalPolicyBindings(pin), pin.botId),
     db.prepare(`SELECT inbox.receipt_id AS receiptId,inbox.update_id AS updateId,inbox.actor_id AS actorId,
       inbox.chat_id AS chatId,inbox.chat_type AS chatType,inbox.thread_id AS threadId,
       inbox.message_id AS messageId,inbox.message_date AS messageDate,inbox.command,inbox.receipt_nonce AS marker,authority.generation,
