@@ -131,7 +131,7 @@ class MemoryAPI:
                 if isinstance(self.response, Exception):
                     raise self.response
                 return deepcopy(self.response)
-            kind = "database" if path.endswith("/d1/database") else next(kind for kind in ("backup", "objects") if self.names[kind] == payload["name"])
+            kind = "database" if path.endswith("/d1/database") else next(kind for kind in ("backup", "objects") if self.names.get(kind) == payload["name"])
             value = {"name": self.names[kind], "created_at" if kind == "database" else "creation_date": STAMP}
             if kind == "database":
                 value["uuid"] = RESTORE_ID
