@@ -507,6 +507,14 @@ export function readGeneralPrivateProviderRefresh(
     ? readGeneralPrivateTicket(update.callback_query, updateId, botId, PROVIDER_REFRESH_TICKET) : null;
 }
 
+export function readGeneralPrivateSelectedRevoke(
+  update: Record<string, unknown>, updateId: number, botId: string,
+): Extract<TelegramSelectedUpdate, { kind: "selected-revoke" }> | null {
+  const ticket = Object.keys(update).length === 2 && isRecord(update.callback_query)
+    ? readGeneralPrivateTicket(update.callback_query, updateId, botId, SELECTED_TICKET) : null;
+  return ticket ? { ...ticket, kind: "selected-revoke" } : null;
+}
+
 export function readGeneralPrivateLifecycleUpdate(
   update: Record<string, unknown>, updateId: number, botId: string,
 ): TelegramLifecycleUpdate | null {

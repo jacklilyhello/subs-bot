@@ -140,6 +140,10 @@ test("closed general authorization replays a sealed candidate in a separate emit
     outbox: "shared-private-management-formats-temp-node-document-provider-claims-share-aggregate" });
   const aggregatePin = parseGeneralTelegramPin(aggregateConfig, fixture.releaseRevision);
   assert.ok(aggregatePin?.privateAggregate && aggregatePin.privateShareCreation && aggregatePin.privateClaims);
+  assert.equal(aggregatePin.privateSelected, false);
+  const selectedConfig = JSON.stringify({ ...JSON.parse(generalConfig),
+    outbox: "shared-private-management-formats-temp-node-document-provider-claims-share-aggregate-selected" });
+  assert.ok(parseGeneralTelegramPin(selectedConfig, fixture.releaseRevision)?.privateSelected);
   const aggregateKeyRaw = Buffer.alloc(32, 17).toString("base64url");
   const shareKeyRaw = Buffer.alloc(32, 0x61).toString("base64url");
   const authConfig = JSON.stringify({ ...JSON.parse(aggregateConfig), authManagement: true });
@@ -238,6 +242,9 @@ test("closed general authorization replays a sealed candidate in a separate emit
       script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"], outboundService: privateTransport,
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: aggregateConfig, PUBLIC_ORIGIN: PRODUCTION_PUBLIC_ORIGIN,
         ...(withKey ? { TELEGRAM_AGGREGATE_KEY: aggregateKeyRaw } : { TELEGRAM_PRIVATE_SHARE_CREATION_KEY: shareKeyRaw }) } })),
+    { name: "selected", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
+      bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: selectedConfig,
+        PUBLIC_ORIGIN: PRODUCTION_PUBLIC_ORIGIN, TELEGRAM_AGGREGATE_KEY: aggregateKeyRaw }, outboundService: privateTransport },
     ...[true, false].map((enabled) => ({ name: enabled ? "provider-open" : "provider-paused", modules: true,
       script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"], outboundService: privateTransport,
       serviceBindings: { PROVIDER_FETCH: { name: "provider-rpc", entrypoint: "ProviderFetch" } },
@@ -1500,6 +1507,61 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.equal((await findReply(7591))?.state, "failed");
   assert.ok(!lifecycleSent.some(({ reply_parameters }) => reply_parameters.message_id === 7591));
 
+  const selectedWorker = await runtime.getWorker("selected");
+  const selectedPost = (updateId: number, actor: number, query: string, options: PostOptions = {}) =>
+    post(actor, `/o ${query}`, { updateId, worker: selectedWorker, date: now + 24, ...options });
+  const firstSelectedShare = fixtureShare + "-selected-first";
+  const secondSelectedShare = fixtureShare + "-selected-second";
+  const selectedIds: number[] = [];
+  for (const [owner, name, source, share] of [
+    ["101", "ÉTÉ-COHORT", "uploaded://selected-fixture-first", firstSelectedShare],
+    ["104", "ÉTÉ-COHORT", "uploaded://selected-fixture-foreign", fixtureShare + "-foreign"],
+    ["101", "Second selected fixture", "uploaded://selected-fixture/été-cohort", secondSelectedShare],
+  ] as const) {
+    const id = await db.prepare(`INSERT INTO subscriptions(owner_id,name,source_url,token,created_at,updated_at)
+      VALUES (?,?,?,?,?,?) RETURNING id`).bind(owner, name, source, crypto.randomUUID().replaceAll("-", ""), now, now).first<number>("id");
+    assert.ok(id);
+    assert.equal(await publishNodeSnapshot(db, bucket, { id, ownerId: owner, expectedGeneration: 0, expectedLifecycleRevision: 0 },
+      [{ type: "temp", name, share }]), true);
+    if (owner === "101") selectedIds.push(id);
+  }
+  const keyword = "été-cohort";
+  assert.equal((await selectedPost(7710, 101, keyword, { worker: aggregateWorker })).status, 204);
+  assert.equal((await selectedPost(7711, 101, keyword, groupEvent)).status, 204);
+  assert.equal((await selectedPost(7712, 104, keyword)).status, 204);
+  assert.equal((await selectedPost(7713, 101, keyword)).status, 200);
+  const selection = await awaitLifecycle(7713);
+  assert.equal(selection.message.chat_id, "101");
+  assert.deepEqual(selection.message.link_preview_options, { is_disabled: true });
+  const selectedUrl = new URL(selection.message.text.split("\n")[1]);
+  assert.equal(selectedUrl.origin, PRODUCTION_PUBLIC_ORIGIN);
+  const selectedCode = /^\/agg\/([A-Za-z0-9_-]{22})\/clash$/u.exec(selectedUrl.pathname)?.[1];
+  assert.ok(selectedCode);
+  assert.equal((await getAggregate(selectedCode, "clash")).status, 200);
+  assert.deepEqual(await readAggregate(selectedCode), [firstSelectedShare, secondSelectedShare]);
+  const selectedDigest = createHash("sha256").update(selectedCode).digest("hex");
+  assert.deepEqual(await db.prepare(`SELECT link.selected_ids AS ids,origin.receipt_nonce AS marker
+    FROM aggregate_links AS link JOIN telegram_selected_links AS selected USING(code_sha256)
+    JOIN telegram_inbox AS origin ON origin.receipt_id=selected.origin_receipt_id WHERE link.code_sha256=?`)
+    .bind(selectedDigest).first(), { ids: JSON.stringify(selectedIds), marker: "general-selected:v1" });
+  assert.equal((await selectedPost(7713, 101, keyword)).status, 204);
+  const firstTicket = selection.message.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data;
+  assert.ok(firstTicket && /^sbo1_[A-Za-z0-9_-]{22}$/u.test(firstTicket));
+  const privateOrigin = { ...origin(selection.messageId, 101), date: now + 25 };
+  assert.equal((await callback(7714, 106, { ...privateOrigin, chat: { id: 106, type: "private" } }, firstTicket, selectedWorker)).status, 204);
+  assert.equal((await callback(7715, 101, { ...privateOrigin, message_id: selection.messageId + 1 }, firstTicket, selectedWorker)).status, 204);
+  assert.equal((await selectedPost(7716, 101, "x".repeat(257))).status, 200);
+  const limit = await awaitLifecycle(7716);
+  const menuTicket = limit.message.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data;
+  assert.ok(menuTicket && menuTicket !== firstTicket && /^sbo1_[A-Za-z0-9_-]{22}$/u.test(menuTicket));
+  const limitOrigin = { ...origin(limit.messageId, 101), date: now + 26 };
+  assert.equal((await callback(7717, 101, limitOrigin, menuTicket, selectedWorker)).status, 200);
+  const revokedSelection = await awaitLifecycle(7717);
+  assert.equal(revokedSelection.message.chat_id, "101");
+  assert.equal(revokedSelection.message.text, "所选聚合链接已撤销。");
+  assert.equal((await callback(7718, 101, limitOrigin, menuTicket, selectedWorker)).status, 204);
+  assert.equal((await getAggregate(selectedCode)).status, 404);
+
   const rehearsal = await runtime.getWorker("rehearsal");
   const lanePost = (actor: number, command: string, options: PostOptions = {}) =>
     post(actor, command, { secret: isolation.webhookSecret, date: now - 3, ...options, worker: rehearsal });
@@ -1545,8 +1607,8 @@ test("closed general authorization replays a sealed candidate in a separate emit
   const open = await readGeneralReadLane(db, isolation, fixture.releaseRevision);
   assert.ok(open?.pin?.rehearsal && open.mode === "general");
   assert.deepEqual([open.pin.privateManagement, open.pin.privateFormats, open.pin.privateTemp,
-    open.pin.privateDocument, open.pin.privateProvider, open.pin.privateClaims, open.pin.privateShareCreation, open.pin.privateAggregate],
-    [false, false, false, false, false, false, false, false],
+    open.pin.privateDocument, open.pin.privateProvider, open.pin.privateClaims, open.pin.privateShareCreation, open.pin.privateAggregate,
+    open.pin.privateSelected], [false, false, false, false, false, false, false, false, false],
     "the rehearsal enables only private reads");
   assert.equal((await lanePost(182, "/list", { updateId: 8102, date: now - 21 })).status, 503,
     "uncommitted pre-cutover delivery is held for the original lane");
