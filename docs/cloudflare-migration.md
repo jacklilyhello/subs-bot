@@ -126,7 +126,7 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 ### 私聊 GitHub 搜索
 
-现有隔离 Telegram 策略与 `0027` 的准确迁移登记共同启用 `/g 关键词`。命令向 GitHub 发送最多 120 个字符和 256 字节的关键词及受支持限定词。每个账号每 15 秒最多发起一次查找。匿名仓库搜索限时 5 秒，按星标显示至多五个已验证的公开仓库。纯关键词或只带一个 `repo:` 限定词的查询也由 Vercel Grep MCP 查找公开代码，最多显示两个经 GitHub 核对为公开仓库的文件链接。Grep 限时 8 秒，并受同一查找租约约束。请求关闭重定向，不发送凭据。接口故障或无法识别的 Grep 文本保留仓库结果和固定 GitHub 网页入口。 [GitHub 仓库搜索](https://docs.github.com/en/rest/search/search#search-repositories) · [Grep MCP](https://vercel.com/blog/grep-a-million-github-repositories-via-mcp)
+现有隔离 Telegram 策略与 `0027` 的准确迁移登记共同启用 `/g 关键词`。命令向 GitHub 发送最多 120 个字符和 256 字节的关键词及受支持限定词。每个账号每 15 秒最多发起一次查找。匿名仓库搜索限时 5 秒，按星标显示至多五个已验证的公开仓库。纯关键词或只带一个 `repo:` 限定词的查询也由 Vercel Grep MCP 查找公开代码，最多显示两个经 GitHub 核对为公开仓库的文件链接。若关键词搜索尚未核对候选仓库，每个仓库最多再发一次精确的公开仓库搜索。两类搜索均关闭重定向，不发送凭据。观察到限流响应时停止后续核对。Grep 及仓库核对共用 8 秒和原查找租约。若有代码候选但无法核验，且无可展示的仓库结果，回复暂时无法获取结果，保留固定 GitHub 网页入口。 [GitHub 仓库搜索](https://docs.github.com/en/rest/search/search#search-repositories) · [GitHub 搜索限定词](https://docs.github.com/en/search-github/searching-on-github/searching-for-repositories) · [Grep MCP](https://vercel.com/blog/grep-a-million-github-repositories-via-mcp)
 
 查找期间只保留去重回执、短租约和授权版本。关键词只在当前调用中使用，查找结果仅暂存回复所需的公开仓库名称、星标和已核对的文件链接元数据。代码片段不进入回复或数据库。定时恢复清理已送达、已失效或超过回复窗口的结果。中断的查找由 Cron 提供固定网页入口，已接收的其他命令可继续发送。发送前复核当前授权，明确限流后可重试，结果不明时保留回执。托管测试使用合成的 GitHub、Grep 和 Bot 响应。真人验收另用两名指定账号和测试 Bot 各执行一次公开关键词查询，并在已批准群确认同一命令不会产生查找。
 

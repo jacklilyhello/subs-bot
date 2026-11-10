@@ -17,7 +17,6 @@ const MAX_CODE_MATCHES = 2;
 const MAX_RESPONSE_BYTES = 256 * 1024;
 const MAX_PROJECTION_BYTES = 1024;
 const GITHUB_API = "https://api.github.com/search/repositories";
-const GITHUB_REPO_API = "https://api.github.com/repos/";
 const GITHUB_HEADERS = { Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2026-03-10",
   "User-Agent": "subs-bot-public-search/1.0" };
 const GITHUB_BROWSER = "https://github.com/search?type=code";
@@ -34,6 +33,8 @@ export type TelegramGitHubReply = { state: ReplyState; publicResults: string | n
 type Repository = { name: string; stars: number };
 type RepositorySearch = { state: "found" | "empty" | "unavailable"; repos: Repository[] };
 type CodeMatch = { repo: string; ref: string; path: string };
+type CodeSearch = { files: CodeMatch[]; verificationUnavailable: boolean };
+type SearchBudget = { blocked: boolean };
 type Admission = { kind: "ignored" | "reply" } | { kind: "lookup"; receiptId: number; nonce: string; query: string };
 type Receipt = { receiptId: number; state: "looking" | "usage" | "limited" };
 
@@ -260,7 +261,12 @@ async function readGitHubResponse(response: Response): Promise<unknown> {
   }
 }
 
-async function searchPublicRepositories(query: string, request: typeof fetch, timeoutMs: number,
+function observeSearchBudget(response: Response, budget: SearchBudget): void {
+  if (response.status === 403 || response.status === 429 || response.headers.has("Retry-After")
+    || response.headers.get("X-RateLimit-Remaining") === "0") budget.blocked = true;
+}
+
+async function searchPublicRepositories(query: string, request: typeof fetch, timeoutMs: number, budget: SearchBudget,
   observation?: GitHubSearchObservation): Promise<RepositorySearch> {
   const unavailable: RepositorySearch = { state: "unavailable", repos: [] };
   try {
@@ -269,6 +275,7 @@ async function searchPublicRepositories(query: string, request: typeof fetch, ti
     const response = await request(url, {
       method: "GET", redirect: "manual", signal: AbortSignal.timeout(timeoutMs), cache: "no-store", headers: GITHUB_HEADERS,
     });
+    observeSearchBudget(response, budget);
     if (observation) observation.repositoryStatus = response.status;
     const data = record(await readGitHubResponse(response));
     if (!data || !Array.isArray(data.items) || data.items.length > MAX_REPOSITORIES) return unavailable;
@@ -330,11 +337,39 @@ function grepMatch(raw: unknown, repoFilter: string | undefined): CodeMatch | nu
   return candidate && url === codeUrl(candidate) ? candidate : null;
 }
 
+async function verifyPublicRepository(repo: string, request: typeof fetch, signal: AbortSignal, budget: SearchBudget,
+  observation?: GitHubSearchObservation): Promise<boolean> {
+  const check: VisibilityObservation = { status: null, outcome: "pending" };
+  observation?.visibility.push(check);
+  try {
+    const url = new URL(GITHUB_API);
+    url.search = new URLSearchParams({ q: `repo:${repo} is:public fork:true`, per_page: "1" }).toString();
+    const response = await request(url, { method: "GET", redirect: "manual", cache: "no-store", signal, headers: GITHUB_HEADERS });
+    observeSearchBudget(response, budget);
+    check.status = response.status;
+    const data = record(await readGitHubResponse(response));
+    if (signal.aborted) {
+      check.outcome = "deadline";
+      return false;
+    }
+    const item = data?.total_count === 1 && data.incomplete_results === false && Array.isArray(data.items) && data.items.length === 1
+      ? record(data.items[0]) : null;
+    const confirmed = item?.private === false && item.visibility === "public" && item.full_name === repo
+      && item.html_url === `${GITHUB_ORIGIN}/${repo}`;
+    check.outcome = confirmed ? "public" : "unconfirmed";
+    return confirmed;
+  } catch {
+    check.outcome = signal.aborted ? "deadline" : "transport-or-body";
+    return false;
+  }
+}
+
 async function searchPublicCode(query: string, request: typeof fetch, signal: AbortSignal,
-  stillAuthorized: () => Promise<boolean>, repositories: Promise<RepositorySearch>,
-  observation?: GitHubSearchObservation): Promise<CodeMatch[]> {
+  stillAuthorized: () => Promise<boolean>, repositories: Promise<RepositorySearch>, budget: SearchBudget,
+  observation?: GitHubSearchObservation): Promise<CodeSearch> {
+  const empty: CodeSearch = { files: [], verificationUnavailable: false };
   const code = codeQuery(query);
-  if (!code || signal.aborted) return [];
+  if (!code || signal.aborted) return empty;
   const publicFromSearch = new Set<string>();
   const repositoryProof = repositories.then(({ repos }) => {
     for (const { name } of repos) publicFromSearch.add(name);
@@ -346,47 +381,28 @@ async function searchPublicCode(query: string, request: typeof fetch, signal: Ab
     if (matches.size === MAX_CODE_MATCHES) break;
   }
   if (observation) observation.candidates = matches.size;
-  if (!matches.size || signal.aborted) return [];
-  const verified = new Map<string, Promise<boolean>>();
+  if (!matches.size) return empty;
+  const verified = new Set<string>();
   const codeMatches = [...matches.values()];
-  // A slow repository search must not consume the file visibility check's time budget.
-  for (const { repo } of codeMatches) {
-    if (!publicFromSearch.has(repo) && !verified.has(repo)) verified.set(repo, (async () => {
-      const check: VisibilityObservation | undefined = observation && { status: null, outcome: "pending" };
-      if (check) observation?.visibility.push(check);
-      try {
-        if (signal.aborted) {
-          if (check) check.outcome = "deadline";
-          return false;
-        }
-        const response = await request(GITHUB_REPO_API + repo, {
-          method: "GET", redirect: "manual", cache: "no-store", signal, headers: GITHUB_HEADERS,
-        });
-        if (check) check.status = response.status;
-        const data = record(await readGitHubResponse(response));
-        const confirmed = data?.private === false && data.visibility === "public" && data.full_name === repo
-          && data.html_url === `${GITHUB_ORIGIN}/${repo}`;
-        if (check) check.outcome = confirmed ? "public" : "unconfirmed";
-        return confirmed;
-      } catch {
-        if (check) check.outcome = signal.aborted ? "deadline" : "transport-or-body";
-        return false;
-      }
-    })());
+  // Start the exact checks even while keyword search is pending. Keep the
+  // checks serial so a throttle can stop the remaining candidate lookup.
+  for (const repo of new Set(codeMatches.map(({ repo }) => repo))) {
+    if (signal.aborted || budget.blocked) break;
+    if (!publicFromSearch.has(repo) && await verifyPublicRepository(repo, request, signal, budget, observation)) verified.add(repo);
   }
-  const allowed = await Promise.all(codeMatches.map(({ repo }) => verified.get(repo)));
   await repositoryProof;
-  return codeMatches.filter(({ repo }, index) => allowed[index] || publicFromSearch.has(repo));
+  const files = codeMatches.filter(({ repo }) => verified.has(repo) || publicFromSearch.has(repo));
+  return { files, verificationUnavailable: files.length !== codeMatches.length };
 }
 
-function packSearchReply(repositorySearch: RepositorySearch, code: CodeMatch[]): TelegramGitHubReply {
+function packSearchReply(repositorySearch: RepositorySearch, { files, verificationUnavailable }: CodeSearch): TelegramGitHubReply {
   const { state, repos } = repositorySearch;
-  for (let count = code.length; count > 0; count--) {
-    const publicResults = JSON.stringify({ v: 2, repos, code: code.slice(0, count) });
+  for (let count = files.length; count > 0; count--) {
+    const publicResults = JSON.stringify({ v: 2, repos, code: files.slice(0, count) });
     // Both repository names and accepted file metadata are ASCII.
     if (publicResults.length <= MAX_PROJECTION_BYTES) return { state: "found", publicResults };
   }
-  if (state !== "found") return { state, publicResults: null };
+  if (state !== "found") return { state: verificationUnavailable ? "unavailable" : state, publicResults: null };
   const publicResults = JSON.stringify(repos);
   return publicResults.length <= MAX_PROJECTION_BYTES ? { state, publicResults } : { state: "unavailable", publicResults: null };
 }
@@ -414,12 +430,13 @@ export async function runTelegramGitHubSearch(
     const bindings = [admission.receiptId, fetchNonce, policy.botId, ...current.bindings];
     const stillAuthorized = async () => await db.prepare(`SELECT 1 FROM telegram_github_search AS search WHERE ${active}`)
       .bind(...bindings).first() !== null;
-    const repositorySearch = searchPublicRepositories(admission.query, request, Math.min(LOOKUP_TIMEOUT_MS, remaining), observation);
+    const searchBudget: SearchBudget = { blocked: false };
+    const repositorySearch = searchPublicRepositories(admission.query, request, Math.min(LOOKUP_TIMEOUT_MS, remaining), searchBudget, observation);
     const codeSignal = AbortSignal.timeout(remaining);
-    const code = await searchPublicCode(admission.query, request, codeSignal, stillAuthorized, repositorySearch, observation);
+    const code = await searchPublicCode(admission.query, request, codeSignal, stillAuthorized, repositorySearch, searchBudget, observation);
     if (observation) {
       observation.codeTimedOut = codeSignal.aborted;
-      observation.verifiedFiles = code.length;
+      observation.verifiedFiles = code.files.length;
     }
     const repository = await repositorySearch;
     if (observation) observation.repositoryState = repository.state;
