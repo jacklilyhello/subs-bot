@@ -162,7 +162,7 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(self.api.db.execute("PRAGMA foreign_key_check").fetchall(), [])
 
     def test_exact_cumulative_cap_above_64_kib_applies_and_reads_back(self):
-        self.assertEqual(MAX_MIGRATION_BYTES, 84 * 1024)
+        self.assertEqual(MAX_MIGRATION_BYTES, 85 * 1024)
         self.add_file("0002_budget.sql", sized_budget_ddl(MAX_MIGRATION_BYTES - len(BASELINE), "é".encode()))
         expected = [{**item, "mode": "applied"} for item in self.manifest["migrations"]]
         self.assertEqual(self.apply(), expected)

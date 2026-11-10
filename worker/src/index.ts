@@ -22,10 +22,11 @@ import { reconcileTelegramDocumentJobReplies, retireTelegramDocumentStage } from
 import { acceptTelegramLifecycle, reapTelegramLifecycle } from "./telegram/lifecycle-actions.ts";
 import { acceptTelegramGitHubSearch, recoverTelegramGitHubSearch, runTelegramGitHubSearch, telegramGitHubSearchReady } from "./telegram/github-search.ts";
 import { scopeGitHubSearchProof, writeGitHubSearchProof } from "./telegram/github-search-proof.ts";
-import { acceptGeneralTelegramCommand, drainGeneralTelegramReply, parseGeneralTelegramPin,
+import { acceptGeneralTelegramCommand, drainGeneralTelegramReply, generalReadEvent, parseGeneralTelegramPin,
   recoverGeneralTelegramReplies } from "./telegram/general-auth-runtime.ts";
-import { acceptGeneralSharedTelegramCommand, drainGeneralSharedTelegramReply,
+import { acceptGeneralReadLaneCommand, acceptGeneralSharedTelegramCommand, drainGeneralSharedTelegramReply,
   recoverGeneralSharedTelegramReplies } from "./telegram/general-auth-shared.ts";
+import { assertGeneralReadLane, readGeneralReadLane } from "./telegram/general-read-lane.ts";
 import { acceptTelegramGroupShare, telegramGroupShareReady } from "./telegram/group-share-actions.ts";
 import { drainTelegramGroupShareCards } from "./telegram/group-share-delivery.ts";
 import { acceptTelegramBulkTrash, telegramBulkTrashReady } from "./telegram/bulk-trash.ts";
@@ -39,7 +40,7 @@ import {
   parseTelegramSubscriptionShareArgs, recoverTelegramPrivateShareCreation, retireAbandonedTelegramPrivateShareCreation,
 } from "./telegram/private-share-creation.ts";
 import { telegramPrivateShareRuntime } from "./telegram/private-share-runtime.ts";
-import { decodeTelegramRequest, parseTelegramPolicy, type TelegramPolicy } from "./telegram/protocol.ts";
+import { decodeAuthenticatedTelegramUpdate, parseTelegramPolicy, readTelegramUpdate, type TelegramPolicy } from "./telegram/protocol.ts";
 import { acceptTelegramProviderRequest } from "./telegram/provider-admission.ts";
 import { acceptTelegramProviderUrlMessage, promoteTelegramProviderDocument,
   settleTelegramProviderDocuments, telegramProviderDocumentReady } from "./telegram/provider-document.ts";
@@ -208,8 +209,36 @@ async function telegramWebhook(request: Request, env: Env, publicOrigin: PublicO
 
   try {
     const inlineSearchEnabled = env.TELEGRAM_INLINE_SEARCH === "1";
-    const decoded = await decodeTelegramRequest(request, policy, inlineSearchEnabled);
+    const authenticated = await readTelegramUpdate(request, policy.webhookSecret);
+    const decoded = decodeAuthenticatedTelegramUpdate(authenticated, policy, inlineSearchEnabled);
     if (decoded.status !== 200) return new Response(null, { status: decoded.status, headers: HEADERS });
+    let isolationReadGuard: D1PreparedStatement | undefined;
+    if (authenticated.status === 200 && (decoded.command?.command === "help" || decoded.view?.kind === "list")) {
+      const selected = generalReadEvent({ botUsername: policy.botUsername, botId: policy.botId, privateManagement: false },
+        authenticated.update, authenticated.updateId);
+      if (selected) {
+        const lane = await readGeneralReadLane(env.DB, policy, env.BUILD_REVISION);
+        if (lane && lane.mode !== "isolated") {
+          if (env.TELEGRAM_GENERAL_CONFIG !== undefined) throw new Error("The Telegram read rehearsal lane is ambiguous.");
+          if (lane.mode === "closed" || !lane.pin || selected.messageDate <= lane.pin.cutoverAt) {
+            const received = await env.DB.prepare(`SELECT 1 FROM telegram_inbox JOIN telegram_outbox USING(receipt_id)
+              WHERE bot_id=? AND update_id=?`).bind(policy.botId, selected.updateId).first();
+            // A held or pre-cutover delivery remains retryable until the isolated lane reopens.
+            return received ? new Response(null, { status: 204, headers: HEADERS })
+              : plain("Service unavailable.", 503, false);
+          }
+          const status = await acceptGeneralReadLaneCommand(env.DB, lane.pin, selected,
+            assertGeneralReadLane(env.DB, policy.botId, "general", lane.epoch));
+          if (status === 200) {
+            const delivery = drainGeneralSharedTelegramReply(env.DB, lane.pin, env.NODES, publicOrigin);
+            if (ctx) ctx.waitUntil(delivery.catch(() => undefined));
+            else await delivery;
+          }
+          return new Response(null, { status, headers: HEADERS });
+        }
+        if (lane) isolationReadGuard = assertGeneralReadLane(env.DB, policy.botId, "isolated", lane.epoch);
+      }
+    }
     if (decoded.legacyInlineClaim) {
       const { legacyInlineClaim } = decoded;
       const url = await legacyInlineClaimUrl(env.DB, policy, legacyInlineClaim);
@@ -267,10 +296,10 @@ async function telegramWebhook(request: Request, env: Env, publicOrigin: PublicO
         })().catch(() => undefined));
       }
     } else if (decoded.command) {
-      await acceptTelegramCommand(env.DB, policy, decoded.command);
+      await acceptTelegramCommand(env.DB, policy, decoded.command, undefined, isolationReadGuard);
       drain();
     } else if (decoded.view) {
-      const outcome = await acceptTelegramView(env.DB, policy, decoded.view);
+      const outcome = await acceptTelegramView(env.DB, policy, decoded.view, isolationReadGuard);
       if (decoded.view.kind === "callback") {
         ctx?.waitUntil(answerTelegramCallback(policy, decoded.view.callbackId));
       }
@@ -661,8 +690,17 @@ async function scheduled(_controller: ScheduledController, env: Env): Promise<vo
   const pin = providerPin(env);
   try {
     const policy = parseTelegramPolicy(env.TELEGRAM_ISOLATION_CONFIG);
-    if (policy) await recoverTelegramWork(env, policy, pin, await telegramProviderQueueReady(env, pin), publicOrigin);
-    else if (env.TELEGRAM_ISOLATION_CONFIG === undefined) {
+    if (policy) {
+      const recovery = await Promise.allSettled([
+        (async () => recoverTelegramWork(env, policy, pin, await telegramProviderQueueReady(env, pin), publicOrigin))(),
+        (async () => {
+          if (env.TELEGRAM_GENERAL_CONFIG !== undefined) return;
+          const lane = await readGeneralReadLane(env.DB, policy, env.BUILD_REVISION);
+          if (lane?.pin) await recoverGeneralSharedTelegramReplies(env.DB, lane.pin, env.NODES, publicOrigin);
+        })(),
+      ]);
+      if (recovery.some(({ status }) => status === "rejected")) throw new Error("Telegram scheduled recovery could not finish.");
+    } else if (env.TELEGRAM_ISOLATION_CONFIG === undefined) {
       const general = parseGeneralTelegramPin(env.TELEGRAM_GENERAL_CONFIG, env.BUILD_REVISION);
       if (general?.sharedOutbox) {
         try {

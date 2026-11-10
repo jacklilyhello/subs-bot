@@ -340,10 +340,14 @@ def activate_once(scope, source, telegram_config, guard, *, run_id, revision, bu
 
 
 def _deploy_once(scope, journal, intent, observed, previous, policy_sha256, current):
+    from general_read_rehearsal import require_general_read_lane_clear
+
+    require_general_read_lane_clear(scope)
     journal.claim(intent, observed.gate)
     # From here on, failure leaves the durable unresolved intent. Another run
     # can only reconcile this exact POST, including after the gate is paused.
     pending = ActivationRecord(intent, None)
+    require_general_read_lane_clear(scope)
     _require_confirmed(current() and scope.active() == previous and journal.control.observe() == observed
                        and journal.read(intent.epoch) == pending)
     try:

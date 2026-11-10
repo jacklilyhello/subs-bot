@@ -19,6 +19,7 @@ WORKER_NAME = "subs-bot-cf-dev-01"
 NAMESPACE = "lilyya"
 TELEGRAM_CONFIG_BINDING = "TELEGRAM_ISOLATION_CONFIG"
 TELEGRAM_DIGEST_BINDING = "TELEGRAM_CONFIG_SHA256"
+GENERAL_READ_LANE_MARKER = b"subs-bot:telegram-general-read-lane:v1"
 PAGE_JUMP_BINDING = "TELEGRAM_PAGE_JUMP"
 PAGE_JUMP_MARKER = b"subs-bot:telegram-page-jump:v1"
 PAGE_JUMP_MIGRATION = "0042_telegram_page_jumps.sql"
@@ -858,7 +859,7 @@ class _Isolation:
         return _Deployment(active["id"], allocation["version_id"], annotations.get("workers/message"))
 
     def version(self, version_id, *, with_legacy_selected=False, with_legacy_temp=False, with_legacy_dynamic_all=False,
-                page_jump_epoch=None):
+                page_jump_epoch=None, with_general_read_lane=False):
         _require(_matches(UUID, version_id), "Invalid isolated Worker version ID.")
         version = _object(self.worker_api("GET", f"{self.versions}/{version_id}?include=modules"), "Worker version")
         _require(version.get("id") == version_id and version.get("main_module") == "index.js"
@@ -1076,6 +1077,7 @@ class _Isolation:
             (with_legacy_selected, _legacy_selected_module_capable),
             (with_legacy_temp, _legacy_temp_module_capable),
             (with_legacy_dynamic_all, _legacy_dynamic_all_module_capable),
+            (with_general_read_lane, lambda module: GENERAL_READ_LANE_MARKER in module),
         ) if requested)
         return (value, *capabilities) if capabilities else value
 
@@ -1301,6 +1303,7 @@ class _Isolation:
                  current_temp_capable=False, target_temp_capable=False,
                  current_dynamic_all_capable=False, target_dynamic_all_capable=False, initial_subscription_shorts_rollback=False,
                  allow_subscription_shorts_enable=False):
+        from general_read_rehearsal import require_general_read_lane_clear
         from page_jump_activation import require_clear_for_release
 
         # All tracked application deployment writes use this boundary, including rollback.
@@ -1318,6 +1321,7 @@ class _Isolation:
                  or allow_subscription_shorts_enable, "Reopen typed subscription short-link issuance only in a protected enable release.")
         self.verify_subscription_shorts_floor(current_version, target_version.telegram_subscription_shorts_capable,
             require_schema=target_version.telegram_subscription_shorts_capable, initial_off_rollback=initial_subscription_shorts_rollback)
+        require_general_read_lane_clear(self)
         _require(self.active() == previous, "Active isolated Worker deployment changed before activation.")
         _guard_current(guard)
         try:
@@ -1496,6 +1500,8 @@ def subscription_shorts_artifact(bundle_dir, manifest):
 
 
 def _artifact(bundle_dir, manifest, telegram_config, aggregate_key=None, private_share_key=None, provider_binding=None):
+    from general_read_rehearsal import general_read_artifact
+
     _require(isinstance(manifest, dict) and manifest.get("version") == 2
              and _matches(REVISION, manifest.get("revision")) and _matches(DIGEST, manifest.get("bundleSha256"))
              and _matches(DATE, manifest.get("compatibilityDate")) and isinstance(manifest.get("migrations"), list),
@@ -1503,6 +1509,7 @@ def _artifact(bundle_dir, manifest, telegram_config, aggregate_key=None, private
     module = _verified_module(bundle_dir, manifest["bundleSha256"])
     page_jump_capable, page_jump_control_capable = _page_jump_artifact_capabilities(module, manifest)
     short_capable = _subscription_shorts_artifact_capable(module, manifest)
+    general_read_artifact(module, manifest)
     revision = manifest["revision"]
     telegram_digest = None
     aggregate_digest = None
@@ -1817,6 +1824,7 @@ def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECI
                          legacy_selected_capable=None, legacy_temp_capable=None, legacy_dynamic_all_capable=None,
                          subscription_shorts=None, subscription_shorts_capable=None):
     """Read ownership, privacy and active binding facts before any release writes."""
+    from general_read_rehearsal import require_general_read_lane_clear
     from page_jump_activation import require_clear_for_release
 
     scope = _Isolation(worker_api, data_api, target)
@@ -1824,6 +1832,7 @@ def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECI
     had_cron = scope.cron_enabled()
     scope.verify_resources()
     require_clear_for_release(scope)
+    require_general_read_lane_clear(scope)
     active = scope.active()
     version, active_selected_capable, active_temp_capable, active_dynamic_all_capable = scope.version(
         active.version, with_legacy_selected=True, with_legacy_temp=True, with_legacy_dynamic_all=True)
@@ -1956,6 +1965,7 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                    provider_url_documents: bool | None = None, mixed_documents: bool | None = None,
                    group_share_cards: bool | None = None, subscription_shorts: bool | None = None):
     """Release the verified Worker and optionally configure its isolated Telegram schedule."""
+    from general_read_rehearsal import MIGRATION as GENERAL_READ_LANE_MIGRATION, require_general_read_lane_clear
     from page_jump_activation import MIGRATION, require_clear_for_release
 
     _require((provider_binding is None and provider_guard is None) or (provider_binding is not None and callable(provider_guard)),
@@ -1969,6 +1979,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
     had_cron = scope.cron_enabled()
     scope.verify_resources()
     require_clear_for_release(scope, required=any(entry["name"] == MIGRATION for entry in manifest["migrations"]))
+    require_general_read_lane_clear(scope, required=any(entry["name"] == GENERAL_READ_LANE_MIGRATION
+                                                      for entry in manifest["migrations"]))
     previous = scope.active()
     old_version, old_selected_capable, old_temp_capable, old_dynamic_all_capable = scope.version(
         previous.version, with_legacy_selected=True, with_legacy_temp=True, with_legacy_dynamic_all=True)

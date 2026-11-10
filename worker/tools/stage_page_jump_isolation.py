@@ -102,6 +102,7 @@ def _gate_document(gate):
 def prepare_stage(worker_api, data_api, target, bundle, manifest, telegram_config, aggregate_key, private_share_key,
                   guard, *, run_id, attempt, expected=None):
     """Read a plan when expected is absent. Otherwise reserve and stage that exact checkpoint."""
+    from general_read_rehearsal import require_general_read_lane_clear
     from page_jump_activation import MIGRATION, require_clear_for_release
 
     proof = artifact_proof(bundle.parent, manifest)
@@ -126,6 +127,7 @@ def prepare_stage(worker_api, data_api, target, bundle, manifest, telegram_confi
     state, history = _read_state(data_api, control.path.removesuffix("/query"), migrations)
     _require(state == "managed" and len(history) == len(migrations), "Apply and verify the full isolated migration chain before staging.")
     require_clear_for_release(scope, required=any(entry["name"] == MIGRATION for entry in manifest["migrations"]))
+    require_general_read_lane_clear(scope)
     _verify_health(active.revision)
 
     def current_release():
