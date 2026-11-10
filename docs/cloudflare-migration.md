@@ -127,6 +127,8 @@ Surge 保留 `[Proxy]`、`[Proxy Group]` 和 `FINAL,Proxy`，支持 Shadowsocks�
 
 `worker-runtime-shape` 模式在 Node 24 直接运行同一提交的 Worker Grep 适配器，使用固定公开查询 `addClass repo:jquery/jquery`，复现运行时握手和查找参数，并在同一时间预算内核对匿名 GitHub 仓库可见性。报告只包含阶段、状态、耗时和结构计数。该模式使用 GitHub runner 的网络，并以合成检查替代 D1 授权查询。
 
+Cloudflare 边缘诊断使用独立的 `worker-grep-edge-preview.yml`。仅在 `main` 手动运行，输入 `probe Grep in the isolated Cloudflare preview`。无凭据构建步骤生成固定公开夹具，受保护步骤核对同次运行的提交、归档和模块摘要，再用隔离 Worker 部署凭据申请临时预览。临时脚本没有业务绑定。探针先确认固定名称不存在且匿名请求无法执行，随后只调用一次固定夹具，并回读该名称仍无已部署脚本。预览凭据由 Cloudflare 管理有效期，任务不会创建常驻 Worker 或启用日志。报告仅含阶段、状态、耗时及结构计数，采用合成授权检查。若临时预览不可用，任务停止。 [Cloudflare 远程开发](https://developers.cloudflare.com/workers/local-development/#wrangler-dev---remote-legacy)
+
 ### 订阅搜索、详情和格式链接
 
 `/s 关键词` 按当前用户的活动订阅搜索名称和来源，沿用旧版的 Unicode 小写子串匹配。每页最多显示 8 项，搜索限于 512 条订阅及 8 MiB 元数据。群聊只显示用户自己的匹配名称和编号。普通私聊可通过搜索结果、`/list`、`/expire` 的详情按钮，或直接发送活动列表顺序编号查看详情。详情显示流量、到期、节点数量及最多 8 个已校验的节点名称。来源 URL、节点凭据和刷新错误原文不进入回复。
