@@ -475,13 +475,15 @@ function validateClaim(row: ClaimedRow): void {
 
 function leaseGuard(lease: ClaimedRow, scope: JobScope, forRetirement = false): Guard {
   const authorization = scopeAuthorization(scope, "job", forRetirement);
+  const exact = ["job.job_id = ? AND job.owner_id = ? AND job.request_key = ? AND job.kind = ?",
+    "job.subscription_id = ? AND job.source_sha256 = ? AND job.expected_generation = ? AND job.expected_lifecycle_revision = ?",
+    "job.state = 'leased' AND job.lease_id = ? AND job.attempts = ? AND job.lease_until = ? AND job.expires_at = ?",
+    "job.lease_until > unixepoch() AND job.expires_at > unixepoch()"];
+  // Keep the exact lease identity from adding depth to the general grant predicate.
+  const fields = scope !== "generic" && "family" in scope ? exact.map((part) => `(${part})`) : exact;
   return {
     sql: `EXISTS (SELECT 1 FROM ${jobTable(scope)} AS job
-      WHERE job.job_id = ? AND job.owner_id = ? AND job.request_key = ? AND job.kind = ?
-        AND job.subscription_id = ? AND job.source_sha256 = ? AND job.expected_generation = ?
-        AND job.expected_lifecycle_revision = ? AND job.state = 'leased'
-        AND job.lease_id = ? AND job.attempts = ? AND job.lease_until = ? AND job.expires_at = ?
-        AND job.lease_until > unixepoch() AND job.expires_at > unixepoch() AND (${authorization.sql}))`,
+      WHERE ${fields.join(" AND ")} AND (${authorization.sql}))`,
     bindings: [lease.jobId, lease.ownerId, lease.requestKey, lease.kind, lease.id, lease.sourceSha256,
       lease.expectedGeneration, lease.expectedLifecycleRevision, lease.leaseId, lease.attempts,
       lease.leaseUntil, lease.expiresAt, ...authorization.bindings],
@@ -606,10 +608,16 @@ export async function claimProviderJob(db: D1Database, policy?: ProviderQueuePol
     validateClaim(lease);
     if (lease.leaseId !== leaseId) throw new Error("Provider job claim could not be confirmed.");
     const live = leaseGuard(lease, scope);
-    const sourceUrl = await db.prepare(`SELECT source_url FROM subscriptions WHERE id = ? AND owner_id = ?
-      AND generation = ? AND ${SUBSCRIPTION_LIFECYCLE_REVISION} = ? AND ${live.sql}`)
-      .bind(lease.id, lease.ownerId, lease.expectedGeneration, lease.expectedLifecycleRevision, ...live.bindings)
-      .first<string>("source_url");
+    const sourceTarget = "id = ? AND owner_id = ? AND generation = ?";
+    const sourceBindings = [lease.id, lease.ownerId, lease.expectedGeneration, lease.expectedLifecycleRevision];
+    const source = scope !== "generic" && "family" in scope
+      ? db.prepare(`WITH lease_authority AS MATERIALIZED (SELECT (${live.sql}) AS allowed)
+        SELECT source_url FROM subscriptions CROSS JOIN lease_authority
+        WHERE (${sourceTarget} AND ${SUBSCRIPTION_LIFECYCLE_REVISION} = ?) AND lease_authority.allowed`)
+        .bind(...live.bindings, ...sourceBindings)
+      : db.prepare(`SELECT source_url FROM subscriptions WHERE ${sourceTarget}
+        AND ${SUBSCRIPTION_LIFECYCLE_REVISION} = ? AND ${live.sql}`).bind(...sourceBindings, ...live.bindings);
+    const sourceUrl = await source.first<string>("source_url");
     if (sourceUrl !== null && providerHost(sourceUrl) && await providerSourceDigest(sourceUrl) === lease.sourceSha256) {
       return Object.freeze({ ...lease, sourceUrl, scope });
     }
