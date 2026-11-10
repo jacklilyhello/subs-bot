@@ -47,6 +47,7 @@ SELECTED_SHORT_PROFILE = "legacy-selected-short-v6"
 DYNAMIC_ALL_PROFILE = "legacy-dynamic-all-v8"
 UNIFIED_PROFILE = "legacy-unified-v9"
 UNIFIED_SHARES_PROFILE = "legacy-unified-shares-v10"
+UNIFIED_AUTH_PROFILE = "legacy-unified-auth-v11"
 EXTERNAL_SHORT_MIGRATION = "0019_telegram_short_links.sql"
 EXTERNAL_SHORT_MIGRATION_SHA256 = "44cda07068dd84435542771899824c1d4196a1ffdc18f990abcb723e5bdaa3c1"
 EXTERNAL_SHORTS = "normal_short_links"
@@ -134,12 +135,14 @@ def worker_artifact(root, revision, manifest_sha):
     return chain, {**identity, "manifestSha256": manifest_sha}
 
 
-def converter_artifact(root, manifest_sha, *, typed_short_domain=None, temp_domain=None, share_domains=None):
+def converter_artifact(root, manifest_sha, *, typed_short_domain=None, temp_domain=None, share_domains=None, auth_domain=None):
     consumed = {name: descriptor for name, descriptor in (("short_links", typed_short_domain), ("temp_nodes", temp_domain))
                 if descriptor is not None}
     if share_domains is not None:
         require(isinstance(share_domains, dict) and set(share_domains) == {"shares", "share_claims"})
         consumed.update(share_domains)
+    if auth_domain is not None:
+        consumed["auth_overrides"] = auth_domain
     raw = read_pinned(root / MANIFEST, 64 * 1024, manifest_sha)
     manifest = converter.verify_bundle(root, require_complete=not consumed)
     require(read_pinned(root / MANIFEST, 64 * 1024, manifest_sha) == raw)
@@ -476,9 +479,10 @@ def describe(path):
 
 def build_candidate(conversion, worker, output, *, converter_manifest_sha, worker_manifest_sha, revision, applied_at,
                     profile=None, source_sqlite_sha=None, owner_map_sha=None, typed_short=None, mixed_short=None,
-                    dynamic_all=None, private_shares=None):
+                    dynamic_all=None, private_shares=None, general_auth=None):
     try:
-        include_shares = profile == UNIFIED_SHARES_PROFILE
+        include_auth = profile == UNIFIED_AUTH_PROFILE
+        include_shares = profile == UNIFIED_SHARES_PROFILE or include_auth
         unified = profile == UNIFIED_PROFILE or include_shares
         include_dynamic_all = profile == DYNAMIC_ALL_PROFILE or unified
         include_selected_shorts = profile == SELECTED_SHORT_PROFILE or unified
@@ -488,7 +492,7 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
         require(profile is None or include_empty_exports)
         require((typed_short is not None) == (profile == TYPED_SHORT_PROFILE)
                 and (mixed_short is not None) == include_mixed_shorts and (dynamic_all is not None) == include_dynamic_all
-                and (private_shares is not None) == include_shares)
+                and (private_shares is not None) == include_shares and (general_auth is not None) == include_auth)
         if include_empty_exports:
             require(native.matches(native.DIGEST, source_sqlite_sha) and native.matches(native.DIGEST, owner_map_sha))
         else:
@@ -501,6 +505,7 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
         typed_domain = None
         temp_domain = None
         share_domains = None
+        auth_domain = None
         chain, build = worker_artifact(worker, revision, worker_manifest_sha)
         if include_selected_shorts:
             require(legacy_selected_artifact(worker, build))
@@ -556,8 +561,17 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
             except shares.CandidateError:
                 raise PackageError(ERROR) from None
             share_domains = share_source.domains
+        if include_auth:
+            import legacy_general_auth_candidate as auth
+
+            require(isinstance(general_auth, auth.UnifiedAuthInput)
+                    and all(not output.is_relative_to(private_path(path, directory=True))
+                            for path in (general_auth.inventory_dir, general_auth.preview_dir)))
+            auth_source = auth.verify_unified_auth_source(general_auth, source=mixed.source, source_sha=source_sqlite_sha,
+                                                          legacy_bot_id=legacy_bot_id, working_parent=output.parent)
+            auth_domain = auth_source.domain
         source, files = converter_artifact(conversion, converter_manifest_sha, typed_short_domain=typed_domain,
-                                          temp_domain=temp_domain, share_domains=share_domains)
+                                          temp_domain=temp_domain, share_domains=share_domains, auth_domain=auth_domain)
         subscription_objects = set(files) - metadata_files(source)
         if include_shares:
             require(len(subscription_objects) + share_source.counts["shares"] <= native.MAX_OBJECTS
@@ -585,6 +599,10 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
         if path_mapping is not None:
             require(len(chain) >= 10 and chain[9].name == "0010_path_rules.sql")
         schema = migrations._objects(chain, len(chain), managed=True)
+        if include_auth:
+            require(all(obj.name not in auth.COLUMNS and obj.table not in auth.COLUMNS for obj in schema))
+            schema += auth.SCHEMA
+            extra_tables.update(auth.COLUMNS)
         replay_source = SimpleNamespace(objects=schema, tables=sorted(obj.name for obj in schema if obj.type == "table"))
         ledger = [{"position": position, "name": item.name, "sha256": item.sha256, "mode": "applied", "applied_at": applied_at}
                   for position, item in enumerate(chain, 1)]
@@ -628,6 +646,8 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                         shares.load_claims(db, share_source.root, share_source.counts, share_source.files, share_rows)
                     except shares.CandidateError:
                         raise PackageError(ERROR) from None
+                if include_auth:
+                    auth.load_general_auth(db, auth_source.rows)
                 require(db.execute("""SELECT 1 FROM subscriptions AS active JOIN subscription_trash AS trash
                     ON active.id=trash.id OR active.token=trash.token LIMIT 1""").fetchone() is None)
                 db.execute("DELETE FROM sqlite_sequence WHERE name='subscriptions'")
@@ -679,6 +699,8 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                     count = share_source.counts["shares"]
                     require(replayed.execute("SELECT seq FROM sqlite_sequence WHERE name=?", (shares.SHARES,)).fetchall()
                             == ([(count,)] if count else []))
+                if include_auth:
+                    auth.verify_general_auth_replay(replayed, auth_source)
             require({"objects/" + item["key"] for item in objects} == subscription_objects | {"objects/" + key for key in share_keys})
             replay_sql.rename(sql)
         report = {"version": 1, "scope": "fresh-unbound-d1-r2", "legacyDomains": "active-and-trash-only",
@@ -758,6 +780,12 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
                                          "tableSha256": {table: hashes[table] for table in shares.COLUMNS}},
                           shareCompatibility="not-validated")
             source_pin.update(share_source.proof)
+        if include_auth:
+            report.update(version=11, legacyDomains=report["legacyDomains"] + "-and-dormant-authorization",
+                          generalAuthorization={"activationAllowed": False, "counts": auth_source.counts,
+                              "schemaSha256": native._schema_digest(auth.SCHEMA),
+                              "tableSha256": {table: summary["tableSha256"][table] for table in auth.COLUMNS}})
+            source_pin["generalAuthorization"] = auth_source.provenance
         manifest = {**report, "source": source_pin, "workerArtifact": build,
                     "ledger": ledger, "layout": layout, "summary": summary, "objects": objects,
                     "lineage": describe(output / LINEAGE), "sql": {**describe(sql), "md5": native.file_hash(sql, "md5")[1]}}
@@ -776,31 +804,32 @@ def build_candidate(conversion, worker, output, *, converter_manifest_sha, worke
 
 def main(args=None):
     args = sys.argv[1:] if args is None else args
-    if (len(args) not in (7, 10, 11, 13, 14, 16) or not re.fullmatch(r"[1-9][0-9]{0,15}", args[6])
+    if (len(args) not in (7, 10, 11, 13, 14, 16, 17) or not re.fullmatch(r"[1-9][0-9]{0,15}", args[6])
             or (len(args) == 10 and args[7] != EMPTY_EXPORT_PROFILE) or (len(args) == 14 and args[7] != TYPED_SHORT_PROFILE)
             or (len(args) == 13 and args[7] != UNIFIED_PROFILE) or (len(args) == 16 and args[7] != UNIFIED_SHARES_PROFILE)
+            or (len(args) == 17 and args[7] != UNIFIED_AUTH_PROFILE)
             or (len(args) == 11 and args[7] not in (MIXED_SHORT_PROFILE, SELECTED_SHORT_PROFILE))):
         print("Usage: legacy_restore_package.py CONVERTER_DIR WORKER_ARTIFACT_DIR OUTPUT_DIR CONVERTER_MANIFEST_SHA WORKER_MANIFEST_SHA REVISION APPLIED_AT"
               " [legacy-empty-v3 SOURCE_SQLITE_SHA OWNER_MAP_SHA | legacy-typed-short-v4 SOURCE_SQLITE_SHA OWNER_MAP_SHA "
               "TYPED_SHORT_INVENTORY TYPED_SHORT_MANIFEST_SHA OLD_ORIGIN_SHA LEGACY_BOT_ID | "
               "{legacy-mixed-short-v5|legacy-selected-short-v6} SOURCE_SQLITE_SHA OWNER_MAP_SHA PRIVATE_INPUT_JSON | "
               "legacy-unified-v9 SOURCE_SQLITE_SHA OWNER_MAP_SHA PRIVATE_INPUT_JSON TEMP_INVENTORY TEMP_INVENTORY_MANIFEST_SHA | "
-              "legacy-unified-shares-v10 SOURCE_SQLITE_SHA OWNER_MAP_SHA PRIVATE_INPUT_JSON TEMP_INVENTORY TEMP_INVENTORY_MANIFEST_SHA "
-              "SHARE_INVENTORY SHARE_INVENTORY_MANIFEST_SHA LEGACY_BOT_USERNAME]",
+              "{legacy-unified-shares-v10|legacy-unified-auth-v11} SOURCE_SQLITE_SHA OWNER_MAP_SHA PRIVATE_INPUT_JSON TEMP_INVENTORY "
+              "TEMP_INVENTORY_MANIFEST_SHA SHARE_INVENTORY SHARE_INVENTORY_MANIFEST_SHA LEGACY_BOT_USERNAME [PRIVATE_AUTH_INPUT_JSON]]",
               file=sys.stderr)
         return 2
     try:
         profile, source_sqlite_sha, owner_map_sha = args[7:10] if len(args) >= 10 else (None, None, None)
         typed_short = TypedShortInput(Path(args[10]), *args[11:]) if len(args) == 14 else None
-        mixed_short = dynamic_all = private_shares = None
-        if len(args) in (11, 13, 16):
+        mixed_short = dynamic_all = private_shares = general_auth = None
+        if len(args) in (11, 13, 16, 17):
             from legacy_mixed_short_candidate import MixedShortError, read_mixed_short_input
 
             try:
                 mixed_short = read_mixed_short_input(Path(args[10]))
             except MixedShortError:
                 raise PackageError(ERROR) from None
-        if profile in (UNIFIED_PROFILE, UNIFIED_SHARES_PROFILE):
+        if profile in (UNIFIED_PROFILE, UNIFIED_SHARES_PROFILE, UNIFIED_AUTH_PROFILE):
             from legacy_dynamic_all_candidate import DynamicAllInput
 
             temp_dir = Path(args[11])
@@ -809,16 +838,20 @@ def main(args=None):
             owner_map = converter._owner_map(native.parsed(read_private(mixed_short.owner_map, maximum), maximum))
             dynamic_all = DynamicAllInput(mixed_short.source, owner_map, mixed_short.namespace, mixed_short.namespace_sha256,
                                           temp_dir, args[12], mixed_short.old_origin, mixed_short.legacy_bot_id)
-        if profile == UNIFIED_SHARES_PROFILE:
+        if profile in (UNIFIED_SHARES_PROFILE, UNIFIED_AUTH_PROFILE):
             from legacy_private_share_candidate import UnifiedShareInput
 
             share_dir = Path(args[13])
             require(share_dir.is_absolute())
             private_shares = UnifiedShareInput(share_dir, args[14], args[15])
+        if profile == UNIFIED_AUTH_PROFILE:
+            from legacy_general_auth_candidate import read_unified_auth_input
+
+            general_auth = read_unified_auth_input(Path(args[16]))
         result = build_candidate(*map(Path, args[:3]), converter_manifest_sha=args[3], worker_manifest_sha=args[4],
                                  revision=args[5], applied_at=int(args[6]), profile=profile,
                                  source_sqlite_sha=source_sqlite_sha, owner_map_sha=owner_map_sha, typed_short=typed_short,
-                                 mixed_short=mixed_short, dynamic_all=dynamic_all, private_shares=private_shares)
+                                 mixed_short=mixed_short, dynamic_all=dynamic_all, private_shares=private_shares, general_auth=general_auth)
         print(json.dumps(result, ensure_ascii=True, sort_keys=True))
         return 0
     except PackageError as error:

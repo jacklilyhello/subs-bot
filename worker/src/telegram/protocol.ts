@@ -229,6 +229,37 @@ function humanSender(message: Record<string, unknown>): string | null {
   return isRecord(actor) && actor.is_bot === false && isPositiveInteger(actor.id) ? String(actor.id) : null;
 }
 
+function readLeadingTelegramCommand(message: Record<string, unknown>, botUsername: string): {
+  name: string; remainder: string;
+} | null {
+  const { text, entities } = message;
+  if (typeof text !== "string" || !Array.isArray(entities)) return null;
+  const commands = entities.filter((entity) => isRecord(entity) && entity.type === "bot_command" && entity.offset === 0);
+  if (commands.length !== 1) return null;
+  const { length } = commands[0];
+  if (!isPositiveInteger(length) || length > text.length) return null;
+  // Telegram offsets and JavaScript string slicing both use UTF-16 code units.
+  const entity = BOT_COMMAND.exec(text.slice(0, length));
+  if (!entity) return null;
+  const [, name, addressedTo] = entity;
+  if (addressedTo && addressedTo.toLowerCase() !== botUsername.toLowerCase()) return null;
+  return { name: name.toLowerCase(), remainder: text.slice(length) };
+}
+
+export function readPrivateTelegramCommand(update: Record<string, unknown>, botUsername: string): {
+  actorId: string; messageId: number; messageDate: number; name: string; remainder: string;
+} | null {
+  const { message } = update;
+  if (Object.keys(update).length !== 2 || !isRecord(message) || "edit_date" in message || "document" in message
+    || "message_thread_id" in message || "reply_to_message" in message) return null;
+  const actorId = humanSender(message);
+  const { chat, message_id: messageId, date: messageDate } = message;
+  if (actorId === null || !isRecord(chat) || chat.type !== "private" || !isPositiveInteger(chat.id)
+    || String(chat.id) !== actorId || !isPositiveInteger(messageId) || !isPositiveInteger(messageDate)) return null;
+  const command = readLeadingTelegramCommand(message, botUsername);
+  return command ? { actorId, messageId, messageDate, ...command } : null;
+}
+
 function authCommand(args: string[], reply: unknown, memberId: string): TelegramCommand["command"] {
   const [actionName = "list", target, ...extra] = args;
   const action = actionName.toLowerCase();
@@ -256,19 +287,9 @@ function messageCommand(
   { inlineSort: TelegramInlineSortAction } | { bulkTrashQuery: string } |
   { inlineConsent: TelegramInlineConsentUpdate["kind"] } | { githubArgs: string } |
   { providerBatch: "preview" | "status" | "usage" } | { apiStatusArgs: string } | "group-share-handoff" | null {
-  const { text, entities } = message;
-  if (typeof text !== "string" || !Array.isArray(entities)) return null;
-  const commands = entities.filter((entity) => isRecord(entity) && entity.type === "bot_command" && entity.offset === 0);
-  if (commands.length !== 1) return null;
-  const { length } = commands[0];
-  if (!isPositiveInteger(length) || length > text.length) return null;
-  // Telegram offsets and JavaScript string slicing both use UTF-16 code units.
-  const entity = BOT_COMMAND.exec(text.slice(0, length));
-  const remainder = text.slice(length);
-  if (!entity) return null;
-  const [, name, addressedTo] = entity;
-  if (addressedTo && addressedTo.toLowerCase() !== policy.botUsername.toLowerCase()) return null;
-  const commandName = name.toLowerCase();
+  const command = readLeadingTelegramCommand(message, policy.botUsername);
+  if (!command) return null;
+  const { name: commandName, remainder } = command;
   const separator = commandName === "path" || commandName === "o" || commandName === "s" || commandName === "i" || commandName === "d"
     ? PATH_RULE_WHITESPACE_PREFIX
     : commandName === "share" ? /^[ \t\r\n]/u : /^\s/u;
@@ -541,10 +562,10 @@ function normalizeUpdate(
   return inlineSearchEnabled && isRecord(update.inline_query) ? normalizeInlineQuery(update.inline_query, updateId, policy) : null;
 }
 
-export async function decodeTelegramRequest(
-  request: Request, policy: TelegramPolicy, inlineSearchEnabled = false,
-): Promise<DecodedTelegramRequest> {
-  if (!await verifyWebhookSecret(request.headers.get("X-Telegram-Bot-Api-Secret-Token"), policy.webhookSecret)) {
+export async function readTelegramUpdate(request: Request, webhookSecret: string): Promise<
+  { status: 200; update: Record<string, unknown>; updateId: number } | { status: 400 | 401 | 413 | 415 }
+> {
+  if (!await verifyWebhookSecret(request.headers.get("X-Telegram-Bot-Api-Secret-Token"), webhookSecret)) {
     return { status: 401 };
   }
   const encoding = request.headers.get("Content-Encoding");
@@ -574,11 +595,23 @@ export async function decodeTelegramRequest(
     const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes.subarray(0, size));
     const update: unknown = JSON.parse(text);
     if (!isRecord(update) || !isPositiveInteger(update.update_id)) return { status: 400 };
-    const event = normalizeUpdate(update, update.update_id, policy, inlineSearchEnabled);
-    return event ? { status: 200, ...event } : { status: 204 };
+    return { status: 200, update, updateId: update.update_id };
   } catch {
     return { status: 400 };
   } finally {
     reader.releaseLock();
+  }
+}
+
+export async function decodeTelegramRequest(
+  request: Request, policy: TelegramPolicy, inlineSearchEnabled = false,
+): Promise<DecodedTelegramRequest> {
+  const decoded = await readTelegramUpdate(request, policy.webhookSecret);
+  if (decoded.status !== 200) return decoded;
+  try {
+    const event = normalizeUpdate(decoded.update, decoded.updateId, policy, inlineSearchEnabled);
+    return event ? { status: 200, ...event } : { status: 204 };
+  } catch {
+    return { status: 400 };
   }
 }

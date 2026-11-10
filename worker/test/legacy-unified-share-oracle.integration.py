@@ -1,4 +1,4 @@
-"""Build and exercise the exact synthetic V10 candidate in hosted loopback."""
+"""Build the exact synthetic unified candidates and run their hosted loopback proofs."""
 
 from contextlib import suppress
 import json
@@ -65,14 +65,15 @@ def worker_continuity(root, worker, worker_sha, revision, candidate, sql_stateme
     return report["continuity"]
 
 
-def publication_target(arguments, bundle, revision):
+def publication_target(arguments, bundle, revision, *, v11=False):
     if not arguments:
         return None, None
     fixture.require(len(arguments) == 2 and arguments[0] == "--output")
     runner = Path(os.environ.get("RUNNER_TEMP", ""))
     output = Path(arguments[1])
     run, attempt = (os.environ.get(name, "") for name in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"))
-    fixture.require(runner.is_absolute() and output == runner / PUBLISH_DIRECTORY and bundle == runner / "subs-bot-worker"
+    directory = fixture.AUTH_ARTIFACT_PREFIX if v11 else PUBLISH_DIRECTORY
+    fixture.require(runner.is_absolute() and output == runner / directory and bundle == runner / "subs-bot-worker"
                     and os.environ.get("GITHUB_REPOSITORY") == artifact.REPOSITORY
                     and os.environ.get("GITHUB_REF") == artifact.MAIN_REF and os.environ.get("GITHUB_SHA") == revision
                     and os.environ.get("GITHUB_EVENT_NAME") in {"push", "workflow_dispatch"}
@@ -102,13 +103,16 @@ def publish(candidate, destination):
 
 
 def main(arguments):
+    v11 = arguments[:1] == ["--v11"]
+    if v11:
+        arguments = arguments[1:]
     stage = "sandbox"
     try:
         run_path(str(TEST / "legacy-dynamic-all-python.py"))["verify_sandbox"]()
         stage = "provenance"
         bundle = Path(os.environ["WORKER_TEST_BUNDLE_DIR"])
         revision = os.environ["WORKER_TEST_REVISION"]
-        destination, original_sha = publication_target(arguments, bundle, revision)
+        destination, original_sha = publication_target(arguments, bundle, revision, v11=v11)
         selected_oracle = run_path(str(TEST / "legacy-selected-short-oracle.integration.py"))
         with TemporaryDirectory(prefix="legacy-unified-share-oracle-", dir=destination.parent if destination else None) as temporary:
             root = Path(temporary)
@@ -118,22 +122,28 @@ def main(arguments):
             worker_sha = selected_oracle["prepare_worker"](bundle, worker, revision)
             fixture.require(original_sha is None or worker_sha == original_sha)
             stage = "candidate"
-            candidate = fixture.build_unified_share_fixture(source_root, worker, revision, produce_oracle=True)
-            stage = "route-replay"
-            continuity = worker_continuity(root, worker, worker_sha, revision, candidate, selected_oracle["sql_statements"])
+            if v11:
+                candidate = fixture.build_unified_auth_fixture(source_root, worker, revision, produce_oracle=True)
+                outcomes = {"candidateVersion": 11, "equivalentExternalRows": 1, "privateShares": 2, "claimRows": 1, "objects": 10,
+                            "generalAuthorization": {"activationAllowed": False, "counts": fixture.AUTH_COUNTS}}
+            else:
+                candidate = fixture.build_unified_share_fixture(source_root, worker, revision, produce_oracle=True)
+                stage = "route-replay"
+                continuity = worker_continuity(root, worker, worker_sha, revision, candidate, selected_oracle["sql_statements"])
+                outcomes = {"candidateVersion": 10, "equivalentExternalRows": 1, "workerRoutePairs": continuity["routePairs"],
+                            "historicalClaimReplies": continuity["historicalClaimReplies"], "privateShares": 2, "claimRows": 1, "objects": 10}
             package.read_pinned(candidate.candidate / package.MANIFEST, package.native.MANIFEST_BYTES, candidate.candidate_sha256)
             if destination is not None:
                 stage = "publication"
                 publish(candidate, destination)
-        print(json.dumps({"candidateVersion": 10, "equivalentExternalRows": 1, "workerRoutePairs": continuity["routePairs"],
-                          "historicalClaimReplies": continuity["historicalClaimReplies"],
-                          "privateShares": 2, "claimRows": 1, "objects": 10}, sort_keys=True))
+        print(json.dumps(outcomes, sort_keys=True))
         return 0
     except RouteContinuityError as error:
         print(f"Synthetic unified share candidate could not be confirmed ({error}).", file=sys.stderr)
         return 2
     except Exception:
-        print(f"Synthetic unified share candidate could not be confirmed ({stage}).", file=sys.stderr)
+        label = "authorization" if v11 else "share"
+        print(f"Synthetic unified {label} candidate could not be confirmed ({stage}).", file=sys.stderr)
         return 2
 
 

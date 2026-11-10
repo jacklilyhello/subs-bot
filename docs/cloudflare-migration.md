@@ -613,6 +613,14 @@ python3 -B worker/tools/legacy_restore_package.py \
 
 保留发送者、领取者、指定对象、份数、到期时间及原始正文。订阅的所有者映射仅用于订阅域。已到期的分享和已有领取历史随数据一起恢复。原内联消息标识留在私有盘点内，候选只记录数量。订阅快照和私密正文共同校验 R2 对象完整性和容量。候选保持私有、未绑定；同一 Bot 下的旧领取链接、旧卡片行为、授权基线和真实数据导入另行验收。
 
+#### V11 同源休眠授权
+
+将 V10 命令中的配置名称改为 `legacy-unified-auth-v11`，末尾追加私有 `PRIVATE_AUTH_INPUT_JSON`。此 JSON 只含四个绝对路径 `inventoryDir`、`configPath`、`targetPath`、`previewDir`，以及对应的独立摘要 `inventorySha256`、`configSha256`、`targetSha256`、`previewSha256`。这些输入沿用通用授权盘点和休眠预览的格式。
+
+封存工具从同一 SQLite 重建通用预览，核对旧 Bot 和覆盖记录数量，再将休眠授权表与 V10 数据写入同一次 SQL 回放。授权主体使用原 Telegram 用户 ID。所有者映射继续按各数据域的原规则处理。清单记录授权行数、结构和逐表摘要。原有 V10 和独立授权原生流程仍各自要求本配置的封存包。
+
+V11 合成原生演练在 `worker-isolation-legacy-candidate.yml` 选择 `synthetic-legacy-unified-auth`，沿用 V10 的七个检查点。所有步骤固定同一个成功的 `main` Worker CI 运行及同一 `cohort`，目标使用新的未绑定 D1 和私有 R2。按同一封存包核对 10 个对象、完整数据摘要、外键、休眠授权三表和原迁移登记。受保护流程只接受固定合成候选。生产授权启用仍由单独流程处理。
+
 #### V10 联合包原生恢复演练
 
 托管 Worker CI 从一份固定合成 SQLite 生成联合候选，并用实际旧 Python 和同一提交的编译后 Worker 核对外部短链跳转。受信的 `main` 构建发布准确候选和三份外部跳转证明文件。证明绑定源 SQLite、短链盘点和 Worker 构建。受保护步骤独立重建候选，核对完整归档、SQL、两类 R2 对象和摘要，并确认隔离 Worker 正在运行同一提交的构建，具备旧所选聚合、临时节点和全量聚合的读写能力。
