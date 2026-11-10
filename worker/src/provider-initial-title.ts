@@ -33,7 +33,7 @@ function decodeTitle(value: string): string | null {
     const encoded = value.slice(7);
     if (!/^[A-Za-z0-9+/_-]+={0,2}$/u.test(encoded)) return null;
     const decoded = atob(encoded.replace(/-/gu, "+").replace(/_/gu, "/"));
-    return new TextDecoder("utf-8", { fatal: true }).decode(Uint8Array.from(decoded, (character) => character.charCodeAt(0)));
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(Uint8Array.from(decoded, (character) => character.charCodeAt(0)));
   } catch {
     return null;
   }
