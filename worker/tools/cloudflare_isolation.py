@@ -137,7 +137,8 @@ DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z")
 SAFE_PATH = re.compile(r"/[A-Za-z0-9/_.%?=&,~-]+")
 SCHEDULE_PATH = re.compile(rf"/accounts/{HEX_ID.pattern}/workers/scripts/{WORKER_NAME}/schedules")
-MAX_MODULE_BYTES = 1024 * 1024
+# Keep this uncompressed project cap aligned with the three legacy Worker oracles.
+MAX_MODULE_BYTES = 1152 * 1024
 MAX_API_BYTES = 8 * 1024 * 1024
 MAX_TELEGRAM_CONFIG_BYTES = 5000
 READBACK_DELAYS = (0, 1, 2, 4)
