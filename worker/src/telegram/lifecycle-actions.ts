@@ -58,7 +58,7 @@ function actionOrigin(general: boolean): string {
   return `(
   (inbox.receipt_nonce ${viewOrigin} AND EXISTS (
     SELECT 1 FROM telegram_view AS view WHERE view.receipt_id = inbox.receipt_id
-      AND ((view.kind ${general ? "= 'list'" : "IN ('list', 'expiry')"} AND ticket.action IN ('rename', 'trash-prompt'))
+      AND ((view.kind IN ('list', 'expiry') AND ticket.action IN ('rename', 'trash-prompt'))
         OR (view.kind = 'recycle' AND ticket.action = 'restore'))
   )) OR
   (inbox.receipt_nonce = '${general ? GENERAL_LIFECYCLE_MARKER : TELEGRAM_LIFECYCLE_MARKER}' AND ticket.action = 'trash' AND EXISTS (
