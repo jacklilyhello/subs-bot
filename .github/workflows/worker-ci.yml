@@ -28,6 +28,7 @@ on:
       - 'worker/**'
       - '.github/workflows/worker-ci.yml'
       - '.github/workflows/worker-isolation-deploy.yml'
+      - '.github/workflows/worker-production-candidate.yml'
       - '.github/workflows/worker-isolation-command-menu.yml'
       - '.github/workflows/worker-isolation-general-window.yml'
       - '.github/workflows/worker-isolation-capacity.yml'
