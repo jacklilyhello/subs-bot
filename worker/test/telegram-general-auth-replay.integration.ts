@@ -91,7 +91,7 @@ test("closed general authorization replays a sealed candidate in a separate emit
   const generalSent: GeneralAuthReplayMessage[] = [];
   const laneSent: GeneralAuthReplayMessage[] = [];
   const sharedSent: (GeneralAuthReplayMessage & { message_thread_id?: number })[] = [];
-  const lifecycleSent: (GeneralAuthReplayMessage & { reply_markup?: {
+  const lifecycleSent: (GeneralAuthReplayMessage & { message_thread_id?: number; reply_markup?: {
     force_reply?: boolean; inline_keyboard?: { text: string; callback_data: string }[][];
   } })[] = [];
   const lifecycleMessagesById = new Map<number, (typeof lifecycleSent)[number]>();
@@ -251,7 +251,8 @@ test("closed general authorization replays a sealed candidate in a separate emit
     lifecycleSent.push(message);
     const messageId = 9400 + lifecycleSent.length;
     lifecycleMessagesById.set(messageId, message);
-    return Response.json({ ok: true, result: { chat: { id: Number(message.chat_id) }, message_id: messageId } });
+    return Response.json({ ok: true, result: { chat: { id: Number(message.chat_id) }, message_id: messageId,
+      ...(message.message_thread_id === undefined ? {} : { message_thread_id: message.message_thread_id }) } });
   };
   const runtime = new Miniflare({ log: new Log(LogLevel.NONE), workers: [
     { name: "serving", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
@@ -838,7 +839,11 @@ test("closed general authorization replays a sealed candidate in a separate emit
   };
   assert.equal((await sharedPost(101, "/s Renamed")).status, 204);
   await grantGroup();
-  assert.equal((await post(101, "/s@GeneralFixtureBot Renamed", { ...groupEvent, worker: lifecycle })).status, 204);
+  assert.equal((await post(101, "/s@GeneralFixtureBot Renamed", { ...groupEvent, updateId: 7319, worker: lifecycle })).status, 200);
+  const groupMetadata = (await awaitLifecycle(7319)).message;
+  assert.deepEqual(groupMetadata, { chat_id: groupId, text: "搜索结果\n#1 Renamed lifecycle fixture", message_thread_id: 44,
+    reply_parameters: { message_id: 7319, allow_sending_without_reply: false }, link_preview_options: { is_disabled: true } });
+  assert.doesNotMatch(JSON.stringify(groupMetadata), /source\.fixture|fixture-token|\/sub\/|\/agg\//u);
   assert.equal((await lifecyclePost(7320, 101, "/s Renamed")).status, 200);
   const searched = await awaitLifecycle(7320);
   assert.match(searched.message.text, /Renamed lifecycle fixture/u);
