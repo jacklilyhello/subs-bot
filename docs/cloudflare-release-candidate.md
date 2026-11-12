@@ -28,7 +28,7 @@
 
 从恢复归档取得 C 的版本 ID，并独立读回确认其 100% 生效后，在内置浏览器用两个固定账号分别发送 `/short https://example.com/subs-bot-normal-short/<cohort>/admin` 和 `/short https://example.org/subs-bot-normal-short/<cohort>/member`。工具最多等待约五分钟，核对真实私聊回执、本地码归属及派生、外链尝试终态和本地 GET/HEAD 跳转。浏览器另行确认回退提示及本地链接，不能把机器读回当成真人验收。数据库未保存 RPC HTTP 状态，报告不宣称直接观测到 401。
 
-主步骤的 `finally` 和工作流的独立 `always()` 步骤均恢复已验证的正常版本。若 runner 被强制终止或恢复未独立确认，使用同一工作流 `action=restore`，填写原 `checkpoint_run_id`、准确 `checkpoint_run_attempt`，确认串为 `restore shortlink fallback for subs-bot-cf-dev-01`。该操作接受失败、取消及未完成运行的签名恢复归档；不要求原 CI 归档仍存在或历史提交仍是 main。仅在当前版本属于 checkpoint 的原版本、C 或 R，且模块、配置及绑定读回完全一致时恢复，遇到外来部署停止，保留现场。恢复归档保留七天，执行者应在演练期间下载保留该无凭据 checkpoint。恢复后还须用新挑战的正常 `/short` 独立确认业务 RPC，并撤销本轮两个账号各自的合成本地码；不删除外层短链。
+主步骤的 `finally` 和工作流的独立 `always()` 步骤均恢复已验证的正常配置。Secret 变化可能使 Cloudflare 拒绝部署较旧的 R；恢复时从签名固定的 R 读取唯一模块，核对摘要和全部绑定，再用原保护凭据向前上传新的正常版本并核验一致后激活，不使用 `force`。若 runner 被强制终止或恢复未独立确认，使用同一工作流 `action=restore`，填写原 `checkpoint_run_id`、准确 `checkpoint_run_attempt`，确认串为 `restore shortlink fallback for subs-bot-cf-dev-01`。该操作接受失败、取消及未完成运行的签名恢复归档；不要求原 CI 归档仍存在或历史提交仍是 main。任何恢复写入均要求当前仍是签名固定的 C，且模块、配置、资源和绑定完全一致；遇到其他部署停止写入。若中断后已是与签名原版本完全一致的正常版本，只做稳定性和健康读回，不覆盖或重新部署。恢复归档保留七天，执行者应在演练期间下载保留该无凭据 checkpoint。恢复后还须用新挑战的正常 `/short` 独立确认业务 RPC，并撤销本轮两个账号各自的合成本地码；不删除外层短链。
 
 ## 审查用候选清单
 
