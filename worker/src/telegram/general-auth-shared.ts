@@ -31,8 +31,9 @@ import {
 } from "./general-auth-runtime.ts";
 import { GENERAL_READ_LANE_ROLE, generalReadLaneRoleBindings } from "./general-read-lane.ts";
 import { answerTelegramInlineSearch } from "./inline-search.ts";
-import { acceptTelegramInlineConsent, GENERAL_INLINE_CONSENT_MARKER, GENERAL_INLINE_SCHEMA, readGeneralInlineConsent,
-  renderTelegramInlineConsent, telegramInlineSearchReady, type TelegramInlineConsentReply } from "./inline-search-consent.ts";
+import { acceptTelegramInlineConsent, GENERAL_INLINE_CONSENT_MARKER, GENERAL_INLINE_TEMP_CONSENT_MARKER, GENERAL_INLINE_SCHEMA,
+  generalTelegramInlineConsentMarker, readGeneralInlineConsent, renderTelegramInlineConsent, telegramGeneralInlineTempReady,
+  telegramInlineSearchReady, type TelegramInlineConsentReply } from "./inline-search-consent.ts";
 import { GENERAL_ACTOR_QUEUE_CAPACITY, GENERAL_LATEST_ACTOR_SQL, GENERAL_NO_LEGACY_WORK, GENERAL_POLICY_ACTORS_SQL, GENERAL_POLICY_PIN_SQL,
   GENERAL_RECEIPT_SCHEMA, GENERAL_REPLY_TTL, generalCurrentAuthoritySql, generalOrdinaryReplyEligibilitySql, generalPolicyBindings, generalRecordedOriginSql,
   approvedGroup, groupSchemaReady, prepareGeneralReceiptAuthority } from "./general-receipt.ts";
@@ -43,7 +44,7 @@ import { acceptGeneralTelegramLifecycle, GENERAL_LIFECYCLE_MARKER, GENERAL_LIFEC
   type TelegramLifecycleReply, type TelegramLifecycleTicket } from "./lifecycle-actions.ts";
 import { acceptGeneralTelegramSubscriptionRead, renderGeneralSubscriptionRead } from "./general-subscription-read.ts";
 import { acceptGeneralProviderRequest, generalProviderAuthority } from "./general-provider.ts";
-import { acceptTelegramPrivateClaim, beginTelegramPrivateClaim, GENERAL_PRIVATE_CLAIM_SCHEMA,
+import { acceptTelegramPrivateClaim, beginTelegramPrivateClaim, GENERAL_PRIVATE_CLAIM_SCHEMA, legacyInlineClaimUrl,
   prepareTelegramPrivateClaim, TELEGRAM_GENERAL_PRIVATE_CLAIM_MARKER } from "./private-claims.ts";
 import { acceptTelegramPrivateShareCreation, acceptTelegramSubscriptionShare, GENERAL_SHARE_CREATION_SCHEMA,
   parseTelegramPrivateShareArgs, parseTelegramSubscriptionShareArgs,
@@ -70,7 +71,7 @@ import { acceptTelegramShortLink, GENERAL_SHORT_SCHEMA, GENERAL_TELEGRAM_SHORT_M
   reapFailedTelegramShortLinks, retireUnsentTelegramShortLink } from "./short-link-actions.ts";
 import { GROUP_SHARE_PUBLISH_CALLBACK, readGeneralGroupShare, readGeneralPrivateDocumentUpdate, readGeneralPrivateLifecycleUpdate, readGeneralPrivateSubscriptionRead,
   readGeneralInlineQuery, readGeneralPrivateApiStatus, readGeneralPrivateGitHubSearch, readGeneralPrivateProviderBatch, readGeneralPrivateProviderRefresh, readGeneralPrivateSelectedRevoke, readGeneralPrivateShareClaim, readGeneralPrivateShareCreation,
-  readGeneralPrivateTempUpdate, readGeneralPrivateBulkTrash, readGeneralPrivateInlineSort, readGeneralPrivateMenuCommand, readPrivateTelegramCommand, readTelegramUpdate } from "./protocol.ts";
+  readGeneralPrivateTempUpdate, readGeneralLegacyShareCallback, readGeneralPrivateBulkTrash, readGeneralPrivateInlineSort, readGeneralPrivateMenuCommand, readPrivateTelegramCommand, readTelegramUpdate } from "./protocol.ts";
 import { confirmTelegramSubscriptionReadSend, GENERAL_SUBSCRIPTION_READ_MARKER, insertTelegramSubscriptionReadTickets,
   prepareTelegramSubscriptionReadTickets, reapTelegramSubscriptionReadTickets,
   type TelegramSubscriptionReadTicket } from "./subscription-read.ts";
@@ -197,7 +198,7 @@ function family(alias: "inbox" | "earlier", group: boolean, pin: GeneralTelegram
     THEN (${generalProviderDocumentReplyScope(alias)})` : ""}
     ${pin.providerBatch ? `WHEN ${alias}.receipt_nonce IN (${GENERAL_TELEGRAM_PROVIDER_BATCH_REPLY_MARKERS})
       THEN (${telegramProviderBatchReplyMarker(alias, true)})` : ""}
-    ${pin.privateInline ? `WHEN ${alias}.receipt_nonce='${GENERAL_INLINE_CONSENT_MARKER}'
+    ${pin.privateInline ? `WHEN ${generalTelegramInlineConsentMarker(alias)}
     THEN (${privateScope} AND ${alias}.command='help' AND (${GENERAL_INLINE_SCHEMA})
       AND EXISTS (SELECT 1 FROM telegram_inline_search_consent AS consent
         WHERE consent.receipt_id=${alias}.receipt_id AND consent.bot_id=${alias}.bot_id AND consent.actor_id=${alias}.actor_id))` : ""}
@@ -234,7 +235,7 @@ function queueMarkers(group: boolean, pin: GeneralTelegramPin): string {
   if (pin.privateAggregate) markers.push(GENERAL_TELEGRAM_AGGREGATE_MARKER);
   if (pin.privateSelected) markers.push(GENERAL_TELEGRAM_SELECTED_MARKER);
   if (pin.privateShort) markers.push(GENERAL_TELEGRAM_SHORT_MARKER);
-  if (pin.privateInline) markers.push(GENERAL_INLINE_CONSENT_MARKER);
+  if (pin.privateInline) markers.push(GENERAL_INLINE_CONSENT_MARKER, GENERAL_INLINE_TEMP_CONSENT_MARKER);
   if (pin.privateGitHub) markers.push(GENERAL_GITHUB_SEARCH_MARKER);
   if (pin.privateApiStatus) markers.push(GENERAL_API_STATUS_MARKER);
   if (!pin.rehearsal) markers.push(GENERAL_AUTH_ACTION_MARKER);
@@ -285,7 +286,7 @@ function readGeneralTempReply(db: D1Database, receiptId: number) {
 }
 
 export async function acceptGeneralSharedTelegramCommand(
-  db: D1Database, pin: GeneralTelegramPin, request: Request, acknowledge?: (callbackId: string, answer?: string) => void,
+  db: D1Database, pin: GeneralTelegramPin, request: Request, acknowledge?: (callbackId: string, answer?: string | { url: string }) => void,
   providerAvailable?: () => Promise<boolean>, refreshAvailable?: () => Promise<boolean>,
   share?: { bucket: R2Bucket; runtime: TelegramPrivateShareRuntime; publicOrigin: PublicOrigin }, aggregateKey?: CryptoKey | null,
   inlineEnabled = false, providerDocumentsEnabled = false, batchAdmission = false, utilities?: GeneralUtilityRuntime, mixedDocumentsEnabled = false,
@@ -293,6 +294,12 @@ export async function acceptGeneralSharedTelegramCommand(
   const decoded = await readTelegramUpdate(request, pin.webhookSecret);
   if (decoded.status !== 200) return decoded.status;
   if (!pin.sharedOutbox || pin.rehearsal) return 204;
+  const legacy = readGeneralLegacyShareCallback(decoded.update, pin.botId);
+  if (legacy) {
+    const url = await legacyInlineClaimUrl(db, pin, legacy);
+    acknowledge?.(legacy.callbackId, url ? { url } : "此旧卡片暂不可用。请打开机器人私聊。");
+    return 204;
+  }
   const sorting = pin.privateManagement ? readGeneralPrivateInlineSort(decoded.update, decoded.updateId, pin.botId, pin.botUsername) : null;
   if (sorting) {
     if (!await telegramGeneralInlineSortReady(db)) return 204;
@@ -946,7 +953,9 @@ export async function drainGeneralSharedTelegramReply(
     const result = await beginTelegramPrivateClaim(db, pin, claim, prepared,
       prepareTelegramOutboxBegin(db, lease, selectLease(pin, lease, true, guard)));
     if (!result) return false;
-    const outcome = await sendPrivateShareClaimResult(pin.botToken, lease.actorId, lease.messageId, result, 5_000);
+    const outcome = await confirmGuardedGeneralSend(db, lease, selectLease(pin, lease, true, guard))
+      ? await sendPrivateShareClaimResult(pin.botToken, lease.actorId, lease.messageId, result, 5_000)
+      : { kind: "failed" as const };
     await settleTelegramOutboxReply(db, lease, selectLease(pin, lease, false), outcome);
     return true;
   }
@@ -1039,14 +1048,16 @@ export async function drainGeneralSharedTelegramReply(
     const temp = await readGeneralTempReply(db, lease.receiptId);
     if (!temp) throw new Error("General Telegram temporary node reply could not be confirmed.");
     presentation = { text: renderTelegramTemp(temp), buttons: [], forceReply: false };
-  } else if (lease.marker === GENERAL_INLINE_CONSENT_MARKER) {
+  } else if (lease.marker === GENERAL_INLINE_CONSENT_MARKER || lease.marker === GENERAL_INLINE_TEMP_CONSENT_MARKER) {
     const consent = await db.prepare(`SELECT kind FROM telegram_inline_search_consent
       WHERE receipt_id=? AND bot_id=? AND actor_id=?`).bind(lease.receiptId, pin.botId, lease.actorId)
       .first<TelegramInlineConsentReply>("kind");
     if (!consent) return false;
+    const temp = await telegramGeneralInlineTempReady(db, pin).catch(() => false);
     const text = consent === "usage"
-      ? "用法：/inline on 在自己的私聊搜索订阅，15 分钟内有效。/inline off 关闭。"
-      : renderTelegramInlineConsent(consent);
+      ? ["/inline on 在自己的私聊搜索订阅（15 分钟）", ...(temp ? ["/inline temp on 同时搜索临时节点名称（15 分钟）"] : []),
+        "/inline off 关闭内联搜索"].join("\n")
+      : renderTelegramInlineConsent(consent === "on" && lease.marker === GENERAL_INLINE_TEMP_CONSENT_MARKER ? "temp-on" : consent);
     presentation = { text, buttons: [], forceReply: false };
   } else if (lease.marker === TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER) {
     const document = await db.prepare(`SELECT job.result_code AS kind,saved.node_count AS nodeCount
@@ -1083,6 +1094,7 @@ export async function drainGeneralSharedTelegramReply(
         inlineOff: pin.privateInline, batchStatus: pin.providerBatch, authorization: pin.privateAuthorization, displayTimezone: pin.displayTimezone,
         documentImport: pin.privateDocument, github: Boolean(pin.privateGitHub && await telegramGitHubSearchReady(db).catch(() => false)),
         apiStatus: Boolean(pin.privateApiStatus && pin.commandFeatures?.apiStatus), ...pin.commandFeatures,
+        inlineTemp: Boolean(pin.commandFeatures?.inline && await telegramGeneralInlineTempReady(db, pin).catch(() => false)),
         inlineSort: pin.privateManagement && await telegramGeneralInlineSortReady(db),
         bulkTrash: pin.privateManagement && await telegramGeneralBulkTrashReady(db),
       };
