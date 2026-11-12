@@ -54,7 +54,7 @@ const MAX_BUTTONS = 16;
 const encoder = new TextEncoder();
 
 function actionOrigin(general: boolean): string {
-  const viewOrigin = general ? `= '${GENERAL_LIFECYCLE_VIEW_MARKER}'` : `IN (${TELEGRAM_VIEW_RECEIPTS})`;
+  const viewOrigin = general ? `IN ('${GENERAL_LIFECYCLE_VIEW_MARKER}','general-view:v1')` : `IN (${TELEGRAM_VIEW_RECEIPTS})`;
   return `(
   (inbox.receipt_nonce ${viewOrigin} AND EXISTS (
     SELECT 1 FROM telegram_view AS view WHERE view.receipt_id = inbox.receipt_id
@@ -386,7 +386,7 @@ export function insertTelegramLifecycleTickets(
   previousChanges = 1,
   general = false,
 ): D1PreparedStatement {
-  if (!validInteger(tickets.length, 1, MAX_BUTTONS) || !validInteger(previousChanges, 1, 2)) {
+  if (!validInteger(tickets.length, 1, MAX_BUTTONS) || !validInteger(previousChanges, 1, MAX_BUTTONS)) {
     throw new RangeError("Invalid Telegram lifecycle ticket count.");
   }
   return db.prepare(`
@@ -408,7 +408,7 @@ export function insertTelegramLifecycleTickets(
 export async function reapTelegramLifecycle(db: D1Database, generalBotId?: string): Promise<void> {
   const scope = generalBotId === undefined ? "" : `AND EXISTS (SELECT 1 FROM telegram_inbox AS origin
     WHERE origin.receipt_id=expired.origin_receipt_id AND origin.bot_id=?
-      AND origin.receipt_nonce IN ('${GENERAL_LIFECYCLE_VIEW_MARKER}','${GENERAL_LIFECYCLE_MARKER}'))`;
+      AND origin.receipt_nonce IN ('${GENERAL_LIFECYCLE_VIEW_MARKER}','${GENERAL_LIFECYCLE_MARKER}','general-view:v1'))`;
   const bindings = generalBotId === undefined ? [] : [generalBotId];
   try {
     const results = await db.batch([

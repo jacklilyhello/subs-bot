@@ -158,7 +158,7 @@ export async function renderTelegramView(
   absoluteOrdinals = includeReadButtons,
   timeZone = "UTC",
 ): Promise<{ text: string; buttons: TelegramViewButton[]; lifecycleButtons: TelegramLifecycleButton[];
-  readButtons?: TelegramSubscriptionReadButton[] }> {
+  readButtons?: TelegramSubscriptionReadButton[]; readTargets?: { subscriptionId: number; lifecycleRevision: number }[] }> {
   if ((view.afterId !== null && !validInteger(view.afterId, 1))
     || (view.afterEpoch !== null && !validInteger(view.afterEpoch, 1))
     || (view.afterEpoch !== null) !== (view.kind !== "list" && view.afterId !== null)) {
@@ -221,7 +221,7 @@ export async function renderTelegramView(
     ? items.map<TelegramSubscriptionReadButton>(({ id }, index) => ({ text: `${ordinal(index)} 详情`, kind: "detail", subscriptionId: id }))
     : undefined;
   return { text: [title, ...(lines.length ? lines : ["当前没有记录。"])].join("\n"), buttons, lifecycleButtons,
-    ...(readButtons ? { readButtons } : {}) };
+    ...(readButtons ? { readButtons, readTargets: items.map(({ id, lifecycleRevision }) => ({ subscriptionId: id, lifecycleRevision })) } : {}) };
 }
 
 export async function prepareTelegramViewTickets(buttons: readonly TelegramViewButton[]): Promise<{
@@ -245,6 +245,7 @@ export function insertTelegramViewTickets(
   attempt: number,
   leaseId: string,
   tickets: readonly TelegramViewTicket[],
+  general = false, previousChanges = 1,
 ): D1PreparedStatement {
   if (tickets.length < 1 || tickets.length > 2) throw new RangeError("Invalid Telegram view ticket count.");
   return db.prepare(`
@@ -256,20 +257,22 @@ export function insertTelegramViewTickets(
     JOIN telegram_inbox AS inbox USING (receipt_id)
     JOIN telegram_view AS origin USING (receipt_id)
     CROSS JOIN tickets
-    WHERE changes() = 1 AND reply.receipt_id = ? AND reply.attempts = ? AND reply.lease_id = ?
-      AND reply.state = 'sending' AND inbox.receipt_nonce IN (${TELEGRAM_VIEW_RECEIPTS})
+    WHERE changes() = ? AND reply.receipt_id = ? AND reply.attempts = ? AND reply.lease_id = ?
+      AND reply.state = 'sending' AND inbox.receipt_nonce ${general ? "='general-view:v1'" : `IN (${TELEGRAM_VIEW_RECEIPTS})`}
   `).bind(...tickets.flatMap(({ sha256, afterId, afterEpoch }) => [sha256, afterId, afterEpoch]),
-    receiptId, attempt, leaseId);
+    previousChanges, receiptId, attempt, leaseId);
 }
 
-export async function reapTelegramViewTickets(db: D1Database): Promise<void> {
+export async function reapTelegramViewTickets(db: D1Database, generalBotId?: string): Promise<void> {
   try {
     const result = await db.prepare(`
       DELETE FROM telegram_view_ticket WHERE token_sha256 IN (
-        SELECT token_sha256 FROM telegram_view_ticket
-        WHERE expires_at <= unixepoch() ORDER BY expires_at, token_sha256 LIMIT ${TICKET_REAP_LIMIT}
+        SELECT token_sha256 FROM telegram_view_ticket AS ticket
+        WHERE expires_at <= unixepoch() ${generalBotId === undefined ? "" : `AND EXISTS (SELECT 1 FROM telegram_inbox AS origin
+          WHERE origin.receipt_id=ticket.origin_receipt_id AND origin.bot_id=? AND origin.receipt_nonce='general-view:v1')`}
+        ORDER BY expires_at, token_sha256 LIMIT ${TICKET_REAP_LIMIT}
       )
-    `).run();
+    `).bind(...(generalBotId === undefined ? [] : [generalBotId])).run();
     if (result.success) return;
   } catch {
     // Avoid exposing private parameters in a D1 error.
