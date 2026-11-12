@@ -259,6 +259,21 @@ test("emitted general /d and /i keep actor epochs, owned targets, atomic moves a
   await db.prepare("DROP TRIGGER revoke_general_during_begin").run();
   await grant(member, 7, "member", now - 3);
   date = now - 2;
+  // /list uses the common reply path, including lifecycle ticket installation in begin.
+  // Revoke at that transition so the rendered private names and buttons must never reach Telegram.
+  const fencedList = ++sequence, beforeList = sent.length;
+  await revokeDuringBegin(fencedList, 8, now - 1);
+  assert.equal((await command("/list", member, fencedList)).status, 200);
+  await settled(fencedList, "failed");
+  assert.equal(sent.length, beforeList, "the common reply must recheck authority after its sending transition");
+  assert.equal(await db.prepare(`SELECT recorded.actor_revision FROM telegram_inbox AS inbox
+    JOIN telegram_general_receipt AS recorded USING(receipt_id) WHERE inbox.bot_id=? AND inbox.update_id=?`)
+    .bind(bot.botId, fencedList).first("actor_revision"), 7);
+  assert.equal(await db.prepare("SELECT max(revision) FROM telegram_general_actors WHERE bot_id=? AND actor_id=?")
+    .bind(bot.botId, member).first("max(revision)"), 8);
+  await db.prepare("DROP TRIGGER revoke_general_during_begin").run();
+  await grant(member, 9, "member", now);
+  date = now + 1;
   await db.prepare("UPDATE telegram_general_policy SET active=0 WHERE bot_id=?").bind(bot.botId).run();
   assert.equal((await command("/i 名称")).status, 204);
   assert.equal((await command("/d revoke-only")).status, 204);

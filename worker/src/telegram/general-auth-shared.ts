@@ -1086,7 +1086,8 @@ export async function drainGeneralSharedTelegramReply(
   }
   const prepared = presentation.buttons.length ? await prepareTelegramLifecycleTickets(presentation.buttons) : undefined;
   if (!await beginGeneralSharedTelegramReply(db, pin, lease, prepared?.tickets)) return false;
-  const outcome = lease.chatType === "private"
+  const confirmed = await confirmGuardedGeneralSend(db, lease, selectLease(pin, lease, true));
+  const outcome = !confirmed ? { kind: "failed" as const } : lease.chatType === "private"
     ? await sendGeneralTelegramPrivateReply(pin.botToken, lease.actorId, lease.messageId, presentation.text,
       settingsKeyboard ?? prepared?.keyboard, presentation.forceReply, mainMenu)
     : await sendGeneralTelegramGroupListReply(pin.botToken, lease.chatId, lease.messageId, lease.threadId, presentation.text);
