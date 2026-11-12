@@ -635,7 +635,7 @@ test("closed general authorization replays a sealed candidate in a separate emit
   }
   assert.deepEqual(await findReply(7104), { marker: "general-read:v1", state: "sent", messageId: 9302,
     generation: pin.generation, actorRevision: 1, kind: null });
-  assert.deepEqual(sharedSent[1], { chat_id: "101", text: renderTelegramHelp({ privateChat: true, role: "admin", features: {} }),
+  assert.deepEqual(sharedSent[1], { chat_id: "101", text: renderTelegramHelp({ privateChat: true, role: "admin", features: { displayTimezone: true } }),
     reply_parameters: { message_id: 7104 }, link_preview_options: { is_disabled: true },
     reply_markup: { keyboard: [[{ text: "📦 订阅列表" }], [{ text: "❓ 帮助菜单" }]], resize_keyboard: true } });
 

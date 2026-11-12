@@ -10,6 +10,7 @@ import { GENERAL_SUBSCRIPTION_READ_MARKER, inTelegramScope, SUBSCRIPTION_READ_RE
   type TelegramPolicy, type TelegramSubscriptionReadUpdate } from "./protocol.ts";
 import { selectedQuery, unicode14Lower } from "./selected-search.ts";
 import { displayTelegramName, displayTelegramDate, TELEGRAM_VIEW_RECEIPTS } from "./views.ts";
+import { readBotDisplayTimeZone } from "./display-time.ts";
 import { TELEGRAM_SUBSCRIPTION_NODE_MARKER, type TelegramNodePageButton } from "./subscription-node-pages.ts";
 import type { SubscriptionShortTarget } from "./subscription-shorts.ts";
 
@@ -300,8 +301,8 @@ function remaining(used: number | null, total: number | null): string {
     ? gb(Math.max(0, total - used)) : "未知";
 }
 
-function expiry(value: number | null): string {
-  return value === null ? "未知" : displayTelegramDate(value);
+function expiry(value: number | null, timeZone: string): string {
+  return value === null ? "未知" : displayTelegramDate(value, timeZone);
 }
 
 export async function renderTelegramSearchResults(
@@ -309,6 +310,7 @@ export async function renderTelegramSearchResults(
 ): Promise<RenderedRead> {
   const root = receipt.searchReceiptId ?? lease.receiptId;
   const showPrivate = privateScope(lease);
+  const timeZone = showPrivate ? await readBotDisplayTimeZone(db, policy.botId) : "UTC";
   const metadata = showPrivate
     ? "sub.traffic_used AS trafficUsed,sub.traffic_total AS trafficTotal,sub.expire_at AS expireAt"
     : "NULL AS trafficUsed,NULL AS trafficTotal,NULL AS expireAt";
@@ -329,7 +331,7 @@ export async function renderTelegramSearchResults(
   if (!rows.success) throw new Error("Telegram subscription search results could not be read.");
   const items = rows.results.slice(0, PAGE_SIZE);
   const lines = items.map((row) => `#${row.rank} ${displayTelegramName(row.name)}` +
-    (showPrivate ? ` · 剩余 ${remaining(row.trafficUsed, row.trafficTotal)} · 到期 ${expiry(row.expireAt)}` : ""));
+    (showPrivate ? ` · 剩余 ${remaining(row.trafficUsed, row.trafficTotal)} · 到期 ${expiry(row.expireAt, timeZone)}` : ""));
   const readButtons: TelegramSubscriptionReadButton[] = showPrivate
     ? items.map((row) => ({ text: `#${row.rank} 详情`, kind: "detail", subscriptionId: row.id })) : [];
   if (general) {
@@ -349,12 +351,12 @@ export async function renderTelegramSearchResults(
   return { text: lines.length ? ["搜索结果", ...lines].join("\n") : "没有匹配订阅。", readButtons, readGuard: guard };
 }
 
-function subscriptionMetadataLines(row: Metadata): string[] {
+function subscriptionMetadataLines(row: Metadata, timeZone: string): string[] {
   const lines = [
     `配置名称：${displayTelegramName(row.name)}`,
     `流量详情：${gb(row.trafficUsed)} / ${gb(row.trafficTotal)}`,
     `剩余可用：${remaining(row.trafficUsed, row.trafficTotal)}`,
-    `过期时间：${expiry(row.expireAt)}`,
+    `过期时间：${expiry(row.expireAt, timeZone)}`,
     `节点数量：${row.nodeCount}`,
   ];
   if (row.refreshFailed === 1) lines.push("上次刷新未成功。");
@@ -373,7 +375,7 @@ function subscriptionShareHint(subscriptionId: number): string {
 
 export async function renderGeneralSubscriptionMetadata(
   db: D1Database, ownerId: string, subscriptionId: number, expectedRevision: number, guard: Guard, offerFormats = false, offerRefresh = false,
-  offerShare = false,
+  offerShare = false, timeZone = "UTC",
 ): Promise<RenderedRead> {
   const row = await db.prepare(`SELECT id,name,expire_at AS expireAt,traffic_used AS trafficUsed,traffic_total AS trafficTotal,
     (last_error IS NOT NULL) AS refreshFailed,generation,${SUBSCRIPTION_LIFECYCLE_REVISION} AS lifecycleRevision,
@@ -385,7 +387,7 @@ export async function renderGeneralSubscriptionMetadata(
   const readButtons = offerFormats && row.generation > 0 && row.nodeCount > 0
     && row.snapshotId !== null && row.manifestSha256 !== null ? subscriptionFormatButtons(row.id) : undefined;
   const refreshTarget = await providerRefreshTarget(row, row.sourceUrl);
-  const lines = subscriptionMetadataLines(row);
+  const lines = subscriptionMetadataLines(row, timeZone);
   if (offerShare) lines.push(subscriptionShareHint(row.id));
   return { text: lines.join("\n"), readButtons, refreshTarget,
     readGuard: subscriptionGuard(guard, row, undefined, refreshTarget ? row.sourceUrl : null) };
@@ -405,9 +407,9 @@ export async function renderGeneralSubscriptionFormat(
 
 async function renderDetail(
   bucket: R2Bucket, row: Metadata, guard: Guard, deadline: number, nodePagesEnabled: boolean, rawFileEnabled: boolean,
-  subscriptionShareEnabled: boolean,
+  subscriptionShareEnabled: boolean, timeZone: string,
 ): Promise<RenderedRead> {
-  const lines = subscriptionMetadataLines(row);
+  const lines = subscriptionMetadataLines(row, timeZone);
   const readButtons: TelegramSubscriptionReadButton[] = [];
   const nodeButtons: TelegramNodePageButton[] = [];
   let rawFileTarget: TelegramRawFileTarget | undefined;
@@ -492,7 +494,7 @@ export async function renderTelegramSubscriptionRead(
       FROM subscriptions WHERE id=? AND owner_id=?`).bind(receipt.subscriptionId, lease.actorId).first<Metadata>();
     if (!row) return { text: "订阅不存在或已被删除。", readGuard: guard };
     if (receipt.kind === "detail") return await renderDetail(bucket, row, guard, deadline, nodePagesEnabled, rawFileEnabled,
-      subscriptionShareEnabled);
+      subscriptionShareEnabled, await readBotDisplayTimeZone(db, policy.botId));
     if (receipt.format) return await renderFormat(db, bucket, row, receipt.format, guard, deadline, publicOrigin);
   } catch {
     // Do not expose source URLs, node data, tokens or D1/R2 diagnostics.

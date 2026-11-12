@@ -75,6 +75,8 @@ async function seed(db: D1Database, bucket: R2Bucket) {
     content: privateContent, maxClaims: 1, targetUserId: null, durationMinutes: 15 });
   assert.equal((await claimPrivateShare(db, bucket, { botId, actorId: ownerA, code: privateShare.code })).kind, "claimed");
   await bucket.put("unreferenced-synthetic-object", "not part of the sealed backup");
+  await db.prepare(`INSERT INTO telegram_bot_display_settings(bot_id,timezone,update_id,message_date,updated_by,updated_at)
+    VALUES (?,'Asia/Singapore',101,1893450000,?,1893450000)`).bind(botId, ownerA).run();
   return { active, trashed, privateShare };
 }
 
@@ -157,6 +159,8 @@ test("the emitted Worker reads an independently restored synthetic D1 and R2 bac
     await restoreSyntheticBackup(backup, migrations, targetDb, targetBucket);
     assert.deepEqual((await targetDb.prepare("PRAGMA foreign_key_check").all()).results, []);
     assert.equal((await captureSyntheticBackup(targetDb, targetBucket, migrations)).sha256, backup.sha256);
+    assert.deepEqual(await targetDb.prepare("SELECT * FROM telegram_bot_display_settings WHERE bot_id=?").bind(botId).first(),
+      await sourceDb.prepare("SELECT * FROM telegram_bot_display_settings WHERE bot_id=?").bind(botId).first());
     assert.equal(await targetBucket.get("unreferenced-synthetic-object"), null);
     assert.deepEqual(await exported(target, active.token), original);
     const head = await request(target, active.token, "HEAD");

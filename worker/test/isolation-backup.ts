@@ -15,6 +15,7 @@ const TABLES = {
   private_shares: ["id", "bot_id", "code_sha256", "sender_id", "sender_name", "payload_id", "payload_sha256", "payload_bytes",
     "max_claims", "target_user_id", "expire_at", "created_at"],
   private_share_claims: ["share_id", "actor_id", "claimed_at"],
+  telegram_bot_display_settings: ["bot_id", "timezone", "update_id", "message_date", "updated_by", "updated_at"],
 } as const;
 type Table = keyof typeof TABLES;
 type Cell = string | number | null;
