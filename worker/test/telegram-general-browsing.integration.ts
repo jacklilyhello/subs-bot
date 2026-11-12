@@ -101,6 +101,14 @@ test("actual bundle general browsing keeps persisted origins, current authority 
   });
   const worker = await runtime.getWorker();
   const tick = async () => assert.equal((await worker.scheduled({ cron: "* * * * *" })).outcome, "ok");
+  const receiptState = async (updateId: number) => {
+    const row = await db.prepare(`SELECT state,attempts FROM telegram_inbox JOIN telegram_outbox USING(receipt_id)
+      WHERE bot_id=? AND update_id=?`).bind(pin.botId, updateId).first<{ state: string; attempts: number }>();
+    if (!row) return { state: "missing", attempts: 0 };
+    assert.ok(["pending", "leased", "sending", "sent", "failed", "uncertain"].includes(row.state));
+    assert.ok(Number.isSafeInteger(row.attempts) && row.attempts >= 0 && row.attempts <= 4);
+    return row;
+  };
   const card = async (updateId: number) => {
     for (let i = 0; i < 80; i++) {
       const id = await db.prepare(`SELECT sent_message_id FROM telegram_inbox JOIN telegram_outbox USING(receipt_id)
@@ -109,17 +117,23 @@ test("actual bundle general browsing keeps persisted origins, current authority 
       if (found) return found;
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
-    assert.fail(`Synthetic browsing reply was not sent for update ${updateId}.`);
+    assert.fail(`Synthetic browsing reply missing: ${JSON.stringify({ ...(await receiptState(updateId)),
+      telegramAttempts: attempts, confirmedMessages: sent.length })}.`);
   };
   const button = (value: { body: Wire }, text: string) => {
     const token = value.body.reply_markup?.inline_keyboard?.flat().find((item) => item.text === text)?.callback_data;
     assert.ok(token, `Missing synthetic button ${text}`); return token;
   };
   assert.equal((await message(1, "/list@BrowsingFixtureBot")).status, 200);
+  let observedRetry = false;
   for (let i = 0; i < 80; i++) {
-    if (await db.prepare("SELECT 1 FROM telegram_inbox JOIN telegram_outbox USING(receipt_id) WHERE update_id=1 AND state='pending' AND attempts=1").first()) break;
+    const state = await receiptState(1);
+    if (state.state === "pending" && state.attempts === 1) { observedRetry = true; break; }
+    if (state.state === "failed" || state.state === "uncertain") break;
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
+  assert.equal(observedRetry, true, `Synthetic first 429 must queue one bounded retry: ${JSON.stringify({
+    ...(await receiptState(1)), telegramAttempts: attempts, confirmedMessages: sent.length })}.`);
   await db.prepare("UPDATE telegram_outbox SET due_at=unixepoch() WHERE state='pending'").run();
   await tick();
   const first = await card(1), next = button(first, "下一页");
