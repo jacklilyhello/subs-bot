@@ -2122,9 +2122,15 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.equal((await authState())?.revision, 4);
   assert.equal((await authState())?.role, "denied");
   assert.equal((await authPost(8211, 101, "/auth remove 106")).status, 200);
-  assert.equal((await awaitLifecycle(8211)).message.text, "只能管理已登记的普通用户。");
+  assert.equal((await awaitLifecycle(8211)).message.text, "无法修改此主体的授权。");
   assert.equal((await authPost(8212, 101, "/auth add 109")).status, 200);
-  assert.equal((await awaitLifecycle(8212)).message.text, "只能管理已登记的普通用户。");
+  assert.equal((await awaitLifecycle(8212)).message.text, "用户 109：已授权。");
+  const newActor = await db.prepare(`SELECT revision,role,effective_at AS effectiveAt FROM telegram_general_actors
+    WHERE bot_id=? AND generation=? AND actor_id='109'`).bind(authPin.botId, authPin.generation)
+    .first<{ revision: number; role: string; effectiveAt: number }>();
+  assert.equal(newActor?.revision, 1);
+  assert.equal(newActor?.role, "member");
+  assert.ok(newActor && newActor.effectiveAt >= actionDate + 60);
   assert.equal(await directAuth(8213, 106, "/auth add 108"), 200);
   await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,'106',2,?,'denied')")
     .bind(authPin.botId, authPin.generation, actionDate).run();
@@ -2157,7 +2163,8 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.equal(rosterLines[0], "授权名单（默认拒绝）");
   assert.equal(rosterLines[1], "101：管理员");
   assert.ok(rosterLines.includes("108：已撤权"));
-  assert.match(rosterLines[7], /^110：(等待授权生效|已授权)$/u);
+  assert.match(rosterLines[7], /^109：(等待授权生效|已授权)$/u);
+  assert.match(rosterLines[8], /^110：(等待授权生效|已授权)$/u);
   assert.equal(rosterLines.at(-1), "仅显示前 20 位，名单中还有其他用户。");
   assert.doesNotMatch(roster.text, /124：|fixture\.invalid|https?:/u);
   assert.equal((await authPost(8221, 101, "/auth list")).status, 204);
