@@ -129,10 +129,10 @@ test("full-v1 is explicit, role scoped and atomically fenced across close and re
   assert.equal(await db.prepare("SELECT count(*) AS n FROM telegram_inbox WHERE update_id=6").first("n"), 0);
   assert.equal((await readGeneralIsolationWindow(db, policy, revision)).pin?.privateManagement, true,
     "the closed window keeps the same full runtime available to Cron for accepted work");
-  const closed = await readGeneralIsolationWindow(db, policy, revision);
-  assert.equal(closed.pin?.privatePageJump, false, "closed admission cannot send a new interactive prompt");
-  assert.ok(closed.pin);
-  await recoverGeneralSharedTelegramReplies(db, closed.pin, bucket, ISOLATION_PUBLIC_ORIGIN);
+  const drainingClosed = await readGeneralIsolationWindow(db, policy, revision);
+  assert.equal(drainingClosed.pin?.privatePageJump, false, "closed admission cannot send a new interactive prompt");
+  assert.ok(drainingClosed.pin);
+  await recoverGeneralSharedTelegramReplies(db, drainingClosed.pin, bucket, ISOLATION_PUBLIC_ORIGIN);
   assert.equal(await db.prepare(`SELECT state FROM telegram_outbox JOIN telegram_inbox USING(receipt_id)
     WHERE bot_id=? AND update_id=9`).bind(policy.botId).first("state"), "failed");
   assert.equal(sent.length, 2, "an unsent prompt is canceled rather than sent after close or held waiting for a reply");
