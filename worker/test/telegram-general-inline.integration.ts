@@ -132,7 +132,7 @@ test("emitted general inline temp consent and historic share cards preserve priv
   async function archive(code: string, options: { target?: string; botId?: string; maxClaims?: number } = {}) {
     const ownerBot = options.botId ?? bot.botId;
     const share = await createPrivateShare(db, bucket, { botId: ownerBot, senderId: admin, senderName: "Synthetic sender",
-      content: "archived-private-content", targetUserId: options.target, maxClaims: options.maxClaims ?? 1, durationMinutes: 5 });
+      content: "archived-private-content", targetUserId: options.target ?? null, maxClaims: options.maxClaims ?? 1, durationMinutes: 5 });
     await db.prepare("UPDATE private_shares SET code_sha256=? WHERE bot_id=? AND code_sha256=?")
       .bind(await privateShareCodeDigest(code), ownerBot, await privateShareCodeDigest(share.code)).run();
     return code;
