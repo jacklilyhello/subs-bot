@@ -3,8 +3,9 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import { after, test } from "node:test";
 import { Miniflare } from "miniflare";
+import { ISOLATION_PUBLIC_ORIGIN } from "../src/public-origin.ts";
 import { fenceTelegramWebhookDatabase, readGeneralIsolationWindow } from "../src/telegram/general-isolation-window.ts";
-import { acceptGeneralSharedTelegramCommand } from "../src/telegram/general-auth-shared.ts";
+import { acceptGeneralSharedTelegramCommand, drainGeneralSharedTelegramReply } from "../src/telegram/general-auth-shared.ts";
 import type { TelegramPolicy } from "../src/telegram/protocol.ts";
 
 const oldComparison = Object.getOwnPropertyDescriptor(crypto.subtle, "timingSafeEqual");
@@ -17,9 +18,10 @@ after(() => {
 
 test("full-v1 is explicit, role scoped and atomically fenced across close and restore", async (t) => {
   const runtime = new Miniflare({ modules: true, script: "export default {fetch(){return new Response(null)}}",
-    compatibilityDate: "2026-07-30", d1Databases: ["DB"] });
+    compatibilityDate: "2026-07-30", d1Databases: ["DB"], r2Buckets: ["NODES"] });
   t.after(() => runtime.dispose());
   const db = await runtime.getD1Database("DB");
+  const bucket = await runtime.getR2Bucket("NODES");
   const directory = new URL("../migrations/", import.meta.url);
   await db.prepare("CREATE TABLE subs_bot_schema_migrations(position INTEGER PRIMARY KEY,name TEXT,sha256 TEXT,mode TEXT)").run();
   for (const name of (await readdir(directory)).filter((name) => name.endsWith(".sql")).sort()) {
@@ -82,6 +84,32 @@ test("full-v1 is explicit, role scoped and atomically fenced across close and re
   assert.equal(await acceptGeneralSharedTelegramCommand(database, opened.pin, post("8199", "/help", 3)), 204);
   assert.equal(await acceptGeneralSharedTelegramCommand(database, opened.pin, post(policy.adminId, "/auth add 8199", 4)), 204);
   assert.equal(await acceptGeneralSharedTelegramCommand(database, opened.pin, post(policy.memberId, "/help", 5)), 200);
+  await db.prepare(`UPDATE telegram_outbox SET state='failed' WHERE state='pending' AND receipt_id IN (
+    SELECT receipt_id FROM telegram_inbox WHERE bot_id=? AND update_id IN (1,5))`).bind(policy.botId).run();
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const sent: Record<string, unknown>[] = [];
+  globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    assert.equal(request.url, `https://api.telegram.org/bot${policy.botToken}/sendMessage`);
+    assert.equal(request.method, "POST");
+    const body = await request.json() as Record<string, unknown>;
+    assert.equal(body.chat_id, policy.adminId);
+    assert.deepEqual(body.reply_parameters, { message_id: 7 });
+    sent.push(body);
+    return Response.json({ ok: true, result: { message_id: 5001, chat: { id: Number(policy.adminId), type: "private" } } });
+  };
+  const helpPin = { ...opened.pin, commandFeatures: { authorizationScope: "general" as const, authorizationMemberId: "8199" } };
+  assert.equal(await acceptGeneralSharedTelegramCommand(database, helpPin, post(policy.adminId, "/help", 7)), 200);
+  assert.equal(await drainGeneralSharedTelegramReply(database, helpPin, bucket, ISOLATION_PUBLIC_ORIGIN), true);
+  assert.equal(sent.length, 1);
+  assert.equal(typeof sent[0].text, "string");
+  const help = sent[0].text as string;
+  assert.ok(help.includes(`/auth add ${policy.memberId} 授权固定测试用户`));
+  assert.ok(help.includes(`/auth remove ${policy.memberId} 撤权固定测试用户`));
+  assert.doesNotMatch(help, /新增或恢复授权|\/auth (?:add|remove) (?:用户ID|8199)/u);
+  assert.equal(await db.prepare(`SELECT state FROM telegram_outbox JOIN telegram_inbox USING(receipt_id)
+    WHERE bot_id=? AND update_id=7`).bind(policy.botId).first("state"), "sent");
   await db.prepare("UPDATE telegram_general_read_lane SET epoch=3,mode='closed' WHERE bot_id=?").bind(policy.botId).run();
   await assert.rejects(acceptGeneralSharedTelegramCommand(database, opened.pin, post(policy.memberId, "/help", 6)));
   assert.equal(await db.prepare("SELECT count(*) AS n FROM telegram_inbox WHERE update_id=6").first("n"), 0);

@@ -3,7 +3,7 @@ export type TelegramCommandFeatures = {
   management?: boolean; subscriptionRead?: boolean; temp?: boolean; tempRawDefault?: boolean; path?: boolean;
   aggregate?: boolean; selected?: boolean; batchRefresh?: boolean; batchStatus?: boolean; short?: boolean; share?: boolean;
   inline?: boolean; inlineOff?: boolean; inlineTemp?: boolean; inlineSort?: boolean; bulkTrash?: boolean; github?: boolean;
-  apiStatus?: boolean; browsing?: boolean; authorization?: boolean; authorizationScope?: "registered" | "fixed"; authorizationMemberId?: string; displayTimezone?: boolean; documentImport?: boolean; providerImport?: boolean;
+  apiStatus?: boolean; browsing?: boolean; authorization?: boolean; authorizationScope?: "general" | "fixed"; authorizationMemberId?: string; displayTimezone?: boolean; documentImport?: boolean; providerImport?: boolean;
 };
 export type TelegramCommandContext = {
   privateChat: boolean; role: "admin" | "member"; features: TelegramCommandFeatures;
@@ -65,10 +65,10 @@ export function telegramCommandEntries({ privateChat, role, features: f }: Teleg
   }
   if (role === "admin" && f.authorization) {
     const fixed = f.authorizationScope === "fixed" && /^[1-9][0-9]{0,15}$/u.test(f.authorizationMemberId ?? "");
-    const target = fixed ? f.authorizationMemberId! : "已登记用户ID";
+    const target = fixed ? f.authorizationMemberId! : "用户ID";
     add("/auth list", "查看授权");
-    add(`/auth add ${target}`, fixed ? "授权固定测试用户" : "授权已登记用户");
-    add(`/auth remove ${target}`, fixed ? "撤权固定测试用户" : "撤权已登记用户");
+    add(`/auth add ${target}`, fixed ? "授权固定测试用户" : "新增或恢复授权");
+    add(`/auth remove ${target}`, fixed ? "撤权固定测试用户" : "撤销用户授权");
   }
   if (role === "admin" && f.displayTimezone) {
     add("/settings", "查看机器人设置");

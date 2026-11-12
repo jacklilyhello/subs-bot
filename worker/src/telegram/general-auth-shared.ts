@@ -1208,6 +1208,8 @@ export async function drainGeneralSharedTelegramReply(
         inlineOff: pin.privateInline, batchStatus: pin.providerBatch, authorization: pin.privateAuthorization, displayTimezone: pin.displayTimezone,
         documentImport: pin.privateDocument, github: Boolean(pin.privateGitHub && await telegramGitHubSearchReady(db).catch(() => false)),
         apiStatus: Boolean(pin.privateApiStatus && pin.commandFeatures?.apiStatus), ...pin.commandFeatures,
+        ...(pin.isolationWindow ? { authorizationScope: "fixed" as const,
+          authorizationMemberId: pin.isolationWindow.memberId } : {}),
         inlineTemp: Boolean(pin.commandFeatures?.inline && await telegramGeneralInlineTempReady(db, pin).catch(() => false)),
         inlineSort: pin.privateManagement && await telegramGeneralInlineSortReady(db),
         bulkTrash: pin.privateManagement && await telegramGeneralBulkTrashReady(db),

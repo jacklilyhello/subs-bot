@@ -187,7 +187,7 @@ test("actual bundle general browsing keeps persisted origins, current authority 
   const expiry = await card(19);
   assert.ok(button(expiry, "1 重命名") && button(expiry, "1 删除"));
   assert.equal((await click(20, expiry, button(expiry, "1 删除"))).status, 200);
-  assert.match((await card(20)).body.text, /删除/u);
+  assert.equal((await card(20)).body.text, "确认将该订阅移入回收站？30 天内可通过 /recycle 恢复。");
   assert.equal((await message(21, "10")).status, 200);
   const fresh = await card(21);
   const fileToken = button(fresh, "📦 导出节点");
