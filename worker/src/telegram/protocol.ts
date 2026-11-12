@@ -323,6 +323,28 @@ export function readGeneralPrivateShareClaim(
     messageId, messageDate, code: match[1] };
 }
 
+/** Historic share cards carry only a lookup code. They never claim or deliver in the callback's chat. */
+export function readGeneralLegacyShareCallback(update: Record<string, unknown>, botId: string): TelegramLegacyInlineClaim | null {
+  if (Object.keys(update).length !== 2 || !isRecord(update.callback_query)) return null;
+  const callback = update.callback_query;
+  const { id: callbackId, from: actor, data, message } = callback;
+  if (!matches(callbackId, CALLBACK_ID) || !isRecord(actor) || actor.is_bot !== false || !isPositiveInteger(actor.id)
+    || String(actor.id) === botId || "game_short_name" in callback || typeof data !== "string") return null;
+  const code = /^share:c:([A-Za-z0-9_-]{11})(?![\s\S])/u.exec(data)?.[1];
+  if (!code) return null;
+  const actorId = String(actor.id);
+  if ("inline_message_id" in callback) {
+    return !("message" in callback) && matches(callback.inline_message_id, /^[!-~]{1,256}(?![\s\S])/u)
+      ? { actorId, callbackId, code } : null;
+  }
+  if (!ownBotMessage(message, { botId })) return null;
+  const scope = telegramMessageScope(message, actorId, Number(update.update_id));
+  if (!scope || scope.threadId !== null || message.is_topic_message === true
+    || (scope.chatType === "private" ? scope.chatId !== actorId
+      : Number(scope.chatId) >= 0 || Number(scope.chatId) <= -(2 ** 52))) return null;
+  return { actorId, callbackId, code };
+}
+
 export function readGeneralGroupCommand(update: Record<string, unknown>, botUsername: string):
   (Omit<TelegramEventScope, "updateId"> & { name: string; remainder: string }) | null {
   const { message } = update;

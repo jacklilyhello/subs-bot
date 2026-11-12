@@ -39,6 +39,7 @@ import "./public-origin.integration.ts";
 import "./telegram-inline-sort.integration.ts";
 import "./telegram-bulk-trash.integration.ts";
 import "./telegram-personal-inline.integration.ts";
+import "./telegram-general-inline.integration.ts";
 import "./telegram-github-search.integration.ts";
 import "./legacy-subscription-short-links.integration.ts";
 import "./legacy-selected-aggregate.integration.ts";

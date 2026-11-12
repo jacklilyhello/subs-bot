@@ -1,8 +1,9 @@
 import { validInteger } from "../storage.ts";
+import type { GeneralTelegramPin } from "./general-auth-runtime.ts";
 import type { InlineSearchArticle } from "./inline-search.ts";
 import type { TelegramInlineQuery, TelegramPolicy } from "./protocol.ts";
 import { unicode14Lower } from "./selected-search.ts";
-import { MAX_TEMP_OWNER_BYTES, MAX_TEMP_OWNER_NODES } from "./temp-import.ts";
+import { GENERAL_TEMP_SCHEMA, MAX_TEMP_OWNER_BYTES, MAX_TEMP_OWNER_NODES } from "./temp-import.ts";
 import {
   ownedTempRowsSql, readTempBatchNodes, readVerifiedTempStorage, tempInventoryGuard, verifyTempInventory,
   type TempBatchMeta,
@@ -27,14 +28,18 @@ const sendScope = `SELECT request.bot_id,request.actor_id,NULL AS before_receipt
 
 /** Read temporary nodes for an admitted personal inline search. The caller owns the final consent fence. */
 export async function readTelegramInlineTempNodes(
-  db: D1Database, policy: TelegramPolicy, event: TelegramInlineQuery, needle: string, limit: number, deadline: number, receivedAt: number,
+  db: D1Database, policy: TelegramPolicy | GeneralTelegramPin, event: TelegramInlineQuery, needle: string, limit: number, deadline: number, receivedAt: number,
 ): Promise<TempScan | null> {
-  if (event.chatType !== "sender" || (event.actorId !== policy.adminId && event.actorId !== policy.memberId)
+  const general = "privateTemp" in policy;
+  if (event.chatType !== "sender" || (general ? !policy.privateTemp || !policy.privateInline || policy.rehearsal || event.actorId === policy.botId
+    : event.actorId !== policy.adminId && event.actorId !== policy.memberId)
     || !validInteger(event.updateId, 1) || !validInteger(limit, 1, 50) || !validInteger(receivedAt, 1) || Date.now() >= deadline) return null;
 
   try {
     const storage = await readVerifiedTempStorage(db);
     const { mode, generalReceipts } = storage;
+    if (general && (mode !== "legacy-ready" || !generalReceipts
+      || await db.prepare(`SELECT 1 WHERE ${GENERAL_TEMP_SCHEMA}`).first() === null)) return null;
     const scopeArgs = [policy.botId, event.actorId, receivedAt] as const;
     const [inventory, clear] = await db.batch<TempBatchMeta | Fence>([
       db.prepare(`WITH temp_scope AS (${scope}), owned AS (${ownedTempRowsSql(mode, "temp_scope", { verifyLive: true, generalReceipts })})
@@ -98,7 +103,7 @@ export async function readTelegramInlineTempNodes(
     if (Date.now() >= deadline) return null;
     const inventoryGuard = tempInventoryGuard(storage, sendScope, rows);
     return { results, guard: {
-      sql: `(${inventoryGuard.sql}) AND COALESCE((SELECT json_array(message_date,message_id) FROM telegram_temp_clear_fence
+      sql: `${general ? `(${GENERAL_TEMP_SCHEMA}) AND ` : ""}(${inventoryGuard.sql}) AND COALESCE((SELECT json_array(message_date,message_id) FROM telegram_temp_clear_fence
         WHERE bot_id=request.bot_id AND actor_id=request.actor_id),'[0,0]')=?`,
       bindings: [...inventoryGuard.bindings, JSON.stringify(fence ? [fence.date, fence.message] : [0, 0])],
     } };
