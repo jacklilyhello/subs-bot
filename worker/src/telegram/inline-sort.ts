@@ -1,14 +1,22 @@
+import type { GeneralTelegramPin } from "./general-auth-runtime.ts";
+import { generalManagementAdmission, generalManagementScope } from "./general-management.ts";
+import { generalCurrentReceiptSql, generalPolicyBindings, prepareGeneralReceiptAuthority } from "./general-receipt.ts";
 import { validInteger } from "../storage.ts";
 import { inTelegramScope, type TelegramInlineSortMode, type TelegramInlineSortUpdate, type TelegramPolicy } from "./protocol.ts";
 
 export const TELEGRAM_INLINE_SORT_MARKER = "inline-sort:v1";
+export const GENERAL_INLINE_SORT_MARKER = "general-inline-sort:v1";
+export const GENERAL_INLINE_SORT_SCHEMA = `EXISTS (SELECT 1 FROM subs_bot_schema_migrations WHERE position=20
+  AND name='0020_telegram_inline_sort.sql' AND mode='applied'
+  AND sha256='b5cb5734a1251f4767df0758fceae4a73f2f64cdeea48cad4fd86d70ed946cd1')`;
+type SortPolicy = TelegramPolicy | GeneralTelegramPin;
 
 export type TelegramInlineSortReply = {
   kind: "current" | "saved" | "stale" | "usage";
   mode: TelegramInlineSortMode | null;
 };
 
-const USAGE = "用法：/i 默认、/i 流量、/i 到期、/i 名称。";
+const USAGE = "用法：\n/i 默认 设置默认排序\n/i 流量 按剩余流量排序\n/i 到期 按到期时间排序\n/i 名称 按名称排序";
 const MODE_LABELS: Record<TelegramInlineSortMode, string> = { default: "默认", traffic: "流量", expiry: "到期", name: "名称" };
 const FRESH_RECEIPT = "incoming.bot_id = ? AND incoming.update_id = ? AND incoming.receipt_nonce = ?";
 
@@ -23,16 +31,29 @@ export async function telegramInlineSortReady(db: D1Database): Promise<boolean> 
   throw new Error("Telegram inline sort schema could not be confirmed.");
 }
 
+export async function telegramGeneralInlineSortReady(db: D1Database): Promise<boolean> {
+  return await telegramInlineSortReady(db)
+    && await db.prepare(`SELECT 1 WHERE ${GENERAL_INLINE_SORT_SCHEMA}`).first() !== null;
+}
+
 export async function acceptTelegramInlineSort(
-  db: D1Database, policy: TelegramPolicy, event: TelegramInlineSortUpdate,
+  db: D1Database, policy: SortPolicy, event: TelegramInlineSortUpdate,
 ): Promise<"accepted" | "ignored"> {
-  if (event.chatType !== "private" || event.threadId !== null || !inTelegramScope(policy, event)
+  const general = "privateManagement" in policy ? policy : null;
+  const isolated = "adminId" in policy ? policy : null;
+  if (event.chatType !== "private" || event.threadId !== null
+    || (general ? !generalManagementScope(general, event) : !inTelegramScope(isolated!, event))
     || !validInteger(event.updateId, 1) || !validInteger(event.messageId, 1) || !validInteger(event.messageDate, 1)) return "ignored";
   try {
     const nonce = crypto.randomUUID();
     const key = [policy.botId, event.updateId, nonce] as const;
     const order = "(preference.message_date, preference.update_id) = (incoming.message_date, incoming.update_id)";
-    const statements = [db.prepare(`
+    const admission = general ? generalManagementAdmission(general, event, GENERAL_INLINE_SORT_SCHEMA) : null;
+    const statements = [general && admission ? db.prepare(`INSERT INTO telegram_inbox
+      (bot_id,update_id,actor_id,chat_id,chat_type,message_id,message_date,thread_id,command,receipt_nonce)
+      SELECT policy.bot_id,?,actor.actor_id,actor.actor_id,'private',?,?,NULL,'help',? ${admission.sql}
+      ON CONFLICT(bot_id,update_id) DO NOTHING`).bind(event.updateId, event.messageId, event.messageDate, nonce, ...admission.bindings)
+      : db.prepare(`
       INSERT INTO telegram_inbox
         (bot_id, update_id, actor_id, chat_id, chat_type, message_id, message_date, thread_id, command, receipt_nonce)
       SELECT ?, ?, ?, ?, 'private', ?, ?, NULL, 'help', ?
@@ -41,7 +62,8 @@ export async function acceptTelegramInlineSort(
           WHERE bot_id = ? AND user_id = ?), 1))
       ON CONFLICT (bot_id, update_id) DO NOTHING
     `).bind(policy.botId, event.updateId, event.actorId, event.chatId, event.messageId, event.messageDate, nonce,
-      event.messageDate, event.actorId, policy.adminId, event.messageDate, policy.botId, event.actorId)];
+      event.messageDate, event.actorId, isolated!.adminId, event.messageDate, policy.botId, event.actorId)];
+    if (general) statements.push(prepareGeneralReceiptAuthority(db, general, key));
 
     if (event.kind === "set") {
       statements.push(db.prepare(`
@@ -61,19 +83,22 @@ export async function acceptTelegramInlineSort(
         CASE WHEN ? = 'set' THEN CASE WHEN ${order} THEN 'saved' ELSE 'stale' END ELSE ? END,
         CASE WHEN ? = 'current' THEN COALESCE(preference.mode, 'default')
           WHEN ? = 'set' AND ${order} THEN preference.mode END,
-        COALESCE(auth.message_date, 0), COALESCE(auth.message_id, 0)
+        ${general ? "0,0" : "COALESCE(auth.message_date, 0), COALESCE(auth.message_id, 0)"}
       FROM telegram_inbox AS incoming
       LEFT JOIN telegram_inline_sort_preferences AS preference
         ON preference.bot_id = incoming.bot_id AND preference.actor_id = incoming.actor_id
-      LEFT JOIN telegram_auth AS auth
-        ON auth.bot_id = incoming.bot_id AND auth.user_id = incoming.actor_id AND incoming.actor_id <> ?
+      ${general ? "" : `LEFT JOIN telegram_auth AS auth
+        ON auth.bot_id = incoming.bot_id AND auth.user_id = incoming.actor_id AND incoming.actor_id <> ?`}
       WHERE ${FRESH_RECEIPT}
-    `).bind(event.kind, event.kind, event.kind, event.kind, policy.adminId, ...key), db.prepare(`
+    `).bind(event.kind, event.kind, event.kind, event.kind, ...(general ? [] : [isolated!.adminId]), ...key), db.prepare(`
       INSERT INTO telegram_outbox (receipt_id)
       SELECT incoming.receipt_id FROM telegram_inbox AS incoming WHERE ${FRESH_RECEIPT}
     `).bind(...key), db.prepare(`
-      UPDATE telegram_inbox AS incoming SET receipt_nonce = ? WHERE ${FRESH_RECEIPT} RETURNING receipt_id
-    `).bind(TELEGRAM_INLINE_SORT_MARKER, ...key));
+      UPDATE telegram_inbox AS incoming SET receipt_nonce = ?,command=CASE WHEN EXISTS (
+        SELECT 1 FROM telegram_inline_sort_reply JOIN telegram_outbox USING(receipt_id) WHERE receipt_id=incoming.receipt_id)
+        ${general ? `AND ${generalCurrentReceiptSql("incoming")}` : ""}
+        THEN command END WHERE ${FRESH_RECEIPT} RETURNING receipt_id
+    `).bind(general ? GENERAL_INLINE_SORT_MARKER : TELEGRAM_INLINE_SORT_MARKER, ...(general ? generalPolicyBindings(general) : []), ...key));
 
     const results = await db.batch(statements);
     const receipt = results.at(-1);

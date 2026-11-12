@@ -515,6 +515,39 @@ function readGeneralPrivateTicket(
     ? { ...scope, callbackId, ticket } : null;
 }
 
+export function readGeneralPrivateBulkTrash(
+  update: Record<string, unknown>, updateId: number, botId: string, botUsername: string,
+): TelegramBulkTrashUpdate | null {
+  if (Object.keys(update).length !== 2) return null;
+  if (isRecord(update.callback_query)) {
+    const ticket = readGeneralPrivateTicket(update.callback_query, updateId, botId, BULK_TRASH_TICKET);
+    return ticket && ticket.actorId !== botId ? { ...ticket, kind: "confirm" } : null;
+  }
+  const command = readPrivateTelegramCommand(update, botUsername);
+  if (!command || command.actorId === botId || command.name !== "d"
+    || (command.remainder !== "" && !PATH_RULE_WHITESPACE_PREFIX.test(command.remainder))) return null;
+  return { updateId, actorId: command.actorId, chatId: command.actorId, chatType: "private", threadId: null,
+    messageId: command.messageId, messageDate: command.messageDate, kind: "preview", query: command.remainder };
+}
+
+export function readGeneralPrivateInlineSort(
+  update: Record<string, unknown>, updateId: number, botId: string, botUsername: string,
+): TelegramInlineSortUpdate | null {
+  const command = readPrivateTelegramCommand(update, botUsername);
+  if (!command || command.actorId === botId || command.name !== "i"
+    || (command.remainder !== "" && !PATH_RULE_WHITESPACE_PREFIX.test(command.remainder))) return null;
+  const scope = { updateId, actorId: command.actorId, chatId: command.actorId, chatType: "private" as const, threadId: null,
+    messageId: command.messageId, messageDate: command.messageDate };
+  switch (command.remainder.length <= 4096 ? collapsePathRuleWhitespace(command.remainder) : null) {
+    case "": return { ...scope, kind: "current" };
+    case "默认": return { ...scope, kind: "set", mode: "default" };
+    case "流量": return { ...scope, kind: "set", mode: "traffic" };
+    case "到期": return { ...scope, kind: "set", mode: "expiry" };
+    case "名称": return { ...scope, kind: "set", mode: "name" };
+    default: return { ...scope, kind: "usage" };
+  }
+}
+
 export function readGeneralPrivateProviderBatch(
   update: Record<string, unknown>, updateId: number, botId: string, botUsername: string,
 ): TelegramProviderBatchUpdate | null {
