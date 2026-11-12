@@ -1,10 +1,11 @@
 import { sendGeneralTelegramPrivateReply } from "./delivery.ts";
 import { GENERAL_LATEST_ACTOR_SQL, GENERAL_POLICY_ACTORS_SQL, GENERAL_POLICY_PIN_SQL, GENERAL_REPLY_TTL,
   generalOrdinaryReplyEligibilitySql, generalPolicyBindings } from "./general-receipt.ts";
-import { readGeneralGroupListCommand, readPrivateTelegramCommand, readTelegramBotCredentials, readTelegramUpdate,
+import { readGeneralGroupCommand, readGeneralPrivateMenuCommand, readTelegramBotCredentials, readTelegramUpdate,
   type TelegramBotCredentials, type TelegramEventScope, type TelegramGroupShareDestination } from "./protocol.ts";
 import type { GeneralReadLaneScope } from "./general-read-lane.ts";
 import { renderTelegramView } from "./views.ts";
+import { renderTelegramHelp, type TelegramCommandFeatures } from "./command-catalog.ts";
 
 export interface GeneralTelegramPin extends TelegramBotCredentials {
   generation: number;
@@ -26,9 +27,14 @@ export interface GeneralTelegramPin extends TelegramBotCredentials {
   subscriptionShorts?: "issue" | "drain";
   privateAuthorization?: boolean;
   privateInline?: boolean;
+  privateGitHub?: boolean;
+  privateApiStatus?: boolean;
   providerBatch?: boolean;
+  displayTimezone?: boolean;
+  commandFeatures?: TelegramCommandFeatures;
   groupShare?: TelegramGroupShareDestination;
   rehearsal?: GeneralReadLaneScope;
+  isolationWindow?: { profile: "full-v1"; adminId: string; memberId: string };
 }
 
 interface Lease {
@@ -72,6 +78,10 @@ export function parseGeneralTelegramPin(input: unknown, releaseRevision: unknown
     const privateAuthorization = value.authManagement === true;
     const inlineConfigured = Object.hasOwn(value, "inlineSearch");
     const privateInline = value.inlineSearch === true;
+    const githubConfigured = Object.hasOwn(value, "githubSearch");
+    const privateGitHub = value.githubSearch === true;
+    const apiConfigured = Object.hasOwn(value, "apiStatus");
+    const privateApiStatus = value.apiStatus === true;
     const batchConfigured = Object.hasOwn(value, "providerBatch");
     const providerBatch = value.providerBatch === true;
     const groupConfigured = Object.hasOwn(value, "groupShare");
@@ -87,10 +97,12 @@ export function parseGeneralTelegramPin(input: unknown, releaseRevision: unknown
       groupShare = { chatId, chatType };
     }
     if (Object.keys(value).length !== 7 + Number(sharedOutbox) + Number(authorizationConfigured) + Number(inlineConfigured)
-        + Number(groupConfigured) + Number(typedConfigured) + Number(batchConfigured)
+        + Number(groupConfigured) + Number(typedConfigured) + Number(batchConfigured) + Number(githubConfigured) + Number(apiConfigured)
       || (sharedOutbox && value.outbox !== "shared" && !privateManagement)
       || (authorizationConfigured && (!privateManagement || !privateAuthorization))
       || (inlineConfigured && (!privateManagement || !privateInline))
+      || (githubConfigured && (!privateManagement || !privateGitHub))
+      || (apiConfigured && (!privateManagement || !privateApiStatus))
       || (batchConfigured && (!privateProvider || !providerBatch))
       || (typedConfigured && (!privateShort || (subscriptionShorts !== "issue" && subscriptionShorts !== "drain")))) return null;
     const credentials = readTelegramBotCredentials(value);
@@ -101,7 +113,7 @@ export function parseGeneralTelegramPin(input: unknown, releaseRevision: unknown
       || !/^[0-9a-f]{64}(?![\s\S])/u.test(activationSha256)) return null;
     return { ...credentials, generation, cutoverAt, activationSha256, releaseRevision, sharedOutbox, privateManagement,
       privateFormats, privateTemp, privateDocument, privateProvider, privateClaims, privateShareCreation, privateAggregate, privateSelected,
-      privateShort, privateAuthorization, privateInline, ...(providerBatch ? { providerBatch } : {}), ...(groupShare ? { groupShare } : {}),
+      privateShort, privateAuthorization, privateInline, ...(privateGitHub ? { privateGitHub } : {}), ...(privateApiStatus ? { privateApiStatus } : {}), ...(providerBatch ? { providerBatch } : {}), ...(groupShare ? { groupShare } : {}),
       ...(subscriptionShorts === "issue" || subscriptionShorts === "drain" ? { subscriptionShorts } : {}) };
   } catch {
     return null;
@@ -113,24 +125,29 @@ function leaseBindings(pin: GeneralTelegramPin, lease: Lease) {
     lease.messageId, lease.messageDate, lease.command, lease.leaseId];
 }
 
-export type GeneralReadCommand = "help" | "list";
+export type GeneralReadCommand = "start" | "help" | "list";
 
-export type GeneralReadEvent = TelegramEventScope & { command: GeneralReadCommand; viewKind: "list" | "recycle" | null };
+export type GeneralReadEvent = TelegramEventScope & { command: GeneralReadCommand; viewKind: "list" | "expiry" | "recycle" | null };
 
 export function generalReadEvent(
   pin: Pick<GeneralTelegramPin, "botUsername" | "botId" | "privateManagement">,
   update: Record<string, unknown>, updateId: number, shared = false,
 ): GeneralReadEvent | null {
-  const event = readPrivateTelegramCommand(update, pin.botUsername);
+  const event = readGeneralPrivateMenuCommand(update, pin.botUsername);
   if (event && event.actorId !== pin.botId && event.remainder.trim() === "") {
     const { actorId, messageId, messageDate, name } = event;
-    if (name === "help" || name === "list" || (name === "recycle" && shared && pin.privateManagement)) {
+    if (name === "help" || name === "list" || name === "start" || (shared && pin.privateManagement && ["start", "expire", "recycle"].includes(name))) {
       return { updateId, actorId, chatId: actorId, chatType: "private", threadId: null, messageId, messageDate,
-        command: name === "help" ? "help" : "list", viewKind: name === "help" ? null : name };
+        command: name === "start" ? (shared ? "start" : "help") : name === "help" ? "help" : "list",
+        viewKind: name === "start" || name === "help" ? null : name === "expire" ? "expiry" : name as "list" | "recycle" };
     }
   }
-  const group = shared ? readGeneralGroupListCommand(update, pin.botUsername) : null;
-  return group && group.actorId !== pin.botId ? { ...group, updateId, command: "list", viewKind: "list" } : null;
+  const group = shared ? readGeneralGroupCommand(update, pin.botUsername) : null;
+  if (!group || group.actorId === pin.botId || group.name === "s") return null;
+  if (["expire", "recycle"].includes(group.name) && !pin.privateManagement) return null;
+  const { name, remainder: _remainder, ...scope } = group;
+  return { ...scope, updateId, command: name === "start" ? "start" : name === "help" ? "help" : "list",
+    viewKind: name === "start" || name === "help" ? null : name === "expire" ? "expiry" : name as "list" | "recycle" };
 }
 
 async function readGeneralReadCommand(pin: GeneralTelegramPin, request: Request): Promise<
@@ -145,7 +162,7 @@ async function readGeneralReadCommand(pin: GeneralTelegramPin, request: Request)
 export async function renderGeneralReadReply(db: D1Database, actorId: string, command: GeneralReadCommand): Promise<string> {
   return command === "list"
     ? (await renderTelegramView(db, actorId, { kind: "list", afterId: null, afterEpoch: null })).text
-    : "可用命令\n/help 帮助\n/list 查看你的订阅";
+    : renderTelegramHelp({ privateChat: true, role: "member", features: {} });
 }
 
 export async function acceptGeneralTelegramCommand(db: D1Database, pin: GeneralTelegramPin, request: Request): Promise<number> {

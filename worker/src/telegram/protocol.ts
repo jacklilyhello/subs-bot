@@ -323,8 +323,8 @@ export function readGeneralPrivateShareClaim(
     messageId, messageDate, code: match[1] };
 }
 
-export function readGeneralGroupListCommand(update: Record<string, unknown>, botUsername: string):
-  Omit<TelegramEventScope, "updateId"> | null {
+export function readGeneralGroupCommand(update: Record<string, unknown>, botUsername: string):
+  (Omit<TelegramEventScope, "updateId"> & { name: string; remainder: string }) | null {
   const { message } = update;
   if (Object.keys(update).length !== 2 || !isRecord(message) || "edit_date" in message || "document" in message) return null;
   const actorId = humanSender(message);
@@ -334,11 +334,36 @@ export function readGeneralGroupListCommand(update: Record<string, unknown>, bot
     || !isPositiveInteger(messageId) || !isPositiveInteger(messageDate)) return null;
   const topic = message.is_topic_message === true;
   if (thread === undefined ? topic : (!topic || chat.type !== "supergroup" || !isPositiveInteger(thread))) return null;
-  const command = readLeadingTelegramCommand(message, botUsername, true);
-  return command?.name === "list" && command.remainder.trim() === "" ? {
+  const command = readLeadingTelegramCommand(message, botUsername);
+  return command && ["start", "help", "list", "expire", "recycle", "s"].includes(command.name)
+    && (command.name === "s" || command.remainder.trim() === "") ? { ...command,
     actorId, chatId: String(chat.id), chatType: chat.type, messageId, messageDate,
     threadId: typeof thread === "number" ? thread : null,
   } : null;
+}
+
+export function readGeneralGroupListCommand(update: Record<string, unknown>, botUsername: string):
+  Omit<TelegramEventScope, "updateId"> | null {
+  const command = readGeneralGroupCommand(update, botUsername);
+  if (!command || command.name !== "list") return null;
+  const { name: _name, remainder: _remainder, ...scope } = command;
+  return scope;
+}
+
+/** Existing reply-keyboard labels share the exact private command parsers. */
+export function readGeneralPrivateMenuCommand(update: Record<string, unknown>, botUsername: string) {
+  const command = readPrivateTelegramCommand(update, botUsername);
+  if (command) return command;
+  const { message } = update;
+  if (!isRecord(message) || typeof message.text !== "string" || (Array.isArray(message.entities)
+    && message.entities.some((entity) => isRecord(entity) && entity.type === "bot_command"))) return null;
+  const action = telegramMainMenuAction(message.text);
+  const name = action === "expiry" ? "expire" : action === "aggregate" ? "export"
+    : action === "batchRefresh" ? "updateall" : action;
+  if (!name) return null;
+  const text = `/${name}`;
+  return readPrivateTelegramCommand({ ...update, message: { ...message, text,
+    entities: [{ type: "bot_command", offset: 0, length: text.length }] } }, botUsername);
 }
 
 function authCommand(args: string[], reply: unknown, memberId: string): TelegramCommand["command"] {
@@ -498,7 +523,7 @@ export function readGeneralPrivateProviderBatch(
     const ticket = readGeneralPrivateTicket(update.callback_query, updateId, botId, PROVIDER_BATCH_TICKET);
     return ticket && ticket.actorId !== botId ? { ...ticket, kind: "confirm" } : null;
   }
-  const command = readPrivateTelegramCommand(update, botUsername);
+  const command = readGeneralPrivateMenuCommand(update, botUsername);
   if (!command || command.actorId === botId || command.name !== "updateall"
     || (command.remainder && !/^[ \t]/u.test(command.remainder))) return null;
   const { actorId, messageId, messageDate, remainder } = command;
@@ -514,6 +539,11 @@ export function readGeneralPrivateSubscriptionRead(
   if (isRecord(update.callback_query)) {
     const ticket = readGeneralPrivateTicket(update.callback_query, updateId, botId, SUBSCRIPTION_READ_TICKET);
     return ticket ? { ...ticket, kind: "callback" } : null;
+  }
+  const group = readGeneralGroupCommand(update, botUsername);
+  if (group?.name === "s" && group.actorId !== botId) {
+    const { name: _name, remainder: query, ...scope } = group;
+    return { ...scope, updateId, kind: "search", query };
   }
   const command = readPrivateTelegramCommand(update, botUsername);
   if (!command || command.actorId === botId || command.name !== "s") return null;
@@ -542,7 +572,7 @@ export function readGeneralPrivateTempUpdate(
 
   const { text, entities } = message;
   const hasCommand = Array.isArray(entities) && entities.some((entity) => isRecord(entity) && entity.type === "bot_command");
-  return !hasCommand && typeof text === "string" && text.trim() !== "" && !text.trimStart().startsWith("/")
+  return !hasCommand && typeof text === "string" && telegramMainMenuAction(text) === null && text.trim() !== "" && !text.trimStart().startsWith("/")
     && classifyTelegramApiStatusInput({ kind: "ordinary", text }).kind === "pass-through"
     ? { ...scope, kind: "temp-text", text } : null;
 }
@@ -597,6 +627,38 @@ export function readGeneralPrivateDocumentUpdate(
   const actorId = humanSender(message);
   const scope = actorId && actorId !== botId ? telegramMessageScope(message, actorId, updateId) : null;
   return scope && scope.chatId === scope.actorId ? documentInput(message, scope) : null;
+}
+
+export function readGeneralPrivateGitHubSearch(
+  update: Record<string, unknown>, updateId: number, botId: string, botUsername: string,
+): TelegramGitHubSearchUpdate | null {
+  const command = readPrivateTelegramCommand(update, botUsername);
+  if (!command || command.actorId === botId || command.name !== "g"
+    || (command.remainder !== "" && !/^\s/u.test(command.remainder))) return null;
+  const { actorId, messageId, messageDate } = command;
+  return { updateId, actorId, chatId: actorId, chatType: "private", threadId: null,
+    messageId, messageDate, args: command.remainder };
+}
+
+export function readGeneralPrivateApiStatus(
+  update: Record<string, unknown>, updateId: number, botId: string, botUsername: string,
+): TelegramApiStatusUpdate | null {
+  const { message } = update;
+  if (Object.keys(update).length !== 2 || !isRecord(message) || "edit_date" in message || "document" in message
+    || "message_thread_id" in message || message.is_topic_message === true) return null;
+  const actorId = humanSender(message);
+  const scope = actorId && actorId !== botId ? telegramMessageScope(message, actorId, updateId) : null;
+  if (!scope || scope.chatType !== "private" || scope.chatId !== scope.actorId || scope.threadId !== null) return null;
+  const origin = message.reply_to_message;
+  if (ownBotMessage(origin, { botId }) && origin.text === TELEGRAM_API_STATUS_PROMPT) {
+    const prompt = telegramMessageScope(origin, actorId!, updateId);
+    return typeof message.text === "string" && prompt?.chatType === "private" && prompt.chatId === scope.chatId
+      && prompt.threadId === null && prompt.messageId < scope.messageId && prompt.messageDate <= scope.messageDate
+      ? { ...scope, kind: "reply", promptMessageId: prompt.messageId, text: message.text } : null;
+  }
+  const command = readPrivateTelegramCommand(update, botUsername);
+  return command?.name === "ai" && classifyTelegramApiStatusInput({ kind: "ai-command", args: command.remainder }).kind === "open-prompt"
+    ? { ...scope, kind: "prompt" } : null;
 }
 
 const DECIMAL_DIGIT = /^\p{Nd}$/u;

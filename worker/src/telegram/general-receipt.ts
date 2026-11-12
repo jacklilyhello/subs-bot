@@ -102,7 +102,7 @@ export async function groupSchemaReady(db: D1Database): Promise<boolean> {
   }
 }
 
-export function approvedGroup(alias?: "inbox" | "earlier"): string {
+export function approvedGroup(alias?: "inbox" | "earlier" | "incoming"): string {
   return `${GROUP_SCHEMA} AND EXISTS (SELECT 1 FROM telegram_general_groups AS approved
     WHERE approved.bot_id=policy.bot_id AND approved.generation=policy.generation
       AND approved.chat_id=${alias ? alias + ".chat_id" : "?"} AND approved.chat_type=${alias ? alias + ".chat_type" : "?"})`;

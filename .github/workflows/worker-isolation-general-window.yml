@@ -1,0 +1,63 @@
+name: Control full general Telegram isolation window
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: One full-v1 checkpoint on the existing two-account test Bot
+        type: choice
+        default: inspect
+        options: [inspect, close, open, drain, restore]
+      source_run_id:
+        description: Successful exact-main Worker CI (initial inspect and open)
+        type: string
+      active_sha256:
+        description: Exact activeSha256 from protected inspection
+        type: string
+      state_sha256:
+        description: Exact predecessor stateSha256 from protected inspection
+        type: string
+      confirmation:
+        description: Exact action confirmation, e.g. close full general window for subs-bot-cf-dev-01
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: subs-bot-isolation-deploy
+  cancel-in-progress: false
+
+jobs:
+  checkpoint:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
+    environment: subs-bot-isolation
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify the exact isolated full-v1 profile and checkpoint
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CI_RUN_ID: ${{ inputs.source_run_id }}
+          GENERAL_WINDOW_ACTION: ${{ inputs.action }}
+          GENERAL_WINDOW_ACTIVE_SHA256: ${{ inputs.active_sha256 }}
+          GENERAL_WINDOW_STATE_SHA256: ${{ inputs.state_sha256 }}
+          GENERAL_WINDOW_CONFIRMATION: ${{ inputs.confirmation }}
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
+          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPLOY_TOKEN }}
+          SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 -B worker/tools/general_isolation_window.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: general-isolation-window-${{ inputs.action }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/general-isolation-window.json
+          if-no-files-found: error
+          retention-days: 7

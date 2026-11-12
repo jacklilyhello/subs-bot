@@ -2,6 +2,8 @@ import { checkOwnerId, SUBSCRIPTION_LIFECYCLE_REVISION, validInteger } from "../
 import { listDeletedSubscriptions, listOwnedSubscriptions } from "../subscriptions.ts";
 import type { TelegramLifecycleButton } from "./lifecycle-actions.ts";
 import type { TelegramSubscriptionReadButton } from "./subscription-read.ts";
+import { displayTelegramDate } from "./display-time.ts";
+export { displayTelegramDate } from "./display-time.ts";
 import { inTelegramScope, TELEGRAM_PAGE_JUMP_RECEIPTS, type TelegramPolicy, type TelegramViewKind, type TelegramViewUpdate } from "./protocol.ts";
 
 export const TELEGRAM_VIEW_MARKER = "view:v1";
@@ -131,12 +133,6 @@ export function displayTelegramName(name: string): string {
   return Array.from(clean).slice(0, 80).join("") || "未命名";
 }
 
-export function displayTelegramDate(epoch: number): string {
-  const date = new Date(epoch * 1000);
-  if (!Number.isFinite(date.getTime())) return "日期未知";
-  return date.toISOString().replace("T", " ").replace(/:\d{2}\.\d{3}Z$/u, " UTC");
-}
-
 async function expiryPage(db: D1Database, ownerId: string, view: TelegramView) {
   checkOwnerId(ownerId);
   try {
@@ -160,6 +156,7 @@ export async function renderTelegramView(
   view: TelegramView,
   includeReadButtons = false,
   absoluteOrdinals = includeReadButtons,
+  timeZone = "UTC",
 ): Promise<{ text: string; buttons: TelegramViewButton[]; lifecycleButtons: TelegramLifecycleButton[];
   readButtons?: TelegramSubscriptionReadButton[] }> {
   if ((view.afterId !== null && !validInteger(view.afterId, 1))
@@ -209,7 +206,7 @@ export async function renderTelegramView(
   }
   const ordinal = (index: number) => preceding + index + 1;
   const lines = items.map((item, index) => `${ordinal(index)}. ${displayTelegramName(item.name)}` +
-    (item.epoch === undefined ? "" : ` · ${displayTelegramDate(item.epoch)}`));
+    (item.epoch === undefined ? "" : ` · ${displayTelegramDate(item.epoch, timeZone)}`));
   const lifecycleButtons = items.flatMap<TelegramLifecycleButton>(({ id, lifecycleRevision }, index) => {
     const target = { subscriptionId: id, expectedLifecycleRevision: lifecycleRevision };
     return view.kind === "recycle"

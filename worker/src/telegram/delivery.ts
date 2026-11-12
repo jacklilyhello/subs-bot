@@ -46,6 +46,8 @@ import {
   type TelegramReplyLease, type TelegramReplyOutcome,
 } from "./store.ts";
 import { prepareTelegramViewTickets, renderTelegramView, type TelegramViewButton } from "./views.ts";
+import { readBotDisplayTimeZone } from "./display-time.ts";
+import { renderTelegramDisplaySettings } from "./display-settings.ts";
 import { renderTelegramTemp } from "./temp-import.ts";
 import { confirmTelegramTempRawSend, prepareTelegramTempRawReply, type TelegramTempRawReply } from "./temp-raw.ts";
 import { renderTelegramProviderReply } from "./provider-replies.ts";
@@ -55,6 +57,7 @@ import { renderTelegramProviderDocumentReply } from "./provider-document-replies
 import { renderTelegramApiStatus } from "./api-status.ts";
 import { telegramMainMenuKeyboard, type TelegramMainMenuFeatures } from "./main-menu.ts";
 import { wrapAuthorizedLocalShortlink, type ExternalShortlinkRuntime } from "./external-shortlinks.ts";
+import { renderTelegramHelp } from "./command-catalog.ts";
 
 const BOT_API = "https://api.telegram.org";
 const MAX_RESPONSE_BYTES = 64 * 1024;
@@ -209,11 +212,13 @@ function sendTelegram(
 
 export function sendGeneralTelegramPrivateReply(
   botToken: string, actorId: string, messageId: number, text: string, keyboard?: InlineKeyboard, forceReply = false,
+  mainMenu?: TelegramMainMenuFeatures,
 ): Promise<TelegramReplyOutcome> {
   return postTelegram(botToken, actorId, "sendMessage", {
     chat_id: actorId, text, reply_parameters: { message_id: messageId }, link_preview_options: { is_disabled: true },
     ...(keyboard?.length ? { reply_markup: { inline_keyboard: keyboard } }
-      : forceReply ? { reply_markup: { force_reply: true } } : {}),
+      : forceReply ? { reply_markup: { force_reply: true } }
+        : mainMenu ? { reply_markup: { keyboard: telegramMainMenuKeyboard(mainMenu), resize_keyboard: true } } : {}),
   }, 5_000, fetch);
 }
 
@@ -403,11 +408,12 @@ async function renderReply(
   shortTarget?: SubscriptionShortTarget & { label: string };
   forceReply?: boolean;
   mainMenu?: TelegramMainMenuFeatures;
+  settingsKeyboard?: InlineKeyboard;
 }> {
   if (lease.command.startsWith("auth-")) {
     if (lease.actorId !== policy.adminId) return { text: "只有管理员可以管理授权。", access: "none" };
     if (lease.chatType !== "private") return { text: "请在私聊中管理授权。", access: "none" };
-    if (lease.command === "auth-usage") return { text: "用法：/auth list、/auth add 用户ID、/auth remove 用户ID。", access: "none" };
+    if (lease.command === "auth-usage") return { text: `/auth list 查看授权\n/auth add ${policy.memberId} 授权固定测试用户\n/auth remove ${policy.memberId} 撤权固定测试用户`, access: "none" };
     if (lease.command === "auth-add" || lease.command === "auth-remove") {
       const allowed = lease.command === "auth-add";
       const outcome = await readTelegramAuthChangeOutcome(db, policy, lease, allowed);
@@ -424,6 +430,10 @@ async function renderReply(
   }
   const allowed = lease.actorId === policy.adminId || await isTelegramMemberAllowed(db, policy);
   if (!allowed) return { text: "当前账号没有使用权限。", access: "denied" };
+  if (lease.command === "help" && lease.chatType === "private" && lease.threadId === null) {
+    const settings = await renderTelegramDisplaySettings(db, policy.botId, lease.receiptId, lease.actorId === policy.adminId);
+    if (settings) return { text: settings.text, settingsKeyboard: settings.keyboard, access: "allowed" };
+  }
   if (lease.subscriptionShareUnavailable) return { text: "无法分享此订阅。请在私聊打开自己的订阅详情后重试。", access: "allowed" };
   if (lease.subscriptionRead) return { ...await renderTelegramSubscriptionRead(db, bucket, policy, lease, deadline,
     subscriptionNodesEnabled, providerRefreshEnabled, subscriptionRawFileEnabled, privateShareEnabled, publicOrigin), access: "allowed" };
@@ -443,7 +453,8 @@ async function renderReply(
   }
   if (lease.view) {
     const privateDetails = subscriptionReadEnabled && lease.chatType === "private" && lease.threadId === null;
-    return { ...await renderTelegramView(db, lease.actorId, lease.view, privateDetails, privateDetails || lease.pageJump === true),
+    return { ...await renderTelegramView(db, lease.actorId, lease.view, privateDetails, privateDetails || lease.pageJump === true,
+      await readBotDisplayTimeZone(db, policy.botId)),
       access: "allowed" };
   }
   if (lease.temp) return { text: renderTelegramTemp(lease.temp), access: "allowed" };
@@ -464,14 +475,7 @@ async function renderReply(
     return { text: names.length ? `你的订阅\n${names.join("\n")}` : "你的订阅列表为空。", access: "allowed" };
   }
   const privateChat = lease.chatType === "private" && lease.threadId === null;
-  const help = "使用 /list 查看你的订阅，/expire 查看临期，/recycle 查看回收站。"
-    + (subscriptionReadEnabled ? "\n/s 关键词搜索订阅。" : "")
-    + (privateChat ? "\n/temp 查看临时节点，/path 管理路径规则。"
-      + (subscriptionReadEnabled ? "\n发送列表编号查看订阅详情。" : "")
-      + (menuFeatures.aggregate ? "\n/export 导出全部订阅，/o 关键词导出所选订阅。" : "")
-      + (menuFeatures.batchRefresh ? "\n/updateall 预览批量刷新。" : "")
-      + (privateShareEnabled ? "\n创建私密分享：/share [x份数] [id领取人ID] [s分钟] -- 正文。"
-        + "\n分享自己的订阅：/share sub 订阅ID [x份数] [id领取人ID] [s分钟]。" : "") : "");
+  const help = renderTelegramHelp({ privateChat, role: lease.actorId === policy.adminId ? "admin" : "member", features: menuFeatures });
   return {
     text: lease.command === "start" ? `欢迎使用 subs-bot。\n${help}` : help,
     access: "allowed",
@@ -610,6 +614,8 @@ export async function drainTelegramReplies(
   pageJumpEpoch: number | null = null,
   publicOrigin: PublicOrigin = ISOLATION_PUBLIC_ORIGIN,
   subscriptionShortsEnabled = false,
+  displayTimezoneEnabled = false,
+  providerUrlImportEnabled = false,
   externalShortlinks?: ExternalShortlinkRuntime,
 ): Promise<void> {
   const deadline = Date.now() + budgetMs;
@@ -620,7 +626,14 @@ export async function drainTelegramReplies(
   const subscriptionRawFileEnabled = subscriptionRawFileReadiness === true;
   const providerBatchEnabled = providerBatchReadiness === true;
   const providerBatch = providerBatchEnabled ? policy : providerBatchReadiness === "unavailable" ? "unavailable" : undefined;
-  const menuFeatures = { aggregate: aggregateKey !== null, batchRefresh: providerBatchEnabled && providerBatchAdmissionEnabled };
+  const menuFeatures: TelegramMainMenuFeatures = {
+    management: true, subscriptionRead: subscriptionReadEnabled, temp: true, tempRawDefault: true, path: true,
+    aggregate: aggregateKey !== null, selected: aggregateKey !== null,
+    batchRefresh: providerBatchEnabled && providerBatchAdmissionEnabled, batchStatus: providerBatchEnabled, short: shortLinksEnabled && aggregateKey !== null,
+    share: privateShareEnabled, inline: inlineConsentEnabled, inlineTemp: inlineConsentEnabled, inlineSort: inlineSortEnabled,
+    bulkTrash: bulkTrashEnabled, github: gitHubSearchEnabled, apiStatus: apiStatusReadiness === true && apiStatusPromptsEnabled,
+    authorization: true, authorizationScope: "fixed", authorizationMemberId: policy.memberId, displayTimezone: displayTimezoneEnabled, documentImport: true, providerImport: providerEnabled && providerUrlImportEnabled,
+  };
   const apiStatusEnabled = apiStatusReadiness === true;
   const apiStatus = apiStatusEnabled ? policy : apiStatusReadiness === "unavailable" ? "unavailable" : undefined;
   const providerDocumentEnabled = providerDocumentReadiness === true;
@@ -734,7 +747,7 @@ export async function drainTelegramReplies(
       const groupButton = reply && privateShareRuntime.groupCardsEnabled && await telegramGroupShareReady(db)
         ? [[{ text: "发到指定群", callback_data: GROUP_SHARE_PUBLISH_CALLBACK }]] : undefined;
       if (reply && Date.now() < deadline && await beginTelegramPrivateShareCreationReply(db, policy, lease, reply)) {
-        const text = renderTelegramPrivateShareLink(policy.botUsername, reply);
+        const text = renderTelegramPrivateShareLink(policy.botUsername, reply, await readBotDisplayTimeZone(db, policy.botId));
         const outcome = await sendTelegramReply(policy, lease, text, Math.max(1, deadline - Date.now()), request, groupButton);
         await settleTelegramReply(db, policy, lease, outcome);
         continue;
@@ -890,7 +903,7 @@ export async function drainTelegramReplies(
     }
     const keyboard = [...(view?.keyboard ?? []), ...(jumpButton ? [[{ text: "🔢 跳转页", callback_data: TELEGRAM_PAGE_JUMP_CALLBACK }]] : []),
       ...(lifecycle?.keyboard ?? []), ...(nodes?.keyboard ?? []), ...(read?.keyboard ?? []),
-      ...(refresh ? [[refresh.button]] : []), ...(rawFile ? [[rawFile.button]] : [])];
+      ...(refresh ? [[refresh.button]] : []), ...(rawFile ? [[rawFile.button]] : []), ...(reply.settingsKeyboard ?? [])];
     const outcome = await sendTelegramReply(policy, lease, reply.text, Math.max(1, deadline - Date.now()), request,
       keyboard, reply.forceReply, reply.mainMenu);
     await settleTelegramReply(db, policy, lease, outcome);
