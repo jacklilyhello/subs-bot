@@ -200,7 +200,13 @@ function generalProviderDocumentsEnabled(env: Env): boolean {
 async function withGeneralProviderDocuments(env: Env, pin: NonNullable<ReturnType<typeof parseGeneralTelegramPin>>) {
   const ready = pin.privateProvider && await telegramGeneralProviderDocumentsReady(
     env.DB, pin.botId, generalProviderDocumentsEnabled(env)).catch(() => false);
-  return ready ? { ...pin, providerDocumentReplies: true } : pin;
+  const providerReady = pin.privateProvider && (env.TELEGRAM_PROVIDER_URL_IMPORT === "1" || env.TELEGRAM_PROVIDER_BATCH_REFRESH === "1")
+    && await generalProviderAdmissionReady(env).catch(() => false);
+  return { ...pin, ...(ready ? { providerDocumentReplies: true } : {}), commandFeatures: {
+    providerImport: providerReady && env.TELEGRAM_PROVIDER_URL_IMPORT === "1",
+    batchRefresh: pin.providerBatch === true && providerReady && env.TELEGRAM_PROVIDER_BATCH_REFRESH === "1",
+    inline: pin.privateInline === true && env.TELEGRAM_INLINE_SEARCH === "1" && await telegramInlineSearchReady(env.DB).catch(() => false),
+  } };
 }
 
 function generalProviderRefreshAvailability(env: Env, enabled: boolean) {
@@ -317,7 +323,7 @@ async function telegramWebhook(request: Request, env: Env, publicOrigin: PublicO
       subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerQueueReady, bulkTrash, inlineConsent,
       await githubSearch().catch(() => "unavailable" as const), providerRefresh, subscriptionRawFile, providerBatch.controls, apiStatus,
       statusProvider !== null, providerDocument, providerBatchAdmission, pageJumpEpoch, publicOrigin,
-      env.TELEGRAM_SUBSCRIPTION_SHORTS === "1");
+      env.TELEGRAM_SUBSCRIPTION_SHORTS === "1", false, env.TELEGRAM_PROVIDER_URL_IMPORT === "1" && providerIntakeReady);
     const drain = () => ctx?.waitUntil(drainReplies().catch(() => undefined));
     if (decoded.apiStatus) {
       if (!statusProvider || apiStatus !== true) return new Response(null, { status: 204, headers: HEADERS });
@@ -645,7 +651,7 @@ async function recoverTelegramWork(
       subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerQueueReady, bulkTrash, inlineConsent,
       await githubSearch().catch(() => "unavailable" as const), providerRefresh, subscriptionRawFile, providerBatch.controls, apiStatus,
       apiStatusProvider(env) !== null, providerDocument, providerBatchAdmission, telegramPageJumpEpoch(env.TELEGRAM_PAGE_JUMP), publicOrigin,
-      env.TELEGRAM_SUBSCRIPTION_SHORTS === "1");
+      env.TELEGRAM_SUBSCRIPTION_SHORTS === "1", false, env.TELEGRAM_PROVIDER_URL_IMPORT === "1" && providerIntakeReady);
   const replies = async () => {
     await drain(10, 45_000);
     await reapTelegramViewTickets(env.DB);
