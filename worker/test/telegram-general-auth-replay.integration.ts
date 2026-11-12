@@ -2380,10 +2380,10 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.equal((await menuPost(7913, 195, "/s Menu fixture", true, { chatId: -100996 })).status, 204);
   assert.equal((await menuPost(7914, 195, "/s Menu fixture")).status, 200);
   const privateSearch = await awaitLifecycle(7914);
-  const detailTicket = privateSearch.message.reply_markup?.inline_keyboard?.flat()[0]?.callback_data;
-  assert.ok(detailTicket && /^sbr1_[A-Za-z0-9_-]{22}$/u.test(detailTicket));
-  assert.equal((await callback(7915, 194, { ...origin(privateSearch.messageId, 194), date: menuDate }, detailTicket, authWorker)).status, 204);
-  assert.equal((await callback(7916, 195, { ...origin(privateSearch.messageId, menuGroup, "supergroup"), date: menuDate }, detailTicket, authWorker)).status, 204);
+  const menuDetailTicket = privateSearch.message.reply_markup?.inline_keyboard?.flat()[0]?.callback_data;
+  assert.ok(menuDetailTicket && /^sbr1_[A-Za-z0-9_-]{22}$/u.test(menuDetailTicket));
+  assert.equal((await callback(7915, 194, { ...origin(privateSearch.messageId, 194), date: menuDate }, menuDetailTicket, authWorker)).status, 204);
+  assert.equal((await callback(7916, 195, { ...origin(privateSearch.messageId, menuGroup, "supergroup"), date: menuDate }, menuDetailTicket, authWorker)).status, 204);
   assert.equal((await callback(7917, 195, { ...origin(privateSearch.messageId, 195), date: menuDate }, "auth:add:194", authWorker)).status, 204);
   assert.equal(await db.prepare("SELECT count(*) AS n FROM telegram_general_auth_actions AS action JOIN telegram_inbox USING(receipt_id) WHERE update_id BETWEEN 7908 AND 7917").first<number>("n"), 0);
 
