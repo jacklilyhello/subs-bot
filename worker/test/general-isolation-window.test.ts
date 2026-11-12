@@ -1,11 +1,19 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import { Miniflare } from "miniflare";
 import { fenceTelegramWebhookDatabase, readGeneralIsolationWindow } from "../src/telegram/general-isolation-window.ts";
 import { acceptGeneralSharedTelegramCommand } from "../src/telegram/general-auth-shared.ts";
 import type { TelegramPolicy } from "../src/telegram/protocol.ts";
+
+const oldComparison = Object.getOwnPropertyDescriptor(crypto.subtle, "timingSafeEqual");
+Object.defineProperty(crypto.subtle, "timingSafeEqual", { configurable: true,
+  value: (received: ArrayBuffer, expected: ArrayBuffer) => timingSafeEqual(new Uint8Array(received), new Uint8Array(expected)) });
+after(() => {
+  if (oldComparison) Object.defineProperty(crypto.subtle, "timingSafeEqual", oldComparison);
+  else Reflect.deleteProperty(crypto.subtle, "timingSafeEqual");
+});
 
 test("full-v1 is explicit, role scoped and atomically fenced across close and restore", async (t) => {
   const runtime = new Miniflare({ modules: true, script: "export default {fetch(){return new Response(null)}}",

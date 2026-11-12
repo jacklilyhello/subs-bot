@@ -669,11 +669,11 @@ V11 合成原生演练在 `worker-isolation-legacy-candidate.yml` 选择 `synthe
 
 通用运行时的 `outbox: "shared-private-temp"` 在私聊管理上增加临时节点粘贴、`/temp` 数量汇总和 `/temp clear`。`outbox: "shared-private-management-formats-temp"` 同时启用格式链接和这些临时节点操作。临时入口核对确切登记的 `0008`、`0039` 和通用回执迁移，按 Bot 和所有者计算历史及新增节点上限。清空只处理该消息时点或之前的节点。显式发送 `/temp raw` 才会在本人私聊返回原始节点链接，较长的内容使用 UTF-8 TXT。读取及发送前复核当前授权、清空界限和当时的节点清单。
 
-`outbox: "shared-private-management-formats-temp-node-document"` 再加入私聊的纯节点文档导入，沿用现有格式、大小和节点数限制。通用文档不提交远程 URL 或混合文档任务。Cron 在下载、发布和发送回复前复核当前授权。已失效任务和未发布暂存的清理只按准确的通用回执与记录授权执行，隔离清理继续保留 `general-document-job:v1` 任务、订阅预留和 R2 暂存。两类任务共用每个 Bot 的租约约束。现有发布流程不启用这些模式。未来启用前须确认受保护的授权世代切换和排空步骤，并验证隔离真人流程。
+`outbox: "shared-private-management-formats-temp-node-document"` 再加入私聊的纯节点文档导入，沿用现有格式、大小和节点数限制。此模式不提交远程 URL 或混合文档任务。Cron 在下载、发布和发送回复前复核当前授权。已失效任务和未发布暂存的清理只按准确的通用回执与记录授权执行，隔离清理继续保留 `general-document-job:v1` 及转换后的 `general-provider-document:v1` 任务、订阅预留和 R2 暂存。两类任务共用每个 Bot 的租约约束。现有发布流程不启用这些模式。未来启用前须确认受保护的授权世代切换和排空步骤，并验证隔离真人流程。
 
 `outbox: "shared-private-management-formats-temp-node-document-provider"` 在上一模式上加入私聊的单条远程订阅链接。还须启用 `TELEGRAM_PROVIDER_URL_IMPORT=1`，确认提供方的命名 RPC、构建及镜像摘要和任务、回执、快照日志迁移。接收时在同一事务内建立通用回执和任务，Cron 复核当前授权与来源摘要后抓取并发布。抓取失败时保留上次已发布快照。终结回复以任务结果的就绪时刻计算 900 秒期限，内容不含原始链接。关闭入口后，同一通用策略和提供方绑定继续处理已接收任务。此模式不改变隔离发布的配置。
 
-再启用 `TELEGRAM_PROVIDER_URL_DOCUMENTS=1` 并核对确切登记的 `0035` 后，同一通用私聊模式支持粘贴多行订阅链接。每行可选 `名称 | 链接`。最多处理 20 条不同链接，重复链接保留第一次的命名选择。Cron 逐条复核当前授权、订阅代次和来源摘要，终结回复只显示成功、合并、失败及超限计数。暂停入口后继续处理已接收的消息。通用 URL 文件和混合文档仍另行接入。
+再启用 `TELEGRAM_PROVIDER_URL_DOCUMENTS=1` 并核对确切登记的 `0035` 后，同一通用私聊模式支持粘贴多行订阅链接和上传只含链接的 `.txt`、`.log` 文件。消息每行可选 `名称 | 链接`；文件沿用严格的整行 URL 解析。最多处理 20 条不同链接，重复链接保留第一次。再启用 `TELEGRAM_MIXED_DOCUMENTS=1` 并核对确切登记的 `0036`，才接收同一文本文件内的节点与 URL 混合内容。本地快照发布和远程任务计划在同一 D1 事务内提交，同名节点文件只更新本人记录。管理员和普通用户都只能导入到本账号，群聊不接收文件。Cron 在下载、逐条抓取、发布和发送前复核当前授权、订阅代次及来源摘要，终结回复只显示本地节点数与成功、合并、失败及超限计数。上传时的 opt-in 持久化到回执，关闭新接收后继续处理已接收文件，不因重投再发布一份快照或新建一组任务。隔离真人验收另行执行。
 
 在同一通用模式中，`TELEGRAM_PROVIDER_REFRESH=1` 和确切登记的 `0028` 允许从本人私聊详情刷新一条远程订阅。一次性按钮绑定同一 Bot、账号、已确认消息、发送尝试和当前授权，并核对来源摘要、快照代次及生命周期。票据消费、回执和入队在同一 D1 批次内提交。静态文档没有刷新按钮。关闭入口后保留已接收任务的处理和回复；失败保留旧快照。批量刷新仍由单独入口处理。
 
@@ -693,7 +693,11 @@ V11 合成原生演练在 `worker-isolation-legacy-candidate.yml` 选择 `synthe
 
 `0050` 为通用授权准备私聊 `/auth add <用户ID>` 和 `/auth remove <用户ID>`。通用私聊管理配置仅在显式包含 `authManagement: true` 时接收这些指令。只允许当前管理员处理本世代已登记的普通用户。同一 Bot 如有 `0049` 演练记录，通用授权入口关闭。授权修改和回复回执在同一 D1 事务内提交。按 Telegram 消息时间及同秒更新编号判定先后。撤权立即拒绝成员权限，重新授权要求新消息晚于新的时间界限。管理员可用 `/auth` 或 `/auth list` 私下查看本世代最多 20 位主体的最新角色；名单还有其他用户时会明确提示。暂停接收后仍可发送已接收的私聊回复。现有受保护发布流程保持此入口关闭。引用消息选择用户及增加新主体另行接入。
 
-通用私聊管理配置可显式加入 `inlineSearch: true`。部署同时启用 `TELEGRAM_INLINE_SEARCH` 时，允许当前主体在自己的 Bot 私聊通过 `/inline on` 同意 15 分钟内联订阅名称搜索。只接受 Telegram 标记为 `sender` 的查询，查询和原始来源不存入回执，结果不含能力链接。发送前再次核对原同意回执、当前授权及订阅版本，重复查询只处理一次。暂停查询时仍可 `/inline off`。现有隔离配置不启用这一通用入口，临时节点内联和群内内联不在此模式内。
+通用私聊管理配置可显式加入 `inlineSearch: true`。部署同时启用 `TELEGRAM_INLINE_SEARCH` 时，允许当前主体在自己的 Bot 私聊通过 `/inline on` 同意 15 分钟内联订阅名称搜索。启用临时节点的累积模式在核对 `0008`、`0039` 和通用回执迁移后，还可通过 `/inline temp on` 单独同意临时节点名称搜索；普通同意不包含临时节点。只接受 Telegram 标记为 `sender` 的查询，查询和原始来源不存入回执，结果不含能力链接或节点原文。发送前再次核对原同意回执、当前授权、订阅版本、临时批次及清空界限，重复查询只处理一次。暂停查询时仍可 `/inline off`，撤权重授权不会复活旧同意。现有隔离配置不启用这一通用入口，群内内联不在此模式内。
+
+通用入口识别旧 `share:c:<11位码>` 内联卡和本 Bot 的旧消息卡，点击只打开本人机器人私聊的 `/start claim_<code>` 入口，不在回调中扣减份数、发送正文或更新群卡。当前主体授权、同 Bot 的分享、指定收件人、剩余份数及到期时间须有效，进入私聊后再次按原领取流程核对。历史领取者重新打开沿用原有幂等语义。旧 `Share ...` 查询在已同意的个人内联中仅返回私聊操作说明，不再在内联中创建能力或发送原始内容；这是对当前隐私边界的适配。合成覆盖及真人验收分别记录，不能以旧行为或合成通过代表真实旧卡已验收。
+
+通用私聊管理配置可分别加入 `githubSearch: true` 和 `apiStatus: true`。前者在准确登记的 `0027` 就绪时允许本人私聊 `/g 关键词`；复用同一 GitHub/Grep 公开搜索器、每账号冷却和有限调用预算，查询只在获胜 webhook 调用的内存中使用。通用与隔离搜索使用不同回执标记，重投及并发不会再次查找，恢复只产生固定备用入口。后者还要求原有 `TELEGRAM_API_STATUS=1`、API V2 命名绑定和准确登记的 `0034`，允许本人私聊 `/ai`。只接受回复已确认发送的本人最新提示；`/cancel` 必须回复该提示。地址与 Key 只在当前调用内存传给已有 V2 探测服务，不进入 D1、恢复任务、业务回复或日志。每行最多启动一次 RPC，中断及不确定结果不重放凭据。两类操作都在收件、执行和发送前核对同一通用世代、主体修订及当前权限，群聊不接收这些命令。帮助和命令菜单仅展示开关与实际依赖均已就绪的入口。配置缺省保持关闭。
 
 #### Bot 展示时区
 
@@ -726,3 +730,14 @@ V11 合成原生演练在 `worker-isolation-legacy-candidate.yml` 选择 `synthe
 - 成本按实测请求数与 CPU、D1 读写行数、R2 容量及对象读写、队列投递与重试计算。若启用 Container，再核对实例运行时间、内存和磁盘配额、活动 CPU、区域出网及关联 Durable Objects 用量。隔离验收以按需启动和可睡眠为前提。显著新增费用或需要常驻时先提交估算和影响。 [Workers 定价](https://developers.cloudflare.com/workers/platform/pricing/) · [R2 定价](https://developers.cloudflare.com/r2/pricing/) · [Queues 定价](https://developers.cloudflare.com/queues/platform/pricing/) · [Containers 定价](https://developers.cloudflare.com/containers/platform/pricing/)
 - 资源管理分开使用只读核查、派生 Token 创建和项目部署权限。新 Token 按目标账户、所需操作和有效期收窄。平台权限无法限定到单个资源时，执行步骤须核对项目专用资源 ID。应用通过绑定和 Secrets 使用运行所需权限。高权限管理凭据留在受控管理位置。 [Cloudflare API Token](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/) · [Workers Secrets](https://developers.cloudflare.com/workers/configuration/secrets/)
 - Worker、反代及其他链路避免记录能力路径、查询参数、Telegram 更新、订阅内容、鉴权头或上游异常正文。Cloudflare 自动 invocation 日志可能包含带凭据的 URL，发布前禁用或验证脱敏，并核对追踪、异常和外部转发的字段。允许的运行信号限于路由类别、状态、计数、耗时和内部操作 ID。私密数据和密钥不得出现在公共缓存、Git、构建产物或测试日志。 [Workers Logs](https://developers.cloudflare.com/workers/observability/logs/workers-logs/)
+
+
+## 外部短链的内部调用与隔离发布
+
+外部短链只包装已经鉴权并签发的本站 `/s/` 链接。调用方绑定 `SHORTLINK` 固定到 `shortlink-new` 的命名入口 `ShortlinkService`；通过 `createShortlink(Request)` 内部调用，Request 中的 HTTPS 地址仅为接口校验元数据。业务 Token 存于调用方 Worker Secret `SHORTLINK_BUSINESS_TOKEN`。不调整短链服务、公网 WAF、Access 或其 Token 权限。
+
+受保护的 `subs-bot-isolation` GitHub Environment 使用 `SUBS_BOT_SHORTLINK_BUSINESS_TOKEN` 向部署流程提供业务凭据。部署操作 `external_shortlinks` 默认 `preserve`；显式选择 `enable external shortlinks for subs-bot-cf-dev-01` 才启用，选择对应 `disable` 只关闭新 RPC 包装，保留原 Service Binding 和 Secret。已配置后，缺少受保护凭据、凭据摘要变化、命名入口变化或丢失恢复能力均拒绝发布。凭据轮换须另行设计，不能通过普通部署暗中变更。
+
+发布读回核对业务 Secret 类型及摘要、精确 Service Binding、启用标志、完整版本 tag 和 `0053_external_shortlinks.sql` 的迁移与实际 D1 表结构。已有批量任务能力 tag 前缀保持可识别。页码跳转的暂停、分阶段候选和恢复保留同一短链身份；历史候选中缺失的新增字段按旧格式处理。
+
+外层短链的成功、重放、限流和失败均须另做隔离 Service Binding 联调，合成测试通过不代表真实业务 Token 已获准使用 `gfw.mom`。外层服务不获得上游来源、直接 `/sub/` 或 `/agg/` 能力地址及节点内容。撤销仍由本地 `/s/` 数据与原分享约束控制，外层映射不依赖删除权限。关闭包装或恢复上一版 Worker 不会恢复已经撤销的本地链接，也不应恢复过时的 SQLite 服务。

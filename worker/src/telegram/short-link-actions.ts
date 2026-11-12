@@ -29,7 +29,7 @@ const fresh = "inbox.bot_id=? AND inbox.update_id=? AND inbox.receipt_nonce=?";
 type ShortRequest = { kind: "help" | "invalid" } | { kind: "issue"; destination: string } | { kind: "revoke"; code: string };
 type Result = "help" | "invalid" | "issued" | "revoked" | "missing" | "limit" | "unavailable";
 export type TelegramShortLinkGuard = { sql: string; bindings: readonly (string | number)[] };
-export type TelegramShortLinkReply = { kind: "notice"; text: string } | { kind: "link"; text: string; guard: TelegramShortLinkGuard };
+export type TelegramShortLinkReply = { kind: "notice"; text: string } | { kind: "link"; text: string; localUrl: string; guard: TelegramShortLinkGuard };
 type ShortPolicy = TelegramPolicy | GeneralTelegramPin;
 interface ShortLease extends TelegramEventScope {
   receiptId: number;
@@ -269,7 +269,7 @@ export async function prepareTelegramShortLinkReply(
     const code = await deriveCode(key, policy.botId, lease.actorId, row.nonce);
     if (await shortCodeDigest(code) !== row.digest) return { kind: "notice", text: notices.issued };
     return {
-      kind: "link", text: `短链已生成。\n${publicOrigin}/s/${code}`,
+      kind: "link", text: `短链已生成。\n${publicOrigin}/s/${code}`, localUrl: `${publicOrigin}/s/${code}`,
       guard: { sql: `inbox.receipt_nonce='${shortMarker(policy)}' AND EXISTS (
         SELECT 1 FROM telegram_short_link_actions AS action JOIN normal_short_links AS link ON ${ownedIssuedLink}
         WHERE action.receipt_id=inbox.receipt_id AND action.result='issued' AND action.code_sha256=?

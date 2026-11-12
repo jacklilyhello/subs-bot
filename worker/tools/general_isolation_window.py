@@ -48,12 +48,24 @@ def _schema(scope):
 
 
 def require_window_clear(scope):
-    present = reads._one(scope, f"SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='{TABLE}') AS present", ("present",))
-    _require(present["present"] in (0, 1), ERROR)
-    if present["present"]:
-        _schema(scope)
-        _require(reads._one(scope, f"SELECT count(*) AS profiles FROM {TABLE}", ("profiles",)) == {"profiles": 0},
-                 "Close, drain and restore the full general isolation window before another lane or deployment operation.")
+    schema = reads._one(scope, f"""SELECT
+        EXISTS(SELECT 1 FROM sqlite_schema WHERE name='{TABLE}') AS windowObject,
+        EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='{TABLE}') AS windowTable,
+        EXISTS(SELECT 1 FROM sqlite_schema WHERE name='subs_bot_schema_migrations') AS ledgerObject,
+        EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='subs_bot_schema_migrations') AS ledger""",
+        ("windowObject", "windowTable", "ledgerObject", "ledger"))
+    _require(all(type(value) is int and value in (0, 1) for value in schema.values())
+             and schema["windowObject"] == schema["windowTable"] and schema["ledgerObject"] == schema["ledger"], ERROR)
+    if not schema["windowTable"]:
+        if schema["ledger"]:
+            registered = reads._one(scope, f"""SELECT EXISTS(SELECT 1 FROM subs_bot_schema_migrations
+                WHERE position=52 OR name='{MIGRATION}') AS windowRegistered""", ("windowRegistered",))
+            _require(type(registered["windowRegistered"]) is int and registered["windowRegistered"] == 0, ERROR)
+        return
+    _require(schema["ledger"] == 1, ERROR)
+    _schema(scope)
+    _require(reads._one(scope, f"SELECT count(*) AS profiles FROM {TABLE}", ("profiles",)) == {"profiles": 0},
+             "Close, drain and restore the full general isolation window before another lane or deployment operation.")
 
 
 def work_sql(bot):

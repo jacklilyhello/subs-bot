@@ -7,9 +7,11 @@ import os
 import re
 import stat
 
+import external_shortlink_release as external_shortlinks
+
 from cloudflare_isolation import (
     CloudflareError, WORKER_NAME, _Isolation, _api_status_tag, _artifact, _page_jump_tag,
-    _require, _telegram_feature_tag, _verify_health, version_evidence,
+    _require, _telegram_feature_tag, _verify_health, version_evidence, _page_jump_version,
 )
 from d1_migrations import _load_migrations, _read_state
 from page_jump_control import MAX_SAFE_INTEGER, PageJumpControl, PageJumpGate
@@ -81,7 +83,7 @@ def artifact_proof(directory, manifest):
 
 
 def _ordinary_tag(base, active):
-    return _telegram_feature_tag(
+    tag = _telegram_feature_tag(
         _api_status_tag(base.tag, active.api_status_binding, active.telegram_api_status),
         active.telegram_inline_search, active.telegram_provider_url_import, active.telegram_provider_refresh,
         active.legacy_subscription_shorts, active.telegram_provider_batch,
@@ -93,6 +95,7 @@ def _ordinary_tag(base, active):
         subscription_shorts=active.telegram_subscription_shorts if active.telegram_subscription_shorts_capable else None,
         short_module_sha256=active.digest if active.telegram_subscription_shorts_capable else None,
     )
+    return external_shortlinks.release_tag(tag, active.external_shortlink_token_sha256, active.telegram_external_shortlinks)
 
 
 def _gate_document(gate):
@@ -121,6 +124,9 @@ def prepare_stage(worker_api, data_api, target, bundle, manifest, telegram_confi
                  active.telegram_aggregate_key_sha256, active.telegram_private_share_key_sha256)
              and active.tag == _ordinary_tag(base, active),
              "Stage page jump from the exact healthy dormant Worker artifact and configuration.")
+    shortlink_token = os.environ.get("SUBS_BOT_SHORTLINK_BUSINESS_TOKEN")
+    external_shortlinks.target(active, None, shortlink_token, capable=base.external_shortlink_capable,
+        telegram_digest=base.telegram_config_sha256, aggregate_digest=base.telegram_aggregate_key_sha256)
     bot_id = json.loads(telegram_config)["botId"]
     control = PageJumpControl(scope, bot_id)
     migrations = _load_migrations(bundle, manifest)
@@ -160,7 +166,7 @@ def prepare_stage(worker_api, data_api, target, bundle, manifest, telegram_confi
         _require(prior is not None or current.origin_after_receipt == 0, "The isolated page-jump stage checkpoint differs.")
     _require(expected["priorEpoch"] == (prior.epoch if prior else None)
              and expected["gateSha256"] == _digest(_gate_document(prior)), "The isolated page-jump stage checkpoint differs.")
-    desired = replace(active, tag=_page_jump_tag(active.tag, run_id, active.digest), telegram_page_jump_epoch=run_id)
+    desired = _page_jump_version(active, run_id)
     candidate = scope.staged(desired)
     if resumed:
         _require(candidate is not None, "The reserved stage has no verified candidate. Start a fresh protected stage.")
@@ -169,7 +175,7 @@ def prepare_stage(worker_api, data_api, target, bundle, manifest, telegram_confi
     reserved = control.reserve(prior, run_id, current_release)
     if candidate is None:
         _require(current_release() and control.observe().gate == reserved, "The isolated closed stage changed before upload.")
-        candidate = scope.upload(module, desired, telegram_config, aggregate_key, private_share_key)
+        candidate = scope.upload(module, desired, telegram_config, aggregate_key, private_share_key, shortlink_token)
     _require(current_release() and scope.worker_config() == settings and scope.cron_enabled(),
              "The isolated active release changed during page-jump staging.")
     control.verify_drained(reserved, current_release)

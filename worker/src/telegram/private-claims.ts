@@ -40,9 +40,18 @@ function inPrivateScope(policy: ClaimPolicy, event: TelegramEventScope): boolean
 }
 
 export async function legacyInlineClaimUrl(
-  db: D1Database, policy: TelegramPolicy, { actorId, code }: TelegramLegacyInlineClaim,
+  db: D1Database, policy: ClaimPolicy, { actorId, code }: TelegramLegacyInlineClaim,
 ): Promise<string | undefined> {
-  if (code.length !== 11 || (actorId !== policy.adminId && actorId !== policy.memberId)) return;
+  if (code.length !== 11) return;
+  if ("privateClaims" in policy) {
+    if (!policy.privateClaims || !policy.sharedOutbox || policy.rehearsal || actorId === policy.botId) return;
+    const current = await db.prepare(`SELECT 1 FROM ${GENERAL_POLICY_ACTORS_SQL}
+      WHERE ${GENERAL_POLICY_PIN_SQL} AND ${GENERAL_RECEIPT_SCHEMA} AND ${GENERAL_PRIVATE_CLAIM_SCHEMA}
+        AND policy.active=1 AND ${GENERAL_NO_LEGACY_WORK} AND actor.actor_id=? AND ${GENERAL_LATEST_ACTOR_SQL}
+        AND unixepoch()>MAX(policy.cutover_at,actor.effective_at)`).bind(...generalPolicyBindings(policy), actorId)
+      .first().catch(() => null);
+    if (!current) return;
+  } else if (actorId !== policy.adminId && actorId !== policy.memberId) return;
   const codeSha256 = await privateShareCodeDigest(code);
   if (codeSha256 === null || !await legacyPrivateShareAvailable(db, { botId: policy.botId, actorId, codeSha256 })) return;
   return `https://t.me/${policy.botUsername}?start=claim_${code}`;

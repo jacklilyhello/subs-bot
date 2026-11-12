@@ -1,5 +1,5 @@
 import { parseSubscriptionDocument } from "../subscription-document.ts";
-import { claimTelegramDocumentJob, isGeneralDocumentPolicy, prepareTelegramDocumentJobLeaseGuard,
+import { claimTelegramDocumentJob, GENERAL_MIXED_DOCUMENT_SCHEMA, isGeneralDocumentPolicy, prepareTelegramDocumentJobLeaseGuard,
   type TelegramDocumentPolicy } from "./document-jobs.ts";
 import { finishTelegramDocumentJob, MAX_TELEGRAM_DOCUMENT_NODES, persistTelegramDocumentJob } from "./document-persistence.ts";
 import { downloadTelegramDocument } from "./document-transport.ts";
@@ -10,10 +10,11 @@ import { parseTelegramMixedDocument } from "./mixed-document-input.ts";
 const DOWNLOAD_BUDGET_MS = 20_000;
 const MIN_FINISH_WINDOW_MS = 5_000;
 
-export async function telegramMixedDocumentReady(db: D1Database): Promise<boolean> {
+export async function telegramMixedDocumentReady(db: D1Database, general = false): Promise<boolean> {
   const present = await db.prepare(`SELECT count(*) AS present FROM sqlite_schema
     WHERE type='table' AND name='telegram_mixed_document_opt_in'`).first<number>("present");
-  if (present === 0 || present === 1) return present === 1;
+  if (present === 0) return false;
+  if (present === 1) return !general || Boolean(await db.prepare(`SELECT 1 WHERE ${GENERAL_MIXED_DOCUMENT_SCHEMA}`).first());
   throw new Error("Telegram mixed document schema could not be confirmed.");
 }
 
@@ -23,6 +24,7 @@ export async function runTelegramDocumentIntake(
   policy: TelegramDocumentPolicy,
   providerDocumentsReady = false,
   mixedDocumentsReady = false,
+  request: typeof fetch = fetch,
 ): Promise<boolean> {
   const lease = await claimTelegramDocumentJob(db, policy);
   if (!lease) return false;
@@ -36,7 +38,7 @@ export async function runTelegramDocumentIntake(
 
   const download = await downloadTelegramDocument(policy, {
     fileId: lease.fileId, expectedSize: lease.expectedSize ?? undefined,
-  }, { timeoutMs });
+  }, { timeoutMs, request });
   if (download.kind !== "downloaded") {
     await finishTelegramDocumentJob(db, policy, lease, download.kind === "retryable"
       ? { kind: "retry" } : { kind: "failed", reason: "download-rejected" });
@@ -44,7 +46,7 @@ export async function runTelegramDocumentIntake(
   }
 
   let mixed: Extract<ReturnType<typeof parseTelegramMixedDocument>, { kind: "mixed" }> | undefined;
-  if (!isGeneralDocumentPolicy(policy) && providerDocumentsReady && (lease.suffix === "txt" || lease.suffix === "log") &&
+  if ((!isGeneralDocumentPolicy(policy) || policy.privateProvider) && providerDocumentsReady && (lease.suffix === "txt" || lease.suffix === "log") &&
       await db.prepare("SELECT 1 AS opted FROM telegram_provider_document_opt_in WHERE receipt_id=?")
         .bind(lease.receiptId).first<number>("opted") === 1) {
     if (mixedDocumentsReady && await db.prepare("SELECT 1 AS opted FROM telegram_mixed_document_opt_in WHERE receipt_id=?")
