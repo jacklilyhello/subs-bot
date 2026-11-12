@@ -135,7 +135,9 @@ function leaseBindings(pin: GeneralTelegramPin, lease: Lease) {
 
 export type GeneralReadCommand = "start" | "help" | "list";
 
-export type GeneralReadEvent = TelegramEventScope & { command: GeneralReadCommand; viewKind: "list" | "expiry" | "recycle" | null };
+export type GeneralReadEvent = TelegramEventScope & {
+  command: GeneralReadCommand; viewKind: "list" | "expiry" | "recycle" | null; renumber?: true;
+};
 
 export function generalReadEvent(
   pin: Pick<GeneralTelegramPin, "botUsername" | "botId" | "privateManagement">,
@@ -144,6 +146,10 @@ export function generalReadEvent(
   const event = readGeneralPrivateMenuCommand(update, pin.botUsername);
   if (event && event.actorId !== pin.botId && event.remainder.trim() === "") {
     const { actorId, messageId, messageDate, name } = event;
+    if (shared && pin.privateManagement && name === "renumber") return {
+      updateId, actorId, chatId: actorId, chatType: "private", threadId: null, messageId, messageDate,
+      command: "help", viewKind: null, renumber: true,
+    };
     if (name === "help" || name === "list" || name === "start" || (shared && pin.privateManagement && ["start", "expire", "recycle"].includes(name))) {
       return { updateId, actorId, chatId: actorId, chatType: "private", threadId: null, messageId, messageDate,
         command: name === "start" ? (shared ? "start" : "help") : name === "help" ? "help" : "list",
@@ -152,8 +158,9 @@ export function generalReadEvent(
   }
   const group = shared ? readGeneralGroupCommand(update, pin.botUsername) : null;
   if (!group || group.actorId === pin.botId || group.name === "s") return null;
-  if (["expire", "recycle"].includes(group.name) && !pin.privateManagement) return null;
+  if (["expire", "recycle", "renumber"].includes(group.name) && !pin.privateManagement) return null;
   const { name, remainder: _remainder, ...scope } = group;
+  if (name === "renumber") return { ...scope, updateId, command: "help", viewKind: null, renumber: true };
   return { ...scope, updateId, command: name === "start" ? "start" : name === "help" ? "help" : "list",
     viewKind: name === "start" || name === "help" ? null : name === "expire" ? "expiry" : name as "list" | "recycle" };
 }

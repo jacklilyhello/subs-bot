@@ -21,6 +21,7 @@ on:
       - '.github/workflows/worker-isolation-legacy-selected-smoke.yml'
       - '.github/workflows/worker-isolation-telegram-selected-smoke.yml'
       - '.github/workflows/worker-isolation-telegram-short-links-smoke.yml'
+      - '.github/workflows/worker-isolation-shortlink-fault-drill.yml'
       - '.github/workflows/worker-isolation-grep-outcome.yml'
   push:
     branches: [main]
@@ -43,6 +44,7 @@ on:
       - '.github/workflows/worker-isolation-legacy-selected-smoke.yml'
       - '.github/workflows/worker-isolation-telegram-selected-smoke.yml'
       - '.github/workflows/worker-isolation-telegram-short-links-smoke.yml'
+      - '.github/workflows/worker-isolation-shortlink-fault-drill.yml'
       - '.github/workflows/worker-isolation-grep-outcome.yml'
   workflow_dispatch:
 

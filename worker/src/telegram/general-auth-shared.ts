@@ -82,7 +82,8 @@ import { acceptTelegramShortLink, GENERAL_SHORT_SCHEMA, GENERAL_TELEGRAM_SHORT_M
   reapFailedTelegramShortLinks, retireUnsentTelegramShortLink } from "./short-link-actions.ts";
 import { GROUP_SHARE_PUBLISH_CALLBACK, readGeneralGroupShare, readGeneralPrivateDocumentUpdate, readGeneralPrivateLifecycleUpdate, readGeneralPrivateSubscriptionRead,
   readGeneralInlineQuery, readGeneralPrivateApiStatus, readGeneralPrivateGitHubSearch, readGeneralPrivateProviderBatch, readGeneralPrivateProviderRefresh, readGeneralPrivateSelectedRevoke, readGeneralPrivateShareClaim, readGeneralPrivateShareCreation,
-  readGeneralPrivateTempUpdate, readGeneralLegacyShareCallback, readGeneralPrivateBulkTrash, readGeneralPrivateInlineSort, readGeneralPrivateMenuCommand, readGeneralSubscriptionBrowsing, readPrivateTelegramCommand, readTelegramUpdate } from "./protocol.ts";
+  readGeneralPrivateTempUpdate, readGeneralPrivateShortLink, readGeneralLegacyShareCallback, readGeneralPrivateBulkTrash, readGeneralPrivateInlineSort, readGeneralPrivateMenuCommand, readGeneralSubscriptionBrowsing, readPrivateTelegramCommand, readTelegramUpdate } from "./protocol.ts";
+import { GENERAL_RENUMBER_MARKER, renderTelegramRenumber } from "./renumber.ts";
 import { confirmTelegramSubscriptionReadSend, GENERAL_SUBSCRIPTION_READ_MARKER, insertTelegramSubscriptionReadTickets,
   prepareTelegramSubscriptionReadTickets, reapTelegramSubscriptionReadTickets,
   type TelegramSubscriptionReadTicket } from "./subscription-read.ts";
@@ -197,6 +198,9 @@ function family(alias: "inbox" | "earlier", group: boolean, pin: GeneralTelegram
   if (pin.rehearsal) return management;
   return `(CASE ${pin.privateGitHub ? `WHEN ${alias}.receipt_nonce='${GENERAL_GITHUB_SEARCH_MARKER}'
     THEN (${telegramGitHubSearchMarker(alias, true)})` : ""}
+    ${pin.privateManagement ? `WHEN ${alias}.receipt_nonce='${GENERAL_RENUMBER_MARKER}'
+      THEN (${alias}.command='help' AND (${privateScope}${group ? ` OR (${alias}.chat_type IN ('group','supergroup')
+        AND (${alias}.chat_type='supergroup' OR ${alias}.thread_id IS NULL))` : ""}))` : ""}
     ${pin.privateApiStatus ? `WHEN ${alias}.receipt_nonce='${GENERAL_API_STATUS_MARKER}'
     THEN (${telegramApiStatusReceipt(alias, true)})` : ""}
     WHEN ${alias}.receipt_nonce='${GENERAL_AUTH_ACTION_MARKER}'
@@ -237,7 +241,7 @@ function queueMarkers(group: boolean, pin: GeneralTelegramPin): string {
   const markers: string[] = [MARKER];
   if (group) markers.push(GROUP_MARKER);
   if (pin.privateManagement) markers.push(GENERAL_LIFECYCLE_MARKER, GENERAL_LIFECYCLE_VIEW_MARKER,
-    GENERAL_SUBSCRIPTION_READ_MARKER, GENERAL_PATH_MARKER, GENERAL_INLINE_SORT_MARKER, GENERAL_BULK_TRASH_MARKER);
+    GENERAL_SUBSCRIPTION_READ_MARKER, GENERAL_PATH_MARKER, GENERAL_INLINE_SORT_MARKER, GENERAL_BULK_TRASH_MARKER, GENERAL_RENUMBER_MARKER);
   if (pin.privateBrowsing) markers.push(GENERAL_VIEW_MARKER, GENERAL_NUMBER_MARKER, GENERAL_NODE_MARKER, GENERAL_RAW_FILE_MARKER, GENERAL_PAGE_JUMP_MARKER);
   if (pin.privateTemp) markers.push(TELEGRAM_GENERAL_TEMP_MARKER);
   if (pin.privateDocument) markers.push(TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER);
@@ -455,6 +459,9 @@ export async function acceptGeneralSharedTelegramCommand(
     if (accepted && search.kind === "callback") acknowledge?.(search.callbackId);
     return accepted ? 200 : 204;
   }
+  const short = pin.privateManagement && pin.privateShort
+    ? readGeneralPrivateShortLink(decoded.update, decoded.updateId, pin.botId, pin.botUsername) : null;
+  if (short) return await acceptTelegramShortLink(db, pin, short, aggregateKey ?? null) === "accepted" ? 200 : 204;
   const tempEvent = pin.privateTemp ? readGeneralPrivateTempUpdate(decoded.update, decoded.updateId, pin.botId, pin.botUsername) : null;
   if (pin.privateProvider && providerAvailable && tempEvent?.kind === "temp-text") {
     const { text, ...event } = tempEvent;
@@ -473,13 +480,6 @@ export async function acceptGeneralSharedTelegramCommand(
     }
   }
   const command = pin.privateManagement && !tempEvent ? readGeneralPrivateMenuCommand(decoded.update, pin.botUsername) : null;
-  if (pin.privateShort && command?.name === "short") {
-    if (command.remainder !== "" && !/^ /u.test(command.remainder)) return 204;
-    const { actorId, messageId, messageDate, remainder: args } = command;
-    const accepted = await acceptTelegramShortLink(db, pin, { args, updateId: decoded.updateId,
-      actorId, chatId: actorId, chatType: "private", threadId: null, messageId, messageDate }, aggregateKey ?? null);
-    return accepted === "accepted" ? 200 : 204;
-  }
   if (pin.privateSelected && command?.name === "o") {
     if (!aggregateKey || (command.remainder !== "" && !/^\s/u.test(command.remainder))) return 204;
     const { actorId, messageId, messageDate, remainder: query } = command;
@@ -512,7 +512,7 @@ export function acceptGeneralReadLaneCommand(
   if (!pin.rehearsal || pin.privateManagement || pin.privateFormats || pin.privateTemp || pin.privateDocument || pin.privateProvider
     || pin.privateClaims || pin.privateShareCreation || pin.privateAggregate || pin.privateSelected || pin.privateShort || pin.privateAuthorization
     || event.chatType !== "private" || event.chatId !== event.actorId
-    || event.threadId !== null || (event.viewKind !== null && event.viewKind !== "list")) return Promise.resolve(204);
+    || event.threadId !== null || event.renumber || (event.viewKind !== null && event.viewKind !== "list")) return Promise.resolve(204);
   return acceptSharedRead(db, pin, event, null, null, guard);
 }
 
@@ -552,7 +552,7 @@ async function acceptSharedRead(
   const path = pathCommand ? prepareTelegramPathReceipt(db, key, { general: pin }, pathCommand.remainder) : null;
   const temp = tempEvent && mode ? prepareGeneralTelegramTempReceipt(db, key, mode, tempEvent) : null;
   if (tempEvent && !temp) return 204;
-  const marker = temp ? TELEGRAM_GENERAL_TEMP_MARKER : path ? GENERAL_PATH_MARKER : group ? GROUP_MARKER
+  const marker = temp ? TELEGRAM_GENERAL_TEMP_MARKER : path ? GENERAL_PATH_MARKER : event.renumber ? GENERAL_RENUMBER_MARKER : group ? GROUP_MARKER
     : pin.privateManagement && event.viewKind !== null ? GENERAL_LIFECYCLE_VIEW_MARKER : MARKER;
   const fresh = "incoming.bot_id=? AND incoming.update_id=? AND incoming.receipt_nonce=?";
   const proof = temp ? `(${temp.proof}) AND ${generalCurrentAuthoritySql("incoming")}` : path?.proof
@@ -1175,7 +1175,9 @@ export async function drainGeneralSharedTelegramReply(
   let settingsKeyboard: { text: string; callback_data: string }[][] | undefined;
   let commandMenu: TelegramCommandContext | undefined;
   let mainMenu: TelegramMainMenuFeatures | undefined;
-  if (lease.marker === GENERAL_LIFECYCLE_MARKER && lease.actionKind !== null && lease.actionSubscriptionId !== null
+  if (lease.marker === GENERAL_RENUMBER_MARKER) {
+    presentation = { text: await renderTelegramRenumber(db, lease.actorId), buttons: [], forceReply: false };
+  } else if (lease.marker === GENERAL_LIFECYCLE_MARKER && lease.actionKind !== null && lease.actionSubscriptionId !== null
     && lease.actionRevision !== null) {
     presentation = renderTelegramLifecycle({ kind: lease.actionKind, subscriptionId: lease.actionSubscriptionId,
       expectedLifecycleRevision: lease.actionRevision });
