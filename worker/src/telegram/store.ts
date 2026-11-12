@@ -620,6 +620,21 @@ export async function beginTelegramAggregateLinkReply(db: D1Database, policy: Te
   return guard !== null && await beginReplyStatement(db, policy, lease, "allowed", guard).first() !== null;
 }
 
+export async function confirmTelegramAggregateLinkSend(db: D1Database, policy: TelegramPolicy, lease: TelegramReplyLease): Promise<boolean> {
+  if (!inTelegramScope(policy, lease) || lease.chatType !== "private" || lease.threadId !== null || !lease.aggregate) return false;
+  const [mode, schema] = await Promise.all([readTempStorage(db).catch(() => null), readShortLinkNamespaces(db).catch(() => null)]);
+  if (mode === null || schema === null) return false;
+  const guard = aggregateLinkDeliveryGuard(policy, lease.aggregate, mode, schema.allMarker);
+  if (!guard) return false;
+  return await db.prepare(`SELECT 1 FROM telegram_inbox AS inbox JOIN telegram_outbox AS reply USING(receipt_id)
+    WHERE inbox.receipt_id=? AND inbox.bot_id=? AND inbox.update_id=? AND inbox.actor_id=? AND inbox.chat_id=?
+      AND inbox.chat_type='private' AND inbox.thread_id IS NULL AND inbox.message_id=? AND inbox.message_date=?
+      AND inbox.command=? AND reply.state='sending' AND reply.lease_id=? AND reply.attempts=? AND reply.lease_until>unixepoch()
+      AND inbox.received_at+${MAX_REPLY_AGE_SECONDS}>unixepoch() AND (${guard.sql})`)
+    .bind(lease.receiptId, policy.botId, lease.updateId, lease.actorId, lease.chatId, lease.messageId, lease.messageDate,
+      lease.command, lease.leaseId, lease.attempts, ...guard.bindings).first() !== null;
+}
+
 export async function beginTelegramShortLinkReply(
   db: D1Database, policy: TelegramPolicy, lease: TelegramReplyLease, guard: TelegramShortLinkGuard,
 ): Promise<boolean> {

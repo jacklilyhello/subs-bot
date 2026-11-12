@@ -73,7 +73,7 @@ export async function readGeneralIsolationWindow(
   return { ready: true, epoch: lane.epoch, mode: lane.mode, pin: { ...pin,
     privateManagement: true, privateFormats: true, privateTemp: true, privateDocument: true, privateProvider: true,
     privateClaims: true, privateShareCreation: true, privateAggregate: true, privateSelected: true, privateShort: true,
-    privateAuthorization: true, privateInline: true, providerBatch: true,
+    privateAuthorization: true, privateInline: true, privateGitHub: true, privateApiStatus: true, providerBatch: true,
     isolationWindow: { profile: "full-v1", adminId: policy.adminId, memberId: policy.memberId },
     subscriptionShorts: options.subscriptionShorts ? "issue" : "drain",
     ...(options.groupCards ? { groupShare: { chatId: policy.groupId, chatType: "group" as const } } : {}),

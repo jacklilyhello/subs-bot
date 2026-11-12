@@ -70,7 +70,7 @@ async function fixture(botId: string) {
     return acceptGeneralSharedTelegramCommand(db, selected, new Request("https://synthetic.invalid/telegram/webhook", {
       method: "POST", headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": pin.webhookSecret },
       body: JSON.stringify(update),
-    }), undefined, async () => options.available !== false, undefined, undefined, null, false, options.urls ?? true, false, options.mixed ?? true);
+    }), undefined, async () => options.available !== false, undefined, undefined, null, false, options.urls ?? true, false, undefined, options.mixed ?? true);
   }
   async function receipt(id: number) {
     const value = await db.prepare("SELECT receipt_id FROM telegram_inbox WHERE bot_id=? AND update_id=?").bind(botId, id).first<number>("receipt_id");

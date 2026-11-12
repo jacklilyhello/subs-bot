@@ -110,6 +110,15 @@ on:
         description: Exact isolation confirmation for API status enable or disable
         required: false
         type: string
+      external_shortlinks:
+        description: Preserve or explicitly confirm caller-only internal shortlink wrapping
+        required: true
+        default: preserve
+        type: choice
+        options:
+          - preserve
+          - enable external shortlinks for subs-bot-cf-dev-01
+          - disable external shortlinks for subs-bot-cf-dev-01
       page_jump:
         description: Preserve ordinary deployment, or manage the isolated page-jump release
         required: true
@@ -232,6 +241,7 @@ jobs:
           SUBS_BOT_SUBSCRIPTION_SHORTS_CONFIRMATION: ${{ inputs.subscription_shorts_confirmation }}
           SUBS_BOT_PROVIDER_BATCH_MODE: ${{ inputs.provider_batch }}
           SUBS_BOT_PROVIDER_BATCH_CONFIRMATION: ${{ inputs.provider_batch_confirmation }}
+          SUBS_BOT_EXTERNAL_SHORTLINKS_MODE: ${{ inputs.external_shortlinks }}
           SUBS_BOT_API_STATUS_MODE: ${{ inputs.api_status }}
           SUBS_BOT_API_STATUS_CONFIRMATION: ${{ inputs.api_status_confirmation }}
           SUBS_BOT_PAGE_JUMP_MODE: ${{ inputs.page_jump }}
@@ -244,6 +254,7 @@ jobs:
           SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
           SUBS_BOT_TELEGRAM_AGGREGATE_KEY: ${{ secrets.SUBS_BOT_TELEGRAM_AGGREGATE_KEY }}
           SUBS_BOT_TELEGRAM_PRIVATE_SHARE_CREATION_KEY: ${{ secrets.SUBS_BOT_TELEGRAM_PRIVATE_SHARE_CREATION_KEY }}
+          SUBS_BOT_SHORTLINK_BUSINESS_TOKEN: ${{ secrets.SUBS_BOT_SHORTLINK_BUSINESS_TOKEN }}
           SUBS_BOT_CF_PROVIDER_BINDING_JSON: ${{ secrets.SUBS_BOT_CF_PROVIDER_BINDING_JSON }}
           SUBS_BOT_CF_PROVIDER_API_STATUS_BINDING_JSON: ${{ secrets.SUBS_BOT_CF_PROVIDER_API_STATUS_BINDING_JSON }}
         run: python3 -B worker/tools/release_isolation.py
@@ -269,6 +280,7 @@ jobs:
           SUBS_BOT_SUBSCRIPTION_SHORTS_CONFIRMATION: ${{ inputs.subscription_shorts_confirmation }}
           SUBS_BOT_PROVIDER_BATCH_MODE: ${{ inputs.provider_batch }}
           SUBS_BOT_PROVIDER_BATCH_CONFIRMATION: ${{ inputs.provider_batch_confirmation }}
+          SUBS_BOT_EXTERNAL_SHORTLINKS_MODE: ${{ inputs.external_shortlinks }}
           SUBS_BOT_API_STATUS_MODE: ${{ inputs.api_status }}
           SUBS_BOT_API_STATUS_CONFIRMATION: ${{ inputs.api_status_confirmation }}
           SUBS_BOT_PAGE_JUMP_MODE: ${{ inputs.page_jump }}

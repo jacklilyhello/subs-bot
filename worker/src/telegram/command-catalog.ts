@@ -49,8 +49,11 @@ export function telegramCommandEntries({ privateChat, role, features: f }: Teleg
   if (f.batchRefresh) add("/updateall", "预览批量刷新");
   if (f.batchRefresh || f.batchStatus) add("/updateall status", "查看批量任务历史");
   if (f.bulkTrash) add("/d 关键词", "预览匹配订阅的删除操作");
-  if (f.github) add("/g 关键词或链接", "搜索 GitHub 公开代码");
-  if (f.apiStatus) add("/ai", "测试 API 地址和 Key");
+  if (f.github) add("/g 关键词", "搜索 GitHub 公开代码");
+  if (f.apiStatus) {
+    add("/ai", "测试 API 地址和 Key");
+    add("/cancel", "回复 API 提示时取消");
+  }
   if (f.inline) {
     add("/inline on", "开启私聊内联搜索（15 分钟）");
     if (f.inlineTemp) add("/inline temp on", "开启临时节点内联搜索（15 分钟）");
