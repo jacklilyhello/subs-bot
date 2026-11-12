@@ -707,10 +707,10 @@ test("closed general authorization replays a sealed candidate in a separate emit
     .bind("442b9f1e52ad961aac41ee9416760863984646a96570bd22f26474d329ee626e").run();
 
   for (const rejected of [
-    groupPost(102, addressed), groupPost(101, "/list"), groupPost(101, "/list@DifferentBot"),
+    groupPost(102, addressed), groupPost(101, "/list extra"), groupPost(101, "/list@DifferentBot"),
     groupPost(101, addressed, { chatId: -100200 }), groupPost(101, addressed, { chatType: "group" }),
     groupPost(101, addressed, { message: { message_thread_id: 44 } }),
-    groupPost(101, "/help@GeneralFixtureBot"), groupPost(101, addressed, { date: pin.cutoverAt }),
+    groupPost(101, "/help@GeneralFixtureBot extra"), groupPost(101, addressed, { date: pin.cutoverAt }),
   ]) assert.equal((await rejected).status, 204);
   await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,'104',5,?,'member')")
     .bind(pin.botId, pin.generation, now - 1).run();
