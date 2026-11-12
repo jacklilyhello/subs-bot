@@ -1,4 +1,5 @@
 import { validInteger } from "../storage.ts";
+import { TELEGRAM_RENUMBER_MARKER } from "./renumber.ts";
 import { readShortLinkNamespaces } from "../short-links.ts";
 import { beginSubscriptionShortDelivery, subscriptionShortPublicationGuard, subscriptionShortSendGuard,
   type SubscriptionShortCandidate } from "./subscription-shorts.ts";
@@ -93,10 +94,11 @@ const SUBSCRIPTION_SHARE_UNAVAILABLE_MARKER = "share-sub-unavailable:v1";
 type ReplyAccess = "allowed" | "denied" | "none";
 
 type ReplyRow = Omit<TelegramReplyLease,
-  "view" | "pageJump" | "lifecycle" | "privateClaim" | "temp" | "tempRaw" | "aggregate" | "selected" | "path" | "document" |
+  "view" | "renumber" | "pageJump" | "lifecycle" | "privateClaim" | "temp" | "tempRaw" | "aggregate" | "selected" | "path" | "document" |
   "privateShareCreation" | "subscriptionShareUnavailable" | "subscriptionRead" | "shortLink" | "inlineSort" | "subscriptionNodes" | "providerOutcome" | "providerRequestKind" |
   "bulkTrash" | "inlineConsent" | "githubSearch" | "subscriptionRawFile" | "providerBatch" | "apiStatus" | "providerDocument"> & {
   viewKind: TelegramView["kind"] | null;
+  renumberMarker: number;
   pageJumpMarker: number;
   afterId: number | null;
   afterEpoch: number | null;
@@ -147,6 +149,7 @@ function supportedReceipt(alias: "inbox" | "earlier", includeAggregate = false, 
   includeRawFile = false, includeProviderBatch = false, includeApiStatus = false, includeProviderDocument = false): string {
   // Keep feature predicates within D1's expression depth limit in the claim query.
   return `(CASE WHEN ${alias}.receipt_nonce IS NULL THEN 1
+    WHEN (${alias}.receipt_nonce='${TELEGRAM_RENUMBER_MARKER}' AND ${alias}.command='help') THEN 1
     WHEN (${alias}.receipt_nonce IN (${TELEGRAM_VIEW_RECEIPTS})
       AND EXISTS (SELECT 1 FROM telegram_view WHERE receipt_id = ${alias}.receipt_id)) THEN 1
     WHEN (${alias}.receipt_nonce = '${TELEGRAM_LIFECYCLE_MARKER}'
@@ -226,6 +229,9 @@ export async function acceptTelegramCommand(
   admissionGuard?: D1PreparedStatement,
 ): Promise<"accepted" | "duplicate"> {
   if (!inTelegramScope(policy, command)) throw new RangeError("Telegram command is outside the isolation scope.");
+  if (command.renumber && (command.command !== "help" || reply !== undefined)) {
+    throw new RangeError("The display numbering receipt differs from its command.");
+  }
   if (reply && (command.command !== "help" || command.chatType !== "private" || command.threadId !== null)) {
     throw new RangeError("The private subscription share reply is outside its scope.");
   }
@@ -262,7 +268,8 @@ export async function acceptTelegramCommand(
       SELECT receipt_id FROM telegram_inbox WHERE bot_id = ? AND update_id = ? AND receipt_nonce = ?
     `).bind(...key),
     db.prepare(`
-      UPDATE telegram_inbox SET receipt_nonce = ${reply ? `'${SUBSCRIPTION_SHARE_UNAVAILABLE_MARKER}'` : "NULL"}
+      UPDATE telegram_inbox SET receipt_nonce = ${reply ? `'${SUBSCRIPTION_SHARE_UNAVAILABLE_MARKER}'`
+        : command.renumber ? `'${TELEGRAM_RENUMBER_MARKER}'` : "NULL"}
       WHERE bot_id = ? AND update_id = ? AND receipt_nonce = ?
       RETURNING receipt_id
     `).bind(...key),
@@ -413,6 +420,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
         inbox.message_id AS messageId, inbox.message_date AS messageDate, inbox.thread_id AS threadId,
         inbox.command, reply.lease_id AS leaseId, reply.attempts,
         page.kind AS viewKind, page.after_id AS afterId, page.after_epoch AS afterEpoch,
+        CASE WHEN inbox.receipt_nonce='${TELEGRAM_RENUMBER_MARKER}' THEN 1 ELSE 0 END AS renumberMarker,
         CASE WHEN inbox.receipt_nonce IN (${TELEGRAM_PAGE_JUMP_RECEIPTS}) THEN 1 ELSE 0 END AS pageJumpMarker,
         action.kind AS lifecycleKind, action.subscription_id AS lifecycleSubscriptionId,
         action.expected_revision AS lifecycleExpectedRevision, claim.code_sha256 AS privateClaimCodeSha256,
@@ -482,7 +490,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
   const row = read.results[0];
   if (!row) return null;
   const { viewKind, afterId, afterEpoch, pageJumpMarker, lifecycleKind, lifecycleSubscriptionId, lifecycleExpectedRevision,
-    privateClaimCodeSha256, groupClaimMarker, tempKind, tempNodeCount, tempTotalCount, tempMalformedCount,
+    renumberMarker, privateClaimCodeSha256, groupClaimMarker, tempKind, tempNodeCount, tempTotalCount, tempMalformedCount,
     tempUnsupportedCount, tempIgnoredCount, tempRawMarker: rawMarker, aggregateResult, aggregateRevision, aggregateCodeSha256,
     selectedResult, selectedCodeSha256,
     pathKind, pathAfterId, pathAffectedCount,
@@ -496,6 +504,7 @@ export async function claimTelegramReply(db: D1Database, botId: string, includeA
   const temp = tempKind === null ? undefined : { kind: tempKind, nodeCount: tempNodeCount!, totalCount: tempTotalCount!,
     malformedCount: tempMalformedCount!, unsupportedCount: tempUnsupportedCount!, ignoredCount: tempIgnoredCount! };
   return { ...lease, view: viewKind === null ? null : { kind: viewKind, afterId, afterEpoch },
+    ...(renumberMarker === 1 ? { renumber: true as const } : {}),
     ...(pageJumpMarker === 1 ? { pageJump: true as const } : {}),
     ...(lifecycle ? { lifecycle } : {}),
     ...(temp ? { temp } : {}),

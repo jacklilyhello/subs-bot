@@ -939,7 +939,7 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
     assert.deepEqual(sentBodies.slice(-2), [ruleSaved, ruleList]);
 
     const ids = [10, 8, 9, 18, 20, 22, 24, 26, 28, 312, 314];
-    const menu = [["📦 订阅列表", "🟠 临期列表"], ["📤 导出链接"], ["♻️ 撤销删除"], ["🧭 路径对应", "❓ 帮助菜单"]];
+    const menu = [["📦 订阅列表", "🟠 临期列表"], ["📤 导出链接"], ["♻️ 撤销删除", "🔢 重置编号"], ["🧭 路径对应", "❓ 帮助菜单"]];
     const helpFeatures = { management: true, subscriptionRead: true, temp: true, tempRawDefault: true, path: true,
       aggregate: true, selected: true, short: true, bulkTrash: true, inlineSort: true, authorization: true, batchStatus: true,
       authorizationScope: "fixed" as const, authorizationMemberId: policy.memberId, documentImport: true };

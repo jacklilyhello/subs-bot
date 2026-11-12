@@ -25,6 +25,7 @@ export interface TelegramEventScope {
 
 export interface TelegramCommand extends TelegramEventScope {
   command: "start" | "help" | "list" | "auth-list" | "auth-add" | "auth-remove" | "auth-usage";
+  renumber?: true;
 }
 
 export type TelegramViewKind = "list" | "expiry" | "recycle";
@@ -256,12 +257,12 @@ function readLeadingTelegramCommand(message: Record<string, unknown>, botUsernam
   return { name: name.toLowerCase(), remainder: text.slice(length) };
 }
 
-export function readPrivateTelegramCommand(update: Record<string, unknown>, botUsername: string): {
+export function readPrivateTelegramCommand(update: Record<string, unknown>, botUsername: string, allowReply = false): {
   actorId: string; messageId: number; messageDate: number; name: string; remainder: string;
 } | null {
   const { message } = update;
   if (Object.keys(update).length !== 2 || !isRecord(message) || "edit_date" in message || "document" in message
-    || "message_thread_id" in message || "reply_to_message" in message) return null;
+    || "message_thread_id" in message || (!allowReply && "reply_to_message" in message)) return null;
   const actorId = humanSender(message);
   const { chat, message_id: messageId, date: messageDate } = message;
   if (actorId === null || !isRecord(chat) || chat.type !== "private" || !isPositiveInteger(chat.id)
@@ -357,7 +358,7 @@ export function readGeneralGroupCommand(update: Record<string, unknown>, botUser
   const topic = message.is_topic_message === true;
   if (thread === undefined ? topic : (!topic || chat.type !== "supergroup" || !isPositiveInteger(thread))) return null;
   const command = readLeadingTelegramCommand(message, botUsername);
-  return command && ["start", "help", "list", "expire", "recycle", "s"].includes(command.name)
+  return command && ["start", "help", "list", "expire", "recycle", "s", "renumber"].includes(command.name)
     && (command.name === "s" || command.remainder.trim() === "") ? { ...command,
     actorId, chatId: String(chat.id), chatType: chat.type, messageId, messageDate,
     threadId: typeof thread === "number" ? thread : null,
@@ -388,6 +389,33 @@ export function readGeneralPrivateMenuCommand(update: Record<string, unknown>, b
     entities: [{ type: "bot_command", offset: 0, length: text.length }] } }, botUsername);
 }
 
+function shortTextAlias(text: string): string | null {
+  const short = /^(?:短链|short)(?: +([\s\S]*))?(?![\s\S])/iu.exec(text.replace(/^ +| +$/gu, ""));
+  return short ? short[1] ?? "" : text === "🔗 短链" ? "" : null;
+}
+
+/** Ordinary text aliases use the same private envelope and short-link admission as /short. */
+export function readGeneralPrivateShortLink(
+  update: Record<string, unknown>, updateId: number, botId: string, botUsername: string,
+): TelegramShortLinkUpdate | null {
+  const command = readGeneralPrivateMenuCommand(update, botUsername);
+  if (command?.name === "short") {
+    if (command.actorId === botId || (command.remainder !== "" && !/^ /u.test(command.remainder))) return null;
+    const { actorId, messageId, messageDate, remainder: args } = command;
+    return { updateId, actorId, chatId: actorId, chatType: "private", threadId: null, messageId, messageDate, args };
+  }
+  const { message } = update;
+  if (Object.keys(update).length !== 2 || !isRecord(message) || "edit_date" in message || "document" in message
+    || "reply_to_message" in message || "message_thread_id" in message || message.is_topic_message === true) return null;
+  const actorId = humanSender(message);
+  const scope = actorId && actorId !== botId ? telegramMessageScope(message, actorId, updateId) : null;
+  if (!scope || scope.chatType !== "private" || scope.chatId !== scope.actorId || scope.threadId !== null
+    || typeof message.text !== "string" || (Array.isArray(message.entities)
+      && message.entities.some((entity) => isRecord(entity) && entity.type === "bot_command"))) return null;
+  const args = shortTextAlias(message.text);
+  return args === null ? null : { ...scope, args };
+}
+
 function authCommand(args: string[], reply: unknown, memberId: string): TelegramCommand["command"] {
   const [actionName = "list", target, ...extra] = args;
   const action = actionName.toLowerCase();
@@ -411,7 +439,7 @@ function authCommand(args: string[], reply: unknown, memberId: string): Telegram
 function messageCommand(
   message: Record<string, unknown>, policy: TelegramPolicy,
 ): TelegramCommand["command"] | TelegramViewKind | "temp-raw" | "temp-summary" | "temp-clear" | "aggregate-show" | "aggregate-revoke" |
-  { code: string } | { args: string } | { shareArgs: string } | { selectedQuery: string } | { subscriptionQuery: string } | { shortArgs: string } |
+  { code: string } | { args: string } | { shareArgs: string } | { selectedQuery: string } | { subscriptionQuery: string } | { shortArgs: string } | { renumber: true } |
   { inlineSort: TelegramInlineSortAction } | { bulkTrashQuery: string } |
   { inlineConsent: TelegramInlineConsentUpdate["kind"] } | { githubArgs: string } |
   { providerBatch: "preview" | "status" | "usage" } | { apiStatusArgs: string } | "group-share-handoff" | null {
@@ -461,6 +489,8 @@ function messageCommand(
       return "help";
     case "list":
       return "list";
+    case "renumber":
+      return args.length === 0 ? { renumber: true } : null;
     case "expire":
       return "expiry";
     case "recycle":
@@ -803,6 +833,7 @@ function normalizeMessage(
   }
   const command = messageCommand(message, policy);
   if (command && typeof command === "object") {
+    if ("renumber" in command) return { command: { ...scope, command: "help", renumber: true } };
     if ("subscriptionQuery" in command) return { subscriptionRead: { ...scope, kind: "search", query: command.subscriptionQuery } };
     if (scope.chatType !== "private" || scope.threadId !== null) return null;
     if ("apiStatusArgs" in command) return classifyTelegramApiStatusInput({ kind: "ai-command", args: command.apiStatusArgs }).kind === "open-prompt"
@@ -849,14 +880,15 @@ function normalizeMessage(
   const menu = typeof text === "string" && !hasCommandEntity ? telegramMainMenuAction(text) : null;
   if (menu === "list" || menu === "expiry" || menu === "recycle") return { view: { ...scope, kind: menu } };
   if (menu === "help") return { command: { ...scope, command: "help" } };
+  if (menu === "renumber") return { command: { ...scope, command: "help", renumber: true } };
   if (menu === "aggregate") return privateChat ? { aggregate: { ...scope, kind: "show" } } : null;
   if (menu === "batchRefresh") return privateChat ? { providerBatch: { ...scope, kind: "preview" } } : null;
   if (menu === "path") return privateChat ? { path: { ...scope, kind: "path", args: "" } } : null;
   if (privateChat && typeof text === "string" && !hasCommandEntity) {
     const position = subscriptionPosition(text);
     if (position !== null) return { subscriptionRead: { ...scope, kind: "number", position } };
-    const short = /^(?:短链|short)(?: +([\s\S]*))?(?![\s\S])/iu.exec(text.replace(/^ +| +$/gu, ""));
-    if (short || text === "🔗 短链") return { shortLink: { ...scope, args: short?.[1] ?? "" } };
+    const short = shortTextAlias(text);
+    if (short !== null) return { shortLink: { ...scope, args: short } };
   }
   return privateChat && typeof text === "string"
     && text.trim() !== "" && !text.trimStart().startsWith("/")

@@ -28,8 +28,9 @@ for (const lane of ["isolated", "general"] as const) {
       const generalConfig = { botId: policy.botId, botUsername: policy.botUsername, botToken: policy.botToken,
         webhookSecret: policy.webhookSecret, generation: 1, cutoverAt: now - 100, activationSha256: "a".repeat(64),
         outbox: "shared-private-management-formats-temp-node-document-provider-claims-share-aggregate-selected-short",
-        subscriptionShorts: "issue" };
+        subscriptionShorts: "issue", authManagement: true };
       const sent: { id: number; message: Message }[] = [];
+      const expectedReplyChats = new Map<number, string>();
       const d1Databases = { DB: "external-paths" };
       const runtime = new Miniflare({ workers: [
         { name: "app", modules: true, script, compatibilityDate: manifest.compatibilityDate, d1Databases, r2Buckets: ["NODES"],
@@ -45,7 +46,7 @@ for (const lane of ["isolated", "general"] as const) {
             if (request.url === api + "answerCallbackQuery") return Response.json({ ok: true, result: true });
             assert.equal(request.url, api + "sendMessage", "RPC metadata must never become a public fetch");
             const message = await request.json() as Message;
-            assert.equal(message.chat_id, policy.memberId);
+            assert.equal(message.chat_id, expectedReplyChats.get(message.reply_parameters.message_id) ?? policy.memberId);
             assert.doesNotMatch(message.text, new RegExp(sourceSecret + "|Bearer|sl_cccc", "u"));
             const id = 1000 + sent.length;
             sent.push({ id, message });
@@ -109,18 +110,25 @@ for (const lane of ["isolated", "general"] as const) {
           await db.prepare("INSERT INTO telegram_general_actors VALUES (?,1,?,1,?,?)")
             .bind(policy.botId, actor, generalConfig.cutoverAt, role).run();
         }
+        await db.prepare("INSERT INTO telegram_general_groups VALUES (?,1,?,'group')").bind(policy.botId, policy.groupId).run();
       }
       const sub = await createSubscription(db, { ownerId: policy.memberId, name: "Fixture owned subscription",
         sourceUrl: "https://provider.example.invalid/" + sourceSecret });
       assert.equal(await publishNodeSnapshot(db, bucket, { id: sub.id, ownerId: policy.memberId, expectedGeneration: 0,
         expectedLifecycleRevision: 0 }, [{ type: "ss", name: "Synthetic RPC path node",
         share: "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.10:8388#synthetic" }]), true);
+      await createSubscription(db, { ownerId: policy.adminId, name: "Other actor inventory",
+        sourceUrl: "https://other.fixture.invalid/owned-elsewhere" });
       let sequence = 500;
-      const post = (text: string, id = ++sequence) => app.fetch(origin + "/telegram/webhook", { method: "POST",
+      const post = (text: string, id = ++sequence, actor = policy.memberId, chat = actor, replyTo?: object) => {
+        expectedReplyChats.set(id, chat);
+        return app.fetch(origin + "/telegram/webhook", { method: "POST",
         headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": policy.webhookSecret },
         body: JSON.stringify({ update_id: id, message: { message_id: id, date: now, text,
-          from: { id: Number(policy.memberId), is_bot: false }, chat: { id: Number(policy.memberId), type: "private" },
-          entities: [{ type: "bot_command", offset: 0, length: text.split(" ", 1)[0].length }] } }) });
+          from: { id: Number(actor), is_bot: false }, chat: { id: Number(chat), type: chat === policy.groupId ? "group" : "private" },
+          ...(replyTo ? { reply_to_message: replyTo } : {}),
+          entities: text.startsWith("/") ? [{ type: "bot_command", offset: 0, length: text.split(" ", 1)[0].length }] : [] } }) });
+      };
       const callback = (source: { id: number }, ticket: string, actor = policy.memberId, id = ++sequence) => app.fetch(origin + "/telegram/webhook", {
         method: "POST", headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": policy.webhookSecret },
         body: JSON.stringify({ update_id: id, callback_query: { id: "synthetic-" + id, from: { id: Number(actor), is_bot: false }, data: ticket,
@@ -149,19 +157,63 @@ for (const lane of ["isolated", "general"] as const) {
         return result;
       }
       const mapCount = () => db.prepare("SELECT count(*) AS n FROM fixture_rpc_maps").first<number>("n");
+      // Legacy renumber only counts this actor's active rows; it never rewrites subscription IDs or timestamps.
+      const inventory = () => db.prepare("SELECT id,owner_id,generation,created_at,updated_at FROM subscriptions ORDER BY id").all();
+      const beforeRenumber = (await inventory()).results;
+      const renumberId = ++sequence;
+      assert.equal((await post("/renumber@fixture_path_bot", renumberId)).status, 200);
+      assert.equal((await reply(renumberId)).message.text, "已重置编号，当前 1 条订阅。");
+      assert.equal((await post("/renumber@fixture_path_bot", renumberId)).status, lane === "isolated" ? 200 : 204);
+      assert.equal((await post("/renumber", ++sequence, policy.memberId, policy.groupId)).status, 200);
+      const groupCount = (await reply()).message;
+      assert.equal(groupCount.chat_id, policy.groupId);
+      assert.equal(groupCount.text, "已重置编号，当前 1 条订阅。");
+      const outsiderUpdate = ++sequence;
+      assert.equal((await post("/renumber", outsiderUpdate, "75999")).status, 204);
+      assert.equal(await db.prepare("SELECT count(*) AS n FROM telegram_inbox WHERE bot_id=? AND update_id=?")
+        .bind(policy.botId, outsiderUpdate).first("n"), 0);
+      assert.deepEqual((await inventory()).results, beforeRenumber);
+      assert.equal(await mapCount(), 0);
+      if (lane === "general") {
+        const target = "75329";
+        const selfQuote = { message_id: 1, date: now - 10, from: { id: Number(policy.adminId), is_bot: false },
+          chat: { id: Number(policy.adminId), type: "private" }, text: "Synthetic own message" };
+        const botQuote = { ...selfQuote, from: { id: Number(policy.botId), is_bot: true }, text: "Synthetic Bot message" };
+        for (const quoted of [selfQuote, botQuote]) {
+          assert.equal((await post("/auth add", ++sequence, policy.adminId, policy.adminId, quoted)).status, 200);
+          assert.equal((await reply()).message.text, "无法修改此主体的授权。");
+        }
+        // Real private chat quotes select self or Bot; explicit numeric targets still take precedence.
+        assert.equal((await post(`/auth add ${target}`, ++sequence, policy.adminId, policy.adminId, selfQuote)).status, 200);
+        assert.equal((await reply()).message.text, `用户 ${target}：已授权。`);
+        assert.equal((await post(`/auth remove ${target}`, ++sequence, policy.adminId, policy.adminId, botQuote)).status, 200);
+        assert.equal((await reply()).message.text, `用户 ${target}：已撤权。`);
+        assert.equal(await db.prepare("SELECT role FROM telegram_general_actors WHERE bot_id=? AND actor_id=? ORDER BY revision DESC LIMIT 1")
+          .bind(policy.botId, target).first("role"), "denied");
+        assert.equal(await db.prepare("SELECT role FROM telegram_general_actors WHERE bot_id=? AND actor_id=? ORDER BY revision DESC LIMIT 1")
+          .bind(policy.botId, policy.adminId).first("role"), "admin");
+      }
       // Ordinary short links retain a visible owner-scoped local revocation command.
       const normalId = ++sequence;
-      assert.equal((await post("/short https://example.com/synthetic", normalId)).status, 200);
+      assert.equal((await post("短链 https://example.com/synthetic", normalId)).status, 200);
       const normal = await reply(normalId);
       const normalMap = await outerTarget(normal.message);
       const normalCode = /\/short revoke ([A-Za-z0-9_-]{22})/u.exec(normal.message.text)?.[1];
       assert.ok(normalCode);
-      assert.equal((await post("/short https://example.com/synthetic", normalId)).status, lane === "isolated" ? 200 : 204);
+      assert.equal((await post("短链 https://example.com/synthetic", normalId)).status, lane === "isolated" ? 200 : 204);
       assert.equal(await mapCount(), 1);
       assert.equal((await app.fetch(normalMap.target, { redirect: "manual" })).status, 302);
       assert.equal((await post("/short revoke " + normalCode)).status, 200);
       await reply();
       assert.equal((await app.fetch(normalMap.target, { redirect: "manual" })).status, 404);
+      assert.equal((await post("SHORT https://example.org/english-alias")).status, 200);
+      const aliasReply = (await reply()).message;
+      const aliasMap = await outerTarget(aliasReply);
+      const aliasCode = /\/short revoke ([A-Za-z0-9_-]{22})/u.exec(aliasReply.text)?.[1];
+      assert.ok(aliasCode);
+      assert.equal((await post("/short revoke " + aliasCode)).status, 200);
+      await reply();
+      assert.equal((await app.fetch(aliasMap.target, { redirect: "manual" })).status, 404);
       // Full aggregates re-show the same local code and external operation, then revoke locally.
       assert.equal((await post("/export")).status, 200);
       const aggregate = await reply();

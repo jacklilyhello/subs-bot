@@ -20,6 +20,7 @@ export function telegramCommandEntries({ privateChat, role, features: f }: Teleg
   if (f.subscriptionRead) add("/s 关键词", "搜索订阅");
   if (!privateChat) return entries;
   add("/start", "打开主菜单");
+  if (f.management) add("/renumber", "重置显示编号");
   if (f.temp) {
     add("/temp", f.tempRawDefault ? "查看临时节点" : "查看临时节点数量");
     add("/temp summary", "查看临时节点数量");
