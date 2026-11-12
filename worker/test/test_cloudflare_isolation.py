@@ -270,6 +270,14 @@ class FakeCloudflare:
     def data_api(self, method, path, payload=None):
         if method == "POST" and path == DATABASE + "/query":
             sql = payload["sql"]
+            if "AS windowObject," in sql and "telegram_general_isolation_window" in sql:
+                # This compatibility fake represents an older environment: the
+                # migration ledger exists, but 0052 and its control table do not.
+                return [{"success": True, "results": [{
+                    "windowObject": 0, "windowTable": 0, "ledgerObject": 1, "ledger": 1,
+                }]}]
+            if "AS windowRegistered" in sql and "0052_telegram_general_isolation_window.sql" in sql:
+                return [{"success": True, "results": [{"windowRegistered": 0}]}]
             if any(alias in sql for alias in ("AS typedShortObjects", "AS typedShortRegistered", "AS hasHistory")):
                 schema = self.subscription_shorts_schema
                 if schema == "absent":
