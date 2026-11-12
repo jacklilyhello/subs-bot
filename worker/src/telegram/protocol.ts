@@ -640,12 +640,13 @@ export function readGeneralSubscriptionBrowsing(
     if (SUBSCRIPTION_RAW_FILE_TICKET.test(ticket)) return { family: "file", event: { ...scope, callbackId, ticket } };
     return null;
   }
-  const command = readGeneralGroupCommand(update, botUsername) ?? readGeneralPrivateMenuCommand(update, botUsername);
+  const group = readGeneralGroupCommand(update, botUsername);
+  const command = group ?? readGeneralPrivateMenuCommand(update, botUsername);
   if (!command || command.actorId === botId || command.remainder.trim() !== "") return null;
   const kind = command.name === "list" ? "list" : command.name === "expire" ? "expiry" : command.name === "recycle" ? "recycle" : null;
   if (!kind) return null;
   const { actorId, messageId, messageDate } = command;
-  const scope: TelegramEventScope = "chatId" in command ? { ...command, updateId } : {
+  const scope: TelegramEventScope = group ? { ...group, updateId } : {
     updateId, actorId, messageId, messageDate, chatId: actorId, chatType: "private", threadId: null,
   };
   return { family: "view", event: { ...scope, kind } };
