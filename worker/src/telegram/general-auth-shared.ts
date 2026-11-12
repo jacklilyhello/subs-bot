@@ -1,4 +1,6 @@
 import type { PublicOrigin } from "../public-origin.ts";
+import { readBotDisplayTimeZone } from "./display-time.ts";
+import { acceptGeneralTelegramDisplaySettings, readTelegramDisplaySettingsUpdate, renderTelegramDisplaySettings } from "./display-settings.ts";
 import { GENERAL_TELEGRAM_PROVIDER_MARKER } from "../provider-jobs.ts";
 import { acceptTelegramAggregate, GENERAL_AGGREGATE_SCHEMA, GENERAL_TELEGRAM_AGGREGATE_MARKER, prepareTelegramAggregateCode,
   renderTelegramAggregateResult, type TelegramAggregateReply } from "./aggregate-actions.ts";
@@ -254,6 +256,13 @@ export async function acceptGeneralSharedTelegramCommand(
   const decoded = await readTelegramUpdate(request, pin.webhookSecret);
   if (decoded.status !== 200) return decoded.status;
   if (!pin.sharedOutbox || pin.rehearsal) return 204;
+  const displaySettings = readTelegramDisplaySettingsUpdate(decoded.update, decoded.updateId, pin);
+  if (displaySettings) {
+    const status = await acceptGeneralTelegramDisplaySettings(db, pin, displaySettings);
+    if (displaySettings.callbackId) acknowledge?.(displaySettings.callbackId,
+      status === 200 ? "已收到设置操作。" : "此操作暂不可用。");
+    return status;
+  }
   if (pin.privateInline && inlineEnabled) {
     const inline = readGeneralInlineQuery(decoded.update, decoded.updateId, pin.botId);
     if (inline) {
@@ -754,7 +763,8 @@ export async function drainGeneralSharedTelegramReply(
     const keyboard = reply && hasGeneralGroupShare(pin) && await generalGroupShareReady(db, pin).catch(() => false)
       ? [[{ text: "发到指定群", callback_data: GROUP_SHARE_PUBLISH_CALLBACK }]] : undefined;
     if (!await prepareTelegramOutboxBegin(db, lease, selection).first()) return false;
-    const text = reply ? renderTelegramPrivateShareLink(pin.botUsername, reply) : "分享链接已失效或授权已变更，请重新创建。";
+    const text = reply ? renderTelegramPrivateShareLink(pin.botUsername, reply, await readBotDisplayTimeZone(db, pin.botId))
+      : "分享链接已失效或授权已变更，请重新创建。";
     const outcome = await sendGeneralTelegramPrivateReply(pin.botToken, lease.actorId, lease.messageId, text, keyboard);
     await settleTelegramOutboxReply(db, lease, recorded, outcome);
     return true;
@@ -846,12 +856,14 @@ export async function drainGeneralSharedTelegramReply(
     return true;
   }
   let presentation: ReturnType<typeof renderTelegramLifecycle>;
+  let settingsKeyboard: { text: string; callback_data: string }[][] | undefined;
   if (lease.marker === GENERAL_LIFECYCLE_MARKER && lease.actionKind !== null && lease.actionSubscriptionId !== null
     && lease.actionRevision !== null) {
     presentation = renderTelegramLifecycle({ kind: lease.actionKind, subscriptionId: lease.actionSubscriptionId,
       expectedLifecycleRevision: lease.actionRevision });
   } else if (lease.marker === GENERAL_LIFECYCLE_VIEW_MARKER && lease.viewKind !== null) {
-    const view = await renderTelegramView(db, lease.actorId, { kind: lease.viewKind, afterId: null, afterEpoch: null });
+    const view = await renderTelegramView(db, lease.actorId, { kind: lease.viewKind, afterId: null, afterEpoch: null }, false, false,
+      await readBotDisplayTimeZone(db, pin.botId));
     presentation = { text: view.text, buttons: view.lifecycleButtons, forceReply: false };
   } else if (lease.marker === GENERAL_PATH_MARKER) {
     const path = await db.prepare(`SELECT kind,after_id AS afterId,affected_count AS affectedCount
@@ -888,16 +900,19 @@ export async function drainGeneralSharedTelegramReply(
     presentation = { text: renderTelegramProviderReply(reply.outcome, reply.kind), buttons: [], forceReply: false };
   } else {
     if (lease.command !== "help" && lease.command !== "list") return false;
+    const settings = lease.command === "help" && lease.chatType === "private" && lease.threadId === null
+      ? await renderTelegramDisplaySettings(db, pin.botId, lease.receiptId, lease.actorRole === "admin") : null;
+    settingsKeyboard = settings?.keyboard;
     const text = await renderGeneralReadReply(db, lease.actorId, lease.command);
     const privateHelp = pin.privateManagement && lease.command === "help";
     const help = privateHelp ? text + "\n/recycle 查看你的回收站\n/s 名称关键词 搜索你的订阅\n/path 管理你的路径规则" : text;
-    presentation = { text: privateHelp && pin.privateTemp ? help + "\n/temp 查看临时节点数量" : help, buttons: [], forceReply: false };
+    presentation = { text: settings?.text ?? (privateHelp && pin.privateTemp ? help + "\n/temp 查看临时节点数量" : help), buttons: [], forceReply: false };
   }
   const prepared = presentation.buttons.length ? await prepareTelegramLifecycleTickets(presentation.buttons) : undefined;
   if (!await beginGeneralSharedTelegramReply(db, pin, lease, prepared?.tickets)) return false;
   const outcome = lease.chatType === "private"
     ? await sendGeneralTelegramPrivateReply(pin.botToken, lease.actorId, lease.messageId, presentation.text,
-      prepared?.keyboard, presentation.forceReply)
+      settingsKeyboard ?? prepared?.keyboard, presentation.forceReply)
     : await sendGeneralTelegramGroupListReply(pin.botToken, lease.chatId, lease.messageId, lease.threadId, presentation.text);
   await settleTelegramOutboxReply(db, lease, selectLease(pin, lease, false), outcome);
   return true;

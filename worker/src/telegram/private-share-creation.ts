@@ -1,4 +1,5 @@
 import { MAX_PRIVATE_SHARE_BYTES, privateShareCodeDigest } from "../private-shares.ts";
+import { displayTelegramDate } from "./display-time.ts";
 import { ISOLATION_PUBLIC_ORIGIN, type PublicOrigin } from "../public-origin.ts";
 import { checkOwnerId, digestHex, getOwnedSubscription, SUBSCRIPTION_LIFECYCLE_REVISION, validInteger,
   type SubscriptionMetadata } from "../storage.ts";
@@ -605,8 +606,8 @@ export async function resolveTelegramPrivateShareCreationReply(
   }
 }
 
-export function renderTelegramPrivateShareLink(botUsername: string, reply: TelegramPrivateShareCreationReply): string {
-  return `私密分享已创建。\nhttps://t.me/${botUsername}?start=claim_${reply.code}\n份数上限：${reply.maxClaims}\n到期时间（UTC）：${new Date(reply.expireAt * 1000).toISOString()}`;
+export function renderTelegramPrivateShareLink(botUsername: string, reply: TelegramPrivateShareCreationReply, timeZone = "UTC"): string {
+  return `私密分享已创建。\nhttps://t.me/${botUsername}?start=claim_${reply.code}\n份数上限：${reply.maxClaims}\n到期时间：${displayTelegramDate(reply.expireAt, timeZone)}`;
 }
 
 const cleanupReady = `creation.state = 'abandoned' AND creation.cleanup_after <= unixepoch()

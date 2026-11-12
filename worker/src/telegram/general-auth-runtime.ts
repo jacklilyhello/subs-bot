@@ -27,6 +27,7 @@ export interface GeneralTelegramPin extends TelegramBotCredentials {
   privateAuthorization?: boolean;
   privateInline?: boolean;
   providerBatch?: boolean;
+  displayTimezone?: boolean;
   groupShare?: TelegramGroupShareDestination;
   rehearsal?: GeneralReadLaneScope;
 }
