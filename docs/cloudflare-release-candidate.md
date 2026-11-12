@@ -22,7 +22,15 @@
 
 ## 审查用候选清单
 
-候选清单由获准的托管流程和实际读回证据生成，保存在受保护的部署产物或 PR 附属证据中。清单至少包含以下项目；不能填写尚未观察到的成功结果。
+`worker-production-candidate.yml` 在 GitHub 托管 runner 生成只供审查的包。它只使用 `github.token` 的 `actions: read` 和 `contents: read`，不接收 Cloudflare 或 Telegram 凭据、不调用 Cloudflare、不改部署、数据、域名、Webhook 或旧消费者。
+
+填写当前 main 的成功 `source_run_id`、准确 `source_run_attempt`、使用同一 CI 归档的成功普通隔离 `deploy_run_id` 及 `deploy_run_attempt`。工具核对仓库、workflow、main SHA、成功状态、准确尝试、CI 归档 SHA-256、包内模块及完整迁移。它只从该部署 job 的有界日志中提取严格允许的 CI proof、版本/开关 JSON 和迁移计数，并确认 CI proof 与选定归档完全相同。原始日志及签名下载 URL 不进入产物或输出。缺失、重复、冲突或过期证据使生成失败，不能用其他提交或只看绿色运行来替代。
+
+可用 `expected_flags_json` 提交要核对的布尔开关，例如 `{"inlineSearchEnabled":true}`。`expected_binding_names_json` 只接受绑定名称数组，不接受值或凭据。输出中的绑定名称、命名入口及开关是基于已验证源码和历史部署记录的审查预期；它们不构成当前 Cloudflare 配置读回。`data_source_kind` 只接受未提供数据或合成夹具描述，`data_source_sha256` 仅记录可选合成夹具摘要，不读取或导入该数据。
+
+生成的 `subs-bot-production-candidate-…` 归档含 `candidate.json`、`candidate.sha256` 和 `review.md`。机器清单固定 `productionReady: false`、`productionMutationPerformed: false`。只将准确 CI 和匹配的历史部署 workflow 证据记为 Passed；当前版本/绑定/迁移读回、真实 SQLite 演练、实时合成用例和 Telegram 真人验收均明确为 Not run，需独立核验。成功生成审查包不授予或替代生产切换授权。
+
+候选清单由获准的托管流程生成，保存在部署产物或 PR 附属证据中。实际读回及验收证据须另行附上，未核验项目保留 Not run。清单至少包含以下项目；不能填写尚未观察到的成功结果。
 
 | 项目 | 必须固定的内容 |
 | --- | --- |
