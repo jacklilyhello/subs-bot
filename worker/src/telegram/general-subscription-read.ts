@@ -56,8 +56,9 @@ function detailProof(pin: GeneralTelegramPin): string {
 function formatProof(pin: GeneralTelegramPin, condition: string): string {
   return `WITH confirmed_format AS MATERIALIZED (
     SELECT COALESCE(lifecycle.revision,0) AS revision,(${generalCurrentReceiptSql("earlier")}) AS detail_current,
-      (EXISTS (SELECT 1 ${detailProof(pin)} AND ticket.used_by_receipt_id=earlier.receipt_id
-        AND ticket.subscription_id=detail.subscription_id AND origin.bot_id=earlier.bot_id AND origin.actor_id=earlier.actor_id)
+      (((${DETAIL_SCOPE}) AND (${generalCurrentReceiptSql("origin")})
+        AND origin.bot_id=earlier.bot_id AND origin.actor_id=earlier.actor_id
+        ${pin.privateBrowsing ? "" : `AND origin.receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MARKER}'`})
         OR (${pin.privateBrowsing ? NUMBER_PROOF : "0"})) AS origin_current
     FROM telegram_subscription_read_ticket AS format_ticket
     JOIN telegram_inbox AS earlier ON earlier.receipt_id=format_ticket.origin_receipt_id
@@ -65,6 +66,10 @@ function formatProof(pin: GeneralTelegramPin, condition: string): string {
     JOIN telegram_subscription_read AS detail ON detail.receipt_id=earlier.receipt_id
     JOIN subscriptions AS sub ON sub.id=detail.subscription_id AND sub.owner_id=earlier.actor_id
     LEFT JOIN subscription_lifecycle AS lifecycle ON lifecycle.subscription_id=sub.id
+    LEFT JOIN telegram_subscription_read_ticket AS ticket ON ticket.used_by_receipt_id=earlier.receipt_id
+      AND ticket.subscription_id=detail.subscription_id
+    LEFT JOIN telegram_inbox AS origin ON origin.receipt_id=ticket.origin_receipt_id
+    LEFT JOIN telegram_outbox AS delivered ON delivered.receipt_id=origin.receipt_id
     WHERE (${FORMAT_SCHEMA}) AND (${condition})
       AND format_ticket.kind='format' AND format_ticket.expires_at>unixepoch()
       AND format_origin.state='sent' AND format_origin.attempts=format_ticket.origin_attempt
