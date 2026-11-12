@@ -2447,7 +2447,8 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.equal((await menuPost(7903, 195, "/start@GeneralFixtureBot")).status, 200);
   assert.match((await awaitLifecycle(7903)).message.text, /^欢迎使用 subs-bot。\n\/help 发送帮助/u);
   assert.equal((await menuPost(7904, 195, "/expire@GeneralFixtureBot")).status, 200);
-  assert.match((await awaitLifecycle(7904)).message.text, /^未来 14 天内到期的订阅\n1\. Menu fixture \[链接已省略\]/u);
+  const menuExpiry = await awaitLifecycle(7904);
+  assert.match(menuExpiry.message.text, /^未来 14 天内到期的订阅\n1\. Menu fixture \[链接已省略\]/u);
   assert.equal((await menuPost(7905, 195, "🟠 临期列表", false, { message: { entities: [] } })).status, 200);
   assert.equal((await awaitLifecycle(7905)).message.text, (await awaitLifecycle(7904)).message.text);
   assert.equal((await menuPost(7906, 194, "/help@GeneralFixtureBot", true)).status, 200);
@@ -2475,5 +2476,9 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.equal((await callback(7916, 195, { ...origin(privateSearch.messageId, menuGroup, "supergroup"), date: menuDate }, menuDetailTicket, authWorker)).status, 204);
   assert.equal((await callback(7917, 195, { ...origin(privateSearch.messageId, 195), date: menuDate }, "auth:add:194", authWorker)).status, 204);
   assert.equal(await db.prepare("SELECT count(*) AS n FROM telegram_general_auth_actions AS action JOIN telegram_inbox USING(receipt_id) WHERE update_id BETWEEN 7908 AND 7917").first<number>("n"), 0);
+  const expiryRename = button(menuExpiry.message, "重命名");
+  assert.equal((await callback(7918, 194, { ...origin(menuExpiry.messageId, 194), date: menuDate }, expiryRename, authWorker)).status, 204);
+  assert.equal((await callback(7919, 195, { ...origin(menuExpiry.messageId, 195), date: menuDate }, expiryRename, authWorker)).status, 200);
+  assert.match((await awaitLifecycle(7919)).message.text, /新名称/u);
 
 });
