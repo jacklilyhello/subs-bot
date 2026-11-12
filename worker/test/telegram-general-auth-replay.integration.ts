@@ -2162,7 +2162,8 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.equal(rosterLines[0], "授权名单（默认拒绝）");
   assert.equal(rosterLines[1], "101：管理员");
   assert.ok(rosterLines.includes("108：已撤权"));
-  assert.match(rosterLines[7], /^110：(等待授权生效|已授权)$/u);
+  assert.match(rosterLines[7], /^109：(等待授权生效|已授权)$/u);
+  assert.match(rosterLines[8], /^110：(等待授权生效|已授权)$/u);
   assert.equal(rosterLines.at(-1), "仅显示前 20 位，名单中还有其他用户。");
   assert.doesNotMatch(roster.text, /124：|fixture\.invalid|https?:/u);
   assert.equal((await authPost(8221, 101, "/auth list")).status, 204);
