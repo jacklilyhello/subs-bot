@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import { after, before, test } from "node:test";
 import { Miniflare } from "miniflare";
@@ -12,6 +12,15 @@ import type { GeneralTelegramPin } from "../src/telegram/general-auth-runtime.ts
 import type { TelegramPolicy } from "../src/telegram/protocol.ts";
 import { renderTelegramPrivateShareLink } from "../src/telegram/private-share-creation.ts";
 import { renderTelegramView } from "../src/telegram/views.ts";
+
+// Exercise the Worker's native constant-time comparison through Node's equivalent.
+const oldComparison = Object.getOwnPropertyDescriptor(crypto.subtle, "timingSafeEqual");
+Object.defineProperty(crypto.subtle, "timingSafeEqual", { configurable: true,
+  value: (received: ArrayBuffer, expected: ArrayBuffer) => timingSafeEqual(new Uint8Array(received), new Uint8Array(expected)) });
+after(() => {
+  if (oldComparison) Object.defineProperty(crypto.subtle, "timingSafeEqual", oldComparison);
+  else Reflect.deleteProperty(crypto.subtle, "timingSafeEqual");
+});
 
 const runtime = new Miniflare({ modules: true, script: "export default {fetch(){return new Response(null)}}",
   compatibilityDate: "2026-07-30", d1Databases: ["DB"] });
