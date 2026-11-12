@@ -662,6 +662,38 @@ export function readGeneralPrivateDocumentUpdate(
   return scope && scope.chatId === scope.actorId ? documentInput(message, scope) : null;
 }
 
+export function readGeneralPrivateGitHubSearch(
+  update: Record<string, unknown>, updateId: number, botId: string, botUsername: string,
+): TelegramGitHubSearchUpdate | null {
+  const command = readPrivateTelegramCommand(update, botUsername);
+  if (!command || command.actorId === botId || command.name !== "g"
+    || (command.remainder !== "" && !/^\s/u.test(command.remainder))) return null;
+  const { actorId, messageId, messageDate } = command;
+  return { updateId, actorId, chatId: actorId, chatType: "private", threadId: null,
+    messageId, messageDate, args: command.remainder };
+}
+
+export function readGeneralPrivateApiStatus(
+  update: Record<string, unknown>, updateId: number, botId: string, botUsername: string,
+): TelegramApiStatusUpdate | null {
+  const { message } = update;
+  if (Object.keys(update).length !== 2 || !isRecord(message) || "edit_date" in message || "document" in message
+    || "message_thread_id" in message || message.is_topic_message === true) return null;
+  const actorId = humanSender(message);
+  const scope = actorId && actorId !== botId ? telegramMessageScope(message, actorId, updateId) : null;
+  if (!scope || scope.chatType !== "private" || scope.chatId !== scope.actorId || scope.threadId !== null) return null;
+  const origin = message.reply_to_message;
+  if (ownBotMessage(origin, { botId }) && origin.text === TELEGRAM_API_STATUS_PROMPT) {
+    const prompt = telegramMessageScope(origin, actorId!, updateId);
+    return typeof message.text === "string" && prompt?.chatType === "private" && prompt.chatId === scope.chatId
+      && prompt.threadId === null && prompt.messageId < scope.messageId && prompt.messageDate <= scope.messageDate
+      ? { ...scope, kind: "reply", promptMessageId: prompt.messageId, text: message.text } : null;
+  }
+  const command = readPrivateTelegramCommand(update, botUsername);
+  return command?.name === "ai" && classifyTelegramApiStatusInput({ kind: "ai-command", args: command.remainder }).kind === "open-prompt"
+    ? { ...scope, kind: "prompt" } : null;
+}
+
 const DECIMAL_DIGIT = /^\p{Nd}$/u;
 
 function subscriptionPosition(text: string): number | null {

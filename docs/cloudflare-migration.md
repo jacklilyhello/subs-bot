@@ -173,7 +173,7 @@ Cloudflare 边缘诊断使用独立的 `worker-grep-edge-preview.yml`。仅在 `
 
 | 案例 | IAB 操作与预期 |
 | --- | --- |
-| `expired` | 管理员先私聊发送 `/share x1 s1 -- <正文>`。普通成员在回复显示的 UTC 到期秒之后发送领取载荷，看到过期提示。 |
+| `expired` | 管理员先私聊发送 `/share x1 s1 -- <正文>`。普通成员按 Bot 当前展示时区，在回复显示的到期秒之后发送领取载荷，看到过期提示。 |
 | `targeted` | 管理员私聊发送 `/share x1 id<普通成员ID> s10 -- <正文>`。管理员先看到指定领取人拒绝，普通成员再领取两次，两次收到同样正文，D1 只有一条领取记录。 |
 | `race` | 普通成员私聊发送 `/share x1 s10 -- <正文>`。两个账号在各自的 IAB 私聊中协调发送同一领取载荷。两次 Telegram 消息日期相差最多五秒，只有一方收到正文，另一方看到份数已领完。 |
 | `group` | 管理员在指定群发送 `/share@<测试Bot> x1 s1 -- <正文>`，随后发送 `/help@<测试Bot>`。第一条不回复也不留回执，第二条收到正常帮助。 |
@@ -695,6 +695,14 @@ V11 合成原生演练在 `worker-isolation-legacy-candidate.yml` 选择 `synthe
 
 通用私聊管理配置可显式加入 `inlineSearch: true`。部署同时启用 `TELEGRAM_INLINE_SEARCH` 时，允许当前主体在自己的 Bot 私聊通过 `/inline on` 同意 15 分钟内联订阅名称搜索。只接受 Telegram 标记为 `sender` 的查询，查询和原始来源不存入回执，结果不含能力链接。发送前再次核对原同意回执、当前授权及订阅版本，重复查询只处理一次。暂停查询时仍可 `/inline off`。现有隔离配置不启用这一通用入口，临时节点内联和群内内联不在此模式内。
 
+通用私聊管理配置可分别加入 `githubSearch: true` 和 `apiStatus: true`。前者在准确登记的 `0027` 就绪时允许本人私聊 `/g 关键词`；复用同一 GitHub/Grep 公开搜索器、每账号冷却和有限调用预算，查询只在获胜 webhook 调用的内存中使用。通用与隔离搜索使用不同回执标记，重投及并发不会再次查找，恢复只产生固定备用入口。后者还要求原有 `TELEGRAM_API_STATUS=1`、API V2 命名绑定和准确登记的 `0034`，允许本人私聊 `/ai`。只接受回复已确认发送的本人最新提示；`/cancel` 必须回复该提示。地址与 Key 只在当前调用内存传给已有 V2 探测服务，不进入 D1、恢复任务、业务回复或日志。每行最多启动一次 RPC，中断及不确定结果不重放凭据。两类操作都在收件、执行和发送前核对同一通用世代、主体修订及当前权限，群聊不接收这些命令。帮助和命令菜单仅展示开关与实际依赖均已就绪的入口。配置缺省保持关闭。
+
+#### Bot 展示时区
+
+`0051` 使机器人生成的日期时间默认按 UTC 展示。管理员在机器人私聊用 `/settings` 或 `/timezone` 查看当前 Bot 的统一展示时区，在面板选择 UTC、Asia/Singapore，或发送 `/timezone America/New_York` 等有效 IANA 名称。`/timezone UTC` 恢复默认。普通成员和群聊不能修改。设置按 Bot 存入 D1，并使用原有收件和发件队列持久记录操作；Telegram 重投不会重复应用。按命令消息时间、同秒 update ID 排序；面板回调以本次接收时刻记录操作时间，因此旧面板仍可由当前管理员使用。 [Telegram Update](https://core.telegram.org/bots/api#update)
+
+展示设置需要两张表及准确登记的迁移；缺少设置行时使用 UTC，非法时区值安全回退 UTC。订阅到期、回收站、分享到期及批量刷新完成时间共用同一格式器，不附时区后缀。数据库中的 Unix 秒、授权界限、实际到期、TTL、租约、分享正文、机器时间字段与 Cron 均保持原语义。合成备份包含 Bot 展示设置；Cloudflare 原生恢复仍按完整迁移 schema 逐表恢复。
+
 #### V10 联合包原生恢复演练
 
 托管 Worker CI 从一份固定合成 SQLite 生成联合候选，并用实际旧 Python 和同一提交的编译后 Worker 核对外部短链跳转。受信的 `main` 构建发布准确候选和三份外部跳转证明文件。证明绑定源 SQLite、短链盘点和 Worker 构建。受保护步骤独立重建候选，核对完整归档、SQL、两类 R2 对象和摘要，并确认隔离 Worker 正在运行同一提交的构建，具备旧所选聚合、临时节点和全量聚合的读写能力。
@@ -720,3 +728,14 @@ V11 合成原生演练在 `worker-isolation-legacy-candidate.yml` 选择 `synthe
 - 成本按实测请求数与 CPU、D1 读写行数、R2 容量及对象读写、队列投递与重试计算。若启用 Container，再核对实例运行时间、内存和磁盘配额、活动 CPU、区域出网及关联 Durable Objects 用量。隔离验收以按需启动和可睡眠为前提。显著新增费用或需要常驻时先提交估算和影响。 [Workers 定价](https://developers.cloudflare.com/workers/platform/pricing/) · [R2 定价](https://developers.cloudflare.com/r2/pricing/) · [Queues 定价](https://developers.cloudflare.com/queues/platform/pricing/) · [Containers 定价](https://developers.cloudflare.com/containers/platform/pricing/)
 - 资源管理分开使用只读核查、派生 Token 创建和项目部署权限。新 Token 按目标账户、所需操作和有效期收窄。平台权限无法限定到单个资源时，执行步骤须核对项目专用资源 ID。应用通过绑定和 Secrets 使用运行所需权限。高权限管理凭据留在受控管理位置。 [Cloudflare API Token](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/) · [Workers Secrets](https://developers.cloudflare.com/workers/configuration/secrets/)
 - Worker、反代及其他链路避免记录能力路径、查询参数、Telegram 更新、订阅内容、鉴权头或上游异常正文。Cloudflare 自动 invocation 日志可能包含带凭据的 URL，发布前禁用或验证脱敏，并核对追踪、异常和外部转发的字段。允许的运行信号限于路由类别、状态、计数、耗时和内部操作 ID。私密数据和密钥不得出现在公共缓存、Git、构建产物或测试日志。 [Workers Logs](https://developers.cloudflare.com/workers/observability/logs/workers-logs/)
+
+
+## 外部短链的内部调用与隔离发布
+
+外部短链只包装已经鉴权并签发的本站 `/s/` 链接。调用方绑定 `SHORTLINK` 固定到 `shortlink-new` 的命名入口 `ShortlinkService`；通过 `createShortlink(Request)` 内部调用，Request 中的 HTTPS 地址仅为接口校验元数据。业务 Token 存于调用方 Worker Secret `SHORTLINK_BUSINESS_TOKEN`。不调整短链服务、公网 WAF、Access 或其 Token 权限。
+
+受保护的 `subs-bot-isolation` GitHub Environment 使用 `SUBS_BOT_SHORTLINK_BUSINESS_TOKEN` 向部署流程提供业务凭据。部署操作 `external_shortlinks` 默认 `preserve`；显式选择 `enable external shortlinks for subs-bot-cf-dev-01` 才启用，选择对应 `disable` 只关闭新 RPC 包装，保留原 Service Binding 和 Secret。已配置后，缺少受保护凭据、凭据摘要变化、命名入口变化或丢失恢复能力均拒绝发布。凭据轮换须另行设计，不能通过普通部署暗中变更。
+
+发布读回核对业务 Secret 类型及摘要、精确 Service Binding、启用标志、完整版本 tag 和 `0053_external_shortlinks.sql` 的迁移与实际 D1 表结构。已有批量任务能力 tag 前缀保持可识别。页码跳转的暂停、分阶段候选和恢复保留同一短链身份；历史候选中缺失的新增字段按旧格式处理。
+
+外层短链的成功、重放、限流和失败均须另做隔离 Service Binding 联调，合成测试通过不代表真实业务 Token 已获准使用 `gfw.mom`。外层服务不获得上游来源、直接 `/sub/` 或 `/agg/` 能力地址及节点内容。撤销仍由本地 `/s/` 数据与原分享约束控制，外层映射不依赖删除权限。关闭包装或恢复上一版 Worker 不会恢复已经撤销的本地链接，也不应恢复过时的 SQLite 服务。

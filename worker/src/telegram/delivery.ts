@@ -35,7 +35,7 @@ import { renderTelegramGitHubReply } from "./github-search.ts";
 import { confirmTelegramSubscriptionRawFileSend, prepareTelegramRawFileButton, prepareTelegramSubscriptionRawFile,
   type TelegramRawFileTarget } from "./subscription-raw-file.ts";
 import {
-  beginTelegramAggregateLinkReply, beginTelegramBulkTrashReply, beginTelegramInlineConsentReply, beginTelegramInlineSortReply,
+  beginTelegramAggregateLinkReply, confirmTelegramAggregateLinkSend, beginTelegramBulkTrashReply, beginTelegramInlineConsentReply, beginTelegramInlineSortReply,
   beginTelegramPrivateShareCreationReply,
   beginTelegramSelectedLinkReply, beginTelegramShortLinkReply, beginTelegramReply, claimTelegramReply, closeUnsentTelegramPageJump, isTelegramMemberAllowed,
   beginTelegramSubscriptionShortReply, readTelegramAuthChangeOutcome,
@@ -46,6 +46,8 @@ import {
   type TelegramReplyLease, type TelegramReplyOutcome,
 } from "./store.ts";
 import { prepareTelegramViewTickets, renderTelegramView, type TelegramViewButton } from "./views.ts";
+import { readBotDisplayTimeZone } from "./display-time.ts";
+import { renderTelegramDisplaySettings } from "./display-settings.ts";
 import { renderTelegramTemp } from "./temp-import.ts";
 import { confirmTelegramTempRawSend, prepareTelegramTempRawReply, type TelegramTempRawReply } from "./temp-raw.ts";
 import { renderTelegramProviderReply } from "./provider-replies.ts";
@@ -54,6 +56,7 @@ import { renderTelegramProviderBatchReply } from "./provider-batch-controls.ts";
 import { renderTelegramProviderDocumentReply } from "./provider-document-replies.ts";
 import { renderTelegramApiStatus } from "./api-status.ts";
 import { telegramMainMenuKeyboard, type TelegramMainMenuFeatures } from "./main-menu.ts";
+import { wrapAuthorizedLocalShortlink, type ExternalShortlinkRuntime } from "./external-shortlinks.ts";
 import { renderTelegramHelp } from "./command-catalog.ts";
 
 const BOT_API = "https://api.telegram.org";
@@ -405,6 +408,7 @@ async function renderReply(
   shortTarget?: SubscriptionShortTarget & { label: string };
   forceReply?: boolean;
   mainMenu?: TelegramMainMenuFeatures;
+  settingsKeyboard?: InlineKeyboard;
 }> {
   if (lease.command.startsWith("auth-")) {
     if (lease.actorId !== policy.adminId) return { text: "只有管理员可以管理授权。", access: "none" };
@@ -426,6 +430,10 @@ async function renderReply(
   }
   const allowed = lease.actorId === policy.adminId || await isTelegramMemberAllowed(db, policy);
   if (!allowed) return { text: "当前账号没有使用权限。", access: "denied" };
+  if (lease.command === "help" && lease.chatType === "private" && lease.threadId === null) {
+    const settings = await renderTelegramDisplaySettings(db, policy.botId, lease.receiptId, lease.actorId === policy.adminId);
+    if (settings) return { text: settings.text, settingsKeyboard: settings.keyboard, access: "allowed" };
+  }
   if (lease.subscriptionShareUnavailable) return { text: "无法分享此订阅。请在私聊打开自己的订阅详情后重试。", access: "allowed" };
   if (lease.subscriptionRead) return { ...await renderTelegramSubscriptionRead(db, bucket, policy, lease, deadline,
     subscriptionNodesEnabled, providerRefreshEnabled, subscriptionRawFileEnabled, privateShareEnabled, publicOrigin), access: "allowed" };
@@ -445,7 +453,8 @@ async function renderReply(
   }
   if (lease.view) {
     const privateDetails = subscriptionReadEnabled && lease.chatType === "private" && lease.threadId === null;
-    return { ...await renderTelegramView(db, lease.actorId, lease.view, privateDetails, privateDetails || lease.pageJump === true),
+    return { ...await renderTelegramView(db, lease.actorId, lease.view, privateDetails, privateDetails || lease.pageJump === true,
+      await readBotDisplayTimeZone(db, policy.botId)),
       access: "allowed" };
   }
   if (lease.temp) return { text: renderTelegramTemp(lease.temp), access: "allowed" };
@@ -476,7 +485,7 @@ async function renderReply(
 
 async function deliverTelegramShortLink(
   db: D1Database, policy: TelegramPolicy, lease: TelegramReplyLease, key: CryptoKey | null, deadline: number, request: typeof fetch,
-  publicOrigin: PublicOrigin,
+  publicOrigin: PublicOrigin, externalShortlinks?: ExternalShortlinkRuntime,
 ): Promise<void> {
   if (lease.chatType !== "private" || lease.threadId !== null || !inTelegramScope(policy, lease)) return;
   const allowed = lease.actorId === policy.adminId || await isTelegramMemberAllowed(db, policy);
@@ -497,7 +506,14 @@ async function deliverTelegramShortLink(
     await settleTelegramReply(db, policy, lease, { kind: "failed" });
     return;
   }
-  const outcome = await sendTelegramReply(policy, lease, reply.text, Math.max(1, deadline - Date.now()), request);
+  let text = reply.text;
+  if (reply.kind === "link" && externalShortlinks) {
+    const wrapped = await wrapAuthorizedLocalShortlink(db, policy.botId, reply.localUrl, publicOrigin, externalShortlinks,
+      () => confirmTelegramShortLinkSend(db, policy, lease, reply.guard), deadline - 1000);
+    if (!wrapped) { await settleTelegramReply(db, policy, lease, { kind: "failed" }); return; }
+    text = `短链已生成。\n${wrapped.url}${wrapped.external ? `\n撤销：/short revoke ${reply.localUrl.slice(reply.localUrl.lastIndexOf("/") + 1)}` : "\n外部短链暂不可用，已使用本地链接。"}`;
+  }
+  const outcome = await sendTelegramReply(policy, lease, text, Math.max(1, deadline - Date.now()), request);
   await settleTelegramReply(db, policy, lease, outcome);
 }
 
@@ -600,6 +616,7 @@ export async function drainTelegramReplies(
   subscriptionShortsEnabled = false,
   displayTimezoneEnabled = false,
   providerUrlImportEnabled = false,
+  externalShortlinks?: ExternalShortlinkRuntime,
 ): Promise<void> {
   const deadline = Date.now() + budgetMs;
   let subscriptionShortsReady: Promise<boolean> | undefined;
@@ -696,7 +713,7 @@ export async function drainTelegramReplies(
       continue;
     }
     if (lease.shortLink) {
-      await deliverTelegramShortLink(db, policy, lease, aggregateKey, deadline, request, publicOrigin);
+      await deliverTelegramShortLink(db, policy, lease, aggregateKey, deadline, request, publicOrigin, externalShortlinks);
       continue;
     }
     if (lease.inlineSort) {
@@ -730,7 +747,7 @@ export async function drainTelegramReplies(
       const groupButton = reply && privateShareRuntime.groupCardsEnabled && await telegramGroupShareReady(db)
         ? [[{ text: "发到指定群", callback_data: GROUP_SHARE_PUBLISH_CALLBACK }]] : undefined;
       if (reply && Date.now() < deadline && await beginTelegramPrivateShareCreationReply(db, policy, lease, reply)) {
-        const text = renderTelegramPrivateShareLink(policy.botUsername, reply);
+        const text = renderTelegramPrivateShareLink(policy.botUsername, reply, await readBotDisplayTimeZone(db, policy.botId));
         const outcome = await sendTelegramReply(policy, lease, text, Math.max(1, deadline - Date.now()), request, groupButton);
         await settleTelegramReply(db, policy, lease, outcome);
         continue;
@@ -744,8 +761,12 @@ export async function drainTelegramReplies(
         if (await beginTelegramSelectedLinkReply(db, policy, lease, [{ ...ticket, codeSha256: lease.selected.codeSha256! }])) {
           const confirmed = await resolveTelegramSelectedCode(db, policy, scope, aggregateKey, true);
           if (confirmed !== code) await retireUnsentSelectedLink(db, policy, lease, "sending");
-          const outcome = confirmed === code && Date.now() < deadline
-            ? await sendTelegramReply(policy, lease, `Clash 所选订阅聚合链接\n${publicOrigin}/agg/${code}/clash`,
+          const wrapped = confirmed === code && externalShortlinks
+            ? await wrapAuthorizedLocalShortlink(db, policy.botId, `${publicOrigin}/s/${code}`, publicOrigin, externalShortlinks,
+              async () => await resolveTelegramSelectedCode(db, policy, scope, aggregateKey, true) === code, deadline - 1000) : null;
+          const outcome = confirmed === code && (!externalShortlinks || wrapped) && Date.now() < deadline
+            ? await sendTelegramReply(policy, lease, `Clash 所选订阅聚合链接\n${wrapped?.url ?? `${publicOrigin}/agg/${code}/clash`}${wrapped && !wrapped.external
+              ? "\n外部短链暂不可用，已使用本地链接。" : ""}`,
               Math.max(1, deadline - Date.now()), request, [[{ text: "撤销此链接", callback_data: ticket.token }]])
             : { kind: "failed" as const };
           await settleTelegramReply(db, policy, lease, outcome);
@@ -767,10 +788,19 @@ export async function drainTelegramReplies(
     if (lease.aggregate && lease.chatType === "private" && lease.threadId === null) {
       const code = await resolveTelegramAggregateCode(db, policy, { ...lease, aggregate: lease.aggregate }, aggregateKey);
       if (code !== null && Date.now() < deadline) {
-        const text = await renderTelegramAggregateLinks(db, bucket, code, deadline, publicOrigin);
+        let text = await renderTelegramAggregateLinks(db, bucket, code, deadline, publicOrigin);
         if (Date.now() < deadline && await beginTelegramAggregateLinkReply(db, policy, lease)) {
+          if (externalShortlinks) {
+            const wrapped = await wrapAuthorizedLocalShortlink(db, policy.botId, `${publicOrigin}/s/${code}`, publicOrigin, externalShortlinks,
+              () => confirmTelegramAggregateLinkSend(db, policy, lease),
+              deadline - 1000);
+            if (!wrapped) { await settleTelegramReply(db, policy, lease, { kind: "failed" }); continue; }
+            text = text.replace(`${publicOrigin}/agg/${code}/clash`, wrapped.url)
+              + (wrapped.external ? "" : "\n外部短链暂不可用，已使用本地链接。");
+          }
           const remaining = deadline - Date.now();
-          const outcome = remaining > 0 ? await sendTelegramReply(policy, lease, text, remaining, request) : { kind: "failed" as const };
+          const outcome = remaining > 0 && await confirmTelegramAggregateLinkSend(db, policy, lease)
+            ? await sendTelegramReply(policy, lease, text, remaining, request) : { kind: "failed" as const };
           await settleTelegramReply(db, policy, lease, outcome);
           continue;
         }
@@ -830,10 +860,13 @@ export async function drainTelegramReplies(
       }
       if (started && readGuard && shortTarget) {
         const guard = subscriptionShortSendGuard(started, readGuard);
-        const confirmed = await confirmTelegramSubscriptionReadSend(db, policy, lease, guard).catch(() => false);
+        const local = `${publicOrigin}/s/${started.code}`;
+        const wrapped = await wrapAuthorizedLocalShortlink(db, policy.botId, local, publicOrigin, externalShortlinks,
+          () => confirmTelegramSubscriptionReadSend(db, policy, lease, guard), deadline - 1000);
         const remaining = deadline - Date.now();
-        const outcome = confirmed && remaining > 0
-          ? await sendTelegramReply(policy, lease, `${shortTarget.label}\n${publicOrigin}/s/${started.code}`, remaining, request)
+        const outcome = wrapped && remaining > 0
+          ? await sendTelegramReply(policy, lease, `${shortTarget.label}\n${wrapped.url}${wrapped.external ? `\n撤销：/short revoke ${started.code}` : ""}${externalShortlinks && !wrapped.external
+            ? "\n外部短链暂不可用，已使用本地链接。" : ""}`, remaining, request)
           : { kind: "failed" as const };
         await settleTelegramReply(db, policy, lease, outcome);
         continue;
@@ -870,7 +903,7 @@ export async function drainTelegramReplies(
     }
     const keyboard = [...(view?.keyboard ?? []), ...(jumpButton ? [[{ text: "🔢 跳转页", callback_data: TELEGRAM_PAGE_JUMP_CALLBACK }]] : []),
       ...(lifecycle?.keyboard ?? []), ...(nodes?.keyboard ?? []), ...(read?.keyboard ?? []),
-      ...(refresh ? [[refresh.button]] : []), ...(rawFile ? [[rawFile.button]] : [])];
+      ...(refresh ? [[refresh.button]] : []), ...(rawFile ? [[rawFile.button]] : []), ...(reply.settingsKeyboard ?? [])];
     const outcome = await sendTelegramReply(policy, lease, reply.text, Math.max(1, deadline - Date.now()), request,
       keyboard, reply.forceReply, reply.mainMenu);
     await settleTelegramReply(db, policy, lease, outcome);

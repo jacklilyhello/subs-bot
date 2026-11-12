@@ -33,6 +33,8 @@ import "./telegram-subscription-node-pages.integration.ts";
 import "./telegram-subscription-raw-file.integration.ts";
 import "./telegram-temp-raw.integration.ts";
 import "./telegram-short-links.integration.ts";
+import "./external-shortlinks.integration.ts";
+import "./external-shortlink-paths.integration.ts";
 import "./public-origin.integration.ts";
 import "./telegram-inline-sort.integration.ts";
 import "./telegram-bulk-trash.integration.ts";
@@ -686,6 +688,7 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
   const replies: Array<{ chatId: string; messageId: number; replyTo: number; text: string; button?: string; actions?: number;
     menu?: string[][] }> = [];
   const sentBodies: unknown[] = [];
+  const outboundErrors: unknown[] = [];
   const callbackId = "fixture-page-callback";
   let acknowledged = 0;
   let nextTicket: string | undefined;
@@ -717,7 +720,8 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
       };
       const observed = { chatId: payload.chat_id, text: payload.text, replyTo: payload.reply_parameters?.message_id };
       sentBodies.push(observed);
-      assert.deepEqual(observed, { chatId: expected.chatId, text: expected.text, replyTo: expected.replyTo });
+      try { assert.deepEqual(observed, { chatId: expected.chatId, text: expected.text, replyTo: expected.replyTo }); }
+      catch (error) { outboundErrors.push(error); throw error; }
       if (expected.menu) {
         assert.deepEqual(payload.reply_markup, {
           keyboard: expected.menu.map((row) => row.map((text) => ({ text }))), resize_keyboard: true,
@@ -810,6 +814,7 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
 
     async function waitForReplies(messageIds: number[], acknowledgements = 0) {
       for (let attempt = 0; attempt < 50; attempt += 1) {
+        if (outboundErrors.length) throw outboundErrors[0];
         const rows = await db.prepare(outbox).all();
         if (rows.results.every((row) => row.state === "sent") && rows.results.length === messageIds.length &&
             acknowledged === acknowledgements) break;
@@ -935,7 +940,7 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
     const ids = [10, 8, 9, 18, 20, 22, 24, 26, 28, 312, 314];
     const menu = [["📦 订阅列表", "🟠 临期列表"], ["📤 导出链接"], ["♻️ 撤销删除"], ["🧭 路径对应", "❓ 帮助菜单"]];
     const helpFeatures = { management: true, subscriptionRead: true, temp: true, tempRawDefault: true, path: true,
-      aggregate: true, selected: true, short: true, bulkTrash: true, inlineSort: true, authorization: true, github: true, batchStatus: true,
+      aggregate: true, selected: true, short: true, bulkTrash: true, inlineSort: true, authorization: true, batchStatus: true,
       authorizationScope: "fixed" as const, authorizationMemberId: policy.memberId, documentImport: true };
     const publicHelp = renderTelegramHelp({ privateChat: false, role: "member", features: helpFeatures });
     const privateHelp = renderTelegramHelp({ privateChat: true, role: "member", features: helpFeatures });

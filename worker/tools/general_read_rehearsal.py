@@ -74,6 +74,8 @@ def _has_schema(scope, *, required):
 
 
 def require_general_read_lane_clear(scope, *, required=False):
+    from general_isolation_window import require_window_clear
+    require_window_clear(scope)
     if _has_schema(scope, required=required):
         result = _one(scope, f"""SELECT EXISTS(SELECT 1 FROM {TABLE} WHERE mode<>'isolated')
             OR EXISTS({WORK}) OR EXISTS(SELECT 1 FROM telegram_general_policy WHERE active=1) AS laneBusy""", ("laneBusy",))
@@ -87,6 +89,9 @@ def general_read_artifact(module, manifest):
         _require(capable and len(migrations) >= 49 and migrations[48] == {
             "name": MIGRATION, "sha256": MIGRATION_SHA256,
         }, ARTIFACT_ERROR)
+    from general_isolation_window import MARKER as WINDOW_MARKER, general_window_artifact
+    if len(migrations) >= 52 or WINDOW_MARKER in module:
+        general_window_artifact(module, manifest)
     return capable
 
 
@@ -217,6 +222,8 @@ def _active_sha256(target, deployment, version):
 
 def run(scope, config, guard, *, action, expected_active, expected_state, artifact=None):
     scope.verify_resources()
+    from general_isolation_window import require_window_clear
+    require_window_clear(scope)
     settings = scope.worker_config()
     _require(scope.cron_enabled(), ERROR)
     require_clear_for_release(scope)
