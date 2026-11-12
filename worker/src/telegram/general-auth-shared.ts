@@ -819,7 +819,7 @@ async function drainGeneralBrowsingView(db: D1Database, pin: GeneralTelegramPin,
   const outcome = !confirmed ? { kind: "failed" as const } : privateChat
     ? await sendGeneralTelegramPrivateReply(pin.botToken, lease.actorId, lease.messageId, view.text, keyboard)
     : await sendGeneralTelegramGroupListReply(pin.botToken, lease.chatId, lease.messageId, lease.threadId, view.text, pages?.keyboard);
-  await settleTelegramOutboxReply(db, lease, selectLease(pin, lease, false), outcome);
+  await settleTelegramOutboxReply(db, lease, selectLease(pin, lease, false), outcome, "inbox.received_at", GENERAL_REPLY_TTL);
   return true;
 }
 
