@@ -228,7 +228,7 @@ test("emitted general inline temp consent and historic share cards preserve priv
   assert.equal((await callback(foreignCode)).status, 204);
   assert.equal((await acknowledged()).url, undefined);
   const expiredCode = await archive("ExpiredCard");
-  await db.prepare("UPDATE private_shares SET expire_at=unixepoch()-1 WHERE bot_id=? AND code_sha256=?")
+  await db.prepare("UPDATE private_shares SET created_at=unixepoch()-2,expire_at=unixepoch()-1 WHERE bot_id=? AND code_sha256=?")
     .bind(bot.botId, await privateShareCodeDigest(expiredCode)).run();
   assert.equal((await callback(expiredCode)).status, 204);
   assert.equal((await acknowledged()).url, undefined);
