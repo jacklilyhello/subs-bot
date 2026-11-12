@@ -22,17 +22,17 @@ from zipfile import ZipFile
 import external_shortlink_release as external
 import prepare_isolation_artifact as artifact
 import production_candidate as candidate
-from capacity_resources import integer, read_private, save_private_json
+from capacity_resources import CapacityError, integer, read_private, save_private_json
 from cloudflare_isolation import (CloudflareClient, CloudflareError, ProviderApiStatusBinding, ProviderBinding,
     UUID, _Isolation, _Version, _artifact, _matches, _require, _verify_health)
-from d1_migrations import _load_migrations, _read_state
+from d1_migrations import MigrationError, _load_migrations, _read_state
 from general_read_rehearsal import require_general_read_lane_clear
 from native_restore_rehearsal import readonly_schema_batch, readonly_sql
 from release_isolation import isolation_credentials, isolated_telegram_config
 from stage_page_jump_isolation import _ordinary_tag
 from telegram_aggregate_smoke import key_bytes
 from telegram_short_links_smoke import Cohort, ORIGIN, probe_code
-from telegram_view_fixtures import rows
+from telegram_view_fixtures import FixtureError, rows
 
 ERROR = "The isolated shortlink fault drill could not be confirmed safely."
 WORKFLOW_FILE = "worker-isolation-shortlink-fault-drill.yml"
@@ -51,6 +51,60 @@ INVALID_TOKEN = "sl_" + "0" * 64
 INVALID_DIGEST = sha256(INVALID_TOKEN.encode("ascii")).hexdigest()
 POLICY_IDS = {"botId": "9293938370", "adminId": "8813701954", "memberId": "8653767757", "groupId": "-5114255828"}
 DATABASE_ID = "c690f7f1-de21-48dc-a6e0-539416fb2e08"
+FAILURE_PHASES = frozenset({"entry", "context-hosted-identity", "context-resources", "context-policy", "context-keys",
+    "prepare-inputs", "artifact", "artifact-manifest", "resources", "config", "active", "version", "artifact-identity",
+    "ordinary-tag", "cron", "shortlink-identity", "ordinary-proof", "schema", "idle", "health", "cohort",
+    "preupload-recheck", "upload-R", "upload-C", "cohort-recheck", "checkpoint", "run-preflight", "run-activation",
+    "run-acceptance", "restore-preflight", "restore-version", "restore-activation", "restore-readback", "unexpected"})
+API_BOUNDARIES = frozenset({"data-read-gate", "d1-resource", "d1-read-query", "r2-bucket", "r2-managed-domain",
+    "r2-custom-domains", "worker-resource", "worker-config", "worker-active", "worker-version", "worker-namespace",
+    "worker-domains", "worker-schedules", "worker-upload", "worker-activation", "other"})
+FAILURE_CATEGORIES = frozenset({"cloudflare", "artifact", "migration", "fixture", "private-file", "io", "validation", "unexpected"})
+_failure_phase = "entry"
+_api_boundary = None
+
+
+def failure_phase(value):
+    """Retain only a fixed stage label; successful calls produce no diagnostic noise."""
+    global _failure_phase, _api_boundary
+    _failure_phase = value if isinstance(value, str) and value in FAILURE_PHASES else "unexpected"
+    _api_boundary = None
+
+
+def observed_api(boundary, operation):
+    global _api_boundary
+    _api_boundary = boundary if isinstance(boundary, str) and boundary in API_BOUNDARIES else "other"
+    result = operation()
+    _api_boundary = None
+    return result
+
+
+def failure_projection(error):
+    saved = getattr(error, "_shortlink_fault_projection", None)
+    if (isinstance(saved, dict) and set(saved) <= {"currentPhaseOnFailure", "category", "apiBoundary", "httpStatus", "uncertain"}
+            and isinstance(saved.get("currentPhaseOnFailure"), str) and saved["currentPhaseOnFailure"] in FAILURE_PHASES
+            and isinstance(saved.get("category"), str) and saved["category"] in FAILURE_CATEGORIES
+            and ("apiBoundary" not in saved or isinstance(saved["apiBoundary"], str) and saved["apiBoundary"] in API_BOUNDARIES)
+            and ("httpStatus" not in saved or type(saved["httpStatus"]) is int and 100 <= saved["httpStatus"] <= 599)
+            and ("uncertain" not in saved or type(saved["uncertain"]) is bool)):
+        return dict(saved)
+    category = next((name for cls, name in ((CloudflareError, "cloudflare"), (artifact.ArtifactError, "artifact"),
+        (MigrationError, "migration"), (FixtureError, "fixture"), (CapacityError, "private-file"),
+        (OSError, "io"), ((ValueError, TypeError, KeyError, AttributeError), "validation")) if isinstance(error, cls)), "unexpected")
+    result = {"currentPhaseOnFailure": _failure_phase, "category": category}
+    if _api_boundary in API_BOUNDARIES:
+        result["apiBoundary"] = _api_boundary
+    if isinstance(error, CloudflareError):
+        if type(error.http_status) is int and 100 <= error.http_status <= 599:
+            result["httpStatus"] = error.http_status
+        if type(error.uncertain) is bool:
+            result["uncertain"] = error.uncertain
+    return result
+
+
+def remember_failure(error):
+    # Keep the acceptance failure's safe phase even when finally performs recovery.
+    error._shortlink_fault_projection = failure_projection(error)
 
 
 def canonical(value):
@@ -168,16 +222,20 @@ def readonly_data_request(method, path, payload, db_path, bucket_path):
 class Context:
     def __init__(self, env):
         self.env = env
+        failure_phase("context-hosted-identity")
         _require(env.get("GITHUB_WORKFLOW_REF") == WORKFLOW and env.get("RUNNER_ENVIRONMENT") == "github-hosted"
             and env.get("GITHUB_REF") == artifact.MAIN_REF and env.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
             and env.get("GITHUB_REPOSITORY_ID") == str(artifact.REPOSITORY_ID)
             and all(_matches(DECIMAL, env.get(name)) for name in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT")), ERROR)
         self.directory = Path(env["RUNNER_TEMP"])
+        failure_phase("context-resources")
         self.target, data_token, deploy_token = isolation_credentials()
         _require(self.target["d1Id"] == DATABASE_ID, ERROR)
+        failure_phase("context-policy")
         self.raw_policy = isolated_telegram_config()
         self.policy = json.loads(self.raw_policy)
         _require(all(self.policy[name] == value for name, value in POLICY_IDS.items()), ERROR)
+        failure_phase("context-keys")
         self.aggregate = env.get("SUBS_BOT_TELEGRAM_AGGREGATE_KEY", "")
         self.private = env.get("SUBS_BOT_TELEGRAM_PRIVATE_SHARE_CREATION_KEY", "")
         self.key = key_bytes(self.aggregate)
@@ -188,10 +246,23 @@ class Context:
         bucket_path = f"/accounts/{self.target['accountId']}/r2/buckets/subs-bot-cf-dev-01"
 
         def read_data(method, path, payload=None):
+            global _api_boundary
+            _api_boundary = "data-read-gate"
             _require(readonly_data_request(method, path, payload, self.db_path, bucket_path), ERROR)
-            return data(method, path, payload)
+            boundary = {self.db_path: "d1-resource", self.db_path + "/query": "d1-read-query", bucket_path: "r2-bucket",
+                bucket_path + "/domains/managed": "r2-managed-domain", bucket_path + "/domains/custom": "r2-custom-domains"}[path]
+            return observed_api(boundary, lambda: data(method, path, payload))
 
-        self.scope = _Isolation(worker, read_data, self.target)
+        def observed_worker(method, path, payload=None):
+            scope = self.scope
+            boundary = {scope.worker: "worker-resource", scope.script + "/settings": "worker-config",
+                scope.deployments: "worker-active" if method == "GET" else "worker-activation",
+                scope.account + "/workers/subdomain": "worker-namespace", scope.schedules: "worker-schedules",
+                scope.account + "/workers/domains?service=subs-bot-cf-dev-01": "worker-domains",
+                scope.versions + "?deploy=false": "worker-upload"}.get(path, "worker-version" if path.startswith(scope.versions + "/") else "other")
+            return observed_api(boundary, lambda: worker(method, path, payload))
+
+        self.scope = _Isolation(observed_worker, read_data, self.target)
         self.read = lambda sql, *params: rows(read_data, self.db_path, sql, *params)
         self.scope_sha = sign(self.key, [self.target, digest(self.raw_policy), digest(self.aggregate), digest(self.private)])
 
@@ -239,45 +310,67 @@ def ordinary_deployment(env, proof, active):
 
 def prepare(ctx):
     env, scope = ctx.env, ctx.scope
+    failure_phase("prepare-inputs")
     _require(env.get("SHORTLINK_FAULT_CONFIRMATION") == "drill shortlink fallback for subs-bot-cf-dev-01"
         and _matches(COHORT, env.get("SHORTLINK_FAULT_COHORT")), ERROR)
+    failure_phase("artifact")
     proof = artifact.prepare()
+    failure_phase("artifact-manifest")
     bundle = ctx.directory / artifact.VERIFIED_DIRECTORY
     manifest = artifact._parse_object(read_private(bundle / "isolation.json", 1_048_576), ERROR)
+    failure_phase("resources")
     scope.verify_resources()
+    failure_phase("config")
     config = scope.worker_config()
+    failure_phase("active")
     original_active = scope.active()
+    failure_phase("version")
     original = scope.version(original_active.version)
+    failure_phase("artifact-identity")
     module, base = _artifact(bundle, manifest, ctx.raw_policy, ctx.aggregate, ctx.private, original.provider_binding)
     _require((original.revision, original.digest, original.compatibility, original.telegram_config_sha256,
         original.telegram_aggregate_key_sha256, original.telegram_private_share_key_sha256)
         == (base.revision, base.digest, base.compatibility, base.telegram_config_sha256,
-            base.telegram_aggregate_key_sha256, base.telegram_private_share_key_sha256)
-        and original.tag == _ordinary_tag(base, original) and scope.cron_enabled(), ERROR)
+            base.telegram_aggregate_key_sha256, base.telegram_private_share_key_sha256), ERROR)
+    failure_phase("ordinary-tag")
+    _require(original.tag == _ordinary_tag(base, original), ERROR)
+    failure_phase("cron")
+    _require(scope.cron_enabled(), ERROR)
+    failure_phase("shortlink-identity")
     external.target(original, None, ctx.business, capable=base.external_shortlink_capable,
         telegram_digest=base.telegram_config_sha256, aggregate_digest=base.telegram_aggregate_key_sha256)
     canary = canary_version(original)
+    failure_phase("ordinary-proof")
     ordinary_deployment(env, proof, original_active)
+    failure_phase("schema")
     migrations = _load_migrations(bundle, manifest)
     state, history = _read_state(scope.data_api, ctx.db_path, migrations)
     _require(state == "managed" and len(history) == len(migrations), ERROR)
+    failure_phase("idle")
     ctx.idle()
+    failure_phase("health")
     _verify_health(original.revision)
+    failure_phase("cohort")
     cohort = ctx.cohort(env["SHORTLINK_FAULT_COHORT"])
     baseline = cohort.prepare(sign(ctx.key, [proof, env["SHORTLINK_FAULT_COHORT"]]))
 
     def unchanged():
+        failure_phase("preupload-recheck")
         artifact.require_current_main(original.revision)
         _require(scope.active() == original_active and scope.version(original_active.version) == original
             and scope.worker_config() == config and scope.cron_enabled(), ERROR)
         ctx.idle()
 
     unchanged()
+    failure_phase("upload-R")
     recovery_id = scope.upload(module, original, ctx.raw_policy, ctx.aggregate, ctx.private, ctx.business)
     unchanged()
+    failure_phase("upload-C")
     canary_id = scope.upload(module, canary, ctx.raw_policy, ctx.aggregate, ctx.private, INVALID_TOKEN)
     unchanged()
+    failure_phase("cohort-recheck")
     _require(cohort.prepare(baseline["identity"]) == baseline, ERROR)
+    failure_phase("checkpoint")
     checkpoint = {"version": 1, "revision": original.revision, "operationRunId": env["GITHUB_RUN_ID"],
         "operationRunAttempt": env["GITHUB_RUN_ATTEMPT"], "cohort": env["SHORTLINK_FAULT_COHORT"],
         "scopeSha256": ctx.scope_sha, "createdAt": int(time()), "originalVersionId": original_active.version,
@@ -292,7 +385,9 @@ def prepare(ctx):
 
 def restore(ctx, checkpoint, original, canary):
     """Never overwrite a foreign deployment; recovery does not depend on old CI retention or main tip."""
+    failure_phase("restore-preflight")
     ctx.verify(checkpoint, current=True, healthy=False)
+    failure_phase("restore-version")
     active = ctx.scope.active()
     expected = {checkpoint["originalVersionId"]: original, checkpoint["recoveryVersionId"]: original,
         checkpoint["canaryVersionId"]: canary}
@@ -302,8 +397,10 @@ def restore(ctx, checkpoint, original, canary):
         def guard():
             _require(ctx.scope.active() == active and ctx.scope.version(active.version) == canary, ERROR)
             ctx.verify(checkpoint, current=True, healthy=False)
+        failure_phase("restore-activation")
         active = ctx.activate(active, checkpoint["recoveryVersionId"], canary, original,
             f"Restore isolated shortlink fault drill {checkpoint['operationRunId']}/{checkpoint['operationRunAttempt']}", guard)
+    failure_phase("restore-readback")
     _require(active.version in {checkpoint["originalVersionId"], checkpoint["recoveryVersionId"]}
         and ctx.scope.active() == active and ctx.scope.version(active.version) == original, ERROR)
     ctx.verify(checkpoint, current=True)
@@ -341,6 +438,7 @@ def failure_evidence(ctx, checkpoint, activated_at):
 
 
 def run_drill(ctx, checkpoint, original, canary, *, wait=sleep, clock=monotonic, poll_seconds=POLL_SECONDS):
+    failure_phase("run-preflight")
     _require(0 < poll_seconds <= POLL_SECONDS and int(time()) - checkpoint["createdAt"] in range(601)
         and (checkpoint["operationRunId"], checkpoint["operationRunAttempt"])
             == (ctx.env["GITHUB_RUN_ID"], ctx.env["GITHUB_RUN_ATTEMPT"]), ERROR)
@@ -352,12 +450,14 @@ def run_drill(ctx, checkpoint, original, canary, *, wait=sleep, clock=monotonic,
     artifact.require_current_main(checkpoint["revision"])
     result = None
     try:
+        failure_phase("run-activation")
         active = ctx.activate(active, checkpoint["canaryVersionId"], original, canary,
             f"Isolated shortlink fault drill {checkpoint['operationRunId']}/{checkpoint['operationRunAttempt']}",
             lambda: artifact.require_current_main(checkpoint["revision"]))
         ctx.verify(checkpoint, current=True)
         _require(ctx.scope.version(active.version) == canary, ERROR)
         activated_at, deadline = int(time()), clock() + poll_seconds
+        failure_phase("run-acceptance")
         print(json.dumps({"phase": "canary-active", "canaryVersionId": active.version,
             "waitSecondsMaximum": poll_seconds, "cohort": checkpoint["cohort"]}), flush=True)
         while clock() < deadline:
@@ -369,6 +469,9 @@ def run_drill(ctx, checkpoint, original, canary, *, wait=sleep, clock=monotonic,
         _require(result is not None, "The bounded shortlink fallback acceptance timed out; recovery is required and retained.")
         save_private_json(ctx.directory / RESULT, result)
         return result
+    except Exception as error:
+        remember_failure(error)
+        raise
     finally:
         restored = restore(ctx, checkpoint, original, canary)
         save_private_json(ctx.directory / RESTORE_RESULT, restored)
@@ -376,6 +479,7 @@ def run_drill(ctx, checkpoint, original, canary, *, wait=sleep, clock=monotonic,
 
 
 def main(env):
+    failure_phase("entry")
     ctx = Context(env)
     phase, action = env.get("SHORTLINK_FAULT_PHASE"), env.get("SHORTLINK_FAULT_ACTION")
     _require((action == "drill" and phase in {"prepare", "run", "restore"}) or (action == "restore" and phase == "restore"), ERROR)
@@ -404,5 +508,6 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, interrupted)
     try:
         print(json.dumps(main(os.environ), sort_keys=True), flush=True)
-    except Exception:
+    except Exception as error:
+        print(json.dumps(failure_projection(error), sort_keys=True), flush=True)
         sys.exit(ERROR + " Use the protected restore action if restoration was not independently confirmed.")

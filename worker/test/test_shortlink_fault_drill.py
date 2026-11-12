@@ -8,6 +8,7 @@ import json
 import sqlite3
 import sys
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
 from zipfile import ZipFile
@@ -86,7 +87,7 @@ class Context:
 
 
 class CheckpointTests(TestCase):
-    def test_actual_migration_readback_crosses_only_readonly_schema_and_pragma_gate(self):
+    def migration_database(self):
         directory = Path(__file__).resolve().parents[1] / "migrations"
         entries = [{"name": path.name, "sha256": drill.sha256(path.read_bytes()).hexdigest()}
             for path in sorted(directory.glob("*.sql"))]
@@ -100,6 +101,27 @@ class CheckpointTests(TestCase):
         db.execute(migrations.LEDGER_SQL)
         db.executemany("INSERT INTO subs_bot_schema_migrations(position,name,sha256,mode) VALUES(?,?,?,'applied')",
             [(position, entry["name"], entry["sha256"]) for position, entry in enumerate(entries, 1)])
+        return db, chain
+
+    def test_actual_isolation_idle_controller_passes_multiline_select_through_readonly_gate(self):
+        db, _chain = self.migration_database()
+        db_path, bucket = "/accounts/synthetic/d1/database/synthetic", "/accounts/synthetic/r2/buckets/synthetic"
+        queries = []
+        def api(method, path, payload):
+            self.assertTrue(drill.readonly_data_request(method, path, payload, db_path, bucket))
+            queries.append(payload["sql"])
+            return [{"success": True, "results": [dict(row) for row in db.execute(payload["sql"], payload.get("params", ()))]}]
+        ctx = object.__new__(drill.Context)
+        ctx.scope = SimpleNamespace(account="/accounts/synthetic", target={"d1Id": "synthetic"}, data_api=api)
+        ctx.policy = {"botId": drill.POLICY_IDS["botId"]}
+        ctx.read = lambda sql, *params: drill.rows(api, db_path, sql, *params)
+        ctx.idle()
+        self.assertTrue(any(query.lstrip().startswith("SELECT\n") for query in queries))
+        self.assertTrue(any("telegram_general_isolation_window" in query for query in queries))
+        self.assertTrue(any("telegram_outbox" in query for query in queries))
+
+    def test_actual_migration_readback_crosses_only_readonly_schema_and_pragma_gate(self):
+        db, chain = self.migration_database()
         db_path, bucket = "/accounts/synthetic/d1/database/synthetic", "/accounts/synthetic/r2/buckets/synthetic"
         seen = []
         def api(method, path, payload):
@@ -242,11 +264,57 @@ class RestorationTests(TestCase):
                         self.assertEqual(drill.run_drill(ctx, checkpoint(), NORMAL, drill.canary_version(NORMAL),
                             wait=lambda _seconds: None, clock=clock, poll_seconds=3)["phase"], "fallback-verified")
                     else:
-                        with self.assertRaises(CloudflareError):
+                        with self.assertRaises(CloudflareError) as raised:
                             drill.run_drill(ctx, checkpoint(), NORMAL, drill.canary_version(NORMAL),
                                 wait=lambda _seconds: None, clock=clock, poll_seconds=3)
+                        self.assertEqual(drill.failure_projection(raised.exception)["currentPhaseOnFailure"],
+                            "run-activation" if scenario == "uncertain-activation" else "run-acceptance")
                 self.assertEqual(ctx.scope.active().version, IDS["recovery"], scenario)
                 self.assertEqual(ctx.activations[-1], IDS["recovery"])
+
+
+class FailureDiagnosticTests(TestCase):
+    def tearDown(self):
+        drill.failure_phase("entry")
+
+    def test_known_phase_boundary_and_http_fields_are_projected_without_message(self):
+        private = "synthetic-private-value-never-emit"
+        error = CloudflareError(private, http_status=403, uncertain=False)
+        drill.failure_phase("resources")
+        def rejected():
+            raise error
+        with self.assertRaises(CloudflareError):
+            drill.observed_api("d1-resource", rejected)
+        self.assertEqual(drill.failure_projection(error), {"currentPhaseOnFailure": "resources", "category": "cloudflare",
+            "apiBoundary": "d1-resource", "httpStatus": 403, "uncertain": False})
+        self.assertNotIn(private, json.dumps(drill.failure_projection(error)))
+        drill.remember_failure(error)
+        drill.failure_phase("restore-readback")
+        self.assertEqual(drill.failure_projection(error)["currentPhaseOnFailure"], "resources")
+
+    def test_unknown_names_and_invalid_status_values_never_enter_output(self):
+        private = "synthetic-sensitive-class-or-message"
+        error = type(private, (RuntimeError,), {})(private)
+        drill.failure_phase(private)
+        error._shortlink_fault_projection = {"currentPhaseOnFailure": private, "category": private}
+        result = drill.failure_projection(error)
+        self.assertEqual(result, {"currentPhaseOnFailure": "unexpected", "category": "unexpected"})
+        self.assertNotIn(private, json.dumps(result))
+        for status in (99, 600, True, private):
+            projected = drill.failure_projection(CloudflareError(private, http_status=status))
+            self.assertNotIn("httpStatus", projected)
+            self.assertNotIn(private, json.dumps(projected))
+
+    def test_prepare_failure_retains_exact_phase_without_printing_values(self):
+        with TemporaryDirectory() as directory:
+            ctx = Context(directory, "original")
+            ctx.env.update(SHORTLINK_FAULT_CONFIRMATION="drill shortlink fallback for subs-bot-cf-dev-01",
+                SHORTLINK_FAULT_COHORT="0123456789abcdef")
+            with patch.object(drill.artifact, "prepare", side_effect=drill.artifact.ArtifactError("synthetic-private-source")):
+                with self.assertRaises(drill.artifact.ArtifactError) as raised:
+                    drill.prepare(ctx)
+            self.assertEqual(drill.failure_projection(raised.exception), {"currentPhaseOnFailure": "artifact", "category": "artifact"})
+            self.assertNotIn("synthetic-private-source", json.dumps(drill.failure_projection(raised.exception)))
 
 
 class FailureEvidenceTests(TestCase):

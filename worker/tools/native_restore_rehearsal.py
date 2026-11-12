@@ -611,7 +611,7 @@ def readonly_sql(sql, *, schema_check=False):
         sql = sql[len(prefix):-len(suffix)]
         if not sql.strip():
             return False
-    elif not (sql.startswith("SELECT ") or re.fullmatch(r"PRAGMA (?:table_list|table_info|table_xinfo|index_list|index_xinfo|foreign_key_check|quick_check)(?:\([^;\r\n]*\))?", sql)):
+    elif not (re.match(r"SELECT[ \t\r\n\f]", sql) or re.fullmatch(r"PRAGMA (?:table_list|table_info|table_xinfo|index_list|index_xinfo|foreign_key_check|quick_check)(?:\([^;\r\n]*\))?", sql)):
         return False
     quote_char = None
     offset = depth = 0

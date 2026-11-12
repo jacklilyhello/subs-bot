@@ -405,9 +405,15 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(request.get_header("Authorization"), "Bearer synthetic-data-token")
         self.assertEqual(json.loads(request.data), {"action": "init", "etag": "a" * 32})
         self.assertTrue(native.readonly_sql("SELECT ';--private' AS value"))
+        self.assertTrue(native.readonly_sql("SELECT\n1 AS value"))
+        self.assertTrue(native.readonly_sql("SELECT\t1 AS value"))
         self.assertTrue(native.readonly_sql("PRAGMA index_xinfo('subscriptions_owner_id')"))
         self.assertFalse(native.readonly_sql("PRAGMA foreign_keys=OFF"))
         self.assertFalse(native.readonly_sql("SELECT 1 /* mutation */"))
+        for query in ("SELECTOR 1", "SELECT\n1; DELETE FROM subscriptions", "SELECT\t1 -- hidden", "SELECT\n1 /* hidden */",
+                "UPDATE subscriptions SET name='fixture'", "PRAGMA foreign_keys=OFF"):
+            with self.subTest(query=query):
+                self.assertFalse(native.readonly_sql(query))
 
     def test_candidate_d1_schema_reads_use_the_single_statement_boundary(self):
         api = native.RehearsalAPI(self.api.target, "synthetic-data-token", COHORT, profile="synthetic-legacy-mixed-shorts")
