@@ -1,5 +1,11 @@
 # Cloudflare 迁移
 
+## Telegram 帮助与命令菜单
+
+帮助、主键盘能力过滤和 Telegram 命令定义共用 `command-catalog.ts`。私聊根据当前角色与已启用能力展示；群聊仅显示适用的基础命令，并引导私聊查看详情。通用入口支持 `/start`、`/expire` 和经群授权检查的名称搜索，所有动作仍由后端鉴权。
+
+隔离部署成功后，可运行受保护的 `Synchronize isolated Telegram command menus` 工作流。`source_run_id` 必须对应当前部署的 main 成功 Worker CI；`isolation_flags` 必须来自当前 Cloudflare 只读绑定读回，字段仅为 `inlineSearch`、`providerUrlImport`、`providerBatch`、`apiStatus` 的布尔值。工作流核对准确产物和在线 health，并仅同步固定测试管理员、成员和群的 chat scope，再用 `getMyCommands` 独立读回。运行前后仍须只读核对绑定，不能把调用者提供的开关本身当作部署证明。该工具不复制 Cloudflare 凭据，也不更新生产 Bot。
+
 迁移目标是让 subs-bot 的 Telegram 处理、订阅与分享数据、导出和后台任务都运行在 Cloudflare。Telegram、GitHub、订阅提供方和已配置的可信短链服务仍是业务接口。完成切换后，服务无需维护者管理 VPS、轮询进程或外部数据库。
 
 ## 隔离环境与 HTTP 接口
