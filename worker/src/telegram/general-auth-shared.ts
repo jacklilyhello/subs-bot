@@ -270,8 +270,6 @@ function current(alias: "inbox" | "earlier", group: boolean, pin: GeneralTelegra
   const claimScope = pin.privateClaims ? ` AND (${alias}.receipt_nonce<>'${TELEGRAM_GENERAL_PRIVATE_CLAIM_MARKER}'
     OR ${GENERAL_PRIVATE_CLAIM_SCHEMA})` : "";
   const authScope = !pin.rehearsal ? ` AND (${alias}.receipt_nonce<>'${GENERAL_AUTH_ACTION_MARKER}' OR authority.actor_role='admin')` : "";
-  const jumpScope = pin.privateBrowsing ? ` AND (${alias}.receipt_nonce<>'${GENERAL_PAGE_JUMP_MARKER}'
-    OR (${generalPageJumpEligibility(alias, Boolean(pin.privatePageJump))}))` : "";
   const ordinaryClock = generalOrdinaryReplyEligibilitySql(alias);
   const utilityClock = `${pin.privateApiStatus ? `WHEN ${alias}.receipt_nonce='${GENERAL_API_STATUS_MARKER}' THEN EXISTS (
     SELECT 1 FROM telegram_api_status AS utility WHERE utility.receipt_id=${alias}.receipt_id AND utility.ready_at IS NOT NULL
@@ -282,19 +280,24 @@ function current(alias: "inbox" | "earlier", group: boolean, pin: GeneralTelegra
     THEN (${generalProviderReplyEligibility(alias)})` : ""}
     ${pin.providerDocumentReplies ? `WHEN ${alias}.receipt_nonce='${GENERAL_TELEGRAM_PROVIDER_DOCUMENT_MARKER}'
     THEN (${generalProviderDocumentReplyEligibility(alias)})` : ""} ELSE (${ordinaryClock}) END)` : utilityClock.trim() ? `(CASE ${utilityClock} ELSE (${ordinaryClock}) END)` : ordinaryClock;
-  const ordinary = `${clock} AND ${generalCurrentAuthoritySql(alias, `${groupScope} AND ${pathScope}${tempScope}${laneScope}${claimScope}${authScope}${jumpScope}`)}`;
+  const ordinary = `${clock} AND ${generalCurrentAuthoritySql(alias, `${groupScope} AND ${pathScope}${tempScope}${laneScope}${claimScope}${authScope}`)}`;
   const card = hasGeneralGroupShare(pin) ? `WHEN ${alias}.receipt_nonce='${TELEGRAM_GENERAL_GROUP_CLAIM_MARKER}'
     THEN (${ordinaryClock} AND ${generalCurrentAuthoritySql(alias,
       `${GENERAL_PRIVATE_CLAIM_SCHEMA} AND ${GENERAL_GROUP_CARD_SCHEMA} AND ${approvedGroup()}`)})` : "";
   const batch = pin.providerBatch ? `WHEN ${alias}.receipt_nonce IN (${GENERAL_TELEGRAM_PROVIDER_BATCH_REPLY_MARKERS})
     THEN (${generalProviderBatchReplyEligible(alias)} AND ${generalCurrentAuthoritySql(alias)})` : "";
-  return card || batch ? `(CASE ${card} ${batch} ELSE (${ordinary}) END)` : ordinary;
+  // This family needs only its own clock and authority, not unrelated feature predicates in D1's bounded expression tree.
+  const jump = pin.privateBrowsing ? `WHEN ${alias}.receipt_nonce='${GENERAL_PAGE_JUMP_MARKER}'
+    THEN (${ordinaryClock} AND ${generalCurrentAuthoritySql(alias, `${groupScope}${laneScope}`)}
+      AND (${generalPageJumpEligibility(alias, Boolean(pin.privatePageJump))}))` : "";
+  return card || batch || jump ? `(CASE ${card} ${batch} ${jump} ELSE (${ordinary}) END)` : ordinary;
 }
 
 function currentBindings(pin: GeneralTelegramPin) {
   return [
     ...(hasGeneralGroupShare(pin) ? [...generalPolicyBindings(pin), ...generalGroupShareBindings(pin)] : []),
     ...(pin.providerBatch ? generalPolicyBindings(pin) : []),
+    ...(pin.privateBrowsing ? [...generalPolicyBindings(pin), ...generalReadLaneRoleBindings(pin)] : []),
     ...generalPolicyBindings(pin), ...generalReadLaneRoleBindings(pin),
   ];
 }
