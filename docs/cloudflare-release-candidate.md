@@ -20,6 +20,16 @@
 
 群卡终态记录在 `terminalCards`，与阻塞排空的 `work` 分开：`terminalUnknown` 是租约已结束、首次发送结果仍未知的记录；`terminalEditFailure` 是编辑已终止的已发送记录，现有 schema 无法进一步区分明确失败与不确定的编辑结果；`terminalDeliveryFailure` 是首次发送已失败的记录。它们不表示成功，不自动重发，也不删除或改写历史。`drain` 和 `restore` 保留这些计数及 `terminalCardPolicy: retained-without-automatic-retry`，在没有仍可继续工作的任务时允许恢复，无需无限等待已终止的编辑。后续审查仍可核对原回执及原消息。
 
+## 隔离调用方的短链故障演练
+
+`worker-isolation-shortlink-fault-drill.yml` 只改变 `subs-bot-cf-dev-01` 的版本和部署。短链生产服务、域名、WAF、Access 和业务 Token 权限不变。先完成通用窗口的 `close`、`drain`、`restore`，再执行该演练；演练中不要启动其他隔离工作流或修改两个账号的授权。
+
+`action=drill` 填写当前 main 的成功 `worker_ci_run_id`、匹配普通隔离部署的 `deploy_run_id`/`deploy_run_attempt`、未用过的 16 位十六进制 `cohort`，确认串为 `drill shortlink fallback for subs-bot-cf-dev-01`。工具核对准确产物、部署、完整迁移、配置、固定账号及空闲队列，先上传原保护凭据的恢复版本 R，再上传故障版本 C。C 仅替换调用方业务 Token、其摘要及派生发布标记，仍使用真实命名 Service Binding。签名恢复 checkpoint 归档成功后才激活 C。其无效 Token 语法有效，以确保经过实际 RPC；普通发布因凭据摘要不同而拒绝覆盖该状态。
+
+从恢复归档取得 C 的版本 ID，并独立读回确认其 100% 生效后，在内置浏览器用两个固定账号分别发送 `/short https://example.com/subs-bot-normal-short/<cohort>/admin` 和 `/short https://example.org/subs-bot-normal-short/<cohort>/member`。工具最多等待约五分钟，核对真实私聊回执、本地码归属及派生、外链尝试终态和本地 GET/HEAD 跳转。浏览器另行确认回退提示及本地链接，不能把机器读回当成真人验收。数据库未保存 RPC HTTP 状态，报告不宣称直接观测到 401。
+
+主步骤的 `finally` 和工作流的独立 `always()` 步骤均恢复已验证的正常版本。若 runner 被强制终止或恢复未独立确认，使用同一工作流 `action=restore`，填写原 `checkpoint_run_id`、准确 `checkpoint_run_attempt`，确认串为 `restore shortlink fallback for subs-bot-cf-dev-01`。该操作接受失败、取消及未完成运行的签名恢复归档；不要求原 CI 归档仍存在或历史提交仍是 main。仅在当前版本属于 checkpoint 的原版本、C 或 R，且模块、配置及绑定读回完全一致时恢复，遇到外来部署停止，保留现场。恢复归档保留七天，执行者应在演练期间下载保留该无凭据 checkpoint。恢复后还须用新挑战的正常 `/short` 独立确认业务 RPC，并撤销本轮两个账号各自的合成本地码；不删除外层短链。
+
 ## 审查用候选清单
 
 `worker-production-candidate.yml` 在 GitHub 托管 runner 生成只供审查的包。它只使用 `github.token` 的 `actions: read` 和 `contents: read`，不接收 Cloudflare 或 Telegram 凭据、不调用 Cloudflare、不改部署、数据、域名、Webhook 或旧消费者。
