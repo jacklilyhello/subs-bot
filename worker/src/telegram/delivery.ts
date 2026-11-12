@@ -239,12 +239,25 @@ export function sendGeneralTelegramTempRawReply(
   return postTelegram(botToken, actorId, "sendDocument", form, timeoutMs, fetch);
 }
 
+export function sendGeneralTelegramSubscriptionFileReply(
+  botToken: string, actorId: string, messageId: number, file: Blob,
+): Promise<TelegramReplyOutcome> {
+  const form = new FormData();
+  form.set("chat_id", actorId);
+  form.set("reply_parameters", JSON.stringify({ message_id: messageId, allow_sending_without_reply: false }));
+  form.set("caption", "订阅节点原文");
+  form.set("document", file, "subscription-nodes.txt");
+  return postTelegram(botToken, actorId, "sendDocument", form, 5_000, fetch);
+}
+
 export function sendGeneralTelegramGroupListReply(
   botToken: string, chatId: string, messageId: number, threadId: number | null, text: string,
+  keyboard?: { text: string; callback_data: string }[][],
 ): Promise<TelegramReplyOutcome> {
   return postTelegram(botToken, chatId, "sendMessage", {
     chat_id: chatId, text, ...(threadId === null ? {} : { message_thread_id: threadId }),
     reply_parameters: { message_id: messageId, allow_sending_without_reply: false }, link_preview_options: { is_disabled: true },
+    ...(keyboard?.length ? { reply_markup: { inline_keyboard: keyboard } } : {}),
   }, 5_000, fetch, threadId ?? undefined);
 }
 

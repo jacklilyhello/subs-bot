@@ -3,7 +3,7 @@ export type TelegramCommandFeatures = {
   management?: boolean; subscriptionRead?: boolean; temp?: boolean; tempRawDefault?: boolean; path?: boolean;
   aggregate?: boolean; selected?: boolean; batchRefresh?: boolean; batchStatus?: boolean; short?: boolean; share?: boolean;
   inline?: boolean; inlineOff?: boolean; inlineTemp?: boolean; inlineSort?: boolean; bulkTrash?: boolean; github?: boolean;
-  apiStatus?: boolean; authorization?: boolean; authorizationScope?: "registered" | "fixed"; authorizationMemberId?: string; displayTimezone?: boolean; documentImport?: boolean; providerImport?: boolean;
+  apiStatus?: boolean; browsing?: boolean; authorization?: boolean; authorizationScope?: "registered" | "fixed"; authorizationMemberId?: string; displayTimezone?: boolean; documentImport?: boolean; providerImport?: boolean;
 };
 export type TelegramCommandContext = {
   privateChat: boolean; role: "admin" | "member"; features: TelegramCommandFeatures;
@@ -83,6 +83,7 @@ export function renderTelegramHelp(context: TelegramCommandContext): string {
   const lines = telegramCommandEntries(context).map(({ syntax, description }) => `${syntax} ${description}`);
   if (!context.privateChat) lines.push("订阅详情、导出、节点和设置请回到机器人私聊。");
   else {
+    if (context.features.browsing) lines.push("发送列表编号打开自己的订阅详情；详情按钮可浏览或导出节点。");
     if (context.features.subscriptionRead) lines.push("在搜索结果中点击详情按钮查看订阅。");
     if (context.features.providerImport) lines.push("直接发送订阅 URL 可添加订阅。");
     if (context.features.documentImport) lines.push("上传 .txt、.log、.yaml、.yml 或 .json 文件可导入节点。");

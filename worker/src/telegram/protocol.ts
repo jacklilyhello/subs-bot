@@ -589,7 +589,7 @@ export function readGeneralPrivateProviderBatch(
 
 export function readGeneralPrivateSubscriptionRead(
   update: Record<string, unknown>, updateId: number, botId: string, botUsername: string,
-): Extract<TelegramSubscriptionReadUpdate, { kind: "search" | "callback" }> | null {
+): TelegramSubscriptionReadUpdate | null {
   if (Object.keys(update).length !== 2) return null;
   if (isRecord(update.callback_query)) {
     const ticket = readGeneralPrivateTicket(update.callback_query, updateId, botId, SUBSCRIPTION_READ_TICKET);
@@ -601,9 +601,54 @@ export function readGeneralPrivateSubscriptionRead(
     return { ...scope, updateId, kind: "search", query };
   }
   const command = readPrivateTelegramCommand(update, botUsername);
-  if (!command || command.actorId === botId || command.name !== "s") return null;
+  if (!command) {
+    const message = update.message;
+    if (!isRecord(message) || "edit_date" in message || "reply_to_message" in message || "document" in message) return null;
+    const actorId = humanSender(message);
+    const scope = actorId && actorId !== botId ? telegramMessageScope(message, actorId, updateId) : null;
+    const position = typeof message.text === "string" && /^[1-9][0-9]{0,6}$/u.test(message.text.trim()) ? Number(message.text.trim()) : null;
+    return scope && scope.chatType === "private" && scope.chatId === actorId && scope.threadId === null && position !== null
+      ? { ...scope, kind: "number", position } : null;
+  }
+  if (command.actorId === botId || command.name !== "s") return null;
   return { kind: "search", actorId: command.actorId, chatId: command.actorId, chatType: "private", threadId: null,
     updateId, messageId: command.messageId, messageDate: command.messageDate, query: command.remainder };
+}
+
+export type GeneralBrowsingUpdate =
+  | { family: "view"; event: TelegramViewUpdate }
+  | { family: "nodes"; event: TelegramSubscriptionNodeUpdate }
+  | { family: "file"; event: TelegramSubscriptionRawFileUpdate };
+
+/** Parse only owned Bot messages; tickets still require transactional authority proof. */
+export function readGeneralSubscriptionBrowsing(
+  update: Record<string, unknown>, updateId: number, botId: string, botUsername: string,
+): GeneralBrowsingUpdate | null {
+  if (Object.keys(update).length !== 2) return null;
+  const callback = update.callback_query;
+  if (isRecord(callback)) {
+    const { id: callbackId, from: actor, message: origin, data: ticket } = callback;
+    if ("inline_message_id" in callback || "game_short_name" in callback || !matches(callbackId, CALLBACK_ID)
+      || !isRecord(actor) || actor.is_bot !== false || !isPositiveInteger(actor.id) || String(actor.id) === botId
+      || !ownBotMessage(origin, { botId }) || typeof ticket !== "string") return null;
+    const scope = telegramMessageScope(origin, String(actor.id), updateId);
+    if (!scope || (scope.chatType === "private" ? scope.chatId !== scope.actorId || scope.threadId !== null
+      : scope.chatType === "group" && scope.threadId !== null)) return null;
+    if (VIEW_TICKET.test(ticket)) return { family: "view", event: { ...scope, kind: "callback", callbackId, ticket } };
+    if (scope.chatType !== "private") return null;
+    if (SUBSCRIPTION_NODE_TICKET.test(ticket)) return { family: "nodes", event: { ...scope, callbackId, ticket } };
+    if (SUBSCRIPTION_RAW_FILE_TICKET.test(ticket)) return { family: "file", event: { ...scope, callbackId, ticket } };
+    return null;
+  }
+  const command = readGeneralGroupCommand(update, botUsername) ?? readGeneralPrivateMenuCommand(update, botUsername);
+  if (!command || command.actorId === botId || command.remainder.trim() !== "") return null;
+  const kind = command.name === "list" ? "list" : command.name === "expire" ? "expiry" : command.name === "recycle" ? "recycle" : null;
+  if (!kind) return null;
+  const { actorId, messageId, messageDate } = command;
+  const scope: TelegramEventScope = "chatId" in command ? { ...command, updateId } : {
+    updateId, actorId, messageId, messageDate, chatId: actorId, chatType: "private", threadId: null,
+  };
+  return { family: "view", event: { ...scope, kind } };
 }
 
 export function readGeneralPrivateTempUpdate(
