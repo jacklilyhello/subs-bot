@@ -32,6 +32,7 @@ export interface GeneralTelegramPin extends TelegramBotCredentials {
   commandFeatures?: TelegramCommandFeatures;
   groupShare?: TelegramGroupShareDestination;
   rehearsal?: GeneralReadLaneScope;
+  isolationWindow?: { profile: "full-v1"; adminId: string; memberId: string };
 }
 
 interface Lease {

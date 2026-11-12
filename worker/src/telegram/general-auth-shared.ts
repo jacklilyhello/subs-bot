@@ -721,7 +721,7 @@ export async function drainGeneralSharedTelegramReply(
   }
   if (lease.marker === GENERAL_AUTH_ACTION_MARKER) {
     const [begun, reply] = await db.batch<GeneralAuthReply>([
-      prepareTelegramOutboxBegin(db, lease, selectLease(pin, lease, true)), prepareGeneralAuthActionReply(db, lease),
+      prepareTelegramOutboxBegin(db, lease, selectLease(pin, lease, true)), prepareGeneralAuthActionReply(db, lease, pin),
     ]);
     const limit = lease.command === "auth-list" ? GENERAL_AUTH_LIST_LIMIT + 1 : 1;
     if (!begun?.success || !reply?.success || begun.results.length > 1 || reply.results.length > begun.results.length * limit) {
