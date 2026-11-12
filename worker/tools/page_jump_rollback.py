@@ -2,7 +2,7 @@
 
 from dataclasses import asdict, replace
 
-from cloudflare_isolation import _page_jump_tag, _require, version_evidence
+from cloudflare_isolation import _page_jump_tag, _page_jump_version, _require, version_evidence
 from page_jump_activation import (
     ActivationIntent, _deploy_once, _reconcile, _release, _reverses,
 )
@@ -74,8 +74,7 @@ def rollback_once(scope, source, telegram_config, guard, *, run_id):
     _require(_active_sha(scope, active, version) == paused["activeSha256"], STALE)
     previous = original.intent.prior_version_id
     predecessor = scope.version(previous)
-    _require(replace(predecessor, tag=_page_jump_tag(predecessor.tag, epoch, predecessor.digest),
-                     telegram_page_jump_epoch=epoch) == version, STALE)
+    _require(_page_jump_version(predecessor, epoch) == version, STALE)
     observed = journal.control.observe()
     gate = observed.gate
     _require(gate is not None and not gate.enabled and gate.epoch == paused["epoch"]

@@ -70,6 +70,9 @@ import { acceptTelegramSubscriptionRawFile, reapTelegramRawFileTickets,
   telegramSubscriptionRawFileReady } from "./telegram/subscription-raw-file.ts";
 
 export interface Env {
+  SHORTLINK?: import("./telegram/external-shortlinks.ts").ShortlinkService;
+  SHORTLINK_BUSINESS_TOKEN?: string;
+  TELEGRAM_EXTERNAL_SHORTLINKS?: string;
   DB: D1Database;
   NODES: R2Bucket;
   BUILD_REVISION?: string;
@@ -208,6 +211,10 @@ function generalProviderRefreshAvailability(env: Env, enabled: boolean) {
     ? async () => await generalProviderRefreshReady(env.DB) && await generalProviderAdmissionReady(env) : undefined;
 }
 
+function externalShortlinks(env: Env) {
+  return env.TELEGRAM_EXTERNAL_SHORTLINKS === "1" ? { service: env.SHORTLINK, token: env.SHORTLINK_BUSINESS_TOKEN } : undefined;
+}
+
 async function telegramWebhook(request: Request, env: Env, publicOrigin: PublicOrigin, ctx?: ExecutionContext): Promise<Response> {
   if (request.method !== "POST") {
     return plain("Method not allowed.", 405, request.method === "HEAD", { Allow: "POST" });
@@ -234,7 +241,8 @@ async function telegramWebhook(request: Request, env: Env, publicOrigin: PublicO
       if (status === 200) {
         const delivery = general.sharedOutbox
           ? withGeneralProviderDocuments(env, general)
-            .then((scoped) => drainGeneralSharedTelegramReply(env.DB, scoped, env.NODES, publicOrigin, refreshAvailable, share, aggregateKey))
+            .then((scoped) => drainGeneralSharedTelegramReply(env.DB, scoped, env.NODES, publicOrigin, refreshAvailable, share, aggregateKey,
+              externalShortlinks(env)))
             .finally(() => drainGeneralGroupShareCards(env.DB, general))
           : drainGeneralTelegramReply(env.DB, general);
         if (ctx) ctx.waitUntil(delivery.catch(() => undefined));
@@ -317,7 +325,7 @@ async function telegramWebhook(request: Request, env: Env, publicOrigin: PublicO
       subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerQueueReady, bulkTrash, inlineConsent,
       await githubSearch().catch(() => "unavailable" as const), providerRefresh, subscriptionRawFile, providerBatch.controls, apiStatus,
       statusProvider !== null, providerDocument, providerBatchAdmission, pageJumpEpoch, publicOrigin,
-      env.TELEGRAM_SUBSCRIPTION_SHORTS === "1");
+      env.TELEGRAM_SUBSCRIPTION_SHORTS === "1", externalShortlinks(env));
     const drain = () => ctx?.waitUntil(drainReplies().catch(() => undefined));
     if (decoded.apiStatus) {
       if (!statusProvider || apiStatus !== true) return new Response(null, { status: 204, headers: HEADERS });
@@ -645,7 +653,7 @@ async function recoverTelegramWork(
       subscriptionRead, shortLinks, inlineSort, subscriptionNodes, providerQueueReady, bulkTrash, inlineConsent,
       await githubSearch().catch(() => "unavailable" as const), providerRefresh, subscriptionRawFile, providerBatch.controls, apiStatus,
       apiStatusProvider(env) !== null, providerDocument, providerBatchAdmission, telegramPageJumpEpoch(env.TELEGRAM_PAGE_JUMP), publicOrigin,
-      env.TELEGRAM_SUBSCRIPTION_SHORTS === "1");
+      env.TELEGRAM_SUBSCRIPTION_SHORTS === "1", externalShortlinks(env));
   const replies = async () => {
     await drain(10, 45_000);
     await reapTelegramViewTickets(env.DB);
@@ -799,7 +807,8 @@ async function scheduled(_controller: ScheduledController, env: Env): Promise<vo
             try {
               await recoverGeneralSharedTelegramReplies(env.DB, general, env.NODES, publicOrigin,
                 generalProviderRefreshAvailability(env, general.privateProvider), share,
-                general.privateAggregate ? await parseTelegramAggregateKey(env.TELEGRAM_AGGREGATE_KEY) : null);
+                general.privateAggregate ? await parseTelegramAggregateKey(env.TELEGRAM_AGGREGATE_KEY) : null,
+                externalShortlinks(env));
               if (general.privateInline && await telegramInlineSearchReady(env.DB)) await reapTelegramInlineSearch(env.DB, general.botId, true);
             } finally {
               await drainGeneralGroupShareCards(env.DB, general);

@@ -20,6 +20,7 @@ from urllib.error import HTTPError
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import attest_api_status_container as attestation
 import cloudflare_isolation as cloudflare
+import external_shortlink_release as external_shortlinks
 import general_read_rehearsal as general_reads
 import page_jump_activation
 import page_jump_control
@@ -234,6 +235,9 @@ class FakeCloudflare:
                 if row["name"] == cloudflare.PRIVATE_SHARE_KEY_BINDING:
                     self.private_share_upload = deepcopy(row)
                     row.pop("text")
+                if row["name"] == external_shortlinks.SECRET_BINDING:
+                    self.shortlink_upload = deepcopy(row)
+                    row.pop("text")
                 if row["name"] == cloudflare.TELEGRAM_DIGEST_BINDING and self.alter_config_digest:
                     row["text"] = "e" * 64
             if self.stale_after_upload:
@@ -270,6 +274,21 @@ class FakeCloudflare:
     def data_api(self, method, path, payload=None):
         if method == "POST" and path == DATABASE + "/query":
             sql = payload["sql"]
+            if "name='telegram_external_shortlinks') AS tableSql" in sql:
+                migration = Path(__file__).resolve().parents[1] / "migrations" / external_shortlinks.MIGRATION
+                raw = migration.read_bytes()
+                state = getattr(self, "external_shortlink_schema", "exact")
+                with closing(sqlite3.connect(":memory:")) as db:
+                    db.row_factory = sqlite3.Row
+                    db.execute("CREATE TABLE subs_bot_schema_migrations(position INTEGER PRIMARY KEY,name TEXT,sha256 TEXT,mode TEXT)")
+                    db.execute("INSERT INTO subs_bot_schema_migrations VALUES (53,?,?,'applied')", (migration.name,
+                        "0" * 64 if state == "bad-ledger" else sha256(raw).hexdigest()))
+                    if state != "missing":
+                        ddl = raw.decode("ascii")
+                        if state == "bad-schema":
+                            ddl = ddl.replace("attempts BETWEEN 0 AND 3", "attempts BETWEEN 0 AND 5")
+                        db.executescript(ddl)
+                    return [{"success": True, "results": [dict(row) for row in db.execute(sql)]}]
             if any(alias in sql for alias in ("AS typedShortObjects", "AS typedShortRegistered", "AS hasHistory")):
                 schema = self.subscription_shorts_schema
                 if schema == "absent":
@@ -1268,12 +1287,118 @@ class ReleaseTests(unittest.TestCase):
             scope.version(OLD_VERSION)
         self.assertEqual(self.api.writes(), [])
 
+    def set_external_shortlink_artifact(self):
+        module = NEW_MODULE + external_shortlinks.MARKER
+        self.api.upload_module = module
+        (self.bundle / "index.js").write_bytes(module)
+        self.manifest["bundleSha256"] = sha256(module).hexdigest()
+        self.manifest["migrations"] = [{"name": external_shortlinks.MIGRATION, "sha256": external_shortlinks.MIGRATION_SHA256}]
+        return module
+
+    def test_external_shortlink_release_uses_exact_internal_service_and_protected_secret(self):
+        self.set_external_shortlink_artifact()
+        token = "sl_" + "f" * 64
+        result = self.release(TELEGRAM_CONFIG, AGGREGATE_KEY, external_shortlinks_mode=True, shortlink_token=token)
+        self.assertIs(result["externalShortlinksEnabled"], True)
+        self.assertEqual((result["externalShortlinkService"], result["externalShortlinkEntrypoint"]),
+                         ("shortlink-new", "ShortlinkService"))
+        self.assertNotIn(token, json.dumps(result))
+        self.assertEqual(self.api.shortlink_upload, {"type": "secret_text", "name": "SHORTLINK_BUSINESS_TOKEN", "text": token})
+        scope = cloudflare._Isolation(self.api.worker_api, self.api.data_api, TARGET)
+        active = scope.version(NEW_VERSION)
+        self.assertEqual(active.external_shortlink_token_sha256, sha256(token.encode("ascii")).hexdigest())
+        self.assertTrue(active.telegram_external_shortlinks)
+        self.assertTrue(active.external_shortlink_capable)
+        self.assertNotIn(token, json.dumps(cloudflare.version_evidence(active)))
+        before = len(self.api.writes())
+        repeated = self.release(TELEGRAM_CONFIG, AGGREGATE_KEY, shortlink_token=token)
+        self.assertFalse(repeated["changed"])
+        self.assertEqual(len(self.api.writes()), before)
+        for missing_or_rotated in (None, "sl_" + "e" * 64):
+            with self.subTest(secret="missing" if missing_or_rotated is None else "changed"), \
+                    self.assertRaises(cloudflare.CloudflareError):
+                self.release(TELEGRAM_CONFIG, AGGREGATE_KEY, shortlink_token=missing_or_rotated)
+        self.assertEqual(len(self.api.writes()), before)
+
+    def test_external_shortlink_readback_rejects_partial_public_or_changed_entrypoint_bindings(self):
+        self.set_external_shortlink_artifact()
+        token = "sl_" + "f" * 64
+        self.release(TELEGRAM_CONFIG, AGGREGATE_KEY, external_shortlinks_mode=True, shortlink_token=token)
+        expected = deepcopy(self.api.versions[NEW_VERSION])
+        scope = cloudflare._Isolation(self.api.worker_api, self.api.data_api, TARGET)
+        for change in ("missing-service", "entrypoint", "service", "public-fetcher", "plain-secret", "wrong-flag", "tag"):
+            with self.subTest(change=change):
+                document = deepcopy(expected)
+                bindings = {row["name"]: row for row in document["bindings"]}
+                if change == "missing-service":
+                    document["bindings"] = [row for row in document["bindings"] if row["name"] != "SHORTLINK"]
+                elif change == "entrypoint":
+                    bindings["SHORTLINK"]["entrypoint"] = "AnotherService"
+                elif change == "service":
+                    bindings["SHORTLINK"]["service"] = "unrelated-service"
+                elif change == "public-fetcher":
+                    bindings["SHORTLINK"].pop("entrypoint")
+                elif change == "plain-secret":
+                    bindings["SHORTLINK_BUSINESS_TOKEN"]["type"] = "plain_text"
+                elif change == "wrong-flag":
+                    bindings["TELEGRAM_EXTERNAL_SHORTLINKS"]["text"] = "true"
+                else:
+                    document["annotations"]["workers/tag"] = "0" * 64
+                self.api.versions[NEW_VERSION] = document
+                with self.assertRaises(cloudflare.CloudflareError):
+                    scope.version(NEW_VERSION)
+        self.api.versions[NEW_VERSION] = expected
+        self.assertTrue(scope.version(NEW_VERSION).telegram_external_shortlinks)
+
+    def test_external_shortlink_disable_preserves_identity_and_staged_page_jump_tags(self):
+        self.set_external_shortlink_artifact()
+        token = "sl_" + "f" * 64
+        self.release(TELEGRAM_CONFIG, AGGREGATE_KEY, external_shortlinks_mode=True, shortlink_token=token)
+        scope = cloudflare._Isolation(self.api.worker_api, self.api.data_api, TARGET)
+        active = scope.version(NEW_VERSION)
+        digest, enabled = external_shortlinks.target(active, False, token, capable=True,
+            telegram_digest=active.telegram_config_sha256, aggregate_digest=active.telegram_aggregate_key_sha256)
+        self.assertEqual(digest, active.external_shortlink_token_sha256)
+        self.assertFalse(enabled)
+        disabled_rows = external_shortlinks.upload_bindings(token, digest, active.external_shortlink_base_tag, False)
+        self.assertEqual({row["name"] for row in disabled_rows}, external_shortlinks.REQUIRED_BINDINGS)
+        self.assertEqual(next(row for row in disabled_rows if row["name"] == "SHORTLINK")["entrypoint"], "ShortlinkService")
+        bound = cloudflare._page_jump_version(active, 700)
+        self.assertEqual(bound.external_shortlink_token_sha256, digest)
+        self.assertEqual(bound.tag, external_shortlinks.release_tag(bound.external_shortlink_base_tag, digest, True))
+        self.assertNotEqual(bound.tag, active.tag)
+        self.assertEqual(cloudflare.version_evidence(bound)["external_shortlink_token_sha256"], digest)
+        for prefix in ("provider-batch-", "batch-ready-"):
+            base = prefix + "a" * 64
+            self.assertTrue(external_shortlinks.release_tag(base, digest, True).startswith(prefix))
+
+    def test_external_shortlink_schema_artifact_and_operator_mode_are_exact(self):
+        module = self.set_external_shortlink_artifact()
+        self.assertTrue(external_shortlinks.artifact_capable(module, self.manifest))
+        for bad in ({"migrations": []}, {"migrations": [{"name": external_shortlinks.MIGRATION, "sha256": "0" * 64}]}):
+            with self.assertRaises(cloudflare.CloudflareError):
+                external_shortlinks.artifact_capable(module, bad)
+        for state in ("bad-ledger", "bad-schema", "missing"):
+            self.api.external_shortlink_schema = state
+            with self.subTest(state=state), self.assertRaises(cloudflare.CloudflareError):
+                self.release(TELEGRAM_CONFIG, AGGREGATE_KEY, external_shortlinks_mode=True, shortlink_token="sl_" + "f" * 64)
+            self.assertEqual(self.api.writes(), [])
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(release_entry.external_shortlinks_release_mode())
+        for mode, expected in (("enable", True), ("disable", False)):
+            with patch.dict(os.environ, {"SUBS_BOT_EXTERNAL_SHORTLINKS_MODE": f"{mode} external shortlinks for {cloudflare.WORKER_NAME}"}, clear=True):
+                self.assertIs(release_entry.external_shortlinks_release_mode(), expected)
+        with patch.dict(os.environ, {"SUBS_BOT_EXTERNAL_SHORTLINKS_MODE": "enable"}, clear=True), self.assertRaises(cloudflare.CloudflareError):
+            release_entry.external_shortlinks_release_mode()
+
     def test_pre_0048_version_evidence_keeps_the_historical_document(self):
         prior = cloudflare._Version(OLD_REVISION, "0" * 64, COMPATIBILITY, None, telegram_page_jump_epoch=42)
         expected = asdict(prior)
         del expected["telegram_subscription_shorts"]
         del expected["telegram_subscription_shorts_capable"]
         del expected["telegram_general_subscription_shorts_capable"]
+        for key in ("external_shortlink_capable", "external_shortlink_token_sha256", "telegram_external_shortlinks", "external_shortlink_base_tag"):
+            del expected[key]
         self.assertEqual(cloudflare.version_evidence(prior), expected)
         capable = replace(prior, telegram_subscription_shorts_capable=True)
         self.assertEqual(cloudflare.version_evidence(capable),

@@ -10,7 +10,7 @@ from hashlib import sha256
 import json
 
 from cloudflare_isolation import (
-    CloudflareError, DIGEST, READBACK_DELAYS, UUID, WORKER_NAME, _guard_current, _matches, _page_jump_tag, _require,
+    CloudflareError, DIGEST, READBACK_DELAYS, UUID, WORKER_NAME, _guard_current, _matches, _page_jump_tag, _page_jump_version, _require,
     _verify_health, sleep, version_evidence,
 )
 from d1_migrations import _load_migrations, _read_state
@@ -323,8 +323,7 @@ def activate_once(scope, source, telegram_config, guard, *, run_id, revision, bu
              == (stage["revision"], stage["bundleSha256"], policy_sha256)
              and _digest({"scope": scope.target, "deployment": asdict(previous), "version": version_evidence(active)})
              == stage["checkpoint"]["activeSha256"], STALE)
-    desired = replace(active, tag=_page_jump_tag(active.tag, stage["epoch"], active.digest),
-                      telegram_page_jump_epoch=stage["epoch"])
+    desired = _page_jump_version(active, stage["epoch"])
     candidate = scope.staged(desired)
     _require(candidate is not None and _digest({"versionId": candidate, "version": version_evidence(desired)})
              == stage["candidateSha256"], STALE)
