@@ -15,6 +15,7 @@ export interface GeneralTelegramPin extends TelegramBotCredentials {
   sharedOutbox: boolean;
   privateManagement: boolean;
   privateBrowsing?: boolean;
+  privatePageJump?: boolean;
   privateFormats: boolean;
   privateTemp: boolean;
   privateDocument: boolean;
@@ -77,6 +78,8 @@ export function parseGeneralTelegramPin(input: unknown, releaseRevision: unknown
     const privateManagement = value.outbox === "shared-private-management" || privateFormats || privateTemp;
     const browsingConfigured = Object.hasOwn(value, "subscriptionBrowsing");
     const privateBrowsing = value.subscriptionBrowsing === true;
+    const jumpConfigured = Object.hasOwn(value, "pageJump");
+    const privatePageJump = value.pageJump === true;
     const authorizationConfigured = Object.hasOwn(value, "authManagement");
     const privateAuthorization = value.authManagement === true;
     const inlineConfigured = Object.hasOwn(value, "inlineSearch");
@@ -100,13 +103,14 @@ export function parseGeneralTelegramPin(input: unknown, releaseRevision: unknown
       groupShare = { chatId, chatType };
     }
     if (Object.keys(value).length !== 7 + Number(sharedOutbox) + Number(authorizationConfigured) + Number(inlineConfigured)
-        + Number(groupConfigured) + Number(typedConfigured) + Number(batchConfigured) + Number(githubConfigured) + Number(apiConfigured) + Number(browsingConfigured)
+        + Number(groupConfigured) + Number(typedConfigured) + Number(batchConfigured) + Number(githubConfigured) + Number(apiConfigured) + Number(browsingConfigured) + Number(jumpConfigured)
       || (sharedOutbox && value.outbox !== "shared" && !privateManagement)
       || (authorizationConfigured && (!privateManagement || !privateAuthorization))
       || (inlineConfigured && (!privateManagement || !privateInline))
       || (githubConfigured && (!privateManagement || !privateGitHub))
       || (apiConfigured && (!privateManagement || !privateApiStatus))
       || (browsingConfigured && (!privateManagement || !privateBrowsing))
+      || (jumpConfigured && (!privateBrowsing || !privatePageJump))
       || (batchConfigured && (!privateProvider || !providerBatch))
       || (typedConfigured && (!privateShort || (subscriptionShorts !== "issue" && subscriptionShorts !== "drain")))) return null;
     const credentials = readTelegramBotCredentials(value);
@@ -117,7 +121,7 @@ export function parseGeneralTelegramPin(input: unknown, releaseRevision: unknown
       || !/^[0-9a-f]{64}(?![\s\S])/u.test(activationSha256)) return null;
     return { ...credentials, generation, cutoverAt, activationSha256, releaseRevision, sharedOutbox, privateManagement,
       privateFormats, privateTemp, privateDocument, privateProvider, privateClaims, privateShareCreation, privateAggregate, privateSelected,
-      privateShort, privateAuthorization, privateInline, ...(privateBrowsing ? { privateBrowsing } : {}), ...(privateGitHub ? { privateGitHub } : {}), ...(privateApiStatus ? { privateApiStatus } : {}), ...(providerBatch ? { providerBatch } : {}), ...(groupShare ? { groupShare } : {}),
+      privateShort, privateAuthorization, privateInline, ...(privateBrowsing ? { privateBrowsing } : {}), ...(privatePageJump ? { privatePageJump } : {}), ...(privateGitHub ? { privateGitHub } : {}), ...(privateApiStatus ? { privateApiStatus } : {}), ...(providerBatch ? { providerBatch } : {}), ...(groupShare ? { groupShare } : {}),
       ...(subscriptionShorts === "issue" || subscriptionShorts === "drain" ? { subscriptionShorts } : {}) };
   } catch {
     return null;
@@ -131,7 +135,9 @@ function leaseBindings(pin: GeneralTelegramPin, lease: Lease) {
 
 export type GeneralReadCommand = "start" | "help" | "list";
 
-export type GeneralReadEvent = TelegramEventScope & { command: GeneralReadCommand; viewKind: "list" | "expiry" | "recycle" | null };
+export type GeneralReadEvent = TelegramEventScope & {
+  command: GeneralReadCommand; viewKind: "list" | "expiry" | "recycle" | null; renumber?: true;
+};
 
 export function generalReadEvent(
   pin: Pick<GeneralTelegramPin, "botUsername" | "botId" | "privateManagement">,
@@ -140,6 +146,10 @@ export function generalReadEvent(
   const event = readGeneralPrivateMenuCommand(update, pin.botUsername);
   if (event && event.actorId !== pin.botId && event.remainder.trim() === "") {
     const { actorId, messageId, messageDate, name } = event;
+    if (shared && pin.privateManagement && name === "renumber") return {
+      updateId, actorId, chatId: actorId, chatType: "private", threadId: null, messageId, messageDate,
+      command: "help", viewKind: null, renumber: true,
+    };
     if (name === "help" || name === "list" || name === "start" || (shared && pin.privateManagement && ["start", "expire", "recycle"].includes(name))) {
       return { updateId, actorId, chatId: actorId, chatType: "private", threadId: null, messageId, messageDate,
         command: name === "start" ? (shared ? "start" : "help") : name === "help" ? "help" : "list",
@@ -148,8 +158,9 @@ export function generalReadEvent(
   }
   const group = shared ? readGeneralGroupCommand(update, pin.botUsername) : null;
   if (!group || group.actorId === pin.botId || group.name === "s") return null;
-  if (["expire", "recycle"].includes(group.name) && !pin.privateManagement) return null;
+  if (["expire", "recycle", "renumber"].includes(group.name) && !pin.privateManagement) return null;
   const { name, remainder: _remainder, ...scope } = group;
+  if (name === "renumber") return { ...scope, updateId, command: "help", viewKind: null, renumber: true };
   return { ...scope, updateId, command: name === "start" ? "start" : name === "help" ? "help" : "list",
     viewKind: name === "start" || name === "help" ? null : name === "expire" ? "expiry" : name as "list" | "recycle" };
 }

@@ -2450,7 +2450,8 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.ok(adminMenu.text.split("\n").includes("/auth list 查看授权"));
   assert.equal((await menuPost(7902, 195, "/help")).status, 200);
   const memberMenu = (await awaitLifecycle(7902)).message;
-  assert.doesNotMatch(memberMenu.text, /\/auth|\/settings|\/timezone|\/g |\/ai|\/renumber/u);
+  assert.doesNotMatch(memberMenu.text, /\/auth|\/settings|\/timezone|\/g |\/ai/u);
+  assert.match(memberMenu.text, /\/renumber 重置显示编号/u);
   assert.equal((await menuPost(7903, 195, "/start@GeneralFixtureBot")).status, 200);
   assert.match((await awaitLifecycle(7903)).message.text, /^欢迎使用 subs-bot。\n\/help 发送帮助/u);
   assert.equal((await menuPost(7904, 195, "/expire@GeneralFixtureBot")).status, 200);

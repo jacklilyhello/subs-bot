@@ -26,13 +26,21 @@ const ROLE_LABELS = { admin: "管理员", member: "已授权", denied: "已撤�
 
 export function readGeneralAuthAction(pin: GeneralTelegramPin, update: Record<string, unknown>, updateId: number) {
   if (!pin.privateAuthorization || !pin.privateManagement || !pin.sharedOutbox || pin.rehearsal) return null;
-  const command = readPrivateTelegramCommand(update, pin.botUsername);
+  const command = readPrivateTelegramCommand(update, pin.botUsername, true);
   if (!command || command.name !== "auth" || command.actorId === pin.botId) return null;
   const event = { updateId, actorId: command.actorId, messageId: command.messageId, messageDate: command.messageDate };
   if (/^(?:\s+(?:list|ls))?\s*$/iu.test(command.remainder)) return { ...event, action: "auth-list" as const };
-  const match = /^\s+(add|remove|del|rm)\s+([1-9][0-9]{0,15})\s*$/iu.exec(command.remainder);
-  if (!match || Number(match[2]) >= 2 ** 52) return null;
-  const targetId = match[2];
+  const match = /^\s+(add|remove|del|rm)(?:\s+([1-9][0-9]{0,15}))?\s*$/iu.exec(command.remainder);
+  if (!match) return null;
+  const message = update.message as Record<string, unknown>;
+  const reply = message.reply_to_message;
+  const sender = reply && typeof reply === "object" && !Array.isArray(reply)
+    ? (reply as Record<string, unknown>).from : null;
+  const repliedId = sender && typeof sender === "object" && !Array.isArray(sender)
+    ? (sender as Record<string, unknown>).id : null;
+  const targetId = match[2] ?? (typeof repliedId === "number" && Number.isSafeInteger(repliedId)
+    && repliedId > 0 && repliedId < 2 ** 52 ? String(repliedId) : null);
+  if (targetId === null || Number(targetId) >= 2 ** 52) return null;
   const action = match[1].toLowerCase() === "add" ? "auth-add" as const : "auth-remove" as const;
   return { ...event, targetId, action };
 }

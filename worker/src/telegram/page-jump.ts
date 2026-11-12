@@ -26,7 +26,9 @@ const basePin = `EXISTS (
       (type='table' AND name='telegram_page_jumps') OR (type='index' AND name='telegram_page_jumps_expiry')))=2
 )`;
 
-async function telegramPageJumpReady(db: D1Database): Promise<boolean> {
+export const TELEGRAM_PAGE_JUMP_SCHEMA = basePin;
+
+export async function telegramPageJumpReady(db: D1Database): Promise<boolean> {
   try {
     return await db.prepare(`SELECT ${basePin} AS ready`).first<number>("ready") === 1;
   } catch {

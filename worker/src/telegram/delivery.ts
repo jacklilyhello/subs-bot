@@ -58,6 +58,7 @@ import { renderTelegramApiStatus } from "./api-status.ts";
 import { telegramMainMenuKeyboard, type TelegramMainMenuFeatures } from "./main-menu.ts";
 import { wrapAuthorizedLocalShortlink, type ExternalShortlinkRuntime } from "./external-shortlinks.ts";
 import { renderTelegramHelp } from "./command-catalog.ts";
+import { renderTelegramRenumber } from "./renumber.ts";
 
 const BOT_API = "https://api.telegram.org";
 const MAX_RESPONSE_BYTES = 64 * 1024;
@@ -443,6 +444,8 @@ async function renderReply(
   }
   const allowed = lease.actorId === policy.adminId || await isTelegramMemberAllowed(db, policy);
   if (!allowed) return { text: "当前账号没有使用权限。", access: "denied" };
+  if (lease.renumber) return { text: await renderTelegramRenumber(db, lease.actorId), access: "allowed",
+    ...(lease.chatType === "private" && lease.threadId === null ? { mainMenu: menuFeatures } : {}) };
   if (lease.command === "help" && lease.chatType === "private" && lease.threadId === null) {
     const settings = await renderTelegramDisplaySettings(db, policy.botId, lease.receiptId, lease.actorId === policy.adminId);
     if (settings) return { text: settings.text, settingsKeyboard: settings.keyboard, access: "allowed" };

@@ -60,9 +60,12 @@ async function fixture(botId: string) {
     return acceptGeneralAuthAction(db, selected, parsed);
   }
   async function webhook(id: number, text: string, actor = admin, group = false, selected = pin) {
+    return payload(update(id, text, actor, stamp, group), selected);
+  }
+  async function payload(value: object, selected = pin) {
     return acceptGeneralSharedTelegramCommand(db, selected, new Request("https://synthetic.invalid/telegram/webhook", {
       method: "POST", headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": pin.webhookSecret },
-      body: JSON.stringify(update(id, text, actor, stamp, group)),
+      body: JSON.stringify(value),
     }));
   }
   const state = (actor = target) => db.prepare(`SELECT revision,role,effective_at AS effectiveAt FROM telegram_general_actors
@@ -77,8 +80,49 @@ async function fixture(botId: string) {
     await db.prepare(`UPDATE telegram_outbox SET state='failed',lease_id=NULL,lease_until=NULL
       WHERE receipt_id IN (SELECT receipt_id FROM telegram_inbox WHERE bot_id=?)`).bind(botId).run();
   }
-  return { pin, admin, member, otherAdmin, target, stamp, update, action, webhook, state, rows, result, settle };
+  return { pin, admin, member, otherAdmin, target, stamp, update, action, webhook, payload, state, rows, result, settle };
 }
+
+test("synthetic legacy reply-target selection retains numeric precedence, canonical IDs and the current-admin gate", async () => {
+  const f = await fixture("960800");
+  const replied = (id: number, text: string, target: unknown = Number(f.target), actor = f.admin) => {
+    const value = f.update(id, text, actor);
+    return { ...value, message: { ...value.message, reply_to_message: { message_id: 1, date: f.stamp - 10,
+      chat: value.message.chat, from: { id: target, is_bot: false }, text: "Synthetic quoted message" } } };
+  };
+  assert.equal(await f.payload(replied(801, "/auth add")), 200);
+  assert.equal((await f.state())?.role, "member");
+  assert.ok((await f.state())!.effectiveAt >= f.stamp + 60);
+  assert.equal(await f.payload(replied(802, "/auth remove")), 200);
+  assert.equal((await f.state())?.role, "denied");
+  await f.settle();
+  const explicit = readGeneralAuthAction(f.pin, replied(803, `/auth add ${f.target}`, Number(f.otherAdmin)), 803);
+  assert.ok(explicit && explicit.action === "auth-add");
+  assert.equal(explicit.targetId, f.target, "a quoted sender cannot override an explicit canonical ID");
+  for (const text of ["/auth add 00", "/auth add +1", "/auth add 1 extra"]) {
+    assert.equal(readGeneralAuthAction(f.pin, replied(804, text), 804), null, "invalid arguments never fall back to the quote");
+  }
+  for (const target of [true, "9608004", 0, -1, 2 ** 52, 1.5]) {
+    assert.equal(readGeneralAuthAction(f.pin, replied(805, "/auth add", target), 805), null);
+  }
+  assert.equal(await f.payload(replied(806, "/auth add", Number(f.target), f.member)), 204);
+  assert.equal((await f.state())?.role, "denied");
+  const full = { ...f.pin, isolationWindow: { profile: "full-v1" as const, adminId: f.admin, memberId: f.member } };
+  const outside = readGeneralAuthAction(full, replied(807, "/auth add"), 807);
+  assert.ok(outside);
+  assert.equal(await acceptGeneralAuthAction(db, full, outside), 204, "the fixed full window does not enroll a quoted outside subject");
+  let protectedId = 808;
+  for (const target of [f.pin.botId, f.admin, f.otherAdmin]) {
+    const id = protectedId++;
+    const selected = readGeneralAuthAction(f.pin, replied(id, "/auth remove", Number(target)), id);
+    assert.ok(selected);
+    assert.equal(await acceptGeneralAuthAction(db, f.pin, selected), 200);
+    assert.equal((await f.result(id))?.result, "unavailable");
+    await f.settle();
+  }
+  assert.equal((await f.state(f.admin))?.role, "admin");
+  assert.equal((await f.state(f.otherAdmin))?.role, "admin");
+});
 
 test("an administrator can enroll a new member once and the new grant retains the activation hold", async () => {
   const f = await fixture("960100");

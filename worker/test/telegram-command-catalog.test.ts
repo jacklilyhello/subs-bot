@@ -4,7 +4,8 @@ import { renderTelegramHelp, syncTelegramCommandMenu, telegramBotCommands, teleg
   type TelegramCommandFeatures } from "../src/telegram/command-catalog.ts";
 import { generalReadEvent } from "../src/telegram/general-auth-runtime.ts";
 import { telegramMainMenuKeyboard } from "../src/telegram/main-menu.ts";
-import { readGeneralPrivateMenuCommand, readGeneralPrivateSubscriptionRead } from "../src/telegram/protocol.ts";
+import { readGeneralPrivateMenuCommand, readGeneralPrivateShortLink, readGeneralPrivateSubscriptionRead,
+  readPrivateTelegramCommand } from "../src/telegram/protocol.ts";
 
 const all: TelegramCommandFeatures = { management: true, subscriptionRead: true, temp: true, path: true,
   aggregate: true, selected: true, batchRefresh: true, short: true, share: true, inline: true, inlineTemp: true,
@@ -22,8 +23,8 @@ test("private catalogs list each real subcommand on its own line and restrict ad
   const member = { privateChat: true, role: "member" as const, features: all };
   const admin = { ...member, role: "admin" as const };
   const memberHelp = renderTelegramHelp(member);
-  assert.doesNotMatch(memberHelp, /\/auth|\/settings|\/timezone|\/renumber/u);
-  for (const expected of ["/temp clear 清空临时节点", "/export revoke 撤销全部订阅链接", "/short revoke 短码或本地短链 撤销自己的短链",
+  assert.doesNotMatch(memberHelp, /\/auth|\/settings|\/timezone/u);
+  for (const expected of ["/renumber 重置显示编号", "/temp clear 清空临时节点", "/export revoke 撤销全部订阅链接", "/short revoke 短码或本地短链 撤销自己的短链",
     "/inline temp on 开启临时节点内联搜索（15 分钟）", "/updateall status 查看批量任务历史", "/i 到期 设置内联排序"]) {
     assert.ok(memberHelp.split("\n").includes(expected));
   }
@@ -37,7 +38,7 @@ test("paused capabilities keep only their available status and opt-out commands"
   const context = { privateChat: true, role: "admin" as const,
     features: { management: true, inlineOff: true, batchStatus: true } };
   assert.deepEqual(telegramCommandEntries(context).map(({ syntax }) => syntax),
-    ["/help", "/list", "/expire", "/recycle", "/start", "/updateall status", "/inline off"]);
+    ["/help", "/list", "/expire", "/recycle", "/start", "/renumber", "/updateall status", "/inline off"]);
   assert.deepEqual(telegramMainMenuKeyboard({ management: false, path: false, aggregate: false, batchRefresh: false }),
     [[{ text: "📦 订阅列表" }], [{ text: "❓ 帮助菜单" }]]);
 });
@@ -54,6 +55,7 @@ test("general start, expiry and safe group commands accept the addressed command
     assert.equal(generalReadEvent(pin, update("/start@FixtureBot", group), 42, true)?.command, "start");
     assert.equal(generalReadEvent(pin, update("/help@fixturebot", group), 42, true)?.command, "help");
     assert.equal(generalReadEvent(pin, update("/expire@FixtureBot", group), 42, true)?.viewKind, "expiry");
+    assert.equal(generalReadEvent(pin, update("/renumber@FixtureBot", group), 42, true)?.renumber, true);
     assert.equal(generalReadEvent(pin, update("/help@DifferentBot", group), 42, true), null);
     assert.equal(generalReadEvent(pin, update("/auth list", group), 42, true), null);
   }
@@ -66,10 +68,30 @@ test("general start, expiry and safe group commands accept the addressed command
 
 test("private reply-keyboard labels go through the same scoped command parsers", () => {
   for (const [label, name] of [["📦 订阅列表", "list"], ["🟠 临期列表", "expire"], ["📤 导出链接", "export"],
-    ["🔄 更新所有", "updateall"], ["♻️ 撤销删除", "recycle"], ["🧭 路径对应", "path"], ["❓ 帮助菜单", "help"]]) {
+    ["🔄 更新所有", "updateall"], ["♻️ 撤销删除", "recycle"], ["🔢 重置编号", "renumber"], ["🧭 路径对应", "path"], ["❓ 帮助菜单", "help"]]) {
     assert.equal(readGeneralPrivateMenuCommand(update(label), pin.botUsername)?.name, name);
     assert.equal(readGeneralPrivateMenuCommand(update(label, true), pin.botUsername), null);
   }
+});
+
+test("ordinary short-link aliases keep the exact private human envelope and slash command parser", () => {
+  for (const text of ["短链 https://example.com/fixture", "short https://example.com/fixture", "SHORT https://example.com/fixture",
+    "/short@FixtureBot https://example.com/fixture"]) {
+    assert.equal(readGeneralPrivateShortLink(update(text), 42, pin.botId, pin.botUsername)?.args.trim(), "https://example.com/fixture");
+    assert.equal(readGeneralPrivateShortLink(update(text, true), 42, pin.botId, pin.botUsername), null);
+  }
+  assert.equal(readGeneralPrivateShortLink(update("🔗 短链"), 42, pin.botId, pin.botUsername)?.args, "");
+  assert.equal(readGeneralPrivateShortLink(update("/short@DifferentBot https://example.com/fixture"), 42, pin.botId, pin.botUsername), null);
+  const alias = update("short https://example.com/fixture");
+  for (const altered of [
+    { ...alias, message: { ...alias.message, from: { id: 101, is_bot: true } } },
+    { ...alias, message: { ...alias.message, reply_to_message: {} } },
+    { ...alias, message: { ...alias.message, edit_date: alias.message.date } },
+    { ...alias, message: { ...alias.message, sender_chat: { id: -10001 } } },
+    { ...alias, message: { ...alias.message, entities: [{ type: "bot_command", offset: 0, length: 5 }] } },
+  ]) assert.equal(readGeneralPrivateShortLink(altered, 42, pin.botId, pin.botUsername), null);
+  const quotedCommand = { ...alias, message: { ...update("/short https://example.com/fixture").message, reply_to_message: {} } };
+  assert.equal(readPrivateTelegramCommand(quotedCommand, pin.botUsername), null, "reply opt-in is limited to authorization target selection");
 });
 
 test("explicit menu synchronization uses chat scope, validates Telegram's result, and never emits credentials", async () => {

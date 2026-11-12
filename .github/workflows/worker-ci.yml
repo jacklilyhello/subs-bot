@@ -175,6 +175,8 @@ jobs:
             SUBS_BOT_LEGACY_PYTHON="$workdir/venv/bin/python" "$(command -v node)" --test test/telegram-general-auth-replay.integration.ts
           offline_python WORKER_TEST_BUNDLE_DIR="$WORKER_TEST_BUNDLE_DIR" WORKER_TEST_REVISION="$BUILD_REVISION" \
             "$(command -v node)" --test test/telegram-general-browsing.integration.ts
+          offline_python WORKER_TEST_BUNDLE_DIR="$WORKER_TEST_BUNDLE_DIR" WORKER_TEST_REVISION="$BUILD_REVISION" \
+            "$(command -v node)" --test test/telegram-general-page-jump.integration.ts
           if [[ "$GITHUB_REPOSITORY" == 'jacklilyhello/subs-bot' && "$GITHUB_REF" == 'refs/heads/main' &&
                 ( "$GITHUB_EVENT_NAME" == 'push' || "$GITHUB_EVENT_NAME" == 'workflow_dispatch' ) ]]; then
             test "$BUILD_REVISION" = "$GITHUB_SHA"

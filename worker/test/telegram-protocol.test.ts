@@ -99,7 +99,17 @@ test("matches only explicit legacy menu labels and preserves private-only dispat
   assert.equal((await decodeMessage("📤 导出链接", plain)).aggregate?.kind, "show");
   assert.equal((await decodeMessage("路径对应", plain)).path?.args, "");
   assert.equal((await decodeMessage("更新所有", plain)).providerBatch?.kind, "preview");
-  for (const text of ["📤 导出链接", "路径对应", "🔄 更新所有", "想看看订阅列表", "重置编号"]) {
+  for (const fields of [plain, group]) {
+    for (const label of ["🔢 重置编号", "重置编号"]) {
+      const decoded = await decodeMessage(label, fields);
+      assert.equal(decoded.status, 200);
+      assert.equal(decoded.command?.command, "help");
+      assert.equal(decoded.command?.renumber, true);
+      assert.equal(decoded.command?.chatId, fields === group ? policy.groupId : policy.adminId);
+      assert.equal(decoded.command?.threadId, fields === group ? 15 : null);
+    }
+  }
+  for (const text of ["📤 导出链接", "路径对应", "🔄 更新所有", "想看看订阅列表", "想重置编号", "重置编号 now"]) {
     assert.equal((await decodeMessage(text, group)).status, 204);
   }
   assert.equal((await decodeMessage("订阅列表", { ...group, entities: [{ type: "bot_command", offset: 0, length: 4 }] })).status, 204);
