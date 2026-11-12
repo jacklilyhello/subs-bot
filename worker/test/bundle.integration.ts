@@ -9,6 +9,7 @@ import { test } from "node:test";
 import { Miniflare } from "miniflare";
 import { parse as parseYaml } from "yaml";
 
+import { renderTelegramHelp } from "../src/telegram/command-catalog.ts";
 import { createPrivateShare } from "../src/private-shares.ts";
 import { runOneProviderJob } from "../src/provider-job-consumer.ts";
 import { enqueueOwnedProviderRefresh } from "../src/provider-jobs.ts";
@@ -932,10 +933,13 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
 
     const ids = [10, 8, 9, 18, 20, 22, 24, 26, 28, 312, 314];
     const menu = [["📦 订阅列表", "🟠 临期列表"], ["📤 导出链接"], ["♻️ 撤销删除"], ["🧭 路径对应", "❓ 帮助菜单"]];
-    const publicHelp = "使用 /list 查看你的订阅，/expire 查看临期，/recycle 查看回收站。\n/s 关键词搜索订阅。";
-    const privateHelp = publicHelp + "\n/temp 查看临时节点，/path 管理路径规则。\n发送列表编号查看订阅详情。"
-      + "\n/export 导出全部订阅，/o 关键词导出所选订阅。";
-    const adminStart = expectSend(policy.adminId, 316, 315, `欢迎使用 subs-bot。\n${privateHelp}`, undefined, undefined, menu);
+    const helpFeatures = { management: true, subscriptionRead: true, temp: true, tempRawDefault: true, path: true,
+      aggregate: true, selected: true, short: true, bulkTrash: true, inlineSort: true, authorization: true, github: true, batchStatus: true,
+      authorizationScope: "fixed" as const, authorizationMemberId: policy.memberId, documentImport: true };
+    const publicHelp = renderTelegramHelp({ privateChat: false, role: "member", features: helpFeatures });
+    const privateHelp = renderTelegramHelp({ privateChat: true, role: "member", features: helpFeatures });
+    const adminHelp = renderTelegramHelp({ privateChat: true, role: "admin", features: helpFeatures });
+    const adminStart = expectSend(policy.adminId, 316, 315, `欢迎使用 subs-bot。\n${adminHelp}`, undefined, undefined, menu);
     const memberHelp = expectSend(policy.memberId, 318, 317, privateHelp, undefined, undefined, menu);
     assert.equal((await post({ update_id: 312, message: { ...pathEvent.message, message_id: 315, text: "/start",
       entities: [{ type: "bot_command", offset: 0, length: 6 }] } })).status, 200);

@@ -1,3 +1,4 @@
+import type { TelegramCommandFeatures } from "./command-catalog.ts";
 const MENU = [
   [{ action: "list", labels: ["📦 订阅列表", "📋 订阅列表", "订阅列表"] },
     { action: "expiry", labels: ["🟠 临期列表", "⏳ 临期列表", "临期列表"] }],
@@ -8,7 +9,7 @@ const MENU = [
     { action: "help", labels: ["❓ 帮助菜单", "帮助菜单", "帮助"] }],
 ] as const;
 
-export type TelegramMainMenuFeatures = { aggregate: boolean; batchRefresh: boolean };
+export type TelegramMainMenuFeatures = TelegramCommandFeatures & { aggregate: boolean; batchRefresh: boolean };
 
 export function telegramMainMenuAction(text: string) {
   if (text.length > 64) return null;
@@ -23,6 +24,7 @@ export function telegramMainMenuAction(text: string) {
 
 export function telegramMainMenuKeyboard(features: TelegramMainMenuFeatures): { text: string }[][] {
   return MENU.map((row) => row
-    .filter(({ action }) => (action !== "aggregate" || features.aggregate) && (action !== "batchRefresh" || features.batchRefresh))
+    .filter(({ action }) => (action !== "aggregate" || features.aggregate) && (action !== "batchRefresh" || features.batchRefresh)
+      && (!["expiry", "recycle"].includes(action) || features.management !== false) && (action !== "path" || features.path !== false))
     .map(({ labels }) => ({ text: labels[0] }))).filter((row) => row.length > 0);
 }

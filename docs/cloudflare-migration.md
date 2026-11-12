@@ -1,5 +1,11 @@
 # Cloudflare 迁移
 
+## Telegram 帮助与命令菜单
+
+帮助、主键盘能力过滤和 Telegram 命令定义共用 `command-catalog.ts`。私聊根据当前角色与已启用能力展示；群聊仅显示适用的基础命令，并引导私聊查看详情。通用入口支持 `/start`、`/expire` 和经群授权检查的名称搜索，所有动作仍由后端鉴权。
+
+隔离部署成功后，可运行受保护的 `Synchronize isolated Telegram command menus` 工作流。`source_run_id` 必须对应当前部署的 main 成功 Worker CI；`isolation_flags` 必须来自当前 Cloudflare 只读绑定读回，字段仅为 `inlineSearch`、`providerUrlImport`、`providerBatch`、`apiStatus` 的布尔值。工作流核对准确产物和在线 health，并仅同步固定测试管理员、成员和群的 chat scope，再用 `getMyCommands` 独立读回。运行前后仍须只读核对绑定，不能把调用者提供的开关本身当作部署证明。该工具不复制 Cloudflare 凭据，也不更新生产 Bot。
+
 迁移目标是让 subs-bot 的 Telegram 处理、订阅与分享数据、导出和后台任务都运行在 Cloudflare。Telegram、GitHub、订阅提供方和已配置的可信短链服务仍是业务接口。完成切换后，服务无需维护者管理 VPS、轮询进程或外部数据库。
 
 ## 隔离环境与 HTTP 接口
@@ -167,7 +173,7 @@ Cloudflare 边缘诊断使用独立的 `worker-grep-edge-preview.yml`。仅在 `
 
 | 案例 | IAB 操作与预期 |
 | --- | --- |
-| `expired` | 管理员先私聊发送 `/share x1 s1 -- <正文>`。普通成员在回复显示的 UTC 到期秒之后发送领取载荷，看到过期提示。 |
+| `expired` | 管理员先私聊发送 `/share x1 s1 -- <正文>`。普通成员按 Bot 当前展示时区，在回复显示的到期秒之后发送领取载荷，看到过期提示。 |
 | `targeted` | 管理员私聊发送 `/share x1 id<普通成员ID> s10 -- <正文>`。管理员先看到指定领取人拒绝，普通成员再领取两次，两次收到同样正文，D1 只有一条领取记录。 |
 | `race` | 普通成员私聊发送 `/share x1 s10 -- <正文>`。两个账号在各自的 IAB 私聊中协调发送同一领取载荷。两次 Telegram 消息日期相差最多五秒，只有一方收到正文，另一方看到份数已领完。 |
 | `group` | 管理员在指定群发送 `/share@<测试Bot> x1 s1 -- <正文>`，随后发送 `/help@<测试Bot>`。第一条不回复也不留回执，第二条收到正常帮助。 |
@@ -688,6 +694,12 @@ V11 合成原生演练在 `worker-isolation-legacy-candidate.yml` 选择 `synthe
 `0050` 为通用授权准备私聊 `/auth add <用户ID>` 和 `/auth remove <用户ID>`。通用私聊管理配置仅在显式包含 `authManagement: true` 时接收这些指令。只允许当前管理员处理本世代已登记的普通用户。同一 Bot 如有 `0049` 演练记录，通用授权入口关闭。授权修改和回复回执在同一 D1 事务内提交。按 Telegram 消息时间及同秒更新编号判定先后。撤权立即拒绝成员权限，重新授权要求新消息晚于新的时间界限。管理员可用 `/auth` 或 `/auth list` 私下查看本世代最多 20 位主体的最新角色；名单还有其他用户时会明确提示。暂停接收后仍可发送已接收的私聊回复。现有受保护发布流程保持此入口关闭。引用消息选择用户及增加新主体另行接入。
 
 通用私聊管理配置可显式加入 `inlineSearch: true`。部署同时启用 `TELEGRAM_INLINE_SEARCH` 时，允许当前主体在自己的 Bot 私聊通过 `/inline on` 同意 15 分钟内联订阅名称搜索。只接受 Telegram 标记为 `sender` 的查询，查询和原始来源不存入回执，结果不含能力链接。发送前再次核对原同意回执、当前授权及订阅版本，重复查询只处理一次。暂停查询时仍可 `/inline off`。现有隔离配置不启用这一通用入口，临时节点内联和群内内联不在此模式内。
+
+#### Bot 展示时区
+
+`0051` 使机器人生成的日期时间默认按 UTC 展示。管理员在机器人私聊用 `/settings` 或 `/timezone` 查看当前 Bot 的统一展示时区，在面板选择 UTC、Asia/Singapore，或发送 `/timezone America/New_York` 等有效 IANA 名称。`/timezone UTC` 恢复默认。普通成员和群聊不能修改。设置按 Bot 存入 D1，并使用原有收件和发件队列持久记录操作；Telegram 重投不会重复应用。按命令消息时间、同秒 update ID 排序；面板回调以本次接收时刻记录操作时间，因此旧面板仍可由当前管理员使用。 [Telegram Update](https://core.telegram.org/bots/api#update)
+
+展示设置需要两张表及准确登记的迁移；缺少设置行时使用 UTC，非法时区值安全回退 UTC。订阅到期、回收站、分享到期及批量刷新完成时间共用同一格式器，不附时区后缀。数据库中的 Unix 秒、授权界限、实际到期、TTL、租约、分享正文、机器时间字段与 Cron 均保持原语义。合成备份包含 Bot 展示设置；Cloudflare 原生恢复仍按完整迁移 schema 逐表恢复。
 
 #### V10 联合包原生恢复演练
 
