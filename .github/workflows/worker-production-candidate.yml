@@ -1,0 +1,74 @@
+name: Package production candidate for review only
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Successful Worker CI of this exact main commit
+        required: true
+        type: string
+      source_run_attempt:
+        description: Exact successful CI attempt used by the isolation deployment
+        required: true
+        default: '1'
+        type: string
+      deploy_run_id:
+        description: Successful ordinary isolation deployment using that same CI artifact
+        required: true
+        type: string
+      deploy_run_attempt:
+        description: Exact successful deployment attempt
+        required: true
+        default: '1'
+        type: string
+      expected_flags_json:
+        description: Optional boolean flag expectations to compare with historical deployment evidence
+        default: '{}'
+        type: string
+      expected_binding_names_json:
+        description: Additional expected binding names only; never values or credentials
+        default: '[]'
+        type: string
+      data_source_kind:
+        description: Descriptive metadata only; this job never reads or imports source data
+        default: not-supplied
+        type: choice
+        options: [not-supplied, synthetic-fixture]
+      data_source_sha256:
+        description: Optional synthetic fixture digest; never a private path, link, data or credential
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  package:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify immutable GitHub evidence and generate the review package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_CI_RUN_ID: ${{ inputs.source_run_id }}
+          CANDIDATE_CI_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
+          CANDIDATE_DEPLOY_RUN_ID: ${{ inputs.deploy_run_id }}
+          CANDIDATE_DEPLOY_RUN_ATTEMPT: ${{ inputs.deploy_run_attempt }}
+          CANDIDATE_EXPECTED_FLAGS: ${{ inputs.expected_flags_json }}
+          CANDIDATE_EXPECTED_BINDINGS: ${{ inputs.expected_binding_names_json }}
+          CANDIDATE_DATA_SOURCE_KIND: ${{ inputs.data_source_kind }}
+          CANDIDATE_DATA_SOURCE_SHA256: ${{ inputs.data_source_sha256 }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 -B worker/tools/production_candidate.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: subs-bot-production-candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/subs-bot-production-candidate/
+          if-no-files-found: error
+          retention-days: 7
