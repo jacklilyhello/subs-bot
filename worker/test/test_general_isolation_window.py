@@ -157,6 +157,45 @@ class FullWindowTests(TestCase):
             with self.assertRaises(cloudflare.CloudflareError):
                 window.general_window_artifact(module, {"migrations": chain})
 
+    def test_clear_accepts_only_a_truly_unregistered_absent_window(self):
+        window.require_window_clear(self.scope)
+        self.api.db.execute(f"DROP TABLE {window.TABLE}")
+        self.api.db.commit()
+        with self.assertRaises(cloudflare.CloudflareError):
+            window.require_window_clear(self.scope)
+        self.api.db.execute("DELETE FROM subs_bot_schema_migrations WHERE position=52")
+        self.api.db.commit()
+        window.require_window_clear(self.scope)
+        # Either the reserved ordinal or the exact name is sufficient to detect
+        # a recorded migration whose table disappeared.
+        self.api.db.execute("INSERT INTO subs_bot_schema_migrations(position,name,sha256,mode) VALUES(52,'synthetic-other.sql',?,'applied')",
+            (window.MIGRATION_SHA256,))
+        self.api.db.commit()
+        with self.assertRaises(cloudflare.CloudflareError):
+            window.require_window_clear(self.scope)
+        self.api.db.execute("DELETE FROM subs_bot_schema_migrations WHERE position=52")
+        self.api.db.execute("""INSERT INTO subs_bot_schema_migrations(position,name,sha256,mode)
+            SELECT COALESCE(max(position),52)+100,?,?,'applied' FROM subs_bot_schema_migrations""",
+            (window.MIGRATION, window.MIGRATION_SHA256))
+        self.api.db.commit()
+        with self.assertRaises(cloudflare.CloudflareError):
+            window.require_window_clear(self.scope)
+        self.assertEqual(self.api.writes, 0, "schema classification never writes recovery or migration state")
+
+    def test_clear_rejects_a_view_in_place_of_the_control_table_or_ledger(self):
+        self.api.db.execute(f"DROP TABLE {window.TABLE}")
+        self.api.db.execute(f"CREATE VIEW {window.TABLE} AS SELECT 'synthetic' AS bot_id")
+        self.api.db.commit()
+        with self.assertRaises(cloudflare.CloudflareError):
+            window.require_window_clear(self.scope)
+        self.api.db.execute(f"DROP VIEW {window.TABLE}")
+        self.api.db.execute("DROP TABLE subs_bot_schema_migrations")
+        self.api.db.execute("CREATE VIEW subs_bot_schema_migrations AS SELECT 1 AS position")
+        self.api.db.commit()
+        with self.assertRaises(cloudflare.CloudflareError):
+            window.require_window_clear(self.scope)
+        self.assertEqual(self.api.writes, 0)
+
     def test_terminal_group_card_failures_are_preserved_as_nonblocking_evidence(self):
         self.action("open", self.action("close", self.action()))
         self.action("close", self.action())

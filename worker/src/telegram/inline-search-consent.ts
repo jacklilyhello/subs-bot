@@ -3,15 +3,19 @@ import { GENERAL_ACTOR_QUEUE_CAPACITY, GENERAL_LATEST_ACTOR_SQL, GENERAL_NO_LEGA
   GENERAL_POLICY_PIN_SQL, GENERAL_RECEIPT_SCHEMA, generalCurrentAuthoritySql, generalPolicyBindings,
   prepareGeneralReceiptAuthority } from "./general-receipt.ts";
 import { validInteger } from "../storage.ts";
+import { GENERAL_TEMP_SCHEMA } from "./temp-import.ts";
+import { readVerifiedTempStorage, tempSchemaGuard } from "./temp-storage.ts";
 import { inTelegramScope, readPrivateTelegramCommand, type TelegramInlineConsentUpdate, type TelegramPolicy } from "./protocol.ts";
 
 export const GENERAL_INLINE_CONSENT_MARKER = "general-inline-consent:v1";
+export const GENERAL_INLINE_TEMP_CONSENT_MARKER = "general-inline-consent-temp:v1";
 export const GENERAL_INLINE_SCHEMA = `EXISTS (SELECT /* subs-bot:telegram-general-private-inline:v1 */ 1
   FROM subs_bot_schema_migrations WHERE position=25 AND name='0025_telegram_personal_inline.sql' AND mode='applied'
     AND sha256='2c504b14ca94597925b1703d2f50d211d29addaff8f139b5411be5fd2306b122')`;
 export const TELEGRAM_INLINE_CONSENT_MARKER = "inline-consent:v1";
 export const TELEGRAM_INLINE_TEMP_CONSENT_MARKER = "inline-consent-temp:v1";
 export type TelegramInlineConsentMarker = typeof TELEGRAM_INLINE_CONSENT_MARKER | typeof TELEGRAM_INLINE_TEMP_CONSENT_MARKER;
+type GeneralInlineConsentMarker = typeof GENERAL_INLINE_CONSENT_MARKER | typeof GENERAL_INLINE_TEMP_CONSENT_MARKER;
 export type TelegramInlineConsentReply = TelegramInlineConsentUpdate["kind"] | "stale";
 const CONSENT_SECONDS = 900;
 const COMMAND_FRESHNESS_SECONDS = 60;
@@ -23,14 +27,15 @@ export function readGeneralInlineConsent(
   const event = readPrivateTelegramCommand(update, pin.botUsername);
   if (!pin.privateInline || pin.rehearsal || !event || event.name !== "inline" || event.actorId === pin.botId) return null;
   const command = event.remainder.trim().toLowerCase();
-  if (command !== "" && command !== "on" && command !== "off") return null;
+  if (command !== "" && command !== "on" && command !== "off" && command !== "temp on") return null;
+  if (command === "temp on" && !pin.privateTemp) return null;
   return { updateId, actorId: event.actorId, chatId: event.actorId, chatType: "private", threadId: null,
-    messageId: event.messageId, messageDate: event.messageDate, kind: command === "" ? "usage" : command };
+    messageId: event.messageId, messageDate: event.messageDate, kind: command === "" ? "usage" : command === "temp on" ? "temp-on" : command };
 }
 
 function consentFamily(receipt: string, general: boolean): string {
   const hasGeneralOrigin = `EXISTS (SELECT 1 FROM telegram_inbox AS origin WHERE origin.receipt_id=${receipt}
-    AND origin.receipt_nonce='${GENERAL_INLINE_CONSENT_MARKER}')`;
+    AND ${generalTelegramInlineConsentMarker("origin")})`;
   return general ? hasGeneralOrigin : `NOT (${hasGeneralOrigin})`;
 }
 
@@ -40,6 +45,17 @@ export function inlineSearchReceiptFamily(receipt: string, general: boolean): st
 
 export function telegramInlineConsentMarker(alias: string): string {
   return `${alias}.receipt_nonce IN ('${TELEGRAM_INLINE_CONSENT_MARKER}','${TELEGRAM_INLINE_TEMP_CONSENT_MARKER}')`;
+}
+
+export function generalTelegramInlineConsentMarker(alias: string): string {
+  return `${alias}.receipt_nonce IN ('${GENERAL_INLINE_CONSENT_MARKER}','${GENERAL_INLINE_TEMP_CONSENT_MARKER}')`;
+}
+
+export async function telegramGeneralInlineTempReady(db: D1Database, pin: GeneralTelegramPin): Promise<boolean> {
+  if (!pin.privateInline || !pin.privateTemp || pin.rehearsal) return false;
+  const storage = await readVerifiedTempStorage(db);
+  return storage.mode === "legacy-ready" && storage.generalReceipts
+    && await db.prepare(`SELECT 1 WHERE ${GENERAL_TEMP_SCHEMA} AND ${tempSchemaGuard(storage.mode)}`).first() !== null;
 }
 
 export async function telegramInlineSearchReady(db: D1Database): Promise<boolean> {
@@ -60,9 +76,10 @@ export async function acceptTelegramInlineConsent(
   const general = "privateManagement" in policy ? policy : null;
   if (event.chatType !== "private" || event.threadId !== null || event.actorId !== event.chatId
     || (isolated ? !inTelegramScope(isolated, event) : !general?.privateInline || general.rehearsal
-      || event.actorId === general.botId || event.kind === "temp-on")
+      || event.actorId === general.botId || (event.kind === "temp-on" && !general.privateTemp))
     || !validInteger(event.updateId, 1) || !validInteger(event.messageId, 1) || !validInteger(event.messageDate, 1)) return "ignored";
   try {
+    if (general && event.kind === "temp-on" && !await telegramGeneralInlineTempReady(db, general)) return "ignored";
     const key = [policy.botId, event.updateId, crypto.randomUUID()] as const;
     // An older opt-out can still close a live consent. The ordering guard below protects newer choices.
     const maxAge = COMMAND_FRESHNESS_SECONDS + (event.kind === "off" ? CONSENT_SECONDS : 0);
@@ -76,6 +93,7 @@ export async function acceptTelegramInlineConsent(
       SELECT policy.bot_id,?,actor.actor_id,actor.actor_id,'private',?,?,NULL,'help',?
       FROM ${GENERAL_POLICY_ACTORS_SQL}
       WHERE (${GENERAL_POLICY_PIN_SQL}) AND (${GENERAL_RECEIPT_SCHEMA}) AND (${GENERAL_INLINE_SCHEMA})
+        ${temp ? `AND ${GENERAL_TEMP_SCHEMA} AND ${tempSchemaGuard("legacy-ready")}` : ""}
         AND (policy.active=1 AND ${GENERAL_NO_LEGACY_WORK}) AND (actor.actor_id=? AND ${GENERAL_LATEST_ACTOR_SQL})
         AND (?>MAX(policy.cutover_at,actor.effective_at,unixepoch()-?) AND ?<=unixepoch()+30)
         AND (${GENERAL_ACTOR_QUEUE_CAPACITY}) AND NOT EXISTS (
@@ -116,7 +134,8 @@ export async function acceptTelegramInlineConsent(
         command=CASE WHEN EXISTS (SELECT 1 FROM telegram_inline_search_consent JOIN telegram_outbox USING(receipt_id)
           WHERE receipt_id=incoming.receipt_id) ${general ? `AND (${generalCurrentAuthoritySql("incoming")})` : ""}
           THEN command END WHERE ${fresh} RETURNING receipt_id`)
-        .bind(Number(temp), TELEGRAM_INLINE_TEMP_CONSENT_MARKER, general ? GENERAL_INLINE_CONSENT_MARKER : TELEGRAM_INLINE_CONSENT_MARKER,
+        .bind(Number(temp), general ? GENERAL_INLINE_TEMP_CONSENT_MARKER : TELEGRAM_INLINE_TEMP_CONSENT_MARKER,
+          general ? GENERAL_INLINE_CONSENT_MARKER : TELEGRAM_INLINE_CONSENT_MARKER,
           ...(general ? generalPolicyBindings(general) : []), ...key)];
     const results = await db.batch(steps);
     const receipt = results.at(-1);
@@ -130,7 +149,7 @@ export async function acceptTelegramInlineConsent(
 }
 
 export function activeInlineConsent(
-  policy: InlinePolicy, marker?: TelegramInlineConsentMarker,
+  policy: InlinePolicy, marker?: TelegramInlineConsentMarker | GeneralInlineConsentMarker,
 ): { sql: string; bindings: readonly (string | number)[] } {
   const general = "privateManagement" in policy;
   const latest = `consent.kind='on' AND consent.expires_at>unixepoch()
@@ -150,12 +169,13 @@ export function activeInlineConsent(
           AND policy.cutover_at=recorded.cutover_at)
       WHERE (origin.receipt_id=consent.receipt_id AND origin.bot_id=consent.bot_id AND origin.actor_id=consent.actor_id)
         AND (origin.chat_id=origin.actor_id AND origin.chat_type='private' AND origin.thread_id IS NULL AND origin.command='help')
-        AND (origin.receipt_nonce='${GENERAL_INLINE_CONSENT_MARKER}' AND origin.update_id=consent.update_id AND origin.message_date=consent.message_date)
+        AND (${marker === undefined ? generalTelegramInlineConsentMarker("origin") : "origin.receipt_nonce=?"}
+          AND origin.update_id=consent.update_id AND origin.message_date=consent.message_date)
         AND (recorded.actor_role=consent.actor_role AND consent.auth_message_date=0 AND consent.auth_message_id=0)
         AND (${GENERAL_POLICY_PIN_SQL}) AND (${GENERAL_RECEIPT_SCHEMA})
         AND (policy.active=1 AND ${GENERAL_NO_LEGACY_WORK}) AND (${GENERAL_LATEST_ACTOR_SQL})
         AND origin.message_date>MAX(policy.cutover_at,actor.effective_at)
-    )`, bindings: generalPolicyBindings(policy) };
+    )`, bindings: [...(marker === undefined ? [] : [marker]), ...generalPolicyBindings(policy)] };
   }
   return { sql: `(${latest})
     AND EXISTS (SELECT 1 FROM telegram_inbox AS origin WHERE origin.receipt_id=consent.receipt_id
