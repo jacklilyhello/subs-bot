@@ -153,7 +153,7 @@ export async function persistTelegramDocumentJob(
   counts: { parsed: number },
   mixed?: TelegramProviderDocumentSources,
 ): Promise<"saved" | "stale"> {
-  if ((mixed && isGeneralDocumentPolicy(policy)) || !validInteger(counts.parsed, 1, MAX_TELEGRAM_DOCUMENT_NODES)
+  if ((mixed && isGeneralDocumentPolicy(policy) && !policy.privateProvider) || !validInteger(counts.parsed, 1, MAX_TELEGRAM_DOCUMENT_NODES)
     || counts.parsed !== nodes.length) {
     throw new RangeError("Invalid Telegram document node count.");
   }
@@ -177,7 +177,7 @@ export async function persistTelegramDocumentJob(
     if (journal !== snapshotId) return "stale";
 
     const staged = await stageNodeSnapshot(bucket, reservation.id, nodes, snapshotId);
-    const plan = mixed && !isGeneralDocumentPolicy(policy) ? await prepareTelegramProviderDocumentPlan(db, policy, lease, mixed, true) : null;
+    const plan = mixed ? await prepareTelegramProviderDocumentPlan(db, policy, lease, mixed, true) : null;
     const pointer = "EXISTS (SELECT 1 FROM subscriptions WHERE id = ? AND owner_id = ? AND snapshot_id = ?)";
     const pointerKey = [reservation.id, lease.actorId, snapshotId] as const;
     const saved = "EXISTS (SELECT 1 FROM telegram_document_jobs WHERE receipt_id = ? AND state = 'done' AND result_code = 'saved')";
@@ -199,7 +199,7 @@ export async function persistTelegramDocumentJob(
       ...(plan ? [
         db.prepare(`DELETE FROM telegram_provider_document_opt_in WHERE receipt_id=? AND changes()=1
           AND EXISTS (SELECT 1 FROM telegram_mixed_document_opt_in WHERE receipt_id=?)`).bind(lease.receiptId, lease.receiptId),
-        ...prepareTelegramProviderDocumentMarker(db, lease.receiptId),
+        ...prepareTelegramProviderDocumentMarker(db, lease.receiptId, policy),
       ] : [
         db.prepare(`INSERT INTO telegram_outbox (receipt_id) SELECT ? WHERE changes() = 1`).bind(lease.receiptId),
         assertBatch(db, `NOT ${pointer} OR changes() = 1`).bind(...pointerKey),

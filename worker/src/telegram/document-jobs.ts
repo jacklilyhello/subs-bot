@@ -5,10 +5,14 @@ import { GENERAL_ACTOR_QUEUE_CAPACITY, GENERAL_LATEST_ACTOR_SQL, GENERAL_NO_LEGA
   GENERAL_POLICY_PIN_SQL, GENERAL_POLICY_SCHEMA, GENERAL_RECEIPT_SCHEMA, GENERAL_REPLY_TTL, generalCurrentAuthoritySql,
   generalPolicyBindings, generalRecordedIdentitySql, prepareGeneralReceiptAuthority } from "./general-receipt.ts";
 import { MAX_TELEGRAM_DOCUMENT_BYTES } from "./document-transport.ts";
+import { GENERAL_PROVIDER_DOCUMENT_SCHEMA, GENERAL_TELEGRAM_PROVIDER_DOCUMENT_MARKER } from "./provider-document-origin.ts";
 import { inTelegramScope, type TelegramEventScope, type TelegramPolicy } from "./protocol.ts";
 
 export const TELEGRAM_DOCUMENT_JOB_MARKER = "document-job:v1";
 export const TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER = "general-document-job:v1";
+export const GENERAL_MIXED_DOCUMENT_SCHEMA = `EXISTS (SELECT 1 FROM subs_bot_schema_migrations
+  WHERE position=36 AND name='0036_telegram_mixed_document_opt_in.sql'
+    AND sha256='05b67a3a3ddfb49b6f801b87dafae240f7328711e9e6c598b8b67e8738a892f8' AND mode='applied')`;
 const JOB_TTL_SECONDS = 600;
 export const TELEGRAM_DOCUMENT_REPLY_TTL = 900;
 const GENERAL_DOCUMENT_SCHEMA = `EXISTS (SELECT /* subs-bot:telegram-general-node-document:v1 */ 1
@@ -75,7 +79,7 @@ const freshReceipt = "incoming.bot_id = ? AND incoming.update_id = ? AND incomin
 // must still follow the existing cleanup path for orphaned isolated jobs.
 export const ISOLATED_DOCUMENT_CLEANUP_SCOPE = `NOT EXISTS (
   SELECT 1 FROM telegram_inbox AS origin WHERE origin.receipt_id = job.receipt_id
-    AND origin.receipt_nonce = '${TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER}'
+    AND origin.receipt_nonce IN ('${TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER}','${GENERAL_TELEGRAM_PROVIDER_DOCUMENT_MARKER}')
 )`;
 
 // The member's current epoch must match, and the original message must postdate that grant.
@@ -127,8 +131,14 @@ export function telegramDocumentJobOrigin(policy: TelegramDocumentPolicy, curren
     WHERE (inbox.receipt_id=job.receipt_id AND inbox.bot_id=job.bot_id
       AND inbox.actor_id=job.actor_id AND inbox.chat_id=job.actor_id)
       AND (inbox.chat_type='private' AND inbox.thread_id IS NULL AND inbox.command='help'
-        AND inbox.receipt_nonce='${TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER}')
+        AND ${current ? `inbox.receipt_nonce='${TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER}'`
+          : `inbox.receipt_nonce IN ('${TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER}','${GENERAL_TELEGRAM_PROVIDER_DOCUMENT_MARKER}')`})
       AND (job.auth_message_date=0 AND job.auth_message_id=0)
+      ${current ? "" : `AND (inbox.receipt_nonce='${TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER}'
+        OR (job.state='done' AND job.result_code='saved' AND (${GENERAL_PROVIDER_DOCUMENT_SCHEMA})
+          AND EXISTS (SELECT 1 FROM telegram_provider_documents AS parent WHERE parent.receipt_id=job.receipt_id
+            AND parent.bot_id=job.bot_id AND parent.actor_id=job.actor_id AND parent.actor_role=recorded.actor_role
+            AND parent.auth_message_date=0 AND parent.auth_message_id=0)))`}
       AND (${GENERAL_DOCUMENT_SCHEMA} AND ${GENERAL_RECEIPT_SCHEMA})
       AND (inbox.message_date>MAX(recorded.cutover_at,actor.effective_at) AND (${authority}))
   )`, bindings: generalPolicyBindings(policy) };
@@ -152,6 +162,15 @@ function documentFields(event: TelegramDocumentJobInput): DocumentFields | null 
     expectedSize: event.fileSize ?? null };
 }
 
+function supportsProviderUrls(document: DocumentFields | null): boolean {
+  return document?.suffix === "txt" || document?.suffix === "log";
+}
+
+/** Only validated plain text uploads can enter URL or mixed classification. */
+export function isTelegramProviderDocumentUpload(event: TelegramDocumentJobInput): boolean {
+  return supportsProviderUrls(documentFields(event));
+}
+
 export async function acceptTelegramDocumentJob(
   db: D1Database,
   policy: TelegramDocumentPolicy,
@@ -164,10 +183,14 @@ export async function acceptTelegramDocumentJob(
   if (!canonicalId(policy.botId) || !canonicalId(event.actorId) || event.chatType !== "private" ||
       event.chatId !== event.actorId || event.threadId !== null || !validInteger(event.updateId, 1) ||
       !validInteger(event.messageId, 1) || !validInteger(event.messageDate, 1)) return "ignored";
-  if (isGeneralDocumentPolicy(policy)) {
-    if (!policy.privateDocument || event.actorId === policy.botId || providerUrlOptIn || mixedOptIn) return "ignored";
-  } else if (!inTelegramScope(policy, event)) return "ignored";
   const document = documentFields(event);
+  const urlCandidate = supportsProviderUrls(document);
+  const providerDocument = providerUrlOptIn && urlCandidate;
+  const mixedDocument = mixedOptIn && providerDocument;
+  if (isGeneralDocumentPolicy(policy)) {
+    if (!policy.privateDocument || event.actorId === policy.botId
+      || (providerDocument && !policy.privateProvider) || (urlCandidate && mixedOptIn && !providerUrlOptIn)) return "ignored";
+  } else if (!inTelegramScope(policy, event)) return "ignored";
   try {
     const nonce = crypto.randomUUID();
     const key = [policy.botId, event.updateId, nonce] as const;
@@ -177,6 +200,8 @@ export async function acceptTelegramDocumentJob(
       SELECT policy.bot_id,?,actor.actor_id,actor.actor_id,'private',?,?,NULL,'help',?
       FROM ${GENERAL_POLICY_ACTORS_SQL}
       WHERE ${GENERAL_POLICY_PIN_SQL} AND ${GENERAL_RECEIPT_SCHEMA} AND ${GENERAL_DOCUMENT_SCHEMA}
+        ${providerDocument ? `AND (${GENERAL_PROVIDER_DOCUMENT_SCHEMA})` : ""}
+        ${mixedDocument ? `AND (${GENERAL_MIXED_DOCUMENT_SCHEMA})` : ""}
         AND policy.active=1 AND ${GENERAL_NO_LEGACY_WORK} AND actor.actor_id=? AND ${GENERAL_LATEST_ACTOR_SQL}
         AND ?>MAX(policy.cutover_at,actor.effective_at,unixepoch()-${GENERAL_REPLY_TTL}) AND ?<=unixepoch()+60
         AND NOT EXISTS (SELECT 1 FROM telegram_general_replies WHERE bot_id=policy.bot_id AND update_id=?)
@@ -235,12 +260,12 @@ export async function acceptTelegramDocumentJob(
         SELECT incoming.receipt_id FROM telegram_inbox AS incoming JOIN telegram_document_jobs AS job USING (receipt_id)
         WHERE ${freshReceipt} AND job.state = 'done'
       `).bind(...key),
-      ...(providerUrlOptIn && (document?.suffix === "txt" || document?.suffix === "log") ? [db.prepare(`
+      ...(providerDocument ? [db.prepare(`
         INSERT INTO telegram_provider_document_opt_in (receipt_id)
         SELECT incoming.receipt_id FROM telegram_inbox AS incoming JOIN telegram_document_jobs AS job USING (receipt_id)
         WHERE ${freshReceipt} AND job.state='pending' AND incoming.message_date BETWEEN unixepoch()-900 AND unixepoch()+30
       `).bind(...key)] : []),
-      ...(mixedOptIn && providerUrlOptIn && (document?.suffix === "txt" || document?.suffix === "log") ? [db.prepare(`
+      ...(mixedDocument ? [db.prepare(`
         INSERT INTO telegram_mixed_document_opt_in (receipt_id)
         SELECT incoming.receipt_id FROM telegram_inbox AS incoming JOIN telegram_provider_document_opt_in USING (receipt_id)
         WHERE ${freshReceipt}
