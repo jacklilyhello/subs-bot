@@ -934,7 +934,7 @@ test("the deployed bundle admits webhook replays once and recovers a queued repl
     const ids = [10, 8, 9, 18, 20, 22, 24, 26, 28, 312, 314];
     const menu = [["📦 订阅列表", "🟠 临期列表"], ["📤 导出链接"], ["♻️ 撤销删除"], ["🧭 路径对应", "❓ 帮助菜单"]];
     const helpFeatures = { management: true, subscriptionRead: true, temp: true, tempRawDefault: true, path: true,
-      aggregate: true, selected: true, short: true, bulkTrash: true, inlineSort: true, authorization: true,
+      aggregate: true, selected: true, short: true, bulkTrash: true, inlineSort: true, authorization: true, github: true, batchStatus: true,
       authorizationScope: "fixed" as const, authorizationMemberId: policy.memberId, documentImport: true };
     const publicHelp = renderTelegramHelp({ privateChat: false, role: "member", features: helpFeatures });
     const privateHelp = renderTelegramHelp({ privateChat: true, role: "member", features: helpFeatures });
