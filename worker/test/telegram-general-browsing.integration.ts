@@ -33,6 +33,8 @@ test("actual bundle general browsing keeps persisted origins, current authority 
   assert.equal(parseGeneralTelegramPin(JSON.stringify({ ...config, outbox: "shared" }), manifest.revision), null);
   const sent: { id: number; body: Wire; file?: string }[] = [];
   let retry = true, attempts = 0;
+  let nodeRetryOrigin: number | null = null, rawRetryOrigin: number | null = null;
+  let nodeAttempts = 0, rawAttempts = 0, firstRawSha256: string | null = null;
   const runtime = new Miniflare({ modules: true, script: script.toString(), compatibilityDate: manifest.compatibilityDate,
     d1Databases: ["DB"], r2Buckets: ["NODES"], bindings: { BUILD_REVISION: manifest.revision,
       TELEGRAM_GENERAL_CONFIG: JSON.stringify(config), PUBLIC_ORIGIN: PRODUCTION_PUBLIC_ORIGIN },
@@ -55,6 +57,21 @@ test("actual bundle general browsing keeps persisted origins, current authority 
       if (body.reply_parameters.message_id === 1) {
         attempts++;
         if (retry) { retry = false; return Response.json({ ok: false, error_code: 429, parameters: { retry_after: 1 } }, { status: 429 }); }
+      }
+      if (request.url === api + "sendMessage" && body.reply_parameters.message_id === nodeRetryOrigin) {
+        nodeAttempts++;
+        if (nodeAttempts === 1) return Response.json({ ok: false, error_code: 429,
+          parameters: { retry_after: 1 } }, { status: 429 });
+      }
+      if (request.url === api + "sendDocument" && body.reply_parameters.message_id === rawRetryOrigin) {
+        rawAttempts++;
+        assert.equal(typeof file, "string");
+        const hash = digest(file!);
+        if (rawAttempts === 1) {
+          firstRawSha256 = hash;
+          return Response.json({ ok: false, error_code: 429, parameters: { retry_after: 1 } }, { status: 429 });
+        }
+        assert.equal(hash, firstRawSha256, "the raw attachment retry reads the same owned snapshot bytes");
       }
       const id = 30_000 + sent.length;
       sent.push({ id, body, ...(file === undefined ? {} : { file }) });
@@ -124,6 +141,26 @@ test("actual bundle general browsing keeps persisted origins, current authority 
     const token = value.body.reply_markup?.inline_keyboard?.flat().find((item) => item.text === text)?.callback_data;
     assert.ok(token, `Missing synthetic button ${text}`); return token;
   };
+  const finishRateLimitedReply = async (updateId: number, label: string) => {
+    let pending = false;
+    for (let i = 0; i < 80; i++) {
+      const state = await receiptState(updateId);
+      if (state.state === "pending" && state.attempts === 1) { pending = true; break; }
+      if (state.state === "failed" || state.state === "uncertain") break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.equal(pending, true, `Synthetic ${label} 429 must queue one bounded retry: ${JSON.stringify(await receiptState(updateId))}.`);
+    const timing = await db.prepare(`SELECT outbox.due_at AS dueAt,inbox.received_at AS receivedAt
+      FROM telegram_inbox AS inbox JOIN telegram_outbox AS outbox USING(receipt_id)
+      WHERE inbox.bot_id=? AND inbox.update_id=?`).bind(pin.botId, updateId)
+      .first<{ dueAt: number; receivedAt: number }>();
+    assert.ok(timing && timing.dueAt >= timing.receivedAt + 1 && timing.dueAt < timing.receivedAt + 600,
+      "the persisted retry respects Retry-After and the ordinary receipt lifetime");
+    await db.prepare(`UPDATE telegram_outbox SET due_at=unixepoch() WHERE receipt_id=(
+      SELECT receipt_id FROM telegram_inbox WHERE bot_id=? AND update_id=?)`).bind(pin.botId, updateId).run();
+    await tick();
+    return card(updateId);
+  };
   assert.equal((await message(1, "/list@BrowsingFixtureBot")).status, 200);
   let observedRetry = false;
   for (let i = 0; i < 80; i++) {
@@ -160,8 +197,10 @@ test("actual bundle general browsing keeps persisted origins, current authority 
   assert.deepEqual(anchor, { marker: "general-number-detail:v1", kind: "number", id: target.id, ticket: 0 });
   assert.equal((await click(9, numeric, button(numeric, "Clash Meta"))).status, 200);
   assert.match((await card(9)).body.text, /Clash/u);
+  nodeRetryOrigin = detail.id;
   assert.equal((await click(10, detail, button(detail, "浏览节点"))).status, 200);
-  const page1 = await card(10);
+  const page1 = await finishRateLimitedReply(10, "node page");
+  assert.equal(nodeAttempts, 2);
   assert.match(page1.body.text, /第 1\/2 页/u);
   assert.doesNotMatch(page1.body.text, /ss:\/\//u);
   assert.equal((await click(11, page1, button(page1, "下一页"))).status, 200);
@@ -169,8 +208,10 @@ test("actual bundle general browsing keeps persisted origins, current authority 
   assert.match(page2.body.text, /第 2\/2 页/u);
   assert.equal((await click(12, page2, button(page2, "返回详情"))).status, 200);
   assert.match((await card(12)).body.text, /配置名称：Member 10/u);
+  rawRetryOrigin = numeric.id;
   assert.equal((await click(13, numeric, button(numeric, "📦 导出节点"))).status, 200);
-  const raw = await card(13);
+  const raw = await finishRateLimitedReply(13, "raw attachment");
+  assert.equal(rawAttempts, 2);
   assert.equal(raw.body.chat_id, member);
   assert.equal(raw.file?.trim().split("\n").length, 16);
   assert.match(raw.file!, /^ss:\/\//u);

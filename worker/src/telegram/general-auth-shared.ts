@@ -45,6 +45,10 @@ import { acceptGeneralTelegramLifecycle, GENERAL_LIFECYCLE_MARKER, GENERAL_LIFEC
 import { acceptGeneralTelegramSubscriptionRead, renderGeneralSubscriptionRead } from "./general-subscription-read.ts";
 import { acceptGeneralBrowsing, generalBrowsingFamily, generalBrowsingGuard, generalViewAnchorGuard, insertGeneralViewAnchors,
   readGeneralView, GENERAL_VIEW_MARKER, GENERAL_NUMBER_MARKER, GENERAL_NODE_MARKER, GENERAL_RAW_FILE_MARKER } from "./general-browsing.ts";
+import { acceptGeneralPageJump, GENERAL_PAGE_JUMP_MARKER, generalPageJumpEligibility, generalPageJumpFamily,
+  telegramGeneralPageJumpReady } from "./general-page-jump.ts";
+import { renderTelegramPageJump } from "./page-jump.ts";
+import { GENERAL_PAGE_JUMP_CALLBACK, readGeneralPageJump } from "./protocol.ts";
 import { insertTelegramNodePageTickets, prepareTelegramNodePageTickets, reapTelegramSubscriptionNodeTickets, renderTelegramSubscriptionNodePage,
   telegramSubscriptionNodePagesReady, type TelegramNodePageTicket } from "./subscription-node-pages.ts";
 import { confirmTelegramSubscriptionRawFileSend, insertTelegramRawFileTicket, prepareTelegramRawFileButton,
@@ -224,7 +228,8 @@ function family(alias: "inbox" | "earlier", group: boolean, pin: GeneralTelegram
     THEN (${selectedFamily(alias)})` : ""}
     ${includeExports && pin.privateShort ? `WHEN ${alias}.receipt_nonce='${GENERAL_TELEGRAM_SHORT_MARKER}'
     THEN (${shortFamily(alias)})` : ""}
-    ${pin.privateBrowsing ? `WHEN ${alias}.receipt_nonce IN ('${GENERAL_VIEW_MARKER}','${GENERAL_NUMBER_MARKER}','${GENERAL_NODE_MARKER}','${GENERAL_RAW_FILE_MARKER}') THEN (${generalBrowsingFamily(alias, group)})` : ""}
+    ${pin.privateBrowsing ? `WHEN ${alias}.receipt_nonce='${GENERAL_PAGE_JUMP_MARKER}' THEN (${generalPageJumpFamily(alias, group)})
+      WHEN ${alias}.receipt_nonce IN ('${GENERAL_VIEW_MARKER}','${GENERAL_NUMBER_MARKER}','${GENERAL_NODE_MARKER}','${GENERAL_RAW_FILE_MARKER}') THEN (${generalBrowsingFamily(alias, group)})` : ""}
     ELSE ((${management})${groupSearch}) END)`;
 }
 
@@ -233,7 +238,7 @@ function queueMarkers(group: boolean, pin: GeneralTelegramPin): string {
   if (group) markers.push(GROUP_MARKER);
   if (pin.privateManagement) markers.push(GENERAL_LIFECYCLE_MARKER, GENERAL_LIFECYCLE_VIEW_MARKER,
     GENERAL_SUBSCRIPTION_READ_MARKER, GENERAL_PATH_MARKER, GENERAL_INLINE_SORT_MARKER, GENERAL_BULK_TRASH_MARKER);
-  if (pin.privateBrowsing) markers.push(GENERAL_VIEW_MARKER, GENERAL_NUMBER_MARKER, GENERAL_NODE_MARKER, GENERAL_RAW_FILE_MARKER);
+  if (pin.privateBrowsing) markers.push(GENERAL_VIEW_MARKER, GENERAL_NUMBER_MARKER, GENERAL_NODE_MARKER, GENERAL_RAW_FILE_MARKER, GENERAL_PAGE_JUMP_MARKER);
   if (pin.privateTemp) markers.push(TELEGRAM_GENERAL_TEMP_MARKER);
   if (pin.privateDocument) markers.push(TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER);
   if (pin.privateProvider) markers.push(GENERAL_TELEGRAM_PROVIDER_MARKER);
@@ -261,6 +266,8 @@ function current(alias: "inbox" | "earlier", group: boolean, pin: GeneralTelegra
   const claimScope = pin.privateClaims ? ` AND (${alias}.receipt_nonce<>'${TELEGRAM_GENERAL_PRIVATE_CLAIM_MARKER}'
     OR ${GENERAL_PRIVATE_CLAIM_SCHEMA})` : "";
   const authScope = !pin.rehearsal ? ` AND (${alias}.receipt_nonce<>'${GENERAL_AUTH_ACTION_MARKER}' OR authority.actor_role='admin')` : "";
+  const jumpScope = pin.privateBrowsing ? ` AND (${alias}.receipt_nonce<>'${GENERAL_PAGE_JUMP_MARKER}'
+    OR (${generalPageJumpEligibility(alias, Boolean(pin.privatePageJump))}))` : "";
   const ordinaryClock = generalOrdinaryReplyEligibilitySql(alias);
   const utilityClock = `${pin.privateApiStatus ? `WHEN ${alias}.receipt_nonce='${GENERAL_API_STATUS_MARKER}' THEN EXISTS (
     SELECT 1 FROM telegram_api_status AS utility WHERE utility.receipt_id=${alias}.receipt_id AND utility.ready_at IS NOT NULL
@@ -271,7 +278,7 @@ function current(alias: "inbox" | "earlier", group: boolean, pin: GeneralTelegra
     THEN (${generalProviderReplyEligibility(alias)})` : ""}
     ${pin.providerDocumentReplies ? `WHEN ${alias}.receipt_nonce='${GENERAL_TELEGRAM_PROVIDER_DOCUMENT_MARKER}'
     THEN (${generalProviderDocumentReplyEligibility(alias)})` : ""} ELSE (${ordinaryClock}) END)` : utilityClock.trim() ? `(CASE ${utilityClock} ELSE (${ordinaryClock}) END)` : ordinaryClock;
-  const ordinary = `${clock} AND ${generalCurrentAuthoritySql(alias, `${groupScope} AND ${pathScope}${tempScope}${laneScope}${claimScope}${authScope}`)}`;
+  const ordinary = `${clock} AND ${generalCurrentAuthoritySql(alias, `${groupScope} AND ${pathScope}${tempScope}${laneScope}${claimScope}${authScope}${jumpScope}`)}`;
   const card = hasGeneralGroupShare(pin) ? `WHEN ${alias}.receipt_nonce='${TELEGRAM_GENERAL_GROUP_CLAIM_MARKER}'
     THEN (${ordinaryClock} AND ${generalCurrentAuthoritySql(alias,
       `${GENERAL_PRIVATE_CLAIM_SCHEMA} AND ${GENERAL_GROUP_CARD_SCHEMA} AND ${approvedGroup()}`)})` : "";
@@ -303,6 +310,12 @@ export async function acceptGeneralSharedTelegramCommand(
   const decoded = await readTelegramUpdate(request, pin.webhookSecret);
   if (decoded.status !== 200) return decoded.status;
   if (!pin.sharedOutbox || pin.rehearsal) return 204;
+  const jump = pin.privatePageJump ? readGeneralPageJump(decoded.update, decoded.updateId, pin.botId, pin.botUsername) : null;
+  if (jump) {
+    const accepted = await acceptGeneralPageJump(db, pin, jump);
+    if (jump.kind === "open") acknowledge?.(jump.callbackId);
+    return accepted ? 200 : 204;
+  }
   const legacy = readGeneralLegacyShareCallback(decoded.update, pin.botId);
   if (legacy) {
     const url = await legacyInlineClaimUrl(db, pin, legacy);
@@ -789,6 +802,8 @@ async function drainGeneralBrowsingView(db: D1Database, pin: GeneralTelegramPin,
   const pages = view.buttons.length ? await prepareTelegramViewTickets(view.buttons) : undefined;
   const reads = view.readButtons?.length ? await prepareTelegramSubscriptionReadTickets(view.readButtons) : undefined;
   const actions = privateChat && view.lifecycleButtons.length ? await prepareTelegramLifecycleTickets(view.lifecycleButtons) : undefined;
+  const jumpKeyboard = page.kind === "list" && pin.privatePageJump && await telegramGeneralPageJumpReady(db)
+    ? [[{ text: "🔢 跳转页", callback_data: GENERAL_PAGE_JUMP_CALLBACK }]] : [];
   const steps = [prepareTelegramOutboxBegin(db, lease, selectLease(pin, lease, true, guard))];
   const counts: number[] = [];
   if (targets.length) {
@@ -815,10 +830,11 @@ async function drainGeneralBrowsingView(db: D1Database, pin: GeneralTelegramPin,
     throw new Error("General Telegram browsing reply could not be confirmed.");
   if (changed !== 1) return false;
   const confirmed = await confirmGuardedGeneralSend(db, lease, selectLease(pin, lease, true, guard));
-  const keyboard = [...(pages?.keyboard ?? []), ...(reads?.keyboard ?? []), ...(actions?.keyboard ?? [])];
+  const keyboard = [...(pages?.keyboard ?? []), ...jumpKeyboard, ...(reads?.keyboard ?? []), ...(actions?.keyboard ?? [])];
   const outcome = !confirmed ? { kind: "failed" as const } : privateChat
     ? await sendGeneralTelegramPrivateReply(pin.botToken, lease.actorId, lease.messageId, view.text, keyboard)
-    : await sendGeneralTelegramGroupListReply(pin.botToken, lease.chatId, lease.messageId, lease.threadId, view.text, pages?.keyboard);
+    : await sendGeneralTelegramGroupListReply(pin.botToken, lease.chatId, lease.messageId, lease.threadId, view.text,
+      [...(pages?.keyboard ?? []), ...jumpKeyboard]);
   await settleTelegramOutboxReply(db, lease, selectLease(pin, lease, false), outcome, "inbox.received_at", GENERAL_REPLY_TTL);
   return true;
 }
@@ -830,6 +846,20 @@ export async function drainGeneralSharedTelegramReply(
 ): Promise<boolean> {
   const lease = await claimGeneralSharedTelegramReply(db, pin);
   if (!lease) return false;
+  if (lease.marker === GENERAL_PAGE_JUMP_MARKER) {
+    const presentation = await renderTelegramPageJump(db, lease.receiptId);
+    if (!presentation || presentation === "page") return false;
+    const guard = { sql: generalPageJumpEligibility("inbox", Boolean(pin.privatePageJump)), bindings: [] };
+    const scope = selectLease(pin, lease, true, guard);
+    if (await prepareTelegramOutboxBegin(db, lease, scope).first() === null) return false;
+    const confirmed = await confirmGuardedGeneralSend(db, lease, scope);
+    const outcome = !confirmed ? { kind: "failed" as const } : lease.chatType === "private"
+      ? await sendGeneralTelegramPrivateReply(pin.botToken, lease.actorId, lease.messageId, presentation.text,
+        undefined, presentation.forceReply)
+      : await sendGeneralTelegramGroupListReply(pin.botToken, lease.chatId, lease.messageId, lease.threadId, presentation.text);
+    await settleTelegramOutboxReply(db, lease, selectLease(pin, lease, false), outcome, "inbox.received_at", GENERAL_REPLY_TTL);
+    return true;
+  }
   if (lease.marker === GENERAL_VIEW_MARKER) return drainGeneralBrowsingView(db, pin, lease);
   if (lease.marker === GENERAL_NODE_MARKER) {
     if (!pin.privateBrowsing || !await telegramSubscriptionNodePagesReady(db)) return false;
@@ -845,7 +875,7 @@ export async function drainGeneralSharedTelegramReply(
     const confirmed = await confirmGuardedGeneralSend(db, lease, selectLease(pin, lease, true, presentation.readGuard));
     const outcome = confirmed ? await sendGeneralTelegramPrivateReply(pin.botToken, lease.actorId, lease.messageId,
       presentation.text, [...(pages?.keyboard ?? []), ...(back?.keyboard ?? [])]) : { kind: "failed" as const };
-    await settleTelegramOutboxReply(db, lease, selectLease(pin, lease, false), outcome);
+    await settleTelegramOutboxReply(db, lease, selectLease(pin, lease, false), outcome, "inbox.received_at", GENERAL_REPLY_TTL);
     return true;
   }
   if (lease.marker === GENERAL_RAW_FILE_MARKER) {
@@ -861,7 +891,7 @@ export async function drainGeneralSharedTelegramReply(
     const outcome = !confirmed ? { kind: "failed" as const } : prepared.kind === "document"
       ? await sendGeneralTelegramSubscriptionFileReply(pin.botToken, lease.actorId, lease.messageId, prepared.file)
       : await sendGeneralTelegramPrivateReply(pin.botToken, lease.actorId, lease.messageId, prepared.text);
-    await settleTelegramOutboxReply(db, lease, selectLease(pin, lease, false), outcome);
+    await settleTelegramOutboxReply(db, lease, selectLease(pin, lease, false), outcome, "inbox.received_at", GENERAL_REPLY_TTL);
     return true;
   }
   if (lease.marker === GENERAL_INLINE_SORT_MARKER) {
@@ -1208,6 +1238,7 @@ export async function drainGeneralSharedTelegramReply(
         inlineOff: pin.privateInline, batchStatus: pin.providerBatch, authorization: pin.privateAuthorization, displayTimezone: pin.displayTimezone,
         documentImport: pin.privateDocument, github: Boolean(pin.privateGitHub && await telegramGitHubSearchReady(db).catch(() => false)),
         apiStatus: Boolean(pin.privateApiStatus && pin.commandFeatures?.apiStatus), ...pin.commandFeatures,
+        pageJump: Boolean(pin.privatePageJump && await telegramGeneralPageJumpReady(db)),
         ...(pin.isolationWindow ? { authorizationScope: "fixed" as const,
           authorizationMemberId: pin.isolationWindow.memberId } : {}),
         inlineTemp: Boolean(pin.commandFeatures?.inline && await telegramGeneralInlineTempReady(db, pin).catch(() => false)),

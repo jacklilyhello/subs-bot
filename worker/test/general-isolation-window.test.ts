@@ -5,7 +5,8 @@ import { after, test } from "node:test";
 import { Miniflare } from "miniflare";
 import { ISOLATION_PUBLIC_ORIGIN } from "../src/public-origin.ts";
 import { fenceTelegramWebhookDatabase, readGeneralIsolationWindow } from "../src/telegram/general-isolation-window.ts";
-import { acceptGeneralSharedTelegramCommand, drainGeneralSharedTelegramReply } from "../src/telegram/general-auth-shared.ts";
+import { acceptGeneralSharedTelegramCommand, drainGeneralSharedTelegramReply, recoverGeneralSharedTelegramReplies } from "../src/telegram/general-auth-shared.ts";
+import { GENERAL_PAGE_JUMP_CALLBACK } from "../src/telegram/protocol.ts";
 import type { TelegramPolicy } from "../src/telegram/protocol.ts";
 
 const oldComparison = Object.getOwnPropertyDescriptor(crypto.subtle, "timingSafeEqual");
@@ -71,6 +72,7 @@ test("full-v1 is explicit, role scoped and atomically fenced across close and re
   const opened = await readGeneralIsolationWindow(db, policy, revision);
   assert.ok(opened.pin?.isolationWindow?.profile === "full-v1");
   assert.equal(opened.pin.rehearsal, undefined);
+  assert.equal(opened.pin.privatePageJump, true);
   assert.ok(opened.pin.privateManagement && opened.pin.privateFormats && opened.pin.privateProvider && opened.pin.privateInline);
   const database = fenceTelegramWebhookDatabase(db, policy.botId, opened);
   const post = (actor: string, text: string, update: number) => new Request("https://fixture.invalid/telegram/webhook", {
@@ -89,15 +91,16 @@ test("full-v1 is explicit, role scoped and atomically fenced across close and re
   const originalFetch = globalThis.fetch;
   t.after(() => { globalThis.fetch = originalFetch; });
   const sent: Record<string, unknown>[] = [];
+  let expectedMessage = 7;
   globalThis.fetch = async (input, init) => {
     const request = new Request(input, init);
     assert.equal(request.url, `https://api.telegram.org/bot${policy.botToken}/sendMessage`);
     assert.equal(request.method, "POST");
     const body = await request.json() as Record<string, unknown>;
     assert.equal(body.chat_id, policy.adminId);
-    assert.deepEqual(body.reply_parameters, { message_id: 7 });
+    assert.deepEqual(body.reply_parameters, { message_id: expectedMessage });
     sent.push(body);
-    return Response.json({ ok: true, result: { message_id: 5001, chat: { id: Number(policy.adminId), type: "private" } } });
+    return Response.json({ ok: true, result: { message_id: 5000 + sent.length, chat: { id: Number(policy.adminId), type: "private" } } });
   };
   const helpPin = { ...opened.pin, commandFeatures: { authorizationScope: "general" as const, authorizationMemberId: "8199" } };
   assert.equal(await acceptGeneralSharedTelegramCommand(database, helpPin, post(policy.adminId, "/help", 7)), 200);
@@ -110,11 +113,29 @@ test("full-v1 is explicit, role scoped and atomically fenced across close and re
   assert.doesNotMatch(help, /新增或恢复授权|\/auth (?:add|remove) (?:用户ID|8199)/u);
   assert.equal(await db.prepare(`SELECT state FROM telegram_outbox JOIN telegram_inbox USING(receipt_id)
     WHERE bot_id=? AND update_id=7`).bind(policy.botId).first("state"), "sent");
+  expectedMessage = 8;
+  assert.equal(await acceptGeneralSharedTelegramCommand(database, opened.pin, post(policy.adminId, "/list", 8)), 200);
+  assert.equal(await drainGeneralSharedTelegramReply(database, opened.pin, bucket, ISOLATION_PUBLIC_ORIGIN), true);
+  assert.equal(sent.length, 2);
+  const jump = new Request("https://fixture.invalid/telegram/webhook", {
+    method: "POST", headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": policy.webhookSecret },
+    body: JSON.stringify({ update_id: 9, callback_query: { id: "full-window-jump", data: GENERAL_PAGE_JUMP_CALLBACK,
+      from: { id: Number(policy.adminId), is_bot: false }, message: { message_id: 5002, date: now,
+        from: { id: Number(policy.botId), is_bot: true }, chat: { id: Number(policy.adminId), type: "private" } } } }),
+  });
+  assert.equal(await acceptGeneralSharedTelegramCommand(database, opened.pin, jump), 200);
   await db.prepare("UPDATE telegram_general_read_lane SET epoch=3,mode='closed' WHERE bot_id=?").bind(policy.botId).run();
   await assert.rejects(acceptGeneralSharedTelegramCommand(database, opened.pin, post(policy.memberId, "/help", 6)));
   assert.equal(await db.prepare("SELECT count(*) AS n FROM telegram_inbox WHERE update_id=6").first("n"), 0);
   assert.equal((await readGeneralIsolationWindow(db, policy, revision)).pin?.privateManagement, true,
     "the closed window keeps the same full runtime available to Cron for accepted work");
+  const closed = await readGeneralIsolationWindow(db, policy, revision);
+  assert.equal(closed.pin?.privatePageJump, false, "closed admission cannot send a new interactive prompt");
+  assert.ok(closed.pin);
+  await recoverGeneralSharedTelegramReplies(db, closed.pin, bucket, ISOLATION_PUBLIC_ORIGIN);
+  assert.equal(await db.prepare(`SELECT state FROM telegram_outbox JOIN telegram_inbox USING(receipt_id)
+    WHERE bot_id=? AND update_id=9`).bind(policy.botId).first("state"), "failed");
+  assert.equal(sent.length, 2, "an unsent prompt is canceled rather than sent after close or held waiting for a reply");
   // Recovery is deliberately performed through the original binding, rather than the closed webhook facade.
   await db.prepare("UPDATE telegram_outbox SET state='failed' WHERE state='pending'").run();
   assert.equal(await db.prepare("SELECT count(*) AS n FROM telegram_outbox WHERE state='pending'").first("n"), 0);

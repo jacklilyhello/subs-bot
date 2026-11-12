@@ -15,6 +15,7 @@ export interface GeneralTelegramPin extends TelegramBotCredentials {
   sharedOutbox: boolean;
   privateManagement: boolean;
   privateBrowsing?: boolean;
+  privatePageJump?: boolean;
   privateFormats: boolean;
   privateTemp: boolean;
   privateDocument: boolean;
@@ -77,6 +78,8 @@ export function parseGeneralTelegramPin(input: unknown, releaseRevision: unknown
     const privateManagement = value.outbox === "shared-private-management" || privateFormats || privateTemp;
     const browsingConfigured = Object.hasOwn(value, "subscriptionBrowsing");
     const privateBrowsing = value.subscriptionBrowsing === true;
+    const jumpConfigured = Object.hasOwn(value, "pageJump");
+    const privatePageJump = value.pageJump === true;
     const authorizationConfigured = Object.hasOwn(value, "authManagement");
     const privateAuthorization = value.authManagement === true;
     const inlineConfigured = Object.hasOwn(value, "inlineSearch");
@@ -100,13 +103,14 @@ export function parseGeneralTelegramPin(input: unknown, releaseRevision: unknown
       groupShare = { chatId, chatType };
     }
     if (Object.keys(value).length !== 7 + Number(sharedOutbox) + Number(authorizationConfigured) + Number(inlineConfigured)
-        + Number(groupConfigured) + Number(typedConfigured) + Number(batchConfigured) + Number(githubConfigured) + Number(apiConfigured) + Number(browsingConfigured)
+        + Number(groupConfigured) + Number(typedConfigured) + Number(batchConfigured) + Number(githubConfigured) + Number(apiConfigured) + Number(browsingConfigured) + Number(jumpConfigured)
       || (sharedOutbox && value.outbox !== "shared" && !privateManagement)
       || (authorizationConfigured && (!privateManagement || !privateAuthorization))
       || (inlineConfigured && (!privateManagement || !privateInline))
       || (githubConfigured && (!privateManagement || !privateGitHub))
       || (apiConfigured && (!privateManagement || !privateApiStatus))
       || (browsingConfigured && (!privateManagement || !privateBrowsing))
+      || (jumpConfigured && (!privateBrowsing || !privatePageJump))
       || (batchConfigured && (!privateProvider || !providerBatch))
       || (typedConfigured && (!privateShort || (subscriptionShorts !== "issue" && subscriptionShorts !== "drain")))) return null;
     const credentials = readTelegramBotCredentials(value);
@@ -117,7 +121,7 @@ export function parseGeneralTelegramPin(input: unknown, releaseRevision: unknown
       || !/^[0-9a-f]{64}(?![\s\S])/u.test(activationSha256)) return null;
     return { ...credentials, generation, cutoverAt, activationSha256, releaseRevision, sharedOutbox, privateManagement,
       privateFormats, privateTemp, privateDocument, privateProvider, privateClaims, privateShareCreation, privateAggregate, privateSelected,
-      privateShort, privateAuthorization, privateInline, ...(privateBrowsing ? { privateBrowsing } : {}), ...(privateGitHub ? { privateGitHub } : {}), ...(privateApiStatus ? { privateApiStatus } : {}), ...(providerBatch ? { providerBatch } : {}), ...(groupShare ? { groupShare } : {}),
+      privateShort, privateAuthorization, privateInline, ...(privateBrowsing ? { privateBrowsing } : {}), ...(privatePageJump ? { privatePageJump } : {}), ...(privateGitHub ? { privateGitHub } : {}), ...(privateApiStatus ? { privateApiStatus } : {}), ...(providerBatch ? { providerBatch } : {}), ...(groupShare ? { groupShare } : {}),
       ...(subscriptionShorts === "issue" || subscriptionShorts === "drain" ? { subscriptionShorts } : {}) };
   } catch {
     return null;

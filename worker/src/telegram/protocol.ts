@@ -35,6 +35,7 @@ export type TelegramViewUpdate = TelegramEventScope & (
 );
 
 export const TELEGRAM_PAGE_JUMP_CALLBACK = "list:jump:v1";
+export const GENERAL_PAGE_JUMP_CALLBACK = "general-list:jump:v1";
 export const TELEGRAM_PAGE_JUMP_PROMPT = "🔢 请回复这条消息，输入要跳转的页码数字（如 2）。";
 export const TELEGRAM_PAGE_JUMP_MARKER = "view-jump:v2";
 export const TELEGRAM_PAGE_JUMP_RECEIPTS = `'view-jump:v1','${TELEGRAM_PAGE_JUMP_MARKER}'`;
@@ -763,6 +764,42 @@ export function readGeneralPrivateApiStatus(
 }
 
 const DECIMAL_DIGIT = /^\p{Nd}$/u;
+
+/** A general prompt uses the same UI but never an isolated control epoch. */
+export function readGeneralPageJump(
+  update: Record<string, unknown>, updateId: number, botId: string, botUsername: string,
+): TelegramPageJumpUpdate | null {
+  if (Object.keys(update).length !== 2) return null;
+  const callback = update.callback_query;
+  if (isRecord(callback)) {
+    const { id: callbackId, from: actor, message: origin, data } = callback;
+    if (data !== GENERAL_PAGE_JUMP_CALLBACK || "inline_message_id" in callback || "game_short_name" in callback
+      || !matches(callbackId, CALLBACK_ID) || !isRecord(actor) || actor.is_bot !== false
+      || !isPositiveInteger(actor.id) || String(actor.id) === botId || !ownBotMessage(origin, { botId })) return null;
+    const scope = telegramMessageScope(origin, String(actor.id), updateId);
+    return scope && (scope.chatType === "private" ? scope.chatId === scope.actorId && scope.threadId === null
+      : scope.chatType !== "group" || scope.threadId === null) ? { ...scope, kind: "open", callbackId } : null;
+  }
+  const { message } = update;
+  if (!isRecord(message) || "edit_date" in message || "document" in message || typeof message.text !== "string"
+    || message.text.length > 4096) return null;
+  const actorId = humanSender(message);
+  const scope = actorId && actorId !== botId ? telegramMessageScope(message, actorId, updateId) : null;
+  const origin = message.reply_to_message;
+  if (!scope || (scope.chatType === "private" ? scope.chatId !== scope.actorId || scope.threadId !== null
+    : scope.chatType === "group" && scope.threadId !== null) || !ownBotMessage(origin, { botId })
+    || origin.text !== TELEGRAM_PAGE_JUMP_PROMPT) return null;
+  const prompt = telegramMessageScope(origin, actorId!, updateId);
+  if (!prompt || prompt.chatId !== scope.chatId || prompt.chatType !== scope.chatType || prompt.threadId !== scope.threadId
+    || prompt.messageId >= scope.messageId || prompt.messageDate > scope.messageDate) return null;
+  const command = readLeadingTelegramCommand(message, botUsername);
+  const cancelled = RENAME_CANCEL.test(message.text.trim())
+    || command?.name === "cancel" && command.remainder.trim() === "";
+  if (message.text.trim().startsWith("/") && !cancelled) return null;
+  const position = subscriptionPosition(message.text);
+  return { ...scope, kind: "reply", promptMessageId: prompt.messageId,
+    page: position === null ? null : Math.max(1, position), cancelled };
+}
 
 function subscriptionPosition(text: string): number | null {
   const value = collapsePathRuleWhitespace(text);

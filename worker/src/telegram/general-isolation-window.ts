@@ -71,7 +71,7 @@ export async function readGeneralIsolationWindow(
   if (!scope || scope.foreignActors !== 0 || scope.groups !== 1 || scope.fixedGroup !== 1) throw new Error(ERROR);
   const { rehearsal: _readOnly, ...pin } = lane.pin;
   return { ready: true, epoch: lane.epoch, mode: lane.mode, pin: { ...pin,
-    privateManagement: true, privateBrowsing: true, privateFormats: true, privateTemp: true, privateDocument: true, privateProvider: true,
+    privateManagement: true, privateBrowsing: true, privatePageJump: lane.mode === "general", privateFormats: true, privateTemp: true, privateDocument: true, privateProvider: true,
     privateClaims: true, privateShareCreation: true, privateAggregate: true, privateSelected: true, privateShort: true,
     privateAuthorization: true, privateInline: true, privateGitHub: true, privateApiStatus: true, providerBatch: true,
     isolationWindow: { profile: "full-v1", adminId: policy.adminId, memberId: policy.memberId },
