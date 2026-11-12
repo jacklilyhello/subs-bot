@@ -23,7 +23,7 @@ async function jsonBody(response: Response): Promise<unknown> {
   const reader = response.body.getReader();
   let bytes = 0;
   let text = "";
-  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
   try {
     for (;;) {
       const chunk = await reader.read();
