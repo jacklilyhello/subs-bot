@@ -76,6 +76,7 @@ import { GENERAL_TEMP_SCHEMA, generalTempRawMarker, generalTempRawStamp, prepare
 import { confirmTelegramTempRawSend, prepareTelegramTempRawReply } from "./temp-raw.ts";
 import { readVerifiedTempStorage, TELEGRAM_GENERAL_TEMP_MARKER, tempCutoverAllows, tempSchemaGuard } from "./temp-storage.ts";
 import { renderTelegramView } from "./views.ts";
+import { wrapAuthorizedLocalShortlink, type ExternalShortlinkRuntime } from "./external-shortlinks.ts";
 import { prepareTelegramOutboxBegin, settleTelegramOutboxReply, TELEGRAM_OUTBOX_LEASE_SECONDS,
   TELEGRAM_OUTBOX_MAX_ATTEMPTS, type TelegramReplyOutcome } from "./store.ts";
 
@@ -663,6 +664,7 @@ export async function beginGeneralSharedTelegramReply(
 
 async function drainGeneralSelectedReply(
   db: D1Database, pin: GeneralTelegramPin, lease: SharedReadLease, publicOrigin: PublicOrigin, key: CryptoKey | null,
+  externalShortlinks?: ExternalShortlinkRuntime,
 ): Promise<boolean> {
   if (!pin.privateSelected) return false;
   let selected = await db.prepare(`SELECT result,code_sha256 AS codeSha256 FROM telegram_selected_actions
@@ -697,8 +699,13 @@ async function drainGeneralSelectedReply(
   const keyboard = tickets?.map((ticket, index) => [{
     text: code === null ? `撤销最近第${index + 1}条链接` : "撤销此链接", callback_data: ticket.token,
   }]);
-  const text = code === null ? renderTelegramSelected(selected) : `Clash 所选订阅聚合链接\n${publicOrigin}/agg/${code}/clash`;
-  const outcome = confirmed ? await sendGeneralTelegramPrivateReply(pin.botToken, lease.actorId, lease.messageId, text, keyboard)
+  const wrapped = confirmed && code !== null && externalShortlinks
+    ? await wrapAuthorizedLocalShortlink(db, pin.botId, `${publicOrigin}/s/${code}`, publicOrigin, externalShortlinks,
+      async () => await resolveTelegramSelectedCode(db, pin, { ...lease, selected }, key, true) === code) : null;
+  const text = code === null ? renderTelegramSelected(selected) : `Clash 所选订阅聚合链接\n${wrapped?.url ?? `${publicOrigin}/agg/${code}/clash`}${wrapped && !wrapped.external
+    ? "\n外部短链暂不可用，已使用本地链接。" : ""}`;
+  const outcome = confirmed && (code === null || !externalShortlinks || wrapped)
+    ? await sendGeneralTelegramPrivateReply(pin.botToken, lease.actorId, lease.messageId, text, keyboard)
     : { kind: "failed" as const };
   await settleTelegramOutboxReply(db, lease, selectLease(pin, lease, false), outcome);
   return true;
@@ -707,6 +714,7 @@ async function drainGeneralSelectedReply(
 export async function drainGeneralSharedTelegramReply(
   db: D1Database, pin: GeneralTelegramPin, bucket: R2Bucket, publicOrigin: PublicOrigin,
   refreshAvailable?: () => Promise<boolean>, share?: TelegramPrivateShareRuntime, aggregateKey: CryptoKey | null = null,
+  externalShortlinks?: ExternalShortlinkRuntime,
 ): Promise<boolean> {
   const lease = await claimGeneralSharedTelegramReply(db, pin);
   if (!lease) return false;
@@ -747,7 +755,12 @@ export async function drainGeneralSharedTelegramReply(
     const scope = selectLease(pin, lease, true, reply.kind === "link" ? reply.guard : undefined);
     if (await prepareTelegramOutboxBegin(db, lease, scope).first() === null) return false;
     const confirmed = reply.kind === "notice" || await confirmGuardedGeneralSend(db, lease, scope);
-    const outcome = confirmed ? await sendGeneralTelegramPrivateReply(pin.botToken, lease.actorId, lease.messageId, reply.text)
+    const wrapped = confirmed && reply.kind === "link" && externalShortlinks
+      ? await wrapAuthorizedLocalShortlink(db, pin.botId, reply.localUrl, publicOrigin, externalShortlinks,
+        () => confirmGuardedGeneralSend(db, lease, scope)) : null;
+    const text = wrapped && reply.kind === "link" ? `短链已生成。\n${wrapped.url}${wrapped.external ? `\n撤销：/short revoke ${reply.localUrl.slice(reply.localUrl.lastIndexOf("/") + 1)}` : "\n外部短链暂不可用，已使用本地链接。"}` : reply.text;
+    const outcome = confirmed && (reply.kind !== "link" || !externalShortlinks || wrapped)
+      ? await sendGeneralTelegramPrivateReply(pin.botToken, lease.actorId, lease.messageId, text)
       : { kind: "failed" as const };
     await settleTelegramOutboxReply(db, lease, selectLease(pin, lease, false), outcome);
     return true;
@@ -777,7 +790,7 @@ export async function drainGeneralSharedTelegramReply(
     return true;
   }
   if (lease.marker === GENERAL_TELEGRAM_SELECTED_MARKER) {
-    return drainGeneralSelectedReply(db, pin, lease, publicOrigin, aggregateKey);
+    return drainGeneralSelectedReply(db, pin, lease, publicOrigin, aggregateKey, externalShortlinks);
   }
   if (lease.marker === GENERAL_AUTH_ACTION_MARKER) {
     const [begun, reply] = await db.batch<GeneralAuthReply>([
@@ -841,12 +854,18 @@ export async function drainGeneralSharedTelegramReply(
       WHERE receipt_id=? AND auth_message_date=0 AND auth_message_id=0`).bind(lease.receiptId).first<TelegramAggregateReply>();
     if (!pin.privateAggregate || !aggregate) return false;
     const prepared = await prepareTelegramAggregateCode(db, pin, { ...lease, aggregate }, aggregateKey);
-    const text = prepared ? await renderTelegramAggregateLinks(db, bucket, prepared.code, Date.now() + 13_000, publicOrigin)
+    let text = prepared ? await renderTelegramAggregateLinks(db, bucket, prepared.code, Date.now() + 13_000, publicOrigin)
       : renderTelegramAggregateResult(aggregate.result);
     const scope = selectLease(pin, lease, true, prepared?.guard);
     if (await prepareTelegramOutboxBegin(db, lease, scope).first() === null) return false;
     const confirmed = !prepared || await confirmGuardedGeneralSend(db, lease, scope);
-    const outcome = confirmed ? await sendGeneralTelegramPrivateReply(pin.botToken, lease.actorId, lease.messageId, text)
+    const wrapped = confirmed && prepared && externalShortlinks
+      ? await wrapAuthorizedLocalShortlink(db, pin.botId, `${publicOrigin}/s/${prepared.code}`, publicOrigin, externalShortlinks,
+        () => confirmGuardedGeneralSend(db, lease, scope)) : null;
+    if (wrapped && prepared) text = text.replace(`${publicOrigin}/agg/${prepared.code}/clash`, wrapped.url)
+      + (wrapped.external ? "" : "\n外部短链暂不可用，已使用本地链接。");
+    const outcome = confirmed && (!prepared || !externalShortlinks || wrapped)
+      ? await sendGeneralTelegramPrivateReply(pin.botToken, lease.actorId, lease.messageId, text)
       : { kind: "failed" as const };
     await settleTelegramOutboxReply(db, lease, selectLease(pin, lease, false), outcome);
     return true;
@@ -909,10 +928,12 @@ export async function drainGeneralSharedTelegramReply(
       }
       if (started && shortTarget) {
         const target = subscriptionShortSendGuard(started, exactOnly, true);
-        const confirmed = await confirmGuardedGeneralSend(db, lease, selectLease(pin, lease, true, readGuard, target));
-        const outcome = confirmed
+        const wrapped = await wrapAuthorizedLocalShortlink(db, pin.botId, `${publicOrigin}/s/${started.code}`,
+          publicOrigin, externalShortlinks,
+          () => confirmGuardedGeneralSend(db, lease, selectLease(pin, lease, true, readGuard, target)));
+        const outcome = wrapped
           ? await sendGeneralTelegramPrivateReply(pin.botToken, lease.actorId, lease.messageId,
-            `${shortTarget.label}\n${publicOrigin}/s/${started.code}`)
+            `${shortTarget.label}\n${wrapped.url}${wrapped.external ? `\n撤销：/short revoke ${started.code}` : ""}${externalShortlinks && !wrapped.external ? "\n外部短链暂不可用，已使用本地链接。" : ""}`)
           : { kind: "failed" as const };
         await settleTelegramOutboxReply(db, lease, selectLease(pin, lease, false), outcome, "inbox.received_at", GENERAL_REPLY_TTL);
         return true;
@@ -1016,6 +1037,7 @@ export async function drainGeneralSharedTelegramReply(
 export async function recoverGeneralSharedTelegramReplies(
   db: D1Database, pin: GeneralTelegramPin, bucket: R2Bucket, publicOrigin: PublicOrigin,
   refreshAvailable?: () => Promise<boolean>, share?: TelegramPrivateShareRuntime, aggregateKey: CryptoKey | null = null,
+  externalShortlinks?: ExternalShortlinkRuntime,
 ): Promise<void> {
   if (!pin.sharedOutbox) return;
   if (pin.privateGitHub && await telegramGitHubSearchReady(db)) await recoverTelegramGitHubSearch(db, pin);
@@ -1048,7 +1070,7 @@ export async function recoverGeneralSharedTelegramReplies(
     await reapTelegramLifecycle(db, pin.botId);
     await reapTelegramSubscriptionReadTickets(db, pin.botId);
   }
-  for (let i = 0; i < 4 && await drainGeneralSharedTelegramReply(db, pin, bucket, publicOrigin, refreshAvailable, share, aggregateKey); i++) {
+  for (let i = 0; i < 4 && await drainGeneralSharedTelegramReply(db, pin, bucket, publicOrigin, refreshAvailable, share, aggregateKey, externalShortlinks); i++) {
     // Bound scheduled work and preserve the ordinary outbox's lease and settlement semantics.
   }
   if (pin.privateSelected) await reapTelegramSelected(db, pin.botId);

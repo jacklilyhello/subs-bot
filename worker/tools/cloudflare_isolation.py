@@ -14,6 +14,8 @@ from urllib.error import HTTPError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 from uuid import uuid4
 
+import external_shortlink_release as external_shortlinks
+
 
 WORKER_NAME = "subs-bot-cf-dev-01"
 NAMESPACE = "lilyya"
@@ -286,6 +288,10 @@ class _Version:
     telegram_subscription_shorts: bool = False
     telegram_subscription_shorts_capable: bool = False
     telegram_general_subscription_shorts_capable: bool = False
+    external_shortlink_capable: bool = False
+    external_shortlink_token_sha256: str | None = None
+    telegram_external_shortlinks: bool = False
+    external_shortlink_base_tag: str | None = None
 
 
 def version_evidence(version):
@@ -296,6 +302,9 @@ def version_evidence(version):
         del result["telegram_subscription_shorts"]
     if not result["telegram_general_subscription_shorts_capable"]:
         del result["telegram_general_subscription_shorts_capable"]
+    if not result["external_shortlink_capable"] and result["external_shortlink_token_sha256"] is None:
+        for key in ("external_shortlink_capable", "external_shortlink_token_sha256", "telegram_external_shortlinks", "external_shortlink_base_tag"):
+            del result[key]
     return result
 
 
@@ -367,6 +376,14 @@ def _page_jump_tag(tag, epoch, module_sha):
                    if tag.startswith(value)), "page-jump-")
     pin = f"{tag}:page-jump-v2:{epoch}:{module_sha}:{PAGE_JUMP_CONTROL_MIGRATION_SHA256}"
     return prefix + sha256(pin.encode("ascii")).hexdigest()
+
+
+def _page_jump_version(active, epoch):
+    base_tag = active.external_shortlink_base_tag if active.external_shortlink_token_sha256 is not None else active.tag
+    staged_tag = _page_jump_tag(base_tag, epoch, active.digest)
+    return replace(active, tag=external_shortlinks.release_tag(staged_tag, active.external_shortlink_token_sha256,
+        active.telegram_external_shortlinks), telegram_page_jump_epoch=epoch,
+        external_shortlink_base_tag=staged_tag if active.external_shortlink_token_sha256 is not None else None)
 
 
 class _Isolation:
@@ -885,7 +902,7 @@ class _Isolation:
                                                      {"enabled": False, "cross_version_cache": False}),
                  "Isolated Worker version runtime settings differ from the supported configuration.")
         rows = version.get("bindings")
-        _require(isinstance(rows, list) and 3 <= len(rows) <= 26 + int(page_jump_epoch is not None)
+        _require(isinstance(rows, list) and 3 <= len(rows) <= 31 + int(page_jump_epoch is not None)
                  and all(isinstance(row, dict) and isinstance(row.get("name"), str) for row in rows),
                  "Unexpected isolated Worker binding inventory.")
         bindings = {row["name"]: row for row in rows}
@@ -909,12 +926,12 @@ class _Isolation:
         subscription_shorts = bindings.get(SUBSCRIPTION_SHORTS_BINDING)
         provider_batch = bindings.get(PROVIDER_BATCH_BINDING)
         api_status = bindings.get(API_STATUS_BINDING)
-        binding_names = set(bindings) - PROVIDER_BINDINGS - PROVIDER_API_STATUS_BINDINGS - {
+        binding_names = set(bindings) - PROVIDER_BINDINGS - PROVIDER_API_STATUS_BINDINGS - external_shortlinks.ALL_BINDINGS - {
             INLINE_SEARCH_BINDING, PROVIDER_URL_IMPORT_BINDING, PROVIDER_REFRESH_BINDING, LEGACY_SUBSCRIPTION_SHORT_BINDING,
             PROVIDER_BATCH_BINDING, API_STATUS_BINDING, PROVIDER_URL_DOCUMENTS_BINDING, MIXED_DOCUMENTS_BINDING,
             GROUP_SHARE_CARDS_BINDING, SUBSCRIPTION_SHORTS_BINDING,
         }
-        _require(len(bindings) <= 25 + int(subscription_shorts is not None)
+        _require(len(bindings) <= 25 + int(subscription_shorts is not None) + len(set(bindings) & external_shortlinks.ALL_BINDINGS)
             and len(bindings) + int(page_jump_epoch is not None) == len(rows) and binding_names in (base_bindings, telegram_bindings,
             telegram_bindings | AGGREGATE_BINDINGS, telegram_bindings | PRIVATE_SHARE_BINDINGS,
             telegram_bindings | AGGREGATE_BINDINGS | PRIVATE_SHARE_BINDINGS)
@@ -990,6 +1007,11 @@ class _Isolation:
             raise CloudflareError("Cloudflare Worker module encoding is invalid.") from None
         _require(0 < len(body) <= MAX_MODULE_BYTES, "Cloudflare Worker module size is invalid.")
         annotations = _object(version.get("annotations") or {}, "version annotations")
+        original_tag = annotations.get("workers/tag")
+        external_digest, external_enabled, external_base_tag = external_shortlinks.read_bindings(bindings, original_tag)
+        external_capable = external_shortlinks.MARKER in body
+        _require(external_digest is None or (external_capable and telegram_digest is not None and aggregate_digest is not None),
+                 "The isolated Worker lacks verified local-link and shortlink recovery capability.")
         provider_binding = None
         message = annotations.get("workers/message")
         tagged_provider = isinstance(message, str) and message.startswith(PROVIDER_MESSAGE)
@@ -1016,7 +1038,7 @@ class _Isolation:
                      and all(set(pin) == {"name", "type", "text"} and pin["type"] == "plain_text" for pin in pins),
                      "Isolated API status V2 binding differs from the reviewed service.")
             api_status_binding = ProviderApiStatusBinding(*(pin["text"] for pin in pins))
-        tag = annotations.get("workers/tag")
+        tag = external_base_tag if external_digest is not None else original_tag
         module_sha256 = sha256(body).hexdigest()
         _require(page_jump_epoch is None or (telegram_digest is not None and PAGE_JUMP_MARKER in body
                  and PAGE_JUMP_CONTROL_MARKER in body), "The isolated Worker lacks staged page-jump capability.")
@@ -1072,13 +1094,17 @@ class _Isolation:
             elif page_jump_epoch is not None:
                 feature = "page-jump"
             _require(tag_matches(expected) or documents_capable, f"Isolated Worker {feature} release tag differs.")
+        if external_digest is not None and not (short_capable or batch_capable or has_api_status or page_jump_epoch is not None
+                or any(binding is not None for binding in (inline, provider_url, refresh, legacy_shorts))):
+            _require(tag == _release_tag(rev["text"], telegram_digest, aggregate_digest, private_share_digest, provider_binding),
+                     "The isolated shortlink base release tag differs.")
         _require(provider_documents is None or documents_capable, "Isolated Worker provider URL document release tag differs.")
         _require(mixed_documents is None or mixed_documents_capable, "Isolated Worker mixed document release tag differs.")
         _require(group_share_cards_capable == has_group_share_cards_marker
                  and (group_share_cards is None or group_share_cards_capable),
                  "Isolated Worker group share card release tag differs.")
         value = _Version(rev["text"], module_sha256, version["compatibility_date"],
-                        tag, telegram_digest, aggregate_digest, private_share_digest, provider_binding, inline is not None,
+                        original_tag, telegram_digest, aggregate_digest, private_share_digest, provider_binding, inline is not None,
                         provider_url is not None, refresh is not None, legacy_shorts is not None,
                         provider_batch is not None, batch_capable, api_status_binding, api_status is not None,
                         provider_documents is not None, documents_capable, mixed_documents is not None, mixed_documents_capable,
@@ -1088,7 +1114,11 @@ class _Isolation:
                         telegram_page_jump_epoch=page_jump_epoch,
                         telegram_subscription_shorts=subscription_shorts is not None,
                         telegram_subscription_shorts_capable=short_capable,
-                        telegram_general_subscription_shorts_capable=general_short_capable)
+                        telegram_general_subscription_shorts_capable=general_short_capable,
+                        external_shortlink_capable=external_capable,
+                        external_shortlink_token_sha256=external_digest,
+                        telegram_external_shortlinks=external_enabled,
+                        external_shortlink_base_tag=external_base_tag)
         capabilities = tuple(check(body) for requested, check in (
             (with_legacy_selected, _legacy_selected_module_capable),
             (with_legacy_temp, _legacy_temp_module_capable),
@@ -1138,7 +1168,7 @@ class _Isolation:
             return None
         return self.verify_candidate(candidates[0], desired)
 
-    def upload(self, module, desired, telegram_config, aggregate_key, private_share_key):
+    def upload(self, module, desired, telegram_config, aggregate_key, private_share_key, shortlink_token=None):
         bindings = [
             {"type": "d1", "name": "DB", "database_id": self.target["d1Id"]},
             {"type": "r2_bucket", "name": "NODES", "bucket_name": WORKER_NAME},
@@ -1190,6 +1220,9 @@ class _Isolation:
             bindings.append({"type": "plain_text", "name": API_STATUS_BINDING, "text": "1"})
         if desired.telegram_page_jump_epoch is not None:
             bindings.append(_page_jump_binding(desired.telegram_page_jump_epoch))
+        if desired.external_shortlink_token_sha256 is not None:
+            bindings.extend(external_shortlinks.upload_bindings(shortlink_token, desired.external_shortlink_token_sha256,
+                desired.external_shortlink_base_tag, desired.telegram_external_shortlinks))
         message = "Reviewed isolated Worker release"
         if desired.provider_binding is not None:
             binding = desired.provider_binding
@@ -1554,6 +1587,7 @@ def _artifact(bundle_dir, manifest, telegram_config, aggregate_key=None, private
     page_jump_capable, page_jump_control_capable = _page_jump_artifact_capabilities(module, manifest)
     short_capable, general_short_capable = _subscription_shorts_artifact_capabilities(module, manifest)
     general_read_artifact(module, manifest)
+    external_capable = external_shortlinks.artifact_capable(module, manifest)
     revision = manifest["revision"]
     telegram_digest = None
     aggregate_digest = None
@@ -1585,7 +1619,8 @@ def _artifact(bundle_dir, manifest, telegram_config, aggregate_key=None, private
                             telegram_page_jump_capable=page_jump_capable,
                             telegram_page_jump_control_capable=page_jump_control_capable,
                             telegram_subscription_shorts_capable=short_capable,
-                            telegram_general_subscription_shorts_capable=general_short_capable)
+                            telegram_general_subscription_shorts_capable=general_short_capable,
+                            external_shortlink_capable=external_capable)
 
 
 def _read_health():
@@ -1868,7 +1903,8 @@ def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECI
                          mixed_documents=None, group_share_cards=None, group_share_cards_capable=None,
                          legacy_selected_capable=None, legacy_temp_capable=None, legacy_dynamic_all_capable=None,
                          subscription_shorts=None, subscription_shorts_capable=None,
-                         general_subscription_shorts_capable=False):
+                         general_subscription_shorts_capable=False, external_shortlinks_mode=None, shortlink_token=None,
+                         external_shortlinks_capable=False):
     """Read ownership, privacy and active binding facts before any release writes."""
     from general_read_rehearsal import require_general_read_lane_clear
     from page_jump_activation import require_clear_for_release
@@ -1882,6 +1918,11 @@ def verify_worker_target(worker_api, data_api, target, *, aggregate_key=_UNSPECI
     active = scope.active()
     version, active_selected_capable, active_temp_capable, active_dynamic_all_capable = scope.version(
         active.version, with_legacy_selected=True, with_legacy_temp=True, with_legacy_dynamic_all=True)
+    if release_manifest is not None or external_shortlinks_mode is not None:
+        external_shortlinks.target(version, external_shortlinks_mode, shortlink_token, capable=external_shortlinks_capable,
+            telegram_digest=version.telegram_config_sha256, aggregate_digest=version.telegram_aggregate_key_sha256)
+    if version.external_shortlink_capable:
+        external_shortlinks.verify_schema(scope)
     if legacy_selected_capable is not None:
         _require(type(legacy_selected_capable) is bool, "The verified legacy selected release capability is invalid.")
         # A first capable release may still be about to apply 0038.
@@ -2010,7 +2051,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                    provider_refresh: bool | None = None, legacy_subscription_shorts: bool | None = None,
                    provider_batch: bool | None = None, api_status: bool | None = None, api_status_gate=None,
                    provider_url_documents: bool | None = None, mixed_documents: bool | None = None,
-                   group_share_cards: bool | None = None, subscription_shorts: bool | None = None):
+                   group_share_cards: bool | None = None, subscription_shorts: bool | None = None,
+                   external_shortlinks_mode: bool | None = None, shortlink_token: str | None = None):
     """Release the verified Worker and optionally configure its isolated Telegram schedule."""
     from general_read_rehearsal import MIGRATION as GENERAL_READ_LANE_MIGRATION, require_general_read_lane_clear
     from page_jump_activation import MIGRATION, require_clear_for_release
@@ -2077,6 +2119,10 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
         desired.telegram_config_sha256, desired.provider_binding, had_cron)
     api_status_enabled, api_status_binding, api_gate, api_status_capable, api_status_must_be_drained = _api_status_target(
         old_version, api_status, manifest, desired.telegram_config_sha256, had_cron, api_status_gate)
+    if external_shortlinks_mode is not None:
+        _require(all(mode is None for mode in (inline_search, provider_url_import, provider_refresh, legacy_subscription_shorts,
+            provider_batch, api_status, provider_url_documents, mixed_documents, group_share_cards, subscription_shorts)),
+            "Change isolated external shortlinks in a separate scoped release.")
     if typed_enabled != old_version.telegram_subscription_shorts:
         _require((desired.provider_binding, desired.telegram_private_share_key_sha256, api_status_binding, api_status_enabled,
                   enabled, provider_url_enabled, refresh_enabled, legacy_shorts_enabled, batch_enabled, documents_enabled,
@@ -2118,6 +2164,15 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                                                 group_share_cards=group_enabled if group_capable else None,
                                                 subscription_shorts=typed_enabled if desired.telegram_subscription_shorts_capable else None,
                                                 short_module_sha256=desired.digest if desired.telegram_subscription_shorts_capable else None))
+    external_digest, external_enabled = external_shortlinks.target(old_version, external_shortlinks_mode, shortlink_token,
+        capable=desired.external_shortlink_capable, telegram_digest=desired.telegram_config_sha256,
+        aggregate_digest=desired.telegram_aggregate_key_sha256)
+    if desired.external_shortlink_capable:
+        external_shortlinks.verify_schema(scope)
+    if external_digest is not None:
+        desired = replace(desired, external_shortlink_token_sha256=external_digest,
+            telegram_external_shortlinks=external_enabled, external_shortlink_base_tag=desired.tag,
+            tag=external_shortlinks.release_tag(desired.tag, external_digest, external_enabled))
     if inline_bot is not None:
         scope.verify_inline_search(inline_bot, require_fresh=first_enable)
     if verify_provider_schema is not None:
@@ -2142,7 +2197,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
     _verify_api_status_dependency(old_version, api_gate, desired.revision)
     if old_version.revision == desired.revision:
         _require(old_version.digest == desired.digest, "Active revision differs from the verified module digest.")
-        if (old_version.telegram_config_sha256, old_version.telegram_aggregate_key_sha256,
+        if (old_version.external_shortlink_token_sha256, old_version.telegram_external_shortlinks,
+                old_version.external_shortlink_capable, old_version.telegram_config_sha256, old_version.telegram_aggregate_key_sha256,
                 old_version.telegram_private_share_key_sha256, old_version.provider_binding,
                 old_version.telegram_inline_search, old_version.telegram_provider_url_import,
                 old_version.telegram_provider_refresh, old_version.legacy_subscription_shorts,
@@ -2152,7 +2208,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                 old_version.telegram_mixed_documents, old_version.telegram_mixed_documents_capable,
                 old_version.telegram_group_share_cards, old_version.telegram_group_share_cards_capable,
                 old_version.telegram_subscription_shorts, old_version.telegram_subscription_shorts_capable) == (
-                desired.telegram_config_sha256, desired.telegram_aggregate_key_sha256,
+                desired.external_shortlink_token_sha256, desired.telegram_external_shortlinks,
+                desired.external_shortlink_capable, desired.telegram_config_sha256, desired.telegram_aggregate_key_sha256,
                 desired.telegram_private_share_key_sha256, desired.provider_binding,
                 desired.telegram_inline_search, desired.telegram_provider_url_import, desired.telegram_provider_refresh,
                 desired.legacy_subscription_shorts, desired.telegram_provider_batch, desired.telegram_provider_batch_capable,
@@ -2176,6 +2233,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                     "legacySubscriptionShortsEnabled": legacy_shorts_enabled, "providerBatchEnabled": batch_enabled,
                     "apiStatusEnabled": api_status_enabled, "providerUrlDocumentsEnabled": documents_enabled,
                     "mixedDocumentsEnabled": mixed_enabled, "groupShareCardsEnabled": group_enabled,
+                    **({"externalShortlinksEnabled": external_enabled, "externalShortlinkService": external_shortlinks.SERVICE,
+                        "externalShortlinkEntrypoint": external_shortlinks.ENTRYPOINT} if external_digest is not None else {}),
                     **({"subscriptionShortsEnabled": typed_enabled, "subscriptionShortsCapable": True}
                        if desired.telegram_subscription_shorts_capable else {})}
 
@@ -2190,7 +2249,7 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                                                target_general_capable=desired.telegram_general_subscription_shorts_capable,
                                                require_schema=desired.telegram_subscription_shorts_capable)
         _guard_current(guard)
-        candidate = scope.upload(module, desired, telegram_config, aggregate_key, private_share_key)
+        candidate = scope.upload(module, desired, telegram_config, aggregate_key, private_share_key, shortlink_token)
 
     _require(scope.worker_config() == config, "Isolated Worker configuration changed before activation.")
     _require(scope.cron_enabled() == had_cron, "Isolated Worker schedule changed before activation.")
@@ -2232,6 +2291,8 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
         scope.verify_subscription_shorts_floor(desired, desired.telegram_subscription_shorts_capable,
                                                target_general_capable=desired.telegram_general_subscription_shorts_capable)
         _verify_health(desired.revision)
+        if desired.external_shortlink_capable:
+            external_shortlinks.verify_schema(scope)
         if inline_bot is not None:
             scope.verify_inline_search(inline_bot)
         if verify_provider_schema is not None:
@@ -2304,5 +2365,7 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
             "legacySubscriptionShortsEnabled": legacy_shorts_enabled, "providerBatchEnabled": batch_enabled,
             "apiStatusEnabled": api_status_enabled, "providerUrlDocumentsEnabled": documents_enabled,
             "mixedDocumentsEnabled": mixed_enabled, "groupShareCardsEnabled": group_enabled,
+            **({"externalShortlinksEnabled": external_enabled, "externalShortlinkService": external_shortlinks.SERVICE,
+                "externalShortlinkEntrypoint": external_shortlinks.ENTRYPOINT} if external_digest is not None else {}),
             **({"subscriptionShortsEnabled": typed_enabled, "subscriptionShortsCapable": True}
                if desired.telegram_subscription_shorts_capable else {})}

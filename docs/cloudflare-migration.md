@@ -728,3 +728,14 @@ V11 合成原生演练在 `worker-isolation-legacy-candidate.yml` 选择 `synthe
 - 成本按实测请求数与 CPU、D1 读写行数、R2 容量及对象读写、队列投递与重试计算。若启用 Container，再核对实例运行时间、内存和磁盘配额、活动 CPU、区域出网及关联 Durable Objects 用量。隔离验收以按需启动和可睡眠为前提。显著新增费用或需要常驻时先提交估算和影响。 [Workers 定价](https://developers.cloudflare.com/workers/platform/pricing/) · [R2 定价](https://developers.cloudflare.com/r2/pricing/) · [Queues 定价](https://developers.cloudflare.com/queues/platform/pricing/) · [Containers 定价](https://developers.cloudflare.com/containers/platform/pricing/)
 - 资源管理分开使用只读核查、派生 Token 创建和项目部署权限。新 Token 按目标账户、所需操作和有效期收窄。平台权限无法限定到单个资源时，执行步骤须核对项目专用资源 ID。应用通过绑定和 Secrets 使用运行所需权限。高权限管理凭据留在受控管理位置。 [Cloudflare API Token](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/) · [Workers Secrets](https://developers.cloudflare.com/workers/configuration/secrets/)
 - Worker、反代及其他链路避免记录能力路径、查询参数、Telegram 更新、订阅内容、鉴权头或上游异常正文。Cloudflare 自动 invocation 日志可能包含带凭据的 URL，发布前禁用或验证脱敏，并核对追踪、异常和外部转发的字段。允许的运行信号限于路由类别、状态、计数、耗时和内部操作 ID。私密数据和密钥不得出现在公共缓存、Git、构建产物或测试日志。 [Workers Logs](https://developers.cloudflare.com/workers/observability/logs/workers-logs/)
+
+
+## 外部短链的内部调用与隔离发布
+
+外部短链只包装已经鉴权并签发的本站 `/s/` 链接。调用方绑定 `SHORTLINK` 固定到 `shortlink-new` 的命名入口 `ShortlinkService`；通过 `createShortlink(Request)` 内部调用，Request 中的 HTTPS 地址仅为接口校验元数据。业务 Token 存于调用方 Worker Secret `SHORTLINK_BUSINESS_TOKEN`。不调整短链服务、公网 WAF、Access 或其 Token 权限。
+
+受保护的 `subs-bot-isolation` GitHub Environment 使用 `SUBS_BOT_SHORTLINK_BUSINESS_TOKEN` 向部署流程提供业务凭据。部署操作 `external_shortlinks` 默认 `preserve`；显式选择 `enable external shortlinks for subs-bot-cf-dev-01` 才启用，选择对应 `disable` 只关闭新 RPC 包装，保留原 Service Binding 和 Secret。已配置后，缺少受保护凭据、凭据摘要变化、命名入口变化或丢失恢复能力均拒绝发布。凭据轮换须另行设计，不能通过普通部署暗中变更。
+
+发布读回核对业务 Secret 类型及摘要、精确 Service Binding、启用标志、完整版本 tag 和 `0053_external_shortlinks.sql` 的迁移与实际 D1 表结构。已有批量任务能力 tag 前缀保持可识别。页码跳转的暂停、分阶段候选和恢复保留同一短链身份；历史候选中缺失的新增字段按旧格式处理。
+
+外层短链的成功、重放、限流和失败均须另做隔离 Service Binding 联调，合成测试通过不代表真实业务 Token 已获准使用 `gfw.mom`。外层服务不获得上游来源、直接 `/sub/` 或 `/agg/` 能力地址及节点内容。撤销仍由本地 `/s/` 数据与原分享约束控制，外层映射不依赖删除权限。关闭包装或恢复上一版 Worker 不会恢复已经撤销的本地链接，也不应恢复过时的 SQLite 服务。
