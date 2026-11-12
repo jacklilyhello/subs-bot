@@ -3,7 +3,7 @@ import type { PublicOrigin } from "../public-origin.ts";
 import type { GeneralTelegramPin } from "./general-auth-runtime.ts";
 import { GENERAL_ACTOR_QUEUE_CAPACITY, GENERAL_LATEST_ACTOR_SQL, GENERAL_NO_LEGACY_WORK, GENERAL_POLICY_ACTORS_SQL, GENERAL_POLICY_PIN_SQL,
   GENERAL_RECEIPT_SCHEMA, GENERAL_REPLY_TTL, generalCurrentReceiptSql, generalPolicyBindings,
-  prepareGeneralReceiptAuthority } from "./general-receipt.ts";
+  approvedGroup, groupSchemaReady, prepareGeneralReceiptAuthority } from "./general-receipt.ts";
 import { SUBSCRIPTION_READ_TICKET, type TelegramSubscriptionReadUpdate } from "./protocol.ts";
 import { GENERAL_SUBSCRIPTION_READ_MARKER, prepareTelegramSubscriptionSearchReceipt, renderGeneralSubscriptionFormat, renderGeneralSubscriptionMetadata,
   renderTelegramSearchResults, scanTelegramSubscriptionSearch, type TelegramSubscriptionReadReceipt } from "./subscription-read.ts";
@@ -58,18 +58,23 @@ function eventAuthorization(pin: GeneralTelegramPin, event: ReadEvent) {
   return { sql: `FROM ${GENERAL_POLICY_ACTORS_SQL}
     WHERE ${GENERAL_POLICY_PIN_SQL} AND ${GENERAL_RECEIPT_SCHEMA} AND policy.active=1 AND ${GENERAL_NO_LEGACY_WORK}
       AND actor.actor_id=? AND ${GENERAL_LATEST_ACTOR_SQL}
+      ${event.chatType === "private" ? "" : `AND ${approvedGroup()}`}
       AND ?>MAX(policy.cutover_at,actor.effective_at,unixepoch()-${GENERAL_REPLY_TTL}) AND ?<=unixepoch()+60
       AND NOT EXISTS (SELECT 1 FROM telegram_general_replies WHERE bot_id=policy.bot_id AND update_id=?)
       AND NOT EXISTS (SELECT 1 FROM telegram_inbox WHERE bot_id=policy.bot_id AND update_id=?)
       AND ${GENERAL_ACTOR_QUEUE_CAPACITY}`,
-  bindings: [...generalPolicyBindings(pin), event.actorId, event.messageDate, event.messageDate, event.updateId, event.updateId] };
+  bindings: [...generalPolicyBindings(pin), event.actorId, ...(event.chatType === "private" ? [] : [event.chatId, event.chatType]),
+    event.messageDate, event.messageDate, event.updateId, event.updateId] };
 }
 
 export async function acceptGeneralTelegramSubscriptionRead(
   db: D1Database, pin: GeneralTelegramPin, event: ReadEvent,
 ): Promise<boolean> {
-  if (!pin.privateManagement || event.actorId === pin.botId || event.chatType !== "private" || event.chatId !== event.actorId
-    || event.threadId !== null || (event.kind === "callback" && !SUBSCRIPTION_READ_TICKET.test(event.ticket))) return false;
+  if (!pin.privateManagement || pin.rehearsal || event.actorId === pin.botId
+    || (event.chatType === "private" ? event.chatId !== event.actorId || event.threadId !== null
+      : event.kind !== "search" || !await groupSchemaReady(db))
+    || (event.kind === "callback" && !SUBSCRIPTION_READ_TICKET.test(event.ticket))) return false;
+  const group = event.chatType !== "private";
   try {
     const auth = eventAuthorization(pin, event);
     const key = [pin.botId, event.updateId, crypto.randomUUID()] as const;
@@ -94,9 +99,10 @@ export async function acceptGeneralTelegramSubscriptionRead(
     const steps = [
       db.prepare(`INSERT INTO telegram_inbox
         (bot_id,update_id,actor_id,chat_id,chat_type,message_id,message_date,thread_id,command,receipt_nonce)
-        SELECT policy.bot_id,?,actor.actor_id,actor.actor_id,'private',?,?,NULL,'help',? ${auth.sql}
+        SELECT policy.bot_id,?,actor.actor_id,?,?,?,?,?,'help',? ${auth.sql}
         ${proof}
-        ON CONFLICT(bot_id,update_id) DO NOTHING`).bind(event.updateId, event.messageId, event.messageDate, key[2], ...auth.bindings,
+        ON CONFLICT(bot_id,update_id) DO NOTHING`).bind(event.updateId, event.chatId, event.chatType, event.messageId, event.messageDate,
+        event.threadId, key[2], ...auth.bindings,
         ...proofBindings),
       prepareGeneralReceiptAuthority(db, pin, key),
     ];
@@ -118,7 +124,7 @@ export async function acceptGeneralTelegramSubscriptionRead(
       db.prepare(`UPDATE telegram_inbox AS incoming SET receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MARKER}',command=CASE WHEN
         EXISTS (SELECT 1 FROM telegram_subscription_read AS detail JOIN telegram_outbox AS reply USING (receipt_id)
           WHERE detail.receipt_id=incoming.receipt_id AND detail.kind${format ? "=" : "<>"}'format')
-        AND ${generalCurrentReceiptSql("incoming")} THEN command END WHERE ${freshness} RETURNING receipt_id`)
+        AND ${generalCurrentReceiptSql("incoming", group ? approvedGroup("incoming") : "1")} THEN command END WHERE ${freshness} RETURNING receipt_id`)
         .bind(...generalPolicyBindings(pin), ...key),
     );
     const results = await db.batch(steps);
@@ -136,16 +142,20 @@ export async function renderGeneralSubscriptionRead(
   db: D1Database, pin: GeneralTelegramPin, lease: ReadLease, bucket: R2Bucket, publicOrigin: PublicOrigin,
   refreshAvailable?: () => Promise<boolean>, offerShare = false,
 ): Promise<Awaited<ReturnType<typeof renderTelegramSearchResults>> | null> {
-  const guard = { sql: `inbox.receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MARKER}' AND ${generalCurrentReceiptSql("inbox")}`,
+  const group = lease.chatType !== "private";
+  const guard = { sql: `inbox.receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MARKER}'
+    AND ${generalCurrentReceiptSql("inbox", group ? approvedGroup("inbox") : "1")}`,
     bindings: generalPolicyBindings(pin) };
   const row = await db.prepare(`SELECT detail.kind,detail.subscription_id AS subscriptionId,detail.format,
       detail.search_receipt_id AS searchReceiptId,detail.search_offset AS searchOffset
     FROM telegram_inbox AS inbox JOIN telegram_subscription_read AS detail USING (receipt_id)
     JOIN telegram_outbox AS reply USING (receipt_id)
-    WHERE inbox.receipt_id=? AND inbox.bot_id=? AND inbox.actor_id=? AND inbox.message_id=? AND inbox.chat_id=inbox.actor_id
-      AND inbox.chat_type='private' AND inbox.thread_id IS NULL AND reply.state='leased'
+    WHERE inbox.receipt_id=? AND inbox.bot_id=? AND inbox.actor_id=? AND inbox.message_id=? AND inbox.chat_id=?
+      AND inbox.chat_type=? AND inbox.thread_id IS ?
+      AND ${group ? "detail.kind IN ('search','usage','limit','stale')" : "inbox.chat_id=inbox.actor_id"} AND reply.state='leased'
       AND reply.lease_id=? AND reply.attempts=? AND reply.lease_until>unixepoch() AND ${guard.sql}`)
-    .bind(lease.receiptId, pin.botId, lease.actorId, lease.messageId, lease.leaseId, lease.attempts, ...guard.bindings)
+    .bind(lease.receiptId, pin.botId, lease.actorId, lease.messageId, lease.chatId, lease.chatType, lease.threadId,
+      lease.leaseId, lease.attempts, ...guard.bindings)
     .first<TelegramSubscriptionReadReceipt>();
   if (!row) return null;
   if (row.kind === "format" && row.subscriptionId !== null && row.format !== null) {

@@ -1,4 +1,6 @@
 import type { PublicOrigin } from "../public-origin.ts";
+import { renderTelegramHelp, type TelegramCommandContext } from "./command-catalog.ts";
+import type { TelegramMainMenuFeatures } from "./main-menu.ts";
 import { GENERAL_TELEGRAM_PROVIDER_MARKER } from "../provider-jobs.ts";
 import { acceptTelegramAggregate, GENERAL_AGGREGATE_SCHEMA, GENERAL_TELEGRAM_AGGREGATE_MARKER, prepareTelegramAggregateCode,
   renderTelegramAggregateResult, type TelegramAggregateReply } from "./aggregate-actions.ts";
@@ -10,7 +12,7 @@ import { acceptGeneralAuthAction, GENERAL_AUTH_ACTION_MARKER, GENERAL_AUTH_ACTIO
   prepareGeneralAuthActionReply, readGeneralAuthAction, renderGeneralAuthActionReply,
   type GeneralAuthReply } from "./general-auth-actions.ts";
 import {
-  generalReadEvent, renderGeneralReadReply,
+  generalReadEvent,
   type GeneralReadCommand, type GeneralReadEvent, type GeneralTelegramPin,
 } from "./general-auth-runtime.ts";
 import { GENERAL_READ_LANE_ROLE, generalReadLaneRoleBindings } from "./general-read-lane.ts";
@@ -54,7 +56,7 @@ import { acceptTelegramShortLink, GENERAL_SHORT_SCHEMA, GENERAL_TELEGRAM_SHORT_M
   reapFailedTelegramShortLinks, retireUnsentTelegramShortLink } from "./short-link-actions.ts";
 import { GROUP_SHARE_PUBLISH_CALLBACK, readGeneralGroupShare, readGeneralPrivateDocumentUpdate, readGeneralPrivateLifecycleUpdate, readGeneralPrivateSubscriptionRead,
   readGeneralInlineQuery, readGeneralPrivateProviderBatch, readGeneralPrivateProviderRefresh, readGeneralPrivateSelectedRevoke, readGeneralPrivateShareClaim, readGeneralPrivateShareCreation,
-  readGeneralPrivateTempUpdate, readPrivateTelegramCommand, readTelegramUpdate } from "./protocol.ts";
+  readGeneralPrivateTempUpdate, readGeneralPrivateMenuCommand, readPrivateTelegramCommand, readTelegramUpdate } from "./protocol.ts";
 import { confirmTelegramSubscriptionReadSend, GENERAL_SUBSCRIPTION_READ_MARKER, insertTelegramSubscriptionReadTickets,
   prepareTelegramSubscriptionReadTickets, reapTelegramSubscriptionReadTickets,
   type TelegramSubscriptionReadTicket } from "./subscription-read.ts";
@@ -92,7 +94,7 @@ interface SharedReadLease {
   actorRole: "admin" | "member";
   command: GeneralReadCommand | "auth-add" | "auth-remove" | "auth-list";
   marker: string;
-  viewKind: "list" | "recycle" | null;
+  viewKind: "list" | "expiry" | "recycle" | null;
   actionKind: TelegramLifecycleReply["kind"] | null;
   actionSubscriptionId: number | null;
   actionRevision: number | null;
@@ -135,12 +137,12 @@ function groupClaimFamily(alias: "inbox" | "earlier"): string {
 function family(alias: "inbox" | "earlier", group: boolean, pin: GeneralTelegramPin, includeExports = true): string {
   const privateScope = `${alias}.chat_type='private' AND ${alias}.chat_id=${alias}.actor_id AND ${alias}.thread_id IS NULL`;
   const groupScope = group ? ` OR (${alias}.receipt_nonce='${GROUP_MARKER}' AND ${alias}.chat_type IN ('group','supergroup')
-    AND ${alias}.command='list' AND (${alias}.chat_type='supergroup' OR ${alias}.thread_id IS NULL))` : "";
+    AND ${alias}.command IN ('start','help','list') AND (${alias}.chat_type='supergroup' OR ${alias}.thread_id IS NULL))` : "";
   const view = `EXISTS (SELECT 1 FROM telegram_view AS page WHERE page.receipt_id=${alias}.receipt_id
     AND page.after_id IS NULL AND page.after_epoch IS NULL AND page.kind`;
   const ordinary = `((${alias}.receipt_nonce='${MARKER}' AND ${privateScope})${groupScope})
-    AND ((${alias}.command='list' AND ${view}='list'))
-      OR (${alias}.command='help' AND NOT EXISTS (SELECT 1 FROM telegram_view WHERE receipt_id=${alias}.receipt_id)))`;
+    AND ((${alias}.command='list' AND ${view} IN ('list','expiry','recycle')))
+      OR (${alias}.command IN ('start','help') AND NOT EXISTS (SELECT 1 FROM telegram_view WHERE receipt_id=${alias}.receipt_id)))`;
   const temp = pin.privateTemp ? `OR (${alias}.command='help' AND CASE
     WHEN ${generalTempRawMarker(alias)} THEN EXISTS (SELECT 1 FROM telegram_temp_reply
       WHERE receipt_id=${alias}.receipt_id AND kind='summary')
@@ -149,7 +151,7 @@ function family(alias: "inbox" | "earlier", group: boolean, pin: GeneralTelegram
   const document = pin.privateDocument ? `OR (${generalDocumentReplyScope(alias)})` : "";
   const provider = pin.privateProvider ? `OR (${generalProviderReplyScope(alias)})` : "";
   const management = pin.privateManagement ? `((${ordinary}) OR (/* subs-bot:telegram-general-private-lifecycle:v1 */ ${privateScope} AND (
-    (${alias}.receipt_nonce='${GENERAL_LIFECYCLE_VIEW_MARKER}' AND ${alias}.command='list' AND ${view} IN ('list','recycle')))
+    (${alias}.receipt_nonce='${GENERAL_LIFECYCLE_VIEW_MARKER}' AND ${alias}.command='list' AND ${view} IN ('list','expiry','recycle')))
     OR (${alias}.receipt_nonce='${GENERAL_LIFECYCLE_MARKER}' AND ${alias}.command='help'
       AND EXISTS (SELECT 1 FROM telegram_lifecycle_action WHERE receipt_id=${alias}.receipt_id))
     OR (${alias}.receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MARKER}' AND ${alias}.command='help'
@@ -157,6 +159,9 @@ function family(alias: "inbox" | "earlier", group: boolean, pin: GeneralTelegram
         WHERE receipt_id=${alias}.receipt_id))
     OR (${alias}.receipt_nonce='${GENERAL_PATH_MARKER}' AND ${alias}.command='help'
       AND EXISTS (SELECT 1 FROM telegram_path_reply WHERE receipt_id=${alias}.receipt_id)) ${temp} ${document} ${provider})))` : ordinary;
+  const groupSearch = group && pin.privateManagement ? ` OR (${alias}.receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MARKER}'
+    AND ${alias}.chat_type IN ('group','supergroup') AND ${alias}.command='help'
+    AND EXISTS (SELECT 1 FROM telegram_subscription_read WHERE receipt_id=${alias}.receipt_id AND kind IN ('search','usage','limit','stale')))` : "";
   if (pin.rehearsal) return management;
   return `(CASE WHEN ${alias}.receipt_nonce='${GENERAL_AUTH_ACTION_MARKER}'
     THEN (${privateScope} AND ${alias}.command IN ('auth-add','auth-remove','auth-list') AND ${GENERAL_AUTH_ACTION_SCHEMA})
@@ -183,7 +188,7 @@ function family(alias: "inbox" | "earlier", group: boolean, pin: GeneralTelegram
     THEN (${selectedFamily(alias)})` : ""}
     ${includeExports && pin.privateShort ? `WHEN ${alias}.receipt_nonce='${GENERAL_TELEGRAM_SHORT_MARKER}'
     THEN (${shortFamily(alias)})` : ""}
-    ELSE (${management}) END)`;
+    ELSE ((${management})${groupSearch}) END)`;
 }
 
 function queueMarkers(group: boolean, pin: GeneralTelegramPin): string {
@@ -208,7 +213,7 @@ function queueMarkers(group: boolean, pin: GeneralTelegramPin): string {
 }
 
 function current(alias: "inbox" | "earlier", group: boolean, pin: GeneralTelegramPin): string {
-  const groupScope = group ? `(${alias}.receipt_nonce<>'${GROUP_MARKER}' OR (${approvedGroup(alias)}))` : "1";
+  const groupScope = group ? `(${alias}.chat_type='private' OR (${approvedGroup(alias)}))` : "1";
   const pathScope = pin.privateManagement ? `(${alias}.receipt_nonce<>'${GENERAL_PATH_MARKER}' OR ${PATH_SCHEMA})` : "1";
   const tempScope = pin.privateTemp ? ` AND ((${alias}.receipt_nonce<>'${TELEGRAM_GENERAL_TEMP_MARKER}' AND NOT (${generalTempRawMarker(alias)})) OR (${GENERAL_TEMP_SCHEMA}
     AND ${tempSchemaGuard("legacy-ready")}))` : "";
@@ -349,7 +354,7 @@ export async function acceptGeneralSharedTelegramCommand(
       return result === "queued" ? 200 : result === "busy" ? 503 : 204;
     }
   }
-  const command = pin.privateManagement && !tempEvent ? readPrivateTelegramCommand(decoded.update, pin.botUsername) : null;
+  const command = pin.privateManagement && !tempEvent ? readGeneralPrivateMenuCommand(decoded.update, pin.botUsername) : null;
   if (pin.privateShort && command?.name === "short") {
     if (command.remainder !== "" && !/^ /u.test(command.remainder)) return 204;
     const { actorId, messageId, messageDate, remainder: args } = command;
@@ -389,7 +394,7 @@ export function acceptGeneralReadLaneCommand(
   if (!pin.rehearsal || pin.privateManagement || pin.privateFormats || pin.privateTemp || pin.privateDocument || pin.privateProvider
     || pin.privateClaims || pin.privateShareCreation || pin.privateAggregate || pin.privateSelected || pin.privateShort || pin.privateAuthorization
     || event.chatType !== "private" || event.chatId !== event.actorId
-    || event.threadId !== null || event.viewKind === "recycle") return Promise.resolve(204);
+    || event.threadId !== null || (event.viewKind !== null && event.viewKind !== "list")) return Promise.resolve(204);
   return acceptSharedRead(db, pin, event, null, null, guard);
 }
 
@@ -433,7 +438,7 @@ async function acceptSharedRead(
     : pin.privateManagement && event.viewKind !== null ? GENERAL_LIFECYCLE_VIEW_MARKER : MARKER;
   const fresh = "incoming.bot_id=? AND incoming.update_id=? AND incoming.receipt_nonce=?";
   const proof = temp ? `(${temp.proof}) AND ${generalCurrentAuthoritySql("incoming")}` : path?.proof
-    ?? `incoming.command='help' OR EXISTS (SELECT 1 FROM telegram_view WHERE receipt_id=incoming.receipt_id AND kind=?)`;
+    ?? `incoming.command IN ('start','help') OR EXISTS (SELECT 1 FROM telegram_view WHERE receipt_id=incoming.receipt_id AND kind=?)`;
   const proofBindings = temp ? generalPolicyBindings(pin) : path?.verification ?? [event.viewKind];
   const steps = [
     ...(admissionGuard ? [admissionGuard] : []),
@@ -570,7 +575,9 @@ export async function beginGeneralSharedTelegramReply(
 ): Promise<boolean> {
   if (!pin.sharedOutbox || lease.marker === TELEGRAM_GENERAL_GROUP_CLAIM_MARKER || isGeneralProviderBatchReply(lease.marker)
     || Boolean(metadata) !== (lease.marker === GENERAL_SUBSCRIPTION_READ_MARKER)) return false;
-  if ((tickets.length > 0 || metadata) && (!pin.privateManagement || lease.chatType !== "private" || lease.threadId !== null)) return false;
+  if ((tickets.length > 0 || metadata) && !pin.privateManagement) return false;
+  if ((tickets.length > 0 || (metadata && (metadata.tickets.length > 0 || metadata.refreshTicket)))
+    && (lease.chatType !== "private" || lease.threadId !== null)) return false;
   if (!pin.privateFormats && metadata?.tickets.some(({ kind }) => kind === "format")) return false;
   const refresh = metadata?.refreshTicket;
   if (refresh && !pin.privateProvider) return false;
@@ -792,6 +799,15 @@ export async function drainGeneralSharedTelegramReply(
     const presentation = await renderGeneralSubscriptionRead(db, pin, lease, bucket, publicOrigin, refreshAvailable,
       pin.privateShareCreation && Boolean(share?.context));
     if (!presentation?.readGuard) return false;
+    if (lease.chatType !== "private") {
+      if (presentation.readButtons?.length || presentation.refreshTarget || presentation.shortTarget) return false;
+      if (!await beginGeneralSharedTelegramReply(db, pin, lease, [], { ...presentation.readGuard, tickets: [] })) return false;
+      const confirmed = await confirmTelegramSubscriptionReadSend(db, pin, lease, presentation.readGuard).catch(() => false);
+      const outcome = confirmed ? await sendGeneralTelegramGroupListReply(pin.botToken, lease.chatId, lease.messageId,
+        lease.threadId, presentation.text) : { kind: "failed" as const };
+      await settleTelegramOutboxReply(db, lease, selectLease(pin, lease, false), outcome);
+      return true;
+    }
     const { readGuard, shortTarget } = presentation;
     const issueShort = pin.subscriptionShorts === "issue";
     if (pin.privateFormats && !pin.rehearsal && (lease.attempts > 1 || (issueShort && shortTarget))) {
@@ -846,6 +862,8 @@ export async function drainGeneralSharedTelegramReply(
     return true;
   }
   let presentation: ReturnType<typeof renderTelegramLifecycle>;
+  let commandMenu: TelegramCommandContext | undefined;
+  let mainMenu: TelegramMainMenuFeatures | undefined;
   if (lease.marker === GENERAL_LIFECYCLE_MARKER && lease.actionKind !== null && lease.actionSubscriptionId !== null
     && lease.actionRevision !== null) {
     presentation = renderTelegramLifecycle({ kind: lease.actionKind, subscriptionId: lease.actionSubscriptionId,
@@ -887,17 +905,30 @@ export async function drainGeneralSharedTelegramReply(
     if (!reply) throw new Error("General Telegram provider reply could not be confirmed.");
     presentation = { text: renderTelegramProviderReply(reply.outcome, reply.kind), buttons: [], forceReply: false };
   } else {
-    if (lease.command !== "help" && lease.command !== "list") return false;
-    const text = await renderGeneralReadReply(db, lease.actorId, lease.command);
-    const privateHelp = pin.privateManagement && lease.command === "help";
-    const help = privateHelp ? text + "\n/recycle 查看你的回收站\n/s 名称关键词 搜索你的订阅\n/path 管理你的路径规则" : text;
-    presentation = { text: privateHelp && pin.privateTemp ? help + "\n/temp 查看临时节点数量" : help, buttons: [], forceReply: false };
+    if (lease.command !== "help" && lease.command !== "list" && lease.command !== "start") return false;
+    if (lease.command === "list") {
+      const view = await renderTelegramView(db, lease.actorId, { kind: lease.viewKind ?? "list", afterId: null, afterEpoch: null });
+      presentation = { text: view.text, buttons: [], forceReply: false };
+    } else {
+      const features: TelegramMainMenuFeatures = {
+        management: pin.privateManagement, subscriptionRead: pin.privateManagement, temp: pin.privateTemp,
+        path: pin.privateManagement, aggregate: pin.privateAggregate && aggregateKey !== null,
+        selected: pin.privateSelected && aggregateKey !== null, short: pin.privateShort && aggregateKey !== null,
+        share: pin.privateShareCreation && Boolean(share?.context), batchRefresh: false,
+        inlineOff: pin.privateInline, batchStatus: pin.providerBatch, authorization: pin.privateAuthorization, displayTimezone: pin.displayTimezone,
+        documentImport: pin.privateDocument, ...pin.commandFeatures,
+      };
+      commandMenu = { privateChat: lease.chatType === "private", role: lease.actorRole, features };
+      const text = renderTelegramHelp(commandMenu);
+      presentation = { text: lease.command === "start" ? `欢迎使用 subs-bot。\n${text}` : text, buttons: [], forceReply: false };
+      if (commandMenu.privateChat) mainMenu = features;
+    }
   }
   const prepared = presentation.buttons.length ? await prepareTelegramLifecycleTickets(presentation.buttons) : undefined;
   if (!await beginGeneralSharedTelegramReply(db, pin, lease, prepared?.tickets)) return false;
   const outcome = lease.chatType === "private"
     ? await sendGeneralTelegramPrivateReply(pin.botToken, lease.actorId, lease.messageId, presentation.text,
-      prepared?.keyboard, presentation.forceReply)
+      prepared?.keyboard, presentation.forceReply, mainMenu)
     : await sendGeneralTelegramGroupListReply(pin.botToken, lease.chatId, lease.messageId, lease.threadId, presentation.text);
   await settleTelegramOutboxReply(db, lease, selectLease(pin, lease, false), outcome);
   return true;

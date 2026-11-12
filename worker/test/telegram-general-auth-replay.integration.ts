@@ -9,6 +9,7 @@ import { test } from "node:test";
 import { build } from "esbuild";
 import { Log, LogLevel, Miniflare } from "miniflare";
 import { PRODUCTION_PUBLIC_ORIGIN } from "../src/public-origin.ts";
+import { renderTelegramHelp } from "../src/telegram/command-catalog.ts";
 import { createPrivateShare, privateShareCodeDigest } from "../src/private-shares.ts";
 import { publishNodeSnapshot } from "../src/storage.ts";
 import { parseSubscriptionDocument } from "../src/subscription-document.ts";
@@ -90,7 +91,7 @@ test("closed general authorization replays a sealed candidate in a separate emit
   const generalSent: GeneralAuthReplayMessage[] = [];
   const laneSent: GeneralAuthReplayMessage[] = [];
   const sharedSent: (GeneralAuthReplayMessage & { message_thread_id?: number })[] = [];
-  const lifecycleSent: (GeneralAuthReplayMessage & { reply_markup?: {
+  const lifecycleSent: (GeneralAuthReplayMessage & { message_thread_id?: number; reply_markup?: {
     force_reply?: boolean; inline_keyboard?: { text: string; callback_data: string }[][];
   } })[] = [];
   const lifecycleMessagesById = new Map<number, (typeof lifecycleSent)[number]>();
@@ -250,7 +251,8 @@ test("closed general authorization replays a sealed candidate in a separate emit
     lifecycleSent.push(message);
     const messageId = 9400 + lifecycleSent.length;
     lifecycleMessagesById.set(messageId, message);
-    return Response.json({ ok: true, result: { chat: { id: Number(message.chat_id) }, message_id: messageId } });
+    return Response.json({ ok: true, result: { chat: { id: Number(message.chat_id) }, message_id: messageId,
+      ...(message.message_thread_id === undefined ? {} : { message_thread_id: message.message_thread_id }) } });
   };
   const runtime = new Miniflare({ log: new Log(LogLevel.NONE), workers: [
     { name: "serving", modules: true, script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"],
@@ -633,8 +635,9 @@ test("closed general authorization replays a sealed candidate in a separate emit
   }
   assert.deepEqual(await findReply(7104), { marker: "general-read:v1", state: "sent", messageId: 9302,
     generation: pin.generation, actorRevision: 1, kind: null });
-  assert.deepEqual(sharedSent[1], { chat_id: "101", text: "可用命令\n/help 帮助\n/list 查看你的订阅",
-    reply_parameters: { message_id: 7104 }, link_preview_options: { is_disabled: true } });
+  assert.deepEqual(sharedSent[1], { chat_id: "101", text: renderTelegramHelp({ privateChat: true, role: "admin", features: {} }),
+    reply_parameters: { message_id: 7104 }, link_preview_options: { is_disabled: true },
+    reply_markup: { keyboard: [[{ text: "📦 订阅列表" }], [{ text: "❓ 帮助菜单" }]], resize_keyboard: true } });
 
   const receiptFacts = (updateId: number, proof = sharedPin) => {
     const pins = generalPolicyBindings(proof);
@@ -705,10 +708,10 @@ test("closed general authorization replays a sealed candidate in a separate emit
     .bind("442b9f1e52ad961aac41ee9416760863984646a96570bd22f26474d329ee626e").run();
 
   for (const rejected of [
-    groupPost(102, addressed), groupPost(101, "/list"), groupPost(101, "/list@DifferentBot"),
+    groupPost(102, addressed), groupPost(101, "/list extra"), groupPost(101, "/list@DifferentBot"),
     groupPost(101, addressed, { chatId: -100200 }), groupPost(101, addressed, { chatType: "group" }),
     groupPost(101, addressed, { message: { message_thread_id: 44 } }),
-    groupPost(101, "/help@GeneralFixtureBot"), groupPost(101, addressed, { date: pin.cutoverAt }),
+    groupPost(101, "/help@GeneralFixtureBot extra"), groupPost(101, addressed, { date: pin.cutoverAt }),
   ]) assert.equal((await rejected).status, 204);
   await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,'104',5,?,'member')")
     .bind(pin.botId, pin.generation, now - 1).run();
@@ -836,7 +839,11 @@ test("closed general authorization replays a sealed candidate in a separate emit
   };
   assert.equal((await sharedPost(101, "/s Renamed")).status, 204);
   await grantGroup();
-  assert.equal((await post(101, "/s@GeneralFixtureBot Renamed", { ...groupEvent, worker: lifecycle })).status, 204);
+  assert.equal((await post(101, "/s@GeneralFixtureBot Renamed", { ...groupEvent, updateId: 7319, worker: lifecycle })).status, 200);
+  const groupMetadata = (await awaitLifecycle(7319)).message;
+  assert.deepEqual(groupMetadata, { chat_id: groupId, text: "搜索结果\n#1 Renamed lifecycle fixture", message_thread_id: 44,
+    reply_parameters: { message_id: 7319, allow_sending_without_reply: false }, link_preview_options: { is_disabled: true } });
+  assert.doesNotMatch(JSON.stringify(groupMetadata), /source\.fixture|fixture-token|\/sub\/|\/agg\//u);
   assert.equal((await lifecyclePost(7320, 101, "/s Renamed")).status, 200);
   const searched = await awaitLifecycle(7320);
   assert.match(searched.message.text, /Renamed lifecycle fixture/u);
@@ -2331,4 +2338,63 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.deepEqual(await armedTickets(), [{ armed: 0 }, { armed: 1 }]);
   await reapTelegramProviderBatchTickets(db, scopedBatchPin);
   assert.deepEqual(await armedTickets(), [{ armed: 0 }, { armed: 0 }]);
+
+  // Exercise the same general entry with synthetic roles and a separately approved group.
+  const menuDate = Math.floor(Date.now() / 1000);
+  const menuGroup = -100995;
+  for (const [actor, role] of [[194, "admin"], [195, "member"], [196, "denied"]] as const) {
+    await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,?,?,?,?)")
+      .bind(pin.botId, pin.generation, String(actor), 1, menuDate - 1, role).run();
+  }
+  await db.prepare("INSERT INTO telegram_general_groups VALUES (?,?,?,'supergroup')")
+    .bind(pin.botId, pin.generation, String(menuGroup)).run();
+  await db.prepare(`INSERT INTO subscriptions(owner_id,name,source_url,token,created_at,updated_at,expire_at)
+    VALUES ('195','Menu fixture https://hidden.fixture.invalid/private','https://source.fixture.invalid/private',
+      'menu-fixture-synthetic-token-only',?,?,?)`).bind(menuDate, menuDate, menuDate + 600).run();
+  const menuPost = (id: number, actor: number, text: string, group = false, extra: PostOptions = {}) =>
+    authPost(id, actor, text, { date: menuDate, ...(group ? { chatId: menuGroup, chatType: "supergroup" } : {}), ...extra });
+  assert.equal((await menuPost(7901, 194, "/help")).status, 200);
+  const adminMenu = (await awaitLifecycle(7901)).message;
+  assert.match(adminMenu.text, /^\/help 发送帮助\n\/list 查看你的订阅\n/u);
+  assert.ok(adminMenu.text.split("\n").includes("/auth list 查看授权"));
+  assert.equal((await menuPost(7902, 195, "/help")).status, 200);
+  const memberMenu = (await awaitLifecycle(7902)).message;
+  assert.doesNotMatch(memberMenu.text, /\/auth|\/settings|\/timezone|\/g |\/ai|\/renumber/u);
+  assert.equal((await menuPost(7903, 195, "/start@GeneralFixtureBot")).status, 200);
+  assert.match((await awaitLifecycle(7903)).message.text, /^欢迎使用 subs-bot。\n\/help 发送帮助/u);
+  assert.equal((await menuPost(7904, 195, "/expire@GeneralFixtureBot")).status, 200);
+  const menuExpiry = await awaitLifecycle(7904);
+  assert.match(menuExpiry.message.text, /^未来 14 天内到期的订阅\n1\. Menu fixture \[链接已省略\]/u);
+  assert.equal((await menuPost(7905, 195, "🟠 临期列表", false, { message: { entities: [] } })).status, 200);
+  assert.equal((await awaitLifecycle(7905)).message.text, (await awaitLifecycle(7904)).message.text);
+  assert.equal((await menuPost(7906, 194, "/help@GeneralFixtureBot", true)).status, 200);
+  const groupHelp = (await awaitLifecycle(7906)).message;
+  assert.equal(groupHelp.chat_id, String(menuGroup));
+  assert.equal(groupHelp.text, "/help 发送帮助\n/list 查看你的订阅\n/expire 查看临期\n/recycle 查看回收站\n/s 关键词 搜索订阅\n订阅详情、导出、节点和设置请回到机器人私聊。");
+  assert.equal(groupHelp.reply_markup, undefined);
+  assert.equal((await menuPost(7907, 195, "/s@GeneralFixtureBot Menu fixture", true)).status, 200);
+  const groupSearch = (await awaitLifecycle(7907)).message;
+  assert.equal(groupSearch.chat_id, String(menuGroup));
+  assert.equal(groupSearch.text, "搜索结果\n#1 Menu fixture [链接已省略]");
+  assert.equal(groupSearch.reply_markup, undefined);
+  assert.doesNotMatch(JSON.stringify(groupSearch), /source\.fixture|hidden\.fixture|menu-fixture-synthetic|\/sub\/|\/agg\//u);
+  for (const [id, actor, text, group] of [[7908, 195, "/auth list", false], [7909, 195, "/auth add 194", false],
+    [7910, 194, "/auth list", true], [7911, 196, "/help", false], [7912, 195, "/help@DifferentBot", true]] as const) {
+    assert.equal((await menuPost(id, actor, text, group)).status, 204);
+    assert.equal(await findReply(id), null);
+  }
+  assert.equal((await menuPost(7913, 195, "/s Menu fixture", true, { chatId: -100996 })).status, 204);
+  assert.equal((await menuPost(7914, 195, "/s Menu fixture")).status, 200);
+  const privateSearch = await awaitLifecycle(7914);
+  const menuDetailTicket = privateSearch.message.reply_markup?.inline_keyboard?.flat()[0]?.callback_data;
+  assert.ok(menuDetailTicket && /^sbr1_[A-Za-z0-9_-]{22}$/u.test(menuDetailTicket));
+  assert.equal((await callback(7915, 194, { ...origin(privateSearch.messageId, 194), date: menuDate }, menuDetailTicket, authWorker)).status, 204);
+  assert.equal((await callback(7916, 195, { ...origin(privateSearch.messageId, menuGroup, "supergroup"), date: menuDate }, menuDetailTicket, authWorker)).status, 204);
+  assert.equal((await callback(7917, 195, { ...origin(privateSearch.messageId, 195), date: menuDate }, "auth:add:194", authWorker)).status, 204);
+  assert.equal(await db.prepare("SELECT count(*) AS n FROM telegram_general_auth_actions AS action JOIN telegram_inbox AS inbox USING(receipt_id) WHERE inbox.update_id BETWEEN 7908 AND 7917").first<number>("n"), 0);
+  const expiryRename = button(menuExpiry.message, "重命名");
+  assert.equal((await callback(7918, 194, { ...origin(menuExpiry.messageId, 194), date: menuDate }, expiryRename, authWorker)).status, 204);
+  assert.equal((await callback(7919, 195, { ...origin(menuExpiry.messageId, 195), date: menuDate }, expiryRename, authWorker)).status, 200);
+  assert.equal((await awaitLifecycle(7919)).message.text, "请回复这条消息，发送新的订阅名称。发送 /cancel 取消。");
+
 });

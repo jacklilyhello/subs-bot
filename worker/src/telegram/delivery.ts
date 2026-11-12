@@ -54,6 +54,7 @@ import { renderTelegramProviderBatchReply } from "./provider-batch-controls.ts";
 import { renderTelegramProviderDocumentReply } from "./provider-document-replies.ts";
 import { renderTelegramApiStatus } from "./api-status.ts";
 import { telegramMainMenuKeyboard, type TelegramMainMenuFeatures } from "./main-menu.ts";
+import { renderTelegramHelp } from "./command-catalog.ts";
 
 const BOT_API = "https://api.telegram.org";
 const MAX_RESPONSE_BYTES = 64 * 1024;
@@ -208,11 +209,13 @@ function sendTelegram(
 
 export function sendGeneralTelegramPrivateReply(
   botToken: string, actorId: string, messageId: number, text: string, keyboard?: InlineKeyboard, forceReply = false,
+  mainMenu?: TelegramMainMenuFeatures,
 ): Promise<TelegramReplyOutcome> {
   return postTelegram(botToken, actorId, "sendMessage", {
     chat_id: actorId, text, reply_parameters: { message_id: messageId }, link_preview_options: { is_disabled: true },
     ...(keyboard?.length ? { reply_markup: { inline_keyboard: keyboard } }
-      : forceReply ? { reply_markup: { force_reply: true } } : {}),
+      : forceReply ? { reply_markup: { force_reply: true } }
+        : mainMenu ? { reply_markup: { keyboard: telegramMainMenuKeyboard(mainMenu), resize_keyboard: true } } : {}),
   }, 5_000, fetch);
 }
 
@@ -406,7 +409,7 @@ async function renderReply(
   if (lease.command.startsWith("auth-")) {
     if (lease.actorId !== policy.adminId) return { text: "只有管理员可以管理授权。", access: "none" };
     if (lease.chatType !== "private") return { text: "请在私聊中管理授权。", access: "none" };
-    if (lease.command === "auth-usage") return { text: "用法：/auth list、/auth add 用户ID、/auth remove 用户ID。", access: "none" };
+    if (lease.command === "auth-usage") return { text: `/auth list 查看授权\n/auth add ${policy.memberId} 授权固定测试用户\n/auth remove ${policy.memberId} 撤权固定测试用户`, access: "none" };
     if (lease.command === "auth-add" || lease.command === "auth-remove") {
       const allowed = lease.command === "auth-add";
       const outcome = await readTelegramAuthChangeOutcome(db, policy, lease, allowed);
@@ -463,14 +466,7 @@ async function renderReply(
     return { text: names.length ? `你的订阅\n${names.join("\n")}` : "你的订阅列表为空。", access: "allowed" };
   }
   const privateChat = lease.chatType === "private" && lease.threadId === null;
-  const help = "使用 /list 查看你的订阅，/expire 查看临期，/recycle 查看回收站。"
-    + (subscriptionReadEnabled ? "\n/s 关键词搜索订阅。" : "")
-    + (privateChat ? "\n/temp 查看临时节点，/path 管理路径规则。"
-      + (subscriptionReadEnabled ? "\n发送列表编号查看订阅详情。" : "")
-      + (menuFeatures.aggregate ? "\n/export 导出全部订阅，/o 关键词导出所选订阅。" : "")
-      + (menuFeatures.batchRefresh ? "\n/updateall 预览批量刷新。" : "")
-      + (privateShareEnabled ? "\n创建私密分享：/share [x份数] [id领取人ID] [s分钟] -- 正文。"
-        + "\n分享自己的订阅：/share sub 订阅ID [x份数] [id领取人ID] [s分钟]。" : "") : "");
+  const help = renderTelegramHelp({ privateChat, role: lease.actorId === policy.adminId ? "admin" : "member", features: menuFeatures });
   return {
     text: lease.command === "start" ? `欢迎使用 subs-bot。\n${help}` : help,
     access: "allowed",
@@ -602,6 +598,8 @@ export async function drainTelegramReplies(
   pageJumpEpoch: number | null = null,
   publicOrigin: PublicOrigin = ISOLATION_PUBLIC_ORIGIN,
   subscriptionShortsEnabled = false,
+  displayTimezoneEnabled = false,
+  providerUrlImportEnabled = false,
 ): Promise<void> {
   const deadline = Date.now() + budgetMs;
   let subscriptionShortsReady: Promise<boolean> | undefined;
@@ -611,7 +609,14 @@ export async function drainTelegramReplies(
   const subscriptionRawFileEnabled = subscriptionRawFileReadiness === true;
   const providerBatchEnabled = providerBatchReadiness === true;
   const providerBatch = providerBatchEnabled ? policy : providerBatchReadiness === "unavailable" ? "unavailable" : undefined;
-  const menuFeatures = { aggregate: aggregateKey !== null, batchRefresh: providerBatchEnabled && providerBatchAdmissionEnabled };
+  const menuFeatures: TelegramMainMenuFeatures = {
+    management: true, subscriptionRead: subscriptionReadEnabled, temp: true, tempRawDefault: true, path: true,
+    aggregate: aggregateKey !== null, selected: aggregateKey !== null,
+    batchRefresh: providerBatchEnabled && providerBatchAdmissionEnabled, batchStatus: providerBatchEnabled, short: shortLinksEnabled && aggregateKey !== null,
+    share: privateShareEnabled, inline: inlineConsentEnabled, inlineTemp: inlineConsentEnabled, inlineSort: inlineSortEnabled,
+    bulkTrash: bulkTrashEnabled, github: gitHubSearchEnabled, apiStatus: apiStatusReadiness === true && apiStatusPromptsEnabled,
+    authorization: true, authorizationScope: "fixed", authorizationMemberId: policy.memberId, displayTimezone: displayTimezoneEnabled, documentImport: true, providerImport: providerEnabled && providerUrlImportEnabled,
+  };
   const apiStatusEnabled = apiStatusReadiness === true;
   const apiStatus = apiStatusEnabled ? policy : apiStatusReadiness === "unavailable" ? "unavailable" : undefined;
   const providerDocumentEnabled = providerDocumentReadiness === true;

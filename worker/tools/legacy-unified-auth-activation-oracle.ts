@@ -3,6 +3,7 @@
 import { createHash } from "node:crypto";
 import type { Miniflare } from "miniflare";
 import { GENERAL_AUTH_LEGACY_ROLE } from "../src/telegram/general-auth-replay.ts";
+import { renderTelegramHelp } from "../src/telegram/command-catalog.ts";
 
 export const GENERAL_RUNTIME_MIGRATION = {
   name: "0044_telegram_general_runtime.sql",
@@ -30,7 +31,7 @@ const TABLES = [
   { name: "general_auth_groups", columns: [["bot_id", "TEXT"], ["chat_id", "TEXT"]],
     primary: ["bot_id", "chat_id"], count: 2 },
 ] as const;
-const HELP = "可用命令\n/help 帮助\n/list 查看你的订阅";
+const HELP = renderTelegramHelp({ privateChat: true, role: "member", features: {} });
 const REPLIES = new Map<number, { actor: string; text: string }>([
   [801, { actor: ADMIN, text: "你的订阅\n1. alpha\n2. empty\n3. beta" }],
   [802, { actor: MEMBER, text: HELP }],
