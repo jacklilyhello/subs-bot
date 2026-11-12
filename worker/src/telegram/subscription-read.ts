@@ -375,7 +375,7 @@ function subscriptionShareHint(subscriptionId: number): string {
 
 export async function renderGeneralSubscriptionMetadata(
   db: D1Database, ownerId: string, subscriptionId: number, expectedRevision: number, guard: Guard, offerFormats = false, offerRefresh = false,
-  offerShare = false, timeZone = "UTC",
+  offerShare = false, timeZone = "UTC", offerBrowsing = false,
 ): Promise<RenderedRead> {
   const row = await db.prepare(`SELECT id,name,expire_at AS expireAt,traffic_used AS trafficUsed,traffic_total AS trafficTotal,
     (last_error IS NOT NULL) AS refreshFailed,generation,${SUBSCRIPTION_LIFECYCLE_REVISION} AS lifecycleRevision,
@@ -389,7 +389,11 @@ export async function renderGeneralSubscriptionMetadata(
   const refreshTarget = await providerRefreshTarget(row, row.sourceUrl);
   const lines = subscriptionMetadataLines(row, timeZone);
   if (offerShare) lines.push(subscriptionShareHint(row.id));
+  const snapshot = offerBrowsing && row.generation > 0 && row.nodeCount > 0 && row.snapshotId !== null && row.manifestSha256 !== null
+    ? { id: row.id, generation: row.generation, lifecycleRevision: row.lifecycleRevision, snapshotId: row.snapshotId,
+      manifestSha256: row.manifestSha256, nodeCount: row.nodeCount } : undefined;
   return { text: lines.join("\n"), readButtons, refreshTarget,
+    ...(snapshot ? { nodeButtons: [{ ...snapshot, text: "浏览节点", pageOffset: 0 }], rawFileTarget: snapshot } : {}),
     readGuard: subscriptionGuard(guard, row, undefined, refreshTarget ? row.sourceUrl : null) };
 }
 
@@ -523,12 +527,18 @@ export function insertTelegramSubscriptionReadTickets(
   if (!validInteger(tickets.length, 1, MAX_BUTTONS) || !validInteger(previousChanges, 1, 16)) {
     throw new RangeError("Invalid Telegram subscription read ticket count.");
   }
-  const origin = general ? `(inbox.receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MARKER}' AND (
+  const origin = general ? `((inbox.receipt_nonce IN ('${GENERAL_SUBSCRIPTION_READ_MARKER}','general-number-detail:v1') AND (
     (ticket.kind='detail' AND EXISTS (SELECT 1 FROM telegram_subscription_read AS search
       JOIN json_each(search.matches) AS item WHERE search.receipt_id=inbox.receipt_id AND search.kind='search'
       AND search.search_receipt_id IS NULL AND json_extract(item.value,'$[0]')=ticket.subscription_id))
     OR (ticket.kind='format' AND EXISTS (SELECT 1 FROM telegram_subscription_read AS detail
-      WHERE detail.receipt_id=inbox.receipt_id AND detail.kind='detail' AND detail.subscription_id=ticket.subscription_id))))`
+      WHERE detail.receipt_id=inbox.receipt_id AND detail.kind='detail' AND detail.subscription_id=ticket.subscription_id))))
+    OR (inbox.receipt_nonce='general-view:v1' AND ticket.kind='detail' AND EXISTS (
+      SELECT 1 FROM telegram_general_subscription_anchor AS anchor WHERE anchor.receipt_id=inbox.receipt_id
+        AND anchor.kind='view' AND anchor.subscription_id=ticket.subscription_id))
+    OR (inbox.receipt_nonce='general-subnodes:v1' AND ticket.kind='detail' AND EXISTS (
+      SELECT 1 FROM telegram_subscription_node_page AS page WHERE page.receipt_id=inbox.receipt_id
+        AND page.subscription_id=ticket.subscription_id)))`
     : `((inbox.receipt_nonce IN (${TELEGRAM_VIEW_RECEIPTS}) AND ticket.kind='detail') OR inbox.receipt_nonce=?
       ${nodePageOrigin ? `OR (inbox.receipt_nonce='${TELEGRAM_SUBSCRIPTION_NODE_MARKER}' AND ticket.kind='detail'
         AND EXISTS (SELECT 1 FROM telegram_subscription_node_page AS page
@@ -553,7 +563,8 @@ export function insertTelegramSubscriptionReadTickets(
 
 export async function reapTelegramSubscriptionReadTickets(db: D1Database, generalBotId?: string): Promise<void> {
   const scope = generalBotId === undefined ? "" : `AND EXISTS (SELECT 1 FROM telegram_inbox AS origin
-    WHERE origin.receipt_id=ticket.origin_receipt_id AND origin.bot_id=? AND origin.receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MARKER}')`;
+    WHERE origin.receipt_id=ticket.origin_receipt_id AND origin.bot_id=?
+      AND origin.receipt_nonce IN ('${GENERAL_SUBSCRIPTION_READ_MARKER}','general-number-detail:v1','general-view:v1','general-subnodes:v1'))`;
   try {
     const result = await db.prepare(`DELETE FROM telegram_subscription_read_ticket WHERE token_sha256 IN (
       SELECT token_sha256 FROM telegram_subscription_read_ticket AS ticket WHERE expires_at<=unixepoch() ${scope}

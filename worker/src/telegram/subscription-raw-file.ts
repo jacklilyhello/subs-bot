@@ -4,6 +4,7 @@ import { digestHex, planSnapshotRead, readPlannedSnapshotNodes, SUBSCRIPTION_LIF
   validInteger, type SubscriptionSnapshot } from "../storage.ts";
 import { inTelegramScope, SUBSCRIPTION_RAW_FILE_TICKET, SUBSCRIPTION_READ_RECEIPT_MARKER,
   type TelegramCommand, type TelegramPolicy, type TelegramSubscriptionRawFileUpdate } from "./protocol.ts";
+import type { GeneralTelegramPin } from "./general-auth-runtime.ts";
 
 export const TELEGRAM_SUBSCRIPTION_RAW_FILE_MARKER = "subrawfile:v1";
 export const MAX_RAW_FILE_BYTES = 4 * 1024 * 1024;
@@ -19,7 +20,7 @@ const STALE_TEXT = "订阅或路径规则已变更，请重新打开详情。";
 
 export type TelegramRawFileTarget = SubscriptionSnapshot & { lifecycleRevision: number };
 export type TelegramRawFileTicket = TelegramRawFileTarget & { sha256: string };
-export type TelegramRawFileGuard = { sql: string; bindings: readonly (string | number)[] };
+export type TelegramRawFileGuard = { sql: string; bindings: readonly (string | number | null)[] };
 type RawFileLease = TelegramCommand & { receiptId: number; leaseId: string; attempts: number; subscriptionRawFile?: true };
 type PreparedRawFile = { kind: "document"; file: Blob; guard: TelegramRawFileGuard }
   | { kind: "text"; text: string; guard: TelegramRawFileGuard };
@@ -66,18 +67,19 @@ export async function prepareTelegramRawFileButton(pin: TelegramRawFileTarget): 
 }
 
 export function insertTelegramRawFileTicket(
-  db: D1Database, policy: TelegramPolicy, lease: RawFileLease, ticket: TelegramRawFileTicket, previousChanges: number,
+  db: D1Database, policy: TelegramPolicy | GeneralTelegramPin, lease: RawFileLease, ticket: TelegramRawFileTicket, previousChanges: number,
 ): D1PreparedStatement {
   return db.prepare(`INSERT INTO telegram_subscription_raw_file_ticket
     (token_sha256,origin_receipt_id,origin_attempt,actor_role,${PIN_FIELDS},expires_at)
-    SELECT ?,inbox.receipt_id,reply.attempts,?,CASE WHEN inbox.receipt_nonce='${SUBSCRIPTION_READ_RECEIPT_MARKER}'
+    SELECT ?,inbox.receipt_id,reply.attempts,${"privateManagement" in policy ? "recorded.actor_role" : "?"},CASE WHEN inbox.receipt_nonce ${"privateManagement" in policy ? "IN ('general-subscription-read:v1','general-number-detail:v1')" : `='${SUBSCRIPTION_READ_RECEIPT_MARKER}'`}
       AND inbox.chat_type='private' AND inbox.chat_id=inbox.actor_id AND inbox.thread_id IS NULL
       AND detail.kind='detail' AND detail.subscription_id=? THEN detail.subscription_id END,
       ?,?,?,?,?,unixepoch()+${TICKET_SECONDS}
     FROM telegram_inbox AS inbox JOIN telegram_outbox AS reply USING(receipt_id)
     JOIN telegram_subscription_read AS detail USING(receipt_id)
+    ${"privateManagement" in policy ? "JOIN telegram_general_receipt AS recorded USING(receipt_id)" : ""}
     WHERE changes()=? AND reply.receipt_id=? AND reply.lease_id=? AND reply.attempts=? AND reply.state='sending'`)
-    .bind(ticket.sha256, lease.actorId === policy.adminId ? "admin" : "member", ...pinBindings(ticket),
+    .bind(ticket.sha256, ...("privateManagement" in policy ? [] : [lease.actorId === policy.adminId ? "admin" : "member"]), ...pinBindings(ticket),
       previousChanges, lease.receiptId, lease.leaseId, lease.attempts);
 }
 
@@ -143,8 +145,9 @@ export async function acceptTelegramSubscriptionRawFile(
   throw new Error("Telegram subscription file receipt could not be confirmed.");
 }
 
-function inRawFileScope(policy: TelegramPolicy, lease: RawFileLease): boolean {
-  return lease.subscriptionRawFile === true && lease.chatType === "private" && lease.threadId === null && inTelegramScope(policy, lease);
+function inRawFileScope(policy: TelegramPolicy | GeneralTelegramPin, lease: RawFileLease): boolean {
+  return lease.subscriptionRawFile === true && lease.chatType === "private" && lease.chatId === lease.actorId
+    && lease.threadId === null && ("privateManagement" in policy ? policy.privateBrowsing === true && !policy.rehearsal : inTelegramScope(policy, lease));
 }
 
 const leaseScope = `reply.lease_id=? AND reply.attempts=? AND reply.lease_until>unixepoch()
@@ -152,22 +155,24 @@ const leaseScope = `reply.lease_id=? AND reply.attempts=? AND reply.lease_until>
   AND inbox.chat_type='private' AND inbox.actor_id=inbox.chat_id AND inbox.thread_id IS NULL AND inbox.command='help'
   AND inbox.message_id=? AND inbox.message_date=?`;
 
-function leaseArgs(policy: TelegramPolicy, lease: RawFileLease) {
+function leaseArgs(policy: Pick<TelegramPolicy, "botId">, lease: RawFileLease) {
   return [lease.leaseId, lease.attempts, lease.receiptId, policy.botId, lease.updateId, lease.actorId, lease.chatId,
     lease.messageId, lease.messageDate] as const;
 }
 
 export async function prepareTelegramSubscriptionRawFile(
-  db: D1Database, bucket: R2Bucket, policy: TelegramPolicy, lease: RawFileLease, deadline: number,
+  db: D1Database, bucket: R2Bucket, policy: TelegramPolicy | GeneralTelegramPin, lease: RawFileLease, deadline: number,
+  authority?: TelegramRawFileGuard,
 ): Promise<PreparedRawFile | null> {
   if (!inRawFileScope(policy, lease) || Date.now() >= deadline) return null;
-  const receipt: TelegramRawFileGuard = { sql: `inbox.receipt_nonce='${TELEGRAM_SUBSCRIPTION_RAW_FILE_MARKER}' AND EXISTS (
+  if ("privateManagement" in policy && !authority) return null;
+  const receipt: TelegramRawFileGuard = authority ?? { sql: `inbox.receipt_nonce='${TELEGRAM_SUBSCRIPTION_RAW_FILE_MARKER}' AND EXISTS (
     SELECT 1 FROM telegram_subscription_raw_file AS action LEFT JOIN telegram_auth AS auth
       ON auth.bot_id=inbox.bot_id AND auth.user_id=inbox.actor_id WHERE action.receipt_id=inbox.receipt_id
       AND ((inbox.actor_id=? AND action.actor_role='admin' AND action.auth_message_date=0 AND action.auth_message_id=0)
         OR (inbox.actor_id=? AND action.actor_role='member' AND COALESCE(auth.allowed,1)=1
           AND action.auth_message_date=COALESCE(auth.message_date,0) AND action.auth_message_id=COALESCE(auth.message_id,0)
-          AND inbox.message_date>COALESCE(auth.message_date,0))))`, bindings: [policy.adminId, policy.memberId] };
+          AND inbox.message_date>COALESCE(auth.message_date,0))))`, bindings: "privateManagement" in policy ? [] : [policy.adminId, policy.memberId] };
   let pin: RawFileSelection | null;
   try {
     pin = await db.prepare(`SELECT action.subscription_id AS id,action.generation,action.lifecycle_revision AS lifecycleRevision,
@@ -218,7 +223,7 @@ export async function prepareTelegramSubscriptionRawFile(
 }
 
 export async function confirmTelegramSubscriptionRawFileSend(
-  db: D1Database, policy: TelegramPolicy, lease: RawFileLease, guard: TelegramRawFileGuard,
+  db: D1Database, policy: TelegramPolicy | GeneralTelegramPin, lease: RawFileLease, guard: TelegramRawFileGuard,
 ): Promise<boolean> {
   if (!inRawFileScope(policy, lease)) return false;
   try {
@@ -230,11 +235,14 @@ export async function confirmTelegramSubscriptionRawFileSend(
   }
 }
 
-export async function reapTelegramRawFileTickets(db: D1Database): Promise<void> {
+export async function reapTelegramRawFileTickets(db: D1Database, generalBotId?: string): Promise<void> {
   try {
     const result = await db.prepare(`DELETE FROM telegram_subscription_raw_file_ticket WHERE token_sha256 IN (
-      SELECT token_sha256 FROM telegram_subscription_raw_file_ticket WHERE expires_at<=unixepoch()
-      ORDER BY expires_at,token_sha256 LIMIT 40)`).run();
+      SELECT token_sha256 FROM telegram_subscription_raw_file_ticket AS ticket WHERE expires_at<=unixepoch()
+      ${generalBotId === undefined ? "" : `AND EXISTS (SELECT 1 FROM telegram_inbox AS origin
+        WHERE origin.receipt_id=ticket.origin_receipt_id AND origin.bot_id=?
+          AND origin.receipt_nonce IN ('general-subscription-read:v1','general-number-detail:v1'))`}
+      ORDER BY expires_at,token_sha256 LIMIT 40)`).bind(...(generalBotId === undefined ? [] : [generalBotId])).run();
     if (result.success) return;
   } catch {
     // Keep callback and backend values out of diagnostics.

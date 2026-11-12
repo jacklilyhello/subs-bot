@@ -58,7 +58,7 @@ export function insertTelegramProviderRefreshTicket(
       FROM telegram_inbox AS inbox JOIN telegram_outbox AS reply USING(receipt_id)
       JOIN telegram_general_receipt AS recorded USING(receipt_id) JOIN telegram_subscription_read AS detail USING(receipt_id)
       WHERE changes()=? AND reply.receipt_id=? AND reply.lease_id=? AND reply.attempts=? AND reply.state='sending'
-        AND inbox.receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MARKER}' AND inbox.chat_type='private'
+        AND inbox.receipt_nonce IN ('${GENERAL_SUBSCRIPTION_READ_MARKER}','general-number-detail:v1') AND inbox.chat_type='private'
         AND inbox.chat_id=inbox.actor_id AND inbox.thread_id IS NULL AND detail.kind='detail' AND detail.subscription_id=?
         AND (${GENERAL_PROVIDER_REFRESH_SCHEMA}) AND (${generalCurrentReceiptSql("inbox")})`)
       .bind(ticket.tokenSha256, ticket.sourceSha256, ticket.generation, ticket.lifecycleRevision, previousChanges,
@@ -99,7 +99,7 @@ export async function readGeneralProviderRefreshAdmission(
     ${ticketSource} JOIN telegram_general_receipt AS recorded ON recorded.receipt_id=origin.receipt_id
     WHERE ticket.token_sha256=? AND ticket.used_by_receipt_id IS NULL AND ticket.expires_at>unixepoch()
       AND origin.bot_id=? AND origin.actor_id=? AND origin.chat_id=? AND origin.chat_type='private' AND origin.thread_id IS NULL
-      AND origin.receipt_nonce='${GENERAL_SUBSCRIPTION_READ_MARKER}' AND detail.kind='detail' AND detail.subscription_id=ticket.subscription_id
+      AND origin.receipt_nonce IN ('${GENERAL_SUBSCRIPTION_READ_MARKER}','general-number-detail:v1') AND detail.kind='detail' AND detail.subscription_id=ticket.subscription_id
       AND reply.state='sent' AND reply.sent_message_id=? AND reply.attempts=ticket.origin_attempt AND ?>=origin.message_date
       AND ticket.actor_role=recorded.actor_role AND subscriptions.generation=ticket.generation
       AND ${SUBSCRIPTION_LIFECYCLE_REVISION}=ticket.lifecycle_revision

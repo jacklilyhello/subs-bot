@@ -2,6 +2,7 @@ import { digestHex, readSnapshotNodeRange, SUBSCRIPTION_LIFECYCLE_REVISION, vali
 import { inTelegramScope, SUBSCRIPTION_NODE_TICKET, SUBSCRIPTION_READ_RECEIPT_MARKER,
   type TelegramPolicy, type TelegramSubscriptionNodeUpdate } from "./protocol.ts";
 import { displayTelegramName } from "./views.ts";
+import type { GeneralTelegramPin } from "./general-auth-runtime.ts";
 
 export const TELEGRAM_SUBSCRIPTION_NODE_MARKER = "subnodes:v1";
 const PAGE_SIZE = 15;
@@ -111,6 +112,7 @@ export async function prepareTelegramNodePageTickets(buttons: readonly TelegramN
 
 export function insertTelegramNodePageTickets(
   db: D1Database, lease: NodeLease, tickets: readonly TelegramNodePageTicket[], previousChanges: number,
+  general = false,
 ): D1PreparedStatement {
   if (!validInteger(tickets.length, 1, 2) || !validInteger(previousChanges, 1, 16)) {
     throw new RangeError("Invalid Telegram node page ticket count.");
@@ -128,9 +130,9 @@ export function insertTelegramNodePageTickets(
       ticket.page_offset,unixepoch()+${TICKET_SECONDS}
     FROM telegram_inbox AS inbox JOIN telegram_outbox AS reply USING(receipt_id)
     LEFT JOIN telegram_subscription_read AS detail ON detail.receipt_id=inbox.receipt_id
-      AND inbox.receipt_nonce='${SUBSCRIPTION_READ_RECEIPT_MARKER}' AND detail.kind='detail'
+      AND inbox.receipt_nonce ${general ? "IN ('general-subscription-read:v1','general-number-detail:v1')" : `='${SUBSCRIPTION_READ_RECEIPT_MARKER}'`} AND detail.kind='detail'
     LEFT JOIN telegram_subscription_node_page AS page ON page.receipt_id=inbox.receipt_id
-      AND inbox.receipt_nonce='${TELEGRAM_SUBSCRIPTION_NODE_MARKER}'
+      AND inbox.receipt_nonce='${general ? "general-subnodes:v1" : TELEGRAM_SUBSCRIPTION_NODE_MARKER}'
     CROSS JOIN tickets AS ticket
     WHERE changes()=? AND reply.receipt_id=? AND reply.lease_id=? AND reply.attempts=? AND reply.state='sending'`)
     .bind(...tickets.flatMap((item) => [item.sha256, item.id, item.generation, item.lifecycleRevision, item.snapshotId,
@@ -138,17 +140,20 @@ export function insertTelegramNodePageTickets(
 }
 
 export async function renderTelegramSubscriptionNodePage(
-  db: D1Database, bucket: R2Bucket, policy: TelegramPolicy, lease: NodeLease, deadline: number,
+  db: D1Database, bucket: R2Bucket, policy: TelegramPolicy | GeneralTelegramPin,
+  lease: NodeLease, deadline: number, authority?: Guard,
 ): Promise<{ text: string; readGuard?: Guard; nodeButtons?: TelegramNodePageButton[]; backId?: number }> {
   if (lease.chatType !== "private" || lease.chatId !== lease.actorId || lease.threadId !== null) {
     return { text: "请在私聊浏览订阅节点。" };
   }
-  const receiptGuard: Guard = { sql: `inbox.receipt_nonce='${TELEGRAM_SUBSCRIPTION_NODE_MARKER}' AND EXISTS (
+  if ("privateManagement" in policy && (!policy.privateBrowsing || policy.rehearsal || !authority))
+    return { text: "此节点浏览暂不可用。" };
+  const receiptGuard: Guard = authority ?? { sql: `inbox.receipt_nonce='${TELEGRAM_SUBSCRIPTION_NODE_MARKER}' AND EXISTS (
     SELECT 1 FROM telegram_subscription_node_page AS page LEFT JOIN telegram_auth AS auth
       ON auth.bot_id=inbox.bot_id AND auth.user_id=inbox.actor_id WHERE page.receipt_id=inbox.receipt_id
       AND (inbox.actor_id=? OR (COALESCE(auth.allowed,1)=1 AND page.auth_message_date=COALESCE(auth.message_date,0)
         AND page.auth_message_id=COALESCE(auth.message_id,0) AND inbox.message_date>COALESCE(auth.message_date,0))))`,
-    bindings: [policy.adminId] };
+    bindings: "privateManagement" in policy ? [] : [policy.adminId] };
   const pin = await db.prepare(`SELECT page.subscription_id AS id,page.generation,page.lifecycle_revision AS lifecycleRevision,
     page.snapshot_id AS snapshotId,page.manifest_sha256 AS manifestSha256,page.node_count AS nodeCount,page.page_offset AS pageOffset
     FROM telegram_inbox AS inbox JOIN telegram_outbox AS reply USING(receipt_id)
@@ -187,9 +192,12 @@ export async function renderTelegramSubscriptionNodePage(
   }
 }
 
-export async function reapTelegramSubscriptionNodeTickets(db: D1Database): Promise<void> {
+export async function reapTelegramSubscriptionNodeTickets(db: D1Database, generalBotId?: string): Promise<void> {
   const result = await db.prepare(`DELETE FROM telegram_subscription_node_ticket WHERE token_sha256 IN (
-    SELECT token_sha256 FROM telegram_subscription_node_ticket WHERE expires_at<=unixepoch()
-    ORDER BY expires_at,token_sha256 LIMIT 40)`).run();
+    SELECT token_sha256 FROM telegram_subscription_node_ticket AS ticket WHERE expires_at<=unixepoch()
+    ${generalBotId === undefined ? "" : `AND EXISTS (SELECT 1 FROM telegram_inbox AS origin
+      WHERE origin.receipt_id=ticket.origin_receipt_id AND origin.bot_id=?
+        AND origin.receipt_nonce IN ('general-subscription-read:v1','general-number-detail:v1','general-subnodes:v1'))`}
+    ORDER BY expires_at,token_sha256 LIMIT 40)`).bind(...(generalBotId === undefined ? [] : [generalBotId])).run();
   if (!result.success) throw new Error("Telegram subscription node page tickets could not be cleaned up.");
 }
