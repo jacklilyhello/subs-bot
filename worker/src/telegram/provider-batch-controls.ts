@@ -18,6 +18,7 @@ import { GENERAL_ACTOR_QUEUE_CAPACITY, GENERAL_LATEST_ACTOR_SQL, GENERAL_NO_LEGA
   GENERAL_POLICY_PIN_SQL, GENERAL_RECEIPT_SCHEMA, generalCurrentAuthoritySql, generalPolicyBindings,
   prepareGeneralReceiptAuthority } from "./general-receipt.ts";
 import { displayTelegramName } from "./views.ts";
+import { displayTelegramDate, readBotDisplayTimeZone } from "./display-time.ts";
 
 const STATUS_MARKER = "provider-batch-status:v1";
 const GENERAL_STATUS_MARKER = "general-provider-batch-status:v1";
@@ -357,7 +358,7 @@ const notices: Record<Exclude<Kind, "preview" | "status" | "terminal">, string> 
   unavailable: "无法开始批量刷新。订阅可能已变更，或已有批次在运行。请查看 /updateall status。",
 };
 
-function renderProgress(progress: TelegramProviderBatchProgress): string {
+function renderProgress(progress: TelegramProviderBatchProgress, timeZone: string): string {
   const { batchId, targetCount, skippedCount, waiting, pending, leased, saved, failed, stale, expired, finishedAt } = progress;
   const done = saved + failed + stale + expired;
   return [
@@ -365,6 +366,7 @@ function renderProgress(progress: TelegramProviderBatchProgress): string {
     `已保存 ${saved} · 失败 ${failed} · 已变更 ${stale} · 超时 ${expired}`,
     ...(finishedAt === null ? [`等待 ${waiting} · 排队 ${pending} · 处理中 ${leased}`] : []),
     ...(skippedCount > 0 ? [`未纳入 ${skippedCount} 条本地或不支持的订阅。`] : []),
+    ...(finishedAt === null ? [] : [`完成时间：${displayTelegramDate(finishedAt, timeZone)}`]),
   ].join("\n");
 }
 
@@ -435,7 +437,7 @@ export async function renderTelegramProviderBatchReply(
   if (reply.kind === "status" || reply.kind === "terminal") {
     const progress = await readTelegramProviderBatchProgress(db, general ? generalProviderAuthority(policy, true) : policy, lease.actorId, reply.batchId!);
     if (!progress || (reply.kind === "terminal" && progress.finishedAt === null)) return null;
-    const text = renderProgress(progress);
+    const text = renderProgress(progress, await readBotDisplayTimeZone(db, policy.botId));
     if (progress.finishedAt === null) return { text, guard };
     const details = await renderTerminalResults(db, policy, lease.actorId, progress);
     const cleanup = !general && reply.kind === "terminal" && details !== null && progress.failed > 0

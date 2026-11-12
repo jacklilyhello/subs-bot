@@ -12,7 +12,14 @@ export const GENERAL_AUTH_ACTION_SCHEMA = `EXISTS (SELECT /* subs-bot:telegram-g
 const GENERAL_AUTH_NON_REHEARSAL = `EXISTS (SELECT 1 FROM subs_bot_schema_migrations WHERE position=49
   AND name='0049_telegram_general_read_lane.sql'
   AND sha256='5b1220f36273d74fb14f333066ae70f26022c5abf8a60f2d236c6a23e3bcce88' AND mode='applied')
-  AND NOT EXISTS (SELECT 1 FROM telegram_general_read_lane WHERE bot_id=policy.bot_id)`;
+`;
+
+function authorizationLane(pin: GeneralTelegramPin | undefined, bot: string, generation: string): string {
+  return pin?.isolationWindow ? `EXISTS (SELECT 1 FROM telegram_general_isolation_window AS profile
+    JOIN telegram_general_read_lane AS lane USING(bot_id) WHERE profile.bot_id=${bot} AND profile.profile='full-v1'
+      AND profile.generation=${generation} AND lane.generation=profile.generation AND lane.mode IN ('closed','general'))`
+    : `NOT EXISTS (SELECT 1 FROM telegram_general_read_lane WHERE bot_id=${bot})`;
+}
 const REGRANT_HOLD_SECONDS = 60;
 const ACTOR_ID = /^[1-9][0-9]{0,15}$/u;
 const ROLE_LABELS = { admin: "管理员", member: "已授权", denied: "已撤权" } as const;
@@ -34,6 +41,7 @@ type Action = NonNullable<ReturnType<typeof readGeneralAuthAction>>;
 
 export async function acceptGeneralAuthAction(db: D1Database, pin: GeneralTelegramPin, action: Action): Promise<number> {
   if (!pin.privateAuthorization || !pin.privateManagement || !pin.sharedOutbox || pin.rehearsal) return 204;
+  if (pin.isolationWindow && action.action !== "auth-list" && action.targetId !== pin.isolationWindow.memberId) return 204;
   const nonce = crypto.randomUUID();
   const key = [pin.botId, action.updateId, nonce] as const;
   const grant = action.action === "auth-add";
@@ -42,7 +50,7 @@ export async function acceptGeneralAuthAction(db: D1Database, pin: GeneralTelegr
   const incoming = "incoming.bot_id=? AND incoming.update_id=? AND incoming.receipt_nonce=?";
   const authority = `FROM ${GENERAL_POLICY_ACTORS_SQL}
     WHERE ${GENERAL_POLICY_PIN_SQL} AND ${GENERAL_RECEIPT_SCHEMA} AND ${GENERAL_AUTH_ACTION_SCHEMA}
-      AND ${GENERAL_AUTH_NON_REHEARSAL} AND ${GENERAL_NO_LEGACY_WORK} AND policy.active=1
+      AND ${GENERAL_AUTH_NON_REHEARSAL} AND ${authorizationLane(pin, "policy.bot_id", "policy.generation")} AND ${GENERAL_NO_LEGACY_WORK} AND policy.active=1
       AND actor.actor_id=? AND actor.role='admin' AND ${GENERAL_LATEST_ACTOR_SQL}
       AND ?>MAX(policy.cutover_at,actor.effective_at,unixepoch()-${GENERAL_REPLY_TTL}) AND ?<=unixepoch()+60
       AND NOT EXISTS (SELECT 1 FROM telegram_general_replies WHERE bot_id=policy.bot_id AND update_id=?)`;
@@ -123,14 +131,13 @@ export type GeneralAuthReply = {
 
 export function prepareGeneralAuthActionReply(db: D1Database, lease: {
   receiptId: number; leaseId: string; attempts: number; command: string;
-}): D1PreparedStatement {
+}, pin?: GeneralTelegramPin): D1PreparedStatement {
   if (lease.command === "auth-list") {
     return db.prepare(`WITH origin AS MATERIALIZED (
         SELECT inbox.bot_id,recorded.generation FROM telegram_inbox AS inbox
         JOIN telegram_general_receipt AS recorded USING(receipt_id) JOIN telegram_outbox AS reply USING(receipt_id)
         WHERE inbox.receipt_id=? AND reply.state='sending' AND reply.lease_id=? AND reply.attempts=?
-          AND recorded.actor_role='admin' AND NOT EXISTS (
-            SELECT 1 FROM telegram_general_read_lane WHERE bot_id=inbox.bot_id)
+          AND recorded.actor_role='admin' AND ${authorizationLane(pin, 'inbox.bot_id', 'recorded.generation')}
       ), page AS MATERIALIZED (
         SELECT DISTINCT actor.actor_id FROM origin JOIN telegram_general_actors AS actor USING(bot_id,generation)
         ORDER BY actor.actor_id LIMIT ${GENERAL_AUTH_LIST_LIMIT + 1}
@@ -148,7 +155,7 @@ export function prepareGeneralAuthActionReply(db: D1Database, lease: {
           WHERE latest.bot_id=auth.bot_id AND latest.generation=auth.generation AND latest.actor_id=auth.target_id)
     ) AS current FROM telegram_general_auth_actions AS auth JOIN telegram_outbox USING(receipt_id)
     WHERE receipt_id=? AND state='sending' AND lease_id=? AND attempts=?
-      AND NOT EXISTS (SELECT 1 FROM telegram_general_read_lane WHERE bot_id=auth.bot_id)`)
+      AND ${authorizationLane(pin, "auth.bot_id", "auth.generation")}`)
     .bind(desired, lease.receiptId, lease.leaseId, lease.attempts);
 }
 
