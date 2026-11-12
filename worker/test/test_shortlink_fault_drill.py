@@ -4,6 +4,7 @@ from copy import deepcopy
 from dataclasses import asdict, replace
 from io import BytesIO
 from pathlib import Path
+import base64
 import json
 import sqlite3
 import sys
@@ -20,10 +21,12 @@ from cloudflare_isolation import CloudflareError, _Deployment, _Version
 
 KEY = bytes(range(32))
 REVISION = "a" * 40
-IDS = {name: f"00000000-0000-4000-8000-{number:012d}" for number, name in enumerate(("original", "recovery", "canary", "foreign"), 1)}
+IDS = {name: f"00000000-0000-4000-8000-{number:012d}" for number, name in enumerate(("original", "recovery", "canary", "foreign", "forward", "forward2"), 1)}
 BASE_TAG = "batch-ready-" + "b" * 64
-REAL_DIGEST = "c" * 64
-NORMAL = _Version(REVISION, "d" * 64, "2026-07-30", drill.external.release_tag(BASE_TAG, REAL_DIGEST, True),
+BUSINESS = "sl_" + "z" * 64
+MODULE = b"export default {fetch(){return new Response('synthetic normal')}}"
+REAL_DIGEST = drill.sha256(BUSINESS.encode()).hexdigest()
+NORMAL = _Version(REVISION, drill.sha256(MODULE).hexdigest(), "2026-07-30", drill.external.release_tag(BASE_TAG, REAL_DIGEST, True),
     telegram_config_sha256="e" * 64, telegram_aggregate_key_sha256="f" * 64,
     external_shortlink_capable=True, external_shortlink_token_sha256=REAL_DIGEST,
     external_shortlink_base_tag=BASE_TAG, telegram_external_shortlinks=True)
@@ -41,15 +44,40 @@ def checkpoint():
 
 
 class Scope:
+    versions = "/accounts/synthetic/workers/workers/synthetic/versions"
+
     def __init__(self, current="canary"):
         self.current = _Deployment("00000000-0000-4000-8000-000000000010", IDS[current], None)
-        self.versions = {IDS["original"]: NORMAL, IDS["recovery"]: NORMAL, IDS["canary"]: drill.canary_version(NORMAL), IDS["foreign"]: NORMAL}
+        self.records = {IDS["original"]: NORMAL, IDS["recovery"]: NORMAL, IDS["canary"]: drill.canary_version(NORMAL),
+            IDS["foreign"]: replace(NORMAL, digest="0" * 64)}
+        self.module_document = {"id": IDS["recovery"], "main_module": "index.js", "modules": [{"name": "index.js",
+            "content_type": "application/javascript+module", "content_base64": base64.b64encode(MODULE).decode()}]}
+        self.uploads = []
+        self.on_upload = None
+        self.lose_upload_ack = False
 
     def active(self):
         return self.current
 
     def version(self, version_id):
-        return self.versions[version_id]
+        return self.records[version_id]
+
+    def worker_api(self, method, path, payload=None):
+        assert method == "GET" and payload is None and path == self.versions + "/" + IDS["recovery"] + "?include=modules"
+        return deepcopy(self.module_document)
+
+    def upload(self, module, desired, policy, aggregate, private, business):
+        assert (module, desired, policy, aggregate, private, business) == (MODULE, NORMAL,
+            "synthetic-policy-original", "synthetic-aggregate-original", "synthetic-private-original", BUSINESS)
+        self.uploads.append((module, desired, policy, aggregate, private, business))
+        version_id = IDS["forward"] if len(self.uploads) == 1 else IDS["forward2"]
+        self.records[version_id] = desired
+        if self.on_upload:
+            self.on_upload()
+        if self.lose_upload_ack:
+            self.lose_upload_ack = False
+            raise CloudflareError("Synthetic lost upload acknowledgement", uncertain=True)
+        return version_id
 
 
 class Context:
@@ -62,6 +90,10 @@ class Context:
         self.fail_activation = False
         self.health_available = True
         self.health_checks = []
+        self.raw_policy = "synthetic-policy-original"
+        self.aggregate = "synthetic-aggregate-original"
+        self.private = "synthetic-private-original"
+        self.business = BUSINESS
 
     def verify(self, _checkpoint, *, current=False, healthy=True):
         drill._require(self.config_valid and current, drill.ERROR)
@@ -76,9 +108,11 @@ class Context:
         guard()
         if self.scope.active() != previous:
             raise CloudflareError("Synthetic deployment drift")
+        if target_id == IDS["recovery"]:
+            raise CloudflareError("Synthetic platform rejects pre-secret-change recovery version", http_status=400)
         self.activations.append(target_id)
         self.scope.current = _Deployment("00000000-0000-4000-8000-000000000011", target_id, message)
-        if target_id == IDS["recovery"]:
+        if target == NORMAL:
             self.health_available = True
         if self.fail_activation:
             self.fail_activation = False
@@ -209,13 +243,97 @@ class CheckpointTests(TestCase):
 
 
 class RestorationTests(TestCase):
+    def test_platform_old_secret_version_400_is_avoided_by_exact_forward_upload(self):
+        with TemporaryDirectory() as directory:
+            ctx = Context(directory)
+            active = ctx.scope.active()
+            with self.assertRaises(CloudflareError) as rejected:
+                ctx.activate(active, IDS["recovery"], drill.canary_version(NORMAL), NORMAL, "synthetic", lambda: None)
+            self.assertEqual(rejected.exception.http_status, 400)
+            self.assertEqual(ctx.scope.active(), active)
+            result = drill.restore(ctx, checkpoint(), NORMAL, drill.canary_version(NORMAL))
+            self.assertEqual(result["versionId"], IDS["forward"])
+            self.assertEqual(len(ctx.scope.uploads), 1)
+            self.assertEqual(ctx.activations, [IDS["forward"]])
+
+    def test_signed_recovery_module_rejects_bad_inventory_encoding_and_digest(self):
+        with TemporaryDirectory() as directory:
+            ctx = Context(directory)
+            valid = deepcopy(ctx.scope.module_document)
+            invalid = [{**valid, "id": IDS["foreign"]}, {**valid, "main_module": "other.js"},
+                {**valid, "modules": valid["modules"] * 2}]
+            for key, value in (("name", "other.js"), ("content_type", "text/plain"), ("content_base64", "not base64!"),
+                    ("content_base64", base64.b64encode(b"changed synthetic module").decode()), ("content_base64", "")):
+                module = {**valid["modules"][0], key: value}
+                invalid.append({**valid, "modules": [module]})
+            for value in invalid:
+                ctx.scope.module_document = value
+                with self.assertRaises(CloudflareError):
+                    drill.restore(ctx, checkpoint(), NORMAL, drill.canary_version(NORMAL))
+                self.assertEqual(ctx.scope.uploads, [])
+                self.assertEqual(ctx.activations, [])
+
+    def test_old_candidate_id_is_never_reused_after_uncertain_upload(self):
+        with TemporaryDirectory() as directory:
+            ctx = Context(directory)
+            with patch.object(ctx.scope, "upload", return_value=IDS["recovery"]):
+                with self.assertRaises(CloudflareError):
+                    drill.restore(ctx, checkpoint(), NORMAL, drill.canary_version(NORMAL))
+            self.assertEqual(ctx.scope.active().version, IDS["canary"])
+            self.assertEqual(ctx.activations, [])
+
+    def test_changed_active_deployment_after_staging_is_never_overwritten(self):
+        with TemporaryDirectory() as directory:
+            ctx = Context(directory)
+            ctx.scope.on_upload = lambda: setattr(ctx.scope, "current", _Deployment(
+                "00000000-0000-4000-8000-000000000012", IDS["foreign"], None))
+            with self.assertRaises(CloudflareError):
+                drill.restore(ctx, checkpoint(), NORMAL, drill.canary_version(NORMAL))
+            self.assertEqual(len(ctx.scope.uploads), 1)
+            self.assertEqual(ctx.activations, [])
+            self.assertEqual(ctx.scope.active().version, IDS["foreign"])
+
+    def test_interrupted_upload_or_activation_can_be_recovered_idempotently(self):
+        with TemporaryDirectory() as directory:
+            for boundary in ("upload", "activation"):
+                ctx = Context(directory)
+                ctx.scope.lose_upload_ack = boundary == "upload"
+                ctx.fail_activation = boundary == "activation"
+                with self.assertRaises(CloudflareError):
+                    drill.restore(ctx, checkpoint(), NORMAL, drill.canary_version(NORMAL))
+                result = drill.restore(ctx, checkpoint(), NORMAL, drill.canary_version(NORMAL))
+                expected = IDS["forward2"] if boundary == "upload" else IDS["forward"]
+                self.assertEqual(result["versionId"], expected)
+                self.assertEqual(ctx.activations, [expected])
+                self.assertEqual(len(ctx.scope.uploads), 2 if boundary == "upload" else 1)
+
+    def test_unknown_exact_normal_version_is_only_verified_and_never_mutated(self):
+        with TemporaryDirectory() as directory:
+            ctx = Context(directory, "foreign")
+            ctx.scope.records[IDS["foreign"]] = NORMAL
+            del ctx.scope.records[IDS["recovery"]]
+            result = drill.restore(ctx, checkpoint(), NORMAL, drill.canary_version(NORMAL))
+            self.assertEqual(result["versionId"], IDS["foreign"])
+            self.assertEqual(ctx.scope.uploads, [])
+            self.assertEqual(ctx.activations, [])
+            previous_verify = ctx.verify
+            def drift_after_health(value, *, current=False, healthy=True):
+                previous_verify(value, current=current, healthy=healthy)
+                if healthy:
+                    ctx.scope.current = _Deployment("00000000-0000-4000-8000-000000000012", IDS["foreign"], None)
+            ctx.verify = drift_after_health
+            with self.assertRaises(CloudflareError):
+                drill.restore(ctx, checkpoint(), NORMAL, drill.canary_version(NORMAL))
+            self.assertEqual(ctx.scope.uploads, [])
+            self.assertEqual(ctx.activations, [])
+
     def test_unhealthy_canary_does_not_prevent_verified_recovery_activation(self):
         with TemporaryDirectory() as directory:
             ctx = Context(directory)
             ctx.health_available = False
             drill.restore(ctx, checkpoint(), NORMAL, drill.canary_version(NORMAL))
-            self.assertEqual(ctx.activations, [IDS["recovery"]])
-            self.assertEqual(ctx.health_checks, [IDS["recovery"]])
+            self.assertEqual(ctx.activations, [IDS["forward"]])
+            self.assertEqual(ctx.health_checks, [IDS["forward"]])
 
     def test_restore_only_known_verified_versions_and_is_idempotent(self):
         with TemporaryDirectory() as directory:
@@ -223,9 +341,10 @@ class RestorationTests(TestCase):
             with patch.object(drill.artifact, "require_current_main", side_effect=AssertionError("Recovery must survive main advancing")):
                 result = drill.restore(ctx, checkpoint(), NORMAL, drill.canary_version(NORMAL))
                 self.assertEqual(result["phase"], "restored")
-                self.assertEqual(ctx.activations, [IDS["recovery"]])
+                self.assertEqual(ctx.activations, [IDS["forward"]])
                 drill.restore(ctx, checkpoint(), NORMAL, drill.canary_version(NORMAL))
-                self.assertEqual(ctx.activations, [IDS["recovery"]])
+                self.assertEqual(ctx.activations, [IDS["forward"]])
+                self.assertEqual(len(ctx.scope.uploads), 1)
             for current in ("foreign", "original"):
                 other = Context(directory, current)
                 if current == "foreign":
@@ -242,7 +361,7 @@ class RestorationTests(TestCase):
                 if field == "config":
                     ctx.config_valid = False
                 else:
-                    ctx.scope.versions[IDS["canary"]] = replace(drill.canary_version(NORMAL), digest="0" * 64)
+                    ctx.scope.records[IDS["canary"]] = replace(drill.canary_version(NORMAL), digest="0" * 64)
                 with self.assertRaises(CloudflareError):
                     drill.restore(ctx, checkpoint(), NORMAL, drill.canary_version(NORMAL))
                 self.assertEqual(ctx.activations, [])
@@ -269,8 +388,8 @@ class RestorationTests(TestCase):
                                 wait=lambda _seconds: None, clock=clock, poll_seconds=3)
                         self.assertEqual(drill.failure_projection(raised.exception)["currentPhaseOnFailure"],
                             "run-activation" if scenario == "uncertain-activation" else "run-acceptance")
-                self.assertEqual(ctx.scope.active().version, IDS["recovery"], scenario)
-                self.assertEqual(ctx.activations[-1], IDS["recovery"])
+                self.assertEqual(ctx.scope.active().version, IDS["forward"], scenario)
+                self.assertEqual(ctx.activations[-1], IDS["forward"])
 
 
 class FailureDiagnosticTests(TestCase):

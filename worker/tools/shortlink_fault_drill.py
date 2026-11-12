@@ -8,6 +8,7 @@ No request URL, capability, credential or untrusted API error is printed.
 from dataclasses import asdict, fields, replace
 from hashlib import sha256
 from io import BytesIO
+import base64
 import hmac
 import json
 import os
@@ -23,7 +24,7 @@ import external_shortlink_release as external
 import prepare_isolation_artifact as artifact
 import production_candidate as candidate
 from capacity_resources import CapacityError, integer, read_private, save_private_json
-from cloudflare_isolation import (CloudflareClient, CloudflareError, ProviderApiStatusBinding, ProviderBinding,
+from cloudflare_isolation import (CloudflareClient, CloudflareError, MAX_MODULE_BYTES, ProviderApiStatusBinding, ProviderBinding,
     UUID, _Isolation, _Version, _artifact, _matches, _require, _verify_health)
 from d1_migrations import MigrationError, _load_migrations, _read_state
 from general_read_rehearsal import require_general_read_lane_clear
@@ -55,7 +56,8 @@ FAILURE_PHASES = frozenset({"entry", "context-hosted-identity", "context-resourc
     "prepare-inputs", "artifact", "artifact-manifest", "resources", "config", "active", "version", "artifact-identity",
     "ordinary-tag", "cron", "shortlink-identity", "ordinary-proof", "schema", "idle", "health", "cohort",
     "preupload-recheck", "upload-R", "upload-C", "cohort-recheck", "checkpoint", "run-preflight", "run-activation",
-    "run-acceptance", "restore-preflight", "restore-version", "restore-activation", "restore-readback", "unexpected"})
+    "run-acceptance", "restore-preflight", "restore-version", "restore-module", "restore-upload", "restore-activation",
+    "restore-readback", "unexpected"})
 API_BOUNDARIES = frozenset({"data-read-gate", "d1-resource", "d1-read-query", "r2-bucket", "r2-managed-domain",
     "r2-custom-domains", "worker-resource", "worker-config", "worker-active", "worker-version", "worker-namespace",
     "worker-domains", "worker-schedules", "worker-upload", "worker-activation", "other"})
@@ -383,27 +385,57 @@ def prepare(ctx):
         "canaryVersionId": canary_id, "checkpointSha256": digest(sealed), "activeChanged": False}
 
 
+def recovery_module(scope, version_id, original):
+    """Read the signed normal version's sole module, independently of old CI retention."""
+    _require(scope.version(version_id) == original, ERROR)
+    version = scope.worker_api("GET", f"{scope.versions}/{version_id}?include=modules")
+    _require(isinstance(version, dict) and version.get("id") == version_id and version.get("main_module") == "index.js", ERROR)
+    modules = version.get("modules")
+    _require(isinstance(modules, list) and len(modules) == 1 and isinstance(modules[0], dict), ERROR)
+    module = modules[0]
+    content = module.get("content_base64")
+    _require(module.get("name") == "index.js" and module.get("content_type") == "application/javascript+module"
+        and isinstance(content, str) and 0 < len(content) <= 4 * ((MAX_MODULE_BYTES + 2) // 3), ERROR)
+    try:
+        body = base64.b64decode(content, validate=True)
+    except (ValueError, TypeError):
+        raise CloudflareError(ERROR) from None
+    _require(0 < len(body) <= MAX_MODULE_BYTES and sha256(body).hexdigest() == original.digest, ERROR)
+    return body
+
+
 def restore(ctx, checkpoint, original, canary):
     """Never overwrite a foreign deployment; recovery does not depend on old CI retention or main tip."""
     failure_phase("restore-preflight")
     ctx.verify(checkpoint, current=True, healthy=False)
     failure_phase("restore-version")
     active = ctx.scope.active()
-    expected = {checkpoint["originalVersionId"]: original, checkpoint["recoveryVersionId"]: original,
-        checkpoint["canaryVersionId"]: canary}
-    _require(active.version in expected and ctx.scope.version(active.version) == expected[active.version]
-        and ctx.scope.version(checkpoint["recoveryVersionId"]) == original, ERROR)
     if active.version == checkpoint["canaryVersionId"]:
+        _require(ctx.scope.version(active.version) == canary, ERROR)
         def guard():
             _require(ctx.scope.active() == active and ctx.scope.version(active.version) == canary, ERROR)
             ctx.verify(checkpoint, current=True, healthy=False)
+        failure_phase("restore-module")
+        module = recovery_module(ctx.scope, checkpoint["recoveryVersionId"], original)
+        guard()
+        # Secret changes can prohibit deploying an older version. Upload the exact
+        # normal bundle and protected original secrets forward; never force rollback.
+        failure_phase("restore-upload")
+        forward_id = ctx.scope.upload(module, original, ctx.raw_policy, ctx.aggregate, ctx.private, ctx.business)
+        _require(forward_id not in {checkpoint["originalVersionId"], checkpoint["recoveryVersionId"], checkpoint["canaryVersionId"]}
+            and ctx.scope.version(forward_id) == original, ERROR)
+        guard()
         failure_phase("restore-activation")
-        active = ctx.activate(active, checkpoint["recoveryVersionId"], canary, original,
+        active = ctx.activate(active, forward_id, canary, original,
             f"Restore isolated shortlink fault drill {checkpoint['operationRunId']}/{checkpoint['operationRunAttempt']}", guard)
+    else:
+        # An interrupted activation may have succeeded before its receipt was saved.
+        # An unknown ID is accepted only as an exact, already-normal readback; no write.
+        _require(ctx.scope.version(active.version) == original, ERROR)
     failure_phase("restore-readback")
-    _require(active.version in {checkpoint["originalVersionId"], checkpoint["recoveryVersionId"]}
-        and ctx.scope.active() == active and ctx.scope.version(active.version) == original, ERROR)
+    _require(ctx.scope.active() == active and ctx.scope.version(active.version) == original, ERROR)
     ctx.verify(checkpoint, current=True)
+    _require(ctx.scope.active() == active and ctx.scope.version(active.version) == original, ERROR)
     return {"phase": "restored", "revision": original.revision, "versionId": active.version,
         "deploymentId": active.id, "configurationReadback": "Passed", "postRestoreBusinessRPC": "Not run"}
 
