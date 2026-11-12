@@ -2391,7 +2391,7 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.equal((await callback(7915, 194, { ...origin(privateSearch.messageId, 194), date: menuDate }, menuDetailTicket, authWorker)).status, 204);
   assert.equal((await callback(7916, 195, { ...origin(privateSearch.messageId, menuGroup, "supergroup"), date: menuDate }, menuDetailTicket, authWorker)).status, 204);
   assert.equal((await callback(7917, 195, { ...origin(privateSearch.messageId, 195), date: menuDate }, "auth:add:194", authWorker)).status, 204);
-  assert.equal(await db.prepare("SELECT count(*) AS n FROM telegram_general_auth_actions AS action JOIN telegram_inbox USING(receipt_id) WHERE update_id BETWEEN 7908 AND 7917").first<number>("n"), 0);
+  assert.equal(await db.prepare("SELECT count(*) AS n FROM telegram_general_auth_actions AS action JOIN telegram_inbox AS inbox USING(receipt_id) WHERE inbox.update_id BETWEEN 7908 AND 7917").first<number>("n"), 0);
   const expiryRename = button(menuExpiry.message, "重命名");
   assert.equal((await callback(7918, 194, { ...origin(menuExpiry.messageId, 194), date: menuDate }, expiryRename, authWorker)).status, 204);
   assert.equal((await callback(7919, 195, { ...origin(menuExpiry.messageId, 195), date: menuDate }, expiryRename, authWorker)).status, 200);
