@@ -61,14 +61,17 @@ export async function acceptGeneralAuthAction(db: D1Database, pin: GeneralTelegr
       .bind(action.updateId, action.messageId, action.messageDate, action.action, nonce, ...bindings),
     prepareGeneralReceiptAuthority(db, pin, key),
     ...(action.action === "auth-list" ? [] : [db.prepare(`WITH candidate AS MATERIALIZED (
-        SELECT incoming.receipt_id,incoming.bot_id,incoming.message_date,incoming.update_id,recorded.generation
+        SELECT incoming.receipt_id,incoming.bot_id,incoming.actor_id AS administrator_id,incoming.message_date,incoming.update_id,recorded.generation
         FROM telegram_inbox AS incoming JOIN telegram_general_receipt AS recorded USING(receipt_id)
         WHERE ${incoming} AND recorded.actor_role='admin'
       ), target AS MATERIALIZED (
         SELECT actor.* FROM candidate JOIN telegram_general_actors AS actor USING(bot_id,generation)
         WHERE actor.actor_id=? ORDER BY actor.revision DESC LIMIT 1
       ), decision AS MATERIALIZED (
-        SELECT candidate.*,target.revision,CASE
+        SELECT candidate.*,COALESCE(target.revision,0) AS revision,CASE
+          WHEN ?=candidate.bot_id OR ?=candidate.administrator_id THEN 'unavailable'
+          /* A first revoke records default denial, fencing an older delayed first grant. */
+          WHEN target.actor_id IS NULL THEN 'changed'
           WHEN target.role NOT IN ('member','denied') OR NOT EXISTS (
             SELECT 1 FROM telegram_general_actors AS enrolled WHERE enrolled.bot_id=target.bot_id
               AND enrolled.generation=target.generation AND enrolled.actor_id=target.actor_id
@@ -87,13 +90,14 @@ export async function acceptGeneralAuthAction(db: D1Database, pin: GeneralTelegr
         (receipt_id,bot_id,generation,target_id,message_date,update_id,result,revision)
       SELECT receipt_id,bot_id,generation,CASE WHEN result='unavailable' THEN '' ELSE ? END,message_date,update_id,result,
         CASE result WHEN 'changed' THEN revision+1 WHEN 'unchanged' THEN revision END FROM decision`)
-      .bind(...key, action.targetId, desired, action.targetId),
+      .bind(...key, action.targetId, action.targetId, action.targetId, desired, action.targetId),
     db.prepare(`INSERT INTO telegram_general_actors (bot_id,generation,actor_id,revision,effective_at,role)
-      SELECT auth.bot_id,auth.generation,auth.target_id,auth.revision,MAX(target.effective_at,unixepoch()+?),?
+      SELECT auth.bot_id,auth.generation,auth.target_id,auth.revision,MAX(COALESCE(target.effective_at,0),unixepoch()+?),?
       FROM telegram_inbox AS incoming JOIN telegram_general_auth_actions AS auth USING(receipt_id)
-      JOIN telegram_general_actors AS target ON target.bot_id=auth.bot_id AND target.generation=auth.generation
+      LEFT JOIN telegram_general_actors AS target ON target.bot_id=auth.bot_id AND target.generation=auth.generation
         AND target.actor_id=auth.target_id AND target.revision=auth.revision-1
-      WHERE ${incoming} AND auth.result='changed'`)
+      WHERE ${incoming} AND auth.result='changed'
+        AND ((auth.revision=1 AND target.actor_id IS NULL) OR (auth.revision>1 AND target.actor_id IS NOT NULL))`)
       .bind(grant ? REGRANT_HOLD_SECONDS : 0, desired, ...key)]),
     db.prepare(`INSERT INTO telegram_outbox (receipt_id) SELECT incoming.receipt_id
       FROM telegram_inbox AS incoming WHERE ${incoming}`).bind(...key),
@@ -168,7 +172,7 @@ export function renderGeneralAuthActionReply(rows: readonly GeneralAuthReply[], 
   }
   const reply = rows[0];
   if (!reply || !("result" in reply) || rows.length !== 1) return null;
-  if (reply.result === "unavailable") return "只能管理已登记的普通用户。";
+  if (reply.result === "unavailable") return "无法修改此主体的授权。";
   if (reply.result === "stale" || ((reply.result === "changed" || reply.result === "unchanged") && reply.current === 0)) {
     return "这次授权操作已被较新的状态取代。";
   }
