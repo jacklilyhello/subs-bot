@@ -1,3 +1,6 @@
+import type { GeneralTelegramPin } from "./general-auth-runtime.ts";
+import { generalManagementAdmission, generalManagementScope } from "./general-management.ts";
+import { GENERAL_ACTOR_QUEUE_CAPACITY, generalCurrentReceiptSql, generalPolicyBindings, prepareGeneralReceiptAuthority } from "./general-receipt.ts";
 import { TELEGRAM_PROVIDER_BATCH_CONFIRM_MARKER } from "../provider-jobs.ts";
 import { digestHex, SUBSCRIPTION_LIFECYCLE_REVISION, validInteger } from "../storage.ts";
 import { prepareOwnedSubscriptionMutation, readLegacySelectedRetirement } from "../subscriptions.ts";
@@ -7,6 +10,12 @@ import { selectedQuery, unicode14Lower } from "./selected-search.ts";
 import { displayTelegramName } from "./views.ts";
 
 export const TELEGRAM_BULK_TRASH_MARKER = "bulktrash:v1";
+export const GENERAL_BULK_TRASH_MARKER = "general-bulktrash:v1";
+export const GENERAL_BULK_TRASH_SCHEMA = `EXISTS (SELECT 1 FROM subs_bot_schema_migrations WHERE position=24
+  AND name='0024_telegram_bulk_trash.sql' AND mode='applied'
+  AND sha256='12b1a0e56ea0156cb9a594b5b0d7bd14c40d671a431d3ca610ecb3602bee6360')`;
+type BulkPolicy = TelegramPolicy | GeneralTelegramPin;
+const bulkMarker = (policy: BulkPolicy) => "adminId" in policy ? TELEGRAM_BULK_TRASH_MARKER : GENERAL_BULK_TRASH_MARKER;
 const MAX_TARGETS = 16;
 const MAX_SCAN_ROWS = 512;
 const MAX_SCAN_BYTES = 8 * 1024 * 1024;
@@ -56,7 +65,11 @@ function currentTargets(targets: string, owner: string): string {
       OR EXISTS (SELECT 1 FROM subscription_trash WHERE id=sub.id))`;
 }
 
-function currentRole(inbox: "origin" | "inbox", action: "preview" | "action", callback = false): string {
+function currentRole(inbox: "origin" | "inbox", action: "preview" | "action", callback = false, general = false): string {
+  if (general) return `(${action}.auth_message_date=0 AND ${action}.auth_message_id=0
+    AND ${action}.actor_role=(SELECT actor_role FROM telegram_general_receipt WHERE receipt_id=${inbox}.receipt_id)
+    AND (${generalCurrentReceiptSql(inbox, callback ? GENERAL_ACTOR_QUEUE_CAPACITY : "1")})
+    ${callback ? `AND ?>=${inbox}.message_date` : ""})`;
   return `((${inbox}.actor_id=? AND ${action}.actor_role='admin') OR (
     ${inbox}.actor_id=? AND ${action}.actor_role='member' AND COALESCE(auth.allowed,1)=1
     AND ${action}.auth_message_date=COALESCE(auth.message_date,0) AND ${action}.auth_message_id=COALESCE(auth.message_id,0)
@@ -104,6 +117,11 @@ export async function telegramBulkTrashReady(db: D1Database): Promise<boolean> {
   }
 }
 
+export async function telegramGeneralBulkTrashReady(db: D1Database): Promise<boolean> {
+  return await telegramBulkTrashReady(db)
+    && await db.prepare(`SELECT 1 WHERE ${GENERAL_BULK_TRASH_SCHEMA}`).first() !== null;
+}
+
 function digestTicket(token: string): Promise<string> {
   return crypto.subtle.digest("SHA-256", encoder.encode(token)).then(digestHex);
 }
@@ -144,37 +162,51 @@ export function installFailedBatchTrashTicket(db: D1Database, lease: Lease, offe
 }
 
 export async function acceptTelegramBulkTrash(
-  db: D1Database, policy: TelegramPolicy, event: TelegramBulkTrashUpdate,
+  db: D1Database, policy: BulkPolicy, event: TelegramBulkTrashUpdate,
 ): Promise<"accepted" | "ignored"> {
-  if (!inTelegramScope(policy, event) || event.chatType !== "private" || event.threadId !== null
+  const general = "privateManagement" in policy ? policy : null;
+  const isolated = "adminId" in policy ? policy : null;
+  if ((general ? !generalManagementScope(general, event) : !inTelegramScope(isolated!, event))
+    || event.chatType !== "private" || event.threadId !== null
     || !validInteger(event.updateId, 1) || !validInteger(event.messageId, 1) || !validInteger(event.messageDate, 1)
     || (event.kind === "confirm" && !BULK_TRASH_TICKET.test(event.ticket))) return "ignored";
   const key = [policy.botId, event.updateId, crypto.randomUUID()] as const;
   const scope = [policy.botId, event.updateId, event.actorId, event.chatId, event.messageId, event.messageDate, key[2]] as const;
-  const auth = [event.messageDate, event.actorId, policy.adminId, event.messageDate, policy.botId, event.actorId] as const;
+  const auth = isolated ? [event.messageDate, event.actorId, isolated.adminId, event.messageDate, policy.botId, event.actorId] : [];
+  const admission = general ? generalManagementAdmission(general, event, GENERAL_BULK_TRASH_SCHEMA) : null;
+  const authJoin = general ? "JOIN telegram_general_receipt AS recorded USING(receipt_id)" : AUTH_JOIN;
+  const authFields = general ? "0 AS auth_date,0 AS auth_id,recorded.actor_role" : "COALESCE(auth.message_date,0) AS auth_date,COALESCE(auth.message_id,0) AS auth_id";
   const statements: D1PreparedStatement[] = [];
   try {
     if (event.kind === "preview") {
-      if (!await db.prepare(`SELECT 1 WHERE ${FRESH_ACTION} AND NOT EXISTS (
-        SELECT 1 FROM telegram_inbox WHERE bot_id=? AND update_id=?)`).bind(...auth, policy.botId, event.updateId).first()) return "ignored";
+      const allowed = admission ? db.prepare(`SELECT 1 ${admission.sql}`).bind(...admission.bindings)
+        : db.prepare(`SELECT 1 WHERE ${FRESH_ACTION} AND NOT EXISTS (
+          SELECT 1 FROM telegram_inbox WHERE bot_id=? AND update_id=?)`).bind(...auth, policy.botId, event.updateId);
+      if (!await allowed.first()) return "ignored";
       const scan = await scanTargets(db, event.actorId, event.query);
-      const actorRole = event.actorId === policy.adminId ? "admin" : "member";
-      statements.push(db.prepare(`INSERT INTO telegram_inbox ${CARRIER} SELECT ${CARRIER_VALUES} WHERE ${FRESH_ACTION} ${DEDUP}`)
-        .bind(...scope, ...auth));
+      const actorRole = event.actorId === isolated?.adminId ? "admin" : "member";
+      statements.push(admission ? db.prepare(`INSERT INTO telegram_inbox ${CARRIER}
+        SELECT policy.bot_id,?,actor.actor_id,actor.actor_id,'private',?,?,NULL,'help',? ${admission.sql} ${DEDUP}`)
+        .bind(event.updateId, event.messageId, event.messageDate, key[2], ...admission.bindings)
+        : db.prepare(`INSERT INTO telegram_inbox ${CARRIER} SELECT ${CARRIER_VALUES} WHERE ${FRESH_ACTION} ${DEDUP}`)
+          .bind(...scope, ...auth));
+      if (general) statements.push(prepareGeneralReceiptAuthority(db, general, key));
       if (scan.kind === "scanned") {
         statements.push(db.prepare(`WITH checked AS (
           SELECT incoming.receipt_id, (SELECT count(*) FROM subscriptions WHERE owner_id=incoming.actor_id)=json_array_length(?)
             AND ${currentTargets("?", "incoming.actor_id")} AS stable,
-            COALESCE(auth.message_date,0) AS auth_date,COALESCE(auth.message_id,0) AS auth_id
-          FROM telegram_inbox AS incoming ${AUTH_JOIN} WHERE ${FRESH}
+            ${authFields}
+          FROM telegram_inbox AS incoming ${authJoin} WHERE ${FRESH}
         ) INSERT INTO telegram_bulk_trash (${ACTION_FIELDS})
         SELECT receipt_id,CASE WHEN NOT stable THEN 'stale' WHEN ?=0 THEN 'empty' ELSE 'preview' END,
-          CASE WHEN stable THEN ? ELSE 0 END,CASE WHEN stable AND ?>0 THEN ? END,?,auth_date,auth_id FROM checked`)
-          .bind(scan.inventory, scan.inventory, policy.adminId, ...key, scan.count, scan.count, scan.count, scan.targets, actorRole));
+          CASE WHEN stable THEN ? ELSE 0 END,CASE WHEN stable AND ?>0 THEN ? END,${general ? "actor_role" : "?"},auth_date,auth_id FROM checked`)
+          .bind(scan.inventory, scan.inventory, ...(general ? [] : [isolated!.adminId]), ...key,
+            scan.count, scan.count, scan.count, scan.targets, ...(general ? [] : [actorRole])));
       } else {
         statements.push(db.prepare(`INSERT INTO telegram_bulk_trash (${ACTION_FIELDS})
-          SELECT incoming.receipt_id,?,0,NULL,?,COALESCE(auth.message_date,0),COALESCE(auth.message_id,0)
-          FROM telegram_inbox AS incoming ${AUTH_JOIN} WHERE ${FRESH}`).bind(scan.kind, actorRole, policy.adminId, ...key));
+          SELECT incoming.receipt_id,?,0,NULL,${general ? "recorded.actor_role,0,0" : "?,COALESCE(auth.message_date,0),COALESCE(auth.message_id,0)"}
+          FROM telegram_inbox AS incoming ${authJoin} WHERE ${FRESH}`).bind(scan.kind,
+            ...(general ? [] : [actorRole, isolated!.adminId]), ...key));
       }
     } else {
       const digest = await digestTicket(event.ticket);
@@ -183,22 +215,25 @@ export async function acceptTelegramBulkTrash(
         LEFT JOIN telegram_auth AS auth ON auth.bot_id=origin.bot_id AND auth.user_id=origin.actor_id
         WHERE preview.kind='preview' AND preview.token_sha256=? AND preview.confirmed_by_receipt_id IS NULL
           AND preview.expires_at>unixepoch()
-          AND origin.receipt_nonce IN ('${TELEGRAM_BULK_TRASH_MARKER}','${TELEGRAM_PROVIDER_BATCH_CONFIRM_MARKER}')
+          AND origin.receipt_nonce IN (${general ? `'${GENERAL_BULK_TRASH_MARKER}'` : `'${TELEGRAM_BULK_TRASH_MARKER}','${TELEGRAM_PROVIDER_BATCH_CONFIRM_MARKER}'`})
           AND origin.bot_id=? AND origin.actor_id=? AND origin.chat_id=? AND origin.chat_type='private' AND origin.thread_id IS NULL
           AND reply.state='sent' AND reply.sent_message_id=? AND reply.attempts=preview.origin_attempt
           AND ? BETWEEN unixepoch()-900 AND unixepoch()+30
-          AND ${currentRole("origin", "preview", true)}`;
-      const originArgs = [digest, policy.botId, event.actorId, event.chatId, event.messageId,
-        event.messageDate, policy.adminId, policy.memberId, event.messageDate] as const;
+          AND ${currentRole("origin", "preview", true, Boolean(general))}
+          ${general ? `AND ${GENERAL_BULK_TRASH_SCHEMA} AND NOT EXISTS (
+            SELECT 1 FROM telegram_general_replies WHERE bot_id=origin.bot_id AND update_id=?)` : ""}`;
+      const originArgs = [digest, policy.botId, event.actorId, event.chatId, event.messageId, event.messageDate,
+        ...(general ? generalPolicyBindings(general) : [isolated!.adminId, isolated!.memberId]), event.messageDate,
+        ...(general ? [event.updateId] : [])];
       const candidate = await db.prepare(`SELECT preview.targets,preview.target_count AS count,
         origin.receipt_id AS receiptId,origin.receipt_nonce AS marker ${origin}`)
         .bind(...originArgs).first<{ targets: string; count: number; receiptId: number; marker: string }>();
       if (!candidate) return "ignored";
       const targets = targetsFrom(candidate.targets);
       if (targets.length !== candidate.count) throw new Error("Invalid bulk trash target count.");
-      const fromBatch = candidate.marker === TELEGRAM_PROVIDER_BATCH_CONFIRM_MARKER;
-      const batchOrigin = fromBatch ? failedBatchTrashOrigin(policy, event.actorId, candidate.receiptId) : null;
-      const selection = fromBatch ? await readFailedBatchTrash(db, policy, event.actorId, candidate.receiptId) : null;
+      const fromBatch = !general && candidate.marker === TELEGRAM_PROVIDER_BATCH_CONFIRM_MARKER;
+      const batchOrigin = fromBatch ? failedBatchTrashOrigin(isolated!, event.actorId, candidate.receiptId) : null;
+      const selection = fromBatch ? await readFailedBatchTrash(db, isolated!, event.actorId, candidate.receiptId) : null;
       const stable = fromBatch
         ? (selection?.targets === candidate.targets ? selection.guard : { sql: "0", bindings: [] })
         : { sql: "1", bindings: [] };
@@ -208,6 +243,7 @@ export async function acceptTelegramBulkTrash(
           ${batchOrigin ? `AND (${batchOrigin.sql})` : ""} ${DEDUP}`)
           .bind(...scope, ...originArgs, candidate.receiptId, candidate.marker, candidate.targets, candidate.count,
             ...(batchOrigin?.bindings ?? [])),
+        ...(general ? [prepareGeneralReceiptAuthority(db, general, key)] : []),
         db.prepare(`UPDATE telegram_bulk_trash AS preview SET confirmed_by_receipt_id=incoming.receipt_id
           FROM telegram_inbox AS incoming WHERE preview.token_sha256=? AND preview.confirmed_by_receipt_id IS NULL AND ${FRESH}`)
           .bind(digest, ...key),
@@ -226,8 +262,8 @@ export async function acceptTelegramBulkTrash(
         const move = await prepareOwnedSubscriptionMutation(db, { id, ownerId: event.actorId, expectedLifecycleRevision: revision },
           { kind: "trash" }, {
             sql: `generation=? AND EXISTS (SELECT 1 FROM telegram_inbox AS incoming JOIN telegram_bulk_trash AS action USING(receipt_id)
-              WHERE ${FRESH} AND action.kind='trashed')`,
-            bindings: [generation, ...key],
+              WHERE ${FRESH} AND action.kind='trashed' ${general ? `AND ${generalCurrentReceiptSql("incoming")}` : ""})`,
+            bindings: [generation, ...key, ...(general ? generalPolicyBindings(general) : [])],
           }, retirement);
         statements.push(move.first, ...move.followups);
       }
@@ -249,7 +285,8 @@ export async function acceptTelegramBulkTrash(
               OR lifecycle.revision IS NOT trash.lifecycle_revision
               OR EXISTS (SELECT 1 FROM subscriptions WHERE id=trash.id)
           )))
-      ) THEN command END WHERE ${FRESH} RETURNING receipt_id`).bind(TELEGRAM_BULK_TRASH_MARKER, ...key),
+      ) ${general ? `AND ${generalCurrentReceiptSql("incoming")}` : ""} THEN command END WHERE ${FRESH} RETURNING receipt_id`)
+        .bind(bulkMarker(policy), ...(general ? generalPolicyBindings(general) : []), ...key),
     );
     const results = await db.batch(statements);
     const receipt = results.at(-1);
@@ -269,28 +306,32 @@ const notices: Record<Exclude<ReplyKind, "preview" | "trashed">, string> = {
   stale: "订阅已变更，本次未移动任何订阅。请重新发送 /d。",
 };
 
-function replyScope(state: "leased" | "sending"): string {
+function replyScope(state: "leased" | "sending", marker = TELEGRAM_BULK_TRASH_MARKER): string {
   return `inbox.receipt_id=? AND inbox.bot_id=? AND inbox.actor_id=? AND inbox.chat_id=? AND inbox.chat_type='private'
-    AND inbox.chat_id=inbox.actor_id AND inbox.thread_id IS NULL AND inbox.receipt_nonce='${TELEGRAM_BULK_TRASH_MARKER}'
+    AND inbox.chat_id=inbox.actor_id AND inbox.thread_id IS NULL AND inbox.receipt_nonce='${marker}'
     AND reply.state='${state}' AND reply.lease_id=? AND reply.attempts=? AND reply.lease_until>unixepoch()`;
 }
 
-function replyArgs(policy: TelegramPolicy, lease: Lease) {
+function replyArgs(policy: BulkPolicy, lease: Lease) {
   return [lease.receiptId, policy.botId, lease.actorId, lease.chatId, lease.leaseId, lease.attempts] as const;
 }
 
-export async function renderTelegramBulkTrash(db: D1Database, policy: TelegramPolicy, lease: Lease): Promise<Rendered | null> {
-  if (!inTelegramScope(policy, lease) || lease.chatType !== "private" || lease.threadId !== null) return null;
-  const guard: BulkTrashGuard = { sql: `inbox.receipt_nonce='${TELEGRAM_BULK_TRASH_MARKER}' AND EXISTS (
+export async function renderTelegramBulkTrash(db: D1Database, policy: BulkPolicy, lease: Lease): Promise<Rendered | null> {
+  const general = "privateManagement" in policy ? policy : null;
+  const isolated = "adminId" in policy ? policy : null;
+  if ((general ? !generalManagementScope(general, lease) : !inTelegramScope(isolated!, lease))
+    || lease.chatType !== "private" || lease.threadId !== null) return null;
+  const guard: BulkTrashGuard = { sql: `inbox.receipt_nonce='${bulkMarker(policy)}' AND EXISTS (
     SELECT 1 FROM telegram_bulk_trash AS action LEFT JOIN telegram_auth AS auth ON auth.bot_id=inbox.bot_id AND auth.user_id=inbox.actor_id
-    WHERE action.receipt_id=inbox.receipt_id AND ${currentRole("inbox", "action")})`, bindings: [policy.adminId, policy.memberId] };
+    WHERE action.receipt_id=inbox.receipt_id AND ${currentRole("inbox", "action", false, Boolean(general))})`,
+    bindings: general ? generalPolicyBindings(general) : [isolated!.adminId, isolated!.memberId] };
   const action = await db.prepare(`SELECT action.kind,action.targets,action.target_count AS count,
     EXISTS (SELECT 1 FROM telegram_bulk_trash AS preview JOIN telegram_inbox AS origin USING(receipt_id)
       WHERE preview.confirmed_by_receipt_id=action.receipt_id
         AND origin.receipt_nonce='${TELEGRAM_PROVIDER_BATCH_CONFIRM_MARKER}') AS fromBatch
     FROM telegram_inbox AS inbox JOIN telegram_outbox AS reply USING(receipt_id)
     JOIN telegram_bulk_trash AS action USING(receipt_id)
-    WHERE ${replyScope("leased")} AND (${guard.sql})`).bind(...replyArgs(policy, lease), ...guard.bindings)
+    WHERE ${replyScope("leased", bulkMarker(policy))} AND (${guard.sql})`).bind(...replyArgs(policy, lease), ...guard.bindings)
     .first<{ kind: ReplyKind; targets: string | null; count: number; fromBatch: number }>();
   if (!action) return null;
   if (action.kind === "trashed") return { text: `已将 ${action.count} 条订阅移入回收站。30 天内可通过 /recycle 恢复。`, guard };
@@ -325,23 +366,23 @@ export function installTelegramBulkTrashTicket(db: D1Database, lease: Lease, sha
 }
 
 export async function confirmTelegramBulkTrashSend(
-  db: D1Database, policy: TelegramPolicy, lease: Lease, guard: BulkTrashGuard, ticketSha256?: string,
+  db: D1Database, policy: BulkPolicy, lease: Lease, guard: BulkTrashGuard, ticketSha256?: string,
 ): Promise<boolean> {
   try {
     const ticket = ticketSha256 ? `AND EXISTS (SELECT 1 FROM telegram_bulk_trash AS preview
       WHERE preview.receipt_id=inbox.receipt_id AND preview.token_sha256=? AND preview.origin_attempt=reply.attempts
         AND preview.expires_at>unixepoch() AND preview.confirmed_by_receipt_id IS NULL)` : "";
     return await db.prepare(`SELECT 1 FROM telegram_inbox AS inbox JOIN telegram_outbox AS reply USING(receipt_id)
-      WHERE ${replyScope("sending")} AND (${guard.sql}) ${ticket}`)
+      WHERE ${replyScope("sending", bulkMarker(policy))} AND (${guard.sql}) ${ticket}`)
       .bind(...replyArgs(policy, lease), ...guard.bindings, ...(ticketSha256 ? [ticketSha256] : [])).first() !== null;
   } catch {
     return false;
   }
 }
 
-export async function closeUnsentTelegramBulkTrashReply(db: D1Database, policy: TelegramPolicy, lease: Lease): Promise<void> {
+export async function closeUnsentTelegramBulkTrashReply(db: D1Database, policy: BulkPolicy, lease: Lease): Promise<void> {
   const result = await db.prepare(`UPDATE telegram_outbox SET state='failed',lease_id=NULL,lease_until=NULL WHERE receipt_id=(
-    SELECT inbox.receipt_id FROM telegram_inbox AS inbox JOIN telegram_outbox AS reply USING(receipt_id) WHERE ${replyScope("leased")}
+    SELECT inbox.receipt_id FROM telegram_inbox AS inbox JOIN telegram_outbox AS reply USING(receipt_id) WHERE ${replyScope("leased", bulkMarker(policy))}
   )`).bind(...replyArgs(policy, lease)).run();
   if (!result.success) throw new Error("Telegram bulk trash reply could not be closed.");
 }
