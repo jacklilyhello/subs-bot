@@ -2395,6 +2395,6 @@ test("closed general authorization replays a sealed candidate in a separate emit
   const expiryRename = button(menuExpiry.message, "重命名");
   assert.equal((await callback(7918, 194, { ...origin(menuExpiry.messageId, 194), date: menuDate }, expiryRename, authWorker)).status, 204);
   assert.equal((await callback(7919, 195, { ...origin(menuExpiry.messageId, 195), date: menuDate }, expiryRename, authWorker)).status, 200);
-  assert.match((await awaitLifecycle(7919)).message.text, /新名称/u);
+  assert.equal((await awaitLifecycle(7919)).message.text, "请回复这条消息，发送新的订阅名称。发送 /cancel 取消。");
 
 });
