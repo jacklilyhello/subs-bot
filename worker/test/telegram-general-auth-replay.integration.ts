@@ -321,13 +321,14 @@ test("closed general authorization replays a sealed candidate in a separate emit
       compatibilityDate, d1Databases, r2Buckets: ["NODES"], outboundService: privateTransport,
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: typedConfig(mode),
         PUBLIC_ORIGIN: PRODUCTION_PUBLIC_ORIGIN, TELEGRAM_AGGREGATE_KEY: aggregateKeyRaw } })),
-    ...["provider-open", "provider-paused", "provider-multiline"].map((name) => ({ name, modules: true,
+    ...["provider-open", "provider-paused", "provider-multiline", "provider-documents", "provider-documents-paused"].map((name) => ({ name, modules: true,
       script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"], outboundService: privateTransport,
       serviceBindings: { PROVIDER_FETCH: { name: "provider-rpc", entrypoint: "ProviderFetch" } },
       bindings: { BUILD_REVISION: fixture.releaseRevision, TELEGRAM_GENERAL_CONFIG: providerConfig,
         PROVIDER_REVISION: providerRevision, PROVIDER_IMAGE_SHA256: imageSha256,
-        ...(name === "provider-paused" ? {} : { TELEGRAM_PROVIDER_URL_IMPORT: "1", TELEGRAM_PROVIDER_REFRESH: "1" }),
-        ...(name === "provider-multiline" ? { TELEGRAM_PROVIDER_URL_DOCUMENTS: "1" } : {}) } })),
+        ...(name.endsWith("-paused") ? {} : { TELEGRAM_PROVIDER_URL_IMPORT: "1", TELEGRAM_PROVIDER_REFRESH: "1" }),
+        ...(name === "provider-multiline" || name === "provider-documents" ? { TELEGRAM_PROVIDER_URL_DOCUMENTS: "1" } : {}),
+        ...(name === "provider-documents" ? { TELEGRAM_MIXED_DOCUMENTS: "1" } : {}) } })),
     ...[true, false].map((enabled) => ({ name: enabled ? "batch-open" : "batch-paused", modules: true,
       script: servingScript.toString(), compatibilityDate, d1Databases, r2Buckets: ["NODES"], outboundService: privateTransport,
       serviceBindings: { PROVIDER_FETCH: { name: "batch-rpc", entrypoint: "ProviderFetch" } },
@@ -2338,6 +2339,89 @@ test("closed general authorization replays a sealed candidate in a separate emit
   assert.deepEqual(await armedTickets(), [{ armed: 0 }, { armed: 1 }]);
   await reapTelegramProviderBatchTickets(db, scopedBatchPin);
   assert.deepEqual(await armedTickets(), [{ armed: 0 }, { armed: 0 }]);
+
+  // Exercise uploaded URL/mixed files through the sealed emitted Worker, including paused ingress recovery.
+  const documentOpen = await runtime.getWorker("provider-documents");
+  const documentPaused = await runtime.getWorker("provider-documents-paused");
+  const uploadedAt = Math.floor(Date.now() / 1000);
+  await db.batch([[197, "admin"], [198, "member"], [199, "member"]].map(([actor, role]) =>
+    db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,?,?,?,?)")
+      .bind(pin.botId, pin.generation, String(actor), 1, uploadedAt - 1, role)));
+  const filePost = (id: number, actor: number, fileId: string, options: PostOptions = {}) =>
+    (options.worker ?? documentOpen).fetch(documentWebhookUrl, { method: "POST",
+      headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": pin.webhookSecret },
+      body: JSON.stringify({ update_id: id, message: { from: { id: actor, is_bot: false },
+        chat: { id: options.chatId ?? actor, type: options.chatType ?? "private" }, message_id: id,
+        date: options.date ?? uploadedAt, document: { file_id: fileId, file_name: "Bundle document.txt",
+          file_size: Buffer.byteLength(fixtureDocuments.get(fileId)!) } } }),
+    });
+  const uploadedFacts = (id: number) => db.prepare(`SELECT inbox.receipt_nonce AS marker,job.state,job.result_code AS outcome,
+    recorded.actor_role AS role,(SELECT count(*) FROM telegram_provider_document_opt_in WHERE receipt_id=job.receipt_id) AS opted
+    FROM telegram_document_jobs AS job JOIN telegram_inbox AS inbox USING(receipt_id)
+    JOIN telegram_general_receipt AS recorded USING(receipt_id) WHERE inbox.bot_id=? AND inbox.update_id=?`)
+    .bind(pin.botId, id).first();
+  fixtureDocuments.set("fixture-bundle-url-file", `${goodLineUrl}\n${goodLineUrl}`);
+  fixtureDocuments.set("fixture-bundle-mixed-file", `${fixtureShare}\n${goodLineUrl}`);
+  fixtureDocuments.set("fixture-bundle-revoked-file", goodLineUrl);
+  const callsBeforeFiles = await providerCalls();
+  assert.ok(callsBeforeFiles !== null);
+  const fileReadsBefore = fileRequests.length;
+  assert.equal((await filePost(8450, 197, "fixture-bundle-url-file")).status, 200);
+  assert.equal((await filePost(8450, 197, "fixture-bundle-url-file", { worker: documentPaused })).status, 204);
+  assert.equal((await filePost(8453, 197, "fixture-bundle-url-file", { chatId: -100100, chatType: "supergroup" })).status, 204);
+  assert.equal((await post(197, goodLineUrl, { worker: documentPaused, updateId: 8454, date: uploadedAt,
+    message: { entities: [] } })).status, 204, "closing URL ingress rejects new remote messages");
+  assert.equal(await providerCalls(), callsBeforeFiles);
+  assert.equal(fileRequests.length, fileReadsBefore);
+  assert.deepEqual(await uploadedFacts(8450), { marker: "general-document-job:v1", state: "pending", outcome: null, role: "admin", opted: 1 });
+  assert.equal((await documentPaused.scheduled({ cron: "* * * * *" })).outcome, "ok");
+  const urlFileReply = (await awaitLifecycle(8450)).message;
+  assert.equal(urlFileReply.chat_id, "197");
+  assert.equal(urlFileReply.text, "订阅链接文件已处理。\n已保存 1 条\n已合并 0 条\n失败 0 条\n超出上限 0 条");
+  assert.deepEqual(await uploadedFacts(8450), { marker: "general-provider-document:v1", state: "done", outcome: "saved", role: "admin", opted: 0 });
+  assert.deepEqual(fileRequests.slice(fileReadsBefore), ["fixture-bundle-url-file", "fixture-bundle-url-file"]);
+
+  assert.equal((await filePost(8451, 198, "fixture-bundle-mixed-file")).status, 200);
+  assert.equal((await documentPaused.scheduled({ cron: "* * * * *" })).outcome, "ok");
+  const mixedFileReply = (await awaitLifecycle(8451)).message;
+  assert.equal(mixedFileReply.chat_id, "198");
+  assert.equal(mixedFileReply.text, "混合文件已处理。\n本地节点已保存 1 个\n远程订阅已保存 1 条\n已合并 0 条\n失败 0 条\n超出上限 0 条");
+  assert.doesNotMatch(mixedFileReply.text, /provider\.fixture|fixture=signed|\/sub\/|\/agg\//u);
+  assert.deepEqual(await uploadedFacts(8451), { marker: "general-provider-document:v1", state: "done", outcome: "saved", role: "member", opted: 0 });
+  assert.equal(await providerCalls(), callsBeforeFiles + 2);
+  const localFile = await db.prepare(`SELECT id,token,snapshot_id AS snapshotId FROM subscriptions
+    WHERE owner_id='198' AND source_url='uploaded://telegram-document'`).first<{ id: number; token: string; snapshotId: string }>();
+  assert.ok(localFile);
+  const localExport = await documentPaused.fetch(`https://app.fixture.invalid/sub/${localFile.token}/base64`);
+  assert.equal(localExport.status, 200);
+  assert.equal(Buffer.from(await localExport.text(), "base64").toString("utf8"), fixtureShare);
+
+  // An abandoned earlier R2 attempt can outlive the source job's conversion to the provider family.
+  const convertedReceipt = await db.prepare("SELECT receipt_id FROM telegram_inbox WHERE bot_id=? AND update_id=8451")
+    .bind(pin.botId).first<number>("receipt_id");
+  assert.ok(convertedReceipt);
+  const orphanSnapshot = crypto.randomUUID();
+  const orphanPrefix = `subscriptions/${localFile.id}/${orphanSnapshot}/`;
+  await db.prepare(`INSERT INTO telegram_document_stages VALUES (?,?,?,?,unixepoch()-1)`)
+    .bind(orphanSnapshot, convertedReceipt, localFile.id, crypto.randomUUID()).run();
+  await bucket.put(`${orphanPrefix}manifest.json`, "synthetic abandoned document stage");
+  await bucket.put(`${orphanPrefix}0.ndjson`, "synthetic abandoned document nodes\n");
+  assert.equal((await documentPaused.scheduled({ cron: "* * * * *" })).outcome, "ok");
+  assert.equal(await db.prepare("SELECT count(*) AS n FROM telegram_document_stages WHERE snapshot_id=?").bind(orphanSnapshot).first("n"), 0);
+  assert.equal(await bucket.head(`${orphanPrefix}manifest.json`), null);
+  assert.equal(await bucket.head(`${orphanPrefix}0.ndjson`), null);
+  assert.ok(await bucket.head(`subscriptions/${localFile.id}/${localFile.snapshotId}/manifest.json`));
+  assert.equal(lifecycleSent.filter(({ reply_parameters }) => reply_parameters.message_id === 8451).length, 1);
+
+  const fileReadsBeforeRevoke = fileRequests.length;
+  assert.equal((await filePost(8452, 199, "fixture-bundle-revoked-file")).status, 200);
+  await db.prepare("INSERT INTO telegram_general_actors VALUES (?,?,?,2,?,'denied')")
+    .bind(pin.botId, pin.generation, "199", uploadedAt).run();
+  assert.equal((await documentPaused.scheduled({ cron: "* * * * *" })).outcome, "ok");
+  assert.equal((await uploadedFacts(8452))?.outcome, "access-changed");
+  assert.equal(fileRequests.length, fileReadsBeforeRevoke);
+  assert.equal(await providerCalls(), callsBeforeFiles + 2);
+  assert.equal(lifecycleSent.some(({ reply_parameters }) => reply_parameters.message_id === 8452), false);
 
   // Exercise the same general entry with synthetic roles and a separately approved group.
   const menuDate = Math.floor(Date.now() / 1000);

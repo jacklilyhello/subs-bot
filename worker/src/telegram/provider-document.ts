@@ -6,8 +6,8 @@ import { providerHostnameLabel, providerInitialTitleReady } from "../provider-in
 import { digestHex, SUBSCRIPTION_LIFECYCLE_REVISION, validInteger } from "../storage.ts";
 import { normalizeSubscriptionName } from "../subscriptions.ts";
 import {
-  prepareTelegramDocumentJobLeaseGuard, prepareTelegramDocumentJobSettlement, TELEGRAM_DOCUMENT_JOB_MARKER,
-  type TelegramDocumentJobLease,
+  GENERAL_MIXED_DOCUMENT_SCHEMA, isGeneralDocumentPolicy, prepareTelegramDocumentJobLeaseGuard, prepareTelegramDocumentJobSettlement, TELEGRAM_DOCUMENT_JOB_MARKER,
+  TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER, type TelegramDocumentJobLease, type TelegramDocumentPolicy,
 } from "./document-jobs.ts";
 import { TELEGRAM_PROVIDER_DOCUMENT_MAX_URLS, type TelegramProviderDocumentInput,
   type TelegramProviderUrlMessage } from "./provider-document-input.ts";
@@ -65,7 +65,10 @@ export async function telegramGeneralProviderDocumentsReady(db: D1Database, botI
       WHERE origin.bot_id=? AND inbox.receipt_nonce='${GENERAL_TELEGRAM_PROVIDER_DOCUMENT_MARKER}'
         AND (origin.finished_at IS NULL OR origin.finished_at>unixepoch()-${PROVIDER_DOCUMENT_REPLY_SECONDS}
           OR EXISTS (SELECT 1 FROM telegram_outbox AS reply WHERE reply.receipt_id=origin.receipt_id
-            AND reply.state IN ('pending','leased','sending')))))`).bind(admission ? 1 : 0, botId).first());
+            AND reply.state IN ('pending','leased','sending'))))
+      OR EXISTS (SELECT 1 FROM telegram_document_jobs AS job JOIN telegram_provider_document_opt_in USING(receipt_id)
+        JOIN telegram_inbox AS inbox USING(receipt_id) WHERE job.bot_id=? AND job.state IN ('pending','leased')
+          AND inbox.receipt_nonce='${TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER}'))`).bind(admission ? 1 : 0, botId, botId).first());
 }
 
 async function prepareProviderLines(
@@ -117,22 +120,28 @@ async function prepareProviderLines(
 }
 
 export async function prepareTelegramProviderDocumentPlan(
-  db: D1Database, policy: TelegramPolicy, lease: TelegramDocumentJobLease, input: TelegramProviderDocumentSources,
+  db: D1Database, policy: TelegramDocumentPolicy, lease: TelegramDocumentJobLease, input: TelegramProviderDocumentSources,
   mixed = false,
 ) {
   const guard = prepareTelegramDocumentJobLeaseGuard(policy, lease);
+  const general = isGeneralDocumentPolicy(policy);
+  if (general && !policy.privateProvider) throw new Error("Provider document capability is unavailable.");
   const receipt = { sql: "?", bindings: [lease.receiptId] };
   const exists = { sql: "EXISTS (SELECT 1 FROM telegram_provider_documents WHERE receipt_id=?)", bindings: receipt.bindings };
   const staged = { sql: `${exists.sql} AND (${guard.sql})`, bindings: [...exists.bindings, ...guard.bindings] };
   const parent = db.prepare(`INSERT INTO telegram_provider_documents
     (receipt_id,bot_id,actor_id,actor_role,auth_message_date,auth_message_id,expires_at,line_count,overflow_count)
-    SELECT receipt_id,bot_id,actor_id,?,auth_message_date,auth_message_id,unixepoch()+${PARENT_TTL_SECONDS},?,?
-    FROM telegram_document_jobs AS source WHERE source.receipt_id=? AND (${guard.sql})
+    SELECT source.receipt_id,source.bot_id,source.actor_id,${general ? "recorded.actor_role" : "?"},
+      source.auth_message_date,source.auth_message_id,unixepoch()+${PARENT_TTL_SECONDS},?,?
+    FROM telegram_document_jobs AS source ${general ? "JOIN telegram_general_receipt AS recorded USING(receipt_id)" : ""}
+    WHERE source.receipt_id=? AND (${guard.sql}) ${general ? `AND (${GENERAL_PROVIDER_DOCUMENT_SCHEMA})` : ""}
+      ${general && mixed ? `AND (${GENERAL_MIXED_DOCUMENT_SCHEMA})` : ""}
       AND EXISTS (SELECT 1 FROM telegram_provider_document_opt_in WHERE receipt_id=source.receipt_id)
       ${mixed ? "AND EXISTS (SELECT 1 FROM telegram_mixed_document_opt_in WHERE receipt_id=source.receipt_id)" : ""}
       AND NOT EXISTS (SELECT 1 FROM telegram_provider_documents AS active WHERE active.bot_id=source.bot_id
         AND active.actor_id=source.actor_id AND active.finished_at IS NULL)`)
-    .bind(lease.actorId === policy.adminId ? "admin" : "member", input.urls.length, input.overflow, lease.receiptId, ...guard.bindings);
+    .bind(...(general ? [] : [lease.actorId === policy.adminId ? "admin" : "member"]),
+      input.urls.length, input.overflow, lease.receiptId, ...guard.bindings);
   const lines = await prepareProviderLines(db, lease.actorId, input.urls.map((sourceUrl) => ({ sourceUrl })), receipt, staged);
   return { ...lines, steps: [parent, ...lines.steps], exists, staged };
 }
@@ -232,17 +241,19 @@ export async function acceptTelegramProviderUrlMessage(
   }
 }
 
-export function prepareTelegramProviderDocumentMarker(db: D1Database, receiptId: number): D1PreparedStatement[] {
+export function prepareTelegramProviderDocumentMarker(db: D1Database, receiptId: number, policy?: TelegramDocumentPolicy): D1PreparedStatement[] {
+  const general = policy !== undefined && isGeneralDocumentPolicy(policy);
   return [
     db.prepare(`UPDATE telegram_inbox SET receipt_nonce=? WHERE receipt_id=? AND receipt_nonce=? AND changes()=1`)
-      .bind(TELEGRAM_PROVIDER_DOCUMENT_MARKER, receiptId, TELEGRAM_DOCUMENT_JOB_MARKER),
+      .bind(general ? GENERAL_TELEGRAM_PROVIDER_DOCUMENT_MARKER : TELEGRAM_PROVIDER_DOCUMENT_MARKER,
+        receiptId, general ? TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER : TELEGRAM_DOCUMENT_JOB_MARKER),
     db.prepare(`SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM telegram_provider_documents WHERE receipt_id=?)
       OR changes()=1 THEN 1 ELSE json_extract('provider document settlement guard failed','$') END`).bind(receiptId),
   ];
 }
 
 export async function stageTelegramProviderDocument(
-  db: D1Database, policy: TelegramPolicy, lease: TelegramDocumentJobLease, input: UrlList,
+  db: D1Database, policy: TelegramDocumentPolicy, lease: TelegramDocumentJobLease, input: UrlList,
 ): Promise<boolean> {
   try {
     const plan = await prepareTelegramProviderDocumentPlan(db, policy, lease, input);
@@ -252,7 +263,7 @@ export async function stageTelegramProviderDocument(
       db.prepare(`DELETE FROM telegram_provider_document_opt_in WHERE (${plan.staged.sql}) AND receipt_id=?`)
         .bind(...plan.staged.bindings, lease.receiptId),
       prepareTelegramDocumentJobSettlement(db, policy, lease, { kind: "saved" }, true),
-      ...prepareTelegramProviderDocumentMarker(db, lease.receiptId),
+      ...prepareTelegramProviderDocumentMarker(db, lease.receiptId, policy),
     ];
     const result = await db.batch(steps);
     assertBatch(result, steps);

@@ -261,7 +261,7 @@ async function generalTelegramWebhook(request: Request, env: Env, publicOrigin: 
     const status = general.sharedOutbox ? await acceptGeneralSharedTelegramCommand(env.DB, general, request,
       (callbackId, answer) => ctx?.waitUntil(answerTelegramCallback(general, callbackId, answer)), providerAvailable, refreshAvailable,
       share ? { bucket: env.NODES, runtime: share, publicOrigin } : undefined, aggregateKey, env.TELEGRAM_INLINE_SEARCH === "1",
-      generalProviderDocumentsEnabled(env), batchAdmission, utilities)
+      generalProviderDocumentsEnabled(env), batchAdmission, utilities, env.TELEGRAM_MIXED_DOCUMENTS === "1")
       : await acceptGeneralTelegramCommand(env.DB, general, request);
     if (status === 200) {
       const delivery = general.sharedOutbox
@@ -810,7 +810,9 @@ async function recoverGeneralWork(env: Env, pin: ProviderPin, publicOrigin: Publ
   try {
     if (general.privateDocument) {
       try {
-        await runTelegramDocumentIntake(env.DB, env.NODES, general);
+        const providerDocuments = general.privateProvider && await telegramGeneralProviderDocumentsReady(env.DB, general.botId, true);
+        const mixedDocuments = providerDocuments && await telegramMixedDocumentReady(env.DB, true);
+        await runTelegramDocumentIntake(env.DB, env.NODES, general, providerDocuments, mixedDocuments);
       } finally {
         try {
           await reconcileTelegramDocumentJobReplies(env.DB, general);

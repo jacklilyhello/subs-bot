@@ -15,9 +15,10 @@ import { acceptGeneralTelegramDisplaySettings, readTelegramDisplaySettingsUpdate
 import { renderTelegramHelp, type TelegramCommandContext } from "./command-catalog.ts";
 import type { TelegramMainMenuFeatures } from "./main-menu.ts";
 import { GENERAL_TELEGRAM_PROVIDER_MARKER } from "../provider-jobs.ts";
+import { telegramMixedDocumentReady } from "./document-intake.ts";
 import { acceptTelegramAggregate, GENERAL_AGGREGATE_SCHEMA, GENERAL_TELEGRAM_AGGREGATE_MARKER, prepareTelegramAggregateCode,
   renderTelegramAggregateResult, type TelegramAggregateReply } from "./aggregate-actions.ts";
-import { acceptTelegramDocumentJob, generalDocumentReplyEligibility, generalDocumentReplyScope, renderTelegramDocumentOutcome,
+import { acceptTelegramDocumentJob, generalDocumentReplyEligibility, generalDocumentReplyScope, isTelegramProviderDocumentUpload, renderTelegramDocumentOutcome,
   TELEGRAM_GENERAL_DOCUMENT_JOB_MARKER, type TelegramDocumentJobResult } from "./document-jobs.ts";
 import { renderTelegramAggregateLinks, sendGeneralTelegramGroupListReply, sendGeneralTelegramPrivateReply,
   sendGeneralTelegramTempRawReply, sendPrivateShareClaimResult, sendTelegramInlineAnswer } from "./delivery.ts";
@@ -287,7 +288,7 @@ export async function acceptGeneralSharedTelegramCommand(
   db: D1Database, pin: GeneralTelegramPin, request: Request, acknowledge?: (callbackId: string, answer?: string) => void,
   providerAvailable?: () => Promise<boolean>, refreshAvailable?: () => Promise<boolean>,
   share?: { bucket: R2Bucket; runtime: TelegramPrivateShareRuntime; publicOrigin: PublicOrigin }, aggregateKey?: CryptoKey | null,
-  inlineEnabled = false, providerDocumentsEnabled = false, batchAdmission = false, utilities?: GeneralUtilityRuntime,
+  inlineEnabled = false, providerDocumentsEnabled = false, batchAdmission = false, utilities?: GeneralUtilityRuntime, mixedDocumentsEnabled = false,
 ): Promise<number> {
   const decoded = await readTelegramUpdate(request, pin.webhookSecret);
   if (decoded.status !== 200) return decoded.status;
@@ -396,7 +397,14 @@ export async function acceptGeneralSharedTelegramCommand(
     return accepted ? 200 : 204;
   }
   const document = pin.privateDocument ? readGeneralPrivateDocumentUpdate(decoded.update, decoded.updateId, pin.botId) : null;
-  if (document) return await acceptTelegramDocumentJob(db, pin, document) === "ignored" ? 204 : 200;
+  if (document) {
+    const providerOptIn = pin.privateProvider && providerDocumentsEnabled && providerAvailable !== undefined
+      && isTelegramProviderDocumentUpload(document);
+    if (providerOptIn && (!await providerAvailable()
+      || !await telegramGeneralProviderDocumentsReady(db, pin.botId, true))) return 503;
+    if (providerOptIn && mixedDocumentsEnabled && !await telegramMixedDocumentReady(db, true)) return 503;
+    return await acceptTelegramDocumentJob(db, pin, document, providerOptIn, providerOptIn && mixedDocumentsEnabled) === "ignored" ? 204 : 200;
+  }
   const action = pin.privateManagement ? readGeneralPrivateLifecycleUpdate(decoded.update, decoded.updateId, pin.botId) : null;
   if (action) {
     const accepted = await acceptGeneralTelegramLifecycle(db, pin, action) === "accepted";
