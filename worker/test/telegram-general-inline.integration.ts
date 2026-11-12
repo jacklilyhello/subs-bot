@@ -140,7 +140,8 @@ test("emitted general inline temp consent and historic share cards preserve priv
 
   await createSubscription(db, { ownerId: member, name: "Owned subscription", sourceUrl: "https://provider.example/owned" });
   await createSubscription(db, { ownerId: admin, name: "Foreign subscription", sourceUrl: "https://provider.example/foreign" });
-  const raw = "ss://" + Buffer.from("aes-256-gcm:synthetic-node-secret").toString("base64url")
+  const rawAuthentication = Buffer.from("aes-256-gcm:synthetic-node-secret").toString("base64url");
+  const raw = "ss://" + rawAuthentication
     + "@203.0.113.71:8388#Live%20https%3A%2F%2Fexample.invalid%2Fhidden";
   const baseline = JSON.stringify([{ type: "temp", name: "Baseline temporary", share: raw }]);
   await db.prepare("INSERT INTO legacy_temp_installations VALUES (?,?,?)").bind(bot.botId, "a".repeat(64), now - 60).run();
@@ -166,7 +167,7 @@ test("emitted general inline temp consent and historic share cards preserve priv
     .bind(bot.botId, tempConsent).first(), { marker: "general-inline-consent-temp:v1", revision: 1, kind: "on" });
   assert.equal((await query()).status, 204);
   assert.deepEqual(titles(), ["Owned subscription", "🧪 Baseline temporary", "🧪 Live [链接已省略]"]);
-  assert.equal((await query("synthetic-node-secret")).status, 204);
+  assert.equal((await query(rawAuthentication)).status, 204);
   assert.deepEqual(titles(), ["🧪 Baseline temporary", "🧪 Live [链接已省略]"]);
   assert.equal((await command("/inline temp on", admin)).status, 200);
   await reply();
