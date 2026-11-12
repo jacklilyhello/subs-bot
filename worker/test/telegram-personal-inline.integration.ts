@@ -29,6 +29,9 @@ const queueDiagnosticsModule = `
     const db = env.DB;
     const claims = new WeakMap();
     const work = new WeakMap();
+    const originals = new WeakMap();
+    const reapers = new WeakMap();
+    const races = new WeakMap();
     const record = (stage, outcome) => db.prepare('INSERT OR IGNORE INTO fixture_queue_diagnostics VALUES (?,?)')
       .bind(stage, outcome).run();
     const capture = (stage, query) => db.prepare('INSERT OR IGNORE INTO fixture_queue_sql VALUES (?,?)')
@@ -44,6 +47,20 @@ const queueDiagnosticsModule = `
       await record(stage, outcome(result));
       return result;
     }
+    async function beforeInlineSend(race) {
+      // Execute an actual bundled webhook after the inline inventory scan but before its send fence.
+      const policy = JSON.parse(env.TELEGRAM_ISOLATION_CONFIG);
+      const actor = race === 'clear' ? policy.memberId : policy.adminId;
+      const id = race === 'clear' ? 216 : 223;
+      const text = race === 'clear' ? '/temp clear' : '/auth remove ' + policy.memberId;
+      const response = await worker.fetch(new Request('https://fixture.invalid/telegram/webhook', {
+        method: 'POST', headers: {'content-type': 'application/json', 'x-telegram-bot-api-secret-token': policy.webhookSecret},
+        body: JSON.stringify({update_id: id, message: {message_id: id, date: Math.floor(Date.now() / 1000), text,
+          from: {id: Number(actor), is_bot: false}, chat: {id: Number(actor), type: 'private'},
+          entities: [{type: 'bot_command', offset: 0, length: text.split(' ', 1)[0].length}]}}),
+      }), env, ctx);
+      await record('inline-' + race + '-before-send', response.status === 200 ? 'ok' : 'other');
+    }
     return {...env, DB: {
       prepare(sql) {
         const query = db.prepare(sql);
@@ -53,21 +70,13 @@ const queueDiagnosticsModule = `
             const statement = query.bind(...bindings);
             const race = bindings.includes(215) ? 'clear' : bindings.includes(222) ? 'revoke' : null;
             if (!race) return statement;
-            return {async first(...fields) {
-              // Execute an actual bundled webhook after the inline inventory scan but before its send fence.
-              const policy = JSON.parse(env.TELEGRAM_ISOLATION_CONFIG);
-              const actor = race === 'clear' ? policy.memberId : policy.adminId;
-              const id = race === 'clear' ? 216 : 223;
-              const text = race === 'clear' ? '/temp clear' : '/auth remove ' + policy.memberId;
-              const response = await worker.fetch(new Request('https://fixture.invalid/telegram/webhook', {
-                method: 'POST', headers: {'content-type': 'application/json', 'x-telegram-bot-api-secret-token': policy.webhookSecret},
-                body: JSON.stringify({update_id: id, message: {message_id: id, date: Math.floor(Date.now() / 1000), text,
-                  from: {id: Number(actor), is_bot: false}, chat: {id: Number(actor), type: 'private'},
-                  entities: [{type: 'bot_command', offset: 0, length: text.split(' ', 1)[0].length}]}}),
-              }), env, ctx);
-              await record('inline-' + race + '-before-send', response.status === 200 ? 'ok' : 'other');
+            const wrapped = {async first(...fields) {
+              await beforeInlineSend(race);
               return statement.first(...fields);
             }};
+            originals.set(wrapped, statement);
+            races.set(statement, race);
+            return wrapped;
           }};
         }
         const combined = sql.includes('UNION ALL SELECT') && sql.includes('FROM telegram_provider_batch_jobs');
@@ -91,24 +100,38 @@ const queueDiagnosticsModule = `
             claims.set(statement, {mode, sql, bindings});
             return statement;
           }
-          return {run: () => observe('reap', async () => {
+          const wrapped = {run: () => observe('reap', async () => {
             await capture(mode + '-reap', {sql, bindings});
             return statement.run();
           }, result => result.success ? 'ok' : 'other')};
+          originals.set(wrapped, statement);
+          reapers.set(statement, {mode, sql, bindings});
+          return wrapped;
         }};
       },
       async batch(statements) {
-        for (const statement of statements) {
+        // The window facade batches first()/run() together with its leading SELECT fence.
+        // Preserve native D1 statements and observe the actual operation at its current batch index.
+        const native = statements.map(statement => originals.get(statement) ?? statement);
+        for (const statement of native) {
+          const race = races.get(statement);
+          if (race) await beforeInlineSend(race);
           const query = work.get(statement);
           if (query) await capture(query.stage, {sql: query.sql, bindings: query.bindings});
         }
-        const claim = statements.map(statement => claims.get(statement)).find(Boolean);
-        if (!claim) return db.batch(statements);
+        const reaper = native.map(statement => reapers.get(statement)).find(Boolean);
+        if (reaper) return observe('reap', async () => {
+          await capture(reaper.mode + '-reap', {sql: reaper.sql, bindings: reaper.bindings});
+          return db.batch(native);
+        }, results => results.every(result => result.success) ? 'ok' : 'other');
+        const claimIndex = native.findIndex(statement => claims.has(statement));
+        if (claimIndex === -1) return db.batch(native);
+        const claim = claims.get(native[claimIndex]);
         return observe('claim', async () => {
           await capture(claim.mode + '-claim', {sql: claim.sql, bindings: claim.bindings});
-          return db.batch(statements);
+          return db.batch(native);
         }, results =>
-          results.every(result => result.success) ? (results[1]?.results?.length ? 'claimed' : 'empty') : 'other');
+          results.every(result => result.success) ? (results[claimIndex]?.meta.changes === 1 ? 'claimed' : 'empty') : 'other');
       },
     }};
   }
