@@ -7,7 +7,7 @@
   },
   "scripts": {
     "check": "tsc --noEmit",
-    "build": "esbuild src/index.ts --bundle --format=esm --platform=browser --target=es2022 --minify-whitespace --minify-syntax --outfile=dist/index.js",
+    "build": "esbuild src/index.ts --bundle --format=esm --platform=browser --target=es2022 --minify-whitespace --minify-syntax --minify-identifiers --outfile=dist/index.js",
     "test": "node --test test/*.test.ts",
     "test:bundle": "node --test test/bundle.integration.ts"
   },

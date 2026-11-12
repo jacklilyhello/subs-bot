@@ -1,0 +1,42 @@
+name: Synchronize isolated Telegram command menus
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Successful Worker CI run for the exact deployed main commit
+        type: string
+        required: true
+      isolation_flags:
+        description: Independently read-back boolean flags inlineSearch, providerUrlImport, providerBatch, apiStatus
+        type: string
+        required: true
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: subs-bot-isolation-deploy
+  cancel-in-progress: false
+jobs:
+  synchronize:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
+    environment: subs-bot-isolation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - name: Verify active revision and synchronize only the authorized scopes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CI_RUN_ID: ${{ inputs.source_run_id }}
+          SUBS_BOT_MENU_FLAGS: ${{ inputs.isolation_flags }}
+          SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 -B worker/tools/sync_telegram_commands.py
+          node worker/tools/sync-telegram-commands.ts
