@@ -1,3 +1,6 @@
+import type { GeneralTelegramPin } from "./general-auth-runtime.ts";
+import { generalPrivateScope, prepareGeneralPrivateAdmission } from "./general-private-admission.ts";
+import { generalCurrentAuthoritySql, generalPolicyBindings, generalRecordedOriginSql, prepareGeneralReceiptAuthority } from "./general-receipt.ts";
 import {
   PROVIDER_API_STATUS_MAX_ELAPSED_MS, type ProviderApiStatusV2Prober, type ProviderPin,
 } from "../provider-fetch-contract.ts";
@@ -6,6 +9,15 @@ import { isolatedTelegramRoleEpochSql } from "./authorization-sql.ts";
 import { inTelegramScope, type TelegramApiStatusUpdate, type TelegramEventScope, type TelegramPolicy } from "./protocol.ts";
 
 export const TELEGRAM_API_STATUS_MARKER = "api-status:v1";
+export const GENERAL_API_STATUS_MARKER = "general-api-status:v1";
+type Policy = TelegramPolicy | GeneralTelegramPin;
+const generalPolicy = (policy: Policy): policy is GeneralTelegramPin => "privateManagement" in policy;
+const marker = (policy: Policy) => generalPolicy(policy) ? GENERAL_API_STATUS_MARKER : TELEGRAM_API_STATUS_MARKER;
+function roleEpoch(policy: Policy, alias: Alias): Guard {
+  return generalPolicy(policy)
+    ? { sql: `origin.auth_message_date=0 AND origin.auth_message_id=0 AND ${generalCurrentAuthoritySql(alias)}`, bindings: generalPolicyBindings(policy) }
+    : isolatedTelegramRoleEpochSql(policy, alias);
+}
 const PROMPT_SECONDS = 300;
 const WORK_SECONDS = 90;
 const REPLY_SECONDS = 900;
@@ -24,12 +36,12 @@ type Prompt = { receiptId: number; role: "admin" | "member"; authDate: number; a
 type Accepted = { receiptId: number; rows: readonly TelegramApiStatusRow[] };
 type Presentation = { promptId: number | null; first: number | null; second: number | null; readyAt: number; expiresAt: number };
 
-function isPrivate(policy: TelegramPolicy, event: Scope): boolean {
-  return event.chatType === "private" && event.threadId === null && inTelegramScope(policy, event);
+function isPrivate(policy: Policy, event: Scope): boolean {
+  return generalPolicy(policy) ? generalPrivateScope(policy, event) : event.chatType === "private" && event.threadId === null && inTelegramScope(policy, event);
 }
 
-function scopeSql(alias: Alias): string {
-  return `${alias}.receipt_nonce='${TELEGRAM_API_STATUS_MARKER}' AND ${alias}.command='help'
+function scopeSql(alias: Alias, general = false): string {
+  return `${alias}.receipt_nonce='${general ? GENERAL_API_STATUS_MARKER : TELEGRAM_API_STATUS_MARKER}' AND ${alias}.command='help'
     AND ${alias}.chat_type='private' AND ${alias}.chat_id=${alias}.actor_id AND ${alias}.thread_id IS NULL`;
 }
 
@@ -38,8 +50,8 @@ function readySql(alias: Alias): string {
     AND (origin.prompt_receipt_id IS NOT NULL OR origin.expires_at>unixepoch())`;
 }
 
-export function telegramApiStatusReceipt(alias: Alias): string {
-  return `(${scopeSql(alias)} AND EXISTS (SELECT 1 FROM telegram_api_status AS origin
+export function telegramApiStatusReceipt(alias: Alias, general = false): string {
+  return `(${scopeSql(alias, general)} AND EXISTS (SELECT 1 FROM telegram_api_status AS origin
     WHERE origin.receipt_id=${alias}.receipt_id AND origin.ready_at IS NOT NULL))`;
 }
 
@@ -55,13 +67,17 @@ export function telegramApiStatusEligible(policy: TelegramPolicy | undefined, al
     SELECT 1 FROM telegram_api_status AS origin WHERE ${readySql(alias)} AND ${epoch.sql}))`, bindings: epoch.bindings };
 }
 
-export async function telegramApiStatusReady(db: D1Database): Promise<boolean> {
+export async function telegramApiStatusReady(db: D1Database, general = false): Promise<boolean> {
   try {
     const count = await db.prepare(`SELECT count(*) AS present FROM sqlite_schema WHERE tbl_name='telegram_api_status'
       AND ((type='table' AND name=tbl_name)
         OR (type='index' AND name IN ('telegram_api_status_expiry','telegram_api_status_ready')))`).first<number>("present");
     if (count !== 0 && count !== 3) throw new Error();
-    return count === 3;
+    if (count !== 3) return false;
+    if (!general) return true;
+    return await db.prepare(`SELECT 1 FROM subs_bot_schema_migrations WHERE position=34
+      AND name='0034_telegram_api_status.sql' AND sha256='39f9f1473740ddbff2ff6d218f91f6a5ef050c6b2221e5b915dd7d91a5618664'
+      AND mode='applied'`).first() !== null;
   } catch {
     throw new Error("Telegram API status schema could not be confirmed.");
   }
@@ -69,12 +85,13 @@ export async function telegramApiStatusReady(db: D1Database): Promise<boolean> {
 
 const fresh = "bot_id=? AND update_id=? AND receipt_nonce=?";
 const age = "? BETWEEN unixepoch()-900 AND unixepoch()+30";
-const latestPrompt = `NOT EXISTS (SELECT 1 FROM telegram_inbox AS newer JOIN telegram_api_status AS other USING(receipt_id)
+const latestPrompt = (policy: Policy) => `NOT EXISTS (SELECT 1 FROM telegram_inbox AS newer JOIN telegram_api_status AS other USING(receipt_id)
     WHERE newer.bot_id=inbox.bot_id AND newer.actor_id=inbox.actor_id AND newer.chat_id=inbox.chat_id
-      AND newer.receipt_nonce='${TELEGRAM_API_STATUS_MARKER}' AND other.prompt_receipt_id IS NULL
+      AND newer.receipt_nonce='${marker(policy)}' AND other.prompt_receipt_id IS NULL
       AND (newer.message_date,newer.message_id)>(inbox.message_date,inbox.message_id))`;
 
-function inboxInsert(db: D1Database, policy: TelegramPolicy, event: TelegramEventScope, nonce: string, guard: Guard) {
+function inboxInsert(db: D1Database, policy: Policy, event: TelegramEventScope, nonce: string, guard: Guard) {
+  if (generalPolicy(policy)) return prepareGeneralPrivateAdmission(db, policy, event, nonce, guard);
   return db.prepare(`INSERT INTO telegram_inbox
     (bot_id,update_id,actor_id,chat_id,chat_type,message_id,message_date,thread_id,command,receipt_nonce)
     SELECT ?,?,?,?,'private',?,?,NULL,'help',? WHERE ${guard.sql}
@@ -82,10 +99,10 @@ function inboxInsert(db: D1Database, policy: TelegramPolicy, event: TelegramEven
     .bind(policy.botId, event.updateId, event.actorId, event.chatId, event.messageId, event.messageDate, nonce, ...guard.bindings);
 }
 
-function finishAdmission(db: D1Database, key: readonly [string, number, string]) {
+function finishAdmission(db: D1Database, key: readonly [string, number, string], policy: Policy) {
   return db.prepare(`UPDATE telegram_inbox AS inbox SET receipt_nonce=?,command=CASE WHEN EXISTS (
     SELECT 1 FROM telegram_api_status WHERE receipt_id=inbox.receipt_id
-  ) THEN command END WHERE ${fresh} RETURNING receipt_id AS receiptId`).bind(TELEGRAM_API_STATUS_MARKER, ...key);
+  ) THEN command END WHERE ${fresh} RETURNING receipt_id AS receiptId`).bind(marker(policy), ...key);
 }
 
 async function accept(db: D1Database, steps: D1PreparedStatement[]): Promise<number | null> {
@@ -96,42 +113,49 @@ async function accept(db: D1Database, steps: D1PreparedStatement[]): Promise<num
   return rows[0]?.receiptId ?? null;
 }
 
-export async function acceptTelegramApiStatusPrompt(db: D1Database, policy: TelegramPolicy, event: TelegramEventScope): Promise<boolean> {
-  if (!isPrivate(policy, event)) return false;
+export async function acceptTelegramApiStatusPrompt(db: D1Database, policy: Policy, event: TelegramEventScope): Promise<boolean> {
+  if (!isPrivate(policy, event) || (generalPolicy(policy) && !policy.privateApiStatus)) return false;
   try {
     const key = [policy.botId, event.updateId, crypto.randomUUID()] as const;
-    const guard = {
+    const general = generalPolicy(policy) ? policy : null;
+    const guard = general ? {
+      sql: `NOT EXISTS (SELECT 1 FROM telegram_inbox AS previous JOIN telegram_api_status AS prompt USING(receipt_id)
+        WHERE previous.bot_id=? AND previous.actor_id=? AND previous.chat_id=? AND previous.receipt_nonce='${marker(policy)}'
+          AND prompt.prompt_receipt_id IS NULL AND (previous.message_date,previous.message_id)>=(?,?))`,
+      bindings: [policy.botId,event.actorId,event.chatId,event.messageDate,event.messageId],
+    } : {
       sql: `${age} AND (?=? OR COALESCE((SELECT allowed=1 AND message_date<? FROM telegram_auth
         WHERE bot_id=? AND user_id=?),1)) AND NOT EXISTS (SELECT 1 FROM telegram_inbox AS previous
         JOIN telegram_api_status AS prompt USING(receipt_id) WHERE previous.bot_id=? AND previous.actor_id=?
-        AND previous.chat_id=? AND previous.receipt_nonce='${TELEGRAM_API_STATUS_MARKER}' AND prompt.prompt_receipt_id IS NULL
+        AND previous.chat_id=? AND previous.receipt_nonce='${marker(policy)}' AND prompt.prompt_receipt_id IS NULL
         AND (previous.message_date,previous.message_id)>=(?,?))`,
-      bindings: [event.messageDate, event.actorId, policy.adminId, event.messageDate, policy.botId, event.actorId,
+      bindings: [event.messageDate, event.actorId, (policy as TelegramPolicy).adminId, event.messageDate, policy.botId, event.actorId,
         policy.botId, event.actorId, event.chatId, event.messageDate, event.messageId],
     };
     return await accept(db, [
       inboxInsert(db, policy, event, key[2], guard),
+      ...(general ? [prepareGeneralReceiptAuthority(db, general, key)] : []),
       db.prepare(`INSERT INTO telegram_api_status (receipt_id,actor_role,auth_message_date,auth_message_id,expires_at,ready_at)
-        SELECT inbox.receipt_id,?,COALESCE(auth.message_date,0),COALESCE(auth.message_id,0),unixepoch()+${PROMPT_SECONDS},unixepoch()
-        FROM telegram_inbox AS inbox LEFT JOIN telegram_auth AS auth
-          ON auth.bot_id=inbox.bot_id AND auth.user_id=inbox.actor_id AND inbox.actor_id<>?
+        SELECT inbox.receipt_id,${general ? 'recorded.actor_role,0,0' : '?,COALESCE(auth.message_date,0),COALESCE(auth.message_id,0)'},unixepoch()+${PROMPT_SECONDS},unixepoch()
+        FROM telegram_inbox AS inbox ${general ? 'JOIN telegram_general_receipt AS recorded USING(receipt_id)' : `LEFT JOIN telegram_auth AS auth
+          ON auth.bot_id=inbox.bot_id AND auth.user_id=inbox.actor_id AND inbox.actor_id<>?`}
         WHERE inbox.bot_id=? AND inbox.update_id=? AND inbox.receipt_nonce=?`)
-        .bind(event.actorId === policy.adminId ? "admin" : "member", policy.adminId, ...key),
+        .bind(...(general ? [] : [event.actorId === (policy as TelegramPolicy).adminId ? "admin" : "member", (policy as TelegramPolicy).adminId]), ...key),
       db.prepare(`INSERT INTO telegram_outbox (receipt_id) SELECT receipt_id FROM telegram_inbox WHERE ${fresh}`).bind(...key),
-      finishAdmission(db, key),
+      finishAdmission(db, key, policy),
     ]) !== null;
   } catch {
     throw new Error("Telegram API status prompt could not be confirmed.");
   }
 }
 
-function promptGuard(policy: TelegramPolicy, event: Reply): Guard {
-  const epoch = isolatedTelegramRoleEpochSql(policy, "inbox");
-  return { sql: `inbox.bot_id=? AND inbox.actor_id=? AND inbox.chat_id=? AND ${scopeSql("inbox")}
+function promptGuard(policy: Policy, event: Reply): Guard {
+  const epoch = roleEpoch(policy, "inbox");
+  return { sql: `inbox.bot_id=? AND inbox.actor_id=? AND inbox.chat_id=? AND ${scopeSql("inbox", generalPolicy(policy))}
     AND origin.prompt_receipt_id IS NULL AND origin.expires_at>unixepoch()
     AND sent.state='sent' AND sent.sent_message_id=? AND sent.attempts>0
     AND ${age} AND ?>=inbox.message_date AND (origin.actor_role='admin' OR ?>origin.auth_message_date)
-    AND ${epoch.sql} AND ${latestPrompt}
+    AND ${epoch.sql} AND ${latestPrompt(policy)}
     AND NOT EXISTS(SELECT 1 FROM telegram_api_status AS consumed WHERE consumed.prompt_receipt_id=inbox.receipt_id)`,
   bindings: [policy.botId, event.actorId, event.chatId, event.promptMessageId, event.messageDate, event.messageDate,
     event.messageDate, ...epoch.bindings] };
@@ -139,8 +163,9 @@ function promptGuard(policy: TelegramPolicy, event: Reply): Guard {
 
 const promptFrom = "FROM telegram_inbox AS inbox JOIN telegram_api_status AS origin USING(receipt_id) JOIN telegram_outbox AS sent USING(receipt_id)";
 
-export async function acceptTelegramApiStatusReply(db: D1Database, policy: TelegramPolicy, event: Reply): Promise<Accepted | null> {
-  if (!isPrivate(policy, event)) return null;
+export async function acceptTelegramApiStatusReply(db: D1Database, policy: Policy, event: Reply): Promise<Accepted | null> {
+  if (!isPrivate(policy, event) || (generalPolicy(policy) && !policy.privateApiStatus)) return null;
+  const general = generalPolicy(policy) ? policy : null;
   try {
     const guard = promptGuard(policy, event);
     const prompt = await db.prepare(`SELECT inbox.receipt_id AS receiptId,origin.actor_role AS role,
@@ -161,11 +186,12 @@ export async function acceptTelegramApiStatusReply(db: D1Database, policy: Teleg
               AND pending.ready_at IS NULL AND pending.expires_at>unixepoch())`,
         bindings: [...guard.bindings, prompt.receiptId, policy.botId, event.actorId],
       }),
+      ...(general ? [prepareGeneralReceiptAuthority(db, general, key)] : []),
       db.prepare(`INSERT INTO telegram_api_status
         (receipt_id,prompt_receipt_id,actor_role,auth_message_date,auth_message_id,expires_at,row_one,row_two)
         SELECT receipt_id,?,?,?,?,unixepoch()+${WORK_SECONDS},?,? FROM telegram_inbox WHERE ${fresh}`)
         .bind(prompt.receiptId, prompt.role, prompt.authDate, prompt.authId, first, second, ...key),
-      finishAdmission(db, key),
+      finishAdmission(db, key, policy),
     ]);
     return receiptId === null ? null : { receiptId, rows };
   } catch {
@@ -173,13 +199,13 @@ export async function acceptTelegramApiStatusReply(db: D1Database, policy: Teleg
   }
 }
 
-function updateRow(db: D1Database, policy: TelegramPolicy, receiptId: number, column: Column, before: number, after: number) {
-  const epoch = isolatedTelegramRoleEpochSql(policy, "inbox");
+function updateRow(db: D1Database, policy: Policy, receiptId: number, column: Column, before: number, after: number) {
+  const epoch = roleEpoch(policy, "inbox");
   return db.prepare(`UPDATE telegram_api_status AS action SET ${column}=?
     WHERE action.receipt_id=? AND action.prompt_receipt_id IS NOT NULL AND action.ready_at IS NULL
       AND action.expires_at>unixepoch() AND action.${column}=? AND EXISTS (
         SELECT 1 FROM telegram_inbox AS inbox JOIN telegram_api_status AS origin USING(receipt_id)
-        WHERE inbox.receipt_id=action.receipt_id AND inbox.bot_id=? AND ${scopeSql("inbox")} AND ${epoch.sql})
+        WHERE inbox.receipt_id=action.receipt_id AND inbox.bot_id=? AND ${scopeSql("inbox", generalPolicy(policy))} AND ${epoch.sql})
     RETURNING expires_at AS expiresAt`).bind(after, receiptId, before, policy.botId, ...epoch.bindings);
 }
 
@@ -214,7 +240,7 @@ async function probe(provider: ProviderApiStatusV2Prober, row: Extract<TelegramA
   }
 }
 
-export async function runTelegramApiStatus(db: D1Database, policy: TelegramPolicy, provider: ProviderApiStatusV2Prober, pin: ProviderPin,
+export async function runTelegramApiStatus(db: D1Database, policy: Policy, provider: ProviderApiStatusV2Prober, pin: ProviderPin,
   accepted: Accepted): Promise<void> {
   const deadline = Date.now() + BUDGET_MS;
   for (const [index, row] of accepted.rows.entries()) {
@@ -229,10 +255,11 @@ export async function runTelegramApiStatus(db: D1Database, policy: TelegramPolic
   }
 }
 
-export async function reconcileTelegramApiStatus(db: D1Database, policy: TelegramPolicy): Promise<number> {
-  const epoch = isolatedTelegramRoleEpochSql(policy, "inbox");
-  const current = `inbox.bot_id=? AND ${scopeSql("inbox")} AND inbox.actor_id IN (?,?)`;
-  const scope = [policy.botId, policy.adminId, policy.memberId];
+export async function reconcileTelegramApiStatus(db: D1Database, policy: Policy): Promise<number> {
+  const epoch = roleEpoch(policy, "inbox");
+  const general = generalPolicy(policy);
+  const current = `inbox.bot_id=? AND ${scopeSql("inbox", general)} AND ${general ? generalRecordedOriginSql('inbox') : 'inbox.actor_id IN (?,?)'}`;
+  const scope = general ? [policy.botId, ...generalPolicyBindings(policy)] : [policy.botId, policy.adminId, policy.memberId];
   try {
     const result = await db.batch([
       db.prepare(`UPDATE telegram_api_status SET
@@ -273,13 +300,13 @@ function describe(code: number | null): string {
     ? `HTTP ${status} · ${elapsed} ms` : "暂时无法确认。";
 }
 
-export async function renderTelegramApiStatus(db: D1Database, policy: TelegramPolicy, lease: Lease): Promise<{
+export async function renderTelegramApiStatus(db: D1Database, policy: Policy, lease: Lease): Promise<{
   text: string; forceReply: boolean; guard: Guard;
 } | null> {
   if (!isPrivate(policy, lease)) return null;
-  const epoch = isolatedTelegramRoleEpochSql(policy, "inbox");
-  const exact = `${scopeSql("inbox")} AND ${readySql("inbox")} AND ${epoch.sql}
-    AND (origin.prompt_receipt_id IS NOT NULL OR (${latestPrompt}))`;
+  const epoch = roleEpoch(policy, "inbox");
+  const exact = `${scopeSql("inbox", generalPolicy(policy))} AND ${readySql("inbox")} AND ${epoch.sql}
+    AND (origin.prompt_receipt_id IS NOT NULL OR (${latestPrompt(policy)}))`;
   const presentation = await db.prepare(`SELECT origin.prompt_receipt_id AS promptId,origin.row_one AS first,origin.row_two AS second,
       origin.ready_at AS readyAt,origin.expires_at AS expiresAt FROM telegram_inbox AS inbox
     JOIN telegram_api_status AS origin USING(receipt_id) JOIN telegram_outbox AS reply USING(receipt_id)

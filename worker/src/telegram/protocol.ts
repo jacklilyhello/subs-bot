@@ -323,6 +323,28 @@ export function readGeneralPrivateShareClaim(
     messageId, messageDate, code: match[1] };
 }
 
+/** Historic share cards carry only a lookup code. They never claim or deliver in the callback's chat. */
+export function readGeneralLegacyShareCallback(update: Record<string, unknown>, botId: string): TelegramLegacyInlineClaim | null {
+  if (Object.keys(update).length !== 2 || !isRecord(update.callback_query)) return null;
+  const callback = update.callback_query;
+  const { id: callbackId, from: actor, data, message } = callback;
+  if (!matches(callbackId, CALLBACK_ID) || !isRecord(actor) || actor.is_bot !== false || !isPositiveInteger(actor.id)
+    || String(actor.id) === botId || "game_short_name" in callback || typeof data !== "string") return null;
+  const code = /^share:c:([A-Za-z0-9_-]{11})(?![\s\S])/u.exec(data)?.[1];
+  if (!code) return null;
+  const actorId = String(actor.id);
+  if ("inline_message_id" in callback) {
+    return !("message" in callback) && matches(callback.inline_message_id, /^[!-~]{1,256}(?![\s\S])/u)
+      ? { actorId, callbackId, code } : null;
+  }
+  if (!ownBotMessage(message, { botId })) return null;
+  const scope = telegramMessageScope(message, actorId, Number(update.update_id));
+  if (!scope || scope.threadId !== null || message.is_topic_message === true
+    || (scope.chatType === "private" ? scope.chatId !== actorId
+      : Number(scope.chatId) >= 0 || Number(scope.chatId) <= -(2 ** 52))) return null;
+  return { actorId, callbackId, code };
+}
+
 export function readGeneralGroupCommand(update: Record<string, unknown>, botUsername: string):
   (Omit<TelegramEventScope, "updateId"> & { name: string; remainder: string }) | null {
   const { message } = update;
@@ -515,6 +537,39 @@ function readGeneralPrivateTicket(
     ? { ...scope, callbackId, ticket } : null;
 }
 
+export function readGeneralPrivateBulkTrash(
+  update: Record<string, unknown>, updateId: number, botId: string, botUsername: string,
+): TelegramBulkTrashUpdate | null {
+  if (Object.keys(update).length !== 2) return null;
+  if (isRecord(update.callback_query)) {
+    const ticket = readGeneralPrivateTicket(update.callback_query, updateId, botId, BULK_TRASH_TICKET);
+    return ticket && ticket.actorId !== botId ? { ...ticket, kind: "confirm" } : null;
+  }
+  const command = readPrivateTelegramCommand(update, botUsername);
+  if (!command || command.actorId === botId || command.name !== "d"
+    || (command.remainder !== "" && !PATH_RULE_WHITESPACE_PREFIX.test(command.remainder))) return null;
+  return { updateId, actorId: command.actorId, chatId: command.actorId, chatType: "private", threadId: null,
+    messageId: command.messageId, messageDate: command.messageDate, kind: "preview", query: command.remainder };
+}
+
+export function readGeneralPrivateInlineSort(
+  update: Record<string, unknown>, updateId: number, botId: string, botUsername: string,
+): TelegramInlineSortUpdate | null {
+  const command = readPrivateTelegramCommand(update, botUsername);
+  if (!command || command.actorId === botId || command.name !== "i"
+    || (command.remainder !== "" && !PATH_RULE_WHITESPACE_PREFIX.test(command.remainder))) return null;
+  const scope = { updateId, actorId: command.actorId, chatId: command.actorId, chatType: "private" as const, threadId: null,
+    messageId: command.messageId, messageDate: command.messageDate };
+  switch (command.remainder.length <= 4096 ? collapsePathRuleWhitespace(command.remainder) : null) {
+    case "": return { ...scope, kind: "current" };
+    case "默认": return { ...scope, kind: "set", mode: "default" };
+    case "流量": return { ...scope, kind: "set", mode: "traffic" };
+    case "到期": return { ...scope, kind: "set", mode: "expiry" };
+    case "名称": return { ...scope, kind: "set", mode: "name" };
+    default: return { ...scope, kind: "usage" };
+  }
+}
+
 export function readGeneralPrivateProviderBatch(
   update: Record<string, unknown>, updateId: number, botId: string, botUsername: string,
 ): TelegramProviderBatchUpdate | null {
@@ -627,6 +682,38 @@ export function readGeneralPrivateDocumentUpdate(
   const actorId = humanSender(message);
   const scope = actorId && actorId !== botId ? telegramMessageScope(message, actorId, updateId) : null;
   return scope && scope.chatId === scope.actorId ? documentInput(message, scope) : null;
+}
+
+export function readGeneralPrivateGitHubSearch(
+  update: Record<string, unknown>, updateId: number, botId: string, botUsername: string,
+): TelegramGitHubSearchUpdate | null {
+  const command = readPrivateTelegramCommand(update, botUsername);
+  if (!command || command.actorId === botId || command.name !== "g"
+    || (command.remainder !== "" && !/^\s/u.test(command.remainder))) return null;
+  const { actorId, messageId, messageDate } = command;
+  return { updateId, actorId, chatId: actorId, chatType: "private", threadId: null,
+    messageId, messageDate, args: command.remainder };
+}
+
+export function readGeneralPrivateApiStatus(
+  update: Record<string, unknown>, updateId: number, botId: string, botUsername: string,
+): TelegramApiStatusUpdate | null {
+  const { message } = update;
+  if (Object.keys(update).length !== 2 || !isRecord(message) || "edit_date" in message || "document" in message
+    || "message_thread_id" in message || message.is_topic_message === true) return null;
+  const actorId = humanSender(message);
+  const scope = actorId && actorId !== botId ? telegramMessageScope(message, actorId, updateId) : null;
+  if (!scope || scope.chatType !== "private" || scope.chatId !== scope.actorId || scope.threadId !== null) return null;
+  const origin = message.reply_to_message;
+  if (ownBotMessage(origin, { botId }) && origin.text === TELEGRAM_API_STATUS_PROMPT) {
+    const prompt = telegramMessageScope(origin, actorId!, updateId);
+    return typeof message.text === "string" && prompt?.chatType === "private" && prompt.chatId === scope.chatId
+      && prompt.threadId === null && prompt.messageId < scope.messageId && prompt.messageDate <= scope.messageDate
+      ? { ...scope, kind: "reply", promptMessageId: prompt.messageId, text: message.text } : null;
+  }
+  const command = readPrivateTelegramCommand(update, botUsername);
+  return command?.name === "ai" && classifyTelegramApiStatusInput({ kind: "ai-command", args: command.remainder }).kind === "open-prompt"
+    ? { ...scope, kind: "prompt" } : null;
 }
 
 const DECIMAL_DIGIT = /^\p{Nd}$/u;

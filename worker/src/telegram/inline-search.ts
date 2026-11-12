@@ -1,7 +1,7 @@
 import { trimPathRuleWhitespace } from "../path-rules.ts";
 import { digestHex, SUBSCRIPTION_LIFECYCLE_REVISION, validInteger } from "../storage.ts";
 import type { GeneralTelegramPin } from "./general-auth-runtime.ts";
-import { activeInlineConsent, GENERAL_INLINE_CONSENT_MARKER, inlineSearchReceiptFamily,
+import { activeInlineConsent, GENERAL_INLINE_CONSENT_MARKER, GENERAL_INLINE_TEMP_CONSENT_MARKER, inlineSearchReceiptFamily,
   TELEGRAM_INLINE_CONSENT_MARKER, TELEGRAM_INLINE_TEMP_CONSENT_MARKER } from "./inline-search-consent.ts";
 import { readTelegramInlineTempNodes } from "./inline-temp-nodes.ts";
 import type { TelegramBotCredentials, TelegramInlineQuery, TelegramInlineSortMode, TelegramPolicy } from "./protocol.ts";
@@ -121,7 +121,8 @@ export async function answerTelegramInlineSearch(
       : !general?.privateInline || general.rehearsal || event.actorId === general.botId)) return;
   const query = trimPathRuleWhitespace(event.query);
   const needle = unicode14Lower(query);
-  if (/^share(?:\s|$)/u.test(needle)) return;
+  const shareQuery = /^share(?:\s|$)/u.test(needle);
+  if (shareQuery && !general) return;
   const queryDigest = digestHex(await crypto.subtle.digest("SHA-256", encoder.encode(event.queryId)));
   const key = [policy.botId, event.updateId, event.actorId, queryDigest] as const;
   const consent = activeInlineConsent(policy);
@@ -153,13 +154,18 @@ export async function answerTelegramInlineSearch(
     const marker = receipt.consentMarker;
     const isolatedMarker = marker === TELEGRAM_INLINE_CONSENT_MARKER || marker === TELEGRAM_INLINE_TEMP_CONSENT_MARKER
       ? marker : undefined;
-    if (general ? marker !== GENERAL_INLINE_CONSENT_MARKER : !isolatedMarker) throw new Error();
-    const sendConsent = activeInlineConsent(policy, isolatedMarker);
+    const generalMarker = marker === GENERAL_INLINE_CONSENT_MARKER || marker === GENERAL_INLINE_TEMP_CONSENT_MARKER
+      ? marker : undefined;
+    if (general ? !generalMarker : !isolatedMarker) throw new Error();
+    const sendConsent = activeInlineConsent(policy, general ? generalMarker : isolatedMarker);
     const deadline = Date.now() + SCAN_MS;
-    const scan = await scanOwned(db, event.actorId, needle, receipt.mode, deadline);
-    const results = scan?.results ?? [];
-    const temp = isolated && marker === TELEGRAM_INLINE_TEMP_CONSENT_MARKER && scan && results.length < MAX_RESULTS
-      ? await readTelegramInlineTempNodes(db, isolated, event, needle, MAX_RESULTS - results.length, deadline, receipt.receivedAt) : undefined;
+    const scan = shareQuery ? null : await scanOwned(db, event.actorId, needle, receipt.mode, deadline);
+    const results: InlineSearchArticle[] = shareQuery ? [{ type: "article", id: crypto.randomUUID(), title: "在机器人私聊创建私密分享",
+      input_message_content: { message_text: `请打开 @${policy.botUsername} 的私聊，发送 ${general?.privateShareCreation ? "/share" : "/help"} 查看可用的私密分享入口。`,
+        link_preview_options: { is_disabled: true } } }] : scan?.results ?? [];
+    const temp = (marker === TELEGRAM_INLINE_TEMP_CONSENT_MARKER || marker === GENERAL_INLINE_TEMP_CONSENT_MARKER)
+      && scan && results.length < MAX_RESULTS
+      ? await readTelegramInlineTempNodes(db, policy, event, needle, MAX_RESULTS - results.length, deadline, receipt.receivedAt) : undefined;
     if (temp === null) results.length = 0;
     else if (temp) results.push(...temp.results);
     const authorization = `EXISTS (SELECT 1 FROM telegram_inline_search_consent AS consent
@@ -168,22 +174,31 @@ export async function answerTelegramInlineSearch(
     const proof = general ? `WITH eligible AS MATERIALIZED (
       SELECT (${authorization}) AS allowed FROM telegram_inline_search_receipts AS request WHERE ${requestKey}
     )` : "";
-    const begin = await db.prepare(`${proof} UPDATE telegram_inline_search_receipts AS request SET state='sending',result_count=?
-      WHERE ${requestKey} AND request.state='preflight' AND request.lease_until>=unixepoch()+${ANSWER_SECONDS + 1}
-        AND ${general ? "EXISTS (SELECT 1 FROM eligible WHERE allowed)" : authorization}
-        AND request.sort_mode=COALESCE((SELECT mode FROM telegram_inline_sort_preferences
+    const prepared = `request.sort_mode=COALESCE((SELECT mode FROM telegram_inline_sort_preferences
           WHERE bot_id=request.bot_id AND actor_id=request.actor_id),'default')
         AND request.sort_update_id=COALESCE((SELECT update_id FROM telegram_inline_sort_preferences
           WHERE bot_id=request.bot_id AND actor_id=request.actor_id),0)
         ${scan ? `AND (${inventoryGuard})` : ""}
-        ${temp ? `AND (${temp.guard.sql})` : ""} RETURNING update_id`)
+        ${temp ? `AND (${temp.guard.sql})` : ""}`;
+    const preparedBindings = [...(scan ? [scan.inventory, scan.inventory] : []), ...(temp?.guard.bindings ?? [])];
+    const begin = await db.prepare(`${proof} UPDATE telegram_inline_search_receipts AS request SET state='sending',result_count=?
+      WHERE ${requestKey} AND request.state='preflight' AND request.lease_until>=unixepoch()+${ANSWER_SECONDS + 1}
+        AND ${general ? "EXISTS (SELECT 1 FROM eligible WHERE allowed)" : authorization}
+        AND (${prepared}) RETURNING update_id`)
       .bind(...(general ? [...sendConsent.bindings, ...key] : []), results.length, ...key,
-        ...(general ? [] : sendConsent.bindings), ...(scan ? [scan.inventory, scan.inventory] : []), ...(temp?.guard.bindings ?? [])).first();
+        ...(general ? [] : sendConsent.bindings), ...preparedBindings).first();
     if (begin === null) {
       await finish(db, key, "preflight", "dropped");
       return;
     }
     state = "sending";
+    const confirmed = await db.prepare(`${proof} SELECT 1 FROM telegram_inline_search_receipts AS request
+      WHERE ${requestKey} AND request.state='sending' AND request.result_count=?
+        AND request.lease_until>=unixepoch()+${ANSWER_SECONDS}
+        AND ${general ? "EXISTS (SELECT 1 FROM eligible WHERE allowed)" : authorization} AND (${prepared})`)
+      .bind(...(general ? [...sendConsent.bindings, ...key] : []), ...key, results.length,
+        ...(general ? [] : sendConsent.bindings), ...preparedBindings).first();
+    if (!confirmed) { await finish(db, key, "sending", "dropped"); return; }
     const outcome = await send(policy, event.queryId, results, ANSWER_SECONDS * 1_000);
     await finish(db, key, "sending", outcome);
   } catch {

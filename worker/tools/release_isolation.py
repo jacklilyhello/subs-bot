@@ -6,6 +6,8 @@ import os
 import re
 import sys
 from functools import cache
+
+import external_shortlink_release as external_shortlinks
 from pathlib import Path
 
 from attest_api_status_container import ATTESTATION_ENV
@@ -167,6 +169,16 @@ def api_status_release_mode():
     raise CloudflareError("The isolated API status release mode or confirmation is invalid.")
 
 
+def external_shortlinks_release_mode():
+    value = os.environ.get("SUBS_BOT_EXTERNAL_SHORTLINKS_MODE", "preserve")
+    if value == "preserve":
+        return None
+    for mode in ("enable", "disable"):
+        if value == f"{mode} external shortlinks for {WORKER_NAME}":
+            return mode == "enable"
+    raise CloudflareError("The isolated external shortlink release mode or confirmation is invalid.")
+
+
 def release():
     revision = os.environ.get("GITHUB_SHA", "")
     if (os.environ.get("GITHUB_REPOSITORY") != "jacklilyhello/subs-bot"
@@ -185,9 +197,15 @@ def release():
     subscription_shorts = subscription_shorts_release_mode()
     provider_batch = provider_batch_release_mode()
     api_status = api_status_release_mode()
+    external_shortlinks_mode = external_shortlinks_release_mode()
+    shortlink_token = os.environ.get("SUBS_BOT_SHORTLINK_BUSINESS_TOKEN") or None
+    if external_shortlinks_mode is not None and any(mode is not None for mode in (
+            inline_search, provider_url_import, provider_url_documents, mixed_documents, group_share_cards,
+            provider_refresh, legacy_subscription_shorts, subscription_shorts, provider_batch, api_status)):
+        raise CloudflareError("Change isolated external shortlinks in a separate scoped release.")
     if subscription_shorts is not None and any(mode is not None for mode in (
             inline_search, provider_url_import, provider_refresh, legacy_subscription_shorts, provider_batch,
-            api_status, provider_url_documents, mixed_documents, group_share_cards)):
+            api_status, provider_url_documents, mixed_documents, group_share_cards, external_shortlinks_mode)):
         raise CloudflareError("Change typed subscription short-link issuance in a separate scoped release.")
     page_jump = os.environ.get("SUBS_BOT_PAGE_JUMP_MODE", "preserve")
     page_jump_confirmation = os.environ.get("SUBS_BOT_PAGE_JUMP_CONFIRMATION", "")
@@ -202,7 +220,7 @@ def release():
         _, page_jump_checkpoint = stage_inputs(page_jump, page_jump_confirmation, page_jump_input)
     if page_jump != "preserve" and any(mode is not None for mode in (
             inline_search, provider_url_import, provider_url_documents, mixed_documents, group_share_cards,
-            provider_refresh, legacy_subscription_shorts, subscription_shorts, provider_batch, api_status)):
+            provider_refresh, legacy_subscription_shorts, subscription_shorts, provider_batch, api_status, external_shortlinks_mode)):
         raise CloudflareError("Manage isolated page jump in a separate scoped operation.")
     if recovery or activation:
         run_id, attempt = hosted_run(os.environ)
@@ -266,6 +284,7 @@ def release():
     temp_capable = legacy_temp_artifact(bundle, manifest)
     dynamic_all_capable = legacy_dynamic_all_artifact(bundle, manifest)
     typed_shorts_capable, general_typed_shorts_capable = subscription_shorts_artifact(bundle, manifest, with_general=True)
+    external_capable = external_shortlinks.artifact_capable((bundle / "index.js").read_bytes(), manifest)
     verify_page_jump_artifact(bundle, manifest)
     verify_general_read_artifact(bundle, manifest)
     telegram_config = telegram_release_config(manifest)
@@ -318,7 +337,9 @@ def release():
                                     legacy_selected_capable=selected_capable, legacy_temp_capable=temp_capable,
                                     legacy_dynamic_all_capable=dynamic_all_capable, subscription_shorts=subscription_shorts,
                                     subscription_shorts_capable=typed_shorts_capable,
-                                    general_subscription_shorts_capable=general_typed_shorts_capable)
+                                    general_subscription_shorts_capable=general_typed_shorts_capable,
+                                    external_shortlinks_mode=external_shortlinks_mode, shortlink_token=shortlink_token,
+                                    external_shortlinks_capable=external_capable)
     if subscription_shorts is True:
         print(json.dumps({"subscriptionShortsPreflight": "verified", "revision": revision,
                           "previousVersionId": starting["versionId"], "previousDeploymentId": starting["deploymentId"],
@@ -338,7 +359,8 @@ def release():
                             legacy_subscription_shorts=legacy_subscription_shorts, provider_batch=provider_batch,
                             api_status=api_status, api_status_gate=api_status_gate,
                             provider_url_documents=provider_url_documents, mixed_documents=mixed_documents,
-                            group_share_cards=group_share_cards, subscription_shorts=subscription_shorts)
+                            group_share_cards=group_share_cards, subscription_shorts=subscription_shorts,
+                            external_shortlinks_mode=external_shortlinks_mode, shortlink_token=shortlink_token)
     guard()
     print(json.dumps(result, sort_keys=True), flush=True)
 
