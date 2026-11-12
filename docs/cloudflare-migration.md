@@ -695,6 +695,8 @@ V11 合成原生演练在 `worker-isolation-legacy-candidate.yml` 选择 `synthe
 
 通用私聊管理配置可显式加入 `inlineSearch: true`。部署同时启用 `TELEGRAM_INLINE_SEARCH` 时，允许当前主体在自己的 Bot 私聊通过 `/inline on` 同意 15 分钟内联订阅名称搜索。只接受 Telegram 标记为 `sender` 的查询，查询和原始来源不存入回执，结果不含能力链接。发送前再次核对原同意回执、当前授权及订阅版本，重复查询只处理一次。暂停查询时仍可 `/inline off`。现有隔离配置不启用这一通用入口，临时节点内联和群内内联不在此模式内。
 
+通用私聊管理配置可分别加入 `githubSearch: true` 和 `apiStatus: true`。前者在准确登记的 `0027` 就绪时允许本人私聊 `/g 关键词`；复用同一 GitHub/Grep 公开搜索器、每账号冷却和有限调用预算，查询只在获胜 webhook 调用的内存中使用。通用与隔离搜索使用不同回执标记，重投及并发不会再次查找，恢复只产生固定备用入口。后者还要求原有 `TELEGRAM_API_STATUS=1`、API V2 命名绑定和准确登记的 `0034`，允许本人私聊 `/ai`。只接受回复已确认发送的本人最新提示；`/cancel` 必须回复该提示。地址与 Key 只在当前调用内存传给已有 V2 探测服务，不进入 D1、恢复任务、业务回复或日志。每行最多启动一次 RPC，中断及不确定结果不重放凭据。两类操作都在收件、执行和发送前核对同一通用世代、主体修订及当前权限，群聊不接收这些命令。帮助和命令菜单仅展示开关与实际依赖均已就绪的入口。配置缺省保持关闭。
+
 #### Bot 展示时区
 
 `0051` 使机器人生成的日期时间默认按 UTC 展示。管理员在机器人私聊用 `/settings` 或 `/timezone` 查看当前 Bot 的统一展示时区，在面板选择 UTC、Asia/Singapore，或发送 `/timezone America/New_York` 等有效 IANA 名称。`/timezone UTC` 恢复默认。普通成员和群聊不能修改。设置按 Bot 存入 D1，并使用原有收件和发件队列持久记录操作；Telegram 重投不会重复应用。按命令消息时间、同秒 update ID 排序；面板回调以本次接收时刻记录操作时间，因此旧面板仍可由当前管理员使用。 [Telegram Update](https://core.telegram.org/bots/api#update)

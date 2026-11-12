@@ -218,9 +218,15 @@ function generalProviderRefreshAvailability(env: Env, enabled: boolean) {
     ? async () => await generalProviderRefreshReady(env.DB) && await generalProviderAdmissionReady(env) : undefined;
 }
 
+async function withGeneralUtilities(env: Env, pin: GeneralTelegramPin): Promise<GeneralTelegramPin> {
+  const github = Boolean(pin.privateGitHub && await telegramGitHubSearchReady(env.DB).catch(() => false));
+  const apiStatus = Boolean(pin.privateApiStatus && apiStatusProvider(env) && await telegramApiStatusReady(env.DB, true).catch(() => false));
+  return { ...pin, commandFeatures: { ...pin.commandFeatures, github, apiStatus } };
+}
+
 async function generalTelegramWebhook(request: Request, env: Env, publicOrigin: PublicOrigin, general: GeneralTelegramPin, ctx?: ExecutionContext): Promise<Response> {
   try {
-    general = await withGeneralProviderDocuments(env, general);
+    general = await withGeneralProviderDocuments(env, await withGeneralUtilities(env, general));
     const providerAvailable = general.privateProvider && env.TELEGRAM_PROVIDER_URL_IMPORT === "1"
       ? () => generalProviderAdmissionReady(env) : undefined;
     const refreshAvailable = generalProviderRefreshAvailability(env, general.privateProvider);
@@ -230,10 +236,25 @@ async function generalTelegramWebhook(request: Request, env: Env, publicOrigin: 
     if (general.providerBatch && !await generalTelegramProviderBatchReady(env.DB)) return plain("Service unavailable.", 503, false);
     const batchAdmission = general.providerBatch === true && env.TELEGRAM_PROVIDER_BATCH_REFRESH === "1"
       && await generalProviderAdmissionReady(env);
+    const statusProvider = general.commandFeatures?.apiStatus ? apiStatusProvider(env) : null;
+    const utilities = {
+      github: general.commandFeatures?.github === true,
+      ...(statusProvider ? { apiStatus: { provider: statusProvider.binding, pin: statusProvider.pin } } : {}),
+      schedule: async (operation: () => Promise<void>) => {
+        const deadline = Date.now() + 28_000;
+        const work = operation().finally(async () => {
+          // Slow probes keep their durable reply for Cron rather than exceed the background delivery window.
+          if (Date.now() + 5_000 >= deadline) return;
+          await drainGeneralSharedTelegramReply(env.DB, general, env.NODES, publicOrigin, refreshAvailable, share, aggregateKey);
+        });
+        if (ctx) ctx.waitUntil(work.catch(() => undefined));
+        else await work;
+      },
+    };
     const status = general.sharedOutbox ? await acceptGeneralSharedTelegramCommand(env.DB, general, request,
       (callbackId, answer) => ctx?.waitUntil(answerTelegramCallback(general, callbackId, answer)), providerAvailable, refreshAvailable,
       share ? { bucket: env.NODES, runtime: share, publicOrigin } : undefined, aggregateKey, env.TELEGRAM_INLINE_SEARCH === "1",
-      generalProviderDocumentsEnabled(env), batchAdmission)
+      generalProviderDocumentsEnabled(env), batchAdmission, utilities)
       : await acceptGeneralTelegramCommand(env.DB, general, request);
     if (status === 200) {
       const delivery = general.sharedOutbox
@@ -244,6 +265,8 @@ async function generalTelegramWebhook(request: Request, env: Env, publicOrigin: 
       if (ctx) ctx.waitUntil(delivery.catch(() => undefined));
       else await delivery;
     }
+    // A readiness probe can fail closed after a concurrent pause. Keep uncommitted updates retryable.
+    if (general.isolationWindow) await env.DB.prepare("SELECT 1").first();
     return new Response(null, { status, headers: HEADERS });
   } catch {
     return plain("Service unavailable.", 503, false);
@@ -851,7 +874,7 @@ async function scheduled(_controller: ScheduledController, env: Env): Promise<vo
         groupCards: env.TELEGRAM_GROUP_SHARE_CARDS === "1", subscriptionShorts: env.TELEGRAM_SUBSCRIPTION_SHORTS === "1",
       });
       const recovery = await Promise.allSettled(window.pin ? [
-        withGeneralProviderDocuments(env, window.pin).then((general) => recoverGeneralWork(env, pin, publicOrigin, general)),
+        withGeneralProviderDocuments(env, await withGeneralUtilities(env, window.pin)).then((general) => recoverGeneralWork(env, pin, publicOrigin, general)),
       ] : [
         (async () => recoverTelegramWork(env, policy, pin, await telegramProviderQueueReady(env, pin), publicOrigin))(),
         (async () => {
@@ -863,7 +886,7 @@ async function scheduled(_controller: ScheduledController, env: Env): Promise<vo
       if (recovery.some(({ status }) => status === "rejected")) throw new Error("Telegram scheduled recovery could not finish.");
     } else if (env.TELEGRAM_ISOLATION_CONFIG === undefined) {
       const configured = parseGeneralTelegramPin(env.TELEGRAM_GENERAL_CONFIG, env.BUILD_REVISION);
-      const general = configured ? await withGeneralProviderDocuments(env, configured) : null;
+      const general = configured ? await withGeneralProviderDocuments(env, await withGeneralUtilities(env, configured)) : null;
       if (general?.sharedOutbox) {
         await recoverGeneralWork(env, pin, publicOrigin, general);
       } else if (general) await recoverGeneralTelegramReplies(env.DB, general);

@@ -1,8 +1,14 @@
+import type { GeneralTelegramPin } from "./general-auth-runtime.ts";
+import { generalPrivateScope, prepareGeneralPrivateAdmission } from "./general-private-admission.ts";
+import { generalCurrentAuthoritySql, generalPolicyBindings, prepareGeneralReceiptAuthority } from "./general-receipt.ts";
 import { validInteger } from "../storage.ts";
 import { grepCodeContent, type GrepSearchObservation } from "./grep-search.ts";
 import { inTelegramScope, type TelegramGitHubSearchUpdate, type TelegramPolicy } from "./protocol.ts";
 
 export const TELEGRAM_GITHUB_SEARCH_MARKER = "github-search:v1";
+export const GENERAL_GITHUB_SEARCH_MARKER = "general-github-search:v1";
+type Policy = TelegramPolicy | GeneralTelegramPin;
+const generalPolicy = (policy: Policy): policy is GeneralTelegramPin => "privateManagement" in policy;
 export const TELEGRAM_GITHUB_SEARCH_MIGRATION = "0027_telegram_github_search.sql";
 export const TELEGRAM_GITHUB_SEARCH_SCHEMA_SHA256 = "189751e07f92b8616de22cfc8593e642426fb6a074be52f09b635e31efe8a0d4";
 
@@ -126,8 +132,8 @@ export async function telegramGitHubSearchReady(db: D1Database): Promise<boolean
   throw new Error("Telegram GitHub search schema could not be confirmed.");
 }
 
-function privateReceipt(alias: InboxAlias): string {
-  return `${alias}.receipt_nonce = '${TELEGRAM_GITHUB_SEARCH_MARKER}' AND ${alias}.command = 'help'
+function privateReceipt(alias: InboxAlias, general = false): string {
+  return `${alias}.receipt_nonce = '${general ? GENERAL_GITHUB_SEARCH_MARKER : TELEGRAM_GITHUB_SEARCH_MARKER}' AND ${alias}.command = 'help'
     AND ${alias}.chat_type = 'private' AND ${alias}.actor_id = ${alias}.chat_id AND ${alias}.thread_id IS NULL`;
 }
 
@@ -135,7 +141,9 @@ function ownSearch(alias: InboxAlias): string {
   return `search.receipt_id = ${alias}.receipt_id AND search.bot_id = ${alias}.bot_id AND search.actor_id = ${alias}.actor_id`;
 }
 
-function epoch(policy: TelegramPolicy, alias: InboxAlias = "inbox") {
+function epoch(policy: Policy, alias: InboxAlias = "inbox") {
+  if (generalPolicy(policy)) return { sql: `search.auth_message_date=0 AND search.auth_message_id=0 AND ${generalCurrentAuthoritySql(alias)}`,
+    bindings: generalPolicyBindings(policy) };
   return { sql: `((${alias}.actor_id = ? AND search.auth_message_date = 0 AND search.auth_message_id = 0)
     OR (${alias}.actor_id = ? AND ${alias}.message_date > search.auth_message_date
       AND COALESCE((SELECT allowed = 1 AND message_date = search.auth_message_date AND message_id = search.auth_message_id
@@ -146,8 +154,8 @@ function epoch(policy: TelegramPolicy, alias: InboxAlias = "inbox") {
 
 const REPLY_READY = "search.state IN ('usage', 'limited', 'found', 'empty', 'unavailable')";
 
-export function telegramGitHubSearchMarker(alias: InboxAlias): string {
-  return `(${privateReceipt(alias)} AND EXISTS (
+export function telegramGitHubSearchMarker(alias: InboxAlias, general = false): string {
+  return `(${privateReceipt(alias, general)} AND EXISTS (
     SELECT 1 FROM telegram_github_search AS search WHERE ${ownSearch(alias)} AND ${REPLY_READY}))`;
 }
 
@@ -159,7 +167,7 @@ export function telegramGitHubSearchEligible(policy: TelegramPolicy | undefined,
   bindings: current.bindings };
 }
 
-export function telegramGitHubSendGuard(policy: TelegramPolicy, reply: TelegramGitHubReply) {
+export function telegramGitHubSendGuard(policy: Policy, reply: TelegramGitHubReply) {
   const current = epoch(policy);
   return { sql: `EXISTS (SELECT 1 FROM telegram_github_search AS search
     WHERE ${ownSearch("inbox")} AND search.state = ? AND search.public_results IS ? AND ${current.sql})`,
@@ -167,9 +175,10 @@ export function telegramGitHubSendGuard(policy: TelegramPolicy, reply: TelegramG
 }
 
 export async function acceptTelegramGitHubSearch(
-  db: D1Database, policy: TelegramPolicy, event: TelegramGitHubSearchUpdate,
+  db: D1Database, policy: Policy, event: TelegramGitHubSearchUpdate,
 ): Promise<Admission> {
-  if (!inTelegramScope(policy, event) || event.chatType !== "private" || event.threadId !== null
+  const general = generalPolicy(policy) ? policy : null;
+  if (!(general ? general.privateGitHub && generalPrivateScope(general, event) : inTelegramScope(policy as TelegramPolicy, event)) || event.chatType !== "private" || event.threadId !== null
     || !validInteger(event.updateId, 1) || !validInteger(event.messageId, 1) || !validInteger(event.messageDate, 1)) {
     return { kind: "ignored" };
   }
@@ -178,7 +187,7 @@ export async function acceptTelegramGitHubSearch(
   const key = [policy.botId, event.updateId, nonce] as const;
   try {
     const statements = [
-      db.prepare(`INSERT INTO telegram_inbox
+      ...(general ? [prepareGeneralPrivateAdmission(db, general, event, nonce), prepareGeneralReceiptAuthority(db, general, key)] : [db.prepare(`INSERT INTO telegram_inbox
         (bot_id, update_id, actor_id, chat_id, chat_type, message_id, message_date, thread_id, command, receipt_nonce)
         SELECT ?, ?, ?, ?, 'private', ?, ?, NULL, 'help', ?
         WHERE ? BETWEEN unixepoch() - 300 AND unixepoch() + 30
@@ -186,10 +195,10 @@ export async function acceptTelegramGitHubSearch(
             WHERE bot_id = ? AND user_id = ?), 1))
         ON CONFLICT (bot_id, update_id) DO NOTHING`).bind(
         policy.botId, event.updateId, event.actorId, event.chatId, event.messageId, event.messageDate, nonce,
-        event.messageDate, event.actorId, policy.adminId, event.messageDate, policy.botId, event.actorId),
+        event.messageDate, event.actorId, (policy as TelegramPolicy).adminId, event.messageDate, policy.botId, event.actorId)]),
       db.prepare(`WITH admitted AS (
         SELECT inbox.receipt_id, inbox.bot_id, inbox.actor_id,
-          COALESCE(auth.message_date, 0) AS grant_date, COALESCE(auth.message_id, 0) AS grant_id,
+          ${general ? "0" : "COALESCE(auth.message_date, 0)"} AS grant_date, ${general ? "0" : "COALESCE(auth.message_id, 0)"} AS grant_id,
           CASE WHEN ? = 0 THEN 'usage' WHEN EXISTS (
             SELECT 1 FROM telegram_github_search AS prior WHERE prior.bot_id = inbox.bot_id
               AND prior.actor_id = inbox.actor_id AND prior.started_at > unixepoch() - ${COOLDOWN_SECONDS}
@@ -204,24 +213,25 @@ export async function acceptTelegramGitHubSearch(
           CASE WHEN next_state = 'looking' THEN unixepoch() END,
           CASE WHEN next_state = 'looking' THEN ? END,
           CASE WHEN next_state = 'looking' THEN unixepoch() + ${LOOKUP_SECONDS} END
-        FROM admitted`).bind(query === null ? 0 : 1, policy.adminId, ...key, nonce),
+        FROM admitted`).bind(query === null ? 0 : 1, general ? "" : (policy as TelegramPolicy).adminId, ...key, nonce),
       db.prepare(`INSERT INTO telegram_outbox (receipt_id)
         SELECT inbox.receipt_id FROM telegram_inbox AS inbox JOIN telegram_github_search AS search USING (receipt_id)
         WHERE ${FRESH_INBOX} AND search.state IN ('usage', 'limited')`).bind(...key),
       db.prepare(`SELECT inbox.receipt_id AS receiptId, search.state FROM telegram_inbox AS inbox
         JOIN telegram_github_search AS search USING (receipt_id) WHERE ${FRESH_INBOX}`).bind(...key),
       db.prepare(`UPDATE telegram_inbox AS inbox SET receipt_nonce = ? WHERE ${FRESH_INBOX}`)
-        .bind(TELEGRAM_GITHUB_SEARCH_MARKER, ...key),
+        .bind(general ? GENERAL_GITHUB_SEARCH_MARKER : TELEGRAM_GITHUB_SEARCH_MARKER, ...key),
     ];
     const result = await db.batch<Receipt>(statements);
-    const row = result[3]?.results[0];
+    const offset = general ? 1 : 0;
+    const row = result[3 + offset]?.results[0];
     if (result.length !== statements.length || result.some(({ success }) => !success)) throw new Error();
-    if (result[0].meta.changes === 0 && !row && result[4].meta.changes === 0) return { kind: "ignored" };
-    if (result[0].meta.changes !== 1 || result[1].meta.changes !== 1 || result[4].meta.changes !== 1 || !row) throw new Error();
-    if (row.state === "looking" && query !== null && result[2].meta.changes === 0) {
+    if (result[0].meta.changes === 0 && !row && result[4 + offset].meta.changes === 0) return { kind: "ignored" };
+    if (result[0].meta.changes !== 1 || result[1 + offset].meta.changes !== 1 || result[4 + offset].meta.changes !== 1 || !row) throw new Error();
+    if (row.state === "looking" && query !== null && result[2 + offset].meta.changes === 0) {
       return { kind: "lookup", receiptId: row.receiptId, nonce, query };
     }
-    if ((row.state === "usage" || row.state === "limited") && result[2].meta.changes === 1) return { kind: "reply" };
+    if ((row.state === "usage" || row.state === "limited") && result[2 + offset].meta.changes === 1) return { kind: "reply" };
   } catch {
     // Never propagate SQL, query text or request information from this boundary.
   }
@@ -409,12 +419,12 @@ function packSearchReply(repositorySearch: RepositorySearch, { files, verificati
 
 /** The winning webhook owns the ephemeral query. A recovered lookup sends the fixed fallback instead of replaying egress. */
 export async function runTelegramGitHubSearch(
-  db: D1Database, policy: TelegramPolicy, admission: Extract<Admission, { kind: "lookup" }>,
+  db: D1Database, policy: Policy, admission: Extract<Admission, { kind: "lookup" }>,
   request: typeof fetch = fetch, observation?: GitHubSearchObservation,
 ): Promise<boolean> {
   const current = epoch(policy);
   const lookup = `SELECT 1 FROM telegram_inbox AS inbox
-    WHERE inbox.bot_id = ? AND ${privateReceipt("inbox")} AND ${ownSearch("inbox")} AND ${current.sql}`;
+    WHERE inbox.bot_id = ? AND ${privateReceipt("inbox", generalPolicy(policy))} AND ${ownSearch("inbox")} AND ${current.sql}`;
   const active = `search.receipt_id = ? AND search.lookup_nonce = ? AND search.state = 'looking'
     AND search.lookup_until > unixepoch() AND EXISTS (${lookup})`;
   try {
@@ -456,7 +466,7 @@ export async function runTelegramGitHubSearch(
   }
 }
 
-export async function recoverTelegramGitHubSearch(db: D1Database, policy: TelegramPolicy): Promise<number> {
+export async function recoverTelegramGitHubSearch(db: D1Database, policy: Policy): Promise<number> {
   const current = epoch(policy);
   const nonce = `recover:${crypto.randomUUID()}`;
   const candidate = "search.bot_id = ? AND search.state = 'looking' AND search.lookup_nonce = ?";
@@ -464,11 +474,13 @@ export async function recoverTelegramGitHubSearch(db: D1Database, policy: Telegr
     const results = await db.batch([
       db.prepare(`UPDATE telegram_github_search SET lookup_nonce = ?
         WHERE receipt_id IN (SELECT receipt_id FROM telegram_github_search
-          WHERE bot_id = ? AND state = 'looking' AND lookup_until <= unixepoch()
+          WHERE bot_id = ? AND state = 'looking' AND lookup_until <= unixepoch() AND EXISTS (
+            SELECT 1 FROM telegram_inbox AS inbox WHERE inbox.receipt_id=telegram_github_search.receipt_id
+              AND ${privateReceipt('inbox', generalPolicy(policy))})
           ORDER BY lookup_until, receipt_id LIMIT ${REAP_LIMIT})`).bind(nonce, policy.botId),
       db.prepare(`INSERT INTO telegram_outbox (receipt_id)
         SELECT search.receipt_id FROM telegram_github_search AS search JOIN telegram_inbox AS inbox USING (receipt_id)
-        WHERE ${candidate} AND ${privateReceipt("inbox")} AND ${ownSearch("inbox")}
+        WHERE ${candidate} AND ${privateReceipt("inbox", generalPolicy(policy))} AND ${ownSearch("inbox")}
           AND inbox.received_at + ${MAX_REPLY_AGE_SECONDS} > unixepoch() AND ${current.sql}`)
         .bind(policy.botId, nonce, ...current.bindings),
       db.prepare(`UPDATE telegram_github_search AS search SET state = CASE WHEN EXISTS (
@@ -477,7 +489,7 @@ export async function recoverTelegramGitHubSearch(db: D1Database, policy: Telegr
       db.prepare(`UPDATE telegram_github_search SET public_results = NULL WHERE receipt_id IN (
         SELECT search.receipt_id FROM telegram_github_search AS search
         JOIN telegram_inbox AS inbox USING (receipt_id) LEFT JOIN telegram_outbox AS reply USING (receipt_id)
-        WHERE search.bot_id = ? AND search.public_results IS NOT NULL AND (
+        WHERE search.bot_id = ? AND ${privateReceipt("inbox", generalPolicy(policy))} AND search.public_results IS NOT NULL AND (
           reply.state IN ('sent', 'failed', 'uncertain') OR inbox.received_at + ${MAX_REPLY_AGE_SECONDS} <= unixepoch()
           OR NOT (${current.sql}))
         ORDER BY search.receipt_id LIMIT ${REAP_LIMIT})`).bind(policy.botId, ...current.bindings),
