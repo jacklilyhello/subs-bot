@@ -1,12 +1,14 @@
 """Cloudflare management release tests with a stateful, in-process API fake."""
 
 import base64
-from contextlib import closing
+from contextlib import closing, redirect_stdout
 from copy import deepcopy
 from dataclasses import asdict, replace
 from hashlib import sha256
 from http.client import IncompleteRead
 from io import BytesIO
+from io import StringIO
+from email.message import Message
 import json
 import os
 from pathlib import Path
@@ -614,7 +616,7 @@ class FakeCloudflare:
             raise AssertionError("Release attempted to write data.")
         return deepcopy(self.data_responses[path])
 
-    def health(self):
+    def health(self, *, timeout=10):
         version_id = self.active["versions"][0]["version_id"]
         if version_id == NEW_VERSION and not self.health_available:
             if self.concurrent_activation:
@@ -2843,8 +2845,12 @@ class ReleaseTests(unittest.TestCase):
 
     def test_health_failure_restores_verified_previous_version(self):
         self.api.health_available = False
-        with self.assertRaisesRegex(cloudflare.CloudflareError, "prior version was restored"):
+        output = StringIO()
+        with redirect_stdout(output), self.assertRaisesRegex(cloudflare.CloudflareError, "prior version was restored") as raised:
             self.release()
+        self.assertEqual(raised.exception.readback_phase, "post-health")
+        self.assertIn({"releaseReadbackPhase": "post-health", "httpStatus": None},
+            [json.loads(line) for line in output.getvalue().splitlines()])
         self.assertEqual(self.api.writes(), [VERSIONS + "?deploy=false", DEPLOYMENTS, DEPLOYMENTS])
         self.assertEqual(self.api.active["id"], ROLLBACK_DEPLOYMENT)
         self.assertEqual(self.api.active["versions"][0]["version_id"], OLD_VERSION)
@@ -2872,6 +2878,26 @@ class ReleaseTests(unittest.TestCase):
 
 
 class ClientTests(unittest.TestCase):
+    def test_retry_after_is_numeric_only_and_never_exposes_raw_headers(self):
+        for values, expected in ((["2"], (True, 2)), ([" 0 "], (True, 0)), (["90"], (True, 90)),
+                (["Wed, 21 Oct 2026 07:28:00 GMT"], (True, None)), (["2", "2"], (True, None)),
+                (["synthetic-private-header"], (True, None)), ([], (False, None))):
+            headers = Message()
+            for value in values:
+                headers.add_header("Retry-After", value)
+            self.assertEqual(cloudflare._retry_after(headers), expected)
+        opener = Mock()
+        headers = Message()
+        headers["Retry-After"] = "2"
+        opener.open.side_effect = HTTPError("https://private.invalid/secret", 429, "private-error", headers, BytesIO(b"private"))
+        with patch.object(cloudflare, "build_opener", return_value=opener):
+            client = cloudflare.CloudflareClient("synthetic-token")
+        with self.assertRaises(cloudflare.CloudflareError) as raised:
+            client("GET", "/accounts/test")
+        self.assertEqual(raised.exception.retry_after_seconds, 2)
+        self.assertTrue(raised.exception.retry_after_present)
+        self.assertNotIn("private", str(raised.exception))
+
     def test_client_blocks_host_overrides_and_redacts_http_errors(self):
         opener = Mock()
         opener.open.side_effect = HTTPError("https://example.invalid/secret", 403, "sensitive body", {},
@@ -2901,7 +2927,18 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(cloudflare.CloudflareError) as error:
             client("POST", "/accounts/test", {})
         self.assertTrue(error.exception.uncertain)
+        self.assertTrue(error.exception.transport_failure)
         self.assertNotIn("response prefix", str(error.exception))
+
+    def test_invalid_response_is_not_a_known_transport_failure(self):
+        opener = MagicMock()
+        opener.open.return_value.__enter__.return_value.read.return_value = b"not-json-private"
+        with patch.object(cloudflare, "build_opener", return_value=opener):
+            client = cloudflare.CloudflareClient("synthetic-token")
+        with self.assertRaises(cloudflare.CloudflareError) as raised:
+            client("GET", "/accounts/test")
+        self.assertFalse(raised.exception.transport_failure)
+        self.assertNotIn("not-json-private", str(raised.exception))
 
     def test_client_put_is_limited_to_the_isolated_cron_path_and_body(self):
         opener = MagicMock()
@@ -2919,6 +2956,134 @@ class ClientTests(unittest.TestCase):
         request = opener.open.call_args.args[0]
         self.assertEqual(request.get_method(), "PUT")
         self.assertEqual(json.loads(request.data), [CRON])
+
+
+class ReadbackResilienceTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 0
+        self.waits = []
+        self.clock_patch = patch.object(cloudflare, "monotonic", side_effect=lambda: self.now)
+        self.sleep_patch = patch.object(cloudflare, "sleep", side_effect=self.wait)
+        self.clock_patch.start()
+        self.sleep_patch.start()
+        self.addCleanup(self.clock_patch.stop)
+        self.addCleanup(self.sleep_patch.stop)
+
+    def wait(self, delay):
+        self.waits.append(delay)
+        self.now += delay
+
+    def test_health_propagation_keeps_fast_path_exact_revision_and_bounded_window(self):
+        correct = {"ok": True, "service": "subs-bot", "revision": NEW_REVISION}
+        wrong = {**correct, "revision": OLD_REVISION}
+        with patch.object(cloudflare, "_read_health", return_value=correct) as read:
+            cloudflare._verify_health(NEW_REVISION)
+            self.assertEqual(read.call_count, 1)
+            self.assertEqual(self.waits, [])
+        with patch.object(cloudflare, "_read_health", side_effect=[wrong, wrong, correct]) as read:
+            cloudflare._verify_health(NEW_REVISION)
+            self.assertEqual(read.call_count, 3)
+            self.assertEqual(self.waits, [1, 2])
+        self.now, self.waits = 0, []
+        with patch.object(cloudflare, "_read_health", return_value=wrong) as read:
+            with self.assertRaises(cloudflare.CloudflareError):
+                cloudflare._verify_health(NEW_REVISION)
+            self.assertLessEqual(self.now, cloudflare.HEALTH_READBACK_SECONDS)
+            self.assertEqual(read.call_count, len(cloudflare.HEALTH_READBACK_DELAYS))
+            self.assertTrue(all(0 < call.kwargs["timeout"] <= 10 for call in read.call_args_list))
+
+    def test_transient_get_and_actual_readonly_query_shapes_retry_then_succeed(self):
+        calls = [("GET", WORKER, None), ("POST", DATABASE + "/query", {"sql": "SELECT\n1", "params": []}),
+            ("POST", DATABASE + "/query", {"sql": "PRAGMA table_list"}),
+            ("POST", DATABASE + "/query", {"sql": "SELECT (1) AS matches;\nSELECT (1) AS matches;"})]
+        for method, path, payload in calls:
+            for status in cloudflare.READ_RETRY_STATUSES:
+                api = Mock(side_effect=[cloudflare.CloudflareError("synthetic-private-error", http_status=status), {"ok": True}])
+                scope = cloudflare._Isolation(api, api, TARGET)
+                output = StringIO()
+                with redirect_stdout(output):
+                    value = (scope.worker_api if method == "GET" else scope.data_api)(method, path, payload)
+                self.assertEqual(value, {"ok": True})
+                self.assertEqual(api.call_count, 2)
+                event = json.loads(output.getvalue())
+                self.assertEqual(event, {"apiKind": "worker-get" if method == "GET" else "d1-read",
+                    "httpStatus": status, "readAttempt": 1, "retryDelaySeconds": 1})
+                self.assertNotIn("synthetic-private-error", output.getvalue())
+                self.assertNotIn(path, output.getvalue())
+
+    def test_attempt_limit_and_known_transport_are_bounded(self):
+        api = Mock(side_effect=cloudflare.CloudflareError("synthetic-private-error", http_status=503))
+        scope = cloudflare._Isolation(api, api, TARGET)
+        with redirect_stdout(StringIO()), self.assertRaises(cloudflare.CloudflareError):
+            scope.worker_api("GET", WORKER)
+        self.assertEqual(api.call_count, 3)
+        self.assertEqual(self.waits, [1, 2])
+        api = Mock(side_effect=[cloudflare.CloudflareError("synthetic transport", transport_failure=True), {}])
+        scope = cloudflare._Isolation(api, api, TARGET)
+        with redirect_stdout(StringIO()):
+            scope.worker_api("GET", WORKER)
+        self.assertEqual(api.call_count, 2)
+
+    def test_long_invalid_or_shared_budget_retry_after_is_not_shortened(self):
+        for delay in (11, None):
+            api = Mock(side_effect=cloudflare.CloudflareError("synthetic", http_status=429,
+                retry_after_present=True, retry_after_seconds=delay))
+            scope = cloudflare._Isolation(api, api, TARGET)
+            with redirect_stdout(StringIO()), self.assertRaises(cloudflare.CloudflareError):
+                scope.worker_api("GET", WORKER)
+            self.assertEqual(api.call_count, 1)
+        self.assertEqual(self.waits, [])
+        worker = Mock(side_effect=[cloudflare.CloudflareError("synthetic", http_status=429,
+            retry_after_present=True, retry_after_seconds=7), {}])
+        data = Mock(side_effect=cloudflare.CloudflareError("synthetic", http_status=503,
+            retry_after_present=True, retry_after_seconds=4))
+        scope = cloudflare._Isolation(worker, data, TARGET)
+        with redirect_stdout(StringIO()):
+            scope.worker_api("GET", WORKER)
+            with self.assertRaises(cloudflare.CloudflareError):
+                scope.data_api("GET", DATABASE)
+        self.assertEqual(data.call_count, 1)
+        self.assertEqual(self.waits, [7])
+
+    def test_slow_first_read_does_not_add_another_retry_or_wait(self):
+        def slow(*_args):
+            self.now += 11
+            raise cloudflare.CloudflareError("synthetic", http_status=502)
+        api = Mock(side_effect=slow)
+        scope = cloudflare._Isolation(api, api, TARGET)
+        with redirect_stdout(StringIO()), self.assertRaises(cloudflare.CloudflareError):
+            scope.worker_api("GET", WORKER)
+        self.assertEqual(api.call_count, 1)
+        self.assertEqual(self.waits, [])
+
+    def test_permission_validation_and_unknown_failures_never_retry(self):
+        for error in [cloudflare.CloudflareError("synthetic", http_status=status) for status in (400, 401, 403, 404, 408, 409)] + [
+                cloudflare.CloudflareError("invalid response"), cloudflare.CloudflareError("schema mismatch"), OSError("unknown failure")]:
+            api = Mock(side_effect=error)
+            scope = cloudflare._Isolation(api, api, TARGET)
+            with redirect_stdout(StringIO()), self.assertRaises((cloudflare.CloudflareError, OSError)):
+                scope.data_api("POST", DATABASE + "/query", {"sql": "SELECT 1"})
+            self.assertEqual(api.call_count, 1)
+        self.assertEqual(self.waits, [])
+
+    def test_mutations_and_unproven_queries_are_never_replayed(self):
+        calls = [("POST", VERSIONS + "?deploy=false", {"secret": "synthetic-private-token"}),
+            ("POST", DEPLOYMENTS, {"strategy": "percentage"}), ("PUT", SCHEDULES, [CRON]),
+            ("POST", DATABASE + "/query", {"sql": "CREATE TABLE synthetic(id INTEGER)"}),
+            ("POST", DATABASE + "/query", {"sql": "UPDATE subscriptions SET name='synthetic'"}),
+            ("POST", DATABASE + "/query", {"sql": "SELECT 1;\nDELETE FROM subscriptions;"}),
+            ("POST", DATABASE + "-other/query", {"sql": "SELECT 1"}),
+            ("POST", DATABASE + "/query", {"sql": "SELECT 1 /* private */"}),
+            ("GET", WORKER, {})]
+        for method, path, payload in calls:
+            api = Mock(side_effect=cloudflare.CloudflareError("synthetic-private-error", http_status=503, uncertain=True))
+            scope = cloudflare._Isolation(api, api, TARGET)
+            output = StringIO()
+            with redirect_stdout(output), self.assertRaises(cloudflare.CloudflareError):
+                (scope.worker_api if path.startswith(VERSIONS) or path in (DEPLOYMENTS, SCHEDULES, WORKER) else scope.data_api)(method, path, payload)
+            self.assertEqual(api.call_count, 1)
+            self.assertEqual(output.getvalue(), "")
+        self.assertEqual(self.waits, [])
 
 
 if __name__ == "__main__":

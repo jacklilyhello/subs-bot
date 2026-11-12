@@ -5,12 +5,12 @@ from __future__ import annotations
 import base64
 from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
-from http.client import HTTPException
+from http.client import HTTPException, IncompleteRead, RemoteDisconnected
 import json
 from pathlib import Path
 import re
-from time import sleep
-from urllib.error import HTTPError
+from time import monotonic, sleep
+from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 from uuid import uuid4
 
@@ -155,13 +155,102 @@ MAX_MODULE_BYTES = 1152 * 1024
 MAX_API_BYTES = 8 * 1024 * 1024
 MAX_TELEGRAM_CONFIG_BYTES = 5000
 READBACK_DELAYS = (0, 1, 2, 4)
+READ_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+READ_RETRY_WAIT_BUDGET = 10
+HEALTH_READBACK_SECONDS = 30
+HEALTH_READBACK_DELAYS = (0, 1, 2, 4, 8, 10)
+VERIFICATION_PHASES = frozenset({"post-config", "post-cron", "post-resources", "post-version", "post-selected-floor",
+    "post-temp-floor", "post-dynamic-floor", "post-typed-floor", "post-health", "post-external-schema", "post-inline",
+    "post-provider-schema", "post-legacy-shorts", "post-provider-batch", "post-api-status", "post-provider-documents",
+    "post-mixed-documents", "post-group-cards", "post-provider-binding", "post-api-binding", "post-active",
+    "group-share-cards", "rollback", "unknown"})
 
 
 class CloudflareError(RuntimeError):
-    def __init__(self, message, *, uncertain=False, http_status=None):
+    def __init__(self, message, *, uncertain=False, http_status=None, retry_after_seconds=None,
+                 retry_after_present=False, transport_failure=False, readback_phase=None):
         super().__init__(message)
         self.uncertain = uncertain
         self.http_status = http_status
+        self.retry_after_seconds = retry_after_seconds
+        self.retry_after_present = retry_after_present
+        self.transport_failure = transport_failure
+        self.readback_phase = readback_phase
+
+
+def _retry_after(headers):
+    if headers is None:
+        return False, None
+    values = headers.get_all("Retry-After") if hasattr(headers, "get_all") else [headers.get("Retry-After")]
+    values = [] if values is None else [value for value in values if value is not None]
+    if not values:
+        return False, None
+    value = values[0].strip(" \t") if len(values) == 1 and isinstance(values[0], str) else None
+    return True, int(value) if isinstance(value, str) and re.fullmatch(r"[0-9]{1,9}", value) else None
+
+
+def _known_transport(error):
+    reason = error.reason if isinstance(error, URLError) else error
+    return isinstance(reason, (TimeoutError, ConnectionError, IncompleteRead, RemoteDisconnected))
+
+
+def _readonly_d1_request(method, path, payload, query_path):
+    if not (method == "POST" and path == query_path and isinstance(payload, dict)
+            and "sql" in payload and set(payload) <= {"sql", "params"} and isinstance(payload["sql"], str)):
+        return False
+    # Lazy imports avoid the native restore tool's dependency on _Isolation.
+    from d1_migrations import MAX_D1_STATEMENT_BYTES
+    from native_restore_rehearsal import readonly_schema_batch, readonly_sql
+    sql = payload["sql"]
+    try:
+        single = len(sql.encode("utf-8")) < MAX_D1_STATEMENT_BYTES and readonly_sql(sql)
+        return single or (set(payload) == {"sql"} and readonly_schema_batch(sql) is not None)
+    except (UnicodeError, ValueError, TypeError):
+        return False
+
+
+class _ReadbackBudget:
+    """Retry only idempotent reads. The shared added WAIT budget is not an I/O timeout."""
+
+    def __init__(self, query_path):
+        self.query_path = query_path
+        self.remaining_wait = READ_RETRY_WAIT_BUDGET
+
+    def call(self, api, get_kind, method, path, payload=None):
+        is_get = method == "GET" and payload is None
+        is_query = _readonly_d1_request(method, path, payload, self.query_path)
+        if not (is_get or is_query):
+            return api(method, path, payload)
+        kind = (get_kind if isinstance(get_kind, str) and get_kind in {"worker-get", "resource-get"} else "read-get") if is_get else "d1-read"
+        started = monotonic()
+        for attempt in range(1, 4):
+            try:
+                return api(method, path, payload)
+            except CloudflareError as error:
+                status = error.http_status if type(error.http_status) is int and 100 <= error.http_status <= 599 else None
+                transient = status in READ_RETRY_STATUSES or (error.http_status is None and error.transport_failure is True)
+                delay = attempt if error.retry_after_present is False else error.retry_after_seconds if error.retry_after_present is True else None
+                remaining = min(self.remaining_wait, READ_RETRY_WAIT_BUDGET - (monotonic() - started))
+                retry = (transient and attempt < 3 and type(delay) is int and delay >= 0 and delay <= remaining)
+                print(json.dumps({"apiKind": kind, "httpStatus": status, "readAttempt": attempt,
+                    "retryDelaySeconds": delay if retry else None}, sort_keys=True), flush=True)
+                if not retry:
+                    raise
+                self.remaining_wait -= delay
+                sleep(delay)
+
+
+def _phase_error(message, error, phase):
+    return CloudflareError(message, uncertain=error.uncertain, http_status=error.http_status,
+        retry_after_seconds=error.retry_after_seconds, retry_after_present=error.retry_after_present,
+        transport_failure=error.transport_failure,
+        readback_phase=phase if isinstance(phase, str) and phase in VERIFICATION_PHASES else "unknown")
+
+
+def _failed_verification(phase, error):
+    status = error.http_status if type(error.http_status) is int and 100 <= error.http_status <= 599 else None
+    phase = phase if isinstance(phase, str) and phase in VERIFICATION_PHASES else "unknown"
+    print(json.dumps({"releaseReadbackPhase": phase, "httpStatus": status}, sort_keys=True), flush=True)
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -214,12 +303,15 @@ class CloudflareClient:
             with self._opener.open(request, timeout=30) as response:
                 raw = response.read(MAX_API_BYTES + 1)
         except HTTPError as error:
+            present, retry_after = _retry_after(error.headers)
             error.close()
             uncertain = method != "GET" and (error.code == 408 or error.code >= 500)
             raise CloudflareError(f"Cloudflare API rejected the request (HTTP {error.code}).",
-                                  uncertain=uncertain, http_status=error.code) from None
-        except (OSError, ValueError, HTTPException):
-            raise CloudflareError("Cloudflare API connection failed.", uncertain=method != "GET") from None
+                                  uncertain=uncertain, http_status=error.code, retry_after_seconds=retry_after,
+                                  retry_after_present=present) from None
+        except (OSError, ValueError, HTTPException) as error:
+            raise CloudflareError("Cloudflare API connection failed.", uncertain=method != "GET",
+                                  transport_failure=_known_transport(error)) from None
         try:
             if len(raw) > MAX_API_BYTES:
                 raise ValueError()
@@ -395,8 +487,6 @@ class _Isolation:
                  and all(_matches(TIMESTAMP, target.get(key))
                          for key in ("workerCreatedOn", "d1CreatedAt", "r2CreatedOn")),
                  "Invalid isolated Cloudflare ownership configuration.")
-        self.worker_api = worker_api
-        self.data_api = data_api
         self.target = target
         self.account = f"/accounts/{target['accountId']}"
         self.worker = f"{self.account}/workers/workers/{target['workerId']}"
@@ -404,6 +494,9 @@ class _Isolation:
         self.deployments = self.script + "/deployments"
         self.versions = self.worker + "/versions"
         self.schedules = self.script + "/schedules"
+        reads = _ReadbackBudget(f"{self.account}/d1/database/{target['d1Id']}/query")
+        self.worker_api = lambda method, path, payload=None: reads.call(worker_api, "worker-get", method, path, payload)
+        self.data_api = lambda method, path, payload=None: reads.call(data_api, "resource-get", method, path, payload)
 
     def worker_config(self):
         worker = _object(self.worker_api("GET", self.worker), "Worker")
@@ -592,9 +685,13 @@ class _Isolation:
             schema = read("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE sql IS NOT NULL "
                           "AND tbl_name IN ('telegram_group_share_cards','telegram_group_share_scopes') ORDER BY name")
             fingerprint = sha256(json.dumps(schema, sort_keys=True, separators=(",", ":")).encode("ascii")).hexdigest()
-            _require(ledger == [{"position": 37, "name": GROUP_SHARE_CARDS_MIGRATION,
-                                 "sha256": GROUP_SHARE_CARDS_MIGRATION_SHA256, "mode": "applied"}]
-                     and fingerprint == GROUP_SHARE_CARDS_SCHEMA_SHA256, error)
+            ledger_matches = ledger == [{"position": 37, "name": GROUP_SHARE_CARDS_MIGRATION,
+                "sha256": GROUP_SHARE_CARDS_MIGRATION_SHA256, "mode": "applied"}]
+            schema_matches = fingerprint == GROUP_SHARE_CARDS_SCHEMA_SHA256
+            if not (ledger_matches and schema_matches):
+                print(json.dumps({"groupShareCardsCheck": "schema", "ledgerMatches": ledger_matches,
+                    "schemaMatches": schema_matches}, sort_keys=True), flush=True)
+            _require(ledger_matches and schema_matches, error)
             active = read("""SELECT EXISTS(
                 SELECT 1 FROM telegram_group_share_cards
                 WHERE state IN ('pending','sending') OR lease_until>unixepoch()
@@ -604,8 +701,12 @@ class _Isolation:
                 JOIN telegram_outbox AS reply USING(receipt_id)
                 WHERE inbox.receipt_nonce='group-claim:v1' AND reply.state IN ('pending','leased','sending')
             ) AS groupShareCardsActive""") if drained else None
-        except (CloudflareError, AttributeError, TypeError, ValueError):
-            raise CloudflareError(error) from None
+        except CloudflareError as failed:
+            _failed_verification("group-share-cards", failed)
+            raise _phase_error(error, failed, "group-share-cards") from None
+        except (AttributeError, TypeError, ValueError):
+            _failed_verification("group-share-cards", CloudflareError(error))
+            raise CloudflareError(error, readback_phase="group-share-cards") from None
         _require(not drained or (active == [{"groupShareCardsActive": 0}] and type(active[0]["groupShareCardsActive"]) is int),
                  "Drain isolated group share card work before switching to a Worker artifact without verified recovery.")
 
@@ -1623,11 +1724,11 @@ def _artifact(bundle_dir, manifest, telegram_config, aggregate_key=None, private
                             external_shortlink_capable=external_capable)
 
 
-def _read_health():
+def _read_health(*, timeout=10):
     request = Request(HEALTH_URL, headers={"Accept": "application/json",
                                          "User-Agent": ISOLATION_RELEASE_USER_AGENT})
     try:
-        with build_opener(ProxyHandler({}), _NoRedirect()).open(request, timeout=10) as response:
+        with build_opener(ProxyHandler({}), _NoRedirect()).open(request, timeout=timeout) as response:
             raw = response.read(1025)
             cache = {value.strip().lower() for value in response.headers.get("Cache-Control", "").split(",")}
             _require(response.status == 200 and response.headers.get_content_type() == "application/json"
@@ -1641,11 +1742,17 @@ def _read_health():
 
 
 def _verify_health(revision):
-    for delay in READBACK_DELAYS:
+    deadline = monotonic() + HEALTH_READBACK_SECONDS
+    for delay in HEALTH_READBACK_DELAYS:
+        if deadline - monotonic() <= delay:
+            break
         if delay:
             sleep(delay)
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            break
         try:
-            if _read_health() == {"ok": True, "service": "subs-bot", "revision": revision}:
+            if _read_health(timeout=min(10, remaining)) == {"ok": True, "service": "subs-bot", "revision": revision}:
                 return
         except CloudflareError:
             pass
@@ -2280,43 +2387,65 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
                                current_temp_capable=old_temp_capable, target_temp_capable=desired_temp_capable,
                                current_dynamic_all_capable=old_dynamic_all_capable, target_dynamic_all_capable=desired_dynamic_all_capable,
                                allow_subscription_shorts_enable=typed_enabled and not old_version.telegram_subscription_shorts)
+    phase = "post-config"
     try:
         _require(scope.worker_config() == config, "Isolated Worker configuration changed after activation.")
+        phase = "post-cron"
         _require(scope.cron_enabled() == had_cron, "Isolated Worker schedule changed during activation.")
+        phase = "post-resources"
         scope.verify_resources()
+        phase = "post-version"
         _require(scope.version(activated.version) == desired, "Active Worker version differs from the verified artifact.")
+        phase = "post-selected-floor"
         scope.verify_legacy_selected_floor(allow_rows=desired_selected_capable, require_schema=desired_selected_capable)
+        phase = "post-temp-floor"
         scope.verify_legacy_temp_floor(allow_rows=desired_temp_capable, require_schema=desired_temp_capable)
+        phase = "post-dynamic-floor"
         scope.verify_legacy_dynamic_all_floor(allow_rows=desired_dynamic_all_capable, require_schema=desired_dynamic_all_capable)
+        phase = "post-typed-floor"
         scope.verify_subscription_shorts_floor(desired, desired.telegram_subscription_shorts_capable,
                                                target_general_capable=desired.telegram_general_subscription_shorts_capable)
+        phase = "post-health"
         _verify_health(desired.revision)
         if desired.external_shortlink_capable:
+            phase = "post-external-schema"
             external_shortlinks.verify_schema(scope)
         if inline_bot is not None:
+            phase = "post-inline"
             scope.verify_inline_search(inline_bot)
         if verify_provider_schema is not None:
+            phase = "post-provider-schema"
             verify_provider_schema()
         if verify_legacy_shorts:
+            phase = "post-legacy-shorts"
             scope.verify_legacy_subscription_shorts()
         if batch_capable:
+            phase = "post-provider-batch"
             scope.verify_provider_batch(drained=batch_must_be_drained)
         if api_status_capable:
+            phase = "post-api-status"
             scope.verify_api_status(drained=api_status_must_be_drained)
         if documents_capable:
+            phase = "post-provider-documents"
             scope.verify_provider_url_documents(drained=documents_must_be_drained)
         if mixed_capable:
+            phase = "post-mixed-documents"
             scope.verify_mixed_documents()
         if verify_group_schema:
+            phase = "post-group-cards"
             scope.verify_group_share_cards(drained=not group_capable)
         if provider_guard is not None:
+            phase = "post-provider-binding"
             provider_guard()
         if api_gate is not None:
+            phase = "post-api-binding"
             api_gate.verify()
+        phase = "post-active"
         _require(scope.active() == activated, "Active isolated Worker deployment changed during verification.")
-    except CloudflareError:
+    except CloudflareError as failure:
+        _failed_verification(phase, failure)
         if old_version.telegram_subscription_shorts and not typed_enabled:
-            raise CloudflareError("Typed short-link withdrawal verification failed. The enabled predecessor was not reactivated.") from None
+            raise _phase_error("Typed short-link withdrawal verification failed. The enabled predecessor was not reactivated.", failure, phase) from None
         try:
             _require(scope.worker_config() == config, "Isolated Worker configuration changed before rollback.")
             _require(scope.cron_enabled() == had_cron, "Isolated Worker schedule changed before rollback.")
@@ -2352,9 +2481,10 @@ def release_worker(worker_api, data_api, target, bundle_dir, manifest, guard, *,
             if old_version.legacy_subscription_shorts:
                 scope.verify_legacy_subscription_shorts()
             _require(scope.active() == restored, "Isolated Worker rollback activation changed.")
-        except CloudflareError:
-            raise CloudflareError("Isolated Worker verification failed and a safe rollback could not be confirmed.") from None
-        raise CloudflareError("Isolated Worker verification failed. The prior version was restored.") from None
+        except CloudflareError as rollback_error:
+            _failed_verification("rollback", rollback_error)
+            raise _phase_error("Isolated Worker verification failed and a safe rollback could not be confirmed.", failure, phase) from None
+        raise _phase_error("Isolated Worker verification failed. The prior version was restored.", failure, phase) from None
 
     # Cron is script-level. A failed update must not restore code that cannot handle a possibly installed trigger.
     if telegram_config is not None:
