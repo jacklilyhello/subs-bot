@@ -9,15 +9,19 @@ import { isAbsolute, join, resolve } from "node:path";
 import { Log, LogLevel, Miniflare } from "miniflare";
 import { isValidStoredShare } from "../src/stored-share.ts";
 import { parseDisplayTimeZone } from "../src/telegram/display-time.ts";
+import { ISOLATION_PUBLIC_ORIGIN } from "../src/public-origin.ts";
 
 const sha = (raw: Uint8Array | string) => createHash("sha256").update(raw).digest("hex");
 const DIGEST = /^[a-f0-9]{64}$/u;
 const TOKEN = /^[A-Za-z0-9_-]{16,128}$/u;
-const ORIGIN = "https://native-restore.fixture.invalid";
+// dispatchFetch stays inside the loopback-only runtime. Its origin must still
+// satisfy the exact emitted Worker's public-origin admission guard.
+const ORIGIN = ISOLATION_PUBLIC_ORIGIN;
 const MAX_SQL = 32 * 1024 * 1024;
 const MAX_RESPONSE = 24 * 1024 * 1024;
 const KEY = /^(?:subscriptions\/[1-9][0-9]{0,15}\/[a-f0-9-]{36}\/(?:[0-9]{1,3}\.ndjson|manifest\.json)|private-shares\/[a-f0-9-]{36}\.txt)$/u;
 let stage = "sandbox";
+let failure: Record<string, string | number | boolean> | null = null;
 function requireSafe(value: unknown): asserts value {
   if (!value) throw new Error("Native restored-link validation failed.");
 }
@@ -131,6 +135,28 @@ async function main() {
   let migrationCount = 0;
   let restoredEffectiveDisplayTimezones: string[] = [];
   try {
+    let checkNumber = 0;
+    const checkResponse = async (response: Response, method: "GET" | "HEAD", status: number, body: Buffer, category: string) => {
+      checkNumber += 1;
+      const expected = method === "HEAD" ? Buffer.alloc(0) : body;
+      failure = { category, check: checkNumber, method, expectedStatus: status, actualStatus: response.status };
+      stage = "native-http-status";
+      requireSafe(response.status === status);
+      stage = "native-http-headers";
+      failure = { ...failure, cacheControlMatches: response.headers.get("cache-control") === "private, no-store",
+        referrerPolicyMatches: response.headers.get("referrer-policy") === "no-referrer",
+        nosniffMatches: response.headers.get("x-content-type-options") === "nosniff" };
+      requireSafe(failure.cacheControlMatches && failure.referrerPolicyMatches && failure.nosniffMatches);
+      stage = "native-http-body";
+      failure = { category, check: checkNumber, method, expectedBytes: expected.length, expectedSha256: sha(expected) };
+      const actual = await bytes(response);
+      failure = { ...failure, actualBytes: actual.bytes, actualSha256: actual.sha256 };
+      requireSafe(actual.bytes === expected.length && actual.sha256 === sha(expected));
+      failure = null;
+    };
+    stage = "runtime-health";
+    const health = await runtime.dispatchFetch(ORIGIN + "/health", { redirect: "manual" });
+    await checkResponse(health, "GET", 200, Buffer.from(JSON.stringify({ ok: true, service: "subs-bot", revision: input.revision })), "health");
     stage = "private-replay";
     const db = await runtime.getD1Database("DB");
     // Schema comes from the exact validated scratch database, not a SQL dump
@@ -199,12 +225,10 @@ async function main() {
     const check = async (token: string, status: number, body: Buffer, category: keyof typeof counts) => {
       requireSafe(TOKEN.test(token));
       for (const method of ["GET", "HEAD"] as const) {
+        stage = "native-http-request";
+        failure = { category, check: checkNumber + 1, method, expectedStatus: status };
         const response = await runtime.dispatchFetch(ORIGIN + "/sub/" + token + "/base64", { method, redirect: "manual" });
-        requireSafe(response.status === status && response.headers.get("cache-control") === "private, no-store"
-          && response.headers.get("referrer-policy") === "no-referrer" && response.headers.get("x-content-type-options") === "nosniff");
-        const actual = await bytes(response);
-        requireSafe(actual.bytes === (method === "HEAD" ? 0 : body.length)
-          && actual.sha256 === sha(method === "HEAD" ? Buffer.alloc(0) : body));
+        await checkResponse(response, method, status, body, category);
       }
       counts[category] += 1;
     };
@@ -257,4 +281,7 @@ async function main() {
   process.stdout.write(JSON.stringify(report) + "\n");
 }
 try { await main(); }
-catch { process.stderr.write(`Native restored-link validation failed [stage=${stage}].\n`); process.exitCode = 1; }
+catch {
+  process.stderr.write(`Native restored-link validation failed [stage=${stage}]${failure === null ? "" : " " + JSON.stringify(failure)}.\n`);
+  process.exitCode = 1;
+}

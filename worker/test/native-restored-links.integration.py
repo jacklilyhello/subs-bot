@@ -91,6 +91,23 @@ class RestoredLinksTests(unittest.TestCase):
         self.assertNotEqual(altered.returncode, 0)
         self.assertIn(b"stage=private-input", altered.stderr)
         self.assertEqual(altered.stdout, b"")
+        # A digest-valid private replay with a damaged publication pointer must
+        # fail the actual HTTP integrity check, with safe numeric diagnostics.
+        damaged_pointer = json.loads(original_input)
+        subscriptions = next(table for table in damaged_pointer["replay"]["tables"] if table["name"] == "subscriptions")
+        manifest_column = next(index for index, (name, _) in enumerate(subscriptions["columns"]) if name == "manifest_sha256")
+        subscriptions["rows"][0][manifest_column] = ["text", "0" * 64]
+        damaged_pointer["replaySha256"] = native.digest(native.canonical(damaged_pointer["replay"]))
+        input_path.write_bytes(native.canonical(damaged_pointer))
+        integrity = subprocess.run(command, capture_output=True, timeout=120)
+        self.assertNotEqual(integrity.returncode, 0)
+        self.assertIn(b"stage=native-http-status", integrity.stderr)
+        self.assertIn(b'"category":"storedShareExports"', integrity.stderr)
+        self.assertIn(b'"expectedStatus":200', integrity.stderr)
+        self.assertIn(b'"actualStatus":503', integrity.stderr)
+        self.assertNotIn(b"abcdefghijklmnop", integrity.stderr)
+        self.assertNotIn(share.encode(), integrity.stderr)
+        self.assertEqual(integrity.stdout, b"")
         input_path.write_bytes(original_input)
         (root / "object-0.bin").write_bytes(b"corrupt")
         corrupted = subprocess.run(command, capture_output=True, timeout=120)
