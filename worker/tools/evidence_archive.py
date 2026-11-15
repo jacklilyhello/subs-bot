@@ -427,8 +427,11 @@ def verify_lifecycle(value, prefix):
     require(isinstance(value, dict) and set(value) <= {"rules"} and isinstance(value.get("rules", []), list))
     for rule in value.get("rules", []):
         require(isinstance(rule, dict) and type(rule.get("enabled")) is bool
-            and isinstance(rule.get("conditions"), dict) and isinstance(rule["conditions"].get("prefix"), str))
-        other = rule["conditions"]["prefix"]
+            and isinstance(rule.get("conditions"), dict) and isinstance(rule["conditions"].get("prefix", ""), str))
+        # The observed default multipart-abort rule omits prefix entirely.
+        # Treat omission conservatively as global scope: any object deletion
+        # transition still overlaps and blocks archival; abort-only is safe.
+        other = rule["conditions"].get("prefix", "")
         overlap = prefix.startswith(other) or other.startswith(prefix)
         require(not (rule["enabled"] and overlap and rule.get("deleteObjectsTransition") is not None))
 

@@ -13,8 +13,10 @@ const sourceSecret = "synthetic-path-source-only";
 type Message = { chat_id: string; text: string; reply_parameters: { message_id: number };
   reply_markup?: { inline_keyboard?: { text: string; callback_data: string }[][] } };
 
-for (const lane of ["isolated", "general"] as const) {
-  test(`emitted ${lane} normal, aggregate, selected and typed exits retain RPC ownership, local revocation and final fences`,
+for (const [lane, subjectRole] of [
+  ["isolated", "admin"], ["isolated", "member"], ["general", "admin"], ["general", "member"],
+] as const) {
+  test(`emitted ${lane} ${subjectRole} normal, aggregate, selected and five typed formats retain RPC ownership, local revocation and final fences`,
     { timeout: 90_000 }, async (t) => {
       const directory = process.env.WORKER_TEST_BUNDLE_DIR;
       assert.ok(directory);
@@ -24,6 +26,8 @@ for (const lane of ["isolated", "general"] as const) {
       const now = Math.floor(Date.now() / 1000);
       const policy = { botId: lane === "isolated" ? "75321" : "75331", botUsername: "fixture_path_bot", adminId: "75322", memberId: "75323",
         groupId: "-75324", botToken: "75321:" + "a".repeat(35), webhookSecret: "synthetic-path-webhook" };
+      const subjectId = subjectRole === "admin" ? policy.adminId : policy.memberId;
+      const otherActorId = subjectRole === "admin" ? policy.memberId : policy.adminId;
       if (lane === "general") policy.botToken = policy.botId + ":" + "a".repeat(35);
       const generalConfig = { botId: policy.botId, botUsername: policy.botUsername, botToken: policy.botToken,
         webhookSecret: policy.webhookSecret, generation: 1, cutoverAt: now - 100, activationSha256: "a".repeat(64),
@@ -46,7 +50,7 @@ for (const lane of ["isolated", "general"] as const) {
             if (request.url === api + "answerCallbackQuery") return Response.json({ ok: true, result: true });
             assert.equal(request.url, api + "sendMessage", "RPC metadata must never become a public fetch");
             const message = await request.json() as Message;
-            assert.equal(message.chat_id, expectedReplyChats.get(message.reply_parameters.message_id) ?? policy.memberId);
+            assert.equal(message.chat_id, expectedReplyChats.get(message.reply_parameters.message_id) ?? subjectId);
             assert.doesNotMatch(message.text, new RegExp(sourceSecret + "|Bearer|sl_cccc", "u"));
             const id = 1000 + sent.length;
             sent.push({ id, message });
@@ -112,15 +116,15 @@ for (const lane of ["isolated", "general"] as const) {
         }
         await db.prepare("INSERT INTO telegram_general_groups VALUES (?,1,?,'group')").bind(policy.botId, policy.groupId).run();
       }
-      const sub = await createSubscription(db, { ownerId: policy.memberId, name: "Fixture owned subscription",
+      const sub = await createSubscription(db, { ownerId: subjectId, name: "Fixture owned subscription",
         sourceUrl: "https://provider.example.invalid/" + sourceSecret });
-      assert.equal(await publishNodeSnapshot(db, bucket, { id: sub.id, ownerId: policy.memberId, expectedGeneration: 0,
+      assert.equal(await publishNodeSnapshot(db, bucket, { id: sub.id, ownerId: subjectId, expectedGeneration: 0,
         expectedLifecycleRevision: 0 }, [{ type: "ss", name: "Synthetic RPC path node",
         share: "ss://YWVzLTI1Ni1nY206Zml4dHVyZQ@203.0.113.10:8388#synthetic" }]), true);
-      await createSubscription(db, { ownerId: policy.adminId, name: "Other actor inventory",
+      await createSubscription(db, { ownerId: otherActorId, name: "Other actor inventory",
         sourceUrl: "https://other.fixture.invalid/owned-elsewhere" });
       let sequence = 500;
-      const post = (text: string, id = ++sequence, actor = policy.memberId, chat = actor, replyTo?: object) => {
+      const post = (text: string, id = ++sequence, actor = subjectId, chat = actor, replyTo?: object) => {
         expectedReplyChats.set(id, chat);
         return app.fetch(origin + "/telegram/webhook", { method: "POST",
         headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": policy.webhookSecret },
@@ -129,13 +133,16 @@ for (const lane of ["isolated", "general"] as const) {
           ...(replyTo ? { reply_to_message: replyTo } : {}),
           entities: text.startsWith("/") ? [{ type: "bot_command", offset: 0, length: text.split(" ", 1)[0].length }] : [] } }) });
       };
-      const callback = (source: { id: number }, ticket: string, actor = policy.memberId, id = ++sequence) => app.fetch(origin + "/telegram/webhook", {
+      const callback = (source: { id: number }, ticket: string, actor = subjectId, id = ++sequence) => {
+        expectedReplyChats.set(source.id, actor);
+        return app.fetch(origin + "/telegram/webhook", {
         method: "POST", headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": policy.webhookSecret },
         body: JSON.stringify({ update_id: id, callback_query: { id: "synthetic-" + id, from: { id: Number(actor), is_bot: false }, data: ticket,
           message: { message_id: source.id, date: now, from: { id: Number(policy.botId), is_bot: true }, chat: { id: Number(actor), type: "private" } } } }) });
-      async function reply(id = sequence) {
+      };
+      async function reply(id = sequence, after = 0) {
         for (let tries = 0; tries < 100; tries++) {
-          const found = sent.find(({ message }) => message.reply_parameters?.message_id === id);
+          const found = sent.slice(after).find(({ message }) => message.reply_parameters?.message_id === id);
           if (found) return found;
           await new Promise((resolve) => setTimeout(resolve, 50));
         }
@@ -164,7 +171,7 @@ for (const lane of ["isolated", "general"] as const) {
       assert.equal((await post("/renumber@fixture_path_bot", renumberId)).status, 200);
       assert.equal((await reply(renumberId)).message.text, "已重置编号，当前 1 条订阅。");
       assert.equal((await post("/renumber@fixture_path_bot", renumberId)).status, lane === "isolated" ? 200 : 204);
-      assert.equal((await post("/renumber", ++sequence, policy.memberId, policy.groupId)).status, 200);
+      assert.equal((await post("/renumber", ++sequence, subjectId, policy.groupId)).status, 200);
       const groupCount = (await reply()).message;
       assert.equal(groupCount.chat_id, policy.groupId);
       assert.equal(groupCount.text, "已重置编号，当前 1 条订阅。");
@@ -203,6 +210,9 @@ for (const lane of ["isolated", "general"] as const) {
       assert.equal((await post("短链 https://example.com/synthetic", normalId)).status, lane === "isolated" ? 200 : 204);
       assert.equal(await mapCount(), 1);
       assert.equal((await app.fetch(normalMap.target, { redirect: "manual" })).status, 302);
+      assert.equal((await post("/short revoke " + normalCode, ++sequence, otherActorId)).status, 200);
+      assert.equal((await reply()).message.text, "没有可撤销的短链。");
+      assert.equal((await app.fetch(normalMap.target, { redirect: "manual" })).status, 302);
       assert.equal((await post("/short revoke " + normalCode)).status, 200);
       await reply();
       assert.equal((await app.fetch(normalMap.target, { redirect: "manual" })).status, 404);
@@ -235,18 +245,72 @@ for (const lane of ["isolated", "general"] as const) {
       const search = await reply();
       const detail = ticket(search.message, "详情");
       const beforeSpoof = await mapCount();
-      assert.equal((await callback(search, detail, policy.adminId)).status, lane === "isolated" ? 200 : 204);
+      assert.equal((await callback(search, detail, otherActorId)).status, lane === "isolated" ? 200 : 204);
       assert.equal(await mapCount(), beforeSpoof);
       assert.equal((await callback(search, detail)).status, 200);
       const metadata = await reply(search.id);
-      assert.equal((await callback(metadata, ticket(metadata.message, "Clash"))).status, 200);
-      const typed = await reply(metadata.id);
-      const typedMap = await outerTarget(typed.message);
-      const typedCode = /\/short revoke ([A-Za-z0-9_-]{22})/u.exec(typed.message.text)?.[1];
-      assert.ok(typedCode, "External typed links must preserve the local revocation operation.");
-      assert.equal((await post("/short revoke " + typedCode)).status, 200);
-      await reply();
-      assert.equal((await app.fetch(typedMap.target, { redirect: "manual" })).status, 404);
+      assert.deepEqual(metadata.message.reply_markup?.inline_keyboard?.flat()
+        .filter(({ text }) => ["Clash Meta", "Sing-box", "Base64", "Surge", "QX"].includes(text)).map(({ text }) => text),
+      ["Clash Meta", "Sing-box", "Base64", "Surge", "QX"]);
+      const typedCodes = new Set<string>();
+      for (const [label, format] of [["Clash Meta", "clash"], ["Sing-box", "singbox"], ["Base64", "base64"],
+        ["Surge", "surge"], ["QX", "qx"]] as const) {
+        const formatTicket = ticket(metadata.message, label);
+        const mapsBefore = await mapCount();
+        assert.equal((await callback(metadata, formatTicket, otherActorId)).status, lane === "isolated" ? 200 : 204);
+        assert.equal(await mapCount(), mapsBefore, "The other role cannot consume an owner's format ticket or call RPC.");
+        const beforeMessages = sent.length;
+        const formatUpdate = ++sequence;
+        assert.equal((await callback(metadata, formatTicket, subjectId, formatUpdate)).status, 200);
+        const typed = await reply(metadata.id, beforeMessages);
+        assert.ok(typed.message.text.startsWith(label + "\n"));
+        const typedMap = await outerTarget(typed.message);
+        const typedCode = /\/short revoke ([A-Za-z0-9_-]{21}t)/u.exec(typed.message.text)?.[1];
+        assert.ok(typedCode, "External typed links must preserve the local owner revocation command.");
+        assert.ok(!typedCodes.has(typedCode));
+        typedCodes.add(typedCode);
+        const typedDigest = createHash("sha256").update(typedCode).digest("hex");
+        const activeLink = await db.prepare(`SELECT owner_id,subscription_id,format,revoked_at
+          FROM telegram_subscription_short_links WHERE code_sha256=?`).bind(typedDigest).first();
+        assert.deepEqual(activeLink, { owner_id: subjectId, subscription_id: sub.id, format, revoked_at: null });
+        assert.equal(await mapCount(), mapsBefore! + 1);
+        for (const method of ["GET", "HEAD"] as const) {
+          const redirect = await app.fetch(typedMap.target, { method, redirect: "manual" });
+          assert.equal(redirect.status, 302);
+          assert.equal(redirect.headers.get("Location"), `/sub/${sub.token}/${format}`);
+          const exported = await app.fetch(origin + redirect.headers.get("Location"), { method });
+          assert.equal(exported.status, 200, "Each issued format points to a usable export of the owner's snapshot.");
+          assert.equal((await exported.arrayBuffer()).byteLength > 0, method === "GET");
+        }
+        // Telegram can deliver the same callback twice. It must retain one local
+        // capability, one external mapping and one send instead of minting again.
+        const sendsBeforeDuplicate = sent.length;
+        assert.equal((await callback(metadata, formatTicket, subjectId, formatUpdate)).status, lane === "isolated" ? 200 : 204);
+        assert.equal(await mapCount(), mapsBefore! + 1);
+        assert.equal(sent.length, sendsBeforeDuplicate);
+        assert.equal(await db.prepare("SELECT count(*) AS n FROM fixture_rpc_attempts WHERE operation_id=? AND target=?")
+          .bind(typedMap.operation_id, typedMap.target).first<number>("n"), 1);
+        assert.deepEqual(await db.prepare(`SELECT owner_id,subscription_id,format,revoked_at
+          FROM telegram_subscription_short_links WHERE code_sha256=?`).bind(typedDigest).first(), activeLink);
+        const repeatedClick = ++sequence;
+        assert.equal((await callback(metadata, formatTicket, subjectId, repeatedClick)).status, lane === "isolated" ? 200 : 204);
+        assert.equal(await db.prepare("SELECT count(*) AS n FROM telegram_inbox WHERE bot_id=? AND update_id=?")
+          .bind(policy.botId, repeatedClick).first<number>("n"), 0, "A fresh callback update cannot reuse a consumed button.");
+        assert.equal(await mapCount(), mapsBefore! + 1);
+        assert.equal(sent.length, sendsBeforeDuplicate);
+        assert.equal((await post("/short revoke " + typedCode, ++sequence, otherActorId)).status, 200);
+        assert.equal((await reply()).message.text, "没有可撤销的短链。");
+        assert.equal((await app.fetch(typedMap.target, { redirect: "manual" })).status, 302);
+        assert.equal((await post("/short revoke " + typedCode)).status, 200);
+        assert.equal((await reply()).message.text, "短链已撤销。");
+        for (const method of ["GET", "HEAD"] as const) {
+          assert.equal((await app.fetch(typedMap.target, { method, redirect: "manual" })).status, 404);
+        }
+        assert.deepEqual(await db.prepare(`SELECT owner_id,subscription_id,token_sha256,format,nonce,revoked_at IS NOT NULL AS retired
+          FROM telegram_subscription_short_links WHERE code_sha256=?`).bind(typedDigest).first(),
+        { owner_id: subjectId, subscription_id: null, token_sha256: null, format: null, nonce: null, retired: 1 });
+      }
+      assert.equal(typedCodes.size, 5);
       // Domain denial falls back to the same published local link and never claims external success.
       await db.prepare("UPDATE fixture_rpc_control SET mode='forbidden'").run();
       assert.equal((await post("/short https://example.com/fallback")).status, 200);

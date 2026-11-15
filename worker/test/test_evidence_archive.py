@@ -308,6 +308,17 @@ class EvidenceArchiveTests(TestCase):
             with self.assertRaises(archive.ArchiveError):
                 archive.verify_lifecycle(value, archive.BASE)
 
+    def test_observed_prefixless_abort_rule_is_safe_but_prefixless_object_expiry_blocks(self):
+        observed = {"id": "default-abort", "enabled": True, "conditions": {},
+            "abortMultipartUploadsTransition": {"condition": {"type": "Age", "maxAge": 604800}}}
+        archive.verify_lifecycle({"rules": [observed]}, archive.BASE)
+        for conditions in ({}, {"prefix": ""}):
+            with self.subTest(conditions=conditions), self.assertRaises(archive.ArchiveError):
+                archive.verify_lifecycle({"rules": [{**observed, "conditions": conditions,
+                    "deleteObjectsTransition": {"condition": {"type": "Age", "maxAge": 604800}}}]}, archive.BASE)
+        with self.assertRaises(archive.ArchiveError):
+            archive.verify_lifecycle({"rules": [{**observed, "conditions": {"prefix": None}}]}, archive.BASE)
+
     def test_manifest_is_last_and_fresh_verification_reads_all_original_bytes(self):
         store = MemoryStore()
         value, blobs = manifest()

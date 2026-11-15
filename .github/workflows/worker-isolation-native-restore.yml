@@ -59,6 +59,14 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11'
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: inputs.action == 'verify-restore'
+        with:
+          node-version: '24'
+      - name: Install locked hosted validation dependencies before reading private data
+        if: inputs.action == 'verify-restore'
+        working-directory: worker
+        run: npm ci --ignore-scripts
       - name: Verify merged artifact provenance and digests
         env:
           GH_TOKEN: ${{ github.token }}
@@ -73,9 +81,28 @@ jobs:
           SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
           SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPLOY_TOKEN }}
         run: python3 -B worker/tools/native_restore_rehearsal.py
+      - name: Verify restored native links with exact bundle and no outbound interface
+        if: inputs.action == 'verify-restore'
+        working-directory: worker
+        run: |
+          validation="$RUNNER_TEMP/native-restore-links"
+          sandbox="$(mktemp -d)"
+          trap 'rm -rf -- "$validation" "$sandbox"' EXIT
+          sudo -n unshare --net -- bash -euc '
+            ip link set dev lo up
+            umask 077
+            ulimit -c 0
+            exec setpriv --reuid="$1" --regid="$2" --clear-groups --no-new-privs -- \
+              env -i PATH=/usr/bin:/bin HOME="$3" TMPDIR="$3" \
+              "$4" tools/native-restored-links.ts "$5" "$6" "$7"
+          ' -- "$(id -u)" "$(id -g)" "$sandbox" "$(command -v node)" "$validation" \
+            "$RUNNER_TEMP/subs-bot-verified" "$RUNNER_TEMP/native-restored-links-evidence.json"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
         with:
           name: subs-bot-native-restore-evidence-${{ github.sha }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/native-restore-evidence.json
+          path: |
+            ${{ runner.temp }}/native-restore-evidence.json
+            ${{ runner.temp }}/native-restored-links-evidence.json
           if-no-files-found: error
           retention-days: 7
