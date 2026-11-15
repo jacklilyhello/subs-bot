@@ -3,6 +3,7 @@
 from pathlib import Path
 import sys
 from unittest import TestCase
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import evidence_archive as archive
@@ -44,6 +45,33 @@ def manifest(body=b"synthetic historical bytes"):
 
 
 class EvidenceArchiveTests(TestCase):
+    def test_collection_preserves_verified_deployment_job_identity(self):
+        spec = archive.SOURCES[0]
+        raw = b"synthetic original archive bytes"
+        proof = {"revision": archive.REVISION}
+        deployment = {"ciProof": proof, "migrationCount": 54, "jobLogSha256": "b" * 64}
+        original = {"source": {"ciProof": proof}, "historicalIsolationDeployment": {**deployment, "jobId": "42"}}
+        run = {"id": int(spec[0]), "run_attempt": 1, "path": spec[1], "head_sha": spec[2],
+            "head_branch": "main", "event": "workflow_dispatch", "status": "completed", "conclusion": "success",
+            "workflow_id": 777, "repository": {"id": artifact.REPOSITORY_ID},
+            "head_repository": {"id": artifact.REPOSITORY_ID}}
+        projected = {"artifactId": archive.CANDIDATE_ID, "sha256": archive.digest(raw), "bytes": len(raw)}
+        def read(path, _token):
+            if path.endswith("/attempts/1"): return run
+            if "/artifacts?" in path: return {"total_count": 1, "artifacts": [{}]}
+            if "/jobs?" in path: return {"jobs": []}
+            if path == "/issues/comments/6825266606":
+                return {"id": 6825266606, "user": {"login": "jacklilyhello"},
+                    "issue_url": artifact.API_ROOT + "/issues/253", "body": "Synthetic acceptance"}
+            self.fail("Unexpected evidence source")
+        with patch.object(archive, "SOURCES", (spec,)), patch.object(archive, "artifact_projection", return_value=projected), \
+                patch.object(archive, "verified_candidate", return_value=original), \
+                patch.object(archive.candidate, "deploy_job", return_value="42"), \
+                patch.object(archive.candidate, "deployment_proofs", return_value=dict(deployment)):
+            manifest_value, blobs = archive.collect("synthetic", read, lambda *_: raw, lambda *_: b"synthetic log")
+        entry = next(item for item in manifest_value["entries"] if item["label"] == "deployment-proofs.json")
+        self.assertEqual(archive.parse(blobs[entry["sha256"]]), original["historicalIsolationDeployment"])
+
     def test_failure_projection_never_exposes_error_bodies_paths_or_untrusted_statuses(self):
         archive.stage("artifact-download")
         error = archive.ArchiveError("synthetic Bearer secret and /private/sensitive/path", http_status=403)

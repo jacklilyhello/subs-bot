@@ -194,6 +194,7 @@ def collect(token, get_json=artifact._get_json, download=artifact._download, log
     jobs = get_json("/actions/runs/43228139603/attempts/1/jobs?per_page=100", token)
     job = candidate.deploy_job(jobs, "43228139603", "1", REVISION)
     projected = candidate.deployment_proofs(log(job, token), proof)
+    projected["jobId"] = job
     require(projected == original["historicalIsolationDeployment"])
     add("deployment-proofs.json", canonical(projected))
     stage("public-comment")
