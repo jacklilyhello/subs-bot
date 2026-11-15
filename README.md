@@ -104,14 +104,18 @@ journalctl -u subs-bot -f
 
 旧版服务收到 systemd 的 `SIGTERM` 后，先停止拉取 Telegram 更新，再等待 Python 应用关闭，最后关闭 HTTP、SQLite 和上游会话。停止前记录该次 `subs-bot` 启动的 systemd `InvocationID`，仅在对应的 `_SYSTEMD_INVOCATION_ID` 日志中核对 `legacy-drain:v1 outcome=complete`。缺少此标记、出现 `outcome=incomplete` 或被强制终止时，应视为排空未获证实。标记仅证明本进程完成上述关闭步骤。迁移仍需单独核对 Telegram 待处理更新、逐条处理结果和切换后数据。
 
-订阅和动态授权均存放在 SQLite 中。先停止旧服务，再复制数据库，避免遗漏 WAL 中未合并的写入；迁移到新实例时保留 `.env` 中的管理员配置。
+订阅和动态授权均存放在 SQLite 中。运行中的主数据库文件可能缺少已提交 WAL 数据，直接复制主文件不能证明备份完整。经确认源位置、归属和访问授权后，使用 SQLite Online Backup API 取得一致视图；不要对活库使用 `immutable=1`，也不要为备份强制 checkpoint 或更改源 journal mode。 [SQLite Online Backup API](https://www.sqlite.org/backup.html) · [SQLite WAL](https://www.sqlite.org/wal.html)
+
+`worker/tools/legacy_consistent_backup.py` 只以只读 SQLite 连接读取源，并在新的私有目录生成备份。先将 `SOURCE_DB` 设为已核对的绝对数据库路径，将 `BACKUP_DIRECTORY` 设为不存在的新目录；其父目录须由执行用户拥有且权限为 0700。在获准的源数据环境执行：
 
 ```bash
-# 旧机器
-systemctl stop subs-bot
-scp /opt/subs-bot/data/subs.db 新机器:/opt/subs-bot/data/
-systemctl start subs-bot
+python3 -B worker/tools/legacy_consistent_backup.py \
+  "$SOURCE_DB" "$BACKUP_DIRECTORY"
 ```
+
+工具纳入已提交 WAL，关闭备份连接后只将目标转为 DELETE journal mode，核对完整性、外键、逐表计数及摘要。数据库、清单及最后写入的摘要标记均为 0600；失败保留未封存的部分目标，不覆盖已有目录。日志不输出路径、表名或数据。封存整个目录到本项目获准的私有持久存储；不要将真实数据库上传到公开 PR 或 Actions 产物。仅存在主文件或缺少有效 `manifest.sha256` 时不宣称备份成功。
+
+在线备份不停止旧服务，也不证明生产切换已停写。最终切换仍需另行批准，关闭所有旧写入者并分类排空后再取得最终一致快照；最后处理水位、管理员/白名单配置、显式授权和旧链接一起核对。参见[生产切换执行方案](docs/cloudflare-production-cutover.md)。恢复其他实例时保留经核对的管理员配置，不能用空库替代真实数据承接。
 
 ### 恢复旧轮询时保留待处理更新
 
