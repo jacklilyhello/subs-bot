@@ -1,4 +1,4 @@
-"""Preserve the reviewed 5752 handoff in private, immutable R2 objects.
+"""Preserve the reviewed 5752 handoff and an optional later candidate in private R2.
 
 Only the protected hosted workflow may write. Historical conclusions and ZIP
 bytes remain unchanged. Raw job logs and signed download URLs are never stored.
@@ -48,6 +48,7 @@ RECOVERY_PINS = {
     "13945960103": "567ac686abe8be1740886711c28b9d839539ec1238835438ceab3d4f3af66f45",
 }
 STAGES = frozenset({"startup", "runtime-guard", "collect-run", "artifact-list", "artifact-download", "candidate-verify",
+    "additional-candidate", "ci-proof",
     "deployment-proof", "public-comment", "store-private", "lifecycle", "put", "readback", "manifest", "complete"})
 _STAGE = "startup"
 
@@ -97,9 +98,11 @@ def parse(raw):
                       parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()))
 
 
-def run_projection(raw, spec):
+def run_projection(raw, spec, attempt="1"):
     run, path, revision, conclusion, _ = spec
-    require(isinstance(raw, dict) and str(raw.get("id")) == run and raw.get("run_attempt") == 1
+    require(isinstance(attempt, str) and DECIMAL.fullmatch(attempt)
+        and isinstance(raw, dict) and str(raw.get("id")) == run and type(raw.get("run_attempt")) is int
+        and str(raw["run_attempt"]) == attempt
         and raw.get("path") in (path, path + "@main", path + "@refs/heads/main")
         and raw.get("head_branch") == "main" and raw.get("head_sha") == revision
         and raw.get("status") == "completed" and raw.get("conclusion") == conclusion
@@ -107,7 +110,7 @@ def run_projection(raw, spec):
         and type(raw.get("workflow_id")) is int
         and all(isinstance(raw.get(key), dict) and raw[key].get("id") == artifact.REPOSITORY_ID
                 for key in ("repository", "head_repository")))
-    return {"runId": run, "runAttempt": "1", "revision": revision, "workflow": path,
+    return {"runId": run, "runAttempt": attempt, "revision": revision, "workflow": path,
             "workflowId": raw["workflow_id"], "event": raw["event"], "status": "completed", "conclusion": conclusion}
 
 
@@ -152,8 +155,214 @@ def verified_candidate(raw):
     return value
 
 
-def collect(token, get_json=artifact._get_json, download=artifact._download, log=candidate.download_job_log):
+def additional_candidate(raw, expected):
+    """Verify a bounded later candidate without promoting its immutable Not run fields."""
+    require(isinstance(raw, bytes) and 0 < len(raw) <= MAX_BLOB
+        and isinstance(expected, str) and DIGEST.fullmatch(expected))
+    marker = (expected + "  candidate.json\n").encode("ascii")
+    with ZipFile(io.BytesIO(raw)) as archive:
+        members = artifact._zip_members(archive)
+        require(set(members) == {"candidate.json", "candidate.sha256", "review.md"}
+            and members["candidate.json"].file_size <= 65536 and members["review.md"].file_size <= 65536
+            and members["candidate.sha256"].file_size == len(marker))
+        body = archive.read(members["candidate.json"])
+        require(digest(body) == expected
+            and archive.read(members["candidate.sha256"]) == marker)
+    value = parse(body)
+    require(isinstance(value, dict) and value.get("version") == 1
+        and value.get("kind") == "production-candidate-review-only"
+        and value.get("productionReady") is False and value.get("productionMutationPerformed") is False
+        and value.get("productionAuthorization") == "not-granted")
+    data = value.get("dataSource")
+    require(isinstance(data, dict) and data.get("kind") in ("not-supplied", "synthetic-fixture")
+        and data.get("realDataImportAuthorized") is False and data.get("emptyDatabaseApproved") is False
+        and data.get("discardLegacyLinksApproved") is False)
+    return value
+
+
+def ci_archive(raw, proof):
+    """Recheck every bounded original CI member in memory; never execute or extract it."""
+    require(isinstance(raw, bytes) and 0 < len(raw) <= MAX_BLOB and digest(raw) == proof["archiveSha256"])
+    with ZipFile(io.BytesIO(raw)) as archive:
+        members = artifact._zip_members(archive)
+        require("isolation.json" in members and members["isolation.json"].file_size <= artifact._MAX_JSON)
+        isolation = parse(archive.read(members["isolation.json"]))
+        require(isinstance(isolation, dict))
+        hashes, sizes = artifact._expected_hashes(isolation, proof["revision"], proof["runId"], proof["runAttempt"])
+        require(set(members) == set(hashes) | {"isolation.json"}
+            and 0 < members["index.js"].file_size <= artifact.MAX_MODULE_BYTES)
+        for name, expected in hashes.items():
+            body = archive.read(members[name])
+            require(digest(body) == expected and (name not in sizes or len(body) == sizes[name]))
+    return isolation
+
+
+def additional_artifact(raw, run, attempt, revision, name):
+    require(isinstance(raw, dict) and raw.get("name") == name and raw.get("expired") is False
+        and type(raw.get("id")) is int and DECIMAL.fullmatch(str(raw["id"]))
+        and type(raw.get("size_in_bytes")) is int and 0 < raw["size_in_bytes"] <= MAX_BLOB
+        and isinstance(raw.get("digest"), str) and re.fullmatch(r"sha256:[0-9a-f]{64}", raw["digest"])
+        and isinstance(raw.get("expires_at"), str) and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z", raw["expires_at"]))
+    source = raw.get("workflow_run")
+    require(isinstance(source, dict) and str(source.get("id")) == run
+        and source.get("repository_id") == source.get("head_repository_id") == artifact.REPOSITORY_ID
+        and source.get("head_branch") == "main" and source.get("head_sha") == revision)
+    return {"artifactId": str(raw["id"]), "name": name, "sha256": raw["digest"][7:], "bytes": raw["size_in_bytes"],
+        "sourceRunId": run, "sourceRunAttempt": attempt, "sourceRevision": revision, "sourceExpiresAt": raw["expires_at"]}
+
+
+def _record_run(value, workflow):
+    require(isinstance(value, dict) and set(value) == {"runId", "runAttempt", "revision", "workflow", "workflowId", "event", "status", "conclusion"}
+        and all(isinstance(value.get(key), str) and DECIMAL.fullmatch(value[key]) for key in ("runId", "runAttempt"))
+        and isinstance(value.get("revision"), str) and artifact._REVISION.fullmatch(value["revision"])
+        and value["workflow"] == workflow and type(value["workflowId"]) is int and value["workflowId"] > 0
+        and value["status"] == "completed" and value["conclusion"] == "success"
+        and value["event"] in (("push", "workflow_dispatch") if workflow == artifact.WORKFLOW_PATH else ("workflow_dispatch",)))
+    if workflow == artifact.WORKFLOW_PATH:
+        require(value["workflowId"] == artifact.WORKFLOW_ID)
+
+
+def _record_artifact(value, run, expected_name, blobs):
+    require(isinstance(value, dict) and set(value) == {"artifactId", "name", "sha256", "bytes", "sourceRunId", "sourceRunAttempt", "sourceRevision", "sourceExpiresAt"}
+        and isinstance(value["artifactId"], str) and DECIMAL.fullmatch(value["artifactId"])
+        and value["name"] == expected_name and isinstance(value["sha256"], str) and DIGEST.fullmatch(value["sha256"])
+        and type(value["bytes"]) is int and 0 < value["bytes"] <= MAX_BLOB
+        and isinstance(value["sourceExpiresAt"], str)
+        and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z", value["sourceExpiresAt"])
+        and (value["sourceRunId"], value["sourceRunAttempt"], value["sourceRevision"])
+            == (run["runId"], run["runAttempt"], run["revision"]))
+    raw = blobs.get(value["sha256"])
+    require(raw is not None and len(raw) == value["bytes"] and digest(raw) == value["sha256"])
+    return raw
+
+
+def verify_additional(record, blobs):
+    """Rebuild the closed candidate/CI/deployment linkage from durable archive bytes."""
+    require(isinstance(record, dict) and set(record) == {"candidateRun", "candidateArtifact", "candidateJsonSha256",
+        "ciRun", "ciArtifact", "deployRun", "deploymentProofSha256"})
+    package_run, ci_run, deploy_run = (record[key] for key in ("candidateRun", "ciRun", "deployRun"))
+    _record_run(package_run, SOURCES[0][1])
+    _record_run(ci_run, artifact.WORKFLOW_PATH)
+    _record_run(deploy_run, candidate.DEPLOY_WORKFLOW)
+    revision = package_run["revision"]
+    require(ci_run["revision"] == deploy_run["revision"] == revision)
+    package = _record_artifact(record["candidateArtifact"], package_run,
+        f"subs-bot-production-candidate-{revision}-{package_run['runId']}-{package_run['runAttempt']}", blobs)
+    value = additional_candidate(package, record["candidateJsonSha256"])
+    raw_ci = _record_artifact(record["ciArtifact"], ci_run,
+        f"subs-bot-worker-{revision}-{ci_run['runAttempt']}", blobs)
+    expected_proof = {"revision": revision, "runId": ci_run["runId"], "runAttempt": ci_run["runAttempt"],
+        "artifactId": record["ciArtifact"]["artifactId"], "archiveSha256": record["ciArtifact"]["sha256"]}
+    source = value.get("source")
+    require(isinstance(source, dict) and source.get("revision") == revision and source.get("ciProof") == expected_proof)
+    expected_deploy = {key: deploy_run[key] for key in ("runId", "runAttempt", "revision", "workflow", "conclusion")}
+    expected_deploy["url"] = f"https://github.com/{artifact.REPOSITORY}/actions/runs/{deploy_run['runId']}/attempts/{deploy_run['runAttempt']}"
+    require(source.get("deployRun") == expected_deploy)
+    isolation = ci_archive(raw_ci, expected_proof)
+    require(isinstance(value.get("artifact"), dict) and type(value["artifact"].get("migrationCount")) is int
+        and value["artifact"] == {"moduleSha256": isolation["bundleSha256"], "compatibilityDate": isolation["compatibilityDate"],
+        "migrations": [{key: item[key] for key in ("name", "sha256")} for item in isolation["migrations"]],
+        "migrationCount": len(isolation["migrations"])})
+    proof_sha = record["deploymentProofSha256"]
+    require(isinstance(proof_sha, str) and DIGEST.fullmatch(proof_sha) and proof_sha in blobs)
+    deployment = parse(blobs[proof_sha])
+    require(isinstance(deployment, dict) and deployment == value.get("historicalIsolationDeployment")
+        and set(deployment) == {"ciProof", "release", "migrationCount", "jobLogSha256", "basis", "liveReadback", "jobId"}
+        and deployment["ciProof"] == expected_proof and type(deployment["migrationCount"]) is int
+        and deployment["migrationCount"] == len(isolation["migrations"])
+        and deployment["basis"] == "historical-protected-workflow-log" and deployment["liveReadback"] is False
+        and isinstance(deployment["jobLogSha256"], str) and DIGEST.fullmatch(deployment["jobLogSha256"])
+        and isinstance(deployment["jobId"], str) and DECIMAL.fullmatch(deployment["jobId"]))
+    release = deployment["release"]
+    require(isinstance(release, dict) and candidate.RESULT_KEYS | {"flags"} <= set(release)
+        and set(release) <= candidate.RESULT_KEYS | {"flags", "serviceMetadata"}
+        and release["revision"] == revision and type(release["changed"]) is bool
+        and all(isinstance(release.get(key), str) and candidate.UUID.fullmatch(release[key])
+                for key in ("deploymentId", "versionId", "previousVersionId"))
+        and isinstance(release["flags"], dict) and release["flags"]
+        and all(candidate.FLAG.fullmatch(key) and type(value) is bool for key, value in release["flags"].items())
+        and ("serviceMetadata" not in release or release["serviceMetadata"] == candidate.SERVICE_METADATA))
+    return {"revision": revision, "candidateRunId": package_run["runId"], "candidateRunAttempt": package_run["runAttempt"],
+        "candidateJsonSha256": record["candidateJsonSha256"], "sourceCiRunId": ci_run["runId"],
+        "sourceCiRunAttempt": ci_run["runAttempt"], "deployRunId": deploy_run["runId"], "deployRunAttempt": deploy_run["runAttempt"]}
+
+
+def collect_additional(token, run, attempt, expected_json, add, blobs, get_json, download, log):
+    stage("additional-candidate")
+    require(all(isinstance(value, str) and DECIMAL.fullmatch(value) for value in (run, attempt))
+        and isinstance(expected_json, str) and DIGEST.fullmatch(expected_json))
+
+    def read_run(run_id, run_attempt, path, revision=None):
+        workflow = get_json("/actions/workflows/" + path.rsplit("/", 1)[-1], token)
+        require(isinstance(workflow, dict) and type(workflow.get("id")) is int and workflow.get("path") == path)
+        raw = get_json(f"/actions/runs/{run_id}/attempts/{run_attempt}", token)
+        sha = raw.get("head_sha") if isinstance(raw, dict) else None
+        require(isinstance(sha, str) and artifact._REVISION.fullmatch(sha) and (revision is None or sha == revision))
+        projected = run_projection(raw, (run_id, path, sha, "success", 0), run_attempt)
+        require(projected["workflowId"] == workflow["id"])
+        _record_run(projected, path)
+        return projected
+
+    def read_artifact(source_run, name, *, metadata_only=False):
+        listing = get_json(f"/actions/runs/{source_run['runId']}/artifacts?name={quote(name, safe='')}&per_page=2", token)
+        require(isinstance(listing, dict) and listing.get("total_count") == 1
+            and isinstance(listing.get("artifacts"), list) and len(listing["artifacts"]) == 1)
+        projected = additional_artifact(listing["artifacts"][0], source_run["runId"], source_run["runAttempt"], source_run["revision"], name)
+        if metadata_only:
+            return projected
+        raw = download(projected["artifactId"], token)
+        require(len(raw) == projected["bytes"] and digest(raw) == projected["sha256"])
+        return projected, raw
+
+    package_run = read_run(run, attempt, SOURCES[0][1])
+    revision = package_run["revision"]
+    package_artifact, package_zip = read_artifact(package_run, f"subs-bot-production-candidate-{revision}-{run}-{attempt}")
+    value = additional_candidate(package_zip, expected_json)
+    source = value.get("source")
+    require(isinstance(source, dict) and source.get("revision") == revision
+        and isinstance(source.get("ciProof"), dict) and set(source["ciProof"]) == candidate.PROOF_KEYS
+        and isinstance(source.get("deployRun"), dict))
+    proof = source["ciProof"]
+    require(proof.get("revision") == revision and all(isinstance(proof.get(key), str) and DECIMAL.fullmatch(proof[key])
+        for key in ("runId", "runAttempt", "artifactId")) and isinstance(proof.get("archiveSha256"), str)
+        and DIGEST.fullmatch(proof["archiveSha256"]))
+    stage("ci-proof")
+    ci_run = read_run(proof["runId"], proof["runAttempt"], artifact.WORKFLOW_PATH, revision)
+    ci_artifact, ci_zip = read_artifact(ci_run, f"subs-bot-worker-{revision}-{ci_run['runAttempt']}")
+    require(ci_artifact["artifactId"] == proof["artifactId"] and ci_artifact["sha256"] == proof["archiveSha256"])
+    deploy = source["deployRun"]
+    require(all(isinstance(deploy.get(key), str) and DECIMAL.fullmatch(deploy[key]) for key in ("runId", "runAttempt")))
+    deploy_run = read_run(deploy["runId"], deploy["runAttempt"], candidate.DEPLOY_WORKFLOW, revision)
+    stage("deployment-proof")
+    job = candidate.deploy_job(get_json(f"/actions/runs/{deploy['runId']}/attempts/{deploy['runAttempt']}/jobs?per_page=100", token),
+        deploy["runId"], deploy["runAttempt"], revision)
+    projected = candidate.deployment_proofs(log(job, token), proof)
+    projected["jobId"] = job
+    require(projected == value.get("historicalIsolationDeployment"))
+    add(f"candidate-{run}-{attempt}.zip", package_zip, artifact=package_artifact)
+    add(f"candidate-{run}-{attempt}-worker-ci.zip", ci_zip, artifact=ci_artifact)
+    raw_proof = canonical(projected)
+    add(f"candidate-{run}-{attempt}-deployment-proof.json", raw_proof)
+    record = {"candidateRun": package_run, "candidateArtifact": package_artifact, "candidateJsonSha256": expected_json,
+        "ciRun": ci_run, "ciArtifact": ci_artifact, "deployRun": deploy_run, "deploymentProofSha256": digest(raw_proof)}
+    verify_additional(record, blobs)
+    # Re-read exact historical attempts/artifacts after collection. They need not
+    # still be main; only this archive writer is guarded against current main.
+    for observed in (package_run, ci_run, deploy_run):
+        require(read_run(observed["runId"], observed["runAttempt"], observed["workflow"], revision) == observed)
+    require(read_artifact(package_run, package_artifact["name"], metadata_only=True) == package_artifact
+        and read_artifact(ci_run, ci_artifact["name"], metadata_only=True) == ci_artifact)
+    return record
+
+
+def collect(token, get_json=artifact._get_json, download=artifact._download, log=candidate.download_job_log,
+            *, current_candidate_run_id="", current_candidate_run_attempt="1", candidate_json_sha256=""):
     """Download exact historical originals; only safe projections of API metadata/logs survive."""
+    require(bool(current_candidate_run_id) == bool(candidate_json_sha256))
+    if current_candidate_run_id:
+        require(all(isinstance(value, str) and DECIMAL.fullmatch(value)
+            for value in (current_candidate_run_id, current_candidate_run_attempt))
+            and isinstance(candidate_json_sha256, str) and DIGEST.fullmatch(candidate_json_sha256))
     blobs, entries, runs, original = {}, [], [], None
 
     def add(label, raw, **metadata):
@@ -204,9 +413,14 @@ def collect(token, get_json=artifact._get_json, download=artifact._download, log
         and isinstance(comment.get("body"), str) and len(comment["body"].encode("utf-8")) <= 65536)
     add("pr253-acceptance-comment.json", canonical({key: comment.get(key) for key in
         ("id", "html_url", "created_at", "updated_at", "body")}))
+    additional = []
+    if current_candidate_run_id:
+        additional.append(collect_additional(token, current_candidate_run_id, current_candidate_run_attempt,
+            candidate_json_sha256, add, blobs, get_json, download, log))
     return {"version": 1, "kind": "private-historical-release-evidence", "revision": REVISION,
         "candidateJsonSha256": CANDIDATE_JSON, "historicalStatusesUnchanged": True,
-        "productionMutationPerformed": False, "rawLogsArchived": False, "runs": runs, "entries": entries}, blobs
+        "productionMutationPerformed": False, "rawLogsArchived": False, "runs": runs, "entries": entries,
+        **({"additionalCandidates": additional} if additional else {})}, blobs
 
 
 def verify_lifecycle(value, prefix):
@@ -317,6 +531,10 @@ def archive(store, manifest, blobs, guard=lambda: None):
     stage("manifest")
     require(store.read("manifest.json") is None)
     require({entry["sha256"] for entry in manifest["entries"]} == set(blobs))
+    additional = manifest.get("additionalCandidates", [])
+    require(isinstance(additional, list) and len(additional) <= 1)
+    for record in additional:
+        verify_additional(record, blobs)
     for key, body in sorted(blobs.items()):
         require(DIGEST.fullmatch(key) and digest(body) == key)
         guard()
@@ -340,7 +558,7 @@ def verify_archive(store, expected):
         and value.get("historicalStatusesUnchanged") is True and value.get("rawLogsArchived") is False
         and value.get("candidateJsonSha256") == CANDIDATE_JSON
         and isinstance(value.get("entries"), list) and 1 <= len(value["entries"]) <= 100)
-    total, seen = 0, set()
+    total, seen, blobs = 0, set(), {}
     for entry in value["entries"]:
         stage("readback")
         require(isinstance(entry, dict) and isinstance(entry.get("sha256"), str) and DIGEST.fullmatch(entry["sha256"])
@@ -351,10 +569,15 @@ def verify_archive(store, expected):
             total += len(body)
             seen.add(entry["sha256"])
         require(total <= MAX_TOTAL)
+        blobs[entry["sha256"]] = body
+    additional = value.get("additionalCandidates", [])
+    require(isinstance(additional, list) and len(additional) <= 1)
+    summaries = [verify_additional(record, blobs) for record in additional]
     stage("complete")
     return {"status": "Passed", "archivePrefix": store.prefix, "manifestSha256": expected,
         "blobCount": len(seen), "bytes": total, "historicalRevision": REVISION,
-        "productionMutationPerformed": False, "historicalStatusesUnchanged": True, "rawLogsArchived": False}
+        "productionMutationPerformed": False, "historicalStatusesUnchanged": True, "rawLogsArchived": False,
+        **({"additionalCandidates": summaries} if summaries else {})}
 
 
 def main():
@@ -373,7 +596,10 @@ def main():
         require(env.get("EVIDENCE_CONFIRMATION") == "preserve original subs-bot 5752 release evidence")
         guard = lambda: artifact.require_current_main(env["GITHUB_SHA"])
         guard()
-        manifest, blobs = collect(artifact._github_token())
+        manifest, blobs = collect(artifact._github_token(),
+            current_candidate_run_id=env.get("EVIDENCE_CURRENT_CANDIDATE_RUN_ID", ""),
+            current_candidate_run_attempt=env.get("EVIDENCE_CURRENT_CANDIDATE_RUN_ATTEMPT", "1"),
+            candidate_json_sha256=env.get("EVIDENCE_CANDIDATE_JSON_SHA256", ""))
         manifest["archiveWriter"] = {"revision": env["GITHUB_SHA"], "runId": run, "runAttempt": attempt}
         result = archive(store, manifest, blobs, guard)
     else:
