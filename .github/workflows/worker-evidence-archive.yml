@@ -1,0 +1,56 @@
+name: Preserve original migration evidence in private R2
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Preserve exact historical originals or independently verify a private archive
+        type: choice
+        options: [archive, verify]
+        default: verify
+      archive_run_id:
+        description: Verify only, original successful archive workflow run ID
+        type: string
+      archive_run_attempt:
+        description: Verify only, exact archive attempt
+        type: string
+        default: '1'
+      manifest_sha256:
+        description: Verify only, independent manifest SHA-256 from the successful archive summary
+        type: string
+      confirmation:
+        description: Archive only, preserve original subs-bot 5752 release evidence
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: subs-bot-isolation-deploy
+  cancel-in-progress: false
+
+jobs:
+  preserve:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
+    environment: subs-bot-isolation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Preserve or independently read back the exact private archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVIDENCE_ACTION: ${{ inputs.action }}
+          EVIDENCE_ARCHIVE_RUN_ID: ${{ inputs.archive_run_id }}
+          EVIDENCE_ARCHIVE_RUN_ATTEMPT: ${{ inputs.archive_run_attempt }}
+          EVIDENCE_MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
+          EVIDENCE_CONFIRMATION: ${{ inputs.confirmation }}
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 -B worker/tools/evidence_archive.py
