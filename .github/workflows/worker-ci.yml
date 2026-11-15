@@ -169,6 +169,9 @@ jobs:
           }
           offline_python WORKER_TEST_BUNDLE_DIR="$WORKER_TEST_BUNDLE_DIR" WORKER_TEST_REVISION="$BUILD_REVISION" \
             "$workdir/venv/bin/python" -B test/legacy-short-redirect-oracle.integration.py
+          offline_python WORKER_TEST_BUNDLE_DIR="$WORKER_TEST_BUNDLE_DIR" \
+            SUBS_BOT_NATIVE_ORACLE_NODE="$(command -v node)" \
+            "$workdir/venv/bin/python" -B test/native-restored-links.integration.py
           offline_python WORKER_TEST_BUNDLE_DIR="$WORKER_TEST_BUNDLE_DIR" WORKER_TEST_REVISION="$BUILD_REVISION" \
             "$workdir/venv/bin/python" -B test/legacy-temp-worker-oracle.integration.py
           offline_python WORKER_TEST_BUNDLE_DIR="$WORKER_TEST_BUNDLE_DIR" WORKER_TEST_REVISION="$BUILD_REVISION" \

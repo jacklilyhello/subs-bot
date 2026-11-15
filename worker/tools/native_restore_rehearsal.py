@@ -61,6 +61,7 @@ MAX_SAFE = 2**53 - 1
 LEASE_SECONDS = 120
 POLL_SECONDS = 120
 READ_ERROR = "Native restore rehearsal could not be verified safely."
+STAGE = "initialization"
 ACTIONS = {"verify", "prepare", "create-backup-bucket", "create-restore-db", "create-restore-bucket",
            "pin-resource", "capture", "poll-export", "restore-objects", "start-import", "verify-restore"}
 RESOURCES = ("backup", "database", "objects")
@@ -278,7 +279,9 @@ class RehearsalAPI:
             self.restore_bucket = object_bucket
 
     def json(self, method, path, payload=None, *, envelope=False):
-        require(method in {"GET", "POST"} and path.startswith(self.root + "/") and not any(c in path for c in ("#", "\\", "\n", "\r")))
+        user_verify = self.profile == "native" and method == "GET" and path == "/user/tokens/verify" and payload is None
+        require(method in {"GET", "POST"} and (path.startswith(self.root + "/") or user_verify)
+                and not any(c in path for c in ("#", "\\", "\n", "\r")))
         route = path.partition("?")[0]
         if self.profile in D1_ONLY_CANDIDATE_PROFILES:
             if method == "GET" and route == self.root + "/d1/database":
@@ -325,7 +328,7 @@ class RehearsalAPI:
                 if "filename" in payload:
                     require(matches(BOOKMARK, payload["filename"]))
         else:
-            allowed = route in {self.root + "/d1/database", self.root + "/r2/buckets", self.root + "/tokens/verify"}
+            allowed = user_verify or route in {self.root + "/d1/database", self.root + "/r2/buckets", self.root + "/tokens/verify"}
             allowed = allowed or any(route == self.root + f"/d1/database/{value}" for value in self.databases)
             allowed = allowed or any(route in {self.root + f"/r2/buckets/{bucket}" + suffix for suffix in
                 ("", "/domains/managed", "/domains/custom", "/objects")} for bucket in self.buckets)
@@ -427,7 +430,14 @@ class RehearsalAPI:
         require(isinstance(body, bytes) and 0 < len(body) <= OBJECT_BYTES)
         validate_metadata(metadata)
         if self.s3_access_key is None:
-            result = self.json("GET", self.root + "/tokens/verify")
+            try:
+                result = self.json("GET", self.root + "/tokens/verify")
+            except RehearsalError as error:
+                # Account and user API tokens have different read-only verify
+                # endpoints. This grants no new write path or token operation.
+                require(self.profile == "native" and error.http_status in {400, 401, 403, 404},
+                        "The existing isolation data token could not be verified for R2 signing.")
+                result = self.json("GET", "/user/tokens/verify")
             require(isinstance(result, dict) and result.get("status") == "active" and matches(HEX_ID, result.get("id")),
                     "The existing isolation data token could not be verified for R2 signing.")
             self.s3_access_key = result["id"]
@@ -677,10 +687,16 @@ class Source:
         self.config = self.active = self.version = None
 
     def verify(self, expected=None):
+        global STAGE
+        STAGE = "source-main"
         self.guard_main()
+        STAGE = "source-worker-config"
         config = self.scope.worker_config()
+        STAGE = "source-resources"
         self.scope.verify_resources()
+        STAGE = "source-active"
         active = self.scope.active()
+        STAGE = "source-version"
         version = self.scope.version(active.version)
         require(version.revision == self.manifest["revision"] and version.digest == self.manifest["bundleSha256"]
                 and version.compatibility == self.manifest["compatibilityDate"] and self.scope.cron_enabled())
@@ -690,6 +706,7 @@ class Source:
                "aggregateKeySha256": version.telegram_aggregate_key_sha256}
         require(expected is None or pin == expected, "The source release or ownership changed after rehearsal preparation.")
         self.config, self.active, self.version = config, active, version
+        STAGE = "source-health"
         _verify_health(version.revision)
         return pin
 
@@ -854,11 +871,11 @@ def remote_summary(api, database_id, layout):
     return data_summary(layout, rows)
 
 
-def open_export(path, source):
+def open_export(path, source, *, scratch=None):
     """Hosted scratch validation. Nothing is evaluated on the local control computer."""
     size, _ = file_hash(path)
     require(0 < size <= SQL_BYTES)
-    scratch = path.with_name("scratch-" + path.name + ".sqlite")
+    scratch = scratch or path.with_name("scratch-" + path.name + ".sqlite")
     with private_file(scratch):
         pass
     db = sqlite3.connect(scratch)
@@ -1004,8 +1021,9 @@ class Rehearsal:
     resource_kinds = RESOURCES
     creation_window_seconds = None
 
-    def __init__(self, api, source, journal, directory):
+    def __init__(self, api, source, journal, directory, *, validation_directory=None):
         self.api, self.source, self.journal, self.directory = api, source, journal, directory
+        self.validation_directory = validation_directory
 
     def observe(self, kind):
         name = self.api.names[kind]
@@ -1439,9 +1457,58 @@ class Rehearsal:
 
     def verify_restore(self, document=None):
         summary, document = self.read_restored_summary(document)
+        if self.validation_directory is not None:
+            self.prepare_link_validation(document)
         self.journal.update(phase="verified", importState={"state": "verified"}, targetDataSha256=summary["dataSha256"],
                             targetPublishedShareMetadataCount=published_share_metadata_count(document["objects"]))
         return summary
+
+    def prepare_link_validation(self, document):
+        """Private runner-only replay input, after exact remote restoration checks.
+
+        SQL is the sealed export whose complete data digest matched the restored
+        D1. Object bytes are fetched again from the restored bucket. No Telegram
+        config, runtime signing key or outbound service binding is supplied.
+        """
+        root = self.validation_directory
+        root.mkdir(mode=0o700)
+        sql = self.directory / "restore.sql"
+        require(file_hash(sql)[1] == document["sqlSha256"])
+        db, layout, summary = open_export(sql, self.source, scratch=root / "verified.sqlite")
+        try:
+            require(summary == document["summary"])
+            # Reconstruct rows with bound values: native imports accept large
+            # cells whose literal INSERT text exceeds D1's query SQL limit.
+            # open_export admits only the exact table/index schema, no triggers
+            # or views that could fire additional effects during reconstruction.
+            schema = [list(row) for row in db.execute("SELECT type,name,sql FROM sqlite_schema "
+                "WHERE sql IS NOT NULL AND name<>'sqlite_sequence' ORDER BY CASE type WHEN 'table' THEN 0 ELSE 1 END,name")]
+            tables = []
+            for table, definition in sorted(layout.items()):
+                columns = definition["columns"]
+                rows = db.execute("SELECT " + ",".join(_identifier(name) for name, _ in columns)
+                    + " FROM " + _identifier(table) + " ORDER BY " + ",".join(map(_identifier, definition["primary"])))
+                tables.append({"name": table, "columns": columns, "primary": definition["primary"],
+                    "rows": [[_cell(value, kind) for value, (_, kind) in zip(row, columns)] for row in rows]})
+            replay = {"schema": schema, "tables": tables}
+        finally:
+            db.close()
+        objects = []
+        for ordinal, entry in enumerate(document["objects"]):
+            raw, _ = self.api.object_or_none(self.api.names["objects"], entry["key"])
+            require(raw is not None and len(raw) == entry["bytes"] and digest(raw) == entry["sha256"])
+            name = f"object-{ordinal}.bin"
+            with private_file(root / name) as file:
+                file.write(raw)
+            objects.append({**entry, "file": name})
+        payload = {"version": 2, "revision": self.source.manifest["revision"],
+            "moduleSha256": self.source.manifest["bundleSha256"],
+            "compatibilityDate": self.source.manifest["compatibilityDate"],
+            "sqlSha256": document["sqlSha256"], "dataSha256": document["summary"]["dataSha256"],
+            "tableCounts": document["summary"]["tableCounts"], "replay": replay,
+            "replaySha256": digest(canonical(replay)), "objects": objects}
+        with private_file(root / "input.json") as file:
+            file.write(canonical(payload))
 
     def read_restored_summary(self, document=None):
         self.verify_resources(all_required=True)
@@ -1463,6 +1530,9 @@ def report(journal, source):
               "schemaSha256": source.schema_sha256, "resourceCount": sum(item["pin"] is not None for item in value["resources"].values()),
               "resourcePinsSha256": digest(canonical({kind: item["pin"] for kind, item in value["resources"].items()})),
               "phaseSha256": digest(value["phase"].encode("ascii"))}
+    if getattr(source, "active", None) is not None:
+        result.update(revision=source.version.revision, moduleSha256=source.version.digest,
+            deploymentId=source.active.id, versionId=source.active.version, artifactMigrationCount=len(source.migrations))
     if value.get("backup") is not None:
         result.update({key: value["backup"][key] for key in
                        ("manifestSha256", "sqlSha256", "dataSha256", "rowCount", "objectCount", "publishedShareMetadataCount")})
@@ -1522,6 +1592,8 @@ def run_action(action, engine, *, pin=None, resource=None, identity_sha256=None)
 
 
 def main():
+    global STAGE
+    STAGE = "input"
     require(os.environ.get("GITHUB_REPOSITORY") == artifact.REPOSITORY and os.environ.get("GITHUB_REF") == artifact.MAIN_REF
             and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch")
     revision = os.environ.get("GITHUB_SHA", "")
@@ -1547,6 +1619,7 @@ def main():
         return worker_client(method, path)
 
     source = Source(api, read_worker, target, bundle, manifest, lambda: artifact.require_current_main(revision))
+    STAGE = "source-release"
     if action == "poll-export":
         # A source export may still be locking D1 and its original main may have
         # advanced. This branch can only poll the privately recorded bookmark.
@@ -1558,13 +1631,17 @@ def main():
         pin = None
     else:
         pin = source.verify()
+        STAGE = "source-schema"
         source.schema()
     owner = os.environ.get("GITHUB_RUN_ID", "") + "/" + os.environ.get("GITHUB_RUN_ATTEMPT", "")
     require(re.fullmatch(r"[1-9][0-9]{0,19}/[1-9][0-9]{0,9}", owner))
     journal = Journal(api, owner)
+    STAGE = "checkpoint-" + action
     with tempfile.TemporaryDirectory(prefix="native-restore-private-", dir=os.environ["RUNNER_TEMP"]) as temporary:
-        result = run_action(action, Rehearsal(api, source, journal, Path(temporary)), pin=pin,
+        validation = Path(os.environ["RUNNER_TEMP"]) / "native-restore-links" if action == "verify-restore" else None
+        result = run_action(action, Rehearsal(api, source, journal, Path(temporary), validation_directory=validation), pin=pin,
                             resource=inputs.get("resource"), identity_sha256=inputs.get("identity_sha256"))
+    STAGE = "public-evidence"
     path = Path(os.environ["RUNNER_TEMP"]) / "native-restore-evidence.json"
     with private_file(path) as file:
         file.write(canonical(result))
@@ -1575,6 +1652,6 @@ if __name__ == "__main__":
     try:
         main()
     except (RehearsalError, CloudflareError, migrations.MigrationError, artifact.ArtifactError) as error:
-        sys.exit(str(error))
+        sys.exit(str(error) + " [stage=" + STAGE + "]")
     except Exception:
-        sys.exit(READ_ERROR)
+        sys.exit(READ_ERROR + " [stage=" + STAGE + "]")

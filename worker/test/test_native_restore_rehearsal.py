@@ -172,6 +172,42 @@ class HarnessTests(unittest.TestCase):
             self.engine.create(kind)
         self.engine.verify_resources(all_required=True)
 
+    def test_private_link_input_uses_verified_sql_and_restored_bytes_without_public_output(self):
+        fixture = SnapshotTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        fixture.snapshot()
+        fixture.db.execute("UPDATE subscriptions SET source_url='https://example.invalid/secret;still-text' WHERE id=1")
+        self.engine.directory = fixture.directory
+        self.engine.source = fixture.source
+        self.engine.source.manifest = {"revision": REVISION, "bundleSha256": "c" * 64, "compatibilityDate": "2026-07-30"}
+        sql = fixture.dump("restore")
+        db, layout, summary = native.open_export(sql, fixture.source)
+        db.close()
+        key, body = f"private-shares/{PAYLOAD}.txt", b"private-fixture"
+        self.api.objects[(self.api.names["objects"], key)] = body
+        document = {"sqlSha256": native.digest(sql.read_bytes()), "objects": [
+            {"key": key, "bytes": len(body), "sha256": native.digest(body), "metadata": EMPTY_METADATA}],
+            "summary": summary}
+        root = self.engine.directory / "validation"
+        self.engine.validation_directory = root
+        self.engine.prepare_link_validation(document)
+        payload = json.loads((root / "input.json").read_bytes())
+        subscription = next(table for table in payload["replay"]["tables"] if table["name"] == "subscriptions")
+        column = next(index for index, (name, _) in enumerate(subscription["columns"]) if name == "source_url")
+        self.assertEqual(subscription["rows"][0][column], ["text", "https://example.invalid/secret;still-text"])
+        self.assertEqual((root / "object-0.bin").read_bytes(), body)
+        self.assertEqual(payload["replaySha256"], native.digest(native.canonical(payload["replay"])))
+        self.assertEqual(root.stat().st_mode & 0o777, 0o700)
+        self.assertEqual((root / "input.json").stat().st_mode & 0o777, 0o600)
+        self.assertEqual(set(payload), {"version", "revision", "moduleSha256", "compatibilityDate", "sqlSha256",
+            "dataSha256", "tableCounts", "replay", "replaySha256", "objects"})
+        # Changed target bytes cannot be materialized as an attested replay.
+        self.api.objects[(self.api.names["objects"], key)] = b"changed"
+        self.engine.validation_directory = self.engine.directory / "corrupt"
+        with self.assertRaises(native.RehearsalError):
+            self.engine.prepare_link_validation(document)
+
     def test_default_verify_reads_existing_checkpoint_without_writes(self):
         self.pin_all()
         self.api.calls.clear()
@@ -669,6 +705,30 @@ class BoundaryTests(unittest.TestCase):
                 self.api.put_restored_object(key, body, metadata)
         self.assertTrue(caught.exception.uncertain)
         self.assertNotIn("synthetic-data-token", str(caught.exception))
+
+    def test_user_token_signing_fallback_is_exact_read_only_and_does_not_mask_transient_failure(self):
+        key = f"private-shares/{PAYLOAD}.txt"
+        self.api.allow_restore(keys=[key], object_bucket=self.api.names["objects"])
+        with patch.object(native, "HTTPSConnection") as connect, patch.object(native, "_response", side_effect=[
+            native.RehearsalError(http_status=401), envelope({"id": "e" * 32, "status": "active"})]) as send:
+            connect.return_value.getresponse.return_value.status = 200
+            connect.return_value.getresponse.return_value.read.return_value = b""
+            self.api.put_restored_object(key, b"synthetic", EMPTY_METADATA)
+            self.assertEqual([call.args[1].full_url for call in send.call_args_list], [
+                f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT}/tokens/verify",
+                "https://api.cloudflare.com/client/v4/user/tokens/verify"])
+        self.api.s3_access_key = None
+        with patch.object(native, "HTTPSConnection") as connect, patch.object(native, "_response", side_effect=native.RehearsalError(http_status=503)) as send:
+            with self.assertRaises(native.RehearsalError):
+                self.api.put_restored_object(key, b"synthetic", EMPTY_METADATA)
+            self.assertEqual(send.call_count, 1)
+            connect.assert_not_called()
+        with patch.object(native, "_response") as send:
+            for method, path, body in [("POST", "/user/tokens/verify", {}), ("GET", "/user/tokens", None),
+                ("GET", "/user/tokens/verify?extra=1", None)]:
+                with self.subTest(path=path), self.assertRaises(native.RehearsalError):
+                    self.api.json(method, path, body)
+            send.assert_not_called()
 
     def test_r2_metadata_rejects_unknown_custom_unknown_http_ssec_and_nonstandard_storage(self):
         for row in ({"custom_metadata": {"other": "private"}}, {"http_metadata": {"unknown": "private"}},
