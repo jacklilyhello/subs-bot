@@ -279,7 +279,7 @@ class RehearsalAPI:
             self.restore_bucket = object_bucket
 
     def json(self, method, path, payload=None, *, envelope=False):
-        user_verify = self.profile == "native" and method == "GET" and path == "/user/tokens/verify" and payload is None
+        user_verify = self.profile not in D1_ONLY_CANDIDATE_PROFILES and method == "GET" and path == "/user/tokens/verify" and payload is None
         require(method in {"GET", "POST"} and (path.startswith(self.root + "/") or user_verify)
                 and not any(c in path for c in ("#", "\\", "\n", "\r")))
         route = path.partition("?")[0]
@@ -435,7 +435,7 @@ class RehearsalAPI:
             except RehearsalError as error:
                 # Account and user API tokens have different read-only verify
                 # endpoints. This grants no new write path or token operation.
-                require(self.profile == "native" and error.http_status in {400, 401, 403, 404},
+                require(self.profile not in D1_ONLY_CANDIDATE_PROFILES and error.http_status in {400, 401, 403, 404},
                         "The existing isolation data token could not be verified for R2 signing.")
                 result = self.json("GET", "/user/tokens/verify")
             require(isinstance(result, dict) and result.get("status") == "active" and matches(HEX_ID, result.get("id")),

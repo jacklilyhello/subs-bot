@@ -79,6 +79,7 @@ from convert import (
 )
 from db import Store, nodes_of
 from export_errors import ExportError
+from legacy_handoff import HandoffApplication, HandoffBot, HandoffError, ledger_from_environment
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 # httpx/httpcore 在 INFO 级会把每次请求的完整 URL 打进日志，而 Telegram 的 URL
@@ -2540,7 +2541,16 @@ def build_app() -> Application:
     # 注意：绝不在这里设全局 parse_mode —— 大量 reply_text 发的是纯文本提示，
     # 一旦被当 HTML 解析，用户输入里带个 < 或 & 就会让整条消息发送失败。
     defaults = Defaults(link_preview_options=LinkPreviewOptions(is_disabled=True))
-    app = Application.builder().token(BOT_TOKEN).defaults(defaults).build()
+    handoff = ledger_from_environment(BOT_TOKEN, config.DB_PATH)
+    if handoff is None:
+        app = Application.builder().token(BOT_TOKEN).defaults(defaults).build()
+    else:
+        try:
+            app = (Application.builder().bot(HandoffBot(BOT_TOKEN, defaults=defaults, handoff=handoff))
+                   .application_class(HandoffApplication, kwargs={"handoff": handoff}).build())
+        except BaseException:
+            handoff.close()
+            raise
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("auth", cmd_auth))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -2570,9 +2580,17 @@ async def amain(stop: asyncio.Event | None = None) -> None:
     if stop is None:
         stop = asyncio.Event()
     app = build_app()
+    handoff = getattr(app, "handoff", None)
+    if handoff is not None:
+        handoff.stop_event = stop
     # 先把建表/迁移一次性做完，之后所有查询共享同一条连接
-    await store.init()
-    runner = await start_http(app)
+    try:
+        await store.init()
+        runner = await start_http(app)
+    except BaseException:
+        if handoff is not None:
+            handoff.close()
+        raise
     polling_started = False
     try:
         log.info("Bot starting...")
@@ -2608,6 +2626,15 @@ async def amain(stop: asyncio.Event | None = None) -> None:
                 await cleanup()
             except Exception:
                 failures.append(stage)
+        if handoff is not None:
+            try:
+                summary = handoff.finish(polling_started=polling_started, failures=failures)
+                log.info("legacy-handoff:v1 %s", json.dumps(summary, sort_keys=True, separators=(",", ":")))
+            except HandoffError:
+                failures.append("handoff")
+                log.warning("legacy-handoff:v1 outcome=incomplete")
+            finally:
+                handoff.close()
         if stop.is_set():
             if not polling_started:
                 log.warning("legacy-drain:v1 outcome=incomplete stages=startup")

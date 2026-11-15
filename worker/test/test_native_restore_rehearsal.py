@@ -730,6 +730,44 @@ class BoundaryTests(unittest.TestCase):
                     self.api.json(method, path, body)
             send.assert_not_called()
 
+    def test_user_token_fallback_preserves_all_r2_candidate_profile_boundaries(self):
+        profiles = {"native", *native.LEGACY_CANDIDATE_NAMES}
+        for profile in sorted(profiles):
+            with self.subTest(profile=profile):
+                api = native.RehearsalAPI(TARGET, "synthetic-data-token", COHORT, profile=profile)
+                if profile in native.D1_ONLY_CANDIDATE_PROFILES:
+                    with patch.object(native, "_response") as send, patch.object(native, "HTTPSConnection") as connect:
+                        for path in (api.root + "/tokens/verify", "/user/tokens/verify"):
+                            with self.assertRaises(native.RehearsalError):
+                                api.json("GET", path)
+                        with self.assertRaises(native.RehearsalError):
+                            api.put_restored_object(f"private-shares/{PAYLOAD}.txt", b"synthetic", EMPTY_METADATA)
+                        send.assert_not_called()
+                        connect.assert_not_called()
+                    continue
+                keys = ([f"subscriptions/{index}/{SNAPSHOT}/manifest.json" for index in range(1, 9)]
+                        + [f"private-shares/{PAYLOAD}.txt", f"private-shares/{SNAPSHOT}.txt"]
+                        if profile in native.UNIFIED_CANDIDATE_PROFILES
+                        else [f"subscriptions/1/{SNAPSHOT}/manifest.json"])
+                api.allow_restore(keys=keys, object_bucket=api.names["objects"])
+                with patch.object(native, "HTTPSConnection") as connect, patch.object(native, "_response", side_effect=[
+                    native.RehearsalError(http_status=401), envelope({"id": "e" * 32, "status": "active"})]) as send:
+                    connect.return_value.getresponse.return_value.status = 200
+                    connect.return_value.getresponse.return_value.read.return_value = b""
+                    api.put_restored_object(keys[0], b"synthetic", EMPTY_METADATA)
+                    self.assertEqual([(call.args[1].get_method(), call.args[1].full_url) for call in send.call_args_list], [
+                        ("GET", f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT}/tokens/verify"),
+                        ("GET", "https://api.cloudflare.com/client/v4/user/tokens/verify")])
+                    self.assertEqual(connect.return_value.request.call_args.args,
+                        ("PUT", "/" + api.names["objects"] + "/" + keys[0]))
+                with patch.object(native, "_response") as send:
+                    for method, path, body in [("POST", "/user/tokens/verify", {}), ("POST", "/user/tokens", {}),
+                        ("POST", api.root + "/tokens", {}), ("PUT", "/user/tokens/verify", {}),
+                        ("GET", "/user/tokens/verify?extra=1", None)]:
+                        with self.subTest(method=method, path=path), self.assertRaises(native.RehearsalError):
+                            api.json(method, path, body)
+                    send.assert_not_called()
+
     def test_r2_metadata_rejects_unknown_custom_unknown_http_ssec_and_nonstandard_storage(self):
         for row in ({"custom_metadata": {"other": "private"}}, {"http_metadata": {"unknown": "private"}},
                     {"ssec": True}, {"http_metadata": {"cacheExpiry": "2026-11-07T00:00:00.123Z"}}):

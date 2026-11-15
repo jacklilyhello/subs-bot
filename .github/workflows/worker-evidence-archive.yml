@@ -1,4 +1,4 @@
-name: Preserve original migration evidence in private R2
+name: Preserve migration candidate evidence in private R2
 
 on:
   workflow_dispatch:
@@ -20,6 +20,16 @@ on:
         type: string
       confirmation:
         description: Archive only, preserve original subs-bot 5752 release evidence
+        type: string
+      current_candidate_run_id:
+        description: Optional additional successful candidate run; original 5752 evidence is always preserved
+        type: string
+      current_candidate_run_attempt:
+        description: Exact additional candidate attempt, archive only
+        type: string
+        default: '1'
+      candidate_json_sha256:
+        description: Independent candidate.json SHA-256 required with the optional candidate run
         type: string
 
 permissions:
@@ -49,6 +59,9 @@ jobs:
           EVIDENCE_ARCHIVE_RUN_ATTEMPT: ${{ inputs.archive_run_attempt }}
           EVIDENCE_MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
           EVIDENCE_CONFIRMATION: ${{ inputs.confirmation }}
+          EVIDENCE_CURRENT_CANDIDATE_RUN_ID: ${{ inputs.current_candidate_run_id }}
+          EVIDENCE_CURRENT_CANDIDATE_RUN_ATTEMPT: ${{ inputs.current_candidate_run_attempt }}
+          EVIDENCE_CANDIDATE_JSON_SHA256: ${{ inputs.candidate_json_sha256 }}
           SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
           SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
         run: |
