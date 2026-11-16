@@ -34,7 +34,7 @@ import prepare_isolation_artifact as artifact
 import prepare_native_restore_artifact as native_artifact
 from cloudflare_isolation import (
     API_ORIGIN, CloudflareClient, CloudflareError, DIGEST, HEX_ID, REVISION, TIMESTAMP, UUID,
-    WORKER_NAME, _Isolation, _NoRedirect, _verify_health, validate_aggregate_key,
+    WORKER_NAME, ISOLATION_RELEASE_USER_AGENT, _Isolation, _NoRedirect, _verify_health, validate_aggregate_key,
 )
 
 
@@ -138,7 +138,8 @@ def read_aggregate_reference(code, method):
     opener = build_opener(ProxyHandler({}), _NoRedirect())
     try:
         status, raw_headers, body = _response(opener, Request(AGGREGATE_ORIGIN + "/agg/" + code + "/base64",
-            method=method, headers={"Accept-Encoding": "identity", "Cache-Control": "no-cache"}), 24 * 1024 * 1024)
+            method=method, headers={"Accept-Encoding": "identity", "Cache-Control": "no-cache",
+                "User-Agent": ISOLATION_RELEASE_USER_AGENT}), 24 * 1024 * 1024)
     except RehearsalError as error:
         status_label = str(error.http_status) if integer(error.http_status, 100, 599) else "unconfirmed"
         raise RehearsalError("Isolated all-aggregate reference " + method + " was not verified (HTTP " + status_label + ").") from None
