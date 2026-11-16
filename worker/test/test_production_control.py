@@ -284,13 +284,16 @@ class ProductionControllerTests(unittest.TestCase):
 
     def test_uncertainty_appearing_after_activation_preflight_aborts_the_atomic_transition(self):
         self.controller.initialize()
-        self.api.db.execute("UPDATE subs_bot_production_control SET workers='run'")
         self.controller.telegram = Mock()
         self.controller.telegram.call.return_value = {"url": "https://" + self.target.data["hostname"] + "/telegram/webhook",
             "max_connections": self.target.data["webhook"]["maxConnections"],
             "allowed_updates": self.target.data["webhook"]["allowedUpdates"]}
         self.controller.verify_domain = Mock(return_value={"domainVerified": True})
-        before = self.controller.inspect()
+        self.controller.activation_baseline_checker = lambda: {"baselineVerified": True,
+            "checkpointId": "a" * 32, "manifestSha256": "b" * 64,
+            "targetSha256": self.target.digest, "configurationSha256": self.target.configuration_digest,
+            "sourceRevision": REVISION, "moduleSha256": self.manifest["bundleSha256"], "versionId": VERSION}
+        before = self.controller.plan_activate()
         def finish_cron_unknown(sql):
             if "SET admission='open'" not in sql:
                 return

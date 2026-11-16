@@ -14,14 +14,32 @@ on:
         description: One guarded lifecycle step; inspect after every uncertain result
         required: true
         type: choice
-        options: [availability, provision-inspect, provision-reconcile, provision, preflight, initialize, inspect, plan-deploy, deploy, reconcile-deploy, pause, drain, freeze, thaw, classify-interruption, domain, webhook, activate]
+        options: [availability, provision-inspect, provision-reconcile, provision, preflight, initialize, inspect, plan-deploy, deploy, reconcile-deploy, pause, drain, freeze, thaw, classify-interruption, domain, webhook, plan-activate, activate]
         default: inspect
       source_run_id:
-        description: Successful Worker CI for the exact current main
-        required: true
+        description: Successful exact main release CI; omit only with pinned private source checkpoint
+        required: false
+        type: string
+      source_checkpoint_id:
+        description: Optional private sealed source checkpoint instead of an expiring Actions artifact
+        type: string
+      source_manifest_sha256:
+        description: Exact independent private source manifest digest
         type: string
       active_run_id:
         description: Exact reviewed active CI for a code or configuration update; omit only for initial deployment or an identical release
+        type: string
+      active_checkpoint_id:
+        description: Optional private active release checkpoint for a code/configuration update
+        type: string
+      active_manifest_sha256:
+        description: Exact independent private active release manifest digest
+        type: string
+      baseline_checkpoint_id:
+        description: Current frozen baseline checkpoint for plan-activate and activate
+        type: string
+      baseline_manifest_sha256:
+        description: Exact independently verified activation baseline manifest digest
         type: string
       state_sha256:
         description: Exact predecessor from independent inspection; required for mutations
@@ -64,6 +82,12 @@ jobs:
           SUBS_BOT_CONTROL_ENVIRONMENT: ${{ inputs.target_environment == 'production' && 'subs-bot-production' || 'subs-bot-isolation' }}
           CONTROL_ACTION: ${{ inputs.action }}
           CONTROL_ACTIVE_CI_RUN_ID: ${{ inputs.active_run_id }}
+          CONTROL_SOURCE_CHECKPOINT_ID: ${{ inputs.source_checkpoint_id }}
+          CONTROL_SOURCE_MANIFEST_SHA256: ${{ inputs.source_manifest_sha256 }}
+          CONTROL_ACTIVE_CHECKPOINT_ID: ${{ inputs.active_checkpoint_id }}
+          CONTROL_ACTIVE_MANIFEST_SHA256: ${{ inputs.active_manifest_sha256 }}
+          CONTROL_BASELINE_CHECKPOINT_ID: ${{ inputs.baseline_checkpoint_id }}
+          CONTROL_BASELINE_MANIFEST_SHA256: ${{ inputs.baseline_manifest_sha256 }}
           CONTROL_STATE_SHA256: ${{ inputs.state_sha256 }}
           CONTROL_WEBHOOK_SHA256: ${{ inputs.webhook_sha256 }}
           CONTROL_RESOURCE: ${{ inputs.resource }}
