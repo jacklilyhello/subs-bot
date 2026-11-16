@@ -162,6 +162,49 @@ class LifecycleDrillTests(unittest.TestCase):
         tool.env["DRILL_REGISTRATION_SHA256"] = contract.digest(value)
         self.assertEqual(tool.registration(required=False).digest, target.digest)
 
+    def test_inspect_projects_bounded_human_receipts_without_claiming_human_acceptance(self):
+        tool = self.tool()
+        target, _ = fixture()
+        controller = Mock()
+        controller.target = target
+        controller.inspect.return_value = {"control": {"admission": "closed", "workers": "frozen"}}
+        tool.controller = controller
+        tool.prepare = Mock(return_value=(Path("/synthetic-unused-bundle"), {}))
+        tool.bind = Mock(return_value=controller)
+        tool.registration = Mock(return_value=target)
+        tool.proof = {"revision": REVISION}
+        observed = [{"actor_id": "8813701954", "message_id": 123, "command": "help", "state": "sent", "attempts": 1},
+            {"actor_id": "8653767757", "message_id": 456, "command": "list", "state": "sent", "attempts": 1}]
+        with patch.object(drill, "rows", return_value=observed) as read:
+            tool.inspect()
+        self.assertEqual(tool.report["humanReceiptsObserved"], 2)
+        self.assertEqual(tool.report["humanReceipts"], observed)
+        self.assertIs(tool.report["humanAcceptance"], False)
+        self.assertIs(tool.report["humanEvidenceRequiresIABCorrelation"], True)
+        sql = read.call_args.args[2]
+        self.assertIn("inbox.update_id<7000000000000000", sql)
+        self.assertIn("inbox.actor_id IN ('8813701954','8653767757')", sql)
+        self.assertIn("inbox.chat_id=inbox.actor_id", sql)
+        self.assertIn("LIMIT 201", sql)
+        self.assertNotIn("payload", sql)
+        self.assertNotIn("DELETE", sql)
+        self.assertNotIn("UPDATE ", sql)
+
+    def test_human_receipt_metadata_rejects_overflow_wrong_actors_and_unbounded_values(self):
+        tool = self.tool()
+        target, _ = fixture()
+        tool.controller = Mock(target=target)
+        receipt = {"actor_id": "8813701954", "message_id": 123, "command": "help", "state": "sent", "attempts": 1}
+        for changed in ([receipt] * 201,
+                [{**receipt, "actor_id": "999999"}], [{**receipt, "command": "https://fixture.invalid/private-link"}],
+                [{**receipt, "message_id": True}], [{**receipt, "attempts": -1}],
+                [{**receipt, "payload": "synthetic private data must not enter the projection"}]):
+            with self.subTest(changed=changed[-1]), patch.object(drill, "rows", return_value=changed):
+                with self.assertRaises(contract.ContractError):
+                    tool.human_receipts()
+        with patch.object(drill, "rows", return_value=[]):
+            self.assertEqual(tool.human_receipts(), [])
+
     def test_same_original_url_with_wrong_secret_is_repaired_then_independently_probed(self):
         tool = self.tool()
         original = self.snapshot(tool)

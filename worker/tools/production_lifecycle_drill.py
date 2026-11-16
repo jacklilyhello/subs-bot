@@ -567,8 +567,34 @@ class Drill:
         ctl = self.bind(self.registration(), bundle, manifest)
         state = ctl.inspect()
         require(state["control"]["admission"] == "closed" and state["control"]["workers"] == "frozen")
+        human = self.human_receipts()
         self.save("independent-inspect", state)
-        self.report.update(status="passed", state=state, ciProof=self.proof, independentReadback=True)
+        self.report.update(status="passed", state=state, ciProof=self.proof, independentReadback=True,
+            humanReceiptsObserved=len(human), humanReceipts=human, humanEvidenceRequiresIABCorrelation=True)
+
+    def human_receipts(self):
+        """Project bounded receipt metadata; a person must still correlate the IAB messages."""
+        ctl = self.controller
+        require(ctl is not None and ctl.target.environment == "rehearsal"
+                and ctl.target.data["workerName"] == SERVICE
+                and ctl.target.data["admins"] == ["8813701954"] and ctl.target.data["members"] == ["8653767757"])
+        observed = rows(ctl.data, ctl.database,
+            "SELECT inbox.actor_id,inbox.message_id,inbox.command,outbox.state,outbox.attempts "
+            "FROM telegram_inbox AS inbox JOIN telegram_outbox AS outbox USING(receipt_id) "
+            f"WHERE inbox.bot_id={migrations._literal(ctl.target.data['botId'])} "
+            "AND inbox.actor_id IN ('8813701954','8653767757') AND inbox.chat_type='private' "
+            "AND inbox.chat_id=inbox.actor_id AND inbox.thread_id IS NULL "
+            "AND inbox.update_id>0 AND inbox.update_id<7000000000000000 ORDER BY inbox.receipt_id LIMIT 201")
+        require(len(observed) <= 200, "Human receipt metadata exceeds the explicit inspection limit; no truncated result is accepted.")
+        for receipt in observed:
+            require(set(receipt) == {"actor_id", "message_id", "command", "state", "attempts"}
+                    and receipt["actor_id"] in ("8813701954", "8653767757")
+                    and type(receipt["message_id"]) is int and 0 < receipt["message_id"] < 2**31
+                    and receipt["command"] in ("start", "help", "list", "auth-list", "auth-add", "auth-remove", "auth-usage")
+                    and receipt["state"] in ("pending", "leased", "sending", "sent", "failed", "uncertain")
+                    and type(receipt["attempts"]) is int and 0 <= receipt["attempts"] < 2**31,
+                    "Human receipt metadata is outside the explicit authorized projection.")
+        return observed
 
     def seed_fixture(self):
         from production_lifecycle_fixture import REVOKED_TOKEN, seed_fixture
