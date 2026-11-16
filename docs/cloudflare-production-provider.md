@@ -72,6 +72,10 @@
 
 资源盘点具有硬界限：固定发布链/Worker/Workflow 版本与 smoke 实例最多九代、deployment 盘点最多 100、DO namespace 盘点最多 1,000、Container application 盘点最多 500、目标 actor/Container instance 最多一个；分页或超限拒绝，不截断后报告通过。OCI archive 最大 256 MiB、Worker 模块最大 1 MiB、fetch 响应最大 10 MiB。单例使用 `lite`，请求结束先发送 `SIGTERM`，有界等待 `monitor()` 正常退出并确认 `running=false`、`inspect()=null`；异常或超时尝试强制清理后仍失败，正常验收继续要求管理 API 的 `stopped` 状态。控制工具不默认创建 API-status Container。`/ai` 首发保持关闭，真实有效 Key 成功探测继续是该功能单独启用条件。
 
+URL 请求使用共享的 120 秒启动总预算，覆盖 `start`、必须等到设置完成的 inactivity-timeout ACK、readiness 和 image inspection；单次 fetch 28 秒、正常关闭 10 秒、失败清理最多再 10 秒。主应用仅由 Cron 消费长 URL RPC，RPC 上限 180 秒、lease headroom 210 秒、lease 240 秒，均小于 Cron 15 分钟执行窗口。Webhook/HTTP 受理保持持久入队和快速回执。上述预算不保证 Cloudflare 任意冷启动都能完成；超限仍失败并保全现场，不能跳过 ACK、重发旧 one-shot 或把后台结果不明改为成功。
+
+发布 Workflow 的四次 fetch 阶段上限 300 秒、单次 named RPC 阶段 210 秒，控制器最多观察 600 秒；专用应用绑定演练等待排空最多 300 秒。新的失败诊断区分 `inactivity-set` 等固定 primary phase、timeout/operation 和有界 elapsed time，并与 shutdown 子阶段分开记录。API-status V2 的 `dispatchBeforeMs` 最多提前 30 秒及实际提交前硬检查保持不变，不随 URL 启动预算扩大真实 Key 的提交窗口。
+
 ## 新工具的隔离演练与持久证明
 
 `worker-production-provider-rehearsal.yml` 的 `rehearse` 路径通过同一个 `production_provider` 控制实现，使用专用 `subs-bot-provider-fetch-control-drill-01`，不修改原 dev 服务。必须提供准确 Provider CI run、明确批准的项目 `/health` URL 与独立读回 revision，并输入 `rehearse production ProviderFetch controls for subs-bot-provider-fetch-control-drill-01`。自动流程覆盖 create、原 OCI 发布、stage、activate、Container/Workflow 初始化、真实 Cloudflare smoke 和独立 verify。

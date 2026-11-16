@@ -635,7 +635,7 @@ def run_operation(api, operation, module, image, guard):
         else:
             require(api.actors(config["activation"]["namespaceId"]) == [] and api.instances(config["activation"]["namespaceId"]) == [])
         api.trigger({**config["build"], "versionId": config["versionId"]})
-    deadline = monotonic() + 300
+    deadline = monotonic() + 600
     while True:
         result = observe(api)
         if operation != "smoke" or (result["instance"] is not None and result["instance"].get("status") not in {"queued", "running", "waiting"}):

@@ -6,6 +6,8 @@ import {
   type ProviderFailureCode, type ProviderFetchInput, type ProviderFetchResult, type ProviderMetadata,
 } from "../src/provider-fetch-contract.ts";
 
+import { PROVIDER_STARTUP_MS, PROVIDER_FETCH_MS, PROVIDER_STOP_MS, PROVIDER_FORCE_CLEANUP_MS } from "../src/provider-lifecycle-budgets.ts";
+
 export const SERVICE = "subs-bot-provider-fetch-dev-01";
 export const API_STATUS_SERVICE = "subs-bot-provider-api-status-dev-01";
 export const SINGLETON = "provider-fetch-v1";
@@ -27,12 +29,12 @@ export function readProviderRuntimeTarget(raw: unknown): ProviderRuntimeTarget |
   } catch { return null; }
 }
 const IDLE_MS = 30_000;
-const START_MS = 30_000;
-const FETCH_MS = 28_000;
+const START_MS = PROVIDER_STARTUP_MS;
+const FETCH_MS = PROVIDER_FETCH_MS;
 const API_STATUS_MS = 20_000;
 const API_STATUS_V2_MAX_AHEAD_MS = 30_000;
 const API_STATUS_V2_DISPATCH_MARGIN_MS = 1_000;
-const STOP_MS = 10_000;
+const STOP_MS = PROVIDER_STOP_MS;
 const PORT = 8080;
 const ORIGIN = "http://container";
 const BLOCKED = ["http://127.0.0.1/", "http://[::1]/", "http://169.254.169.254/"];
@@ -145,22 +147,28 @@ export function providerApiStatusResult(value: unknown): ProviderApiStatusResult
 
 type ProbeStage = "configuration" | "start" | "readiness" | "image" | "edge" | "address-policy" | "stop";
 
+type PrimaryPhase = "none" | "configuration" | "start-call" | "inactivity-set" | "readiness" | "inspect" | "use";
 type StopPhase = "monitor-create" | "signal" | "monitor-wait" | "state-read";
 export interface StopDiagnostic {
-  version: 1; phase: StopPhase; reason: "operation" | "timeout" | "nonzero-exit";
+  version: 2; phase: StopPhase; reason: "operation" | "timeout" | "nonzero-exit";
   exitCode: number | null; primaryStage: ProbeStage | "none";
+  primaryPhase: PrimaryPhase; primaryReason: "none" | "operation" | "timeout"; primaryElapsedMs: number;
   runningBeforeCleanup: boolean | null; inspectNullBeforeCleanup: boolean | null;
   forcedCleanup: "returned" | "unconfirmed";
 }
 
+export interface PrimaryDiagnostic { version: 1; phase: PrimaryPhase; reason: "operation" | "timeout"; elapsedMs: number }
+
 export class ProviderProbeError extends Error {
   readonly stage: ProbeStage;
   readonly stop?: StopDiagnostic;
+  readonly primary?: PrimaryDiagnostic;
 
-  constructor(stage: ProbeStage, stop?: StopDiagnostic) {
+  constructor(stage: ProbeStage, stop?: StopDiagnostic, primary?: PrimaryDiagnostic) {
     super(`Provider container smoke failed during ${stage}.`);
     this.stage = stage;
     this.stop = stop;
+    this.primary = primary;
   }
 }
 
@@ -272,6 +280,13 @@ async function withPinnedContainer<T>(
   let stage: ProbeStage = "configuration";
   let started = false;
   let primaryStage: ProbeStage | "none" = "none";
+  let currentPhase: PrimaryPhase = "configuration";
+  let primaryPhase: PrimaryPhase = "none";
+  let primaryReason: StopDiagnostic["primaryReason"] = "none";
+  let primaryElapsedMs = 0;
+  const operationStarted = Date.now();
+  let startup: AbortSignal | undefined;
+  let startupDeadlineMs: number | undefined;
   try {
     const image = container.images.provider;
     const identity = typeof image === "string" ? IMAGE.exec(image) : null;
@@ -282,21 +297,32 @@ async function withPinnedContainer<T>(
       "The provider container image does not match the caller's pin.");
     const now = Date.now();
     const deadline = Math.min(now + START_MS, startupDeadline ?? Infinity);
+    startupDeadlineMs = deadline;
     requireResult(deadline > now, "The provider startup deadline elapsed.");
-    const startup = AbortSignal.timeout(deadline - now);
+    startup = AbortSignal.timeout(deadline - now);
     stage = "start";
+    currentPhase = "start-call";
     container.start({ image, instance: "lite", enableInternet: true });
     started = true;
+    currentPhase = "inactivity-set";
     await within(container.setInactivityTimeout(IDLE_MS), startup);
     stage = "readiness";
+    currentPhase = "readiness";
     const port = container.getTcpPort(PORT);
     await ready(port, revision, deadline);
     stage = "image";
+    currentPhase = "inspect";
     requireResult((await within(container.inspect(), startup))?.image === image, "The running provider image differs.");
+    currentPhase = "use";
     return await use(port, image);
   } catch (error) {
+    primaryPhase = currentPhase;
+    primaryReason = currentPhase !== "use" && (startup?.aborted
+      || startupDeadlineMs !== undefined && Date.now() >= startupDeadlineMs) ? "timeout" : "operation";
+    primaryElapsedMs = Math.max(0, Math.min(300_000, Date.now() - operationStarted));
     primaryStage = error instanceof ProviderProbeError ? error.stage : stage;
-    throw error instanceof ProviderProbeError ? error : new ProviderProbeError(stage);
+    throw new ProviderProbeError(primaryStage, error instanceof ProviderProbeError ? error.stop : undefined,
+      { version: 1, phase: primaryPhase, reason: primaryReason, elapsedMs: primaryElapsedMs });
   } finally {
     if (started) {
       const shutdown = AbortSignal.timeout(STOP_MS);
@@ -331,9 +357,9 @@ async function withPinnedContainer<T>(
           : exitCode !== null && exitCode !== 0 ? "nonzero-exit" : "operation";
         let forcedCleanup: StopDiagnostic["forcedCleanup"] = "unconfirmed";
         // A forced cleanup never converts an unconfirmed graceful exit to success.
-        try { await within(container.destroy(), AbortSignal.timeout(STOP_MS)); forcedCleanup = "returned"; } catch { /* fail closed below */ }
-        throw new ProviderProbeError("stop", { version: 1, phase: stopPhase,
-          reason, exitCode, primaryStage, runningBeforeCleanup, inspectNullBeforeCleanup, forcedCleanup });
+        try { await within(container.destroy(), AbortSignal.timeout(PROVIDER_FORCE_CLEANUP_MS)); forcedCleanup = "returned"; } catch { /* fail closed below */ }
+        throw new ProviderProbeError("stop", { version: 2, phase: stopPhase,
+          reason, exitCode, primaryStage, primaryPhase, primaryReason, primaryElapsedMs, runningBeforeCleanup, inspectNullBeforeCleanup, forcedCleanup });
       }
     }
   }

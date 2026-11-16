@@ -5,9 +5,9 @@ import { providerDocumentOrigin, type ProviderDocumentPolicy } from "./telegram/
 import { providerInitialTitleReady } from "./provider-initial-title.ts";
 import { GENERAL_LATEST_ACTOR_SQL, GENERAL_NO_LEGACY_WORK, GENERAL_POLICY_SCHEMA, GENERAL_RECEIPT_SCHEMA,
   generalPolicyBindings, type GeneralAuthorityPin } from "./telegram/general-receipt.ts";
+import { PROVIDER_LEASE_SECONDS } from "./provider-lifecycle-budgets.ts";
 
 export const PROVIDER_JOB_TTL_SECONDS = 3600;
-const LEASE_SECONDS = 120;
 const MAX_ATTEMPTS = 3;
 const MAX_OWNER_JOBS = 4;
 const MAX_GLOBAL_JOBS = 8;
@@ -649,7 +649,7 @@ export async function claimProviderJob(db: D1Database, policy?: ProviderQueuePol
       const table = jobTable(scope);
       return db.prepare(`
         UPDATE ${table} SET state = 'leased', attempts = attempts + 1, lease_id = ?,
-          lease_until = min(unixepoch() + ${LEASE_SECONDS}, expires_at)
+          lease_until = min(unixepoch() + ${PROVIDER_LEASE_SECONDS}, expires_at)
         WHERE job_id = (SELECT job_id FROM (${candidates.sql}) WHERE queue='${table}')
         RETURNING job_id AS jobId, subscription_id AS id, owner_id AS ownerId, kind, request_key AS requestKey,
           expected_generation AS expectedGeneration, expected_lifecycle_revision AS expectedLifecycleRevision,

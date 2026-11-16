@@ -151,6 +151,18 @@ class ForcedTerminalTests(unittest.TestCase):
             with self.subTest(output=output), self.assertRaises(ValueError):
                 self.verify()
 
+    def test_exact_v2_primary_phase_reason_and_elapsed_are_bound_without_relaxing_v1(self):
+        diagnostic = {"version": 2, "phase": "monitor-wait", "reason": "timeout", "exitCode": None,
+            "primaryStage": "start", "primaryPhase": "inactivity-set", "primaryReason": "timeout", "primaryElapsedMs": 120000,
+            "runningBeforeCleanup": True, "inspectNullBeforeCleanup": None, "forcedCleanup": "returned"}
+        self.workflow["output"] = {"ok": False, "stage": "stop", "stop": diagnostic}
+        self.assertEqual(self.verify()["workflowFailureSha256"], control.digest(self.workflow["output"]))
+        for changed in ({"version": 1}, {"primaryElapsedMs": True}, {"primaryElapsedMs": 300001},
+                        {"primaryPhase": "use"}, {"primaryReason": "none"}, {"primaryPhase": "private-error"}):
+            self.workflow["output"] = {"ok": False, "stage": "stop", "stop": {**diagnostic, **changed}}
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                self.verify()
+
     def test_stale_listing_cannot_hide_a_later_failed_process_in_detail(self):
         self.detail["started_at"] = "2026-11-16T00:00:05.000Z"
         self.detail["status"]["updated_at"] = "2026-11-16T00:00:06.000Z"

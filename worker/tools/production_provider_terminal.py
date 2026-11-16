@@ -49,9 +49,25 @@ def validate_stop_failure(output):
     if set(output) == {"ok", "stage"}:
         return output
     control.fields(output, {"ok", "stage", "stop"})
-    diagnostic = control.fields(output["stop"], {"version", "phase", "reason", "exitCode", "primaryStage",
-                                               "runningBeforeCleanup", "inspectNullBeforeCleanup", "forcedCleanup"})
-    control.require(type(diagnostic["version"]) is int and diagnostic["version"] == 1
+    diagnostic = output["stop"]
+    control.require(isinstance(diagnostic, dict) and type(diagnostic.get("version")) is int
+                    and diagnostic["version"] in {1, 2}, ERROR)
+    names = {"version", "phase", "reason", "exitCode", "primaryStage", "runningBeforeCleanup", "inspectNullBeforeCleanup", "forcedCleanup"}
+    if diagnostic["version"] == 2:
+        names |= {"primaryPhase", "primaryReason", "primaryElapsedMs"}
+    control.fields(diagnostic, names)
+    if diagnostic["version"] == 2:
+        control.require(diagnostic.get("primaryPhase") in {"none", "configuration", "start-call", "inactivity-set", "readiness", "inspect", "use"}
+            and diagnostic.get("primaryReason") in {"none", "operation", "timeout"}
+            and type(diagnostic.get("primaryElapsedMs")) is int and 0 <= diagnostic["primaryElapsedMs"] <= 300000, ERROR)
+        control.require((diagnostic["primaryStage"] == "none") == (diagnostic["primaryPhase"] == "none")
+            and (diagnostic["primaryStage"] == "none") == (diagnostic["primaryReason"] == "none")
+            and (diagnostic["primaryStage"] != "none" or diagnostic["primaryElapsedMs"] == 0), ERROR)
+        phases = {"none": {"none"}, "configuration": {"configuration"}, "start": {"start-call", "inactivity-set"},
+                  "readiness": {"readiness"}, "image": {"inspect"}, "edge": {"use"}, "address-policy": {"use"}, "stop": {"use"}}
+        control.require(diagnostic["primaryPhase"] in phases.get(diagnostic["primaryStage"], set())
+                        and (diagnostic["primaryReason"] != "timeout" or diagnostic["primaryPhase"] != "use"), ERROR)
+    control.require(type(diagnostic["version"]) is int
         and diagnostic["phase"] in {"monitor-create", "signal", "monitor-wait", "state-read"}
         and diagnostic["reason"] in {"operation", "timeout", "nonzero-exit"}
         and diagnostic["primaryStage"] in {"none", "configuration", "start", "readiness", "image", "edge", "address-policy", "stop"}
