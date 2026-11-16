@@ -21,6 +21,7 @@ FEATURES = {
     "groupShareCards", "githubSearch", "apiStatus",
 }
 TEST_ACTORS = {"8813701954", "8653767757"}
+TEST_BOT_ID = "9293938370"
 TEST_GROUP = "-5114255828"
 NAMES = {
     "production": ("subs-bot-cf-prod-01", "subs-bot-cf-prod-backup-01", "subs-bot.lilyya.top"),
@@ -137,7 +138,7 @@ def validate_target(raw, *, draft=False):
     # Existing runtime has a single group destination; reject unsupported scope rather than truncate.
     require(len(groups) <= 1, "The current group-card runtime supports at most one explicit group.")
     if env == "production":
-        require(value["botUsername"].lower() != "test_cfsubs_bot",
+        require(value["botId"] != TEST_BOT_ID and value["botUsername"].lower() != "test_cfsubs_bot",
                 "The production Bot must be separate from the test Bot.")
     else:
         require(value["botUsername"] == "test_cfsubs_bot" and value["admins"] == ["8813701954"]
