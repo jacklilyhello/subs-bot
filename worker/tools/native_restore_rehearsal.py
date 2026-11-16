@@ -272,10 +272,10 @@ def _response(opener, request, maximum, *, allow_aggregate_content_denial=False)
                 require(len(body) <= maximum)
                 return status, dict(error.headers.items()), body
         error.close()
-        raise RehearsalError("Native rehearsal API request was not confirmed.", uncertain=request.method != "GET" and
+        raise RehearsalError("Native rehearsal API request was not confirmed.", uncertain=request.get_method() != "GET" and
                              (status == 408 or status >= 500), http_status=status) from None
     except (OSError, ValueError, HTTPException):
-        raise RehearsalError("Native rehearsal API request was not confirmed.", uncertain=request.method != "GET") from None
+        raise RehearsalError("Native rehearsal API request was not confirmed.", uncertain=request.get_method() != "GET") from None
 
 
 class RehearsalAPI:

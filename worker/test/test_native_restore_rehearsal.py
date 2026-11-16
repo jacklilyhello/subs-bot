@@ -968,6 +968,7 @@ class SnapshotTests(unittest.TestCase):
         with self.assertRaises(native.RehearsalError) as caught:
             native._response(opener, native.Request(native.API_ORIGIN + "/accounts/example"), 1024)
         self.assertEqual(caught.exception.http_status, 422)
+        self.assertFalse(caught.exception.uncertain)
         with self.assertRaises(native.RehearsalError):
             native._response(Mock(), native.Request(native.API_ORIGIN + "/accounts/example"), 1024, allow_aggregate_content_denial=True)
         for status, body in ((403, b"private raw error"), (503, b"private raw error"), (422, b"wrong content denial")):
