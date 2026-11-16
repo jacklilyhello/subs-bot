@@ -817,3 +817,6 @@ if __name__ == "__main__":
     except (ContractError, OperationError, migrations.MigrationError, artifact.ArtifactError, RecoveryError) as error:
         print(json.dumps({"status": "stopped", "reason": str(error), "uncertain": bool(getattr(error, "uncertain", False))}))
         raise SystemExit(1) from None
+    except Exception:
+        print(json.dumps({"status": "stopped", "reason": "An unexpected lifecycle failure occurred. Inspect the target state before retrying.", "uncertain": True}))
+        raise SystemExit(1) from None
