@@ -314,6 +314,9 @@ class PrivateProofTransportTests(unittest.TestCase):
             def __exit__(self, *_args):
                 pass
 
+            def close(self):
+                pass
+
         class Connection:
             def __init__(self, host, **_kwargs):
                 owner.assertEqual(host, owner.store.target["accountId"] + ".r2.cloudflarestorage.com")
