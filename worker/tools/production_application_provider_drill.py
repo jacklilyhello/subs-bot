@@ -18,6 +18,7 @@ import production_provider as provider
 
 SERVICE = "subs-bot-cf-control-drill-01"
 READY = "IAB ready for subs-bot-cf-control-drill-01 refresh"
+UNKNOWN = ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates")
 
 
 def closed(state):
@@ -162,7 +163,7 @@ def run(runner, wire):
     source = runner.bind(original, source_bundle, source_manifest)
     source_state, source_proof = source.inspect(), dict(runner.proof)
     closed(source_state)
-    require(not any(source_state["terminal"].get(key, 0) for key in ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates")))
+    require(not any(source_state["terminal"].get(key, 0) for key in UNKNOWN))
     fixture = seed_fixture(source, source_bundle, source_manifest, runner.env["SUBS_BOT_CF_BOOTSTRAP_TOKEN"])
     status, expected_body = wire["public_readback"](wire["public_request"](wire["origin"] + "/sub/" + SMALL_TOKEN + "/base64"), 64 * 1024)
     wire["expect_status"](status, 200, "provider-source")
@@ -206,6 +207,8 @@ def run(runner, wire):
         runner.exercise(provided_controller=on,
             verify_extra=lambda ctl, anchors, base: url_and_refresh(runner, ctl, anchors, base, expected_body, wire))
         require(runner.report.get("applicationProviderCases", {}).get("realRefreshSaved") is True)
+        require(not any(on.inspect()["terminal"].get(key, 0) for key in UNKNOWN),
+                "The application has an unresolved external outcome; retain it without declaring the rehearsal passed.")
         provider.verify_provider_dependency(dependency, target.data["provider"])
     except Exception as error:
         primary = error

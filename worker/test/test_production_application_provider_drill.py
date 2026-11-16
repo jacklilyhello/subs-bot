@@ -121,8 +121,8 @@ class ApplicationProviderProtocolTests(unittest.TestCase):
         with patch.object(app, "seed_fixture", return_value={"synthetic": True}), patch.object(app, "load_provider", return_value=loaded), \
                 patch.object(app, "DependencyReadOnly", return_value=Mock()), patch.object(app, "API"), patch.object(app, "Telegram"), \
                 patch.object(app, "Controller", side_effect=[on, off]), \
-                patch.object(provider, "verify_provider_dependency", side_effect=[{"callerState": "unbound"},
-                    {"callerState": "bound"}, {"callerState": "bound"}, {"callerState": "unbound"}]):
+                patch.object(provider, "verify_provider_dependency", side_effect=lambda *_args, **options:
+                    {"callerState": "unbound" if options.get("allow_unbound_caller") else "bound"}):
             app.run(runner, wire)
 
     def test_complete_protocol_uses_real_controller_deploy_contract_on_and_off(self):
@@ -186,6 +186,15 @@ class ApplicationProviderProtocolTests(unittest.TestCase):
         self.assertFalse(runner.report["applicationProvider"]["configurationRestored"])
         self.assertNotEqual(runner.report.get("status"), "passed")
         self.assertIn("provider-binding-off-intent", [args.args[0] for args in runner.save.call_args_list])
+
+    def test_unknown_terminal_preserves_safe_off_path_but_cannot_become_passed(self):
+        runner, wire, loaded, _source, on, off = self.runner()
+        on.inspect.return_value = {**frozen(), "terminal": {"unknownInvocations": 1}}
+        with self.assertRaises(contract.ContractError):
+            self.execute(runner, wire, loaded, on, off)
+        off.deploy.assert_called_once()
+        self.assertTrue(runner.report["applicationProvider"]["configurationRestored"])
+        self.assertNotEqual(runner.report.get("status"), "passed")
 
     def test_missing_readiness_baseline_reuse_or_wrong_target_never_deploys(self):
         for change in ({"baseline_checkpoint": "a" * 32}, {"human_window": 0}, {"attempt": "2"}):
