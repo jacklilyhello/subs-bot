@@ -9,6 +9,7 @@ import base64
 import errno
 from hashlib import sha256
 from http.client import HTTPException
+from ipaddress import ip_address
 import json
 import os
 from pathlib import Path
@@ -272,8 +273,12 @@ def general_config(target, revision, secrets):
 
 class Telegram:
     """No redirects; token-bearing URL never leaves this bounded client."""
-    def __init__(self, target, secrets):
+    def __init__(self, target, secrets, *, rehearsal_previous_url=None):
         self.target, self.secrets = target, secrets
+        require(rehearsal_previous_url is None or (target.environment == "rehearsal"
+                and rehearsal_previous_url == "https://subs-bot-cf-dev-01.lilyya.workers.dev/telegram/webhook"),
+                "Only an explicitly registered original rehearsal webhook may be selected.")
+        self.rehearsal_previous_url = rehearsal_previous_url
         self.opener = build_opener(ProxyHandler({}), NoRedirect())
 
     def call(self, method, payload=None):
@@ -312,20 +317,72 @@ class Telegram:
                     "The exact configured group or Bot send permission was not confirmed.")
         return {"verifiedGroups": len(self.target.data["groups"])}
 
-    def configure(self, expected_before):
-        self.identity()
-        before = self.call("getWebhookInfo")
-        require(digest(before) == expected_before, "Webhook predecessor changed; no mutation performed.")
+    def webhook_info(self, info):
+        """Separate stable settings from delivery observations; never expose error text."""
+        fields = {"url", "has_custom_certificate", "pending_update_count", "ip_address", "last_error_date",
+                  "last_error_message", "last_synchronization_error_date", "max_connections", "allowed_updates"}
+        require(isinstance(info, dict) and set(info) <= fields and isinstance(info.get("url"), str)
+                and info.get("has_custom_certificate") is False, "Webhook settings contain an unsupported certificate or field.")
+        desired_url = "https://" + self.target.data["hostname"] + "/telegram/webhook"
+        allowed = {"", desired_url}
+        if self.rehearsal_previous_url is not None:
+            allowed.add(self.rehearsal_previous_url)
+        require(info["url"] in allowed, "Webhook URL is outside the explicitly approved predecessor scope; no mutation performed.")
+        connections, updates = info.get("max_connections"), info.get("allowed_updates", [])
+        require((connections is None and info["url"] == "") or type(connections) is int and 1 <= connections <= 100)
+        require(isinstance(updates, list) and all(isinstance(value, str) for value in updates)
+                and len(updates) == len(set(updates))
+                and set(updates) <= {"message", "callback_query", "inline_query"}, "Webhook update categories are unsupported.")
+        count = info.get("pending_update_count")
+        require(type(count) is int and 0 <= count <= 9007199254740991, "Webhook pending-update observation is malformed.")
+        for field in ("last_error_date", "last_synchronization_error_date"):
+            require(field not in info or type(info[field]) is int and 0 <= info[field] <= 9007199254740991)
+        require("last_error_message" not in info or isinstance(info["last_error_message"], str)
+                and len(info["last_error_message"].encode("utf-8")) <= 4096)
+        reported_ip = info.get("ip_address")
+        ip_proof = None
+        if "ip_address" in info:
+            require(info["url"] != "" and isinstance(reported_ip, str), "An empty webhook cannot carry an IP override.")
+            try:
+                address = ip_address(reported_ip)
+                require(address.is_global and not address.is_multicast and not address.is_reserved,
+                        "Webhook IP is outside the public target scope.")
+            except ValueError:
+                raise ContractError("Webhook reported IP is malformed or outside the public target scope.") from None
+            # Telegram exposes the currently used address, not whether a fixed
+            # override was configured. Observe it without inventing that proof
+            # or making DNS rotation invalidate a stable settings approval.
+            ip_proof = digest(str(address))
+        settings = {"url": info["url"], "hasCustomCertificate": False,
+                    "maxConnections": connections, "allowedUpdates": sorted(updates)}
+        return {"settings": settings, "settingsSha256": digest(settings), "observation": {
+            "infoSha256": digest(info), "pendingUpdateCount": count,
+            "lastErrorDate": info.get("last_error_date"), "hasLastError": "last_error_message" in info,
+            "lastSynchronizationErrorDate": info.get("last_synchronization_error_date"), "reportedIpSha256": ip_proof}}
+
+    def plan_webhook(self):
+        identity = self.identity()
+        return {"botIdentity": identity, **self.webhook_info(self.call("getWebhookInfo"))}
+
+    def configure(self, expected_before, *, before_write=lambda: None):
+        before = self.plan_webhook()
+        require(matches(SHA, expected_before) and before["settingsSha256"] == expected_before,
+                "Webhook settings predecessor changed; no mutation performed.")
         t = self.target.data
         desired = {"url": "https://" + t["hostname"] + "/telegram/webhook", "secret_token": self.secrets["webhookSecret"],
             "drop_pending_updates": False, "allowed_updates": t["webhook"]["allowedUpdates"],
             "max_connections": t["webhook"]["maxConnections"]}
-        self.call("setWebhook", desired)
-        after = self.call("getWebhookInfo")
-        require(after.get("url") == desired["url"] and after.get("max_connections") == desired["max_connections"]
-                and set(after.get("allowed_updates", [])) == set(desired["allowed_updates"])
-                and after.get("has_custom_certificate") is False, "Webhook mutation did not read back exactly; keep admission closed.")
-        return {"webhookSha256": digest(after), "pendingUpdateCount": after.get("pending_update_count"), "dropPendingUpdates": False}
+        before_write()
+        try:
+            require(self.call("setWebhook", desired) is True)
+            after = self.plan_webhook()
+            require(after["settings"] == {"url": desired["url"], "hasCustomCertificate": False,
+                "maxConnections": desired["max_connections"], "allowedUpdates": sorted(desired["allowed_updates"])})
+        except Exception:
+            raise OperationError("Webhook mutation is unconfirmed; keep admission closed and use read-only planning before any new approval.",
+                                 uncertain=True) from None
+        return {"webhookSha256": after["settingsSha256"], "pendingUpdateCount": after["observation"]["pendingUpdateCount"],
+                "webhookObservation": after["observation"], "dropPendingUpdates": False}
 
 
 class Controller:
@@ -590,6 +647,38 @@ class Controller:
         before["stateSha256"] = digest(before["approvalState"])
         return before
 
+    def plan_webhook(self):
+        before = self.inspect()
+        require(before["control"]["admission"] == "closed", "Webhook planning requires closed admission.")
+        require(self.telegram is not None)
+        webhook = self.telegram.plan_webhook()
+        before["webhook"] = webhook
+        before["approvalState"] = {"planAction": "webhook", **{key: before[key] for key in
+            ("targetSha256", "configurationSha256", "release", "control", "migrationCount")},
+            "webhookSettingsSha256": webhook["settingsSha256"]}
+        before["stateSha256"] = digest(before["approvalState"])
+        return before
+
+    def configure_webhook(self, envelope, predecessor, webhook_sha256):
+        before = self.plan_webhook()
+        require(before["stateSha256"] == predecessor, "Webhook plan changed; no mutation performed.")
+        self.approval(envelope, "webhook", predecessor)
+        require(matches(SHA, webhook_sha256) and before["webhook"]["settingsSha256"] == webhook_sha256,
+                "The exact planned webhook settings digest is required.")
+        self.verify_domain()
+        def before_write():
+            self.guard()
+            require(self._control() == before["control"], "Durable control changed before webhook configuration.")
+        result = self.telegram.configure(webhook_sha256, before_write=before_write)
+        try:
+            after = self.inspect()
+            require(after["control"] == before["control"])
+        except Exception:
+            raise OperationError("Webhook configuration requires independent control readback; keep admission closed and do not retry blindly.",
+                                 uncertain=True) from None
+        return {**result, "targetSha256": self.target.digest, "configurationSha256": self.target.configuration_digest,
+                "stateSha256": after["stateSha256"]}
+
     def plan_activate(self):
         before = self.inspect()
         require(before["control"]["admission"] == "closed" and before["control"]["workers"] == "frozen"
@@ -610,9 +699,11 @@ class Controller:
         self.telegram.identity()
         self.telegram.group_permissions()
         info = self.telegram.call("getWebhookInfo")
+        self.telegram.webhook_info(info)
         require(info.get("url") == "https://" + self.target.data["hostname"] + "/telegram/webhook"
                 and info.get("max_connections") == self.target.data["webhook"]["maxConnections"]
-                and set(info.get("allowed_updates", [])) == set(self.target.data["webhook"]["allowedUpdates"]),
+                and set(info.get("allowed_updates", [])) == set(self.target.data["webhook"]["allowedUpdates"])
+                and info.get("has_custom_certificate") is False,
                 "An exact read-back webhook is required before activation.")
         self.verify_domain()
         before["activationBaseline"] = proof
@@ -863,6 +954,8 @@ def main():
         result = controller.plan_deploy(source_controller)
     elif action == "plan-pause":
         result = controller.plan_pause()
+    elif action == "plan-webhook":
+        result = controller.plan_webhook()
     elif action == "plan-activate":
         result = controller.plan_activate()
     elif action == "deploy":
@@ -884,11 +977,7 @@ def main():
     elif action == "domain":
         result = controller.attach_domain(envelope, predecessor)
     elif action == "webhook":
-        state = controller.inspect()
-        require(state["stateSha256"] == predecessor and state["control"]["admission"] == "closed")
-        controller.approval(envelope, action, predecessor)
-        controller.verify_domain()
-        result = controller.telegram.configure(os.environ.get("CONTROL_WEBHOOK_SHA256", ""))
+        result = controller.configure_webhook(envelope, predecessor, os.environ.get("CONTROL_WEBHOOK_SHA256", ""))
     else:
         raise ContractError("Unsupported lifecycle action.")
     # Public evidence never contains actor lists, bindings with Secrets or SQL.

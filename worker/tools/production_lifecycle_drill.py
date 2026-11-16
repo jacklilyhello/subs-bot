@@ -285,7 +285,8 @@ class Drill:
         data = API(target, self.env.get("SUBS_BOT_CF_BOOTSTRAP_TOKEN", ""))
         worker = API(target, self.env.get("SUBS_BOT_CF_DEPLOY_TOKEN", ""))
         self.controller = Controller(target, data, worker, bundle, manifest, guard=self.guard,
-            telegram=Telegram(target, self.secrets), secrets=self.secrets, control_revision=self.revision)
+            telegram=Telegram(target, self.secrets, rehearsal_previous_url=ORIGINAL_ORIGIN + "/telegram/webhook"),
+            secrets=self.secrets, control_revision=self.revision)
         return self.controller
 
     def source_controller(self, target):
@@ -551,6 +552,7 @@ class Drill:
         old_settings = webhook_settings(before_hook)
         require(old_settings["url"] == ORIGINAL_ORIGIN + "/telegram/webhook",
                 "Recover the previous test webhook before opening another rehearsal window.")
+        webhook_plan = ctl.plan_webhook()
         snapshot = {"schemaVersion": 1, "draftSha256": self.draft.digest, "botId": self.previous["botId"],
             "oldWebhookSecret": self.previous["webhookSecret"], "webhookInfo": before_hook,
             "revision": self.revision, "runId": self.run, "runAttempt": self.attempt}
@@ -560,7 +562,8 @@ class Drill:
         primary_error = None
         phase = "configure-webhook"
         try:
-            configured = ctl.telegram.configure(digest(before_hook))
+            configured = ctl.configure_webhook(approval(ctl.target, "webhook", ctl.revision, webhook_plan["stateSha256"]),
+                webhook_plan["stateSha256"], webhook_plan["webhook"]["settingsSha256"])
             changed = True
             self.save("webhook-configured", configured)
             # The new production code path is present but still denies new work.
