@@ -46,6 +46,9 @@ FLAG_BINDINGS = {
     "subscriptionShortsEnabled": {"TELEGRAM_SUBSCRIPTION_SHORTS", "TELEGRAM_AGGREGATE_KEY"},
     "externalShortlinksEnabled": SHORTLINK_BINDINGS | {"TELEGRAM_EXTERNAL_SHORTLINKS"},
 }
+LEGACY_RELEASE_INTENT = "legacy-migration"
+FIRST_RELEASE_INTENT = "first-release"
+RELEASE_INTENTS = frozenset({LEGACY_RELEASE_INTENT, FIRST_RELEASE_INTENT})
 
 
 def require(value):
@@ -177,13 +180,15 @@ def expectations(flags_raw, bindings_raw, deployment, module):
         "displayTimezone": {"default": "UTC", "persistedSelectionStatus": "Not run"}}
 
 
-def make_manifest(ci_proof, isolation, deployment, deploy_run, configuration, *, source_kind, source_sha):
+def make_manifest(ci_proof, isolation, deployment, deploy_run, configuration, *, source_kind, source_sha,
+                  release_intent=LEGACY_RELEASE_INTENT):
+    require(release_intent in RELEASE_INTENTS)
     require(source_kind in ("not-supplied", "synthetic-fixture") and (source_sha == "" or DIGEST.fullmatch(source_sha))
         and (source_kind != "not-supplied" or source_sha == ""))
     migrations = [{"name": entry["name"], "sha256": entry["sha256"]} for entry in isolation["migrations"]]
     require(deployment["migrationCount"] == len(migrations))
     not_run = lambda reason: {"status": "Not run", "reason": reason}
-    return {
+    manifest = {
         "version": 1, "kind": "production-candidate-review-only", "productionReady": False,
         "productionMutationPerformed": False, "productionAuthorization": "not-granted", "reservedProductionHostname": "subs-bot.lilyya.top",
         "createdAt": datetime.now(timezone.utc).isoformat(),
@@ -216,18 +221,58 @@ def make_manifest(ci_proof, isolation, deployment, deploy_run, configuration, *,
             "Seal Cloudflare new writes before any data recovery; never resume stale SQLite as a lossless rollback",
         ],
     }
+    if release_intent == FIRST_RELEASE_INTENT:
+        no_legacy = {"status": "N/A", "reason": "Maintainer confirmed on 2026-11-16 that no previous production instance, production SQLite/WAL, production data or old consumer exists."}
+        manifest["releaseIntent"] = FIRST_RELEASE_INTENT
+        manifest["firstRelease"] = {"history": "no-prior-production", "basis": "maintainer-confirmed-2026-11-16",
+            "legacyProductionMigration": "N/A", "legacyConsumerHandoff": "N/A",
+            "testDataImportAuthorized": False, "testSigningKeyReuseAuthorized": False,
+            "formalConfigurationApproved": False, "productionActivationAuthorized": False,
+            "apiStatusPolicy": "disabled-first-release; valid-key success is a later feature-enablement gate"}
+        manifest["validation"]["realSQLiteRehearsal"] = dict(no_legacy)
+        manifest["validation"]["legacyConsumerHandoff"] = dict(no_legacy)
+        manifest["validation"]["productionConfiguration"] = not_run("Formal Bot, actors, groups, fresh secrets, resource identities, dependencies and feature approvals are evaluated by the protected lifecycle controls, not this packaging job.")
+        manifest["validation"]["freshProductionInitialization"] = not_run("No production resource is created or initialized here; verify the complete migration and fresh-database whitelist separately after explicit approval.")
+        manifest["validation"]["productionLifecycleLiveValidation"] = not_run("Review exact production-control, provider and recovery workflow rehearsal/readback evidence separately; this job executes none of those tools.")
+        manifest["validation"]["productionActivation"] = not_run("Production activation remains unauthorized and requires the exact approved target, configuration and predecessor checks.")
+        manifest["validation"]["aiValidKeySuccess"] = not_run("No approved valid target API key is supplied. API status remains disabled for the first release; this does not block the other first-release development.")
+        manifest["dataSource"].update(finalConsistentBackup="N/A", ownershipAndCountsReconciled="N/A",
+            legacyProductionMigration="N/A", legacyProductionReason=no_legacy["reason"],
+            productionInitialization="Not run", testDataCopyAuthorized=False, testSigningKeyReuseAuthorized=False)
+        manifest["recovery"].update(strategy="preserve-current-cloudflare-state-and-restore-pinned-checkpoints-into-independent-private-targets",
+            legacySQLiteFallback="N/A", automaticIncrementalReplayAvailable=False)
+        manifest["requiredBeforeProduction"] = [
+            "Review exact candidate CI and independent live version, module, bindings, configuration, migration, Cron and timezone readback",
+            "Fill and approve the formal Bot identity, administrators, members/default-deny policy, groups and fresh signing-key digests",
+            "Approve dedicated production resource creation and fresh-database whitelist initialization without copying test business data or test signing keys",
+            "Review actual new lifecycle deployment, pause, classified drain, backup, recovery and activation code-path evidence from the registered rehearsal target",
+            "Approve an independently pinned production ProviderFetch when URL import/refresh is enabled; retain the existing internal ShortlinkService contract",
+            "Close new admission, finish accepted work and retain failed or uncertain external outcomes without deletion or automatic resend",
+            "Approve the exact production domain, preserve-pending webhook configuration, unique consumer and final activation predecessor",
+            "Preserve pending Telegram updates and durable update dispositions; initialization time must not discard pending work",
+            "Seal initialization G0 and preserve current-state G1 before independent data recovery; no lossless incremental replay is assumed",
+            "Keep API status disabled for first release; approve valid-key success separately before later feature enablement",
+        ]
+    return manifest
 
 
 def write_package(directory, manifest):
     directory.mkdir(mode=0o700)
     raw = canonical(manifest)
     digest = sha256(raw).hexdigest()
+    unverified = "Not run: live Cloudflare readback, real SQLite rehearsal, live synthetic acceptance and human Telegram acceptance.\n\n"
+    if manifest.get("releaseIntent") == FIRST_RELEASE_INTENT:
+        unverified = ("Release intent: first release; no prior production.\n\n"
+            "N/A: old production SQLite/WAL migration and old-consumer handoff, as confirmed by the maintainer. N/A is not Passed.\n\n"
+            "Not run by this package: live Cloudflare readback, formal configuration, fresh production initialization, "
+            "new lifecycle tool live validation, synthetic acceptance and human Telegram acceptance. "
+            "Review independently recorded exact-run evidence; packaging grants no production authorization.\n\n")
     files = {"candidate.json": raw, "candidate.sha256": (digest + "  candidate.json\n").encode("ascii"),
         "review.md": ("# Production candidate review package\n\n"
             "Review only. `productionReady` is **false**. No production operation was performed.\n\n"
             f"Revision: `{manifest['source']['revision']}`\n\n"
             "Passed: exact main Worker CI artifact and matching historical isolation workflow evidence.\n\n"
-            "Not run: live Cloudflare readback, real SQLite rehearsal, live synthetic acceptance and human Telegram acceptance.\n\n"
+            + unverified +
             "Binding names and flags are review expectations, not a current live inventory.\n\n"
             "Before production:\n\n" + "".join(f"- {item}\n" for item in manifest["requiredBeforeProduction"])).encode("utf-8")}
     for name, body in files.items():
@@ -241,6 +286,8 @@ def main(env):
     require(env.get("GITHUB_WORKFLOW_REF") == WORKFLOW and env.get("RUNNER_ENVIRONMENT") == "github-hosted"
         and env.get("GITHUB_REF") == artifact.MAIN_REF and env.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
         and env.get("GITHUB_REPOSITORY_ID") == str(artifact.REPOSITORY_ID))
+    release_intent = env.get("CANDIDATE_RELEASE_INTENT", LEGACY_RELEASE_INTENT)
+    require(release_intent in RELEASE_INTENTS)
     revision = env.get("GITHUB_SHA", "")
     token = artifact._github_token()
     artifact.require_current_main(revision)
@@ -267,7 +314,8 @@ def main(env):
     configuration = expectations(env.get("CANDIDATE_EXPECTED_FLAGS", "{}"), env.get("CANDIDATE_EXPECTED_BINDINGS", "[]"),
         deployment, (bundle / "index.js").read_bytes())
     manifest = make_manifest(ci_proof, isolation, deployment, metadata, configuration,
-        source_kind=env.get("CANDIDATE_DATA_SOURCE_KIND", "not-supplied"), source_sha=env.get("CANDIDATE_DATA_SOURCE_SHA256", ""))
+        source_kind=env.get("CANDIDATE_DATA_SOURCE_KIND", "not-supplied"), source_sha=env.get("CANDIDATE_DATA_SOURCE_SHA256", ""),
+        release_intent=release_intent)
     require(run_metadata(read_run(), deploy_run, deploy_attempt, revision, workflow["id"], DEPLOY_WORKFLOW) == metadata)
     artifact.require_current_main(revision)
     digest = write_package(temp / "subs-bot-production-candidate", manifest)

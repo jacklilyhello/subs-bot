@@ -3,6 +3,12 @@ name: Package production candidate for review only
 on:
   workflow_dispatch:
     inputs:
+      release_intent:
+        description: Explicit first release has no legacy production migration; legacy mode preserves historical package semantics
+        required: true
+        default: first-release
+        type: choice
+        options: [first-release, legacy-migration]
       source_run_id:
         description: Successful Worker CI of this exact main commit
         required: true
@@ -63,6 +69,7 @@ jobs:
           CANDIDATE_EXPECTED_BINDINGS: ${{ inputs.expected_binding_names_json }}
           CANDIDATE_DATA_SOURCE_KIND: ${{ inputs.data_source_kind }}
           CANDIDATE_DATA_SOURCE_SHA256: ${{ inputs.data_source_sha256 }}
+          CANDIDATE_RELEASE_INTENT: ${{ inputs.release_intent }}
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           python3 -B worker/tools/production_candidate.py
