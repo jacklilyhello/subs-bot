@@ -74,6 +74,22 @@ class StagedReleaseTests(unittest.TestCase):
 
 
 class ProvisionCredentialTests(unittest.TestCase):
+    def test_explicit_production_subjects_are_never_inferred_from_test_defaults(self):
+        rehearsal, _ = fixture()
+        value = deepcopy(rehearsal.data)
+        service, backup, hostname = contract.NAMES["production"]
+        value.update(environment="production", workerName=service, d1Name=service, bucketName=service,
+                     backupBucketName=backup, hostname=hostname, botUsername="ProductionFixtureBot")
+        formal = contract.validate_target(value)
+        self.assertEqual(formal.data["admins"], value["admins"])
+        self.assertNotEqual(formal.digest, rehearsal.digest)
+        missing = deepcopy(value)
+        missing.pop("admins")
+        with self.assertRaises(contract.ContractError):
+            contract.validate_target(missing)
+        with self.assertRaises(contract.ContractError):
+            contract.approve(formal, approval(rehearsal, "initialize", "a"*64), "initialize", REVISION, "a"*64)
+
     def test_missing_bot_secret_stops_before_constructing_a_cloud_mutation_client(self):
         rehearsal, _ = fixture()
         value = deepcopy(rehearsal.data)

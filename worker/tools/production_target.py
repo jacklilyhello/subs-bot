@@ -137,9 +137,8 @@ def validate_target(raw, *, draft=False):
     # Existing runtime has a single group destination; reject unsupported scope rather than truncate.
     require(len(groups) <= 1, "The current group-card runtime supports at most one explicit group.")
     if env == "production":
-        require(value["botUsername"].lower() != "test_cfsubs_bot"
-                and not TEST_ACTORS & set(value["admins"] + value["members"]) and TEST_GROUP not in seen,
-                "Test identities cannot become implicit production identities.")
+        require(value["botUsername"].lower() != "test_cfsubs_bot",
+                "The production Bot must be separate from the test Bot.")
     else:
         require(value["botUsername"] == "test_cfsubs_bot" and value["admins"] == ["8813701954"]
                 and value["members"] == ["8653767757"] and seen <= {TEST_GROUP}, "Rehearsal identity is outside the authorized scope.")

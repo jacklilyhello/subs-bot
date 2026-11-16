@@ -81,7 +81,7 @@ gh workflow run worker-production-control.yml --ref main \
 - 正式 Bot 创建责任、已确认 ID／用户名、正式 Token 和独立 Webhook Secret。
 - 正式管理员、成员、默认拒绝策略、初始授权世代、群范围及实际 Bot 权限。
 - 生产固定资源 ID／创建时间、私有 journal anchor、备份保留期和恢复独立目标命名。
-- 最小权限的生产凭据、安全注入、environment 审批负责人；不得填入测试主体、测试签名密钥或默认 dev 依赖。
+- 最小权限的生产凭据、安全注入、environment 审批负责人；不继承测试授权、测试签名密钥或默认 dev 依赖。同一 Telegram 账号若被选择为正式主体，也必须重新显式填写正式角色并批准。
 - 每个功能明确开关；正式 ProviderFetch 的准确版本／镜像／资源／停止后 smoke 证明；内部短链继续 `shortlink-new` / `ShortlinkService` / Service Binding / Bearer 业务 Token。
 - 准确候选 main、CI run/attempt、模块／ZIP／迁移摘要、独立读回、私有持久归档及适用恢复基线。
 - `subs-bot.lilyya.top`、Webhook allowed_updates/max_connections、明确保留 pending updates。
