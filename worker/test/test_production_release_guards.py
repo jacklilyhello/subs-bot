@@ -73,6 +73,41 @@ class StagedReleaseTests(unittest.TestCase):
             self.controller.verify_bindings(active)
 
 
+class ActivationBaselineTests(unittest.TestCase):
+    setUp = fixtures.ProductionControllerTests.setUp
+
+    def prepare(self):
+        self.controller.initialize()
+        self.controller.telegram = Mock()
+        self.controller.telegram.call.return_value = {"url": "https://" + self.target.data["hostname"] + "/telegram/webhook",
+            "max_connections": self.target.data["webhook"]["maxConnections"],
+            "allowed_updates": self.target.data["webhook"]["allowedUpdates"]}
+        self.controller.verify_domain = Mock(return_value={"domainVerified": True})
+        return {"baselineVerified": True, "checkpointId": "a" * 32, "manifestSha256": "b" * 64,
+                "targetSha256": self.target.digest, "configurationSha256": self.target.configuration_digest,
+                "sourceRevision": REVISION, "moduleSha256": self.manifest["bundleSha256"], "versionId": VERSION}
+
+    def test_missing_or_mismatched_baseline_never_opens_admission(self):
+        proof = self.prepare()
+        with self.assertRaises(contract.ContractError):
+            self.controller.plan_activate()
+        for key in ("targetSha256", "configurationSha256", "sourceRevision", "moduleSha256", "versionId", "manifestSha256", "checkpointId"):
+            wrong = {**proof, key: "incorrect"}
+            self.controller.activation_baseline_checker = lambda: wrong
+            with self.assertRaises(contract.ContractError):
+                self.controller.plan_activate()
+        self.assertEqual(self.controller._control()["admission"], "closed")
+
+    def test_baseline_pin_is_bound_to_the_exact_activation_approval(self):
+        proof = self.prepare()
+        self.controller.activation_baseline_checker = lambda: proof
+        planned = self.controller.plan_activate()
+        proof["manifestSha256"] = "c" * 64
+        with self.assertRaises(contract.ContractError):
+            self.controller.transition("activate", approval(self.target, "activate", planned["stateSha256"]), planned["stateSha256"])
+        self.assertEqual(self.controller._control()["admission"], "closed")
+
+
 class ProvisionCredentialTests(unittest.TestCase):
     def test_explicit_production_subjects_are_never_inferred_from_test_defaults(self):
         rehearsal, _ = fixture()
