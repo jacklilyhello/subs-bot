@@ -76,6 +76,8 @@ URL 请求使用共享的 120 秒启动总预算，覆盖 `start`、必须等到
 
 发布 Workflow 的四次 fetch 阶段上限 300 秒、单次 named RPC 阶段 210 秒，控制器最多观察 600 秒；专用应用绑定演练等待排空最多 300 秒。新的失败诊断区分 `inactivity-set` 等固定 primary phase、timeout/operation 和有界 elapsed time，并与 shutdown 子阶段分开记录。API-status V2 的 `dispatchBeforeMs` 最多提前 30 秒及实际提交前硬检查保持不变，不随 URL 启动预算扩大真实 Key 的提交窗口。
 
+可信 GitHub 元数据读取只对 GET 做最多三次尝试，单次网络超时 20 秒、累计退避最多 4 秒。只允许传输失败、500/502/503/504、具有有效小型 Retry-After 或 `remaining=0` 小型 reset 的 429，以及明确 `remaining=0` 且 reset 在剩余等待预算内的 403 重读；普通 403、身份不符、无效 JSON 和超限响应立即失败。缺少明确等待信号的 429、较长 Retry-After 或 reset 也立即失败，不触发短促盲重试或长时间等待。安全诊断只写 stderr 的固定读取类别、阶段和有界数值，不写请求 URL、响应正文、原始 header 或 Token，也不破坏 stdout 的 JSON 原件。失败的操作 intent 仍需封存并独立读回；只有明确 `executed=false / failed-before-dispatch` 才能说明该操作尚未写入，不能据一次 HTTP 错误推断其他操作结果或改用个人凭据绕过配额。
+
 ## 新工具的隔离演练与持久证明
 
 `worker-production-provider-rehearsal.yml` 的 `rehearse` 路径通过同一个 `production_provider` 控制实现，使用专用 `subs-bot-provider-fetch-control-drill-01`，不修改原 dev 服务。必须提供准确 Provider CI run、明确批准的项目 `/health` URL 与独立读回 revision，并输入 `rehearse production ProviderFetch controls for subs-bot-provider-fetch-control-drill-01`。自动流程覆盖 create、原 OCI 发布、stage、activate、Container/Workflow 初始化、真实 Cloudflare smoke 和独立 verify。

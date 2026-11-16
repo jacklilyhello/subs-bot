@@ -11,8 +11,8 @@ import stat
 import sys
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import patch
-from urllib.error import HTTPError
+from unittest.mock import Mock, call, patch
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
 from zipfile import ZipFile, ZipInfo
 
@@ -73,6 +73,120 @@ def zip_release(manifest, files, extra_entries=()):
         for name, data in (*files.items(), *extra_entries):
             archive.writestr(name, data)
     return body.getvalue()
+
+
+
+class MetadataReadTests(unittest.TestCase):
+    def response(self, body=b'{"ok":true}'):
+        value = io.BytesIO(body)
+        value.status, value.headers = 200, Message()
+        return value
+
+    def failure(self, status, headers=None):
+        class UnreadableBody(io.BytesIO):
+            def read(self, *_args):
+                raise AssertionError("HTTP error bodies must not be read.")
+        return HTTPError("https://private.invalid/capability-secret", status, "synthetic-private-error",
+                         headers or Message(), UnreadableBody(b"synthetic-private-body"))
+
+    def run_read(self, outcomes):
+        opened = Mock(side_effect=outcomes)
+        self.stderr, self.stdout = io.StringIO(), io.StringIO()
+        self.enterContext(patch.object(release._OPENER, "open", opened))
+        self.slept = self.enterContext(patch.object(release, "sleep"))
+        self.enterContext(patch.object(release, "time", return_value=1000))
+        self.enterContext(patch.object(release.sys, "stderr", self.stderr))
+        self.enterContext(patch.object(release.sys, "stdout", self.stdout))
+        self.opened = opened
+        return lambda: release._get_json("/actions/artifacts/200", "synthetic-secret-token")
+
+    def test_only_gets_retry_transient_http_and_transport_with_four_second_budget(self):
+        read = self.run_read([self.failure(503), URLError("synthetic-private-transport"), self.response()])
+        self.assertEqual(read(), {"ok": True})
+        self.assertEqual(self.slept.call_args_list, [call(1), call(3)])
+        self.assertEqual(self.opened.call_count, 3)
+        self.assertTrue(all(item.args[0].get_method() == "GET" and item.kwargs == {"timeout": 20}
+                            for item in self.opened.call_args_list))
+        self.assertNotIn("synthetic-private", self.stderr.getvalue())
+        self.assertNotIn("synthetic-secret-token", self.stderr.getvalue())
+        self.assertNotIn("private.invalid", self.stderr.getvalue())
+        self.assertIn('"outcome": "retry"', self.stderr.getvalue())
+        self.assertEqual(self.stdout.getvalue(), "")
+
+    def test_ordinary_permission_denial_redirect_and_not_found_are_never_retried(self):
+        for status in (401, 403, 404, 422, 302):
+            with self.subTest(status=status):
+                read = self.run_read([self.failure(status)])
+                with self.assertRaises(release.ArtifactError) as failed:
+                    read()
+                self.assertEqual(str(failed.exception), "Could not read trusted GitHub release metadata.")
+                self.assertEqual(failed.exception.read_diagnostic["httpStatus"], status)
+                self.assertEqual(self.opened.call_count, 1)
+                self.slept.assert_not_called()
+                self.assertNotIn("synthetic-private", self.stderr.getvalue())
+                self.assertNotIn("private.invalid", self.stderr.getvalue())
+
+    def test_secondary_429_requires_a_small_explicit_wait_instead_of_a_short_blind_retry(self):
+        for values in ({}, {"X-RateLimit-Remaining": "100"}):
+            headers = Message()
+            for key, value in values.items():
+                headers[key] = value
+            read = self.run_read([self.failure(429, headers)])
+            with self.assertRaises(release.ArtifactError):
+                read()
+            self.slept.assert_not_called()
+            self.assertEqual(self.opened.call_count, 1)
+        headers = Message()
+        headers["Retry-After"] = "2"
+        read = self.run_read([self.failure(429, headers), self.response()])
+        self.assertEqual(read(), {"ok": True})
+        self.slept.assert_called_once_with(2)
+        self.assertEqual(self.stdout.getvalue(), "")
+
+    def test_confirmed_primary_rate_reset_can_wait_only_within_the_small_budget(self):
+        headers = Message()
+        headers["X-RateLimit-Remaining"], headers["X-RateLimit-Reset"] = "0", "1002"
+        read = self.run_read([self.failure(403, headers), self.response()])
+        self.assertEqual(read(), {"ok": True})
+        self.slept.assert_called_once_with(2)
+        self.assertIn('"rateLimitRemaining": 0', self.stderr.getvalue())
+        self.assertIn('"rateLimitReset": 1002', self.stderr.getvalue())
+
+    def test_large_reset_retry_after_or_unparseable_header_fails_without_sleep(self):
+        cases = [(403, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1100"}),
+                 (403, {"X-RateLimit-Remaining": "0"}), (429, {"Retry-After": "60"}),
+                 (503, {"Retry-After": "synthetic-private-header"})]
+        for status, values in cases:
+            headers = Message()
+            for name, value in values.items():
+                headers[name] = value
+            with self.subTest(status=status, fields=list(values)):
+                read = self.run_read([self.failure(status, headers)])
+                with self.assertRaises(release.ArtifactError):
+                    read()
+                self.slept.assert_not_called()
+                self.assertEqual(self.opened.call_count, 1)
+                self.assertNotIn("synthetic-private", self.stderr.getvalue())
+
+    def test_exhausted_reads_still_fail_and_json_or_size_failure_never_retries(self):
+        read = self.run_read([self.failure(502), self.failure(502), self.failure(502)])
+        with self.assertRaises(release.ArtifactError) as failed:
+            read()
+        self.assertEqual(failed.exception.read_diagnostic["attempt"], 3)
+        self.assertEqual(self.slept.call_args_list, [call(1), call(3)])
+        self.assertIn('"outcome": "failed"', self.stderr.getvalue())
+        for body in (b'{"private":"synthetic-private-body","private":1}', b'[]'):
+            with self.subTest(kind="invalid-response"):
+                read = self.run_read([self.response(body)])
+                with self.assertRaises(release.ArtifactError):
+                    read()
+                self.assertEqual(self.opened.call_count, 1)
+                self.slept.assert_not_called()
+                self.assertNotIn("synthetic-private", self.stderr.getvalue())
+        read = self.run_read([self.response(b"private-body-too-large")])
+        with patch.object(release, "_MAX_JSON", 8), self.assertRaises(release.ArtifactError):
+            read()
+        self.slept.assert_not_called()
 
 
 class PrepareIsolationArtifactTests(unittest.TestCase):
