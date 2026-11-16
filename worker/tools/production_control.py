@@ -12,12 +12,14 @@ import json
 import os
 from pathlib import Path
 import re
+import tempfile
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 import d1_migrations as migrations
 import prepare_isolation_artifact as artifact
+import prepare_control_artifact
 from general_isolation_window import work_sql, terminal_card_sql
 from production_target import Target, ContractError, approve, canonical, digest, matches, parsed, require, validate_target, SHA, REV, UUID
 
@@ -249,7 +251,7 @@ class Telegram:
 
 
 class Controller:
-    def __init__(self, target, data_api, worker_api, bundle, manifest, *, guard=lambda: None, telegram=None, secrets=None, dependency_api=None):
+    def __init__(self, target, data_api, worker_api, bundle, manifest, *, guard=lambda: None, telegram=None, secrets=None, dependency_api=None, control_revision=None):
         self.target, self.data, self.worker = target, data_api, worker_api
         self.bundle, self.manifest, self.guard = Path(bundle), manifest, guard
         self.telegram, self.secrets = telegram, secrets
@@ -259,7 +261,11 @@ class Controller:
         self.script = self.root + "/workers/scripts/" + target.data["workerName"]
         self.worker_path = self.root + "/workers/workers/" + target.data["workerId"]
         self.revision = manifest["revision"]
+        self.control_revision = self.revision if control_revision is None else control_revision
         require(matches(REV, self.revision) and matches(SHA, manifest.get("bundleSha256")))
+
+    def approval(self, envelope, action, state_sha):
+        return approve(self.target, envelope, action, self.revision, state_sha, control_revision=self.control_revision)
 
     def resources(self):
         t = self.target.data
@@ -279,6 +285,10 @@ class Controller:
         require(set(live.get("tags", [])) == {"subs-bot", "lifecycle-" + t["environment"]}, "Worker ownership tags differ.")
         require(live.get("logpush") is False and live.get("tail_consumers") == []
                 and live.get("observability", {}).get("enabled") is False, "Unexpected logging or consumers are present.")
+        references = live.get("references")
+        require(isinstance(references, dict) and all(references.get(k) == [] for k in
+                ("queues", "durable_objects", "dispatch_namespace_outbounds", "workers")),
+                "Unexpected queue, durable object or Worker consumers are present.")
         if self.target.environment == "production":
             require(live.get("subdomain", {}).get("enabled") is False and live.get("subdomain", {}).get("previews_enabled") is False,
                     "Production workers.dev and preview access must be disabled.")
@@ -403,6 +413,10 @@ class Controller:
         if verify_release:
             self.verify_bindings(active)
             require(control["release_revision"] == active["revision"])
+            schedules = self.worker("GET", self.script + "/schedules")
+            require(isinstance(schedules, dict) and isinstance(schedules.get("schedules"), list)
+                    and len(schedules["schedules"]) == 1 and schedules["schedules"][0].get("cron") == "* * * * *",
+                    "The recovery Cron configuration differs from the reviewed release.")
         state = {"targetSha256": self.target.digest, "configurationSha256": self.target.configuration_digest, "release": {k: v for k, v in active.items() if k != "bindings"},
             "control": control, "work": self.work(), "terminal": self.terminal(), "migrationCount": len(history)}
         state["stateSha256"] = digest(state)
@@ -478,7 +492,7 @@ class Controller:
     def transition(self, action, approval, state_sha):
         before = self.inspect()
         require(before["stateSha256"] == state_sha, "Predecessor state changed; no transition performed.")
-        approve(self.target, approval, action, self.revision, state_sha)
+        self.approval(approval, action, state_sha)
         control = before["control"]
         desired = {"pause": ("closed", "run"), "freeze": ("closed", "frozen"),
                    "thaw": ("closed", "run"), "activate": ("open", "run")}
@@ -526,7 +540,7 @@ class Controller:
     def classify_interruption(self, approval, state_sha):
         before = self.inspect()
         require(before["stateSha256"] == state_sha and before["control"]["admission"] == "closed")
-        approve(self.target, approval, "classify-interruption", self.revision, state_sha)
+        self.approval(approval, "classify-interruption", state_sha)
         # 960s lease + 60s quarantine exceeds the platform's 900s scheduled
         # execution ceiling. This classifies execution as ended, not its external
         # effect as successful. Nothing is deleted or automatically re-executed.
@@ -538,11 +552,24 @@ class Controller:
             f"UPDATE subs_bot_production_updates SET state='uncertain' WHERE state='processing' AND EXISTS(SELECT 1 FROM {INVOCATIONS} AS invocation WHERE invocation.invocation_id=subs_bot_production_updates.invocation_id AND invocation.state='uncertain' AND invocation.finished_at IS NOT NULL)"])
         return self.inspect()
 
-    def deploy(self, approval, state_sha):
+    def plan_deploy(self, source_controller=None):
         before = self.inspect(verify_release=False)
-        require(before["stateSha256"] == state_sha and before["control"]["admission"] == "closed"
+        require(before["control"]["admission"] == "closed"
                 and before["control"]["workers"] == "frozen" and not any(before["work"].values()), "Freeze and reconcile the exact source before deployment.")
-        approve(self.target, approval, "deploy", self.revision, state_sha)
+        if before["release"]["versionId"] is not None:
+            if source_controller is None:
+                self.verify_bindings(self.active())
+            else:
+                require(source_controller.target.digest == self.target.digest, "The approved source belongs to a different target.")
+                prior = source_controller.inspect()
+                require(prior["release"] == before["release"] and prior["control"] == before["control"]
+                        and not any(prior["work"].values()), "Current release does not match the independent reviewed source artifact.")
+        return before
+
+    def deploy(self, approval, state_sha, source_controller=None):
+        before = self.plan_deploy(source_controller)
+        require(before["stateSha256"] == state_sha, "The planned deployment predecessor changed.")
+        self.approval(approval, "deploy", state_sha)
         module = (self.bundle / "index.js").read_bytes()
         require(sha256(module).hexdigest() == self.manifest["bundleSha256"] and 0 < len(module) <= 1152*1024)
         bindings = self.expected_bindings(include_secrets=True)
@@ -605,7 +632,7 @@ class Controller:
     def attach_domain(self, approval, state_sha):
         before = self.inspect()
         require(before["stateSha256"] == state_sha and before["control"]["admission"] == "closed")
-        approve(self.target, approval, "domain", self.revision, state_sha)
+        self.approval(approval, "domain", state_sha)
         require(self.target.environment == "production", "Rehearsal uses its registered workers.dev identity.")
         t = self.target.data
         current = self.worker("GET", self.root + "/workers/domains?" + urlencode({"hostname": t["hostname"]}))
@@ -633,7 +660,7 @@ def main():
     hosted_environment(target.environment)
     revision = os.environ.get("GITHUB_SHA", "")
     artifact.require_current_main(revision)
-    proof = artifact.prepare()
+    proof = prepare_control_artifact.prepare(action)
     bundle = Path(os.environ["RUNNER_TEMP"]) / artifact.VERIFIED_DIRECTORY
     manifest = parsed((bundle / "isolation.json").read_bytes())
     secrets = parsed(os.environ.get("SUBS_BOT_CONTROL_SECRETS", ""))
@@ -641,8 +668,20 @@ def main():
     data = API(target, os.environ.get("SUBS_BOT_CF_DATA_TOKEN", ""))
     worker = API(target, os.environ.get("SUBS_BOT_CF_WORKER_TOKEN", ""))
     controller = Controller(target, data, worker, bundle, manifest, guard=lambda: artifact.require_current_main(revision),
-                            telegram=Telegram(target, secrets), secrets=secrets,
+                            telegram=Telegram(target, secrets), secrets=secrets, control_revision=revision,
                             dependency_api=API(target, os.environ["SUBS_BOT_CF_DEPENDENCY_READ_TOKEN"]) if target.data["provider"] is not None and os.environ.get("SUBS_BOT_CF_DEPENDENCY_READ_TOKEN") else None)
+    source_controller = None
+    source_directory = None
+    if action in ("plan-deploy", "deploy") and os.environ.get("CONTROL_ACTIVE_CI_RUN_ID"):
+        source_directory = tempfile.TemporaryDirectory(prefix="subs-bot-reviewed-active-", dir=os.environ["RUNNER_TEMP"])
+        source_proof = prepare_control_artifact.prepare("inspect", run_id=os.environ["CONTROL_ACTIVE_CI_RUN_ID"], directory=source_directory.name)
+        source_bundle = Path(source_directory.name) / artifact.VERIFIED_DIRECTORY
+        source_manifest = parsed((source_bundle / "isolation.json").read_bytes())
+        previous_target = validate_target(os.environ.get("SUBS_BOT_ACTIVE_TARGET_JSON") or canonical(target.data))
+        previous_secrets = parsed(os.environ.get("SUBS_BOT_ACTIVE_CONTROL_SECRETS") or canonical(secrets))
+        source_controller = Controller(previous_target, data, worker, source_bundle, source_manifest,
+            guard=lambda: artifact.require_current_main(revision), secrets=previous_secrets, control_revision=revision,
+            dependency_api=controller.dependency_api)
     envelope = os.environ.get("SUBS_BOT_APPROVAL_JSON", "")
     predecessor = os.environ.get("CONTROL_STATE_SHA256", "")
     if action == "preflight":
@@ -652,16 +691,18 @@ def main():
         result = controller.inspect()
     elif action == "initialize":
         require(matches(SHA, predecessor))
-        approve(target, envelope, action, revision, predecessor)
+        controller.approval(envelope, action, predecessor)
         # The predecessor for initialization is the exact resource registration.
         require(digest(controller.resources()) == predecessor)
         result = controller.initialize()
+    elif action == "plan-deploy":
+        result = controller.plan_deploy(source_controller)
     elif action == "deploy":
-        result = controller.deploy(envelope, predecessor)
+        result = controller.deploy(envelope, predecessor, source_controller)
     elif action == "reconcile-deploy":
         before = controller.inspect(verify_release=False)
         require(before["stateSha256"] == predecessor)
-        approve(target, envelope, action, revision, predecessor)
+        controller.approval(envelope, action, predecessor)
         result = controller.reconcile_deployment(before)
     elif action in ("pause", "freeze", "thaw", "activate"):
         result = controller.transition(action, envelope, predecessor)
@@ -677,7 +718,7 @@ def main():
     elif action == "webhook":
         state = controller.inspect()
         require(state["stateSha256"] == predecessor and state["control"]["admission"] == "closed")
-        approve(target, envelope, action, revision, predecessor)
+        controller.approval(envelope, action, predecessor)
         controller.verify_domain()
         result = controller.telegram.configure(os.environ.get("CONTROL_WEBHOOK_SHA256", ""))
     else:

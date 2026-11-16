@@ -14,11 +14,14 @@ on:
         description: One guarded lifecycle step; inspect after every uncertain result
         required: true
         type: choice
-        options: [availability, provision-inspect, provision-reconcile, provision, preflight, initialize, inspect, deploy, reconcile-deploy, pause, drain, freeze, thaw, classify-interruption, domain, webhook, activate]
+        options: [availability, provision-inspect, provision-reconcile, provision, preflight, initialize, inspect, plan-deploy, deploy, reconcile-deploy, pause, drain, freeze, thaw, classify-interruption, domain, webhook, activate]
         default: inspect
       source_run_id:
         description: Successful Worker CI for the exact current main
         required: true
+        type: string
+      active_run_id:
+        description: Exact reviewed active CI for a code or configuration update; omit only for initial deployment or an identical release
         type: string
       state_sha256:
         description: Exact predecessor from independent inspection; required for mutations
@@ -60,12 +63,15 @@ jobs:
           SUBS_BOT_CI_RUN_ID: ${{ inputs.source_run_id }}
           SUBS_BOT_CONTROL_ENVIRONMENT: ${{ inputs.target_environment == 'production' && 'subs-bot-production' || 'subs-bot-isolation' }}
           CONTROL_ACTION: ${{ inputs.action }}
+          CONTROL_ACTIVE_CI_RUN_ID: ${{ inputs.active_run_id }}
           CONTROL_STATE_SHA256: ${{ inputs.state_sha256 }}
           CONTROL_WEBHOOK_SHA256: ${{ inputs.webhook_sha256 }}
           CONTROL_RESOURCE: ${{ inputs.resource }}
           CONTROL_IDENTITY_SHA256: ${{ inputs.identity_sha256 }}
           SUBS_BOT_TARGET_JSON: ${{ secrets.SUBS_BOT_TARGET_JSON }}
           SUBS_BOT_CONTROL_SECRETS: ${{ secrets.SUBS_BOT_CONTROL_SECRETS }}
+          SUBS_BOT_ACTIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_ACTIVE_TARGET_JSON }}
+          SUBS_BOT_ACTIVE_CONTROL_SECRETS: ${{ secrets.SUBS_BOT_ACTIVE_CONTROL_SECRETS }}
           SUBS_BOT_APPROVAL_JSON: ${{ secrets.SUBS_BOT_APPROVAL_JSON }}
           SUBS_BOT_PROVISION_ANCHOR_JSON: ${{ secrets.SUBS_BOT_PROVISION_ANCHOR_JSON }}
           SUBS_BOT_CF_DATA_TOKEN: ${{ secrets.SUBS_BOT_CF_DATA_TOKEN }}

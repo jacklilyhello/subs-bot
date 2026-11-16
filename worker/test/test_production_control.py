@@ -46,6 +46,7 @@ def fixture():
 def approval(target, action, state):
     return {"schemaVersion": 1, "environment": target.environment, "targetSha256": target.digest,
         "configurationSha256": target.configuration_digest,
+        "controlRevision": REVISION,
         "revision": REVISION, "action": action, "stateSha256": state,
         "authorization": "approve " + action + " for " + target.data["workerName"]}
 
@@ -127,6 +128,7 @@ class StatefulAPI:
         if path == self.worker_path:
             return {"id": t["workerId"], "name": t["workerName"], "created_on": t["workerCreatedOn"],
                 "tags": ["subs-bot", "lifecycle-rehearsal"], "logpush": False, "tail_consumers": [],
+                "references": {"queues": [], "durable_objects": [], "dispatch_namespace_outbounds": [], "workers": []},
                 "observability": {"enabled": False}, "subdomain": {"enabled": True, "url": "https://" + t["hostname"]}}
         if path == self.script + "/schedules":
             return {"schedules": [{"cron": "* * * * *"}]}
@@ -316,7 +318,7 @@ class ProductionControllerTests(unittest.TestCase):
         self.assertEqual(self.api.initialization_mutations, 0)
         self.controller.initialize()
         before = self.controller.inspect()
-        for key in ("targetSha256", "configurationSha256", "revision", "action", "stateSha256", "authorization"):
+        for key in ("targetSha256", "configurationSha256", "controlRevision", "revision", "action", "stateSha256", "authorization"):
             envelope = approval(self.target, "thaw", before["stateSha256"])
             envelope[key] = "incorrect"
             with self.assertRaises(contract.ContractError):

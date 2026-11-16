@@ -170,15 +170,16 @@ def validate_target(raw, *, draft=False):
     return Target(value)
 
 
-def approve(target, envelope, action, revision, state_sha256):
+def approve(target, envelope, action, revision, state_sha256, *, control_revision=None):
     """Approval is supplied only by the selected protected workflow environment."""
     value = parsed(envelope) if isinstance(envelope, (str, bytes)) else envelope
-    require(isinstance(value, dict) and set(value) == {"schemaVersion", "environment", "targetSha256", "configurationSha256", "revision", "action", "stateSha256", "authorization"},
+    control_revision = revision if control_revision is None else control_revision
+    require(isinstance(value, dict) and set(value) == {"schemaVersion", "environment", "targetSha256", "configurationSha256", "revision", "controlRevision", "action", "stateSha256", "authorization"},
             "An action-specific approval envelope is required.")
     require(value == {"schemaVersion": 1, "environment": target.environment, "targetSha256": target.digest,
             "configurationSha256": target.configuration_digest,
-            "revision": revision, "action": action, "stateSha256": state_sha256,
+            "revision": revision, "controlRevision": control_revision, "action": action, "stateSha256": state_sha256,
             "authorization": "approve " + action + " for " + target.data["workerName"]},
             "Approval does not match this exact target, configuration, revision, action and predecessor state.")
-    require(matches(REV, revision) and matches(SHA, state_sha256))
+    require(matches(REV, revision) and matches(REV, control_revision) and matches(SHA, state_sha256))
     return True
