@@ -15,8 +15,10 @@ from secrets import token_hex
 import tempfile
 from time import monotonic, sleep, time
 from urllib.error import HTTPError
+from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
 
+from cloudflare_isolation import ISOLATION_RELEASE_USER_AGENT
 import d1_migrations as migrations
 import native_restore_rehearsal as native
 import prepare_isolation_artifact as artifact
@@ -105,19 +107,81 @@ def webhook_settings(info):
             "max_connections": info["max_connections"], "allowed_updates": sorted(updates)}
 
 
-def post_update(update, secret):
-    request = Request(ORIGIN + "/telegram/webhook", data=canonical(update), method="POST",
-        headers={"Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": secret})
+PROBE_CASES = {"closed-admission", "wrong-secret", "durable-help", "duplicate-update", "payload-conflict",
+    "member-admin-denial", "private-share", "paused-admission", "original-auth-before", "original-auth-after",
+    "fixture-get", "fixture-head", "revoked-get", "revoked-head"}
+
+
+class ProbeStatusError(OperationError):
+    def __init__(self, case, status, expected):
+        require(case in PROBE_CASES and type(status) is int and 100 <= status <= 599
+                and expected and all(type(value) is int and 100 <= value <= 599 for value in expected))
+        self.case, self.expected = case, tuple(expected)
+        super().__init__("Public probe did not match (case=%s; HTTP=%d; expected=%s); no retry performed."
+            % (case, status, ",".join(map(str, expected))), status=status)
+
+
+def expect_status(status, expected, case):
+    expected = (expected,) if type(expected) is int else tuple(expected)
+    if type(status) is not int or not 100 <= status <= 599:
+        raise OperationError("Public probe returned no valid numeric HTTP status; no retry performed.")
+    if status not in expected:
+        raise ProbeStatusError(case, status, expected)
+
+
+def public_request(url, *, method="GET", data=None, secret=None):
+    parts = urlsplit(url)
+    origin = parts.scheme + "://" + parts.netloc
+    require(origin in (ORIGIN, ORIGINAL_ORIGIN) and not parts.query and not parts.fragment)
+    headers = {"User-Agent": ISOLATION_RELEASE_USER_AGENT, "Accept-Encoding": "identity", "Cache-Control": "no-cache"}
+    if method == "POST":
+        require(parts.path == "/telegram/webhook" and isinstance(data, bytes)
+                and matches(r"[A-Za-z0-9_-]{1,256}", secret) and (origin != ORIGINAL_ORIGIN or data == b"{}"))
+        headers.update({"Accept": "application/json", "Content-Type": "application/json",
+            "X-Telegram-Bot-Api-Secret-Token": secret})
+    else:
+        require(method in ("GET", "HEAD") and origin == ORIGIN and data is None and secret is None
+                and matches(r"/sub/[A-Za-z0-9_-]{1,128}/base64", parts.path))
+        headers["Accept"] = "text/plain"
+    return Request(url, data=data, method=method, headers=headers)
+
+
+def public_readback(request, maximum, *, timeout=20):
+    require(type(maximum) is int and 0 < maximum <= 64 * 1024)
     try:
-        with build_opener(ProxyHandler({}), NoRedirect()).open(request, timeout=45) as response:
-            require(len(response.read(4097)) <= 4096, "Rehearsal response exceeded its bounded capacity.")
-            return response.status
-    except HTTPError as error:
-        status = error.code
-        error.close()
-        return status
+        try:
+            response = build_opener(ProxyHandler({}), NoRedirect()).open(request, timeout=timeout)
+        except HTTPError as error:
+            response = error
+        with response:
+            status = response.status
+            require(type(status) is int and 100 <= status <= 599, "Public probe returned no valid numeric HTTP status.")
+            body = response.read(maximum + 1)
+            if len(body) > maximum:
+                raise OperationError("Public probe exceeded its explicit capacity; no partial response is accepted.",
+                    uncertain=request.get_method() == "POST", status=status)
+            return status, body
     except (OSError, HTTPException):
-        raise OperationError("Rehearsal HTTP mutation is unconfirmed; do not resend it blindly.", uncertain=True) from None
+        raise OperationError("Public probe response is unconfirmed; no retry performed.", uncertain=request.get_method() == "POST") from None
+
+
+def safe_failure(error, phase):
+    require(phase in ("configure-webhook", "closed-admission", "activation", "synthetic-verification", "human-window",
+        "pause-and-freeze", "cleanup-pause", "cleanup-webhook", "cleanup-freeze"))
+    kind = "http-status" if isinstance(error, ProbeStatusError) else "stale-predecessor" if isinstance(error, StalePredecessorError) \
+        else "operation" if isinstance(error, OperationError) else "contract" if isinstance(error, ContractError) else "unexpected"
+    result = {"phase": phase, "kind": kind, "uncertain": bool(getattr(error, "uncertain", kind == "unexpected"))}
+    status = getattr(error, "http_status", None)
+    if type(status) is int and 100 <= status <= 599:
+        result["httpStatus"] = status
+    if isinstance(error, ProbeStatusError):
+        result.update(probe=error.case, expectedStatuses=list(error.expected))
+    return result
+
+
+def post_update(update, secret):
+    request = public_request(ORIGIN + "/telegram/webhook", data=canonical(update), method="POST", secret=secret)
+    return public_readback(request, 4096, timeout=45)[0]
 
 
 def probe_original_webhook(secret):
@@ -125,18 +189,8 @@ def probe_original_webhook(secret):
     The original handler authenticates first: 400 proves the secret, 401 rejects
     it. No genuine Telegram update or original-database write is submitted.
     """
-    request = Request(ORIGINAL_ORIGIN + "/telegram/webhook", data=b"{}", method="POST",
-        headers={"Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": secret})
-    try:
-        with build_opener(ProxyHandler({}), NoRedirect()).open(request, timeout=20) as response:
-            require(len(response.read(4097)) <= 4096)
-            return response.status
-    except HTTPError as error:
-        status = error.code
-        error.close()
-        return status
-    except (OSError, HTTPException):
-        raise OperationError("Original test webhook authentication could not be verified.", uncertain=True) from None
+    request = public_request(ORIGINAL_ORIGIN + "/telegram/webhook", data=b"{}", method="POST", secret=secret)
+    return public_readback(request, 4096)[0]
 
 
 def update_payload(update_id, actor, message_id, text, date):
@@ -168,6 +222,12 @@ class Drill:
         require(matches(r"0|[1-9][0-9]{0,2}", window) and int(window) <= 180,
                 "The explicit human observation window must be between zero and 180 seconds.")
         self.human_window = int(window)
+        self.baseline_checkpoint = env.get("DRILL_BASELINE_CHECKPOINT_ID", "")
+        self.baseline_manifest_sha = env.get("DRILL_BASELINE_MANIFEST_SHA256", "")
+        require(bool(self.baseline_checkpoint) == bool(self.baseline_manifest_sha)
+                and (not self.baseline_checkpoint or (matches(r"[0-9a-f]{32}", self.baseline_checkpoint)
+                    and matches(r"[0-9a-f]{64}", self.baseline_manifest_sha))),
+                "Explicit reused baseline pins must be paired and well formed.")
         self.guard = lambda: artifact.require_current_main(self.revision)
         self.controller = None
         self.transition_sequence = 0
@@ -398,7 +458,7 @@ class Drill:
         rewrite = current != before
         if not rewrite:
             probe = probe_original_webhook(self.previous["webhookSecret"])
-            require(probe in (400, 401), "Original webhook authentication returned an unexpected result; preserve the snapshot.")
+            expect_status(probe, (400, 401), "original-auth-before")
             rewrite = probe == 401
         if rewrite:
             telegram.call("setWebhook", {"url": before["url"], "secret_token": self.previous["webhookSecret"],
@@ -408,7 +468,7 @@ class Drill:
         require(after == before, "Original test webhook restoration was not confirmed; keep all recovery evidence.")
         if rewrite:
             probe = probe_original_webhook(self.previous["webhookSecret"])
-        require(probe == 400, "Original webhook secret was not independently confirmed; keep the private recovery snapshot.")
+        expect_status(probe, 400, "original-auth-after")
         return {"webhookRestored": True, "restoredSettingsSha256": digest(after), "dropPendingUpdates": False,
                 "originalWebhookAuthProbe": {"status": 400, "businessAccepted": False}}
 
@@ -436,25 +496,28 @@ class Drill:
         import production_recovery as recovery
         from production_release_evidence import verify_activation_baseline
         ctl = self.controller
-        proof, archive = self.code_archive()
-        checkpoint = token_hex(16)
-        name = "subs-bot-cf-restore-control-" + checkpoint[:16]
-        contract = {"version": 1, "checkpointId": checkpoint, "databaseName": name, "objectsName": name, "purpose": "baseline"}
         data_token = self.env["SUBS_BOT_CF_BOOTSTRAP_TOKEN"]
-        api = recovery.RecoveryAPI(ctl.target.data, data_token, ctl.worker, contract)
-        source = recovery.RecoverySource(api, ctl.target.data, ctl.bundle, ctl.manifest, ctl.inspect, ctl.guard)
-        source.archive_body, source.code_proof = archive, proof
-        journal = recovery.RecoveryJournal(api, self.run + "/" + self.attempt, guard=ctl.guard)
-        journal.load()
-        try:
-            with tempfile.TemporaryDirectory(prefix="lifecycle-activation-baseline-", dir=self.env["RUNNER_TEMP"]) as directory:
-                engine = recovery.RecoveryEngine(api, source, journal, Path(directory))
-                for action in ("prepare", "capture", "verify-backup"):
-                    result = recovery.run_action(action, engine)
-                    self.save("activation-baseline-" + action, result)
-            manifest_sha = result["backup"]["manifestSha256"]
-        finally:
-            journal.release()
+        if self.baseline_checkpoint:
+            checkpoint, manifest_sha = self.baseline_checkpoint, self.baseline_manifest_sha
+        else:
+            proof, archive = self.code_archive()
+            checkpoint = token_hex(16)
+            name = "subs-bot-cf-restore-control-" + checkpoint[:16]
+            contract = {"version": 1, "checkpointId": checkpoint, "databaseName": name, "objectsName": name, "purpose": "baseline"}
+            api = recovery.RecoveryAPI(ctl.target.data, data_token, ctl.worker, contract)
+            source = recovery.RecoverySource(api, ctl.target.data, ctl.bundle, ctl.manifest, ctl.inspect, ctl.guard)
+            source.archive_body, source.code_proof = archive, proof
+            journal = recovery.RecoveryJournal(api, self.run + "/" + self.attempt, guard=ctl.guard)
+            journal.load()
+            try:
+                with tempfile.TemporaryDirectory(prefix="lifecycle-activation-baseline-", dir=self.env["RUNNER_TEMP"]) as directory:
+                    engine = recovery.RecoveryEngine(api, source, journal, Path(directory))
+                    for action in ("prepare", "capture", "verify-backup"):
+                        result = recovery.run_action(action, engine)
+                        self.save("activation-baseline-" + action, result)
+                manifest_sha = result["backup"]["manifestSha256"]
+            finally:
+                journal.release()
         ctl.activation_baseline_checker = lambda: verify_activation_baseline(ctl, data_token, checkpoint, manifest_sha)
         verified = ctl.activation_baseline_checker()
         require(isinstance(verified, dict) and verified.get("baselineVerified") is True
@@ -465,19 +528,23 @@ class Drill:
                 "The independent activation baseline proof did not verify exactly.")
         self.report["activationBaseline"] = {"checkpointId": checkpoint, "manifestSha256": manifest_sha,
             "targetSha256": ctl.target.digest, "verification": verified}
-        self.save("activation-baseline-verified", self.report["activationBaseline"])
+        self.report["baselineReused"] = bool(self.baseline_checkpoint)
+        self.save("activation-baseline-reused-verified" if self.baseline_checkpoint else "activation-baseline-verified",
+            self.report["activationBaseline"])
 
     def exercise(self):
         bundle, manifest = self.prepare(active=True)
         ctl = self.bind(self.registration(), bundle, manifest)
         baseline = ctl.inspect()
+        self.report.update(state=baseline, ciProof=self.proof)
         require(baseline["control"]["admission"] == "closed" and baseline["control"]["workers"] == "frozen"
                 and not any(baseline["work"].values()))
         ctl.verify_domain()
-        self.transition("thaw")
-        self.transition("pause")
-        self.quiet()
-        self.transition("freeze")
+        if not self.baseline_checkpoint:
+            self.transition("thaw")
+            self.transition("pause")
+            self.quiet()
+            self.transition("freeze")
         self.activation_baseline()
         reply_anchors = self.anchors()
         before_hook = ctl.telegram.call("getWebhookInfo")
@@ -490,6 +557,8 @@ class Drill:
         self.store.put(self.snapshot_key(), canonical(snapshot))
         self.report.update(webhookCheckpoint=self.run + "/" + self.attempt, webhookSnapshotSha256=digest(snapshot))
         changed = False
+        primary_error = None
+        phase = "configure-webhook"
         try:
             configured = ctl.telegram.configure(digest(before_hook))
             changed = True
@@ -499,28 +568,31 @@ class Drill:
             base = 7_000_000_000_000_000 + (int(self.run) % 1_000_000_000) * 1000 + int(self.attempt) * 100
             admin, member = self.previous["adminId"], self.previous["memberId"]
             help_update = update_payload(base + 1, admin, reply_anchors["admin"], "/help", now - 5)
-            require(post_update(help_update, self.secrets["webhookSecret"]) == 503, "Closed deployment accepted new work.")
+            phase = "closed-admission"
+            expect_status(post_update(help_update, self.secrets["webhookSecret"]), 503, "closed-admission")
+            phase = "activation"
             active = self.transition("activate")
             self.save("activated", active)
-            require(post_update(help_update, "incorrect-lifecycle-fixture-secret") == 401, "Wrong-secret request was not rejected.")
-            require(post_update(help_update, self.secrets["webhookSecret"]) == 200, "The synthetic help update was not durably accepted.")
+            phase = "synthetic-verification"
+            expect_status(post_update(help_update, "incorrect-lifecycle-fixture-secret"), 401, "wrong-secret")
+            expect_status(post_update(help_update, self.secrets["webhookSecret"]), 200, "durable-help")
             self.quiet()
             before_duplicate = one(ctl.data, ctl.database, "SELECT count(*) AS n FROM telegram_inbox")["n"]
-            require(post_update(help_update, self.secrets["webhookSecret"]) == 200)
+            expect_status(post_update(help_update, self.secrets["webhookSecret"]), 200, "duplicate-update")
             require(one(ctl.data, ctl.database, "SELECT count(*) AS n FROM telegram_inbox")["n"] == before_duplicate,
                     "A repeated update created another business receipt.")
             conflict = deepcopy(help_update)
             conflict["message"]["text"] = "/list"
             conflict["message"]["entities"][0]["length"] = 5
-            require(post_update(conflict, self.secrets["webhookSecret"]) == 409, "Changed content reused a durable update identity.")
+            expect_status(post_update(conflict, self.secrets["webhookSecret"]), 409, "payload-conflict")
             denied = update_payload(base + 2, member, reply_anchors["member"], "/auth remove " + admin, now - 5)
             actor_before = rows(ctl.data, ctl.database, "SELECT * FROM telegram_general_actors ORDER BY actor_id,revision")
-            require(post_update(denied, self.secrets["webhookSecret"]) == 204, "A member administrator operation was not rejected.")
+            expect_status(post_update(denied, self.secrets["webhookSecret"]), 204, "member-admin-denial")
             require(rows(ctl.data, ctl.database, "SELECT * FROM telegram_general_actors ORDER BY actor_id,revision") == actor_before,
                     "A denied operation changed authorization records.")
             share_text = "/share s1440 x1 id" + member + " -- Lifecycle control fixture " + self.run + "-" + self.attempt
             shared = update_payload(base + 3, admin, reply_anchors["admin"], share_text, now - 5)
-            require(post_update(shared, self.secrets["webhookSecret"]) == 200, "The private object fixture was not accepted.")
+            expect_status(post_update(shared, self.secrets["webhookSecret"]), 200, "private-share")
             self.quiet()
             private = rows(ctl.data, ctl.database, f"SELECT creation.payload_id,creation.payload_sha256,creation.state FROM telegram_private_share_creations AS creation "
                 f"JOIN telegram_inbox USING(receipt_id) WHERE telegram_inbox.update_id={base + 3}")
@@ -535,6 +607,7 @@ class Drill:
             require(len(states) == 2 and all(r["state"] == "sent" for r in states),
                     "Synthetic replies did not both reach a confirmed sent terminal state.")
             if self.human_window:
+                phase = "human-window"
                 window = {"stage": "human-window-open", "targetSha256": ctl.target.digest,
                     "deadlineEpoch": int(time()) + self.human_window, "seconds": self.human_window,
                     "humanPassed": "not-evaluated-by-runner"}
@@ -542,9 +615,10 @@ class Drill:
                 self.report.update(humanWindowOpened=True, humanAcceptance="requires-independent-IAB-evidence")
                 print(json.dumps(window, sort_keys=True), flush=True)
                 sleep(self.human_window)
+            phase = "pause-and-freeze"
             self.transition("pause")
             paused = update_payload(base + 4, member, reply_anchors["member"], "/help", now - 5)
-            require(post_update(paused, self.secrets["webhookSecret"]) == 503, "Pause did not stop admission.")
+            expect_status(post_update(paused, self.secrets["webhookSecret"]), 503, "paused-admission")
             self.quiet()
             frozen = self.transition("freeze")
             final_states = rows(ctl.data, ctl.database, f"SELECT inbox.update_id,outbox.state,outbox.attempts FROM telegram_inbox AS inbox "
@@ -557,28 +631,48 @@ class Drill:
                 wrongSecretRejected=True, conflictingPayloadRejected=True, memberAdminDenied=True,
                 closedAdmissionRejected=True, pausedAdmissionRejected=True, referencedObjectCount=1,
                 referencedObjectSha256=sha256(body).hexdigest(), state=frozen, ciProof=self.proof)
+        except Exception as error:
+            primary_error = error
+            self.report["primaryFailure"] = safe_failure(error, phase)
+            raise
         finally:
-            # Read back even if setWebhook's response was lost; ownership determines
-            # whether restoration is safe. No pending updates are dropped.
-            pause_error = None
             try:
-                if changed:
-                    current = ctl.inspect()
-                    if current["control"]["admission"] != "closed":
-                        self.transition("pause")
+                self.cleanup_exercise(changed)
+            except Exception:
+                if primary_error is not None:
+                    raise primary_error from None
+                raise
+
+    def cleanup_exercise(self, changed):
+        # Always attempt restoration, including a lost setWebhook response or a
+        # pause failure. A cleanup failure must not hide the primary probe result.
+        ctl, errors = self.controller, []
+        def attempt(phase, action):
+            try:
+                action()
             except Exception as error:
-                pause_error = error
-            finally:
-                self.report["webhookRecovery"] = self.restore_webhook(automatic=True)
-                if "originalWebhookAuthProbe" in self.report["webhookRecovery"]:
-                    self.report["originalWebhookAuthProbe"] = self.report["webhookRecovery"]["originalWebhookAuthProbe"]
-            if pause_error is not None:
-                raise pause_error
-            if changed:
-                self.quiet()
-                current = ctl.inspect()
-                if current["control"]["workers"] != "frozen":
-                    self.transition("freeze")
+                self.report.setdefault("cleanupFailures", []).append(safe_failure(error, phase))
+                errors.append(error)
+        def pause():
+            current = ctl.inspect()
+            if current["control"]["admission"] != "closed":
+                self.transition("pause")
+        def restore():
+            self.report["webhookRecovery"] = self.restore_webhook(automatic=True)
+            if "originalWebhookAuthProbe" in self.report["webhookRecovery"]:
+                self.report["originalWebhookAuthProbe"] = self.report["webhookRecovery"]["originalWebhookAuthProbe"]
+        def freeze():
+            self.quiet()
+            current = ctl.inspect()
+            if current["control"]["workers"] != "frozen":
+                self.transition("freeze")
+        if changed:
+            attempt("cleanup-pause", pause)
+        attempt("cleanup-webhook", restore)
+        if changed:
+            attempt("cleanup-freeze", freeze)
+        if errors:
+            raise errors[0] from None
 
     def inspect(self):
         bundle, manifest = self.prepare(active=True)
@@ -641,23 +735,19 @@ class Drill:
         ctl = self.bind(self.registration(), bundle, manifest)
         result = seed_fixture(ctl, bundle, manifest, self.env["SUBS_BOT_CF_BOOTSTRAP_TOKEN"])
         snapshot = manifest["snapshots"][0]
-        opener = build_opener(ProxyHandler({}), NoRedirect())
         url = ORIGIN + "/sub/" + snapshot["token"] + "/base64"
-        status, _, body = native._response(opener, Request(url, headers={"Cache-Control": "no-cache"}), 64 * 1024)
-        require(status == 200 and len(body) == snapshot["bodyBytes"] and sha256(body).hexdigest() == snapshot["bodySha256"],
+        status, body = public_readback(public_request(url), 64 * 1024)
+        expect_status(status, 200, "fixture-get")
+        require(len(body) == snapshot["bodyBytes"] and sha256(body).hexdigest() == snapshot["bodySha256"],
                 "The actual deployed synthetic three-node export differs from its verified CI bytes.")
-        status, _, body = native._response(opener, Request(url, method="HEAD", headers={"Cache-Control": "no-cache"}), 1024)
-        require(status == 200 and body == b"", "The actual deployed fixture HEAD readback failed.")
+        status, body = public_readback(public_request(url, method="HEAD"), 1024)
+        expect_status(status, 200, "fixture-head")
+        require(body == b"", "The actual deployed fixture HEAD readback failed.")
         denied = 0
         for method in ("GET", "HEAD"):
-            try:
-                with opener.open(Request(ORIGIN + "/sub/" + REVOKED_TOKEN + "/base64", method=method,
-                    headers={"Cache-Control": "no-cache"}), timeout=20) as response:
-                    response.read(4097)
-            except HTTPError as error:
-                require(error.code == 404, "The synthetic trashed token did not retain its expected denial.")
-                error.close()
-                denied += 1
+            status, _ = public_readback(public_request(ORIGIN + "/sub/" + REVOKED_TOKEN + "/base64", method=method), 4096)
+            expect_status(status, 404, "revoked-" + method.lower())
+            denied += 1
         require(denied == 2, "A synthetic revoked-token request unexpectedly succeeded.")
         result.update(publicPositiveExports=2, publicRevokedDenials=denied)
         self.save("synthetic-export-fixture", result)

@@ -353,8 +353,10 @@ class LifecycleDrillTests(unittest.TestCase):
         self.assertEqual([call.args[0] for call in telegram.call.call_args_list].count("setWebhook"), 1)
         telegram.reset_mock()
         with patch.object(drill, "Telegram", return_value=telegram), patch.object(drill, "probe_original_webhook", return_value=503):
-            with self.assertRaises(contract.ContractError):
+            with self.assertRaises(drill.ProbeStatusError) as caught:
                 tool.restore_webhook(automatic=True)
+        self.assertEqual(caught.exception.http_status, 503)
+        self.assertEqual(caught.exception.expected, (400, 401))
         self.assertNotIn("setWebhook", [call.args[0] for call in telegram.call.call_args_list])
 
     def test_other_current_webhook_or_wrong_snapshot_is_never_overwritten(self):

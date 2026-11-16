@@ -35,6 +35,14 @@ on:
         type: number
         default: 0
         required: false
+      baseline_checkpoint_id:
+        description: Optional explicit sealed G0 to reverify and reuse without a new capture
+        type: string
+        required: false
+      baseline_manifest_sha256:
+        description: Exact independent digest paired with the reused G0 checkpoint
+        type: string
+        required: false
       webhook_checkpoint:
         description: Interrupted exercise run-id/attempt for explicit webhook recovery
         type: string
@@ -67,6 +75,8 @@ jobs:
       DRILL_ADMIN_MESSAGE_ID: ${{ inputs.admin_message_id }}
       DRILL_MEMBER_MESSAGE_ID: ${{ inputs.member_message_id }}
       DRILL_HUMAN_WINDOW_SECONDS: ${{ inputs.human_window_seconds }}
+      DRILL_BASELINE_CHECKPOINT_ID: ${{ inputs.baseline_checkpoint_id }}
+      DRILL_BASELINE_MANIFEST_SHA256: ${{ inputs.baseline_manifest_sha256 }}
       DRILL_WEBHOOK_CHECKPOINT: ${{ inputs.webhook_checkpoint }}
       DRILL_WEBHOOK_SNAPSHOT_SHA256: ${{ inputs.webhook_snapshot_sha256 }}
     steps:
