@@ -49,7 +49,7 @@
 6. **封存上线前基线。** 独立 `inspect` 核对实际配置、结构和分类状态，以恢复工作流 `prepare → capture → verify-backup` 保存初始化 G0。资料包含 D1、R2 引用闭包、完整配置及摘要、原始准确 CI ZIP 和来源证明；不包含原始 Secret。已有隔离恢复证据不等于允许覆盖生产 D1。
 7. **绑定正式域名。** 生命周期 `domain` 仅在准确 Zone、DNS／Custom Domain 无冲突时将 `subs-bot.lilyya.top` 绑定到唯一目标，读回 HTTPS、健康提交及响应安全策略。生产 workers.dev／预览保持关闭，Telegram 接收仍关闭。
 8. **设置唯一正式 Webhook。** 用独立 `getWebhookInfo` 摘要批准 `webhook`；工具重新核对 `getMe`，设置准确 URL、Secret、allowed_updates 和 max_connections，显式 `drop_pending_updates: false`，并独立读回。没有旧消费者需要停止。若出现意外积压，先分类其来源、授权和有效期，不用清队列、高 offset 或 `cutoverAt=now` 隐去更新；首次批准策略与主体生效下界为 1，业务时效拒绝／忽略也须持久记录。结果不明只读核对，不启动第二消费者试探。
-9. **最终激活。** 单独批准 `activate`：必须同时满足准确资源、目标身份／完整配置摘要、版本、Webhook、域名、分类排空及未知结果检查，才能打开 admission。Webhook 是当前唯一可写公开 HTTP，其他公开路径仅 GET/HEAD，目前没有 queue handler；Cron 使用同一持久 invocation 与 D1 fence。持久受理／disposition 后才确认，重复 `(bot_id, update_id)` 核对载荷摘要并复用完成结果，处理中或外部结果不确定的更新不能重执行业务。封存首次 receipt／任务水位。
+9. **最终激活。** 先以 G0 的 `baseline_checkpoint_id`、`baseline_manifest_sha256` 执行 `plan-activate`；工具完整读回 SQL／R2／原始 CI 闭包并与当前 frozen 现场核对。以包含该基线的前态单独批准 `activate`，再次核对后直接从 frozen 原子开启，不先 thaw。任何新写入、epoch、版本或配置变化均需重新封存并批准。准确资源、身份／配置、Webhook、域名、分类排空及未知结果检查也必须通过。Webhook 是当前唯一可写公开 HTTP，其他公开路径仅 GET/HEAD，目前没有 queue handler；Cron 使用同一持久 invocation 与 D1 fence。持久受理／disposition 后才确认，重复 `(bot_id, update_id)` 核对载荷摘要并复用完成结果，处理中或外部结果不确定的更新不能重执行业务。封存首次 receipt／任务水位。
 10. **限定验收并结束窗口。** 使用生产授权中指定的账号/群验证必要角色权限、导入/读取/导出、后台任务及撤销；新增夹具可识别，结束恢复修改的设置并退役本次夹具。固定准确版本、观察时间、错误/任务/不确定发送计数和新 checkpoint。原测试 Bot 的真人授权不能自动扩大到正式 Bot。
 
 ### 工作流与实际操作参数
@@ -62,7 +62,7 @@ gh workflow run worker-production-control.yml --ref main \
   -f source_run_id=EXACT_SUCCESSFUL_MAIN_WORKER_CI
 ```
 
-同一工作流后续调用以 `-f action=initialize`、`deploy`、`domain`、`webhook`、`activate` 逐步执行，并为 mutation 提供 `-f state_sha256=EXACT_INDEPENDENT_PREDECESSOR`；Webhook 另传 `-f webhook_sha256=EXACT_GETWEBHOOKINFO_DIGEST`。批准绑定固定 `targetSha256`、完整 `configurationSha256`、应用 `revision`、当前工具 `controlRevision`、action 和前态。全部正式字段及 Secret 名见 [集中配置与批准清单](cloudflare-production-controls.md#集中的正式配置与批准清单)。
+同一工作流后续调用以 `-f action=initialize`、`deploy`、`domain`、`webhook`、`plan-activate`、`activate` 逐步执行，并为 mutation 提供 `-f state_sha256=EXACT_INDEPENDENT_PREDECESSOR`；Webhook 另传 `-f webhook_sha256=EXACT_GETWEBHOOKINFO_DIGEST`；plan-activate／activate 另传准确 `-f baseline_checkpoint_id=SEALED_G0_ID -f baseline_manifest_sha256=INDEPENDENT_G0_DIGEST`。批准绑定固定 `targetSha256`、完整 `configurationSha256`、应用 `revision`、当前工具 `controlRevision`、action 和前态。Actions 资料过期后的私有归档参数与全部正式字段、Secret 名见 [生命周期说明](cloudflare-production-controls.md)。
 
 ```sh
 gh workflow run worker-production-recovery.yml --ref main \
