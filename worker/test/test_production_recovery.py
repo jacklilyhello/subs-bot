@@ -117,11 +117,55 @@ class APITests(unittest.TestCase):
             if path.endswith("/workers/scripts"):
                 return []
             if path.endswith("/environments"):
-                return [{"environment": "staging"}]
+                return {"id": "consumer", "default_environment": {"environment": "staging"},
+                        "environments": [{"environment": "staging"}]}
             return {"bindings": [{"type": "r2_bucket", "bucket_name": self.api.names["objects"]}]}
         self.api.worker_api = worker
         with self.assertRaises(recovery.RecoveryError):
             self.api.consumer_proof()
+
+    def test_real_service_wrapper_scans_every_environment_including_the_default(self):
+        reads = []
+        def worker(_method, path):
+            reads.append(path)
+            if path.endswith("/workers/services"):
+                return [{"id": "consumer"}]
+            if path.endswith("/workers/scripts"):
+                return []
+            if path.endswith("/environments"):
+                return {"id": "consumer", "created_on": STAMP, "modified_on": STAMP, "usage_model": "standard",
+                        "default_environment": {"environment": "production", "script": {"id": "consumer"}},
+                        "environments": [{"environment": "production"}, {"environment": "staging"}]}
+            return {"bindings": []}
+        self.api.worker_api = worker
+        result = self.api.consumer_proof()
+        self.assertEqual(result["checked"], 2)
+        self.assertEqual(result["consumers"], 0)
+        self.assertTrue(any(path.endswith("/environments/production/settings") for path in reads))
+        self.assertTrue(any(path.endswith("/environments/staging/settings") for path in reads))
+        self.assertEqual(set(result), {"checked", "inventorySha256", "consumers"})
+
+    def test_incomplete_wrong_identity_or_unknown_environment_wrappers_are_rejected(self):
+        valid = {"id": "consumer", "default_environment": {"environment": "production"},
+                 "environments": [{"environment": "production"}]}
+        cases = [[], {**valid, "id": "foreign"}, {**valid, "environments": []},
+            {**valid, "environments": [{"environment": "staging"}]},
+            {**valid, "environments": valid["environments"] * 2},
+            {**valid, "default_environment": None}, {**valid, "cursor": "unread-page"},
+            {**valid, "environments": [{"environment": "production"}] * recovery.MAX_ENVIRONMENTS}]
+        for wrapper in cases:
+            def worker(_method, path):
+                if path.endswith("/workers/services"):
+                    return [{"id": "consumer"}]
+                if path.endswith("/workers/scripts"):
+                    return []
+                if path.endswith("/environments"):
+                    return deepcopy(wrapper)
+                return {"bindings": []}
+            self.api.worker_api = worker
+            with self.subTest(wrapper=wrapper), self.assertRaises(recovery.RecoveryError):
+                self.api.consumer_proof()
+            self.assertEqual(self.api.consumer_stage, "service-environments")
 
     def test_bounded_consumer_inventory_fails_instead_of_truncating(self):
         self.api.worker_api = Mock(return_value=[{"id": "worker"}] * recovery.MAX_CONSUMERS)

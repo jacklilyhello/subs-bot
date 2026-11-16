@@ -769,7 +769,8 @@ class Drill:
             nonlocal generation
             generation += 1
             self.save("recovery-stage-" + str(generation).zfill(3), value)
-        recovered = run_recovery_drill(ctl, archive, proof, self.env["SUBS_BOT_CF_BOOTSTRAP_TOKEN"], evidence=evidence)
+        recovered = run_recovery_drill(ctl, archive, proof, self.env["SUBS_BOT_CF_BOOTSTRAP_TOKEN"], evidence=evidence,
+                                      resume=self.env.get("DRILL_RECOVERY_RESUME_JSON", ""))
         require(recovered.get("status") == "recovery-verified-http-pending"
                 and recovered.get("newWritesPreservedInG1") is True,
                 "Recovery cannot finish before the independent no-egress HTTP stages.")
