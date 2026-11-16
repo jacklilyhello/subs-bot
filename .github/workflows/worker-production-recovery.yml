@@ -1,0 +1,125 @@
+name: Control production-aware D1 and R2 recovery
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Explicit protected identity; rehearsal never falls back to the existing test deployment
+        type: choice
+        options: [rehearsal, production]
+        default: rehearsal
+        required: true
+      action:
+        description: One protected checkpoint; no source data mutation or consumer switch
+        type: choice
+        options: [inspect, prepare, prepare-restore, create-database, create-objects, pin-resource, capture, poll-export, restore-objects, start-import, verify-backup, verify-restore]
+        default: inspect
+        required: true
+      source_run_id:
+        description: Successful exact frozen source main CI; omit only with private source manifest digest
+        type: string
+      source_run_attempt:
+        description: Exact source CI attempt
+        type: string
+        default: '1'
+      source_manifest_sha256:
+        description: Optional sealed private checkpoint manifest; loads original CI ZIP from R2 only
+        type: string
+      current_run_id:
+        description: Current frozen onsite CI; empty uses sealed G1 code or the source CI
+        type: string
+      current_run_attempt:
+        description: Exact successful current-site CI attempt
+        type: string
+        default: '1'
+      state_sha256:
+        description: Exact source inspect predecessor for every mutation
+        type: string
+      resource:
+        description: Resource to reconcile only after an unacknowledged create
+        type: choice
+        options: [database, objects]
+        default: database
+      identity_sha256:
+        description: Independently verified resource identity digest for pin-resource only
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: subs-bot-lifecycle-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  recovery:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
+    environment: ${{ inputs.environment == 'production' && 'subs-bot-production' || 'subs-bot-isolation' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11.18'
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: inputs.action == 'verify-restore'
+        with:
+          node-version: '24'
+      - name: Install locked hosted replay dependencies before reading private data
+        if: inputs.action == 'verify-restore'
+        working-directory: worker
+        run: npm ci --ignore-scripts
+      - name: Verify identities and execute one production-aware checkpoint
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CONTROL_ENVIRONMENT: ${{ inputs.environment == 'production' && 'subs-bot-production' || 'subs-bot-isolation' }}
+          SUBS_BOT_TARGET_JSON: ${{ secrets.SUBS_BOT_TARGET_JSON }}
+          SUBS_BOT_CONTROL_SECRETS: ${{ secrets.SUBS_BOT_CONTROL_SECRETS }}
+          SUBS_BOT_CF_DATA_TOKEN: ${{ secrets.SUBS_BOT_CF_DATA_TOKEN }}
+          SUBS_BOT_CF_WORKER_TOKEN: ${{ secrets.SUBS_BOT_CF_WORKER_TOKEN }}
+          SUBS_BOT_CF_DEPENDENCY_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPENDENCY_READ_TOKEN }}
+          SUBS_BOT_APPROVAL_JSON: ${{ secrets.SUBS_BOT_APPROVAL_JSON }}
+          SUBS_BOT_RECOVERY_JSON: ${{ secrets.SUBS_BOT_RECOVERY_JSON }}
+          RECOVERY_ACTION: ${{ inputs.action }}
+          SUBS_BOT_CI_RUN_ID: ${{ inputs.source_run_id }}
+          SUBS_BOT_CI_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
+          RECOVERY_SOURCE_MANIFEST_SHA256: ${{ inputs.source_manifest_sha256 }}
+          RECOVERY_CURRENT_CI_RUN_ID: ${{ inputs.current_run_id }}
+          RECOVERY_CURRENT_CI_RUN_ATTEMPT: ${{ inputs.current_run_attempt }}
+          RECOVERY_STATE_SHA256: ${{ inputs.state_sha256 }}
+          RECOVERY_RESOURCE: ${{ inputs.resource }}
+          RECOVERY_IDENTITY_SHA256: ${{ inputs.identity_sha256 }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          python3 -B worker/tools/production_recovery_cli.py
+      - name: Replay the restored production identity and links without outbound access
+        if: inputs.action == 'verify-restore'
+        working-directory: worker
+        run: |
+          validation="$RUNNER_TEMP/production-restored-links"
+          module="$RUNNER_TEMP/production-restored-module"
+          sandbox="$(mktemp -d)"
+          trap 'rm -rf -- "$validation" "$module" "$sandbox"' EXIT
+          sudo -n unshare --net -- bash -euc '
+            ip link set dev lo up
+            umask 077
+            ulimit -c 0
+            exec setpriv --reuid="$1" --regid="$2" --clear-groups --no-new-privs -- \
+              env -i PATH=/usr/bin:/bin HOME="$3" TMPDIR="$3" \
+              "$4" tools/production-restored-links.ts "$5" "$6" "$7"
+          ' -- "$(id -u)" "$(id -g)" "$sandbox" "$(command -v node)" "$validation" \
+            "$module" "$RUNNER_TEMP/production-restored-links-result.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: subs-bot-production-recovery-${{ inputs.environment }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/production-recovery-result.json
+            ${{ runner.temp }}/production-restored-links-result.json
+          if-no-files-found: error
+          retention-days: 7
