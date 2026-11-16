@@ -2,7 +2,8 @@ import { AggregateLimitError, getAggregateNodeSource } from "./aggregate.ts";
 import { normalShortLinksReady, readShortLinkNamespaces, resolveShortLocation } from "./short-links.ts";
 import { parsePublicOrigin, type PublicOrigin } from "./public-origin.ts";
 import { beginProductionInvocation, fenceProductionDatabase, finishProductionInvocation,
-  readProductionControl } from "./production-control.ts";
+  productionUpdateDigest, readProductionControl, readProductionUpdate,
+  reserveProductionUpdate, settleProductionUpdate } from "./production-control.ts";
 import { getSubscriptionNodeSource, PathRuleContentError } from "./path-rules.ts";
 import { legacyEmptyExportResponse, legacyEmptyExportState } from "./legacy-empty-export.ts";
 import { base64Chunks, ExportContentError, planBase64 } from "./base64-response.ts";
@@ -722,6 +723,11 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
     if (new URL(request.url).protocol !== "https:") return plain("Not found.", 404, false);
     const authenticated = await readTelegramUpdate(request.clone(), general.webhookSecret);
     if (authenticated.status !== 200) return new Response(null, { status: authenticated.status, headers: HEADERS });
+    const payloadSha256 = await productionUpdateDigest(authenticated.update);
+    const disposition = await readProductionUpdate(env.DB, control, authenticated.updateId);
+    if (disposition && disposition.payloadSha256 !== payloadSha256) return plain("Update identity conflict.", 409, false);
+    if (disposition?.state === "completed") return new Response(null, { status: disposition.httpStatus!, headers: HEADERS });
+    if (disposition?.state === "processing" || disposition?.state === "uncertain") return plain("Service unavailable.", 503, false);
     if (control.admission !== "open" || control.workers !== "run") return plain("Service unavailable.", 503, false);
     const invocation = await beginProductionInvocation(env.DB, control, "webhook");
     const admissionEnv = { ...env, DB: fenceProductionDatabase(env.DB, invocation) };
@@ -734,7 +740,10 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
     let response: Response;
     let complete = true;
     try {
-      response = await generalTelegramWebhook(request, admissionEnv, origin, general, trackedContext, workEnv);
+      if (await reserveProductionUpdate(env.DB, invocation, authenticated.updateId, payloadSha256)) {
+        response = await generalTelegramWebhook(request, admissionEnv, origin, general, trackedContext, workEnv);
+        await settleProductionUpdate(env.DB, invocation, authenticated.updateId, payloadSha256, response.status);
+      } else response = plain("Service unavailable.", 503, false);
     } catch {
       complete = false;
       response = plain("Service unavailable.", 503, false);
