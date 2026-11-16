@@ -10,8 +10,22 @@ export const SERVICE = "subs-bot-provider-fetch-dev-01";
 export const API_STATUS_SERVICE = "subs-bot-provider-api-status-dev-01";
 export const SINGLETON = "provider-fetch-v1";
 export { REVISION };
-const IMAGE = /^registry\.cloudflare\.com\/[0-9a-f]{32}\/(subs-bot-provider-fetch-dev-01|subs-bot-provider-api-status-dev-01)@sha256:[0-9a-f]{64}(?![\s\S])/u;
+const IMAGE = /^registry\.cloudflare\.com\/([0-9a-f]{32})\/(subs-bot-provider-fetch-dev-01|subs-bot-provider-api-status-dev-01|subs-bot-provider-fetch-prod-01|subs-bot-provider-fetch-control-drill-01)@sha256:[0-9a-f]{64}(?![\s\S])/u;
 type ProviderService = typeof SERVICE | typeof API_STATUS_SERVICE;
+export interface ProviderRuntimeTarget { accountId: string; service: string }
+
+/** Production and its dedicated rehearsal are explicit identities, never a dev fallback. */
+export function readProviderRuntimeTarget(raw: unknown): ProviderRuntimeTarget | null {
+  if (typeof raw !== "string" || raw.length > 512) return null;
+  try {
+    const value = JSON.parse(raw) as Record<string, unknown>;
+    if (!isRecord(value) || Object.keys(value).length !== 3 || typeof value.accountId !== "string"
+      || !/^[0-9a-f]{32}(?![\s\S])/u.test(value.accountId)
+      || !((value.environment === "production" && value.service === "subs-bot-provider-fetch-prod-01")
+        || (value.environment === "rehearsal" && value.service === "subs-bot-provider-fetch-control-drill-01"))) return null;
+    return { accountId: value.accountId, service: value.service as string };
+  } catch { return null; }
+}
 const IDLE_MS = 30_000;
 const START_MS = 30_000;
 const FETCH_MS = 28_000;
@@ -238,8 +252,9 @@ function post(port: Fetcher, path: "/v1/edge-proof" | "/v1/fetch" | "/v1/api-sta
 
 async function withPinnedContainer<T>(
   container: Container, revision: string, use: (port: Fetcher, image: string) => Promise<T>,
-  { service = SERVICE, imageSha256, startupDeadline }: {
+  { service = SERVICE, target, imageSha256, startupDeadline }: {
     service?: ProviderService;
+    target?: ProviderRuntimeTarget;
     imageSha256?: string;
     startupDeadline?: number;
   } = {},
@@ -248,7 +263,9 @@ async function withPinnedContainer<T>(
   let started = false;
   try {
     const image = container.images.provider;
-    requireResult(REVISION.test(revision) && typeof image === "string" && IMAGE.exec(image)?.[1] === service && !container.running,
+    const identity = typeof image === "string" ? IMAGE.exec(image) : null;
+    requireResult(REVISION.test(revision) && identity !== null && identity[2] === (target?.service ?? service)
+      && (target === undefined || identity[1] === target.accountId) && !container.running,
       "The provider container image or stopped state differs.");
     requireResult(imageSha256 === undefined || image.endsWith(`@sha256:${imageSha256}`),
       "The provider container image does not match the caller's pin.");
@@ -344,10 +361,11 @@ async function fetchPort(port: Fetcher, payload: string): Promise<ProviderFetchR
   }
 }
 
-export async function fetchPinnedProvider(container: Container, revision: string, payload: string, imageSha256: string): Promise<ProviderFetchResult> {
+export async function fetchPinnedProvider(container: Container, revision: string, payload: string, imageSha256: string,
+  target?: ProviderRuntimeTarget): Promise<ProviderFetchResult> {
   try {
     if (typeof imageSha256 !== "string" || !SHA256.test(imageSha256)) return providerFailure("invalid-request");
-    return await withPinnedContainer(container, revision, (port) => fetchPort(port, payload), { imageSha256 });
+    return await withPinnedContainer(container, revision, (port) => fetchPort(port, payload), { imageSha256, target });
   } catch {
     return providerFailure("unavailable");
   }
@@ -445,4 +463,25 @@ export async function exercise(container: Container, revision: string, isolatedR
       throw new ProviderProbeError(stage);
     }
   }, { service });
+}
+
+/** Exercise the deployed production code path with an explicitly approved public health fixture. */
+export async function exerciseProviderRelease(container: Container, revision: string, imageSha256: string,
+  target: ProviderRuntimeTarget, healthUrl: string, healthRevision: string, healthSha256: string) {
+  requireResult(/^https:\/\/[a-z0-9.-]+\/health(?![\s\S])/u.test(healthUrl)
+    && REVISION.test(healthRevision) && SHA256.test(healthSha256), "Provider health fixture is invalid.");
+  return withPinnedContainer(container, revision, async (port) => {
+    const positive = await fetchPort(port, JSON.stringify({ url: healthUrl }));
+    requireResult(positive.ok && positive.bodySha256 === healthSha256, "Provider health fixture digest differs.");
+    if (!positive.ok) throw new ProviderProbeError("edge");
+    const value = json(new Uint8Array(positive.body));
+    requireResult(isRecord(value) && Object.keys(value).length === 3 && value.ok === true
+      && value.service === "subs-bot" && value.revision === healthRevision, "Provider health revision differs.");
+    for (const url of BLOCKED) {
+      const result = await fetchPort(port, JSON.stringify({ url }));
+      requireResult(!result.ok && result.code === "blocked-address", "Provider private-address denial failed.");
+    }
+    return { ok: true, stopped: true, revision, imageSha256, healthRevision, healthSha256,
+      healthBytes: positive.body.byteLength, blockedPrivateTargets: BLOCKED.length };
+  }, { target, imageSha256 });
 }

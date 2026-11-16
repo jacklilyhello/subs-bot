@@ -13,6 +13,14 @@ on:
       - 'worker/tools/prepare_provider_artifact.py'
       - 'worker/tools/prepare_provider_api_status_artifact.py'
       - 'worker/tools/prepare_isolation_artifact.py'
+      - 'worker/tools/production_provider.py'
+      - 'worker/tools/production_provider_rehearsal.py'
+      - 'worker/tools/archive_production_provider.py'
+      - 'worker/test/test_production_provider.py'
+      - 'worker/test/test_production_provider_rehearsal.py'
+      - 'worker/test/test_archive_production_provider.py'
+      - '.github/workflows/worker-production-provider.yml'
+      - '.github/workflows/worker-production-provider-rehearsal.yml'
       - 'worker/tools/publish_provider_registry.py'
       - 'worker/tools/stage_provider_version.py'
       - 'worker/tools/stage_provider_api_status_version.py'
@@ -47,6 +55,14 @@ on:
       - 'worker/tools/prepare_provider_artifact.py'
       - 'worker/tools/prepare_provider_api_status_artifact.py'
       - 'worker/tools/prepare_isolation_artifact.py'
+      - 'worker/tools/production_provider.py'
+      - 'worker/tools/production_provider_rehearsal.py'
+      - 'worker/tools/archive_production_provider.py'
+      - 'worker/test/test_production_provider.py'
+      - 'worker/test/test_production_provider_rehearsal.py'
+      - 'worker/test/test_archive_production_provider.py'
+      - '.github/workflows/worker-production-provider.yml'
+      - '.github/workflows/worker-production-provider-rehearsal.yml'
       - 'worker/tools/publish_provider_registry.py'
       - 'worker/tools/stage_provider_version.py'
       - 'worker/tools/stage_provider_api_status_version.py'
@@ -93,6 +109,10 @@ jobs:
         run: python -m unittest discover -s worker/provider_fetch -p 'test_*.py'
       - name: Test release provenance without network access
         run: python -B -m unittest discover -s worker/test -p 'test_prepare_provider_artifact.py'
+      - name: Test explicit provider controls and private source-proof preservation
+        run: |
+          python -B -m unittest discover -s worker/test -p 'test_production_provider*.py'
+          python -B -m unittest discover -s worker/test -p 'test_archive_production_provider.py'
       - name: Test guarded registry publication without network access
         run: python -B -m unittest discover -s worker/test -p 'test_publish_provider_registry.py'
       - name: Test the private Worker bootstrap without network access
