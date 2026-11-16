@@ -1,7 +1,7 @@
 import type { GeneralTelegramPin } from "./telegram/general-auth-runtime.ts";
 
 export const PRODUCTION_CONTROL_MIGRATION = "0055_production_control.sql";
-export const PRODUCTION_CONTROL_SHA256 = "e353b427b1a2bb2f0d092959f322525523301f3a68a26ca2da714a1e07e76c55";
+export const PRODUCTION_CONTROL_SHA256 = "4ac1fcc966f3567fa66bdd0e6a3e4e2f88d07c36ebb215753c393ae71cd4e2ee";
 const ERROR = "The production runtime identity could not be confirmed.";
 const TABLE = "subs_bot_production_control";
 const INVOCATIONS = "subs_bot_production_invocations";

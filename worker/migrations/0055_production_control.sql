@@ -23,4 +23,4 @@ CREATE TABLE subs_bot_production_invocations (
     CHECK((state='running' AND finished_at IS NULL) OR (state<>'running' AND finished_at IS NOT NULL))
 ) STRICT;
 
-CREATE INDEX subs_bot_production_invocations_state ON subs_bot_production_invocations(state,lease_until);
+CREATE INDEX subs_bot_production_invocations_state ON subs_bot_production_invocations (state,lease_until);
