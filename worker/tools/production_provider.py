@@ -325,6 +325,24 @@ class ProviderAPI(legacy.ProviderAPI):
                 and len(rows) == len(expected), "Unknown provider versions require independent reconciliation.")
         return rows
 
+    def wait_uploaded_version(self, candidate):
+        """Only settle a just-returned candidate; ordinary inventory stays strict."""
+        require(match(stage.VERSION_ID, candidate) and self.config["versionId"] == candidate)
+        expected = {row["versionId"] for row in releases(self.config) if row["versionId"] is not None}
+        for delay in (0, 1, 3):
+            if delay:
+                sleep(delay)
+            envelope = self._request(self.beta_path + "?page=1&per_page=10", limit=stage.MAX_VERSION_RESPONSE)
+            rows = legacy._page(envelope, envelope["result"], 9)
+            require(all(isinstance(row, dict) for row in rows))
+            observed = {row.get("id") for row in rows}
+            require(len(observed) == len(rows), "Duplicate provider versions require independent reconciliation.")
+            if observed == expected:
+                return
+            require(observed == expected - {candidate},
+                    "Unexpected provider versions require independent reconciliation; no upload was repeated.")
+        raise ProviderError("The exact uploaded provider candidate is not visible; independently reconcile without repeating upload.")
+
     def deployment(self, release=None):
         envelope = self._request(self.worker_path + "/deployments?page=1&per_page=100")
         require(isinstance(envelope["result"], dict))
@@ -583,6 +601,7 @@ def run_operation(api, operation, module, image, guard):
         candidate = api.upload(module)
         # Do not silently create the identity pin; report it for independent readback.
         api.config = {**config, "versionId": candidate}
+        api.wait_uploaded_version(candidate)
         result = observe(api)
         require(result == state, UNCERTAIN)
         return {**result, "versionId": candidate}

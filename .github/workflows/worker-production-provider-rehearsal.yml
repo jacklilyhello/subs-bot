@@ -8,7 +8,7 @@ on:
         description: Rehearse, preserve an interrupted attempt, or independently read R2
         required: true
         type: choice
-        options: [verify-archive, verify-partial, rehearse, preserve-partial, reconcile-partial, reconcile-terminal, verify-terminal]
+        options: [verify-archive, verify-partial, rehearse, preserve-partial, reconcile-partial, reconcile-terminal, verify-terminal, reconcile-forward-stage, verify-forward-stage]
         default: verify-archive
       provider_ci_run_id:
         description: Exact successful main CI for the selected current or registered frozen source
@@ -235,7 +235,7 @@ jobs:
           if-no-files-found: error
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         id: terminal-request
-        if: inputs.action == 'reconcile-terminal'
+        if: inputs.action == 'reconcile-terminal' || inputs.action == 'reconcile-forward-stage'
         with:
           name: subs-bot-provider-terminal-request-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -246,7 +246,7 @@ jobs:
 
   terminal-readback:
     needs: private-proof
-    if: always() && needs.private-proof.result == 'success' && github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && inputs.action == 'reconcile-terminal'
+    if: always() && needs.private-proof.result == 'success' && github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && (inputs.action == 'reconcile-terminal' || inputs.action == 'reconcile-forward-stage')
     environment: subs-bot-provider-isolation
     concurrency:
       group: subs-bot-provider-isolation
@@ -265,7 +265,7 @@ jobs:
         with:
           name: subs-bot-provider-terminal-request-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/provider-terminal-request-input
-      - name: Preserve exact failed terminal without replay or mutation
+      - name: Verify explicit private recovery identity without replay or mutation
         env:
           GH_TOKEN: ${{ github.token }}
           PROVIDER_TERMINAL_ARTIFACT_ID: ${{ needs.private-proof.outputs.terminal_artifact_id }}
@@ -279,14 +279,14 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         id: terminal-proof
         with:
-          name: subs-bot-provider-forward-terminal-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/provider-forward-terminal-output/
+          name: ${{ inputs.action == 'reconcile-forward-stage' && 'subs-bot-provider-forward-stage' || 'subs-bot-provider-forward-terminal' }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/${{ inputs.action == 'reconcile-forward-stage' && 'provider-forward-stage-output' || 'provider-forward-terminal-output' }}/
           retention-days: 7
           if-no-files-found: error
 
   private-terminal-proof:
     needs: terminal-readback
-    if: always() && needs.terminal-readback.result == 'success' && github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && inputs.action == 'reconcile-terminal'
+    if: always() && needs.terminal-readback.result == 'success' && github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && (inputs.action == 'reconcile-terminal' || inputs.action == 'reconcile-forward-stage')
     environment: subs-bot-isolation
     concurrency:
       group: subs-bot-isolation-deploy
@@ -300,12 +300,12 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: subs-bot-provider-forward-terminal-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ inputs.action == 'reconcile-forward-stage' && 'subs-bot-provider-forward-stage' || 'subs-bot-provider-forward-terminal' }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/provider-terminal-proof-input
-      - name: Seal failed terminal in private R2 without declaring success
+      - name: Seal private recovery identity without activating consumers
         env:
           GH_TOKEN: ${{ github.token }}
-          PROVIDER_ARCHIVE_ACTION: seal-terminal
+          PROVIDER_ARCHIVE_ACTION: ${{ inputs.action == 'reconcile-forward-stage' && 'seal-forward-stage' || 'seal-terminal' }}
           PROVIDER_TERMINAL_ARTIFACT_ID: ${{ needs.terminal-readback.outputs.terminal_artifact_id }}
           PROVIDER_TERMINAL_ARTIFACT_SHA256: ${{ needs.terminal-readback.outputs.terminal_artifact_sha256 }}
           SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}

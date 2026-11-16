@@ -395,5 +395,62 @@ class PrivateProofTransportTests(unittest.TestCase):
         self.assertEqual(len(self.requests), 5)
 
 
+class ForwardStageArchiveTests(unittest.TestCase):
+    def setUp(self):
+        from test_production_provider_forward import recovery
+        from test_production_provider import DEPLOYMENT
+        environment = patch.dict(os.environ, {"GITHUB_SHA": "b" * 40})
+        environment.start()
+        self.addCleanup(environment.stop)
+        previous = config(active=True)
+        self.target = config()
+        self.target.update({"versionId": DEPLOYMENT, "container": previous["container"], "previous": previous,
+                            "forwardRecovery": recovery(previous)})
+        self.target["build"]["revision"] = "7" * 40
+        self.result = {"version": 1, "status": "confirmed-identity-only", "completion": "not-complete", "operation": "forward-stage",
+                       "readOnly": True, "controllerRevision": "b" * 40, "runId": "100", "runAttempt": "1",
+                       "targetSha256": control.digest(self.target), "sourceRevision": self.target["build"]["revision"],
+                       "sourceRunId": "200", "sourceRunAttempt": "1", "sourceManifestSha256": "1" * 64,
+                       "responseIdentitySha256": "2" * 64, "sourceTargetSha256": control.digest({**self.target, "versionId": None})}
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.store = MemoryStore()
+        self.write()
+
+    def write(self):
+        for name, value in (("provider-reconciled-target.json", self.target), ("provider-reconciliation.json", self.result)):
+            (self.root / name).write_bytes(control.canonical(value))
+
+    def test_identity_is_sealed_and_r2_only_verified_without_marking_rehearsal_complete(self):
+        with patch("production_provider_forward.artifact_receipt"):
+            result = archive.stage_identity_archive(self.store, self.root)
+        self.assertEqual(result["completion"], "not-complete")
+        self.assertEqual(result["readback"], "R2-only-forward-stage-identity")
+        self.assertNotIn("manifest.json", self.store.objects)
+        self.assertEqual(archive.stage_identity_archive(self.store, expected=result["manifestSha256"]), result)
+
+    def test_wrong_target_response_or_complete_label_is_not_sealed(self):
+        for changed in ({"targetSha256": "9" * 64}, {"sourceTargetSha256": "9" * 64}, {"completion": "complete"},
+                        {"readOnly": False}, {"operation": "activate"}, {"sourceManifestSha256": ""}, {"runId": "101"}):
+            original = deepcopy(self.result)
+            self.result.update(changed)
+            self.write()
+            with patch("production_provider_forward.artifact_receipt"), self.subTest(changed=changed), self.assertRaises(ValueError):
+                archive.stage_identity_archive(self.store, self.root)
+            self.assertEqual(self.store.writes, 0)
+            self.result = original
+
+    def test_corruption_or_wrong_manifest_never_registers_identity(self):
+        with patch("production_provider_forward.artifact_receipt"):
+            result = archive.stage_identity_archive(self.store, self.root)
+        with self.assertRaises(ValueError):
+            archive.stage_identity_archive(self.store, expected="0" * 64)
+        key = next(key for key in self.store.objects if key.startswith("blobs/"))
+        self.store.objects[key] += b"corrupt"
+        with self.assertRaises(ValueError):
+            archive.stage_identity_archive(self.store, expected=result["manifestSha256"])
+
+
 if __name__ == "__main__":
     unittest.main()
