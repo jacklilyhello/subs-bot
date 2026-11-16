@@ -216,7 +216,7 @@ Webhook 配置顺序为 `plan-webhook → 明确批准其 stateSha256 → webhoo
 
 整体通过还要求 off 后再次独立检查 closed/frozen、所有 work 为零、无未知终态，并通过既有 prepare／capture／verify-backup 和完整基线读回封存当前配置、准确 CI、全部受支持数据及对象闭包。这不创建恢复资源或再触碰 Webhook。报告以 `onActivationBaseline` 保留启用前基线，`latestOffBaseline` 记录新增导入／刷新后的新快照；两者使用不同 checkpoint、journal 和私有阶段键，不以旧 G0 或候选 ZIP 代替新写入保全。任何备份或独立读回失败都会停止整体通过，并保留已经恢复的 off 现场与两份资料。
 
-依赖读取 Secret `SUBS_BOT_CF_DEPENDENCY_READ_TOKEN` 只在 `provider-binding` 和下述 `provider-binding-resume` 注入，所需权限组为 Workers Scripts Read 与 Workers Containers Read。平台只能按账户授予这些读权限；工具再限制到已验证的 Provider 当前／历史准确 ID 与实际盘点所得对象，GET-only，拒绝其他项目、写操作、D1、R2、Zone 和 Registry。使用短期凭据并核对到期时间，不复制 Provider 运行 Secret。
+依赖读取 Secret `SUBS_BOT_CF_DEPENDENCY_READ_TOKEN` 只在 `provider-binding`、下述 `provider-binding-resume` 和 `provider-binding-reconcile` 注入，所需权限组为 Workers Scripts Read 与 Workers Containers Read。平台只能按账户授予这些读权限；工具再限制到已验证的 Provider 当前／历史准确 ID 与实际盘点所得对象，GET-only，拒绝其他项目、写操作、D1、R2、Zone 和 Registry。使用短期凭据并核对到期时间，不复制 Provider 运行 Secret。
 
 每个完整 Provider 配置与应用提交组合只允许一个私有持久 on-intent。部署结果未知时不能重跑 `provider-binding`，也不能删除标记以重发。若关闭配置的部署未知，同样保留两份契约和 intent；下述 on 续接不代替未知 off 的处置，不能用原 Provider=null 登记的检查失败声称已经恢复，也不能盲目重新部署或恢复 Webhook。所有 G0、业务记录、票据和私有部分结果保留。
 
@@ -255,6 +255,10 @@ gh workflow run worker-production-lifecycle-rehearsal.yml --ref main \
 准确目标、配置、模块、绑定、依赖及原控制前态全部核验后，续接通过正式 Controller 的规划／批准／协调方法完成控制记录，不上传新版本、不再切换 on 流量。完整活动 snapshot 贯穿重新读取；第三个发布、未知终态、其他 epoch 或配置漂移均拒绝。已经协调的准确 successor 遵守前述只读或明确空 Cron 修补规则，不能靠重新 dispatch 重放已发生的 SQL 或业务。
 
 协调成功后仍须真实执行完整后续流程：封存新的 on G0、配置并读回保留 pending 的 Webhook、激活、合成三节点 URL 导入与精确导出，并在 `provider-refresh-window-open` 由管理员点击本次真实票据完成刷新。接着关闭／排空／冻结、恢复原 Webhook 与认证、发布准确 off 配置并确认无 Provider caller，最后封存不同 checkpoint 的 `latestOffBaseline`，包含本轮新增写入和原始 CI 闭包。协调本身、窗口打开或旧 G0 通过均不能代替这些结果；真人验收还须浏览器证据独立对应。
+
+需要分段完成控制协调时，可使用同一工作流的 `action=provider-binding-reconcile`。沿用上述准确 `provider_binding_resume_json`、登记、Provider 归档及冻结应用 CI 输入，仅将 `human_window_seconds=0`；不要求 `provider_ready_ack` 或真人消息锚点。该入口使用相同原 intent、正式协调方法和独立读回，重验共享 admission 未改变，并持久保存 `provider-binding-on-reconciled` 后保持准确 on 配置、原 desired 应用源及 closed/frozen 状态。它不上传版本、不切换 on 流量、不请求公开订阅源、不执行 exercise、Webhook 操作、导入、真人刷新、off 发布或最新备份，也不触发 Webhook 清理。
+
+该分段报告为 `status=reconciled-closed-only`、`humanAcceptance=false`，不报告 `passed`；配置摘要对应实际 on 配置，`ciProof` 对应冻结的 desired 源，control 仍须是原前态的唯一准确 successor。`providerBusinessAcceptance` 中 URL 导入、真人刷新、off 发布和 latest-off 备份均标为 `not-run`。之后重新明确批准完整 `provider-binding-resume`，在准备好真人会话的 60–540 秒窗口内，从同一准确 successor 继续；已确认的协调不再写 SQL 或增加 epoch，后续全部验收仍须实际完成。
 
 ## 集中的正式配置与批准清单
 

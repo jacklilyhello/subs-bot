@@ -64,14 +64,14 @@ class InterruptedBindingTests(unittest.TestCase):
         runner.store.put(local, raw)
         return runner, wire, loaded, on, off, intent, previous, active, key, local
 
-    def execute(self, value):
+    def execute(self, value, *, reconcile_only=False):
         runner, wire, loaded, on, off, intent, previous, active, key, local = value
         with patch.object(resume.app, "load_provider", return_value=loaded), \
                 patch.object(resume.app, "DependencyReadOnly", return_value=Mock()), \
                 patch.object(resume.app, "controllers", return_value=(on, off)) as created, \
                 patch.object(resume, "original_release", return_value=previous), \
                 patch.object(resume.app, "complete_binding", return_value="continued") as completed:
-            result = resume.run(runner, wire)
+            result = resume.run(runner, wire, reconcile_only=reconcile_only)
         return result, created, completed
 
     def test_resume_approves_real_reconcile_without_reupload_or_new_admission(self):
@@ -143,6 +143,23 @@ class InterruptedBindingTests(unittest.TestCase):
         for raw in ("", "[]", "null", "{}", '{"runId":"1000"}'):
             with self.subTest(raw=raw), self.assertRaises(contract.ContractError):
                 resume.parameters(raw)
+
+    def test_reconcile_only_stops_closed_without_webhook_import_or_off_and_never_reports_passed(self):
+        value = self.setup_protocol()
+        runner, wire, _loaded, on, off, _intent, _previous, _active, _key, _local = value
+        runner.human_window = 0
+        runner.env.pop("DRILL_PROVIDER_READY_ACK")
+        result, _created, completed = self.execute(value, reconcile_only=True)
+        self.assertIsNone(result)
+        self.assertEqual(runner.report["status"], "reconciled-closed-only")
+        self.assertIs(runner.report["humanAcceptance"], False)
+        self.assertEqual(runner.report["state"]["control"]["epoch"], 19)
+        self.assertEqual(runner.report["configurationSha256"], on.target.configuration_digest)
+        self.assertEqual(set(runner.report["providerBusinessAcceptance"].values()), {"not-run"})
+        on.reconcile_deploy.assert_called_once()
+        completed.assert_not_called()
+        wire["public_readback"].assert_not_called()
+        off.deploy.assert_not_called()
 
     def test_factory_keeps_frozen_runtime_and_current_control_approval_distinct(self):
         value = self.setup_protocol()

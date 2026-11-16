@@ -827,6 +827,10 @@ class Drill:
             "expect_status": expect_status, "public_request": public_request, "public_readback": public_readback,
             "origin": ORIGIN, "originalOrigin": ORIGINAL_ORIGIN})
 
+    def provider_binding_reconcile(self):
+        from production_application_provider_resume import run
+        run(self, {"approval": approval, "origin": ORIGIN, "originalOrigin": ORIGINAL_ORIGIN}, reconcile_only=True)
+
     def recovery(self):
         from production_recovery_drill import run_recovery_drill
         bundle, manifest = self.prepare(active=True)
@@ -908,7 +912,7 @@ def main():
     hosted_environment("rehearsal")
     require(env.get("GITHUB_WORKFLOW_REF") == WORKFLOW, "Only the protected dedicated hosted rehearsal workflow may run this drill.")
     action = env.get("DRILL_ACTION", "inspect")
-    require(action in ("bootstrap", "exercise", "inspect", "stabilize", "recover-webhook", "seed-fixture", "recovery", "finalize-recovery", "provider-binding", "provider-binding-resume"))
+    require(action in ("bootstrap", "exercise", "inspect", "stabilize", "recover-webhook", "seed-fixture", "recovery", "finalize-recovery", "provider-binding", "provider-binding-resume", "provider-binding-reconcile"))
     tool = Drill(env)
     try:
         if action == "recover-webhook":

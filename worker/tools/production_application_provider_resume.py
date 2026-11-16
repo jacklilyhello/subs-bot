@@ -48,9 +48,10 @@ def original_release(runner, original, intent, before):
         return release
 
 
-def run(runner, wire):
+def run(runner, wire, *, reconcile_only=False):
     pin = parameters(runner.env.get("DRILL_PROVIDER_BINDING_RESUME_JSON", ""))
-    require(runner.env.get("DRILL_PROVIDER_READY_ACK") == app.READY and 60 <= runner.human_window <= 540
+    require(type(reconcile_only) is bool and ((reconcile_only and runner.human_window == 0) or (
+        not reconcile_only and runner.env.get("DRILL_PROVIDER_READY_ACK") == app.READY and 60 <= runner.human_window <= 540))
         and runner.attempt == "1" and not runner.baseline_checkpoint
         and runner.env.get("SUBS_BOT_CF_DEPENDENCY_READ_TOKEN"),
         "Explicit IAB readiness and a fresh, independently approved reconciliation are required.")
@@ -115,6 +116,14 @@ def run(runner, wire):
     require(runner.store.get(key) == raw, "The original one-shot admission changed; preserve the exact evidence.")
     runner.save("provider-binding-on-reconciled", reconciled)
     runner.controller = on
+    if reconcile_only:
+        runner.report.update(status="reconciled-closed-only", humanAcceptance=False, state=reconciled,
+            configurationSha256=target.configuration_digest, releaseRevision=manifest["revision"], ciProof=desired_proof,
+            reconciliationOnly=True, providerBusinessAcceptance={"urlImport": "not-run", "humanRefresh": "not-run",
+                "offRelease": "not-run", "latestOffBackup": "not-run"})
+        runner.save("provider-binding-reconciled-closed", {"intentSha256": pin["intentSha256"],
+            "stateSha256": reconciled["stateSha256"], "status": "reconciled-closed-only"})
+        return
     status, expected = wire["public_readback"](wire["public_request"](wire["origin"] + "/sub/" + app.SMALL_TOKEN + "/base64"), 64 * 1024)
     wire["expect_status"](status, 200, "provider-source")
     snapshot = manifest["snapshots"][0]
