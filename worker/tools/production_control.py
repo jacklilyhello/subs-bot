@@ -48,6 +48,21 @@ class OperationError(RuntimeError):
         self.uncertain, self.http_status = uncertain, status
 
 
+class DeploymentReconciliationRequired(OperationError):
+    """A deployment mutation was attempted; no write is safe to retry blindly."""
+    def __init__(self, phase, version_id=None, deployment_id=None):
+        require(phase in {"upload", "staged-readback", "traffic", "active-readback", "reconcile"})
+        self.phase = phase
+        self.version_sha256 = sha256(version_id.encode()).hexdigest() if matches(UUID, version_id) else None
+        self.deployment_sha256 = sha256(deployment_id.encode()).hexdigest() if matches(UUID, deployment_id) else None
+        super().__init__("Deployment requires independent reconciliation (phase=" + phase + ").", uncertain=True)
+
+    def safe_details(self):
+        return {"kind": "deployment-reconciliation-required", "phase": self.phase, "uncertain": True,
+            "mutationAttempted": True, "versionSha256": self.version_sha256,
+            "deploymentSha256": self.deployment_sha256}
+
+
 class StalePredecessorError(ContractError):
     """A transition's read-only predecessor comparison failed before any SQL began."""
     def __init__(self):
@@ -386,12 +401,13 @@ class Telegram:
 
 
 class Controller:
-    def __init__(self, target, data_api, worker_api, bundle, manifest, *, guard=lambda: None, telegram=None, secrets=None, dependency_api=None, control_revision=None, activation_baseline_checker=None):
+    def __init__(self, target, data_api, worker_api, bundle, manifest, *, guard=lambda: None, telegram=None, secrets=None, dependency_api=None, control_revision=None, activation_baseline_checker=None, deployment_checkpoint=None):
         self.target, self.data, self.worker = target, data_api, worker_api
         self.bundle, self.manifest, self.guard = Path(bundle), manifest, guard
         self.telegram, self.secrets = telegram, secrets
         self.dependency_api = dependency_api
         self.activation_baseline_checker = activation_baseline_checker
+        self.deployment_checkpoint = deployment_checkpoint
         self.root = "/accounts/" + target.data["accountId"]
         self.database = self.root + "/d1/database/" + target.data["d1Id"]
         self.script = self.root + "/workers/scripts/" + target.data["workerName"]
@@ -474,9 +490,10 @@ class Controller:
             return {"revision": None, "moduleSha256": None, "versionId": None, "deploymentId": None, "bindings": {}, "compatibilityDate": None}
         require(isinstance(deployments, list) and deployments, "No active deployment was confirmed.")
         current = deployments[0]
+        require(isinstance(current, dict), "Active deployment metadata is not an exact object.")
         versions = current.get("versions")
-        require(current.get("strategy") == "percentage" and isinstance(versions, list) and len(versions) == 1
-                and versions[0].get("percentage") == 100 and matches(UUID, versions[0].get("version_id")))
+        require(matches(UUID, current.get("id")) and current.get("strategy") == "percentage" and isinstance(versions, list) and len(versions) == 1
+                and isinstance(versions[0], dict) and versions[0].get("percentage") == 100 and matches(UUID, versions[0].get("version_id")))
         return self.version(versions[0]["version_id"], deployment_id=current["id"])
 
     def version(self, version_id, *, deployment_id=None):
@@ -805,44 +822,153 @@ class Controller:
         require(sha256(module).hexdigest() == self.manifest["bundleSha256"] and 0 < len(module) <= 1152*1024)
         bindings = self.expected_bindings(include_secrets=True, allow_unbound_provider=True, verify_dependency=True)
         previous_active = self.active(allow_empty=True)
+        require(canonical({key: value for key, value in previous_active.items() if key != "bindings"}) == canonical(before["release"]),
+                "The approved active predecessor changed before upload.")
         if previous_active["versionId"] is not None:
+            (self if source_controller is None else source_controller).verify_bindings(previous_active)
             for binding, key in (("TELEGRAM_AGGREGATE_KEY_SHA256", "aggregate"), ("TELEGRAM_PRIVATE_SHARE_CREATION_KEY_SHA256", "privateShare")):
                 require(previous_active["bindings"].get(binding, {}).get("text") == self.target.data["keyDigests"][key],
                         "Ordinary deployment cannot replace published-link signing keys.")
         require(self.telegram is not None)
         self.telegram.identity()
         self.guard()
-        uploaded = self.worker("POST", self.worker_path + "/versions?deploy=false", {
-            "main_module": "index.js", "compatibility_date": self.manifest["compatibilityDate"], "usage_model": "standard",
-            "modules": [{"name": "index.js", "content_type": "application/javascript+module", "content_base64": base64.b64encode(module).decode()}],
-            "bindings": bindings, "annotations": {"workers/tag": "lifecycle-" + self.revision[:12], "workers/message": self.target.digest}})
-        require(isinstance(uploaded, dict) and matches(UUID, uploaded.get("id")), "Uploaded version is unconfirmed; do not retry blindly.")
-        # Verify staged bytes and every binding before the first traffic change.
-        # Post-deployment verification alone cannot make an unknown module safe.
-        self.verify_bindings(self.version(uploaded["id"]), allow_unbound_provider=True, verify_dependency=True)
-        self.resources()
-        require(self.active(allow_empty=True)["deploymentId"] == before["release"]["deploymentId"], "Active deployment changed during staging.")
-        self.guard()
-        self.worker("POST", self.script + "/deployments", {"strategy": "percentage", "versions": [{"version_id": uploaded["id"], "percentage": 100}],
-            "annotations": {"workers/message": "Reviewed lifecycle release " + self.target.digest}})
+        version_id, deployment_id, phase = None, None, "upload"
+        def checkpoint(name):
+            if self.deployment_checkpoint is not None:
+                self.deployment_checkpoint({"phase": name, "versionId": version_id, "deploymentId": deployment_id,
+                    "targetSha256": self.target.digest, "configurationSha256": self.target.configuration_digest,
+                    "sourceRevision": self.revision, "moduleSha256": self.manifest["bundleSha256"],
+                    "predecessorStateSha256": before["stateSha256"], "previousVersionId": before["release"]["versionId"],
+                    "previousDeploymentId": before["release"]["deploymentId"]})
+        try:
+            checkpoint("upload-intent")
+        except Exception:
+            raise ContractError("The deployment intent evidence was not confirmed; no upload was attempted.") from None
+        try:
+            uploaded = self.worker("POST", self.worker_path + "/versions?deploy=false", {
+                "main_module": "index.js", "compatibility_date": self.manifest["compatibilityDate"], "usage_model": "standard",
+                "modules": [{"name": "index.js", "content_type": "application/javascript+module", "content_base64": base64.b64encode(module).decode()}],
+                "bindings": bindings, "annotations": {"workers/tag": "lifecycle-" + self.revision[:12], "workers/message": self.target.digest}})
+            require(isinstance(uploaded, dict) and matches(UUID, uploaded.get("id")))
+            version_id, phase = uploaded["id"], "staged-readback"
+            checkpoint("upload-confirmed")
+            self.verify_bindings(self.version(version_id), allow_unbound_provider=True, verify_dependency=True)
+            self.resources()
+            prior = self.active(allow_empty=True)
+            require(canonical(prior) == canonical(previous_active), "Active deployment changed during staging.")
+            self.guard()
+            phase = "traffic"
+            checkpoint("traffic-intent")
+            deployed = self.worker("POST", self.script + "/deployments", {"strategy": "percentage",
+                "versions": [{"version_id": version_id, "percentage": 100}],
+                "annotations": {"workers/message": "Reviewed lifecycle release " + self.target.digest}})
+            require(isinstance(deployed, dict) and matches(UUID, deployed.get("id")))
+            deployment_id, phase = deployed["id"], "active-readback"
+            checkpoint("traffic-confirmed")
+            from production_deploy_readback import wait_for_deployment
+            def read():
+                self.resources()
+                return self.active(allow_empty=True)
+            active = wait_for_deployment(read, previous=previous_active, desired_version=version_id,
+                desired_deployment=deployment_id, verify_desired=lambda active: self.verify_bindings(active, verify_dependency=True))
+            checkpoint("active-confirmed")
+            phase = "reconcile"
+            return self.reconcile_deployment(before, expected_active=active)
+        except Exception:
+            raise DeploymentReconciliationRequired(phase, version_id, deployment_id) from None
+
+    def _reconcile_cron(self):
+        value = self.worker("GET", self.script + "/schedules")
+        require(isinstance(value, dict) and isinstance(value.get("schedules"), list), "Cron reconciliation readback is unknown.")
+        cron = value["schedules"]
+        require(cron == [] or len(cron) == 1 and isinstance(cron[0], dict) and cron[0].get("cron") == "* * * * *"
+            and set(cron[0]) <= {"cron", "created_on", "modified_on"}
+            and all(isinstance(item, str) for item in cron[0].values()), "Unknown Cron configuration cannot be replaced.")
+        return cron
+
+    def plan_reconcile_deploy(self):
+        before = self.inspect(verify_release=False)
+        require(before["control"]["admission"] == "closed" and before["control"]["workers"] == "frozen"
+            and not any(before["work"].values()), "Only a drained frozen release may plan reconciliation.")
         active = self.active()
         self.verify_bindings(active, verify_dependency=True)
-        require(active["versionId"] == uploaded["id"])
-        # At this point a failure stays safely frozen. Revision updates are one
-        # transaction, and never reset actor permissions, receipts or business data.
-        return self.reconcile_deployment(before)
+        require(canonical({key: value for key, value in active.items() if key != "bindings"}) == canonical(before["release"]))
+        before["reconcileCron"] = self._reconcile_cron()
+        policy = one(self.data, self.database, "SELECT release_revision FROM telegram_general_policy WHERE bot_id="
+            + migrations._literal(self.target.data["botId"]))["release_revision"]
+        require(policy == before["control"]["release_revision"], "The current control and policy revisions differ.")
+        before["reconcilePolicyRevision"] = policy
+        before["reconcileMode"] = "already-coherent" if policy == self.revision else "revision-reconcile"
+        before["stateSha256"] = digest({key: value for key, value in before.items() if key != "stateSha256"})
+        return before
 
-    def reconcile_deployment(self, before):
+    def reconcile_deploy(self, approval, state_sha, *, predecessor=None, expected_active=None):
+        before = self.plan_reconcile_deploy()
+        require(before["stateSha256"] == state_sha, "The reconciliation predecessor changed before any SQL.")
+        self.approval(approval, "reconcile-deploy", state_sha)
+        active = self.active()
+        self.verify_bindings(active, verify_dependency=True)
+        require(canonical({key: value for key, value in active.items() if key != "bindings"}) == canonical(before["release"]),
+                "The approved reconciliation release changed before mutation.")
+        if expected_active is not None:
+            require(canonical(active) == canonical(expected_active), "The independently pinned reconciliation release differs.")
+        return self.reconcile_deployment(before if predecessor is None else predecessor, expected_active=active,
+            approved_cron=before["reconcileCron"], current_coherent=predecessor is None and before["reconcileMode"] == "already-coherent")
+
+    def reconcile_deployment(self, before, *, expected_active=None, approved_cron=None, current_coherent=False):
         old = before["control"]["release_revision"]
-        self.verify_bindings(self.active(), verify_dependency=True)
+        active = self.active()
+        self.verify_bindings(active, verify_dependency=True)
+        if expected_active is not None:
+            require(canonical(active) == canonical(expected_active), "The complete reconciliation release changed before SQL.")
+        else:
+            expected_active = active
         require(before["control"]["admission"] == "closed" and before["control"]["workers"] == "frozen"
                 and not any(self.work().values()), "Only a fully frozen deployment can reconcile its revision.")
+        observed = self._control()
+        cron = self._reconcile_cron()
+        if approved_cron is not None:
+            require(canonical(cron) == canonical(approved_cron), "The approved Cron predecessor changed before mutation.")
+        successor = {**before["control"], "epoch": before["control"]["epoch"] + 1, "release_revision": self.revision}
+        expected_control = before["control"] if current_coherent else successor
+        def confirmed():
+            result = self.inspect()
+            require(canonical(result["release"]) == canonical({key: value for key, value in expected_active.items() if key != "bindings"})
+                and canonical(result["control"]) == canonical(expected_control), "The exact reconciled control state changed.")
+            require(one(self.data, self.database, "SELECT release_revision FROM telegram_general_policy WHERE bot_id="
+                + migrations._literal(self.target.data["botId"]))["release_revision"] == self.revision,
+                "The exact reconciled policy successor changed.")
+            return result
+        if current_coherent or canonical(observed) == canonical(successor):
+            require(type(current_coherent) is bool and canonical(observed) == canonical(expected_control)
+                and observed["release_revision"] == self.revision, "The exact coherent control state changed.")
+            policy = one(self.data, self.database, "SELECT release_revision FROM telegram_general_policy WHERE bot_id=" + migrations._literal(self.target.data["botId"]))
+            require(policy["release_revision"] == self.revision, "The reconciliation successor policy differs.")
+            if not cron:
+                require(approved_cron == [], "Empty successor Cron needs a new explicit reconciliation approval.")
+                self.guard()
+                try:
+                    self.worker("PUT", self.script + "/schedules", [{"cron": "* * * * *"}])
+                    return confirmed()
+                except Exception:
+                    raise DeploymentReconciliationRequired("reconcile", active["versionId"], active["deploymentId"]) from None
+            else:
+                return confirmed()
+        require(canonical(observed) == canonical(before["control"]), "The original reconciliation control predecessor changed.")
+        policy_guard = "EXISTS(SELECT 1 FROM telegram_general_policy WHERE bot_id=" + migrations._literal(self.target.data["botId"]) \
+            + " AND release_revision=" + migrations._literal(old) + ")"
+        require(one(self.data, self.database, "SELECT release_revision FROM telegram_general_policy WHERE bot_id="
+            + migrations._literal(self.target.data["botId"]))["release_revision"] == old,
+            "The original reconciliation policy predecessor changed; no mutation was attempted.")
         self.guard()
-        _mutate_sql(self.data, self.database, [migrations._assert_sql(f"EXISTS(SELECT 1 FROM {CONTROL} WHERE admission='closed' AND workers='frozen' AND epoch={before['control']['epoch']} AND target_sha256={migrations._literal(self.target.digest)} AND bot_id={migrations._literal(self.target.data['botId'])} AND generation={self.target.data['generation']} AND release_revision={migrations._literal(old)})"),
-            f"UPDATE {CONTROL} SET release_revision={migrations._literal(self.revision)},epoch=epoch+1 WHERE singleton=1",
-            f"UPDATE telegram_general_policy SET release_revision={migrations._literal(self.revision)} WHERE bot_id={migrations._literal(self.target.data['botId'])} AND release_revision={migrations._literal(old)}"])
-        self.worker("PUT", self.script + "/schedules", [{"cron": "* * * * *"}])
-        return self.inspect()
+        try:
+            _mutate_sql(self.data, self.database, [migrations._assert_sql(f"EXISTS(SELECT 1 FROM {CONTROL} WHERE admission='closed' AND workers='frozen' AND epoch={before['control']['epoch']} AND target_sha256={migrations._literal(self.target.digest)} AND bot_id={migrations._literal(self.target.data['botId'])} AND generation={self.target.data['generation']} AND release_revision={migrations._literal(old)}) AND {policy_guard}"),
+                f"UPDATE {CONTROL} SET release_revision={migrations._literal(self.revision)},epoch=epoch+1 WHERE singleton=1",
+                f"UPDATE telegram_general_policy SET release_revision={migrations._literal(self.revision)} WHERE bot_id={migrations._literal(self.target.data['botId'])} AND release_revision={migrations._literal(old)}"])
+            self.worker("PUT", self.script + "/schedules", [{"cron": "* * * * *"}])
+            return confirmed()
+        except Exception:
+            raise DeploymentReconciliationRequired("reconcile", active["versionId"], active["deploymentId"]) from None
 
     def verify_domain(self):
         t = self.target.data
@@ -921,6 +1047,12 @@ def main():
     controller = Controller(target, data, worker, bundle, manifest, guard=lambda: artifact.require_current_main(revision),
                             telegram=Telegram(target, secrets), secrets=secrets, control_revision=revision,
                             dependency_api=API(target, os.environ["SUBS_BOT_CF_DEPENDENCY_READ_TOKEN"]) if target.data["provider"] is not None and os.environ.get("SUBS_BOT_CF_DEPENDENCY_READ_TOKEN") else None)
+    def deployment_checkpoint(event):
+        path = Path(os.environ["RUNNER_TEMP"]) / "production-control-deployment-events.ndjson"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW
+        with os.fdopen(os.open(path, flags, 0o600), "ab") as stream:
+            stream.write(canonical(event) + b"\n")
+    controller.deployment_checkpoint = deployment_checkpoint
     source_controller = None
     source_directory = None
     baseline_checkpoint = os.environ.get("CONTROL_BASELINE_CHECKPOINT_ID", "")
@@ -970,6 +1102,8 @@ def main():
         result = controller.initialize()
     elif action == "plan-deploy":
         result = controller.plan_deploy(source_controller)
+    elif action == "plan-reconcile-deploy":
+        result = controller.plan_reconcile_deploy()
     elif action == "plan-pause":
         result = controller.plan_pause()
     elif action == "plan-webhook":
@@ -979,10 +1113,7 @@ def main():
     elif action == "deploy":
         result = controller.deploy(envelope, predecessor, source_controller)
     elif action == "reconcile-deploy":
-        before = controller.inspect(verify_release=False)
-        require(before["stateSha256"] == predecessor)
-        controller.approval(envelope, action, predecessor)
-        result = controller.reconcile_deployment(before)
+        result = controller.reconcile_deploy(envelope, predecessor)
     elif action in ("pause", "freeze", "thaw", "activate"):
         result = controller.transition(action, envelope, predecessor)
     elif action == "classify-interruption":
@@ -1014,7 +1145,8 @@ if __name__ == "__main__":
     try:
         main()
     except (ContractError, OperationError, migrations.MigrationError, artifact.ArtifactError, RecoveryError) as error:
-        print(json.dumps({"status": "stopped", "reason": str(error), "uncertain": bool(getattr(error, "uncertain", False))}))
+        print(json.dumps({"status": "stopped", "reason": str(error), "uncertain": bool(getattr(error, "uncertain", False)),
+            **(error.safe_details() if isinstance(error, DeploymentReconciliationRequired) else {})}))
         raise SystemExit(1) from None
     except Exception:
         print(json.dumps({"status": "stopped", "reason": "An unexpected lifecycle failure occurred. Inspect the target state before retrying.", "uncertain": True}))

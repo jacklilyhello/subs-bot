@@ -183,6 +183,22 @@ class ApplicationProviderProtocolTests(unittest.TestCase):
         self.assertEqual(len(runner.store.values), 1)
         self.assertNotEqual(runner.report.get("status"), "passed")
 
+    def test_primary_failure_cannot_hide_unknown_off_deployment(self):
+        runner, wire, loaded, _source, on, off = self.runner()
+        primary = contract.ContractError("Synthetic primary confidential-content")
+        off_error = control.DeploymentReconciliationRequired("active-readback")
+        runner.exercise.side_effect = primary
+        off.deploy.side_effect = off_error
+        with self.assertRaises(control.DeploymentReconciliationRequired) as caught:
+            self.execute(runner, wire, loaded, on, off)
+        self.assertIs(caught.exception, off_error)
+        self.assertTrue(caught.exception.uncertain)
+        self.assertTrue(runner.report["offDeploymentFailure"]["uncertain"])
+        self.assertFalse(runner.report["priorApplicationFailure"]["uncertain"])
+        self.assertNotIn("confidential-content", str(runner.report))
+        off.deploy.assert_called_once()
+        runner.activation_baseline.assert_not_called()
+
     def test_one_shot_intent_rejects_blind_repeated_deployment(self):
         runner, wire, loaded, _source, on, off = self.runner()
         admission = runner.prefix + "provider-binding/" + provider.digest(loaded["config"]) + "/" + runner.revision + "/admission.json"
@@ -299,7 +315,7 @@ class DisplayAndWindowTests(unittest.TestCase):
 
     def test_extended_window_is_limited_to_provider_and_its_independent_cleanup(self):
         env = {**drill_fixtures.environment(), "DRILL_HUMAN_WINDOW_SECONDS": "300"}
-        for action in ("provider-binding", "recover-webhook"):
+        for action in ("provider-binding", "provider-binding-resume", "recover-webhook"):
             self.assertEqual(lifecycle.Drill({**env, "DRILL_ACTION": action}).human_window, 300)
         with self.assertRaises(contract.ContractError):
             lifecycle.Drill({**env, "DRILL_ACTION": "exercise"})

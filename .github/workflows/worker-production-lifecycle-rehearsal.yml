@@ -9,7 +9,7 @@ on:
         type: choice
         required: true
         default: inspect
-        options: [bootstrap, exercise, inspect, stabilize, seed-fixture, recovery, recover-webhook, provider-binding]
+        options: [bootstrap, exercise, inspect, stabilize, seed-fixture, recovery, recover-webhook, provider-binding, provider-binding-resume]
       source_run_id:
         description: Successful exact-main Worker CI run
         type: string
@@ -31,7 +31,7 @@ on:
         type: string
         required: false
       human_window_seconds:
-        description: IAB window; exercise up to 180s, provider-binding requires explicit 60-540s within refresh-ticket TTL
+        description: IAB window; exercise up to 180s, provider-binding/resume requires explicit 60-540s within refresh-ticket TTL
         type: number
         default: 0
         required: false
@@ -56,7 +56,7 @@ on:
         type: string
         required: false
       provider_run_id:
-        description: Exact completed dedicated Provider archive run; only required for provider-binding
+        description: Exact completed dedicated Provider archive run; required for provider-binding and its explicit resume
         type: string
         required: false
       provider_run_attempt:
@@ -69,6 +69,10 @@ on:
         required: false
       provider_ready_ack:
         description: Explicit IAB readiness for real refresh, copied from the documented dedicated-target phrase
+        type: string
+        required: false
+      provider_binding_resume_json:
+        description: Explicit interrupted run/attempt/intent SHA and independently confirmed active version/deployment; never re-uploads
         type: string
         required: false
 
@@ -104,6 +108,7 @@ jobs:
       DRILL_PROVIDER_RUN_ATTEMPT: ${{ inputs.provider_run_attempt }}
       DRILL_PROVIDER_MANIFEST_SHA256: ${{ inputs.provider_manifest_sha256 }}
       DRILL_PROVIDER_READY_ACK: ${{ inputs.provider_ready_ack }}
+      DRILL_PROVIDER_BINDING_RESUME_JSON: ${{ inputs.provider_binding_resume_json }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -128,13 +133,13 @@ jobs:
           SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
           SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
           SUBS_BOT_CONTROL_DRILL_KEYS: ${{ secrets.SUBS_BOT_CONTROL_DRILL_KEYS }}
-          SUBS_BOT_CF_DEPENDENCY_READ_TOKEN: ${{ inputs.action == 'provider-binding' && secrets.SUBS_BOT_CF_DEPENDENCY_READ_TOKEN || '' }}
+          SUBS_BOT_CF_DEPENDENCY_READ_TOKEN: ${{ (inputs.action == 'provider-binding' || inputs.action == 'provider-binding-resume') && secrets.SUBS_BOT_CF_DEPENDENCY_READ_TOKEN || '' }}
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           umask 077
           python3 -B worker/tools/production_lifecycle_drill.py
       - name: Independently restore the original test webhook after the exercise
-        if: always() && (inputs.action == 'exercise' || inputs.action == 'provider-binding')
+        if: always() && (inputs.action == 'exercise' || inputs.action == 'provider-binding' || inputs.action == 'provider-binding-resume')
         env:
           DRILL_ACTION: recover-webhook
           DRILL_AUTOMATIC_CLEANUP: '1'
