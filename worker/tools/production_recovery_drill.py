@@ -19,7 +19,12 @@ import production_recovery as recovery
 def resume_parameters(raw):
     if raw in (None, ""):
         return None
-    value = recovery.native.parsed(raw, 4096) if isinstance(raw, (str, bytes)) else raw
+    if isinstance(raw, str):
+        try:
+            raw = raw.encode("utf-8")
+        except UnicodeError:
+            raise recovery.RecoveryError() from None
+    value = recovery.native.parsed(raw, 4096) if isinstance(raw, bytes) else raw
     recovery.require(isinstance(value, dict) and set(value) == {"version", "checkpointId", "manifestSha256", "journalSha256"}
                      and type(value["version"]) is int and value["version"] == 1
                      and recovery.matches(recovery.CHECKPOINT, value["checkpointId"])
