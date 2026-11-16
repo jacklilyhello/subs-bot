@@ -151,6 +151,7 @@ class ActiveDependencyCliTests(unittest.TestCase):
         desired, secrets = fixture()
         current = deepcopy(desired.data)
         current["provider"] = provider_fixtures.config(active=True)
+        current["provider"]["worker"]["workerId"] = "d" * 32
         current["provider"]["caller"] = {"id": desired.data["workerId"], "name": desired.data["workerName"]}
         current["features"]["providerUrlImport"] = True
         previous = contract.validate_target(current)
