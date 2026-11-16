@@ -190,6 +190,19 @@ class WebhookControllerTests(unittest.TestCase):
         self.assertEqual(len(self.mutations), 1, "read-only reconciliation never repeats setWebhook")
         self.assertEqual(observation["webhook"]["settings"]["url"], self.info["url"])
 
+    def test_activation_rechecks_the_same_webhook_safety_contract(self):
+        self.controller.activation_baseline_checker = lambda: {"baselineVerified": True,
+            "checkpointId": "a" * 32, "manifestSha256": "b" * 64,
+            "targetSha256": self.target.digest, "configurationSha256": self.target.configuration_digest,
+            "sourceRevision": fixtures.REVISION, "moduleSha256": self.manifest["bundleSha256"],
+            "versionId": fixtures.VERSION}
+        for changed in ({"ip_address": "127.0.0.1"}, {"ip_address": "malformed"},
+                        {"certificate": PRIVATE}, {"has_custom_certificate": True}):
+            self.info = {**active_info(self.target), **changed}
+            with self.subTest(changed=changed), self.assertRaises(contract.ContractError):
+                self.controller.plan_activate()
+        self.assertEqual(self.mutations, [])
+
 
 class WebhookCliTests(unittest.TestCase):
     def test_cli_routes_planning_and_writing_to_the_matching_controller_methods(self):

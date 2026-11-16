@@ -699,6 +699,7 @@ class Controller:
         self.telegram.identity()
         self.telegram.group_permissions()
         info = self.telegram.call("getWebhookInfo")
+        self.telegram.webhook_info(info)
         require(info.get("url") == "https://" + self.target.data["hostname"] + "/telegram/webhook"
                 and info.get("max_connections") == self.target.data["webhook"]["maxConnections"]
                 and set(info.get("allowed_updates", [])) == set(self.target.data["webhook"]["allowedUpdates"])
