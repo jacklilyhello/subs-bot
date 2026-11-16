@@ -148,7 +148,8 @@ gh workflow run worker-production-control.yml --ref main \
 | plan-deploy | 已存在版本时先固定 `active_run_id` 及原正式配置／安全 Secret，独立核对当前源；新开关和依赖配置需新的完整配置批准 |
 | reconcile-deploy | 发布结果不明后先独立读回，只有已部署准确模块、固定配置和冻结现场才能完成版本控制记录 |
 | domain | 精确域名、Zone、DNS 无冲突才绑定；HTTPS／健康提交读回；生产 workers.dev 和预览保持关闭 |
-| webhook | 重新核对 getMe/getWebhookInfo 前态，明确 drop_pending_updates=false，读回 URL／类别／连接参数 |
+| plan-webhook | 只读核对 Bot、闭合控制和 Webhook；输出稳定 `webhook.settingsSha256` 和包含它的批准 `stateSha256`，不调用 setWebhook |
+| webhook | 仅接受 plan-webhook 的两份摘要；重验配置／版本／完整控制行、Bot、HTTPS 域名和稳定设置后写入；drop_pending_updates=false，读回 URL／类别／连接参数及无自定义证书 |
 | plan-activate | closed/frozen 且已排空；指定 `baseline_checkpoint_id`、`baseline_manifest_sha256`，完整读回私有 G0 SQL／R2／CI 闭包并与当前数据、版本和配置核对；输出包含该基线的批准前态 |
 | activate | 使用相同基线 pin 和 plan-activate 前态重新完整核对，精确批准、版本、配置、Webhook、域名和未知结果检查全部满足后，直接从 frozen 原子开启；中间不得 thaw 或写入 |
 | plan-pause | 输出完整现场观察；独立 `approvalState` 绑定 pause、目标／配置、准确版本、完整 control 行和迁移数，输出本次 pause 批准所需的 `stateSha256` |
@@ -166,6 +167,10 @@ gh workflow run worker-production-control.yml --ref main \
 Actions 产物过期时，可用 `source_checkpoint_id` 和独立保存的 `source_manifest_sha256` 代替 `source_run_id`。工具从私有 R2 核对原始 CI ZIP、来源证明、完整迁移和源配置，不查询已过期的 Actions 产物；旧源仅可用于检查、暂停等运维，新部署仍要求准确当前 main。升级时可用 `active_checkpoint_id`／`active_manifest_sha256` 代替 `active_run_id`，旧完整配置从受摘要保护的私有资料读取，Secret 仍单独安全注入。字段必须成对填写。源代码归档可读不代表备份通过；最终激活还会强制验证全部 SQL 分片、R2 对象、归属元数据及当前 D1 数据，任何损坏、新写入或控制 epoch 变化都停止并要求重新封存基线。
 
 暂停覆盖所有现存业务入口：Webhook 是唯一可写公开 HTTP；其他公开路径仅 GET/HEAD；目前没有 queue handler。运行中 Webhook 与 Cron 每次 D1 操作均受事务 fence，R2／外部发送的执行期由持久 invocation 覆盖。重复 `(bot_id,update_id)` 先核对载荷摘要；处理完成后才持久确认；冲突、未完成或不确定更新不能重新执行业务。未受理更新在 Telegram 保留。业务时效规则仍有效，忽略／拒绝结果也有持久 disposition，不用初始化时间隐藏积压。
+
+Webhook 配置顺序为 `plan-webhook → 明确批准其 stateSha256 → webhook`；同时将规划输出的 `webhook.settingsSha256` 填入 `webhook_sha256`。普通 inspect 摘要或原始 getWebhookInfo 全量摘要不能替代该规划。稳定前态绑定 URL、无自定义证书、连接数和更新类别；待处理数量、投递错误与当前 IP 仅作为净化观察，因此正常投递变化不使批准失效。正式前 URL 只允许空或准确正式目标；通用 rehearsal 也不默认接受 dev URL，只有专用 Drill 从登记的原实例上下文显式提供原 dev URL。未知 URL、证书、额外设置或畸形字段在写入前拒绝。新请求不设置自定义证书或固定 IP。Telegram 的 reported `ip_address` 仅说明当前使用的地址，不能据此判断是否曾设置固定 IP；工具只核对合法公网格式并记录摘要，不宣称证明其来源，也不将地址轮转加入稳定批准摘要。[Telegram Webhook 字段定义](https://core.telegram.org/bots/api#getwebhookinfo)
+
+写入或结果读回不明时保持 admission 关闭，保存失败并先重新执行只读 `plan-webhook` 核对实际设置；工具不自动重发 setWebhook。规划读回不能证明 Telegram 未公开的 Secret 值，不能把结果不明标为成功或沿用旧批准盲目重试；需要新的明确批准和独立认证证据后再决定下一步。
 
 ## 集中的正式配置与批准清单
 

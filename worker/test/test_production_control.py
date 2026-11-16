@@ -286,6 +286,7 @@ class ProductionControllerTests(unittest.TestCase):
         self.controller.initialize()
         self.controller.telegram = Mock()
         self.controller.telegram.call.return_value = {"url": "https://" + self.target.data["hostname"] + "/telegram/webhook",
+            "has_custom_certificate": False,
             "max_connections": self.target.data["webhook"]["maxConnections"],
             "allowed_updates": self.target.data["webhook"]["allowedUpdates"]}
         self.controller.verify_domain = Mock(return_value={"domainVerified": True})
@@ -378,7 +379,7 @@ class ConfigurationAndTransportTests(unittest.TestCase):
     def test_webhook_preserves_pending_updates_and_wrong_bot_cannot_be_modified(self):
         target, secrets = fixture()
         telegram = control.Telegram(target, secrets)
-        before = {"url": "", "pending_update_count": 7}
+        before = {"url": "", "pending_update_count": 7, "has_custom_certificate": False}
         after = {"url": "https://" + target.data["hostname"] + "/telegram/webhook",
             "pending_update_count": 7, "max_connections": 2, "allowed_updates": ["message", "callback_query"],
             "has_custom_certificate": False}
@@ -391,7 +392,7 @@ class ConfigurationAndTransportTests(unittest.TestCase):
                 return before if len([m for m, _ in calls if m == "getWebhookInfo"]) == 1 else after
             return True
         telegram.call = call
-        result = telegram.configure(contract.digest(before))
+        result = telegram.configure(telegram.webhook_info(before)["settingsSha256"])
         self.assertFalse(result["dropPendingUpdates"])
         sent = [body for method, body in calls if method == "setWebhook"]
         self.assertEqual(len(sent), 1)
@@ -399,7 +400,7 @@ class ConfigurationAndTransportTests(unittest.TestCase):
         self.assertEqual(result["pendingUpdateCount"], 7)
         telegram.call = Mock(return_value={"id": 999, "username": "wrong_bot", "is_bot": True})
         with self.assertRaises(contract.ContractError):
-            telegram.configure(contract.digest(before))
+            telegram.configure(telegram.webhook_info(before)["settingsSha256"])
         self.assertEqual([call.args[0] for call in telegram.call.call_args_list], ["getMe"])
 
 

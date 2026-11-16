@@ -83,6 +83,7 @@ class ActivationBaselineTests(unittest.TestCase):
         self.controller.initialize()
         self.controller.telegram = Mock()
         self.controller.telegram.call.return_value = {"url": "https://" + self.target.data["hostname"] + "/telegram/webhook",
+            "has_custom_certificate": False,
             "max_connections": self.target.data["webhook"]["maxConnections"],
             "allowed_updates": self.target.data["webhook"]["allowedUpdates"]}
         self.controller.verify_domain = Mock(return_value={"domainVerified": True})

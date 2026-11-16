@@ -46,6 +46,7 @@ class PublicProbeTests(unittest.TestCase):
         target, _ = control_fixtures.fixture()
         controller = Mock(target=target, revision=control_fixtures.REVISION)
         controller.inspect.return_value = {"control": {"admission": "closed", "workers": "frozen"}, "work": {"invocations": 0}}
+        controller.plan_webhook.return_value = {"stateSha256": "c" * 64, "webhook": {"settingsSha256": "d" * 64}}
         tool.controller = controller
         tool.prepare = Mock(return_value=(Path("/synthetic-unused-bundle"), {}))
         tool.registration = Mock(return_value=target)
@@ -175,6 +176,7 @@ class PublicProbeTests(unittest.TestCase):
             tool.code_archive.assert_not_called()
             controller.telegram.call.assert_not_called()
             controller.telegram.configure.assert_not_called()
+            controller.configure_webhook.assert_not_called()
 
     def test_no_explicit_baseline_keeps_fresh_control_sequence(self):
         tool, controller = self.tool(baseline=False)
@@ -183,13 +185,14 @@ class PublicProbeTests(unittest.TestCase):
             tool.exercise()
         self.assertEqual(tool.transition.call_args_list, [call("thaw"), call("pause"), call("freeze")])
         controller.telegram.configure.assert_not_called()
+        controller.configure_webhook.assert_not_called()
 
     def test_primary_probe_failure_survives_cleanup_failure_without_secret_leak(self):
         tool, controller = self.tool()
         tool.anchors = Mock(return_value={"admin": 1, "member": 2})
         controller.telegram.call.return_value = {"url": drill.ORIGINAL_ORIGIN + "/telegram/webhook", "has_custom_certificate": False,
             "max_connections": 40, "allowed_updates": ["message", "callback_query"]}
-        controller.telegram.configure.return_value = {"configured": True}
+        controller.configure_webhook.return_value = {"configured": True}
         tool.restore_webhook = Mock(side_effect=drill.ProbeStatusError("original-auth-after", 403, (400,)))
         with patch.object(release_evidence, "verify_activation_baseline", return_value=self.proof(tool)), \
                 patch.object(drill, "one", return_value={"n": 1000}), patch.object(drill, "post_update", return_value=403):
@@ -201,6 +204,7 @@ class PublicProbeTests(unittest.TestCase):
         self.assertEqual(tool.report["cleanupFailures"][0]["expectedStatuses"], [400])
         self.assertEqual(tool.report["cleanupFailures"][0]["phase"], "cleanup-webhook")
         tool.restore_webhook.assert_called_once_with(automatic=True)
+        controller.configure_webhook.assert_called_once()
         tool.quiet.assert_called_once_with()
         tool.transition.assert_not_called()
         report = json.dumps(tool.report)
