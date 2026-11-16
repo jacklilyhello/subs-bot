@@ -106,7 +106,6 @@ def main():
                     and os.environ.get("GITHUB_WORKFLOW_REF")
                     == f"{control.github.REPOSITORY}/{control.REHEARSAL_WORKFLOW_PATH}@{control.github.MAIN_REF}")
     phase("artifact")
-    phase("artifact")
     artifact_receipt(os.environ.get("PROVIDER_TERMINAL_ARTIFACT_ID", ""),
                      os.environ.get("PROVIDER_TERMINAL_ARTIFACT_SHA256", ""), "subs-bot-provider-terminal-request")
     root = Path(os.environ["RUNNER_TEMP"])
@@ -123,7 +122,6 @@ def main():
     recovery = {key: request[key] for key in ("version", "sourceRunId", "sourceRunAttempt", "sourceManifestSha256",
                                              "responseIdentitySha256", "previousTargetSha256")}
     control.validate_forward_recovery({**recovery, "terminalSha256": "0" * 64})
-    phase("source")
     phase("source")
     control.guard_sources(target)
     api = control.ProviderAPI(target, os.environ.get("SUBS_BOT_CF_PROVIDER_WORKER_TOKEN", ""),
