@@ -184,7 +184,7 @@ class DeploymentReconciliationTests(unittest.TestCase):
         self.assertEqual(result["control"]["epoch"], self.before["control"]["epoch"] + 1)
         self.assertEqual(self.api.db.execute("SELECT count(*) FROM subscriptions").fetchone()[0], 1)
         self.assertEqual([event["phase"] for event in self.checkpoints],
-                         ["upload-confirmed", "traffic-intent", "traffic-confirmed", "active-confirmed"])
+                         ["upload-intent", "upload-confirmed", "traffic-intent", "traffic-confirmed", "active-confirmed"])
         for event in self.checkpoints:
             self.assertEqual(event["sourceRevision"], NEW_REVISION)
             self.assertEqual(event["targetSha256"], self.target.digest)
@@ -273,12 +273,28 @@ class DeploymentReconciliationTests(unittest.TestCase):
         self.assertEqual(self.api.control_batches, [])
 
     def test_checkpoint_failure_after_upload_is_unknown_without_second_mutation(self):
-        self.new.deployment_checkpoint = Mock(side_effect=OSError(SECRET))
+        def checkpoint(event):
+            if event["phase"] == "upload-confirmed":
+                raise OSError(SECRET)
+            self.checkpoints.append(event)
+        self.new.deployment_checkpoint = checkpoint
         with self.assertRaises(control.DeploymentReconciliationRequired) as caught:
             self.deploy()
         self.assertEqual(caught.exception.phase, "staged-readback")
         self.assertEqual((self.api.uploads, self.api.traffic_posts), (1, 0))
         self.assertNotIn(SECRET, str(caught.exception))
+
+    def test_unconfirmed_preupload_intent_stops_before_every_mutation(self):
+        self.new.deployment_checkpoint = Mock(side_effect=OSError(SECRET))
+        preserved = list(self.api.db.iterdump())
+        with self.assertRaises(contract.ContractError) as caught:
+            self.deploy()
+        self.assertNotIsInstance(caught.exception, control.DeploymentReconciliationRequired)
+        self.assertNotIn(SECRET, str(caught.exception))
+        self.assertFalse(bool(getattr(caught.exception, "uncertain", False)))
+        self.assertEqual((self.api.uploads, self.api.traffic_posts, self.api.schedule_puts), (0, 0, 0))
+        self.assertEqual(self.api.control_batches, [])
+        self.assertEqual(list(self.api.db.iterdump()), preserved)
 
     def test_full_expected_active_rejects_third_version_with_same_module_and_configuration_before_sql(self):
         expected = self.activate_new()
