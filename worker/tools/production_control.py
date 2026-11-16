@@ -47,6 +47,12 @@ class OperationError(RuntimeError):
         self.uncertain, self.http_status = uncertain, status
 
 
+class StalePredecessorError(ContractError):
+    """A transition's read-only predecessor comparison failed before any SQL began."""
+    def __init__(self):
+        super().__init__("Predecessor state changed; no transition performed.")
+
+
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -574,6 +580,16 @@ class Controller:
         # No timezone row means UTC, avoiding a synthetic Telegram receipt.
         return True
 
+    def plan_pause(self):
+        before = self.inspect()
+        # Accepted work may finish, fail or become uncertain while a pause is
+        # approved. The complete observation remains visible; approval binds the
+        # immutable target/configuration/release and the entire control CAS row.
+        before["approvalState"] = {"planAction": "pause", **{key: before[key] for key in
+            ("targetSha256", "configurationSha256", "release", "control", "migrationCount")}}
+        before["stateSha256"] = digest(before["approvalState"])
+        return before
+
     def plan_activate(self):
         before = self.inspect()
         require(before["control"]["admission"] == "closed" and before["control"]["workers"] == "frozen"
@@ -604,8 +620,9 @@ class Controller:
         return before
 
     def transition(self, action, approval, state_sha):
-        before = self.plan_activate() if action == "activate" else self.inspect()
-        require(before["stateSha256"] == state_sha, "Predecessor state changed; no transition performed.")
+        before = self.plan_activate() if action == "activate" else self.plan_pause() if action == "pause" else self.inspect()
+        if before["stateSha256"] != state_sha:
+            raise StalePredecessorError()
         self.approval(approval, action, state_sha)
         control = before["control"]
         desired = {"pause": ("closed", "run"), "freeze": ("closed", "frozen"),
@@ -844,6 +861,8 @@ def main():
         result = controller.initialize()
     elif action == "plan-deploy":
         result = controller.plan_deploy(source_controller)
+    elif action == "plan-pause":
+        result = controller.plan_pause()
     elif action == "plan-activate":
         result = controller.plan_activate()
     elif action == "deploy":

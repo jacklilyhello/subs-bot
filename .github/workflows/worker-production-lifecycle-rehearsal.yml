@@ -9,7 +9,7 @@ on:
         type: choice
         required: true
         default: inspect
-        options: [bootstrap, exercise, inspect, seed-fixture, recovery, recover-webhook]
+        options: [bootstrap, exercise, inspect, stabilize, seed-fixture, recovery, recover-webhook]
       source_run_id:
         description: Successful exact-main Worker CI run
         type: string

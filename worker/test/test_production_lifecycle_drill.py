@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 WORKER = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(WORKER / "tools"))
@@ -98,6 +98,7 @@ class LifecycleDrillTests(unittest.TestCase):
         controller.revision = REVISION
         controller.plan_activate.return_value = {"stateSha256": "c" * 64,
             "activationBaseline": {"checkpointId": "d" * 32, "manifestSha256": "e" * 64}}
+        controller.transition.return_value = {"stateSha256": "f" * 64}
         tool.controller = controller
         with patch.dict(drill.os.environ, {"GITHUB_SHA": REVISION}):
             tool.transition("activate")
@@ -107,6 +108,142 @@ class LifecycleDrillTests(unittest.TestCase):
         self.assertEqual(action, "activate")
         self.assertEqual(predecessor, "c" * 64)
         self.assertEqual(envelope["stateSha256"], predecessor)
+
+    def planned_controller(self, tool):
+        target, _ = fixture()
+        controller = Mock(target=target, revision=REVISION)
+        controller.plan_pause.return_value = {"stateSha256": "a" * 64, "control": {"admission": "open", "workers": "run"}}
+        controller.transition.return_value = {"stateSha256": "b" * 64, "control": {"admission": "closed", "workers": "run"}}
+        tool.controller = controller
+        return controller
+
+    def test_only_explicit_pre_sql_staleness_replans_with_unique_private_stages(self):
+        tool = self.tool()
+        controller = self.planned_controller(tool)
+        confirmed = controller.transition.return_value
+        controller.transition.side_effect = [drill.StalePredecessorError(), confirmed, confirmed]
+        with patch.dict(drill.os.environ, {"GITHUB_SHA": REVISION}):
+            tool.transition("pause")
+            tool.transition("pause")
+        self.assertEqual(controller.plan_pause.call_count, 3)
+        self.assertEqual(controller.transition.call_count, 3)
+        stages = [value["stage"] for value in tool.report["stages"]]
+        self.assertEqual(stages, ["control-001-pause-intent", "control-001-pause-stale",
+            "control-002-pause-intent", "control-002-pause-confirmed", "control-003-pause-intent", "control-003-pause-confirmed"])
+        self.assertEqual(len(stages), len(set(stages)))
+        self.assertEqual(tool.report["state"], confirmed)
+        for attempted in controller.transition.call_args_list:
+            action, envelope, predecessor = attempted.args
+            self.assertEqual(action, "pause")
+            self.assertEqual(envelope["stateSha256"], predecessor)
+            self.assertEqual(envelope["environment"], "rehearsal")
+
+    def test_stale_replanning_is_limited_to_three_and_unknown_results_never_retry(self):
+        failures = [(drill.StalePredecessorError(), 3),
+            (drill.OperationError("Synthetic unconfirmed SQL result.", uncertain=True), 1),
+            (contract.ContractError("Predecessor state changed; no transition performed."), 1)]
+        for failure, count in failures:
+            tool = self.tool()
+            controller = self.planned_controller(tool)
+            controller.transition.side_effect = failure
+            with self.subTest(kind=type(failure).__name__), patch.dict(drill.os.environ, {"GITHUB_SHA": REVISION}):
+                with self.assertRaises(type(failure)):
+                    tool.transition("pause")
+            self.assertEqual(controller.transition.call_count, count)
+            self.assertEqual(controller.plan_pause.call_count, count)
+            self.assertFalse(any(stage["stage"].endswith("-confirmed") for stage in tool.report["stages"]))
+
+    def test_private_confirmation_failure_cannot_repeat_an_executed_transition(self):
+        tool = self.tool()
+        controller = self.planned_controller(tool)
+        tool.save = Mock(side_effect=[None, drill.OperationError("Synthetic private confirmation uncertainty.", uncertain=True)])
+        with patch.dict(drill.os.environ, {"GITHUB_SHA": REVISION}):
+            with self.assertRaises(drill.OperationError):
+                tool.transition("pause")
+        controller.transition.assert_called_once()
+        controller.plan_pause.assert_called_once()
+
+    def test_private_intent_must_be_durable_before_any_transition(self):
+        tool = self.tool()
+        controller = self.planned_controller(tool)
+        tool.save = Mock(side_effect=drill.OperationError("Synthetic unconfirmed private intent.", uncertain=True))
+        with self.assertRaises(drill.OperationError):
+            tool.transition("pause")
+        controller.transition.assert_not_called()
+
+    def test_stabilize_preserves_unknowns_and_only_pauses_drains_and_freezes(self):
+        tool = self.tool()
+        controller = self.planned_controller(tool)
+        initial = {"control": {"admission": "closed", "workers": "run"}, "work": {"invocations": 0},
+            "terminal": {"unknownInvocations": 1}}
+        frozen = {**initial, "control": {"admission": "closed", "workers": "frozen"}}
+        controller.inspect.return_value = initial
+        tool.prepare = Mock(return_value=(Path("/synthetic-unused-bundle"), {}))
+        tool.registration = Mock(return_value=controller.target)
+        tool.bind = Mock(return_value=controller)
+        tool.transition = Mock(side_effect=[initial, frozen])
+        tool.quiet = Mock(return_value=initial["work"])
+        tool.stabilize()
+        self.assertEqual(tool.transition.call_args_list, [call("pause"), call("freeze")])
+        tool.prepare.assert_called_once_with(active=True)
+        tool.registration.assert_called_once_with()
+        tool.quiet.assert_called_once_with()
+        self.assertEqual(tool.report["stabilization"]["preservedUnknown"]["unknownInvocations"], 1)
+        self.assertIs(tool.report["stabilization"]["activationPermitted"], False)
+        self.assertIs(tool.report["stabilization"]["webhookTouched"], False)
+        controller.telegram.call.assert_not_called()
+        controller.classify_interruption.assert_not_called()
+        controller.data.assert_not_called()
+
+    def test_stabilize_rejects_other_scope_before_transition_or_webhook(self):
+        tool = self.tool()
+        controller = self.planned_controller(tool)
+        target = deepcopy(controller.target.data)
+        service, backup, hostname = contract.NAMES["production"]
+        target.update(environment="production", workerName=service, d1Name=service, bucketName=service,
+            backupBucketName=backup, hostname=hostname, botUsername="SyntheticFormalBot")
+        controller.target = contract.validate_target(target)
+        tool.prepare = Mock(return_value=(Path("/synthetic-unused-bundle"), {}))
+        tool.registration = Mock(return_value=controller.target)
+        tool.bind = Mock(return_value=controller)
+        with self.assertRaises(contract.ContractError):
+            tool.stabilize()
+        controller.inspect.assert_not_called()
+        controller.transition.assert_not_called()
+        controller.telegram.call.assert_not_called()
+
+    def test_stabilize_never_classifies_or_freezes_work_that_has_not_drained(self):
+        tool = self.tool()
+        controller = self.planned_controller(tool)
+        controller.inspect.return_value = {"control": {"admission": "closed", "workers": "run"},
+            "work": {"invocations": 1}, "terminal": {"unknownInvocations": 1}}
+        tool.prepare = Mock(return_value=(Path("/synthetic-unused-bundle"), {}))
+        tool.registration = Mock(return_value=controller.target)
+        tool.bind = Mock(return_value=controller)
+        tool.transition = Mock(return_value=controller.inspect.return_value)
+        tool.quiet = Mock(side_effect=contract.ContractError("Synthetic accepted work is not drained."))
+        with self.assertRaises(contract.ContractError):
+            tool.stabilize()
+        self.assertEqual(tool.transition.call_args_list, [call("pause")])
+        controller.classify_interruption.assert_not_called()
+        controller.telegram.call.assert_not_called()
+        self.assertNotEqual(tool.report.get("status"), "passed")
+
+    def test_unfrozen_inspection_retains_actual_state_without_reporting_passed(self):
+        tool = self.tool()
+        controller = self.planned_controller(tool)
+        state = {"control": {"admission": "closed", "workers": "run"}, "work": {"invocations": 1}}
+        controller.inspect.return_value = state
+        tool.prepare = Mock(return_value=(Path("/synthetic-unused-bundle"), {}))
+        tool.registration = Mock(return_value=controller.target)
+        tool.bind = Mock(return_value=controller)
+        with self.assertRaises(contract.ContractError), patch.object(drill, "rows") as read:
+            tool.inspect()
+        self.assertEqual(tool.report["state"], state)
+        self.assertIs(tool.report["independentReadback"], True)
+        self.assertNotEqual(tool.report.get("status"), "passed")
+        self.assertTrue(any(key.endswith("-independent-inspect.json") for key in tool.store.values))
+        read.assert_not_called()
 
     def test_code_archive_rechecks_exact_attempt_and_rejects_changed_bytes(self):
         tool = self.tool()

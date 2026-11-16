@@ -14,7 +14,7 @@ on:
         description: One guarded lifecycle step; inspect after every uncertain result
         required: true
         type: choice
-        options: [availability, provision-inspect, provision-reconcile, provision, preflight, initialize, inspect, plan-deploy, deploy, reconcile-deploy, pause, drain, freeze, thaw, classify-interruption, domain, webhook, plan-activate, activate]
+        options: [availability, provision-inspect, provision-reconcile, provision, preflight, initialize, inspect, plan-deploy, deploy, reconcile-deploy, plan-pause, pause, drain, freeze, thaw, classify-interruption, domain, webhook, plan-activate, activate]
         default: inspect
       source_run_id:
         description: Successful exact main release CI; omit only with pinned private source checkpoint
@@ -42,7 +42,7 @@ on:
         description: Exact independently verified activation baseline manifest digest
         type: string
       state_sha256:
-        description: Exact predecessor from independent inspection; required for mutations
+        description: Exact approved predecessor; pause requires plan-pause and activation requires plan-activate
         type: string
       webhook_sha256:
         description: Exact getWebhookInfo predecessor digest for webhook configuration

@@ -28,7 +28,7 @@
 
 ## 同一状态的 D1/R2 备份
 
-1. 用生命周期工具关闭新增 admission，保留已经持久受理的后台任务完成；查看分类 work 和 terminal 计数。
+1. 用生命周期 `plan-pause` 取得准确批准前态，明确批准该摘要后执行 `pause` 关闭新增 admission，再 `inspect → drain`。普通 inspect 摘要不能替代 plan-pause；保留已经持久受理的后台任务完成，查看完整分类 work 和 terminal 计数。
 2. 仅在尚可执行的工作为零时 freeze。中断租约必须按受保护分类流程处理，保留不确定终态，不删记录或重发消息。未知外部结果不是成功完成，也不能据此自动激活消费者。
 3. 用准确源 CI run/attempt 调用 `prepare`。工具核对固定源资源、版本、模块、配置、完整迁移及冻结 epoch，在固定私有备份桶建立追加式意图链。
 4. 调用 `capture`。工具原生导出 D1，受限私有 scratch 重建完整 schema/外键/数据，捕获所有 D1 引用的 R2 对象、字节和 ownership metadata。导出后和对象捕获后分别比较完整源数据摘要，并再次读回对象及元数据；源发生变化就停止，不发布完整 manifest。

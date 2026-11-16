@@ -21,7 +21,7 @@ import d1_migrations as migrations
 import native_restore_rehearsal as native
 import prepare_isolation_artifact as artifact
 import prepare_control_artifact
-from production_control import API, Controller, NoRedirect, OperationError, Telegram, general_config, hosted_environment, one, rows
+from production_control import API, Controller, NoRedirect, OperationError, StalePredecessorError, Telegram, general_config, hosted_environment, one, rows
 from production_provision import Provisioner, ProvisionJournal
 from production_storage import PrivateStore
 from production_target import ACCOUNT, ZONE, FEATURES, NAMES, HEX, UUID, STAMP, ContractError, canonical, digest, matches, parsed, require, validate_target
@@ -170,6 +170,7 @@ class Drill:
         self.human_window = int(window)
         self.guard = lambda: artifact.require_current_main(self.revision)
         self.controller = None
+        self.transition_sequence = 0
         self.proof = None
         self.report = {"schemaVersion": 1, "environment": "rehearsal", "productionMutated": False,
             "controlRevision": self.revision, "runId": self.run, "runAttempt": self.attempt,
@@ -241,9 +242,26 @@ class Drill:
 
     def transition(self, action):
         ctl = self.controller
-        require(ctl is not None)
-        before = ctl.plan_activate() if action == "activate" else ctl.inspect()
-        return ctl.transition(action, approval(ctl.target, action, ctl.revision, before["stateSha256"]), before["stateSha256"])
+        require(ctl is not None and ctl.target.environment == "rehearsal"
+                and ctl.target.data["workerName"] == SERVICE and action in ("pause", "freeze", "thaw", "activate"))
+        for attempt in range(1, 4):
+            self.transition_sequence += 1
+            stage = "control-" + str(self.transition_sequence).zfill(3) + "-" + action
+            before = ctl.plan_activate() if action == "activate" else ctl.plan_pause() if action == "pause" else ctl.inspect()
+            self.report.update(state=before, ciProof=self.proof)
+            self.save(stage + "-intent", {"action": action, "attempt": attempt, "observed": before})
+            try:
+                after = ctl.transition(action, approval(ctl.target, action, ctl.revision, before["stateSha256"]), before["stateSha256"])
+            except StalePredecessorError:
+                self.save(stage + "-stale", {"action": action, "attempt": attempt, "transitionPerformed": False})
+                if attempt == 3:
+                    raise
+                continue
+            # A SQL/transport/unknown result or failed confirmation never reaches
+            # the retry branch, including a failure of this private evidence write.
+            self.report["state"] = after
+            self.save(stage + "-confirmed", after)
+            return after
 
     def negative_preflight(self, target, bundle, manifest):
         observed = {"reads": 0, "mutationAttempts": 0}
@@ -566,11 +584,32 @@ class Drill:
         bundle, manifest = self.prepare(active=True)
         ctl = self.bind(self.registration(), bundle, manifest)
         state = ctl.inspect()
-        require(state["control"]["admission"] == "closed" and state["control"]["workers"] == "frozen")
-        human = self.human_receipts()
+        self.report.update(state=state, ciProof=self.proof, independentReadback=True)
         self.save("independent-inspect", state)
-        self.report.update(status="passed", state=state, ciProof=self.proof, independentReadback=True,
+        require(state["control"]["admission"] == "closed" and state["control"]["workers"] == "frozen",
+                "The observed rehearsal target is not closed and frozen; its actual state was retained.")
+        human = self.human_receipts()
+        self.report.update(status="passed",
             humanReceiptsObserved=len(human), humanReceipts=human, humanEvidenceRequiresIABCorrelation=True)
+
+    def stabilize(self):
+        bundle, manifest = self.prepare(active=True)
+        ctl = self.bind(self.registration(), bundle, manifest)
+        require(ctl.target.environment == "rehearsal" and ctl.target.data["workerName"] == SERVICE)
+        before = ctl.inspect()
+        self.report.update(state=before, ciProof=self.proof)
+        self.save("stabilization-observed", before)
+        self.transition("pause")
+        self.quiet()
+        frozen = self.transition("freeze")
+        require(frozen["control"]["admission"] == "closed" and frozen["control"]["workers"] == "frozen"
+                and not any(frozen["work"].values()))
+        unknown = {key: frozen["terminal"].get(key, 0) for key in
+            ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates")}
+        self.report.update(status="passed", state=frozen,
+            stabilization={"admissionClosed": True, "workersFrozen": True, "preservedUnknown": unknown,
+                "activationPermitted": False, "webhookTouched": False})
+        self.save("stabilization-confirmed", self.report["stabilization"])
 
     def human_receipts(self):
         """Project bounded receipt metadata; a person must still correlate the IAB messages."""
@@ -704,7 +743,7 @@ def main():
     hosted_environment("rehearsal")
     require(env.get("GITHUB_WORKFLOW_REF") == WORKFLOW, "Only the protected dedicated hosted rehearsal workflow may run this drill.")
     action = env.get("DRILL_ACTION", "inspect")
-    require(action in ("bootstrap", "exercise", "inspect", "recover-webhook", "seed-fixture", "recovery", "finalize-recovery"))
+    require(action in ("bootstrap", "exercise", "inspect", "stabilize", "recover-webhook", "seed-fixture", "recovery", "finalize-recovery"))
     tool = Drill(env)
     try:
         if action == "recover-webhook":

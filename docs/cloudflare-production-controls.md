@@ -151,12 +151,15 @@ gh workflow run worker-production-control.yml --ref main \
 | webhook | 重新核对 getMe/getWebhookInfo 前态，明确 drop_pending_updates=false，读回 URL／类别／连接参数 |
 | plan-activate | closed/frozen 且已排空；指定 `baseline_checkpoint_id`、`baseline_manifest_sha256`，完整读回私有 G0 SQL／R2／CI 闭包并与当前数据、版本和配置核对；输出包含该基线的批准前态 |
 | activate | 使用相同基线 pin 和 plan-activate 前态重新完整核对，精确批准、版本、配置、Webhook、域名和未知结果检查全部满足后，直接从 frozen 原子开启；中间不得 thaw 或写入 |
-| pause | 同事务关闭业务 admission；不会把 frozen 后台意外解冻；已受理工作继续完成 |
+| plan-pause | 输出完整现场观察；独立 `approvalState` 绑定 pause、目标／配置、准确版本、完整 control 行和迁移数，输出本次 pause 批准所需的 `stateSha256` |
+| pause | 仅接受 plan-pause 的批准前态，不能用普通 inspect 摘要；正常已受理工作的计数／终态变化不使暂停批准失效，目标／配置／版本／控制行变化仍拒绝。同事务 CAS 关闭 admission，不要求 work=0，也不会把 frozen 后台意外解冻 |
 | drain | 完整分类状态只读检查；未排空则失败；明确失败／外部不确定结果单列，不删除记录 |
 | classify-interruption | 暂停后明确分类已结束或超过执行上限与隔离宽限的调用，保留 uncertain；不确认、不重发相关更新 |
 | freeze / thaw | freeze 需已关闭 admission 且无可继续执行工作；thaw 只恢复已受理后台处理，仍保持 admission 关闭 |
 
 常规 inspect／pause／drain 可以显式选择已通过 CI 的 main 祖先应用产物，控制工具自身始终运行当前准确 main。新初始化／部署要求当前 main 产物。不能用新提交的绿色状态替代旧线上模块的来源证明。
+
+暂停顺序为 `plan-pause → 批准该摘要 → pause → inspect → drain → freeze`。生产流程不会自动更换批准；重新规划只发生在新的明确批准下。freeze／activate 的工作与未知结果限制继续生效。专用演练工作流的 `stabilize` 仅绑定独立登记的准确演练源，执行 pause、等待已受理工作、freeze，不接触 Webhook、不删除数据、不分类或重发未知结果。演练自动重新批准最多三次，而且只处理已确认 SQL 尚未开始的 `StalePredecessorError`；SQL CAS 失败、传输未知或确认失败均停止并保留私有 intent。每次 intent 和确认使用唯一序号。
 
 Actions 产物过期时，可用 `source_checkpoint_id` 和独立保存的 `source_manifest_sha256` 代替 `source_run_id`。工具从私有 R2 核对原始 CI ZIP、来源证明、完整迁移和源配置，不查询已过期的 Actions 产物；旧源仅可用于检查、暂停等运维，新部署仍要求准确当前 main。升级时可用 `active_checkpoint_id`／`active_manifest_sha256` 代替 `active_run_id`，旧完整配置从受摘要保护的私有资料读取，Secret 仍单独安全注入。字段必须成对填写。源代码归档可读不代表备份通过；最终激活还会强制验证全部 SQL 分片、R2 对象、归属元数据及当前 D1 数据，任何损坏、新写入或控制 epoch 变化都停止并要求重新封存基线。
 
