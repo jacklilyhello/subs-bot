@@ -281,16 +281,27 @@ class RecoveryAPI:
         def get(path):
             method = getattr(self.worker_api, "json", None)
             if method is None:
-                # These legacy Workers inventory endpoints are SinglePage APIs.
-                return self.worker_api("GET", path)
+                method = self.worker_api
             envelope = method("GET", path, envelope=True)
-            require(isinstance(envelope, dict) and envelope.get("success") is True and "result" in envelope)
+            require(isinstance(envelope, dict) and envelope.get("success") is True
+                    and envelope.get("errors") in (None, []) and "result" in envelope)
             info = envelope.get("result_info", {})
-            require(isinstance(info, dict) and not info.get("cursor") and not info.get("next_page_token")
-                    and info.get("is_truncated") in (None, False) and info.get("total_pages", 1) <= 1,
+            require(isinstance(info, dict) and set(info) <= {"page", "per_page", "count", "total_count", "total_pages",
+                    "cursor", "next_page_token", "is_truncated"}
+                    and info.get("cursor") in (None, "") and info.get("next_page_token") in (None, "")
+                    and (info.get("is_truncated") is None or info.get("is_truncated") is False)
+                    and all(type(info[key]) is int and info[key] >= 0
+                            for key in ("page", "per_page", "count", "total_count", "total_pages") if key in info)
+                    and info.get("page", 1) == 1 and info.get("total_pages", 1) <= 1
+                    and ("per_page" not in info or info["per_page"] > 0),
                     "Consumer discovery was truncated; no recovery mutation is permitted.")
-            if isinstance(envelope["result"], list) and "total_count" in info:
-                require(info["total_count"] == len(envelope["result"]))
+            result = envelope["result"]
+            inventory = result if isinstance(result, list) else result.get("environments") if isinstance(result, dict) else None
+            if isinstance(inventory, list):
+                require(all(info[key] == len(inventory) for key in ("count", "total_count") if key in info)
+                        and ("per_page" not in info or len(inventory) <= info["per_page"])
+                        and (not inventory or info.get("total_pages", 1) == 1),
+                        "Consumer inventory count differs; no recovery mutation is permitted.")
             return envelope["result"]
 
         self.consumer_stage = "services-list"

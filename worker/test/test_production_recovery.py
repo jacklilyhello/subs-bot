@@ -1,6 +1,7 @@
 """Hosted-only synthetic production recovery failure and identity coverage."""
 
 from copy import deepcopy
+from io import BytesIO
 from pathlib import Path
 import sys
 import tempfile
@@ -10,6 +11,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import production_recovery as recovery
+import production_control as control
 
 
 ACCOUNT = "a" * 32
@@ -23,6 +25,14 @@ TARGET = {"accountId": ACCOUNT, "d1Id": SOURCE, "d1Name": "subs-bot-cf-control-d
 CONTRACT = {"version": 1, "checkpointId": CHECKPOINT, "databaseName": "subs-bot-restore-db-drill",
             "objectsName": "subs-bot-restore-r2-drill", "purpose": "baseline"}
 PIN = {"revision": "b" * 40, "scopeSha256": recovery.digest(recovery.canonical(TARGET))}
+
+
+def inventory_reader(read):
+    """Callable-only adapter: recovery must explicitly request the envelope."""
+    def request(method, path, payload=None, *, envelope=False):
+        assert method == "GET" and payload is None and envelope is True
+        return {"success": True, "result": read(method, path)}
+    return request
 
 
 class ContractTests(unittest.TestCase):
@@ -106,7 +116,7 @@ class APITests(unittest.TestCase):
                 if path.endswith("/workers/scripts"):
                     return [{"id": "consumer"}]
                 return {"bindings": [{"type": "d1", key: DESTINATION}]}
-            self.api.worker_api = worker
+            self.api.worker_api = inventory_reader(worker)
             with self.subTest(alias=key), self.assertRaises(recovery.RecoveryError):
                 self.api.consumer_proof()
 
@@ -120,7 +130,7 @@ class APITests(unittest.TestCase):
                 return {"id": "consumer", "default_environment": {"environment": "staging"},
                         "environments": [{"environment": "staging"}]}
             return {"bindings": [{"type": "r2_bucket", "bucket_name": self.api.names["objects"]}]}
-        self.api.worker_api = worker
+        self.api.worker_api = inventory_reader(worker)
         with self.assertRaises(recovery.RecoveryError):
             self.api.consumer_proof()
 
@@ -137,7 +147,7 @@ class APITests(unittest.TestCase):
                         "default_environment": {"environment": "production", "script": {"id": "consumer"}},
                         "environments": [{"environment": "production"}, {"environment": "staging"}]}
             return {"bindings": []}
-        self.api.worker_api = worker
+        self.api.worker_api = inventory_reader(worker)
         result = self.api.consumer_proof()
         self.assertEqual(result["checked"], 2)
         self.assertEqual(result["consumers"], 0)
@@ -162,13 +172,13 @@ class APITests(unittest.TestCase):
                 if path.endswith("/environments"):
                     return deepcopy(wrapper)
                 return {"bindings": []}
-            self.api.worker_api = worker
+            self.api.worker_api = inventory_reader(worker)
             with self.subTest(wrapper=wrapper), self.assertRaises(recovery.RecoveryError):
                 self.api.consumer_proof()
             self.assertEqual(self.api.consumer_stage, "service-environments")
 
     def test_bounded_consumer_inventory_fails_instead_of_truncating(self):
-        self.api.worker_api = Mock(return_value=[{"id": "worker"}] * recovery.MAX_CONSUMERS)
+        self.api.worker_api = inventory_reader(lambda _method, _path: [{"id": "worker"}] * recovery.MAX_CONSUMERS)
         with self.assertRaises(recovery.RecoveryError):
             self.api.consumer_proof()
 
@@ -177,6 +187,85 @@ class APITests(unittest.TestCase):
             "result_info": {"total_pages": 2}}))
         with self.assertRaises(recovery.RecoveryError):
             self.api.consumer_proof()
+
+
+class ConsumerTransportTests(unittest.TestCase):
+    """Use the real control API parser/transport, including callable-only support."""
+
+    def api(self, metadata=None, *, callable_only=False, stopped_at="services"):
+        requests = []
+        worker = control.API(TARGET, "synthetic-scoped-worker-read-token")
+        def transport(request, *, timeout):
+            self.assertEqual(request.method, "GET")
+            self.assertIsNone(request.data)
+            self.assertEqual(timeout, 45)
+            requests.append(request)
+            route = request.full_url.split("/accounts/" + ACCOUNT, 1)[1]
+            if route.endswith("/workers/services"):
+                result = [{"id": "consumer"}]
+                info = metadata if stopped_at == "services" else None
+            elif route.endswith("/workers/scripts"):
+                result, info = [], metadata if stopped_at == "scripts" else None
+            elif route.endswith("/environments"):
+                result = {"id": "consumer", "default_environment": {"environment": "production"},
+                          "environments": [{"environment": "production"}]}
+                info = metadata if stopped_at == "environments" else None
+            else:
+                self.assertTrue(route.endswith("/environments/production/settings"))
+                result, info = {"bindings": []}, None
+            body = {"success": True, "result": result, **({"result_info": info} if info is not None else {})}
+            return BytesIO(recovery.canonical(body))
+        worker.opener.open = Mock(side_effect=transport)
+        reader = (lambda *args, **kwargs: worker(*args, **kwargs)) if callable_only else worker
+        return recovery.RecoveryAPI(TARGET, "synthetic-token", reader, CONTRACT), requests, worker
+
+    def test_real_controller_api_and_callable_only_adapter_read_complete_envelopes(self):
+        for callable_only in (False, True):
+            api, requests, _worker = self.api({"page": 1, "per_page": 1000, "count": 1, "total_count": 1, "total_pages": 1},
+                                               callable_only=callable_only)
+            with self.subTest(callable_only=callable_only):
+                self.assertEqual(api.consumer_proof()["checked"], 1)
+                self.assertEqual(len(requests), 4)
+                self.assertTrue(all(request.method == "GET" for request in requests))
+
+    def test_paginated_truncated_or_inconsistent_real_envelopes_stop_before_resource_writes(self):
+        metadata = [{"total_pages": 2}, {"total_count": 2}, {"count": 0}, {"page": 2}, {"cursor": "next"},
+            {"next_page_token": "next"}, {"is_truncated": True}, {"is_truncated": 0}, {"has_more": True},
+            {"total_count": True}, {"total_pages": "1"}, {"per_page": 0}, {"total_pages": 0}]
+        for callable_only in (False, True):
+            for info in metadata:
+                api, requests, _worker = self.api(info, callable_only=callable_only)
+                engine = object.__new__(recovery.RecoveryEngine)
+                engine.api, engine.source, engine.journal = api, Mock(), Mock()
+                engine.verify_resources = Mock()
+                engine.verify_preservation = Mock()
+                engine.manifest = Mock(return_value=({"objects": []}, None))
+                engine.target_objects, engine.restore_object = Mock(), Mock()
+                with self.subTest(callable_only=callable_only, info=info), self.assertRaises(recovery.RecoveryError):
+                    engine.restore_objects()
+                engine.journal.update.assert_not_called()
+                engine.target_objects.assert_not_called()
+                engine.restore_object.assert_not_called()
+                self.assertEqual(len(requests), 1)
+                self.assertTrue(all(request.method == "GET" for request in requests))
+
+    def test_pagination_is_checked_at_scripts_and_service_environments_too(self):
+        for stopped_at in ("scripts", "environments"):
+            api, requests, _worker = self.api({"total_pages": 2}, callable_only=True, stopped_at=stopped_at)
+            with self.subTest(stopped_at=stopped_at), self.assertRaises(recovery.RecoveryError):
+                api.consumer_proof()
+            self.assertEqual(len(requests), 2 if stopped_at == "scripts" else 3)
+            self.assertTrue(all(request.method == "GET" for request in requests))
+
+    def test_bare_list_fallback_is_never_accepted_as_a_complete_inventory(self):
+        # A callable which ignores the requested envelope cannot prove its list
+        # is complete, even if no consumer happens to appear in that list.
+        reader = Mock(side_effect=lambda *_args, **_kwargs: [])
+        del reader.json
+        api = recovery.RecoveryAPI(TARGET, "synthetic-token", reader, CONTRACT)
+        with self.assertRaises(recovery.RecoveryError):
+            api.consumer_proof()
+        reader.assert_called_once_with("GET", api.root + "/workers/services", envelope=True)
 
 
 class MemoryAPI:

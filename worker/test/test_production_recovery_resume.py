@@ -4,7 +4,7 @@ from copy import deepcopy
 import json
 from pathlib import Path
 import sys
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
@@ -16,12 +16,44 @@ import test_production_recovery as fixtures
 class ResumeContractTests(unittest.TestCase):
     def test_explicit_paired_complete_pins_are_required(self):
         pins = {"version": 1, "checkpointId": fixtures.CHECKPOINT, "manifestSha256": "a" * 64, "journalSha256": "b" * 64}
-        self.assertEqual(drill.resume_parameters(recovery.canonical(pins)), pins)
+        for raw in (pins, recovery.canonical(pins), recovery.canonical(pins).decode("utf-8")):
+            with self.subTest(input_type=type(raw).__name__):
+                self.assertEqual(drill.resume_parameters(raw), pins)
         self.assertIsNone(drill.resume_parameters(""))
         for changed in ({"version": True}, {"checkpointId": "../wrong"}, {"manifestSha256": ""},
                         {"journalSha256": ""}, {"extra": True}):
             with self.subTest(changed=changed), self.assertRaises(recovery.RecoveryError):
                 drill.resume_parameters({**pins, **changed})
+
+    def test_workflow_json_is_utf8_encoded_before_bounded_unique_key_parsing(self):
+        pins = {"version": 1, "checkpointId": fixtures.CHECKPOINT, "manifestSha256": "a" * 64, "journalSha256": "b" * 64}
+        raw = recovery.canonical(pins).decode("utf-8")
+        for encoded in (False, True):
+            bounded = raw + " " * (4096 - len(raw.encode("utf-8")))
+            for body, accepted in ((bounded, True), (bounded + " ", False),
+                                   ('{"version":1,' + raw[1:], False)):
+                value = body.encode("utf-8") if encoded else body
+                with self.subTest(encoded=encoded, accepted=accepted):
+                    if accepted:
+                        self.assertEqual(drill.resume_parameters(value), pins)
+                    else:
+                        with self.assertRaises(recovery.RecoveryError):
+                            drill.resume_parameters(value)
+        for malformed in (b"\xff", "\ud800", b"", "[]", '{"version":NaN}'):
+            with self.subTest(input_type=type(malformed).__name__), self.assertRaises(recovery.RecoveryError):
+                drill.resume_parameters(malformed)
+
+    def test_multibyte_overflow_is_rejected_before_json_decoding(self):
+        # Character count fits while actual UTF-8 bytes exceed the 4 KiB input
+        # limit. Neither strings nor bytes can bypass that limit.
+        raw = json.dumps({"padding": "é" * 2100}, ensure_ascii=False)
+        self.assertLess(len(raw), 4096)
+        self.assertGreater(len(raw.encode("utf-8")), 4096)
+        for value in (raw, raw.encode("utf-8")):
+            with self.subTest(input_type=type(value).__name__), patch.object(recovery.native.json, "loads") as parse:
+                with self.assertRaises(recovery.RecoveryError):
+                    drill.resume_parameters(value)
+                parse.assert_not_called()
 
     def test_safe_failure_never_publishes_error_text_paths_or_other_projects(self):
         error = recovery.RecoveryError("synthetic-secret https://private.invalid/internal", uncertain=True, http_status=403)
