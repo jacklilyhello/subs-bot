@@ -28,6 +28,10 @@ on:
       current_run_id:
         description: Current frozen onsite CI; empty uses sealed G1 code or the source CI
         type: string
+      current_run_attempt:
+        description: Exact successful current-site CI attempt
+        type: string
+        default: '1'
       state_sha256:
         description: Exact source inspect predecessor for every mutation
         type: string
@@ -86,7 +90,7 @@ jobs:
           SUBS_BOT_CI_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
           RECOVERY_SOURCE_MANIFEST_SHA256: ${{ inputs.source_manifest_sha256 }}
           RECOVERY_CURRENT_CI_RUN_ID: ${{ inputs.current_run_id }}
-          RECOVERY_CURRENT_CI_RUN_ATTEMPT: '1'
+          RECOVERY_CURRENT_CI_RUN_ATTEMPT: ${{ inputs.current_run_attempt }}
           RECOVERY_STATE_SHA256: ${{ inputs.state_sha256 }}
           RECOVERY_RESOURCE: ${{ inputs.resource }}
           RECOVERY_IDENTITY_SHA256: ${{ inputs.identity_sha256 }}
