@@ -937,6 +937,7 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(native.read_aggregate_reference(code, "GET"), {"status": 200, "bytes": 4, "sha256": native.digest(b"eA==")})
             request = send.call_args.args[1]
             self.assertEqual(request.full_url, native.AGGREGATE_ORIGIN + "/agg/" + code + "/base64")
+            self.assertEqual(request.get_header("User-agent"), native.ISOLATION_RELEASE_USER_AGENT)
             self.assertIsNone(request.get_header("Authorization"))
             self.assertIsNone(request.get_header("Cookie"))
         for status, body in ((302, b""), (503, b"private raw error"), (200, b"not-base64")):
