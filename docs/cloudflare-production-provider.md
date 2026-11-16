@@ -92,6 +92,18 @@
 
 当前自动只读注册仅覆盖明确的首次 create/stage、无消费者响应；其他不明状态保留现场并拒绝自动注册。原始 mutation 永不自动重试，重复 reconcile 也不能跳过实时身份和未激活状态检查。
 
+### 已执行 smoke 后的受保护前向修复
+
+容器请求结束时先发送 `SIGTERM`，在固定期限内等待 `monitor()` 正常退出并核对 `running=false`、`inspect()=null`。异常或超时后会尝试 `destroy()` 清理，但仍返回失败。正常验收继续要求管理 API 的精确实例为 `stopped`，不会把 `failed` 改名为正常停止。
+
+若旧版本曾强制结束容器，必须保留原失败 run、private partial、旧 Workflow 实例和 Durable Object one-shot 标记。仅当旧实例已完整成功执行固定健康摘要、私网拒绝及 named RPC，且同一精确 image/actor 的 inventory 和 detail 均为 `failed/137`、时间属于旧执行、全部 active 实例为空、两次读回一致、资源没有应用 caller，才可生成单独的 `failed-terminal-preserved / not-complete` 证据。该证据不代表旧版本验收通过，也不能授权重触旧 smoke。
+
+用 `action=reconcile-terminal` 填原 run/attempt、经独立 R2-only 读回的 partial manifest SHA 和 smoke response identity SHA。流程先在 R2 环境验证原始源代码及 intent/response 归属，再通过不可变 artifact 将无凭据目标交给 Provider 环境，使用各自既有凭据只读验证终态；最后另一个 R2 环境 job 封存三份小型原件。凭据不跨环境搬运，任一步失败均不产生前向批准。记录返回的 terminal manifest SHA，再以 `action=verify-terminal` 和该 reconcile run/attempt/SHA 从私有 R2 独立读回；状态始终为 not-complete。
+
+只有上述读回成功，才把该 run 的 `subs-bot-provider-forward-terminal-<run>-<attempt>` artifact 中原样的 `provider-reconciled-target.json` 登记为现有 rehearsal/control target 配置，把 `provider-forward-terminal.json` 登记到同一 `subs-bot-provider-isolation` 环境的 `SUBS_BOT_PROVIDER_FORWARD_TERMINAL_JSON`。通过文件 stdin 设置 Secret，不在终端打印配置。
+
+随后明确选择 `source_mode=forward`、新的 current main Provider CI 和 `fault=none`，仍需输入既定专用资源确认。新配置的 `previous` 保留完整旧版本及不可变资源 pins，`forwardRecovery` 绑定原 partial、响应、旧 target 和终态摘要；每次暂存、激活及新 smoke 前都核对旧终态及无 caller 条件。新 revision、新版本和新 Workflow 实例执行完整验收，旧实例与标记保留。最终只有新版本真正 `stopped`、完整 proof 封存和独立 `verify-archive` 成功才能声明完成。通用 `verify`、`stopped` 与依赖验收不会采用 failed-terminal 例外。
+
 后继 job 在原 `subs-bot-isolation` Environment 中，将完成证明、完整 target、journal、源原 ZIP、源 module、OCI archive 和 manifest 封存到既有私有 R2 的 `maintenance/production-provider/<run>/<attempt>/`。每块最大 16 MiB，最多 128 块、总量 600 MiB；超限在 manifest 封存前拒绝。S3 条件写只创建新对象，逐块及完整文件摘要读回后才写最终 manifest；不删除任何原记录。
 
 partial 保存至同一 attempt 的独立 manifest，最多 128 个原始文件、2 GiB 逻辑字节；去重后最多 128 个块/600 MiB。单个 checkpoint 最大 256 KiB、journal 最多 80 个事件；超限停止，不截断。每个版本的原始 target、journal、响应观察和源文件均有独立摘要，重复字节只保留一份物理块。partial 与完整 proof 的读回类型和完成状态分开输出；原始失败不会被存储 job 的成功覆盖。
