@@ -25,8 +25,23 @@ on:
         required: true
         type: string
       source_run_id:
-        description: Successful Worker CI run for this exact main commit
+        description: Successful main Worker CI of the exact immutable deployed source, which may predate the current control tool
         required: true
+        type: string
+      source_run_attempt:
+        description: Exact successful source CI attempt; keep fixed for an existing rehearsal
+        required: true
+        default: '1'
+        type: string
+      source_archive_run_id:
+        description: Optional private evidence archive holding the exact source CI, independent of Actions artifact expiry
+        type: string
+      source_archive_run_attempt:
+        description: Exact private evidence archive attempt; requires archive run and manifest digest
+        default: '1'
+        type: string
+      source_archive_manifest_sha256:
+        description: Independent private archive manifest SHA-256; must accompany archive run
         type: string
       resource:
         description: Resource to reconcile after an unacknowledged create (pin-resource only)
@@ -67,19 +82,26 @@ jobs:
         if: inputs.action == 'verify-restore'
         working-directory: worker
         run: npm ci --ignore-scripts
-      - name: Verify merged artifact provenance and digests
+      - name: Verify current control tool and immutable native source artifact
         env:
           GH_TOKEN: ${{ github.token }}
           SUBS_BOT_CI_RUN_ID: ${{ inputs.source_run_id }}
+          SUBS_BOT_CI_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
+          NATIVE_SOURCE_ARCHIVE_RUN_ID: ${{ inputs.source_archive_run_id }}
+          NATIVE_SOURCE_ARCHIVE_RUN_ATTEMPT: ${{ inputs.source_archive_run_attempt }}
+          NATIVE_SOURCE_ARCHIVE_MANIFEST_SHA256: ${{ inputs.source_archive_manifest_sha256 }}
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          python3 -B worker/tools/prepare_isolation_artifact.py
+          python3 -B worker/tools/prepare_native_restore_artifact.py
       - name: Run the selected isolation rehearsal checkpoint
         env:
           GH_TOKEN: ${{ github.token }}
           SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
           SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
           SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPLOY_TOKEN }}
+          SUBS_BOT_TELEGRAM_AGGREGATE_KEY: ${{ inputs.action == 'verify-restore' && secrets.SUBS_BOT_TELEGRAM_AGGREGATE_KEY || '' }}
         run: python3 -B worker/tools/native_restore_rehearsal.py
       - name: Verify restored native links with exact bundle and no outbound interface
         if: inputs.action == 'verify-restore'

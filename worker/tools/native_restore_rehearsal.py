@@ -12,6 +12,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from email.utils import format_datetime, parsedate_to_datetime
 from hashlib import md5, sha256
+import base64
 import hmac
 from http.client import HTTPSConnection, HTTPException
 import json
@@ -30,9 +31,10 @@ from urllib.request import ProxyHandler, Request, build_opener
 
 import d1_migrations as migrations
 import prepare_isolation_artifact as artifact
+import prepare_native_restore_artifact as native_artifact
 from cloudflare_isolation import (
     API_ORIGIN, CloudflareClient, CloudflareError, DIGEST, HEX_ID, REVISION, TIMESTAMP, UUID,
-    WORKER_NAME, _Isolation, _NoRedirect, _verify_health,
+    WORKER_NAME, _Isolation, _NoRedirect, _verify_health, validate_aggregate_key,
 )
 
 
@@ -90,6 +92,8 @@ LEGACY_CANDIDATE_NAMES = {LEGACY_CANDIDATE_PROFILE: "legacy", LEGACY_PATH_CANDID
                           LEGACY_UNIFIED_AUTH_CANDIDATE_PROFILE: "legacy-v11",
                           LEGACY_GENERAL_AUTH_CANDIDATE_PROFILE: "legacy-auth"}
 ACCOUNT_SHA256 = "ffdbf3dd5d042c6edb68d7f628998a69a22320b0199775bfda9f97593136e508"
+AGGREGATE_ORIGIN = "https://subs-bot-cf-dev-01.lilyya.workers.dev"
+AGGREGATE_CODE = re.compile(r"[A-Za-z0-9_-]{22}")
 
 
 class RehearsalError(RuntimeError):
@@ -118,6 +122,42 @@ def canonical(value):
 
 def digest(value):
     return sha256(value).hexdigest()
+
+
+def aggregate_code(encoded_key, bot_id, actor_id, nonce):
+    validate_aggregate_key(encoded_key)
+    require(matches(AGGREGATE_CODE, nonce))
+    message = canonical(["subs-bot/telegram-aggregate/all", 1, AGGREGATE_ORIGIN, bot_id, actor_id, nonce])
+    signature = hmac.digest(base64.urlsafe_b64decode(encoded_key + "="), message, "sha256")[:16]
+    return base64.urlsafe_b64encode(signature).rstrip(b"=").decode("ascii")
+
+
+def read_aggregate_reference(code, method):
+    """Fixed isolated origin only; no redirects, proxy, auth header or raw output."""
+    require(matches(AGGREGATE_CODE, code) and method in {"GET", "HEAD"})
+    opener = build_opener(ProxyHandler({}), _NoRedirect())
+    try:
+        status, raw_headers, body = _response(opener, Request(AGGREGATE_ORIGIN + "/agg/" + code + "/base64",
+            method=method, headers={"Accept-Encoding": "identity", "Cache-Control": "no-cache"}), 24 * 1024 * 1024)
+    except RehearsalError as error:
+        status_label = str(error.http_status) if integer(error.http_status, 100, 599) else "unconfirmed"
+        raise RehearsalError("Isolated all-aggregate reference " + method + " was not verified (HTTP " + status_label + ").") from None
+    headers = {key.lower(): value for key, value in raw_headers.items()}
+    require(status == 200, "Isolated all-aggregate reference " + method + " expected HTTP 200; observed HTTP " + str(status) + ".")
+    require(headers.get("cache-control") == "private, no-store"
+        and headers.get("referrer-policy") == "no-referrer" and headers.get("x-content-type-options") == "nosniff"
+        and headers.get("content-type") == "text/plain; charset=utf-8"
+        and headers.get("content-encoding", "identity") == "identity",
+        "The isolated all-aggregate reference response was not verified.")
+    require((method == "HEAD" and not body) or (method == "GET" and body),
+        "The isolated all-aggregate reference body was not verified.")
+    if method == "GET":
+        try:
+            decoded = base64.b64decode(body, validate=True)
+            require(decoded and base64.b64encode(decoded) == body)
+        except (ValueError, UnicodeError):
+            raise RehearsalError("The isolated all-aggregate reference body was not verified.") from None
+    return {"status": status, "bytes": len(body), "sha256": digest(body)}
 
 
 def parsed(raw, maximum):
@@ -723,10 +763,44 @@ class Source:
         return history
 
     def quiet(self):
-        rows = self.api.rows(self.target["d1Id"], "SELECT " + quiet_expression(self.tables) + " AS quiet, unixepoch() AS observed_at")
+        counts = quiet_capability_counts(self.tables)
+        fields = ",".join(expression + " AS " + name for name, expression in counts.items())
+        rows = self.api.rows(self.target["d1Id"], "SELECT " + quiet_expression(self.tables)
+            + " AS quiet, unixepoch() AS observed_at," + fields)
+        require(len(rows) == 1 and all(integer(rows[0].get(name)) for name in counts))
+        print(canonical({"quiet": rows[0].get("quiet") == 1,
+            "capabilityReferences": {name: rows[0][name] for name in counts}}).decode("ascii"))
         require(len(rows) == 1 and rows[0].get("quiet") == 1 and integer(rows[0].get("observed_at"), 1),
                 "The isolated source is not quiet; finish interactions and durable work before export.")
         return rows[0]["observed_at"]
+
+
+def quiet_capability_counts(tables):
+    """Published capabilities are persistent data, not unfinished consumers.
+
+    Match the action stores' owner/Bot/kind references. Pending replies, leases
+    and unconsumed tickets remain independent blockers in quiet_expression.
+    """
+    return {
+        "aggregate_slot_references": "(SELECT count(*) FROM telegram_aggregate_slots WHERE code_sha256 IS NOT NULL)"
+            if "telegram_aggregate_slots" in tables else "0",
+        "invalid_aggregate_slots": """(SELECT count(*) FROM telegram_aggregate_slots AS slot
+            LEFT JOIN aggregate_links AS link ON link.code_sha256=slot.code_sha256
+            WHERE slot.code_sha256 IS NOT NULL AND (link.code_sha256 IS NULL
+              OR link.owner_id IS NOT slot.actor_id OR link.bot_id IS NOT slot.bot_id
+              OR link.kind<>'all' OR link.revoked_at IS NOT NULL))"""
+            if "telegram_aggregate_slots" in tables else "0",
+        "selected_link_references": "(SELECT count(*) FROM telegram_selected_links)"
+            if "telegram_selected_links" in tables else "0",
+        "invalid_selected_links": """(SELECT count(*) FROM telegram_selected_links AS selected
+            LEFT JOIN aggregate_links AS link ON link.code_sha256=selected.code_sha256
+            LEFT JOIN telegram_inbox AS origin ON origin.receipt_id=selected.origin_receipt_id
+            WHERE link.code_sha256 IS NULL OR link.owner_id IS NOT selected.actor_id
+              OR link.kind<>'selected' OR link.bot_id IS NOT NULL
+              OR origin.receipt_id IS NULL OR origin.bot_id IS NOT selected.bot_id
+              OR origin.actor_id IS NOT selected.actor_id)"""
+            if "telegram_selected_links" in tables else "0",
+    }
 
 
 def quiet_expression(tables, observed_at=None):
@@ -736,8 +810,9 @@ def quiet_expression(tables, observed_at=None):
         "NOT EXISTS(SELECT 1 FROM telegram_outbox WHERE state IN ('pending','leased','sending'))",
         "NOT EXISTS(SELECT 1 FROM telegram_document_jobs WHERE state IN ('pending','leased'))",
         "NOT EXISTS(SELECT 1 FROM telegram_document_stages)",
-        "NOT EXISTS(SELECT 1 FROM telegram_aggregate_slots WHERE code_sha256 IS NOT NULL)",
     ]
+    counts = quiet_capability_counts(tables)
+    conditions.extend(counts[name] + "=0" for name in ("invalid_aggregate_slots", "invalid_selected_links"))
     waits = ["telegram_rename_wait", "telegram_view_ticket", "telegram_lifecycle_ticket"]
     for table in ("subscription_provider_jobs", "telegram_provider_jobs"):
         if table in tables:
@@ -779,7 +854,6 @@ def quiet_expression(tables, observed_at=None):
         conditions.append(f"NOT EXISTS(SELECT 1 FROM provider_snapshot_attempts WHERE state IN ('open','sealed') AND lease_until > {epoch})")
     if "telegram_selected_links" in tables:
         waits.append("telegram_selected_revoke_ticket")
-        conditions.append("NOT EXISTS(SELECT 1 FROM telegram_selected_links AS selected JOIN aggregate_links AS link ON link.code_sha256=selected.code_sha256 WHERE link.revoked_at IS NULL)")
     if "telegram_subscription_read_ticket" in tables:
         waits.append("telegram_subscription_read_ticket")
     if "telegram_page_jumps" in tables:
@@ -1491,6 +1565,7 @@ class Rehearsal:
                 tables.append({"name": table, "columns": columns, "primary": definition["primary"],
                     "rows": [[_cell(value, kind) for value, (_, kind) in zip(row, columns)] for row in rows]})
             replay = {"schema": schema, "tables": tables}
+            aggregate_probes = self.aggregate_link_probes(db, document)
         finally:
             db.close()
         objects = []
@@ -1506,9 +1581,48 @@ class Rehearsal:
             "compatibilityDate": self.source.manifest["compatibilityDate"],
             "sqlSha256": document["sqlSha256"], "dataSha256": document["summary"]["dataSha256"],
             "tableCounts": document["summary"]["tableCounts"], "replay": replay,
-            "replaySha256": digest(canonical(replay)), "objects": objects}
+            "replaySha256": digest(canonical(replay)), "objects": objects, "aggregateProbes": aggregate_probes}
         with private_file(root / "input.json") as file:
             file.write(canonical(payload))
+
+    def aggregate_link_probes(self, db, document):
+        rows = db.execute("""SELECT slot.bot_id,slot.actor_id,slot.nonce,slot.code_sha256,slot.key_version
+            FROM telegram_aggregate_slots AS slot JOIN aggregate_links AS link USING(code_sha256)
+            WHERE slot.code_sha256 IS NOT NULL AND link.revoked_at IS NULL
+              AND link.owner_id=slot.actor_id AND link.bot_id=slot.bot_id AND link.kind='all'
+              AND NOT EXISTS(SELECT 1 FROM legacy_all_aggregates WHERE code_sha256=slot.code_sha256)
+            ORDER BY slot.bot_id,slot.actor_id""").fetchall()
+        expected = db.execute("SELECT count(*) FROM telegram_aggregate_slots WHERE code_sha256 IS NOT NULL").fetchone()[0]
+        require(len(rows) == expected and len(rows) <= 32,
+            "Active all-aggregate capabilities could not be scoped for restoration validation.")
+        if not rows:
+            return []
+        encoded = os.environ.get("SUBS_BOT_TELEGRAM_AGGREGATE_KEY", "")
+        validate_aggregate_key(encoded)
+        require(digest(encoded.encode("ascii")) == self.source.version.telegram_aggregate_key_sha256,
+            "The protected all-aggregate key differs from the exact source version.")
+        probes = []
+        for bot_id, actor_id, nonce, expected_sha, key_version in rows:
+            require(key_version == 1)
+            code = aggregate_code(encoded, bot_id, actor_id, nonce)
+            require(digest(code.encode("ascii")) == expected_sha,
+                "An all-aggregate capability does not match the protected source key.")
+            probes.append({"code": code, "codeSha256": expected_sha})
+        # Dynamic all-links must be compared with the same frozen data generation,
+        # not a later source state. Never accept 503 or silently omit a live slot.
+        self.source.before_write()
+        self.source.quiet()
+        require(remote_summary(self.api, self.api.target["d1Id"], document["layout"]) == document["summary"],
+            "The isolated source data changed before all-aggregate validation.")
+        for probe in probes:
+            probe["get"] = read_aggregate_reference(probe["code"], "GET")
+            probe["head"] = read_aggregate_reference(probe["code"], "HEAD")
+        self.source.before_write()
+        self.source.quiet()
+        require(remote_summary(self.api, self.api.target["d1Id"], document["layout"]) == document["summary"],
+            "The isolated source data changed during all-aggregate validation.")
+        self.source.before_write()
+        return probes
 
     def read_restored_summary(self, document=None):
         self.verify_resources(all_required=True)
@@ -1594,14 +1708,12 @@ def run_action(action, engine, *, pin=None, resource=None, identity_sha256=None)
 def main():
     global STAGE
     STAGE = "input"
-    require(os.environ.get("GITHUB_REPOSITORY") == artifact.REPOSITORY and os.environ.get("GITHUB_REF") == artifact.MAIN_REF
-            and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch")
-    revision = os.environ.get("GITHUB_SHA", "")
-    require(matches(REVISION, revision))
+    control_revision = native_artifact.require_control_revision()
     with Path(os.environ["GITHUB_EVENT_PATH"]).open("rb") as event_file:
         event = parsed(event_file.read(65537), 65536)
     inputs = event.get("inputs")
-    require(isinstance(inputs, dict) and set(inputs) <= {"action", "cohort", "source_run_id", "resource", "identity_sha256"})
+    require(isinstance(inputs, dict) and set(inputs) <= {"action", "cohort", "source_run_id", "source_run_attempt",
+        "source_archive_run_id", "source_archive_run_attempt", "source_archive_manifest_sha256", "resource", "identity_sha256"})
     action, cohort = inputs.get("action"), inputs.get("cohort")
     require(action in ACTIONS and matches(COHORT, cohort))
     target = parsed(os.environ.get("SUBS_BOT_CF_ISOLATION_TARGET_JSON", "").encode(), 4096)
@@ -1609,7 +1721,9 @@ def main():
     require(token and deploy and token != deploy)
     bundle = Path(os.environ["RUNNER_TEMP"]) / artifact.VERIFIED_DIRECTORY
     manifest = parsed((bundle / "isolation.json").read_bytes(), 65536)
-    require(manifest.get("revision") == revision and manifest.get("version") == 2
+    require(matches(REVISION, manifest.get("revision")) and manifest.get("version") == 2
+            and manifest.get("runId") == inputs.get("source_run_id")
+            and manifest.get("runAttempt") == inputs.get("source_run_attempt", "1")
             and file_hash(bundle / "index.js")[1] == manifest.get("bundleSha256"))
     api = RehearsalAPI(target, token, cohort)
     worker_client = CloudflareClient(deploy)
@@ -1618,7 +1732,7 @@ def main():
         require(method == "GET" and payload is None)
         return worker_client(method, path)
 
-    source = Source(api, read_worker, target, bundle, manifest, lambda: artifact.require_current_main(revision))
+    source = Source(api, read_worker, target, bundle, manifest, lambda: artifact.require_current_main(control_revision))
     STAGE = "source-release"
     if action == "poll-export":
         # A source export may still be locking D1 and its original main may have
@@ -1642,6 +1756,9 @@ def main():
         result = run_action(action, Rehearsal(api, source, journal, Path(temporary), validation_directory=validation), pin=pin,
                             resource=inputs.get("resource"), identity_sha256=inputs.get("identity_sha256"))
     STAGE = "public-evidence"
+    result["controlRevision"] = control_revision
+    result["sourceRevision"] = manifest["revision"]
+    result["sourceArtifactBackend"] = "private-release-evidence" if inputs.get("source_archive_run_id") else "github-actions"
     path = Path(os.environ["RUNNER_TEMP"]) / "native-restore-evidence.json"
     with private_file(path) as file:
         file.write(canonical(result))

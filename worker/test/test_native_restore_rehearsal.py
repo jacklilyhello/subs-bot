@@ -201,7 +201,7 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(root.stat().st_mode & 0o777, 0o700)
         self.assertEqual((root / "input.json").stat().st_mode & 0o777, 0o600)
         self.assertEqual(set(payload), {"version", "revision", "moduleSha256", "compatibilityDate", "sqlSha256",
-            "dataSha256", "tableCounts", "replay", "replaySha256", "objects"})
+            "dataSha256", "tableCounts", "replay", "replaySha256", "objects", "aggregateProbes"})
         # Changed target bytes cannot be materialized as an attested replay.
         self.api.objects[(self.api.names["objects"], key)] = b"changed"
         self.engine.validation_directory = self.engine.directory / "corrupt"
@@ -826,10 +826,127 @@ class SnapshotTests(unittest.TestCase):
             (PAYLOAD, native.digest(body), len(body)))
         return key
 
+    def published_capabilities(self):
+        """Stable native links remain stored after their replies have finished."""
+        self.db.executemany("""INSERT INTO telegram_inbox
+            (receipt_id,bot_id,update_id,actor_id,chat_id,chat_type,message_id,message_date,command,receipt_nonce)
+            VALUES (?,'881000',?,'881001','881001','private',?,?,'help',?)""",
+            [(2, 2, 2, 2, "aggregate:v1"), (3, 3, 3, 3, "selected:v1")])
+        self.db.execute("INSERT INTO aggregate_links(code_sha256,owner_id,kind,bot_id,created_at) VALUES (?,'881001','all','881000',1)", ("c" * 64,))
+        self.db.execute("INSERT INTO telegram_aggregate_slots VALUES ('881000','881001',1,?,?,1,2,2)", ("c" * 64, "a" * 22))
+        self.db.execute("INSERT INTO telegram_aggregate_actions VALUES (2,'issued',1,?,0,0)", ("c" * 64,))
+        self.db.execute("INSERT INTO aggregate_links(code_sha256,owner_id,kind,selected_ids,created_at) VALUES (?,'881001','selected','[1]',1)", ("d" * 64,))
+        self.db.execute("INSERT INTO telegram_selected_links VALUES (?,'881000','881001',3,?,1,'[[1,1,0]]')", ("d" * 64, "b" * 22))
+        self.db.execute("INSERT INTO telegram_selected_actions VALUES (3,'issued',?,0,0)", ("d" * 64,))
+        self.db.executemany("INSERT INTO telegram_outbox(receipt_id,state,attempts,sent_message_id) VALUES (?,'sent',1,?)", [(2, 2), (3, 3)])
+
     def dump(self, suffix="source"):
         path = self.directory / (suffix + ".sql")
         path.write_text("\n".join(self.db.iterdump()), "utf-8")
         return path
+
+    def test_quiet_preserves_published_capabilities_but_pending_replies_and_tickets_block(self):
+        self.snapshot()
+        self.published_capabilities()
+        quiet = lambda epoch: self.db.execute("SELECT " + native.quiet_expression(self.source.tables, epoch)).fetchone()
+        self.assertEqual(quiet(9), (1,))
+        source = object.__new__(native.Source)
+        source.api = MemoryAPI()
+        source.api.db = self.db
+        source.target, source.tables = TARGET, self.source.tables
+        with patch("builtins.print") as output:
+            self.assertGreater(source.quiet(), 0)
+        classification = json.loads(output.call_args.args[0])
+        self.assertEqual(classification, {"quiet": True, "capabilityReferences": {
+            "aggregate_slot_references": 1, "invalid_aggregate_slots": 0,
+            "selected_link_references": 1, "invalid_selected_links": 0}})
+        for state in ("pending", "leased", "sending"):
+            self.db.execute("UPDATE telegram_outbox SET state=?,sent_message_id=NULL,lease_id=?,lease_until=? WHERE receipt_id=2",
+                (state, None if state == "pending" else "synthetic-lease", None if state == "pending" else 10))
+            self.assertEqual(quiet(9), (0,), state)
+        self.db.execute("UPDATE telegram_outbox SET state='sent',sent_message_id=2,lease_id=NULL,lease_until=NULL WHERE receipt_id=2")
+        self.db.execute("INSERT INTO telegram_selected_revoke_ticket VALUES (?,3,?,1,10,NULL)", ("e" * 64, "d" * 64))
+        self.assertEqual(quiet(9), (0,))
+        self.assertEqual(quiet(10), (1,))
+        self.assertEqual(self.db.execute("SELECT count(*) FROM aggregate_links WHERE revoked_at IS NULL").fetchone(), (2,))
+
+    def test_quiet_rejects_missing_or_foreign_capability_owner_bot_and_kind_references(self):
+        self.snapshot()
+        self.published_capabilities()
+        mutations = [
+            "UPDATE telegram_aggregate_slots SET actor_id='881099'",
+            "UPDATE telegram_aggregate_slots SET bot_id='881099'",
+            "UPDATE telegram_aggregate_slots SET code_sha256='" + "d" * 64 + "'",
+            "DELETE FROM aggregate_links WHERE kind='all'",
+            "UPDATE telegram_selected_links SET actor_id='881099'",
+            "UPDATE telegram_selected_links SET bot_id='881099'",
+            "UPDATE telegram_selected_links SET code_sha256='" + "c" * 64 + "'",
+            "DELETE FROM aggregate_links WHERE kind='selected'",
+            "UPDATE telegram_inbox SET actor_id='881099',chat_id='881099' WHERE receipt_id=3",
+        ]
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                self.db.execute("SAVEPOINT malformed")
+                self.db.execute(mutation)
+                self.assertEqual(self.db.execute("SELECT " + native.quiet_expression(self.source.tables, 9)).fetchone(), (0,))
+                self.db.execute("ROLLBACK TO malformed")
+                self.db.execute("RELEASE malformed")
+        self.assertEqual(self.db.execute("SELECT " + native.quiet_expression(self.source.tables, 9)).fetchone(), (1,))
+
+    def test_all_aggregate_probes_require_exact_key_capability_and_unchanged_source_generation(self):
+        import telegram_aggregate_smoke as existing
+        self.snapshot()
+        encoded = native.base64.urlsafe_b64encode(bytes(range(32))).decode().rstrip("=")
+        nonce = "A" * 22
+        code = native.aggregate_code(encoded, "881000", "881001", nonce)
+        self.assertEqual(code, existing.derive_code(encoded, {"botId": "881000", "adminId": "881001"}, "admin", nonce))
+        self.db.execute("INSERT INTO aggregate_links(code_sha256,owner_id,kind,bot_id) VALUES (?,'881001','all','881000')", (native.digest(code.encode()),))
+        self.db.execute("INSERT INTO telegram_aggregate_slots VALUES ('881000','881001',1,?,?,1,1,1)", (native.digest(code.encode()), nonce))
+        source = fake_source()
+        source.version = SimpleNamespace(telegram_aggregate_key_sha256=native.digest(encoded.encode()))
+        api = MemoryAPI()
+        api.db = self.db
+        engine = native.Rehearsal(api, source, None, self.directory)
+        layout = native.table_layout(self.db, self.source.tables)
+        summary = native.remote_summary(api, SOURCE_ID, layout)
+        document = {"layout": layout, "summary": summary}
+        get = {"status": 200, "bytes": 4, "sha256": native.digest(b"eA==")}
+        head = {"status": 200, "bytes": 0, "sha256": native.digest(b"")}
+        with patch.dict(native.os.environ, {"SUBS_BOT_TELEGRAM_AGGREGATE_KEY": encoded}), patch.object(native, "read_aggregate_reference", side_effect=[get, head]) as read:
+            self.assertEqual(engine.aggregate_link_probes(self.db, document), [{"code": code, "codeSha256": native.digest(code.encode()), "get": get, "head": head}])
+            self.assertEqual(read.call_args_list, [unittest.mock.call(code, "GET"), unittest.mock.call(code, "HEAD")])
+        for key in ("", native.base64.urlsafe_b64encode(bytes(32)).decode().rstrip("=")):
+            with patch.dict(native.os.environ, {"SUBS_BOT_TELEGRAM_AGGREGATE_KEY": key}), patch.object(native, "read_aggregate_reference") as read:
+                with self.assertRaises((native.CloudflareError, native.RehearsalError)):
+                    engine.aggregate_link_probes(self.db, document)
+                read.assert_not_called()
+        with patch.dict(native.os.environ, {"SUBS_BOT_TELEGRAM_AGGREGATE_KEY": encoded}), patch.object(native, "remote_summary", side_effect=[summary, {"changed": True}]), patch.object(native, "read_aggregate_reference", side_effect=[get, head]):
+            with self.assertRaisesRegex(native.RehearsalError, "changed during"):
+                engine.aggregate_link_probes(self.db, document)
+        self.db.execute("UPDATE telegram_aggregate_slots SET nonce=?", ("b" * 22,))
+        with patch.dict(native.os.environ, {"SUBS_BOT_TELEGRAM_AGGREGATE_KEY": encoded}), patch.object(native, "read_aggregate_reference") as read:
+            with self.assertRaisesRegex(native.RehearsalError, "does not match"):
+                engine.aggregate_link_probes(self.db, document)
+            read.assert_not_called()
+
+    def test_all_aggregate_reference_reads_only_fixed_origin_without_credentials_or_redirects(self):
+        headers = {"Cache-Control": "private, no-store", "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff", "Content-Type": "text/plain; charset=utf-8"}
+        code = "a" * 22
+        with patch.object(native, "_response", return_value=(200, headers, b"eA==")) as send:
+            self.assertEqual(native.read_aggregate_reference(code, "GET"), {"status": 200, "bytes": 4, "sha256": native.digest(b"eA==")})
+            request = send.call_args.args[1]
+            self.assertEqual(request.full_url, native.AGGREGATE_ORIGIN + "/agg/" + code + "/base64")
+            self.assertIsNone(request.get_header("Authorization"))
+            self.assertIsNone(request.get_header("Cookie"))
+        for status, body in ((302, b""), (503, b"private raw error"), (200, b"not-base64")):
+            with patch.object(native, "_response", return_value=(status, headers, body)):
+                with self.assertRaises(native.RehearsalError) as caught:
+                    native.read_aggregate_reference(code, "GET")
+                self.assertNotIn(code, str(caught.exception))
+                self.assertNotIn("private raw error", str(caught.exception))
+        with patch.object(native, "_response", return_value=(200, headers, b"")):
+            self.assertEqual(native.read_aggregate_reference(code, "HEAD")["bytes"], 0)
 
     def test_quiet_checks_only_unexpired_inline_work_on_the_new_schema(self):
         self.db.execute("""INSERT INTO telegram_inbox
@@ -1051,6 +1168,9 @@ class SnapshotTests(unittest.TestCase):
     def test_sealed_capture_objects_before_native_import_and_verify_digest(self):
         self.snapshot()
         share_key = self.published_share()
+        self.published_capabilities()
+        capability_tables = ("aggregate_links", "telegram_aggregate_slots", "telegram_selected_links", "telegram_outbox")
+        original_capabilities = {table: self.db.execute("SELECT * FROM " + table + " ORDER BY 1").fetchall() for table in capability_tables}
         sql = self.dump().read_bytes()
         api = MemoryAPI()
         api.db = self.db
@@ -1114,6 +1234,9 @@ class SnapshotTests(unittest.TestCase):
             engine.start_import()
         self.assertEqual(journal.value["phase"], "verified")
         self.assertEqual(journal.value["targetDataSha256"], journal.value["backup"]["dataSha256"])
+        for table in capability_tables:
+            self.assertEqual(restored.execute("SELECT * FROM " + table + " ORDER BY 1").fetchall(), original_capabilities[table])
+        self.assertEqual(restored.execute("SELECT count(*) FROM aggregate_links WHERE revoked_at IS NULL").fetchone(), (2,))
         report = native.report(journal, source)
         self.assertEqual(report["publishedShareMetadataCount"], 1)
         self.assertEqual(report["targetPublishedShareMetadataCount"], 1)
