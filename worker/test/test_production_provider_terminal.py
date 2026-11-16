@@ -121,6 +121,36 @@ class ForcedTerminalTests(unittest.TestCase):
         self.assertEqual(captured[0]["activeCount"], 0)
         self.assertNotIn("synthetic-private-error", control.canonical(captured).decode())
 
+    def test_exact_legacy_stop_failure_is_preserved_without_claiming_named_rpc(self):
+        self.workflow["output"] = {"ok": False, "stage": "stop"}
+        evidence = []
+        result = self.verify(evidence_sink=evidence.append)
+        self.assertEqual(result["smokeFailure"], "stop")
+        self.assertEqual(result["workflowFailureSha256"], control.digest(self.workflow["output"]))
+        self.assertEqual(result["completion"], "not-complete")
+        self.assertIs(evidence[0]["workflowResult"]["namedRpcVerified"], False)
+        self.assertEqual(evidence[0]["workflowResult"]["output"], self.workflow["output"])
+        self.api.stopped.assert_not_called()
+        self.api.trigger.assert_not_called()
+
+    def test_new_stop_diagnostic_has_a_closed_schema_and_cannot_hide_a_primary_failure(self):
+        diagnostic = {"version": 1, "phase": "monitor-wait", "reason": "nonzero-exit", "exitCode": 143,
+            "primaryStage": "edge", "runningBeforeCleanup": True, "inspectNullBeforeCleanup": None,
+            "forcedCleanup": "returned"}
+        self.workflow["output"] = {"ok": False, "stage": "stop", "stop": diagnostic}
+        result = self.verify()
+        self.assertEqual(result["workflowFailureSha256"], control.digest(self.workflow["output"]))
+        for changed in ({"version": True}, {"exitCode": True}, {"exitCode": 256}, {"exitCode": 0},
+                        {"phase": "synthetic-private-error"}, {"primaryStage": "rpc-success"}, {"extra": "private"}):
+            self.workflow["output"] = {"ok": False, "stage": "stop", "stop": {**diagnostic, **changed}}
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                self.verify()
+        for output in ({"ok": 0, "stage": "stop"}, {"ok": False, "stage": "edge"},
+                       {"ok": False, "stage": "stop", "rawError": "private"}):
+            self.workflow["output"] = output
+            with self.subTest(output=output), self.assertRaises(ValueError):
+                self.verify()
+
     def test_stale_listing_cannot_hide_a_later_failed_process_in_detail(self):
         self.detail["started_at"] = "2026-11-16T00:00:05.000Z"
         self.detail["status"]["updated_at"] = "2026-11-16T00:00:06.000Z"

@@ -145,12 +145,22 @@ export function providerApiStatusResult(value: unknown): ProviderApiStatusResult
 
 type ProbeStage = "configuration" | "start" | "readiness" | "image" | "edge" | "address-policy" | "stop";
 
+type StopPhase = "monitor-create" | "signal" | "monitor-wait" | "state-read";
+export interface StopDiagnostic {
+  version: 1; phase: StopPhase; reason: "operation" | "timeout" | "nonzero-exit";
+  exitCode: number | null; primaryStage: ProbeStage | "none";
+  runningBeforeCleanup: boolean | null; inspectNullBeforeCleanup: boolean | null;
+  forcedCleanup: "returned" | "unconfirmed";
+}
+
 export class ProviderProbeError extends Error {
   readonly stage: ProbeStage;
+  readonly stop?: StopDiagnostic;
 
-  constructor(stage: ProbeStage) {
+  constructor(stage: ProbeStage, stop?: StopDiagnostic) {
     super(`Provider container smoke failed during ${stage}.`);
     this.stage = stage;
+    this.stop = stop;
   }
 }
 
@@ -261,6 +271,7 @@ async function withPinnedContainer<T>(
 ): Promise<T> {
   let stage: ProbeStage = "configuration";
   let started = false;
+  let primaryStage: ProbeStage | "none" = "none";
   try {
     const image = container.images.provider;
     const identity = typeof image === "string" ? IMAGE.exec(image) : null;
@@ -284,22 +295,45 @@ async function withPinnedContainer<T>(
     requireResult((await within(container.inspect(), startup))?.image === image, "The running provider image differs.");
     return await use(port, image);
   } catch (error) {
+    primaryStage = error instanceof ProviderProbeError ? error.stage : stage;
     throw error instanceof ProviderProbeError ? error : new ProviderProbeError(stage);
   } finally {
     if (started) {
+      const shutdown = AbortSignal.timeout(STOP_MS);
+      let stopPhase: StopPhase = "monitor-create";
+      let runningBeforeCleanup: boolean | null = null;
+      let inspectNullBeforeCleanup: boolean | null = null;
       try {
-        const shutdown = AbortSignal.timeout(STOP_MS);
         const stopped = container.monitor();
         // Observe before signalling, including an exit between these two calls.
         void stopped.catch(() => {});
+        stopPhase = "signal";
         container.signal(15);
+        stopPhase = "monitor-wait";
         await within(stopped, shutdown);
-        requireResult(!container.running && await within(container.inspect(), shutdown) === null,
-          "The provider container graceful stop could not be confirmed.");
-      } catch {
+        stopPhase = "state-read";
+        // Management visibility may settle after the successful monitor. Reads
+        // remain bounded by the same deadline; neither condition is relaxed.
+        for (;;) {
+          runningBeforeCleanup = container.running;
+          inspectNullBeforeCleanup = await within(container.inspect(), shutdown) === null;
+          if (!runningBeforeCleanup && inspectNullBeforeCleanup) break;
+          await within(new Promise<void>((resolve) => setTimeout(resolve, 100)), shutdown);
+        }
+      } catch (error) {
+        let exitCode: number | null = null;
+        try {
+          const observed = isRecord(error) ? error.exitCode : undefined;
+          if (typeof observed === "number" && Number.isInteger(observed) && observed >= 0 && observed <= 255) exitCode = observed;
+          if (typeof container.running === "boolean") runningBeforeCleanup = container.running;
+        } catch { /* unknown exception properties are never logged */ }
+        const reason: StopDiagnostic["reason"] = shutdown.aborted ? "timeout"
+          : exitCode !== null && exitCode !== 0 ? "nonzero-exit" : "operation";
+        let forcedCleanup: StopDiagnostic["forcedCleanup"] = "unconfirmed";
         // A forced cleanup never converts an unconfirmed graceful exit to success.
-        try { await within(container.destroy(), AbortSignal.timeout(STOP_MS)); } catch { /* fail closed below */ }
-        throw new ProviderProbeError("stop");
+        try { await within(container.destroy(), AbortSignal.timeout(STOP_MS)); forcedCleanup = "returned"; } catch { /* fail closed below */ }
+        throw new ProviderProbeError("stop", { version: 1, phase: stopPhase,
+          reason, exitCode, primaryStage, runningBeforeCleanup, inspectNullBeforeCleanup, forcedCleanup });
       }
     }
   }
@@ -479,17 +513,21 @@ export async function exerciseProviderRelease(container: Container, revision: st
   requireResult(/^https:\/\/[a-z0-9.-]+\/health(?![\s\S])/u.test(healthUrl)
     && REVISION.test(healthRevision) && SHA256.test(healthSha256), "Provider health fixture is invalid.");
   return withPinnedContainer(container, revision, async (port) => {
-    const positive = await fetchPort(port, JSON.stringify({ url: healthUrl }));
-    requireResult(positive.ok && positive.bodySha256 === healthSha256, "Provider health fixture digest differs.");
-    if (!positive.ok) throw new ProviderProbeError("edge");
-    const value = json(new Uint8Array(positive.body));
-    requireResult(isRecord(value) && Object.keys(value).length === 3 && value.ok === true
-      && value.service === "subs-bot" && value.revision === healthRevision, "Provider health revision differs.");
-    for (const url of BLOCKED) {
-      const result = await fetchPort(port, JSON.stringify({ url }));
-      requireResult(!result.ok && result.code === "blocked-address", "Provider private-address denial failed.");
-    }
-    return { ok: true, stopped: true, revision, imageSha256, healthRevision, healthSha256,
-      healthBytes: positive.body.byteLength, blockedPrivateTargets: BLOCKED.length };
+    let stage: ProbeStage = "edge";
+    try {
+      const positive = await fetchPort(port, JSON.stringify({ url: healthUrl }));
+      requireResult(positive.ok && positive.bodySha256 === healthSha256, "Provider health fixture digest differs.");
+      if (!positive.ok) throw new ProviderProbeError("edge");
+      const value = json(new Uint8Array(positive.body));
+      requireResult(isRecord(value) && Object.keys(value).length === 3 && value.ok === true
+        && value.service === "subs-bot" && value.revision === healthRevision, "Provider health revision differs.");
+      stage = "address-policy";
+      for (const url of BLOCKED) {
+        const result = await fetchPort(port, JSON.stringify({ url }));
+        requireResult(!result.ok && result.code === "blocked-address", "Provider private-address denial failed.");
+      }
+      return { ok: true, stopped: true, revision, imageSha256, healthRevision, healthSha256,
+        healthBytes: positive.body.byteLength, blockedPrivateTargets: BLOCKED.length };
+    } catch { throw new ProviderProbeError(stage); }
   }, { target, imageSha256 });
 }

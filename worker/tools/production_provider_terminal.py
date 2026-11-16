@@ -1,4 +1,4 @@
-"""Read-only evidence for a pinned failed first ProviderFetch release.
+"""Read-only evidence for a pinned failed ProviderFetch release.
 
 Exit 137 is retained as failure, never accepted by the ordinary stopped/smoke
 verifier. This evidence alone authorizes no mutation, replay, binding or release.
@@ -43,7 +43,27 @@ class GETOnlyProviderAPI(control.ProviderAPI):
         raise control.ProviderError("A failed-terminal provider is not a verified stopped smoke result.")
 
 
-def _workflow_success(config, instance):
+def validate_stop_failure(output):
+    """Two closed failure schemas, never a successful egress/RPC result."""
+    control.require(isinstance(output, dict) and output.get("ok") is False and output.get("stage") == "stop", ERROR)
+    if set(output) == {"ok", "stage"}:
+        return output
+    control.fields(output, {"ok", "stage", "stop"})
+    diagnostic = control.fields(output["stop"], {"version", "phase", "reason", "exitCode", "primaryStage",
+                                               "runningBeforeCleanup", "inspectNullBeforeCleanup", "forcedCleanup"})
+    control.require(type(diagnostic["version"]) is int and diagnostic["version"] == 1
+        and diagnostic["phase"] in {"monitor-create", "signal", "monitor-wait", "state-read"}
+        and diagnostic["reason"] in {"operation", "timeout", "nonzero-exit"}
+        and diagnostic["primaryStage"] in {"none", "configuration", "start", "readiness", "image", "edge", "address-policy", "stop"}
+        and diagnostic["forcedCleanup"] in {"returned", "unconfirmed"}
+        and all(diagnostic[key] is None or type(diagnostic[key]) is bool
+                for key in ("runningBeforeCleanup", "inspectNullBeforeCleanup"))
+        and (diagnostic["exitCode"] is None or type(diagnostic["exitCode"]) is int and 0 <= diagnostic["exitCode"] <= 255), ERROR)
+    control.require(diagnostic["reason"] != "nonzero-exit" or diagnostic["exitCode"] not in (None, 0), ERROR)
+    return output
+
+
+def _workflow_terminal(config, instance):
     control.require(isinstance(instance, dict) and instance.get("status") == "complete"
         and instance.get("success") is True and instance.get("versionId") == config["workflow"]["versionId"]
         and instance.get("params") == control.smoke_params(config) and instance.get("error") in (None, {})
@@ -59,8 +79,10 @@ def _workflow_success(config, instance):
         "imageSha256": config["build"]["ociManifestSha256"], "healthRevision": config["smoke"]["healthRevision"],
         "healthSha256": config["smoke"]["healthSha256"], "healthBytes": config["smoke"]["healthBytes"],
         "blockedPrivateTargets": 3, "rpcVerified": True}
-    control.require(isinstance(output, dict) and control.canonical(output) == control.canonical(expected), ERROR)
-    return start
+    control.require(isinstance(output, dict), ERROR)
+    if control.canonical(output) == control.canonical(expected):
+        return start, None
+    return start, validate_stop_failure(output)
 
 
 def _snapshot(api, config, current):
@@ -72,7 +94,7 @@ def _snapshot(api, config, current):
         and state["activation"] in [value for value in (config["activation"], current["activation"]) if value is not None]
         and state["workflow"] in [value for value in (config["workflow"], current["workflow"]) if value is not None], ERROR)
     old_instance = api.smoke_instance({**config["build"], "versionId": config["versionId"]}, config["workflow"])
-    started = _workflow_success(config, old_instance)
+    started, _failure = _workflow_terminal(config, old_instance)
     namespace = config["activation"]["namespaceId"]
     rows = api.instances(namespace)
     control.require(len(rows) == 1 and isinstance(rows[0], dict)
@@ -127,8 +149,11 @@ def verify_forced_terminal(api, config, *, current_config=None, evidence_sink=No
         "instanceIdSha256": sha256(actor.encode("ascii")).hexdigest(), "exitCode": 137, "state": "failed",
         "processSha256": control.digest({"id": actor, "image": process["image"],
             "startedAt": process["started_at"], "status": {key: process["status"][key] for key in ("state", "exit_code", "updated_at")}})}
+    workflow = first["oldWorkflowInstance"]
+    _started, failure = _workflow_terminal(config, workflow)
+    if failure is not None:
+        result.update({"smokeFailure": "stop", "workflowFailureSha256": control.digest(failure)})
     if evidence_sink is not None:
-        workflow = first["oldWorkflowInstance"]
         def container_fields(instance):
             return {"applicationId": instance["application_id"], "instanceIdSha256": result["instanceIdSha256"],
                     "image": instance["image"], "startedAt": instance["started_at"],
@@ -140,7 +165,8 @@ def verify_forced_terminal(api, config, *, current_config=None, evidence_sink=No
             "container": config["container"], "workflow": config["workflow"],
             "workflowResult": {"status": "complete", "success": True, "versionId": workflow["versionId"],
                                "params": workflow["params"], "start": workflow["start"], "end": workflow["end"],
-                               "error": None, "namedRpcVerified": True},
+                               "error": None, "namedRpcVerified": failure is None,
+                               **({"output": failure} if failure is not None else {})},
             "inventory": container_fields(first["instances"][0]), "detail": container_fields(first["detail"]),
             "actorStoredData": True, "actorCount": 1, "instanceCount": 1, "activeCount": 0})
     return result

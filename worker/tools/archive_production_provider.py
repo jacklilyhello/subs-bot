@@ -422,6 +422,42 @@ def reconcile_identity(config, identity):
     return candidate
 
 
+def terminal_prerequisite(store, manifest, target, journal):
+    """Verify the original confirmed resource intent, including registered reuse."""
+    matched = [step for step in journal["steps"] if step.get("operation") in {"activate", "provision-workflow"}
+               and step.get("status") == "confirmed" and step.get("targetSha256") == provider.digest(target)]
+    require(len(matched) == 1)
+    step = matched[0]
+    operation = step["operation"]
+    name = f"subs-bot-provider-attempt-intent-{operation}-{store.run_id}-{store.attempt}"
+    recorded = manifest["source"]["artifacts"].get(name)
+    require(isinstance(recorded, dict) and any(event.get("phase") == "intent-persisted"
+        and event.get("operation") == operation and event.get("intentSha256") == step.get("intentSha256")
+        and event.get("artifactId") == recorded["artifactId"]
+        and event.get("archiveSha256") == recorded["archiveSha256"] for event in journal["events"]))
+    original = provider.github._parse_object(read_record(store, manifest, name + "/provider-rehearsal-checkpoint.json"), ERROR)
+    before = provider.validate_config(original["target"])
+    intent = original["journal"]["currentIntent"]
+    require(isinstance(intent, dict) and intent.get("operation") == operation
+        and intent.get("status") == "started-unknown" and intent.get("executed") is False
+        and intent.get("intentSha256") == step.get("intentSha256")
+        and intent["intentSha256"] == provider.digest({key: value for key, value in intent.items() if key != "intentSha256"})
+        and intent.get("targetSha256") == provider.digest(before) and intent.get("source") == target["build"] == before["build"]
+        and intent.get("approvalSha256") == provider.digest({"operation": operation, "target": before}))
+    require(before["workflow"] is None)
+    if operation == "provision-workflow":
+        require({**before, "workflow": target["workflow"]} == target)
+    else:
+        previous = target.get("previous")
+        require(previous is not None and before["activation"] is None
+            and {**before, "activation": target["activation"], "workflow": target["workflow"]} == target
+            and target["worker"] == previous["worker"] and target["container"] == previous["container"]
+            and target["versionId"] != previous["versionId"]
+            and target["activation"]["namespaceId"] == previous["activation"]["namespaceId"]
+            and target["activation"]["deploymentId"] != previous["activation"]["deploymentId"]
+            and all(target["workflow"][key] == previous["workflow"][key] for key in ("workflowId", "createdOn")))
+
+
 def reconcile_partial(store, manifest_sha256, response_sha256, *, terminal=False, forward_stage=False):
     require(provider.match(provider.provider.HEX, response_sha256))
     verify_partial(store, manifest_sha256)
@@ -471,9 +507,8 @@ def reconcile_partial(store, manifest_sha256, response_sha256, *, terminal=False
                     and all(target[key] is not None for key in ("worker", "versionId", "activation", "container", "workflow"))
                     and identity["identities"] == {"id": "provider-release-" + target["build"]["revision"],
                                                   "workflow_id": target["workflow"]["workflowId"],
-                                                  "version_id": target["workflow"]["versionId"]}
-                    and any(step.get("operation") == "provision-workflow" and step.get("status") == "confirmed"
-                            and step.get("targetSha256") == provider.digest(target) for step in journal["steps"]))
+                                                  "version_id": target["workflow"]["versionId"]})
+                terminal_prerequisite(store, manifest, target, journal)
             request = {"version": 1, "controllerRevision": os.environ["GITHUB_SHA"], "runId": os.environ["GITHUB_RUN_ID"],
                        "runAttempt": os.environ["GITHUB_RUN_ATTEMPT"], "sourceRunId": store.run_id,
                        "sourceRunAttempt": store.attempt, "sourceManifestSha256": manifest_sha256,
@@ -509,7 +544,16 @@ def terminal_archive(store, directory=None, expected=None):
         recovery = provider.validate_forward_recovery(provider.github._parse_object(values["provider-forward-terminal.json"], ERROR))
         state = provider.github._parse_object(values["provider-failed-terminal-state.json"], ERROR)
         readback = provider.github._parse_object(values["provider-failed-terminal-readback.json"], ERROR)
-        provider.fields(state, {"status", "completion", "targetSha256", "sourceRevision", "instanceIdSha256", "exitCode", "state", "processSha256"})
+        expected_fields = {"status", "completion", "targetSha256", "sourceRevision", "instanceIdSha256", "exitCode", "state", "processSha256"}
+        if "smokeFailure" in state:
+            from production_provider_terminal import validate_stop_failure
+            expected_fields |= {"smokeFailure", "workflowFailureSha256"}
+            observed = readback.get("workflowResult", {})
+            provider.require(isinstance(observed, dict))
+            provider.require(state["smokeFailure"] == "stop" and observed.get("namedRpcVerified") is False)
+            failure = validate_stop_failure(observed.get("output"))
+            provider.require(state.get("workflowFailureSha256") == provider.digest(failure))
+        provider.fields(state, expected_fields)
         require(recovery["previousTargetSha256"] == provider.digest(target) == state.get("targetSha256")
                 and recovery["terminalSha256"] == provider.digest(state) and state.get("status") == "failed-terminal-preserved"
                 and state.get("completion") == "not-complete" and state.get("state") == "failed"
