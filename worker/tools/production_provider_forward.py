@@ -7,6 +7,55 @@ from pathlib import Path
 import production_provider as control
 from production_provider_terminal import GETOnlyProviderAPI, verify_forced_terminal
 
+PHASES = {"context", "artifact", "source", "candidate_inventory", "candidate_resources", "old_resource_pins",
+          "terminal_before", "terminal_digest", "terminal_after", "snapshot_unchanged", "output"}
+READS = {"none", "versions", "candidate_module", "previous_module", "old_active", "namespace", "worker_identity",
+         "container_profile", "container_instance", "workflow_metadata", "workflow_instance", "other"}
+CONTEXT = {"phase": "context", "lastRead": "none"}
+
+
+def phase(value):
+    control.require(value in PHASES)
+    CONTEXT["phase"] = value
+
+
+class DiagnosticReader(GETOnlyProviderAPI):
+    def _request(self, path, **kwargs):
+        if "/deployments" in path:
+            label = "old_active"
+        elif path.startswith("/workers/durable_objects/"):
+            label = "namespace"
+        elif "/versions/" in path and path.startswith("/workers/"):
+            label = "candidate_module" if self.config["versionId"] in path else "previous_module"
+        elif path.startswith("/workers/") and "/versions?" in path:
+            label = "versions"
+        elif path.startswith("/workers/"):
+            label = "worker_identity"
+        elif path.startswith("/containers/"):
+            label = "container_instance" if "/instances" in path else "container_profile"
+        elif path.startswith("/workflows/"):
+            label = "workflow_instance" if "/instances" in path else "workflow_metadata"
+        else:
+            label = "other"
+        CONTEXT["lastRead"] = label
+        return super()._request(path, **kwargs)
+
+
+def safe_diagnostic(error):
+    classes = ((control.ProviderError, "provider_guard"), (control.stage.StageError, "version_guard"),
+               (control.legacy.ActivationError, "resource_guard"), (control.github.ArtifactError, "source_guard"),
+               (AttributeError, "attribute_error"), (KeyError, "field_error"), (TypeError, "type_error"), (ValueError, "format_guard"))
+    kind = next((label for expected, label in classes if isinstance(error, expected)), "unexpected")
+    result = {"phase": CONTEXT["phase"] if CONTEXT.get("phase") in PHASES else "context",
+              "lastRead": CONTEXT["lastRead"] if CONTEXT.get("lastRead") in READS else "none", "reason": kind}
+    diagnostic = getattr(error, "read_diagnostic", None) if isinstance(error, control.ProviderError) else None
+    if isinstance(diagnostic, dict):
+        status, codes = diagnostic.get("httpStatus"), diagnostic.get("cloudflareCodes")
+        result["httpStatus"] = status if type(status) is int and 100 <= status <= 599 else None
+        result["cloudflareCodes"] = sorted({value for value in codes[:8] if type(value) is int and 1000 <= value <= 999999}) \
+            if isinstance(codes, list) else []
+    return result
+
 
 def artifact_receipt(artifact_id, archive_sha256, prefix):
     control.require(control.match(control.provider.DECIMAL, artifact_id)
@@ -30,17 +79,25 @@ def confirmed_forward_stage(api, target):
                     and target["versionId"] != previous["versionId"]
                     and target["activation"] is None and target["workflow"] is None and target["container"] == previous["container"])
     reader = GETOnlyProviderAPI(api, target)
+    phase("candidate_inventory")
     reader.wait_uploaded_version(target["versionId"])
+    phase("candidate_resources")
     state = control.observe(reader)
+    phase("old_resource_pins")
     control.require(all(state[key] == previous[key] for key in ("activation", "container", "workflow")))
+    phase("terminal_before")
     terminal = verify_forced_terminal(reader, previous, current_config=target)
+    phase("terminal_digest")
     control.require(control.digest(terminal) == target["forwardRecovery"]["terminalSha256"])
+    phase("terminal_after")
     control.require(control.canonical(control.observe(reader)) == control.canonical(state),
                     "The forward staged state changed during read-only reconciliation.")
     return target
 
 
 def main():
+    CONTEXT.update({"phase": "context", "lastRead": "none"})
+    phase("context")
     control.require(os.environ.get("GITHUB_REPOSITORY") == control.github.REPOSITORY
                     and os.environ.get("GITHUB_REF") == control.github.MAIN_REF
                     and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
@@ -48,6 +105,8 @@ def main():
                     and os.environ.get("GITHUB_WORKFLOW_SHA") == os.environ.get("GITHUB_SHA")
                     and os.environ.get("GITHUB_WORKFLOW_REF")
                     == f"{control.github.REPOSITORY}/{control.REHEARSAL_WORKFLOW_PATH}@{control.github.MAIN_REF}")
+    phase("artifact")
+    phase("artifact")
     artifact_receipt(os.environ.get("PROVIDER_TERMINAL_ARTIFACT_ID", ""),
                      os.environ.get("PROVIDER_TERMINAL_ARTIFACT_SHA256", ""), "subs-bot-provider-terminal-request")
     root = Path(os.environ["RUNNER_TEMP"])
@@ -64,9 +123,12 @@ def main():
     recovery = {key: request[key] for key in ("version", "sourceRunId", "sourceRunAttempt", "sourceManifestSha256",
                                              "responseIdentitySha256", "previousTargetSha256")}
     control.validate_forward_recovery({**recovery, "terminalSha256": "0" * 64})
+    phase("source")
+    phase("source")
     control.guard_sources(target)
     api = control.ProviderAPI(target, os.environ.get("SUBS_BOT_CF_PROVIDER_WORKER_TOKEN", ""),
                               os.environ.get("SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN", ""))
+    api = DiagnosticReader(api, target)
     if request["kind"] == "forward-stage":
         control.require(request["sourceTargetSha256"] == control.digest({**target, "versionId": None}))
         confirmed = confirmed_forward_stage(api, target)
@@ -76,6 +138,7 @@ def main():
                   "runAttempt": os.environ["GITHUB_RUN_ATTEMPT"], "targetSha256": control.digest(confirmed),
                   "sourceRevision": confirmed["build"]["revision"],
                   **{key: request[key] for key in ("sourceRunId", "sourceRunAttempt", "sourceManifestSha256", "responseIdentitySha256", "sourceTargetSha256")}}
+        phase("output")
         output = root / "provider-forward-stage-output"
         output.mkdir(mode=0o700)
         for name, value in (("provider-reconciled-target.json", confirmed), ("provider-reconciliation.json", result)):
@@ -85,11 +148,13 @@ def main():
         return
     control.require(request["sourceTargetSha256"] == control.digest(target))
     observations = []
+    phase("terminal_before")
     terminal = verify_forced_terminal(api, target, evidence_sink=observations.append)
     control.require(len(observations) == 1)
     control.guard_sources(target)
     recovery["terminalSha256"] = control.digest(terminal)
     recovery = control.validate_forward_recovery(recovery)
+    phase("output")
     output = root / "provider-forward-terminal-output"
     output.mkdir(mode=0o700)
     for name, value in (("provider-reconciled-target.json", target), ("provider-forward-terminal.json", recovery),
@@ -104,5 +169,6 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
+    except Exception as error:
+        print("Provider readback diagnostic " + json.dumps(safe_diagnostic(error), sort_keys=True))
         raise SystemExit("The failed provider terminal could not be independently confirmed; no mutation was performed.") from None

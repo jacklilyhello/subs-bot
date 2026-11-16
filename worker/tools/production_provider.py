@@ -54,8 +54,10 @@ def read_failure(phase, status=None, envelope=None):
     if isinstance(errors, list):
         diagnostic["cloudflareCodes"] = sorted({row["code"] for row in errors[:8] if isinstance(row, dict)
             and type(row.get("code")) is int and 1000 <= row["code"] <= 999999})
-    return ProviderError("The explicit ProviderFetch GET was not confirmed. Read diagnostic "
-                         + json.dumps(diagnostic, separators=(",", ":")) + ".")
+    error = ProviderError("The explicit ProviderFetch GET was not confirmed. Read diagnostic "
+                          + json.dumps(diagnostic, separators=(",", ":")) + ".")
+    error.read_diagnostic = diagnostic
+    return error
 
 
 def canonical(value):

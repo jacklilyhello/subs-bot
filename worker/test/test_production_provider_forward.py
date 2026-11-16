@@ -127,5 +127,31 @@ class ForwardStageReadbackTests(unittest.TestCase):
             observe.assert_not_called()
 
 
+class SafeReadbackDiagnosticTests(unittest.TestCase):
+    def test_only_fixed_phase_reason_and_bounded_numeric_read_fields_are_reported(self):
+        private = "synthetic-private-token-body-path"
+        with patch.dict(forward.CONTEXT, {"phase": "candidate_resources", "lastRead": "candidate_module"}, clear=True):
+            error = control.read_failure("response-envelope", 403, {"errors": [{"code": 10000, "message": private}]})
+            self.assertEqual(forward.safe_diagnostic(error), {"phase": "candidate_resources", "lastRead": "candidate_module",
+                             "reason": "provider_guard", "httpStatus": 403, "cloudflareCodes": [10000]})
+            self.assertNotIn(private, str(forward.safe_diagnostic(error)))
+            self.assertEqual(forward.safe_diagnostic(AttributeError(private))["reason"], "attribute_error")
+        with patch.dict(forward.CONTEXT, {"phase": private, "lastRead": private}, clear=True):
+            self.assertEqual(forward.safe_diagnostic(RuntimeError(private)),
+                             {"phase": "context", "lastRead": "none", "reason": "unexpected"})
+
+    def test_diagnostic_reader_remains_get_only_and_never_reports_resource_paths(self):
+        target = config(active=True)
+        api = Mock(config=target)
+        api._request.return_value = {"result": {}}
+        reader = forward.DiagnosticReader(api, target)
+        reader._request(reader.beta_path + "/" + target["versionId"] + "?include=modules")
+        self.assertEqual(forward.CONTEXT["lastRead"], "candidate_module")
+        with self.assertRaises(control.ProviderError):
+            reader._request("/containers/applications", method="POST", container=True, body={})
+        self.assertEqual(api._request.call_count, 1)
+        self.assertNotIn(target["worker"]["workerId"], str(forward.safe_diagnostic(ValueError("private"))))
+
+
 if __name__ == "__main__":
     unittest.main()
