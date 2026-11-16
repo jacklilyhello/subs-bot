@@ -14,7 +14,7 @@ on:
         description: One guarded lifecycle step; inspect after every uncertain result
         required: true
         type: choice
-        options: [availability, provision-inspect, provision-reconcile, provision, preflight, initialize, inspect, plan-deploy, deploy, reconcile-deploy, plan-pause, pause, drain, freeze, thaw, classify-interruption, domain, plan-webhook, webhook, plan-activate, activate]
+        options: [availability, provision-inspect, provision-reconcile, provision, preflight, initialize, inspect, plan-deploy, deploy, plan-reconcile-deploy, reconcile-deploy, plan-pause, pause, drain, freeze, thaw, classify-interruption, domain, plan-webhook, webhook, plan-activate, activate]
         default: inspect
       source_run_id:
         description: Successful exact main release CI; omit only with pinned private source checkpoint
@@ -132,6 +132,13 @@ jobs:
           store.put('maintenance/production-control/registrations/' + validate_target(target).digest + '.json', canonical(receipt))
           print('Private resource registration persisted and independently read back.')
           PY
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && inputs.action != 'provision' && inputs.action != 'availability'
+        with:
+          name: subs-bot-production-deployment-events-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/production-control-deployment-events.ndjson
+          if-no-files-found: warn
+          retention-days: 7
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: success() && inputs.action != 'provision' && inputs.action != 'availability'
         with:

@@ -10,7 +10,7 @@ from hashlib import sha256
 import json
 from time import monotonic, sleep, time
 
-from production_control import API, Controller, OperationError, Telegram, one, rows
+from production_control import API, Controller, DeploymentReconciliationRequired, OperationError, Telegram, one, rows
 from production_target import canonical, digest, matches, require, validate_target
 from production_lifecycle_fixture import SMALL_TOKEN, seed_fixture
 from production_application_provider_source import DependencyReadOnly, load_provider
@@ -153,6 +153,16 @@ def url_and_refresh(runner, controller, anchors, base, expected_body, wire):
     runner.save("provider-import-refresh-verified", runner.report["applicationProviderCases"])
 
 
+def controllers(runner, wire, original, target, bundle, manifest, dependency):
+    def controller(value, label, reader=None):
+        return Controller(value, API(value, runner.env["SUBS_BOT_CF_BOOTSTRAP_TOKEN"]),
+            API(value, runner.env["SUBS_BOT_CF_DEPLOY_TOKEN"]), bundle, manifest, guard=runner.guard,
+            telegram=Telegram(value, runner.secrets, rehearsal_previous_url=wire["originalOrigin"] + "/telegram/webhook"),
+            secrets=runner.secrets, dependency_api=reader, control_revision=runner.revision,
+            deployment_checkpoint=lambda event: runner.save("provider-binding-" + label + "-" + event["phase"], event))
+    return controller(target, "on", dependency), controller(original, "off")
+
+
 def run(runner, wire):
     require(runner.env.get("DRILL_PROVIDER_READY_ACK") == READY and 60 <= runner.human_window <= 540
             and runner.attempt == "1" and not runner.baseline_checkpoint,
@@ -177,12 +187,7 @@ def run(runner, wire):
     require(prebind["callerState"] == "unbound", "An application caller is already present; no configuration mutation was attempted.")
     bundle, manifest = runner.prepare()
     require(manifest["revision"] == runner.revision)
-    def controller(value, reader=None):
-        return Controller(value, API(value, runner.env["SUBS_BOT_CF_BOOTSTRAP_TOKEN"]),
-            API(value, runner.env["SUBS_BOT_CF_DEPLOY_TOKEN"]), bundle, manifest, guard=runner.guard,
-            telegram=Telegram(value, runner.secrets, rehearsal_previous_url=wire["originalOrigin"] + "/telegram/webhook"),
-            secrets=runner.secrets, dependency_api=reader, control_revision=runner.revision)
-    on, off = controller(target, dependency), controller(original)
+    on, off = controllers(runner, wire, original, target, bundle, manifest, dependency)
     before = on.plan_deploy(source)
     admission = runner.prefix + "provider-binding/" + provider.digest(loaded["config"]) + "/" + runner.revision + "/admission.json"
     require(runner.store.get(admission, absent=True) is None,
@@ -195,9 +200,21 @@ def run(runner, wire):
     runner.report.update(applicationProvider={"providerEvidence": loaded["evidence"], "validatedConfigurationSha256": target.configuration_digest,
         "originalConfigurationSha256": original.configuration_digest, "oneShotIntentSha256": digest(intent)}, fixture=fixture,
         activeSourceProof=source_proof)
-    on_state = on.deploy(wire["approval"](target, "deploy", on.revision, before["stateSha256"]), before["stateSha256"], source_controller=source)
+    try:
+        on_state = on.deploy(wire["approval"](target, "deploy", on.revision, before["stateSha256"]), before["stateSha256"], source_controller=source)
+    except DeploymentReconciliationRequired as error:
+        runner.report["deploymentFailure"] = error.safe_details()
+        try:
+            runner.save("provider-binding-on-unconfirmed", error.safe_details())
+        except Exception:
+            runner.report["deploymentFailureEvidenceConfirmed"] = False
+        raise error from None
     closed(on_state)
     runner.save("provider-binding-on-confirmed", on_state)
+    return complete_binding(runner, wire, original, target, dependency, on, off, expected_body)
+
+
+def complete_binding(runner, wire, original, target, dependency, on, off, expected_body):
     runner.controller = on
     primary = None
     try:
@@ -234,8 +251,20 @@ def run(runner, wire):
                 runner.controller = off
                 runner.report.update(state=restored, configurationSha256=original.configuration_digest, releaseRevision=off.revision)
                 runner.report["applicationProvider"].update(configurationRestored=True, unboundProof=unbound)
-            except Exception:
+            except Exception as off_error:
                 runner.report["applicationProvider"]["configurationRestored"] = False
+                if bool(getattr(off_error, "uncertain", False)):
+                    details = off_error.safe_details() if isinstance(off_error, DeploymentReconciliationRequired) else {
+                        "kind": "off-deployment-reconciliation-required", "uncertain": True}
+                    runner.report["offDeploymentFailure"] = details
+                    if primary is not None:
+                        runner.report["priorApplicationFailure"] = {"kind": "application-stage-failed",
+                            "uncertain": bool(getattr(primary, "uncertain", False))}
+                    try:
+                        runner.save("provider-binding-off-unconfirmed", details)
+                    except Exception:
+                        runner.report["offDeploymentFailureEvidenceConfirmed"] = False
+                    raise off_error from None
                 if primary is not None:
                     raise primary from None
                 raise

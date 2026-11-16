@@ -24,7 +24,7 @@ import d1_migrations as migrations
 import native_restore_rehearsal as native
 import prepare_isolation_artifact as artifact
 import prepare_control_artifact
-from production_control import API, Controller, NoRedirect, OperationError, StalePredecessorError, Telegram, general_config, hosted_environment, one, rows
+from production_control import API, Controller, DeploymentReconciliationRequired, NoRedirect, OperationError, StalePredecessorError, Telegram, general_config, hosted_environment, one, rows
 from production_provision import Provisioner, ProvisionJournal
 from production_storage import PrivateStore
 from production_target import ACCOUNT, ZONE, FEATURES, NAMES, HEX, UUID, STAMP, ContractError, canonical, digest, matches, parsed, require, validate_target
@@ -224,7 +224,7 @@ class Drill:
         require(matches(r"[1-9][0-9]{0,19}", self.run) and matches(r"[1-9][0-9]{0,5}", self.attempt))
         self.revision = env.get("GITHUB_SHA", "")
         window = env.get("DRILL_HUMAN_WINDOW_SECONDS") or "0"
-        maximum_window = 540 if env.get("DRILL_ACTION") in ("provider-binding", "recover-webhook") else 180
+        maximum_window = 540 if env.get("DRILL_ACTION") in ("provider-binding", "provider-binding-resume", "recover-webhook") else 180
         require(matches(r"0|[1-9][0-9]{0,2}", window) and int(window) <= maximum_window,
                 "The explicit human observation window is outside the selected action's bounded duration.")
         self.human_window = int(window)
@@ -821,6 +821,16 @@ class Drill:
             "expect_status": expect_status, "public_request": public_request, "public_readback": public_readback,
             "origin": ORIGIN, "originalOrigin": ORIGINAL_ORIGIN})
 
+    def provider_binding_resume(self):
+        from production_application_provider_resume import run
+        run(self, {"approval": approval, "post_update": post_update, "update_payload": update_payload,
+            "expect_status": expect_status, "public_request": public_request, "public_readback": public_readback,
+            "origin": ORIGIN, "originalOrigin": ORIGINAL_ORIGIN})
+
+    def provider_binding_reconcile(self):
+        from production_application_provider_resume import run
+        run(self, {"approval": approval, "origin": ORIGIN, "originalOrigin": ORIGINAL_ORIGIN}, reconcile_only=True)
+
     def recovery(self):
         from production_recovery_drill import run_recovery_drill
         bundle, manifest = self.prepare(active=True)
@@ -902,7 +912,7 @@ def main():
     hosted_environment("rehearsal")
     require(env.get("GITHUB_WORKFLOW_REF") == WORKFLOW, "Only the protected dedicated hosted rehearsal workflow may run this drill.")
     action = env.get("DRILL_ACTION", "inspect")
-    require(action in ("bootstrap", "exercise", "inspect", "stabilize", "recover-webhook", "seed-fixture", "recovery", "finalize-recovery", "provider-binding"))
+    require(action in ("bootstrap", "exercise", "inspect", "stabilize", "recover-webhook", "seed-fixture", "recovery", "finalize-recovery", "provider-binding", "provider-binding-resume", "provider-binding-reconcile"))
     tool = Drill(env)
     try:
         if action == "recover-webhook":
@@ -914,9 +924,16 @@ def main():
         else:
             artifact.require_current_main(tool.revision)
             getattr(tool, action.replace("-", "_"))()
-    except Exception:
+    except Exception as error:
         tool.report["status"] = "stopped"
-        tool.publish()
+        if isinstance(error, DeploymentReconciliationRequired):
+            tool.report["deploymentFailure"] = error.safe_details()
+        try:
+            tool.publish()
+        except Exception:
+            if bool(getattr(error, "uncertain", False)):
+                raise error from None
+            raise OperationError("Private failure evidence was not confirmed; preserve the runner and inspect independently.", uncertain=True) from None
         raise
     tool.publish()
 
@@ -925,7 +942,8 @@ if __name__ == "__main__":
     try:
         main()
     except (ContractError, OperationError, artifact.ArtifactError, migrations.MigrationError, native.RehearsalError) as error:
-        print(json.dumps({"status": "stopped", "reason": str(error), "uncertain": bool(getattr(error, "uncertain", False))}))
+        print(json.dumps({"status": "stopped", "reason": str(error), "uncertain": bool(getattr(error, "uncertain", False)),
+            **(error.safe_details() if isinstance(error, DeploymentReconciliationRequired) else {})}))
         raise SystemExit(1) from None
     except Exception:
         print(json.dumps({"status": "stopped", "reason": "The rehearsal encountered an unconfirmed result; retain the private checkpoints and inspect independently."}))

@@ -49,8 +49,10 @@ class StagedReleaseTests(unittest.TestCase):
             return original(method, path, payload, **kwargs)
         self.controller.worker = api
         before = self.controller.inspect()
-        with self.assertRaises(contract.ContractError):
+        with self.assertRaises(control.DeploymentReconciliationRequired) as caught:
             self.controller.deploy(approval(self.target, "deploy", before["stateSha256"]), before["stateSha256"])
+        self.assertTrue(caught.exception.uncertain)
+        self.assertEqual(caught.exception.phase, "staged-readback")
         self.assertEqual(activations, [])
         self.assertEqual(self.controller._control()["workers"], "frozen")
         self.assertEqual(self.controller._control()["admission"], "closed")

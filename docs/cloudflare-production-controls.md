@@ -125,7 +125,7 @@
 
 平台不支持细分的权限应限制到唯一账户、使用短期凭据，并由工具的固定资源 allowlist、受保护 environment 和不取消的并发锁共同约束。需要新权限时先明确范围，不能借短链业务 Token、其他项目凭据或 `/ai` Key 代替。
 
-批准 JSON 必须包含 `schemaVersion=1`, `environment`, `targetSha256`, `configurationSha256`, `revision`, `controlRevision`, `action`, `stateSha256`, `authorization`。`revision` 是被验证应用产物的准确提交；`controlRevision` 是当前控制工具 main 提交；`authorization` 精确为 `approve <action> for subs-bot-cf-prod-01`。创建使用草稿身份，初始化使用资源前态摘要；pause、webhook 和 activate 分别使用专门 plan-pause、plan-webhook 和 plan-activate 的批准前态，其他操作按其说明使用独立 inspect 或 plan-deploy 前态。恢复另绑定完整恢复契约。旧批准、旧前态、其他目标或配置不符均停止。
+批准 JSON 必须包含 `schemaVersion=1`, `environment`, `targetSha256`, `configurationSha256`, `revision`, `controlRevision`, `action`, `stateSha256`, `authorization`。`revision` 是被验证应用产物的准确提交；`controlRevision` 是当前控制工具 main 提交；`authorization` 精确为 `approve <action> for subs-bot-cf-prod-01`。创建使用草稿身份，初始化使用资源前态摘要；pause、webhook、activate 和 reconcile-deploy 分别使用专门 plan-pause、plan-webhook、plan-activate 和 plan-reconcile-deploy 的批准前态，其他操作按其说明使用独立 inspect 或 plan-deploy 前态。恢复另绑定完整恢复契约。旧批准、旧前态、其他目标或配置不符均停止。
 
 ## 操作顺序
 
@@ -148,7 +148,8 @@ gh workflow run worker-production-control.yml --ref main \
 | initialize | 准确完整迁移，只写正式权限白名单；业务表为空；默认无时区行即 UTC；closed/frozen |
 | deploy | 准确 main CI 模块和迁移，精确绑定／配置读回；保持 closed/frozen；设置恢复 Cron 但冻结状态不执行工作 |
 | plan-deploy | 已存在版本时先固定 `active_run_id` 及原正式配置／安全 Secret，独立核对当前源；新开关和依赖配置需新的完整配置批准 |
-| reconcile-deploy | 发布结果不明后先独立读回，只有已部署准确模块、固定配置和冻结现场才能完成版本控制记录 |
+| plan-reconcile-deploy | 只读核对已部署准确模块、配置、依赖和排空冻结现场；将完整状态及 Cron 前态 `reconcileCron` 一起绑定到本次 `stateSha256` |
+| reconcile-deploy | 仅接受 plan-reconcile-deploy 的摘要与 `reconcile-deploy` 批准；协调准确控制版本和 policy，或在已确认 successor 上按明确批准补齐空 Cron；不重新上传或切流量 |
 | domain | 精确域名、Zone、DNS 无冲突才绑定；HTTPS／健康提交读回；生产 workers.dev 和预览保持关闭 |
 | plan-webhook | 只读核对 Bot、闭合控制和 Webhook；输出稳定 `webhook.settingsSha256` 和包含它的批准 `stateSha256`，不调用 setWebhook |
 | webhook | 仅接受 plan-webhook 的两份摘要；重验配置／版本／完整控制行、Bot、HTTPS 域名和稳定设置后写入；drop_pending_updates=false，读回 URL／类别／连接参数及无自定义证书 |
@@ -161,6 +162,35 @@ gh workflow run worker-production-control.yml --ref main \
 | freeze / thaw | freeze 需已关闭 admission 且无可继续执行工作；thaw 只恢复已受理后台处理，仍保持 admission 关闭 |
 
 常规 inspect／pause／drain 可以显式选择已通过 CI 的 main 祖先应用产物，控制工具自身始终运行当前准确 main。新初始化／部署要求当前 main 产物。不能用新提交的绿色状态替代旧线上模块的来源证明。
+
+### 发布中断后的协调
+
+上传或流量切换一旦开始，后续错误以 `deployment-reconciliation-required`、固定 phase 和 `uncertain=true` 保留。`upload`、`staged-readback`、`traffic`、`active-readback`、`reconcile` 区分中断边界；版本／deployment 摘要只帮助关联证据，不表示该操作未执行。生产控制工作流另保存 `subs-bot-production-deployment-events-<run>-<attempt>` artifact，其中 `production-control-deployment-events.ndjson` 记录已确认 ID 和阶段。缺失事件或结果报告不能代替实际读回，事件本身也不等于完整验收。
+
+正常发布在一次流量 POST 返回准确 deployment ID 后，只对完整、已验证的原版本允许最多三次 GET 观察，间隔 1 秒、3 秒；准确新 version/deployment 必须通过原有完整绑定及依赖检查。第三个发布、原版本的模块／绑定漂移、未知读回或验证失败立即停止，不重发上传或流量 POST。保留原批准、source／desired 配置、CI ZIP 和不可变 intent，再独立确认实际发布边界。
+
+协调顺序是 `plan-reconcile-deploy → 明确批准其 stateSha256 → reconcile-deploy`。目标 JSON 和 Secret 必须对应已经独立确认的已部署配置；`source_run_id` 固定该应用的准确 CI，而 `--ref main` 始终选择当前控制代码。应用提交可以是已审查的 main 祖先，不能为协调而改成新构建。以下占位符必须替换；示例不授予生产批准：
+
+```sh
+gh workflow run worker-production-control.yml --ref main \
+  -f target_environment=production -f action=plan-reconcile-deploy \
+  -f source_run_id=EXACT_DEPLOYED_APPLICATION_CI_RUN
+```
+
+独立核对计划后，在受保护 environment 安全配置新的 `SUBS_BOT_APPROVAL_JSON`，其 `action=reconcile-deploy`、应用 `revision`、当前工具 `controlRevision`、完整配置及前态摘要必须一致，再执行：
+
+```sh
+gh workflow run worker-production-control.yml --ref main \
+  -f target_environment=production -f action=reconcile-deploy \
+  -f source_run_id=EXACT_DEPLOYED_APPLICATION_CI_RUN \
+  -f state_sha256=EXACT_PLAN_RECONCILE_DEPLOY_STATE_SHA256
+```
+
+规划只接受 Cron `[]` 或唯一的 `* * * * *`；仅允许平台的 `created_on`／`modified_on` 元数据，整个读回前态随计划批准。计划另绑定 `reconcilePolicyRevision` 和 `reconcileMode`，要求 policy 与当前 control revision 一致。其他 Cron、未知字段或规划后的漂移均拒绝。需要更新版本的 `revision-reconcile` 模式把完整 control 前态和旧 `telegram_general_policy.release_revision` 一起原子断言，再更新版本及 epoch，并读回准确 Cron。不能把 policy 更新零行当作协调成功。
+
+正式 CLI 发现当前 control、policy 和准确已部署应用均为 desired revision 时，规划使用 `already-coherent`，无需额外提供原前态。批准后只确认当前完整 control／epoch 保持不变；Cron 已准确时无写入，明确批准空 Cron 时仅补写准确计划并读回，不再执行 SQL 或增加 epoch。这只证明当前配置一致，不证明某次历史 SQL 或发布步骤曾经成功。显式 on-intent 续接仍使用原不可变前态，不能借此模式放宽原 epoch 到唯一 successor 的约束。
+
+在持有原不可变前态的明确续接中，已协调 successor 仅允许原 epoch 加一、准确新 revision、policy 和完整活动发布均一致：Cron 已准确时只读返回，不写 SQL、不增加 epoch；若 Cron 明确为空，只有本次计划已绑定并批准该空状态，才允许一次 PUT 写入准确 Cron 并重新读回，仍不重放 SQL。写入／确认不明时保留 uncertain；其他状态停止，不能借此补写未知计划或重新部署。正式生产的每一步仍须单独批准。
 
 常规现场检查、暂停、排空及封存只要求主应用的版本、完整配置和实际绑定准确，不因 ProviderFetch 正在正常处理或故障而阻止关闭 admission。启用依赖的部署在上传前、暂存后和发布后完整读回 Provider 代码／镜像／资源／调用者；最终 plan-activate 与 activate 也要求依赖停止状态和完整证明。实际绑定错误仍会阻止暂停，须保留现场并使用准确配置处理，不能以忽略绑定检查来关闭工作。
 
@@ -186,9 +216,49 @@ Webhook 配置顺序为 `plan-webhook → 明确批准其 stateSha256 → webhoo
 
 整体通过还要求 off 后再次独立检查 closed/frozen、所有 work 为零、无未知终态，并通过既有 prepare／capture／verify-backup 和完整基线读回封存当前配置、准确 CI、全部受支持数据及对象闭包。这不创建恢复资源或再触碰 Webhook。报告以 `onActivationBaseline` 保留启用前基线，`latestOffBaseline` 记录新增导入／刷新后的新快照；两者使用不同 checkpoint、journal 和私有阶段键，不以旧 G0 或候选 ZIP 代替新写入保全。任何备份或独立读回失败都会停止整体通过，并保留已经恢复的 off 现场与两份资料。
 
-依赖读取 Secret `SUBS_BOT_CF_DEPENDENCY_READ_TOKEN` 只在此 action 注入，所需权限组为 Workers Scripts Read 与 Workers Containers Read。平台只能按账户授予这些读权限；工具再限制到已验证的 Provider 当前／历史准确 ID 与实际盘点所得对象，GET-only，拒绝其他项目、写操作、D1、R2、Zone 和 Registry。使用短期凭据并核对到期时间，不复制 Provider 运行 Secret。
+依赖读取 Secret `SUBS_BOT_CF_DEPENDENCY_READ_TOKEN` 只在 `provider-binding`、下述 `provider-binding-resume` 和 `provider-binding-reconcile` 注入，所需权限组为 Workers Scripts Read 与 Workers Containers Read。平台只能按账户授予这些读权限；工具再限制到已验证的 Provider 当前／历史准确 ID 与实际盘点所得对象，GET-only，拒绝其他项目、写操作、D1、R2、Zone 和 Registry。使用短期凭据并核对到期时间，不复制 Provider 运行 Secret。
 
-每个完整 Provider 配置与应用 main 组合只允许一个私有持久 on-intent。部署结果未知时不能重跑此 action；从该 intent 取出完整 source／desired 配置和准确源，使用正式 plan-deploy／reconcile-deploy 路径独立核对发布，再以新的明确批准决定后续。若关闭配置的部署未知也保留两份契约和 intent；不能用原 Provider=null 登记的检查失败来声称恢复成功，不能盲目重新部署或恢复 Webhook。所有 G0、业务记录、票据和私有部分结果保留。
+每个完整 Provider 配置与应用提交组合只允许一个私有持久 on-intent。部署结果未知时不能重跑 `provider-binding`，也不能删除标记以重发。若关闭配置的部署未知，同样保留两份契约和 intent；下述 on 续接不代替未知 off 的处置，不能用原 Provider=null 登记的检查失败声称已经恢复，也不能盲目重新部署或恢复 Webhook。所有 G0、业务记录、票据和私有部分结果保留。
+
+### 明确续接已经部署的 on 配置
+
+`worker-production-lifecycle-rehearsal.yml` 的 `provider-binding-resume` 调用 `worker/tools/production_application_provider_resume.py`，只用于原 on-intent 已存在、实际已部署准确 desired 版本的专用演练目标。先独立读回原始 intent 字节摘要及活动 version/deployment ID；不能仅凭名称、latest 或缺失的确认文件采用资源。新的 dispatch 必须为 attempt 1，继续使用相同登记、完整 Provider 归档和明确的管理员浏览器 ready 合同，不填写旧基线 pin。
+
+`provider_binding_resume_json` 精确包含以下五个字符串字段；未知字段或占位符均拒绝：
+
+```json
+{
+  "runId": "ORIGINAL_BINDING_RUN_ID",
+  "runAttempt": "ORIGINAL_BINDING_RUN_ATTEMPT",
+  "intentSha256": "INDEPENDENT_ORIGINAL_RAW_INTENT_SHA256",
+  "versionId": "INDEPENDENT_ACTIVE_DESIRED_VERSION_UUID",
+  "deploymentId": "INDEPENDENT_ACTIVE_DESIRED_DEPLOYMENT_UUID"
+}
+```
+
+模块从原共享 admission 以及原 run 专用 on-intent 两处读回，要求字节相同、摘要及原 run/attempt 完全一致，再核对 source／desired 目标、不可变资源、完整配置、两份 CI proof 和 Provider 证据。应用固定为原 `desiredProof` 的准确提交、run/attempt/artifact/ZIP；即使当前控制工具 main 已前进，也不能重建或替换这个应用源。原 source proof 则独立验证部署前版本。`source_run_id` 与 `active_run_id` 在此次续接中都填写原 desired 应用 CI，原来的部署前 CI 从 intent 读取，不再将其填为 `active_run_id`。
+
+```sh
+gh workflow run worker-production-lifecycle-rehearsal.yml --ref main \
+  -f action=provider-binding-resume \
+  -f source_run_id=FROZEN_ORIGINAL_DESIRED_APPLICATION_CI_RUN \
+  -f active_run_id=FROZEN_ORIGINAL_DESIRED_APPLICATION_CI_RUN \
+  -f registration_sha256=EXACT_EXISTING_REGISTRATION_SHA256 \
+  -f provider_run_id=EXACT_COMPLETE_PROVIDER_ARCHIVE_RUN \
+  -f provider_run_attempt=EXACT_PROVIDER_ARCHIVE_ATTEMPT \
+  -f provider_manifest_sha256=INDEPENDENT_COMPLETE_PROVIDER_MANIFEST_SHA256 \
+  -f human_window_seconds=540 \
+  -f provider_ready_ack='IAB ready for subs-bot-cf-control-drill-01 refresh' \
+  -f provider_binding_resume_json='{"runId":"ORIGINAL_BINDING_RUN_ID","runAttempt":"ORIGINAL_BINDING_RUN_ATTEMPT","intentSha256":"INDEPENDENT_ORIGINAL_RAW_INTENT_SHA256","versionId":"INDEPENDENT_ACTIVE_DESIRED_VERSION_UUID","deploymentId":"INDEPENDENT_ACTIVE_DESIRED_DEPLOYMENT_UUID"}'
+```
+
+准确目标、配置、模块、绑定、依赖及原控制前态全部核验后，续接通过正式 Controller 的规划／批准／协调方法完成控制记录，不上传新版本、不再切换 on 流量。完整活动 snapshot 贯穿重新读取；第三个发布、未知终态、其他 epoch 或配置漂移均拒绝。已经协调的准确 successor 遵守前述只读或明确空 Cron 修补规则，不能靠重新 dispatch 重放已发生的 SQL 或业务。
+
+协调成功后仍须真实执行完整后续流程：封存新的 on G0、配置并读回保留 pending 的 Webhook、激活、合成三节点 URL 导入与精确导出，并在 `provider-refresh-window-open` 由管理员点击本次真实票据完成刷新。接着关闭／排空／冻结、恢复原 Webhook 与认证、发布准确 off 配置并确认无 Provider caller，最后封存不同 checkpoint 的 `latestOffBaseline`，包含本轮新增写入和原始 CI 闭包。协调本身、窗口打开或旧 G0 通过均不能代替这些结果；真人验收还须浏览器证据独立对应。
+
+需要分段完成控制协调时，可使用同一工作流的 `action=provider-binding-reconcile`。沿用上述准确 `provider_binding_resume_json`、登记、Provider 归档及冻结应用 CI 输入，仅将 `human_window_seconds=0`；不要求 `provider_ready_ack` 或真人消息锚点。该入口使用相同原 intent、正式协调方法和独立读回，重验共享 admission 未改变，并持久保存 `provider-binding-on-reconciled` 后保持准确 on 配置、原 desired 应用源及 closed/frozen 状态。它不上传版本、不切换 on 流量、不请求公开订阅源、不执行 exercise、Webhook 操作、导入、真人刷新、off 发布或最新备份，也不触发 Webhook 清理。
+
+该分段报告为 `status=reconciled-closed-only`、`humanAcceptance=false`，不报告 `passed`；配置摘要对应实际 on 配置，`ciProof` 对应冻结的 desired 源，control 仍须是原前态的唯一准确 successor。`providerBusinessAcceptance` 中 URL 导入、真人刷新、off 发布和 latest-off 备份均标为 `not-run`。之后重新明确批准完整 `provider-binding-resume`，在准备好真人会话的 60–540 秒窗口内，从同一准确 successor 继续；已确认的协调不再写 SQL 或增加 epoch，后续全部验收仍须实际完成。
 
 ## 集中的正式配置与批准清单
 
