@@ -2,6 +2,7 @@
 
 import hashlib
 from http.client import HTTPException
+from math import ceil
 import io
 import json
 import os
@@ -9,7 +10,9 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import sys
 import tempfile
+from time import sleep, time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -91,13 +94,101 @@ def _parse_object(body, error):
     return value
 
 
+def _metadata_family(path):
+    if path == "/git/ref/heads/main":
+        return "main-ref"
+    if re.fullmatch(r"/actions/artifacts/[0-9]+", path):
+        return "artifact"
+    if re.fullmatch(r"/actions/runs/[0-9]+(?:/attempts/[0-9]+)?", path):
+        return "source-run"
+    if re.fullmatch(r"/actions/runs/[0-9]+/artifacts\?.*", path):
+        return "artifact-list"
+    if re.fullmatch(r"/actions/runs/[0-9]+(?:/attempts/[0-9]+)?/jobs\?.*", path):
+        return "jobs"
+    if path.startswith("/compare/"):
+        return "ancestry"
+    return "other"
+
+
+def _header_number(headers, name, maximum):
+    value = headers.get(name) if headers is not None else None
+    if not isinstance(value, str) or not re.fullmatch(r"0|[1-9][0-9]{0,12}", value):
+        return None
+    number = int(value)
+    return number if number <= maximum else None
+
+
+def _metadata_diagnostic(path, phase, attempt, status=None, headers=None):
+    return {"family": _metadata_family(path), "phase": phase, "attempt": attempt, "maximumAttempts": 3,
+        "retryBudgetSeconds": 4, "httpStatus": status if type(status) is int and 100 <= status <= 599 else None,
+        "rateLimitRemaining": _header_number(headers, "X-RateLimit-Remaining", 1000000),
+        "rateLimitReset": _header_number(headers, "X-RateLimit-Reset", 4102444800),
+        "retryAfterSeconds": _header_number(headers, "Retry-After", 86400)}
+
+
+def _metadata_retry(status, diagnostic, headers, attempt, waited):
+    if attempt >= 3:
+        return None
+    budget = 4 - waited
+    delay = (1, 3)[attempt - 1]
+    explicit = headers.get("Retry-After") if headers is not None else None
+    if explicit is not None:
+        if diagnostic["retryAfterSeconds"] is None:
+            return None
+        delay = max(1, diagnostic["retryAfterSeconds"])
+    if diagnostic["rateLimitRemaining"] == 0:
+        reset = diagnostic["rateLimitReset"]
+        if reset is None or reset < time() - 1:
+            return None
+        delay = max(delay, ceil(reset - time()))
+    if status == 403 and diagnostic["rateLimitRemaining"] != 0:
+        return None
+    # Secondary 429 without an explicit wait signal requires at least one
+    # minute. That exceeds this helper's small cumulative backoff budget.
+    if status == 429 and explicit is None and diagnostic["rateLimitRemaining"] != 0:
+        return None
+    if status is not None and status not in {403, 429, 500, 502, 503, 504}:
+        return None
+    return delay if 0 < delay <= budget else None
+
+
+def _report_metadata(diagnostic, outcome):
+    # stderr preserves callers' JSON stdout. No body, exception, URL or raw header
+    # is read or printed, including on denied redirects and ordinary 403s.
+    print("GitHub metadata read diagnostic " + json.dumps({**diagnostic, "outcome": outcome}, sort_keys=True), file=sys.stderr)
+
+
 def _get_json(path, token):
     error = "Could not read trusted GitHub release metadata."
-    try:
-        with _OPENER.open(_api_request(path, token), timeout=20) as response:
-            return _parse_object(_bounded_read(response, _MAX_JSON), error)
-    except (URLError, OSError, HTTPException):
-        raise ArtifactError(error) from None
+    waited = 0
+    for attempt in range(1, 4):
+        try:
+            with _OPENER.open(_api_request(path, token), timeout=20) as response:
+                try:
+                    return _parse_object(_bounded_read(response, _MAX_JSON), error)
+                except ArtifactError:
+                    diagnostic = _metadata_diagnostic(path, "response", attempt, getattr(response, "status", None),
+                                                      getattr(response, "headers", None))
+                    _report_metadata(diagnostic, "failed")
+                    raise
+        except HTTPError as failure:
+            diagnostic = _metadata_diagnostic(path, "http", attempt, failure.code, failure.headers)
+            delay = _metadata_retry(failure.code, diagnostic, failure.headers, attempt, waited)
+            try:
+                failure.close()
+            except (OSError, HTTPException):
+                pass
+        except (URLError, OSError, HTTPException):
+            diagnostic = _metadata_diagnostic(path, "transport", attempt)
+            delay = _metadata_retry(None, diagnostic, None, attempt, waited)
+        if delay is None:
+            _report_metadata(diagnostic, "failed")
+            rejected = ArtifactError(error)
+            rejected.read_diagnostic = diagnostic
+            raise rejected from None
+        _report_metadata(diagnostic, "retry")
+        sleep(delay)
+        waited += delay
 
 
 def require_current_main(revision: str) -> None:
