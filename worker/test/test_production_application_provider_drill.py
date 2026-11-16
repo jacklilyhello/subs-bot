@@ -112,6 +112,11 @@ class ApplicationProviderProtocolTests(unittest.TestCase):
             runner.report.update(webhookCheckpoint="1001/1", webhookRecovery={"webhookRestored": True,
                 "originalWebhookAuthProbe": {"status": 400}}, applicationProviderCases={"realRefreshSaved": True})
         runner.exercise = Mock(side_effect=exercise)
+        def latest_off(**_kwargs):
+            self.assertIs(runner.controller, off)
+            runner.report["latestOffBaseline"] = {"verification": {"baselineVerified": True,
+                "sourceRevision": off.revision, "configurationSha256": target.configuration_digest}}
+        runner.activation_baseline = Mock(side_effect=latest_off)
         wire = {"origin": lifecycle.ORIGIN, "originalOrigin": lifecycle.ORIGINAL_ORIGIN, "approval": Mock(return_value={}),
             "public_readback": Mock(return_value=(200, body)), "public_request": Mock(), "expect_status": lifecycle.expect_status}
         loaded = {"config": dependency(), "evidence": {"manifestSha256": "e" * 64}}
@@ -137,6 +142,7 @@ class ApplicationProviderProtocolTests(unittest.TestCase):
         self.assertTrue(callable(runner.exercise.call_args.kwargs["verify_extra"]))
         self.assertEqual(runner.report["status"], "passed")
         self.assertTrue(runner.report["applicationProvider"]["configurationRestored"])
+        runner.activation_baseline.assert_called_once_with(stage_prefix="latest-off-baseline")
         self.assertIs(runner.controller, off)
         self.assertEqual(len(runner.store.values), 1)
         self.assertNotIn("registration.json", " ".join(runner.store.values))
@@ -151,6 +157,7 @@ class ApplicationProviderProtocolTests(unittest.TestCase):
         self.assertTrue(caught.exception.uncertain)
         on.deploy.assert_called_once()
         off.deploy.assert_not_called()
+        runner.activation_baseline.assert_not_called()
         runner.exercise.assert_not_called()
         self.assertEqual(len(runner.store.values), 1)
         self.assertNotEqual(runner.report.get("status"), "passed")
@@ -183,6 +190,7 @@ class ApplicationProviderProtocolTests(unittest.TestCase):
         with self.assertRaises(control.OperationError):
             self.execute(runner, wire, loaded, on, off)
         off.deploy.assert_called_once()
+        runner.activation_baseline.assert_not_called()
         self.assertFalse(runner.report["applicationProvider"]["configurationRestored"])
         self.assertNotEqual(runner.report.get("status"), "passed")
         self.assertIn("provider-binding-off-intent", [args.args[0] for args in runner.save.call_args_list])
@@ -194,6 +202,28 @@ class ApplicationProviderProtocolTests(unittest.TestCase):
             self.execute(runner, wire, loaded, on, off)
         off.deploy.assert_called_once()
         self.assertTrue(runner.report["applicationProvider"]["configurationRestored"])
+        runner.activation_baseline.assert_not_called()
+        self.assertNotEqual(runner.report.get("status"), "passed")
+
+    def test_latest_off_backup_failure_cannot_pass_or_repeat_configuration_release(self):
+        runner, wire, loaded, _source, on, off = self.runner()
+        runner.activation_baseline.side_effect = control.OperationError("Synthetic incomplete off backup.", uncertain=True)
+        with self.assertRaises(control.OperationError):
+            self.execute(runner, wire, loaded, on, off)
+        on.deploy.assert_called_once()
+        off.deploy.assert_called_once()
+        self.assertTrue(runner.report["applicationProvider"]["configurationRestored"])
+        self.assertEqual(runner.report["status"], "latest-off-backup-pending")
+        self.assertNotIn("latestOffBaseline", runner.report)
+
+    def test_stale_configuration_proof_cannot_substitute_for_latest_off_data(self):
+        runner, wire, loaded, _source, on, off = self.runner()
+        def stale(**_kwargs):
+            runner.report["latestOffBaseline"] = {"verification": {"baselineVerified": True,
+                "sourceRevision": off.revision, "configurationSha256": on.target.configuration_digest}}
+        runner.activation_baseline.side_effect = stale
+        with self.assertRaises(contract.ContractError):
+            self.execute(runner, wire, loaded, on, off)
         self.assertNotEqual(runner.report.get("status"), "passed")
 
     def test_missing_readiness_baseline_reuse_or_wrong_target_never_deploys(self):

@@ -242,5 +242,11 @@ def run(runner, wire):
         else:
             runner.report["applicationProvider"]["configurationRestored"] = False
     require(runner.report["applicationProvider"].get("configurationRestored") is True)
+    runner.report["status"] = "latest-off-backup-pending"
+    runner.activation_baseline(stage_prefix="latest-off-baseline")
+    latest = runner.report.get("latestOffBaseline", {}).get("verification", {})
+    require(latest.get("baselineVerified") is True and latest.get("sourceRevision") == off.revision
+            and latest.get("configurationSha256") == original.configuration_digest,
+            "The latest off data and release closure were not independently preserved.")
     runner.report["status"] = "passed"
     runner.save("provider-binding-complete", runner.report["applicationProvider"])

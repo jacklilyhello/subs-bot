@@ -499,16 +499,32 @@ class Drill:
                 "The frozen source CI ZIP changed or its digest did not verify.")
         return proof, archive
 
-    def activation_baseline(self):
+    def activation_baseline(self, *, stage_prefix="activation-baseline"):
         import production_recovery as recovery
         from production_release_evidence import verify_activation_baseline
+        require(stage_prefix in ("activation-baseline", "latest-off-baseline"), "Unknown baseline evidence stage.")
         ctl = self.controller
+        latest_off = stage_prefix == "latest-off-baseline"
+        if latest_off:
+            require(not self.baseline_checkpoint and ctl.target.environment == "rehearsal"
+                    and ctl.target.data["workerName"] == SERVICE and ctl.target.data["provider"] is None,
+                    "The latest off snapshot requires a fresh exact closed configuration.")
+            before = ctl.inspect()
+            require(before["control"]["admission"] == "closed" and before["control"]["workers"] == "frozen"
+                    and not any(before["work"].values())
+                    and not any(before["terminal"].get(key, 0) for key in
+                        ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates")),
+                    "The latest off snapshot requires frozen work and no unresolved outcome.")
+            require(isinstance(self.report.get("activationBaseline"), dict), "The distinct on baseline must remain preserved.")
+            self.report["onActivationBaseline"] = deepcopy(self.report["activationBaseline"])
         data_token = self.env["SUBS_BOT_CF_BOOTSTRAP_TOKEN"]
         if self.baseline_checkpoint:
             checkpoint, manifest_sha = self.baseline_checkpoint, self.baseline_manifest_sha
         else:
             proof, archive = self.code_archive()
             checkpoint = token_hex(16)
+            require(not latest_off or checkpoint != self.report["onActivationBaseline"]["checkpointId"],
+                    "The latest off snapshot must use a distinct checkpoint.")
             name = "subs-bot-cf-restore-control-" + checkpoint[:16]
             contract = {"version": 1, "checkpointId": checkpoint, "databaseName": name, "objectsName": name, "purpose": "baseline"}
             api = recovery.RecoveryAPI(ctl.target.data, data_token, ctl.worker, contract)
@@ -521,7 +537,7 @@ class Drill:
                     engine = recovery.RecoveryEngine(api, source, journal, Path(directory))
                     for action in ("prepare", "capture", "verify-backup"):
                         result = recovery.run_action(action, engine)
-                        self.save("activation-baseline-" + action, result)
+                        self.save(stage_prefix + "-" + action, result)
                 manifest_sha = result["backup"]["manifestSha256"]
             finally:
                 journal.release()
@@ -533,11 +549,12 @@ class Drill:
                 and verified.get("configurationSha256") == ctl.target.configuration_digest
                 and verified.get("sourceRevision") == ctl.revision and verified.get("mutationPerformed") is False,
                 "The independent activation baseline proof did not verify exactly.")
-        self.report["activationBaseline"] = {"checkpointId": checkpoint, "manifestSha256": manifest_sha,
+        key = "latestOffBaseline" if latest_off else "activationBaseline"
+        self.report[key] = {"checkpointId": checkpoint, "manifestSha256": manifest_sha,
             "targetSha256": ctl.target.digest, "verification": verified}
-        self.report["baselineReused"] = bool(self.baseline_checkpoint)
-        self.save("activation-baseline-reused-verified" if self.baseline_checkpoint else "activation-baseline-verified",
-            self.report["activationBaseline"])
+        if not latest_off:
+            self.report["baselineReused"] = bool(self.baseline_checkpoint)
+        self.save(stage_prefix + ("-reused-verified" if self.baseline_checkpoint else "-verified"), self.report[key])
 
     def exercise(self, *, provided_controller=None, verify_extra=None):
         if provided_controller is None:

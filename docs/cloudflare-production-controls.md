@@ -182,6 +182,8 @@ Webhook 配置顺序为 `plan-webhook → 明确批准其 stateSha256 → webhoo
 
 随后先关闭、排空、冻结并独立恢复原 Webhook／认证，再以真实 Controller 发布原 Provider=null／关闭功能的完整配置，核对依赖无调用者。专用数据与原登记保持，后续 inspect 的 active_run_id 应指向这次发布所用的准确 main CI；displayTimezone 仅投影本 Bot 的时区与设置来源，无行明确为默认 UTC。
 
+整体通过还要求 off 后再次独立检查 closed/frozen、所有 work 为零、无未知终态，并通过既有 prepare／capture／verify-backup 和完整基线读回封存当前配置、准确 CI、全部受支持数据及对象闭包。这不创建恢复资源或再触碰 Webhook。报告以 `onActivationBaseline` 保留启用前基线，`latestOffBaseline` 记录新增导入／刷新后的新快照；两者使用不同 checkpoint、journal 和私有阶段键，不以旧 G0 或候选 ZIP 代替新写入保全。任何备份或独立读回失败都会停止整体通过，并保留已经恢复的 off 现场与两份资料。
+
 依赖读取 Secret `SUBS_BOT_CF_DEPENDENCY_READ_TOKEN` 只在此 action 注入，所需权限组为 Workers Scripts Read 与 Workers Containers Read。平台只能按账户授予这些读权限；工具再限制到已验证的 Provider 当前／历史准确 ID 与实际盘点所得对象，GET-only，拒绝其他项目、写操作、D1、R2、Zone 和 Registry。使用短期凭据并核对到期时间，不复制 Provider 运行 Secret。
 
 每个完整 Provider 配置与应用 main 组合只允许一个私有持久 on-intent。部署结果未知时不能重跑此 action；从该 intent 取出完整 source／desired 配置和准确源，使用正式 plan-deploy／reconcile-deploy 路径独立核对发布，再以新的明确批准决定后续。若关闭配置的部署未知也保留两份契约和 intent；不能用原 Provider=null 登记的检查失败来声称恢复成功，不能盲目重新部署或恢复 Webhook。所有 G0、业务记录、票据和私有部分结果保留。
