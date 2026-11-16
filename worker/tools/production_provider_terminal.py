@@ -93,6 +93,9 @@ def _snapshot(api, config, current):
         process_start = control.bootstrap._timestamp(instance.get("started_at"))
         updated = control.bootstrap._timestamp(status.get("updated_at"))
         control.require(started <= process_start <= updated, ERROR)
+    control.require(all(rows[0][key] == detail[key] for key in ("image", "started_at"))
+                    and all(rows[0]["status"][key] == detail["status"][key]
+                            for key in ("state", "exit_code", "updated_at")), ERROR)
     active = api.instances(namespace, active=True)
     control.require(active == [], ERROR)
     return deepcopy({"state": state, "oldWorkflowInstance": old_instance,
@@ -118,9 +121,12 @@ def verify_forced_terminal(api, config, *, current_config=None, evidence_sink=No
     control.require(control.canonical(_snapshot(reader, config, current)) == control.canonical(first),
                     "The failed ProviderFetch state changed during read-only reconciliation.")
     actor = first["instances"][0]["id"]
+    process = first["instances"][0]
     result = {"status": "failed-terminal-preserved", "completion": "not-complete",
         "targetSha256": control.digest(config), "sourceRevision": config["build"]["revision"],
-        "instanceIdSha256": sha256(actor.encode("ascii")).hexdigest(), "exitCode": 137, "state": "failed"}
+        "instanceIdSha256": sha256(actor.encode("ascii")).hexdigest(), "exitCode": 137, "state": "failed",
+        "processSha256": control.digest({"id": actor, "image": process["image"],
+            "startedAt": process["started_at"], "status": {key: process["status"][key] for key in ("state", "exit_code", "updated_at")}})}
     if evidence_sink is not None:
         workflow = first["oldWorkflowInstance"]
         def container_fields(instance):

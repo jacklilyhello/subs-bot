@@ -4,6 +4,7 @@ from copy import deepcopy
 from base64 import b64encode
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -229,13 +230,16 @@ class ReconciliationTests(unittest.TestCase):
 class FailedTerminalArchiveTests(unittest.TestCase):
     def setUp(self):
         from test_production_provider_forward import recovery
+        environment = patch.dict(os.environ, {"GITHUB_SHA": "b" * 40})
+        environment.start()
+        self.addCleanup(environment.stop)
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         self.target = config(active=True)
         self.state = {"status": "failed-terminal-preserved", "completion": "not-complete", "state": "failed", "exitCode": 137,
                       "targetSha256": control.digest(self.target), "sourceRevision": self.target["build"]["revision"],
-                      "instanceIdSha256": "5" * 64}
+                      "instanceIdSha256": "5" * 64, "processSha256": "6" * 64}
         self.recovery = {**recovery(self.target), "terminalSha256": control.digest(self.state)}
         self.write()
         self.store = MemoryStore()

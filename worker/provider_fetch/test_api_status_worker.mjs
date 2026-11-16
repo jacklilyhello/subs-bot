@@ -19,6 +19,7 @@ test("the V2 probe requires its own image repository before starting the contain
     [API_STATUS_SERVICE, undefined, false],
   ]) {
     const calls = [];
+    let completeStop;
     const selected = image(repository);
     const headers = {
       "Cache-Control": "private, no-store", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff",
@@ -28,7 +29,9 @@ test("the V2 probe requires its own image repository before starting the contain
       running: false,
       start(options) { calls.push(["start", options.image]); this.running = true; },
       async setInactivityTimeout() {},
-      async inspect() { return { image: selected }; },
+      async inspect() { return this.running ? { image: selected } : null; },
+      monitor() { calls.push(["monitor"]); return new Promise((resolve) => { completeStop = resolve; }); },
+      signal(value) { calls.push(["signal", value]); this.running = false; completeStop?.(); },
       async destroy() { calls.push(["stop"]); this.running = false; },
       getTcpPort(port) {
         assert.equal(port, 8080);
@@ -44,7 +47,8 @@ test("the V2 probe requires its own image repository before starting the contain
     const dispatchBeforeMs = Date.now() + 20_000;
     const result = await probePinnedProviderApiStatusV2(container, { ...input, dispatchBeforeMs }, service);
     assert.deepEqual(result, allowed ? { ok: true, status: 401, elapsedMs: 12 } : { ok: false, code: "unavailable" });
-    assert.deepEqual(calls, allowed ? [["start", selected], ["probe", { url: input.url, key: input.key, dispatchBeforeMs }], ["stop"]] : []);
+    assert.deepEqual(calls, allowed ? [["start", selected], ["probe", { url: input.url, key: input.key, dispatchBeforeMs }],
+      ["monitor"], ["signal", 15]] : []);
   }
 });
 

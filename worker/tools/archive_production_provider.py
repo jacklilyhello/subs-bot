@@ -494,16 +494,19 @@ def terminal_archive(store, directory=None, expected=None):
         recovery = provider.validate_forward_recovery(provider.github._parse_object(values["provider-forward-terminal.json"], ERROR))
         state = provider.github._parse_object(values["provider-failed-terminal-state.json"], ERROR)
         readback = provider.github._parse_object(values["provider-failed-terminal-readback.json"], ERROR)
-        provider.fields(state, {"status", "completion", "targetSha256", "sourceRevision", "instanceIdSha256", "exitCode", "state"})
+        provider.fields(state, {"status", "completion", "targetSha256", "sourceRevision", "instanceIdSha256", "exitCode", "state", "processSha256"})
         require(recovery["previousTargetSha256"] == provider.digest(target) == state.get("targetSha256")
                 and recovery["terminalSha256"] == provider.digest(state) and state.get("status") == "failed-terminal-preserved"
                 and state.get("completion") == "not-complete" and state.get("state") == "failed"
                 and type(state.get("exitCode")) is int and state["exitCode"] == 137
                 and state.get("sourceRevision") == target["build"]["revision"]
                 and provider.match(provider.provider.HEX, state.get("instanceIdSha256"))
+                and provider.match(provider.provider.HEX, state.get("processSha256"))
                 and readback.get("summarySha256") == recovery["terminalSha256"]
                 and readback.get("targetSha256") == provider.digest(target) and readback.get("observations") == 2)
+        require(provider.match(provider.provider.REVISION, os.environ.get("GITHUB_SHA", "")))
         manifest = {"version": 1, "kind": "subs-bot-provider-failed-terminal", "completion": "not-complete",
+                    "controllerRevision": os.environ["GITHUB_SHA"],
                     "runId": store.run_id, "runAttempt": store.attempt,
                     "files": {name: {"bytes": len(raw), "sha256": sha256(raw).hexdigest()} for name, raw in values.items()}}
         for name, raw in values.items():
@@ -515,6 +518,7 @@ def terminal_archive(store, directory=None, expected=None):
     require(isinstance(raw, bytes) and len(raw) <= 8192 and sha256(raw).hexdigest() == expected)
     manifest = provider.github._parse_object(raw, ERROR)
     require(manifest.get("kind") == "subs-bot-provider-failed-terminal" and manifest.get("version") == 1
+            and provider.match(provider.provider.REVISION, manifest.get("controllerRevision"))
             and manifest.get("completion") == "not-complete" and manifest.get("runId") == store.run_id
             and manifest.get("runAttempt") == store.attempt and set(manifest.get("files", {})) == set(names))
     for name, limit in names.items():

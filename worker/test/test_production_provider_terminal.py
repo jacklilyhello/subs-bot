@@ -92,7 +92,9 @@ class ForcedTerminalTests(unittest.TestCase):
         result = self.verify()
         self.assertEqual(result, {"status": "failed-terminal-preserved", "completion": "not-complete",
             "targetSha256": control.digest(self.config), "sourceRevision": fixtures.REVISION,
-            "instanceIdSha256": sha256(ACTOR.encode()).hexdigest(), "exitCode": 137, "state": "failed"})
+            "instanceIdSha256": sha256(ACTOR.encode()).hexdigest(), "exitCode": 137, "state": "failed",
+            "processSha256": control.digest({"id": ACTOR, "image": self.instance["image"],
+                "startedAt": self.instance["started_at"], "status": self.instance["status"]})})
         self.assertEqual(self.snapshots, 2)
         self.assertNotIn(ACTOR, json.dumps(result))
         self.api.trigger.assert_not_called()
@@ -118,6 +120,12 @@ class ForcedTerminalTests(unittest.TestCase):
         self.assertEqual(captured[0]["workflowResult"]["namedRpcVerified"], True)
         self.assertEqual(captured[0]["activeCount"], 0)
         self.assertNotIn("synthetic-private-error", control.canonical(captured).decode())
+
+    def test_stale_listing_cannot_hide_a_later_failed_process_in_detail(self):
+        self.detail["started_at"] = "2026-11-16T00:00:05.000Z"
+        self.detail["status"]["updated_at"] = "2026-11-16T00:00:06.000Z"
+        with self.assertRaises(ValueError):
+            self.verify()
 
     def test_workflow_failure_wrong_source_or_missing_named_rpc_never_authorizes_forward(self):
         cases = [{"status": "running"}, {"success": False}, {"versionId": fixtures.VERSION},
