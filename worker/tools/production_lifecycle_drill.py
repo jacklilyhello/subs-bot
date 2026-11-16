@@ -17,6 +17,7 @@ from time import monotonic, sleep, time
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from cloudflare_isolation import ISOLATION_RELEASE_USER_AGENT
 import d1_migrations as migrations
@@ -109,7 +110,8 @@ def webhook_settings(info):
 
 PROBE_CASES = {"closed-admission", "wrong-secret", "durable-help", "duplicate-update", "payload-conflict",
     "member-admin-denial", "private-share", "paused-admission", "original-auth-before", "original-auth-after",
-    "fixture-get", "fixture-head", "revoked-get", "revoked-head"}
+    "fixture-get", "fixture-head", "revoked-get", "revoked-head", "provider-source", "provider-import", "provider-detail",
+    "provider-export"}
 
 
 class ProbeStatusError(OperationError):
@@ -132,7 +134,10 @@ def expect_status(status, expected, case):
 def public_request(url, *, method="GET", data=None, secret=None):
     parts = urlsplit(url)
     origin = parts.scheme + "://" + parts.netloc
-    require(origin in (ORIGIN, ORIGINAL_ORIGIN) and not parts.query and not parts.fragment)
+    query_ok = not parts.query or (method in ("GET", "HEAD") and origin == ORIGIN
+        and parts.path == "/sub/subsbot-synthetic-small-01/base64"
+        and matches(r"provider_fixture=[1-9][0-9]{0,19}-[1-9][0-9]{0,5}", parts.query))
+    require(origin in (ORIGIN, ORIGINAL_ORIGIN) and query_ok and not parts.fragment)
     headers = {"User-Agent": ISOLATION_RELEASE_USER_AGENT, "Accept-Encoding": "identity", "Cache-Control": "no-cache"}
     if method == "POST":
         require(parts.path == "/telegram/webhook" and isinstance(data, bytes)
@@ -167,7 +172,7 @@ def public_readback(request, maximum, *, timeout=20):
 
 def safe_failure(error, phase):
     require(phase in ("configure-webhook", "closed-admission", "activation", "synthetic-verification", "human-window",
-        "pause-and-freeze", "cleanup-pause", "cleanup-webhook", "cleanup-freeze"))
+        "pause-and-freeze", "cleanup-pause", "cleanup-webhook", "cleanup-freeze", "provider-verification"))
     kind = "http-status" if isinstance(error, ProbeStatusError) else "stale-predecessor" if isinstance(error, StalePredecessorError) \
         else "operation" if isinstance(error, OperationError) else "contract" if isinstance(error, ContractError) else "unexpected"
     result = {"phase": phase, "kind": kind, "uncertain": bool(getattr(error, "uncertain", kind == "unexpected"))}
@@ -219,8 +224,9 @@ class Drill:
         require(matches(r"[1-9][0-9]{0,19}", self.run) and matches(r"[1-9][0-9]{0,5}", self.attempt))
         self.revision = env.get("GITHUB_SHA", "")
         window = env.get("DRILL_HUMAN_WINDOW_SECONDS") or "0"
-        require(matches(r"0|[1-9][0-9]{0,2}", window) and int(window) <= 180,
-                "The explicit human observation window must be between zero and 180 seconds.")
+        maximum_window = 540 if env.get("DRILL_ACTION") in ("provider-binding", "recover-webhook") else 180
+        require(matches(r"0|[1-9][0-9]{0,2}", window) and int(window) <= maximum_window,
+                "The explicit human observation window is outside the selected action's bounded duration.")
         self.human_window = int(window)
         self.baseline_checkpoint = env.get("DRILL_BASELINE_CHECKPOINT_ID", "")
         self.baseline_manifest_sha = env.get("DRILL_BASELINE_MANIFEST_SHA256", "")
@@ -533,9 +539,21 @@ class Drill:
         self.save("activation-baseline-reused-verified" if self.baseline_checkpoint else "activation-baseline-verified",
             self.report["activationBaseline"])
 
-    def exercise(self):
-        bundle, manifest = self.prepare(active=True)
-        ctl = self.bind(self.registration(), bundle, manifest)
+    def exercise(self, *, provided_controller=None, verify_extra=None):
+        if provided_controller is None:
+            bundle, manifest = self.prepare(active=True)
+            ctl = self.bind(self.registration(), bundle, manifest)
+        else:
+            registered = self.registration()
+            ctl = provided_controller
+            require(ctl.target.environment == "rehearsal" and ctl.target.data["workerName"] == SERVICE
+                    and ctl.target.digest == registered.digest and ctl.target.data["keyDigests"] == registered.data["keyDigests"]
+                    and ctl.target.data["webhook"] == registered.data["webhook"] and ctl.secrets is self.secrets
+                    and self.proof is not None and ctl.revision == self.proof["revision"],
+                    "The provided rehearsal controller is outside the registered identity and reviewed source.")
+            self.controller = ctl
+            self.report.update(targetSha256=ctl.target.digest, configurationSha256=ctl.target.configuration_digest,
+                releaseRevision=ctl.revision)
         baseline = ctl.inspect()
         self.report.update(state=baseline, ciProof=self.proof)
         require(baseline["control"]["admission"] == "closed" and baseline["control"]["workers"] == "frozen"
@@ -609,7 +627,10 @@ class Drill:
                 f"JOIN telegram_outbox AS outbox USING(receipt_id) WHERE inbox.update_id IN ({base + 1},{base + 3}) ORDER BY inbox.update_id")
             require(len(states) == 2 and all(r["state"] == "sent" for r in states),
                     "Synthetic replies did not both reach a confirmed sent terminal state.")
-            if self.human_window:
+            if verify_extra is not None:
+                phase = "provider-verification"
+                verify_extra(ctl, reply_anchors, base + 10)
+            elif self.human_window:
                 phase = "human-window"
                 window = {"stage": "human-window-open", "targetSha256": ctl.target.digest,
                     "deadlineEpoch": int(time()) + self.human_window, "seconds": self.human_window,
@@ -687,7 +708,28 @@ class Drill:
                 "The observed rehearsal target is not closed and frozen; its actual state was retained.")
         human = self.human_receipts()
         self.report.update(status="passed",
-            humanReceiptsObserved=len(human), humanReceipts=human, humanEvidenceRequiresIABCorrelation=True)
+            humanReceiptsObserved=len(human), humanReceipts=human, humanEvidenceRequiresIABCorrelation=True,
+            displayTimezone=self.display_timezone())
+
+    def display_timezone(self):
+        ctl = self.controller
+        require(ctl is not None and ctl.target.environment == "rehearsal" and ctl.target.data["workerName"] == SERVICE)
+        observed = rows(ctl.data, ctl.database, "SELECT timezone,updated_by,update_id,message_date "
+            "FROM telegram_bot_display_settings WHERE bot_id=" + migrations._literal(ctl.target.data["botId"]) + " LIMIT 2")
+        require(len(observed) <= 1, "The dedicated Bot display settings are not unique.")
+        if not observed:
+            return {"timezone": "UTC", "persisted": False, "updated_by": None, "update_id": None, "message_date": None}
+        row = observed[0]
+        require(set(row) == {"timezone", "updated_by", "update_id", "message_date"}
+                and matches(r"[A-Za-z0-9_+./-]{1,100}", row["timezone"])
+                and row["updated_by"] in ctl.target.data["admins"]
+                and all(type(row[key]) is int and 1 <= row[key] <= 9007199254740991 for key in ("update_id", "message_date")),
+                "The dedicated Bot display settings are outside the explicit safe projection.")
+        try:
+            ZoneInfo(row["timezone"])
+        except (ZoneInfoNotFoundError, ValueError):
+            raise ContractError("The dedicated Bot display timezone is invalid.") from None
+        return {**row, "persisted": True}
 
     def stabilize(self):
         bundle, manifest = self.prepare(active=True)
@@ -755,6 +797,12 @@ class Drill:
         result.update(publicPositiveExports=2, publicRevokedDenials=denied)
         self.save("synthetic-export-fixture", result)
         self.report.update(status="passed", fixture=result, state=ctl.inspect(), ciProof=self.proof)
+
+    def provider_binding(self):
+        from production_application_provider_drill import run
+        run(self, {"approval": approval, "post_update": post_update, "update_payload": update_payload,
+            "expect_status": expect_status, "public_request": public_request, "public_readback": public_readback,
+            "origin": ORIGIN, "originalOrigin": ORIGINAL_ORIGIN})
 
     def recovery(self):
         from production_recovery_drill import run_recovery_drill
@@ -836,7 +884,7 @@ def main():
     hosted_environment("rehearsal")
     require(env.get("GITHUB_WORKFLOW_REF") == WORKFLOW, "Only the protected dedicated hosted rehearsal workflow may run this drill.")
     action = env.get("DRILL_ACTION", "inspect")
-    require(action in ("bootstrap", "exercise", "inspect", "stabilize", "recover-webhook", "seed-fixture", "recovery", "finalize-recovery"))
+    require(action in ("bootstrap", "exercise", "inspect", "stabilize", "recover-webhook", "seed-fixture", "recovery", "finalize-recovery", "provider-binding"))
     tool = Drill(env)
     try:
         if action == "recover-webhook":
