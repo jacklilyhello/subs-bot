@@ -54,6 +54,7 @@ test("emitted production runtime preserves pre-initialization updates, deduplica
   assert.equal((await post(1)).status, 503);
   assert.equal(await receipts(), 0);
   assert.equal(await calls(), 0);
+  assert.equal(await db.prepare("SELECT count(*) AS n FROM subs_bot_production_updates").first("n"), 0);
   assert.equal((await post(1, member, "/help", "wrong-secret")).status, 401);
   assert.equal(await calls(), 0);
   await db.prepare("UPDATE subs_bot_production_control SET admission='open',epoch=2").run();
@@ -63,6 +64,7 @@ test("emitted production runtime preserves pre-initialization updates, deduplica
   assert.equal(await db.prepare("SELECT count(*) AS n FROM subs_bot_production_invocations WHERE state='running'").first("n"), 1);
   await db.prepare("UPDATE subs_bot_production_control SET admission='closed',epoch=3").run();
   assert.equal((await post(2)).status, 503);
+  assert.equal((await post(1)).status, 200, "an already durable disposition can be acknowledged while admission is paused");
   assert.equal(await receipts(), 1);
   release.resolve();
   for (let attempt = 0; attempt < 160; attempt++) {
@@ -73,13 +75,24 @@ test("emitted production runtime preserves pre-initialization updates, deduplica
   assert.equal(await db.prepare("SELECT state FROM telegram_outbox WHERE receipt_id=1").first("state"), "sent");
   assert.equal(await db.prepare("SELECT count(*) AS n FROM subs_bot_production_invocations WHERE state<>'finished'").first("n"), 0);
   await db.prepare("UPDATE subs_bot_production_control SET admission='open',epoch=4").run();
-  assert.equal((await post(1)).status, 204);
+  assert.equal((await post(1)).status, 200);
   assert.equal(await receipts(), 1);
   assert.equal(sends, 1, "redelivery must not repeat the send");
+  assert.equal((await post(1, member, "/list")).status, 409, "a reused update ID with different content never reaches business code");
+  assert.equal(await receipts(), 1);
   assert.equal((await post(3, "92004")).status, 204, "an unapproved actor is not enrolled by the control tool");
+  assert.deepEqual(await db.prepare("SELECT state,http_status FROM subs_bot_production_updates WHERE update_id=3").first(),
+    { state: "completed", http_status: 204 });
+  assert.equal((await post(3, "92004")).status, 204);
   assert.equal(await receipts(), 1);
   assert.equal((await post(4, member, "/auth add 92005")).status, 204);
   assert.equal(await db.prepare("SELECT count(*) AS n FROM telegram_general_actors WHERE actor_id='92005'").first("n"), 0);
+  await db.prepare("UPDATE subs_bot_production_updates SET state='uncertain',http_status=NULL,completed_at=NULL WHERE update_id=1").run();
+  const beforeUncertain = await calls();
+  assert.equal((await post(1)).status, 503, "a classified uncertain update stays unacknowledged without executing business again");
+  assert.equal(await calls(), beforeUncertain);
+  assert.equal(await receipts(), 1);
+  assert.equal(sends, 1);
   await db.prepare("UPDATE subs_bot_production_control SET admission='closed',workers='frozen',epoch=5").run();
   const before = await calls();
   assert.equal((await (await runtime.getWorker()).scheduled({ cron: "* * * * *" })).outcome, "ok");

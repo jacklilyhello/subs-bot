@@ -1,0 +1,117 @@
+name: Control explicit subs-bot lifecycle
+run-name: Lifecycle ${{ inputs.target_environment }} ${{ inputs.action }} at ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_environment:
+        description: Explicit target; production requires separately configured protected credentials and approval
+        required: true
+        type: choice
+        options: [rehearsal, production]
+        default: rehearsal
+      action:
+        description: One guarded lifecycle step; inspect after every uncertain result
+        required: true
+        type: choice
+        options: [availability, provision-inspect, provision-reconcile, provision, preflight, initialize, inspect, plan-deploy, deploy, reconcile-deploy, pause, drain, freeze, thaw, classify-interruption, domain, webhook, activate]
+        default: inspect
+      source_run_id:
+        description: Successful Worker CI for the exact current main
+        required: true
+        type: string
+      active_run_id:
+        description: Exact reviewed active CI for a code or configuration update; omit only for initial deployment or an identical release
+        type: string
+      state_sha256:
+        description: Exact predecessor from independent inspection; required for mutations
+        type: string
+      webhook_sha256:
+        description: Exact getWebhookInfo predecessor digest for webhook configuration
+        type: string
+      resource:
+        description: Exact resource kind for explicit interrupted-creation reconciliation
+        type: choice
+        options: [database, bucketName, backupBucketName, worker]
+        default: database
+      identity_sha256:
+        description: Independently read candidate identity digest; never infer from its name
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: subs-bot-lifecycle-${{ inputs.target_environment }}
+  cancel-in-progress: false
+
+jobs:
+  control:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
+    environment: ${{ inputs.target_environment == 'production' && 'subs-bot-production' || 'subs-bot-isolation' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Execute an exact target lifecycle step
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CI_RUN_ID: ${{ inputs.source_run_id }}
+          SUBS_BOT_CONTROL_ENVIRONMENT: ${{ inputs.target_environment == 'production' && 'subs-bot-production' || 'subs-bot-isolation' }}
+          CONTROL_ACTION: ${{ inputs.action }}
+          CONTROL_ACTIVE_CI_RUN_ID: ${{ inputs.active_run_id }}
+          CONTROL_STATE_SHA256: ${{ inputs.state_sha256 }}
+          CONTROL_WEBHOOK_SHA256: ${{ inputs.webhook_sha256 }}
+          CONTROL_RESOURCE: ${{ inputs.resource }}
+          CONTROL_IDENTITY_SHA256: ${{ inputs.identity_sha256 }}
+          SUBS_BOT_TARGET_JSON: ${{ secrets.SUBS_BOT_TARGET_JSON }}
+          SUBS_BOT_CONTROL_SECRETS: ${{ secrets.SUBS_BOT_CONTROL_SECRETS }}
+          SUBS_BOT_ACTIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_ACTIVE_TARGET_JSON }}
+          SUBS_BOT_ACTIVE_CONTROL_SECRETS: ${{ secrets.SUBS_BOT_ACTIVE_CONTROL_SECRETS }}
+          SUBS_BOT_APPROVAL_JSON: ${{ secrets.SUBS_BOT_APPROVAL_JSON }}
+          SUBS_BOT_PROVISION_ANCHOR_JSON: ${{ secrets.SUBS_BOT_PROVISION_ANCHOR_JSON }}
+          SUBS_BOT_CF_DATA_TOKEN: ${{ secrets.SUBS_BOT_CF_DATA_TOKEN }}
+          SUBS_BOT_CF_WORKER_TOKEN: ${{ secrets.SUBS_BOT_CF_WORKER_TOKEN }}
+          SUBS_BOT_CF_DEPENDENCY_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPENDENCY_READ_TOKEN }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          case "$CONTROL_ACTION" in
+            availability|provision|provision-inspect|provision-reconcile) python3 -B worker/tools/production_provision.py ;;
+            *) python3 -B worker/tools/production_control.py ;;
+          esac
+      - name: Preserve new private registration
+        if: always() && inputs.action == 'provision'
+        env:
+          SUBS_BOT_CF_DATA_TOKEN: ${{ secrets.SUBS_BOT_CF_DATA_TOKEN }}
+        run: |
+          umask 077
+          python3 -B - <<'PY'
+          import os, sys
+          from pathlib import Path
+          sys.path.insert(0, 'worker/tools')
+          from production_control import API
+          from production_storage import PrivateStore
+          from production_target import canonical, digest, parsed, require, validate_target
+          path = Path(os.environ['RUNNER_TEMP']) / 'production-private-registration.json'
+          if not path.exists():
+              raise SystemExit(0)
+          receipt = parsed(path.read_bytes())
+          require(receipt.get('state') == 'created-no-module-no-consumer',
+                  'Provisioning stopped partway. Preserve the runner; do not repeat or adopt occupied names.')
+          target = receipt['target']
+          store = PrivateStore(API(target, os.environ['SUBS_BOT_CF_DATA_TOKEN']), target['backupBucketName'])
+          store.put('maintenance/production-control/registrations/' + validate_target(target).digest + '.json', canonical(receipt))
+          print('Private resource registration persisted and independently read back.')
+          PY
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: success() && inputs.action != 'provision' && inputs.action != 'availability'
+        with:
+          name: subs-bot-production-control-${{ inputs.action }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/production-control-result.json
+          if-no-files-found: error
+          retention-days: 7

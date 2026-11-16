@@ -37,6 +37,12 @@ QX = ("qx", "quantumult", "quantumultx")
 SINGBOX = ("singbox", "sing-box")
 FORMATS = (*BASE64, *QX, *SINGBOX, "clash", "surge", "unknown-format")
 MAX_BODY = 64 * 1024
+# Match the emitted Worker's existing statements() bound. The growing reviewed
+# migration chain contributes DDL and one ledger INSERT per migration; V11's
+# authorization fixture crossed the former 256-statement parser limit at 0056.
+# SQL bytes, exact file digest/framing, per-statement size and full replay checks
+# remain independently enforced before any result can be reported as verified.
+MAX_SQL_STATEMENTS = 512
 PUBLISH_DIRECTORY = "subs-bot-legacy-selected-aggregate-candidate"
 HEADER_FIELDS = {
     "contentType": "Content-Type", "cacheControl": "Cache-Control", "referrerPolicy": "Referrer-Policy",
@@ -92,7 +98,7 @@ def sql_statements(candidate: fixture.SelectedFixture) -> list[str]:
         if sqlite3.complete_statement(pending):
             statements.append(pending)
             pending = ""
-    require(not pending and 0 < len(statements) <= 256, "candidate-sql-statements")
+    require(not pending and 0 < len(statements) <= MAX_SQL_STATEMENTS, "candidate-sql-statements")
     return statements
 
 
