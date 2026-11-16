@@ -66,6 +66,11 @@ class RestoredLinksTests(unittest.TestCase):
         aggregate_sha = native.digest(aggregate_code.encode())
         fixture.db.execute("INSERT INTO aggregate_links(code_sha256,owner_id,kind,bot_id) VALUES (?,'881002','all','881000')", (aggregate_sha,))
         fixture.db.execute("INSERT INTO telegram_aggregate_slots VALUES ('881000','881002',1,?,?,1,1,1)", (aggregate_sha, "A" * 22))
+        denial_nonce = "A" * 21 + "Q"
+        denial_code = native.aggregate_code(encoded_key, "881000", "881001", denial_nonce)
+        denial_sha = native.digest(denial_code.encode())
+        fixture.db.execute("INSERT INTO aggregate_links(code_sha256,owner_id,kind,bot_id) VALUES (?,'881001','all','881000')", (denial_sha,))
+        fixture.db.execute("INSERT INTO telegram_aggregate_slots VALUES ('881000','881001',1,?,?,1,1,1)", (denial_sha, denial_nonce))
         bundle = Path(os.environ["WORKER_TEST_BUNDLE_DIR"]).resolve()
         manifest = json.loads((bundle / "isolation.json").read_bytes())
         fixture.source.manifest = manifest
@@ -84,9 +89,10 @@ class RestoredLinksTests(unittest.TestCase):
         engine = native.Rehearsal(api, fixture.source, None, fixture.directory, validation_directory=root)
         expected_aggregate = native.base64.b64encode(share.encode())
         def reference(code, method):
-            self.assertEqual(code, aggregate_code)
-            body = expected_aggregate if method == "GET" else b""
-            return {"status": 200, "bytes": len(body), "sha256": native.digest(body)}
+            self.assertIn(code, {aggregate_code, denial_code})
+            status = 200 if code == aggregate_code else 422
+            body = (expected_aggregate if status == 200 else native.AGGREGATE_CONTENT_DENIAL) if method == "GET" else b""
+            return {"status": status, "bytes": len(body), "sha256": native.digest(body)}
         with patch.dict(native.os.environ, {"SUBS_BOT_TELEGRAM_AGGREGATE_KEY": encoded_key}), patch.object(native, "read_aggregate_reference", side_effect=reference):
             engine.prepare_link_validation(document)
         report = fixture.directory / "report.json"
@@ -95,7 +101,8 @@ class RestoredLinksTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         output = json.loads(result.stdout)
         self.assertEqual(output, json.loads(report.read_bytes()))
-        self.assertEqual(output["counts"], {"storedShareExports": 2, "legacyEmptyExports": 1, "unpublishedDenials": 1, "oversizeDenials": 1, "activeAllAggregatePairs": 1,
+        self.assertEqual(output["counts"], {"storedShareExports": 2, "legacyEmptyExports": 1, "unpublishedDenials": 1, "oversizeDenials": 1, "activeAllAggregatePairs": 2,
+            "activeAllAggregateSuccessPairs": 1, "activeAllAggregateContentDenialPairs": 1,
             "trashDenials": 1, "missingDenials": 1, "omittedStructuredOrInvalidShare": 0,
             "omittedResponseLimit": 0, "omittedHashedCapabilities": 0})
         self.assertEqual(output["outboundAttempts"], 0)
@@ -104,6 +111,7 @@ class RestoredLinksTests(unittest.TestCase):
         self.assertNotIn(b"abcdefghijklmnop", result.stdout)
         self.assertNotIn(share.encode(), result.stdout)
         self.assertNotIn(aggregate_code.encode(), result.stdout)
+        self.assertNotIn(denial_code.encode(), result.stdout)
         self.assertNotIn(encoded_key.encode(), (root / "input.json").read_bytes())
         input_path = root / "input.json"
         original_input = input_path.read_bytes()
