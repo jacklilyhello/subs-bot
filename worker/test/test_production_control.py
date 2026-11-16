@@ -201,7 +201,7 @@ class ProductionControllerTests(unittest.TestCase):
 
     def test_pause_does_not_thaw_a_frozen_target(self):
         self.controller.initialize()
-        before = self.controller.inspect()
+        before = self.controller.plan_pause()
         result = self.controller.transition("pause", approval(self.target, "pause", before["stateSha256"]), before["stateSha256"])
         self.assertEqual(result["control"]["workers"], "frozen")
         self.assertEqual(result["control"]["admission"], "closed")
