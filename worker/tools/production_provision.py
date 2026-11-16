@@ -169,6 +169,10 @@ class Provisioner:
         checked = self.worker("GET", self.root + "/workers/workers/" + workerpin["id"])
         require((checked.get("id"), checked.get("name"), checked.get("created_on")) == (workerpin["id"], workerpin["name"], workerpin["createdOn"]))
         t.update(workerId=workerpin["id"], workerCreatedOn=workerpin["createdOn"])
+        if t["provider"] is not None and t["provider"].get("caller") is None:
+            # The draft explicitly selected this new project caller; its exact
+            # ID is registered only after our creation intent is confirmed.
+            t["provider"]["caller"] = {"id": workerpin["id"], "name": workerpin["name"]}
         final = validate_target(t)
         receipt.update(state="created-no-module-no-consumer", targetSha256=final.digest, target=t)
         save(receipt)

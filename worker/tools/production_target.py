@@ -111,7 +111,7 @@ def validate_target(raw, *, draft=False):
     require(isinstance(value, dict) and set(value) == BASE_KEYS)
     value = json.loads(canonical(value))  # disconnect caller-owned mutable structures
     env = value["environment"]
-    require(value["schemaVersion"] == 1 and env in NAMES)
+    require(type(value["schemaVersion"]) is int and value["schemaVersion"] == 1 and env in NAMES)
     service, backup, hostname = NAMES[env]
     require(value["accountId"] == ACCOUNT and value["zoneId"] == ZONE and value["namespace"] == "lilyya")
     require(value["workerName"] == value["d1Name"] == value["bucketName"] == service
@@ -152,6 +152,16 @@ def validate_target(raw, *, draft=False):
     needs_provider = any(flags[k] for k in ("providerUrlImport", "providerRefresh", "providerBatch"))
     require(not needs_provider or isinstance(value["provider"], dict), "An independently pinned ProviderFetch dependency is required.")
     require(value["provider"] is None or isinstance(value["provider"], dict))
+    if value["provider"] is not None:
+        provider = value["provider"]
+        expected_service = "subs-bot-provider-fetch-prod-01" if env == "production" else "subs-bot-provider-fetch-control-drill-01"
+        require(provider.get("environment") == env and provider.get("accountId") == value["accountId"]
+                and provider.get("service") == expected_service, "ProviderFetch belongs to a different environment or account.")
+        if not draft:
+            require(provider.get("caller") == {"id": value["workerId"], "name": value["workerName"]},
+                    "ProviderFetch must explicitly register this exact application caller.")
+        from production_provider import validate_config
+        validate_config(provider)
     webhook = value["webhook"]
     require(isinstance(webhook, dict) and set(webhook) == {"allowedUpdates", "maxConnections"}
             and isinstance(webhook["allowedUpdates"], list) and webhook["allowedUpdates"]
@@ -174,6 +184,7 @@ def approve(target, envelope, action, revision, state_sha256, *, control_revisio
     """Approval is supplied only by the selected protected workflow environment."""
     value = parsed(envelope) if isinstance(envelope, (str, bytes)) else envelope
     control_revision = revision if control_revision is None else control_revision
+    require(isinstance(value, dict) and type(value.get("schemaVersion")) is int)
     require(isinstance(value, dict) and set(value) == {"schemaVersion", "environment", "targetSha256", "configurationSha256", "revision", "controlRevision", "action", "stateSha256", "authorization"},
             "An action-specific approval envelope is required.")
     require(value == {"schemaVersion": 1, "environment": target.environment, "targetSha256": target.digest,

@@ -62,7 +62,8 @@ class API:
         self.opener = build_opener(ProxyHandler({}), NoRedirect())
 
     def __call__(self, method, path, payload=None, *, envelope=False, absent=False):
-        require(isinstance(path, str) and matches(r"/[A-Za-z0-9/_.?=&,~-]+", path)
+        require(isinstance(path, str) and len(path) <= 16384 and matches(r"/[A-Za-z0-9/_.%?=&,~-]+", path)
+                and "%" not in path.partition("?")[0]
                 and not any(p in (".", "..") for p in path.partition("?")[0].split("/")))
         require(path.startswith(self.root + "/") or (method == "GET" and path == "/user/tokens/verify") or path in (self.root, "/zones/" + self.target["zoneId"])
                 or path.startswith("/zones/" + self.target["zoneId"] + "/"), "API request is outside the approved account or zone.")
@@ -384,7 +385,7 @@ class Controller:
         if t["provider"] is not None:
             from production_provider import verify_provider_dependency
             require(self.dependency_api is not None, "An explicit read-only ProviderFetch inspection credential is required.")
-            dependency = verify_provider_dependency(self.dependency_api, t["provider"])
+            dependency = verify_provider_dependency(self.dependency_api, t["provider"], allow_unbound_caller=include_secrets)
             result.append({"type": "service", "name": "PROVIDER_FETCH", "service": dependency["service"], "entrypoint": "ProviderFetch"})
             text.update({"PROVIDER_REVISION": dependency["revision"], "PROVIDER_IMAGE_SHA256": dependency["imageSha256"]})
         result.extend({"type": "plain_text", "name": key, "text": value} for key, value in text.items())
@@ -545,11 +546,12 @@ class Controller:
         # execution ceiling. This classifies execution as ended, not its external
         # effect as successful. Nothing is deleted or automatically re-executed.
         epoch = before["control"]["epoch"]
+        identity = "target_sha256=" + migrations._literal(self.target.digest) + " AND bot_id=" + migrations._literal(self.target.data["botId"])
         self.guard()
         _mutate_sql(self.data, self.database, [
-            migrations._assert_sql(f"EXISTS(SELECT 1 FROM {CONTROL} WHERE epoch={epoch} AND admission='closed')"),
-            f"UPDATE {INVOCATIONS} SET state='uncertain',finished_at=unixepoch() WHERE state='running' AND lease_until<=unixepoch()-60",
-            f"UPDATE subs_bot_production_updates SET state='uncertain' WHERE state='processing' AND EXISTS(SELECT 1 FROM {INVOCATIONS} AS invocation WHERE invocation.invocation_id=subs_bot_production_updates.invocation_id AND invocation.state='uncertain' AND invocation.finished_at IS NOT NULL)"])
+            migrations._assert_sql(f"EXISTS(SELECT 1 FROM {CONTROL} WHERE epoch={epoch} AND admission='closed' AND {identity})"),
+            f"UPDATE {INVOCATIONS} SET state='uncertain',finished_at=unixepoch() WHERE state='running' AND lease_until<=unixepoch()-60 AND {identity}",
+            f"UPDATE subs_bot_production_updates SET state='uncertain' WHERE state='processing' AND {identity} AND EXISTS(SELECT 1 FROM {INVOCATIONS} AS invocation WHERE invocation.invocation_id=subs_bot_production_updates.invocation_id AND invocation.state='uncertain' AND invocation.finished_at IS NOT NULL)"])
         return self.inspect()
 
     def plan_deploy(self, source_controller=None):
@@ -604,7 +606,7 @@ class Controller:
         require(before["control"]["admission"] == "closed" and before["control"]["workers"] == "frozen"
                 and not any(self.work().values()), "Only a fully frozen deployment can reconcile its revision.")
         self.guard()
-        _mutate_sql(self.data, self.database, [migrations._assert_sql(f"EXISTS(SELECT 1 FROM {CONTROL} WHERE admission='closed' AND workers='frozen' AND epoch={before['control']['epoch']})"),
+        _mutate_sql(self.data, self.database, [migrations._assert_sql(f"EXISTS(SELECT 1 FROM {CONTROL} WHERE admission='closed' AND workers='frozen' AND epoch={before['control']['epoch']} AND target_sha256={migrations._literal(self.target.digest)} AND bot_id={migrations._literal(self.target.data['botId'])} AND generation={self.target.data['generation']} AND release_revision={migrations._literal(old)})"),
             f"UPDATE {CONTROL} SET release_revision={migrations._literal(self.revision)},epoch=epoch+1 WHERE singleton=1",
             f"UPDATE telegram_general_policy SET release_revision={migrations._literal(self.revision)} WHERE bot_id={migrations._literal(self.target.data['botId'])} AND release_revision={migrations._literal(old)}"])
         self.worker("PUT", self.script + "/schedules", [{"cron": "* * * * *"}])
@@ -725,6 +727,9 @@ def main():
         raise ContractError("Unsupported lifecycle action.")
     # Public evidence never contains actor lists, bindings with Secrets or SQL.
     result["ciProof"] = proof
+    result["controlRevision"] = revision
+    if source_controller is not None:
+        result["activeCIProof"] = source_proof
     path = Path(os.environ["RUNNER_TEMP"]) / "production-control-result.json"
     path.write_bytes(canonical(result))
     print(json.dumps(result, sort_keys=True))
