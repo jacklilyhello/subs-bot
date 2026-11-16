@@ -342,9 +342,13 @@ class Controller:
         versions = current.get("versions")
         require(current.get("strategy") == "percentage" and isinstance(versions, list) and len(versions) == 1
                 and versions[0].get("percentage") == 100 and matches(UUID, versions[0].get("version_id")))
-        version = self.worker("GET", self.worker_path + "/versions/" + versions[0]["version_id"] + "?include=modules")
+        return self.version(versions[0]["version_id"], deployment_id=current["id"])
+
+    def version(self, version_id, *, deployment_id=None):
+        require(matches(UUID, version_id))
+        version = self.worker("GET", self.worker_path + "/versions/" + version_id + "?include=modules")
         modules = version.get("modules")
-        require(version.get("id") == versions[0]["version_id"] and version.get("main_module") == "index.js"
+        require(version.get("id") == version_id and version.get("main_module") == "index.js"
                 and not any(version.get(k) for k in ("compatibility_flags", "limits", "placement", "assets", "containers", "migrations"))
                 and version.get("usage_model") in (None, "standard")
                 and isinstance(modules, list) and len(modules) == 1 and modules[0].get("name") == "index.js"
@@ -361,9 +365,9 @@ class Controller:
         revision = bindings.get("BUILD_REVISION", {}).get("text")
         require(matches(REV, revision))
         return {"revision": revision, "moduleSha256": sha256(body).hexdigest(), "versionId": version["id"],
-                "deploymentId": current["id"], "bindings": bindings, "compatibilityDate": version["compatibility_date"]}
+                "deploymentId": deployment_id, "bindings": bindings, "compatibilityDate": version["compatibility_date"]}
 
-    def expected_bindings(self, *, include_secrets=False):
+    def expected_bindings(self, *, include_secrets=False, allow_unbound_provider=False):
         t, flags = self.target.data, self.target.data["features"]
         result = [{"type": "d1", "name": "DB", "database_id": t["d1Id"]},
             {"type": "r2_bucket", "name": "NODES", "bucket_name": t["bucketName"]}]
@@ -385,23 +389,31 @@ class Controller:
         if t["provider"] is not None:
             from production_provider import verify_provider_dependency
             require(self.dependency_api is not None, "An explicit read-only ProviderFetch inspection credential is required.")
-            dependency = verify_provider_dependency(self.dependency_api, t["provider"], allow_unbound_caller=include_secrets)
+            dependency = verify_provider_dependency(self.dependency_api, t["provider"], allow_unbound_caller=include_secrets or allow_unbound_provider)
             result.append({"type": "service", "name": "PROVIDER_FETCH", "service": dependency["service"], "entrypoint": "ProviderFetch"})
             text.update({"PROVIDER_REVISION": dependency["revision"], "PROVIDER_IMAGE_SHA256": dependency["imageSha256"]})
         result.extend({"type": "plain_text", "name": key, "text": value} for key, value in text.items())
         result.extend({"type": "secret_text", "name": key, **({"text": value} if include_secrets else {})} for key, value in secrets.items())
         return result
 
-    def verify_bindings(self, active):
-        expected = {r["name"]: r for r in self.expected_bindings()}
+    def verify_bindings(self, active, *, allow_unbound_provider=False):
+        expected = {r["name"]: r for r in self.expected_bindings(allow_unbound_provider=allow_unbound_provider)}
         actual = active["bindings"]
         require(set(expected) == set(actual), "Active binding inventory differs from the exact configuration.")
         for name, wanted in expected.items():
             observed = actual[name]
             if wanted["type"] == "secret_text":
                 require(observed.get("type") == "secret_text" and "text" not in observed)
+            elif wanted["type"] == "d1":
+                identities = [observed[k] for k in ("database_id", "id") if observed.get(k) is not None]
+                require(observed.get("name") == wanted["name"] and observed.get("type") == "d1"
+                        and identities and all(identity == wanted["database_id"] for identity in identities), "D1 binding identity differs.")
             else:
                 require(all(observed.get(k) == v for k, v in wanted.items()), "Active binding differs from the approved configuration.")
+                if wanted["type"] == "service":
+                    require(observed.get("environment") in (None, "production"), "Service binding points to an unexpected environment.")
+                if wanted["type"] == "r2_bucket":
+                    require(observed.get("jurisdiction") in (None, "default"), "R2 binding points to an unexpected jurisdiction.")
         require(active["revision"] == self.revision and active["moduleSha256"] == self.manifest["bundleSha256"]
                 and active["compatibilityDate"] == self.manifest["compatibilityDate"], "Active artifact differs from the verified CI artifact.")
 
@@ -588,6 +600,9 @@ class Controller:
             "modules": [{"name": "index.js", "content_type": "application/javascript+module", "content_base64": base64.b64encode(module).decode()}],
             "bindings": bindings, "annotations": {"workers/tag": "lifecycle-" + self.revision[:12], "workers/message": self.target.digest}})
         require(isinstance(uploaded, dict) and matches(UUID, uploaded.get("id")), "Uploaded version is unconfirmed; do not retry blindly.")
+        # Verify staged bytes and every binding before the first traffic change.
+        # Post-deployment verification alone cannot make an unknown module safe.
+        self.verify_bindings(self.version(uploaded["id"]), allow_unbound_provider=True)
         self.resources()
         require(self.active(allow_empty=True)["deploymentId"] == before["release"]["deploymentId"], "Active deployment changed during staging.")
         self.guard()
@@ -635,6 +650,8 @@ class Controller:
         before = self.inspect()
         require(before["stateSha256"] == state_sha and before["control"]["admission"] == "closed")
         self.approval(approval, "domain", state_sha)
+        require(self.telegram is not None)
+        self.telegram.identity()
         require(self.target.environment == "production", "Rehearsal uses its registered workers.dev identity.")
         t = self.target.data
         current = self.worker("GET", self.root + "/workers/domains?" + urlencode({"hostname": t["hostname"]}))
