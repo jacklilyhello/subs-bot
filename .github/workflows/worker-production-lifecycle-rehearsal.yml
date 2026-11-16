@@ -1,0 +1,161 @@
+name: Rehearse production lifecycle on registered isolation
+run-name: Production lifecycle rehearsal ${{ inputs.action }} at ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Exercise the production control implementation on the dedicated project rehearsal identity
+        type: choice
+        required: true
+        default: inspect
+        options: [bootstrap, exercise, inspect, seed-fixture, recovery, recover-webhook]
+      source_run_id:
+        description: Successful exact-main Worker CI run
+        type: string
+        required: false
+      registration_sha256:
+        description: Exact private registration digest returned by bootstrap; required after initial bootstrap
+        type: string
+        required: false
+      active_run_id:
+        description: Explicit reviewed active Worker CI when inspecting or preserving an earlier deployment
+        type: string
+        required: false
+      admin_message_id:
+        description: Optional real authorized administrator message reply anchor read in the existing Telegram session
+        type: string
+        required: false
+      member_message_id:
+        description: Optional real authorized member message reply anchor read in the existing Telegram session
+        type: string
+        required: false
+      human_window_seconds:
+        description: Optional observation window for the two authorized IAB accounts, from 0 to 180 seconds
+        type: number
+        default: 0
+        required: false
+      webhook_checkpoint:
+        description: Interrupted exercise run-id/attempt for explicit webhook recovery
+        type: string
+        required: false
+      webhook_snapshot_sha256:
+        description: Exact private webhook snapshot digest from that interrupted exercise
+        type: string
+        required: false
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: subs-bot-lifecycle-rehearsal
+  cancel-in-progress: false
+
+jobs:
+  rehearse:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
+    environment: subs-bot-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SUBS_BOT_CI_RUN_ID: ${{ inputs.source_run_id }}
+      SUBS_BOT_CONTROL_ENVIRONMENT: subs-bot-isolation
+      DRILL_ACTION: ${{ inputs.action }}
+      DRILL_REGISTRATION_SHA256: ${{ inputs.registration_sha256 }}
+      DRILL_ACTIVE_CI_RUN_ID: ${{ inputs.active_run_id }}
+      DRILL_ADMIN_MESSAGE_ID: ${{ inputs.admin_message_id }}
+      DRILL_MEMBER_MESSAGE_ID: ${{ inputs.member_message_id }}
+      DRILL_HUMAN_WINDOW_SECONDS: ${{ inputs.human_window_seconds }}
+      DRILL_WEBHOOK_CHECKPOINT: ${{ inputs.webhook_checkpoint }}
+      DRILL_WEBHOOK_SNAPSHOT_SHA256: ${{ inputs.webhook_snapshot_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11.18'
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: inputs.action == 'recovery'
+        with:
+          node-version: '24'
+      - name: Install locked hosted replay dependencies before private inputs
+        if: inputs.action == 'recovery'
+        working-directory: worker
+        run: npm ci --ignore-scripts
+      - name: Execute the registered production lifecycle code path
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
+          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPLOY_TOKEN }}
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
+          SUBS_BOT_CONTROL_DRILL_KEYS: ${{ secrets.SUBS_BOT_CONTROL_DRILL_KEYS }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          python3 -B worker/tools/production_lifecycle_drill.py
+      - name: Independently restore the original test webhook after the exercise
+        if: always() && inputs.action == 'exercise'
+        env:
+          DRILL_ACTION: recover-webhook
+          DRILL_AUTOMATIC_CLEANUP: '1'
+          DRILL_REPORT_NAME: production-lifecycle-drill-cleanup.json
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
+          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPLOY_TOKEN }}
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
+          SUBS_BOT_CONTROL_DRILL_KEYS: ${{ secrets.SUBS_BOT_CONTROL_DRILL_KEYS }}
+        run: |
+          umask 077
+          python3 -B worker/tools/production_lifecycle_drill.py
+      - name: Independently replay G0 and recovered target without outbound access
+        if: inputs.action == 'recovery'
+        working-directory: worker
+        run: |
+          module="$RUNNER_TEMP/production-recovery-drill-module"
+          sandbox="$(mktemp -d)"
+          trap 'rm -rf -- "$sandbox" "$module" "$RUNNER_TEMP/production-recovery-drill-g0-links" "$RUNNER_TEMP/production-recovery-drill-recovered-links"' EXIT
+          for kind in g0 recovered; do
+            validation="$RUNNER_TEMP/production-recovery-drill-$kind-links"
+            result="$RUNNER_TEMP/production-recovery-drill-$kind-http.json"
+            sudo -n unshare --net -- bash -euc '
+              ip link set dev lo up
+              umask 077
+              ulimit -c 0
+              exec setpriv --reuid="$1" --regid="$2" --clear-groups --no-new-privs -- \
+                env -i PATH=/usr/bin:/bin HOME="$3" TMPDIR="$3" \
+                "$4" tools/production-restored-links.ts "$5" "$6" "$7"
+            ' -- "$(id -u)" "$(id -g)" "$sandbox" "$(command -v node)" "$validation" "$module" "$result"
+          done
+      - name: Finalize only both complete positive and revoked-link HTTP results
+        if: inputs.action == 'recovery'
+        env:
+          DRILL_ACTION: finalize-recovery
+          DRILL_REPORT_NAME: production-lifecycle-drill-final.json
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
+          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPLOY_TOKEN }}
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
+          SUBS_BOT_CONTROL_DRILL_KEYS: ${{ secrets.SUBS_BOT_CONTROL_DRILL_KEYS }}
+        run: |
+          umask 077
+          python3 -B worker/tools/production_lifecycle_drill.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: subs-bot-lifecycle-rehearsal-${{ inputs.action }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/production-lifecycle-drill-result.json
+            ${{ runner.temp }}/production-lifecycle-drill-cleanup.json
+            ${{ runner.temp }}/production-lifecycle-drill-final.json
+            ${{ runner.temp }}/production-recovery-drill-g0-http.json
+            ${{ runner.temp }}/production-recovery-drill-recovered-http.json
+            ${{ runner.temp }}/production-lifecycle-recovery-g0-http-result.json
+            ${{ runner.temp }}/production-lifecycle-recovery-recovered-http-result.json
+          if-no-files-found: warn
+          retention-days: 7

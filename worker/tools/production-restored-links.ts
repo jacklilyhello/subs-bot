@@ -330,7 +330,7 @@ async function main() {
     requireSafe(outboundAttempts === 0);
   } finally { await runtime.dispose(); }
   stage = "safe-evidence";
-  const report = { version: 1, evidenceKind: "hosted-production-restored-data-http-replay", revision: input.revision,
+  const report = { version: 1, status: "passed", evidenceKind: "hosted-production-restored-data-http-replay", revision: input.revision,
     moduleSha256: input.moduleSha256, restoredDataSha256: input.dataSha256,
     targetSha256: input.targetSha256, consumerBound: false, realTelegramCredentialsSupplied: false,
     syntheticProductionGateVerified: true, outboundAttempts, counts, migrationCount, restoredEffectiveDisplayTimezones,
