@@ -6,20 +6,25 @@ Mutations never retry transport failures. Inspect/reconcile the independent stat
 from __future__ import annotations
 
 import base64
+import errno
 from hashlib import sha256
 from http.client import HTTPException
 import json
 import os
 from pathlib import Path
 import re
+import socket
+import ssl
 import tempfile
-from urllib.error import HTTPError
+from time import sleep
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 import d1_migrations as migrations
 import prepare_isolation_artifact as artifact
 import prepare_control_artifact
+from cloudflare_isolation import ISOLATION_RELEASE_USER_AGENT
 from general_isolation_window import work_sql, terminal_card_sql
 from production_target import Target, ContractError, approve, canonical, digest, matches, parsed, require, validate_target, SHA, REV, UUID
 
@@ -45,6 +50,72 @@ class OperationError(RuntimeError):
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+class _HealthReadbackError(OperationError):
+    def __init__(self, category, *, status=None, codes=(), retryable=False, attempts=1):
+        self.category, self.codes, self.retryable = category, codes, retryable
+        super().__init__("HTTPS domain health was not confirmed (category=%s; HTTP=%s; Cloudflare=%s; attempts=%d); admission remains closed."
+            % (category, status if status is not None else "none", ",".join(map(str, codes)) or "none", attempts), status=status)
+
+
+def _health_http_error(status, raw, attempt):
+    # Numeric edge codes are useful diagnostics; response text and URLs are never
+    # exposed. A response containing credentials must not become an error message.
+    codes = tuple(sorted({int(code) for code in re.findall(
+        rb'(?:\berror\s+code\s*:\s*|"code"\s*:\s*)(1[0-9]{3})\b', raw[:4096], re.IGNORECASE)}))[:4]
+    return _HealthReadbackError("http", status=status, codes=codes, attempts=attempt,
+        retryable=status in {408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524})
+
+
+def _health_transport_error(error, attempt):
+    reason = error.reason if isinstance(error, URLError) else error
+    if isinstance(reason, (ssl.SSLError, ssl.CertificateError)):
+        category, retryable = "tls", False
+    elif isinstance(reason, socket.gaierror):
+        category, retryable = "dns", reason.errno == socket.EAI_AGAIN
+    elif isinstance(reason, TimeoutError):
+        category, retryable = "timeout", True
+    elif isinstance(reason, OSError) and reason.errno in {
+            errno.ECONNRESET, errno.ECONNABORTED, errno.ECONNREFUSED, errno.ETIMEDOUT, errno.ENETUNREACH, errno.EHOSTUNREACH}:
+        category, retryable = "connection", True
+    else:
+        category, retryable = ("protocol" if isinstance(reason, HTTPException) else "transport"), False
+    return _HealthReadbackError(category, retryable=retryable, attempts=attempt)
+
+
+def _read_domain_health(url, revision, attempt):
+    request = Request(url, headers={"Accept": "application/json", "User-Agent": ISOLATION_RELEASE_USER_AGENT,
+        "Cache-Control": "no-cache", "Accept-Encoding": "identity"})
+    try:
+        with build_opener(ProxyHandler({}), NoRedirect()).open(request, timeout=10) as response:
+            status = response.status
+            if type(status) is not int or not 100 <= status <= 599:
+                raise _HealthReadbackError("protocol", attempts=attempt)
+            if status != 200:
+                raise _health_http_error(status, response.read(4097), attempt)
+            raw = response.read(1025)
+            cache = {value.strip().lower() for value in response.headers.get("Cache-Control", "").split(",")}
+            if len(raw) > 1024 or response.headers.get_content_type() != "application/json" \
+                    or not {"private", "no-store"} <= cache or response.headers.get("Referrer-Policy") != "no-referrer" \
+                    or response.headers.get("X-Content-Type-Options") != "nosniff":
+                raise _HealthReadbackError("response", status=200, attempts=attempt)
+    except HTTPError as error:
+        try:
+            failure = _health_http_error(error.code, error.read(4097), attempt)
+        except (OSError, HTTPException):
+            failure = _health_http_error(error.code, b"", attempt)
+        finally:
+            error.close()
+        raise failure from None
+    except (OSError, HTTPException) as error:
+        raise _health_transport_error(error, attempt) from None
+    try:
+        health = parsed(raw)
+    except ContractError:
+        raise _HealthReadbackError("body", status=200, attempts=attempt) from None
+    if health.get("ok") is not True or health != {"ok": True, "service": "subs-bot", "revision": revision}:
+        raise _HealthReadbackError("body", status=200, attempts=attempt)
 
 
 class API:
@@ -658,13 +729,15 @@ class Controller:
                 {"hostname": t["hostname"], "service": t["workerName"], "zone_id": t["zoneId"], "environment": "production"}.items()),
                 "Custom domain is not attached to the exact approved target.")
         url = "https://" + t["hostname"] + "/health"
-        try:
-            with build_opener(ProxyHandler({}), NoRedirect()).open(Request(url, headers={"Cache-Control": "no-cache"}), timeout=20) as response:
-                health = parsed(response.read(4097))
-            require(health == {"ok": True, "service": "subs-bot", "revision": self.revision})
-        except (OSError, HTTPException):
-            raise OperationError("HTTPS domain health did not confirm the exact revision; admission remains closed.") from None
-        return {"domainVerified": True}
+        for attempt, delay in enumerate((0, 1, 3), 1):
+            if delay:
+                sleep(delay)
+            try:
+                _read_domain_health(url, self.revision, attempt)
+                return {"domainVerified": True, "healthReadbackAttempts": attempt}
+            except _HealthReadbackError as error:
+                if not error.retryable or attempt == 3:
+                    raise
 
     def attach_domain(self, approval, state_sha):
         before = self.inspect()
