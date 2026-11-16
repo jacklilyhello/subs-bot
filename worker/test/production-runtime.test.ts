@@ -7,6 +7,7 @@ import { CONTROL_REHEARSAL_PUBLIC_ORIGIN } from "../src/public-origin.ts";
 
 test("emitted production runtime preserves pre-initialization updates, deduplicates, pauses admission and drains accepted sends", { timeout: 45_000 }, async (t) => {
   const target = "e".repeat(64), revision = "f".repeat(40), admin = "92002", member = "92003";
+  const pendingAt = Math.floor(Date.now() / 1000) - 60;
   const config = { botId: "92001", botUsername: "ProductionFixtureBot", botToken: "92001:synthetic-token",
     webhookSecret: "synthetic-hook", generation: 1, cutoverAt: 1, activationSha256: target,
     outbox: "shared-private-management", authManagement: true };
@@ -42,7 +43,7 @@ test("emitted production runtime preserves pre-initialization updates, deduplica
       .bind(target, config.botId, revision),
   ]);
   const payload = (id: number, actor = member, text = "/help") => ({ update_id: id,
-    message: { message_id: id, date: 20, text, from: { id: Number(actor), is_bot: false },
+    message: { message_id: id, date: pendingAt, text, from: { id: Number(actor), is_bot: false },
       chat: { id: Number(actor), type: "private" }, entities: [{ type: "bot_command", offset: 0, length: text.split(/\s/u)[0].length }] } });
   const post = (id: number, actor = member, text = "/help", secret = config.webhookSecret) =>
     runtime.dispatchFetch(CONTROL_REHEARSAL_PUBLIC_ORIGIN + "/telegram/webhook", { method: "POST",
