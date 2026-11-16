@@ -161,6 +161,8 @@ gh workflow run worker-production-control.yml --ref main \
 
 暂停顺序为 `plan-pause → 批准该摘要 → pause → inspect → drain → freeze`。生产流程不会自动更换批准；重新规划只发生在新的明确批准下。freeze／activate 的工作与未知结果限制继续生效。专用演练工作流的 `stabilize` 仅绑定独立登记的准确演练源，执行 pause、等待已受理工作、freeze，不接触 Webhook、不删除数据、不分类或重发未知结果。演练自动重新批准最多三次，而且只处理已确认 SQL 尚未开始的 `StalePredecessorError`；SQL CAS 失败、传输未知或确认失败均停止并保留私有 intent。每次 intent 和确认使用唯一序号。
 
+演练在 Webhook 操作中断后，先用准确 `webhook_checkpoint`／`webhook_snapshot_sha256` 执行 `recover-webhook`，独立确认原 URL／参数和空对象认证探针 HTTP 400，不能把 Telegram API 设置读回等同于 Secret 已生效。重新 exercise 可显式成对提供 `baseline_checkpoint_id`／`baseline_manifest_sha256` 复用完整私有 G0；工具仍完整读回 SQL／R2／代码并与当前 frozen 状态核对，激活规划和执行再各自重验。缺项、格式错误或任何漂移都在触碰 Webhook 前停止，不自动重新导出或采用其他基线。未提供时保留新建基线的流程。公网探针统一使用项目读回请求头、保持 TLS／目标／Secret／状态和容量检查，不自动重发业务 POST；报告分别保留净化主因和清理失败。
+
 Actions 产物过期时，可用 `source_checkpoint_id` 和独立保存的 `source_manifest_sha256` 代替 `source_run_id`。工具从私有 R2 核对原始 CI ZIP、来源证明、完整迁移和源配置，不查询已过期的 Actions 产物；旧源仅可用于检查、暂停等运维，新部署仍要求准确当前 main。升级时可用 `active_checkpoint_id`／`active_manifest_sha256` 代替 `active_run_id`，旧完整配置从受摘要保护的私有资料读取，Secret 仍单独安全注入。字段必须成对填写。源代码归档可读不代表备份通过；最终激活还会强制验证全部 SQL 分片、R2 对象、归属元数据及当前 D1 数据，任何损坏、新写入或控制 epoch 变化都停止并要求重新封存基线。
 
 暂停覆盖所有现存业务入口：Webhook 是唯一可写公开 HTTP；其他公开路径仅 GET/HEAD；目前没有 queue handler。运行中 Webhook 与 Cron 每次 D1 操作均受事务 fence，R2／外部发送的执行期由持久 invocation 覆盖。重复 `(bot_id,update_id)` 先核对载荷摘要；处理完成后才持久确认；冲突、未完成或不确定更新不能重新执行业务。未受理更新在 Telegram 保留。业务时效规则仍有效，忽略／拒绝结果也有持久 disposition，不用初始化时间隐藏积压。
