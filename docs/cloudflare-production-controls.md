@@ -28,6 +28,89 @@
 
 `SUBS_BOT_CONTROL_SECRETS` 只通过受保护 environment 注入，含 `botToken`, `webhookSecret`, `aggregateKey`, `privateShareKey`, `shortlinkToken`。两个签名密钥必须分别是独立 32 字节密钥的规范 43 字符 Base64URL；Webhook Secret 使用 32–256 字符安全集合；短链启用时必须提供原有完整业务 Token。原始 Secret 不进入目标 JSON、CI 日志、候选或数据备份。
 
+### 可填写的正式草稿模板
+
+以下占位符会被严格拒绝，不能直接 dispatch。所有角色和开关必须由正式批准清单选择；这个关闭可选功能的草稿不表示已经选定首发功能。六个资源 pin 仅在创建草稿中为 null；创建后只从私有 journal 和独立读回填写，不能采用未知同名资源。未启用的外部短链 Token 和摘要都保持 null。
+
+`SUBS_BOT_TARGET_JSON`：
+
+```json
+{
+  "schemaVersion": 1,
+  "environment": "production",
+  "accountId": "9431815bdb8beb2272f6668e06b7d3be",
+  "zoneId": "07c83547944da720e03b31a406fdcd55",
+  "namespace": "lilyya",
+  "workerName": "subs-bot-cf-prod-01",
+  "workerId": null,
+  "workerCreatedOn": null,
+  "d1Name": "subs-bot-cf-prod-01",
+  "d1Id": null,
+  "d1CreatedAt": null,
+  "bucketName": "subs-bot-cf-prod-01",
+  "bucketCreatedAt": null,
+  "backupBucketName": "subs-bot-cf-prod-backup-01",
+  "backupBucketCreatedAt": null,
+  "hostname": "subs-bot.lilyya.top",
+  "botId": "REPLACE_WITH_FORMAL_BOT_ID",
+  "botUsername": "REPLACE_WITH_FORMAL_BOT_USERNAME",
+  "generation": 1,
+  "admins": ["REPLACE_WITH_FORMAL_ADMIN_ID"],
+  "members": [],
+  "groups": [],
+  "defaultAccess": "deny",
+  "features": {
+    "inlineSearch": false,
+    "providerUrlImport": false,
+    "providerUrlDocuments": false,
+    "mixedDocuments": false,
+    "providerRefresh": false,
+    "providerBatch": false,
+    "subscriptionShorts": false,
+    "externalShortlinks": false,
+    "groupShareCards": false,
+    "githubSearch": false,
+    "apiStatus": false
+  },
+  "provider": null,
+  "webhook": {"allowedUpdates": ["message", "callback_query"], "maxConnections": 2},
+  "keyDigests": {
+    "aggregate": "REPLACE_WITH_INDEPENDENT_AGGREGATE_KEY_SHA256",
+    "privateShare": "REPLACE_WITH_INDEPENDENT_PRIVATE_SHARE_KEY_SHA256",
+    "webhook": "REPLACE_WITH_WEBHOOK_SECRET_SHA256",
+    "shortlink": null
+  }
+}
+```
+
+`SUBS_BOT_CONTROL_SECRETS` 仅在安全注入渠道填写以下形状。生成新的独立生产签名密钥，再将其 SHA-256 填入上面的非 Secret 契约；不复制任何测试密钥。
+
+```json
+{
+  "botToken": "REPLACE_WITH_FORMAL_BOT_TOKEN",
+  "webhookSecret": "REPLACE_WITH_INDEPENDENT_WEBHOOK_SECRET",
+  "aggregateKey": "REPLACE_WITH_INDEPENDENT_32_BYTE_BASE64URL_KEY",
+  "privateShareKey": "REPLACE_WITH_ANOTHER_INDEPENDENT_32_BYTE_BASE64URL_KEY",
+  "shortlinkToken": null
+}
+```
+
+`SUBS_BOT_APPROVAL_JSON` 的初始化示例；后续每个 action 都重新绑定完整配置与独立前态。此模板不提供批准：
+
+```json
+{
+  "schemaVersion": 1,
+  "environment": "production",
+  "targetSha256": "REPLACE_WITH_EXACT_TARGET_SHA256",
+  "configurationSha256": "REPLACE_WITH_EXACT_CONFIGURATION_SHA256",
+  "revision": "REPLACE_WITH_REVIEWED_APPLICATION_MAIN_SHA",
+  "controlRevision": "REPLACE_WITH_CURRENT_CONTROL_MAIN_SHA",
+  "action": "initialize",
+  "stateSha256": "REPLACE_WITH_INDEPENDENT_RESOURCE_PREDECESSOR_SHA256",
+  "authorization": "approve initialize for subs-bot-cf-prod-01"
+}
+```
+
 ## 凭据与批准
 
 | Secret | 所需权限／用途 |
@@ -66,13 +149,16 @@ gh workflow run worker-production-control.yml --ref main \
 | reconcile-deploy | 发布结果不明后先独立读回，只有已部署准确模块、固定配置和冻结现场才能完成版本控制记录 |
 | domain | 精确域名、Zone、DNS 无冲突才绑定；HTTPS／健康提交读回；生产 workers.dev 和预览保持关闭 |
 | webhook | 重新核对 getMe/getWebhookInfo 前态，明确 drop_pending_updates=false，读回 URL／类别／连接参数 |
-| activate | 精确批准、版本、配置、Webhook、域名、排空和未知结果检查全部满足才开启 |
+| plan-activate | closed/frozen 且已排空；指定 `baseline_checkpoint_id`、`baseline_manifest_sha256`，完整读回私有 G0 SQL／R2／CI 闭包并与当前数据、版本和配置核对；输出包含该基线的批准前态 |
+| activate | 使用相同基线 pin 和 plan-activate 前态重新完整核对，精确批准、版本、配置、Webhook、域名和未知结果检查全部满足后，直接从 frozen 原子开启；中间不得 thaw 或写入 |
 | pause | 同事务关闭业务 admission；不会把 frozen 后台意外解冻；已受理工作继续完成 |
 | drain | 完整分类状态只读检查；未排空则失败；明确失败／外部不确定结果单列，不删除记录 |
 | classify-interruption | 暂停后明确分类已结束或超过执行上限与隔离宽限的调用，保留 uncertain；不确认、不重发相关更新 |
 | freeze / thaw | freeze 需已关闭 admission 且无可继续执行工作；thaw 只恢复已受理后台处理，仍保持 admission 关闭 |
 
 常规 inspect／pause／drain 可以显式选择已通过 CI 的 main 祖先应用产物，控制工具自身始终运行当前准确 main。新初始化／部署要求当前 main 产物。不能用新提交的绿色状态替代旧线上模块的来源证明。
+
+Actions 产物过期时，可用 `source_checkpoint_id` 和独立保存的 `source_manifest_sha256` 代替 `source_run_id`。工具从私有 R2 核对原始 CI ZIP、来源证明、完整迁移和源配置，不查询已过期的 Actions 产物；旧源仅可用于检查、暂停等运维，新部署仍要求准确当前 main。升级时可用 `active_checkpoint_id`／`active_manifest_sha256` 代替 `active_run_id`，旧完整配置从受摘要保护的私有资料读取，Secret 仍单独安全注入。字段必须成对填写。源代码归档可读不代表备份通过；最终激活还会强制验证全部 SQL 分片、R2 对象、归属元数据及当前 D1 数据，任何损坏、新写入或控制 epoch 变化都停止并要求重新封存基线。
 
 暂停覆盖所有现存业务入口：Webhook 是唯一可写公开 HTTP；其他公开路径仅 GET/HEAD；目前没有 queue handler。运行中 Webhook 与 Cron 每次 D1 操作均受事务 fence，R2／外部发送的执行期由持久 invocation 覆盖。重复 `(bot_id,update_id)` 先核对载荷摘要；处理完成后才持久确认；冲突、未完成或不确定更新不能重新执行业务。未受理更新在 Telegram 保留。业务时效规则仍有效，忽略／拒绝结果也有持久 disposition，不用初始化时间隐藏积压。
 
@@ -81,7 +167,7 @@ gh workflow run worker-production-control.yml --ref main \
 - 正式 Bot 创建责任、已确认 ID／用户名、正式 Token 和独立 Webhook Secret。
 - 正式管理员、成员、默认拒绝策略、初始授权世代、群范围及实际 Bot 权限。
 - 生产固定资源 ID／创建时间、私有 journal anchor、备份保留期和恢复独立目标命名。
-- 最小权限的生产凭据、安全注入、environment 审批负责人；不得填入测试主体、测试签名密钥或默认 dev 依赖。
+- 最小权限的生产凭据、安全注入、environment 审批负责人；不继承测试授权、测试签名密钥或默认 dev 依赖。同一 Telegram 账号若被选择为正式主体，也必须重新显式填写正式角色并批准。
 - 每个功能明确开关；正式 ProviderFetch 的准确版本／镜像／资源／停止后 smoke 证明；内部短链继续 `shortlink-new` / `ShortlinkService` / Service Binding / Bearer 业务 Token。
 - 准确候选 main、CI run/attempt、模块／ZIP／迁移摘要、独立读回、私有持久归档及适用恢复基线。
 - `subs-bot.lilyya.top`、Webhook allowed_updates/max_connections、明确保留 pending updates。

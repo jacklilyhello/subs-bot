@@ -5,38 +5,54 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: Run the dedicated private dependency rehearsal or independently read its R2 archive
+        description: Rehearse, preserve an interrupted attempt, or independently read R2
         required: true
         type: choice
-        options: [verify-archive, rehearse]
+        options: [verify-archive, verify-partial, rehearse, preserve-partial, reconcile-partial]
         default: verify-archive
       provider_ci_run_id:
-        description: Successful Provider Fetch CI for this exact main, rehearsal only
+        description: Exact successful main CI for the selected current or registered frozen source
         required: false
         type: string
+      source_mode:
+        description: Resume the registered frozen source, or explicitly select current main for an unbound upgrade
+        required: true
+        type: choice
+        options: [registered, current]
+        default: registered
+      fault:
+        description: Deterministic hosted interruption, only before first consumer activation
+        required: true
+        type: choice
+        options: [none, after-create-response, after-stage-response]
+        default: none
       confirmation:
         description: Rehearsal only, exact dedicated resource confirmation
         required: false
         type: string
       health_url:
-        description: Explicit approved public project /health fixture URL, rehearsal only
+        description: Explicit approved public project /health fixture URL, new source only
         required: false
         type: string
       health_revision:
-        description: Exact independent fixture health revision, rehearsal only
+        description: Exact independent fixture health revision, new source only
         required: false
         type: string
       archive_run_id:
-        description: Verify only, sealed rehearsal run
+        description: Original run for preservation or independent R2 verification
         required: false
         type: string
       archive_run_attempt:
-        description: Verify only, exact sealed attempt
+        description: Exact original attempt
         required: false
         default: '1'
         type: string
       manifest_sha256:
         description: Verify only, independently recorded R2 manifest digest
+        required: false
+        type: string
+      response_identity_sha256:
+        description: Reconcile only, exact response identity digest from independent partial readback
         required: false
         type: string
 
@@ -53,6 +69,13 @@ jobs:
       cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 40
+    env:
+      SUBS_BOT_PROVIDER_CI_RUN_ID: ${{ inputs.provider_ci_run_id }}
+      SUBS_BOT_PROVIDER_REHEARSAL_SOURCE_MODE: ${{ inputs.source_mode }}
+      SUBS_BOT_PROVIDER_REHEARSAL_FAULT: ${{ inputs.fault }}
+      SUBS_BOT_PROVIDER_REHEARSAL_CONFIRMATION: ${{ inputs.confirmation }}
+      SUBS_BOT_PROVIDER_REHEARSAL_HEALTH_URL: ${{ inputs.health_url }}
+      SUBS_BOT_PROVIDER_REHEARSAL_HEALTH_REVISION: ${{ inputs.health_revision }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -60,84 +83,149 @@ jobs:
           persist-credentials: false
       - name: Install and verify the pinned registry client
         run: bash worker/tools/install_provider_skopeo.sh
-      - name: Verify the exact source module and complete OCI closure
+      - name: Verify and preserve the selected source originals
         env:
           GH_TOKEN: ${{ github.token }}
-          SUBS_BOT_PROVIDER_CI_RUN_ID: ${{ inputs.provider_ci_run_id }}
+          SUBS_BOT_PROVIDER_REHEARSAL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_REHEARSAL_TARGET_JSON }}
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           umask 077
-          python3 -B worker/tools/prepare_provider_artifact.py > "$RUNNER_TEMP/provider-provenance.json"
-      - name: Run the production code against the dedicated rehearsal identity
+          python3 -B worker/tools/production_provider_rehearsal.py prepare-source > "$RUNNER_TEMP/provider-provenance.json"
+      - name: Initialize exact registered target and checkpoint
         env:
           GH_TOKEN: ${{ github.token }}
-          SUBS_BOT_PROVIDER_CI_RUN_ID: ${{ inputs.provider_ci_run_id }}
-          SUBS_BOT_PROVIDER_REHEARSAL_CONFIRMATION: ${{ inputs.confirmation }}
-          SUBS_BOT_PROVIDER_REHEARSAL_HEALTH_URL: ${{ inputs.health_url }}
-          SUBS_BOT_PROVIDER_REHEARSAL_HEALTH_REVISION: ${{ inputs.health_revision }}
           SUBS_BOT_PROVIDER_REHEARSAL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_REHEARSAL_TARGET_JSON }}
           SUBS_BOT_CF_PROVIDER_WORKER_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_WORKER_TOKEN }}
           SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN }}
         run: |
           umask 077
-          python3 -B worker/tools/production_provider_rehearsal.py
-      - name: Assemble private source and completed proof
-        run: |
-          umask 077
-          mkdir -p "$RUNNER_TEMP/provider-proof-output/source"
-          cp "$RUNNER_TEMP/subs-bot-provider-verified/provider-worker.js" "$RUNNER_TEMP/provider-proof-output/source/"
-          cp "$RUNNER_TEMP/subs-bot-provider-verified/provider-release.json" "$RUNNER_TEMP/provider-proof-output/source/"
-          cp "$RUNNER_TEMP/subs-bot-provider-verified/provider-image.tar" "$RUNNER_TEMP/provider-proof-output/source/"
-          cp "$RUNNER_TEMP/provider-source-archive.zip" "$RUNNER_TEMP/provider-proof-output/"
-          cp "$RUNNER_TEMP/provider-rehearsal-proof.json" "$RUNNER_TEMP/provider-proof-output/"
-          cp "$RUNNER_TEMP/provider-rehearsal-target.json" "$RUNNER_TEMP/provider-proof-output/"
-          cp "$RUNNER_TEMP/provider-rehearsal-journal.json" "$RUNNER_TEMP/provider-proof-output/"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+          python3 -B worker/tools/production_provider_rehearsal.py initialize
+          python3 -B worker/tools/production_provider_rehearsal.py assemble source
+      - name: Persist original source and initial pins before resource operations
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: subs-bot-provider-control-proof-${{ github.sha }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/provider-proof-output/
+          name: subs-bot-provider-attempt-source-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/provider-control-source-output/
           retention-days: 7
           if-no-files-found: error
+      - name: Create exact private Worker
+        uses: ./.github/actions/provider-control-step
+        with:
+          operation: create
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CF_PROVIDER_WORKER_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_WORKER_TOKEN }}
+          SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN }}
+      - name: Publish exact OCI source
+        uses: ./.github/actions/provider-control-step
+        with:
+          operation: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CF_PROVIDER_WORKER_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_WORKER_TOKEN }}
+          SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN }}
+      - name: Stage exact version
+        uses: ./.github/actions/provider-control-step
+        with:
+          operation: stage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CF_PROVIDER_WORKER_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_WORKER_TOKEN }}
+          SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN }}
+      - name: Activate exact private version
+        uses: ./.github/actions/provider-control-step
+        with:
+          operation: activate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CF_PROVIDER_WORKER_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_WORKER_TOKEN }}
+          SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN }}
+      - name: Provision private Container
+        uses: ./.github/actions/provider-control-step
+        with:
+          operation: provision-container
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CF_PROVIDER_WORKER_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_WORKER_TOKEN }}
+          SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN }}
+      - name: Provision one-shot Workflow
+        uses: ./.github/actions/provider-control-step
+        with:
+          operation: provision-workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CF_PROVIDER_WORKER_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_WORKER_TOKEN }}
+          SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN }}
+      - name: Verify actual named RPC and stopped Container
+        uses: ./.github/actions/provider-control-step
+        with:
+          operation: smoke
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CF_PROVIDER_WORKER_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_WORKER_TOKEN }}
+          SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN }}
+      - name: Independently read back before complete proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CF_PROVIDER_WORKER_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_WORKER_TOKEN }}
+          SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN }}
+        run: python3 -B worker/tools/production_provider_rehearsal.py finalize
+      - name: Preserve available source and checkpoint originals on every outcome
+        if: always()
+        env:
+          PROVIDER_REHEARSAL_OUTCOME: ${{ job.status }}
+        run: python3 -B worker/tools/production_provider_rehearsal.py assemble final
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: subs-bot-provider-control-checkpoint-${{ github.sha }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/provider-rehearsal-target.json
-            ${{ runner.temp }}/provider-rehearsal-journal.json
+          name: subs-bot-provider-attempt-final-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/provider-proof-output/
           retention-days: 7
           if-no-files-found: warn
 
   private-proof:
     needs: rehearse
-    if: >-
-      always() && github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' &&
-      ((inputs.action == 'rehearse' && needs.rehearse.result == 'success') || inputs.action == 'verify-archive')
+    if: always() && github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
     environment: subs-bot-isolation
     concurrency:
       group: subs-bot-isolation-deploy
       cancel-in-progress: false
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        if: inputs.action == 'rehearse'
+        if: inputs.action == 'rehearse' || inputs.action == 'preserve-partial'
         with:
-          name: subs-bot-provider-control-proof-${{ github.sha }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/provider-proof-input
-      - name: Archive or independently read the complete private source proof
+          pattern: subs-bot-provider-attempt-*-${{ inputs.action == 'rehearse' && github.run_id || inputs.archive_run_id }}-${{ inputs.action == 'rehearse' && github.run_attempt || inputs.archive_run_attempt }}
+          path: ${{ runner.temp }}/provider-attempt-input
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.action == 'rehearse' && github.run_id || inputs.archive_run_id }}
+      - name: Seal complete proof or preserve partial originals without changing the failed result
         env:
-          PROVIDER_ARCHIVE_ACTION: ${{ inputs.action == 'rehearse' && 'archive' || 'verify' }}
-          PROVIDER_ARCHIVE_RUN_ID: ${{ inputs.archive_run_id }}
-          PROVIDER_ARCHIVE_RUN_ATTEMPT: ${{ inputs.archive_run_attempt }}
+          GH_TOKEN: ${{ github.token }}
+          PROVIDER_ARCHIVE_ACTION: ${{ inputs.action }}
+          PROVIDER_REHEARSAL_JOB_RESULT: ${{ needs.rehearse.result }}
+          PROVIDER_ARCHIVE_RUN_ID: ${{ inputs.action == 'rehearse' && github.run_id || inputs.archive_run_id }}
+          PROVIDER_ARCHIVE_RUN_ATTEMPT: ${{ inputs.action == 'rehearse' && github.run_attempt || inputs.archive_run_attempt }}
           PROVIDER_ARCHIVE_MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
+          PROVIDER_RESPONSE_IDENTITY_SHA256: ${{ inputs.response_identity_sha256 }}
           SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
           SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
+          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ inputs.action == 'reconcile-partial' && secrets.SUBS_BOT_CF_DEPLOY_TOKEN || '' }}
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           umask 077
           python3 -B worker/tools/archive_production_provider.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: inputs.action == 'reconcile-partial'
+        with:
+          name: subs-bot-provider-reconciled-target-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/provider-reconciled-target.json
+            ${{ runner.temp }}/provider-reconciliation.json
+          retention-days: 7
+          if-no-files-found: error

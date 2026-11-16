@@ -252,11 +252,12 @@ class Telegram:
 
 
 class Controller:
-    def __init__(self, target, data_api, worker_api, bundle, manifest, *, guard=lambda: None, telegram=None, secrets=None, dependency_api=None, control_revision=None):
+    def __init__(self, target, data_api, worker_api, bundle, manifest, *, guard=lambda: None, telegram=None, secrets=None, dependency_api=None, control_revision=None, activation_baseline_checker=None):
         self.target, self.data, self.worker = target, data_api, worker_api
         self.bundle, self.manifest, self.guard = Path(bundle), manifest, guard
         self.telegram, self.secrets = telegram, secrets
         self.dependency_api = dependency_api
+        self.activation_baseline_checker = activation_baseline_checker
         self.root = "/accounts/" + target.data["accountId"]
         self.database = self.root + "/d1/database/" + target.data["d1Id"]
         self.script = self.root + "/workers/scripts/" + target.data["workerName"]
@@ -342,9 +343,13 @@ class Controller:
         versions = current.get("versions")
         require(current.get("strategy") == "percentage" and isinstance(versions, list) and len(versions) == 1
                 and versions[0].get("percentage") == 100 and matches(UUID, versions[0].get("version_id")))
-        version = self.worker("GET", self.worker_path + "/versions/" + versions[0]["version_id"] + "?include=modules")
+        return self.version(versions[0]["version_id"], deployment_id=current["id"])
+
+    def version(self, version_id, *, deployment_id=None):
+        require(matches(UUID, version_id))
+        version = self.worker("GET", self.worker_path + "/versions/" + version_id + "?include=modules")
         modules = version.get("modules")
-        require(version.get("id") == versions[0]["version_id"] and version.get("main_module") == "index.js"
+        require(version.get("id") == version_id and version.get("main_module") == "index.js"
                 and not any(version.get(k) for k in ("compatibility_flags", "limits", "placement", "assets", "containers", "migrations"))
                 and version.get("usage_model") in (None, "standard")
                 and isinstance(modules, list) and len(modules) == 1 and modules[0].get("name") == "index.js"
@@ -361,9 +366,9 @@ class Controller:
         revision = bindings.get("BUILD_REVISION", {}).get("text")
         require(matches(REV, revision))
         return {"revision": revision, "moduleSha256": sha256(body).hexdigest(), "versionId": version["id"],
-                "deploymentId": current["id"], "bindings": bindings, "compatibilityDate": version["compatibility_date"]}
+                "deploymentId": deployment_id, "bindings": bindings, "compatibilityDate": version["compatibility_date"]}
 
-    def expected_bindings(self, *, include_secrets=False):
+    def expected_bindings(self, *, include_secrets=False, allow_unbound_provider=False):
         t, flags = self.target.data, self.target.data["features"]
         result = [{"type": "d1", "name": "DB", "database_id": t["d1Id"]},
             {"type": "r2_bucket", "name": "NODES", "bucket_name": t["bucketName"]}]
@@ -385,23 +390,31 @@ class Controller:
         if t["provider"] is not None:
             from production_provider import verify_provider_dependency
             require(self.dependency_api is not None, "An explicit read-only ProviderFetch inspection credential is required.")
-            dependency = verify_provider_dependency(self.dependency_api, t["provider"], allow_unbound_caller=include_secrets)
+            dependency = verify_provider_dependency(self.dependency_api, t["provider"], allow_unbound_caller=include_secrets or allow_unbound_provider)
             result.append({"type": "service", "name": "PROVIDER_FETCH", "service": dependency["service"], "entrypoint": "ProviderFetch"})
             text.update({"PROVIDER_REVISION": dependency["revision"], "PROVIDER_IMAGE_SHA256": dependency["imageSha256"]})
         result.extend({"type": "plain_text", "name": key, "text": value} for key, value in text.items())
         result.extend({"type": "secret_text", "name": key, **({"text": value} if include_secrets else {})} for key, value in secrets.items())
         return result
 
-    def verify_bindings(self, active):
-        expected = {r["name"]: r for r in self.expected_bindings()}
+    def verify_bindings(self, active, *, allow_unbound_provider=False):
+        expected = {r["name"]: r for r in self.expected_bindings(allow_unbound_provider=allow_unbound_provider)}
         actual = active["bindings"]
         require(set(expected) == set(actual), "Active binding inventory differs from the exact configuration.")
         for name, wanted in expected.items():
             observed = actual[name]
             if wanted["type"] == "secret_text":
                 require(observed.get("type") == "secret_text" and "text" not in observed)
+            elif wanted["type"] == "d1":
+                identities = [observed[k] for k in ("database_id", "id") if observed.get(k) is not None]
+                require(observed.get("name") == wanted["name"] and observed.get("type") == "d1"
+                        and identities and all(identity == wanted["database_id"] for identity in identities), "D1 binding identity differs.")
             else:
                 require(all(observed.get(k) == v for k, v in wanted.items()), "Active binding differs from the approved configuration.")
+                if wanted["type"] == "service":
+                    require(observed.get("environment") in (None, "production"), "Service binding points to an unexpected environment.")
+                if wanted["type"] == "r2_bucket":
+                    require(observed.get("jurisdiction") in (None, "default"), "R2 binding points to an unexpected jurisdiction.")
         require(active["revision"] == self.revision and active["moduleSha256"] == self.manifest["bundleSha256"]
                 and active["compatibilityDate"] == self.manifest["compatibilityDate"], "Active artifact differs from the verified CI artifact.")
 
@@ -490,8 +503,37 @@ class Controller:
         # No timezone row means UTC, avoiding a synthetic Telegram receipt.
         return True
 
-    def transition(self, action, approval, state_sha):
+    def plan_activate(self):
         before = self.inspect()
+        require(before["control"]["admission"] == "closed" and before["control"]["workers"] == "frozen"
+                and not any(before["work"].values()), "Final activation requires a drained, frozen source.")
+        require(not any(before["terminal"].get(key, 0) for key in ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates")),
+                "Unresolved external effects or interrupted updates require an explicit decision before activation.")
+        require(callable(self.activation_baseline_checker), "A pinned independently verified current baseline is required before activation.")
+        proof = self.activation_baseline_checker()
+        require(isinstance(proof, dict) and proof.get("baselineVerified") is True
+                and proof.get("targetSha256") == self.target.digest
+                and proof.get("configurationSha256") == self.target.configuration_digest
+                and proof.get("sourceRevision") == self.revision
+                and proof.get("moduleSha256") == before["release"]["moduleSha256"]
+                and proof.get("versionId") == before["release"]["versionId"]
+                and matches(SHA, proof.get("manifestSha256")) and matches(r"[0-9a-f]{32}", proof.get("checkpointId")),
+                "Activation baseline proof does not match this exact frozen release and configuration.")
+        require(self.telegram is not None)
+        self.telegram.identity()
+        self.telegram.group_permissions()
+        info = self.telegram.call("getWebhookInfo")
+        require(info.get("url") == "https://" + self.target.data["hostname"] + "/telegram/webhook"
+                and info.get("max_connections") == self.target.data["webhook"]["maxConnections"]
+                and set(info.get("allowed_updates", [])) == set(self.target.data["webhook"]["allowedUpdates"]),
+                "An exact read-back webhook is required before activation.")
+        self.verify_domain()
+        before["activationBaseline"] = proof
+        before["stateSha256"] = digest({k: v for k, v in before.items() if k != "stateSha256"})
+        return before
+
+    def transition(self, action, approval, state_sha):
+        before = self.plan_activate() if action == "activate" else self.inspect()
         require(before["stateSha256"] == state_sha, "Predecessor state changed; no transition performed.")
         self.approval(approval, action, state_sha)
         control = before["control"]
@@ -505,18 +547,6 @@ class Controller:
             require(control["admission"] == "closed", "Close admission and drain before freezing workers.")
         if action in ("freeze", "activate", "thaw"):
             require(not any(before["work"].values()), "Active, future or uncertain invocation work prevents this transition.")
-        if action == "activate":
-            require(not any(before["terminal"].get(key, 0) for key in ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates")),
-                    "Unresolved external effects or interrupted updates require an explicit decision before activation.")
-            require(self.telegram is not None)
-            self.telegram.identity()
-            self.telegram.group_permissions()
-            info = self.telegram.call("getWebhookInfo")
-            require(info.get("url") == "https://" + self.target.data["hostname"] + "/telegram/webhook"
-                    and info.get("max_connections") == self.target.data["webhook"]["maxConnections"]
-                    and set(info.get("allowed_updates", [])) == set(self.target.data["webhook"]["allowedUpdates"]),
-                    "An exact read-back webhook is required before activation.")
-            self.verify_domain()
         predicate = " AND ".join(f"{key} IS {migrations._literal(value) if isinstance(value,str) else value}" for key, value in control.items())
         quiet, fields = work_sql(self.target.data["botId"])
         conditions = [f"EXISTS(SELECT 1 FROM {CONTROL} WHERE {predicate})"]
@@ -536,6 +566,8 @@ class Controller:
         after = self.inspect()
         require(after["control"]["epoch"] == control["epoch"] + 1 and after["control"]["admission"] == admission
                 and after["control"]["workers"] == workers, "Transition outcome is not confirmed; inspect before proceeding.")
+        if action == "activate":
+            after["activationBaseline"] = before["activationBaseline"]
         return after
 
     def classify_interruption(self, approval, state_sha):
@@ -588,6 +620,9 @@ class Controller:
             "modules": [{"name": "index.js", "content_type": "application/javascript+module", "content_base64": base64.b64encode(module).decode()}],
             "bindings": bindings, "annotations": {"workers/tag": "lifecycle-" + self.revision[:12], "workers/message": self.target.digest}})
         require(isinstance(uploaded, dict) and matches(UUID, uploaded.get("id")), "Uploaded version is unconfirmed; do not retry blindly.")
+        # Verify staged bytes and every binding before the first traffic change.
+        # Post-deployment verification alone cannot make an unknown module safe.
+        self.verify_bindings(self.version(uploaded["id"]), allow_unbound_provider=True)
         self.resources()
         require(self.active(allow_empty=True)["deploymentId"] == before["release"]["deploymentId"], "Active deployment changed during staging.")
         self.guard()
@@ -635,6 +670,8 @@ class Controller:
         before = self.inspect()
         require(before["stateSha256"] == state_sha and before["control"]["admission"] == "closed")
         self.approval(approval, "domain", state_sha)
+        require(self.telegram is not None)
+        self.telegram.identity()
         require(self.target.environment == "production", "Rehearsal uses its registered workers.dev identity.")
         t = self.target.data
         current = self.worker("GET", self.root + "/workers/domains?" + urlencode({"hostname": t["hostname"]}))
@@ -662,28 +699,63 @@ def main():
     hosted_environment(target.environment)
     revision = os.environ.get("GITHUB_SHA", "")
     artifact.require_current_main(revision)
-    proof = prepare_control_artifact.prepare(action)
-    bundle = Path(os.environ["RUNNER_TEMP"]) / artifact.VERIFIED_DIRECTORY
-    manifest = parsed((bundle / "isolation.json").read_bytes())
     secrets = parsed(os.environ.get("SUBS_BOT_CONTROL_SECRETS", ""))
     general_config(target, revision, secrets)
     data = API(target, os.environ.get("SUBS_BOT_CF_DATA_TOKEN", ""))
     worker = API(target, os.environ.get("SUBS_BOT_CF_WORKER_TOKEN", ""))
+    source_checkpoint = os.environ.get("CONTROL_SOURCE_CHECKPOINT_ID", "")
+    source_manifest_sha = os.environ.get("CONTROL_SOURCE_MANIFEST_SHA256", "")
+    require(bool(source_checkpoint) == bool(source_manifest_sha), "Both pinned private source fields are required.")
+    if source_checkpoint:
+        from production_release_evidence import load_release
+        archived = load_release(target, os.environ["SUBS_BOT_CF_DATA_TOKEN"], source_checkpoint, source_manifest_sha, Path(os.environ["RUNNER_TEMP"]))
+        proof, bundle, manifest = archived["proof"], archived["bundle"], archived["manifest"]
+        if action in ("plan-deploy", "deploy", "initialize", "preflight"):
+            require(proof["revision"] == revision, "New deployment requires the exact current main, including an archived source.")
+        else:
+            require(archived["sourceTarget"].configuration_digest == target.configuration_digest,
+                    "Archived source configuration differs from the explicitly selected target.")
+    else:
+        proof = prepare_control_artifact.prepare(action)
+        bundle = Path(os.environ["RUNNER_TEMP"]) / artifact.VERIFIED_DIRECTORY
+        manifest = parsed((bundle / "isolation.json").read_bytes())
     controller = Controller(target, data, worker, bundle, manifest, guard=lambda: artifact.require_current_main(revision),
                             telegram=Telegram(target, secrets), secrets=secrets, control_revision=revision,
                             dependency_api=API(target, os.environ["SUBS_BOT_CF_DEPENDENCY_READ_TOKEN"]) if target.data["provider"] is not None and os.environ.get("SUBS_BOT_CF_DEPENDENCY_READ_TOKEN") else None)
     source_controller = None
     source_directory = None
-    if action in ("plan-deploy", "deploy") and os.environ.get("CONTROL_ACTIVE_CI_RUN_ID"):
+    baseline_checkpoint = os.environ.get("CONTROL_BASELINE_CHECKPOINT_ID", "")
+    baseline_manifest_sha = os.environ.get("CONTROL_BASELINE_MANIFEST_SHA256", "")
+    require(bool(baseline_checkpoint) == bool(baseline_manifest_sha), "Both exact activation baseline fields are required.")
+    if baseline_checkpoint:
+        from production_release_evidence import verify_activation_baseline
+        controller.activation_baseline_checker = lambda: verify_activation_baseline(controller, os.environ["SUBS_BOT_CF_DATA_TOKEN"], baseline_checkpoint, baseline_manifest_sha)
+    active_checkpoint = os.environ.get("CONTROL_ACTIVE_CHECKPOINT_ID", "")
+    active_manifest_sha = os.environ.get("CONTROL_ACTIVE_MANIFEST_SHA256", "")
+    require(bool(active_checkpoint) == bool(active_manifest_sha), "Both archived active-source fields are required.")
+    if action in ("plan-deploy", "deploy") and (os.environ.get("CONTROL_ACTIVE_CI_RUN_ID") or active_checkpoint):
         source_directory = tempfile.TemporaryDirectory(prefix="subs-bot-reviewed-active-", dir=os.environ["RUNNER_TEMP"])
-        source_proof = prepare_control_artifact.prepare("inspect", run_id=os.environ["CONTROL_ACTIVE_CI_RUN_ID"], directory=source_directory.name)
-        source_bundle = Path(source_directory.name) / artifact.VERIFIED_DIRECTORY
-        source_manifest = parsed((source_bundle / "isolation.json").read_bytes())
-        previous_target = validate_target(os.environ.get("SUBS_BOT_ACTIVE_TARGET_JSON") or canonical(target.data))
+        if active_checkpoint:
+            from production_release_evidence import load_release
+            previous_release = load_release(target, os.environ["SUBS_BOT_CF_DATA_TOKEN"], active_checkpoint, active_manifest_sha, source_directory.name)
+            source_proof, source_bundle, source_manifest = previous_release["proof"], previous_release["bundle"], previous_release["manifest"]
+            previous_target = previous_release["sourceTarget"]
+            if os.environ.get("SUBS_BOT_ACTIVE_TARGET_JSON"):
+                require(validate_target(os.environ["SUBS_BOT_ACTIVE_TARGET_JSON"]).configuration_digest == previous_target.configuration_digest)
+        else:
+            source_proof = prepare_control_artifact.prepare("inspect", run_id=os.environ["CONTROL_ACTIVE_CI_RUN_ID"], directory=source_directory.name)
+            source_bundle = Path(source_directory.name) / artifact.VERIFIED_DIRECTORY
+            source_manifest = parsed((source_bundle / "isolation.json").read_bytes())
+            previous_target = validate_target(os.environ.get("SUBS_BOT_ACTIVE_TARGET_JSON") or canonical(target.data))
         previous_secrets = parsed(os.environ.get("SUBS_BOT_ACTIVE_CONTROL_SECRETS") or canonical(secrets))
+        previous_dependency_api = None
+        if previous_target.data["provider"] is not None:
+            require(os.environ.get("SUBS_BOT_CF_DEPENDENCY_READ_TOKEN"),
+                    "The reviewed active ProviderFetch requires its own explicit read credential before unbinding.")
+            previous_dependency_api = API(previous_target, os.environ["SUBS_BOT_CF_DEPENDENCY_READ_TOKEN"])
         source_controller = Controller(previous_target, data, worker, source_bundle, source_manifest,
             guard=lambda: artifact.require_current_main(revision), secrets=previous_secrets, control_revision=revision,
-            dependency_api=controller.dependency_api)
+            dependency_api=previous_dependency_api)
     envelope = os.environ.get("SUBS_BOT_APPROVAL_JSON", "")
     predecessor = os.environ.get("CONTROL_STATE_SHA256", "")
     if action == "preflight":
@@ -699,6 +771,8 @@ def main():
         result = controller.initialize()
     elif action == "plan-deploy":
         result = controller.plan_deploy(source_controller)
+    elif action == "plan-activate":
+        result = controller.plan_activate()
     elif action == "deploy":
         result = controller.deploy(envelope, predecessor, source_controller)
     elif action == "reconcile-deploy":
@@ -728,6 +802,7 @@ def main():
     # Public evidence never contains actor lists, bindings with Secrets or SQL.
     result["ciProof"] = proof
     result["controlRevision"] = revision
+    result["releaseSourceBackend"] = "private-r2" if source_checkpoint else "github-actions"
     if source_controller is not None:
         result["activeCIProof"] = source_proof
     path = Path(os.environ["RUNNER_TEMP"]) / "production-control-result.json"
@@ -736,8 +811,9 @@ def main():
 
 
 if __name__ == "__main__":
+    from production_recovery import RecoveryError
     try:
         main()
-    except (ContractError, OperationError, migrations.MigrationError, artifact.ArtifactError) as error:
+    except (ContractError, OperationError, migrations.MigrationError, artifact.ArtifactError, RecoveryError) as error:
         print(json.dumps({"status": "stopped", "reason": str(error), "uncertain": bool(getattr(error, "uncertain", False))}))
         raise SystemExit(1) from None

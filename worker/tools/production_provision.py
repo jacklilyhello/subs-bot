@@ -14,7 +14,7 @@ from urllib.parse import urlencode
 
 import prepare_isolation_artifact as artifact
 from bootstrap_provider_worker import OBSERVABILITY_OFF
-from production_control import API, hosted_environment, privacy, OperationError
+from production_control import API, Telegram, general_config, hosted_environment, privacy, OperationError
 from production_target import ContractError, approve, canonical, digest, matches, parsed, require, validate_target, HEX, UUID, STAMP
 from production_storage import PrivateStore
 
@@ -45,10 +45,11 @@ class ProvisionJournal:
 
 
 class Provisioner:
-    def __init__(self, draft, data_api, worker_api, guard=lambda: None, journal=None):
+    def __init__(self, draft, data_api, worker_api, guard=lambda: None, journal=None, identity_preflight=None):
         self.draft, self.data, self.worker, self.guard = draft, data_api, worker_api, guard
         self.root = "/accounts/" + draft.data["accountId"]
         self.journal = journal
+        self.identity_preflight = identity_preflight
 
     def available(self):
         t = self.draft.data
@@ -112,6 +113,10 @@ class Provisioner:
 
     def create(self, approval, revision, predecessor, save=None):
         require(self.journal is not None, "A verified existing private provisioning anchor is required.")
+        require(self.draft.environment != "production" or callable(self.identity_preflight),
+                "Production resource creation requires a live Bot and group identity preflight.")
+        if self.identity_preflight is not None:
+            self.identity_preflight()
         prior = self.journal.value
         require(digest(prior if prior is not None else self.available()) == predecessor)
         approve(self.draft, approval, "provision", revision, predecessor)
@@ -184,6 +189,13 @@ def main():
     hosted_environment(draft.environment)
     revision = os.environ.get("GITHUB_SHA", "")
     artifact.require_current_main(revision)
+    secrets = parsed(os.environ.get("SUBS_BOT_CONTROL_SECRETS", ""))
+    general_config(draft, revision, secrets)
+    telegram = Telegram(draft, secrets)
+    def identity_preflight():
+        telegram.identity()
+        telegram.group_permissions()
+    identity_preflight()
     data = API(draft, os.environ.get("SUBS_BOT_CF_DATA_TOKEN", ""), create=True)
     worker = API(draft, os.environ.get("SUBS_BOT_CF_WORKER_TOKEN", ""), create=True)
     anchor = parsed(os.environ.get("SUBS_BOT_PROVISION_ANCHOR_JSON", ""))
@@ -191,7 +203,7 @@ def main():
     anchor_target = {**draft.data, "backupBucketName": anchor["bucketName"], "backupBucketCreatedAt": anchor["bucketCreatedAt"]}
     anchor_api = API(anchor_target, os.environ.get("SUBS_BOT_CF_DATA_TOKEN", ""))
     journal = ProvisionJournal(PrivateStore(anchor_api, anchor["bucketName"]), draft, lambda: artifact.require_current_main(revision))
-    tool = Provisioner(draft, data, worker, lambda: artifact.require_current_main(revision), journal=journal)
+    tool = Provisioner(draft, data, worker, lambda: artifact.require_current_main(revision), journal=journal, identity_preflight=identity_preflight)
     action = os.environ.get("CONTROL_ACTION", "availability")
     if action == "provision-inspect":
         result = {"draftSha256": draft.digest, "stateSha256": digest(journal.value if journal.value is not None else tool.available()),
