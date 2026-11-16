@@ -1,6 +1,8 @@
 import { AggregateLimitError, getAggregateNodeSource } from "./aggregate.ts";
 import { normalShortLinksReady, readShortLinkNamespaces, resolveShortLocation } from "./short-links.ts";
 import { parsePublicOrigin, type PublicOrigin } from "./public-origin.ts";
+import { beginProductionInvocation, fenceProductionDatabase, finishProductionInvocation,
+  readProductionControl } from "./production-control.ts";
 import { getSubscriptionNodeSource, PathRuleContentError } from "./path-rules.ts";
 import { legacyEmptyExportResponse, legacyEmptyExportState } from "./legacy-empty-export.ts";
 import { base64Chunks, ExportContentError, planBase64 } from "./base64-response.ts";
@@ -81,6 +83,7 @@ export interface Env {
   PUBLIC_ORIGIN?: string;
   TELEGRAM_ISOLATION_CONFIG?: string;
   TELEGRAM_GENERAL_CONFIG?: string;
+  TELEGRAM_PRODUCTION_CONTROL_SHA256?: string;
   TELEGRAM_CONFIG_SHA256?: string;
   TELEGRAM_AGGREGATE_KEY?: string;
   TELEGRAM_PRIVATE_SHARE_CREATION_KEY?: string;
@@ -231,7 +234,8 @@ async function withGeneralUtilities(env: Env, pin: GeneralTelegramPin): Promise<
   return { ...pin, commandFeatures: { ...pin.commandFeatures, github, apiStatus } };
 }
 
-async function generalTelegramWebhook(request: Request, env: Env, publicOrigin: PublicOrigin, general: GeneralTelegramPin, ctx?: ExecutionContext): Promise<Response> {
+async function generalTelegramWebhook(request: Request, env: Env, publicOrigin: PublicOrigin, general: GeneralTelegramPin,
+  ctx?: ExecutionContext, workEnv: Env = env): Promise<Response> {
   try {
     general = await withGeneralProviderDocuments(env, await withGeneralUtilities(env, general));
     const providerAvailable = general.privateProvider && env.TELEGRAM_PROVIDER_URL_IMPORT === "1"
@@ -246,13 +250,14 @@ async function generalTelegramWebhook(request: Request, env: Env, publicOrigin: 
     const statusProvider = general.commandFeatures?.apiStatus ? apiStatusProvider(env) : null;
     const utilities = {
       github: general.commandFeatures?.github === true,
+      backgroundDatabase: workEnv.DB,
       ...(statusProvider ? { apiStatus: { provider: statusProvider.binding, pin: statusProvider.pin } } : {}),
       schedule: async (operation: () => Promise<void>) => {
         const deadline = Date.now() + 28_000;
         const work = operation().finally(async () => {
           // Slow probes keep their durable reply for Cron rather than exceed the background delivery window.
           if (Date.now() + 5_000 >= deadline) return;
-          await drainGeneralSharedTelegramReply(env.DB, general, env.NODES, publicOrigin, refreshAvailable, share, aggregateKey, externalShortlinks(env));
+          await drainGeneralSharedTelegramReply(workEnv.DB, general, workEnv.NODES, publicOrigin, refreshAvailable, share, aggregateKey, externalShortlinks(workEnv));
         });
         if (ctx) ctx.waitUntil(work.catch(() => undefined));
         else await work;
@@ -265,15 +270,17 @@ async function generalTelegramWebhook(request: Request, env: Env, publicOrigin: 
       : await acceptGeneralTelegramCommand(env.DB, general, request);
     if (status === 200) {
       const delivery = general.sharedOutbox
-        ? withGeneralProviderDocuments(env, general)
-          .then((scoped) => drainGeneralSharedTelegramReply(env.DB, scoped, env.NODES, publicOrigin, refreshAvailable, share, aggregateKey, externalShortlinks(env)))
-          .finally(() => drainGeneralGroupShareCards(env.DB, general))
-        : drainGeneralTelegramReply(env.DB, general);
+        ? withGeneralProviderDocuments(workEnv, general)
+          .then((scoped) => drainGeneralSharedTelegramReply(workEnv.DB, scoped, workEnv.NODES, publicOrigin, refreshAvailable, share, aggregateKey, externalShortlinks(workEnv)))
+          .finally(() => drainGeneralGroupShareCards(workEnv.DB, general))
+        : drainGeneralTelegramReply(workEnv.DB, general);
       if (ctx) ctx.waitUntil(delivery.catch(() => undefined));
       else await delivery;
     }
     // A readiness probe can fail closed after a concurrent pause. Keep uncommitted updates retryable.
-    if (general.isolationWindow) await env.DB.prepare("SELECT 1").first();
+    if (general.isolationWindow || (env.TELEGRAM_PRODUCTION_CONTROL_SHA256 !== undefined && status !== 200)) {
+      await env.DB.prepare("SELECT 1").first();
+    }
     return new Response(null, { status, headers: HEADERS });
   } catch {
     return plain("Service unavailable.", 503, false);
@@ -605,7 +612,7 @@ async function telegramWebhook(request: Request, env: Env, publicOrigin: PublicO
   }
 }
 
-async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
+async function fetchBusinessRequest(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
   const publicOrigin = parsePublicOrigin(env.PUBLIC_ORIGIN);
   const head = request.method === "HEAD";
   if (publicOrigin === null) return plain("Service unavailable.", 503, head);
@@ -694,6 +701,58 @@ async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext):
       return plain("Subscription content cannot be exported.", 422, head);
     }
     return plain("Subscription temporarily unavailable.", 503, head);
+  }
+}
+
+async function fetchRequest(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
+  if (env.TELEGRAM_PRODUCTION_CONTROL_SHA256 === undefined) return fetchBusinessRequest(request, env, ctx);
+  try {
+    // A production/rehearsal target never falls back to the fixed isolation Bot.
+    const origin = parsePublicOrigin(env.PUBLIC_ORIGIN);
+    const general = parseGeneralTelegramPin(env.TELEGRAM_GENERAL_CONFIG, env.BUILD_REVISION);
+    if (env.TELEGRAM_ISOLATION_CONFIG !== undefined || env.PUBLIC_ORIGIN === undefined || !origin || !general) {
+      return plain("Service unavailable.", 503, request.method === "HEAD");
+    }
+    const control = await readProductionControl(env.DB, env.TELEGRAM_PRODUCTION_CONTROL_SHA256, general);
+    if (new URL(request.url).pathname !== "/telegram/webhook") {
+      // All other implemented routes are GET/HEAD exports/health; they do not write.
+      return fetchBusinessRequest(request, env, ctx);
+    }
+    if (request.method !== "POST") return plain("Method not allowed.", 405, request.method === "HEAD", { Allow: "POST" });
+    if (new URL(request.url).protocol !== "https:") return plain("Not found.", 404, false);
+    const authenticated = await readTelegramUpdate(request.clone(), general.webhookSecret);
+    if (authenticated.status !== 200) return new Response(null, { status: authenticated.status, headers: HEADERS });
+    if (control.admission !== "open" || control.workers !== "run") return plain("Service unavailable.", 503, false);
+    const invocation = await beginProductionInvocation(env.DB, control, "webhook");
+    const admissionEnv = { ...env, DB: fenceProductionDatabase(env.DB, invocation) };
+    const workEnv = { ...env, DB: fenceProductionDatabase(env.DB, { ...invocation, kind: "scheduled" }) };
+    const background: Promise<unknown>[] = [];
+    const trackedContext = {
+      waitUntil: (promise: Promise<unknown>) => { background.push(Promise.resolve(promise)); },
+      passThroughOnException: () => {},
+    } as ExecutionContext;
+    let response: Response;
+    let complete = true;
+    try {
+      response = await generalTelegramWebhook(request, admissionEnv, origin, general, trackedContext, workEnv);
+    } catch {
+      complete = false;
+      response = plain("Service unavailable.", 503, false);
+    }
+    const settle = (async () => {
+      let cursor = 0;
+      while (cursor < background.length) {
+        const batch = background.slice(cursor);
+        cursor = background.length;
+        if ((await Promise.allSettled(batch)).some(({ status }) => status === "rejected")) complete = false;
+      }
+      await finishProductionInvocation(env.DB, invocation, complete);
+    })();
+    if (ctx) ctx.waitUntil(settle);
+    else await settle;
+    return response;
+  } catch {
+    return plain("Service unavailable.", 503, request.method === "HEAD");
   }
 }
 
@@ -872,7 +931,7 @@ async function recoverGeneralWork(env: Env, pin: ProviderPin, publicOrigin: Publ
   }
 }
 
-async function scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+async function runScheduled(_controller: ScheduledController, env: Env): Promise<void> {
   const publicOrigin = parsePublicOrigin(env.PUBLIC_ORIGIN);
   if (publicOrigin === null) return;
   const pin = providerPin(env);
@@ -902,6 +961,23 @@ async function scheduled(_controller: ScheduledController, env: Env): Promise<vo
     }
   } finally {
     await runOneProviderJob(env.DB, env.NODES, env.PROVIDER_FETCH, pin);
+  }
+}
+
+async function scheduled(controller: ScheduledController, env: Env): Promise<void> {
+  if (env.TELEGRAM_PRODUCTION_CONTROL_SHA256 === undefined) return runScheduled(controller, env);
+  const general = parseGeneralTelegramPin(env.TELEGRAM_GENERAL_CONFIG, env.BUILD_REVISION);
+  if (env.TELEGRAM_ISOLATION_CONFIG !== undefined || env.PUBLIC_ORIGIN === undefined
+    || !parsePublicOrigin(env.PUBLIC_ORIGIN) || !general) throw new Error("Production scheduled configuration unavailable.");
+  const control = await readProductionControl(env.DB, env.TELEGRAM_PRODUCTION_CONTROL_SHA256, general);
+  if (control.workers === "frozen") return;
+  const invocation = await beginProductionInvocation(env.DB, control, "scheduled");
+  let complete = false;
+  try {
+    await runScheduled(controller, { ...env, DB: fenceProductionDatabase(env.DB, invocation) });
+    complete = true;
+  } finally {
+    await finishProductionInvocation(env.DB, invocation, complete);
   }
 }
 

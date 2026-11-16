@@ -111,6 +111,7 @@ export type GeneralUtilityRuntime = {
   github: boolean;
   apiStatus?: { provider: ProviderApiStatusV2Prober; pin: ProviderPin };
   schedule: (operation: () => Promise<void>) => Promise<void>;
+  backgroundDatabase?: D1Database;
 };
 
 interface SharedReadLease {
@@ -356,8 +357,9 @@ export async function acceptGeneralSharedTelegramCommand(
     if (!accepted) return 204;
     const provider = utilities.apiStatus;
     await utilities.schedule(async () => {
-      try { await runTelegramApiStatus(db, pin, provider.provider, provider.pin, accepted); }
-      finally { await reconcileTelegramApiStatus(db, pin); }
+      const workDb = utilities.backgroundDatabase ?? db;
+      try { await runTelegramApiStatus(workDb, pin, provider.provider, provider.pin, accepted); }
+      finally { await reconcileTelegramApiStatus(workDb, pin); }
     });
     return 200;
   }
@@ -366,7 +368,9 @@ export async function acceptGeneralSharedTelegramCommand(
     if (!pin.privateGitHub || !utilities?.github || !await telegramGitHubSearchReady(db)) return 204;
     const admitted = await acceptTelegramGitHubSearch(db, pin, github);
     if (admitted.kind === "ignored") return 204;
-    if (admitted.kind === "lookup") await utilities.schedule(async () => { await runTelegramGitHubSearch(db, pin, admitted); });
+    if (admitted.kind === "lookup") await utilities.schedule(async () => {
+      await runTelegramGitHubSearch(utilities.backgroundDatabase ?? db, pin, admitted);
+    });
     return 200;
   }
   if (pin.privateInline && inlineEnabled) {

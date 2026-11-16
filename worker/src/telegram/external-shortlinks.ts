@@ -1,4 +1,4 @@
-import { ISOLATION_PUBLIC_ORIGIN, PRODUCTION_PUBLIC_ORIGIN, type PublicOrigin } from "../public-origin.ts";
+import { CONTROL_REHEARSAL_PUBLIC_ORIGIN, ISOLATION_PUBLIC_ORIGIN, PRODUCTION_PUBLIC_ORIGIN, type PublicOrigin } from "../public-origin.ts";
 
 /** This is an RPC entrypoint, deliberately not a Fetcher/public HTTP client. */
 export interface ShortlinkService {
@@ -14,7 +14,7 @@ const TOKEN = /^sl_[A-Za-z0-9_-]{32,128}(?![\s\S])/u;
 const MAX_BODY = 8192;
 
 export function localShortlink(value: string, origin: PublicOrigin): boolean {
-  return (origin === ISOLATION_PUBLIC_ORIGIN || origin === PRODUCTION_PUBLIC_ORIGIN)
+  return (origin === ISOLATION_PUBLIC_ORIGIN || origin === PRODUCTION_PUBLIC_ORIGIN || origin === CONTROL_REHEARSAL_PUBLIC_ORIGIN)
     && value.startsWith(origin + "/s/") && CODE.test(value.slice(origin.length + 3));
 }
 
