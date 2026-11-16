@@ -9,7 +9,9 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+from urllib.error import HTTPError
+from urllib.parse import unquote
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import archive_production_provider as archive
@@ -284,6 +286,110 @@ class FailedTerminalArchiveTests(unittest.TestCase):
         self.store.objects["terminal/provider-failed-terminal-state.json"] += b"changed"
         with self.assertRaises(control.ProviderError):
             archive.terminal_archive(self.store, expected=result["manifestSha256"])
+
+
+class PrivateProofTransportTests(unittest.TestCase):
+    """Exercise the actual key/read/signed-put layer; only HTTP is synthetic."""
+
+    def setUp(self):
+        self.objects, self.requests = {}, []
+        self.store = archive.PrivateProofStore({"accountId": "9431815bdb8beb2272f6668e06b7d3be", "namespace": "lilyya",
+                                               "r2CreatedOn": STAMP}, "synthetic-token", "100", "1")
+        self.store.access_key = "a" * 32
+        owner = self
+
+        class Response:
+            status = 200
+            headers = {"Content-Encoding": "identity"}
+
+            def __init__(self, raw=b""):
+                self.raw = raw
+
+            def read(self, limit):
+                return self.raw[:limit]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                pass
+
+        class Connection:
+            def __init__(self, host, **_kwargs):
+                owner.assertEqual(host, owner.store.target["accountId"] + ".r2.cloudflarestorage.com")
+
+            def request(self, method, path, body, headers):
+                owner.assertEqual(method, "PUT")
+                owner.assertEqual(headers["if-none-match"], "*")
+                owner.assertTrue(headers["Authorization"].startswith("AWS4-HMAC-SHA256 "))
+                prefix = "/" + owner.store.bucket + "/"
+                owner.assertTrue(path.startswith(prefix))
+                key = unquote(path[len(prefix):])
+                owner.assertTrue(key.startswith(owner.store.prefix))
+                owner.assertNotIn(key, owner.objects)
+                owner.objects[key] = body
+                owner.requests.append((method, key))
+
+            def getresponse(self):
+                return Response()
+
+            def close(self):
+                pass
+
+        def get(request, **_kwargs):
+            self.assertEqual(request.get_method(), "GET")
+            origin = archive.API_ORIGIN + self.store.base + "/objects/"
+            self.assertTrue(request.full_url.startswith(origin))
+            key = unquote(request.full_url[len(origin):])
+            if key not in self.objects:
+                raise HTTPError(request.full_url, 404, "synthetic missing", {}, None)
+            return Response(self.objects[key])
+
+        self.store.opener = Mock()
+        self.store.opener.open.side_effect = get
+        transport = patch.object(archive, "HTTPSConnection", Connection)
+        transport.start()
+        self.addCleanup(transport.stop)
+
+    def test_only_the_five_exact_terminal_keys_reach_real_signed_put_and_readback(self):
+        keys = {"terminal-manifest.json", "terminal/provider-reconciled-target.json", "terminal/provider-forward-terminal.json",
+                "terminal/provider-failed-terminal-state.json", "terminal/provider-failed-terminal-readback.json"}
+        self.assertEqual(archive.TERMINAL_KEYS, keys)
+        for relative in keys:
+            raw = ("synthetic " + relative).encode()
+            self.store.put(relative, raw)
+            self.assertEqual(self.store.read(relative), raw)
+            self.store.put(relative, raw)
+        self.assertEqual(len(self.requests), 5)
+        for relative in ("terminal/unknown.json", "terminal/../manifest.json", "../terminal-manifest.json",
+                         "terminal-manifest.json/extra", "terminal/provider-forward-terminal.json?x=1", "terminal/%2e%2e/manifest.json"):
+            calls = self.store.opener.open.call_count
+            with self.subTest(relative=relative), self.assertRaises(control.ProviderError):
+                self.store.put(relative, b"refused")
+            self.assertEqual(self.store.opener.open.call_count, calls)
+        self.assertEqual(len(self.requests), 5)
+
+    def test_terminal_archive_and_independent_verify_use_actual_store_keys_and_transport(self):
+        from test_production_provider_forward import recovery
+        target = config(active=True)
+        state = {"status": "failed-terminal-preserved", "completion": "not-complete", "state": "failed", "exitCode": 137,
+                 "targetSha256": control.digest(target), "sourceRevision": target["build"]["revision"],
+                 "instanceIdSha256": "5" * 64, "processSha256": "6" * 64}
+        proof = {**recovery(target), "terminalSha256": control.digest(state)}
+        self.store.verify = Mock()
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"GITHUB_SHA": "b" * 40}), \
+                patch("production_provider_forward.artifact_receipt"):
+            directory = Path(temporary)
+            for name, value in (("provider-reconciled-target.json", target), ("provider-forward-terminal.json", proof),
+                    ("provider-failed-terminal-state.json", state), ("provider-failed-terminal-readback.json",
+                     {"version": 1, "summarySha256": control.digest(state), "targetSha256": control.digest(target), "observations": 2})):
+                (directory / name).write_bytes(control.canonical(value))
+            result = archive.terminal_archive(self.store, directory)
+        self.assertEqual(result["completion"], "not-complete")
+        self.assertEqual(result["readback"], "R2-only-failed-terminal")
+        self.assertEqual(len(self.requests), 5)
+        self.assertEqual(archive.terminal_archive(self.store, expected=result["manifestSha256"]), result)
+        self.assertEqual(len(self.requests), 5)
 
 
 if __name__ == "__main__":
