@@ -19,6 +19,7 @@ import production_provider as control
 CONFIRMATION = "rehearse production ProviderFetch controls for subs-bot-provider-fetch-control-drill-01"
 CHECKPOINT = "provider-rehearsal-checkpoint.json"
 OPERATIONS = ("create", "publish", "stage", "activate", "provision-container", "provision-workflow", "smoke")
+FAULTS = {"none", "after-create-response", "after-stage-response"}
 MAX_CHECKPOINT = 256 * 1024
 MAX_EVENTS = 80
 SAFE_FILES = {"provider-rehearsal-proof.json": 65536, "provider-rehearsal-target.json": 65536,
@@ -34,6 +35,7 @@ def context():
     control.require(os.environ.get("SUBS_BOT_PROVIDER_REHEARSAL_CONFIRMATION") == CONFIRMATION,
                     "The dedicated rehearsal resource creation was not explicitly selected.")
     control.require(os.environ.get("GITHUB_RUN_ATTEMPT") == "1", "Do not retry an interrupted rehearsal; reconcile its saved pins first.")
+    control.require(os.environ.get("SUBS_BOT_PROVIDER_REHEARSAL_FAULT", "none") in FAULTS)
     control.require(os.environ.get("GITHUB_REPOSITORY") == control.github.REPOSITORY
                     and os.environ.get("GITHUB_REF") == control.github.MAIN_REF
                     and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
@@ -106,10 +108,18 @@ class ObservedAPI(control.ProviderAPI):
     Neither response bodies nor exception text are saved.
     """
 
-    def __init__(self, config, sink):
+    def __init__(self, config, sink, operation):
         super().__init__(config, os.environ.get("SUBS_BOT_CF_PROVIDER_WORKER_TOKEN", ""),
                          os.environ.get("SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN", ""))
         self.sink = sink
+        self.operation = operation
+
+    def observed(self, value):
+        self.sink(value)
+        fault = os.environ.get("SUBS_BOT_PROVIDER_REHEARSAL_FAULT", "none")
+        control.require(fault in FAULTS and self.config["environment"] == "rehearsal")
+        if (fault == "after-create-response" and self.operation == "create") or (fault == "after-stage-response" and self.operation == "stage"):
+            raise control.ProviderError("The explicit rehearsal interruption preserved a response-only identity; independently reconcile before continuing.")
 
     def _write(self, path, body, *, container=False, method="POST"):
         result = super()._write(path, body, container=container, method=method)
@@ -125,13 +135,13 @@ class ObservedAPI(control.ProviderAPI):
                 value = result.get(field)
                 if control.match(control.bootstrap.TIMESTAMP, value):
                     safe[field] = value
-        self.sink({"kind": "response-only", "method": method, "path": path,
+        self.observed({"kind": "response-only", "method": method, "path": path,
                    "identities": safe, "responseSha256": control.digest(result)})
         return result
 
     def upload(self, module):
         candidate = super().upload(module)
-        self.sink({"kind": "response-only", "method": "POST", "path": self.worker_path + "/versions",
+        self.observed({"kind": "response-only", "method": "POST", "path": self.worker_path + "/versions",
                    "identities": {"versionId": candidate}})
         return candidate
 
@@ -139,7 +149,7 @@ class ObservedAPI(control.ProviderAPI):
 def execute(config, operation, module, archive, *, sink=lambda _value: None):
     with tempfile.TemporaryDirectory(prefix=".provider-control-step-", dir=os.environ["RUNNER_TEMP"]) as directory:
         scratch = Path(directory)
-        client = ObservedAPI(config, sink)
+        client = ObservedAPI(config, sink, operation)
         guard = lambda: control.guard_sources(config)
         if operation == "create":
             return {"worker": client.create()}
@@ -214,8 +224,16 @@ def initialize():
             control.verify_provider_dependency(api(old), old, allow_unbound_caller=True)
             config.update({"worker": old["worker"], "container": old["container"], "workflow": None, "previous": old})
             config = control.validate_config(config)
+    fault = os.environ.get("SUBS_BOT_PROVIDER_REHEARSAL_FAULT", "none")
+    if fault != "none":
+        control.require(config.get("previous") is None and config["activation"] is None,
+                        "A deterministic interruption is limited to the first private release before consumers.")
+        control.require((fault == "after-create-response" and config["worker"] is None)
+                        or (fault == "after-stage-response" and config["versionId"] is None),
+                        "The selected deterministic interruption operation has already completed.")
     journal = {"version": 2, "controllerRevision": os.environ["GITHUB_SHA"], "runId": os.environ["GITHUB_RUN_ID"],
                "runAttempt": os.environ["GITHUB_RUN_ATTEMPT"], "sourceMode": mode, "source": evidence,
+               "faultMode": fault,
                "events": [], "steps": [], "currentIntent": None, "completion": "not-complete"}
     checkpoint(config, journal)
     with tempfile.TemporaryDirectory(prefix=".provider-source-closure-", dir=os.environ["RUNNER_TEMP"]) as directory:
@@ -254,6 +272,7 @@ def prepare_operation(operation):
     intent = {"operation": operation, "runId": os.environ["GITHUB_RUN_ID"], "runAttempt": os.environ["GITHUB_RUN_ATTEMPT"],
               "controllerRevision": os.environ["GITHUB_SHA"], "source": config["build"], "targetSha256": control.digest(config),
               "approvalSha256": control.digest({"operation": operation, "target": config}), "preflight": preflight,
+              "faultMode": os.environ.get("SUBS_BOT_PROVIDER_REHEARSAL_FAULT", "none"),
               "status": "started-unknown" if is_needed else "skipped", "executed": False}
     intent["intentSha256"] = control.digest(intent)
     journal["currentIntent"] = intent
@@ -304,6 +323,7 @@ def execute_operation(operation):
                     and intent.get("status") in {"started-unknown", "skipped"}, "An old or already executed provider intent cannot be replayed.")
     control.require(intent.get("intentSha256") == control.digest({key: value for key, value in intent.items() if key != "intentSha256"})
                     and intent.get("source") == config["build"]
+                    and intent.get("faultMode") == os.environ.get("SUBS_BOT_PROVIDER_REHEARSAL_FAULT", "none")
                     and intent.get("approvalSha256") == control.digest({"operation": operation, "target": config}),
                     "The operation intent, source, target and approval digest differ.")
     if intent["status"] == "skipped":

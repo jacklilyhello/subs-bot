@@ -238,6 +238,21 @@ def partial_record(name, run_id, attempt):
     return PARTIAL_LIMITS[parts[1]]
 
 
+def response_identity(envelope):
+    journal = envelope.get("journal")
+    intent = journal.get("currentIntent") if isinstance(journal, dict) else None
+    if not isinstance(intent, dict):
+        return None
+    observations = [event.get("identities") for event in journal.get("events", []) if isinstance(event, dict)
+                    and event.get("phase") == "observation" and event.get("kind") == "response-only"
+                    and event.get("operation") == intent.get("operation") and event.get("intentSha256") == intent.get("intentSha256")]
+    if not observations:
+        return None
+    require(all(isinstance(value, dict) and value == observations[0] for value in observations))
+    value = {"operation": intent["operation"], "intentSha256": intent["intentSha256"], "identities": observations[0]}
+    return {**value, "sha256": provider.digest(value)}
+
+
 def archive_partial(store, directory, provenance):
     """Preserve every downloaded source/intent/result original, never promote it to acceptance."""
     store.verify()
@@ -286,7 +301,7 @@ def archive_partial(store, directory, provenance):
                 intent = journal.get("currentIntent")
                 manifest["latestCheckpoint"] = {"record": name, "targetSha256": provider.digest(target),
                     "events": latest_events, "intent": {key: intent[key] for key in ("operation", "status", "intentSha256")}
-                    if isinstance(intent, dict) else None}
+                    if isinstance(intent, dict) else None, "responseIdentity": response_identity(envelope)}
     raw = provider.canonical(manifest)
     require(len(raw) <= MAX_PARTIAL_MANIFEST)
     store.put("partial-manifest.json", raw)
@@ -338,13 +353,121 @@ def verify_partial(store, expected_manifest):
             "logicalBytes": logical, "uniqueBytes": sum(unique.values()), "latestCheckpoint": manifest["latestCheckpoint"]}
 
 
+def read_record(store, manifest, name, output=None):
+    entry = manifest["files"].get(name)
+    require(isinstance(entry, dict))
+    digest, count, collected = sha256(), 0, bytearray()
+    for chunk in entry["chunks"]:
+        body = store.read("blobs/" + chunk["sha256"])
+        require(isinstance(body, bytes) and len(body) == chunk["bytes"] and sha256(body).hexdigest() == chunk["sha256"])
+        count += len(body)
+        require(count <= entry["bytes"])
+        digest.update(body)
+        if output is not None:
+            output.write(body)
+        else:
+            require(count <= rehearsal.MAX_CHECKPOINT)
+            collected.extend(body)
+    require(count == entry["bytes"] and digest.hexdigest() == entry["sha256"])
+    return bytes(collected) if output is None else digest.hexdigest()
+
+
+class ReconciliationReader(provider.ProviderAPI):
+    def _request(self, path, *, container=False, method="GET", body=None, absent=None, limit=provider.publication.HTTP_LIMIT):
+        require(method == "GET" and not container and body is None and path.startswith("/workers/"))
+        return super()._request(path, method="GET", absent=absent, limit=limit)
+
+    def _write(self, *_args, **_kwargs):
+        raise provider.ProviderError("Provider reconciliation is read-only.")
+
+    def upload(self, *_args, **_kwargs):
+        raise provider.ProviderError("Provider reconciliation is read-only.")
+
+
+def reconcile_identity(config, identity):
+    candidate = json.loads(provider.canonical(config))
+    require(candidate["environment"] == "rehearsal" and candidate["caller"] is None and candidate.get("previous") is None
+            and candidate["activation"] is None and candidate["container"] is None and candidate["workflow"] is None)
+    operation, observed = identity["operation"], identity["identities"]
+    if operation == "create":
+        require(candidate["worker"] is None and candidate["versionId"] is None)
+        pin = provider.bootstrap.Identity(observed.get("id"), observed.get("created_on"))
+        candidate["worker"] = {"workerId": pin.worker_id, "workerCreatedOn": pin.created_on}
+    elif operation == "stage":
+        require(candidate["worker"] is not None and candidate["versionId"] is None
+                and provider.match(provider.stage.VERSION_ID, observed.get("versionId")))
+        candidate["versionId"] = observed["versionId"]
+    else:
+        raise provider.ProviderError("Only the declared pre-consumer create/stage responses can be reconciled by this tool.")
+    candidate = provider.validate_config(candidate)
+    client = ReconciliationReader(candidate, os.environ.get("SUBS_BOT_CF_DEPLOY_TOKEN", ""))
+    for _pass in range(2):
+        for worker in (client.by_name(), client.worker.by_id(client.identity)):
+            provider.verify_profile(worker, candidate, client.identity, False)
+            provider.legacy._references(worker, client.identity, None, service=candidate["service"])
+        client.versions()
+        require(client.deployment() is None)
+        if candidate["versionId"] is not None:
+            version = candidate["versionId"]
+            metadata = provider.metadata(candidate)
+            beta = client._request(client.beta_path + "/" + version + "?include=modules", limit=provider.stage.MAX_VERSION_RESPONSE)["result"]
+            legacy = client._request(client.worker_path + "/versions/" + version)["result"]
+            provider.stage._verify_version(beta, version, metadata, candidate["build"]["workerSha256"], service=candidate["service"])
+            provider.stage._verify_legacy_version(legacy, version, metadata, service=candidate["service"])
+    provider.public_denied(candidate)
+    return candidate
+
+
+def reconcile_partial(store, manifest_sha256, response_sha256):
+    require(provider.match(provider.provider.HEX, response_sha256))
+    verify_partial(store, manifest_sha256)
+    manifest = provider.github._parse_object(store.read("partial-manifest.json"), ERROR)
+    latest = manifest["latestCheckpoint"]
+    require(isinstance(latest, dict) and isinstance(latest.get("responseIdentity"), dict)
+            and latest["responseIdentity"].get("sha256") == response_sha256)
+    envelope = provider.github._parse_object(read_record(store, manifest, latest["record"]), ERROR)
+    target, journal = provider.validate_config(envelope["target"]), envelope["journal"]
+    identity = response_identity(envelope)
+    require(identity is not None and identity == latest["responseIdentity"] and identity["sha256"] == response_sha256)
+    intent = journal["currentIntent"]
+    require(intent["status"] in {"started-unknown", "unconfirmed"} and intent["targetSha256"] == provider.digest(target)
+            and intent["source"] == target["build"] and journal["source"] == target["build"]
+            and intent["approvalSha256"] == provider.digest({"operation": intent["operation"], "target": target}))
+    name = f"subs-bot-provider-attempt-intent-{intent['operation']}-{store.run_id}-{store.attempt}"
+    recorded = manifest["source"]["artifacts"].get(name)
+    require(isinstance(recorded, dict) and any(event.get("phase") == "intent-persisted"
+            and event.get("intentSha256") == intent["intentSha256"] and event.get("artifactId") == recorded["artifactId"]
+            and event.get("archiveSha256") == recorded["archiveSha256"] for event in journal["events"]))
+    source_name = f"subs-bot-provider-attempt-source-{store.run_id}-{store.attempt}/provider-source-archive.zip"
+    with tempfile.TemporaryDirectory(prefix=".provider-partial-source-", dir=os.environ["RUNNER_TEMP"]) as temporary:
+        directory = Path(temporary)
+        archive = directory / "source.zip"
+        with provider.provenance._write_private(archive) as output:
+            archive_sha = read_record(store, manifest, source_name, output)
+        require(archive_sha == target["build"]["archiveSha256"])
+        verified = directory / "verified"
+        verified.mkdir(mode=0o700)
+        provider.provenance._unpack(archive, verified)
+        release = provider.provider.verify_release(verified, target["build"]["revision"], ref=provider.github.MAIN_REF,
+                                                   run_id=target["build"]["runId"], run_attempt=target["build"]["runAttempt"])
+        require(all(release[key] == target["build"][key] for key in provider.publication.MANIFEST_FIELDS))
+        confirmed = reconcile_identity(target, identity)
+    result = {"status": "confirmed-identity-only", "completion": "not-complete", "operation": identity["operation"],
+              "sourceManifestSha256": manifest_sha256, "responseIdentitySha256": response_sha256,
+              "targetSha256": provider.digest(confirmed), "sourceRevision": confirmed["build"]["revision"]}
+    for name, value in (("provider-reconciled-target.json", confirmed), ("provider-reconciliation.json", result)):
+        with provider.provenance._write_private(Path(os.environ["RUNNER_TEMP"]) / name) as output:
+            output.write(provider.canonical(value))
+    return result
+
+
 def main():
     require(os.environ.get("GITHUB_REPOSITORY") == provider.github.REPOSITORY
             and os.environ.get("GITHUB_REF") == provider.github.MAIN_REF and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"
             and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
             and os.environ.get("GITHUB_WORKFLOW_REF") == f"{provider.github.REPOSITORY}/{provider.REHEARSAL_WORKFLOW_PATH}@{provider.github.MAIN_REF}")
     action = os.environ.get("PROVIDER_ARCHIVE_ACTION", "")
-    require(action in {"archive", "verify", "rehearse", "preserve-partial", "verify-archive", "verify-partial"})
+    require(action in {"archive", "verify", "rehearse", "preserve-partial", "verify-archive", "verify-partial", "reconcile-partial"})
     run_id = os.environ["GITHUB_RUN_ID"] if action in {"archive", "rehearse"} else os.environ.get("PROVIDER_ARCHIVE_RUN_ID", "")
     attempt = os.environ["GITHUB_RUN_ATTEMPT"] if action in {"archive", "rehearse"} else os.environ.get("PROVIDER_ARCHIVE_RUN_ATTEMPT", "")
     target = provider.github._parse_object(os.environ.get("SUBS_BOT_CF_ISOLATION_TARGET_JSON", ""), ERROR)
@@ -373,7 +496,10 @@ def main():
     else:
         expected = os.environ.get("PROVIDER_ARCHIVE_MANIFEST_SHA256", "")
         require(provider.match(provider.provider.HEX, expected))
-        result = verify_partial(store, expected) if action == "verify-partial" else {"status": "complete", **verify_archive(store, expected)}
+        if action == "reconcile-partial":
+            result = reconcile_partial(store, expected, os.environ.get("PROVIDER_RESPONSE_IDENTITY_SHA256", ""))
+        else:
+            result = verify_partial(store, expected) if action == "verify-partial" else {"status": "complete", **verify_archive(store, expected)}
     print(json.dumps({"action": action, **result}, sort_keys=True))
 
 

@@ -144,6 +144,18 @@ class DurableIntentTests(unittest.TestCase):
             with self.assertRaises(control.ProviderError):
                 rehearsal.persisted_intent("create")
 
+    def test_explicit_fault_preserves_only_safe_response_before_readback(self):
+        records = []
+        env = {"SUBS_BOT_CF_PROVIDER_WORKER_TOKEN": "synthetic-worker-token", "SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN": "synthetic-container-token",
+               "SUBS_BOT_PROVIDER_REHEARSAL_FAULT": "after-create-response"}
+        with patch.dict(os.environ, env), patch.object(control.ProviderAPI, "_write", return_value={
+                "id": WORKER_ID, "created_on": STAMP, "untrustedMessage": "synthetic-secret-not-recorded"}):
+            observed = rehearsal.ObservedAPI(self.target, records.append, "create")
+            with self.assertRaises(control.ProviderError):
+                observed._write("/workers/workers", {})
+        self.assertEqual(records[0]["identities"], {"id": WORKER_ID, "created_on": STAMP})
+        self.assertNotIn("synthetic-secret-not-recorded", json.dumps(records))
+
 
 if __name__ == "__main__":
     unittest.main()

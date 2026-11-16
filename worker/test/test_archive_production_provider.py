@@ -1,6 +1,7 @@
 """Cloud-hosted synthetic checks of complete, private provider source preservation."""
 
 from copy import deepcopy
+from base64 import b64encode
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -13,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import archive_production_provider as archive
 import production_provider as control
 import production_provider_rehearsal as rehearsal
-from test_production_provider import config
+from test_production_provider import config, STAMP, VERSION, WORKER_ID, worker_profile
 
 
 class MemoryStore:
@@ -168,6 +169,61 @@ class PartialArchiveTests(unittest.TestCase):
         self.store.objects["partial-manifest.json"] = raw
         with self.assertRaises(control.ProviderError):
             archive.verify_partial(self.store, sha256(raw).hexdigest())
+
+
+class ReconciliationTests(unittest.TestCase):
+    def setUp(self):
+        self.target = config()
+        self.target["versionId"] = None
+        self.module = b"export default {fetch(){return new Response(null,{status:404})}};"
+        self.target["build"]["workerSha256"] = sha256(self.module).hexdigest()
+        self.identity = {"operation": "stage", "intentSha256": "6" * 64, "identities": {"versionId": VERSION}}
+
+    def client(self, *, corrupt=False):
+        from unittest.mock import Mock
+        candidate = deepcopy(self.target)
+        candidate["versionId"] = VERSION
+        client = Mock()
+        client.identity = control.bootstrap.Identity(WORKER_ID, STAMP)
+        client.beta_path = "/workers/workers/" + WORKER_ID + "/versions"
+        client.worker_path = "/workers/scripts/" + candidate["service"]
+        observed = worker_profile(candidate)
+        client.by_name.return_value = observed
+        client.worker.by_id.return_value = observed
+        client.deployment.return_value = None
+        metadata = control.metadata(candidate)
+        beta = {**metadata, "id": VERSION, "urls": [], "modules": [{"name": control.provider.WORKER,
+                "content_type": control.stage.MODULE_TYPE, "content_base64": b64encode(b"wrong" if corrupt else self.module).decode()}]}
+        legacy = {"id": VERSION, "resources": {"script_runtime": {"compatibility_date": metadata["compatibility_date"],
+                  "containers": metadata["containers"]}, "bindings": metadata["bindings"]}}
+        client._request.side_effect = lambda path, **_kwargs: {"result": beta if "include=modules" in path else legacy}
+        return client
+
+    def test_exact_response_is_registered_only_after_repeated_source_module_readback(self):
+        client = self.client()
+        with patch.object(archive, "ReconciliationReader", return_value=client), patch.object(control, "public_denied"):
+            confirmed = archive.reconcile_identity(self.target, self.identity)
+        self.assertEqual(confirmed["versionId"], VERSION)
+        self.assertEqual(self.target["versionId"], None)
+        self.assertEqual(client.deployment.call_count, 2)
+        client._write.assert_not_called()
+        client.upload.assert_not_called()
+
+    def test_wrong_module_or_active_consumer_is_not_registered(self):
+        client = self.client(corrupt=True)
+        with patch.object(archive, "ReconciliationReader", return_value=client), self.assertRaises(ValueError):
+            archive.reconcile_identity(self.target, self.identity)
+        client = self.client()
+        client.deployment.return_value = {"id": "unexpected-active-deployment"}
+        with patch.object(archive, "ReconciliationReader", return_value=client), self.assertRaises(control.ProviderError):
+            archive.reconcile_identity(self.target, self.identity)
+
+    def test_reconciliation_transport_has_no_write_capability(self):
+        client = archive.ReconciliationReader(self.target, "synthetic-worker-token")
+        with self.assertRaises(control.ProviderError):
+            client._write("/workers/workers", {})
+        with self.assertRaises(control.ProviderError):
+            client.upload(b"module")
 
 
 if __name__ == "__main__":

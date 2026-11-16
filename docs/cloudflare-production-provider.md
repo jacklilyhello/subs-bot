@@ -80,6 +80,18 @@
 
 独立核对已确认 pins 与所有 response-only 观察后，才将准确 target 存入 `SUBS_BOT_PROVIDER_REHEARSAL_TARGET_JSON`。`source_mode=registered` 会保留其中冻结源和准确 CI run，在新的 main 控制工具下继续未完成流程，不强迫升级尚未完成的目标。`source_mode=current` 是明确选择新源，只允许先证明原依赖已完整验证、私有、停止且无调用方后升级。发现未知同名资源/版本或结果不明时仍停止，不从单纯名称或失败回执推断成功。
 
+可用 `fault=after-create-response` 或 `after-stage-response` 做明确的托管确定性中断演练，默认 `none`。它只允许首次私有发布、尚未激活消费者、无 previous/caller 的目标；先把真实 API 响应的白名单 ID/时间记为 response-only，再主动失败。原 job 始终失败，partial 仍为 not-complete。该证据应标为“确定性托管中断”，不能称为真实网络故障。
+
+接续流程可直接执行：
+
+1. 用上述 fault 运行 `rehearse`；保存失败 run/attempt、partial manifest SHA 和输出的 `latestCheckpoint.responseIdentity.sha256`。
+2. 另开 `verify-partial`，填原 run/attempt 和 manifest SHA；它仅从私有 R2 读回全部原件。仍不能声明业务 complete。
+3. 运行 `reconcile-partial`，提供同一原 run/attempt、manifest SHA 及准确 `response_identity_sha256`。工具从已验证 R2 重建原 CI ZIP，核对原摘要、模块与 OCI 闭包；再使用已有项目部署凭据的读取能力，按响应 immutable ID/版本 ID 独立读取名称/创建时间/私有归属、确认无 deployment/消费者，并在 stage 场景读回准确模块、绑定、镜像及版本元数据。专用 transport 强制仅 GET，不按名称猜测 ID，不写 Cloudflare，也不调用 Container/registry mutation。
+4. 只有上述核对全部成功，才产生 `provider-reconciled-target.json` 和 `confirmed-identity-only` 回执；该状态仍为 not-complete。将这一准确 target 安全登记到 `subs-bot-provider-isolation` 的 `SUBS_BOT_PROVIDER_REHEARSAL_TARGET_JSON`，保留原 source CI run。
+5. 用 `source_mode=registered`、原准确 CI run 和 `fault=none` 再运行 `rehearse`。已验证阶段跳过，未完成阶段继续；完整 named RPC、停止状态和最终独立读回全部成功后才生成 complete proof。可先从 create 的确认点继续并选择 stage fault，再重复同样的只读核对流程，覆盖两个真实响应后中断点。
+
+当前自动只读注册仅覆盖明确的首次 create/stage、无消费者响应；其他不明状态保留现场并拒绝自动注册。原始 mutation 永不自动重试，重复 reconcile 也不能跳过实时身份和未激活状态检查。
+
 后继 job 在原 `subs-bot-isolation` Environment 中，将完成证明、完整 target、journal、源原 ZIP、源 module、OCI archive 和 manifest 封存到既有私有 R2 的 `maintenance/production-provider/<run>/<attempt>/`。每块最大 16 MiB，最多 128 块、总量 600 MiB；超限在 manifest 封存前拒绝。S3 条件写只创建新对象，逐块及完整文件摘要读回后才写最终 manifest；不删除任何原记录。
 
 partial 保存至同一 attempt 的独立 manifest，最多 128 个原始文件、2 GiB 逻辑字节；去重后最多 128 个块/600 MiB。单个 checkpoint 最大 256 KiB、journal 最多 80 个事件；超限停止，不截断。每个版本的原始 target、journal、响应观察和源文件均有独立摘要，重复字节只保留一份物理块。partial 与完整 proof 的读回类型和完成状态分开输出；原始失败不会被存储 job 的成功覆盖。
