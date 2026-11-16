@@ -207,7 +207,8 @@ def run(runner, wire):
         runner.exercise(provided_controller=on,
             verify_extra=lambda ctl, anchors, base: url_and_refresh(runner, ctl, anchors, base, expected_body, wire))
         require(runner.report.get("applicationProviderCases", {}).get("realRefreshSaved") is True)
-        require(not any(on.inspect()["terminal"].get(key, 0) for key in UNKNOWN),
+        final = on.inspect()
+        require(not any(final["terminal"].get(key, 0) for key in UNKNOWN),
                 "The application has an unresolved external outcome; retain it without declaring the rehearsal passed.")
         provider.verify_provider_dependency(dependency, target.data["provider"])
     except Exception as error:
