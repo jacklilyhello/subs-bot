@@ -16,6 +16,64 @@ from production_control import _mutate_sql, rows
 import production_recovery as recovery
 
 
+def resume_parameters(raw):
+    if raw in (None, ""):
+        return None
+    value = recovery.native.parsed(raw, 4096) if isinstance(raw, (str, bytes)) else raw
+    recovery.require(isinstance(value, dict) and set(value) == {"version", "checkpointId", "manifestSha256", "journalSha256"}
+                     and type(value["version"]) is int and value["version"] == 1
+                     and recovery.matches(recovery.CHECKPOINT, value["checkpointId"])
+                     and all(recovery.matches(recovery.DIGEST, value[key]) for key in ("manifestSha256", "journalSha256")),
+                     "Recovery resumption requires the exact sealed G0 and independently read latest journal pins.")
+    return deepcopy(value)
+
+
+def resume_baseline(engine, pins):
+    """Reconcile an owned G0 before claiming it; never capture or create targets."""
+    pins = resume_parameters(pins)
+    api, source, journal = engine.api, engine.source, engine.journal
+    recovery.require(pins is not None and api.cohort == pins["checkpointId"]
+                     and api.contract["purpose"] == "baseline" and "sessionId" not in api.contract
+                     and journal.value is not None and not journal.poisoned and isinstance(journal.raw, bytes)
+                     and recovery.digest(journal.raw) == pins["journalSha256"],
+                     "The preserved G0 journal changed; no recovery resumption is authorized.")
+    value = journal.value
+    raw_value = recovery.native.parsed(journal.raw, recovery.native.JOURNAL_BYTES)
+    recovery.require(recovery.canonical(raw_value.get("value")) == recovery.canonical(value)
+                     and raw_value.get("generation") == journal.generation
+                     and value.get("phase") in {"captured", "restoring-objects", "objects-restored", "imported", "verified"}
+                     and isinstance(value.get("backup"), dict) and value["backup"].get("manifestSha256") == pins["manifestSha256"]
+                     and value.get("scopeSha256") == source.scope_sha256
+                     and set(value.get("resources", {})) == {"database", "objects"}
+                     and all(isinstance(record, dict) and set(record) == {"pin", "intent"}
+                             and isinstance(record.get("pin"), dict) and isinstance(record.get("intent"), dict)
+                             and record["intent"].get("state") == "confirmed" for record in value["resources"].values()),
+                     "Resumption requires the original sealed G0 and both confirmed immutable target pins.")
+    source.verify(capture=False)
+    engine.verify_resources(all_required=True)
+    engine.verify_preservation()
+    api.consumer_proof()
+    source.before_write()
+    # Claim only after all source, archive, ownership and no-consumer checks.
+    journal.claim()
+    return {"checkpointId": api.cohort, "manifestSha256": pins["manifestSha256"],
+            "previousJournalSha256": pins["journalSha256"], "resourcePinsSha256": recovery.digest(recovery.canonical(value["resources"])),
+            "captureRepeated": False, "resourcesCreated": False}
+
+
+def safe_failure(error, action, api):
+    recovery.require(action in {"resume-g0", "prepare", "capture", "verify-backup", "create-database", "create-objects",
+                               "restore-objects", "start-import", "verify-restore", "prepare-restore"})
+    result = {"action": action, "uncertain": bool(getattr(error, "uncertain", True))}
+    status = getattr(error, "http_status", None)
+    if type(status) is int and 100 <= status <= 599:
+        result["httpStatus"] = status
+    phase = getattr(api, "consumer_stage", None)
+    if phase in {"services-list", "scripts-list", "script-settings", "service-environments", "service-settings"}:
+        result["consumerPhase"] = phase
+    return result
+
+
 def timezone_fixture(controller):
     """Synthetic new write on the dedicated rehearsal D1; never a live-user test."""
     t, literal = controller.target.data, recovery.migrations._literal
@@ -52,7 +110,7 @@ def timezone_fixture(controller):
     return cleanup
 
 
-def run_recovery_drill(controller, archive_body, code_proof, data_token, *, mutate_current=timezone_fixture, evidence=None):
+def run_recovery_drill(controller, archive_body, code_proof, data_token, *, mutate_current=timezone_fixture, evidence=None, resume=None):
     """Return safe counters/pins; any failed checkpoint raises, never reports success.
 
     The caller runs production-restored-links.ts for both fixed replay directory
@@ -66,6 +124,7 @@ def run_recovery_drill(controller, archive_body, code_proof, data_token, *, muta
                      and env.get("GITHUB_REF") == "refs/heads/main",
                      "Recovery drill may only execute against the registered project rehearsal identity on a hosted runner.")
     recovery.require(isinstance(archive_body, bytes) and recovery.digest(archive_body) == code_proof.get("archiveSha256"))
+    resume = resume_parameters(resume)
     root = Path(env["RUNNER_TEMP"])
     owner = env["GITHUB_RUN_ID"] + "/" + env["GITHUB_RUN_ATTEMPT"]
     report = {"version": 1, "status": "running", "targetSha256": target.digest, "stages": [],
@@ -91,9 +150,14 @@ def run_recovery_drill(controller, archive_body, code_proof, data_token, *, muta
 
     def run(action, context, *, validation=None):
         api, source, journal = context
-        with tempfile.TemporaryDirectory(prefix="production-recovery-checkpoint-", dir=root) as temporary:
-            engine = recovery.RecoveryEngine(api, source, journal, Path(temporary), validation_directory=validation)
-            result = recovery.run_action(action, engine)
+        api.consumer_stage = None
+        try:
+            with tempfile.TemporaryDirectory(prefix="production-recovery-checkpoint-", dir=root) as temporary:
+                engine = recovery.RecoveryEngine(api, source, journal, Path(temporary), validation_directory=validation)
+                result = recovery.run_action(action, engine)
+        except Exception as error:
+            report["failure"] = safe_failure(error, action, api)
+            raise
         report["stages"].append(result)
         publish()
         return result
@@ -101,10 +165,27 @@ def run_recovery_drill(controller, archive_body, code_proof, data_token, *, muta
     cleanup = None
     contexts = []
     try:
-        g0_contract = contract("baseline")
+        if resume is not None:
+            checkpoint = resume["checkpointId"]
+            name = "subs-bot-cf-restore-control-" + checkpoint[:16]
+            g0_contract = {"version": 1, "checkpointId": checkpoint, "databaseName": name, "objectsName": name, "purpose": "baseline"}
+        else:
+            g0_contract = contract("baseline")
         g0 = setup(g0_contract)
         contexts.append(g0)
-        for action in ("prepare", "capture", "verify-backup", "create-database", "create-objects", "restore-objects", "start-import"):
+        if resume is not None:
+            try:
+                with tempfile.TemporaryDirectory(prefix="production-recovery-resume-", dir=root) as temporary:
+                    engine = recovery.RecoveryEngine(*g0[:2], g0[2], Path(temporary))
+                    report["resumedFrom"] = resume_baseline(engine, resume)
+            except Exception as error:
+                report["failure"] = safe_failure(error, "resume-g0", g0[0])
+                raise
+            publish()
+            initial = ("verify-backup", "restore-objects", "start-import")
+        else:
+            initial = ("prepare", "capture", "verify-backup", "create-database", "create-objects", "restore-objects", "start-import")
+        for action in initial:
             run(action, g0)
         baseline = run("verify-restore", g0, validation=root / "production-recovery-drill-g0-links")
         recovery.require(baseline["backup"]["objectCount"] >= 1,

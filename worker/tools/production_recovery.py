@@ -293,7 +293,9 @@ class RecoveryAPI:
                 require(info["total_count"] == len(envelope["result"]))
             return envelope["result"]
 
+        self.consumer_stage = "services-list"
         services = get(self.root + "/workers/services")
+        self.consumer_stage = "scripts-list"
         scripts = get(self.root + "/workers/scripts")
         require(isinstance(services, list) and isinstance(scripts, list)
                 and len(services) < MAX_CONSUMERS and len(scripts) < MAX_CONSUMERS,
@@ -320,6 +322,7 @@ class RecoveryAPI:
 
         script_ids = []
         for script in scripts:
+            self.consumer_stage = "script-settings"
             require(isinstance(script, dict) and matches(SCRIPT, script.get("id")))
             name = script["id"]
             require(name not in script_ids)
@@ -327,19 +330,32 @@ class RecoveryAPI:
             check("script/" + name, get(self.root + "/workers/scripts/" + name + "/settings"))
         seen = set()
         for service in services:
+            self.consumer_stage = "service-environments"
             require(isinstance(service, dict) and matches(SCRIPT, service.get("id")) and service["id"] not in seen)
             name = service["id"]
             seen.add(name)
-            environments = get(self.root + "/workers/services/" + name + "/environments")
-            require(isinstance(environments, list) and len(environments) < MAX_ENVIRONMENTS)
+            wrapper = get(self.root + "/workers/services/" + name + "/environments")
+            require(isinstance(wrapper, dict) and {"id", "environments", "default_environment"} <= set(wrapper)
+                    and set(wrapper) <= {"id", "environments", "default_environment", "created_on", "modified_on", "usage_model"}
+                    and wrapper["id"] == name and isinstance(wrapper["environments"], list)
+                    and 0 < len(wrapper["environments"]) < MAX_ENVIRONMENTS
+                    and isinstance(wrapper["default_environment"], dict)
+                    and matches(SCRIPT, wrapper["default_environment"].get("environment")),
+                    "Consumer discovery requires the exact complete service-environments wrapper.")
+            environments = wrapper["environments"]
             envs = set()
             for environment in environments:
                 require(isinstance(environment, dict) and matches(SCRIPT, environment.get("environment"))
                         and environment["environment"] not in envs)
                 env_name = environment["environment"]
                 envs.add(env_name)
+                self.consumer_stage = "service-settings"
                 check("service/" + name + "/" + env_name, get(self.root + "/workers/services/" + name
                     + "/environments/" + env_name + "/settings"))
+                self.consumer_stage = "service-environments"
+            require(wrapper["default_environment"]["environment"] in envs,
+                    "The default service environment is missing from the complete inventory.")
+        self.consumer_stage = "complete"
         return {"checked": len(checked), "inventorySha256": digest(canonical(sorted(checked))), "consumers": 0}
 
 

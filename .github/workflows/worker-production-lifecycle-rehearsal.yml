@@ -43,6 +43,10 @@ on:
         description: Exact independent digest paired with the reused G0 checkpoint
         type: string
         required: false
+      recovery_resume_json:
+        description: Optional exact G0 checkpoint, manifest and latest journal SHA pins to resume owned recovery targets
+        type: string
+        required: false
       webhook_checkpoint:
         description: Interrupted exercise run-id/attempt for explicit webhook recovery
         type: string
@@ -93,6 +97,7 @@ jobs:
       DRILL_HUMAN_WINDOW_SECONDS: ${{ inputs.human_window_seconds }}
       DRILL_BASELINE_CHECKPOINT_ID: ${{ inputs.baseline_checkpoint_id }}
       DRILL_BASELINE_MANIFEST_SHA256: ${{ inputs.baseline_manifest_sha256 }}
+      DRILL_RECOVERY_RESUME_JSON: ${{ inputs.recovery_resume_json }}
       DRILL_WEBHOOK_CHECKPOINT: ${{ inputs.webhook_checkpoint }}
       DRILL_WEBHOOK_SNAPSHOT_SHA256: ${{ inputs.webhook_snapshot_sha256 }}
       DRILL_PROVIDER_RUN_ID: ${{ inputs.provider_run_id }}

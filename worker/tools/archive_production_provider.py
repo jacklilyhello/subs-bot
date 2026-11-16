@@ -35,6 +35,9 @@ PARTIAL_LIMITS = {**FILE_LIMITS, "provider-rehearsal-journal.json": rehearsal.MA
 MAX_PARTIAL_FILES = 128
 MAX_PARTIAL_LOGICAL_BYTES = 2 * 1024 * 1024 * 1024
 MAX_PARTIAL_MANIFEST = 256 * 1024
+TERMINAL_FILES = {"provider-reconciled-target.json": 65536, "provider-forward-terminal.json": 4096,
+                  "provider-failed-terminal-state.json": 4096, "provider-failed-terminal-readback.json": 8192}
+TERMINAL_KEYS = {"terminal-manifest.json", *("terminal/" + name for name in TERMINAL_FILES)}
 
 
 def require(value):
@@ -66,7 +69,8 @@ class PrivateProofStore:
         verify_lifecycle(self.api("GET", self.base + "/lifecycle"), self.prefix)
 
     def key(self, relative):
-        require(relative in {"manifest.json", "partial-manifest.json"} or re.fullmatch(r"blobs/[0-9a-f]{64}", relative))
+        require(relative in {"manifest.json", "partial-manifest.json"} | TERMINAL_KEYS
+                or re.fullmatch(r"blobs/[0-9a-f]{64}", relative))
         return self.prefix + relative
 
     def read(self, relative):
@@ -481,8 +485,7 @@ def reconcile_partial(store, manifest_sha256, response_sha256, *, terminal=False
 
 def terminal_archive(store, directory=None, expected=None):
     """Seal a failed terminal as evidence, never as a complete provider rehearsal."""
-    names = {"provider-reconciled-target.json": 65536, "provider-forward-terminal.json": 4096,
-             "provider-failed-terminal-state.json": 4096, "provider-failed-terminal-readback.json": 8192}
+    names = TERMINAL_FILES
     store.verify()
     if directory is not None:
         from production_provider_forward import artifact_receipt
