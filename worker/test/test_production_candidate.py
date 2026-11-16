@@ -112,6 +112,69 @@ class ProductionCandidateTests(TestCase):
         with self.assertRaises(artifact.ArtifactError):
             candidate.make_manifest(PROOF, ISOLATION, self.evidence(), run, self.configuration(), source_kind="real-sqlite", source_sha="f" * 64)
 
+    def test_first_release_marks_absent_legacy_production_as_na_without_granting_authorization(self):
+        run = candidate.run_metadata(RUN, "300", "1", REVISION, 400, candidate.DEPLOY_WORKFLOW)
+        manifest = candidate.make_manifest(PROOF, ISOLATION, self.evidence(), run, self.configuration(),
+            source_kind="not-supplied", source_sha="", release_intent="first-release")
+        self.assertEqual(manifest["version"], 1)
+        self.assertEqual(manifest["releaseIntent"], "first-release")
+        self.assertFalse(manifest["productionReady"])
+        self.assertFalse(manifest["productionMutationPerformed"])
+        self.assertEqual(manifest["productionAuthorization"], "not-granted")
+        self.assertEqual(manifest["validation"]["realSQLiteRehearsal"]["status"], "N/A")
+        self.assertEqual(manifest["validation"]["legacyConsumerHandoff"]["status"], "N/A")
+        self.assertEqual(manifest["firstRelease"]["history"], "no-prior-production")
+        for key in ("testDataImportAuthorized", "testSigningKeyReuseAuthorized", "formalConfigurationApproved", "productionActivationAuthorized"):
+            self.assertFalse(manifest["firstRelease"][key])
+        for key in ("finalConsistentBackup", "ownershipAndCountsReconciled", "legacyProductionMigration"):
+            self.assertEqual(manifest["dataSource"][key], "N/A")
+        self.assertFalse(manifest["dataSource"]["realDataImportAuthorized"])
+        self.assertFalse(manifest["dataSource"]["emptyDatabaseApproved"])
+        self.assertFalse(manifest["dataSource"]["testDataCopyAuthorized"])
+        self.assertFalse(manifest["dataSource"]["testSigningKeyReuseAuthorized"])
+        required = "\n".join(manifest["requiredBeforeProduction"])
+        self.assertNotIn("Authorized final SQLite backup", required)
+        self.assertNotIn("Stop and drain the old consumer", required)
+        self.assertIn("fresh-database whitelist initialization", required)
+        self.assertIn("preserve current-state G1", required)
+        self.assertIn("Keep API status disabled", required)
+
+    def test_first_release_packaging_keeps_actual_lifecycle_and_production_checks_independent(self):
+        run = candidate.run_metadata(RUN, "300", "1", REVISION, 400, candidate.DEPLOY_WORKFLOW)
+        manifest = candidate.make_manifest(PROOF, ISOLATION, self.evidence(), run, self.configuration(),
+            source_kind="synthetic-fixture", source_sha="f" * 64, release_intent="first-release")
+        for key in ("liveVersionBindingsMigrations", "humanTelegramAcceptance", "syntheticIsolationAcceptance",
+                    "productionConfiguration", "freshProductionInitialization", "productionLifecycleLiveValidation",
+                    "productionActivation", "aiValidKeySuccess"):
+            self.assertEqual(manifest["validation"][key]["status"], "Not run")
+        self.assertEqual(manifest["recovery"]["consistentD1AndR2RecoveryRehearsal"], "Not run")
+        self.assertFalse(manifest["recovery"]["sqliteFallbackAllowed"])
+        self.assertFalse(manifest["recovery"]["automaticIncrementalReplayAvailable"])
+        with TemporaryDirectory() as temp:
+            output = Path(temp) / "first-release"
+            candidate.write_package(output, manifest)
+            review = (output / "review.md").read_text()
+            self.assertIn("N/A is not Passed", review)
+            self.assertIn("packaging grants no production authorization", review)
+            self.assertNotIn("Not run: live Cloudflare readback, real SQLite rehearsal", review)
+
+    def test_omitted_release_intent_preserves_legacy_package_shape_and_requirements(self):
+        run = candidate.run_metadata(RUN, "300", "1", REVISION, 400, candidate.DEPLOY_WORKFLOW)
+        args = (PROOF, ISOLATION, self.evidence(), run, self.configuration())
+        default = candidate.make_manifest(*args, source_kind="not-supplied", source_sha="")
+        explicit = candidate.make_manifest(*args, source_kind="not-supplied", source_sha="", release_intent="legacy-migration")
+        default.pop("createdAt")
+        explicit.pop("createdAt")
+        self.assertEqual(default, explicit)
+        self.assertNotIn("releaseIntent", default)
+        self.assertNotIn("firstRelease", default)
+        self.assertEqual(default["validation"]["realSQLiteRehearsal"]["status"], "Not run")
+        self.assertIn("Authorized final SQLite backup including WAL; ownership/count/object/link reconciliation in an isolated target",
+                      default["requiredBeforeProduction"])
+        for intent in ("", "approved-production", None):
+            with self.subTest(intent=intent), self.assertRaises(artifact.ArtifactError):
+                candidate.make_manifest(*args, source_kind="not-supplied", source_sha="", release_intent=intent)
+
     def test_shortlink_metadata_is_exact_and_disabled_configuration_retains_binding_expectations(self):
         for enabled in (False, True):
             result = {**RESULT, **candidate.SERVICE_METADATA, "externalShortlinksEnabled": enabled}

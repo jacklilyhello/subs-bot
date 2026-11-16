@@ -2,7 +2,7 @@
 
 用户于 **2026-11-16** 确认本项目从未投入生产，没有旧生产实例、SQLite/WAL、正式用户数据、旧生产链接或旧消费者；正式 Bot 尚未创建。因此旧数据迁移、最终旧库快照和旧消费者/处理水位交接均为 **N/A（不适用：用户确认无历史生产）**，不再追加旧服务开发。该分类不同于 Passed 或 Not run；历史验收、失败和候选中的 `Not run` 原样保留，由独立说明记录本次首次上线的 N/A 项。
 
-本文件是待批准方案，不表示生产已上线或已经具备可直接执行的生产工具。候选包、隔离恢复和真人测试通过都不授权生产操作。
+本文件对应已实现的受保护生产配置、创建、初始化、部署、暂停、排空、备份、恢复和激活控制。它是取得正式配置和逐项批准后的执行说明，不表示生产已经上线。工具的准确提交、云端检查和实际隔离演练结果记录在 PR 证据中；候选包、隔离恢复和真人测试均不授予生产操作权限。
 
 ## 上线目标与前置条件
 
@@ -19,11 +19,13 @@
 
 正式 Bot 和初始正式账号尚未确定。测试管理员 `8813701954`、成员 `8653767757`、群 `-5114255828` 不自动成为正式配置。正式库不复制测试订阅、授权覆盖、回执、短码、分享、临时节点、恢复演练数据或测试签名密钥。现有测试环境和原记录保持原样。
 
-当前 `worker-isolation-*` 工具固定保护隔离资源，不能改名后直接用于生产。正式身份或适用的生产控制工具未具备时，**STOP，保持正式接收关闭**。所有安装、构建、自动化测试、恢复和运行验证仍只在 GitHub 托管 runner 或 Cloudflare 执行。
+生产操作使用 [生命周期控制](cloudflare-production-controls.md)、[ProviderFetch 控制](cloudflare-production-provider.md) 和 [备份／故障恢复控制](cloudflare-production-recovery.md)。`worker-isolation-*` 继续保护原隔离资源，不通过替换其资源名称来操作生产。正式身份、明确配置、必要凭据或本次操作批准缺失时，工具拒绝执行，保持接收关闭；不会回退到测试身份。所有安装、构建、自动化测试、恢复和运行验证仍只在 GitHub 托管 runner 或 Cloudflare 执行。
 
 ## 审批所需证据与局部限制
 
 批准清单必须关联准确 main SHA、Worker/Python CI run/attempt、原 ZIP/模块摘要、完整迁移、隔离部署和独立版本/绑定/配置读回；同时提供私有持久候选归档、来源 CI/部署证明及 D1/R2 一致恢复 checkpoint。工具控制版本与冻结恢复源版本分别记录。恢复演练结果放在 PR 独立证据中，不预填本文件为 Passed。
+
+新候选通过 `worker-production-candidate.yml` 的显式 `release_intent=first-release` 生成。该模式将不存在的旧生产 SQLite/WAL 迁移和旧消费者交接标为 N/A，不把这些项目算作 Passed，也不继续要求提供不存在的旧库。打包器本身不执行实时核验：正式配置、生产新库初始化、新工具的实际隔离路径、独立读回及正式激活仍保留独立 Not run 条目，实际结果按准确云端 run/attempt 在 PR 记录。manifest 继续为 version 1、`productionReady=false`、`productionAuthorization=not-granted`。旧候选和私有 R2 原始归档不改写。
 
 | 覆盖项 | 首次上线的处理 |
 | --- | --- |
@@ -41,18 +43,39 @@
 
 1. **创建并确认正式 Bot。** 由维护者创建或另行明确授权代为创建；安全注入受保护生产配置，核对 `getMe` 和唯一消费者安排。不得复用测试 Bot、启动轮询探测或向未经批准的正式账号发消息。固定正式管理员、默认访问策略及群范围。
 2. **只读核对目标。** 固定账户/Zone、资源名称和域名状态。发现同名资源、未知 Webhook、意外消费者或其他项目资源时停止核对，不覆盖采用。
-3. **创建独立生产资源。** 仅创建批准清单中的 Worker、D1、私有 R2 及必要依赖，记录 ID/创建时间；R2 无公开访问，备份前缀不被生命周期规则提前删除。Telegram、Cron 和其他业务写入保持关闭。
-4. **初始化新 schema 和正式权限。** 应用候选的完整准确迁移，核对 ledger、schema、外键及序列。只插入批准的 Bot/权限/设置初始化记录；业务表符合新库白名单。发现测试身份、夹具或非白名单记录即停止。没有 SQLite 导入或从隔离恢复目标复制数据的步骤。
-5. **部署准确候选，保持暂停。** 核对实际 100% 版本、模块、健康提交、D1/R2 身份、功能开关和依赖版本；仅启用批准能力，保持 UTC 和管理员时区权限。`/ai` 首发关闭，未批准的正式群等范围关闭。
-6. **封存上线前基线。** 保存初始化 D1、R2 引用闭包、配置及版本/绑定证明到私有持久 checkpoint；固定适用的暂停控制和兼容代码恢复版本。已有隔离恢复证据不等于允许覆盖生产 D1。
-7. **绑定正式域名。** 只将 `subs-bot.lilyya.top` 绑定到唯一目标，核对 HTTPS、健康、缓存/引用策略及无意外公开路径；Telegram 接收仍关闭。
-8. **设置唯一正式 Webhook。** 再核对 Bot 身份和 `getWebhookInfo`，设置准确 URL、Secret、接收集合及连接参数，显式 `drop_pending_updates: false`，并独立读回。没有旧消费者需要停止；若出现意外积压，先核对其来源、类别、授权和有效期，不用清队列、临时高 offset 或 `cutoverAt=now` 隐去更新。结果不明只读核对，不启动第二消费者试探。
-9. **开启正式接收与必要后台处理。** 固定新正式授权世代及接收边界，确保适用的待处理更新不会被初始化时间误判为已处理；Webhook、Cron、队列和可写 HTTP 使用同一生产 D1/R2 及暂停边界。持久受理后才确认，重复 `(bot_id, update_id)` 不重复执行业务，封存首次 receipt/任务水位。
+3. **创建独立生产资源。** 在生命周期工作流先执行 `availability`，以草稿身份及准确前态批准 `provision`。创建前的每资源意图和实际 ID／时间写入已登记的私有 journal anchor；只创建批准清单中的 Worker、D1 和私有 R2。新资源不带业务模块或消费者。若结果不明，用 `provision-inspect` 独立读回，再以准确种类、身份摘要和意图时间窗执行 `provision-reconcile`；不能重复创建或采用未知同名资源。
+4. **初始化新 schema 和正式权限。** 固定所有实际资源 ID／时间后，执行 `preflight`，核对账户／Zone、Bot／群权限、私有性及准确初始化前态，再批准 `initialize`。应用候选的完整准确迁移，只写批准的正式权限白名单，业务表为空，持久控制为 `closed/frozen`。默认没有时区设置行即 UTC，管理员仍可在私聊持久修改。发现测试身份、夹具或非白名单记录即停止；没有从隔离数据恢复目标复制业务数据的步骤。
+5. **部署准确候选，保持暂停。** 若启用 URL 导入／刷新，先按 ProviderFetch 说明完成正式专用依赖的原 OCI 发布、版本、Container／Workflow、真实 smoke 与独立 verify，并固定应用 caller；不能自动使用 dev 服务。生命周期 `deploy` 仅使用已审查的准确 CI 字节，读回 100% 版本、模块、完整绑定／配置和迁移，保持 `closed/frozen`。仅启用批准功能，`/ai` 首发关闭，未批准群范围关闭。后续配置／开关更新用 `plan-deploy` 固定当前线上产物和新配置前态，不沿用初次批准。
+6. **封存上线前基线。** 独立 `inspect` 核对实际配置、结构和分类状态，以恢复工作流 `prepare → capture → verify-backup` 保存初始化 G0。资料包含 D1、R2 引用闭包、完整配置及摘要、原始准确 CI ZIP 和来源证明；不包含原始 Secret。已有隔离恢复证据不等于允许覆盖生产 D1。
+7. **绑定正式域名。** 生命周期 `domain` 仅在准确 Zone、DNS／Custom Domain 无冲突时将 `subs-bot.lilyya.top` 绑定到唯一目标，读回 HTTPS、健康提交及响应安全策略。生产 workers.dev／预览保持关闭，Telegram 接收仍关闭。
+8. **设置唯一正式 Webhook。** 用独立 `getWebhookInfo` 摘要批准 `webhook`；工具重新核对 `getMe`，设置准确 URL、Secret、allowed_updates 和 max_connections，显式 `drop_pending_updates: false`，并独立读回。没有旧消费者需要停止。若出现意外积压，先分类其来源、授权和有效期，不用清队列、高 offset 或 `cutoverAt=now` 隐去更新；首次批准策略与主体生效下界为 1，业务时效拒绝／忽略也须持久记录。结果不明只读核对，不启动第二消费者试探。
+9. **最终激活。** 单独批准 `activate`：必须同时满足准确资源、目标身份／完整配置摘要、版本、Webhook、域名、分类排空及未知结果检查，才能打开 admission。Webhook 是当前唯一可写公开 HTTP，其他公开路径仅 GET/HEAD，目前没有 queue handler；Cron 使用同一持久 invocation 与 D1 fence。持久受理／disposition 后才确认，重复 `(bot_id, update_id)` 核对载荷摘要并复用完成结果，处理中或外部结果不确定的更新不能重执行业务。封存首次 receipt／任务水位。
 10. **限定验收并结束窗口。** 使用生产授权中指定的账号/群验证必要角色权限、导入/读取/导出、后台任务及撤销；新增夹具可识别，结束恢复修改的设置并退役本次夹具。固定准确版本、观察时间、错误/任务/不确定发送计数和新 checkpoint。原测试 Bot 的真人授权不能自动扩大到正式 Bot。
+
+### 工作流与实际操作参数
+
+下列命令仅说明获准后的托管 dispatch，不在本机执行应用工具，也不是本轮生产操作授权。先在受保护 Environment 填写契约／安全 Secret 和精确 `SUBS_BOT_APPROVAL_JSON`；每次写入使用独立前态，不能把下列占位符直接提交。
+
+```sh
+gh workflow run worker-production-control.yml --ref main \
+  -f target_environment=production -f action=preflight \
+  -f source_run_id=EXACT_SUCCESSFUL_MAIN_WORKER_CI
+```
+
+同一工作流后续调用以 `-f action=initialize`、`deploy`、`domain`、`webhook`、`activate` 逐步执行，并为 mutation 提供 `-f state_sha256=EXACT_INDEPENDENT_PREDECESSOR`；Webhook 另传 `-f webhook_sha256=EXACT_GETWEBHOOKINFO_DIGEST`。批准绑定固定 `targetSha256`、完整 `configurationSha256`、应用 `revision`、当前工具 `controlRevision`、action 和前态。全部正式字段及 Secret 名见 [集中配置与批准清单](cloudflare-production-controls.md#集中的正式配置与批准清单)。
+
+```sh
+gh workflow run worker-production-recovery.yml --ref main \
+  -f environment=production -f action=prepare \
+  -f source_run_id=EXACT_FROZEN_SOURCE_MAIN_CI -f source_run_attempt=EXACT_ATTEMPT \
+  -f state_sha256=EXACT_INDEPENDENT_PREDECESSOR
+```
+
+恢复工作流另外需要明确 `SUBS_BOT_RECOVERY_JSON`。常规备份接续 `capture`、`verify-backup`；独立恢复按说明选择 `create-database`、`create-objects`、`restore-objects`、`start-import`、`verify-restore`。现场已有新写入时必须先封存 G1，再用独立 session 的 `prepare-restore`，不复用空库初始化操作覆盖现场。
 
 ## 接收新写入后的失败恢复
 
-先关闭新增 admission、管理/领取及其他可写入口并保留现场，固定已受理水位。保留受理工作完成所需的依赖，分类核对 outbox、文档/暂存、提供方单条/文档/批量及未来回复、私密创建、群卡、内联、快照租约、搜索和探测。有效租约或未来生产者仍存在时不宣称排空；已终止失败和外部效果不明单独保留，不删记录或自动重发以取得零计数。暂停期间保留 Telegram 待处理更新，不运行两套消费者写不同数据库。
+使用生命周期 `pause → inspect → drain` 关闭新增 admission 并固定已受理水位；`pause` 不会意外解冻已经冻结的后台。保留已受理工作完成所需的依赖，分类核对 outbox、文档／暂存、提供方单条／文档／批量及未来回复、私密创建、群卡、内联、快照租约、搜索和探测。有效租约或未来生产者仍存在时不宣称排空。异常中断调用只能通过单独批准的 `classify-interruption`，在明确结束或超过执行上限与隔离宽限后保留为 uncertain；不把外部效果判成成功，也不重发更新。已终止失败和外部不确定结果单列保留，不删记录来取得零计数。随后仅在没有可继续执行工作时批准 `freeze`，再封存现场。未知结果仍会阻止自动重新激活；暂停期间 Telegram 待处理更新继续保留。
 
 仅恢复代码时保留当前数据，使用已验证兼容当前完整 schema、授权、回执/租约、能力/撤销语义及依赖配置的准确版本，核对模块和绑定后才恢复接收。历史版本曾成功运行不证明未来兼容；平台拒绝旧 Secret 版本时，不强制绕过检查。
 
@@ -72,4 +95,4 @@
 4. `subs-bot.lilyya.top` 绑定、准确正式 Webhook（保留待处理更新）与通用生产入口激活。
 5. 正式验收范围、观察期和备份保留期；`/ai` 首发关闭，真实有效 Key 成功验收后再单独批准其启用。
 
-正式 Bot、生产身份或控制工具尚未具备时，只能批准明确的前置准备步骤，不能把方案审批当成可以直接激活生产。授权不包含删除隔离环境、变更短链服务或自行接受数据损失。
+最终等待项是明确的正式配置和逐项生产批准。缺失正式 Bot、固定资源身份、权限／群范围、独立安全凭据或准确批准时，工具保持拒绝生产操作；不能把方案审批当成直接激活。授权不包含删除隔离环境、变更短链服务或自行接受数据损失。
