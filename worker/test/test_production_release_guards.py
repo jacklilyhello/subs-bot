@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -13,6 +15,7 @@ import production_control as control
 import production_provision as provision
 import production_target as contract
 import test_production_control as fixtures
+import test_production_provider as provider_fixtures
 
 REVISION, VERSION = fixtures.REVISION, fixtures.VERSION
 approval, fixture = fixtures.approval, fixtures.fixture
@@ -141,3 +144,97 @@ class ProvisionCredentialTests(unittest.TestCase):
             with self.assertRaises(contract.ContractError):
                 provision.main()
             client.assert_not_called()
+
+
+class ActiveDependencyCliTests(unittest.TestCase):
+    def exercise_provider_removal(self, *, private_source, provide_read_token=True):
+        desired, secrets = fixture()
+        current = deepcopy(desired.data)
+        current["provider"] = provider_fixtures.config(active=True)
+        current["provider"]["caller"] = {"id": desired.data["workerId"], "name": desired.data["workerName"]}
+        current["features"]["providerUrlImport"] = True
+        previous = contract.validate_target(current)
+        self.assertIsNone(desired.data["provider"])
+        self.assertEqual(previous.digest, desired.digest)
+        token = "synthetic-dependency-read-token"
+        dependency_api = Mock(name="previous-provider-read-client")
+        constructors, prepared = [], []
+        desired_proof = {"revision": REVISION, "runId": "11", "runAttempt": "1", "artifactId": "21", "archiveSha256": "e" * 64}
+        active_proof = {**desired_proof, "revision": "a" * 40, "runId": "10", "artifactId": "20"}
+        desired_manifest = {"version": 2, "revision": REVISION, "bundleSha256": "d" * 64}
+        active_manifest = {**desired_manifest, "revision": active_proof["revision"]}
+
+        def make_api(target, credential, **_kwargs):
+            if credential == token:
+                self.assertEqual(target.configuration_digest, previous.configuration_digest)
+                return dependency_api
+            return Mock(name="scoped-project-api")
+
+        def make_controller(target, _data, _worker, _bundle, _manifest, **kwargs):
+            instance = SimpleNamespace(target=target, dependency_api=kwargs.get("dependency_api"))
+            constructors.append(instance)
+            if target.configuration_digest == desired.configuration_digest:
+                def plan(source_controller):
+                    self.assertEqual(source_controller.target.configuration_digest, previous.configuration_digest)
+                    self.assertIs(source_controller.dependency_api, dependency_api)
+                    return {"stateSha256": "f" * 64, "targetSha256": target.digest}
+                instance.plan_deploy = Mock(side_effect=plan)
+            return instance
+
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            desired_bundle = root / control.artifact.VERIFIED_DIRECTORY
+            desired_bundle.mkdir()
+            (desired_bundle / "isolation.json").write_bytes(contract.canonical(desired_manifest))
+
+            def prepare(action, *, run_id=None, directory=None):
+                prepared.append((action, run_id))
+                if directory is None:
+                    return desired_proof
+                bundle = Path(directory) / control.artifact.VERIFIED_DIRECTORY
+                bundle.mkdir()
+                (bundle / "isolation.json").write_bytes(contract.canonical(active_manifest))
+                return active_proof
+
+            env = {"CONTROL_ACTION": "plan-deploy", "SUBS_BOT_TARGET_JSON": json.dumps(desired.data),
+                "SUBS_BOT_CONTROL_SECRETS": json.dumps(secrets), "SUBS_BOT_ACTIVE_TARGET_JSON": json.dumps(previous.data),
+                "SUBS_BOT_ACTIVE_CONTROL_SECRETS": json.dumps(secrets), "GITHUB_SHA": REVISION,
+                "RUNNER_TEMP": temporary, "SUBS_BOT_CF_DATA_TOKEN": "synthetic-data-token",
+                "SUBS_BOT_CF_WORKER_TOKEN": "synthetic-worker-token"}
+            if provide_read_token:
+                env["SUBS_BOT_CF_DEPENDENCY_READ_TOKEN"] = token
+            if private_source:
+                env.update(CONTROL_ACTIVE_CHECKPOINT_ID="a" * 32, CONTROL_ACTIVE_MANIFEST_SHA256="b" * 64)
+            else:
+                env["CONTROL_ACTIVE_CI_RUN_ID"] = "10"
+            archived = {"proof": active_proof, "bundle": desired_bundle, "manifest": active_manifest, "sourceTarget": previous}
+            with patch.dict(os.environ, env, clear=True), patch.object(control, "hosted_environment"), \
+                 patch.object(control.artifact, "require_current_main"), patch.object(control, "API", side_effect=make_api), \
+                 patch.object(control, "Controller", side_effect=make_controller), \
+                 patch.object(control.prepare_control_artifact, "prepare", side_effect=prepare), \
+                 patch("production_release_evidence.load_release", return_value=archived) as load_private, \
+                 patch("builtins.print"):
+                if provide_read_token:
+                    control.main()
+                    self.assertEqual(len(constructors), 2)
+                    self.assertIsNone(constructors[0].dependency_api)
+                    self.assertIs(constructors[1].dependency_api, dependency_api)
+                    constructors[0].plan_deploy.assert_called_once_with(constructors[1])
+                else:
+                    with self.assertRaisesRegex(contract.ContractError, "active ProviderFetch requires its own explicit read credential"):
+                        control.main()
+                    self.assertEqual(len(constructors), 1)
+                    constructors[0].plan_deploy.assert_not_called()
+                self.assertEqual(load_private.call_count, 1 if private_source else 0)
+                self.assertEqual(prepared, [("plan-deploy", None)] if private_source else [("plan-deploy", None), ("inspect", "10")])
+
+    def test_ci_active_source_keeps_dependency_reads_when_new_target_removes_provider(self):
+        self.exercise_provider_removal(private_source=False)
+
+    def test_private_active_source_keeps_dependency_reads_when_new_target_removes_provider(self):
+        self.exercise_provider_removal(private_source=True)
+
+    def test_missing_old_dependency_credential_refuses_both_source_backends(self):
+        for private_source in (False, True):
+            with self.subTest(private_source=private_source):
+                self.exercise_provider_removal(private_source=private_source, provide_read_token=False)

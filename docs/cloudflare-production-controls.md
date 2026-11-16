@@ -28,6 +28,89 @@
 
 `SUBS_BOT_CONTROL_SECRETS` 只通过受保护 environment 注入，含 `botToken`, `webhookSecret`, `aggregateKey`, `privateShareKey`, `shortlinkToken`。两个签名密钥必须分别是独立 32 字节密钥的规范 43 字符 Base64URL；Webhook Secret 使用 32–256 字符安全集合；短链启用时必须提供原有完整业务 Token。原始 Secret 不进入目标 JSON、CI 日志、候选或数据备份。
 
+### 可填写的正式草稿模板
+
+以下占位符会被严格拒绝，不能直接 dispatch。所有角色和开关必须由正式批准清单选择；这个关闭可选功能的草稿不表示已经选定首发功能。六个资源 pin 仅在创建草稿中为 null；创建后只从私有 journal 和独立读回填写，不能采用未知同名资源。未启用的外部短链 Token 和摘要都保持 null。
+
+`SUBS_BOT_TARGET_JSON`：
+
+```json
+{
+  "schemaVersion": 1,
+  "environment": "production",
+  "accountId": "9431815bdb8beb2272f6668e06b7d3be",
+  "zoneId": "07c83547944da720e03b31a406fdcd55",
+  "namespace": "lilyya",
+  "workerName": "subs-bot-cf-prod-01",
+  "workerId": null,
+  "workerCreatedOn": null,
+  "d1Name": "subs-bot-cf-prod-01",
+  "d1Id": null,
+  "d1CreatedAt": null,
+  "bucketName": "subs-bot-cf-prod-01",
+  "bucketCreatedAt": null,
+  "backupBucketName": "subs-bot-cf-prod-backup-01",
+  "backupBucketCreatedAt": null,
+  "hostname": "subs-bot.lilyya.top",
+  "botId": "REPLACE_WITH_FORMAL_BOT_ID",
+  "botUsername": "REPLACE_WITH_FORMAL_BOT_USERNAME",
+  "generation": 1,
+  "admins": ["REPLACE_WITH_FORMAL_ADMIN_ID"],
+  "members": [],
+  "groups": [],
+  "defaultAccess": "deny",
+  "features": {
+    "inlineSearch": false,
+    "providerUrlImport": false,
+    "providerUrlDocuments": false,
+    "mixedDocuments": false,
+    "providerRefresh": false,
+    "providerBatch": false,
+    "subscriptionShorts": false,
+    "externalShortlinks": false,
+    "groupShareCards": false,
+    "githubSearch": false,
+    "apiStatus": false
+  },
+  "provider": null,
+  "webhook": {"allowedUpdates": ["message", "callback_query"], "maxConnections": 2},
+  "keyDigests": {
+    "aggregate": "REPLACE_WITH_INDEPENDENT_AGGREGATE_KEY_SHA256",
+    "privateShare": "REPLACE_WITH_INDEPENDENT_PRIVATE_SHARE_KEY_SHA256",
+    "webhook": "REPLACE_WITH_WEBHOOK_SECRET_SHA256",
+    "shortlink": null
+  }
+}
+```
+
+`SUBS_BOT_CONTROL_SECRETS` 仅在安全注入渠道填写以下形状。生成新的独立生产签名密钥，再将其 SHA-256 填入上面的非 Secret 契约；不复制任何测试密钥。
+
+```json
+{
+  "botToken": "REPLACE_WITH_FORMAL_BOT_TOKEN",
+  "webhookSecret": "REPLACE_WITH_INDEPENDENT_WEBHOOK_SECRET",
+  "aggregateKey": "REPLACE_WITH_INDEPENDENT_32_BYTE_BASE64URL_KEY",
+  "privateShareKey": "REPLACE_WITH_ANOTHER_INDEPENDENT_32_BYTE_BASE64URL_KEY",
+  "shortlinkToken": null
+}
+```
+
+`SUBS_BOT_APPROVAL_JSON` 的初始化示例；后续每个 action 都重新绑定完整配置与独立前态。此模板不提供批准：
+
+```json
+{
+  "schemaVersion": 1,
+  "environment": "production",
+  "targetSha256": "REPLACE_WITH_EXACT_TARGET_SHA256",
+  "configurationSha256": "REPLACE_WITH_EXACT_CONFIGURATION_SHA256",
+  "revision": "REPLACE_WITH_REVIEWED_APPLICATION_MAIN_SHA",
+  "controlRevision": "REPLACE_WITH_CURRENT_CONTROL_MAIN_SHA",
+  "action": "initialize",
+  "stateSha256": "REPLACE_WITH_INDEPENDENT_RESOURCE_PREDECESSOR_SHA256",
+  "authorization": "approve initialize for subs-bot-cf-prod-01"
+}
+```
+
 ## 凭据与批准
 
 | Secret | 所需权限／用途 |

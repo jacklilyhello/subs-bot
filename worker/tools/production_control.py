@@ -748,9 +748,14 @@ def main():
             source_manifest = parsed((source_bundle / "isolation.json").read_bytes())
             previous_target = validate_target(os.environ.get("SUBS_BOT_ACTIVE_TARGET_JSON") or canonical(target.data))
         previous_secrets = parsed(os.environ.get("SUBS_BOT_ACTIVE_CONTROL_SECRETS") or canonical(secrets))
+        previous_dependency_api = None
+        if previous_target.data["provider"] is not None:
+            require(os.environ.get("SUBS_BOT_CF_DEPENDENCY_READ_TOKEN"),
+                    "The reviewed active ProviderFetch requires its own explicit read credential before unbinding.")
+            previous_dependency_api = API(previous_target, os.environ["SUBS_BOT_CF_DEPENDENCY_READ_TOKEN"])
         source_controller = Controller(previous_target, data, worker, source_bundle, source_manifest,
             guard=lambda: artifact.require_current_main(revision), secrets=previous_secrets, control_revision=revision,
-            dependency_api=controller.dependency_api)
+            dependency_api=previous_dependency_api)
     envelope = os.environ.get("SUBS_BOT_APPROVAL_JSON", "")
     predecessor = os.environ.get("CONTROL_STATE_SHA256", "")
     if action == "preflight":
