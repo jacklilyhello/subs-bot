@@ -12,6 +12,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import archive_production_provider as archive
 import production_provider as control
+import production_provider_rehearsal as rehearsal
 from test_production_provider import config
 
 
@@ -110,6 +111,63 @@ class ArchiveTests(unittest.TestCase):
         selected.symlink_to(self.root / "source/provider-image.tar")
         with self.assertRaises(ValueError):
             archive.archive(self.store, self.root)
+
+
+class PartialArchiveTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.store = MemoryStore()
+        self.names = ["subs-bot-provider-attempt-source-100-1", "subs-bot-provider-attempt-result-stage-100-1"]
+        self.provenance = {"revision": "b" * 40, "runId": "100", "runAttempt": "1", "workflowPath": control.REHEARSAL_WORKFLOW_PATH,
+                           "artifacts": {name: {"artifactId": str(index + 200), "archiveSha256": "5" * 64} for index, name in enumerate(self.names)}}
+        target = config()
+        target["versionId"] = None
+        for index, name in enumerate(self.names):
+            directory = self.root / name
+            directory.mkdir()
+            journal = {"version": 2, "controllerRevision": "b" * 40, "runId": "100", "runAttempt": "1",
+                       "targetSha256": control.digest(target), "events": [{"phase": "intent"}] * (index + 1),
+                       "currentIntent": {"operation": "stage", "status": "unconfirmed", "intentSha256": "6" * 64}}
+            envelope = {"version": 2, "target": target, "journal": journal}
+            (directory / rehearsal.CHECKPOINT).write_bytes(control.canonical(envelope))
+            (directory / "provider-rehearsal-target.json").write_bytes(control.canonical(target))
+
+    def test_partial_originals_are_complete_storage_but_never_business_acceptance(self):
+        result = archive.archive_partial(self.store, self.root, self.provenance)
+        self.assertEqual(result["status"], "partial-preserved")
+        self.assertEqual(result["completion"], "not-complete")
+        self.assertEqual(result["latestCheckpoint"]["intent"]["status"], "unconfirmed")
+        self.assertNotIn("manifest.json", self.store.objects)
+        self.assertLess(result["uniqueBytes"], result["logicalBytes"])
+        self.assertEqual(archive.verify_partial(self.store, result["manifestSha256"]), result)
+
+    def test_missing_or_corrupt_partial_blob_is_not_verified(self):
+        result = archive.archive_partial(self.store, self.root, self.provenance)
+        blob = next(key for key in self.store.objects if key.startswith("blobs/"))
+        del self.store.objects[blob]
+        with self.assertRaises(control.ProviderError):
+            archive.verify_partial(self.store, result["manifestSha256"])
+
+    def test_unknown_artifact_and_capacity_fail_before_writing(self):
+        wrong = deepcopy(self.provenance)
+        wrong["artifacts"]["subs-bot-provider-attempt-intent-create-100-1"] = {"artifactId": "300", "archiveSha256": "5" * 64}
+        with self.assertRaises(control.ProviderError):
+            archive.archive_partial(self.store, self.root, wrong)
+        self.assertEqual(self.store.writes, 0)
+        with patch.object(archive, "MAX_PARTIAL_LOGICAL_BYTES", 1), self.assertRaises(control.ProviderError):
+            archive.archive_partial(self.store, self.root, self.provenance)
+        self.assertEqual(self.store.writes, 0)
+
+    def test_partial_manifest_cannot_be_relabelled_complete(self):
+        result = archive.archive_partial(self.store, self.root, self.provenance)
+        manifest = json.loads(self.store.objects["partial-manifest.json"])
+        manifest["completion"] = "complete"
+        raw = control.canonical(manifest)
+        self.store.objects["partial-manifest.json"] = raw
+        with self.assertRaises(control.ProviderError):
+            archive.verify_partial(self.store, sha256(raw).hexdigest())
 
 
 if __name__ == "__main__":

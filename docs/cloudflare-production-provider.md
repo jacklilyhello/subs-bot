@@ -70,9 +70,19 @@
 
 ## 新工具的隔离演练与持久证明
 
-`worker-production-provider-rehearsal.yml` 的 `rehearse` 路径通过同一个 `production_provider` 控制实现，使用专用 `subs-bot-provider-fetch-control-drill-01`，不修改原 dev 服务。必须提供准确 Provider CI run、明确批准的项目 `/health` URL 与独立读回 revision，并输入 `rehearse production ProviderFetch controls for subs-bot-provider-fetch-control-drill-01`。自动流程覆盖 create、原 OCI 发布、stage、activate、Container/Workflow 初始化、真实 Cloudflare smoke 和独立 verify。每步将准确完整目标与步骤摘要保存到 runner checkpoint；中断后不自动采用同名资源或重做不明 mutation，可从保留 checkpoint 独立核对并将批准的 target 存入专用 `SUBS_BOT_PROVIDER_REHEARSAL_TARGET_JSON` 后继续。
+`worker-production-provider-rehearsal.yml` 的 `rehearse` 路径通过同一个 `production_provider` 控制实现，使用专用 `subs-bot-provider-fetch-control-drill-01`，不修改原 dev 服务。必须提供准确 Provider CI run、明确批准的项目 `/health` URL 与独立读回 revision，并输入 `rehearse production ProviderFetch controls for subs-bot-provider-fetch-control-drill-01`。自动流程覆盖 create、原 OCI 发布、stage、activate、Container/Workflow 初始化、真实 Cloudflare smoke 和独立 verify。
+
+每个操作通过受保护的 `provider-control-step` 复合 Action 执行：只读预检 → 写入 `started-unknown` intent → 官方 artifact 上传 → 以 GitHub API 核对该 artifact 的准确 main/run/attempt/operation 与摘要 → 执行一次 mutation → 无论结果如何保留结果 checkpoint。intent 包含完整配置摘要、源 CI/模块/OCI pins、操作 approval 摘要与前态摘要；创建前还核对准确名称不存在。artifact 上传失败或回读身份不符时，不允许 dispatch。源原 ZIP、OCI、module 和初始 pins 也在首个资源操作之前上传。
+
+单个原子 `provider-rehearsal-checkpoint.json` 包含完整 target 和 journal，是恢复时的权威记录；两个拆分 JSON 是便于审查的派生文件。收到创建/上传响应后，首先记录白名单资源 ID/时间为 `response-only`，之后才进行完整读回并提交 confirmed pin。后续失败保留这些观察，不把它们自动提升为已验证资源，也不保存上游响应正文或异常文本。状态分别为 `started-unknown`、`confirmed`、`failed-before-dispatch`、`unconfirmed` 和 `skipped`。同一 intent 不可重复 dispatch；未确认 intent 阻止后续操作和完整 proof。
+
+发生 runner 丢失或中断时，已上传的 source/intent/result artifacts 仍可独立取得。源 job 的失败结果保持失败，`always()` 后继 job 将所有可用原件追加封存至私有 R2；平台整体取消导致后继 job 未启动时，可用 `preserve-partial` 加原 run/attempt 再封存。工具核对原 workflow、仓库、main 祖先提交、准确 attempt 和完整有界 artifact inventory，拒绝采用其他任务产物。partial 使用独立 `partial-manifest.json`，固定 `completion=not-complete`；保存成功仅表示现场原件存储完成，不是业务验证通过。`verify-partial` 只从 R2 独立重读这些原件，不能把 partial 转为 complete。
+
+独立核对已确认 pins 与所有 response-only 观察后，才将准确 target 存入 `SUBS_BOT_PROVIDER_REHEARSAL_TARGET_JSON`。`source_mode=registered` 会保留其中冻结源和准确 CI run，在新的 main 控制工具下继续未完成流程，不强迫升级尚未完成的目标。`source_mode=current` 是明确选择新源，只允许先证明原依赖已完整验证、私有、停止且无调用方后升级。发现未知同名资源/版本或结果不明时仍停止，不从单纯名称或失败回执推断成功。
 
 后继 job 在原 `subs-bot-isolation` Environment 中，将完成证明、完整 target、journal、源原 ZIP、源 module、OCI archive 和 manifest 封存到既有私有 R2 的 `maintenance/production-provider/<run>/<attempt>/`。每块最大 16 MiB，最多 128 块、总量 600 MiB；超限在 manifest 封存前拒绝。S3 条件写只创建新对象，逐块及完整文件摘要读回后才写最终 manifest；不删除任何原记录。
+
+partial 保存至同一 attempt 的独立 manifest，最多 128 个原始文件、2 GiB 逻辑字节；去重后最多 128 个块/600 MiB。单个 checkpoint 最大 256 KiB、journal 最多 80 个事件；超限停止，不截断。每个版本的原始 target、journal、响应观察和源文件均有独立摘要，重复字节只保留一份物理块。partial 与完整 proof 的读回类型和完成状态分开输出；原始失败不会被存储 job 的成功覆盖。
 
 另开 `verify-archive` dispatch，提供原 run/attempt 与独立记录的 manifest digest，只从私有 R2 读取七个完整文件的全部块并核对计数、字节和摘要，不读取源 Actions artifact。该读回与真实 Cloudflare smoke 是不同证据；工作流结果不预填为 Passed，实际 run/attempt 与失败必须记录在 PR 证据中。
 

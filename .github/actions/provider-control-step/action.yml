@@ -1,0 +1,43 @@
+name: Execute one durable provider control
+description: Persist the exact intent before any production-control rehearsal mutation
+inputs:
+  operation:
+    description: Exact production_provider operation
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Prepare exact operation intent
+      shell: bash
+      env:
+        PROVIDER_STEP_OPERATION: ${{ inputs.operation }}
+      run: python3 -B worker/tools/production_provider_rehearsal.py prepare-operation "$PROVIDER_STEP_OPERATION"
+    - name: Persist immutable intent before mutation
+      id: intent
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: subs-bot-provider-attempt-intent-${{ inputs.operation }}-${{ github.run_id }}-${{ github.run_attempt }}
+        path: |
+          ${{ runner.temp }}/provider-rehearsal-checkpoint.json
+          ${{ runner.temp }}/provider-rehearsal-target.json
+          ${{ runner.temp }}/provider-rehearsal-journal.json
+        retention-days: 7
+        if-no-files-found: error
+    - name: Execute once after cloud intent acknowledgement
+      shell: bash
+      env:
+        PROVIDER_STEP_OPERATION: ${{ inputs.operation }}
+        SUBS_BOT_PROVIDER_INTENT_ARTIFACT_ID: ${{ steps.intent.outputs.artifact-id }}
+        SUBS_BOT_PROVIDER_INTENT_ARTIFACT_SHA256: ${{ steps.intent.outputs.artifact-digest }}
+      run: python3 -B worker/tools/production_provider_rehearsal.py execute-operation "$PROVIDER_STEP_OPERATION"
+    - name: Preserve confirmed or unknown result
+      if: always()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: subs-bot-provider-attempt-result-${{ inputs.operation }}-${{ github.run_id }}-${{ github.run_attempt }}
+        path: |
+          ${{ runner.temp }}/provider-rehearsal-checkpoint.json
+          ${{ runner.temp }}/provider-rehearsal-target.json
+          ${{ runner.temp }}/provider-rehearsal-journal.json
+        retention-days: 7
+        if-no-files-found: warn
