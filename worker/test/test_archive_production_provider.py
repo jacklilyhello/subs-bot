@@ -1,6 +1,7 @@
 """Cloud-hosted synthetic checks of complete, private provider source preservation."""
 
 from copy import deepcopy
+from base64 import b64encode
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -12,7 +13,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import archive_production_provider as archive
 import production_provider as control
-from test_production_provider import config
+import production_provider_rehearsal as rehearsal
+from test_production_provider import config, STAMP, VERSION, WORKER_ID, worker_profile
 
 
 class MemoryStore:
@@ -110,6 +112,118 @@ class ArchiveTests(unittest.TestCase):
         selected.symlink_to(self.root / "source/provider-image.tar")
         with self.assertRaises(ValueError):
             archive.archive(self.store, self.root)
+
+
+class PartialArchiveTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.store = MemoryStore()
+        self.names = ["subs-bot-provider-attempt-source-100-1", "subs-bot-provider-attempt-result-stage-100-1"]
+        self.provenance = {"revision": "b" * 40, "runId": "100", "runAttempt": "1", "workflowPath": control.REHEARSAL_WORKFLOW_PATH,
+                           "artifacts": {name: {"artifactId": str(index + 200), "archiveSha256": "5" * 64} for index, name in enumerate(self.names)}}
+        target = config()
+        target["versionId"] = None
+        for index, name in enumerate(self.names):
+            directory = self.root / name
+            directory.mkdir()
+            journal = {"version": 2, "controllerRevision": "b" * 40, "runId": "100", "runAttempt": "1",
+                       "targetSha256": control.digest(target), "events": [{"phase": "intent"}] * (index + 1),
+                       "currentIntent": {"operation": "stage", "status": "unconfirmed", "intentSha256": "6" * 64}}
+            envelope = {"version": 2, "target": target, "journal": journal}
+            (directory / rehearsal.CHECKPOINT).write_bytes(control.canonical(envelope))
+            (directory / "provider-rehearsal-target.json").write_bytes(control.canonical(target))
+
+    def test_partial_originals_are_complete_storage_but_never_business_acceptance(self):
+        result = archive.archive_partial(self.store, self.root, self.provenance)
+        self.assertEqual(result["status"], "partial-preserved")
+        self.assertEqual(result["completion"], "not-complete")
+        self.assertEqual(result["latestCheckpoint"]["intent"]["status"], "unconfirmed")
+        self.assertNotIn("manifest.json", self.store.objects)
+        self.assertLess(result["uniqueBytes"], result["logicalBytes"])
+        self.assertEqual(archive.verify_partial(self.store, result["manifestSha256"]), result)
+
+    def test_missing_or_corrupt_partial_blob_is_not_verified(self):
+        result = archive.archive_partial(self.store, self.root, self.provenance)
+        blob = next(key for key in self.store.objects if key.startswith("blobs/"))
+        del self.store.objects[blob]
+        with self.assertRaises(control.ProviderError):
+            archive.verify_partial(self.store, result["manifestSha256"])
+
+    def test_unknown_artifact_and_capacity_fail_before_writing(self):
+        wrong = deepcopy(self.provenance)
+        wrong["artifacts"]["subs-bot-provider-attempt-intent-create-100-1"] = {"artifactId": "300", "archiveSha256": "5" * 64}
+        with self.assertRaises(control.ProviderError):
+            archive.archive_partial(self.store, self.root, wrong)
+        self.assertEqual(self.store.writes, 0)
+        with patch.object(archive, "MAX_PARTIAL_LOGICAL_BYTES", 1), self.assertRaises(control.ProviderError):
+            archive.archive_partial(self.store, self.root, self.provenance)
+        self.assertEqual(self.store.writes, 0)
+
+    def test_partial_manifest_cannot_be_relabelled_complete(self):
+        result = archive.archive_partial(self.store, self.root, self.provenance)
+        manifest = json.loads(self.store.objects["partial-manifest.json"])
+        manifest["completion"] = "complete"
+        raw = control.canonical(manifest)
+        self.store.objects["partial-manifest.json"] = raw
+        with self.assertRaises(control.ProviderError):
+            archive.verify_partial(self.store, sha256(raw).hexdigest())
+
+
+class ReconciliationTests(unittest.TestCase):
+    def setUp(self):
+        self.target = config()
+        self.target["versionId"] = None
+        self.module = b"export default {fetch(){return new Response(null,{status:404})}};"
+        self.target["build"]["workerSha256"] = sha256(self.module).hexdigest()
+        self.identity = {"operation": "stage", "intentSha256": "6" * 64, "identities": {"versionId": VERSION}}
+
+    def client(self, *, corrupt=False):
+        from unittest.mock import Mock
+        candidate = deepcopy(self.target)
+        candidate["versionId"] = VERSION
+        client = Mock()
+        client.identity = control.bootstrap.Identity(WORKER_ID, STAMP)
+        client.beta_path = "/workers/workers/" + WORKER_ID + "/versions"
+        client.worker_path = "/workers/scripts/" + candidate["service"]
+        observed = worker_profile(candidate)
+        client.by_name.return_value = observed
+        client.worker.by_id.return_value = observed
+        client.deployment.return_value = None
+        metadata = control.metadata(candidate)
+        beta = {**metadata, "id": VERSION, "urls": [], "modules": [{"name": control.provider.WORKER,
+                "content_type": control.stage.MODULE_TYPE, "content_base64": b64encode(b"wrong" if corrupt else self.module).decode()}]}
+        legacy = {"id": VERSION, "resources": {"script_runtime": {"compatibility_date": metadata["compatibility_date"],
+                  "containers": metadata["containers"]}, "bindings": metadata["bindings"]}}
+        client._request.side_effect = lambda path, **_kwargs: {"result": beta if "include=modules" in path else legacy}
+        return client
+
+    def test_exact_response_is_registered_only_after_repeated_source_module_readback(self):
+        client = self.client()
+        with patch.object(archive, "ReconciliationReader", return_value=client), patch.object(control, "public_denied"):
+            confirmed = archive.reconcile_identity(self.target, self.identity)
+        self.assertEqual(confirmed["versionId"], VERSION)
+        self.assertEqual(self.target["versionId"], None)
+        self.assertEqual(client.deployment.call_count, 2)
+        client._write.assert_not_called()
+        client.upload.assert_not_called()
+
+    def test_wrong_module_or_active_consumer_is_not_registered(self):
+        client = self.client(corrupt=True)
+        with patch.object(archive, "ReconciliationReader", return_value=client), self.assertRaises(ValueError):
+            archive.reconcile_identity(self.target, self.identity)
+        client = self.client()
+        client.deployment.return_value = {"id": "unexpected-active-deployment"}
+        with patch.object(archive, "ReconciliationReader", return_value=client), self.assertRaises(control.ProviderError):
+            archive.reconcile_identity(self.target, self.identity)
+
+    def test_reconciliation_transport_has_no_write_capability(self):
+        client = archive.ReconciliationReader(self.target, "synthetic-worker-token")
+        with self.assertRaises(control.ProviderError):
+            client._write("/workers/workers", {})
+        with self.assertRaises(control.ProviderError):
+            client.upload(b"module")
 
 
 if __name__ == "__main__":
