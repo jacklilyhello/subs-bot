@@ -60,13 +60,17 @@
 
 所有产物均保留准确 run/attempt 和完整配置摘要，上传的 `production-provider-evidence.json` 不含 Token、能力链接或订阅原始内容。正式发布资料仍应由项目候选封存流程保存至私有 R2，不能仅依赖有保留期限的 Actions artifact。
 
+首次正式 Provider 尚为空，应在正式配置和操作获准后，用新的准确 main 运行 [Provider Fetch CI](../.github/workflows/worker-provider-fetch-ci.yml)，待全部检查成功并独立核对 run/attempt、head SHA 和原始产物摘要，再填入[生产控制工作流](../.github/workflows/worker-production-provider.yml)。隔离候选、历史 dev 服务标签和已有 dev 身份均不自动成为正式源或正式目标。
+
 ## 故障、容量与限制
 
 任何写结果不明、响应错误、读回身份或摘要不符，都以失败退出。mutation 不做自动重试，也不删除资源或已存 admission 标记来制造成功。新开 `verify` dispatch 只读观察；将观察状态独立核对后再更新契约。一个执行进程最多一次 Worker/Container/Workflow 创建、上传或部署；镜像准备仅在平台明确返回 pending 时继续轮询同一个 digest。registry 可能已经保留准确镜像，应读回确认，不覆盖不同 tag。
 
+当前发布、升级及 `previous` 链检查仍要求每代原 GitHub Provider CI artifact 存在且未过期；CI 工作流目前设置 14 天保留期。冻结源可随 main 控制工具前进继续使用，但不会免除这项[原始源检查](../worker/tools/production_provider.py)。私有 R2 的候选保全、恢复与独立读回不等于已支持从私有归档自动发布源代码，也不代表可以无限期回退。源产物过期、被删除或无法核验时，受影响操作会拒绝；必须先明确审查处置方案，不能用新 CI run ID 替换历史 pins、改写旧摘要或自动采用 dev。首次正式部署使用新准确 main 的成功 CI，不能用过期隔离源代替。
+
 尚未绑定任何应用 caller 的 Provider 可以通过明确 `previous` 链修复/升级。操作前再次核对 Beta `references.workers=[]`，上一代资源身份、已完成 smoke 和 stopped/无 active instance；保留既有资源和版本。已绑定应用的 Provider 不能使用这个无 caller 升级路径：必须先制定并批准主应用冻结、排空及依赖更新计划，不能从一次空闲样本推断 caller 已暂停。主应用缺少正式依赖 pin 或依赖不符时仍拒绝激活 URL 导入/刷新。
 
-资源盘点具有硬界限：固定发布链/Worker/Workflow 版本与 smoke 实例最多九代、deployment 盘点最多 100、DO namespace 盘点最多 1,000、Container application 盘点最多 500、目标 actor/Container instance 最多一个；分页或超限拒绝，不截断后报告通过。OCI archive 最大 256 MiB、Worker 模块最大 1 MiB、fetch 响应最大 10 MiB。单例使用 `lite`，请求结束必须销毁并确认停止；控制工具不默认创建 API-status Container。`/ai` 首发保持关闭，真实有效 Key 成功探测继续是该功能单独启用条件。
+资源盘点具有硬界限：固定发布链/Worker/Workflow 版本与 smoke 实例最多九代、deployment 盘点最多 100、DO namespace 盘点最多 1,000、Container application 盘点最多 500、目标 actor/Container instance 最多一个；分页或超限拒绝，不截断后报告通过。OCI archive 最大 256 MiB、Worker 模块最大 1 MiB、fetch 响应最大 10 MiB。单例使用 `lite`，请求结束先发送 `SIGTERM`，有界等待 `monitor()` 正常退出并确认 `running=false`、`inspect()=null`；异常或超时尝试强制清理后仍失败，正常验收继续要求管理 API 的 `stopped` 状态。控制工具不默认创建 API-status Container。`/ai` 首发保持关闭，真实有效 Key 成功探测继续是该功能单独启用条件。
 
 ## 新工具的隔离演练与持久证明
 
@@ -98,7 +102,7 @@
 
 若旧版本曾强制结束容器，必须保留原失败 run、private partial、旧 Workflow 实例和 Durable Object one-shot 标记。仅当旧实例已完整成功执行固定健康摘要、私网拒绝及 named RPC，且同一精确 image/actor 的 inventory 和 detail 均为 `failed/137`、时间属于旧执行、全部 active 实例为空、两次读回一致、资源没有应用 caller，才可生成单独的 `failed-terminal-preserved / not-complete` 证据。该证据不代表旧版本验收通过，也不能授权重触旧 smoke。
 
-用 `action=reconcile-terminal` 填原 run/attempt、经独立 R2-only 读回的 partial manifest SHA 和 smoke response identity SHA。流程先在 R2 环境验证原始源代码及 intent/response 归属，再通过不可变 artifact 将无凭据目标交给 Provider 环境，使用各自既有凭据只读验证终态；最后另一个 R2 环境 job 封存三份小型原件。凭据不跨环境搬运，任一步失败均不产生前向批准。记录返回的 terminal manifest SHA，再以 `action=verify-terminal` 和该 reconcile run/attempt/SHA 从私有 R2 独立读回；状态始终为 not-complete。
+用 `action=reconcile-terminal` 填原 run/attempt、经独立 R2-only 读回的 partial manifest SHA 和 smoke response identity SHA。流程先在 R2 环境验证原始源代码及 intent/response 归属，再通过不可变 artifact 将无凭据目标交给 Provider 环境，使用各自既有凭据只读验证终态；最后另一个 R2 环境 job 封存四份小型原件。凭据不跨环境搬运，任一步失败均不产生前向批准。记录返回的 terminal manifest SHA，再以 `action=verify-terminal` 和该 reconcile run/attempt/SHA 从私有 R2 独立读回；状态始终为 not-complete。
 
 只有上述读回成功，才把该 run 的 `subs-bot-provider-forward-terminal-<run>-<attempt>` artifact 中原样的 `provider-reconciled-target.json` 登记为现有 rehearsal/control target 配置，把 `provider-forward-terminal.json` 登记到同一 `subs-bot-provider-isolation` 环境的 `SUBS_BOT_PROVIDER_FORWARD_TERMINAL_JSON`。通过文件 stdin 设置 Secret，不在终端打印配置。
 
