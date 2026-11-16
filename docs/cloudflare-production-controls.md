@@ -24,6 +24,8 @@
 
 全部开关：`inlineSearch`, `providerUrlImport`, `providerUrlDocuments`, `mixedDocuments`, `providerRefresh`, `providerBatch`, `subscriptionShorts`, `externalShortlinks`, `groupShareCards`, `githubSearch`, `apiStatus`。首发 `apiStatus=false`。文档导入依赖 URL 导入，混合文档依赖 URL 文档。生产 ProviderFetch 使用独立 `subs-bot-provider-fetch-prod-01`，不自动接受 dev 身份。
 
+正式 Bot 必须是独立的新身份。生产草稿和已登记目标同时拒绝测试用户名 `test_cfsubs_bot`（不区分大小写）及已核验的稳定测试 Bot ID `9293938370`；改名不能把同一个测试 Bot 变成正式身份。`getMe` 仍须独立核对正式配置的 ID 和用户名，缺失配置不会采用测试值。
+
 固定资源／Bot／授权世代的 `targetSha256` 与完整 `configurationSha256` 分开。开关、依赖、Webhook 参数或 Secret 摘要变化必须重新批准配置；不能沿用旧批准。普通发布保持 aggregate/privateShare 签名密钥连续性，不提供隐式换钥或测试密钥复制。
 
 `SUBS_BOT_CONTROL_SECRETS` 只通过受保护 environment 注入，含 `botToken`, `webhookSecret`, `aggregateKey`, `privateShareKey`, `shortlinkToken`。两个签名密钥必须分别是独立 32 字节密钥的规范 43 字符 Base64URL；Webhook Secret 使用 32–256 字符安全集合；短链启用时必须提供原有完整业务 Token。原始 Secret 不进入目标 JSON、CI 日志、候选或数据备份。
