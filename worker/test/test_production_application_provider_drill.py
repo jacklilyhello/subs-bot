@@ -149,6 +149,27 @@ class ApplicationProviderProtocolTests(unittest.TestCase):
         self.assertIs(on.target.data["features"]["providerRefresh"], True)
         self.assertIsNone(off.target.data["provider"])
 
+    def test_import_wait_covers_cron_plus_extended_rpc_without_extending_unrelated_waits(self):
+        runner, wire, _loaded, _source, on, _off = self.runner()
+        runner.quiet = Mock()
+        wire.update(update_payload=lifecycle.update_payload, post_update=Mock(return_value=200))
+        owner = on.target.data["admins"][0]
+        imported = {"owner_id": owner, "subscription_id": 42, "expected_generation": 0,
+            "generation": 1, "node_count": 3, "job_state": "done", "result_code": "saved",
+            "outcome": "saved", "reply_state": "sent", "attempts": 1}
+        refreshed = {**imported, "job_id": 2, "actor_id": owner, "expected_generation": 1, "generation": 2}
+        with patch.object(app, "rows", side_effect=[[], [refreshed], [refreshed]]), \
+                patch.object(app, "one", return_value={"n": 1794839000}), \
+                patch.object(app, "accepted_import", return_value=[imported]), \
+                patch.object(app, "positive_export", return_value={"nodeCount": 3}) as exported, \
+                patch.object(app, "monotonic", return_value=0), patch.object(app, "time", return_value=1794839000), \
+                patch.object(app, "print"):
+            app.url_and_refresh(runner, on, {"admin": 123}, 7_000_000_000_001_000, b"exact fixture", wire)
+        self.assertEqual(runner.quiet.call_args_list, [call(seconds=300), call(), call()])
+        self.assertEqual(wire["post_update"].call_count, 2)
+        self.assertEqual(exported.call_count, 2)
+        self.assertEqual(runner.report["applicationProviderCases"]["refreshedGeneration"], 2)
+
     def test_unknown_enable_is_not_retried_or_hidden_by_cleanup(self):
         runner, wire, loaded, _source, on, off = self.runner()
         on.deploy.side_effect = control.OperationError("Synthetic unconfirmed deployment.", uncertain=True)

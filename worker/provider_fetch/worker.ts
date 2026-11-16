@@ -122,7 +122,8 @@ export class ProviderContainer extends DurableObject<Env> {
     } catch (error) {
       // Store fixed stage/stop diagnostics only; platform errors can contain request data.
       return { ok: false, stage: error instanceof ProviderProbeError ? error.stage : "admission",
-        ...(error instanceof ProviderProbeError && error.stop ? { stop: error.stop } : {}) };
+        ...(error instanceof ProviderProbeError && error.stop ? { stop: error.stop } : {}),
+        ...(error instanceof ProviderProbeError && !error.stop && error.primary ? { primary: error.primary } : {}) };
     } finally {
       this.busy = false;
     }
@@ -144,7 +145,8 @@ export class ProviderContainer extends DurableObject<Env> {
         probe.healthUrl, probe.healthRevision, probe.healthSha256);
     } catch (error) {
       return { ok: false, stage: error instanceof ProviderProbeError ? error.stage : "admission",
-        ...(error instanceof ProviderProbeError && error.stop ? { stop: error.stop } : {}) };
+        ...(error instanceof ProviderProbeError && error.stop ? { stop: error.stop } : {}),
+        ...(error instanceof ProviderProbeError && !error.stop && error.primary ? { primary: error.primary } : {}) };
     } finally { this.busy = false; }
   }
 }
@@ -168,11 +170,11 @@ export class ProviderReleaseSmoke extends WorkflowEntrypoint<Env, ReleaseProbe> 
     if (!target || !validReleaseProbe(event.payload, this.env.BUILD_REVISION)
       || event.workflowName !== target.service + "-smoke"
       || event.instanceId !== `provider-release-${this.env.BUILD_REVISION}`) throw new Error("Provider release smoke target differs.");
-    const egress = await step.do("verify approved provider release", { retries: { limit: 0, delay: "1 second" }, timeout: "150 seconds" }, async () => {
+    const egress = await step.do("verify approved provider release", { retries: { limit: 0, delay: "1 second" }, timeout: "300 seconds" }, async () => {
       return this.ctx.exports.ProviderContainer.getByName(SINGLETON).proveRelease(event.payload);
     });
     if (!egress.ok || !("imageSha256" in egress)) return egress;
-    await step.do("verify exact named ProviderFetch RPC", { retries: { limit: 0, delay: "1 second" }, timeout: "75 seconds" }, async () => {
+    await step.do("verify exact named ProviderFetch RPC", { retries: { limit: 0, delay: "1 second" }, timeout: "210 seconds" }, async () => {
       const result = await this.ctx.exports.ProviderFetch.fetchSubscription({ url: event.payload.healthUrl,
         providerRevision: event.payload.providerRevision, imageSha256: event.payload.imageSha256 });
       if (!result.ok || result.bodySha256 !== event.payload.healthSha256 || result.body.byteLength !== egress.healthBytes) {
@@ -228,7 +230,7 @@ export class ProviderSmoke extends WorkflowEntrypoint<Env, Probe> {
         || event.instanceId !== `provider-smoke-${revision}`) {
       throw new Error("Provider smoke request differs from the pinned release.");
     }
-    return step.do("verify fixed provider egress", { retries: { limit: 0, delay: "1 second" }, timeout: "75 seconds" }, async () => {
+    return step.do("verify fixed provider egress", { retries: { limit: 0, delay: "1 second" }, timeout: "300 seconds" }, async () => {
       try {
         const container = this.ctx.exports.ProviderContainer.getByName(SINGLETON);
         return await container.prove(event.payload);

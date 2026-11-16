@@ -95,7 +95,7 @@ def url_and_refresh(runner, controller, anchors, base, expected_body, wire):
     update = wire["update_payload"](base + 1, owner, anchors["admin"], name + " | " + source_url, date - 5)
     update["message"].pop("entities")
     wire["expect_status"](wire["post_update"](update, runner.secrets["webhookSecret"]), 200, "provider-import")
-    runner.quiet()
+    runner.quiet(seconds=300)
     imported = accepted_import(controller, base + 1, owner, source_sha)
     require(len(imported) == 1 and imported[0]["owner_id"] == owner)
     successful(imported[0], expected_generation=0)

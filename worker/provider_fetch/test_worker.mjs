@@ -269,8 +269,8 @@ test("shutdown diagnostics preserve only fixed subphases and the original busine
   nonzero.container.monitor = () => Promise.reject(Object.assign(new Error("synthetic-private-error"), { exitCode: 143 }));
   await assert.rejects(run(nonzero.container), (error) => {
     assert.equal(error.stage, "stop");
-    assert.deepEqual(error.stop, { version: 1, phase: "monitor-wait", reason: "nonzero-exit", exitCode: 143,
-      primaryStage: "none", runningBeforeCleanup: false, inspectNullBeforeCleanup: null, forcedCleanup: "returned" });
+    assert.deepEqual(error.stop, { version: 2, phase: "monitor-wait", reason: "nonzero-exit", exitCode: 143,
+      primaryStage: "none", primaryPhase: "none", primaryReason: "none", primaryElapsedMs: 0, runningBeforeCleanup: false, inspectNullBeforeCleanup: null, forcedCleanup: "returned" });
     assert(!JSON.stringify(error.stop).includes("synthetic-private"));
     return true;
   });
@@ -279,6 +279,9 @@ test("shutdown diagnostics preserve only fixed subphases and the original busine
   await assert.rejects(run(signal.container), (error) => {
     assert.equal(error.stop.phase, "signal");
     assert.equal(error.stop.primaryStage, "edge");
+    assert.equal(error.stop.primaryPhase, "use");
+    assert.equal(error.stop.primaryReason, "operation");
+    assert(Number.isInteger(error.stop.primaryElapsedMs) && error.stop.primaryElapsedMs >= 0);
     assert.equal(error.stop.reason, "operation");
     assert.equal(error.stop.forcedCleanup, "returned");
     assert(!JSON.stringify(error.stop).includes("synthetic-private"));
@@ -310,6 +313,27 @@ test("shutdown diagnostics preserve only fixed subphases and the original busine
     });
     assert.deepEqual(stalled.calls.at(-1), ["destroy"]);
   }
+});
+
+test("startup timeout retains the exact inactivity acknowledgement phase without skipping its await", async (t) => {
+  const timeout = AbortSignal.timeout.bind(AbortSignal);
+  t.mock.method(AbortSignal, "timeout", (ms) => {
+    if (ms < 110_000) return timeout(ms);
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 20);
+    return controller.signal;
+  });
+  const { container, calls } = fake();
+  container.setInactivityTimeout = () => new Promise(() => {});
+  await assert.rejects(exercise(container, revision, isolatedRevision), (error) => {
+    assert.equal(error.stage, "start");
+    assert.equal(error.primary.phase, "inactivity-set");
+    assert.equal(error.primary.reason, "timeout");
+    assert(Number.isInteger(error.primary.elapsedMs) && error.primary.elapsedMs >= 0);
+    return true;
+  });
+  assert.equal(calls.filter(([name]) => name === "http://container/ready").length, 0);
+  assert.deepEqual(calls.at(-1), ["signal", 15]);
 });
 
 const apiInput = { url: "https://fixture.example:443/tenant/v1/models", key: "synthetic-api-key",

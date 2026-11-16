@@ -10,9 +10,8 @@ import { providerSnapshotJournalReady, publishProviderSnapshot, stageProviderSna
 import { initialProviderTitle } from "./provider-initial-title.ts";
 import { digestHex, type SnapshotMetadataUpdate, type StagedNodeSnapshot } from "./storage.ts";
 import { parseSubscriptionDocument } from "./subscription-document.ts";
+import { PROVIDER_LEASE_HEADROOM_MS, PROVIDER_RPC_TIMEOUT_MS } from "./provider-lifecycle-budgets.ts";
 
-const RPC_TIMEOUT_MS = 72_000;
-const LEASE_HEADROOM_MS = 90_000;
 const encoder = new TextEncoder();
 const timedOut = Symbol("Provider RPC timeout");
 
@@ -32,7 +31,7 @@ async function callProvider(provider: ProviderFetcher, lease: ProviderJobLease, 
   try {
     return await Promise.race([
       provider.fetchSubscription({ url: lease.sourceUrl, ...pin }),
-      new Promise<typeof timedOut>((resolve) => { timer = setTimeout(() => resolve(timedOut), RPC_TIMEOUT_MS); }),
+      new Promise<typeof timedOut>((resolve) => { timer = setTimeout(() => resolve(timedOut), PROVIDER_RPC_TIMEOUT_MS); }),
     ]);
   } finally {
     if (timer !== undefined) clearTimeout(timer);
@@ -116,7 +115,7 @@ export async function runOneProviderJob(
     await retireStaleProviderJob(db, lease);
     return "stale";
   }
-  if (lease.leaseUntil * 1000 - Date.now() < LEASE_HEADROOM_MS) {
+  if (lease.leaseUntil * 1000 - Date.now() < PROVIDER_LEASE_HEADROOM_MS) {
     return settleProviderJob(db, lease, { kind: "retry", reason: "timeout" });
   }
   let fetched: unknown;

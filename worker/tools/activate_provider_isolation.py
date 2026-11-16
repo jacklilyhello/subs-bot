@@ -668,7 +668,7 @@ def _run(api, operation, release, pins, isolated_revision, guard):
                      and response.get("workflow_id") == pins["workflow"]["workflowId"], WRITE_ERROR)
             created = None
         # Read retries never repeat a mutation. A partial state remains private for operator recovery.
-        deadline = monotonic() + 150
+        deadline = monotonic() + 360
         while True:
             try:
                 state = _observe(api, release)
