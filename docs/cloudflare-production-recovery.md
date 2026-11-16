@@ -95,6 +95,16 @@ G0 之后发生任何新增、修改、删除、授权、领取、撤销、短�
 | 重复已确认调用 | 从持久 pin、内容摘要和完整远端状态确认；不会重复产生未知的创建或导入操作 |
 | 恢复目标有 Worker 绑定或公开 R2 | 停止恢复，保留原数据和目标；不会修改其他 Worker 来消除阻塞 |
 
+专用演练若在 G0 独立恢复阶段中断，可在同一个 `recovery` action 显式填写 `recovery_resume_json`，复用已创建的原 D1/R2 和原 hash-chain journal，而不是重新 capture 或 create。以下仅为格式占位符，所有值均须来自独立私有读回：
+
+```json
+{"version":1,"checkpointId":"11111111111111111111111111111111","manifestSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","journalSha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+```
+
+同时填写原登记 `registration_sha256` 和准确当前线上源的 `active_run_id`；工具代码仍运行当前 main。续接先完整核对最新 journal 摘要、封存 manifest/代码/SQL/对象、原目标 ID／创建时间／私有性、当前源冻结状态及完整数据，以及全账户 Worker／服务环境的无消费者证明。服务环境必须是准确身份的完整 API wrapper，包含默认环境；未知包装、默认环境缺失、分页或超限均拒绝。全部只读前置检查通过后才 claim 原 journal，从 `verify-backup → restore-objects → start-import → verify-restore` 接续；已确认对象仍读回字节与元数据，未知导入仅按原书签或完整状态对账处理。旧 latest-journal pin 在链推进后立即失效，不能重复使用。
+
+该演练续接仅用于当前源仍等于原 G0 的阶段，不自动跳过之后的 G1／新写入，亦不复用不明的 G1 会话。源发生变化时停止，按前述 G1 和独立恢复会话流程处理。原失败证据保留，只有新流程的完整数据／对象和无出网 HTTP 验证都通过后才能报告恢复通过。失败报告只包含固定 action／消费者读取阶段、数值 HTTP 状态及不确定标记，不包含其他项目配置、响应体、URL 或凭据。
+
 ## 容量与限制
 
 | 项目 | 当前硬界限 |
