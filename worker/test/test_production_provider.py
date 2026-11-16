@@ -325,5 +325,67 @@ class DependencyCallerTests(unittest.TestCase):
             self.verify(value, [{"id": "6" * 32, "name": "other-project"}], allow_unbound_caller=True)
 
 
+class ReadDiagnosticTests(unittest.TestCase):
+    def setUp(self):
+        self.api = control.ProviderAPI(config(), "synthetic-worker-credential", "synthetic-container-credential")
+        self.path = "/workers/workers/" + self.api.service
+        self.private = "synthetic-private-response-content-never-log"
+
+    def read(self, status, envelope, **options):
+        with patch.object(control.publication, "_response", return_value=(status, {"Private-Header": self.private}, json.dumps(envelope).encode())):
+            return self.api._request(self.path, **options)
+
+    def test_success_and_exact_missing_name_semantics_are_preserved(self):
+        envelope = {"success": True, "result": {"id": WORKER_ID}, "errors": []}
+        self.assertEqual(self.read(200, envelope), envelope)
+        missing = {"success": False, "result": None, "errors": [{"code": 10007, "message": self.private}]}
+        self.assertIsNone(self.read(404, missing, absent=10007))
+        with self.assertRaises(control.ProviderError):
+            self.read(404, missing)
+        self.assertEqual(self.api._writes, 0)
+
+    def test_http_and_numeric_codes_are_visible_without_body_headers_or_credentials(self):
+        for status, code in ((401, 10000), (403, 9109), (500, 10001)):
+            envelope = {"success": False, "errors": [{"code": code, "message": self.private,
+                         "source": {"pointer": self.private}}], "message": self.private, "result": {"credential": self.private}}
+            with self.subTest(status=status), self.assertRaises(control.ProviderError) as raised:
+                self.read(status, envelope, absent=10007)
+            rendered = str(raised.exception)
+            self.assertIn(f'"httpStatus":{status}', rendered)
+            self.assertIn(f'"cloudflareCodes":[{code}]', rendered)
+            for private in (self.private, "Private-Header", "synthetic-worker-credential", "synthetic-container-credential"):
+                self.assertNotIn(private, rendered)
+
+    def test_other_not_found_shapes_and_denials_never_become_absence(self):
+        envelopes = [(404, {"success": False, "result": None, "errors": [{"code": 10000}]}),
+                     (403, {"success": False, "result": None, "errors": [{"code": 10007}]}),
+                     (404, {"success": True, "result": None, "errors": [{"code": 10007}]}),
+                     (404, {"success": False, "result": {}, "errors": [{"code": 10007}]}),
+                     (404, {"success": False, "result": None, "errors": [{"code": 10007}, {"code": 10007}]})]
+        for status, envelope in envelopes:
+            with self.subTest(status=status, envelope=envelope), self.assertRaises(control.ProviderError):
+                self.read(status, envelope, absent=10007)
+
+    def test_malformed_and_transport_errors_do_not_echo_private_data(self):
+        with patch.object(control.publication, "_response", return_value=(403, {}, self.private.encode())), self.assertRaises(control.ProviderError) as raised:
+            self.api._request(self.path)
+        self.assertIn('"phase":"response-json"', str(raised.exception))
+        self.assertIn('"httpStatus":403', str(raised.exception))
+        self.assertNotIn(self.private, str(raised.exception))
+        with patch.object(control.publication, "_response", side_effect=control.publication.PublicationError(self.private)), self.assertRaises(control.ProviderError) as raised:
+            self.api._request(self.path)
+        self.assertIn('"phase":"transport"', str(raised.exception))
+        self.assertIn('"httpStatus":null', str(raised.exception))
+        self.assertNotIn(self.private, str(raised.exception))
+
+    def test_only_bounded_numeric_codes_are_reported(self):
+        envelope = {"errors": [{"code": self.private}, {"code": True}, {"code": 999}, {"code": 1000000},
+                               {"code": 10007}, {"code": 10007}, {"code": 9109}, {"code": 10000}, {"code": 99999}]}
+        rendered = str(control.read_failure("response-envelope", 403, envelope))
+        self.assertIn('"cloudflareCodes":[9109,10000,10007]', rendered)
+        self.assertNotIn("99999", rendered)
+        self.assertNotIn(self.private, rendered)
+
+
 if __name__ == "__main__":
     unittest.main()

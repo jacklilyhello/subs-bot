@@ -45,6 +45,19 @@ def require(condition, message=ERROR):
         raise ProviderError(message)
 
 
+def read_failure(phase, status=None, envelope=None):
+    """Only bounded numeric diagnostics cross the private HTTP boundary."""
+    require(phase in {"transport", "response-json", "response-envelope", "absence"})
+    diagnostic = {"phase": phase, "httpStatus": status if type(status) is int and 100 <= status <= 599 else None,
+                  "cloudflareCodes": []}
+    errors = envelope.get("errors") if isinstance(envelope, dict) else None
+    if isinstance(errors, list):
+        diagnostic["cloudflareCodes"] = sorted({row["code"] for row in errors[:8] if isinstance(row, dict)
+            and type(row.get("code")) is int and 1000 <= row["code"] <= 999999})
+    return ProviderError("The explicit ProviderFetch GET was not confirmed. Read diagnostic "
+                         + json.dumps(diagnostic, separators=(",", ":")) + ".")
+
+
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
 
@@ -221,6 +234,8 @@ class ProviderAPI(legacy.ProviderAPI):
         self.worker = Shell(self)
 
     def _request(self, path, *, container=False, method="GET", body=None, absent=None, limit=publication.HTTP_LIMIT):
+        if method == "GET":
+            return self._read(path, container=container, body=body, absent=absent, limit=limit)
         if method != "GET":
             require(isinstance(body, dict), "Provider writes require an explicit exact-target payload.")
             if method == "POST" and path == "/workers/workers":
@@ -240,6 +255,34 @@ class ProviderAPI(legacy.ProviderAPI):
             else:
                 raise ProviderError("Provider writes outside the exact registered target are forbidden.")
         return super()._request(path, container=container, method=method, body=body, absent=absent, limit=limit)
+
+    def _read(self, path, *, container=False, body=None, absent=None, limit=publication.HTTP_LIMIT):
+        # Keep the legacy transport's token/path and strict absence/envelope rules.
+        require(body is None and (not self._worker_reads_only or not container and path.startswith("/workers/")))
+        token = self._container_token if container else self._worker_token
+        require(match(publication.API_TOKEN, token), "The dedicated provider read credential is missing or malformed.")
+        require(path.startswith("/containers/" if container else ("/workers/", "/workflows/")))
+        request = Request(self.base + path, headers={"Authorization": "Bearer " + token, "Accept": "application/json",
+                                                    "Cache-Control": "no-cache"}, method="GET")
+        try:
+            status, _headers, raw = publication._response(request, self._opener, ERROR, limit=limit)
+        except publication.PublicationError:
+            raise read_failure("transport") from None
+        try:
+            envelope = github._parse_object(raw, ERROR)
+        except github.ArtifactError:
+            raise read_failure("response-json", status) from None
+        if absent is not None and status == 404:
+            errors = envelope.get("errors")
+            valid = (envelope.get("success") is False and envelope.get("result") is None
+                     and isinstance(errors, list) and len(errors) == 1 and isinstance(errors[0], dict)
+                     and type(errors[0].get("code")) is int and errors[0]["code"] == absent)
+            if not valid:
+                raise read_failure("absence", status, envelope) from None
+            return None
+        if not (status == 200 and envelope.get("success") is True and envelope.get("errors") in (None, []) and "result" in envelope):
+            raise read_failure("response-envelope", status, envelope) from None
+        return envelope
 
     def by_name(self):
         return self.worker.by_name()
