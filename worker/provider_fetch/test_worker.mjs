@@ -23,12 +23,18 @@ const digest = createHash("sha256").update(body).digest("hex");
 
 function fake({ runningImage = image, failStop = false, corruptEdge = false, providerResponse, apiResponse } = {}) {
   const calls = [];
+  let completeStop;
   const container = {
     images: { provider: image },
     running: false,
     start(options) { calls.push(["start", options]); this.running = true; },
     async setInactivityTimeout(ms) { calls.push(["idle", ms]); },
-    async inspect() { return { image: runningImage }; },
+    async inspect() { return this.running ? { image: runningImage } : null; },
+    monitor() {
+      calls.push(["monitor"]);
+      return failStop ? Promise.reject(new Error("remote-error-fixture")) : new Promise((resolve) => { completeStop = resolve; });
+    },
+    signal(value) { calls.push(["signal", value]); this.running = false; completeStop?.(); },
     async destroy() {
       calls.push(["destroy"]);
       if (failStop) throw new Error("remote-error-fixture");
@@ -57,7 +63,7 @@ function fake({ runningImage = image, failStop = false, corruptEdge = false, pro
   return { container, calls };
 }
 
-test("starts only the pinned image, checks the fixed cases and destroys the instance", async () => {
+test("starts only the pinned image, checks the fixed cases and confirms graceful exit", async () => {
   const { container, calls } = fake();
   assert.deepEqual(await exercise(container, revision, isolatedRevision), {
     ok: true, revision, isolatedRevision, imageSha256: imageDigest, edgeStatus: 200,
@@ -69,7 +75,7 @@ test("starts only the pinned image, checks the fixed cases and destroys the inst
     ["http://container/ready", null], ["http://container/v1/edge-proof", {}],
     ["http://container/v1/fetch", { url: "http://127.0.0.1/" }],
     ["http://container/v1/fetch", { url: "http://[::1]/" }],
-    ["http://container/v1/fetch", { url: "http://169.254.169.254/" }], ["destroy"],
+    ["http://container/v1/fetch", { url: "http://169.254.169.254/" }], ["monitor"], ["signal", 15],
   ]);
 });
 
@@ -114,7 +120,7 @@ test("production fetch uses exact account/service/image and proves approved heal
     healthBytes: Buffer.byteLength(body), blockedPrivateTargets: 3,
   });
   assert.equal(calls.filter(([kind]) => kind === "start").length, 1);
-  assert.equal(calls.filter(([kind]) => kind === "destroy").length, 1);
+  assert.equal(calls.filter(([kind]) => kind === "destroy").length, 0);
 });
 
 test("admits only a bounded RPC input and posts the exact URL to the verified private container", async () => {
@@ -134,7 +140,7 @@ test("admits only a bounded RPC input and posts the exact URL to the verified pr
   assert.equal(Buffer.from(result.body).toString(), "synthetic subscription bytes");
   assert.equal(result.bodySha256, createHash("sha256").update(Buffer.from(result.body)).digest("hex"));
   assert.deepEqual(result.metadata, { "profile-title": "港 😀", "subscription-userinfo": "upload=1; total=9" });
-  assert.deepEqual(calls.slice(-2), [["http://container/v1/fetch", { url: providerUrl }], ["destroy"]]);
+  assert.deepEqual(calls.slice(-3), [["http://container/v1/fetch", { url: providerUrl }], ["monitor"], ["signal", 15]]);
 
   const empty = fake({ providerResponse: () => success({}, Buffer.alloc(0)) });
   const emptyResult = await fetchPinnedProvider(empty.container, revision, payload, imageDigest);
@@ -163,7 +169,7 @@ test("rejects incomplete bodies, invalid hashes, foreign headers and malformed m
     const { container, calls } = fake({ providerResponse: response });
     assert.deepEqual(await fetchPinnedProvider(container, revision, providerPayload({ url: providerUrl }), imageDigest),
       { ok: false, code: "invalid-body", retryable: false });
-    assert.deepEqual(calls.at(-1), ["destroy"]);
+    assert.deepEqual(calls.at(-1), ["signal", 15]);
   }
 });
 
@@ -187,7 +193,7 @@ test("returns only closed failure fields and verifies the stop before releasing 
     const { container, calls } = fake(options);
     assert.deepEqual(await fetchPinnedProvider(container, revision, providerPayload({ url: providerUrl }), imageDigest),
       { ok: false, code: "unavailable", retryable: true });
-    assert.deepEqual(calls.at(-1), ["destroy"]);
+    assert.deepEqual(calls.at(-1), options.failStop ? ["destroy"] : ["signal", 15]);
   }
 });
 
@@ -205,7 +211,7 @@ test("bounds a stalled response body and stops the container", async (t) => {
     "X-Provider-Body-Sha256": "a".repeat(64) } }) });
   assert.deepEqual(await fetchPinnedProvider(container, revision, providerPayload({ url: providerUrl }), imageDigest),
     { ok: false, code: "timeout", retryable: true });
-  assert.deepEqual(calls.at(-1), ["destroy"]);
+  assert.deepEqual(calls.at(-1), ["signal", 15]);
 });
 
 test("refuses a foreign or running image and cleans up owned failed probes", async () => {
@@ -229,7 +235,25 @@ test("refuses a foreign or running image and cleans up owned failed probes", asy
       assert(!error.message.includes("remote-error-fixture"));
       return true;
     });
+    assert.deepEqual(calls.at(-1), options.failStop ? ["destroy"] : ["signal", 15]);
+  }
+});
+
+test("an unsuccessful graceful exit remains failure even when forced cleanup succeeds", async (t) => {
+  const timeout = AbortSignal.timeout.bind(AbortSignal);
+  t.mock.method(AbortSignal, "timeout", (ms) => {
+    if (ms !== 10_000) return timeout(ms);
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 20);
+    return controller.signal;
+  });
+  for (const monitor of [() => Promise.reject(new Error("synthetic-private-error")), () => new Promise(() => {})]) {
+    const { container, calls } = fake({ providerResponse: () => success() });
+    container.monitor = monitor;
+    assert.deepEqual(await fetchPinnedProvider(container, revision, providerPayload({ url: providerUrl }), imageDigest),
+      { ok: false, code: "unavailable", retryable: true });
     assert.deepEqual(calls.at(-1), ["destroy"]);
+    assert.equal(container.running, false);
   }
 });
 
@@ -260,7 +284,7 @@ test("API status accepts exact pinned bounded input and posts only URL and key o
   assert.deepEqual(await probePinnedProviderApiStatus(live.container, apiInput), { ok: true, status: 302, elapsedMs: 15_000 });
   assert.deepEqual(live.calls, [
     ["start", { image, instance: "lite", enableInternet: true }], ["idle", 30_000], ["http://container/ready", null],
-    [apiPath, { url: apiInput.url, key: apiInput.key }], ["destroy"],
+    [apiPath, { url: apiInput.url, key: apiInput.key }], ["monitor"], ["signal", 15],
   ]);
   const wrongPin = fake();
   assert.deepEqual(await probePinnedProviderApiStatus(wrongPin.container, { ...apiInput, imageSha256: "e".repeat(64) }),
@@ -273,7 +297,7 @@ test("API status accepts exact pinned bounded input and posts only URL and key o
   const wrongRunningImage = fake({ runningImage: "foreign" });
   assert.deepEqual(await probePinnedProviderApiStatus(wrongRunningImage.container, apiInput), { ok: false, code: "unavailable" });
   assert.equal(wrongRunningImage.calls.filter(([path]) => path === apiPath).length, 0);
-  assert.deepEqual(wrongRunningImage.calls.at(-1), ["destroy"]);
+  assert.deepEqual(wrongRunningImage.calls.at(-1), ["signal", 15]);
 });
 
 test("API status rejects malformed port replies and never replays a key after an ambiguous call", async () => {
@@ -301,7 +325,7 @@ test("API status rejects malformed port replies and never replays a key after an
     const { container, calls } = fake({ apiResponse });
     assert.deepEqual(await probePinnedProviderApiStatus(container, apiInput), expected);
     assert.equal(calls.filter(([path]) => path === apiPath).length, 1);
-    assert.deepEqual(calls.at(-1), ["destroy"]);
+    assert.deepEqual(calls.at(-1), ["signal", 15]);
   }
   const failStop = fake({ apiResponse: () => apiJson({ status: 200, elapsedMs: 1 }), failStop: true });
   assert.deepEqual(await probePinnedProviderApiStatus(failStop.container, apiInput), { ok: false, code: "unavailable" });
@@ -321,7 +345,7 @@ test("API status body timeout finishes without a second port call", async (t) =>
   }), { headers: { ...headers, "Content-Type": "application/json" } }) });
   assert.deepEqual(await probePinnedProviderApiStatus(container, apiInput), { ok: false, code: "timeout" });
   assert.equal(calls.filter(([path]) => path === apiPath).length, 1);
-  assert.deepEqual(calls.at(-1), ["destroy"]);
+  assert.deepEqual(calls.at(-1), ["signal", 15]);
 });
 
 test("API status v2 refuses a late startup and submits the exact deadline once", async (t) => {
@@ -344,9 +368,9 @@ test("API status v2 refuses a late startup and submits the exact deadline once",
   assert.deepEqual(expired.calls, []);
 
   const late = fake({ apiResponse: () => assert.fail("Late startup must never post the credential.") });
-  late.container.inspect = async () => { now = input.dispatchBeforeMs; return { image }; };
+  late.container.inspect = async () => { now = input.dispatchBeforeMs; return late.container.running ? { image } : null; };
   assert.deepEqual(await probePinnedProviderApiStatusV2(late.container, input), { ok: false, code: "timeout" });
-  assert.deepEqual(late.calls.map(([call]) => call), ["start", "idle", "http://container/ready", "destroy"]);
+  assert.deepEqual(late.calls.map(([call]) => call), ["start", "idle", "http://container/ready", "monitor", "signal"]);
 
   now = start;
   for (const [apiResponse, result] of [
@@ -357,7 +381,7 @@ test("API status v2 refuses a late startup and submits the exact deadline once",
     assert.deepEqual(await probePinnedProviderApiStatusV2(fixture.container, input), result);
     assert.deepEqual(fixture.calls.filter(([path]) => path.endsWith("/api-status")), [[apiV2Path,
       { url: input.url, key: input.key, dispatchBeforeMs: input.dispatchBeforeMs }]]);
-    assert.deepEqual(fixture.calls.at(-1), ["destroy"]);
+    assert.deepEqual(fixture.calls.at(-1), ["signal", 15]);
   }
 });
 

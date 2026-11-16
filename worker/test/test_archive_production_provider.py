@@ -4,6 +4,7 @@ from copy import deepcopy
 from base64 import b64encode
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -224,6 +225,65 @@ class ReconciliationTests(unittest.TestCase):
             client._write("/workers/workers", {})
         with self.assertRaises(control.ProviderError):
             client.upload(b"module")
+
+
+class FailedTerminalArchiveTests(unittest.TestCase):
+    def setUp(self):
+        from test_production_provider_forward import recovery
+        environment = patch.dict(os.environ, {"GITHUB_SHA": "b" * 40})
+        environment.start()
+        self.addCleanup(environment.stop)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.target = config(active=True)
+        self.state = {"status": "failed-terminal-preserved", "completion": "not-complete", "state": "failed", "exitCode": 137,
+                      "targetSha256": control.digest(self.target), "sourceRevision": self.target["build"]["revision"],
+                      "instanceIdSha256": "5" * 64, "processSha256": "6" * 64}
+        self.recovery = {**recovery(self.target), "terminalSha256": control.digest(self.state)}
+        self.write()
+        self.store = MemoryStore()
+
+    def write(self):
+        for name, value in (("provider-reconciled-target.json", self.target), ("provider-forward-terminal.json", self.recovery),
+                            ("provider-failed-terminal-state.json", self.state),
+                            ("provider-failed-terminal-readback.json", {"version": 1, "summarySha256": control.digest(self.state),
+                                "targetSha256": control.digest(self.target), "observations": 2})):
+            (self.root / name).write_bytes(control.canonical(value))
+
+    def test_failed_terminal_is_sealed_and_independently_read_only_as_not_complete(self):
+        with patch("production_provider_forward.artifact_receipt"):
+            result = archive.terminal_archive(self.store, self.root)
+        self.assertEqual(result["completion"], "not-complete")
+        self.assertEqual(result["status"], "failed-terminal-preserved")
+        writes = self.store.writes
+        self.assertEqual(archive.terminal_archive(self.store, expected=result["manifestSha256"]), result)
+        self.assertEqual(self.store.writes, writes)
+        self.assertNotIn("manifest.json", self.store.objects)
+        self.assertNotIn("partial-manifest.json", self.store.objects)
+
+    def test_mismatched_receipt_hash_state_or_target_never_seals(self):
+        with patch("production_provider_forward.artifact_receipt", side_effect=control.ProviderError("refused")), \
+                self.assertRaises(control.ProviderError):
+            archive.terminal_archive(self.store, self.root)
+        self.assertEqual(self.store.writes, 0)
+        for changed in ({"completion": "complete"}, {"state": "stopped"}, {"exitCode": 0}, {"targetSha256": "8" * 64}):
+            original = deepcopy(self.state)
+            self.state.update(changed)
+            self.recovery["terminalSha256"] = control.digest(self.state)
+            self.write()
+            with patch("production_provider_forward.artifact_receipt"), self.subTest(changed=changed), \
+                    self.assertRaises(control.ProviderError):
+                archive.terminal_archive(self.store, self.root)
+            self.assertEqual(self.store.writes, 0)
+            self.state = original
+
+    def test_corrupt_or_missing_terminal_record_cannot_be_verified(self):
+        with patch("production_provider_forward.artifact_receipt"):
+            result = archive.terminal_archive(self.store, self.root)
+        self.store.objects["terminal/provider-failed-terminal-state.json"] += b"changed"
+        with self.assertRaises(control.ProviderError):
+            archive.terminal_archive(self.store, expected=result["manifestSha256"])
 
 
 if __name__ == "__main__":

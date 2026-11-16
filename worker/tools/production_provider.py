@@ -88,7 +88,7 @@ def validate_config(value, *, depth=0):
     """Pure strict contract, also used by the application's dependency preflight."""
     required = {"version", "environment", "accountId", "service", "workersDevOrigin", "worker", "build", "versionId",
                 "activation", "container", "workflow", "smoke", "caller"}
-    require(isinstance(value, dict) and set(value) in (required, required | {"previous"}) and depth <= 8)
+    require(isinstance(value, dict) and required <= set(value) <= required | {"previous", "forwardRecovery"} and depth <= 8)
     require(type(value["version"]) is int and value["version"] == 1 and isinstance(value["environment"], str)
             and value["environment"] in SERVICES
             and value["service"] == SERVICES[value["environment"]]
@@ -133,6 +133,21 @@ def validate_config(value, *, depth=0):
     if caller:
         require(caller["name"] == ("subs-bot-cf-prod-01" if value["environment"] == "production" else "subs-bot-cf-control-drill-01")
                 and (worker is None or caller["id"] != worker["workerId"]))
+    if "forwardRecovery" in value:
+        recovery = validate_forward_recovery(value["forwardRecovery"])
+        require(previous is not None and recovery["previousTargetSha256"] == digest(previous)
+                and all(previous[key] is not None for key in ("worker", "versionId", "activation", "container", "workflow")),
+                "A failed-terminal forward approval must pin the complete previous unbound target.")
+    return deepcopy(value)
+
+
+def validate_forward_recovery(value):
+    fields(value, {"version", "sourceRunId", "sourceRunAttempt", "sourceManifestSha256", "responseIdentitySha256",
+                   "previousTargetSha256", "terminalSha256"})
+    require(type(value["version"]) is int and value["version"] == 1
+            and all(match(provider.DECIMAL, value[key]) for key in ("sourceRunId", "sourceRunAttempt"))
+            and all(match(provider.HEX, value[key]) for key in ("sourceManifestSha256", "responseIdentitySha256",
+                                                               "previousTargetSha256", "terminalSha256")))
     return deepcopy(value)
 
 
@@ -523,9 +538,23 @@ def unbound_upgrade(api, state):
     if previous["activation"] is not None:
         require(previous["container"] is not None and previous["workflow"] is not None)
         old_instance = api.smoke_instance({**previous["build"], "versionId": previous["versionId"]}, previous["workflow"])
-        verify_smoke(api, {"instance": old_instance}, config=previous)
+        verify_previous_terminal(api, previous, old_instance)
     else:
         require(state["container"] is None and state["workflow"] is None)
+
+
+def verify_previous_terminal(api, previous, old_instance):
+    recovery = api.config.get("forwardRecovery")
+    if recovery is None:
+        return verify_smoke(api, {"instance": old_instance}, config=previous)
+    from production_provider_terminal import verify_forced_terminal
+    require(recovery["previousTargetSha256"] == digest(previous) and api.config["caller"] is None
+            and previous["caller"] is None and api.config["build"]["revision"] != previous["build"]["revision"])
+    # This proof is solely an upgrade precondition. The ordinary stopped/smoke
+    # verifier remains strict, and the previous failed release is never passed.
+    result = verify_forced_terminal(api, previous, current_config=api.config)
+    require(digest(result) == recovery["terminalSha256"], "The preserved failed terminal changed before forward recovery.")
+    return result
 
 
 def run_operation(api, operation, module, image, guard):
@@ -581,7 +610,7 @@ def run_operation(api, operation, module, image, guard):
             require(config["caller"] is None)
             previous = config["previous"]
             old_instance = api.smoke_instance({**previous["build"], "versionId": previous["versionId"]}, previous["workflow"])
-            verify_smoke(api, {"instance": old_instance}, config=previous)
+            verify_previous_terminal(api, previous, old_instance)
         else:
             require(api.actors(config["activation"]["namespaceId"]) == [] and api.instances(config["activation"]["namespaceId"]) == [])
         api.trigger({**config["build"], "versionId": config["versionId"]})

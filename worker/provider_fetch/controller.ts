@@ -288,9 +288,17 @@ async function withPinnedContainer<T>(
   } finally {
     if (started) {
       try {
-        await within(container.destroy(), AbortSignal.timeout(STOP_MS));
-        requireResult(!container.running, "The provider container stop could not be confirmed.");
+        const shutdown = AbortSignal.timeout(STOP_MS);
+        const stopped = container.monitor();
+        // Observe before signalling, including an exit between these two calls.
+        void stopped.catch(() => {});
+        container.signal(15);
+        await within(stopped, shutdown);
+        requireResult(!container.running && await within(container.inspect(), shutdown) === null,
+          "The provider container graceful stop could not be confirmed.");
       } catch {
+        // A forced cleanup never converts an unconfirmed graceful exit to success.
+        try { await within(container.destroy(), AbortSignal.timeout(STOP_MS)); } catch { /* fail closed below */ }
         throw new ProviderProbeError("stop");
       }
     }

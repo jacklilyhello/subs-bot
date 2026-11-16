@@ -175,10 +175,12 @@ def initial_config(build, health_url, health_revision):
 
 def selection():
     mode = os.environ.get("SUBS_BOT_PROVIDER_REHEARSAL_SOURCE_MODE", "registered")
-    control.require(mode in {"registered", "current"})
+    control.require(mode in {"registered", "current", "forward"})
     raw = os.environ.get("SUBS_BOT_PROVIDER_REHEARSAL_TARGET_JSON", "")
     old = control.read_config(raw) if raw else None
     control.require(old is None or old["environment"] == "rehearsal" and old["caller"] is None)
+    control.require(mode != "forward" or old is not None,
+                    "Forward recovery requires the independently registered complete previous target.")
     revision = old["build"]["revision"] if old is not None and mode == "registered" else os.environ["GITHUB_SHA"]
     if old is not None and mode == "registered":
         control.require(os.environ.get("SUBS_BOT_PROVIDER_CI_RUN_ID") == old["build"]["runId"],
@@ -213,15 +215,27 @@ def initialize():
     context()
     mode, old, _revision = selection()
     _archive, evidence, _module = verified_input()
+    control.require(mode != "forward" or old is not None and old["build"]["revision"] != evidence["revision"],
+                    "Forward recovery requires a distinct newly reviewed source revision.")
     if old is not None and old["build"] == evidence:
         config = old
     else:
         config = initial_config(evidence, os.environ.get("SUBS_BOT_PROVIDER_REHEARSAL_HEALTH_URL", ""),
                                 os.environ.get("SUBS_BOT_PROVIDER_REHEARSAL_HEALTH_REVISION", ""))
         if old is not None:
-            control.require(mode == "current")
+            control.require(mode in {"current", "forward"})
             approve(old, "verify")
-            control.verify_provider_dependency(api(old), old, allow_unbound_caller=True)
+            if mode == "forward":
+                from production_provider_terminal import verify_forced_terminal
+                recovery = control.validate_forward_recovery(control.github._parse_object(
+                    os.environ.get("SUBS_BOT_PROVIDER_FORWARD_TERMINAL_JSON", ""), control.ERROR))
+                control.require(recovery["previousTargetSha256"] == control.digest(old)
+                                and old["build"]["revision"] != evidence["revision"])
+                control.require(control.digest(verify_forced_terminal(api(old), old)) == recovery["terminalSha256"],
+                                "The registered failed terminal changed before forward recovery.")
+                config["forwardRecovery"] = recovery
+            else:
+                control.verify_provider_dependency(api(old), old, allow_unbound_caller=True)
             config.update({"worker": old["worker"], "container": old["container"], "workflow": None, "previous": old})
             config = control.validate_config(config)
     fault = os.environ.get("SUBS_BOT_PROVIDER_REHEARSAL_FAULT", "none")
