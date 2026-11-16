@@ -44,6 +44,7 @@ def worker_profile(value):
     return {"id": value["worker"]["workerId"], "created_on": STAMP, "name": value["service"],
             "tags": [control.TAGS[value["environment"]]], "deployed_on": None,
             "subdomain": {"enabled": False, "previews_enabled": False}, "logpush": False,
+            "tail_consumers": [],
             "observability": deepcopy(control.bootstrap.OBSERVABILITY_OFF),
             "references": {key: [] for key in control.bootstrap.REFERENCE_FIELDS}}
 
