@@ -7,10 +7,12 @@ import {
   apiStatusFailure, exercise, fetchPinnedProvider, probePinnedProviderApiStatus, probePinnedProviderApiStatusV2,
   providerApiStatusRequest, providerApiStatusResult, providerApiStatusV2Expired, providerApiStatusV2Request,
   providerFailure, providerPayload, providerRequest, ProviderProbeError, REVISION, SERVICE, SINGLETON,
+  readProviderRuntimeTarget, exerciseProviderRelease,
 } from "./controller.ts";
 
 interface Env {
   BUILD_REVISION: string;
+  PROVIDER_TARGET_JSON?: string;
 }
 
 declare global {
@@ -50,9 +52,11 @@ export class ProviderContainer extends DurableObject<Env> {
         return providerFailure("unavailable");
       }
       if (this.busy) return providerFailure("busy");
+      const target = this.env.PROVIDER_TARGET_JSON === undefined ? undefined : readProviderRuntimeTarget(this.env.PROVIDER_TARGET_JSON);
+      if (target === null) return providerFailure("unavailable");
       this.busy = true;
       try {
-        return await fetchPinnedProvider(container, revision, payload, request.imageSha256);
+        return await fetchPinnedProvider(container, revision, payload, request.imageSha256, target);
       } finally {
         this.busy = false;
       }
@@ -121,6 +125,59 @@ export class ProviderContainer extends DurableObject<Env> {
     } finally {
       this.busy = false;
     }
+  }
+
+  async proveRelease(probe: ReleaseProbe) {
+    const revision = this.env.BUILD_REVISION;
+    const target = readProviderRuntimeTarget(this.env.PROVIDER_TARGET_JSON);
+    const singleton = this.ctx.exports.ProviderContainer.idFromName(SINGLETON);
+    if (!target || !this.ctx.id.equals(singleton) || !validReleaseProbe(probe, revision) || this.busy || !this.ctx.container) {
+      throw new Error("Provider release smoke admission rejected.");
+    }
+    this.busy = true;
+    try {
+      const key = `release-smoke:${revision}:${probe.imageSha256}`;
+      if (await this.ctx.storage.get(key)) throw new Error("Provider release smoke was already admitted.");
+      await this.ctx.storage.put(key, true);
+      return await exerciseProviderRelease(this.ctx.container, revision, probe.imageSha256, target,
+        probe.healthUrl, probe.healthRevision, probe.healthSha256);
+    } catch (error) {
+      return { ok: false, stage: error instanceof ProviderProbeError ? error.stage : "admission" };
+    } finally { this.busy = false; }
+  }
+}
+
+interface ReleaseProbe {
+  providerRevision: string; imageSha256: string; healthUrl: string; healthRevision: string; healthSha256: string;
+}
+
+function validReleaseProbe(probe: ReleaseProbe, revision: string): boolean {
+  return typeof probe === "object" && probe !== null && Object.keys(probe).length === 5
+    && REVISION.test(revision) && probe.providerRevision === revision
+    && typeof probe.imageSha256 === "string" && /^[0-9a-f]{64}(?![\s\S])/u.test(probe.imageSha256)
+    && typeof probe.healthRevision === "string" && REVISION.test(probe.healthRevision)
+    && typeof probe.healthSha256 === "string" && /^[0-9a-f]{64}(?![\s\S])/u.test(probe.healthSha256)
+    && typeof probe.healthUrl === "string" && /^https:\/\/[a-z0-9.-]+\/health(?![\s\S])/u.test(probe.healthUrl);
+}
+
+export class ProviderReleaseSmoke extends WorkflowEntrypoint<Env, ReleaseProbe> {
+  async run(event: WorkflowEvent<ReleaseProbe>, step: WorkflowStep) {
+    const target = readProviderRuntimeTarget(this.env.PROVIDER_TARGET_JSON);
+    if (!target || !validReleaseProbe(event.payload, this.env.BUILD_REVISION)
+      || event.workflowName !== target.service + "-smoke"
+      || event.instanceId !== `provider-release-${this.env.BUILD_REVISION}`) throw new Error("Provider release smoke target differs.");
+    const egress = await step.do("verify approved provider release", { retries: { limit: 0, delay: "1 second" }, timeout: "150 seconds" }, async () => {
+      return this.ctx.exports.ProviderContainer.getByName(SINGLETON).proveRelease(event.payload);
+    });
+    if (!egress.ok || !("imageSha256" in egress)) return egress;
+    await step.do("verify exact named ProviderFetch RPC", { retries: { limit: 0, delay: "1 second" }, timeout: "75 seconds" }, async () => {
+      const result = await this.ctx.exports.ProviderFetch.fetchSubscription({ url: event.payload.healthUrl,
+        providerRevision: event.payload.providerRevision, imageSha256: event.payload.imageSha256 });
+      if (!result.ok || result.bodySha256 !== event.payload.healthSha256 || result.body.byteLength !== egress.healthBytes) {
+        throw new Error("The exact named ProviderFetch RPC did not return the approved health fixture.");
+      }
+    });
+    return { ...egress, rpcVerified: true };
   }
 }
 

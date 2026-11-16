@@ -1,0 +1,78 @@
+name: Control explicit production ProviderFetch dependency
+run-name: ProviderFetch ${{ inputs.target_environment }} ${{ inputs.operation }} at ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_environment:
+        description: Explicit registered target; production is separately protected
+        required: true
+        type: choice
+        options: [rehearsal, production]
+        default: rehearsal
+      provider_ci_run_id:
+        description: Successful exact pinned main-ancestor Provider Fetch CI run
+        required: true
+        type: string
+      operation:
+        description: One guarded operation; use verify after any interrupted or ambiguous mutation
+        required: true
+        type: choice
+        options: [verify, create, publish, stage, activate, provision-container, provision-workflow, smoke]
+        default: verify
+      approval_sha256:
+        description: SHA256 of canonical operation and complete target contract for mutations
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: subs-bot-production-provider-${{ inputs.target_environment }}
+  cancel-in-progress: false
+
+jobs:
+  control:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
+    environment: ${{ inputs.target_environment == 'production' && 'subs-bot-production-provider' || 'subs-bot-provider-isolation' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install and verify the pinned registry client
+        run: bash worker/tools/install_provider_skopeo.sh
+      - name: Verify exact main artifact and its OCI closure
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_CI_RUN_ID: ${{ inputs.provider_ci_run_id }}
+          SUBS_BOT_PROVIDER_CONTROL_ENVIRONMENT: ${{ inputs.target_environment }}
+          SUBS_BOT_PROVIDER_CONTROL_OPERATION: ${{ inputs.operation }}
+          SUBS_BOT_PROVIDER_CONTROL_APPROVAL: ${{ inputs.approval_sha256 }}
+          SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          python3 -B worker/tools/production_provider.py prepare > "$RUNNER_TEMP/provider-provenance.json"
+      - name: Execute the explicit identity control
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_CONTROL_ENVIRONMENT: ${{ inputs.target_environment }}
+          SUBS_BOT_PROVIDER_CONTROL_OPERATION: ${{ inputs.operation }}
+          SUBS_BOT_PROVIDER_CONTROL_APPROVAL: ${{ inputs.approval_sha256 }}
+          SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          SUBS_BOT_CF_PROVIDER_WORKER_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_WORKER_TOKEN }}
+          SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_CONTAINER_TOKEN }}
+        run: |
+          umask 077
+          python3 -B worker/tools/production_provider.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: subs-bot-production-provider-${{ inputs.operation }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/production-provider-evidence.json
+          if-no-files-found: error
+          retention-days: 7

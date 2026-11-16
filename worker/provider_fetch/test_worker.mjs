@@ -6,6 +6,7 @@ import { Miniflare } from "miniflare";
 import {
   exercise, fetchPinnedProvider, probePinnedProviderApiStatus, probePinnedProviderApiStatusV2, providerApiStatusRequest,
   providerApiStatusV2Request, providerPayload, ProviderProbeError,
+  readProviderRuntimeTarget, exerciseProviderRelease,
 } from "./controller.ts";
 
 const revision = "a".repeat(40);
@@ -77,6 +78,43 @@ const metadataHeader = (text) => Buffer.from(text).toString("base64").replaceAll
 const success = (extra = {}, bytes = Buffer.from("synthetic subscription bytes")) => new Response(bytes, {
   headers: { ...headers, "Content-Type": "application/octet-stream", "Content-Length": String(bytes.length),
     "X-Provider-Body-Sha256": createHash("sha256").update(bytes).digest("hex"), ...extra },
+});
+
+test("production runtime pins require an explicit environment, account and dedicated service", () => {
+  const target = { environment: "production", accountId: "d".repeat(32), service: "subs-bot-provider-fetch-prod-01" };
+  assert.deepEqual(readProviderRuntimeTarget(JSON.stringify(target)), { accountId: target.accountId, service: target.service });
+  for (const bad of [undefined, null, "{}", JSON.stringify({ ...target, accountId: "" }),
+    JSON.stringify({ ...target, service: "subs-bot-provider-fetch-dev-01" }), JSON.stringify({ ...target, environment: "rehearsal" }),
+    JSON.stringify({ ...target, unknown: true })]) assert.equal(readProviderRuntimeTarget(bad), null);
+});
+
+test("production fetch rejects a dev image and wrong account before starting a container", async () => {
+  const target = { accountId: "d".repeat(32), service: "subs-bot-provider-fetch-prod-01" };
+  const { container, calls } = fake();
+  assert.deepEqual(await fetchPinnedProvider(container, revision, JSON.stringify({ url: providerUrl }), imageDigest, target),
+    { ok: false, code: "unavailable", retryable: true });
+  assert.equal(calls.length, 0);
+  container.images.provider = `registry.cloudflare.com/${"e".repeat(32)}/${target.service}@sha256:${imageDigest}`;
+  assert.deepEqual(await fetchPinnedProvider(container, revision, JSON.stringify({ url: providerUrl }), imageDigest, target),
+    { ok: false, code: "unavailable", retryable: true });
+  assert.equal(calls.length, 0);
+});
+
+test("production fetch uses exact account/service/image and proves approved health plus private denials", async () => {
+  const target = { accountId: "d".repeat(32), service: "subs-bot-provider-fetch-prod-01" };
+  const exactImage = `registry.cloudflare.com/${target.accountId}/${target.service}@sha256:${imageDigest}`;
+  const healthUrl = "https://subs-bot.fixture.example/health";
+  const { container, calls } = fake({ runningImage: exactImage, providerResponse: (init) => {
+    if (JSON.parse(init.body).url === healthUrl) return success({}, Buffer.from(body));
+    return Response.json({ error: "blocked-address" }, { status: 422, headers });
+  } });
+  container.images.provider = exactImage;
+  assert.deepEqual(await exerciseProviderRelease(container, revision, imageDigest, target, healthUrl, isolatedRevision, digest), {
+    ok: true, stopped: true, revision, imageSha256: imageDigest, healthRevision: isolatedRevision, healthSha256: digest,
+    healthBytes: Buffer.byteLength(body), blockedPrivateTargets: 3,
+  });
+  assert.equal(calls.filter(([kind]) => kind === "start").length, 1);
+  assert.equal(calls.filter(([kind]) => kind === "destroy").length, 1);
 });
 
 test("admits only a bounded RPC input and posts the exact URL to the verified private container", async () => {
