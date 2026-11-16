@@ -19,6 +19,7 @@ const TOKEN = /^[A-Za-z0-9_-]{16,128}$/u;
 const ORIGIN = ISOLATION_PUBLIC_ORIGIN;
 const MAX_SQL = 32 * 1024 * 1024;
 const MAX_RESPONSE = 24 * 1024 * 1024;
+const CONTENT_DENIAL = Buffer.from("Subscription content cannot be exported.", "utf8");
 const KEY = /^(?:subscriptions\/[1-9][0-9]{0,15}\/[a-f0-9-]{36}\/(?:[0-9]{1,3}\.ndjson|manifest\.json)|private-shares\/[a-f0-9-]{36}\.txt)$/u;
 let stage = "sandbox";
 let failure: Record<string, string | number | boolean> | null = null;
@@ -132,6 +133,7 @@ async function main() {
     outboundService: () => { outboundAttempts += 1; throw new Error("Native restored-link egress denied."); },
   });
   const counts = { storedShareExports: 0, legacyEmptyExports: 0, unpublishedDenials: 0, trashDenials: 0, oversizeDenials: 0, activeAllAggregatePairs: 0,
+    activeAllAggregateSuccessPairs: 0, activeAllAggregateContentDenialPairs: 0,
     missingDenials: 0, omittedStructuredOrInvalidShare: 0, omittedResponseLimit: 0, omittedHashedCapabilities: 0 };
   let migrationCount = 0;
   let restoredEffectiveDisplayTimezones: string[] = [];
@@ -282,21 +284,27 @@ async function main() {
           AND NOT EXISTS(SELECT 1 FROM legacy_all_aggregates WHERE code_sha256=slot.code_sha256)`)
         .bind(probe.codeSha256).first<number>("count");
       requireSafe(match === 1);
+      requireSafe(record(probe.get) && record(probe.head) && (probe.get.status === 200 || probe.get.status === 422)
+        && probe.get.status === probe.head.status);
       for (const [method, key] of [["GET", "get"], ["HEAD", "head"]] as const) {
         const expected = probe[key];
-        requireSafe(record(expected) && expected.status === 200 && integer(expected.bytes, MAX_RESPONSE)
+        requireSafe(record(expected) && (expected.status === 200 || expected.status === 422) && integer(expected.bytes, MAX_RESPONSE)
           && (method === "GET" ? expected.bytes > 0 : expected.bytes === 0)
           && typeof expected.sha256 === "string" && DIGEST.test(expected.sha256)
-          && (method !== "HEAD" || expected.sha256 === sha(Buffer.alloc(0))));
+          && (method !== "HEAD" || expected.sha256 === sha(Buffer.alloc(0)))
+          && (expected.status !== 422 || method === "HEAD"
+            || expected.bytes === CONTENT_DENIAL.length && expected.sha256 === sha(CONTENT_DENIAL)));
         stage = "native-http-request";
-        failure = { category: "activeAllAggregatePairs", check: checkNumber + 1, method, expectedStatus: 200 };
+        failure = { category: "activeAllAggregatePairs", check: checkNumber + 1, method, expectedStatus: expected.status };
         const response = await runtime.dispatchFetch(ORIGIN + "/agg/" + probe.code + "/base64", { method, redirect: "manual" });
         stage = "native-http-content-type";
         failure = { ...failure, contentTypeMatches: response.headers.get("content-type") === "text/plain; charset=utf-8" };
         requireSafe(failure.contentTypeMatches);
-        await checkExpected(response, method, 200, expected.bytes, expected.sha256, "activeAllAggregatePairs");
+        await checkExpected(response, method, expected.status, expected.bytes, expected.sha256, "activeAllAggregatePairs");
       }
       counts.activeAllAggregatePairs += 1;
+      if (probe.get.status === 200) counts.activeAllAggregateSuccessPairs += 1;
+      else counts.activeAllAggregateContentDenialPairs += 1;
     }
     for (const table of ["normal_short_links", "aggregate_links", "private_shares"]) {
       counts.omittedHashedCapabilities += await db.prepare(`SELECT count(*) AS count FROM ${table}`).first<number>("count") ?? 0;
@@ -310,6 +318,7 @@ async function main() {
     moduleSha256: input.moduleSha256, restoredDataSha256: input.dataSha256,
     consumerBound: false, telegramConfigSupplied: false, outboundAttempts, counts, migrationCount, restoredEffectiveDisplayTimezones,
     limitations: ["Only active native all-slots proven by the protected source key and matching source HTTP baseline are probed; other hashed capabilities remain omitted.",
+      "Matching known 422 content denials are counted separately and do not prove a successful export or its failure cause.",
       "Structured or invalid stored-share exports and responses above the bound are reported as omitted.",
       "Scratch runtime replays the sealed SQL proven equal to restored D1 and bytes read from restored R2; this is not a public target deployment."] };
   await writeFile(process.argv[4], JSON.stringify(report) + "\n", { mode: 0o600, flag: "wx" });

@@ -94,6 +94,7 @@ LEGACY_CANDIDATE_NAMES = {LEGACY_CANDIDATE_PROFILE: "legacy", LEGACY_PATH_CANDID
 ACCOUNT_SHA256 = "ffdbf3dd5d042c6edb68d7f628998a69a22320b0199775bfda9f97593136e508"
 AGGREGATE_ORIGIN = "https://subs-bot-cf-dev-01.lilyya.workers.dev"
 AGGREGATE_CODE = re.compile(r"[A-Za-z0-9_-]{22}")
+AGGREGATE_CONTENT_DENIAL = b"Subscription content cannot be exported."
 
 
 class RehearsalError(RuntimeError):
@@ -139,12 +140,12 @@ def read_aggregate_reference(code, method):
     try:
         status, raw_headers, body = _response(opener, Request(AGGREGATE_ORIGIN + "/agg/" + code + "/base64",
             method=method, headers={"Accept-Encoding": "identity", "Cache-Control": "no-cache",
-                "User-Agent": ISOLATION_RELEASE_USER_AGENT}), 24 * 1024 * 1024)
+                "User-Agent": ISOLATION_RELEASE_USER_AGENT}), 24 * 1024 * 1024, allow_aggregate_content_denial=True)
     except RehearsalError as error:
         status_label = str(error.http_status) if integer(error.http_status, 100, 599) else "unconfirmed"
         raise RehearsalError("Isolated all-aggregate reference " + method + " was not verified (HTTP " + status_label + ").") from None
     headers = {key.lower(): value for key, value in raw_headers.items()}
-    require(status == 200, "Isolated all-aggregate reference " + method + " expected HTTP 200; observed HTTP " + str(status) + ".")
+    require(status in {200, 422}, "Isolated all-aggregate reference " + method + " expected HTTP 200 or known content denial; observed HTTP " + str(status) + ".")
     require(headers.get("cache-control") == "private, no-store"
         and headers.get("referrer-policy") == "no-referrer" and headers.get("x-content-type-options") == "nosniff"
         and headers.get("content-type") == "text/plain; charset=utf-8"
@@ -152,7 +153,9 @@ def read_aggregate_reference(code, method):
         "The isolated all-aggregate reference response was not verified.")
     require((method == "HEAD" and not body) or (method == "GET" and body),
         "The isolated all-aggregate reference body was not verified.")
-    if method == "GET":
+    if method == "GET" and status == 422:
+        require(body == AGGREGATE_CONTENT_DENIAL, "The isolated all-aggregate content denial was not verified.")
+    elif method == "GET":
         try:
             decoded = base64.b64decode(body, validate=True)
             require(decoded and base64.b64encode(decoded) == body)
@@ -249,7 +252,13 @@ def signed_put_headers(host, path, token_id, token, raw, metadata, now, *, if_ma
     return headers
 
 
-def _response(opener, request, maximum):
+def _response(opener, request, maximum, *, allow_aggregate_content_denial=False):
+    if allow_aggregate_content_denial:
+        # This exception is only for the fixed public read-only application
+        # baseline. Cloudflare management API error handling is unchanged.
+        require(request.get_method() in {"GET", "HEAD"}
+            and re.fullmatch(re.escape(AGGREGATE_ORIGIN) + r"/agg/[A-Za-z0-9_-]{22}/base64", request.full_url)
+            and request.get_header("Authorization") is None and request.get_header("Cookie") is None)
     try:
         with opener.open(request, timeout=30) as response:
             body = response.read(maximum + 1)
@@ -257,6 +266,11 @@ def _response(opener, request, maximum):
             return response.status, dict(response.headers.items()), body
     except HTTPError as error:
         status = error.code
+        if allow_aggregate_content_denial and status == 422:
+            with closing(error):
+                body = error.read(maximum + 1)
+                require(len(body) <= maximum)
+                return status, dict(error.headers.items()), body
         error.close()
         raise RehearsalError("Native rehearsal API request was not confirmed.", uncertain=request.method != "GET" and
                              (status == 408 or status >= 500), http_status=status) from None
@@ -1618,6 +1632,8 @@ class Rehearsal:
         for probe in probes:
             probe["get"] = read_aggregate_reference(probe["code"], "GET")
             probe["head"] = read_aggregate_reference(probe["code"], "HEAD")
+            require(probe["get"]["status"] == probe["head"]["status"],
+                "The isolated all-aggregate status changed between GET and HEAD.")
         self.source.before_write()
         self.source.quiet()
         require(remote_summary(self.api, self.api.target["d1Id"], document["layout"]) == document["summary"],

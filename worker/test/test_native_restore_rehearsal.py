@@ -940,7 +940,8 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(request.get_header("User-agent"), native.ISOLATION_RELEASE_USER_AGENT)
             self.assertIsNone(request.get_header("Authorization"))
             self.assertIsNone(request.get_header("Cookie"))
-        for status, body in ((302, b""), (503, b"private raw error"), (200, b"not-base64")):
+        for status, body in ((302, b""), (403, b"private raw error"), (503, b"private raw error"),
+                             (422, b"wrong content denial"), (200, b"not-base64")):
             with patch.object(native, "_response", return_value=(status, headers, body)):
                 with self.assertRaises(native.RehearsalError) as caught:
                     native.read_aggregate_reference(code, "GET")
@@ -948,6 +949,35 @@ class SnapshotTests(unittest.TestCase):
                 self.assertNotIn("private raw error", str(caught.exception))
         with patch.object(native, "_response", return_value=(200, headers, b"")):
             self.assertEqual(native.read_aggregate_reference(code, "HEAD")["bytes"], 0)
+
+    def test_known_422_content_denial_is_only_accepted_for_the_fixed_application_baseline(self):
+        headers = {"Cache-Control": "private, no-store", "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff", "Content-Type": "text/plain; charset=utf-8"}
+        code = "A" * 22
+        url = native.AGGREGATE_ORIGIN + "/agg/" + code + "/base64"
+        for method in ("GET", "HEAD"):
+            body = native.AGGREGATE_CONTENT_DENIAL if method == "GET" else b""
+            opener = Mock()
+            opener.open.side_effect = HTTPError(url, 422, "private raw reason", headers, BytesIO(body))
+            with patch.object(native, "build_opener", return_value=opener):
+                self.assertEqual(native.read_aggregate_reference(code, method),
+                    {"status": 422, "bytes": len(body), "sha256": native.digest(body)})
+        # Cloudflare API callers still treat 422 as an error by default.
+        opener = Mock()
+        opener.open.side_effect = HTTPError(native.API_ORIGIN + "/accounts/example", 422, "private", headers, BytesIO(native.AGGREGATE_CONTENT_DENIAL))
+        with self.assertRaises(native.RehearsalError) as caught:
+            native._response(opener, native.Request(native.API_ORIGIN + "/accounts/example"), 1024)
+        self.assertEqual(caught.exception.http_status, 422)
+        with self.assertRaises(native.RehearsalError):
+            native._response(Mock(), native.Request(native.API_ORIGIN + "/accounts/example"), 1024, allow_aggregate_content_denial=True)
+        for status, body in ((403, b"private raw error"), (503, b"private raw error"), (422, b"wrong content denial")):
+            opener = Mock()
+            opener.open.side_effect = HTTPError(url, status, "private raw reason", headers, BytesIO(body))
+            with patch.object(native, "build_opener", return_value=opener):
+                with self.assertRaises(native.RehearsalError) as caught:
+                    native.read_aggregate_reference(code, "GET")
+                self.assertNotIn("private raw", str(caught.exception))
+                self.assertNotIn(code, str(caught.exception))
 
     def test_quiet_checks_only_unexpired_inline_work_on_the_new_schema(self):
         self.db.execute("""INSERT INTO telegram_inbox
