@@ -98,11 +98,11 @@
 
 ### 已执行 smoke 后的受保护前向修复
 
-容器请求结束时先发送 `SIGTERM`，在固定期限内等待 `monitor()` 正常退出并核对 `running=false`、`inspect()=null`。异常或超时后会尝试 `destroy()` 清理，但仍返回失败。正常验收继续要求管理 API 的精确实例为 `stopped`，不会把 `failed` 改名为正常停止。
+容器请求结束时先发送 `SIGTERM`，在同一个 10 秒期限内等待 `monitor()` 正常退出并核对 `running=false`、`inspect()=null`；状态读取可在剩余期限内短暂重复，两个条件均不放宽。镜像将 aiohttp 的 shutdown timeout 显式限制为 2 秒，使服务关闭预算小于控制器总期限；预算对齐本身不证明任何既往失败的根因。异常或超时后会尝试 `destroy()` 清理，但仍返回失败。新的失败结果只记录固定 `stop.phase/reason/primaryStage`、有界退出码和清理结果，不记录异常文本；primaryStage 为空也不能代替业务或 RPC 成功证明。正常验收继续要求管理 API 的精确实例为 `stopped`，不会把 `failed` 改名为正常停止。
 
-若旧版本曾强制结束容器，必须保留原失败 run、private partial、旧 Workflow 实例和 Durable Object one-shot 标记。仅当旧实例已完整成功执行固定健康摘要、私网拒绝及 named RPC，且同一精确 image/actor 的 inventory 和 detail 均为 `failed/137`、时间属于旧执行、全部 active 实例为空、两次读回一致、资源没有应用 caller，才可生成单独的 `failed-terminal-preserved / not-complete` 证据。该证据不代表旧版本验收通过，也不能授权重触旧 smoke。
+若旧版本曾强制结束容器，必须保留原失败 run、private partial、旧 Workflow 实例和 Durable Object one-shot 标记。仅当旧实例已完整成功执行固定健康摘要、私网拒绝及 named RPC，且同一精确 image/actor 的 inventory 和 detail 均为 `failed/137`、时间属于旧执行、全部 active 实例为空、两次读回一致、资源没有应用 caller，才可生成单独的 `failed-terminal-preserved / not-complete` 证据。该证据不代表旧版本验收通过，也不能授权重触旧 smoke。另一个独立失败分支仅接受同样固定源、Workflow 和实例、`complete/success` 但业务输出严格为旧格式 `{ok:false,stage:"stop"}` 或新格式附带闭合白名单 `stop` 诊断的结果，并继续要求同一精确 image/actor 的 `failed/137`、无 active、双读一致和无 caller。它单独绑定失败输出摘要并明确 `namedRpcVerified=false`，不能宣称健康、地址策略或 RPC 已通过。
 
-用 `action=reconcile-terminal` 填原 run/attempt、经独立 R2-only 读回的 partial manifest SHA 和 smoke response identity SHA。流程先在 R2 环境验证原始源代码及 intent/response 归属，再通过不可变 artifact 将无凭据目标交给 Provider 环境，使用各自既有凭据只读验证终态；最后另一个 R2 环境 job 封存四份小型原件。凭据不跨环境搬运，任一步失败均不产生前向批准。记录返回的 terminal manifest SHA，再以 `action=verify-terminal` 和该 reconcile run/attempt/SHA 从私有 R2 独立读回；状态始终为 not-complete。
+用 `action=reconcile-terminal` 填原 run/attempt、经独立 R2-only 读回的 partial manifest SHA 和 smoke response identity SHA。流程先在 R2 环境验证原始源代码及 intent/response 归属；复用既有 Workflow 而跳过 provision 的 registered 接续，还必须读回该次 activate 的原始不可变 intent、准确源与操作批准、确认后目标及保留的 namespace/Workflow 身份，不接受一条 skipped 记录代替证明。再通过不可变 artifact 将无凭据目标交给 Provider 环境，使用各自既有凭据只读验证终态；最后另一个 R2 环境 job 封存四份小型原件。凭据不跨环境搬运，任一步失败均不产生前向批准。记录返回的 terminal manifest SHA，再以 `action=verify-terminal` 和该 reconcile run/attempt/SHA 从私有 R2 独立读回；状态始终为 not-complete。
 
 只有上述读回成功，才把该 run 的 `subs-bot-provider-forward-terminal-<run>-<attempt>` artifact 中原样的 `provider-reconciled-target.json` 登记为现有 rehearsal/control target 配置，把 `provider-forward-terminal.json` 登记到同一 `subs-bot-provider-isolation` 环境的 `SUBS_BOT_PROVIDER_FORWARD_TERMINAL_JSON`。通过文件 stdin 设置 Secret，不在终端打印配置。
 

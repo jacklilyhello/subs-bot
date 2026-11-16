@@ -131,4 +131,5 @@ def application(revision):
 
 if __name__ == "__main__":
     revision = Path(__file__).with_name("revision").read_text(encoding="ascii").strip()
-    web.run_app(application(revision), host="0.0.0.0", port=PORT, access_log=None, print=None, handler_cancellation=True)
+    web.run_app(application(revision), host="0.0.0.0", port=PORT, access_log=None, print=None, handler_cancellation=True,
+                shutdown_timeout=2)

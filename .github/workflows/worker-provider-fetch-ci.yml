@@ -178,6 +178,7 @@ jobs:
           exit_code="$(timeout --kill-after=2s 10s docker wait provider-fetch-ci)"
           test "$exit_code" = '0'
           test "$(docker inspect --format '{{.State.ExitCode}} {{.State.Running}}' provider-fetch-ci)" = '0 false'
+          python3 -B probe_shutdown.py "sha256:$config_digest" "$BUILD_REVISION"
           python3 -B release_artifact.py config "$artifact" "$BUILD_REVISION" \
             --account-id aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa > "$RUNNER_TEMP/provider-private-config.json"
           jq -e '.workers_dev == false and .preview_urls == false and .observability.enabled == false and
@@ -248,6 +249,7 @@ jobs:
           exit_code="$(timeout --kill-after=2s 10s docker wait provider-api-status-ci)"
           test "$exit_code" = '0'
           test "$(docker inspect --format '{{.State.ExitCode}} {{.State.Running}}' provider-api-status-ci)" = '0 false'
+          python3 -B probe_shutdown.py "sha256:$config_digest" "$BUILD_REVISION"
           python3 -B release_artifact.py config "$artifact" "$BUILD_REVISION" --profile api-status-v2 \
             --account-id aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa > "$RUNNER_TEMP/provider-api-status-private-config.json"
           jq -e --arg repository "registry.cloudflare.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/subs-bot-provider-api-status-dev-01" \

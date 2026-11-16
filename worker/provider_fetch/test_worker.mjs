@@ -257,6 +257,61 @@ test("an unsuccessful graceful exit remains failure even when forced cleanup suc
   }
 });
 
+test("shutdown diagnostics preserve only fixed subphases and the original business failure", async (t) => {
+  const target = { accountId: "d".repeat(32), service: "subs-bot-provider-fetch-dev-01" };
+  const healthUrl = "https://subs-bot.fixture.example/health";
+  const fixture = (primaryFailure = false) => fake({ providerResponse: (init) => {
+    if (JSON.parse(init.body).url === healthUrl) return primaryFailure ? new Response("synthetic-private-body") : success({}, Buffer.from(body));
+    return Response.json({ error: "blocked-address" }, { status: 422, headers });
+  } });
+  const run = (container) => exerciseProviderRelease(container, revision, imageDigest, target, healthUrl, isolatedRevision, digest);
+  const nonzero = fixture();
+  nonzero.container.monitor = () => Promise.reject(Object.assign(new Error("synthetic-private-error"), { exitCode: 143 }));
+  await assert.rejects(run(nonzero.container), (error) => {
+    assert.equal(error.stage, "stop");
+    assert.deepEqual(error.stop, { version: 1, phase: "monitor-wait", reason: "nonzero-exit", exitCode: 143,
+      primaryStage: "none", runningBeforeCleanup: false, inspectNullBeforeCleanup: null, forcedCleanup: "returned" });
+    assert(!JSON.stringify(error.stop).includes("synthetic-private"));
+    return true;
+  });
+  const signal = fixture(true);
+  signal.container.signal = () => { throw new Error("synthetic-private-signal"); };
+  await assert.rejects(run(signal.container), (error) => {
+    assert.equal(error.stop.phase, "signal");
+    assert.equal(error.stop.primaryStage, "edge");
+    assert.equal(error.stop.reason, "operation");
+    assert.equal(error.stop.forcedCleanup, "returned");
+    assert(!JSON.stringify(error.stop).includes("synthetic-private"));
+    return true;
+  });
+  const settled = fixture();
+  const inspect = settled.container.inspect.bind(settled.container);
+  let reads = 0;
+  settled.container.inspect = async () => !settled.container.running && ++reads < 3 ? { image } : inspect();
+  assert.equal((await run(settled.container)).ok, true);
+  assert.equal(settled.calls.filter(([name]) => name === "destroy").length, 0);
+  const timeout = AbortSignal.timeout.bind(AbortSignal);
+  t.mock.method(AbortSignal, "timeout", (ms) => {
+    if (ms !== 10_000) return timeout(ms);
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 20);
+    return controller.signal;
+  });
+  for (const phase of ["monitor-wait", "state-read"]) {
+    const stalled = fixture();
+    if (phase === "monitor-wait") stalled.container.monitor = () => new Promise(() => {});
+    else stalled.container.inspect = async () => ({ image });
+    await assert.rejects(run(stalled.container), (error) => {
+      assert.equal(error.stage, "stop");
+      assert.equal(error.stop.phase, phase);
+      assert.equal(error.stop.reason, "timeout");
+      assert.equal(error.stop.forcedCleanup, "returned");
+      return true;
+    });
+    assert.deepEqual(stalled.calls.at(-1), ["destroy"]);
+  }
+});
+
 const apiInput = { url: "https://fixture.example:443/tenant/v1/models", key: "synthetic-api-key",
   providerRevision: revision, imageSha256: imageDigest };
 const apiPath = "http://container/v1/api-status";

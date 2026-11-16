@@ -229,6 +229,53 @@ class ReconciliationTests(unittest.TestCase):
             client.upload(b"module")
 
 
+
+class TerminalPrerequisiteTests(unittest.TestCase):
+    def prepared(self, operation):
+        target = config(active=True)
+        if operation == "activate":
+            previous = deepcopy(target)
+            target.update({"previous": previous, "versionId": "33333333-4444-5555-6666-777777777777",
+                           "activation": {**target["activation"], "deploymentId": "44444444-5555-6666-7777-888888888888"}})
+            target["build"]["revision"] = "7" * 40
+        target = control.validate_config(target)
+        before = {**deepcopy(target), "workflow": None}
+        if operation == "activate":
+            before["activation"] = None
+        intent = {"operation": operation, "status": "started-unknown", "executed": False,
+                  "targetSha256": control.digest(before), "source": before["build"],
+                  "approvalSha256": control.digest({"operation": operation, "target": before})}
+        intent["intentSha256"] = control.digest(intent)
+        original = {"target": before, "journal": {"currentIntent": intent}}
+        name = "subs-bot-provider-attempt-intent-" + operation + "-100-1"
+        manifest = {"source": {"artifacts": {name: {"artifactId": "200", "archiveSha256": "9" * 64}}}}
+        journal = {"steps": [{"operation": operation, "status": "confirmed", "targetSha256": control.digest(target),
+                             "intentSha256": intent["intentSha256"]}],
+                   "events": [{"phase": "intent-persisted", "operation": operation, "intentSha256": intent["intentSha256"],
+                               "artifactId": "200", "archiveSha256": "9" * 64}]}
+        return target, manifest, journal, original, name
+
+    def test_original_provision_and_registered_reuse_require_their_exact_immutable_intents(self):
+        for operation in ("provision-workflow", "activate"):
+            target, manifest, journal, original, name = self.prepared(operation)
+            with self.subTest(operation=operation), patch.object(archive, "read_record", return_value=control.canonical(original)) as read:
+                archive.terminal_prerequisite(MemoryStore(), manifest, target, journal)
+                read.assert_called_once_with(unittest.mock.ANY, manifest, name + "/provider-rehearsal-checkpoint.json")
+
+    def test_skipped_step_missing_receipt_wrong_approval_or_source_never_authorizes_reuse(self):
+        for change in ("skipped", "receipt", "approval", "source", "executed", "pin"):
+            target, manifest, journal, original, _name = self.prepared("activate")
+            if change == "skipped": journal["steps"][0]["status"] = "skipped"
+            if change == "receipt": journal["events"][0]["archiveSha256"] = "8" * 64
+            if change == "approval": original["journal"]["currentIntent"]["approvalSha256"] = "8" * 64
+            if change == "source": original["target"]["build"]["revision"] = "8" * 40
+            if change == "executed": original["journal"]["currentIntent"]["executed"] = True
+            if change == "pin": target["workflow"]["createdOn"] = "2026-11-16T00:00:02.000Z"
+            with self.subTest(change=change), patch.object(archive, "read_record", return_value=control.canonical(original)), \
+                    self.assertRaises(ValueError):
+                archive.terminal_prerequisite(MemoryStore(), manifest, target, journal)
+
+
 class FailedTerminalArchiveTests(unittest.TestCase):
     def setUp(self):
         from test_production_provider_forward import recovery
@@ -263,6 +310,23 @@ class FailedTerminalArchiveTests(unittest.TestCase):
         self.assertEqual(self.store.writes, writes)
         self.assertNotIn("manifest.json", self.store.objects)
         self.assertNotIn("partial-manifest.json", self.store.objects)
+
+    def test_stop_failure_archive_binds_the_exact_failed_output_and_never_claims_rpc(self):
+        failure = {"ok": False, "stage": "stop"}
+        self.state.update({"smokeFailure": "stop", "workflowFailureSha256": control.digest(failure)})
+        self.recovery["terminalSha256"] = control.digest(self.state)
+        self.write()
+        path = self.root / "provider-failed-terminal-readback.json"
+        readback = json.loads(path.read_bytes())
+        readback["workflowResult"] = {"namedRpcVerified": False, "output": failure}
+        path.write_bytes(control.canonical(readback))
+        with patch("production_provider_forward.artifact_receipt"):
+            result = archive.terminal_archive(self.store, self.root)
+        self.assertEqual(result["completion"], "not-complete")
+        readback["workflowResult"]["namedRpcVerified"] = True
+        path.write_bytes(control.canonical(readback))
+        with patch("production_provider_forward.artifact_receipt"), self.assertRaises(ValueError):
+            archive.terminal_archive(MemoryStore(), self.root)
 
     def test_mismatched_receipt_hash_state_or_target_never_seals(self):
         with patch("production_provider_forward.artifact_receipt", side_effect=control.ProviderError("refused")), \

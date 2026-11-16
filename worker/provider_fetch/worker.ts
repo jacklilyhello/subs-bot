@@ -120,8 +120,9 @@ export class ProviderContainer extends DurableObject<Env> {
       await this.ctx.storage.put(key, true);
       return await exercise(this.ctx.container, revision, probe.isolatedRevision);
     } catch (error) {
-      // Store a fixed stage only, even when a platform error contains request data.
-      return { ok: false, stage: error instanceof ProviderProbeError ? error.stage : "admission" };
+      // Store fixed stage/stop diagnostics only; platform errors can contain request data.
+      return { ok: false, stage: error instanceof ProviderProbeError ? error.stage : "admission",
+        ...(error instanceof ProviderProbeError && error.stop ? { stop: error.stop } : {}) };
     } finally {
       this.busy = false;
     }
@@ -142,7 +143,8 @@ export class ProviderContainer extends DurableObject<Env> {
       return await exerciseProviderRelease(this.ctx.container, revision, probe.imageSha256, target,
         probe.healthUrl, probe.healthRevision, probe.healthSha256);
     } catch (error) {
-      return { ok: false, stage: error instanceof ProviderProbeError ? error.stage : "admission" };
+      return { ok: false, stage: error instanceof ProviderProbeError ? error.stage : "admission",
+        ...(error instanceof ProviderProbeError && error.stop ? { stop: error.stop } : {}) };
     } finally { this.busy = false; }
   }
 }
