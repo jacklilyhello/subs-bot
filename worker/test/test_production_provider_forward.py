@@ -88,6 +88,8 @@ class ForwardStageReadbackTests(unittest.TestCase):
                             "forwardRecovery": {**recovery(previous), "terminalSha256": control.digest(self.proof)}})
         self.target["build"]["revision"] = "7" * 40
         self.api = Mock(config=self.target)
+        self.api._request.return_value = {"result": [{"id": self.target["versionId"]}, {"id": previous["versionId"]}],
+                                         "result_info": {"page": 1, "per_page": 10, "count": 2, "total_count": 2}}
         self.state = {key: previous[key] for key in ("activation", "container", "workflow")}
         self.state["instance"] = {"status": "complete"}
 

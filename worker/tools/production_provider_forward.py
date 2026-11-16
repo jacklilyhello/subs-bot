@@ -30,6 +30,7 @@ def confirmed_forward_stage(api, target):
                     and target["versionId"] != previous["versionId"]
                     and target["activation"] is None and target["workflow"] is None and target["container"] == previous["container"])
     reader = GETOnlyProviderAPI(api, target)
+    reader.wait_uploaded_version(target["versionId"])
     state = control.observe(reader)
     control.require(all(state[key] == previous[key] for key in ("activation", "container", "workflow")))
     terminal = verify_forced_terminal(reader, previous, current_config=target)
