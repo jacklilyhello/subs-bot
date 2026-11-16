@@ -331,6 +331,28 @@ class ProductionControllerTests(unittest.TestCase):
 
 
 class ConfigurationAndTransportTests(unittest.TestCase):
+    def test_production_rejects_the_stable_test_bot_even_after_a_username_change(self):
+        target, _ = fixture()
+        raw = deepcopy(target.data)
+        raw.update(environment="production", botUsername="formal_subs_bot")
+        raw.update({key: contract.NAMES["production"][0] for key in ("workerName", "d1Name", "bucketName")})
+        raw.update(backupBucketName=contract.NAMES["production"][1], hostname=contract.NAMES["production"][2])
+        for draft in (False, True):
+            value = deepcopy(raw)
+            if draft:
+                for key in ("workerId", "workerCreatedOn", "d1Id", "d1CreatedAt", "bucketCreatedAt", "backupBucketCreatedAt"):
+                    value[key] = None
+            with self.subTest(draft=draft):
+                self.assertEqual(contract.validate_target(value, draft=draft).data["botId"], "92001")
+                for bot_id, username in (("9293938370", "renamed_test_bot"), ("92001", "TEST_CFSUBS_BOT")):
+                    with self.subTest(botId=bot_id, username=username), self.assertRaises(contract.ContractError):
+                        contract.validate_target({**value, "botId": bot_id, "botUsername": username}, draft=draft)
+                for key in ("botId", "botUsername"):
+                    missing = {field: item for field, item in value.items() if field != key}
+                    with self.subTest(missing=key), self.assertRaises(contract.ContractError):
+                        contract.validate_target(missing, draft=draft)
+        self.assertEqual(contract.validate_target(target.data).data["botId"], "92001")
+
     def test_feature_configuration_changes_keep_identity_and_require_a_new_approval(self):
         target, _ = fixture()
         raw = deepcopy(target.data)
