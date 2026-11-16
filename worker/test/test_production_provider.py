@@ -93,6 +93,10 @@ class TargetTests(unittest.TestCase):
         current["build"]["revision"] = "7" * 40
         self.assertEqual(control.validate_config(current), current)
         self.assertEqual(len(control.releases(current)), 2)
+        # Registering the first application caller after an unbound upgrade is
+        # legitimate; the operation-time upgrade guard still rejects that caller.
+        current["caller"] = {"id": "5" * 32, "name": "subs-bot-cf-control-drill-01"}
+        self.assertEqual(control.validate_config(current), current)
         for target in (current, previous):
             target["caller"] = {"id": "5" * 32, "name": "subs-bot-cf-control-drill-01"}
         with self.assertRaises(control.ProviderError):

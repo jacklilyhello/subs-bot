@@ -101,7 +101,7 @@ def validate_config(value, *, depth=0):
         previous = validate_config(previous, depth=depth + 1)
         require(all(previous[key] == value[key] for key in ("environment", "accountId", "service", "worker", "workersDevOrigin"))
                 and previous["versionId"] is not None and previous["build"]["revision"] != value["build"]["revision"]
-                and previous["caller"] is None and value["caller"] is None,
+                and previous["caller"] is None,
                 "Provider upgrades require an explicitly pinned previous release with no application caller.")
     effective_active = active or (previous["activation"] if previous else None)
     if container:
