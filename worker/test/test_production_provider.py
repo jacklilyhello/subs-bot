@@ -387,5 +387,57 @@ class ReadDiagnosticTests(unittest.TestCase):
         self.assertNotIn(self.private, rendered)
 
 
+class UploadedVersionVisibilityTests(unittest.TestCase):
+    def setUp(self):
+        old = config()
+        current = config()
+        current["build"]["revision"] = "7" * 40
+        current.update({"versionId": DEPLOYMENT, "previous": old})
+        self.api = control.ProviderAPI(current, "synthetic-worker-token", "synthetic-container-token")
+
+    def envelope(self, ids):
+        return {"result": [{"id": value} for value in ids], "result_info": {"page": 1, "per_page": 10,
+                "count": len(ids), "total_count": len(ids), "total_pages": 1}}
+
+    def test_just_uploaded_candidate_can_settle_using_only_bounded_gets(self):
+        with patch.object(self.api, "_request", side_effect=[self.envelope([VERSION]), self.envelope([DEPLOYMENT, VERSION])]) as read, \
+                patch.object(control, "sleep") as wait, patch.object(self.api, "upload") as upload:
+            self.api.wait_uploaded_version(DEPLOYMENT)
+        self.assertEqual(read.call_count, 2)
+        wait.assert_called_once_with(1)
+        upload.assert_not_called()
+
+    def test_generic_inventory_remains_strict_and_never_settles(self):
+        with patch.object(self.api, "_request", return_value=self.envelope([VERSION])) as read, \
+                patch.object(control, "sleep") as wait, self.assertRaises(control.ProviderError):
+            self.api.versions()
+        self.assertEqual(read.call_count, 1)
+        wait.assert_not_called()
+
+    def test_unknown_duplicate_missing_previous_or_incomplete_page_reject_immediately(self):
+        for value in (self.envelope([DEPLOYMENT, VERSION, "33333333-4444-5555-6666-777777777777"]),
+                      self.envelope([VERSION, VERSION]), self.envelope([DEPLOYMENT]),
+                      {**self.envelope([VERSION]), "result_info": {"page": 1, "count": 1, "total_count": 2}}):
+            with self.subTest(value=value), patch.object(self.api, "_request", return_value=value) as read, \
+                    patch.object(control, "sleep") as wait, self.assertRaises(ValueError):
+                self.api.wait_uploaded_version(DEPLOYMENT)
+            self.assertEqual(read.call_count, 1)
+            wait.assert_not_called()
+
+    def test_unconfirmed_http_or_never_visible_candidate_cannot_repeat_upload(self):
+        with patch.object(self.api, "_request", side_effect=control.ProviderError("read refused")) as read, \
+                patch.object(control, "sleep") as wait, self.assertRaises(control.ProviderError):
+            self.api.wait_uploaded_version(DEPLOYMENT)
+        self.assertEqual(read.call_count, 1)
+        wait.assert_not_called()
+        with patch.object(self.api, "_request", return_value=self.envelope([VERSION])) as read, \
+                patch.object(control, "sleep") as wait, patch.object(self.api, "upload") as upload, \
+                self.assertRaises(control.ProviderError):
+            self.api.wait_uploaded_version(DEPLOYMENT)
+        self.assertEqual(read.call_count, 3)
+        self.assertEqual(wait.call_count, 2)
+        upload.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

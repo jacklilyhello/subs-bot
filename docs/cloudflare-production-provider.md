@@ -115,3 +115,11 @@ partial 保存至同一 attempt 的独立 manifest，最多 128 个原始文件�
 另开 `verify-archive` dispatch，提供原 run/attempt 与独立记录的 manifest digest，只从私有 R2 读取七个完整文件的全部块并核对计数、字节和摘要，不读取源 Actions artifact。该读回与真实 Cloudflare smoke 是不同证据；工作流结果不预填为 Passed，实际 run/attempt 与失败必须记录在 PR 证据中。
 
 短链仍使用既有 `shortlink-new` / `ShortlinkService` 和 Bearer 业务 Token 的内部 Service Binding；本工具不触碰短链的部署、域名、权限或业务数据。
+
+### 已上传 forward 版本的只读接续
+
+上传 API 返回准确 candidate 后，仅当完整版本盘点恰好包含全部旧版本且唯一缺少该 candidate 时，上传控制路径才会在最多三次 GET 内等待可见性，间隔为 1、3 秒；不会重复上传。未知额外版本、重复 ID、缺失旧版本、分页不完整或 HTTP 错误立即失败。通用 `verify` 的严格版本集合检查不采用此等待例外。
+
+若 forward 暂存已返回 candidate、后续读回仍失败，先保存原 run/attempt、private partial manifest SHA、response identity SHA，并独立运行 `verify-partial`。随后显式选择 `action=reconcile-forward-stage`，填相同原件 pins：工具重验原 CI ZIP/模块/OCI 闭包，按响应指定的既有 candidate 双读完整模块、绑定、版本集合、旧激活/Container/Workflow、无 caller 以及已保全旧 `failed/137` 终态。它不上传、部署或触发 smoke，也不放宽首次 create/stage 的无消费者注册门。
+
+成功仅输出 `confirmed-identity-only / not-complete`，两个小型原件通过准确 run 的不可变 artifact 在既有环境间传递后封存至私有 R2。记录 manifest SHA，再以 `action=verify-forward-stage`、该 reconcile run/attempt/SHA 独立从 R2 读回。只有全部核对成功，才将 `subs-bot-provider-forward-stage-<run>-<attempt>` artifact 的原样 `provider-reconciled-target.json` 安全 stdin 登记到既有 rehearsal/control target 配置。然后使用 `source_mode=registered`、该 target 原冻结 CI run 和 `fault=none` 继续；已固定版本不再上传，旧 smoke 实例及 one-shot 标记保持保全。新版本仍须完成正常停止、完整归档和独立读回验收。

@@ -422,7 +422,7 @@ def reconcile_identity(config, identity):
     return candidate
 
 
-def reconcile_partial(store, manifest_sha256, response_sha256, *, terminal=False):
+def reconcile_partial(store, manifest_sha256, response_sha256, *, terminal=False, forward_stage=False):
     require(provider.match(provider.provider.HEX, response_sha256))
     verify_partial(store, manifest_sha256)
     manifest = provider.github._parse_object(store.read("partial-manifest.json"), ERROR)
@@ -456,8 +456,18 @@ def reconcile_partial(store, manifest_sha256, response_sha256, *, terminal=False
         release = provider.provider.verify_release(verified, target["build"]["revision"], ref=provider.github.MAIN_REF,
                                                    run_id=target["build"]["runId"], run_attempt=target["build"]["runAttempt"])
         require(all(release[key] == target["build"][key] for key in provider.publication.MANIFEST_FIELDS))
-        if terminal:
-            require(identity["operation"] == "smoke" and target["caller"] is None and target["environment"] == "rehearsal"
+        if terminal or forward_stage:
+            require(not (terminal and forward_stage) and target["caller"] is None and target["environment"] == "rehearsal")
+            original_sha = provider.digest(target)
+            if forward_stage:
+                require(identity["operation"] == "stage" and target["versionId"] is None
+                        and provider.match(provider.stage.VERSION_ID, identity["identities"].get("versionId"))
+                        and target.get("previous") is not None and target.get("forwardRecovery") is not None
+                        and target["activation"] is None and target["workflow"] is None)
+                target["versionId"] = identity["identities"]["versionId"]
+                target = provider.validate_config(target)
+            else:
+                require(identity["operation"] == "smoke"
                     and all(target[key] is not None for key in ("worker", "versionId", "activation", "container", "workflow"))
                     and identity["identities"] == {"id": "provider-release-" + target["build"]["revision"],
                                                   "workflow_id": target["workflow"]["workflowId"],
@@ -467,11 +477,13 @@ def reconcile_partial(store, manifest_sha256, response_sha256, *, terminal=False
             request = {"version": 1, "controllerRevision": os.environ["GITHUB_SHA"], "runId": os.environ["GITHUB_RUN_ID"],
                        "runAttempt": os.environ["GITHUB_RUN_ATTEMPT"], "sourceRunId": store.run_id,
                        "sourceRunAttempt": store.attempt, "sourceManifestSha256": manifest_sha256,
-                       "responseIdentitySha256": response_sha256, "previousTargetSha256": provider.digest(target)}
+                       "responseIdentitySha256": response_sha256, "previousTargetSha256": provider.digest(target),
+                       "kind": "forward-stage" if forward_stage else "terminal", "sourceTargetSha256": original_sha}
             for name, value in (("provider-reconciled-target.json", target), ("provider-terminal-request.json", request)):
                 with provider.provenance._write_private(Path(os.environ["RUNNER_TEMP"]) / name) as output:
                     output.write(provider.canonical(value))
-            return {"status": "terminal-request-prepared", "completion": "not-complete", "requestSha256": provider.digest(request),
+            return {"status": "forward-stage-request-prepared" if forward_stage else "terminal-request-prepared",
+                    "completion": "not-complete", "requestSha256": provider.digest(request),
                     "targetSha256": provider.digest(target)}
         confirmed = reconcile_identity(target, identity)
     result = {"status": "confirmed-identity-only", "completion": "not-complete", "operation": identity["operation"],
@@ -535,6 +547,67 @@ def terminal_archive(store, directory=None, expected=None):
             "prefix": store.prefix, "files": len(names), "readback": "R2-only-failed-terminal"}
 
 
+def validate_stage_identity(target, result, store):
+    target = provider.validate_config(target)
+    provider.fields(result, {"version", "status", "completion", "operation", "readOnly", "controllerRevision", "runId", "runAttempt",
+                            "targetSha256", "sourceRevision", "sourceRunId", "sourceRunAttempt", "sourceManifestSha256",
+                            "responseIdentitySha256", "sourceTargetSha256"})
+    require(target["environment"] == "rehearsal" and target["caller"] is None and target.get("previous") is not None
+            and target.get("forwardRecovery") is not None and target["versionId"] is not None
+            and target["activation"] is None and target["workflow"] is None)
+    require(type(result.get("version")) is int and result["version"] == 1
+            and result.get("status") == "confirmed-identity-only" and result.get("completion") == "not-complete"
+            and result.get("operation") == "forward-stage" and result.get("readOnly") is True
+            and result.get("runId") == store.run_id and result.get("runAttempt") == store.attempt
+            and provider.match(provider.provider.REVISION, result.get("controllerRevision"))
+            and result.get("sourceRevision") == target["build"]["revision"]
+            and result.get("targetSha256") == provider.digest(target)
+            and result.get("sourceTargetSha256") == provider.digest({**target, "versionId": None})
+            and all(provider.match(provider.provider.DECIMAL, result.get(key)) for key in ("sourceRunId", "sourceRunAttempt"))
+            and all(provider.match(provider.provider.HEX, result.get(key)) for key in ("sourceManifestSha256", "responseIdentitySha256")))
+
+
+def stage_identity_archive(store, directory=None, expected=None):
+    names = {"provider-reconciled-target.json": 65536, "provider-reconciliation.json": 4096}
+    store.verify()
+    if directory is not None:
+        from production_provider_forward import artifact_receipt
+        artifact_receipt(os.environ.get("PROVIDER_TERMINAL_ARTIFACT_ID", ""),
+                         os.environ.get("PROVIDER_TERMINAL_ARTIFACT_SHA256", ""), "subs-bot-provider-forward-stage")
+        require({path.name for path in directory.iterdir() if path.is_file()} == set(names))
+        values = {name: provider.provider.checked_file(directory / name, limit).read_bytes() for name, limit in names.items()}
+        target, result = (provider.github._parse_object(values[name], ERROR) for name in names)
+        validate_stage_identity(target, result, store)
+        require(result["controllerRevision"] == os.environ.get("GITHUB_SHA"))
+        manifest = {"version": 1, "kind": "subs-bot-provider-forward-stage-identity", "completion": "not-complete",
+                    "controllerRevision": result["controllerRevision"], "runId": store.run_id, "runAttempt": store.attempt,
+                    "files": {name: {"bytes": len(raw), "sha256": sha256(raw).hexdigest()} for name, raw in values.items()}}
+        for raw in values.values():
+            store.put("blobs/" + sha256(raw).hexdigest(), raw)
+        raw = provider.canonical(manifest)
+        store.put("partial-manifest.json", raw)
+        expected = sha256(raw).hexdigest()
+    raw = store.read("partial-manifest.json")
+    require(isinstance(raw, bytes) and len(raw) <= 8192 and sha256(raw).hexdigest() == expected)
+    manifest = provider.github._parse_object(raw, ERROR)
+    require(manifest.get("version") == 1 and manifest.get("kind") == "subs-bot-provider-forward-stage-identity"
+            and manifest.get("completion") == "not-complete" and manifest.get("runId") == store.run_id
+            and manifest.get("runAttempt") == store.attempt and set(manifest.get("files", {})) == set(names))
+    values = {}
+    for name, limit in names.items():
+        entry = manifest["files"][name]
+        require(set(entry) == {"bytes", "sha256"} and type(entry["bytes"]) is int and 0 < entry["bytes"] <= limit
+                and provider.match(provider.provider.HEX, entry["sha256"]))
+        body = store.read("blobs/" + entry["sha256"])
+        require(isinstance(body, bytes) and len(body) == entry["bytes"] and sha256(body).hexdigest() == entry["sha256"])
+        values[name] = provider.github._parse_object(body, ERROR)
+    validate_stage_identity(values["provider-reconciled-target.json"], values["provider-reconciliation.json"], store)
+    require(manifest["controllerRevision"] == values["provider-reconciliation.json"]["controllerRevision"])
+    store.verify()
+    return {"status": "confirmed-identity-only", "completion": "not-complete", "manifestSha256": expected,
+            "prefix": store.prefix, "files": 2, "readback": "R2-only-forward-stage-identity"}
+
+
 def main():
     require(os.environ.get("GITHUB_REPOSITORY") == provider.github.REPOSITORY
             and os.environ.get("GITHUB_REF") == provider.github.MAIN_REF and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"
@@ -542,13 +615,16 @@ def main():
             and os.environ.get("GITHUB_WORKFLOW_REF") == f"{provider.github.REPOSITORY}/{provider.REHEARSAL_WORKFLOW_PATH}@{provider.github.MAIN_REF}")
     action = os.environ.get("PROVIDER_ARCHIVE_ACTION", "")
     require(action in {"archive", "verify", "rehearse", "preserve-partial", "verify-archive", "verify-partial", "reconcile-partial",
-                       "reconcile-terminal", "seal-terminal", "verify-terminal"})
-    run_id = os.environ["GITHUB_RUN_ID"] if action in {"archive", "rehearse", "seal-terminal"} else os.environ.get("PROVIDER_ARCHIVE_RUN_ID", "")
-    attempt = os.environ["GITHUB_RUN_ATTEMPT"] if action in {"archive", "rehearse", "seal-terminal"} else os.environ.get("PROVIDER_ARCHIVE_RUN_ATTEMPT", "")
+                       "reconcile-terminal", "seal-terminal", "verify-terminal", "reconcile-forward-stage", "seal-forward-stage", "verify-forward-stage"})
+    own = action in {"archive", "rehearse", "seal-terminal", "seal-forward-stage"}
+    run_id = os.environ["GITHUB_RUN_ID"] if own else os.environ.get("PROVIDER_ARCHIVE_RUN_ID", "")
+    attempt = os.environ["GITHUB_RUN_ATTEMPT"] if own else os.environ.get("PROVIDER_ARCHIVE_RUN_ATTEMPT", "")
     target = provider.github._parse_object(os.environ.get("SUBS_BOT_CF_ISOLATION_TARGET_JSON", ""), ERROR)
     store = PrivateProofStore(target, os.environ.get("SUBS_BOT_CF_BOOTSTRAP_TOKEN", ""), run_id, attempt)
     if action == "seal-terminal":
         result = terminal_archive(store, Path(os.environ["RUNNER_TEMP"]) / "provider-terminal-proof-input")
+    elif action == "seal-forward-stage":
+        result = stage_identity_archive(store, Path(os.environ["RUNNER_TEMP"]) / "provider-terminal-proof-input")
     elif action in {"rehearse", "preserve-partial"}:
         provenance = original_run(run_id, attempt)
         inputs = Path(os.environ["RUNNER_TEMP"]) / "provider-attempt-input"
@@ -573,11 +649,13 @@ def main():
     else:
         expected = os.environ.get("PROVIDER_ARCHIVE_MANIFEST_SHA256", "")
         require(provider.match(provider.provider.HEX, expected))
-        if action in {"reconcile-partial", "reconcile-terminal"}:
+        if action in {"reconcile-partial", "reconcile-terminal", "reconcile-forward-stage"}:
             result = reconcile_partial(store, expected, os.environ.get("PROVIDER_RESPONSE_IDENTITY_SHA256", ""),
-                                       terminal=action == "reconcile-terminal")
+                                       terminal=action == "reconcile-terminal", forward_stage=action == "reconcile-forward-stage")
         elif action == "verify-terminal":
             result = terminal_archive(store, expected=expected)
+        elif action == "verify-forward-stage":
+            result = stage_identity_archive(store, expected=expected)
         else:
             result = verify_partial(store, expected) if action == "verify-partial" else {"status": "complete", **verify_archive(store, expected)}
     print(json.dumps({"action": action, **result}, sort_keys=True))
