@@ -182,6 +182,7 @@ class ForcedTerminalTests(unittest.TestCase):
         def drift(count):
             if count == 1:
                 self.detail["status"]["updated_at"] = END
+                self.inventory[0]["status"]["updated_at"] = END
         self.after_read = drift
         with self.assertRaisesRegex(control.ProviderError, "changed during read-only reconciliation"):
             self.verify()
