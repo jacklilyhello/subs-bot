@@ -558,7 +558,22 @@ def run_operation(api, operation, module, image, guard):
     return result
 
 
-def verify_provider_dependency(api, target_provider):
+def caller_state(api, config, allow_unbound):
+    require(type(allow_unbound) is bool)
+    caller = config["caller"]
+    require(caller is not None or allow_unbound, "A bound ProviderFetch dependency requires the exact application caller pin.")
+    inventories = []
+    for worker in (api.by_name(), api.worker.by_id(api.identity)):
+        verify_profile(worker, config, api.identity, True)
+        workers = worker["references"]["workers"]
+        require((caller is not None and workers == [caller]) or (allow_unbound and workers == []),
+                "The ProviderFetch caller is not bound to the exact approved application identity.")
+        inventories.append(workers)
+    require(inventories[0] == inventories[1], "ProviderFetch caller references changed during readback.")
+    return "unbound" if inventories[0] == [] else "bound"
+
+
+def verify_provider_dependency(api, target_provider, *, allow_unbound_caller=False):
     """Read a fully pinned dependency. No registry/Container write credential is needed.
 
     ``api`` may be an existing ProviderAPI or an object with request(method,path,payload,envelope=True).
@@ -567,13 +582,18 @@ def verify_provider_dependency(api, target_provider):
     """
     config = validate_config(target_provider)
     require(config["worker"] is not None and config["versionId"] is not None)
+    require(type(allow_unbound_caller) is bool and (config["caller"] is not None or allow_unbound_caller),
+            "A bound ProviderFetch dependency requires the exact application caller pin.")
     if not isinstance(api, ProviderAPI):
         api = DependencyReader(config, api)
     require(api.config == config)
     first = observe(api, need_smoke=True)
+    caller = caller_state(api, config, allow_unbound_caller)
     require(observe(api, need_smoke=True) == first)
+    require(caller_state(api, config, allow_unbound_caller) == caller)
     return {"service": config["service"], "entrypoint": "ProviderFetch", "revision": config["build"]["revision"],
-            "imageSha256": config["build"]["ociManifestSha256"], "proofSha256": digest({"target": config, "state": first})}
+            "imageSha256": config["build"]["ociManifestSha256"], "callerState": caller,
+            "proofSha256": digest({"target": config, "state": first, "callerState": caller})}
 
 
 class DependencyReader(ProviderAPI):

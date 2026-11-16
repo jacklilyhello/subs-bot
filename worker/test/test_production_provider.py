@@ -292,5 +292,38 @@ class WriteScopeTests(unittest.TestCase):
             transport.assert_not_called()
 
 
+class DependencyCallerTests(unittest.TestCase):
+    def verify(self, value, callers, **options):
+        api = control.ProviderAPI(value, "synthetic-worker-token", "synthetic-container-token")
+        observed = worker_profile(value)
+        observed["deployed_on"] = STAMP
+        observed["references"]["workers"] = callers
+        with patch.object(control, "observe", return_value={"syntheticState": True}), \
+                patch.object(api, "by_name", return_value=observed), patch.object(api.worker, "by_id", return_value=observed):
+            return control.verify_provider_dependency(api, value, **options)
+
+    def test_default_requires_explicit_exact_bound_caller(self):
+        value = config(active=True)
+        with self.assertRaises(control.ProviderError):
+            self.verify(value, [])
+        value["caller"] = {"id": "5" * 32, "name": "subs-bot-cf-control-drill-01"}
+        with self.assertRaises(control.ProviderError):
+            self.verify(value, [])
+        self.assertEqual(self.verify(value, [value["caller"]])["callerState"], "bound")
+
+    def test_only_explicit_prebind_check_allows_empty_references(self):
+        value = config(active=True)
+        self.assertEqual(self.verify(value, [], allow_unbound_caller=True)["callerState"], "unbound")
+        value["caller"] = {"id": "5" * 32, "name": "subs-bot-cf-control-drill-01"}
+        self.assertEqual(self.verify(value, [], allow_unbound_caller=True)["callerState"], "unbound")
+        self.assertEqual(self.verify(value, [value["caller"]], allow_unbound_caller=True)["callerState"], "bound")
+
+    def test_unknown_caller_is_refused_even_for_prebind(self):
+        value = config(active=True)
+        value["caller"] = {"id": "5" * 32, "name": "subs-bot-cf-control-drill-01"}
+        with self.assertRaises(control.ProviderError):
+            self.verify(value, [{"id": "6" * 32, "name": "other-project"}], allow_unbound_caller=True)
+
+
 if __name__ == "__main__":
     unittest.main()

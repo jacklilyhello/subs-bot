@@ -56,7 +56,7 @@
 4. 独立固定 Worker pin 后执行 `verify`。`stage` 准备准确 digest 镜像，只上传一次准确模块及 `PROVIDER_TARGET_JSON={environment,accountId,service}`；不部署。读回 Beta 模块字节和绑定、legacy container 声明、版本和兼容设置。新版本用可选 `previous` 保存完整上一代契约，最多九代；每代准确 CI archive 都独立重验。Worker 版本集合必须恰好等于链中明确固定的版本集合；未知版本不能被采用或替换，旧版本不删除。
 5. 固定准确 `versionId` 后执行 `activate`，再独立读回并固定 deployment/SQLite namespace。随后分别执行 `provision-container`、`provision-workflow` 并固定准确 identity。创建之前必须完整有界证明没有同名应用、未知 actors/instances 或既有 Workflow。
 6. `smoke` 仅由无自动重试的专用 `ProviderReleaseSmoke` Workflow 调用同一 Container/`ProviderFetch` 控制代码，读取明确健康夹具并比对原始摘要和模块版本；同时验证 IPv4 loopback、IPv6 loopback、metadata 地址均拒绝。固定唯一实例 `provider-release-<revision>`，持久 admission 标记阻止再次执行；失败不能被替换为通过。最后独立核对 image、actor、stopped 状态、无 active instance 和 workers.dev 拒绝。
-7. 新 dispatch `verify` 独立读回身份、版本、模块、绑定、container、Workflow 和 smoke。主应用通过 `verify_provider_dependency(api,target.provider)` 再读一次完整已固定依赖，返回 `PROVIDER_FETCH` 的 `service`、`entrypoint=ProviderFetch`、revision、image digest 和 proof digest；仅成功后才允许生产 URL import/refresh/batch 开关。
+7. 新 dispatch `verify` 独立读回身份、版本、模块、绑定、container、Workflow 和 smoke。主应用通过 `verify_provider_dependency(api,target.provider)` 再读一次完整已固定依赖，默认要求非空 caller pin 且 name/id 双读 `references.workers` 恰好为该调用方，返回 `PROVIDER_FETCH` 的 service、entrypoint、revision、image digest、callerState 和 proof digest。首次部署前仅在主应用已固定准确身份并证明冻结时显式传 `allow_unbound_caller=True`，允许空 references 或同一个精确 caller；任何其他 caller 均拒绝。部署后和独立 inspect 使用默认严格已绑定检查。专用 provider 演练没有应用调用方，显式使用 prebind 检查并记录 `callerState=unbound`，不声称已完成应用绑定。
 
 所有产物均保留准确 run/attempt 和完整配置摘要，上传的 `production-provider-evidence.json` 不含 Token、能力链接或订阅原始内容。正式发布资料仍应由项目候选封存流程保存至私有 R2，不能仅依赖有保留期限的 Actions artifact。
 

@@ -83,7 +83,7 @@ def main():
             config = old
         else:
             approve(old, "verify")
-            control.verify_provider_dependency(api(old), old)
+            control.verify_provider_dependency(api(old), old, allow_unbound_caller=True)
             config.update({"worker": old["worker"], "container": old["container"], "workflow": None, "previous": old})
             config = control.validate_config(config)
     with tempfile.TemporaryDirectory(prefix=".provider-source-closure-", dir=root) as directory:
@@ -129,7 +129,7 @@ def main():
         steps.append({"operation": "smoke", "stateSha256": control.digest(result)})
         checkpoint(config, steps)
     execute(config, "verify", module, archive)
-    binding = control.verify_provider_dependency(api(config), config)
+    binding = control.verify_provider_dependency(api(config), config, allow_unbound_caller=True)
     proof = {"version": 1, "controllerRevision": revision, "runId": os.environ["GITHUB_RUN_ID"],
              "runAttempt": os.environ["GITHUB_RUN_ATTEMPT"], "status": "complete", "target": config,
              "binding": binding, "steps": steps, "productionMutation": False}
