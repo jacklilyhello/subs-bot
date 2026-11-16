@@ -317,6 +317,8 @@ Worker 的可选部署绑定 `PUBLIC_ORIGIN` 决定 Telegram 回复中订阅、�
 
 ### 数据与切换
 
+用户于 2026-11-16 确认本项目尚未生产，没有旧生产数据或消费者，正式 Bot 尚未创建。当前适用[首次生产上线执行方案](cloudflare-production-cutover.md)：独立生产资源按迁移初始化，不复制隔离测试数据；旧 SQLite 承接、旧链接迁移和旧消费者交接均为 N/A（不适用：用户确认无历史生产），与 Passed、Not run 分开记录。下列旧源步骤只适用于未来确有获准旧实例的迁移场景，不作为本次首发门槛。正式 Bot、生产身份或适用的生产控制工具未具备时保持暂停，不能将固定隔离工具改名用于生产。
+
 隔离容量检查使用当前 `main` 的已部署版本，手动运行 `gh workflow run worker-isolation-capacity.yml --ref main`。托管 runner 生成合成快照，依次验证恰好达到 64 MiB NDJSON 和 16 MiB 分享原文的有效输出、分享原文超 1 字节的拒绝、快照清单超 1 字节的拒绝。正向测试流式核对 Base64 长度和摘要，覆盖串行、并发 2 和 4、慢读及中途取消。发布和容量检查使用同一并发组，测试结束先撤销 D1 能力，再清理对应的私有 R2 对象。清理失败时，工作流保留不含凭据或原始能力令牌的恢复清单。
 
 上传结果未确认时，在产物过期前私下保留原运行的恢复清单。仅使用原清单和对应的隔离资源继续核对清理。待确认对象仍读不到时保留记录，直到核实其内容并确认删除。重新运行容量检查会使用新的合成数据。
@@ -464,11 +466,17 @@ python3 -B worker/tools/legacy_general_auth_candidate.py \
 
 ### 隔离环境原生备份与恢复演练
 
-`Rehearse isolated native D1 and R2 restore` 只在受保护的 `main` 环境运行。输入同一组随机 32 位小写十六进制 `cohort` 和当前提交成功的 Worker CI 运行 ID。逐项完成后再开始下一项：
+`Rehearse isolated native D1 and R2 restore` 的控制工具只在受保护的当前 `main`、GitHub 托管 runner 运行，核对 checkout、workflow 和仓库身份。恢复源独立固定为实际隔离 Worker 对应的成功 main Worker CI：输入准确 `source_run_id`、`source_run_attempt` 和同一组随机 32 位小写十六进制 `cohort`。源提交可以早于控制工具；报告分别记录 `controlRevision` 和 `sourceRevision`。只修复恢复工具时不为此重部署冻结源，也不更改原 checkpoint 的 source pin 或重建已有恢复资源。普通隔离部署/候选的当前 main 产物要求不变。
+
+源产物有两种受控来源。默认从准确 GitHub CI attempt 校验下载；持久来源模式同时填写 `source_archive_run_id`、`source_archive_run_attempt`、独立取得的 `source_archive_manifest_sha256`。该模式只读核对项目私有 R2 归档的资源身份、保留策略、清单摘要、全部 blob 及候选/CI/部署证明闭包，从与指定源 run/attempt 严格匹配的记录取 CI ZIP，再校验完整包。它不读取源 GitHub run/artifact，也不向归档写入或因失败退回临时下载；当前控制 main 的只读 GitHub 核对仍保留。原 Actions 产物尚未到期时也可验证该持久来源，但不能据此声称实际做过已过期产物试验。
+
+不论来源，实际 Worker 的完整提交、模块、兼容日期、配置、schema 和既有 checkpoint 必须精确匹配；本流程没有 Worker 部署/回滚权限扩展。恢复已有演练时先 `verify` 读回原记录和三个专用资源，再续做下一未完成步骤，不重新 `prepare`、创建或改 pin。逐项完成后再开始下一项：
 
 1. `verify` 只读核对当前 Worker、D1、R2 与候选名称。`prepare` 在源私有 R2 的保留前缀建立追加式操作记录。依次运行 `create-backup-bucket`、`create-restore-db`、`create-restore-bucket`，各自只发起一次创建，并核对账号、名称、创建时间及适用的资源 ID。已有同名资源不会被采用。创建未确认时先只读核对；只有独立证据能确认该候选确属该次创建，才以 `pin-resource` 提供资源类别及候选身份摘要继续。
-2. 先结束隔离验收并回收测试能力，待队列、回复、临时交互和待清理对象安定后，安排安静窗口并暂停人工命令与部署，再运行 `capture`。如需验证私密分享的 R2 归属元数据，可保留已验证且自然到期的合成分享及正文，封存后再清理源夹具。Cloudflare 原生导出期间源 D1 **暂时不能查询**；原有 Cron 保留，触发可能暂时失败。只用已记录书签的 `poll-export` 继续查询导出状态，再用 `capture` 保存导出。首次请求响应丢失且没有确认书签时，先等 Cloudflare 自动取消并核对源查询恢复；不要重发首次请求。导出包由原生 SQL、SQL 指向的完整 R2 内容及清单组成。 [D1 原生导出](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/export/)
+2. 先结束隔离交互，待队列、回复、临时交互和待清理对象安定，安排安静窗口并暂停人工命令与部署，再运行 `capture`。稳定且关联合法的已发布能力链接是持久数据，无需为演练撤销；聚合槽/全量链接及所选链接按所有者、Bot、类型和来源回执核对，不能通过清表、撤销原链接或重置测试数据制造空闲。待发送回复、有效租约、未消费票据及其他未来生产者仍阻止封存。可保留已验证且自然到期的合成分享及正文以验证 R2 归属元数据，夹具清理另按原授权执行。Cloudflare 原生导出期间源 D1 **暂时不能查询**；原有 Cron 保留，触发可能暂时失败。只用已记录书签的 `poll-export` 继续查询导出状态，再用 `capture` 保存导出。首次请求响应丢失且没有确认书签时，先等 Cloudflare 自动取消并核对源查询恢复；不要重发首次请求。导出包由原生 SQL、SQL 指向的完整 R2 内容及清单组成。 [D1 原生导出](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/export/)
 3. `restore-objects` 在未绑定应用的专用 R2 重建引用内容，`start-import` 再向仍为空的专用 D1 导入已核对的同一份 SQL。已上传文件可能使 D1 `init` 直接开始导入；导入状态不明时，只用确认的书签继续轮询，或核对目标完整摘要。不要重发 `init`、`ingest` 或清空目标。`verify-restore` 核对完整 schema、迁移记录、序列、外键、逐表内容摘要及 R2 引用和字节。源 D1 永不导入或原地恢复，目标不绑定 Worker，也不会处理 Telegram 更新。 [D1 原生导入](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/import/)
+
+`verify-restore` 的 HTTP 读回使用已证明与恢复目标相等的封存 SQL、从恢复 R2 读回的字节及准确源模块，在仅有 loopback、拒绝出站的托管临时运行时检查 GET/HEAD。稳定的原生全量聚合槽另用受保护的既有签名配置重建能力，并先核对其摘要与实际源版本一致；密钥不进入 Node、日志或产物。固定隔离源的 GET/HEAD 摘要作为比较基线，读取前后必须仍安静且全量数据与封存代一致。其他无法重建的哈希能力及未覆盖格式明确计为 omitted；数据摘要一致不自动变成所有链接的 HTTP 验收通过。私有输入由任务结束清理，公开证据仅含计数、摘要和限制。
 
 受保护工作流与隔离部署使用同一并发组。仅此流程可写该演练前缀；每次追加核对上一条记录及本次写入，不依赖管理 REST API 未承诺的条件写入。不要同时从 Dashboard 或其他工具修改相关资源。遇到分叉、未确认写入、源版本变更或目标数据不匹配时保留记录和专用资源，不执行覆盖、删除或重置。SQL、源/目标私有身份、签名 URL、令牌、内容与对象键只留在私有 R2 或 runner 临时目录；Actions 证据只上传摘要和计数。
 
@@ -731,9 +739,9 @@ V11 合成原生演练在 `worker-isolation-legacy-candidate.yml` 选择 `synthe
 
 1. 先只读核对 Cloudflare 目标账户、Zone、`subs-bot.lilyya.top` 的 DNS、Worker 路由和 Custom Domain 绑定。新资源记录账号、环境及资源 ID，隔离与生产分别使用各自的 Worker、D1、R2 和队列。现有配置冲突须在改动前报告。目标主机名可用且切换获准后，仅增加所需的 Custom Domain 绑定。 [Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)
 2. `Worker CI` 在 GitHub 托管 runner 上安装依赖、检查类型、构建和测试。构建产物标记准确提交与摘要，由授权的部署步骤核对并上传至隔离 Worker。普通 PR CI 使用只读权限和合成数据。部署 Token 通过独立的受控步骤使用。云端 smoke 显式指定隔离环境和提交，核对 `/health` 与提交、已知测试快照的输出和负面用例。分别记录测试、构建、部署和真实运行结果。
-3. 确认获准的数据来源和使用范围后，对旧 SQLite 执行包含 WAL 的一致性备份。先在项目专用隔离目标做恢复和容量盘点。对账活动订阅、回收站、路径规则、临时节点、授权覆盖、分享及领取、短链的数量和归属。核对节点摘要、有效订阅令牌、旧短码、仍有效的领取状态和跨域链接依赖。旧群级数据须由维护者确认归属。
+3. 仅在确有获准旧数据时，对旧 SQLite 执行包含 WAL 的一致性备份，并在独立目标恢复、盘点容量和核对各类记录、归属、授权、对象及旧链接。本次首次上线无旧生产数据，该项为 N/A。
 4. 隔离合成演练和原生恢复用于验证恢复路径。真实数据验收须用获准的数据和独立目标，核对清单、对象摘要、外键、导出和两个账号的权限。Workers Paid 的 D1 Time Travel 可用于最近 30 天的原地恢复，会覆盖目标 D1；R2 对象另行恢复。 [D1 Time Travel](https://developers.cloudflare.com/d1/reference/time-travel/)
-5. 在功能清单中记录代表性提供方、客户端及双账号的实测结果，并核对容量、失败恢复和旧链接连续性。确认生产切换范围、窗口及回滚方案并取得授权后，冻结旧写入，完成最后一次同步，再切换 Telegram Webhook 或域名流量。保留待处理更新，先处理旧轮询配置 `drop_pending_updates=True` 的回滚风险。验收失败时停止新写入，核对迁移后写入如何回放，再分别恢复 Worker 版本、数据和 Telegram 模式。 [Telegram `setWebhook` / `deleteWebhook`](https://core.telegram.org/bots/api#setwebhook) · [Worker 版本与部署](https://developers.cloudflare.com/workers/versions-and-deployments/)
+5. 在功能清单中分别记录实测、合成及 Not run。首次上线按获准的新 Bot、初始化清单、生产目标和暂停/恢复步骤部署，设置 Webhook 时保留待处理更新；旧源停写/同步为 N/A。启用前仍须独立核对正式版本、资源和权限，不能因无旧数据跳过生产授权。上线失败先停止新增写入并封存 Cloudflare 现状，保留已受理数据后再决定恢复。若未来有旧生产迁移，再单独核对停写、最后同步及消费者边界。 [Telegram `setWebhook` / `deleteWebhook`](https://core.telegram.org/bots/api#setwebhook) · [Worker 版本与部署](https://developers.cloudflare.com/workers/versions-and-deployments/)
 
 ## 限额、成本和凭据
 

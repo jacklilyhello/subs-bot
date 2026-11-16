@@ -106,7 +106,8 @@ async function main() {
     && Array.isArray(input.replay.tables) && input.replay.tables.length <= 500 && typeof input.replaySha256 === "string"
     && DIGEST.test(input.replaySha256) && sha(JSON.stringify(input.replay)) === input.replaySha256 && record(input.tableCounts)
     && Object.entries(input.tableCounts).every(([name, count]) => /^[a-z][a-z0-9_]*$/u.test(name) && integer(count, 20_000))
-    && Array.isArray(input.objects) && input.objects.length <= 512);
+    && Array.isArray(input.objects) && input.objects.length <= 512
+    && Array.isArray(input.aggregateProbes) && input.aggregateProbes.length <= 32);
   const scriptFile = await open(join(bundle, "index.js"), constants.O_RDONLY | constants.O_NOFOLLOW);
   let script: Buffer;
   try {
@@ -130,15 +131,14 @@ async function main() {
     bindings: { BUILD_REVISION: input.revision, PUBLIC_ORIGIN: ORIGIN },
     outboundService: () => { outboundAttempts += 1; throw new Error("Native restored-link egress denied."); },
   });
-  const counts = { storedShareExports: 0, legacyEmptyExports: 0, unpublishedDenials: 0, trashDenials: 0, oversizeDenials: 0,
+  const counts = { storedShareExports: 0, legacyEmptyExports: 0, unpublishedDenials: 0, trashDenials: 0, oversizeDenials: 0, activeAllAggregatePairs: 0,
     missingDenials: 0, omittedStructuredOrInvalidShare: 0, omittedResponseLimit: 0, omittedHashedCapabilities: 0 };
   let migrationCount = 0;
   let restoredEffectiveDisplayTimezones: string[] = [];
   try {
     let checkNumber = 0;
-    const checkResponse = async (response: Response, method: "GET" | "HEAD", status: number, body: Buffer, category: string) => {
+    const checkExpected = async (response: Response, method: "GET" | "HEAD", status: number, expectedBytes: number, expectedSha256: string, category: string) => {
       checkNumber += 1;
-      const expected = method === "HEAD" ? Buffer.alloc(0) : body;
       failure = { category, check: checkNumber, method, expectedStatus: status, actualStatus: response.status };
       stage = "native-http-status";
       requireSafe(response.status === status);
@@ -148,11 +148,15 @@ async function main() {
         nosniffMatches: response.headers.get("x-content-type-options") === "nosniff" };
       requireSafe(failure.cacheControlMatches && failure.referrerPolicyMatches && failure.nosniffMatches);
       stage = "native-http-body";
-      failure = { category, check: checkNumber, method, expectedBytes: expected.length, expectedSha256: sha(expected) };
+      failure = { category, check: checkNumber, method, expectedBytes, expectedSha256 };
       const actual = await bytes(response);
       failure = { ...failure, actualBytes: actual.bytes, actualSha256: actual.sha256 };
-      requireSafe(actual.bytes === expected.length && actual.sha256 === sha(expected));
+      requireSafe(actual.bytes === expectedBytes && actual.sha256 === expectedSha256);
       failure = null;
+    };
+    const checkResponse = async (response: Response, method: "GET" | "HEAD", status: number, body: Buffer, category: string) => {
+      const expected = method === "HEAD" ? Buffer.alloc(0) : body;
+      await checkExpected(response, method, status, expected.length, sha(expected), category);
     };
     stage = "runtime-health";
     const health = await runtime.dispatchFetch(ORIGIN + "/health", { redirect: "manual" });
@@ -265,16 +269,47 @@ async function main() {
     const missing = "NativeRestoreMissingToken0001";
     requireSafe(!subscriptions.results.some((row) => row.token === missing) && !trash.results.some((row) => row.token === missing));
     await check(missing, 404, Buffer.from("Not found."), "missingDenials");
+    const allSlots = await db.prepare("SELECT count(*) AS count FROM telegram_aggregate_slots WHERE code_sha256 IS NOT NULL").first<number>("count");
+    requireSafe(allSlots === input.aggregateProbes.length);
+    const seenAggregateCodes = new Set<string>();
+    for (const probe of input.aggregateProbes) {
+      requireSafe(record(probe) && typeof probe.code === "string" && /^[A-Za-z0-9_-]{22}$/u.test(probe.code)
+        && !seenAggregateCodes.has(probe.code) && probe.codeSha256 === sha(probe.code));
+      seenAggregateCodes.add(probe.code);
+      const match = await db.prepare(`SELECT count(*) AS count FROM telegram_aggregate_slots AS slot
+        JOIN aggregate_links AS link USING(code_sha256) WHERE slot.code_sha256=? AND link.kind='all'
+          AND link.revoked_at IS NULL AND link.owner_id=slot.actor_id AND link.bot_id=slot.bot_id
+          AND NOT EXISTS(SELECT 1 FROM legacy_all_aggregates WHERE code_sha256=slot.code_sha256)`)
+        .bind(probe.codeSha256).first<number>("count");
+      requireSafe(match === 1);
+      for (const [method, key] of [["GET", "get"], ["HEAD", "head"]] as const) {
+        const expected = probe[key];
+        requireSafe(record(expected) && expected.status === 200 && integer(expected.bytes, MAX_RESPONSE)
+          && (method === "GET" ? expected.bytes > 0 : expected.bytes === 0)
+          && typeof expected.sha256 === "string" && DIGEST.test(expected.sha256)
+          && (method !== "HEAD" || expected.sha256 === sha(Buffer.alloc(0))));
+        stage = "native-http-request";
+        failure = { category: "activeAllAggregatePairs", check: checkNumber + 1, method, expectedStatus: 200 };
+        const response = await runtime.dispatchFetch(ORIGIN + "/agg/" + probe.code + "/base64", { method, redirect: "manual" });
+        stage = "native-http-content-type";
+        failure = { ...failure, contentTypeMatches: response.headers.get("content-type") === "text/plain; charset=utf-8" };
+        requireSafe(failure.contentTypeMatches);
+        await checkExpected(response, method, 200, expected.bytes, expected.sha256, "activeAllAggregatePairs");
+      }
+      counts.activeAllAggregatePairs += 1;
+    }
     for (const table of ["normal_short_links", "aggregate_links", "private_shares"]) {
       counts.omittedHashedCapabilities += await db.prepare(`SELECT count(*) AS count FROM ${table}`).first<number>("count") ?? 0;
     }
+    counts.omittedHashedCapabilities -= counts.activeAllAggregatePairs;
+    requireSafe(counts.omittedHashedCapabilities >= 0);
     requireSafe(outboundAttempts === 0);
   } finally { await runtime.dispose(); }
   stage = "safe-evidence";
   const report = { version: 1, evidenceKind: "hosted-restored-data-http-replay", revision: input.revision,
     moduleSha256: input.moduleSha256, restoredDataSha256: input.dataSha256,
     consumerBound: false, telegramConfigSupplied: false, outboundAttempts, counts, migrationCount, restoredEffectiveDisplayTimezones,
-    limitations: ["Hashed aggregate, short and private-share code preimages were not supplied.",
+    limitations: ["Only active native all-slots proven by the protected source key and matching source HTTP baseline are probed; other hashed capabilities remain omitted.",
       "Structured or invalid stored-share exports and responses above the bound are reported as omitted.",
       "Scratch runtime replays the sealed SQL proven equal to restored D1 and bytes read from restored R2; this is not a public target deployment."] };
   await writeFile(process.argv[4], JSON.stringify(report) + "\n", { mode: 0o600, flag: "wx" });

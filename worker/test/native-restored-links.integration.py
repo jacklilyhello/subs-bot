@@ -6,6 +6,7 @@ import subprocess
 import sys
 from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock, patch
 
 import test_native_restore_rehearsal as fixtures
 from test_native_restore_rehearsal import SNAPSHOT, native
@@ -54,27 +55,47 @@ class RestoredLinksTests(unittest.TestCase):
         fixture.db.execute("""INSERT INTO subscriptions(id,owner_id,name,source_url,token,created_at,updated_at,generation,snapshot_id,manifest_sha256,node_count)
             VALUES(5,'881001','oversize','https://example.invalid/','native-oversize-token-01',1,1,1,?,?,33)""", (oversized_snapshot, native.digest(oversized_manifest)))
         fixture.db.execute("UPDATE sqlite_sequence SET seq=9 WHERE name='subscriptions'")
+        aggregate_snapshot = "dddddddd-eeee-ffff-aaaa-111111111111"
+        aggregate_prefix = f"subscriptions/6/{aggregate_snapshot}/"
+        fixture.bodies[aggregate_prefix + "0.ndjson"] = raw
+        fixture.bodies[aggregate_prefix + "manifest.json"] = plan
+        fixture.db.execute("""INSERT INTO subscriptions(id,owner_id,name,source_url,token,created_at,updated_at,generation,snapshot_id,manifest_sha256,node_count)
+            VALUES(6,'881002','aggregate-small','https://example.invalid/','native-aggregate-sub-001',1,1,1,?,?,1)""", (aggregate_snapshot, native.digest(plan)))
+        encoded_key = native.base64.urlsafe_b64encode(bytes(range(32))).decode().rstrip("=")
+        aggregate_code = native.aggregate_code(encoded_key, "881000", "881002", "A" * 22)
+        aggregate_sha = native.digest(aggregate_code.encode())
+        fixture.db.execute("INSERT INTO aggregate_links(code_sha256,owner_id,kind,bot_id) VALUES (?,'881002','all','881000')", (aggregate_sha,))
+        fixture.db.execute("INSERT INTO telegram_aggregate_slots VALUES ('881000','881002',1,?,?,1,1,1)", (aggregate_sha, "A" * 22))
         bundle = Path(os.environ["WORKER_TEST_BUNDLE_DIR"]).resolve()
         manifest = json.loads((bundle / "isolation.json").read_bytes())
         fixture.source.manifest = manifest
+        fixture.source.version = SimpleNamespace(telegram_aggregate_key_sha256=native.digest(encoded_key.encode()))
+        fixture.source.before_write, fixture.source.quiet = Mock(), Mock(return_value=1_800_000_000)
         sql = fixture.dump("restore")
         db, layout, summary = native.open_export(sql, fixture.source)
         db.close()
         refs = [{"key": key, "bytes": len(body), "sha256": native.digest(body), "metadata": {"custom": {}, "http": {}}}
             for key, body in sorted(fixture.bodies.items())]
-        document = {"sqlSha256": native.digest(sql.read_bytes()), "objects": refs, "summary": summary}
+        document = {"sqlSha256": native.digest(sql.read_bytes()), "objects": refs, "summary": summary, "layout": layout}
         root = fixture.directory / "validation"
-        api = SimpleNamespace(names={"objects": "synthetic-restored-r2"},
-            object_or_none=lambda bucket, key: (fixture.bodies.get(key), None))
+        api = fixtures.MemoryAPI()
+        api.db = fixture.db
+        api.objects.update({(api.names["objects"], key): body for key, body in fixture.bodies.items()})
         engine = native.Rehearsal(api, fixture.source, None, fixture.directory, validation_directory=root)
-        engine.prepare_link_validation(document)
+        expected_aggregate = native.base64.b64encode(share.encode())
+        def reference(code, method):
+            self.assertEqual(code, aggregate_code)
+            body = expected_aggregate if method == "GET" else b""
+            return {"status": 200, "bytes": len(body), "sha256": native.digest(body)}
+        with patch.dict(native.os.environ, {"SUBS_BOT_TELEGRAM_AGGREGATE_KEY": encoded_key}), patch.object(native, "read_aggregate_reference", side_effect=reference):
+            engine.prepare_link_validation(document)
         report = fixture.directory / "report.json"
         command = [os.environ.get("SUBS_BOT_NATIVE_ORACLE_NODE", "node"), "tools/native-restored-links.ts", str(root), str(bundle), str(report)]
         result = subprocess.run(command, capture_output=True, timeout=120)
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         output = json.loads(result.stdout)
         self.assertEqual(output, json.loads(report.read_bytes()))
-        self.assertEqual(output["counts"], {"storedShareExports": 1, "legacyEmptyExports": 1, "unpublishedDenials": 1, "oversizeDenials": 1,
+        self.assertEqual(output["counts"], {"storedShareExports": 2, "legacyEmptyExports": 1, "unpublishedDenials": 1, "oversizeDenials": 1, "activeAllAggregatePairs": 1,
             "trashDenials": 1, "missingDenials": 1, "omittedStructuredOrInvalidShare": 0,
             "omittedResponseLimit": 0, "omittedHashedCapabilities": 0})
         self.assertEqual(output["outboundAttempts"], 0)
@@ -82,6 +103,8 @@ class RestoredLinksTests(unittest.TestCase):
         self.assertEqual(output["restoredEffectiveDisplayTimezones"], ["UTC"])
         self.assertNotIn(b"abcdefghijklmnop", result.stdout)
         self.assertNotIn(share.encode(), result.stdout)
+        self.assertNotIn(aggregate_code.encode(), result.stdout)
+        self.assertNotIn(encoded_key.encode(), (root / "input.json").read_bytes())
         input_path = root / "input.json"
         original_input = input_path.read_bytes()
         altered_input = json.loads(original_input)
