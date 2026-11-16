@@ -502,7 +502,15 @@ class Controller:
         return {"revision": revision, "moduleSha256": sha256(body).hexdigest(), "versionId": version["id"],
                 "deploymentId": deployment_id, "bindings": bindings, "compatibilityDate": version["compatibility_date"]}
 
-    def expected_bindings(self, *, include_secrets=False, allow_unbound_provider=False):
+    def verify_dependency(self, *, allow_unbound=False):
+        config = self.target.data["provider"]
+        if config is None:
+            return None
+        from production_provider import verify_provider_dependency
+        require(self.dependency_api is not None, "An explicit read-only ProviderFetch inspection credential is required.")
+        return verify_provider_dependency(self.dependency_api, config, allow_unbound_caller=allow_unbound)
+
+    def expected_bindings(self, *, include_secrets=False, allow_unbound_provider=False, verify_dependency=False):
         t, flags = self.target.data, self.target.data["features"]
         result = [{"type": "d1", "name": "DB", "database_id": t["d1Id"]},
             {"type": "r2_bucket", "name": "NODES", "bucket_name": t["bucketName"]}]
@@ -522,17 +530,22 @@ class Controller:
             result.append({"type": "service", "name": "SHORTLINK", "service": "shortlink-new", "entrypoint": "ShortlinkService"})
             secrets["SHORTLINK_BUSINESS_TOKEN"] = self.secrets["shortlinkToken"]
         if t["provider"] is not None:
-            from production_provider import verify_provider_dependency
-            require(self.dependency_api is not None, "An explicit read-only ProviderFetch inspection credential is required.")
-            dependency = verify_provider_dependency(self.dependency_api, t["provider"], allow_unbound_caller=include_secrets or allow_unbound_provider)
+            # Incident inspection/pause validates the application's exact approved
+            # binding even while its dependency is busy or unavailable. Enabling
+            # deployment and final activation separately require live full proof.
+            config = t["provider"]
+            dependency = self.verify_dependency(allow_unbound=allow_unbound_provider) if verify_dependency else {
+                "service": config["service"], "revision": config["build"]["revision"],
+                "imageSha256": config["build"]["ociManifestSha256"]}
             result.append({"type": "service", "name": "PROVIDER_FETCH", "service": dependency["service"], "entrypoint": "ProviderFetch"})
             text.update({"PROVIDER_REVISION": dependency["revision"], "PROVIDER_IMAGE_SHA256": dependency["imageSha256"]})
         result.extend({"type": "plain_text", "name": key, "text": value} for key, value in text.items())
         result.extend({"type": "secret_text", "name": key, **({"text": value} if include_secrets else {})} for key, value in secrets.items())
         return result
 
-    def verify_bindings(self, active, *, allow_unbound_provider=False):
-        expected = {r["name"]: r for r in self.expected_bindings(allow_unbound_provider=allow_unbound_provider)}
+    def verify_bindings(self, active, *, allow_unbound_provider=False, verify_dependency=False):
+        expected = {r["name"]: r for r in self.expected_bindings(allow_unbound_provider=allow_unbound_provider,
+            verify_dependency=verify_dependency)}
         actual = active["bindings"]
         require(set(expected) == set(actual), "Active binding inventory differs from the exact configuration.")
         for name, wanted in expected.items():
@@ -685,6 +698,7 @@ class Controller:
                 and not any(before["work"].values()), "Final activation requires a drained, frozen source.")
         require(not any(before["terminal"].get(key, 0) for key in ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates")),
                 "Unresolved external effects or interrupted updates require an explicit decision before activation.")
+        dependency = self.verify_dependency()
         require(callable(self.activation_baseline_checker), "A pinned independently verified current baseline is required before activation.")
         proof = self.activation_baseline_checker()
         require(isinstance(proof, dict) and proof.get("baselineVerified") is True
@@ -707,6 +721,8 @@ class Controller:
                 "An exact read-back webhook is required before activation.")
         self.verify_domain()
         before["activationBaseline"] = proof
+        if dependency is not None:
+            before["dependencyProof"] = dependency
         before["stateSha256"] = digest({k: v for k, v in before.items() if k != "stateSha256"})
         return before
 
@@ -747,6 +763,8 @@ class Controller:
                 and after["control"]["workers"] == workers, "Transition outcome is not confirmed; inspect before proceeding.")
         if action == "activate":
             after["activationBaseline"] = before["activationBaseline"]
+            if "dependencyProof" in before:
+                after["dependencyProof"] = before["dependencyProof"]
         return after
 
     def classify_interruption(self, approval, state_sha):
@@ -785,7 +803,7 @@ class Controller:
         self.approval(approval, "deploy", state_sha)
         module = (self.bundle / "index.js").read_bytes()
         require(sha256(module).hexdigest() == self.manifest["bundleSha256"] and 0 < len(module) <= 1152*1024)
-        bindings = self.expected_bindings(include_secrets=True)
+        bindings = self.expected_bindings(include_secrets=True, allow_unbound_provider=True, verify_dependency=True)
         previous_active = self.active(allow_empty=True)
         if previous_active["versionId"] is not None:
             for binding, key in (("TELEGRAM_AGGREGATE_KEY_SHA256", "aggregate"), ("TELEGRAM_PRIVATE_SHARE_CREATION_KEY_SHA256", "privateShare")):
@@ -801,14 +819,14 @@ class Controller:
         require(isinstance(uploaded, dict) and matches(UUID, uploaded.get("id")), "Uploaded version is unconfirmed; do not retry blindly.")
         # Verify staged bytes and every binding before the first traffic change.
         # Post-deployment verification alone cannot make an unknown module safe.
-        self.verify_bindings(self.version(uploaded["id"]), allow_unbound_provider=True)
+        self.verify_bindings(self.version(uploaded["id"]), allow_unbound_provider=True, verify_dependency=True)
         self.resources()
         require(self.active(allow_empty=True)["deploymentId"] == before["release"]["deploymentId"], "Active deployment changed during staging.")
         self.guard()
         self.worker("POST", self.script + "/deployments", {"strategy": "percentage", "versions": [{"version_id": uploaded["id"], "percentage": 100}],
             "annotations": {"workers/message": "Reviewed lifecycle release " + self.target.digest}})
         active = self.active()
-        self.verify_bindings(active)
+        self.verify_bindings(active, verify_dependency=True)
         require(active["versionId"] == uploaded["id"])
         # At this point a failure stays safely frozen. Revision updates are one
         # transaction, and never reset actor permissions, receipts or business data.
@@ -816,7 +834,7 @@ class Controller:
 
     def reconcile_deployment(self, before):
         old = before["control"]["release_revision"]
-        self.verify_bindings(self.active())
+        self.verify_bindings(self.active(), verify_dependency=True)
         require(before["control"]["admission"] == "closed" and before["control"]["workers"] == "frozen"
                 and not any(self.work().values()), "Only a fully frozen deployment can reconcile its revision.")
         self.guard()

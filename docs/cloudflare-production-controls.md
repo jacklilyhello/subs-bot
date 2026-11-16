@@ -14,8 +14,8 @@
 | `backupBucketName` | `subs-bot-cf-prod-backup-01` |
 | `hostname` | `subs-bot.lilyya.top` |
 | `workerId`, `workerCreatedOn`, `d1Id`, `d1CreatedAt`, `bucketCreatedAt`, `backupBucketCreatedAt` | 独立读回的不可变 ID／创建时间；只有创建草稿允许这些值为 null |
-| `botId`, `botUsername`, `generation` | 已通过 getMe 的新正式 Bot；明确的正整数授权世代 |
-| `admins`, `members`, `defaultAccess` | 升序、去重的正式 ID 数组；至少一个管理员；互不重叠；`defaultAccess=deny` |
+| `botId`, `botUsername`, `generation` | 已通过 getMe 的新正式 Bot，ID 为小于 2^52 的正整数；授权世代为 1 至 2^53−1 的整数 |
+| `admins`, `members`, `defaultAccess` | 每组至多 100 个、按 JSON 字符串字典序排序并去重的正式 ID；ID 为正整数且小于 2^52，至少一个管理员，两组互不重叠；`defaultAccess=deny` |
 | `groups` | `[]` 或一个明确 `{chatId,chatType}`；目前单一群卡目的地，超限拒绝；预检实际 Bot 成员／发送权限 |
 | `features` | 必须显式填写下述所有布尔开关，不推断默认启用 |
 | `provider` | 关闭 URL 能力时可为 null；启用时填写独立验证的完整 ProviderFetch 契约，见 [依赖说明](cloudflare-production-provider.md) |
@@ -123,7 +123,7 @@
 
 平台不支持细分的权限应限制到唯一账户、使用短期凭据，并由工具的固定资源 allowlist、受保护 environment 和不取消的并发锁共同约束。需要新权限时先明确范围，不能借短链业务 Token、其他项目凭据或 `/ai` Key 代替。
 
-批准 JSON 必须包含 `schemaVersion=1`, `environment`, `targetSha256`, `configurationSha256`, `revision`, `controlRevision`, `action`, `stateSha256`, `authorization`。`revision` 是被验证应用产物的准确提交；`controlRevision` 是当前控制工具 main 提交；`authorization` 精确为 `approve <action> for subs-bot-cf-prod-01`。创建使用草稿身份，初始化使用资源前态摘要；其他操作使用独立 inspect 的前态摘要。恢复另绑定完整恢复契约。旧批准、旧前态、其他目标或配置不符均停止。
+批准 JSON 必须包含 `schemaVersion=1`, `environment`, `targetSha256`, `configurationSha256`, `revision`, `controlRevision`, `action`, `stateSha256`, `authorization`。`revision` 是被验证应用产物的准确提交；`controlRevision` 是当前控制工具 main 提交；`authorization` 精确为 `approve <action> for subs-bot-cf-prod-01`。创建使用草稿身份，初始化使用资源前态摘要；pause、webhook 和 activate 分别使用专门 plan-pause、plan-webhook 和 plan-activate 的批准前态，其他操作按其说明使用独立 inspect 或 plan-deploy 前态。恢复另绑定完整恢复契约。旧批准、旧前态、其他目标或配置不符均停止。
 
 ## 操作顺序
 
@@ -160,6 +160,8 @@ gh workflow run worker-production-control.yml --ref main \
 
 常规 inspect／pause／drain 可以显式选择已通过 CI 的 main 祖先应用产物，控制工具自身始终运行当前准确 main。新初始化／部署要求当前 main 产物。不能用新提交的绿色状态替代旧线上模块的来源证明。
 
+常规现场检查、暂停、排空及封存只要求主应用的版本、完整配置和实际绑定准确，不因 ProviderFetch 正在正常处理或故障而阻止关闭 admission。启用依赖的部署在上传前、暂存后和发布后完整读回 Provider 代码／镜像／资源／调用者；最终 plan-activate 与 activate 也要求依赖停止状态和完整证明。实际绑定错误仍会阻止暂停，须保留现场并使用准确配置处理，不能以忽略绑定检查来关闭工作。
+
 暂停顺序为 `plan-pause → 批准该摘要 → pause → inspect → drain → freeze`。生产流程不会自动更换批准；重新规划只发生在新的明确批准下。freeze／activate 的工作与未知结果限制继续生效。专用演练工作流的 `stabilize` 仅绑定独立登记的准确演练源，执行 pause、等待已受理工作、freeze，不接触 Webhook、不删除数据、不分类或重发未知结果。演练自动重新批准最多三次，而且只处理已确认 SQL 尚未开始的 `StalePredecessorError`；SQL CAS 失败、传输未知或确认失败均停止并保留私有 intent。每次 intent 和确认使用唯一序号。
 
 演练在 Webhook 操作中断后，先用准确 `webhook_checkpoint`／`webhook_snapshot_sha256` 执行 `recover-webhook`，独立确认原 URL／参数和空对象认证探针 HTTP 400，不能把 Telegram API 设置读回等同于 Secret 已生效。重新 exercise 可显式成对提供 `baseline_checkpoint_id`／`baseline_manifest_sha256` 复用完整私有 G0；工具仍完整读回 SQL／R2／代码并与当前 frozen 状态核对，激活规划和执行再各自重验。缺项、格式错误或任何漂移都在触碰 Webhook 前停止，不自动重新导出或采用其他基线。未提供时保留新建基线的流程。公网探针统一使用项目读回请求头、保持 TLS／目标／Secret／状态和容量检查，不自动重发业务 POST；报告分别保留净化主因和清理失败。
@@ -171,6 +173,18 @@ Actions 产物过期时，可用 `source_checkpoint_id` 和独立保存的 `sour
 Webhook 配置顺序为 `plan-webhook → 明确批准其 stateSha256 → webhook`；同时将规划输出的 `webhook.settingsSha256` 填入 `webhook_sha256`。普通 inspect 摘要或原始 getWebhookInfo 全量摘要不能替代该规划。稳定前态绑定 URL、无自定义证书、连接数和更新类别；待处理数量、投递错误与当前 IP 仅作为净化观察，因此正常投递变化不使批准失效。正式前 URL 只允许空或准确正式目标；通用 rehearsal 也不默认接受 dev URL，只有专用 Drill 从登记的原实例上下文显式提供原 dev URL。未知 URL、证书、额外设置或畸形字段在写入前拒绝。新请求不设置自定义证书或固定 IP。Telegram 的 reported `ip_address` 仅说明当前使用的地址，不能据此判断是否曾设置固定 IP；工具只核对合法公网格式并记录摘要，不宣称证明其来源，也不将地址轮转加入稳定批准摘要。[Telegram Webhook 字段定义](https://core.telegram.org/bots/api#getwebhookinfo)
 
 写入或结果读回不明时保持 admission 关闭，保存失败并先重新执行只读 `plan-webhook` 核对实际设置；工具不自动重发 setWebhook。规划读回不能证明 Telegram 未公开的 Secret 值，不能把结果不明标为成功或沿用旧批准盲目重试；需要新的明确批准和独立认证证据后再决定下一步。
+
+## 专用主应用 Provider 绑定演练
+
+`worker-production-lifecycle-rehearsal.yml` 的 `provider-binding` 仅接受已登记的 `subs-bot-cf-control-drill-01`，不操作原 dev 数据或 Provider 部署。先取得完整、未绑定的专用 Provider 私有归档与独立摘要，并通知操作者准备好既有管理员浏览器会话；操作者明确 ready 后才 dispatch。输入 `source_run_id` 为当前准确 main Worker CI，`active_run_id` 为当前专用应用准确源 CI，`registration_sha256` 保持原登记值。另必填 `provider_run_id`、`provider_run_attempt`、`provider_manifest_sha256`，`human_window_seconds` 选 60–540 秒，`provider_ready_ack` 精确为 `IAB ready for subs-bot-cf-control-drill-01 refresh`。不提供旧基线 pin；配置变化后先封存并核对新的 G0。
+
+流程通过正式 Controller 的 plan-deploy／deploy 保留身份、密钥和数据，仅开启 URL 导入和刷新；严格读回唯一调用者绑定后，执行正常 G0／Webhook／激活流程。合成 URL 导入必须保存完整三个节点并精确导出原 URI。出现 `provider-refresh-window-open` 后，管理员在测试 Bot 私聊找到本次带 run 标记的订阅，打开详情并点击真实刷新按钮；工具只接受该管理员、该订阅、同一来源与真实票据的成功请求，核对 generation 增加一次、三个节点、确认发送及精确导出。重复发送 URL 不算刷新。报告需再与浏览器独立观察交叉核对，窗口打开本身不等于真人通过。
+
+随后先关闭、排空、冻结并独立恢复原 Webhook／认证，再以真实 Controller 发布原 Provider=null／关闭功能的完整配置，核对依赖无调用者。专用数据与原登记保持，后续 inspect 的 active_run_id 应指向这次发布所用的准确 main CI；displayTimezone 仅投影本 Bot 的时区与设置来源，无行明确为默认 UTC。
+
+依赖读取 Secret `SUBS_BOT_CF_DEPENDENCY_READ_TOKEN` 只在此 action 注入，所需权限组为 Workers Scripts Read 与 Workers Containers Read。平台只能按账户授予这些读权限；工具再限制到已验证的 Provider 当前／历史准确 ID 与实际盘点所得对象，GET-only，拒绝其他项目、写操作、D1、R2、Zone 和 Registry。使用短期凭据并核对到期时间，不复制 Provider 运行 Secret。
+
+每个完整 Provider 配置与应用 main 组合只允许一个私有持久 on-intent。部署结果未知时不能重跑此 action；从该 intent 取出完整 source／desired 配置和准确源，使用正式 plan-deploy／reconcile-deploy 路径独立核对发布，再以新的明确批准决定后续。若关闭配置的部署未知也保留两份契约和 intent；不能用原 Provider=null 登记的检查失败来声称恢复成功，不能盲目重新部署或恢复 Webhook。所有 G0、业务记录、票据和私有部分结果保留。
 
 ## 集中的正式配置与批准清单
 

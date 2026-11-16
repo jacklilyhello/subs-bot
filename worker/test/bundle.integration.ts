@@ -24,6 +24,7 @@ import "./telegram-private-share-command.integration.ts";
 import "./telegram-subscription-share.integration.ts";
 import "./telegram-group-share.integration.ts";
 import "./provider-job-consumer.integration.ts";
+import "./application-provider-fixture.integration.ts";
 import "./telegram-provider-url-import.integration.ts";
 import "./telegram-provider-refresh.integration.ts";
 import "./telegram-provider-batch.integration.ts";

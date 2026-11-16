@@ -310,6 +310,7 @@ class LifecycleDrillTests(unittest.TestCase):
         tool.bind = Mock(return_value=controller)
         tool.registration = Mock(return_value=target)
         tool.proof = {"revision": REVISION}
+        tool.display_timezone = Mock(return_value={"timezone": "UTC", "persisted": True})
         observed = [{"actor_id": "8813701954", "message_id": 123, "command": "help", "state": "sent", "attempts": 1},
             {"actor_id": "8653767757", "message_id": 456, "command": "list", "state": "sent", "attempts": 1}]
         with patch.object(drill, "rows", return_value=observed) as read:
@@ -318,6 +319,7 @@ class LifecycleDrillTests(unittest.TestCase):
         self.assertEqual(tool.report["humanReceipts"], observed)
         self.assertIs(tool.report["humanAcceptance"], False)
         self.assertIs(tool.report["humanEvidenceRequiresIABCorrelation"], True)
+        self.assertEqual(tool.report["displayTimezone"], {"timezone": "UTC", "persisted": True})
         sql = read.call_args.args[2]
         self.assertIn("inbox.update_id<7000000000000000", sql)
         self.assertIn("inbox.actor_id IN ('8813701954','8653767757')", sql)

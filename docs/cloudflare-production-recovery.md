@@ -24,7 +24,7 @@
 
 `checkpointId` 为本次唯一的 32 位小写十六进制标识。恢复 D1/R2 名必须是本项目新的 `subs-bot-restore-*` 或 `subs-bot-cf-restore-*` 名，不能等于源 Worker、D1、对象桶或备份桶名。它们在 `prepare` 时必须不存在；常规备份无需创建这些恢复目标。
 
-每次 mutation 的 approval action 为 `recovery-<action>:<SHA-256(canonical 完整恢复配置)>`，其余 approval 字段严格关联环境、固定目标身份 `targetSha256`、完整当前配置 `configurationSha256`、当前 main 控制提交和源 `stateSha256`。开关、Provider、密钥摘要及 Webhook 配置属于配置摘要，不改变固定资源身份；每次更改仍须单独批准并重新核验准确部署。不能把另一个 checkpoint、另一份 G1 或另一组目标的批准用于本次操作。可用生命周期 `inspect` 或本工作流 `inspect` 的 `sourceStateSha256` 取得准确前态。
+每次 mutation 的 approval action 为 `recovery-<action>:<SHA-256(canonical 完整恢复配置)>`，其余 approval 字段严格关联环境、固定目标身份 `targetSha256` 和完整当前配置 `configurationSha256`。`revision` 固定为被恢复 G0 的源 CI 提交，`controlRevision` 为当前 main 控制工具提交，`stateSha256` 绑定当前现场／G1 的准确前态，不能互换。开关、Provider、密钥摘要及 Webhook 配置属于配置摘要，不改变固定资源身份；每次更改仍须单独批准并重新核验准确部署。不能把另一个 checkpoint、另一份 G1 或另一组目标的批准用于本次操作。可用生命周期 `inspect` 或本工作流 `inspect` 的 `sourceStateSha256` 取得准确前态。
 
 ## 同一状态的 D1/R2 备份
 
@@ -110,12 +110,12 @@ G0 之后发生任何新增、修改、删除、授权、领取、撤销、短�
 | 项目 | 当前硬界限 |
 | --- | --- |
 | 原生 SQL 导出 | 32 MiB |
-| 完整 D1 数据 | 20,000 行；TEXT/INTEGER/REAL，单元格至多 2,000,000 UTF-8 字节 |
+| 完整 D1 数据 | 20,000 行；支持 NULL/TEXT/INTEGER/REAL，INTEGER 限于 JavaScript 安全整数范围 ±(2^53−1)，BLOB 拒绝；单元格至多 2,000,000 UTF-8 字节，每行 canonical typed 编码至多 8,000,000 字节 |
 | 引用 R2 闭包 | 至多 512 对象、总计 256 MiB、单对象 512 KiB；私密分享更严格遵守业务内容界限 |
 | 私有 manifest | 256 KiB |
 | 原始 CI ZIP | 16 MiB，最多 32 个 512 KiB 分片 |
 | 控制 journal | 至多 4,096 代，单代 32 KiB |
 | 消费者发现 | 单页 Worker 脚本/服务各少于 1,000；每服务环境少于 32；未知分页或截断状态直接失败 |
-| 原生导出/导入轮询 | 每次至多 120 秒；保留已知书签供下次接续 |
+| 原生导出/导入轮询 | 每次循环期限 120 秒，不包含已在途请求的 HTTP timeout；保留已知书签供下次接续 |
 
 所有界限采用超限拒绝，不截断数据。工具备份完整 D1 与 D1 引用的 R2 闭包，不声称复制任意无引用孤儿对象或 Worker Secret。Secret 由受保护配置另行保管。任务超时可能留下已确认分片或独立目标；这些资料不会被自动删除。源码/配置/密钥不兼容、非支持 schema/元数据或无法完整读取资源时停止，不能用部分摘要宣布恢复成功。
