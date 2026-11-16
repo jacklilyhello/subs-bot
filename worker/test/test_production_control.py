@@ -45,6 +45,7 @@ def fixture():
 
 def approval(target, action, state):
     return {"schemaVersion": 1, "environment": target.environment, "targetSha256": target.digest,
+        "configurationSha256": target.configuration_digest,
         "revision": REVISION, "action": action, "stateSha256": state,
         "authorization": "approve " + action + " for " + target.data["workerName"]}
 
@@ -66,6 +67,7 @@ class StatefulAPI:
         self.inject_initialization_row = False
         self.lose_initialization_response = False
         self.initialization_mutations = 0
+        self.before_guarded_mutation = None
 
     def insert_business(self):
         self.db.execute("""INSERT INTO subscriptions(owner_id,name,source_url,token,created_at,updated_at)
@@ -81,6 +83,8 @@ class StatefulAPI:
             if self.inject_initialization_row:
                 self.inject_initialization_row = False
                 self.insert_business()
+        if self.before_guarded_mutation is not None and sql.startswith("SELECT CASE WHEN"):
+            self.before_guarded_mutation(sql)
         results = []
         try:
             self.db.execute("BEGIN")
@@ -200,20 +204,64 @@ class ProductionControllerTests(unittest.TestCase):
         self.assertEqual(result["control"]["workers"], "frozen")
         self.assertEqual(result["control"]["admission"], "closed")
 
-    def test_pending_and_unknown_invocations_block_freeze_without_deleting_them(self):
+    def test_running_blocks_freeze_and_ended_uncertainty_can_be_sealed_without_becoming_success(self):
         self.controller.initialize()
         self.api.db.execute("UPDATE subs_bot_production_control SET workers='run'")
-        for index, state in enumerate(("running", "uncertain"), 1):
-            with self.subTest(state=state):
-                invocation = format(index, "032x")
-                finished = None if state == "running" else 10
-                self.api.db.execute("""INSERT INTO subs_bot_production_invocations
-                    VALUES(?,?,?,1,'scheduled',1,9999999999,?,?)""", (invocation, self.target.digest, self.target.data["botId"], state, finished))
-                before = self.controller.inspect()
-                with self.assertRaises(contract.ContractError):
-                    self.controller.transition("freeze", approval(self.target, "freeze", before["stateSha256"]), before["stateSha256"])
-                self.assertEqual(self.api.db.execute("SELECT workers FROM subs_bot_production_control").fetchone()[0], "run")
-                self.assertEqual(self.api.db.execute("SELECT state FROM subs_bot_production_invocations WHERE invocation_id=?", (invocation,)).fetchone()[0], state)
+        invocation = "1" * 32
+        self.api.db.execute("""INSERT INTO subs_bot_production_invocations
+            VALUES(?,?,?,1,'scheduled',1,9999999999,'running',NULL)""", (invocation, self.target.digest, self.target.data["botId"]))
+        before = self.controller.inspect()
+        self.assertEqual(before["work"]["invocations"], 1)
+        with self.assertRaises(contract.ContractError):
+            self.controller.transition("freeze", approval(self.target, "freeze", before["stateSha256"]), before["stateSha256"])
+        self.api.db.execute("UPDATE subs_bot_production_invocations SET state='uncertain',finished_at=unixepoch() WHERE invocation_id=?", (invocation,))
+        ended = self.controller.inspect()
+        self.assertEqual(ended["work"]["invocations"], 0)
+        self.assertEqual(ended["terminal"]["unknownInvocations"], 1)
+        frozen = self.controller.transition("freeze", approval(self.target, "freeze", ended["stateSha256"]), ended["stateSha256"])
+        self.assertEqual(frozen["control"]["workers"], "frozen")
+        self.assertEqual(frozen["terminal"]["unknownInvocations"], 1)
+        with self.assertRaises(contract.ContractError):
+            self.controller.transition("activate", approval(self.target, "activate", frozen["stateSha256"]), frozen["stateSha256"])
+        self.assertEqual(self.api.db.execute("SELECT invocation_id,state FROM subs_bot_production_invocations").fetchone()[:], (invocation, "uncertain"))
+
+    def test_classification_preserves_expired_and_ended_unknown_updates_and_cannot_close_live_work(self):
+        self.controller.initialize()
+        self.api.db.execute("UPDATE subs_bot_production_control SET workers='run'")
+        now = self.api.db.execute("SELECT unixepoch()").fetchone()[0]
+        for index, state, lease, finished in ((1, "running", now - 600, None),
+                (2, "uncertain", now + 3600, now), (3, "running", now + 3600, None)):
+            invocation = format(index, "032x")
+            self.api.db.execute("INSERT INTO subs_bot_production_invocations VALUES(?,?,?,1,'webhook',?,?,?,?)",
+                (invocation, self.target.digest, self.target.data["botId"], now - 1200, lease, state, finished))
+            self.api.db.execute("""INSERT INTO subs_bot_production_updates
+                (bot_id,update_id,target_sha256,payload_sha256,invocation_id,state)
+                VALUES(?,?,?,?,?,'processing')""", (self.target.data["botId"], index, self.target.digest, format(index, "064x"), invocation))
+        before = self.controller.inspect()
+        result = self.controller.classify_interruption(approval(self.target, "classify-interruption", before["stateSha256"]), before["stateSha256"])
+        self.assertEqual(result["work"]["invocations"], 1)
+        self.assertEqual(result["work"]["processingUpdates"], 1)
+        self.assertEqual(result["terminal"]["unknownInvocations"], 2)
+        self.assertEqual(result["terminal"]["unknownUpdates"], 2)
+        self.assertEqual([tuple(row) for row in self.api.db.execute("SELECT update_id,state,http_status FROM subs_bot_production_updates ORDER BY update_id")],
+                         [(1, "uncertain", None), (2, "uncertain", None), (3, "processing", None)])
+        with self.assertRaises(contract.ContractError):
+            self.controller.transition("freeze", approval(self.target, "freeze", result["stateSha256"]), result["stateSha256"])
+        self.api.query("""UPDATE subs_bot_production_invocations SET state='finished',finished_at=unixepoch() WHERE invocation_id='00000000000000000000000000000003';
+            UPDATE subs_bot_production_updates SET state='completed',http_status=204,completed_at=unixepoch() WHERE update_id=3;""")
+        stopped = self.controller.inspect()
+        frozen = self.controller.transition("freeze", approval(self.target, "freeze", stopped["stateSha256"]), stopped["stateSha256"])
+        self.assertEqual(frozen["control"]["workers"], "frozen")
+        self.assertEqual(frozen["terminal"]["unknownUpdates"], 2)
+        self.assertEqual(self.api.db.execute("SELECT count(*) FROM subs_bot_production_updates").fetchone()[0], 3)
+        with self.assertRaises(contract.ContractError):
+            self.controller.transition("activate", approval(self.target, "activate", frozen["stateSha256"]), frozen["stateSha256"])
+        self.api.db.execute("UPDATE subs_bot_production_control SET admission='open',workers='run'")
+        opened = self.controller.inspect()
+        preserved = list(self.api.db.iterdump())
+        with self.assertRaises(contract.ContractError):
+            self.controller.classify_interruption(approval(self.target, "classify-interruption", opened["stateSha256"]), opened["stateSha256"])
+        self.assertEqual(list(self.api.db.iterdump()), preserved)
 
     def test_pending_durable_business_reply_prevents_freeze_and_activation(self):
         self.controller.initialize()
@@ -232,6 +280,27 @@ class ProductionControllerTests(unittest.TestCase):
         self.assertEqual(self.api.db.execute("SELECT state FROM telegram_outbox").fetchone()[0], "pending")
         self.assertEqual(self.api.db.execute("SELECT workers FROM subs_bot_production_control").fetchone()[0], "run")
 
+    def test_uncertainty_appearing_after_activation_preflight_aborts_the_atomic_transition(self):
+        self.controller.initialize()
+        self.api.db.execute("UPDATE subs_bot_production_control SET workers='run'")
+        self.controller.telegram = Mock()
+        self.controller.telegram.call.return_value = {"url": "https://" + self.target.data["hostname"] + "/telegram/webhook",
+            "max_connections": self.target.data["webhook"]["maxConnections"],
+            "allowed_updates": self.target.data["webhook"]["allowedUpdates"]}
+        self.controller.verify_domain = Mock(return_value={"domainVerified": True})
+        before = self.controller.inspect()
+        def finish_cron_unknown(sql):
+            if "SET admission='open'" not in sql:
+                return
+            self.api.before_guarded_mutation = None
+            self.api.db.execute("""INSERT INTO subs_bot_production_invocations
+                VALUES(?,?,?,1,'scheduled',1,2,'uncertain',3)""", ("f" * 32, self.target.digest, self.target.data["botId"]))
+        self.api.before_guarded_mutation = finish_cron_unknown
+        with self.assertRaises(control.OperationError):
+            self.controller.transition("activate", approval(self.target, "activate", before["stateSha256"]), before["stateSha256"])
+        self.assertEqual(self.api.db.execute("SELECT admission FROM subs_bot_production_control").fetchone()[0], "closed")
+        self.assertEqual(self.api.db.execute("SELECT state FROM subs_bot_production_invocations").fetchone()[0], "uncertain")
+
     def test_missing_or_wrong_identity_and_approval_never_mutate(self):
         for key, value in (("d1Id", None), ("workerId", "d" * 32), ("botId", "8813701954")):
             changed = deepcopy(self.target.data)
@@ -247,7 +316,7 @@ class ProductionControllerTests(unittest.TestCase):
         self.assertEqual(self.api.initialization_mutations, 0)
         self.controller.initialize()
         before = self.controller.inspect()
-        for key in ("targetSha256", "revision", "action", "stateSha256", "authorization"):
+        for key in ("targetSha256", "configurationSha256", "revision", "action", "stateSha256", "authorization"):
             envelope = approval(self.target, "thaw", before["stateSha256"])
             envelope[key] = "incorrect"
             with self.assertRaises(contract.ContractError):
@@ -256,6 +325,22 @@ class ProductionControllerTests(unittest.TestCase):
 
 
 class ConfigurationAndTransportTests(unittest.TestCase):
+    def test_feature_configuration_changes_keep_identity_and_require_a_new_approval(self):
+        target, _ = fixture()
+        raw = deepcopy(target.data)
+        raw["features"]["githubSearch"] = True
+        changed = contract.validate_target(raw)
+        self.assertEqual(changed.digest, target.digest)
+        self.assertNotEqual(changed.configuration_digest, target.configuration_digest)
+        state = "f" * 64
+        old_approval = approval(target, "deploy", state)
+        with self.assertRaises(contract.ContractError):
+            contract.approve(changed, old_approval, "deploy", REVISION, state)
+        self.assertTrue(contract.approve(changed, approval(changed, "deploy", state), "deploy", REVISION, state))
+        legacy_approval = {key: value for key, value in old_approval.items() if key != "configurationSha256"}
+        with self.assertRaises(contract.ContractError):
+            contract.approve(target, legacy_approval, "deploy", REVISION, state)
+
     def test_config_rejects_keys_that_runtime_cannot_decode(self):
         target, secrets = fixture()
         self.assertEqual(json.loads(control.general_config(target, REVISION, secrets))["cutoverAt"], 1)

@@ -62,7 +62,7 @@ class API:
     def __call__(self, method, path, payload=None, *, envelope=False, absent=False):
         require(isinstance(path, str) and matches(r"/[A-Za-z0-9/_.?=&,~-]+", path)
                 and not any(p in (".", "..") for p in path.partition("?")[0].split("/")))
-        require(path.startswith(self.root + "/") or path in (self.root, "/zones/" + self.target["zoneId"])
+        require(path.startswith(self.root + "/") or (method == "GET" and path == "/user/tokens/verify") or path in (self.root, "/zones/" + self.target["zoneId"])
                 or path.startswith("/zones/" + self.target["zoneId"] + "/"), "API request is outside the approved account or zone.")
         if method != "GET":
             t = self.target
@@ -197,7 +197,11 @@ class Telegram:
         self.opener = build_opener(ProxyHandler({}), NoRedirect())
 
     def call(self, method, payload=None):
-        require(method in ("getMe", "getWebhookInfo", "setWebhook"))
+        require(method in ("getMe", "getWebhookInfo", "setWebhook", "getChat", "getChatMember"))
+        if method in ("getChat", "getChatMember"):
+            require(isinstance(payload, dict) and str(payload.get("chat_id")) in {g["chatId"] for g in self.target.data["groups"]})
+            if method == "getChatMember":
+                require(str(payload.get("user_id")) == self.target.data["botId"])
         request = Request("https://api.telegram.org/bot" + self.secrets["botToken"] + "/" + method,
             data=canonical(payload or {}), headers={"Content-Type": "application/json"}, method="POST")
         try:
@@ -216,6 +220,18 @@ class Telegram:
                 and me.get("username") == self.target.data["botUsername"], "Live Bot identity differs from the approved target.")
         return {"botId": str(me["id"]), "botUsername": me["username"]}
 
+    def group_permissions(self):
+        self.identity()
+        for group in self.target.data["groups"]:
+            chat = self.call("getChat", {"chat_id": group["chatId"]})
+            member = self.call("getChatMember", {"chat_id": group["chatId"], "user_id": self.target.data["botId"]})
+            require(str(chat.get("id")) == group["chatId"] and chat.get("type") == group["chatType"]
+                    and member.get("user", {}).get("is_bot") is True and str(member["user"].get("id")) == self.target.data["botId"]
+                    and (member.get("status") in ("creator", "administrator") or (member.get("status") == "member"
+                        and chat.get("permissions", {}).get("can_send_messages") is True)),
+                    "The exact configured group or Bot send permission was not confirmed.")
+        return {"verifiedGroups": len(self.target.data["groups"])}
+
     def configure(self, expected_before):
         self.identity()
         before = self.call("getWebhookInfo")
@@ -233,10 +249,11 @@ class Telegram:
 
 
 class Controller:
-    def __init__(self, target, data_api, worker_api, bundle, manifest, *, guard=lambda: None, telegram=None, secrets=None):
+    def __init__(self, target, data_api, worker_api, bundle, manifest, *, guard=lambda: None, telegram=None, secrets=None, dependency_api=None):
         self.target, self.data, self.worker = target, data_api, worker_api
         self.bundle, self.manifest, self.guard = Path(bundle), manifest, guard
         self.telegram, self.secrets = telegram, secrets
+        self.dependency_api = dependency_api
         self.root = "/accounts/" + target.data["accountId"]
         self.database = self.root + "/d1/database/" + target.data["d1Id"]
         self.script = self.root + "/workers/scripts/" + target.data["workerName"]
@@ -262,6 +279,9 @@ class Controller:
         require(set(live.get("tags", [])) == {"subs-bot", "lifecycle-" + t["environment"]}, "Worker ownership tags differ.")
         require(live.get("logpush") is False and live.get("tail_consumers") == []
                 and live.get("observability", {}).get("enabled") is False, "Unexpected logging or consumers are present.")
+        if self.target.environment == "production":
+            require(live.get("subdomain", {}).get("enabled") is False and live.get("subdomain", {}).get("previews_enabled") is False,
+                    "Production workers.dev and preview access must be disabled.")
         return {"targetSha256": self.target.digest, "buckets": buckets}
 
     def migration_state(self):
@@ -338,6 +358,7 @@ class Controller:
             {"type": "r2_bucket", "name": "NODES", "bucket_name": t["bucketName"]}]
         text = {"BUILD_REVISION": self.revision, "PUBLIC_ORIGIN": "https://" + t["hostname"],
             "TELEGRAM_PRODUCTION_CONTROL_SHA256": self.target.digest,
+            "SUBS_BOT_CONFIGURATION_SHA256": self.target.configuration_digest,
             "TELEGRAM_AGGREGATE_KEY_SHA256": t["keyDigests"]["aggregate"],
             "TELEGRAM_PRIVATE_SHARE_CREATION_KEY_SHA256": t["keyDigests"]["privateShare"]}
         require(self.secrets is not None, "Safe secret injection is required for binding verification.")
@@ -352,7 +373,8 @@ class Controller:
             secrets["SHORTLINK_BUSINESS_TOKEN"] = self.secrets["shortlinkToken"]
         if t["provider"] is not None:
             from production_provider import verify_provider_dependency
-            dependency = verify_provider_dependency(self.worker, t["provider"])
+            require(self.dependency_api is not None, "An explicit read-only ProviderFetch inspection credential is required.")
+            dependency = verify_provider_dependency(self.dependency_api, t["provider"])
             result.append({"type": "service", "name": "PROVIDER_FETCH", "service": dependency["service"], "entrypoint": "ProviderFetch"})
             text.update({"PROVIDER_REVISION": dependency["revision"], "PROVIDER_IMAGE_SHA256": dependency["imageSha256"]})
         result.extend({"type": "plain_text", "name": key, "text": value} for key, value in text.items())
@@ -381,7 +403,7 @@ class Controller:
         if verify_release:
             self.verify_bindings(active)
             require(control["release_revision"] == active["revision"])
-        state = {"targetSha256": self.target.digest, "release": {k: v for k, v in active.items() if k != "bindings"},
+        state = {"targetSha256": self.target.digest, "configurationSha256": self.target.configuration_digest, "release": {k: v for k, v in active.items() if k != "bindings"},
             "control": control, "work": self.work(), "terminal": self.terminal(), "migrationCount": len(history)}
         state["stateSha256"] = digest(state)
         return state
@@ -390,6 +412,7 @@ class Controller:
         self.resources()
         if self.telegram is not None:
             self.telegram.identity()
+            self.telegram.group_permissions()
         chain, kind, history = self.migration_state()
         # Empty or partially applied *schema only* can resume. Every business table
         # must remain empty before the one atomic whitelist initialization.
@@ -472,6 +495,7 @@ class Controller:
                     "Unresolved external effects or interrupted updates require an explicit decision before activation.")
             require(self.telegram is not None)
             self.telegram.identity()
+            self.telegram.group_permissions()
             info = self.telegram.call("getWebhookInfo")
             require(info.get("url") == "https://" + self.target.data["hostname"] + "/telegram/webhook"
                     and info.get("max_connections") == self.target.data["webhook"]["maxConnections"]
@@ -485,6 +509,12 @@ class Controller:
             conditions += ["EXISTS(SELECT 1 FROM (" + quiet + ") WHERE " + " AND ".join(f"{f}=0" for f in fields) + ")",
                 f"NOT EXISTS(SELECT 1 FROM {INVOCATIONS} WHERE state='running')",
                 "NOT EXISTS(SELECT 1 FROM subs_bot_production_updates WHERE state='processing')"]
+        if action == "activate":
+            bot = migrations._literal(self.target.data["botId"])
+            conditions += [f"NOT EXISTS(SELECT 1 FROM {INVOCATIONS} WHERE state='uncertain' OR (state='running' AND lease_until<=unixepoch()))",
+                "NOT EXISTS(SELECT 1 FROM subs_bot_production_updates WHERE state='uncertain')",
+                f"NOT EXISTS(SELECT 1 FROM telegram_outbox JOIN telegram_inbox USING(receipt_id) WHERE bot_id={bot} AND state='uncertain')",
+                f"NOT EXISTS(SELECT 1 FROM telegram_group_share_cards JOIN telegram_private_share_creations USING(receipt_id) WHERE bot_id={bot} AND telegram_group_share_cards.state='uncertain')"]
         self.guard()
         _mutate_sql(self.data, self.database, [migrations._assert_sql(" AND ".join(conditions)),
             f"UPDATE {CONTROL} SET admission='{admission}',workers='{workers}',epoch=epoch+1 WHERE singleton=1"])
@@ -516,6 +546,11 @@ class Controller:
         module = (self.bundle / "index.js").read_bytes()
         require(sha256(module).hexdigest() == self.manifest["bundleSha256"] and 0 < len(module) <= 1152*1024)
         bindings = self.expected_bindings(include_secrets=True)
+        previous_active = self.active(allow_empty=True)
+        if previous_active["versionId"] is not None:
+            for binding, key in (("TELEGRAM_AGGREGATE_KEY_SHA256", "aggregate"), ("TELEGRAM_PRIVATE_SHARE_CREATION_KEY_SHA256", "privateShare")):
+                require(previous_active["bindings"].get(binding, {}).get("text") == self.target.data["keyDigests"][key],
+                        "Ordinary deployment cannot replace published-link signing keys.")
         require(self.telegram is not None)
         self.telegram.identity()
         self.guard()
@@ -606,11 +641,12 @@ def main():
     data = API(target, os.environ.get("SUBS_BOT_CF_DATA_TOKEN", ""))
     worker = API(target, os.environ.get("SUBS_BOT_CF_WORKER_TOKEN", ""))
     controller = Controller(target, data, worker, bundle, manifest, guard=lambda: artifact.require_current_main(revision),
-                            telegram=Telegram(target, secrets), secrets=secrets)
+                            telegram=Telegram(target, secrets), secrets=secrets,
+                            dependency_api=API(target, os.environ["SUBS_BOT_CF_DEPENDENCY_READ_TOKEN"]) if target.data["provider"] is not None and os.environ.get("SUBS_BOT_CF_DEPENDENCY_READ_TOKEN") else None)
     envelope = os.environ.get("SUBS_BOT_APPROVAL_JSON", "")
     predecessor = os.environ.get("CONTROL_STATE_SHA256", "")
     if action == "preflight":
-        result = {"resources": controller.resources(), "bot": controller.telegram.identity()}
+        result = {"resources": controller.resources(), "bot": controller.telegram.identity(), "groups": controller.telegram.group_permissions()}
         result["stateSha256"] = digest(result["resources"])
     elif action == "inspect":
         result = controller.inspect()

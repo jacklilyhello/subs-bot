@@ -70,6 +70,7 @@ jobs:
           SUBS_BOT_PROVISION_ANCHOR_JSON: ${{ secrets.SUBS_BOT_PROVISION_ANCHOR_JSON }}
           SUBS_BOT_CF_DATA_TOKEN: ${{ secrets.SUBS_BOT_CF_DATA_TOKEN }}
           SUBS_BOT_CF_WORKER_TOKEN: ${{ secrets.SUBS_BOT_CF_WORKER_TOKEN }}
+          SUBS_BOT_CF_DEPENDENCY_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPENDENCY_READ_TOKEN }}
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           umask 077
@@ -89,7 +90,7 @@ jobs:
           sys.path.insert(0, 'worker/tools')
           from production_control import API
           from production_storage import PrivateStore
-          from production_target import canonical, digest, parsed, require
+          from production_target import canonical, digest, parsed, require, validate_target
           path = Path(os.environ['RUNNER_TEMP']) / 'production-private-registration.json'
           if not path.exists():
               raise SystemExit(0)
@@ -98,7 +99,7 @@ jobs:
                   'Provisioning stopped partway. Preserve the runner; do not repeat or adopt occupied names.')
           target = receipt['target']
           store = PrivateStore(API(target, os.environ['SUBS_BOT_CF_DATA_TOKEN']), target['backupBucketName'])
-          store.put('maintenance/production-control/registrations/' + digest(target) + '.json', canonical(receipt))
+          store.put('maintenance/production-control/registrations/' + validate_target(target).digest + '.json', canonical(receipt))
           print('Private resource registration persisted and independently read back.')
           PY
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

@@ -157,7 +157,7 @@ class Provisioner:
         self.guard()
         if begin("worker"):
             live = self.worker("POST", self.root + "/workers/workers", {
-            "name": t["workerName"], "subdomain": {"enabled": True, "previews_enabled": False},
+            "name": t["workerName"], "subdomain": {"enabled": t["environment"] == "rehearsal", "previews_enabled": False},
             "logpush": False, "observability": OBSERVABILITY_OFF, "tail_consumers": [],
             "tags": ["subs-bot", "lifecycle-" + t["environment"]],
                 "previews_base_config": {"logpush": False, "observability": OBSERVABILITY_OFF, "tail_consumers": []}})
@@ -212,6 +212,7 @@ def main():
                                     os.environ.get("CONTROL_STATE_SHA256", ""), save)
         result = {"created": True, "targetSha256": final.digest, "registrationSha256": digest(receipt), "consumers": 0}
     print(json.dumps(result, sort_keys=True))
+    (Path(os.environ["RUNNER_TEMP"]) / "production-control-result.json").write_bytes(canonical(result))
 
 
 if __name__ == "__main__":

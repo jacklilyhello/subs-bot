@@ -51,7 +51,11 @@ class PrivateStore:
         if existing is not None:
             require(existing == body, "Immutable lifecycle registration is occupied by different bytes.")
             return sha256(body).hexdigest()
-        token = self.api("GET", self.api.root + "/tokens/verify")
+        try:
+            token = self.api("GET", self.api.root + "/tokens/verify")
+        except OperationError as error:
+            require(error.http_status in (400, 401, 403, 404))
+            token = self.api("GET", "/user/tokens/verify")
         require(isinstance(token, dict) and token.get("status") == "active" and matches(r"[a-f0-9]{32}", token.get("id")))
         host = self.api.target["accountId"] + ".r2.cloudflarestorage.com"
         path = "/" + self.bucket + "/" + quote(key, safe="/-_.~")

@@ -76,6 +76,13 @@ class Target:
 
     @property
     def digest(self):
+        # Resource/Bot/authorization generation identity remains stable across a
+        # reviewed feature or dependency release. Approval separately binds the
+        # full configuration, so changing a flag cannot reuse its old approval.
+        return digest({k: v for k, v in self.data.items() if k not in {"features", "provider", "keyDigests", "webhook"}})
+
+    @property
+    def configuration_digest(self):
         return digest(self.data)
 
     @property
@@ -151,6 +158,9 @@ def validate_target(raw, *, draft=False):
             and len(webhook["allowedUpdates"]) == len(set(webhook["allowedUpdates"]))
             and set(webhook["allowedUpdates"]) <= {"message", "callback_query", "inline_query"}
             and type(webhook["maxConnections"]) is int and 1 <= webhook["maxConnections"] <= 40)
+    require({"message", "callback_query"} <= set(webhook["allowedUpdates"])
+            and (not flags["inlineSearch"] or "inline_query" in webhook["allowedUpdates"]),
+            "Webhook update categories must cover the configured runtime features.")
     keys = value["keyDigests"]
     require(isinstance(keys, dict) and set(keys) == {"aggregate", "privateShare", "webhook", "shortlink"})
     for key in keys:
@@ -163,9 +173,10 @@ def validate_target(raw, *, draft=False):
 def approve(target, envelope, action, revision, state_sha256):
     """Approval is supplied only by the selected protected workflow environment."""
     value = parsed(envelope) if isinstance(envelope, (str, bytes)) else envelope
-    require(isinstance(value, dict) and set(value) == {"schemaVersion", "environment", "targetSha256", "revision", "action", "stateSha256", "authorization"},
+    require(isinstance(value, dict) and set(value) == {"schemaVersion", "environment", "targetSha256", "configurationSha256", "revision", "action", "stateSha256", "authorization"},
             "An action-specific approval envelope is required.")
     require(value == {"schemaVersion": 1, "environment": target.environment, "targetSha256": target.digest,
+            "configurationSha256": target.configuration_digest,
             "revision": revision, "action": action, "stateSha256": state_sha256,
             "authorization": "approve " + action + " for " + target.data["workerName"]},
             "Approval does not match this exact target, configuration, revision, action and predecessor state.")
