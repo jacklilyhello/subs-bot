@@ -1,5 +1,6 @@
 """Hosted safety checks for the real rehearsal's configuration and webhook recovery."""
 from copy import deepcopy
+from hashlib import sha256
 import json
 from pathlib import Path
 import sys
@@ -88,6 +89,42 @@ class LifecycleDrillTests(unittest.TestCase):
         formal = contract.validate_target(raw)
         with self.assertRaises(contract.ContractError):
             drill.approval(formal, "deploy", REVISION, "f" * 64)
+
+    def test_activation_approval_uses_the_baseline_bound_plan(self):
+        tool = self.tool()
+        target, _ = fixture()
+        controller = Mock()
+        controller.target = target
+        controller.revision = REVISION
+        controller.plan_activate.return_value = {"stateSha256": "c" * 64,
+            "activationBaseline": {"checkpointId": "d" * 32, "manifestSha256": "e" * 64}}
+        tool.controller = controller
+        with patch.dict(drill.os.environ, {"GITHUB_SHA": REVISION}):
+            tool.transition("activate")
+        controller.plan_activate.assert_called_once_with()
+        controller.inspect.assert_not_called()
+        action, envelope, predecessor = controller.transition.call_args.args
+        self.assertEqual(action, "activate")
+        self.assertEqual(predecessor, "c" * 64)
+        self.assertEqual(envelope["stateSha256"], predecessor)
+
+    def test_code_archive_rechecks_exact_attempt_and_rejects_changed_bytes(self):
+        tool = self.tool()
+        archive = b"synthetic trusted CI ZIP bytes"
+        proof = {"revision": REVISION, "runId": "50", "runAttempt": "1", "artifactId": "60", "archiveSha256": sha256(archive).hexdigest()}
+        tool.proof = proof
+        selection = ("1", "60", proof["archiveSha256"])
+        with patch.object(drill.artifact, "_github_token", return_value="synthetic-read-token"), \
+                patch.object(drill.artifact, "_select_artifact", return_value=selection), \
+                patch.object(drill.artifact, "_download", return_value=archive):
+            actual_proof, actual = tool.code_archive()
+        self.assertEqual(actual_proof, proof)
+        self.assertEqual(actual, archive)
+        with patch.object(drill.artifact, "_github_token", return_value="synthetic-read-token"), \
+                patch.object(drill.artifact, "_select_artifact", return_value=selection), \
+                patch.object(drill.artifact, "_download", return_value=b"changed bytes"):
+            with self.assertRaises(contract.ContractError):
+                tool.code_archive()
 
     def test_restore_uses_private_snapshot_preserves_pending_and_is_idempotent(self):
         tool = self.tool()
@@ -187,7 +224,7 @@ class LifecycleDrillTests(unittest.TestCase):
         tool.prepare = Mock(return_value=(Path("/synthetic-unused-bundle"), {}))
         tool.bind = Mock(return_value=controller)
         tool.registration = Mock(return_value=target)
-        replay = {"version": 1, "evidenceKind": "hosted-production-restored-data-http-replay", "revision": REVISION,
+        replay = {"version": 1, "status": "passed", "evidenceKind": "hosted-production-restored-data-http-replay", "revision": REVISION,
             "moduleSha256": "a" * 64, "targetSha256": target.digest, "restoredDataSha256": "c" * 64,
             "migrationCount": 56, "consumerBound": False, "realTelegramCredentialsSupplied": False,
             "syntheticProductionGateVerified": True, "outboundAttempts": 0,
@@ -217,7 +254,7 @@ class LifecycleDrillTests(unittest.TestCase):
     def test_http_result_rejects_changed_source_identity_egress_and_failed_status(self):
         source = {"revision": REVISION, "targetSha256": "a" * 64, "moduleSha256": "b" * 64,
             "dataSha256": "c" * 64, "migrationCount": 56}
-        value = {"version": 1, "evidenceKind": "hosted-production-restored-data-http-replay", "revision": REVISION,
+        value = {"version": 1, "status": "passed", "evidenceKind": "hosted-production-restored-data-http-replay", "revision": REVISION,
             "targetSha256": "a" * 64, "moduleSha256": "b" * 64, "restoredDataSha256": "c" * 64,
             "migrationCount": 56, "consumerBound": False, "realTelegramCredentialsSupplied": False,
             "syntheticProductionGateVerified": True, "outboundAttempts": 0,
@@ -227,6 +264,8 @@ class LifecycleDrillTests(unittest.TestCase):
                 {"realTelegramCredentialsSupplied": True}, {"consumerBound": True}):
             with self.assertRaises(contract.ContractError):
                 drill.checked_http_result({**value, **change}, source)
+        with self.assertRaises(contract.ContractError):
+            drill.checked_http_result({key: item for key, item in value.items() if key != "status"}, source)
 
 
 if __name__ == "__main__":

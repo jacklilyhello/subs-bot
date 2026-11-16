@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+from secrets import token_hex
 import tempfile
 from time import monotonic, sleep, time
 from urllib.error import HTTPError
@@ -36,7 +37,7 @@ FINAL_REPORT = "production-lifecycle-drill-final.json"
 
 def checked_http_result(value, source):
     require(isinstance(value, dict) and value.get("version") == 1
-            and value.get("status", "passed") == "passed"
+            and value.get("status") == "passed"
             and value.get("evidenceKind") == "hosted-production-restored-data-http-replay"
             and value.get("revision") == source["revision"] and value.get("moduleSha256") == source["moduleSha256"]
             and value.get("targetSha256") == source["targetSha256"] and value.get("restoredDataSha256") == source["dataSha256"]
@@ -241,7 +242,7 @@ class Drill:
     def transition(self, action):
         ctl = self.controller
         require(ctl is not None)
-        before = ctl.inspect()
+        before = ctl.plan_activate() if action == "activate" else ctl.inspect()
         return ctl.transition(action, approval(ctl.target, action, ctl.revision, before["stateSha256"]), before["stateSha256"])
 
     def negative_preflight(self, target, bundle, manifest):
@@ -402,6 +403,52 @@ class Drill:
             require(monotonic() < deadline, "Rehearsal work has not drained; preserve categorized work and do not clear records.")
             sleep(2)
 
+    def code_archive(self):
+        proof = {key: str(self.proof[key]) for key in ("revision", "runId", "runAttempt", "artifactId", "archiveSha256")}
+        token = artifact._github_token()
+        expected = (proof["runAttempt"], proof["artifactId"], proof["archiveSha256"])
+        require(tuple(map(str, artifact._select_artifact(proof["runId"], proof["revision"], token))) == expected)
+        archive = artifact._download(proof["artifactId"], token)
+        require(sha256(archive).hexdigest() == proof["archiveSha256"]
+                and tuple(map(str, artifact._select_artifact(proof["runId"], proof["revision"], token))) == expected,
+                "The frozen source CI ZIP changed or its digest did not verify.")
+        return proof, archive
+
+    def activation_baseline(self):
+        import production_recovery as recovery
+        from production_release_evidence import verify_activation_baseline
+        ctl = self.controller
+        proof, archive = self.code_archive()
+        checkpoint = token_hex(16)
+        name = "subs-bot-cf-restore-control-" + checkpoint[:16]
+        contract = {"version": 1, "checkpointId": checkpoint, "databaseName": name, "objectsName": name, "purpose": "baseline"}
+        data_token = self.env["SUBS_BOT_CF_BOOTSTRAP_TOKEN"]
+        api = recovery.RecoveryAPI(ctl.target.data, data_token, ctl.worker, contract)
+        source = recovery.RecoverySource(api, ctl.target.data, ctl.bundle, ctl.manifest, ctl.inspect, ctl.guard)
+        source.archive_body, source.code_proof = archive, proof
+        journal = recovery.RecoveryJournal(api, self.run + "/" + self.attempt, guard=ctl.guard)
+        journal.load()
+        try:
+            with tempfile.TemporaryDirectory(prefix="lifecycle-activation-baseline-", dir=self.env["RUNNER_TEMP"]) as directory:
+                engine = recovery.RecoveryEngine(api, source, journal, Path(directory))
+                for action in ("prepare", "capture", "verify-backup"):
+                    result = recovery.run_action(action, engine)
+                    self.save("activation-baseline-" + action, result)
+            manifest_sha = result["backup"]["manifestSha256"]
+        finally:
+            journal.release()
+        ctl.activation_baseline_checker = lambda: verify_activation_baseline(ctl, data_token, checkpoint, manifest_sha)
+        verified = ctl.activation_baseline_checker()
+        require(isinstance(verified, dict) and verified.get("baselineVerified") is True
+                and verified.get("checkpointId") == checkpoint and verified.get("manifestSha256") == manifest_sha
+                and verified.get("targetSha256") == ctl.target.digest
+                and verified.get("configurationSha256") == ctl.target.configuration_digest
+                and verified.get("sourceRevision") == ctl.revision and verified.get("mutationPerformed") is False,
+                "The independent activation baseline proof did not verify exactly.")
+        self.report["activationBaseline"] = {"checkpointId": checkpoint, "manifestSha256": manifest_sha,
+            "targetSha256": ctl.target.digest, "verification": verified}
+        self.save("activation-baseline-verified", self.report["activationBaseline"])
+
     def exercise(self):
         bundle, manifest = self.prepare(active=True)
         ctl = self.bind(self.registration(), bundle, manifest)
@@ -409,6 +456,11 @@ class Drill:
         require(baseline["control"]["admission"] == "closed" and baseline["control"]["workers"] == "frozen"
                 and not any(baseline["work"].values()))
         ctl.verify_domain()
+        self.transition("thaw")
+        self.transition("pause")
+        self.quiet()
+        self.transition("freeze")
+        self.activation_baseline()
         reply_anchors = self.anchors()
         before_hook = ctl.telegram.call("getWebhookInfo")
         old_settings = webhook_settings(before_hook)
@@ -430,7 +482,6 @@ class Drill:
             admin, member = self.previous["adminId"], self.previous["memberId"]
             help_update = update_payload(base + 1, admin, reply_anchors["admin"], "/help", now - 5)
             require(post_update(help_update, self.secrets["webhookSecret"]) == 503, "Closed deployment accepted new work.")
-            self.transition("thaw")
             active = self.transition("activate")
             self.save("activated", active)
             require(post_update(help_update, "incorrect-lifecycle-fixture-secret") == 401, "Wrong-secret request was not rejected.")
@@ -554,14 +605,7 @@ class Drill:
         source = ctl.inspect()
         require(source["control"]["admission"] == "closed" and source["control"]["workers"] == "frozen"
                 and not any(source["work"].values()))
-        proof = {key: str(self.proof[key]) for key in ("revision", "runId", "runAttempt", "artifactId", "archiveSha256")}
-        token = artifact._github_token()
-        expected = (proof["runAttempt"], proof["artifactId"], proof["archiveSha256"])
-        require(tuple(map(str, artifact._select_artifact(proof["runId"], proof["revision"], token))) == expected)
-        archive = artifact._download(proof["artifactId"], token)
-        require(sha256(archive).hexdigest() == proof["archiveSha256"]
-                and tuple(map(str, artifact._select_artifact(proof["runId"], proof["revision"], token))) == expected,
-                "The frozen source CI ZIP changed or its digest did not verify.")
+        proof, archive = self.code_archive()
         generation = 0
         def evidence(value):
             nonlocal generation
