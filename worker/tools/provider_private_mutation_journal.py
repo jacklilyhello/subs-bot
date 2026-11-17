@@ -412,6 +412,7 @@ def verify():
               "nextTargetSha256": control.digest(updated), "resultSha256": control.digest(record["result"]),
               "nextTargetCipherSha256": next_sha, "nextTargetArchiveSha256": payloads["archive"], "nextTargetLiveSha256": payloads["live"],
               "nextDigestApprovalSha256": control.digest({"operation": "publish-digest", "target": updated}),
+              "nextWitnessApprovalSha256": control.digest({"operation": "publish", "target": updated}),
               **{f"next{action.title().replace('-', '')}ApprovalSha256": control.digest({"operation": action, "target": updated})
                  for action in sorted(mutation.OPERATIONS)}}
     digest_journal.output("verification_json", result)
@@ -444,6 +445,7 @@ def seal_next_target(target):
 
 VERIFICATION_HASH_FIELDS = {"targetSha256", "nextTargetSha256", "resultSha256", "nextTargetCipherSha256",
                             "nextTargetArchiveSha256", "nextTargetLiveSha256", "nextDigestApprovalSha256",
+                            "nextWitnessApprovalSha256",
                             "nextPrepareImageApprovalSha256", "nextStageApprovalSha256", "nextActivateApprovalSha256",
                             "nextSmokeApprovalSha256"}
 VERIFICATION_FIELDS = VERIFICATION_HASH_FIELDS | {"status", "operation"}
