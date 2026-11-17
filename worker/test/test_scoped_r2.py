@@ -64,6 +64,21 @@ class ScopedR2Tests(unittest.TestCase):
         with self.assertRaises(ContractError):
             store.put_once(KEY, b"test")
 
+    def test_write_map_can_omit_a_bucket_that_is_only_read(self):
+        other = "subs-bot-cf-prod-backup-01"
+        env = {"SUBS_BOT_SCOPED_R2_READ_JSON": json.dumps({BUCKET: CREDENTIAL, other: CREDENTIAL}),
+               "SUBS_BOT_SCOPED_R2_WRITE_JSON": json.dumps({BUCKET: CREDENTIAL})}
+        read_only = scoped_r2.from_environment(ACCOUNT, other, env)
+        self.assertIsNone(read_only.write_credential)
+        self.assertEqual(scoped_r2.from_environment(ACCOUNT, BUCKET, env).write_credential, CREDENTIAL)
+        with self.assertRaises(ContractError):
+            read_only.put_once(KEY, b"test")
+        with self.assertRaises(ContractError):
+            scoped_r2.from_environment(ACCOUNT, "unregistered-bucket", env)
+        env["SUBS_BOT_SCOPED_R2_WRITE_JSON"] = json.dumps({other: None})
+        with self.assertRaises(ContractError):
+            scoped_r2.from_environment(ACCOUNT, other, env)
+
     def test_conditional_write_rejects_conflict_and_never_retries(self):
         store = scoped_r2.ScopedR2(ACCOUNT, BUCKET, CREDENTIAL, CREDENTIAL)
         with patch.object(store, "_request", return_value=(412, None, b"")) as request, \

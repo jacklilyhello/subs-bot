@@ -59,6 +59,8 @@ def _credential(raw, bucket, *, required):
         require(not required, "The exact bucket-scoped object credential is required.")
         return None
     value = parsed(raw)
+    if not required and bucket not in value:
+        return None
     credential = value.get(bucket)
     require(isinstance(credential, dict) and set(credential) == {"accessKeyId", "secretAccessKey"}
             and re.fullmatch(r"[a-f0-9]{32}", credential.get("accessKeyId", "") or "")
