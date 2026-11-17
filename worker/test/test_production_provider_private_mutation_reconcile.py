@@ -162,6 +162,9 @@ class ReconcileTests(unittest.TestCase):
             with patch.object(reconcile, "protected_pin", return_value={**pin, "readbackJobId": "202"}), \
                     self.assertRaises(control.ProviderError):
                 reconcile.approved_plan()
+            with patch.dict(os.environ, {"SUBS_BOT_PROVIDER_RECONCILE_TRUSTED_APPROVAL": "0" * 64}), \
+                    self.assertRaises(control.ProviderError):
+                reconcile.approved_plan()
 
     def test_resolution_write_is_once_and_requires_original_evidence(self):
         target, pin, plan, approval = {}, {"originalRunId": "101"}, {}, "a" * 64
@@ -200,9 +203,6 @@ class ReconcileTests(unittest.TestCase):
         self.assertNotIn("do-not-print-this-pin", output.getvalue())
         self.assertNotIn("do-not-print-this-pin", repr(emitted.call_args_list))
         self.assertEqual(seal.call_args.args[0]["101"]["pin"], pin)
-            with patch.dict(os.environ, {"SUBS_BOT_PROVIDER_RECONCILE_TRUSTED_APPROVAL": "0" * 64}), \
-                    self.assertRaises(control.ProviderError):
-                reconcile.approved_plan()
 
 
 if __name__ == "__main__":
