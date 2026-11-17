@@ -106,7 +106,7 @@ def validate(env):
             and pull["base"].get("ref") == "main"
             and all(isinstance(pull[key].get("repo"), dict) and pull[key]["repo"].get("id") == github.REPOSITORY_ID
                     for key in ("head", "base")))
-    comparison = github._get_json("/compare/" + main + "..." + spec["headSha"], token)
+    comparison = github.compare_commits_metadata(main, spec["headSha"], token)
     require(comparison.get("status") in {"ahead", "identical"} and comparison.get("base_commit", {}).get("sha") == main
             and comparison.get("merge_base_commit", {}).get("sha") == main)
     workspace = Path(env.get("GITHUB_WORKSPACE", ""))

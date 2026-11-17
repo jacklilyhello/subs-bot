@@ -231,7 +231,7 @@ def original_run(run_id, attempt):
             and provider.match(provider.provider.REVISION, run.get("head_sha")))
     current = os.environ["GITHUB_SHA"]
     if run["head_sha"] != current:
-        comparison = provider.github._get_json(f"/compare/{run['head_sha']}...{current}?per_page=1", token)
+        comparison = provider.github.compare_commits_metadata(run["head_sha"], current, token)
         require(comparison.get("status") == "ahead" and comparison.get("behind_by") == 0
                 and all(isinstance(comparison.get(key), dict) and comparison[key].get("sha") == run["head_sha"]
                         for key in ("base_commit", "merge_base_commit")))

@@ -103,6 +103,9 @@ class TrustedGateTests(unittest.TestCase):
         self.assertIn("CAPACITY_FIXTURE_D1_WRITE_TOKEN", workflow)
         self.assertIn("!startsWith(vars.SUBS_BOT_BACKUP_CAPACITY_MODE, 'verify-')", workflow)
         self.assertIn("SUBS_BOT_CF_REHEARSAL_DATA_READ_TOKEN", workflow)
+        self.assertIn('contains(fromJSON(\'["inspect","genesis-plan","verify","capacity-fixture"]\'), fromJSON(inputs.validation_json).action) && secrets.SUBS_BOT_CF_REHEARSAL_DATA_READ_TOKEN', workflow)
+        self.assertIn('contains(fromJSON(\'["genesis-initialize","backup","watchdog","open-backup"]\'), fromJSON(inputs.validation_json).action) && secrets.SUBS_BOT_CF_REHEARSAL_DATA_TOKEN', workflow)
+        self.assertIn('action == \'capacity-fixture\' && !startsWith(vars.SUBS_BOT_BACKUP_CAPACITY_MODE, \'verify-\')', workflow)
         self.assertIn("needs: [probe_intent]", workflow)
         self.assertIn("CAPACITY_FIXTURE_PROBE_INTENT_SHA256: ${{ needs.probe_intent.outputs.intent_sha256 }}", workflow)
 

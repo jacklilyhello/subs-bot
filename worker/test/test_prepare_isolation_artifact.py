@@ -77,6 +77,14 @@ def zip_release(manifest, files, extra_entries=()):
 
 
 class MetadataReadTests(unittest.TestCase):
+    def test_comparison_requests_bounded_second_page_with_exact_revisions(self):
+        with patch.object(release, "_get_json", return_value={"status": "ahead"}) as read:
+            self.assertEqual(release.compare_commits_metadata("a" * 40, "b" * 40, "fixture"), {"status": "ahead"})
+            read.assert_called_once_with("/compare/" + "a" * 40 + "..." + "b" * 40 + "?per_page=1&page=2", "fixture")
+            with self.assertRaises(release.ArtifactError):
+                release.compare_commits_metadata("../other", "b" * 40, "fixture")
+            read.assert_called_once()
+
     def response(self, body=b'{"ok":true}'):
         value = io.BytesIO(body)
         value.status, value.headers = 200, Message()

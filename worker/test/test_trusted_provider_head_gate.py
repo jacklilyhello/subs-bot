@@ -29,7 +29,7 @@ def github(path, _token):
     if path == "/pulls/290":
         return {"number": 290, "state": "open", "head": {"sha": HEAD, "ref": "codex/provider-durable-source",
                 "repo": {"id": gate.github.REPOSITORY_ID}}, "base": {"ref": "main", "repo": {"id": gate.github.REPOSITORY_ID}}}
-    if path == "/compare/" + MAIN + "..." + HEAD:
+    if path == "/compare/" + MAIN + "..." + HEAD + "?per_page=1&page=2":
         return {"status": "ahead", "base_commit": {"sha": MAIN}, "merge_base_commit": {"sha": MAIN}}
     raise AssertionError("unexpected API request")
 

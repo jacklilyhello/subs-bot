@@ -326,6 +326,34 @@ class MemoryAPI:
 
 
 class EngineTests(unittest.TestCase):
+    def test_sealed_source_recheck_precedes_resource_creation(self):
+        engine = object.__new__(recovery.RecoveryEngine)
+        engine.journal = Mock(value={"backup": {"manifestSha256": "a" * 64}})
+        engine.verify_preservation = Mock(side_effect=recovery.RecoveryError("source changed"))
+        with patch.object(recovery.native.Rehearsal, "create") as create, self.assertRaises(recovery.RecoveryError):
+            engine.create("database")
+        create.assert_not_called()
+
+    def test_baseline_preservation_checks_current_referenced_object_bytes_and_metadata(self):
+        body = b"synthetic-preserved-object"
+        metadata = {"custom": {}, "http": {}}
+        for changed in (False, True):
+            engine = object.__new__(recovery.RecoveryEngine)
+            engine.source = SimpleNamespace(before_write=Mock(), current={"control": {"epoch": 1}})
+            engine.journal = Mock(value={"sourcePin": {"observed": engine.source.current}})
+            engine.api = Mock(contract={"purpose": "baseline"}, target={"d1Id": SOURCE, "bucketName": "source"})
+            engine.api.object_or_none.return_value = (b"changed" if changed else body, None)
+            engine.object_metadata = Mock(return_value=metadata)
+            entry = {"key": "private-shares/synthetic.txt", "bytes": len(body), "sha256": recovery.digest(body), "metadata": metadata}
+            engine.manifest = Mock(return_value=({"layout": {}, "summary": {"rowCount": 1}, "objects": [entry]}, None))
+            with self.subTest(changed=changed), patch.object(recovery.native, "remote_summary", return_value={"rowCount": 1}):
+                if changed:
+                    with self.assertRaises(recovery.RecoveryError):
+                        engine.verify_preservation()
+                else:
+                    engine.verify_preservation()
+                    engine.object_metadata.assert_called_once_with("source", entry["key"], len(body))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
