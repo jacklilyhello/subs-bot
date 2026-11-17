@@ -170,10 +170,13 @@ class Transaction:
         checkpoint = events[0]["details"].get("checkpointId")
         require(current["stage"] == "capture-intent" and current["details"].get("checkpointId") == checkpoint
                 and source.api.cohort == checkpoint and source.scope_sha256 == self.target_sha256)
-        value = source_journal.load()
+        # Use a new reader: RecoveryJournal.load() on an already populated
+        # instance retains its prior value if its entire listing disappears.
+        fresh = recovery.RecoveryJournal(source_journal.api, source_journal.owner, guard=source_journal.guard)
+        value = fresh.load()
         require(isinstance(value, dict) and isinstance(value.get("export"), dict)
                 and value["export"].get("state") in {"download-ready", "sql-archived", "complete"}
-                and isinstance(source_journal.raw, bytes))
+                and isinstance(fresh.raw, bytes))
         frozen = next((event for event in events if event["stage"] == "frozen-data"), None)
         observed = controller.inspect()
         initial = events[0]["details"]

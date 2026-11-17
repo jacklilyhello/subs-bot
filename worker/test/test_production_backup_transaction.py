@@ -145,8 +145,12 @@ class JournalTests(unittest.TestCase):
             api, scope_sha256 = FakeAPI(), "a" * 64
         class FakeJournal:
             api, raw = FakeSource.api, b"journal"
+            owner, guard = "123-1", None
+            active = True
+            def __init__(self, api=None, owner=None, guard=None):
+                pass
             def load(self):
-                return {"export": {"state": "complete"}}
+                return {"export": {"state": "complete"}} if self.active else None
         class FakeController:
             def inspect(self):
                 return {"control": initial["control"], "release": initial["release"],
@@ -155,6 +159,12 @@ class JournalTests(unittest.TestCase):
         with patch.object(recovery, "RecoverySource", FakeSource), patch.object(recovery, "RecoveryJournal", FakeJournal), \
                 patch.object(production_control, "Controller", FakeController), \
                 patch.object(capacity, "frozen_fingerprint", return_value=fingerprint):
+            FakeJournal.active = False
+            with self.assertRaises(ContractError):
+                self.journal.append_stopped_export(details, 109, source_journal=FakeJournal(),
+                                                   source=FakeSource(), controller=FakeController())
+            self.assertEqual(self.journal.load()[-1]["stage"], "capture-intent")
+            FakeJournal.active = True
             self.journal.append_stopped_export(details, 110, source_journal=FakeJournal(),
                                                source=FakeSource(), controller=FakeController())
         self.assertEqual(self.journal.load()[-1]["stage"], "preserved-frozen")
