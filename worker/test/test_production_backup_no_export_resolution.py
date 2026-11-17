@@ -2,6 +2,7 @@ import hashlib
 import base64
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
@@ -25,6 +26,45 @@ class MemoryStore:
 
 
 class NoExportEvidenceTests(unittest.TestCase):
+    def test_legacy_seal_requires_readonly_bucket_and_all_exact_private_originals(self):
+        import scoped_r2
+        import production_backup_webhook_recovery as webhook
+        log = b"synthetic private evidence"
+        registration = b"synthetic registration"
+        spec = {"registrationSha256": hashlib.sha256(registration).hexdigest()}
+        plan = {"version": 1, "kind": "test-webhook-history-log-archive", "registrationSha256": spec["registrationSha256"],
+                "record": {"sourceRunId": "123", "logSha256": hashlib.sha256(log).hexdigest()}}
+        intent = {"version": 1, "plan": plan, "planSha256": hashlib.sha256(resolution.canonical(plan)).hexdigest(),
+                  "archiveRunId": "456", "archiveAttempt": "1"}
+        intent_raw = resolution.canonical(intent)
+        done = {"version": 1, "intentSha256": hashlib.sha256(intent_raw).hexdigest(),
+                "logSha256": hashlib.sha256(log).hexdigest()}
+        records = {"private/history-log-123-intent.json": intent_raw,
+                   "private/history-log-123-complete.json": resolution.canonical(done),
+                   "private/history-log-123-original.log": log}
+        ledger = {"456": {"action": "seal", "sourceRunId": "123", "sourceLogSha256": hashlib.sha256(log).hexdigest(),
+                          "planSha256": intent["planSha256"], "completionSha256": hashlib.sha256(resolution.canonical(done)).hexdigest()}}
+        objects = Mock(write_credential=None)
+        objects.get.side_effect = lambda key, **_kwargs: (records[key], '"etag"')
+        store = Mock(api=Mock(target={"accountId": "a" * 32}), bucket="synthetic-bucket")
+        store.get.return_value = registration
+        env = {"NO_EXPORT_LEGACY_ARCHIVES_JSON": json.dumps(ledger), "SUBS_BOT_SCOPED_R2_WRITE_JSON": "not-for-reading"}
+        with patch.object(webhook, "open_store", return_value=(None, None, None, store, "private/")), \
+                patch.object(scoped_r2, "from_environment", return_value=objects) as scoped:
+            self.assertEqual(resolution.verify_legacy_archives(env, spec), ledger)
+            self.assertNotIn("SUBS_BOT_SCOPED_R2_WRITE_JSON", scoped.call_args.args[2])
+            store.verify.assert_called()
+            records["private/history-log-123-original.log"] = b"corrupt"
+            with self.assertRaises(Exception):
+                resolution.verify_legacy_archives(env, spec)
+            records["private/history-log-123-original.log"] = log
+            records.pop("private/history-log-123-complete.json")
+            with self.assertRaises(Exception):
+                resolution.verify_legacy_archives(env, spec)
+            objects.write_credential = {"unexpected": True}
+            with self.assertRaises(Exception):
+                resolution.verify_legacy_archives(env, spec)
+
     def test_failed_plan_originals_require_candidate_steps_skipped(self):
         run = {"id": int(resolution.FAILED_PLAN_RUN), "run_attempt": 1, "head_sha": resolution.FAILED_PLAN_MAIN,
                "head_branch": "main", "event": "workflow_dispatch", "status": "completed", "conclusion": "failure",
@@ -70,19 +110,29 @@ class NoExportEvidenceTests(unittest.TestCase):
         review = {"candidateCodeSha256": {"candidate.py": hashlib.sha256(b"source").hexdigest()},
                   "dispatcherCodeSha256": {"trusted.py": hashlib.sha256(b"source").hexdigest()},
                   "sourceLogSha256": hashlib.sha256(raw).hexdigest()}
-        def get(path, _token):
-            name = path.split("/contents/", 1)[1].split("?", 1)[0]
-            return {"path": name, "type": "file", "encoding": "base64", "size": 6,
-                    "content": base64.b64encode(b"source").decode()}
-        with patch.object(resolution.github, "_get_json", side_effect=get), \
-                patch.object(resolution, "OLD_LOG_SHA", review["sourceLogSha256"]):
-            originals = resolution.historical_originals(review, spec, "token", lambda *_: raw)
-            self.assertEqual(originals["original-job-log"], raw)
-            wrong = dict(spec, sourceManifestSha256="e" * 64)
-            with self.assertRaises(Exception):
-                resolution.historical_originals(review, wrong, "token", lambda *_: raw)
-            with self.assertRaises(Exception):
-                resolution.historical_originals(review, spec, "token", lambda *_: raw[:-1])
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "no-export-reviewed-source-cache"
+            cache.mkdir(mode=0o700)
+            for revision, path in ((resolution.OLD_HEAD, "candidate.py"), (resolution.OLD_MAIN, "trusted.py")):
+                name = hashlib.sha256((revision + "\n" + path).encode()).hexdigest()
+                file = cache / name
+                file.write_bytes(b"source")
+                file.chmod(0o600)
+            with patch.object(resolution, "OLD_LOG_SHA", review["sourceLogSha256"]):
+                originals = resolution.historical_originals(review, spec, "token", lambda *_: raw, directory=directory)
+                self.assertEqual(originals["original-job-log"], raw)
+                wrong = dict(spec, sourceManifestSha256="e" * 64)
+                with self.assertRaises(Exception):
+                    resolution.historical_originals(review, wrong, "token", lambda *_: raw, directory=directory)
+                with self.assertRaises(Exception):
+                    resolution.historical_originals(review, spec, "token", lambda *_: raw[:-1], directory=directory)
+                file.write_bytes(b"tampered")
+                with self.assertRaises(Exception):
+                    resolution.historical_originals(review, spec, "token", lambda *_: raw, directory=directory)
+                file.unlink()
+                file.symlink_to(cache / "missing")
+                with self.assertRaises(Exception):
+                    resolution.historical_originals(review, spec, "token", lambda *_: raw, directory=directory)
 
     def test_originals_are_sealed_once_and_rechecked_byte_for_byte(self):
         store = MemoryStore()
@@ -121,14 +171,21 @@ class NoExportEvidenceTests(unittest.TestCase):
         response = MagicMock()
         response.__enter__.return_value = response
         response.read.return_value = json.dumps({"resources": {"core": {"remaining": 100, "reset": 2000}}}).encode()
-        with patch.object(resolution, "checked_gate", return_value=(review, 2)), \
+        with patch.object(resolution, "checked_gate", return_value=(review, 2, 14)), \
                 patch.object(resolution.github, "_github_token", return_value="token"), \
                 patch.object(resolution.github._OPENER, "open", return_value=response), \
                 patch.object(resolution.time, "time", return_value=1000):
             with self.assertRaises(Exception):
                 resolution.require_request_budget({"NO_EXPORT_ACTION": "seal"}, review, 20)
             response.read.return_value = json.dumps({"resources": {"core": {"remaining": 5000, "reset": 2000}}}).encode()
-            self.assertGreater(resolution.require_request_budget({"NO_EXPORT_ACTION": "seal"}, review, 20)["required"], 100)
+            result = resolution.require_request_budget({"NO_EXPORT_ACTION": "seal"}, review, 20)
+            self.assertEqual(result["required"], (17 + 2 * (2 + 2)) * 20 + 3 * 14 + 12 + 100)
+            self.assertEqual(result["writerLimit"], 4)
+        with patch.object(resolution, "checked_gate", return_value=(review, 4, 14)), \
+                patch.object(resolution, "verify_legacy_archives"):
+            resolution.guarded_review({}, review, 4, {})
+        with patch.object(resolution, "checked_gate", return_value=(review, 5, 14)), self.assertRaises(Exception):
+            resolution.guarded_review({}, review, 4, {})
 
     def test_original_seal_and_fresh_reader_are_both_required(self):
         main, candidate, run_id = "c" * 40, "d" * 40, "123"
@@ -180,13 +237,14 @@ class NoExportEvidenceTests(unittest.TestCase):
         def save(_key, raw):
             store.get.return_value = raw
         store.put_exclusive.side_effect = save
-        with patch.object(resolution, "checked_gate", return_value=review), \
+        with patch.object(resolution, "checked_gate", side_effect=lambda _env, with_stats=False: (review, 0, 0) if with_stats else review), \
+                patch.object(resolution, "verify_legacy_archives"), \
                 patch.object(resolution, "verify_jobs"), patch.object(resolution, "log_reader", return_value=Mock()), \
                 patch.object(resolution, "historical_originals", return_value={"source": b"source"}), \
                 patch.object(resolution, "failed_plan_originals", return_value={"failed-log": b"log"}), \
                 patch.object(resolution, "custody_original", return_value=b"custody"), \
                 patch.object(resolution, "inventory_original", return_value=b"inventory"), \
-                patch.object(resolution, "require_request_budget"), \
+                patch.object(resolution, "require_request_budget", return_value={"writerLimit": 2}), \
                 patch.object(resolution, "read_originals"), patch.object(resolution, "observe", return_value=observed), \
                 patch.object(resolution.github, "_github_token", return_value="token"):
             with self.assertRaises(RuntimeError):
