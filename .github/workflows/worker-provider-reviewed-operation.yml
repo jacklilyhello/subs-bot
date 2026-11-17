@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       validation_json:
-        description: Independently approved exact PR head, original CI, target and private archive refs
+        description: Independently approved exact PR head or current main, original CI, target and private archive refs
         required: true
         type: string
       operation:

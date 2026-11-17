@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       validation_json:
-        description: Exact reviewed PR head, original Provider CI, approval and private source pins
+        description: Exact reviewed PR head or current main, original Provider CI, approval and private source pins
         required: true
         type: string
       fault_scenario:

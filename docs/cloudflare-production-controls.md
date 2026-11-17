@@ -212,9 +212,11 @@ Provider 持久来源的独立 Worker 演练入口使用受信 main dispatcher `
 
 先独立完成隔离镜像发布及全量读回，再分别审批并执行 `prepare-image`、`stage`、`activate`、`smoke`；镜像准备完成证明必须先经私有归档独立读回并登记，才能执行 stage。每次都重新核对准确来源、前态、旧版本终态和无 caller，先单次写入意图、独立读回，再发起对应请求；相应凭据使用隔离资源的短期最小权限。写前观察不能充当外部并发的原子锁，必须确保隔离目标没有其他写者。
 
-私有来源归档保留原始 CI ZIP（含 Worker 模块与 OCI 镜像归档），并按独立固定摘要重新核验目标和原件；它不把归档存在本身当作可信来源。校验仍依赖 GitHub 的原 CI run／attempt、工作流与 main 祖先元数据，以及对应原提交的 requirements 原文；这些信息不可读时安全停止，不能重建旧版或改写来源。正式及隔离来源库存各以 32 次封存为当前上限，当前版本与 previous 合计最多 9 代；达到边界前须实施经审查的分页或分段扩容，不删除历史证据。演练中模拟 Actions 产物不可用应明确标为模拟，不代表产物真实过期。
+私有来源归档保留原始 CI ZIP（含 Worker 模块与 OCI 镜像归档），并按独立固定摘要重新核验目标和原件；它不把归档存在本身当作可信来源。校验仍依赖 GitHub 的原 CI run／attempt、工作流与 main 祖先元数据，以及对应原提交的 requirements 原文；这些信息不可读时安全停止，不能重建旧版或改写来源。正式及隔离来源库存各以 32 次封存为当前上限，当前版本与 previous 合计最多 9 代；来源、镜像和 Worker 操作各自的 controller 允许列表最多 16 个版本。达到边界前须实施经审查的分页或分段扩容，不删除历史证据。演练中模拟 Actions 产物不可用应明确标为模拟，不代表产物真实过期。
 
 首次正式来源封存可使用单独登记的 `isolated-source` 归档作为原 CI ZIP 的运输来源：在正式归档 Environment 的 `SUBS_BOT_PROVIDER_SOURCE_ORIGIN_JSON` 中固定其 kind、run／attempt、manifest／目标／桶及独立读回 ledger 记录摘要，同时单独配置该项目来源桶的只读凭据、桶身份和完整隔离来源 ledger／controller；来源读取步骤不持正式桶写凭据。工具复验原封存和独立读回 run、原 CI 元数据、ZIP 及 Worker／OCI 全部摘要，要求原 build 与正式目标中的 build 完全一致；正式目标、调用方、桶和批准仍独立核对。来源 pin 被记录在正式 plan、intent 和 manifest，且不会把隔离目标当作正式授权。未配置 origin 时仍使用原 Actions 产物；配置不完整或任何来源不符即停止，不回退下载或写入。即使 ZIP 持久保存，原 GitHub run／attempt 元数据或原 requirements 不可验证时仍不能继续。
+
+来源 pin 的字段为 `version`、`kind`、`runId`、`runAttempt`、`manifestSha256`、`targetSha256`、`bucketSha256` 和 `ledgerRecordSha256`；版本固定为 1、kind 为 `isolated-source`、attempt 为 `1`。桶摘要针对登记的完整来源桶配置，ledger 摘要针对原封存对应的完整独立读回登记记录，均按工具的 canonical JSON 计算。原桶配置、ledger 和 controller 分别由 `SUBS_BOT_PROVIDER_SOURCE_ORIGIN_ARCHIVE_TARGET_JSON`、`SUBS_BOT_PROVIDER_SOURCE_ORIGIN_LEDGER_JSON`、`SUBS_BOT_PROVIDER_SOURCE_ORIGIN_CONTROLLERS_JSON` 提供；`SUBS_BOT_PROVIDER_SOURCE_ORIGIN_R2_READ_JSON` 是仅来源桶的只读映射，`SUBS_BOT_PROVIDER_SOURCE_ORIGIN_METADATA_READ_TOKEN` 用于核对桶身份。正式桶写凭据仅用于后续获批准的封存步骤。配置前须独立核对 Environment 身份和同名 repository secret 不产生意外回退。
 
 每步完成后独立读回 Provider 状态及私有意图／密文证据，审核后登记 ledger 并安全注入两个目标环境的加密下一配置和准确审批摘要，再进入下一步。密文 artifact 只用于短时交接，不能当作长期私有归档。响应已收到而后续失败时，流程尝试单次追加加密观察并独立读回；若进程死亡或写入结果不明，保留原 intent 和全部现场，不推断成功、不重发。`worker-provider-reviewed-operation-reconcile.yml` 只诊断写入 job 均明确跳过且私有前缀为空的 run；不得用它解除已执行或结果不明的操作。此入口及各项隔离验收以对应准确提交的实际检查和独立证据为准，不代表正式资源获得授权。
 

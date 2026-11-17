@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       validation_json:
-        description: Independently approved exact reviewed PR head and archive references
+        description: Independently approved exact PR head or current main and archive references
         required: true
         type: string
       prior_run_id:
