@@ -45,7 +45,25 @@ def require(condition, message=ERROR):
         raise ProviderError(message)
 
 
-def read_failure(phase, status=None, envelope=None):
+READ_ENDPOINT_FAMILIES = {"worker-metadata", "worker-versions", "script-versions", "deployments", "namespace-inventory",
+                          "workflow", "container-inventory", "container-detail", "worker-other"}
+
+
+def read_endpoint_family(path, *, container=False):
+    if container:
+        return "container-inventory" if path.startswith("/containers/applications?") else "container-detail"
+    if path.startswith("/workers/durable_objects/namespaces"):
+        return "namespace-inventory"
+    if path.startswith("/workflows/"):
+        return "workflow"
+    if path.startswith("/workers/workers/"):
+        return "worker-versions" if "/versions" in path else "worker-metadata"
+    if path.startswith("/workers/scripts/"):
+        return "deployments" if "/deployments" in path else "script-versions" if "/versions/" in path else "worker-other"
+    return "worker-other"
+
+
+def read_failure(phase, status=None, envelope=None, *, family=None):
     """Only bounded numeric diagnostics cross the private HTTP boundary."""
     require(phase in {"transport", "response-json", "response-envelope", "absence"})
     diagnostic = {"phase": phase, "httpStatus": status if type(status) is int and 100 <= status <= 599 else None,
@@ -57,6 +75,9 @@ def read_failure(phase, status=None, envelope=None):
     error = ProviderError("The explicit ProviderFetch GET was not confirmed. Read diagnostic "
                           + json.dumps(diagnostic, separators=(",", ":")) + ".")
     error.read_diagnostic = diagnostic
+    if family is not None:
+        require(family in READ_ENDPOINT_FAMILIES)
+        error.read_endpoint_family = family
     return error
 
 
@@ -279,26 +300,27 @@ class ProviderAPI(legacy.ProviderAPI):
         token = self._container_token if container else self._worker_token
         require(match(publication.API_TOKEN, token), "The dedicated provider read credential is missing or malformed.")
         require(path.startswith("/containers/" if container else ("/workers/", "/workflows/")))
+        family = read_endpoint_family(path, container=container)
         request = Request(self.base + path, headers={"Authorization": "Bearer " + token, "Accept": "application/json",
                                                     "Cache-Control": "no-cache"}, method="GET")
         try:
             status, _headers, raw = publication._response(request, self._opener, ERROR, limit=limit)
         except publication.PublicationError:
-            raise read_failure("transport") from None
+            raise read_failure("transport", family=family) from None
         try:
             envelope = github._parse_object(raw, ERROR)
         except github.ArtifactError:
-            raise read_failure("response-json", status) from None
+            raise read_failure("response-json", status, family=family) from None
         if absent is not None and status == 404:
             errors = envelope.get("errors")
             valid = (envelope.get("success") is False and envelope.get("result") is None
                      and isinstance(errors, list) and len(errors) == 1 and isinstance(errors[0], dict)
                      and type(errors[0].get("code")) is int and errors[0]["code"] == absent)
             if not valid:
-                raise read_failure("absence", status, envelope) from None
+                raise read_failure("absence", status, envelope, family=family) from None
             return None
         if not (status == 200 and envelope.get("success") is True and envelope.get("errors") in (None, []) and "result" in envelope):
-            raise read_failure("response-envelope", status, envelope) from None
+            raise read_failure("response-envelope", status, envelope, family=family) from None
         return envelope
 
     def by_name(self):
