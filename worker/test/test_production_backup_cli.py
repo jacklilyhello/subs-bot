@@ -291,6 +291,13 @@ class ProductionBackupTests(unittest.TestCase):
             self.assertTrue(unknown["unknown"])
             missing = backup.monitor_workflow_runs(json.dumps({"version": 1, "revisions": [revision]}), now, now - 100, "999")
             self.assertTrue(missing["unknown"])
+            run["display_title"] = "Production backup begin at " + revision + " #" + "c" * 64
+            coordinated = backup.monitor_workflow_runs(json.dumps({"version": 1, "revisions": [revision]}), now, now - 100)
+            self.assertTrue(coordinated["failed"])
+            self.assertFalse(coordinated["unknown"])
+            run["display_title"] = "Production backup begin at " + revision + " #" + "c" * 63
+            with self.assertRaises(ContractError):
+                backup.monitor_workflow_runs(json.dumps({"version": 1, "revisions": [revision]}), now, now - 100)
 
     def test_missing_or_incomplete_workflow_history_is_unknown(self):
         controllers = json.dumps({"version": 1, "revisions": ["a" * 40]})

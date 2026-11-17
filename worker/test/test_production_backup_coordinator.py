@@ -399,16 +399,20 @@ class CoordinatorTests(unittest.TestCase):
     def test_run_discovery_queries_a_bounded_window_and_requires_complete_pages(self):
         from urllib.parse import parse_qs, urlsplit
         value = self.intent()
-        row = {"created_at": "1970-01-01T00:16:40Z"}
-        first = {"total_count": 101, "workflow_runs": [row] * 100}
-        second = {"total_count": 101, "workflow_runs": [row]}
+        rows = [{"id": index + 1, "created_at": "1970-01-01T00:16:40Z"} for index in range(51)]
+        first = {"total_count": 51, "workflow_runs": rows[:50]}
+        second = {"total_count": 51, "workflow_runs": rows[50:]}
         with patch.object(coordinator.artifact, "_get_json", side_effect=[first, second]) as read, \
              patch.object(coordinator, "matching_run", return_value={"id": 456}) as match:
             self.assertEqual(coordinator.discover_run(value, 7, "token"), {"id": 456})
         query = parse_qs(urlsplit(read.call_args_list[0].args[0]).query)
         self.assertEqual(query["created"], ["1970-01-01T00:14:40Z..1970-01-02T00:16:40Z"])
-        self.assertEqual(len(match.call_args.args[0]), 101)
-        with patch.object(coordinator.artifact, "_get_json", side_effect=[first, {**second, "total_count": 102}]), \
+        self.assertEqual(query["per_page"], ["50"])
+        self.assertEqual(len(match.call_args.args[0]), 51)
+        with patch.object(coordinator.artifact, "_get_json", side_effect=[first, {**second, "total_count": 52}]), \
+             self.assertRaises(ContractError):
+            coordinator.discover_run(value, 7, "token")
+        with patch.object(coordinator.artifact, "_get_json", side_effect=[first, {**second, "workflow_runs": [rows[0]]}]), \
              self.assertRaises(ContractError):
             coordinator.discover_run(value, 7, "token")
 

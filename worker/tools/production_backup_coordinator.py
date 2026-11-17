@@ -655,16 +655,18 @@ def discover_run(intent, workflow_id, token):
     created = datetime.fromtimestamp(intent["createdAt"], tz=timezone.utc)
     start = (created - timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
     end = (created + timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    rows, total = [], None
-    for page in range(1, 7):
-        query = urlencode({"branch": "main", "created": start + ".." + end, "per_page": 100, "page": page})
+    rows, total, seen = [], None, set()
+    for page in range(1, 12):
+        query = urlencode({"branch": "main", "created": start + ".." + end, "per_page": 50, "page": page})
         child = profile_config(intent["profile"])["child"].rsplit("/", 1)[-1]
         response = artifact._get_json("/actions/workflows/" + child + "/runs?" + query, token)
         batch, count = response.get("workflow_runs"), response.get("total_count")
-        require(isinstance(batch, list) and len(batch) <= 100 and type(count) is int and 0 <= count <= 500
+        require(isinstance(batch, list) and len(batch) <= 50 and type(count) is int and 0 <= count <= 500
                 and (total is None or total == count))
         for row in batch:
-            require(isinstance(row, dict) and isinstance(row.get("created_at"), str))
+            require(isinstance(row, dict) and type(row.get("id")) is int and row["id"] > 0
+                    and row["id"] not in seen and isinstance(row.get("created_at"), str))
+            seen.add(row["id"])
             try:
                 timestamp = datetime.strptime(row["created_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
             except ValueError:
@@ -676,7 +678,7 @@ def discover_run(intent, workflow_id, token):
         require(len(rows) <= total)
         if len(rows) == total:
             return matching_run(rows, intent, workflow_id)
-        require(len(batch) == 100)
+        require(len(batch) == 50)
     require(False, "The complete checkpoint workflow history could not be enumerated.")
 
 
