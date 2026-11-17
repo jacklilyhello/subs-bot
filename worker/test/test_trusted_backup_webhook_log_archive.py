@@ -39,6 +39,21 @@ class WebhookLogArchiveTests(unittest.TestCase):
         cleanup = {"runId": "123", "webhookRecovery": {"webhookWasNotChanged": True, "webhookRestored": True}}
         self.assertEqual(archive.classify(self.log(report, cleanup), archive.LIFECYCLE, "123"), "unresolved")
 
+    def test_only_four_exact_reviewed_stopped_runs_have_pre_write_proof(self):
+        for run_id, (revision, _action, stages, reason) in archive.REVIEWED_PRE_WEBHOOK.items():
+            with self.subTest(run_id=run_id):
+                report = {"runId": run_id, "status": "stopped", "stages": [{"stage": stage} for stage in stages]}
+                error = {"status": "stopped", "reason": reason, "uncertain": False}
+                cleanup = {"runId": run_id, "webhookRecovery": {"webhookWasNotChanged": True, "webhookRestored": True}}
+                self.assertEqual(archive.classify(self.log(report, error, cleanup), archive.LIFECYCLE, run_id,
+                                                  main_sha=revision), "no-write-independently-confirmed")
+                self.assertEqual(archive.classify(self.log(report, {**error, "uncertain": True}, cleanup),
+                                                  archive.LIFECYCLE, run_id, main_sha=revision), "unresolved")
+                self.assertEqual(archive.classify(self.log({**report, "webhookRecovery": {}}, error, cleanup),
+                                                  archive.LIFECYCLE, run_id, main_sha=revision), "unresolved")
+                self.assertEqual(archive.classify(self.log(report, error, cleanup), archive.LIFECYCLE, run_id,
+                                                  main_sha="a" * 40), "unresolved")
+
     def test_reviewed_head_requires_exact_candidate_and_explicit_no_webhook(self):
         result = {"runId": "123", "runAttempt": "1", "dispatcherMainRevision": "a" * 40,
                   "headRevision": "b" * 40, "environment": "rehearsal", "productionMutated": False, "webhookTouched": False}

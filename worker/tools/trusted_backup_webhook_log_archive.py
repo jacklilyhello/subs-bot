@@ -26,6 +26,29 @@ REV = re.compile(r"[a-f0-9]{40}")
 SHA = re.compile(r"[a-f0-9]{64}")
 DECIMAL = re.compile(r"[1-9][0-9]{0,19}")
 MAX_LOG = 4 * 1024 * 1024
+# Each entry is tied to a separately reviewed historical source and its exact
+# published stopped report. These are observations, not general retry rules.
+REVIEWED_PRE_WEBHOOK = {
+    "43945207035": ("cc9d3a9425bcf0858ffbe63ce3e5283748bd0e9b", "provider-binding", ["provider-binding-on-intent"],
+                    "Active binding inventory differs from the exact configuration."),
+    "43939288298": ("cc9d3a9425bcf0858ffbe63ce3e5283748bd0e9b", "provider-binding", [],
+                    "Active binding inventory differs from the exact configuration."),
+    "43868642682": ("e0a9c9398f1ea84835a5d9b32dc8e3d890972651", "exercise", [],
+                    "Predecessor state changed; no transition performed."),
+    "43865731376": ("7d068deae67fbf4183698434001cbb1e5f5d06a6", "exercise", [],
+                    "HTTPS domain health did not confirm the exact revision; admission remains closed."),
+}
+
+
+def audited_paths(workflow, revision):
+    if workflow == INLINE:
+        return {"worker/tools/telegram_inline_webhook.py"}
+    if workflow == HEAD:
+        return {"worker/tools/trusted_backup_head_gate.py"}
+    paths = {"worker/tools/production_lifecycle_drill.py", "worker/tools/production_control.py"}
+    if revision == REVIEWED_PRE_WEBHOOK["43945207035"][0]:
+        paths.add("worker/tools/production_application_provider_drill.py")
+    return paths
 
 
 def context(env):
@@ -105,6 +128,15 @@ def classify(raw, workflow, run_id, *, main_sha="", candidates=()):
                  and value.get("runId") == run_id
                  and value["webhookRecovery"].get("webhookWasNotChanged") is True
                  and value["webhookRecovery"].get("webhookRestored") is True]
+    reviewed = REVIEWED_PRE_WEBHOOK.get(run_id)
+    stopped = [value for value in reports if value.get("status") == "stopped"]
+    errors = [value for value in documents if value.get("status") == "stopped" and "reason" in value]
+    if reviewed and reviewed[0] == main_sha and len(stopped) == len(errors) == len(no_change) == 1:
+        stages = [stage.get("stage") for stage in stopped[0]["stages"] if isinstance(stage, dict)]
+        if (len(stages) == len(stopped[0]["stages"]) and stages == reviewed[2]
+                and "webhookRecovery" not in stopped[0] and errors[0].get("reason") == reviewed[3]
+                and errors[0].get("uncertain") is False):
+            return "no-write-independently-confirmed"
     if len(no_change) == 1 and not any(any(stage.get("stage") == "webhook-configured" for stage in value["stages"] if isinstance(stage, dict))
                                        for value in reports):
         return "unresolved"
@@ -132,9 +164,7 @@ def source(env):
     require(isinstance(approved, list) and revision in approved and all(isinstance(item, str) and REV.fullmatch(item) for item in approved))
     audits = parsed(env.get("SUBS_BOT_PHASE_WEBHOOK_LOG_AUDIT_JSON", ""))
     audited_files = audits.get(revision)
-    expected_paths = ({"worker/tools/telegram_inline_webhook.py"} if workflow == INLINE else
-                      {"worker/tools/trusted_backup_head_gate.py"} if workflow == HEAD else
-                      {"worker/tools/production_lifecycle_drill.py", "worker/tools/production_control.py"})
+    expected_paths = audited_paths(workflow, revision)
     require(isinstance(audited_files, dict) and set(audited_files) == expected_paths
             and all(isinstance(value, str) and SHA.fullmatch(value) for value in audited_files.values()),
             "The exact historical request code must be independently reviewed and pinned.")
@@ -156,6 +186,10 @@ def source(env):
             and run.get("status") == latest.get("status") == "completed"
             and all(isinstance(run.get(key), dict) and run[key].get("id") == github.REPOSITORY_ID
                     for key in ("repository", "head_repository")))
+    reviewed = REVIEWED_PRE_WEBHOOK.get(run_id)
+    if workflow == LIFECYCLE and reviewed:
+        require(revision == reviewed[0] and run.get("display_title") ==
+                "Production lifecycle rehearsal " + reviewed[1] + " at " + revision)
     jobs = github._get_json("/actions/runs/" + run_id + "/attempts/1/jobs?per_page=100", token)
     require(isinstance(jobs.get("jobs"), list) and type(jobs.get("total_count")) is int
             and jobs["total_count"] == len(jobs["jobs"]) < 100)

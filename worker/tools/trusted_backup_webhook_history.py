@@ -164,7 +164,7 @@ def _restoration_boundary(env, store, prefix, draft, secrets, previous, token, c
 
 def _archived_log(run, workflow, record, store, prefix, token, controllers, env):
     """Recheck original bytes plus the exact fresh readback run and jobs."""
-    from trusted_backup_webhook_log_archive import classify
+    from trusted_backup_webhook_log_archive import REVIEWED_PRE_WEBHOOK, audited_paths, classify
     require(isinstance(record, dict) and set(record) == {"status", "sourceRunId", "sourceJobId", "sourceHeadSha",
             "sourceWorkflow", "classification", "logSha256", "planSha256", "completionSha256", "archiveRunId",
             "archiveControllerRevision", "archiveJobId", "readbackJobId"}
@@ -194,9 +194,11 @@ def _archived_log(run, workflow, record, store, prefix, token, controllers, env)
             and item.get("classification") == record["classification"] == classify(raw, workflow, record["sourceRunId"],
                 main_sha=record["sourceHeadSha"], candidates=json.loads(env.get("SUBS_BOT_PHASE_WEBHOOK_CANDIDATES_JSON", "[]"))))
     audit = parsed(env.get("SUBS_BOT_PHASE_WEBHOOK_LOG_AUDIT_JSON", "")).get(record["sourceHeadSha"])
-    paths = ({"worker/tools/telegram_inline_webhook.py"} if workflow == INLINE else
-             {"worker/tools/trusted_backup_head_gate.py"} if workflow == HEAD else
-             {"worker/tools/production_lifecycle_drill.py", "worker/tools/production_control.py"})
+    paths = audited_paths(workflow, record["sourceHeadSha"])
+    reviewed = REVIEWED_PRE_WEBHOOK.get(record["sourceRunId"])
+    if workflow == LIFECYCLE and reviewed:
+        require(record["sourceHeadSha"] == reviewed[0] and run.get("display_title") ==
+                "Production lifecycle rehearsal " + reviewed[1] + " at " + reviewed[0])
     require(isinstance(audit, dict) and set(audit) == paths
             and sha256(canonical(audit)).hexdigest() == item.get("auditedSourceSha256"))
     for path in sorted(paths):
