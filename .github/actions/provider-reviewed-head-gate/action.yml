@@ -1,0 +1,56 @@
+name: Verify reviewed Provider head using trusted main
+description: Recheck current main, same-repository PR and isolated identity before sensitive steps
+inputs:
+  validation_json:
+    required: true
+  reviewed_head_sha:
+    required: true
+  phase:
+    required: true
+  environment:
+    required: true
+  provider_target_json:
+    required: false
+  archive_target_json:
+    required: true
+  archive_refs_json:
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Check trusted main and independently approved PR head
+      shell: bash
+      env:
+        PROVIDER_HEAD_VALIDATION_JSON: ${{ inputs.validation_json }}
+        PROVIDER_REVIEWED_HEAD_SHA: ${{ inputs.reviewed_head_sha }}
+        PROVIDER_HEAD_PHASE: ${{ inputs.phase }}
+        PROVIDER_HEAD_ENVIRONMENT: ${{ inputs.environment }}
+        PROVIDER_HEAD_CHECK: before
+      run: python3 -B trusted/worker/tools/trusted_provider_head_gate.py
+    - name: Check out the exact approved candidate
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ fromJSON(inputs.validation_json).headSha }}
+        path: candidate
+        persist-credentials: false
+    - name: Independently recheck both checkouts and the live PR
+      shell: bash
+      env:
+        PROVIDER_HEAD_VALIDATION_JSON: ${{ inputs.validation_json }}
+        PROVIDER_REVIEWED_HEAD_SHA: ${{ inputs.reviewed_head_sha }}
+        PROVIDER_HEAD_PHASE: ${{ inputs.phase }}
+        PROVIDER_HEAD_ENVIRONMENT: ${{ inputs.environment }}
+        PROVIDER_HEAD_CHECK: ready
+      run: python3 -B trusted/worker/tools/trusted_provider_head_gate.py
+    - name: Confirm only the exact isolated resource contracts
+      shell: bash
+      env:
+        PROVIDER_HEAD_VALIDATION_JSON: ${{ inputs.validation_json }}
+        PROVIDER_REVIEWED_HEAD_SHA: ${{ inputs.reviewed_head_sha }}
+        PROVIDER_HEAD_PHASE: ${{ inputs.phase }}
+        PROVIDER_HEAD_ENVIRONMENT: ${{ inputs.environment }}
+        PROVIDER_HEAD_CHECK: credential
+        SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ inputs.provider_target_json }}
+        SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ inputs.archive_target_json }}
+        SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON: ${{ inputs.archive_refs_json }}
+      run: python3 -B trusted/worker/tools/trusted_provider_head_gate.py
