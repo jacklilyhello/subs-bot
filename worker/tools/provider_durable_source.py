@@ -43,17 +43,66 @@ def source_ancestor(build, token):
                                 for key in ("base_commit", "merge_base_commit")))
 
 
+def checked_transport_origin(value):
+    fields = {"version", "kind", "runId", "runAttempt", "manifestSha256", "targetSha256", "bucketSha256", "ledgerRecordSha256"}
+    control.require(isinstance(value, dict) and set(value) == fields and type(value["version"]) is int
+                    and value["version"] == 1 and value["kind"] == "isolated-source"
+                    and control.match(control.provider.DECIMAL, value["runId"]) and value["runAttempt"] == "1"
+                    and all(control.match(control.provider.HEX, value[key]) for key in
+                            ("manifestSha256", "targetSha256", "bucketSha256", "ledgerRecordSha256")))
+    return value
+
+
+def prepare_archived_transport(config, origin, root):
+    """Use independently pinned isolated archival bytes, never its target identity."""
+    import provider_isolated_source as isolated
+    checked_transport_origin(origin)
+    bucket = control.github._parse_object(os.environ.get("SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON", ""), sealed.ERROR)
+    control.require(control.digest(bucket) == origin["bucketSha256"])
+    store = isolated.Store(bucket, "", origin["runId"])
+    completed, registered = isolated.inventory(store), isolated.ledger()
+    isolated.verify_registered(store, completed, registered)
+    record = registered.get(origin["runId"])
+    control.require(isinstance(record, dict) and control.digest(record) == origin["ledgerRecordSha256"]
+                    and record["manifestSha256"] == origin["manifestSha256"] and record["targetSha256"] == origin["targetSha256"])
+    isolated.verify_origin(origin["runId"], completed[origin["runId"]])
+    manifest, source_target = isolated.manifest(store, origin["manifestSha256"])
+    control.require(control.digest(source_target) == origin["targetSha256"] and source_target["build"] == config["build"])
+    isolated.verify_original(manifest, source_target, store)
+    with control.provenance._write_private(root / "provider-source-archive.zip") as output:
+        control.require(sealed.read_record(store, manifest, "provider-source-archive.zip", output) == config["build"]["archiveSha256"])
+    store.verify()
+
+
+def read_transport_marker(path):
+    raw = control.provider.checked_file(path, 65536).read_bytes()
+    marker = control.github._parse_object(raw, sealed.ERROR)
+    control.require(raw == control.canonical(marker) and set(marker) == {"version", "mode", "origin"}
+                    and type(marker["version"]) is int and marker["version"] == 1
+                    and ((marker["mode"] == "actions" and marker["origin"] is None)
+                         or (marker["mode"] == "isolated-source" and checked_transport_origin(marker["origin"]))))
+    return marker["origin"]
+
+
 def prepare_seal():
     seal_context()
     config = control.read_config(os.environ.get("SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON", ""))
     control.require(config["environment"] == "production" and os.environ.get("SUBS_BOT_PROVIDER_CI_RUN_ID") == config["build"]["runId"])
     source_ancestor(config["build"], control.github._github_token())
-    evidence = control.provenance.prepare(provider_revision=config["build"]["revision"], provider_attempt=config["build"]["runAttempt"])
-    control.require(evidence == config["build"])
     root = Path(os.environ["RUNNER_TEMP"]) / "provider-source-seal-input"
     root.mkdir(mode=0o700)
-    control.provenance._download_zip(evidence["artifactId"], control.github._github_token(), evidence["archiveSha256"],
-                                    root / "provider-source-archive.zip")
+    origin_raw = os.environ.get("SUBS_BOT_PROVIDER_SOURCE_ORIGIN_JSON", "")
+    origin = None
+    if origin_raw:
+        origin = checked_transport_origin(control.github._parse_object(origin_raw, sealed.ERROR))
+        prepare_archived_transport(config, origin, root)
+    else:
+        evidence = control.provenance.prepare(provider_revision=config["build"]["revision"], provider_attempt=config["build"]["runAttempt"])
+        control.require(evidence == config["build"])
+        control.provenance._download_zip(evidence["artifactId"], control.github._github_token(), evidence["archiveSha256"],
+                                        root / "provider-source-archive.zip")
+    with control.provenance._write_private(root / "source-transport.json") as output:
+        output.write(control.canonical({"version": 1, "mode": "isolated-source" if origin is not None else "actions", "origin": origin}))
     with control.provenance._write_private(root / "target.sha256") as output:
         output.write((control.digest(config) + "\n").encode("ascii"))
 
@@ -111,13 +160,16 @@ def production_manifest(store, expected):
     raw = store.read("source-manifest.json")
     control.require(isinstance(raw, bytes) and len(raw) <= 65536 and sha256(raw).hexdigest() == expected)
     manifest = control.github._parse_object(raw, sealed.ERROR)
-    control.require(set(manifest) == {"version", "kind", "runId", "runAttempt", "controllerRevision", "target", "files"}
+    fields = {"version", "kind", "runId", "runAttempt", "controllerRevision", "target", "files"}
+    control.require(set(manifest) in (fields, fields | {"origin"})
                     and manifest["version"] == 1 and manifest["kind"] == "subs-bot-production-provider-source"
                     and manifest["runId"] == store.run_id and manifest["runAttempt"] == store.attempt
                     and control.match(control.provider.REVISION, manifest["controllerRevision"])
                     and isinstance(manifest["files"], dict) and set(manifest["files"]) == {"provider-source-archive.zip"})
     config = control.validate_config(manifest["target"])
     control.require(config["environment"] == "production")
+    if "origin" in manifest:
+        checked_transport_origin(manifest["origin"])
     entry = manifest["files"]["provider-source-archive.zip"]
     control.require(isinstance(entry, dict) and set(entry) == {"bytes", "sha256", "chunks"}
                     and type(entry["bytes"]) is int and 0 < entry["bytes"] <= control.provenance.MAX_ZIP
@@ -221,9 +273,10 @@ def production_inventory(store, bucket, *, inspect_operation=None):
         manifest, target = production_manifest(existing, sha256(manifest_raw).hexdigest())
         plan = intent.get("plan")
         mutable = {"inventorySha256", "controllersSha256", "resolutionsSha256"}
-        control.require(isinstance(plan, dict) and set(plan) == {"version", "action", "operationId", "targetSha256", "build", "bucketSha256", "prefixState", "inventorySha256", "controllersSha256", "resolutionsSha256", "controllerRevision"}
+        expected = source_plan(target, bucket, operation_id, {}, [], intent.get("controllerRevision"), origin=manifest.get("origin"))
+        control.require(isinstance(plan, dict) and set(plan) == set(expected)
                         and {key: value for key, value in plan.items() if key not in mutable}
-                        == {key: value for key, value in source_plan(target, bucket, operation_id, {}, [], intent.get("controllerRevision")).items() if key not in mutable}
+                        == {key: value for key, value in expected.items() if key not in mutable}
                         and all(control.match(control.provider.HEX, plan[key]) for key in mutable)
                         and intent.get("approvalSha256") == control.digest(plan) and intent.get("status") == "started-unknown"
                         and intent.get("controllerRevision") == manifest["controllerRevision"]
@@ -401,14 +454,16 @@ def seal_history(operation_id, completed, controllers, *, resolutions=None, buck
     control.require(current_seen, "The current source seal run is not yet independently visible; no write was attempted.")
 
 
-def source_plan(config, bucket, operation_id, inventory, controllers, controller_revision, resolutions=None):
+def source_plan(config, bucket, operation_id, inventory, controllers, controller_revision, resolutions=None, *, origin=None):
     control.require(control.match(control.provider.DECIMAL, operation_id) and control.match(control.provider.REVISION, controller_revision))
+    if origin is not None:
+        checked_transport_origin(origin)
     return {"version": 1, "action": "seal-production-provider-source", "operationId": operation_id,
             "targetSha256": control.digest(config), "build": config["build"],
             "bucketSha256": control.digest(bucket), "prefixState": "intent-and-manifest-absent",
             "inventorySha256": control.digest(inventory), "controllersSha256": control.digest(controllers),
             "resolutionsSha256": control.digest({} if resolutions is None else resolutions),
-            "controllerRevision": controller_revision}
+            "controllerRevision": controller_revision, **({"origin": origin} if origin is not None else {})}
 
 
 def verify_seal_origin(operation_id, record, *, bucket=None, store=None, inventory=None):
@@ -445,7 +500,11 @@ def production_seal_action(write):
     resolutions = source_resolutions()
     control.require(store.read("source-intent.json") is None and store.read("source-manifest.json") is None,
                     "The selected source archive operation is occupied or unconfirmed.")
-    plan = source_plan(config, bucket, operation_id, completed, controllers, os.environ["GITHUB_SHA"], resolutions)
+    source = Path(os.environ["RUNNER_TEMP"]) / "provider-source-seal-input" / "provider-source-archive.zip"
+    origin = read_transport_marker(source.with_name("source-transport.json"))
+    pin = source.with_name("target.sha256")
+    control.require(control.provider.checked_file(pin, 128).read_bytes() == (control.digest(config) + "\n").encode("ascii"))
+    plan = source_plan(config, bucket, operation_id, completed, controllers, os.environ["GITHUB_SHA"], resolutions, origin=origin)
     approval = control.digest(plan)
     if not write:
         print(json.dumps({"status": "plan-only", "approvalSha256": approval, "targetSha256": plan["targetSha256"],
@@ -457,9 +516,6 @@ def production_seal_action(write):
                     "The exact source seal plan was not approved.")
     seal_history(operation_id, completed, controllers, resolutions=resolutions, bucket=bucket, store=store)
     build = config["build"]
-    source = Path(os.environ["RUNNER_TEMP"]) / "provider-source-seal-input" / "provider-source-archive.zip"
-    pin = source.with_name("target.sha256")
-    control.require(control.provider.checked_file(pin, 128).read_bytes() == (control.digest(config) + "\n").encode("ascii"))
     control.provider.checked_file(source, control.provenance.MAX_ZIP)
     control.require(control.provider.checksum(source) == build["archiveSha256"])
     with tempfile.TemporaryDirectory(prefix=".provider-source-seal-", dir=os.environ["RUNNER_TEMP"]) as temporary:
@@ -490,7 +546,8 @@ def production_seal_action(write):
     control.require(size > 0 and hashed.hexdigest() == build["archiveSha256"])
     manifest = {"version": 1, "kind": "subs-bot-production-provider-source", "runId": operation_id,
                 "runAttempt": "1", "controllerRevision": os.environ["GITHUB_SHA"], "target": config,
-                "files": {"provider-source-archive.zip": {"bytes": size, "sha256": hashed.hexdigest(), "chunks": chunks}}}
+                "files": {"provider-source-archive.zip": {"bytes": size, "sha256": hashed.hexdigest(), "chunks": chunks}},
+                **({"origin": origin} if origin is not None else {})}
     raw = control.canonical(manifest)
     control.require(len(raw) <= 65536)
     store.put("source-manifest.json", raw)

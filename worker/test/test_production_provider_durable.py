@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import archive_production_provider as archive
 import production_provider as control
 import provider_durable_source as durable
+import provider_isolated_source as isolated
 from test_archive_production_provider import MemoryStore, fixture
 from test_production_provider import config
 import test_prepare_provider_artifact as artifact_fixture
@@ -345,6 +346,125 @@ class OriginalAttemptMetadataTests(unittest.TestCase):
         after = durable.source_plan(target, {}, "1001", {}, ["b" * 40], "b" * 40, {"1000": {"fixture": "resolution"}})
         self.assertNotEqual(control.digest(before), control.digest(after))
 
+    def test_production_seal_origin_is_independently_pinned_to_approval(self):
+        target = config(active=True)
+        origin = {"version": 1, "kind": "isolated-source", "runId": "101", "runAttempt": "1",
+                  **{key: "a" * 64 for key in ("manifestSha256", "targetSha256", "bucketSha256", "ledgerRecordSha256")}}
+        plain = durable.source_plan(target, {}, "1001", {}, ["b" * 40], "b" * 40)
+        archived = durable.source_plan(target, {}, "1001", {}, ["b" * 40], "b" * 40, origin=origin)
+        self.assertNotEqual(control.digest(plain), control.digest(archived))
+        self.assertNotEqual(control.digest(archived), control.digest(durable.source_plan(
+            target, {}, "1001", {}, ["b" * 40], "b" * 40, origin={**origin, "manifestSha256": "b" * 64})))
+        for bad in ({**origin, "kind": "partial"}, {**origin, "runAttempt": "2"}, {**origin, "targetSha256": "bad"},
+                    {**origin, "extra": True}):
+            with self.subTest(bad=bad), self.assertRaises(control.ProviderError):
+                durable.source_plan(target, {}, "1001", {}, ["b" * 40], "b" * 40, origin=bad)
+
+    def test_archived_transport_requires_original_identity_and_never_selects_actions_artifact(self):
+        target, bucket, store = config(active=True), {"fixture": "isolated-bucket"}, Mock()
+        raw = b"fixture original ZIP"
+        target["build"]["archiveSha256"] = sha256(raw).hexdigest()
+        source_target = deepcopy(target)
+        source_target["environment"] = "rehearsal"
+        record = {"manifestSha256": "a" * 64, "targetSha256": control.digest(source_target)}
+        origin = {"version": 1, "kind": "isolated-source", "runId": "101", "runAttempt": "1",
+                  "manifestSha256": record["manifestSha256"], "targetSha256": record["targetSha256"],
+                  "bucketSha256": control.digest(bucket), "ledgerRecordSha256": control.digest(record)}
+        def read_record(_store, _manifest, _name, output):
+            output.write(raw)
+            return sha256(raw).hexdigest()
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"RUNNER_TEMP": temp,
+                "SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON": json.dumps(bucket),
+                "SUBS_BOT_PROVIDER_SIMULATE_ARTIFACT_UNAVAILABLE": "1"}, clear=True), \
+                patch.object(isolated, "Store", return_value=store), patch.object(isolated, "inventory", return_value={"101": record}), \
+                patch.object(isolated, "ledger", return_value={"101": record}), patch.object(isolated, "verify_registered") as registered, \
+                patch.object(isolated, "verify_origin") as source_run, patch.object(isolated, "manifest", return_value=({}, source_target)), \
+                patch.object(isolated, "verify_original") as original, patch.object(archive, "read_record", side_effect=read_record), \
+                patch.object(control.provenance, "_select_artifact") as select, patch.object(control.provenance, "_download_zip") as download:
+            durable.prepare_archived_transport(target, origin, Path(temp))
+            self.assertEqual((Path(temp) / "provider-source-archive.zip").read_bytes(), raw)
+            registered.assert_called_once()
+            source_run.assert_called_once()
+            original.assert_called_once()
+            select.assert_not_called()
+            download.assert_not_called()
+            store.put.assert_not_called()
+            with tempfile.TemporaryDirectory() as other, patch.object(isolated, "manifest", return_value=({}, {**source_target, "build": {**source_target["build"], "artifactId": "999"}})), \
+                    self.assertRaises(control.ProviderError):
+                durable.prepare_archived_transport(target, origin, Path(other))
+            for failure in ("missing", "corrupt"):
+                with self.subTest(failure=failure), tempfile.TemporaryDirectory() as other, \
+                        patch.object(isolated, "verify_original", side_effect=control.ProviderError(failure)), \
+                        self.assertRaises(control.ProviderError):
+                    durable.prepare_archived_transport(target, origin, Path(other))
+                store.put.assert_not_called()
+            with tempfile.TemporaryDirectory() as other, \
+                    patch.object(isolated, "ledger", return_value={"101": {**record, "manifestSha256": "b" * 64}}), \
+                    self.assertRaises(control.ProviderError):
+                durable.prepare_archived_transport(target, origin, Path(other))
+            store.put.assert_not_called()
+
+    def test_transport_marker_cannot_silently_lose_the_archived_origin(self):
+        origin = {"version": 1, "kind": "isolated-source", "runId": "101", "runAttempt": "1",
+                  **{key: "a" * 64 for key in ("manifestSha256", "targetSha256", "bucketSha256", "ledgerRecordSha256")}}
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "source-transport.json"
+            with self.assertRaises((OSError, control.ProviderError)):
+                durable.read_transport_marker(path)
+            for marker in ({"version": 1, "mode": "isolated-source", "origin": None},
+                           {"version": 1, "mode": "actions", "origin": origin},
+                           {"version": 1, "mode": "other", "origin": None}):
+                path.write_bytes(control.canonical(marker))
+                with self.subTest(marker=marker), self.assertRaises(control.ProviderError):
+                    durable.read_transport_marker(path)
+            path.write_bytes(control.canonical({"version": 1, "mode": "isolated-source", "origin": origin}))
+            self.assertEqual(durable.read_transport_marker(path), origin)
+            path.write_bytes(control.canonical({"version": 1, "mode": "actions", "origin": None}))
+            self.assertIsNone(durable.read_transport_marker(path))
+
+    def test_origin_verifies_real_fixture_zip_and_complete_oci_without_actions(self):
+        revision, run_id, attempt = artifact_fixture.REVISION, artifact_fixture.RUN_ID, artifact_fixture.ATTEMPT
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "release"
+            source.mkdir()
+            (source / control.provider.IMAGE).write_bytes(artifact_fixture.oci_fixture())
+            (source / control.provider.WORKER).write_bytes(b"export default {};\n")
+            requirements = Path(control.provider.__file__).with_name("requirements.txt")
+            manifest = control.provider.release_manifest(source, revision, requirements, ref=control.github.MAIN_REF,
+                                                         run_id=run_id, run_attempt=attempt)
+            members = {name: (source / name).read_bytes() for name in (control.provider.IMAGE, control.provider.WORKER)}
+            members[control.provider.MANIFEST] = artifact_fixture.encoded(manifest)
+            original = artifact_fixture.zip_fixture(members)
+            target, bucket, store = config(active=True), {"fixture": "origin-bucket"}, Mock()
+            target["build"].update(revision=revision, runId=run_id, runAttempt=attempt, artifactId=artifact_fixture.ARTIFACT_ID,
+                                   archiveSha256=sha256(original).hexdigest(),
+                                   **{key: manifest[key] for key in control.publication.MANIFEST_FIELDS})
+            source_target = deepcopy(target)
+            target["environment"] = "production"
+            target["service"] = control.SERVICES["production"]
+            record = {"manifestSha256": "a" * 64, "targetSha256": control.digest(source_target)}
+            origin = {"version": 1, "kind": "isolated-source", "runId": "101", "runAttempt": "1",
+                      "manifestSha256": record["manifestSha256"], "targetSha256": record["targetSha256"],
+                      "bucketSha256": control.digest(bucket), "ledgerRecordSha256": control.digest(record)}
+            def read_record(_store, _manifest, _name, output):
+                output.write(original)
+                return sha256(original).hexdigest()
+            env = {"RUNNER_TEMP": temp, "GITHUB_SHA": revision, "GH_TOKEN": "fixture-token",
+                   "SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON": json.dumps(bucket), "SUBS_BOT_PROVIDER_SIMULATE_ARTIFACT_UNAVAILABLE": "1"}
+            destination = root / "output"
+            destination.mkdir()
+            with patch.dict(os.environ, env, clear=True), patch.object(isolated, "Store", return_value=store), \
+                    patch.object(isolated, "inventory", return_value={"101": record}), patch.object(isolated, "ledger", return_value={"101": record}), \
+                    patch.object(isolated, "verify_registered"), patch.object(isolated, "verify_origin"), \
+                    patch.object(isolated, "manifest", return_value=({}, source_target)), patch.object(archive, "read_record", side_effect=read_record), \
+                    patch.object(control.github, "verify_main_run"), patch.object(control.github, "_github_token", return_value="fixture-token"), \
+                    patch.object(control.provenance, "_select_artifact", side_effect=AssertionError("unexpected artifact selection")), \
+                    patch.object(control.provenance, "_download_zip", side_effect=AssertionError("unexpected artifact download")):
+                durable.prepare_archived_transport(target, origin, destination)
+            self.assertEqual((destination / "provider-source-archive.zip").read_bytes(), original)
+            store.put.assert_not_called()
+
     def test_skipped_resolution_requires_original_and_independent_readback(self):
         revision, operation_id, seal_run, reconcile_run = "b" * 40, "1000", "101", "102"
         origin = {"runId": seal_run, "controllerRevision": revision, "runConclusion": "failure", "sealStepConclusion": "skipped"}
@@ -471,6 +591,7 @@ class OriginalAttemptMetadataTests(unittest.TestCase):
             root.mkdir()
             (root / "provider-source-archive.zip").write_bytes(raw)
             (root / "target.sha256").write_text(control.digest(target) + "\n")
+            (root / "source-transport.json").write_bytes(control.canonical({"version": 1, "mode": "actions", "origin": None}))
             env = {"RUNNER_TEMP": temp, "GITHUB_SHA": target["build"]["revision"], "GITHUB_RUN_ID": "102",
                    "GITHUB_RUN_ATTEMPT": "1", "SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON": json.dumps(target),
                    "SUBS_BOT_PROVIDER_ARCHIVE_BUCKET_JSON": json.dumps(bucket), "SUBS_BOT_PROVIDER_SOURCE_OPERATION_ID": operation_id,
@@ -486,6 +607,11 @@ class OriginalAttemptMetadataTests(unittest.TestCase):
                     patch.object(control.github, "require_current_main"), patch.object(control.provenance, "_unpack"), \
                     patch.object(control.provenance, "source_requirements", return_value=nullcontext(Path("requirements"))), \
                     patch.object(control.provider, "verify_release", return_value=target["build"]):
+                (root / "source-transport.json").unlink()
+                with self.assertRaises((OSError, control.ProviderError)):
+                    durable.production_seal_action(True)
+                store.put.assert_not_called()
+                (root / "source-transport.json").write_bytes(control.canonical({"version": 1, "mode": "actions", "origin": None}))
                 with self.assertRaises(control.ProviderError):
                     durable.production_seal_action(True)
             self.assertEqual(store.put.call_count, 1)
