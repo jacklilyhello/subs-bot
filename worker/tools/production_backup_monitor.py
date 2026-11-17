@@ -193,8 +193,13 @@ def main():
         events = Transaction(store, session, active["day"], target.digest, active["controlRevision"]).load()
         result["activeTransaction"] = {"session": session, "state": interruption(events),
                                        "stage": events[-1]["stage"] if events else "missing"}
-        result["alerts"] = sorted(set(result["alerts"]) | {"maintenance-transaction-unresolved"})
-        result["status"] = "alert"
+        matching = [run for run in runs if run["runId"] + "-" + run["runAttempt"] == session]
+        normally_running = (len(matching) == 1 and matching[0]["status"] in
+                            {"queued", "in_progress", "waiting", "requested", "pending"}
+                            and now - matching[0]["created"] <= timeout * 60)
+        if not normally_running:
+            result["alerts"] = sorted(set(result["alerts"]) | {"maintenance-transaction-unresolved"})
+            result["status"] = "alert"
     github.require_current_main(revision)
     return result
 

@@ -632,7 +632,7 @@ class Drill:
         return target, archived["bundle"], archived["manifest"]
 
     def activation_baseline(self, *, stage_prefix="activation-baseline", checkpoint_id=None, preloaded_code=None,
-                            simulate_readback_failure=False):
+                            simulate_readback_failure=False, simulate_process_kill=False):
         import production_recovery as recovery
         from production_release_evidence import verify_activation_baseline
         require(stage_prefix in ("activation-baseline", "latest-off-baseline"), "Unknown baseline evidence stage.")
@@ -675,7 +675,9 @@ class Drill:
                 manifest_sha = result["backup"]["manifestSha256"]
             finally:
                 journal.release()
-        require(not simulate_readback_failure or ctl.target.environment == "rehearsal")
+        require(not (simulate_readback_failure or simulate_process_kill) or ctl.target.environment == "rehearsal")
+        if simulate_process_kill:
+            os._exit(73)  # isolated runner: simulate loss after confirmed export
         if simulate_readback_failure:
             raise ContractError("Synthetic independent backup readback failure; preserve this checkpoint.")
         ctl.activation_baseline_checker = lambda: verify_activation_baseline(ctl, data_token, checkpoint, manifest_sha)
@@ -1007,13 +1009,12 @@ class Drill:
             journal.append("frozen", {"control": frozen["control"]}, int(time.time()))
             frozen_data = capacity.frozen_fingerprint(api, source)
             journal.append("frozen-data", frozen_data, int(time.time()))
-            if fault == "process-kill":
-                os._exit(73)  # isolated runner: simulate loss without finally handlers
             journal.append("capture-intent", {"checkpointId": checkpoint}, int(time.time()))
             # The intended checkpoint is pinned before capture and independently
             # read back by the existing activation-baseline verifier.
             self.activation_baseline(checkpoint_id=checkpoint, preloaded_code=(proof, archive),
-                                     simulate_readback_failure=fault == "readback-failure")
+                                     simulate_readback_failure=fault == "readback-failure",
+                                     simulate_process_kill=fault == "process-kill")
             baseline = self.report["activationBaseline"]
             journal.append("verified", {"checkpointId": baseline["checkpointId"],
                            "manifestSha256": baseline["manifestSha256"]}, int(time.time()))
@@ -1090,6 +1091,42 @@ class Drill:
             self.report.update(status="reconciled", watchdog="completed-anchor-released", session=session)
             return
         effective = events[-2]["stage"] if events[-1]["stage"] == "failed" and len(events) >= 2 else events[-1]["stage"]
+        original = events[0]["details"]
+        if original.get("control", {}).get("admission") == "closed" and original["control"].get("workers") == "frozen":
+            if effective not in {"capture-intent", "verified"}:
+                self.report.update(status="stopped", watchdog="frozen-source-reconciliation-required", session=session)
+                return
+            import production_backup_capacity as capacity
+            frozen_data = next((item for item in events if item["stage"] == "frozen-data"), None)
+            checkpoint = original.get("checkpointId")
+            require(frozen_data is not None and matches(r"[0-9a-f]{32}", checkpoint))
+            name = "subs-bot-cf-restore-control-" + checkpoint[:16]
+            contract = {"version": 1, "checkpointId": checkpoint, "databaseName": name,
+                        "objectsName": name, "purpose": "baseline"}
+            token = self.env["SUBS_BOT_CF_BOOTSTRAP_TOKEN"]
+            api = recovery.RecoveryAPI(ctl.target.data, token, ctl.worker, contract)
+            api.verify_backup()
+            source = recovery.RecoverySource(api, ctl.target.data, bundle, manifest, ctl.inspect, ctl.guard)
+            source_journal = recovery.RecoveryJournal(api, self.run + "/" + self.attempt, guard=ctl.guard)
+            source_journal.load()
+            require(isinstance(source_journal.value, dict) and isinstance(source_journal.value.get("export"), dict)
+                    and source_journal.value["export"].get("state") in {"download-ready", "sql-archived", "complete"},
+                    "The frozen source export status is not independently confirmed stopped.")
+            current = ctl.inspect()
+            require(current["control"] == original["control"] and current["release"] == original["release"]
+                    and current["configurationSha256"] == original["configurationSha256"]
+                    and capacity.frozen_fingerprint(api, source) == frozen_data["details"])
+            verified_event = next((item for item in events if item["stage"] == "verified"), None)
+            if verified_event is not None:
+                proof = verify_activation_baseline(ctl, token, verified_event["details"]["checkpointId"],
+                                                   verified_event["details"]["manifestSha256"])
+                require(proof.get("baselineVerified") is True)
+            journal.append("preserved-frozen", {"control": current["control"],
+                           "backupVerified": verified_event is not None, "confirmedByWatchdog": True}, int(time.time()))
+            anchor.release(session)
+            self.report.update(status="reconciled", watchdog="frozen-source-preserved",
+                               session=session, backupVerified=verified_event is not None)
+            return
         if effective == "paused":
             paused_event = next(event for event in events if event["stage"] == "paused")
             pause_intent = next(event for event in events if event["stage"] == "pause-intent")

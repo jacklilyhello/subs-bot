@@ -3,6 +3,7 @@ from pathlib import Path
 from hashlib import sha256
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import production_backup_transaction as transaction
@@ -45,6 +46,9 @@ class Store:
     def list_backup_journals(self):
         return sorted(key for key in self.objects if key.startswith("maintenance/production-control/evidence/daily-backup/"))
 
+    def list_backup_session(self, prefix):
+        return sorted(key for key in self.objects if key.startswith(prefix))
+
 
 class JournalTests(unittest.TestCase):
     def setUp(self):
@@ -74,6 +78,17 @@ class JournalTests(unittest.TestCase):
         self.journal.append("started", {}, 100)
         with self.assertRaises(ContractError):
             self.journal.append("verified", {"checkpointId": "a" * 32, "manifestSha256": "b" * 64}, 101)
+
+    def test_poll_requires_a_recorded_intent_and_never_starts_a_second_capture(self):
+        stages = [("started", {}), ("preflight", {"capacity": {}}), ("pause-intent", {}), ("paused", {}),
+                  ("freeze-intent", {}), ("frozen", {}), ("frozen-data", {}), ("capture-intent", {})]
+        for timestamp, (stage, details) in enumerate(stages, 100):
+            self.journal.append(stage, details, timestamp)
+        with self.assertRaises(ContractError):
+            self.journal.append("capture-intent", {}, 110)
+        self.journal.append("poll-intent", {}, 110)
+        self.assertEqual(transaction.interruption(self.journal.load()), "reconciliation-required")
+        self.journal.append("capture-intent", {}, 111)
 
     def test_anchor_blocks_new_sessions_until_exact_release(self):
         anchor = self.anchor()
@@ -134,6 +149,29 @@ class JournalTests(unittest.TestCase):
             anchor.reconcile_initialization("0" * 64)
         anchor.reconcile_initialization(sha256(transaction.canonical(plan)).hexdigest())
         self.assertEqual(anchor.read()[0]["state"], "idle")
+
+    def test_unknown_pointer_write_is_inspected_not_reissued(self):
+        anchor = self.anchor()
+        anchor.initialize()
+        write = self.store.compare_and_put
+        def committed_but_unacknowledged(*args):
+            write(*args)
+            raise RuntimeError("synthetic transport loss")
+        with patch.object(self.store, "compare_and_put", side_effect=committed_but_unacknowledged):
+            with self.assertRaises(RuntimeError):
+                anchor.acquire("123-1", "2026/11/17", "b" * 40)
+        self.assertEqual(anchor.read()[0]["session"], "123-1")
+        with self.assertRaises(ContractError):
+            anchor.acquire("123-1", "2026/11/17", "b" * 40)
+
+    def test_unknown_uncommitted_pointer_write_blocks_new_claims(self):
+        anchor = self.anchor()
+        anchor.initialize()
+        with patch.object(self.store, "compare_and_put", side_effect=RuntimeError("synthetic transport loss")):
+            with self.assertRaises(RuntimeError):
+                anchor.acquire("123-1", "2026/11/17", "b" * 40)
+        with self.assertRaises(ContractError):
+            anchor.acquire("124-1", "2026/11/17", "b" * 40)
 
     def anchor(self):
         target = "a" * 64

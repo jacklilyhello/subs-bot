@@ -42,9 +42,14 @@ class PrivateStore:
     def list_backup_journals(self):
         return self._list_backup_prefix("maintenance/production-control/evidence/daily-backup/")
 
+    def list_backup_session(self, prefix):
+        require(matches(r"maintenance/production-control/evidence/daily-backup/[0-9]{4}/[0-9]{2}/[0-9]{2}/[1-9][0-9]{0,19}-[1-9][0-9]{0,9}/", prefix))
+        return self._list_backup_prefix(prefix)
+
     def _list_backup_prefix(self, prefix):
         require(prefix == "maintenance/production-control/evidence/daily-backup/" or
-                matches(r"maintenance/production-control/evidence/daily-backup-anchor/[a-f0-9]{64}/", prefix))
+                matches(r"maintenance/production-control/evidence/daily-backup-anchor/[a-f0-9]{64}/", prefix) or
+                matches(r"maintenance/production-control/evidence/daily-backup/[0-9]{4}/[0-9]{2}/[0-9]{2}/[1-9][0-9]{0,19}-[1-9][0-9]{0,9}/", prefix))
         self.verify()
         try:
             token = self.api("GET", self.api.root + "/tokens/verify")

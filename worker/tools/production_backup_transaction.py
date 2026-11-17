@@ -15,14 +15,15 @@ SESSION = re.compile(r"[1-9][0-9]{0,19}-[1-9][0-9]{0,9}")
 SHA = re.compile(r"[0-9a-f]{64}")
 REVISION = re.compile(r"[0-9a-f]{40}")
 STAGES = {"started", "preflight", "pause-intent", "paused", "freeze-intent", "frozen", "frozen-data",
-          "capture-intent", "verified", "resume-intent", "resumed", "preserved-frozen", "failed"}
+          "capture-intent", "poll-intent", "verified", "resume-intent", "resumed", "preserved-frozen", "failed"}
 NEXT = {None: {"started"}, "started": {"preflight", "failed"},
         "preflight": {"pause-intent", "frozen", "failed"}, "pause-intent": {"paused", "failed"},
         "paused": {"freeze-intent", "failed", "resume-intent"}, "freeze-intent": {"frozen", "failed"},
         "frozen": {"frozen-data", "failed"}, "frozen-data": {"capture-intent", "failed", "resume-intent"},
-        "capture-intent": {"verified", "failed", "resume-intent"},
+        "capture-intent": {"poll-intent", "verified", "failed", "resume-intent", "preserved-frozen"},
+        "poll-intent": {"capture-intent"},
         "verified": {"resume-intent", "preserved-frozen", "failed"}, "resume-intent": {"resumed", "failed"},
-        "resumed": set(), "preserved-frozen": set(), "failed": {"resume-intent"}}
+        "resumed": set(), "preserved-frozen": set(), "failed": {"resume-intent", "preserved-frozen"}}
 
 
 def validate_step(previous, event):
@@ -49,7 +50,8 @@ class Transaction:
         self.prefix = "maintenance/production-control/evidence/daily-backup/" + day + "/" + session + "/"
 
     def load(self):
-        keys = self.store.list(self.prefix, maximum=64)
+        keys = self.store.list_backup_session(self.prefix)
+        require(len(keys) < 64, "Backup transaction history exceeds its supported bound.")
         events, previous = [], None
         for position, key in enumerate(keys, 1):
             require(key == self.prefix + str(position).zfill(4) + ".json", "Backup journal has a gap or an unknown key.")
@@ -67,6 +69,8 @@ class Transaction:
             if events and events[-1]["stage"] == "failed" and event["stage"] == "resume-intent":
                 require(len(events) >= 2 and events[-2]["stage"] in {"paused", "verified", "frozen-data", "capture-intent"},
                         "A failed unresolved operation cannot be automatically retried.")
+            if events and events[-1]["stage"] == "failed" and event["stage"] == "preserved-frozen":
+                require(len(events) >= 2 and events[-2]["stage"] in {"verified", "capture-intent"})
             previous = sha256(raw).hexdigest()
             events.append(event)
         return events
@@ -83,6 +87,8 @@ class Transaction:
         if events and events[-1]["stage"] == "failed" and stage == "resume-intent":
             require(len(events) >= 2 and events[-2]["stage"] in {"paused", "verified", "frozen-data", "capture-intent"},
                     "A failed unresolved operation cannot be automatically retried.")
+        if events and events[-1]["stage"] == "failed" and stage == "preserved-frozen":
+            require(len(events) >= 2 and events[-2]["stage"] in {"verified", "capture-intent"})
         body = canonical(event)
         self.store.put(self.prefix + str(len(events) + 1).zfill(4) + ".json", body)
         observed = self.load()
@@ -99,7 +105,7 @@ def interruption(events):
     last = events[-1]["stage"]
     if last in {"resumed", "preserved-frozen"}:
         return "complete"
-    if last in {"pause-intent", "freeze-intent", "capture-intent", "resume-intent"}:
+    if last in {"pause-intent", "freeze-intent", "capture-intent", "poll-intent", "resume-intent"}:
         return "reconciliation-required"
     if last == "failed":
         if len(events) > 1 and events[-2]["stage"].endswith("-intent"):
