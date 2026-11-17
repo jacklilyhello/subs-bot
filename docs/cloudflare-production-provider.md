@@ -102,6 +102,16 @@ URL 请求使用共享的 120 秒启动总预算，覆盖 `start`、必须等到
 
 ## 新工具的隔离演练与持久证明
 
+### 可信 main 驱动的已审查候选验收
+
+为避免候选 workflow 自行证明自己的身份，[Provider reviewed-head 工作流](../.github/workflows/worker-provider-reviewed-head.yml) 默认关闭，只有仓库变量 `SUBS_BOT_PROVIDER_HEAD_VALIDATION_ENABLED=true` 时才运行。它只接受同仓库、基于当前准确 main 的开放 PR；两个专用 GitHub Environment 分别独立登记 `SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA`，必须与输入的 `headSha` 和实时 PR head 完全一致。每个 job 都在新 runner 先 checkout 当前 trusted main，执行 main 中的独立 gate，再 checkout 精确候选并重核。依赖包由 trusted main 在读取私有目标前固定校验，凭据仅在各自通过 gate 后的指定步骤注入。固定隔离服务为 `subs-bot-provider-fetch-control-drill-01`，caller 必须为空；正式身份、其他资源及关闭模拟不可用的请求均拒绝。
+
+输入 `validation_json` 的严格字段为 `version: 1`、字符串 `pr`、完整 `headSha`、原 `providerCiRunId`、`approvalSha256`、`archiveRefs` 数组和 `simulateActionsUnavailable: true`。每个引用须含 `kind`（仅 `complete` 或 `partial`）、原 `runId`、`runAttempt`、独立记录的 `manifestSha256` 和 `targetSha256`；链中每代都须提供。各隔离 Environment 的受保护配置 `SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON` 必须预先独立登记完全相同的引用数组，不能把本次 dispatch 的自报摘要当作信任锚。归档 run 身份、控制提交和原 CI attempt 分别核验；partial 始终保留 not-complete 性质。该验收仅复核已存在、摘要匹配的 OCI 标签，不创建标签或部署 Provider；模拟禁用原 Actions source artifact，不表示真实过期。
+
+该入口只提供受信调度及独立见证，候选必须实现 `worker/tools/production_provider_reviewed_head_harness.py` 接口并经对应准确 head 的 CI 和人工审查；缺少接口时不会执行。此入口的可用性不等于候选已经实现或完成隔离验收。
+
+三个 job 分别使用全新 runner：候选只获得隔离 R2 只读凭据并校验完整来源链；可信 main 独立重新读取每代原 ZIP、原 CI attempt、历史 requirements blob、Worker 和 OCI；第三个 job 只获得 Provider 只读凭据，核对相同 target、无 caller、停止状态及精确 registry manifest/config。两个 SHA（trusted main、实际 reviewed head）分别记录。该入口不封存新证据，不执行 R2、Provider 或 registry 写入，也不证明发布、stage 或 activate；模拟不可用不等于真实过期。任一 gate 或读回失败均不视为通过。此入口不代表正式生产已经授权或启用；所需隔离环境和只读凭据须单独安全配置，缺失时停止。
+
 `worker-production-provider-rehearsal.yml` 的 `rehearse` 路径通过同一个 `production_provider` 控制实现，使用专用 `subs-bot-provider-fetch-control-drill-01`，不修改原 dev 服务。必须提供准确 Provider CI run、明确批准的项目 `/health` URL 与独立读回 revision，并输入 `rehearse production ProviderFetch controls for subs-bot-provider-fetch-control-drill-01`。自动流程覆盖 create、原 OCI 发布、stage、activate、Container/Workflow 初始化、真实 Cloudflare smoke 和独立 verify。
 
 每个操作通过受保护的 `provider-control-step` 复合 Action 执行：只读预检 → 写入 `started-unknown` intent → 官方 artifact 上传 → 以 GitHub API 核对该 artifact 的准确 main/run/attempt/operation 与摘要 → 执行一次 mutation → 无论结果如何保留结果 checkpoint。intent 包含完整配置摘要、源 CI/模块/OCI pins、操作 approval 摘要与前态摘要；创建前还核对准确名称不存在。artifact 上传失败或回读身份不符时，不允许 dispatch。源原 ZIP、OCI、module 和初始 pins 也在首个资源操作之前上传。
