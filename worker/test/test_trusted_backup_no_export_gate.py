@@ -57,8 +57,28 @@ class NoExportGateTests(unittest.TestCase):
             return {"id": number, "path": ".github/workflows/python-ci.yml", "event": "pull_request",
                     "head_sha": "a" * 40, "created_at": "2026-11-17T20:00:00Z", "run_attempt": 1, "status": "completed"}
         env = ("2026-11-17T19:00:00Z", "2026-11-17T21:00:00Z", "synthetic")
-        with patch.object(gate.github, "_get_json", side_effect=[{"total_count": 101, "workflow_runs": [row(i) for i in range(1, 101)]},
-                                                                  {"total_count": 101, "workflow_runs": [row(1)]}]):
+        with patch.object(gate.github, "_get_json", side_effect=[{"total_count": 51, "workflow_runs": [row(i) for i in range(1, 51)]},
+                                                                  {"total_count": 51, "workflow_runs": [row(1)]}]):
+            with self.assertRaises(ContractError):
+                gate.workflow_runs(*env)
+
+    def test_bounded_50_item_inventory_is_complete_and_rejects_overflow(self):
+        def row(number):
+            return {"id": number, "path": ".github/workflows/python-ci.yml", "event": "pull_request",
+                    "head_sha": "a" * 40, "created_at": "2026-11-17T20:00:00Z", "run_attempt": 1, "status": "completed"}
+        env = ("2026-11-17T19:00:00Z", "2026-11-17T21:00:00Z", "synthetic")
+        responses = [{"total_count": 127, "workflow_runs": [row(i) for i in range(first, min(first + 50, 128))]}
+                     for first in (1, 51, 101)]
+        with patch.object(gate.github, "_get_json", side_effect=responses) as get:
+            self.assertEqual(len(gate.workflow_runs(*env, maximum=150)), 127)
+            self.assertEqual(get.call_count, 3)
+            self.assertTrue(all("per_page=50" in call.args[0] for call in get.call_args_list))
+        full = [{"total_count": 400, "workflow_runs": [row(i) for i in range(first, first + 50)]}
+                for first in range(1, 401, 50)]
+        with patch.object(gate.github, "_get_json", side_effect=full) as get:
+            self.assertEqual(len(gate.workflow_runs(*env)), 400)
+            self.assertEqual(get.call_count, 8)
+        with patch.object(gate.github, "_get_json", return_value={"total_count": 401, "workflow_runs": [row(1)]}):
             with self.assertRaises(ContractError):
                 gate.workflow_runs(*env)
         with patch.object(gate.github, "_get_json", return_value={"total_count": 2, "workflow_runs": [row(1)]}):
@@ -76,6 +96,55 @@ class NoExportGateTests(unittest.TestCase):
                "display_title": "No-export release at " + "a" * 40 + " candidate " + "b" * 40}
         with patch.object(gate.github, "_get_json", return_value=run), self.assertRaises(ContractError):
             gate.live_writer_boundary([prior], env, "synthetic", "b" * 40)
+
+    def test_only_exact_failed_precheckout_plan_is_classified_without_writes(self):
+        item = {"id": int(gate.FAILED_PLAN_RUN), "path": gate.WORKFLOW, "event": "workflow_dispatch",
+                "head_sha": gate.FAILED_PLAN_MAIN, "run_attempt": 1}
+        repo = {"id": gate.github.REPOSITORY_ID}
+        run = {**item, "head_branch": "main", "status": "completed", "conclusion": "failure",
+               "display_title": "No-export plan at " + gate.FAILED_PLAN_MAIN + " candidate " + gate.FAILED_PLAN_HEAD,
+               "repository": repo, "head_repository": repo}
+        checkout = "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+        states = [(2, checkout, "success"), (3, "Verify no-export identity before candidate checkout", "failure"),
+                  (4, checkout, "skipped"), (5, "Verify exact reviewed no-export checkout", "skipped"),
+                  (6, "Verify no-export test Bot identity", "skipped"), (7, "Plan or apply the no-export resolution", "skipped")]
+        steps = [{"number": n, "name": name, "status": "completed", "conclusion": result} for n, name, result in states]
+        steps.append({"number": 1, "name": "Set up job", "status": "completed", "conclusion": "success"})
+        base = {"run_id": int(gate.FAILED_PLAN_RUN), "run_attempt": 1, "head_sha": gate.FAILED_PLAN_MAIN, "status": "completed"}
+        jobs = {"total_count": 2, "jobs": [{**base, "id": int(gate.FAILED_PLAN_JOB), "name": "resolution", "conclusion": "failure", "steps": steps},
+                                           {**base, "name": "readback", "conclusion": "skipped", "steps": []}]}
+        env = {"RUNNER_TEMP": "/synthetic"}
+        with patch.object(gate.github, "_get_json", side_effect=[run, jobs]), patch.object(gate, "reviewed_source") as sources:
+            gate.verify_failed_initial_plan(item, env, "synthetic")
+            self.assertEqual(sources.call_count, 2)
+        steps[2]["conclusion"] = "success"
+        with patch.object(gate.github, "_get_json", side_effect=[run, jobs]), patch.object(gate, "reviewed_source"), self.assertRaises(ContractError):
+            gate.verify_failed_initial_plan(item, env, "synthetic")
+        steps[2]["conclusion"] = "skipped"
+        with self.assertRaises(ContractError):
+            gate.verify_failed_initial_plan({**item, "run_attempt": 2}, env, "synthetic")
+
+    def test_only_pinned_finished_provider_read_is_allowed_from_previous_main(self):
+        item = {"id": int(gate.PROVIDER_READ_RUN), "path": gate.PROVIDER_READ_WORKFLOW,
+                "event": "workflow_dispatch", "head_sha": gate.FAILED_PLAN_MAIN, "run_attempt": 1}
+        repo = {"id": gate.github.REPOSITORY_ID}
+        run = {**item, "head_branch": "main", "status": "completed", "conclusion": "failure",
+               "display_title": "Reviewed Provider source verification at " + gate.FAILED_PLAN_MAIN,
+               "repository": repo, "head_repository": repo}
+        expected = {"Reviewed Provider source verification": "success", "Trusted Provider R2 attestation": "success",
+                    "Reviewed Provider simulated source fault": "skipped", "Trusted Provider live attestation": "failure"}
+        jobs = [{"name": name, "run_id": int(gate.PROVIDER_READ_RUN), "run_attempt": 1,
+                 "head_sha": gate.FAILED_PLAN_MAIN, "status": "completed", "conclusion": conclusion}
+                for name, conclusion in expected.items()]
+        result = {"total_count": 4, "jobs": jobs}
+        with patch.object(gate.github, "_get_json", side_effect=[run, result]), patch.object(gate, "reviewed_source") as source:
+            gate.verify_fixed_provider_read(item, {"RUNNER_TEMP": "/synthetic"}, "synthetic")
+            source.assert_called_once()
+        jobs[0]["status"] = "in_progress"
+        with patch.object(gate.github, "_get_json", side_effect=[run, result]), patch.object(gate, "reviewed_source"), self.assertRaises(ContractError):
+            gate.verify_fixed_provider_read(item, {"RUNNER_TEMP": "/synthetic"}, "synthetic")
+        with self.assertRaises(ContractError):
+            gate.verify_fixed_provider_read({**item, "run_attempt": 2}, {"RUNNER_TEMP": "/synthetic"}, "synthetic")
 
     def test_fresh_readback_never_receives_writer_credentials(self):
         workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/worker-backup-no-export-resolution.yml").read_text()

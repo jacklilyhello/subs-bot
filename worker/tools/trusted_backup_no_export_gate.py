@@ -23,6 +23,17 @@ OLD_MAIN = "43ec8cc22c3f51eedde5569e8025e26f3244091a"
 OLD_CANDIDATE = "7aa685990859cffb30d47c5a6e593d969f1d0452"
 OLD_RUN, OLD_JOB, CHECKPOINT = "44164739374", "134327660057", "1bbadaa9755d1733ddd80fe12192420a"
 OLD_LOG = "6bc155ec5a2dac24b96a036bb0b884fe98ecb07ff82092f3992ca8d6983c194a"
+FAILED_PLAN_RUN = "44180277055"
+FAILED_PLAN_JOB = "134382463410"
+FAILED_PLAN_MAIN = "777bf60f8881755802a957777f55b7e3e9ff273a"
+FAILED_PLAN_HEAD = "98562f7cbef35a6847db1bd342abf689b31eacc0"
+FAILED_PLAN_SOURCES = {
+    ".github/workflows/worker-backup-no-export-resolution.yml": "8b46e11408866e5369013d2715b2339df9d37794753b6b61cdc067dade523355",
+    "worker/tools/trusted_backup_no_export_gate.py": "dec99713970c4259161ed038b1e02fa96e620bfa1d739a794cdfd162d937ba3f",
+}
+PROVIDER_READ_RUN = "44179992037"
+PROVIDER_READ_WORKFLOW = ".github/workflows/worker-provider-reviewed-head.yml"
+PROVIDER_READ_SOURCE_SHA256 = "4d46897f48702019d0f376a33f744998d1a0a5ea852058642f0034e50e4f1dbf"
 ENVIRONMENT = "subs-bot-backup-head-isolation"
 HEX32, HEX40, HEX64 = (re.compile(r"[a-f0-9]{32}"), re.compile(r"[a-f0-9]{40}"), re.compile(r"[a-f0-9]{64}"))
 DECIMAL = re.compile(r"[1-9][0-9]{0,19}")
@@ -48,14 +59,15 @@ def checkout_sha(path):
     return value
 
 
-def workflow_runs(start, end, token):
+def workflow_runs(start, end, token, *, maximum=400):
     """Complete bounded run inventory; zero omitted pages or duplicate runs."""
+    require(type(maximum) is int and 1 <= maximum <= 400)
     rows, total = [], None
-    for page in range(1, 7):
-        query = urlencode({"created": start + ".." + end, "per_page": 100, "page": page})
+    for page in range(1, (maximum + 49) // 50 + 1):
+        query = urlencode({"created": start + ".." + end, "per_page": 50, "page": page})
         result = github._get_json("/actions/runs?" + query, token)
         batch, count = result.get("workflow_runs"), result.get("total_count")
-        require(isinstance(batch, list) and len(batch) <= 100 and type(count) is int and 0 <= count <= 500
+        require(isinstance(batch, list) and len(batch) <= 50 and type(count) is int and 0 <= count <= maximum
                 and (total is None or total == count))
         total = count
         for run in batch:
@@ -69,7 +81,7 @@ def workflow_runs(start, end, token):
         if len(rows) == count:
             require(len({row["id"] for row in rows}) == len(rows))
             return sorted(rows, key=lambda row: row["id"])
-        require(len(batch) == 100)
+        require(len(batch) == 50)
     require(False, "The complete writer-window inventory exceeded its bound.")
 
 
@@ -137,10 +149,75 @@ def original_source(review, token, main, directory):
     reviewed_source(main, provider_path, review["dispatcherCodeSha256"][provider_path], token, directory)
 
 
+def verify_failed_initial_plan(item, env, token):
+    """The one proven failed pre-candidate plan never received cloud credentials."""
+    require(str(item["id"]) == FAILED_PLAN_RUN and item["path"] == WORKFLOW
+            and item["event"] == "workflow_dispatch" and item["head_sha"] == FAILED_PLAN_MAIN
+            and item["run_attempt"] == 1)
+    run = github._get_json("/actions/runs/" + FAILED_PLAN_RUN, token)
+    require(str(run.get("id")) == FAILED_PLAN_RUN and run.get("run_attempt") == 1
+            and run.get("path") in {WORKFLOW, WORKFLOW + "@main", WORKFLOW + "@refs/heads/main"}
+            and run.get("head_sha") == FAILED_PLAN_MAIN and run.get("head_branch") == "main"
+            and run.get("event") == "workflow_dispatch" and (run.get("status"), run.get("conclusion")) == ("completed", "failure")
+            and run.get("display_title") == "No-export plan at " + FAILED_PLAN_MAIN + " candidate " + FAILED_PLAN_HEAD
+            and all(isinstance(run.get(k), dict) and run[k].get("id") == github.REPOSITORY_ID for k in ("repository", "head_repository")))
+    response = github._get_json("/actions/runs/" + FAILED_PLAN_RUN + "/attempts/1/jobs?per_page=100", token)
+    jobs = response.get("jobs")
+    require(isinstance(jobs, list) and response.get("total_count") == len(jobs) == 2
+            and {job.get("name") for job in jobs} == {"resolution", "readback"})
+    resolution = next(job for job in jobs if job.get("name") == "resolution")
+    reader = next(job for job in jobs if job.get("name") == "readback")
+    require(str(resolution.get("id")) == FAILED_PLAN_JOB and str(resolution.get("run_id")) == FAILED_PLAN_RUN and resolution.get("run_attempt") == 1
+            and resolution.get("head_sha") == FAILED_PLAN_MAIN
+            and (resolution.get("status"), resolution.get("conclusion")) == ("completed", "failure")
+            and str(reader.get("run_id")) == FAILED_PLAN_RUN and reader.get("run_attempt") == 1
+            and reader.get("head_sha") == FAILED_PLAN_MAIN
+            and (reader.get("status"), reader.get("conclusion")) == ("completed", "skipped"))
+    steps = resolution.get("steps")
+    require(isinstance(steps, list) and len(steps) >= 7)
+    expected = ((2, "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1", "success"),
+                (3, "Verify no-export identity before candidate checkout", "failure"),
+                (4, "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1", "skipped"),
+                (5, "Verify exact reviewed no-export checkout", "skipped"),
+                (6, "Verify no-export test Bot identity", "skipped"),
+                (7, "Plan or apply the no-export resolution", "skipped"))
+    for number, name, conclusion in expected:
+        matches = [step for step in steps if isinstance(step, dict) and step.get("number") == number]
+        require(len(matches) == 1 and matches[0].get("name") == name
+                and (matches[0].get("status"), matches[0].get("conclusion")) == ("completed", conclusion))
+    for path, expected_sha in FAILED_PLAN_SOURCES.items():
+        reviewed_source(FAILED_PLAN_MAIN, path, expected_sha, token, env.get("RUNNER_TEMP", ""))
+
+
+def verify_fixed_provider_read(item, env, token):
+    """Recognize only the completed, reviewed read-only Provider run at old main."""
+    require(str(item["id"]) == PROVIDER_READ_RUN and item["path"] == PROVIDER_READ_WORKFLOW
+            and item["event"] == "workflow_dispatch" and item["head_sha"] == FAILED_PLAN_MAIN
+            and item["run_attempt"] == 1)
+    run = github._get_json("/actions/runs/" + PROVIDER_READ_RUN, token)
+    require(str(run.get("id")) == PROVIDER_READ_RUN and run.get("run_attempt") == 1
+            and run.get("head_sha") == FAILED_PLAN_MAIN and run.get("head_branch") == "main"
+            and run.get("event") == "workflow_dispatch" and (run.get("status"), run.get("conclusion")) == ("completed", "failure")
+            and run.get("path") in {PROVIDER_READ_WORKFLOW, PROVIDER_READ_WORKFLOW + "@main", PROVIDER_READ_WORKFLOW + "@refs/heads/main"}
+            and run.get("display_title") == "Reviewed Provider source verification at " + FAILED_PLAN_MAIN
+            and all(isinstance(run.get(k), dict) and run[k].get("id") == github.REPOSITORY_ID for k in ("repository", "head_repository")))
+    response = github._get_json("/actions/runs/" + PROVIDER_READ_RUN + "/attempts/1/jobs?per_page=100", token)
+    jobs = response.get("jobs")
+    expected = {"Reviewed Provider source verification": "success", "Trusted Provider R2 attestation": "success",
+                "Reviewed Provider simulated source fault": "skipped", "Trusted Provider live attestation": "failure"}
+    require(isinstance(jobs, list) and response.get("total_count") == len(jobs) == len(expected)
+            and {job.get("name") for job in jobs} == set(expected))
+    for job in jobs:
+        require(str(job.get("run_id")) == PROVIDER_READ_RUN and job.get("run_attempt") == 1
+                and job.get("head_sha") == FAILED_PLAN_MAIN and job.get("status") == "completed"
+                and job.get("conclusion") == expected[job["name"]])
+    reviewed_source(FAILED_PLAN_MAIN, PROVIDER_READ_WORKFLOW, PROVIDER_READ_SOURCE_SHA256, token, env.get("RUNNER_TEMP", ""))
+
+
 def live_writer_boundary(rows, env, token, candidate):
     """Reject non-reviewed writers after the fixed historical audit cutoff."""
     safe_ci = {".github/workflows/python-ci.yml", ".github/workflows/worker-ci.yml", ".github/workflows/worker-provider-fetch-ci.yml"}
-    provider_read = ".github/workflows/worker-provider-reviewed-head.yml"
+    provider_read = PROVIDER_READ_WORKFLOW
     current_run = env.get("GITHUB_RUN_ID", "")
     require(DECIMAL.fullmatch(current_run or ""))
     for item in rows:
@@ -148,6 +225,12 @@ def live_writer_boundary(rows, env, token, candidate):
         if event in {"pull_request", "push"} and path in safe_ci:
             continue
         if event == "workflow_dispatch" and path == provider_read and item["head_sha"] in {OLD_MAIN, env["GITHUB_SHA"]}:
+            continue
+        if run_id == PROVIDER_READ_RUN:
+            verify_fixed_provider_read(item, env, token)
+            continue
+        if run_id == FAILED_PLAN_RUN:
+            verify_failed_initial_plan(item, env, token)
             continue
         require(event == "workflow_dispatch" and path == WORKFLOW and item["head_sha"] == env["GITHUB_SHA"],
                 "An unreviewed run may have held a target-bucket writer.")
@@ -322,7 +405,7 @@ def validate(env):
     if action == "verify-release":
         reviewed_run(env["NO_EXPORT_RELEASE_RUN_ID"], "release", main, spec["headSha"], token, successful=False,
                      jobs_required=[("resolution", "Plan or apply the no-export resolution", False)])
-    historic = workflow_runs(review["auditWindowStart"], review["auditWindowEnd"], token)
+    historic = workflow_runs(review["auditWindowStart"], review["auditWindowEnd"], token, maximum=150)
     inventory = canonical(historic)
     inventory_sha = sha256(inventory).hexdigest()
     require(action == "audit-writers" or inventory_sha == review["writerInventorySha256"], "The reviewed writer inventory changed.")
