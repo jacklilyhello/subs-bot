@@ -16,6 +16,35 @@ from test_trusted_provider_head_gate import spec
 
 
 class AttestationTests(unittest.TestCase):
+    def test_digest_witness_retrieves_and_verifies_complete_oci_closure(self):
+        target = config(active=True)
+        build = target["build"]
+        registry = Mock(repository="fixture", mint=Mock(return_value="pull"))
+        registry.manifest.return_value = build["ociManifestSha256"]
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"RUNNER_TEMP": temporary}, clear=True), \
+                patch.object(attest.provider.publication, "_write_auth", return_value=Path(temporary) / "auth"), \
+                patch.object(attest.provider.publication, "_skopeo_env", return_value={}), \
+                patch.object(attest.subprocess, "run") as copy, \
+                patch.object(attest.provider.provider, "verify_image", return_value=(build["ociManifestSha256"], build["ociConfigSha256"])) as verify:
+            self.assertTrue(attest.verify_registry(target, registry, "digest-only"))
+            self.assertEqual(registry.manifest.call_count, 1)
+            self.assertIn("--retry-times=0", copy.call_args.args[0])
+            verify.assert_called_once()
+            verify.return_value = ("0" * 64, build["ociConfigSha256"])
+            with self.assertRaises(attest.provider.ProviderError):
+                attest.verify_registry(target, registry, "digest-only")
+            with self.assertRaises(attest.provider.ProviderError):
+                attest.verify_registry(target, registry, "unknown")
+
+    def test_default_tag_witness_still_requires_exact_tag(self):
+        target = config(active=True)
+        registry = Mock(repository="fixture", mint=Mock(return_value="pull"))
+        registry.manifest.return_value = target["build"]["ociManifestSha256"]
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"RUNNER_TEMP": temporary}, clear=True), \
+                patch.object(attest.provider.publication, "_write_auth", return_value=Path(temporary) / "auth"), \
+                patch.object(attest.provider.publication, "_config", return_value=target["build"]["ociConfigSha256"]):
+            self.assertFalse(attest.verify_registry(target, registry, "tag"))
+            self.assertEqual(registry.manifest.call_count, 2)
     def test_source_job_must_pass_trusted_gate_and_verification(self):
         rows = [{"name": name, "run_id": 101, "run_attempt": 1, "head_sha": "a" * 40,
                  "status": "completed", "conclusion": "success", "steps": [

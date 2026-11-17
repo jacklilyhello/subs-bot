@@ -59,6 +59,9 @@ class CandidateTargetTests(unittest.TestCase):
             self.assertFalse(result["destinationWritten"])
             self.assertFalse(result["productionMutation"])
             self.assertEqual(result["candidateTargetSha256"], control.digest(candidate.candidate(previous, build)))
+            value = candidate.candidate(previous, build)
+            self.assertEqual(result["approvalSha256"], control.digest({"operation": "publish-digest", "target": value}))
+            self.assertEqual(result["witnessApprovalSha256"], control.digest({"operation": "publish", "target": value}))
 
 
 if __name__ == "__main__":

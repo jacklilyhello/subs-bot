@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 import re
+import resource
+import subprocess
 import tempfile
 
 import archive_production_provider as archive
@@ -285,6 +287,40 @@ def attest_r2():
                       "simulatedArtifactUnavailability": True}, sort_keys=True))
 
 
+def verify_registry(target, registry, mode):
+    """Independently verify the immutable image; digest mode reads every blob."""
+    provider.require(mode in {"tag", "digest-only"} and target["environment"] == "rehearsal" and target["caller"] is None)
+    pull, build = registry.mint(), target["build"]
+    digest_ref = "sha256:" + build["ociManifestSha256"]
+    provider.require(registry.manifest(digest_ref, pull) == build["ociManifestSha256"])
+    with tempfile.TemporaryDirectory(prefix=".trusted-provider-registry-", dir=os.environ["RUNNER_TEMP"]) as directory:
+        scratch = Path(directory)
+        auth = provider.publication._write_auth(scratch / "pull-auth.json", pull, registry.repository)
+        image = f"{provider.publication.HOST}/{registry.repository}@{digest_ref}"
+        if mode == "tag":
+            tag = f"git-{build['revision']}-{build['ociManifestSha256'][:12]}"
+            provider.require(registry.manifest(tag, pull) == build["ociManifestSha256"]
+                             and provider.publication._config(scratch, image, auth) == build["ociConfigSha256"])
+            return False
+        output = scratch / "readback-oci.tar"
+        def limit_file():
+            resource.setrlimit(resource.RLIMIT_FSIZE, (provider.provider.MAX_IMAGE, provider.provider.MAX_IMAGE))
+        try:
+            subprocess.run([provider.publication.SKOPEO, "copy", "--quiet", "--preserve-digests", "--retry-times=0",
+                            "--src-tls-verify=true", "--src-authfile", str(auth), "docker://" + image,
+                            "oci-archive:" + str(output)], env=provider.publication._skopeo_env(scratch),
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=900, check=True, preexec_fn=limit_file)
+        except (OSError, subprocess.SubprocessError):
+            raise provider.ProviderError("The independent OCI closure could not be read.") from None
+        try:
+            manifest, config = provider.provider.verify_image(output, build["revision"])
+        except provider.provider.VERIFICATION_ERRORS:
+            raise provider.ProviderError("The independent OCI closure did not match its source.") from None
+        provider.require(manifest == build["ociManifestSha256"] and config == build["ociConfigSha256"])
+        return True
+
+
 def attest_provider():
     result, spec = checks()
     target = provider.read_config(os.environ.get("SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON", ""))
@@ -304,19 +340,12 @@ def attest_provider():
     provider.require(caller == "unbound" and provider.observe(api) == first and provider.caller_state(api, target, allow_unbound=True) == caller)
     if target.get("previous") is not None and target["activation"] is None:
         provider.unbound_upgrade(api, first)
+    mode = os.environ.get("SUBS_BOT_PROVIDER_WITNESS_REGISTRY_MODE", "")
     registry = provider.Registry(target, os.environ.get("SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN", ""))
-    pull = registry.mint()
-    build = target["build"]
-    tag = f"git-{build['revision']}-{build['ociManifestSha256'][:12]}"
-    with tempfile.TemporaryDirectory(prefix=".trusted-provider-registry-", dir=os.environ["RUNNER_TEMP"]) as directory:
-        scratch = Path(directory)
-        auth = provider.publication._write_auth(scratch / "pull-auth.json", pull, registry.repository)
-        image = f"{provider.publication.HOST}/{registry.repository}@sha256:{build['ociManifestSha256']}"
-        provider.require(registry.manifest(tag, pull) == build["ociManifestSha256"]
-                         and registry.manifest("sha256:" + build["ociManifestSha256"], pull) == build["ociManifestSha256"]
-                         and provider.publication._config(scratch, image, auth) == build["ociConfigSha256"])
+    all_blobs = verify_registry(target, registry, mode)
     print(json.dumps({**result, "status": "trusted-provider-readback", "providerMutation": False,
-                      "registryMutation": False, "simulatedArtifactUnavailability": True}, sort_keys=True))
+                      "registryMutation": False, "registryMode": mode, "allReferencedBlobsVerified": all_blobs,
+                      "simulatedArtifactUnavailability": True}, sort_keys=True))
 
 
 if __name__ == "__main__":

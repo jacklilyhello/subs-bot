@@ -49,6 +49,7 @@ def create(env):
     return {"status": "sealed-candidate-only", "mapping": approved["mapping"], "runId": approved["runId"],
             "controllerRevision": approved["revision"], "sourceTargetSha256": attestation["targetSha256"],
             "candidateTargetSha256": control.digest(value), "approvalSha256": control.digest({"operation": "publish-digest", "target": value}),
+            "witnessApprovalSha256": control.digest({"operation": "publish", "target": value}),
             "destinationKeyPinSha256": approved["keyPinSha256"], "ciphertextPayloadSha256": sha256(body).hexdigest(),
             "destinationWritten": False, "productionMutation": False}
 
