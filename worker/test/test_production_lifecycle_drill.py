@@ -99,12 +99,21 @@ class LifecycleDrillTests(unittest.TestCase):
         with self.assertRaises(contract.ContractError):
             drill.approval(formal, "deploy", REVISION, "f" * 64)
 
+    def test_reviewed_rehearsal_controller_approval_keeps_dispatcher_sha_separate(self):
+        target, _, _, _ = drill.configuration(environment())
+        dispatcher, candidate = "a" * 40, "b" * 40
+        with patch.dict(drill.os.environ, {"GITHUB_SHA": dispatcher}):
+            envelope = drill.approval(target, "pause", REVISION, "f" * 64, control_revision=candidate)
+        self.assertEqual(envelope["controlRevision"], candidate)
+        self.assertTrue(contract.approve(target, envelope, "pause", REVISION, "f" * 64, control_revision=candidate))
+
     def test_activation_approval_uses_the_baseline_bound_plan(self):
         tool = self.tool()
         target, _ = fixture()
         controller = Mock()
         controller.target = target
         controller.revision = REVISION
+        controller.control_revision = REVISION
         controller.plan_activate.return_value = {"stateSha256": "c" * 64,
             "activationBaseline": {"checkpointId": "d" * 32, "manifestSha256": "e" * 64}}
         controller.transition.return_value = {"stateSha256": "f" * 64}
@@ -120,7 +129,7 @@ class LifecycleDrillTests(unittest.TestCase):
 
     def planned_controller(self, tool):
         target, _ = fixture()
-        controller = Mock(target=target, revision=REVISION)
+        controller = Mock(target=target, revision=REVISION, control_revision=REVISION)
         controller.plan_pause.return_value = {"stateSha256": "a" * 64, "control": {"admission": "open", "workers": "run"}}
         controller.transition.return_value = {"stateSha256": "b" * 64, "control": {"admission": "closed", "workers": "run"}}
         tool.controller = controller

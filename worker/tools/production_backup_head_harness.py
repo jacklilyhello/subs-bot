@@ -14,6 +14,7 @@ import subprocess
 import prepare_isolation_artifact as artifact
 import production_backup_transaction as maintenance
 from production_lifecycle_drill import Drill, SERVICE
+from production_control import rows
 from production_release_evidence import verify_activation_baseline
 from production_storage import PrivateStore
 from production_target import canonical, parsed, require
@@ -114,7 +115,7 @@ def main(env=None):
                HEAD_VALIDATION_MANIFEST_SHA256=spec["manifestSha256"],
                DRILL_ACTION="daily-backup-watchdog" if spec["action"] == "watchdog" else "daily-backup")
     action = env.get("HEAD_VALIDATION_ACTION", "")
-    require(action in {"inspect", "genesis-plan", "genesis-initialize", "backup", "watchdog", "verify"})
+    require(action in {"inspect", "genesis-plan", "genesis-initialize", "backup", "open-backup", "watchdog", "verify"})
     tool, ctl, state = setup(env)
     store = PrivateStore(ctl.data, ctl.target.data["backupBucketName"])
     if action in {"genesis-plan", "genesis-initialize"}:
@@ -138,6 +139,42 @@ def main(env=None):
                 and re.fullmatch(r"[0-9a-f]{64}", manifest_sha or ""))
         result = verify_activation_baseline(ctl, env["SUBS_BOT_CF_BOOTSTRAP_TOKEN"], checkpoint, manifest_sha)
         require(result.get("baselineVerified") is True and result.get("manifestSha256") == manifest_sha)
+    elif action == "open-backup":
+        require(env.get("HEAD_TRUSTED_WEBHOOK_CLEANUP") == "configured-v1" and spec["fault"] == "none",
+                "Open rehearsal requires the trusted dispatcher cleanup and no injected fault.")
+        # Reuse the explicitly pinned current frozen checkpoint for the initial
+        # activation check. This avoids even temporary control mutations before
+        # the independently recoverable webhook snapshot is written.
+        tool.baseline_checkpoint = spec["sourceCheckpointId"]
+        tool.baseline_manifest_sha = spec["sourceManifestSha256"]
+        def authorization_state(controller):
+            return {"policy": rows(controller.data, controller.database, "SELECT * FROM telegram_general_policy ORDER BY bot_id"),
+                    "actors": rows(controller.data, controller.database, "SELECT * FROM telegram_general_actors ORDER BY actor_id"),
+                    "groups": rows(controller.data, controller.database, "SELECT * FROM telegram_general_groups ORDER BY chat_id")}
+        def run_backup(controller, _reply_anchors, _fixture_base):
+            before_auth = authorization_state(controller)
+            initial_checkpoint, initial_manifest = tool.baseline_checkpoint, tool.baseline_manifest_sha
+            tool.baseline_checkpoint, tool.baseline_manifest_sha = "", ""
+            try:
+                tool.daily_backup()
+            finally:
+                tool.baseline_checkpoint, tool.baseline_manifest_sha = initial_checkpoint, initial_manifest
+            after = tool.controller.inspect()
+            require(after["control"]["admission"] == "open" and after["control"]["workers"] == "run"
+                    and not any(after["terminal"].get(key, 0) for key in
+                                ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates"))
+                    and authorization_state(tool.controller) == before_auth,
+                    "The backup did not restore admission or preserve the exact authorization state.")
+            observed = tool.report.get("backupMaintenance")
+            require(isinstance(observed, dict) and isinstance(observed.get("baseline"), dict)
+                    and observed.get("pauseSeconds", 0) > 0)
+            tool.report["dailyBackupAcceptance"] = {"baseline": observed["baseline"],
+                "pauseSeconds": observed["pauseSeconds"], "pauseLimitExceeded": observed["pauseLimitExceeded"],
+                "admissionRestored": True, "authorizationUnchanged": True}
+            tool.report["openWindowStartingBaseline"] = {"checkpointId": initial_checkpoint, "manifestSha256": initial_manifest}
+        tool.exercise(provided_controller=ctl, verify_extra=run_backup, external_webhook_cleanup=True)
+        result = tool.report
+        result["status"] = "awaiting-trusted-webhook-restoration"
     else:
         # Each invocation re-resolves PR head and active source. The same
         # implementation and private transaction engine are used by rehearsal.
@@ -148,7 +185,7 @@ def main(env=None):
         result = tool.report
     tool.guard()
     result.update(headRevision=env["HEAD_VALIDATION_SHA"], dispatcherMainRevision=env["GITHUB_SHA"], targetSha256=ctl.target.digest,
-                  environment="rehearsal", productionMutated=False, webhookTouched=False,
+                  environment="rehearsal", productionMutated=False, webhookTouched=action == "open-backup",
                   runId=env["GITHUB_RUN_ID"], runAttempt=env["GITHUB_RUN_ATTEMPT"])
     output = Path(env["RUNNER_TEMP"]) / "production-backup-head-result.json"
     with output.open("xb") as stream:

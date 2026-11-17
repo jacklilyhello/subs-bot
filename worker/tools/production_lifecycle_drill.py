@@ -91,11 +91,13 @@ def configuration(env):
     return draft, secrets, previous, original
 
 
-def approval(target, action, revision, predecessor):
+def approval(target, action, revision, predecessor, *, control_revision=None):
     require(target.environment == "rehearsal" and target.data["workerName"] == SERVICE,
             "Automatic approvals are restricted to the dedicated rehearsal target.")
+    control_revision = os.environ.get("GITHUB_SHA", revision) if control_revision is None else control_revision
+    require(matches(r"[0-9a-f]{40}", control_revision), "The exact rehearsal controller revision is required.")
     return {"schemaVersion": 1, "environment": "rehearsal", "targetSha256": target.digest,
-        "configurationSha256": target.configuration_digest, "controlRevision": os.environ.get("GITHUB_SHA", revision),
+        "configurationSha256": target.configuration_digest, "controlRevision": control_revision,
         "revision": revision, "action": action, "stateSha256": predecessor,
         "authorization": "approve " + action + " for " + SERVICE}
 
@@ -106,7 +108,7 @@ def resume_failed_backup(ctl, api, source, recovery_journal, *, initial, frozen,
     require(ctl.target.environment == "rehearsal" and ctl.target.data["workerName"] == SERVICE)
     plan = resume.plan_failed_backup(ctl, api, source, recovery_journal, initial=initial, frozen=frozen,
                                      fingerprint=fingerprint, session=session)
-    envelope = approval(ctl.target, plan["approvalAction"], ctl.revision, plan["stateSha256"])
+    envelope = approval(ctl.target, plan["approvalAction"], ctl.revision, plan["stateSha256"], control_revision=ctl.control_revision)
     return resume.resume_failed_backup(ctl, api, source, recovery_journal, initial=initial, frozen=frozen,
         fingerprint=fingerprint, session=session, approval_envelope=envelope, record_intent=record_intent)
 
@@ -115,7 +117,7 @@ def resume_aborted_drain(ctl, *, initial, paused, session, record_intent):
     import production_backup_resume as resume
     require(ctl.target.environment == "rehearsal" and ctl.target.data["workerName"] == SERVICE)
     plan = resume.plan_aborted_drain(ctl, initial=initial, paused=paused, session=session)
-    envelope = approval(ctl.target, plan["approvalAction"], ctl.revision, plan["stateSha256"])
+    envelope = approval(ctl.target, plan["approvalAction"], ctl.revision, plan["stateSha256"], control_revision=ctl.control_revision)
     return resume.resume_aborted_drain(ctl, initial=initial, paused=paused, session=session,
                                        approval_envelope=envelope, record_intent=record_intent)
 
@@ -342,7 +344,8 @@ class Drill:
             self.report.update(state=before, ciProof=self.proof)
             self.save(stage + "-intent", {"action": action, "attempt": attempt, "observed": before})
             try:
-                after = ctl.transition(action, approval(ctl.target, action, ctl.revision, before["stateSha256"]), before["stateSha256"])
+                after = ctl.transition(action, approval(ctl.target, action, ctl.revision, before["stateSha256"],
+                                       control_revision=ctl.control_revision), before["stateSha256"])
             except StalePredecessorError:
                 self.save(stage + "-stale", {"action": action, "attempt": attempt, "transitionPerformed": False})
                 if attempt == 3:
@@ -611,7 +614,11 @@ class Drill:
             self.report["baselineReused"] = bool(self.baseline_checkpoint)
         self.save(stage_prefix + ("-reused-verified" if self.baseline_checkpoint else "-verified"), self.report[key])
 
-    def exercise(self, *, provided_controller=None, verify_extra=None):
+    def exercise(self, *, provided_controller=None, verify_extra=None, external_webhook_cleanup=False):
+        if external_webhook_cleanup:
+            require(self.env.get("HEAD_TRUSTED_WEBHOOK_CLEANUP") == "configured-v1"
+                    and getattr(self, "backup_evidence_workflow", "") == "worker-backup-reviewed-head.yml",
+                    "Only the trusted dispatcher may own external webhook cleanup.")
         if provided_controller is None:
             bundle, manifest = self.prepare(active=True)
             ctl = self.bind(self.registration(), bundle, manifest)
@@ -642,17 +649,32 @@ class Drill:
         old_settings = webhook_settings(before_hook)
         require(old_settings["url"] == ORIGINAL_ORIGIN + "/telegram/webhook",
                 "Recover the previous test webhook before opening another rehearsal window.")
+        if external_webhook_cleanup:
+            require(type(before_hook.get("pending_update_count")) is int and before_hook["pending_update_count"] == 0,
+                    "The original test Bot has pending Telegram updates; preserve them and do not switch its webhook.")
         webhook_plan = ctl.plan_webhook()
         snapshot = {"schemaVersion": 1, "draftSha256": self.draft.digest, "botId": self.previous["botId"],
             "oldWebhookSecret": self.previous["webhookSecret"], "webhookInfo": before_hook,
             "revision": self.revision, "runId": self.run, "runAttempt": self.attempt}
-        self.store.put(self.snapshot_key(), canonical(snapshot))
-        self.report.update(webhookCheckpoint=self.run + "/" + self.attempt, webhookSnapshotSha256=digest(snapshot))
+        snapshot_raw = canonical(snapshot)
+        self.store.put(self.snapshot_key(), snapshot_raw)
+        snapshot_sha = sha256(snapshot_raw).hexdigest()
+        self.report.update(webhookCheckpoint=self.run + "/" + self.attempt, webhookSnapshotSha256=snapshot_sha)
+        if external_webhook_cleanup:
+            # This public-safe pin is written before any webhook mutation. The
+            # trusted dispatcher independently reads the original private bytes.
+            pin = {"version": 1, "runId": self.run, "runAttempt": self.attempt, "snapshotSha256": snapshot_sha,
+                   "controllerRevision": self.revision, "dispatcherRevision": self.env["GITHUB_SHA"],
+                   "targetSha256": ctl.target.digest}
+            path = Path(self.env["RUNNER_TEMP"]) / "backup-webhook-snapshot-pin.json"
+            with native.private_file(path) as stream:
+                stream.write(canonical(pin))
         changed = False
         primary_error = None
         phase = "configure-webhook"
         try:
-            configured = ctl.configure_webhook(approval(ctl.target, "webhook", ctl.revision, webhook_plan["stateSha256"]),
+            configured = ctl.configure_webhook(approval(ctl.target, "webhook", ctl.revision, webhook_plan["stateSha256"],
+                                                       control_revision=ctl.control_revision),
                 webhook_plan["stateSha256"], webhook_plan["webhook"]["settingsSha256"])
             changed = True
             self.save("webhook-configured", configured)
@@ -711,6 +733,24 @@ class Drill:
                 self.report.update(humanWindowOpened=True, humanAcceptance="requires-independent-IAB-evidence")
                 print(json.dumps(window, sort_keys=True), flush=True)
                 sleep(self.human_window)
+            if external_webhook_cleanup:
+                # The trusted dispatcher, not the candidate, performs the
+                # subsequent pause/drain/freeze and webhook restoration.
+                self.quiet()
+                ready = self.controller.inspect()
+                require(ready["control"]["admission"] == "open" and ready["control"]["workers"] == "run"
+                        and not any(ready["work"].values())
+                        and not any(ready["terminal"].get(key, 0) for key in
+                                    ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates")))
+                final_states = rows(ctl.data, ctl.database, f"SELECT inbox.update_id,outbox.state,outbox.attempts FROM telegram_inbox AS inbox "
+                    f"JOIN telegram_outbox AS outbox USING(receipt_id) WHERE inbox.update_id IN ({base + 1},{base + 3}) ORDER BY inbox.update_id")
+                require(final_states == states, "A completed synthetic reply was executed again during backup.")
+                self.save("open-backup-ready-for-cleanup", {"state": ready})
+                self.report.update(status="awaiting-trusted-cleanup", state=ready, ciProof=self.proof,
+                                   positiveSent=len(states), duplicateBusinessReceipts=0,
+                                   wrongSecretRejected=True, conflictingPayloadRejected=True, memberAdminDenied=True,
+                                   closedAdmissionRejected=True)
+                return
             phase = "pause-and-freeze"
             self.transition("pause")
             paused = update_payload(base + 4, member, reply_anchors["member"], "/help", now - 5)
@@ -732,12 +772,18 @@ class Drill:
             self.report["primaryFailure"] = safe_failure(error, phase)
             raise
         finally:
-            try:
-                self.cleanup_exercise(changed)
-            except Exception:
-                if primary_error is not None:
-                    raise primary_error from None
-                raise
+            if external_webhook_cleanup:
+                # The independently trusted dispatcher owns webhook recovery.
+                # An unsuccessful candidate never guesses whether an earlier
+                # control mutation completed or issues another control write.
+                self.report["webhookRecovery"] = {"status": "pending-trusted-dispatcher"}
+            else:
+                try:
+                    self.cleanup_exercise(changed)
+                except Exception:
+                    if primary_error is not None:
+                        raise primary_error from None
+                    raise
 
     def cleanup_exercise(self, changed):
         # Always attempt restoration, including a lost setWebhook response or a
@@ -911,7 +957,7 @@ class Drill:
                         and planned["configurationSha256"] == before["configurationSha256"])
                 journal.append("pause-intent", {"stateSha256": planned["stateSha256"]}, int(time.time()))
                 pause_started = time.monotonic()
-                paused = ctl.transition("pause", approval(ctl.target, "pause", ctl.revision, planned["stateSha256"]),
+                paused = ctl.transition("pause", approval(ctl.target, "pause", ctl.revision, planned["stateSha256"], control_revision=ctl.control_revision),
                                         planned["stateSha256"])
                 journal.append("paused", {"control": paused["control"]}, int(time.time()))
                 remaining = pause_limit - (time.monotonic() - pause_started)
@@ -920,7 +966,7 @@ class Drill:
                 require(time.monotonic() - pause_started < pause_limit, "The pause window expired before freeze.")
                 frozen_before = ctl.inspect()
                 journal.append("freeze-intent", {"stateSha256": frozen_before["stateSha256"]}, int(time.time()))
-                frozen = ctl.transition("freeze", approval(ctl.target, "freeze", ctl.revision, frozen_before["stateSha256"]),
+                frozen = ctl.transition("freeze", approval(ctl.target, "freeze", ctl.revision, frozen_before["stateSha256"], control_revision=ctl.control_revision),
                                         frozen_before["stateSha256"])
             else:
                 frozen = ctl.inspect()
@@ -947,7 +993,7 @@ class Drill:
                 return
             plan = ctl.plan_activate()
             journal.append("resume-intent", {"stateSha256": plan["stateSha256"]}, int(time.time()))
-            resumed = ctl.transition("activate", approval(ctl.target, "activate", ctl.revision, plan["stateSha256"]),
+            resumed = ctl.transition("activate", approval(ctl.target, "activate", ctl.revision, plan["stateSha256"], control_revision=ctl.control_revision),
                                      plan["stateSha256"])
             elapsed = time.monotonic() - pause_started
             journal.append("resumed", {"control": resumed["control"], "pauseSeconds": round(elapsed, 3),
@@ -1112,7 +1158,7 @@ class Drill:
             ctl.activation_baseline_checker = lambda: verify_activation_baseline(ctl, token, checkpoint, manifest_sha)
             plan = ctl.plan_activate()
             journal.append("resume-intent", {"stateSha256": plan["stateSha256"], "watchdogRevision": self.revision}, int(time.time()))
-            resumed = ctl.transition("activate", approval(ctl.target, "activate", ctl.revision, plan["stateSha256"]),
+            resumed = ctl.transition("activate", approval(ctl.target, "activate", ctl.revision, plan["stateSha256"], control_revision=ctl.control_revision),
                                      plan["stateSha256"])
             resume_kind = "verified-baseline-resumed"
         else:
