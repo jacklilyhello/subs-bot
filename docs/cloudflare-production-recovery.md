@@ -2,6 +2,14 @@
 
 `worker/tools/production_recovery.py` 和 `production_recovery_cli.py` 是独立的生产控制实现，使用与部署控制相同的 `production_target.py` 配置契约。`worker-production-recovery.yml` 在 GitHub 托管 runner 执行。生产与明确登记的 rehearsal 运行相同的代码；不修改历史隔离恢复脚本的账户、资源或源版本保护，也不自动采用已有 dev 目标。
 
+恢复 Environment 必须分别配置 `SUBS_BOT_CF_DATA_READ_TOKEN`、`SUBS_BOT_CF_DATA_TOKEN`（D1 写）、`SUBS_BOT_CF_WORKER_READ_TOKEN`、`SUBS_BOT_CF_R2_METADATA_READ_TOKEN` 及按准确桶登记的 `SUBS_BOT_SCOPED_R2_READ_JSON`／`SUBS_BOT_SCOPED_R2_WRITE_JSON`。仅创建数据库、导出及导入步骤得到 D1 写凭据；Worker 始终只读，`inspect`／`verify-backup` 不注入对象写凭据。其余恢复步骤仍可能追加私有 journal，不能因为 D1 只读就称整个步骤没有写入。缺失的只读配置不回退到写凭据。
+
+`create-objects` 另需经批准的 `SUBS_BOT_CF_R2_CREATE_TOKEN`，仅向该步骤注入；D1、对象 S3 或 metadata read 凭据不能替代创建权限。隔离 native 恢复的两个建桶动作使用相同规则。创建新目标仍受原始 intent、精确名称、独立身份读回和无消费者检查约束；新桶在任何对象读写前必须加入对应的准确桶 S3 凭据配置。该配置项不构成创建资源或扩大平台权限的授权。
+
+已登记 control-drill 的真实恢复可在同一个工作流显式选择 `environment=rehearsal`，提供 `rehearsal_registration_sha256`，并把准确恢复 contract 配入该隔离 Environment 的 `SUBS_BOT_RECOVERY_JSON`。这一路径从原私有登记加载唯一演练目标，复用现有隔离 Bot／签名配置，使用相同恢复引擎及全部源、前态、日志和独立目标检查；没有重新构建或修改旧源。自动生成的动作批准仅适用于既有 `subs-bot-cf-control-drill-01`，不能用于 production。选择此模式时不接收另一份 `SUBS_BOT_TARGET_JSON`、`SUBS_BOT_CONTROL_SECRETS` 或批准 Secret。未提供登记摘要时沿用原明确目标／外部批准模式；不存在默认 dev 回退。新资源创建仍需本次准确目标的外部授权。
+
+输入的登记摘要必须同时等于受保护 Environment 的 `SUBS_BOT_REHEARSAL_REGISTRATION_SHA256`；调用者自给摘要不足以替换登记。源现场仍与正常 baseline 完全一致时，可以沿该 baseline 已 captured 的原 journal 接续创建独立目标及恢复。创建前也会重核完整源库和全部引用对象／metadata；现场已变化即停止。若存在后续写入，必须另行封存 G1，再使用独立 recovery session，不能伪造 G1 或把旧 baseline 覆盖回源。
+
 工具完成备份和独立目标恢复，不授权切换正式消费者。首次上线仍须填写真实正式配置并另行批准，不能通过选择 workflow 的 `production` 选项取得生产授权。
 
 ## 运行前配置
