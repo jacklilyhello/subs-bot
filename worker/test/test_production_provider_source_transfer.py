@@ -21,6 +21,25 @@ import test_prepare_provider_artifact as artifact_fixture
 
 
 class SourceTransferTests(unittest.TestCase):
+    def test_reviewed_dispatch_keeps_candidate_and_main_separate(self):
+        main, head = "a" * 40, "b" * 40
+        refs = [{"fixture": "pinned"}]
+        spec = {"version": 1, "pr": "290", "headSha": head, "providerCiRunId": "101", "approvalSha256": "1" * 64,
+                "archiveRefs": refs, "simulateActionsUnavailable": True}
+        env = {"GITHUB_WORKFLOW_REF": f"{control.github.REPOSITORY}/{transfer.REVIEWED_WORKFLOW_PATH}@{control.github.MAIN_REF}",
+               "PROVIDER_HEAD_VALIDATION_JSON": json.dumps(spec), "PROVIDER_HEAD_REVIEWED_SHA": head,
+               "PROVIDER_HEAD_TRUSTED_MAIN_SHA": main, "SUBS_BOT_PROVIDER_CI_RUN_ID": "101",
+               "SUBS_BOT_PROVIDER_DIGEST_APPROVAL": "1" * 64, "SUBS_BOT_PROVIDER_SIMULATE_ARTIFACT_UNAVAILABLE": "1",
+               "SUBS_BOT_PROVIDER_ARCHIVE_REFS": json.dumps(refs), "SUBS_BOT_PROVIDER_TRUSTED_ARCHIVE_REFS_JSON": json.dumps(refs)}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(transfer.execution_identity(main), {"workflowPath": transfer.REVIEWED_WORKFLOW_PATH,
+                                                                  "candidateRevision": head, "reviewedPr": "290"})
+            for change in ({"PROVIDER_HEAD_REVIEWED_SHA": main}, {"PROVIDER_HEAD_TRUSTED_MAIN_SHA": head},
+                           {"SUBS_BOT_PROVIDER_DIGEST_APPROVAL": "2" * 64},
+                           {"SUBS_BOT_PROVIDER_TRUSTED_ARCHIVE_REFS_JSON": "[]"}):
+                with self.subTest(change=change), patch.dict(os.environ, change), self.assertRaises(control.ProviderError):
+                    transfer.execution_identity(main)
+
     def test_exact_target_approval_and_unbound_caller_are_required(self):
         target = config(active=True)
         env = {"SUBS_BOT_PROVIDER_CI_RUN_ID": target["build"]["runId"], "SUBS_BOT_PROVIDER_DURABLE_REQUIRED": "1",

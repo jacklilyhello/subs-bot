@@ -15,6 +15,7 @@ from urllib.parse import quote
 from urllib.request import Request
 
 import production_provider as control
+import provider_source_transfer as transfer
 
 
 def tag_snapshot(registry, credentials):
@@ -117,7 +118,8 @@ def intent(target, refs, state, run_id, revision):
             "targetSha256": control.digest(target), "archiveRefsSha256": control.digest(refs),
             "approvalSha256": control.digest({"operation": "publish-digest", "target": target}),
             "resolutionLedgerSha256": control.digest(resolutions),
-            "simulatedActionsUnavailable": simulation == "1", "prestate": state, "status": "started-unknown"}
+            "simulatedActionsUnavailable": simulation == "1", "prestate": state, "status": "started-unknown",
+            **transfer.execution_identity(revision)}
 
 
 def publish_once(target, refs, archive, prior_intent, verified_intent_sha, worker_read, registry_read, registry_write):

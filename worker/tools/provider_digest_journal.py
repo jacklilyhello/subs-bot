@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+from urllib.parse import urlencode
 
 import archive_production_provider as sealed
 import production_provider as control
@@ -42,9 +43,16 @@ def ledger():
     control.require(len(value) <= MAX_HISTORY)
     for run_id, row in value.items():
         control.require(control.match(control.provider.DECIMAL, run_id) and isinstance(row, dict)
-                        and set(row) == {"intentSha256", "completionSha256", "targetSha256", "controllerRevision", "readbackJobId", "readbackSha256"}
+                        and set(row) == {"intentSha256", "completionSha256", "targetSha256", "controllerRevision", "readbackJobId", "readbackSha256",
+                                         "workflowPath", "candidateRevision", "reviewedPr"}
                         and all(control.match(control.provider.HEX, row[k]) for k in ("intentSha256", "completionSha256", "targetSha256", "readbackSha256"))
                         and control.match(control.provider.REVISION, row["controllerRevision"])
+                        and control.match(control.provider.REVISION, row["candidateRevision"])
+                        and row["workflowPath"] in {transfer.WORKFLOW_PATH, transfer.REVIEWED_WORKFLOW_PATH}
+                        and ((row["workflowPath"] == transfer.WORKFLOW_PATH and row["reviewedPr"] is None
+                              and row["candidateRevision"] == row["controllerRevision"])
+                             or (row["workflowPath"] == transfer.REVIEWED_WORKFLOW_PATH
+                                 and control.match(control.provider.DECIMAL, row["reviewedPr"])))
                         and control.match(control.provider.DECIMAL, row["readbackJobId"]))
     return value
 
@@ -62,11 +70,12 @@ def readonly_resolutions():
     control.require(len(value) <= MAX_HISTORY)
     for run_id, row in value.items():
         control.require(control.match(control.provider.DECIMAL, run_id) and isinstance(row, dict)
-                        and set(row) == {"controllerRevision", "intentJobId", "publishJobId", "completionJobId", "readbackSha256",
+                        and set(row) == {"controllerRevision", "workflowPath", "intentJobId", "publishJobId", "completionJobId", "readbackSha256",
                                          "reconcileRunId", "reconcileRunAttempt", "reconcileRevision"}
                         and all(control.match(control.provider.DECIMAL, row[k]) for k in
                                 ("intentJobId", "publishJobId", "completionJobId", "reconcileRunId", "reconcileRunAttempt"))
                         and all(control.match(control.provider.REVISION, row[k]) for k in ("controllerRevision", "reconcileRevision"))
+                        and row["workflowPath"] in {transfer.WORKFLOW_PATH, transfer.REVIEWED_WORKFLOW_PATH}
                         and control.match(control.provider.HEX, row["readbackSha256"]))
     return value
 
@@ -77,8 +86,9 @@ def inspect_readonly_run(reader, run_id, allowed):
     token = control.github._github_token()
     run = control.github._get_json(f"/actions/runs/{run_id}/attempts/1", token)
     revision = run.get("head_sha")
+    path = run.get("path", "").removesuffix("@refs/heads/main").removesuffix("@main")
     control.require(str(run.get("id")) == run_id and run.get("run_attempt") == 1 and revision in allowed
-                    and run.get("path") in (transfer.WORKFLOW_PATH, transfer.WORKFLOW_PATH + "@main", transfer.WORKFLOW_PATH + "@refs/heads/main")
+                    and path in {transfer.WORKFLOW_PATH, transfer.REVIEWED_WORKFLOW_PATH}
                     and run.get("head_branch") == "main" and run.get("event") == "workflow_dispatch" and run.get("status") == "completed"
                     and run.get("conclusion") in {"success", "failure", "cancelled", "timed_out", "skipped"}
                     and all(isinstance(run.get(k), dict) and run[k].get("id") == control.github.REPOSITORY_ID
@@ -106,7 +116,7 @@ def inspect_readonly_run(reader, run_id, allowed):
     control.require(durable.list_private_keys(reader, prefix) == [],
                     "An executed or occupied digest attempt cannot be resolved as read-only.")
     return {"version": 1, "kind": "isolated-provider-digest-readonly-resolution", "classification": "intent-job-skipped-empty-prefix",
-            "runId": run_id, "controllerRevision": revision, "runConclusion": run["conclusion"],
+            "runId": run_id, "controllerRevision": revision, "workflowPath": path, "runConclusion": run["conclusion"],
             "intentJobId": writes["intent-write"], "publishJobId": writes["publish"], "completionJobId": writes["completion-write"],
             "bucketSha256": control.digest(reader.target), "objectCount": 0}
 
@@ -114,7 +124,7 @@ def inspect_readonly_run(reader, run_id, allowed):
 def verify_readonly_resolution(reader, run_id, pin, allowed):
     control.require(pin["controllerRevision"] in allowed and pin["reconcileRevision"] in allowed)
     report = inspect_readonly_run(reader, run_id, allowed)
-    control.require(report["controllerRevision"] == pin["controllerRevision"]
+    control.require(report["controllerRevision"] == pin["controllerRevision"] and report["workflowPath"] == pin["workflowPath"]
                     and all(report[k] == pin[k] for k in ("intentJobId", "publishJobId", "completionJobId"))
                     and control.digest(report) == pin["readbackSha256"])
     token, reconciliation, attempt = control.github._github_token(), pin["reconcileRunId"], pin["reconcileRunAttempt"]
@@ -141,7 +151,8 @@ def verify_readonly_resolution(reader, run_id, pin, allowed):
 
 def projection(run_id, source, completion_sha, job_id):
     return {"version": 1, "kind": "isolated-provider-digest-readback", "runId": run_id, "runAttempt": "1",
-            "controllerRevision": source["controllerRevision"], "targetSha256": source["targetSha256"],
+            "controllerRevision": source["controllerRevision"], "candidateRevision": source["candidateRevision"],
+            "workflowPath": source["workflowPath"], "reviewedPr": source["reviewedPr"], "targetSha256": source["targetSha256"],
             "intentSha256": control.digest(source), "completionSha256": completion_sha, "readbackJobId": job_id}
 
 
@@ -187,7 +198,8 @@ def inventory(reader, *, current=None):
         done = control.github._parse_object(raw_done, sealed.ERROR)
         control.require(raw_intent == control.canonical(original) and raw_done == control.canonical(done)
                         and set(original) == {"version", "kind", "operation", "runId", "runAttempt", "controllerRevision", "targetSha256",
-                                              "archiveRefsSha256", "approvalSha256", "resolutionLedgerSha256", "simulatedActionsUnavailable", "prestate", "status"}
+                                              "archiveRefsSha256", "approvalSha256", "resolutionLedgerSha256", "simulatedActionsUnavailable", "prestate", "status",
+                                              "workflowPath", "candidateRevision", "reviewedPr"}
                         and type(original["version"]) is int and original["version"] == 1 and original["operation"] == "publish-digest"
                         and type(original["simulatedActionsUnavailable"]) is bool
                         and all(control.match(control.provider.HEX, original[k]) for k in ("targetSha256", "archiveRefsSha256", "approvalSha256", "resolutionLedgerSha256"))
@@ -197,11 +209,13 @@ def inventory(reader, *, current=None):
                         and original["prestate"]["manifestSha256"] is None
                         and original.get("runId") == run_id and original.get("runAttempt") == "1"
                         and original.get("kind") == "isolated-provider-digest-intent" and original.get("status") == "started-unknown"
-                        and original.get("controllerRevision") == pin["controllerRevision"] and original.get("targetSha256") == pin["targetSha256"]
-                        and set(done) == {"version", "kind", "runId", "runAttempt", "controllerRevision", "intentSha256", "response", "verification"}
+                        and all(original.get(key) == pin[key] for key in ("controllerRevision", "candidateRevision", "reviewedPr", "workflowPath"))
+                        and original.get("targetSha256") == pin["targetSha256"]
+                        and set(done) == {"version", "kind", "runId", "runAttempt", "controllerRevision", "candidateRevision", "reviewedPr", "workflowPath", "intentSha256", "response", "verification"}
                         and type(done["version"]) is int and done["version"] == 1 and done["runAttempt"] == "1"
                         and done.get("kind") == "isolated-provider-digest-completion" and done.get("intentSha256") == pin["intentSha256"]
-                        and done.get("runId") == run_id and done.get("controllerRevision") == pin["controllerRevision"]
+                        and done.get("runId") == run_id and all(done.get(key) == pin[key] for key in
+                            ("controllerRevision", "candidateRevision", "reviewedPr", "workflowPath"))
                         and isinstance(done["response"], dict) and set(done["response"]) == {"status", "manifestSha256", "configSha256", "prestateSha256", "providerMutation", "registryMutation"}
                         and done["response"]["status"] == "published-digest" and done["response"]["providerMutation"] is False
                         and done["response"]["registryMutation"] is True and done["response"]["prestateSha256"] == control.digest(original["prestate"])
@@ -216,40 +230,66 @@ def inventory(reader, *, current=None):
     return grouped
 
 
+def workflow_has_main_history(path, revision, token):
+    control.require(path in {transfer.WORKFLOW_PATH, transfer.REVIEWED_WORKFLOW_PATH}
+                    and control.match(control.provider.REVISION, revision))
+    query = urlencode({"sha": revision, "path": path, "per_page": 1})
+    request = control.github._api_request("/commits?" + query, token)
+    with control.github._OPENER.open(request, timeout=20) as response:
+        commits = json.loads(control.github._bounded_read(response, control.github._MAX_JSON),
+                             object_pairs_hook=control.github._unique_json_object)
+    control.require(isinstance(commits, list) and len(commits) <= 1 and all(isinstance(row, dict) for row in commits))
+    return bool(commits)
+
+
 def history(registered, reader):
     token, current, allowed = control.github._github_token(), os.environ["GITHUB_RUN_ID"], controllers()
-    rows = []
-    for page in range(1, 11):
-        response = control.github._get_json(f"/actions/workflows/{transfer.WORKFLOW_PATH.rsplit('/', 1)[-1]}/runs?per_page=100&page={page}", token)
-        batch = response.get("workflow_runs")
-        control.require(isinstance(batch, list) and len(batch) <= 100 and type(response.get("total_count")) is int
-                        and 0 <= response["total_count"] <= 1000)
-        rows.extend(batch)
-        if len(batch) < 100:
-            break
-    else:
-        raise control.ProviderError("Isolated digest history exceeds its safe bound.")
-    control.require(len(rows) == response["total_count"] and len({str(r.get("id")) for r in rows if isinstance(r, dict)}) == len(rows))
     resolutions = readonly_resolutions()
+    rows = []
+    for path in (transfer.WORKFLOW_PATH, transfer.REVIEWED_WORKFLOW_PATH):
+        # A workflow never present in main cannot have a main dispatch. Verify
+        # that fact explicitly; an unavailable API or a deleted old workflow is
+        # not silently interpreted as empty history.
+        if not workflow_has_main_history(path, os.environ["GITHUB_SHA"], token):
+            control.require(path != transfer.workflow_path() and not any(pin["workflowPath"] == path for pin in registered.values())
+                            and not any(pin["workflowPath"] == path for pin in resolutions.values()))
+            continue
+        workflow_rows = []
+        for page in range(1, 11):
+            response = control.github._get_json(f"/actions/workflows/{path.rsplit('/', 1)[-1]}/runs?per_page=100&page={page}", token)
+            batch = response.get("workflow_runs")
+            control.require(isinstance(batch, list) and len(batch) <= 100 and type(response.get("total_count")) is int
+                            and 0 <= response["total_count"] <= 1000)
+            workflow_rows.extend(batch)
+            if len(batch) < 100:
+                break
+        else:
+            raise control.ProviderError("Isolated digest history exceeds its safe bound.")
+        control.require(len(workflow_rows) == response["total_count"])
+        rows.extend(workflow_rows)
+    control.require(len({str(r.get("id")) for r in rows if isinstance(r, dict)}) == len(rows))
     control.require(not set(resolutions) & set(registered) and current not in resolutions)
     seen, resolved, current_seen = set(), set(), False
     for row in rows:
-        control.require(isinstance(row, dict) and row.get("path") in (transfer.WORKFLOW_PATH, transfer.WORKFLOW_PATH + "@main", transfer.WORKFLOW_PATH + "@refs/heads/main")
+        path = row.get("path", "").removesuffix("@refs/heads/main").removesuffix("@main") if isinstance(row, dict) else ""
+        control.require(isinstance(row, dict) and path in {transfer.WORKFLOW_PATH, transfer.REVIEWED_WORKFLOW_PATH}
                         and row.get("head_sha") in allowed and row.get("head_branch") == "main" and row.get("event") == "workflow_dispatch"
                         and row.get("run_attempt") == 1 and all(isinstance(row.get(k), dict) and row[k].get("id") == control.github.REPOSITORY_ID
                                                                 for k in ("repository", "head_repository")))
+        durable.source_ancestor({"revision": row["head_sha"]}, token)
         run_id = str(row.get("id"))
         if run_id == current:
-            control.require(not current_seen and row.get("head_sha") == os.environ["GITHUB_SHA"])
+            control.require(not current_seen and path == transfer.workflow_path() and row.get("head_sha") == os.environ["GITHUB_SHA"])
             current_seen = True
         else:
             if run_id in resolutions:
                 control.require(run_id not in resolved and row.get("status") == "completed"
-                                and row.get("head_sha") == resolutions[run_id]["controllerRevision"])
+                                and path == resolutions[run_id]["workflowPath"] and row.get("head_sha") == resolutions[run_id]["controllerRevision"])
                 verify_readonly_resolution(reader, run_id, resolutions[run_id], allowed)
                 resolved.add(run_id)
                 continue
-            control.require(run_id in registered and run_id not in seen and row.get("head_sha") == registered[run_id]["controllerRevision"]
+            control.require(run_id in registered and run_id not in seen and path == registered[run_id]["workflowPath"]
+                            and row.get("head_sha") == registered[run_id]["controllerRevision"]
                             and (row.get("status"), row.get("conclusion")) == ("completed", "success"),
                             "An earlier isolated digest attempt is unresolved; do not retry it.")
             seen.add(run_id)
@@ -358,7 +398,8 @@ def completion_value(value, target):
                                           "dependencySha256": value["prestate"]["dependencySha256"],
                                           "tagsSha256": value["prestate"]["tagsSha256"]})
     return {"version": 1, "kind": "isolated-provider-digest-completion", "runId": value["runId"], "runAttempt": "1",
-            "controllerRevision": value["controllerRevision"], "intentSha256": control.digest(value),
+            "controllerRevision": value["controllerRevision"], "candidateRevision": value["candidateRevision"],
+            "reviewedPr": value["reviewedPr"], "workflowPath": value["workflowPath"], "intentSha256": control.digest(value),
             "response": response, "verification": verify_result}
 
 
@@ -397,7 +438,8 @@ def independent_readback():
                     and os.environ.get("SUBS_BOT_PROVIDER_DIGEST_COMPLETION_SHA256") == sha256(raw_done).hexdigest())
     job_id = workflow_job(run_id, revision, JOBS["readback"], running=True)
     result = {"intentSha256": sha256(raw_intent).hexdigest(), "completionSha256": sha256(raw_done).hexdigest(),
-              "targetSha256": value["targetSha256"], "controllerRevision": revision, "readbackJobId": job_id}
+              "targetSha256": value["targetSha256"], "controllerRevision": revision, "readbackJobId": job_id,
+              "candidateRevision": value["candidateRevision"], "reviewedPr": value["reviewedPr"], "workflowPath": value["workflowPath"]}
     result["readbackSha256"] = control.digest(projection(run_id, value, result["completionSha256"], job_id))
     print(json.dumps({"status": "independent-digest-evidence-readback", "runId": run_id, "ledgerRecord": result,
                       "providerMutation": False, "productionMutation": False,
@@ -414,7 +456,7 @@ def reconcile_readonly():
     reconcile_id, attempt, revision = os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"], os.environ["GITHUB_SHA"]
     control.require(control.match(control.provider.DECIMAL, reconcile_id) and control.match(control.provider.DECIMAL, attempt)
                     and control.match(control.provider.REVISION, revision))
-    pin = {"controllerRevision": report["controllerRevision"], "intentJobId": report["intentJobId"],
+    pin = {"controllerRevision": report["controllerRevision"], "workflowPath": report["workflowPath"], "intentJobId": report["intentJobId"],
            "publishJobId": report["publishJobId"], "completionJobId": report["completionJobId"],
            "readbackSha256": control.digest(report), "reconcileRunId": reconcile_id,
            "reconcileRunAttempt": attempt, "reconcileRevision": revision}

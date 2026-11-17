@@ -23,6 +23,7 @@ import provider_durable_source as durable
 import provider_private_handoff as handoff
 
 WORKFLOW_PATH = ".github/workflows/worker-provider-digest-rehearsal.yml"
+REVIEWED_WORKFLOW_PATH = ".github/workflows/worker-provider-reviewed-digest.yml"
 MAX_BUNDLE = 2 * 1024 * 1024 * 1024
 MAX_INDEX = 512 * 1024
 DISK_MARGIN = 512 * 1024 * 1024
@@ -34,6 +35,34 @@ def require_disk(root, required):
                     "Insufficient isolated runner scratch space for the complete private source transfer.")
 
 
+def workflow_path():
+    ref = os.environ.get("GITHUB_WORKFLOW_REF", "")
+    matches = [path for path in (WORKFLOW_PATH, REVIEWED_WORKFLOW_PATH)
+               if ref == f"{control.github.REPOSITORY}/{path}@{control.github.MAIN_REF}"]
+    control.require(len(matches) == 1)
+    return matches[0]
+
+
+def execution_identity(revision):
+    """Distinguish the actual main dispatcher from the reviewed PR code."""
+    ref = os.environ.get("GITHUB_WORKFLOW_REF", "")
+    if not ref or ref == f"{control.github.REPOSITORY}/{WORKFLOW_PATH}@{control.github.MAIN_REF}":
+        return {"workflowPath": WORKFLOW_PATH, "candidateRevision": revision, "reviewedPr": None}
+    control.require(workflow_path() == REVIEWED_WORKFLOW_PATH)
+    spec = control.github._parse_object(os.environ.get("PROVIDER_HEAD_VALIDATION_JSON", ""), control.ERROR)
+    head = os.environ.get("PROVIDER_HEAD_REVIEWED_SHA", "")
+    control.require(set(spec) == {"version", "pr", "headSha", "providerCiRunId", "approvalSha256", "archiveRefs", "simulateActionsUnavailable"}
+                    and type(spec["version"]) is int and spec["version"] == 1
+                    and control.match(control.provider.DECIMAL, spec["pr"])
+                    and control.match(control.provider.REVISION, head) and spec["headSha"] == head
+                    and os.environ.get("PROVIDER_HEAD_TRUSTED_MAIN_SHA") == revision
+                    and spec["providerCiRunId"] == os.environ.get("SUBS_BOT_PROVIDER_CI_RUN_ID")
+                    and spec["approvalSha256"] == os.environ.get("SUBS_BOT_PROVIDER_DIGEST_APPROVAL")
+                    and spec["archiveRefs"] == refs() and spec["simulateActionsUnavailable"] is True
+                    and os.environ.get("SUBS_BOT_PROVIDER_SIMULATE_ARTIFACT_UNAVAILABLE") == "1")
+    return {"workflowPath": REVIEWED_WORKFLOW_PATH, "candidateRevision": head, "reviewedPr": spec["pr"]}
+
+
 def context():
     revision = os.environ.get("GITHUB_SHA", "")
     control.require(os.environ.get("GITHUB_REPOSITORY") == control.github.REPOSITORY
@@ -41,7 +70,7 @@ def context():
                     and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
                     and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"
                     and os.environ.get("GITHUB_WORKFLOW_SHA") == revision
-                    and os.environ.get("GITHUB_WORKFLOW_REF") == f"{control.github.REPOSITORY}/{WORKFLOW_PATH}@{control.github.MAIN_REF}"
+                    and workflow_path() in {WORKFLOW_PATH, REVIEWED_WORKFLOW_PATH}
                     and os.environ.get("GITHUB_RUN_ATTEMPT") == "1"
                     and control.match(control.provider.REVISION, revision)
                     and control.match(control.provider.DECIMAL, os.environ.get("GITHUB_RUN_ID", "")))
@@ -78,7 +107,8 @@ def metadata(value):
     control.require(simulation in {"0", "1"})
     return {"version": 1, "kind": "isolated-provider-source-transfer", "runId": os.environ["GITHUB_RUN_ID"],
             "runAttempt": "1", "controllerRevision": os.environ["GITHUB_SHA"], "targetSha256": control.digest(value),
-            "archiveRefsSha256": control.digest(refs()), "simulatedActionsUnavailable": simulation == "1"}
+            "archiveRefsSha256": control.digest(refs()), "simulatedActionsUnavailable": simulation == "1",
+            **execution_identity(os.environ["GITHUB_SHA"])}
 
 
 def file_sha(path, limit):
@@ -186,8 +216,9 @@ def download_cipher():
                     and origin.get("head_sha") == revision
                     and origin.get("repository_id") == origin.get("head_repository_id") == control.github.REPOSITORY_ID)
     run = control.github._get_json(f"/actions/runs/{run_id}/attempts/1", token)
+    path = workflow_path()
     control.require(str(run.get("id")) == run_id and run.get("run_attempt") == 1
-                    and run.get("path") in (WORKFLOW_PATH, WORKFLOW_PATH + "@main", WORKFLOW_PATH + "@refs/heads/main")
+                    and run.get("path") in (path, path + "@main", path + "@refs/heads/main")
                     and run.get("head_sha") == revision and run.get("head_branch") == "main" and run.get("event") == "workflow_dispatch"
                     and all(isinstance(run.get(k), dict) and run[k].get("id") == control.github.REPOSITORY_ID
                             for k in ("repository", "head_repository")))

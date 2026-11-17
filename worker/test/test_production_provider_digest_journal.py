@@ -51,10 +51,12 @@ class DigestJournalTests(unittest.TestCase):
         revision, run_id, reconcile_id = "b" * 40, "101", "103"
         report = {"version": 1, "kind": "isolated-provider-digest-readonly-resolution",
                   "classification": "intent-job-skipped-empty-prefix", "runId": run_id,
-                  "controllerRevision": revision, "runConclusion": "success", "intentJobId": "202", "publishJobId": "203",
+                  "controllerRevision": revision, "workflowPath": journal.transfer.WORKFLOW_PATH,
+                  "runConclusion": "success", "intentJobId": "202", "publishJobId": "203",
                   "completionJobId": "204",
                   "bucketSha256": "1" * 64, "objectCount": 0}
-        pin = {"controllerRevision": revision, "intentJobId": "202", "publishJobId": "203", "completionJobId": "204",
+        pin = {"controllerRevision": revision, "workflowPath": journal.transfer.WORKFLOW_PATH,
+               "intentJobId": "202", "publishJobId": "203", "completionJobId": "204",
                "readbackSha256": control.digest(report),
                "reconcileRunId": reconcile_id, "reconcileRunAttempt": "1", "reconcileRevision": revision}
         run = {"id": 103, "run_attempt": 1, "path": journal.RECONCILE_WORKFLOW, "display_title": "Inspect isolated digest 101",
@@ -82,9 +84,13 @@ class DigestJournalTests(unittest.TestCase):
                   "head_repository": {"id": control.github.REPOSITORY_ID}}
         rows = [{**common, "id": 101, "status": "completed", "conclusion": "success"},
                 {**common, "id": 102, "status": "in_progress", "conclusion": None}]
-        pin = {"controllerRevision": revision}
-        with patch.dict(os.environ, {"GITHUB_RUN_ID": "102", "GITHUB_SHA": revision}, clear=True), \
+        pin = {"controllerRevision": revision, "workflowPath": journal.transfer.WORKFLOW_PATH}
+        env = {"GITHUB_RUN_ID": "102", "GITHUB_SHA": revision,
+               "GITHUB_WORKFLOW_REF": f"{control.github.REPOSITORY}/{journal.transfer.WORKFLOW_PATH}@{control.github.MAIN_REF}"}
+        with patch.dict(os.environ, env, clear=True), \
                 patch.object(journal, "controllers", return_value=[revision]), \
+                patch.object(journal, "workflow_has_main_history", side_effect=lambda path, *_: path == journal.transfer.WORKFLOW_PATH), \
+                patch.object(journal.durable, "source_ancestor"), \
                 patch.object(control.github, "_github_token", return_value="synthetic"), \
                 patch.object(control.github, "_get_json", return_value={"total_count": 2, "workflow_runs": rows}), \
                 patch.object(journal, "verify_readonly_resolution") as verify:
@@ -95,7 +101,7 @@ class DigestJournalTests(unittest.TestCase):
                 journal.history({}, Mock())
                 verify.assert_called_once()
 
-    def test_workflow_statically_disables_all_digest_and_journal_writes(self):
+    def test_workflow_requires_explicit_enable_for_all_digest_writes(self):
         workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/worker-provider-digest-rehearsal.yml").read_text()
         intent = workflow.split("\n  intent_write:\n", 1)[1].split("\n  intent_readback:\n", 1)[0]
         self.assertIn("if: ${{ vars.SUBS_BOT_PROVIDER_DIGEST_WRITE_ENABLED == 'true' }}", intent)
@@ -106,6 +112,26 @@ class DigestJournalTests(unittest.TestCase):
         publish = workflow.split("\n  publish:\n", 1)[1].split("\n  verify:\n", 1)[0]
         self.assertNotIn("SUBS_BOT_CF_PROVIDER_ARCHIVE_WRITE_TOKEN", publish)
         self.assertNotIn("SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN", publish)
+
+    def test_unregistered_other_dispatcher_run_blocks(self):
+        revision = "b" * 40
+        common = {"head_sha": revision, "head_branch": "main", "event": "workflow_dispatch", "run_attempt": 1,
+                  "repository": {"id": control.github.REPOSITORY_ID}, "head_repository": {"id": control.github.REPOSITORY_ID}}
+        def get(path, _token):
+            reviewed = journal.transfer.REVIEWED_WORKFLOW_PATH.rsplit("/", 1)[-1] in path
+            row = {**common, "path": journal.transfer.REVIEWED_WORKFLOW_PATH if reviewed else journal.transfer.WORKFLOW_PATH,
+                   "id": 101 if reviewed else 102, "status": "completed" if reviewed else "in_progress",
+                   "conclusion": "failure" if reviewed else None}
+            return {"total_count": 1, "workflow_runs": [row]}
+        env = {"GITHUB_RUN_ID": "102", "GITHUB_SHA": revision,
+               "GITHUB_WORKFLOW_REF": f"{control.github.REPOSITORY}/{journal.transfer.WORKFLOW_PATH}@{control.github.MAIN_REF}"}
+        with patch.dict(os.environ, env, clear=True), patch.object(journal, "controllers", return_value=[revision]), \
+                patch.object(journal, "workflow_has_main_history", return_value=True), \
+                patch.object(journal.durable, "source_ancestor"), \
+                patch.object(journal, "readonly_resolutions", return_value={}), \
+                patch.object(control.github, "_github_token", return_value="synthetic"), \
+                patch.object(control.github, "_get_json", side_effect=get), self.assertRaises(control.ProviderError):
+            journal.history({}, Mock())
 
     def test_unknown_prior_intent_blocks_before_any_new_write(self):
         reader = Mock()
@@ -124,6 +150,29 @@ class DigestJournalTests(unittest.TestCase):
         with patch.dict(os.environ, {"SUBS_BOT_PROVIDER_DIGEST_READONLY_RESOLUTIONS_JSON": '{"99":{}}'}, clear=True):
             after = journal.digest.intent(target, refs, state, "101", "b" * 40)
         self.assertNotEqual(control.digest(before), control.digest(after))
+
+    def test_completion_preserves_both_revisions_and_exact_tag_snapshot(self):
+        import json
+        target = config(active=True)
+        state = {"dependencySha256": "1" * 64, "manifestSha256": None, "tagsSha256": "4" * 64}
+        with patch.dict(os.environ, {}, clear=True):
+            value = journal.digest.intent(target, [{"fixture": "source"}], state, "101", "b" * 40)
+        value.update(workflowPath=journal.transfer.REVIEWED_WORKFLOW_PATH, candidateRevision="c" * 40, reviewedPr="290")
+        response = {"status": "published-digest", "manifestSha256": target["build"]["ociManifestSha256"],
+                    "configSha256": target["build"]["ociConfigSha256"], "prestateSha256": control.digest(state),
+                    "providerMutation": False, "registryMutation": True}
+        verification = {"manifestSha256": response["manifestSha256"], "configSha256": response["configSha256"],
+                        "allReferencedBlobsVerified": True, "dependencySha256": state["dependencySha256"],
+                        "tagsSha256": state["tagsSha256"]}
+        env = {"SUBS_BOT_PROVIDER_DIGEST_RESPONSE_JSON": json.dumps(response),
+               "SUBS_BOT_PROVIDER_DIGEST_VERIFICATION_JSON": json.dumps(verification)}
+        with patch.dict(os.environ, env, clear=True):
+            result = journal.completion_value(value, target)
+            self.assertEqual((result["controllerRevision"], result["candidateRevision"], result["reviewedPr"]),
+                             ("b" * 40, "c" * 40, "290"))
+            with patch.dict(os.environ, {"SUBS_BOT_PROVIDER_DIGEST_VERIFICATION_JSON": json.dumps({**verification, "tagsSha256": "5" * 64})}), \
+                    self.assertRaises(control.ProviderError):
+                journal.completion_value(value, target)
 
     def test_existing_digest_does_not_count_as_write_rehearsal(self):
         target = config(active=True)
