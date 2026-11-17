@@ -31,6 +31,9 @@ FAILED_PLAN_SOURCES = {
     ".github/workflows/worker-backup-no-export-resolution.yml": "8b46e11408866e5369013d2715b2339df9d37794753b6b61cdc067dade523355",
     "worker/tools/trusted_backup_no_export_gate.py": "dec99713970c4259161ed038b1e02fa96e620bfa1d739a794cdfd162d937ba3f",
 }
+PROVIDER_READ_RUN = "44179992037"
+PROVIDER_READ_WORKFLOW = ".github/workflows/worker-provider-reviewed-head.yml"
+PROVIDER_READ_SOURCE_SHA256 = "4d46897f48702019d0f376a33f744998d1a0a5ea852058642f0034e50e4f1dbf"
 ENVIRONMENT = "subs-bot-backup-head-isolation"
 HEX32, HEX40, HEX64 = (re.compile(r"[a-f0-9]{32}"), re.compile(r"[a-f0-9]{40}"), re.compile(r"[a-f0-9]{64}"))
 DECIMAL = re.compile(r"[1-9][0-9]{0,19}")
@@ -186,10 +189,35 @@ def verify_failed_initial_plan(item, env, token):
         reviewed_source(FAILED_PLAN_MAIN, path, expected_sha, token, env.get("RUNNER_TEMP", ""))
 
 
+def verify_fixed_provider_read(item, env, token):
+    """Recognize only the completed, reviewed read-only Provider run at old main."""
+    require(str(item["id"]) == PROVIDER_READ_RUN and item["path"] == PROVIDER_READ_WORKFLOW
+            and item["event"] == "workflow_dispatch" and item["head_sha"] == FAILED_PLAN_MAIN
+            and item["run_attempt"] == 1)
+    run = github._get_json("/actions/runs/" + PROVIDER_READ_RUN, token)
+    require(str(run.get("id")) == PROVIDER_READ_RUN and run.get("run_attempt") == 1
+            and run.get("head_sha") == FAILED_PLAN_MAIN and run.get("head_branch") == "main"
+            and run.get("event") == "workflow_dispatch" and (run.get("status"), run.get("conclusion")) == ("completed", "failure")
+            and run.get("path") in {PROVIDER_READ_WORKFLOW, PROVIDER_READ_WORKFLOW + "@main", PROVIDER_READ_WORKFLOW + "@refs/heads/main"}
+            and run.get("display_title") == "Reviewed Provider source verification at " + FAILED_PLAN_MAIN
+            and all(isinstance(run.get(k), dict) and run[k].get("id") == github.REPOSITORY_ID for k in ("repository", "head_repository")))
+    response = github._get_json("/actions/runs/" + PROVIDER_READ_RUN + "/attempts/1/jobs?per_page=100", token)
+    jobs = response.get("jobs")
+    expected = {"Reviewed Provider source verification": "success", "Trusted Provider R2 attestation": "success",
+                "Reviewed Provider simulated source fault": "skipped", "Trusted Provider live attestation": "failure"}
+    require(isinstance(jobs, list) and response.get("total_count") == len(jobs) == len(expected)
+            and {job.get("name") for job in jobs} == set(expected))
+    for job in jobs:
+        require(str(job.get("run_id")) == PROVIDER_READ_RUN and job.get("run_attempt") == 1
+                and job.get("head_sha") == FAILED_PLAN_MAIN and job.get("status") == "completed"
+                and job.get("conclusion") == expected[job["name"]])
+    reviewed_source(FAILED_PLAN_MAIN, PROVIDER_READ_WORKFLOW, PROVIDER_READ_SOURCE_SHA256, token, env.get("RUNNER_TEMP", ""))
+
+
 def live_writer_boundary(rows, env, token, candidate):
     """Reject non-reviewed writers after the fixed historical audit cutoff."""
     safe_ci = {".github/workflows/python-ci.yml", ".github/workflows/worker-ci.yml", ".github/workflows/worker-provider-fetch-ci.yml"}
-    provider_read = ".github/workflows/worker-provider-reviewed-head.yml"
+    provider_read = PROVIDER_READ_WORKFLOW
     current_run = env.get("GITHUB_RUN_ID", "")
     require(DECIMAL.fullmatch(current_run or ""))
     for item in rows:
@@ -197,6 +225,9 @@ def live_writer_boundary(rows, env, token, candidate):
         if event in {"pull_request", "push"} and path in safe_ci:
             continue
         if event == "workflow_dispatch" and path == provider_read and item["head_sha"] in {OLD_MAIN, env["GITHUB_SHA"]}:
+            continue
+        if run_id == PROVIDER_READ_RUN:
+            verify_fixed_provider_read(item, env, token)
             continue
         if run_id == FAILED_PLAN_RUN:
             verify_failed_initial_plan(item, env, token)

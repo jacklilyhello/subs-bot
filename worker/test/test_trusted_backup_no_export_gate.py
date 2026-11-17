@@ -124,6 +124,28 @@ class NoExportGateTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             gate.verify_failed_initial_plan({**item, "run_attempt": 2}, env, "synthetic")
 
+    def test_only_pinned_finished_provider_read_is_allowed_from_previous_main(self):
+        item = {"id": int(gate.PROVIDER_READ_RUN), "path": gate.PROVIDER_READ_WORKFLOW,
+                "event": "workflow_dispatch", "head_sha": gate.FAILED_PLAN_MAIN, "run_attempt": 1}
+        repo = {"id": gate.github.REPOSITORY_ID}
+        run = {**item, "head_branch": "main", "status": "completed", "conclusion": "failure",
+               "display_title": "Reviewed Provider source verification at " + gate.FAILED_PLAN_MAIN,
+               "repository": repo, "head_repository": repo}
+        expected = {"Reviewed Provider source verification": "success", "Trusted Provider R2 attestation": "success",
+                    "Reviewed Provider simulated source fault": "skipped", "Trusted Provider live attestation": "failure"}
+        jobs = [{"name": name, "run_id": int(gate.PROVIDER_READ_RUN), "run_attempt": 1,
+                 "head_sha": gate.FAILED_PLAN_MAIN, "status": "completed", "conclusion": conclusion}
+                for name, conclusion in expected.items()]
+        result = {"total_count": 4, "jobs": jobs}
+        with patch.object(gate.github, "_get_json", side_effect=[run, result]), patch.object(gate, "reviewed_source") as source:
+            gate.verify_fixed_provider_read(item, {"RUNNER_TEMP": "/synthetic"}, "synthetic")
+            source.assert_called_once()
+        jobs[0]["status"] = "in_progress"
+        with patch.object(gate.github, "_get_json", side_effect=[run, result]), patch.object(gate, "reviewed_source"), self.assertRaises(ContractError):
+            gate.verify_fixed_provider_read(item, {"RUNNER_TEMP": "/synthetic"}, "synthetic")
+        with self.assertRaises(ContractError):
+            gate.verify_fixed_provider_read({**item, "run_attempt": 2}, {"RUNNER_TEMP": "/synthetic"}, "synthetic")
+
     def test_fresh_readback_never_receives_writer_credentials(self):
         workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/worker-backup-no-export-resolution.yml").read_text()
         readback = workflow.split("\n  readback:\n", 1)[1]
