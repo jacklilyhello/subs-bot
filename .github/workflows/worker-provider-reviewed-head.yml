@@ -13,7 +13,7 @@ on:
         required: false
         type: choice
         default: none
-        options: [none, missing-current, missing-previous, corrupt-current, corrupt-previous, digest-current, digest-previous, identity-current, identity-previous]
+        options: [none, all, missing-current, missing-previous, corrupt-current, corrupt-previous, digest-current, digest-previous, identity-current, identity-previous]
 
 permissions:
   actions: read
@@ -82,7 +82,7 @@ jobs:
     if: inputs.fault_scenario != 'none' && needs.verify_sources.result == 'success'
     environment: subs-bot-provider-archive-head-isolation
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
