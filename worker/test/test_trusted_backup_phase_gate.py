@@ -113,10 +113,14 @@ class TrustedPhaseGateTests(unittest.TestCase):
                   "SUBS_BOT_BACKUP_RECOVERY_VERIFY_CLAIM_SHA256": "c" * 64,
                   "SUBS_BOT_BACKUP_RECOVERY_VERIFY_COMPLETION_SHA256": ""}
         self.check(verify)
+        self.check({**verify, "BACKUP_RECOVERY_CLAIM_SHA256": "", "SUBS_BOT_BACKUP_RECOVERY_VERIFY_CLAIM_SHA256": ""})
         for change in ({"BACKUP_RECOVERY_SOURCE_RUN_ID": "900"}, {"BACKUP_RECOVERY_SOURCE_RUN_ID": "902"},
                        {"SUBS_BOT_BACKUP_RECOVERY_VERIFY_ACTION": "abort-unstarted"},
                        {"SUBS_BOT_BACKUP_RECOVERY_VERIFY_CLAIM_SHA256": "d" * 64},
-                       {"BACKUP_RECOVERY_COMPLETION_SHA256": "f" * 64}):
+                       {"BACKUP_RECOVERY_COMPLETION_SHA256": "f" * 64},
+                       {"BACKUP_RECOVERY_CLAIM_SHA256": "", "SUBS_BOT_BACKUP_RECOVERY_VERIFY_CLAIM_SHA256": "",
+                        "BACKUP_RECOVERY_COMPLETION_SHA256": "f" * 64,
+                        "SUBS_BOT_BACKUP_RECOVERY_VERIFY_COMPLETION_SHA256": "f" * 64}):
             with self.subTest(change=change), self.assertRaises(ContractError):
                 self.check({**verify, **change})
 

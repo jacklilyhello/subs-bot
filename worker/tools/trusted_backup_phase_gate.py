@@ -94,6 +94,7 @@ def validate(env):
                             ("BACKUP_RECOVERY_CLAIM_SHA256", "BACKUP_RECOVERY_COMPLETION_SHA256")))
         if role == "recovery-verify":
             require(not env["BACKUP_ACTION"].startswith("plan-") and env.get("BACKUP_RECOVERY_MODE") == "verify"
+                    and DECIMAL.fullmatch(env.get("GITHUB_RUN_ID", ""))
                     and DECIMAL.fullmatch(env.get("BACKUP_RECOVERY_SOURCE_RUN_ID", ""))
                     and env["BACKUP_RECOVERY_SOURCE_RUN_ID"] != env.get("GITHUB_RUN_ID")
                     and env["BACKUP_RECOVERY_SOURCE_RUN_ID"] == env.get("SUBS_BOT_BACKUP_RECOVERY_VERIFY_RUN_ID")
@@ -101,10 +102,12 @@ def validate(env):
                     and re.fullmatch(r"[1-9][0-9]{0,19}-1-[0-9]{4}", env.get("BACKUP_RECOVERY_SLOT", ""))
                     and env["BACKUP_RECOVERY_SLOT"].startswith(env["BACKUP_SESSION"] + "-")
                     and env["BACKUP_RECOVERY_SLOT"] == env.get("SUBS_BOT_BACKUP_RECOVERY_VERIFY_SLOT")
-                    and HEX64.fullmatch(env.get("BACKUP_RECOVERY_CLAIM_SHA256", ""))
-                    and env["BACKUP_RECOVERY_CLAIM_SHA256"] == env.get("SUBS_BOT_BACKUP_RECOVERY_VERIFY_CLAIM_SHA256")
+                    and (not env.get("BACKUP_RECOVERY_CLAIM_SHA256") or
+                         HEX64.fullmatch(env["BACKUP_RECOVERY_CLAIM_SHA256"]))
+                    and env.get("BACKUP_RECOVERY_CLAIM_SHA256", "") == env.get("SUBS_BOT_BACKUP_RECOVERY_VERIFY_CLAIM_SHA256", "")
                     and (not env.get("BACKUP_RECOVERY_COMPLETION_SHA256") or
                          HEX64.fullmatch(env["BACKUP_RECOVERY_COMPLETION_SHA256"]))
+                    and (env.get("BACKUP_RECOVERY_CLAIM_SHA256") or not env.get("BACKUP_RECOVERY_COMPLETION_SHA256"))
                     and env.get("BACKUP_RECOVERY_COMPLETION_SHA256", "") == env.get("SUBS_BOT_BACKUP_RECOVERY_VERIFY_COMPLETION_SHA256", ""))
     elif env.get("BACKUP_ACTION") in {"initialize", "initialize-webhook-anchor", "run", "resume", "reconcile", "abort"}:
         require(env.get("SUBS_BOT_BACKUP_PHASE_REHEARSAL_WRITES_ENABLED") == "true",
