@@ -53,6 +53,13 @@ class IsolatedSourceTests(unittest.TestCase):
             isolated.inventory(reader)
         reader.put.assert_not_called()
 
+    def test_duplicate_listing_is_not_treated_as_complete_inventory(self):
+        reader = Mock()
+        key = isolated.BASE + "100/1/source-intent.json"
+        with patch.object(durable, "list_private_keys", return_value=[key, key]), self.assertRaises(control.ProviderError):
+            isolated.inventory(reader)
+        reader.put.assert_not_called()
+
     def test_origin_controller_must_be_independently_allowlisted(self):
         revision = "b" * 40
         record = {"runId": "102", "controllerRevision": revision}

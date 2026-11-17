@@ -103,7 +103,9 @@ def inventory(reader):
     for key in durable.list_private_keys(reader, BASE):
         match = re.fullmatch(re.escape(BASE) + r"([1-9][0-9]*)/1/(source-intent\.json|source-manifest\.json|blobs/[0-9a-f]{64})", key)
         control.require(match is not None)
-        grouped.setdefault(match.group(1), set()).add(match.group(2))
+        grouped.setdefault(match.group(1), set())
+        control.require(match.group(2) not in grouped[match.group(1)])
+        grouped[match.group(1)].add(match.group(2))
     control.require(len(grouped) <= MAX_HISTORY)
     completed = {}
     for operation_id, keys in grouped.items():

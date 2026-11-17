@@ -277,7 +277,7 @@ def verify_source_resolution(operation_id, record, bucket, controllers, complete
     control.require(origin["controllerRevision"] == record["controllerRevision"])
     prefix = sealed.BASE + operation_id + "/1/"
     listed = list_private_keys(store, prefix)
-    control.require(all(isinstance(key, str) and key.startswith(prefix) for key in listed))
+    control.require(all(isinstance(key, str) and key.startswith(prefix) for key in listed) and len(set(listed)) == len(listed))
     keys = {key[len(prefix):] for key in listed}
     projection = {"version": 1, "kind": "provider-source-failure-readback", "operationId": operation_id,
                   "bucketSha256": control.digest(bucket), "origin": origin, "objectCount": len(keys)}
