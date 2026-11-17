@@ -26,6 +26,7 @@ WORKFLOW_PATH = ".github/workflows/worker-provider-digest-rehearsal.yml"
 REVIEWED_WORKFLOW_PATH = ".github/workflows/worker-provider-reviewed-digest.yml"
 REVIEWED_OPERATION_WORKFLOW_PATH = ".github/workflows/worker-provider-reviewed-operation.yml"
 REVIEWED_RECOVERY_WORKFLOW_PATH = ".github/workflows/worker-provider-reviewed-recovery.yml"
+REVIEWED_DIGEST_RECONCILE_WORKFLOW_PATH = ".github/workflows/worker-provider-reviewed-digest-reconcile.yml"
 REVIEWED_SOURCE_WORKFLOW_PATH = ".github/workflows/worker-provider-reviewed-isolated-source.yml"
 REVIEWED_SOURCE_READBACK_WORKFLOW_PATH = ".github/workflows/worker-provider-reviewed-isolated-source-readback.yml"
 MAX_BUNDLE = 2 * 1024 * 1024 * 1024
@@ -42,6 +43,7 @@ def require_disk(root, required):
 def workflow_path():
     ref = os.environ.get("GITHUB_WORKFLOW_REF", "")
     matches = [path for path in (WORKFLOW_PATH, REVIEWED_WORKFLOW_PATH, REVIEWED_OPERATION_WORKFLOW_PATH, REVIEWED_RECOVERY_WORKFLOW_PATH,
+                                 REVIEWED_DIGEST_RECONCILE_WORKFLOW_PATH,
                                  REVIEWED_SOURCE_WORKFLOW_PATH, REVIEWED_SOURCE_READBACK_WORKFLOW_PATH)
                if ref == f"{control.github.REPOSITORY}/{path}@{control.github.MAIN_REF}"]
     control.require(len(matches) == 1)
@@ -54,9 +56,9 @@ def execution_identity(revision):
     if not ref or ref == f"{control.github.REPOSITORY}/{WORKFLOW_PATH}@{control.github.MAIN_REF}":
         return {"workflowPath": WORKFLOW_PATH, "candidateRevision": revision, "reviewedPr": None}
     path = workflow_path()
-    control.require(path in {REVIEWED_WORKFLOW_PATH, REVIEWED_OPERATION_WORKFLOW_PATH, REVIEWED_RECOVERY_WORKFLOW_PATH,
+    control.require(path in {REVIEWED_WORKFLOW_PATH, REVIEWED_OPERATION_WORKFLOW_PATH, REVIEWED_RECOVERY_WORKFLOW_PATH, REVIEWED_DIGEST_RECONCILE_WORKFLOW_PATH,
                              REVIEWED_SOURCE_WORKFLOW_PATH, REVIEWED_SOURCE_READBACK_WORKFLOW_PATH})
-    simulation = path in {REVIEWED_WORKFLOW_PATH, REVIEWED_OPERATION_WORKFLOW_PATH, REVIEWED_RECOVERY_WORKFLOW_PATH}
+    simulation = path in {REVIEWED_WORKFLOW_PATH, REVIEWED_OPERATION_WORKFLOW_PATH, REVIEWED_RECOVERY_WORKFLOW_PATH, REVIEWED_DIGEST_RECONCILE_WORKFLOW_PATH}
     spec = control.github._parse_object(os.environ.get("PROVIDER_HEAD_VALIDATION_JSON", ""), control.ERROR)
     head = os.environ.get("PROVIDER_HEAD_REVIEWED_SHA", "")
     control.require(set(spec) == {"version", "pr", "headSha", "providerCiRunId", "approvalSha256", "archiveRefs", "simulateActionsUnavailable"}
@@ -78,7 +80,8 @@ def context():
                     and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
                     and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"
                     and os.environ.get("GITHUB_WORKFLOW_SHA") == revision
-                    and workflow_path() in {WORKFLOW_PATH, REVIEWED_WORKFLOW_PATH, REVIEWED_OPERATION_WORKFLOW_PATH, REVIEWED_RECOVERY_WORKFLOW_PATH}
+                    and workflow_path() in {WORKFLOW_PATH, REVIEWED_WORKFLOW_PATH, REVIEWED_OPERATION_WORKFLOW_PATH,
+                                            REVIEWED_RECOVERY_WORKFLOW_PATH, REVIEWED_DIGEST_RECONCILE_WORKFLOW_PATH}
                     and os.environ.get("GITHUB_RUN_ATTEMPT") == "1"
                     and control.match(control.provider.REVISION, revision)
                     and control.match(control.provider.DECIMAL, os.environ.get("GITHUB_RUN_ID", "")))

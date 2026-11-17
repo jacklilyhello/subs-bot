@@ -69,14 +69,20 @@ def readonly_resolutions():
     value = control.github._parse_object(os.environ.get("SUBS_BOT_PROVIDER_DIGEST_READONLY_RESOLUTIONS_JSON", ""), sealed.ERROR)
     control.require(len(value) <= MAX_HISTORY)
     for run_id, row in value.items():
+        base = {"controllerRevision", "workflowPath", "intentJobId", "publishJobId", "completionJobId", "readbackSha256",
+                "reconcileRunId", "reconcileRunAttempt", "reconcileRevision"}
+        extra = {"reconcileWorkflowPath", "reconcileCandidateRevision", "reconcileReviewedPr"}
         control.require(control.match(control.provider.DECIMAL, run_id) and isinstance(row, dict)
-                        and set(row) == {"controllerRevision", "workflowPath", "intentJobId", "publishJobId", "completionJobId", "readbackSha256",
-                                         "reconcileRunId", "reconcileRunAttempt", "reconcileRevision"}
+                        and set(row) in (base, base | extra)
                         and all(control.match(control.provider.DECIMAL, row[k]) for k in
                                 ("intentJobId", "publishJobId", "completionJobId", "reconcileRunId", "reconcileRunAttempt"))
                         and all(control.match(control.provider.REVISION, row[k]) for k in ("controllerRevision", "reconcileRevision"))
                         and row["workflowPath"] in {transfer.WORKFLOW_PATH, transfer.REVIEWED_WORKFLOW_PATH}
-                        and control.match(control.provider.HEX, row["readbackSha256"]))
+                        and control.match(control.provider.HEX, row["readbackSha256"])
+                        and (set(row) == base or (row["reconcileWorkflowPath"] == transfer.REVIEWED_DIGEST_RECONCILE_WORKFLOW_PATH
+                             and control.match(control.provider.REVISION, row["reconcileCandidateRevision"])
+                             and control.match(control.provider.DECIMAL, row["reconcileReviewedPr"])
+                             and row["reconcileRunAttempt"] == "1")))
     return value
 
 
@@ -85,9 +91,10 @@ def inspect_readonly_run(reader, run_id, allowed):
     control.require(control.match(control.provider.DECIMAL, run_id))
     token = control.github._github_token()
     run = control.github._get_json(f"/actions/runs/{run_id}/attempts/1", token)
+    latest = control.github._get_json(f"/actions/runs/{run_id}", token)
     revision = run.get("head_sha")
     path = run.get("path", "").removesuffix("@refs/heads/main").removesuffix("@main")
-    control.require(str(run.get("id")) == run_id and run.get("run_attempt") == 1 and revision in allowed
+    control.require(str(run.get("id")) == str(latest.get("id")) == run_id and run.get("run_attempt") == latest.get("run_attempt") == 1 and revision in allowed
                     and path in {transfer.WORKFLOW_PATH, transfer.REVIEWED_WORKFLOW_PATH}
                     and run.get("head_branch") == "main" and run.get("event") == "workflow_dispatch" and run.get("status") == "completed"
                     and run.get("conclusion") in {"success", "failure", "cancelled", "timed_out", "skipped"}
@@ -129,13 +136,24 @@ def verify_readonly_resolution(reader, run_id, pin, allowed):
                     and control.digest(report) == pin["readbackSha256"])
     token, reconciliation, attempt = control.github._github_token(), pin["reconcileRunId"], pin["reconcileRunAttempt"]
     run = control.github._get_json(f"/actions/runs/{reconciliation}/attempts/{attempt}", token)
+    reviewed = pin.get("reconcileWorkflowPath") == transfer.REVIEWED_DIGEST_RECONCILE_WORKFLOW_PATH
+    path = transfer.REVIEWED_DIGEST_RECONCILE_WORKFLOW_PATH if reviewed else RECONCILE_WORKFLOW
+    title = ("Inspect isolated digest " + run_id + " head " + pin["reconcileCandidateRevision"] + " pr " + pin["reconcileReviewedPr"]
+             if reviewed else "Inspect isolated digest " + run_id)
     control.require(str(run.get("id")) == reconciliation and str(run.get("run_attempt")) == attempt
-                    and run.get("path") in (RECONCILE_WORKFLOW, RECONCILE_WORKFLOW + "@main", RECONCILE_WORKFLOW + "@refs/heads/main")
-                    and run.get("display_title") == "Inspect isolated digest " + run_id
+                    and run.get("path") in (path, path + "@main", path + "@refs/heads/main")
+                    and run.get("display_title") == title
                     and run.get("head_sha") == pin["reconcileRevision"] and run.get("head_branch") == "main"
                     and run.get("event") == "workflow_dispatch" and (run.get("status"), run.get("conclusion")) == ("completed", "success")
                     and all(isinstance(run.get(k), dict) and run[k].get("id") == control.github.REPOSITORY_ID
                             for k in ("repository", "head_repository")))
+    if reviewed:
+        latest = control.github._get_json(f"/actions/runs/{reconciliation}", token)
+        control.require(str(latest.get("id")) == reconciliation and latest.get("run_attempt") == 1)
+        comparison = control.github.compare_commits_metadata(pin["reconcileRevision"], pin["reconcileCandidateRevision"], token)
+        control.require(comparison.get("status") in {"ahead", "identical"} and comparison.get("behind_by") == 0
+                        and all(isinstance(comparison.get(key), dict) and comparison[key].get("sha") == pin["reconcileRevision"]
+                                for key in ("base_commit", "merge_base_commit")))
     durable.source_ancestor({"revision": pin["reconcileRevision"]}, token)
     response = control.github._get_json(f"/actions/runs/{reconciliation}/attempts/{attempt}/jobs?per_page=100", token)
     jobs = response.get("jobs")
@@ -145,6 +163,10 @@ def verify_readonly_resolution(reader, run_id, pin, allowed):
                     and str(job.get("run_id")) == reconciliation and str(job.get("run_attempt")) == attempt
                     and job.get("head_sha") == pin["reconcileRevision"] and (job.get("status"), job.get("conclusion")) == ("completed", "success")
                     and isinstance(job.get("steps"), list))
+    if reviewed:
+        gates = [step for step in job["steps"] if isinstance(step, dict)
+                 and step.get("name") == "Verify independently approved Provider head and isolation contracts"]
+        control.require(len(gates) == 1 and (gates[0].get("status"), gates[0].get("conclusion")) == ("completed", "success"))
     steps = [step for step in job["steps"] if isinstance(step, dict) and step.get("name") == "Inspect skipped intent without writes"]
     control.require(len(steps) == 1 and (steps[0].get("status"), steps[0].get("conclusion")) == ("completed", "success"))
 
@@ -448,8 +470,14 @@ def independent_readback():
 
 
 def reconcile_readonly():
-    durable.seal_context(RECONCILE_WORKFLOW, mutation=False)
-    control.require(os.environ.get("SUBS_BOT_PROVIDER_DIGEST_REHEARSAL_ENABLED") == "true")
+    reviewed = os.environ.get("GITHUB_WORKFLOW_REF") == f"{control.github.REPOSITORY}/{transfer.REVIEWED_DIGEST_RECONCILE_WORKFLOW_PATH}@{control.github.MAIN_REF}"
+    if reviewed:
+        transfer.context()
+        transfer.target()
+        transfer.refs()
+    else:
+        durable.seal_context(RECONCILE_WORKFLOW, mutation=False)
+        control.require(os.environ.get("SUBS_BOT_PROVIDER_DIGEST_REHEARSAL_ENABLED") == "true")
     run_id = os.environ.get("SUBS_BOT_PROVIDER_DIGEST_PRIOR_RUN_ID", "")
     reader = store("SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN", run_id)
     reader.verify()
@@ -461,6 +489,10 @@ def reconcile_readonly():
            "publishJobId": report["publishJobId"], "completionJobId": report["completionJobId"],
            "readbackSha256": control.digest(report), "reconcileRunId": reconcile_id,
            "reconcileRunAttempt": attempt, "reconcileRevision": revision}
+    if reviewed:
+        identity = transfer.execution_identity(revision)
+        pin.update(reconcileWorkflowPath=identity["workflowPath"], reconcileCandidateRevision=identity["candidateRevision"],
+                   reconcileReviewedPr=identity["reviewedPr"])
     control.github.require_current_main(revision)
     print(json.dumps({**report, "resolutionRecord": pin, "retryAuthorized": False}, sort_keys=True))
 

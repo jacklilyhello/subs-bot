@@ -210,6 +210,8 @@ Webhook 配置顺序为 `plan-webhook → 明确批准其 stateSha256 → webhoo
 
 Provider 持久来源的独立 Worker 演练入口使用受信 main dispatcher `worker-provider-reviewed-operation.yml`，默认关闭，仅接受已审准确 PR head、项目隔离目标及独立登记的当前／previous 原始归档。先独立完成隔离镜像发布及全量读回，再分别审批并执行 `prepare-image`、`stage`、`activate`、`smoke`；镜像准备完成证明必须先经私有归档独立读回并登记，才能执行 stage。每次都重新核对准确来源、前态、旧版本终态和无 caller，先单次写入意图、独立读回，再发起对应请求；相应凭据使用隔离资源的短期最小权限。写前观察不能充当外部并发的原子锁，必须确保隔离目标没有其他写者。
 
+私有来源归档保留原始 CI ZIP（含 Worker 模块与 OCI 镜像归档），并按独立固定摘要重新核验目标和原件；它不把归档存在本身当作可信来源。校验仍依赖 GitHub 的原 CI run／attempt、工作流与 main 祖先元数据，以及对应原提交的 requirements 原文；这些信息不可读时安全停止，不能重建旧版或改写来源。正式及隔离来源库存各以 32 次封存为当前上限，当前版本与 previous 合计最多 9 代；达到边界前须实施经审查的分页或分段扩容，不删除历史证据。演练中模拟 Actions 产物不可用应明确标为模拟，不代表产物真实过期。
+
 每步完成后独立读回 Provider 状态及私有意图／密文证据，审核后登记 ledger 并安全注入两个目标环境的加密下一配置和准确审批摘要，再进入下一步。密文 artifact 只用于短时交接，不能当作长期私有归档。响应已收到而后续失败时，流程尝试单次追加加密观察并独立读回；若进程死亡或写入结果不明，保留原 intent 和全部现场，不推断成功、不重发。`worker-provider-reviewed-operation-reconcile.yml` 只诊断写入 job 均明确跳过且私有前缀为空的 run；不得用它解除已执行或结果不明的操作。此入口及各项隔离验收以对应准确提交的实际检查和独立证据为准，不代表正式资源获得授权。
 
 该隔离操作 ledger 和只读对账列表各以上限 32 条为界；达到边界前须完成经审查的分页或分段扩容，不能删除旧意图、证据或登记记录以继续写入。新增限制只约束这个演练 journal，不改变历史版本链的独立上限。
@@ -228,7 +230,7 @@ Provider 隔离交接使用一次性的临时 age 私钥；全部已取得的响
 
 整体通过还要求 off 后再次独立检查 closed/frozen、所有 work 为零、无未知终态，并通过既有 prepare／capture／verify-backup 和完整基线读回封存当前配置、准确 CI、全部受支持数据及对象闭包。这不创建恢复资源或再触碰 Webhook。报告以 `onActivationBaseline` 保留启用前基线，`latestOffBaseline` 记录新增导入／刷新后的新快照；两者使用不同 checkpoint、journal 和私有阶段键，不以旧 G0 或候选 ZIP 代替新写入保全。任何备份或独立读回失败都会停止整体通过，并保留已经恢复的 off 现场与两份资料。
 
-依赖读取 Secret `SUBS_BOT_CF_DEPENDENCY_READ_TOKEN` 只在 `provider-binding`、下述 `provider-binding-resume` 和 `provider-binding-reconcile` 注入，所需权限组为 Workers Scripts Read 与 Workers Containers Read。平台只能按账户授予这些读权限；工具再限制到已验证的 Provider 当前／历史准确 ID 与实际盘点所得对象，GET-only，拒绝其他项目、写操作、D1、R2、Zone 和 Registry。使用短期凭据并核对到期时间，不复制 Provider 运行 Secret。
+依赖读取 Secret `SUBS_BOT_CF_DEPENDENCY_READ_TOKEN` 只在 `provider-binding`、下述 `provider-binding-resume` 和 `provider-binding-reconcile` 注入，所需权限组为 Workers Scripts Read 与 Workers Containers Read。Workers Scripts Read 可使用 account-owned granular token 限定准确 Worker 资源；Containers Read 本轮仅核实到账号级产品权限，必须单独评估并批准其范围。工具按已验证的 Provider 当前／历史准确 ID 与实际盘点所得对象限制 GET，不把工具白名单当作平台级资源隔离。使用短期凭据并核对到期时间，不复制 Provider 运行 Secret。
 
 每个完整 Provider 配置与应用提交组合只允许一个私有持久 on-intent。部署结果未知时不能重跑 `provider-binding`，也不能删除标记以重发。若关闭配置的部署未知，同样保留两份契约和 intent；下述 on 续接不代替未知 off 的处置，不能用原 Provider=null 登记的检查失败声称已经恢复，也不能盲目重新部署或恢复 Webhook。所有 G0、业务记录、票据和私有部分结果保留。
 

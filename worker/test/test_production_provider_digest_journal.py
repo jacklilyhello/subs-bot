@@ -90,6 +90,40 @@ class DigestJournalTests(unittest.TestCase):
             with self.assertRaises(control.ProviderError):
                 journal.verify_readonly_resolution(Mock(), run_id, {**pin, "readbackSha256": "0" * 64}, [revision])
 
+    def test_reviewed_readonly_resolution_binds_controller_candidate_and_gate(self):
+        revision, candidate, run_id, reconcile_id = "b" * 40, "c" * 40, "101", "103"
+        report = {"version": 1, "kind": "isolated-provider-digest-readonly-resolution",
+                  "classification": "intent-job-skipped-empty-prefix", "runId": run_id,
+                  "controllerRevision": revision, "workflowPath": journal.transfer.REVIEWED_WORKFLOW_PATH,
+                  "runConclusion": "failure", "intentJobId": "202", "publishJobId": "203", "completionJobId": "204",
+                  "bucketSha256": "1" * 64, "objectCount": 0}
+        pin = {"controllerRevision": revision, "workflowPath": journal.transfer.REVIEWED_WORKFLOW_PATH,
+               "intentJobId": "202", "publishJobId": "203", "completionJobId": "204", "readbackSha256": control.digest(report),
+               "reconcileRunId": reconcile_id, "reconcileRunAttempt": "1", "reconcileRevision": revision,
+               "reconcileWorkflowPath": journal.transfer.REVIEWED_DIGEST_RECONCILE_WORKFLOW_PATH,
+               "reconcileCandidateRevision": candidate, "reconcileReviewedPr": "290"}
+        run = {"id": 103, "run_attempt": 1, "path": pin["reconcileWorkflowPath"],
+               "display_title": "Inspect isolated digest 101 head " + candidate + " pr 290", "head_sha": revision,
+               "head_branch": "main", "event": "workflow_dispatch", "status": "completed", "conclusion": "success",
+               "repository": {"id": control.github.REPOSITORY_ID}, "head_repository": {"id": control.github.REPOSITORY_ID}}
+        gate = {"name": "Verify independently approved Provider head and isolation contracts", "status": "completed", "conclusion": "success"}
+        job = {"name": "Digest read-only reconciliation", "run_id": 103, "run_attempt": 1, "head_sha": revision,
+               "status": "completed", "conclusion": "success", "steps": [gate,
+                    {"name": "Inspect skipped intent without writes", "status": "completed", "conclusion": "success"}]}
+        comparison = {"status": "ahead", "behind_by": 0, "base_commit": {"sha": revision}, "merge_base_commit": {"sha": revision}}
+        def get(path, _token):
+            return {"total_count": 1, "jobs": [job]} if path.endswith("/jobs?per_page=100") else run
+        with patch.object(journal, "inspect_readonly_run", return_value=report), patch.object(journal.durable, "source_ancestor"), \
+                patch.object(control.github, "_github_token", return_value="fixture"), patch.object(control.github, "_get_json", side_effect=get), \
+                patch.object(control.github, "compare_commits_metadata", return_value=comparison):
+            journal.verify_readonly_resolution(Mock(), run_id, pin, [revision])
+            with patch.dict(gate, {"conclusion": "failure"}), self.assertRaises(control.ProviderError):
+                journal.verify_readonly_resolution(Mock(), run_id, pin, [revision])
+            with patch.dict(run, {"run_attempt": 2}), self.assertRaises(control.ProviderError):
+                journal.verify_readonly_resolution(Mock(), run_id, pin, [revision])
+            with self.assertRaises(control.ProviderError):
+                journal.verify_readonly_resolution(Mock(), run_id, {**pin, "reconcileCandidateRevision": "d" * 40}, [revision])
+
     def test_unregistered_readonly_run_blocks_until_explicit_resolution(self):
         revision = "b" * 40
         common = {"path": journal.transfer.WORKFLOW_PATH, "head_sha": revision, "head_branch": "main", "event": "workflow_dispatch",
