@@ -195,6 +195,16 @@ jobs:
       DRILL_BACKUP_ANCHOR_APPROVAL_SHA256: ${{ inputs.backup_anchor_approval_sha256 }}
       DRILL_BACKUP_FAULT: ${{ github.event_name == 'schedule' && 'none' || inputs.backup_fault || 'none' }}
     steps:
+      - name: Reject legacy test webhook writes before loading credentials
+        env:
+          REQUESTED_ACTION: ${{ github.event_name == 'schedule' && '' || inputs.action }}
+        run: |
+          case "$REQUESTED_ACTION" in
+            exercise|provider-binding|provider-binding-resume|recover-webhook)
+              echo 'Legacy test webhook writes are disabled pending the shared durable lock.' >&2
+              exit 1
+              ;;
+          esac
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
@@ -228,7 +238,8 @@ jobs:
           umask 077
           python3 -B worker/tools/production_lifecycle_drill.py
       - name: Independently restore the original test webhook after the exercise
-        if: always() && (inputs.action == 'exercise' || inputs.action == 'provider-binding' || inputs.action == 'provider-binding-resume')
+        # The legacy writer is blocked above; always() must never bypass that block.
+        if: ${{ false }}
         env:
           DRILL_ACTION: recover-webhook
           DRILL_AUTOMATIC_CLEANUP: '1'

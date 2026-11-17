@@ -1045,11 +1045,12 @@ class Drill:
                                      plan["stateSha256"])
             elapsed = time.monotonic() - pause_started
             journal.append("resumed", {"control": resumed["control"], "pauseSeconds": round(elapsed, 3),
-                           "pauseLimitExceeded": elapsed > pause_limit}, int(time.time()))
+                           "pauseLimitExceeded": elapsed > pause_limit, "maximumPauseExceeded": elapsed > maximum_pause}, int(time.time()))
             anchor.release(session)
             self.report.update(status="warning" if elapsed > pause_limit else "passed", backupMaintenance={"session": session, "day": day,
                 "pauseSeconds": round(elapsed, 3), "pauseLimitSeconds": pause_limit, "maximumPauseSeconds": maximum_pause,
-                "pauseLimitExceeded": elapsed > pause_limit, "capacity": observed, "baseline": baseline})
+                "pauseLimitExceeded": elapsed > pause_limit, "maximumPauseExceeded": elapsed > maximum_pause,
+                "capacity": observed, "baseline": baseline})
         except Exception as error:
             # Do not hide an unconfirmed transition behind an automatic retry or
             # resume. A separate observer must reconcile the durable intent.
@@ -1200,8 +1201,10 @@ class Drill:
             elapsed = max(0, int(time.time()) - pause_intent["timestamp"])
             limit = initial.get("pauseLimitSeconds")
             require(type(limit) is int and 60 <= limit <= 900)
+            maximum = initial.get("maximumPauseSeconds", 1800)
+            require(type(maximum) is int and 300 <= maximum <= 21600 and maximum >= limit)
             journal.append("resumed", {"control": resumed["control"], "pauseSeconds": elapsed,
-                           "pauseLimitExceeded": elapsed > limit, "confirmedByWatchdog": True}, int(time.time()))
+                           "pauseLimitExceeded": elapsed > limit, "maximumPauseExceeded": elapsed > maximum, "confirmedByWatchdog": True}, int(time.time()))
             anchor.release(session)
             self.report.update(status="reconciled", watchdog="aborted-drain-resumed", session=session,
                                pauseSeconds=elapsed, pauseLimitExceeded=elapsed > limit)
@@ -1261,8 +1264,10 @@ class Drill:
         elapsed = max(0, int(time.time()) - pause["timestamp"])
         limit = initial.get("pauseLimitSeconds")
         require(type(limit) is int and 60 <= limit <= 900)
+        maximum = initial.get("maximumPauseSeconds", 1800)
+        require(type(maximum) is int and 300 <= maximum <= 21600 and maximum >= limit)
         journal.append("resumed", {"control": resumed["control"], "pauseSeconds": elapsed,
-                       "pauseLimitExceeded": elapsed > limit, "confirmedByWatchdog": True}, int(time.time()))
+                       "pauseLimitExceeded": elapsed > limit, "maximumPauseExceeded": elapsed > maximum, "confirmedByWatchdog": True}, int(time.time()))
         anchor.release(session)
         self.report.update(status="reconciled", watchdog=resume_kind, session=session,
                            pauseSeconds=elapsed, pauseLimitExceeded=elapsed > limit)
@@ -1520,6 +1525,8 @@ def main():
     env = os.environ
     require(env.get("GITHUB_WORKFLOW_REF") == WORKFLOW, "Only the protected dedicated hosted rehearsal workflow may run this drill.")
     action = env.get("DRILL_ACTION", "inspect")
+    require(action not in {"exercise", "provider-binding", "provider-binding-resume", "recover-webhook"},
+            "Legacy test webhook writes are disabled until they share the protected webhook lock; use the trusted recovery entry for an existing incident.")
     if action in {"daily-backup", "daily-backup-watchdog"}:
         require(backup_enabled(env, watchdog=action == "daily-backup-watchdog"),
                 "This isolated backup operation is not enabled.")

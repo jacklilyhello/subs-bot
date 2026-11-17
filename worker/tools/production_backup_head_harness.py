@@ -55,7 +55,7 @@ def public_result(result):
         for key in ("pauseSeconds", "pauseLimitSeconds", "maximumPauseSeconds"):
             if type(maintenance.get(key)) in (int, float) and 0 <= maintenance[key] <= 86400:
                 summary[key] = maintenance[key]
-        for key in ("pauseLimitExceeded", "admissionRestored", "authorizationUnchanged", "initiallyFrozen"):
+        for key in ("pauseLimitExceeded", "maximumPauseExceeded", "admissionRestored", "authorizationUnchanged", "initiallyFrozen"):
             if type(maintenance.get(key)) is bool:
                 summary[key] = maintenance[key]
         baseline = maintenance.get("baseline")

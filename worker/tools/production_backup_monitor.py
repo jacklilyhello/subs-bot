@@ -116,14 +116,24 @@ def evaluate(runs, journals, now, *, overdue_hours=48, timeout_minutes=30):
             resumed = [event for event in events if event["stage"] == "resumed"]
             if paused:
                 require(events[0]["stage"] == "started")
-                maximum = events[0]["details"].get("pauseLimitSeconds")
-                require(type(maximum) is int and 60 <= maximum <= 900 and len(paused) == 1 and len(resumed) <= 1)
+                warning = events[0]["details"].get("pauseLimitSeconds")
+                maximum = events[0]["details"].get("maximumPauseSeconds", 1800)
+                require(type(warning) is int and 60 <= warning <= 900 and type(maximum) is int
+                        and 300 <= maximum <= 21600 and maximum >= warning and len(paused) == 1 and len(resumed) <= 1)
+                started = intents[0]["timestamp"] if intents else paused[0]["timestamp"]
                 if resumed:
                     require(type(resumed[0]["details"].get("pauseLimitExceeded")) is bool)
                     if resumed[0]["details"]["pauseLimitExceeded"]:
                         alerts.add("pause-limit-exceeded")
-                elif now - (intents[0]["timestamp"] if intents else paused[0]["timestamp"]) > maximum:
-                    alerts.add("pause-limit-exceeded")
+                    maximum_exceeded = resumed[0]["details"].get("maximumPauseExceeded")
+                    require(maximum_exceeded is None or type(maximum_exceeded) is bool)
+                    if maximum_exceeded is True or (maximum_exceeded is None and resumed[0]["timestamp"] - started > maximum):
+                        alerts.add("pause-maximum-exceeded")
+                else:
+                    if now - started > warning:
+                        alerts.add("pause-limit-exceeded")
+                    if now - started > maximum:
+                        alerts.add("pause-maximum-exceeded")
             elif intents:
                 alerts.add("pause-state-unconfirmed")
             if run["status"] == "completed":

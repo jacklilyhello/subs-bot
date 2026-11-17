@@ -63,6 +63,21 @@ class MonitorTests(unittest.TestCase):
         result = self.observe([run()], {"123-1": events})
         self.assertIn("pause-limit-exceeded", result["alerts"])
 
+    def test_maximum_pause_is_distinct_from_warning_and_legacy_receipts(self):
+        events = [event("started", {"pauseLimitSeconds": 60, "maximumPauseSeconds": 300}),
+                  event("pause-intent", timestamp=1000), event("paused", timestamp=1000)]
+        active = self.observe([run(status="in_progress", conclusion=None)], {"123-1": events}, now=1301)
+        self.assertIn("pause-limit-exceeded", active["alerts"])
+        self.assertIn("pause-maximum-exceeded", active["alerts"])
+        events.append(event("resumed", {"pauseLimitExceeded": True, "maximumPauseExceeded": True}, timestamp=1301))
+        completed = self.observe([run()], {"123-1": events}, now=1301)
+        self.assertIn("pause-maximum-exceeded", completed["alerts"])
+        events[-1]["details"].pop("maximumPauseExceeded")
+        self.assertIn("pause-maximum-exceeded", self.observe([run()], {"123-1": events}, now=1301)["alerts"])
+        events[-1]["details"]["maximumPauseExceeded"] = "true"
+        with self.assertRaises(Exception):
+            self.observe([run()], {"123-1": events}, now=1301)
+
     def test_untrusted_or_future_success_cannot_clear_alerts(self):
         malformed = complete()
         malformed[2]["details"]["manifestSha256"] = "bad"

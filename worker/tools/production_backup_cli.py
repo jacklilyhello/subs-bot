@@ -58,6 +58,16 @@ def maximum_pause(policy):
     return maximum
 
 
+def session_maximum(events):
+    require(events and events[0]["stage"] == "started")
+    details = events[0]["details"]
+    warning = details.get("pauseLimitSeconds")
+    maximum = details.get("maximumPauseSeconds", 1800)
+    require(type(warning) is int and 60 <= warning <= 900 and type(maximum) is int
+            and 300 <= maximum <= 21600 and maximum >= warning)
+    return maximum
+
+
 def require_pause_window(events, policy):
     pauses = [event for event in events if event.get("stage") == "pause-intent"]
     now = int(time.time())
@@ -248,7 +258,7 @@ def require_finished_intent(details, *, allowed_actions=None):
 def monitor_anchor(anchor, store, target, policy, now):
     """Read committed anchor history; missing or malformed evidence fails closed."""
     pin, _raw, _etag = anchor.read()
-    history, current, seen, latest_capacity, latest_completed_failed, latest_pause_exceeded = [], pin, set(), None, None, False
+    history, current, seen, latest_capacity, latest_completed_failed, latest_pause_exceeded, latest_maximum_exceeded = [], pin, set(), None, None, False, False
     while current["generation"] > 1:
         if current["state"] == "idle":
             session = current["session"]
@@ -263,6 +273,12 @@ def monitor_anchor(anchor, store, target, policy, now):
             if latest_completed_failed is None:
                 latest_completed_failed = not (verified and events[-1]["stage"] in {"resumed", "preserved-frozen"})
                 latest_pause_exceeded = events[-1]["details"].get("pauseLimitExceeded") is True
+                maximum_exceeded = events[-1]["details"].get("maximumPauseExceeded")
+                require(maximum_exceeded is None or type(maximum_exceeded) is bool)
+                pauses = [event for event in events if event["stage"] == "pause-intent"]
+                latest_maximum_exceeded = maximum_exceeded is True or (maximum_exceeded is None
+                    and events[-1]["stage"] == "resumed" and pauses
+                    and events[-1]["timestamp"] - pauses[0]["timestamp"] > session_maximum(events))
             preflight = [event for event in events if event["stage"] == "preflight"]
             if latest_capacity is None and preflight:
                 latest_capacity = preflight[0]["details"].get("capacity")
@@ -279,6 +295,8 @@ def monitor_anchor(anchor, store, target, policy, now):
         alerts.append("backup-failed")
     if latest_pause_exceeded:
         alerts.append("pause-limit-exceeded")
+    if latest_maximum_exceeded:
+        alerts.append("pause-maximum-exceeded")
     if latest is None or now - latest > policy["overdueHours"] * 3600:
         alerts.append("backup-overdue")
     elif now - latest > policy["frequencyHours"] * 3600:
@@ -298,9 +316,13 @@ def monitor_anchor(anchor, store, target, policy, now):
         if phase == "failed":
             alerts.append("backup-failed")
         pauses = [event for event in events if event["stage"] == "pause-intent"]
-        if pauses and phase not in {"resumed", "preserved-frozen"} and now - pauses[0]["timestamp"] > policy["pauseLimitSeconds"]:
+        maximum = session_maximum(events) if pauses else None
+        if pauses and phase not in {"resumed", "preserved-frozen"} and now - pauses[0]["timestamp"] > events[0]["details"]["pauseLimitSeconds"]:
             if "pause-limit-exceeded" not in alerts:
                 alerts.append("pause-limit-exceeded")
+        if pauses and phase not in {"resumed", "preserved-frozen"} and now - pauses[0]["timestamp"] > maximum:
+            if "pause-maximum-exceeded" not in alerts:
+                alerts.append("pause-maximum-exceeded")
     if isinstance(latest_capacity, dict):
         levels = [latest_capacity.get(key) for key in ("rowStatus", "objectStatus", "objectBytesStatus")]
         if "over-limit" in levels or latest_capacity.get("failureReason") == "object-too-large":
@@ -439,7 +461,7 @@ def emit_result(result, target, revision, root, *, source_revision=None):
     # GitHub logs and artifacts are visible to repository readers, so expose only
     # the exact predecessor digest and non-identifying operational aggregates.
     safe_keys = {"status", "action", "alerts", "latestVerifiedAt", "phase", "notification", "approvalAction",
-                 "stateSha256", "session", "day", "pauseSeconds", "pauseLimitExceeded", "capacity", "liveCapacity", "checkpointId", "manifestSha256",
+                 "stateSha256", "session", "day", "pauseSeconds", "pauseLimitExceeded", "maximumPauseExceeded", "capacity", "liveCapacity", "checkpointId", "manifestSha256",
                  "anchorPlanSha256", "candidateSha256", "genesisSha256", "historyPresent", "pointerPresent", "mutationPermitted"}
     observed = result.get("state")
     result = {key: value for key, value in result.items() if key in safe_keys}
@@ -591,6 +613,7 @@ def main(env=None):
                 guard()
                 started = {"configurationSha256": target.configuration_digest, "control": state["control"],
                     "release": state["release"], "pauseLimitSeconds": policy["pauseLimitSeconds"],
+                    "maximumPauseSeconds": maximum_pause(policy),
                     "checkpointId": contract["checkpointId"], "contractSha256": digest(contract), "policySha256": digest(policy)}
                 original = {"version": 1, "targetSha256": target.digest, "session": session, "day": day,
                     "controlRevision": revision, "dispatcherRevision": revision, "dispatcherWorkflow": "worker-production-backup.yml",
@@ -727,7 +750,8 @@ def main(env=None):
                     if next_stage == "resumed":
                         pause = next(event for event in events if event["stage"] == "pause-intent")
                         elapsed = max(0, int(time.time()) - pause["timestamp"])
-                        details.update(pauseSeconds=elapsed, pauseLimitExceeded=elapsed > policy["pauseLimitSeconds"])
+                        details.update(pauseSeconds=elapsed, pauseLimitExceeded=elapsed > policy["pauseLimitSeconds"],
+                                       maximumPauseExceeded=elapsed > maximum_pause(policy))
                     journal.append(next_stage, details, int(time.time()))
                     if next_stage == "resumed":
                         anchor.release(pin["session"])
@@ -771,10 +795,11 @@ def main(env=None):
                         after = resume.resume_failed_backup(ctl, api, source, rj, **kwargs, approval_envelope=env.get("SUBS_BOT_APPROVAL_JSON", ""), record_intent=record_intent)
                     elapsed = max(0, int(time.time()) - pause["timestamp"])
                     journal.append("resumed", {"control": after["control"], "pauseSeconds": elapsed,
-                                   "pauseLimitExceeded": elapsed > policy["pauseLimitSeconds"], "backupVerified": False}, int(time.time()))
+                                   "pauseLimitExceeded": elapsed > policy["pauseLimitSeconds"],
+                                   "maximumPauseExceeded": elapsed > maximum_pause(policy), "backupVerified": False}, int(time.time()))
                     anchor.release(pin["session"])
                     result = {"status": "resumed-after-failure", "action": action, "pauseSeconds": elapsed,
-                              "pauseLimitExceeded": elapsed > policy["pauseLimitSeconds"]}
+                              "pauseLimitExceeded": elapsed > policy["pauseLimitSeconds"], "maximumPauseExceeded": elapsed > maximum_pause(policy)}
             elif action == "capture":
                 last(events, "frozen-data")
                 require_pause_window(events, policy)
@@ -862,10 +887,10 @@ def main(env=None):
                     started = next(event for event in events if event["stage"] == "pause-intent")
                     elapsed = max(0, int(time.time()) - started["timestamp"])
                     journal.append("resumed", {"control": after["control"], "pauseSeconds": elapsed,
-                        "pauseLimitExceeded": elapsed > policy["pauseLimitSeconds"]}, int(time.time()))
+                        "pauseLimitExceeded": elapsed > policy["pauseLimitSeconds"], "maximumPauseExceeded": elapsed > maximum_pause(policy)}, int(time.time()))
                     anchor.release(pin["session"])
                     result = {"status": "resumed", "action": action, "pauseSeconds": elapsed,
-                              "pauseLimitExceeded": elapsed > policy["pauseLimitSeconds"]}
+                              "pauseLimitExceeded": elapsed > policy["pauseLimitSeconds"], "maximumPauseExceeded": elapsed > maximum_pause(policy)}
             else:
                 raise ValueError("Unsupported backup action.")
         return emit_result(result, target, revision, root, source_revision=proof["revision"])

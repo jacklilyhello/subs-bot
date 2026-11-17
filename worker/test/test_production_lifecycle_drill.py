@@ -45,6 +45,14 @@ class MemoryStore:
 
 
 class LifecycleDrillTests(unittest.TestCase):
+    def test_legacy_webhook_actions_reject_before_opening_private_state(self):
+        for action in ("exercise", "provider-binding", "provider-binding-resume", "recover-webhook"):
+            with self.subTest(action=action), patch.dict(drill.os.environ, {
+                    "GITHUB_WORKFLOW_REF": drill.WORKFLOW, "DRILL_ACTION": action}, clear=True), \
+                    patch.object(drill, "Drill") as target, self.assertRaises(contract.ContractError):
+                drill.main()
+            target.assert_not_called()
+
     def test_private_share_readback_uses_scoped_s3_without_rest_fallback(self):
         import scoped_r2
         key = "private-shares/00000000-0000-4000-8000-000000000001.txt"

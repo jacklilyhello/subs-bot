@@ -98,6 +98,15 @@ class ProductionBackupTests(unittest.TestCase):
         with patch.object(backup.time, "time", return_value=2800), self.assertRaises(ContractError):
             backup.require_pause_window(events, legacy)
 
+    def test_maximum_uses_the_journaled_session_value_with_legacy_default(self):
+        event = {"stage": "started", "details": {"pauseLimitSeconds": 300, "maximumPauseSeconds": 3600}}
+        self.assertEqual(backup.session_maximum([event]), 3600)
+        del event["details"]["maximumPauseSeconds"]
+        self.assertEqual(backup.session_maximum([event]), 1800)
+        event["details"]["maximumPauseSeconds"] = True
+        with self.assertRaises(ContractError):
+            backup.session_maximum([event])
+
     def test_unknown_predecessor_cannot_authorize_writes(self):
         with self.assertRaises(ContractError):
             backup.exact_predecessor({"BACKUP_STATE_SHA256": "a" * 64}, {"stateSha256": "b" * 64})
