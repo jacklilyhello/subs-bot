@@ -14,7 +14,7 @@ from time import monotonic
 from urllib.parse import quote
 from xml.etree import ElementTree
 
-from production_target import parsed, require
+from production_target import ContractError, canonical, parsed, require
 
 MAX_OBJECT = 16 * 1024 * 1024
 MAX_LIST = 2 * 1024 * 1024
@@ -23,7 +23,9 @@ MAX_LIST = 2 * 1024 * 1024
 def metadata_token(env=None):
     env = os.environ if env is None else env
     token = env.get("SUBS_BOT_CF_R2_METADATA_READ_TOKEN", "")
-    require(token or not (env.get("SUBS_BOT_SCOPED_R2_READ_JSON") or env.get("SUBS_BOT_SCOPED_R2_WRITE_JSON")),
+    require(token or not any(env.get(key) for key in (
+        "SUBS_BOT_SCOPED_R2_READ_JSON", "SUBS_BOT_SCOPED_R2_WRITE_JSON",
+        "SUBS_BOT_SCOPED_R2_EXTRA_READ_JSON", "SUBS_BOT_SCOPED_R2_EXTRA_WRITE_JSON")),
             "A separate R2 metadata credential is required with scoped object credentials.")
     return token
 
@@ -33,13 +35,28 @@ def creation_token(fallback, env=None):
     env = os.environ if env is None else env
     token = env.get("SUBS_BOT_CF_R2_CREATE_TOKEN", "")
     scoped = any(env.get(key) for key in (
-        "SUBS_BOT_SCOPED_R2_READ_JSON", "SUBS_BOT_SCOPED_R2_WRITE_JSON", "SUBS_BOT_CF_R2_METADATA_READ_TOKEN"))
+        "SUBS_BOT_SCOPED_R2_READ_JSON", "SUBS_BOT_SCOPED_R2_WRITE_JSON", "SUBS_BOT_CF_R2_METADATA_READ_TOKEN",
+        "SUBS_BOT_SCOPED_R2_EXTRA_READ_JSON", "SUBS_BOT_SCOPED_R2_EXTRA_WRITE_JSON"))
     require(token or not scoped, "A separate approved R2 creation credential is required with scoped storage credentials.")
     return token or fallback
 
 
 class ScopedR2Error(ValueError):
     """An operation was not confirmed; never infer a failed write was absent."""
+
+
+class ScopedR2ReadError(ContractError):
+    """A failed read retains the pre-existing target-contract error category."""
+
+
+def read_status(status, phase):
+    """Attach only a bounded HTTP status to a failed object-read operation."""
+    require(phase in {"get", "list", "head"})
+    if status != 200:
+        error = ScopedR2ReadError("The scoped R2 read was not confirmed.")
+        error.read_diagnostic = {"source": "r2", "phase": phase,
+                                 "httpStatus": status if type(status) is int and 100 <= status <= 599 else None}
+        raise error
 
 
 def sign(method, host, path, query, headers, payload_sha, access, secret, now):
@@ -81,11 +98,26 @@ def _credential(raw, bucket, *, required):
 
 def from_environment(account, bucket, env=None):
     env = os.environ if env is None else env
-    read = env.get("SUBS_BOT_SCOPED_R2_READ_JSON", "")
-    write = env.get("SUBS_BOT_SCOPED_R2_WRITE_JSON", "")
+    read = _combined_credentials(env.get("SUBS_BOT_SCOPED_R2_READ_JSON", ""), env.get("SUBS_BOT_SCOPED_R2_EXTRA_READ_JSON", ""))
+    write = _combined_credentials(env.get("SUBS_BOT_SCOPED_R2_WRITE_JSON", ""), env.get("SUBS_BOT_SCOPED_R2_EXTRA_WRITE_JSON", ""))
     if not read and not write:
         return None
     return ScopedR2(account, bucket, _credential(read, bucket, required=True), _credential(write, bucket, required=False))
+
+
+def _combined_credentials(primary, additional):
+    """Append separately injected target credentials without replacing old keys."""
+    if not additional:
+        return primary
+    base, extra = parsed(primary) if primary else {}, parsed(additional)
+    require(extra and not set(base).intersection(extra) and len(base) + len(extra) <= 32,
+            "Additional bucket credentials must be nonempty, disjoint and bounded.")
+    combined = canonical({**base, **extra})
+    for name in (*base, *extra):
+        require(re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", name) is not None,
+                "Additional bucket credential names are invalid.")
+        _credential(combined, name, required=True)
+    return combined
 
 
 class ScopedR2:
@@ -110,6 +142,8 @@ class ScopedR2:
                 connection.request(method, path + ("?" + encoded if encoded else ""), body=raw if method == "PUT" else None, headers=headers)
                 with closing(connection.getresponse()) as response:
                     status, etag = response.status, response.getheader("ETag")
+                    if method in {"GET", "HEAD"} and status != 200:
+                        return (status, etag, b"", []) if include_headers else (status, etag, b"")
                     deadline, body = monotonic() + 45, bytearray()
                     while monotonic() < deadline:
                         chunk = response.read1(min(65536, limit + 1 - len(body)))
@@ -126,7 +160,8 @@ class ScopedR2:
         status, etag, raw = self._request("GET", key, limit=limit)
         if status == 404 and absent:
             return None, None
-        require(status == 200 and etag and not any(c in etag for c in "\r\n"))
+        read_status(status, "get")
+        require(etag and not any(c in etag for c in "\r\n"))
         return raw, etag
 
     def put_once(self, key, raw, *, etag=None, metadata=None):
@@ -164,7 +199,8 @@ class ScopedR2:
             if cursor is not None:
                 query["continuation-token"] = cursor
             status, _etag, raw = self._request("GET", "", query=query, limit=MAX_LIST)
-            require(status == 200 and b"<!" not in raw)
+            read_status(status, "list")
+            require(b"<!" not in raw)
             try:
                 root = ElementTree.fromstring(raw)
             except ElementTree.ParseError:
@@ -201,7 +237,8 @@ class ScopedR2:
 
     def head(self, key):
         status, etag, _body, headers = self._request("HEAD", key, limit=0, include_headers=True)
-        require(status == 200 and isinstance(etag, str))
+        read_status(status, "head")
+        require(isinstance(etag, str))
         seen = {}
         for name, value in headers:
             name = name.lower()

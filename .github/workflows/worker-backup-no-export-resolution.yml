@@ -1,0 +1,171 @@
+name: Resolve one interrupted isolated backup without export
+run-name: No-export ${{ inputs.action }} at ${{ github.sha }} candidate ${{ fromJSON(inputs.validation_json).headSha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        type: choice
+        options: [audit-writers, plan, seal, verify-seal, release, verify-release]
+        required: true
+      validation_json:
+        type: string
+        required: true
+      plan_sha256:
+        type: string
+      evidence_sha256:
+        type: string
+      seal_run_id:
+        type: string
+      seal_reader_run_id:
+        type: string
+      release_run_id:
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+concurrency:
+  group: subs-bot-lifecycle-rehearsal
+  cancel-in-progress: false
+
+jobs:
+  resolution:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    environment: subs-bot-backup-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      plan_sha256: ${{ steps.resolution.outputs.plan_sha256 }}
+      evidence_sha256: ${{ steps.resolution.outputs.evidence_sha256 }}
+      release_sha256: ${{ steps.resolution.outputs.release_sha256 }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      NO_EXPORT_ENVIRONMENT: subs-bot-backup-head-isolation
+      NO_EXPORT_ACTION: ${{ inputs.action }}
+      NO_EXPORT_VALIDATION_JSON: ${{ inputs.validation_json }}
+      NO_EXPORT_REVIEW_JSON: ${{ secrets.SUBS_BOT_BACKUP_NO_EXPORT_REVIEW_JSON }}
+      NO_EXPORT_CUSTODY_JSON: ${{ secrets.SUBS_BOT_BACKUP_NO_EXPORT_CUSTODY_JSON }}
+      NO_EXPORT_REVIEW_SHA256: ${{ vars.SUBS_BOT_BACKUP_NO_EXPORT_REVIEW_SHA256 }}
+      NO_EXPORT_PLAN_SHA256: ${{ inputs.plan_sha256 }}
+      NO_EXPORT_EVIDENCE_SHA256: ${{ inputs.evidence_sha256 }}
+      NO_EXPORT_SEAL_RUN_ID: ${{ inputs.seal_run_id }}
+      NO_EXPORT_SEAL_READER_RUN_ID: ${{ inputs.seal_reader_run_id }}
+      NO_EXPORT_RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+      NO_EXPORT_PROTECTED_PLAN_SHA256: ${{ vars.SUBS_BOT_BACKUP_NO_EXPORT_PLAN_SHA256 }}
+      NO_EXPORT_PROTECTED_EVIDENCE_SHA256: ${{ vars.SUBS_BOT_BACKUP_NO_EXPORT_EVIDENCE_SHA256 }}
+      SUBS_BOT_BACKUP_NO_EXPORT_SEAL_RUN_ID: ${{ vars.SUBS_BOT_BACKUP_NO_EXPORT_SEAL_RUN_ID }}
+      SUBS_BOT_BACKUP_NO_EXPORT_SEAL_READER_RUN_ID: ${{ vars.SUBS_BOT_BACKUP_NO_EXPORT_SEAL_READER_RUN_ID }}
+      SUBS_BOT_BACKUP_NO_EXPORT_RELEASE_RUN_ID: ${{ vars.SUBS_BOT_BACKUP_NO_EXPORT_RELEASE_RUN_ID }}
+      SUBS_BOT_BACKUP_NO_EXPORT_ENABLED: ${{ vars.SUBS_BOT_BACKUP_NO_EXPORT_ENABLED }}
+      SUBS_BOT_BACKUP_NO_EXPORT_WRITES_ENABLED: ${{ vars.SUBS_BOT_BACKUP_NO_EXPORT_WRITES_ENABLED }}
+      BACKUP_REVIEWED_HEAD_SHA: ${{ vars.SUBS_BOT_BACKUP_REVIEWED_HEAD_SHA }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Verify no-export identity before candidate checkout
+        env:
+          NO_EXPORT_GATE_CHECK: before
+        run: python3 -B trusted/worker/tools/trusted_backup_no_export_gate.py
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ fromJSON(inputs.validation_json).headSha }}
+          path: candidate
+          persist-credentials: false
+      - name: Verify exact reviewed no-export checkout
+        id: ready
+        env:
+          NO_EXPORT_GATE_CHECK: ready
+        run: python3 -B trusted/worker/tools/trusted_backup_no_export_gate.py
+      - name: Verify no-export test Bot identity
+        if: inputs.action != 'audit-writers'
+        env:
+          NO_EXPORT_GATE_CHECK: credential
+          SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
+        run: python3 -B trusted/worker/tools/trusted_backup_no_export_gate.py
+      - name: Plan or apply the no-export resolution
+        id: resolution
+        if: inputs.action != 'audit-writers'
+        env:
+          NO_EXPORT_WRITER_INVENTORY_SHA256: ${{ steps.ready.outputs.writer_inventory_sha256 }}
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_CONTROL_DRILL_KEYS: ${{ secrets.SUBS_BOT_CONTROL_DRILL_KEYS }}
+          SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_REHEARSAL_DATA_READ_TOKEN }}
+          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_REHEARSAL_WORKER_READ_TOKEN }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_SCOPED_R2_WRITE_JSON: ${{ contains(fromJSON('["seal","release"]'), inputs.action) && secrets.SUBS_BOT_SCOPED_R2_WRITE_JSON || '' }}
+          PYTHONPATH: ${{ github.workspace }}/trusted/worker/tools
+        run: |
+          umask 077
+          python3 -B candidate/worker/tools/production_backup_no_export_resolution.py
+  readback:
+    needs: [resolution]
+    if: needs.resolution.result == 'success' && (inputs.action == 'seal' || inputs.action == 'release')
+    environment: subs-bot-backup-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+      NO_EXPORT_ENVIRONMENT: subs-bot-backup-head-isolation
+      NO_EXPORT_ACTION: ${{ inputs.action == 'seal' && 'evidence-readback' || 'release-readback' }}
+      NO_EXPORT_VALIDATION_JSON: ${{ inputs.validation_json }}
+      NO_EXPORT_REVIEW_JSON: ${{ secrets.SUBS_BOT_BACKUP_NO_EXPORT_REVIEW_JSON }}
+      NO_EXPORT_CUSTODY_JSON: ${{ secrets.SUBS_BOT_BACKUP_NO_EXPORT_CUSTODY_JSON }}
+      NO_EXPORT_REVIEW_SHA256: ${{ vars.SUBS_BOT_BACKUP_NO_EXPORT_REVIEW_SHA256 }}
+      NO_EXPORT_PLAN_SHA256: ${{ inputs.plan_sha256 }}
+      NO_EXPORT_EVIDENCE_SHA256: ${{ inputs.evidence_sha256 }}
+      NO_EXPORT_SEAL_RUN_ID: ${{ inputs.seal_run_id }}
+      NO_EXPORT_SEAL_READER_RUN_ID: ${{ inputs.seal_reader_run_id }}
+      NO_EXPORT_PROTECTED_PLAN_SHA256: ${{ vars.SUBS_BOT_BACKUP_NO_EXPORT_PLAN_SHA256 }}
+      NO_EXPORT_PROTECTED_EVIDENCE_SHA256: ${{ vars.SUBS_BOT_BACKUP_NO_EXPORT_EVIDENCE_SHA256 }}
+      SUBS_BOT_BACKUP_NO_EXPORT_SEAL_RUN_ID: ${{ vars.SUBS_BOT_BACKUP_NO_EXPORT_SEAL_RUN_ID }}
+      SUBS_BOT_BACKUP_NO_EXPORT_SEAL_READER_RUN_ID: ${{ vars.SUBS_BOT_BACKUP_NO_EXPORT_SEAL_READER_RUN_ID }}
+      SUBS_BOT_BACKUP_NO_EXPORT_ENABLED: ${{ vars.SUBS_BOT_BACKUP_NO_EXPORT_ENABLED }}
+      BACKUP_REVIEWED_HEAD_SHA: ${{ vars.SUBS_BOT_BACKUP_REVIEWED_HEAD_SHA }}
+      NO_EXPORT_SEAL_EVIDENCE_SHA256: ${{ needs.resolution.outputs.evidence_sha256 }}
+      NO_EXPORT_RELEASE_SHA256: ${{ needs.resolution.outputs.release_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Verify no-export identity before candidate checkout
+        env:
+          NO_EXPORT_GATE_CHECK: before
+        run: python3 -B trusted/worker/tools/trusted_backup_no_export_gate.py
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ fromJSON(inputs.validation_json).headSha }}
+          path: candidate
+          persist-credentials: false
+      - name: Verify exact reviewed no-export checkout
+        id: ready
+        env:
+          NO_EXPORT_GATE_CHECK: ready
+        run: python3 -B trusted/worker/tools/trusted_backup_no_export_gate.py
+      - name: Verify no-export test Bot identity
+        env:
+          NO_EXPORT_GATE_CHECK: credential
+          SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
+        run: python3 -B trusted/worker/tools/trusted_backup_no_export_gate.py
+      - name: Independently verify no-export evidence
+        env:
+          NO_EXPORT_WRITER_INVENTORY_SHA256: ${{ steps.ready.outputs.writer_inventory_sha256 }}
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_CONTROL_DRILL_KEYS: ${{ secrets.SUBS_BOT_CONTROL_DRILL_KEYS }}
+          SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_REHEARSAL_DATA_READ_TOKEN }}
+          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_REHEARSAL_WORKER_READ_TOKEN }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          PYTHONPATH: ${{ github.workspace }}/trusted/worker/tools
+        run: |
+          umask 077
+          python3 -B candidate/worker/tools/production_backup_no_export_resolution.py

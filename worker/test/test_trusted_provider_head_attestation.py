@@ -16,6 +16,31 @@ from test_trusted_provider_head_gate import spec
 
 
 class AttestationTests(unittest.TestCase):
+    def test_fixed_stage_diagnostic_reports_only_bounded_status(self):
+        error = attest.scoped_r2.ScopedR2Error("private path and response body")
+        error.read_diagnostic = {"source": "r2", "phase": "get", "httpStatus": 403}
+        def fail():
+            raise error
+        output = StringIO()
+        with redirect_stdout(output), self.assertRaises(attest.scoped_r2.ScopedR2Error):
+            attest.diagnosed("archive-source", fail, index=1)
+        rows = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(rows[-1], {"category": "r2", "httpStatus": 403, "phase": "archive-source",
+                                   "sourceIndex": 1, "status": "rejected"})
+        self.assertNotIn("private path", output.getvalue())
+
+    def test_untrusted_diagnostic_cannot_print_response_or_invalid_status(self):
+        error = RuntimeError("private token")
+        error.read_diagnostic = {"httpStatus": "private body"}
+        def fail():
+            raise error
+        output = StringIO()
+        with redirect_stdout(output), self.assertRaises(RuntimeError):
+            attest.diagnosed("provider-state", fail)
+        self.assertNotIn("private", output.getvalue())
+        self.assertEqual(json.loads(output.getvalue().splitlines()[-1]),
+                         {"category": "other", "phase": "provider-state", "status": "rejected"})
+
     def test_digest_witness_retrieves_and_verifies_complete_oci_closure(self):
         target = config(active=True)
         build = target["build"]
