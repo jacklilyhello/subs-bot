@@ -767,7 +767,7 @@ class ContinuationTests(unittest.TestCase):
         check = activation.require_historical_provider_ancestor
         with patch.object(activation.github, "_get_json", return_value=self.compare) as compare:
             check(HISTORICAL["revision"], REVISION, "synthetic-token")
-            compare.assert_called_once_with(f"/compare/{HISTORICAL['revision']}...{REVISION}?per_page=1", "synthetic-token")
+            compare.assert_called_once_with(f"/compare/{HISTORICAL['revision']}...{REVISION}?per_page=1&page=2", "synthetic-token")
             for key, value in (("status", "diverged"), ("ahead_by", True), ("behind_by", False), ("behind_by", 1),
                                ("merge_base_commit", {"sha": ISOLATED}), ("base_commit", None)):
                 compare.return_value = {**self.compare, key: value}
