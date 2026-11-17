@@ -522,6 +522,341 @@ def emit_result(result, target, revision, root, *, source_revision=None):
     return result
 
 
+def execute_phase(*, action, env, target, revision, policy, contract, proof, state, store,
+                  guard, bounded_guard, ctl, source, api, directory):
+    """Run one phase after its caller has validated identity and dependencies.
+
+    This function retains the phase-specific authorization and state checks.
+    Production and isolation wrappers must provide their own verified context.
+    """
+    seed = maintenance.Anchor(store, target.digest, "0" * 64)
+    genesis_sha = recovery.digest(seed.initial_material()[1])
+    supplied_genesis = env.get("SUBS_BOT_BACKUP_GENESIS_SHA256", "")
+    require(supplied_genesis == genesis_sha or action == "plan-initialize-anchor" and not supplied_genesis,
+            "The independently pinned maintenance genesis differs.")
+    anchor = maintenance.Anchor(store, target.digest, genesis_sha)
+    if action == "inspect-anchor-initialization":
+        plan, _initial, _etag = anchor.plan_initialization_reconciliation()
+        result = {"status": "unknown", "action": action, "anchorPlanSha256": digest(plan),
+                  "historyPresent": plan["historyPresent"], "pointerPresent": plan["pointerPresent"],
+                  "genesisSha256": genesis_sha, "stateSha256": state["stateSha256"], "mutationPermitted": False}
+    elif action == "inspect-anchor-unknown":
+        result = {**missing_started_observation(anchor, store, target), "action": action,
+                  "stateSha256": state["stateSha256"]}
+    elif action in {"plan-initialize-anchor", "initialize-anchor"}:
+        require(store.get(anchor.genesis_key, absent=True) is None and store.get_with_etag(anchor.key) == (None, None)
+                and not store.list_backup_anchor_history(target.digest) and not store.list_backup_journals(),
+                "An existing or partial maintenance anchor requires independent reconciliation.")
+        scope = digest({"policy": policy, "genesisSha256": genesis_sha, "contract": contract})
+        approval_action = "backup-initialize-anchor:" + scope
+        if action == "plan-initialize-anchor":
+            result = {"status": "plan-only", "action": action, "approvalAction": approval_action,
+                      "stateSha256": state["stateSha256"], "genesisSha256": genesis_sha}
+        else:
+            predecessor = exact_predecessor(env, state)
+            authorized(target, env, approval_action, proof["revision"], predecessor, revision)
+            guard()
+            anchor.initialize()
+            result = {"status": "initialized", "action": action}
+    elif action in {"plan-begin", "begin"}:
+        require(state["control"]["admission"] == "open" and state["control"]["workers"] == "run"
+                and not any(state["terminal"].get(key, 0) for key in ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates")))
+        now = datetime.now(timezone.utc)
+        if action == "plan-begin":
+            require(env.get("GITHUB_RUN_ATTEMPT") == "1" and re.fullmatch(r"[1-9][0-9]{0,19}", env.get("GITHUB_RUN_ID", "")))
+            session, day = env["GITHUB_RUN_ID"] + "-1", now.strftime("%Y/%m/%d")
+        else:
+            session, day = session_input(env)
+            confirm_plan_run(session, day, revision)
+        require(day == now.strftime("%Y/%m/%d") and in_window(policy, now), "The selected maintenance window is not open.")
+        pin, anchor_raw, anchor_etag = anchor.read()
+        require(pin["state"] == "idle" and pin["session"] != session)
+        scope = digest({"policy": policy, "contract": contract, "session": session, "day": day,
+                        "anchorSha256": recovery.digest(anchor_raw)})
+        approval_action = "backup-begin:" + scope
+        if action == "plan-begin":
+            result = {"status": "plan-only", "action": action, "approvalAction": approval_action,
+                      "stateSha256": state["stateSha256"], "session": session, "day": day}
+        else:
+            predecessor = exact_predecessor(env, state)
+            authorized(target, env, approval_action, proof["revision"], predecessor, revision)
+            journal = maintenance.Transaction(store, session, day, target.digest, revision)
+            require(not journal.load())
+            guard()
+            started = {"configurationSha256": target.configuration_digest, "control": state["control"],
+                "release": state["release"], "pauseLimitSeconds": policy["pauseLimitSeconds"],
+                "checkpointId": contract["checkpointId"], "contractSha256": digest(contract), "policySha256": digest(policy)}
+            original = {"version": 1, "targetSha256": target.digest, "session": session, "day": day,
+                "controlRevision": revision, "dispatcherRevision": revision, "dispatcherWorkflow": "worker-production-backup.yml",
+                "writerRunId": env["GITHUB_RUN_ID"], "writerAttempt": env["GITHUB_RUN_ATTEMPT"],
+                "anchorPredecessorSha256": recovery.digest(anchor_raw), "stateSha256": state["stateSha256"],
+                "sourceRevision": proof["revision"], "approvalSha256": recovery.digest(env["SUBS_BOT_APPROVAL_JSON"].encode("utf-8")),
+                "timestamp": int(time.time()), "startedDetails": started}
+            intent_sha = maintenance.write_begin(store, original)
+            guard()
+            require(ctl.inspect()["stateSha256"] == predecessor, "The approved begin predecessor changed.")
+            anchor._advance(pin, anchor_raw, anchor_etag, state="active", session=session, day=day, revision=revision)
+            journal.append("started", {**started, "beginIntentSha256": intent_sha}, int(time.time()))
+            result = {"status": "started", "action": action, "session": session, "day": day}
+    elif action in {"plan-abort-unstarted", "abort-unstarted"}:
+        candidate = env.get("BACKUP_ANCHOR_CANDIDATE_SHA256", "") or None
+        plan, original, journal = unstarted_abort_plan(anchor, store, target, ctl, contract, policy, candidate_sha=candidate)
+        if action == "plan-abort-unstarted":
+            result = {"status": "plan-only", "action": action, **plan}
+        else:
+            predecessor = exact_predecessor(env, plan)
+            authorized(target, env, plan["approvalAction"], proof["revision"], predecessor, revision)
+            claim = {"version": 1, "targetSha256": target.digest, "session": plan["session"],
+                     "beginIntentSha256": plan["beginIntentSha256"], "stateSha256": predecessor,
+                     "writerRunId": env["GITHUB_RUN_ID"], "writerAttempt": env["GITHUB_RUN_ATTEMPT"],
+                     "controlRevision": revision}
+            maintenance.claim_begin_reconciliation(store, target.digest, plan["session"], claim)
+            guard()
+            again, _original, _journal = unstarted_abort_plan(anchor, store, target, ctl, contract, policy,
+                candidate_sha=candidate, reconciliation_raw=canonical(claim))
+            require(again == plan, "The approved begin recovery predecessor changed.")
+            if candidate:
+                anchor.reconcile(candidate, plan["anchorPlanSha256"])
+            journal.append("started", {**original["startedDetails"], "beginIntentSha256": plan["beginIntentSha256"],
+                                       "reconciledUnstarted": True}, int(time.time()))
+            journal.append("failed", {"reason": "aborted-before-start-confirmation", "uncertain": False}, int(time.time()))
+            anchor.release(plan["session"])
+            result = {"status": "aborted-before-pause", "action": action, "session": plan["session"]}
+    elif action in {"plan-anchor-reconcile", "anchor-reconcile"}:
+        candidate = env.get("BACKUP_ANCHOR_CANDIDATE_SHA256", "")
+        plan = completed_anchor_reconciliation(anchor, store, target, ctl, candidate, contract, policy)
+        if action == "plan-anchor-reconcile":
+            result = {"status": "plan-only", "action": action, **plan}
+        else:
+            predecessor = exact_predecessor(env, plan)
+            authorized(target, env, plan["approvalAction"], proof["revision"], predecessor, revision)
+            guard()
+            require(completed_anchor_reconciliation(anchor, store, target, ctl, candidate, contract, policy) == plan,
+                    "The exact approved anchor reconciliation changed.")
+            anchor.reconcile(candidate, plan["anchorPlanSha256"])
+            result = {"status": "anchor-release-reconciled", "action": action,
+                      "candidateSha256": candidate, "anchorPlanSha256": plan["anchorPlanSha256"]}
+    else:
+        pin, journal, events = active_transaction(anchor, store, target)
+        require(events[0]["details"].get("contractSha256") == digest(contract)
+                and events[0]["details"].get("policySha256") == digest(policy)
+                and events[0]["details"].get("configurationSha256") == target.configuration_digest)
+        if action == "inspect":
+            result = {"status": "observed", "action": action, "phase": events[-1]["stage"], "state": state}
+        elif action == "preflight":
+            last(events, "started")
+            predecessor = exact_predecessor(env, state)
+            authorized(target, env, "backup-preflight:" + digest(contract), proof["revision"], predecessor, revision)
+            observed = capacity.observe(api, source, warning_percent=policy["warningPercent"])
+            guard()
+            journal.append("preflight", {"capacity": observed}, int(time.time()))
+            result = {"status": "observed", "action": action, "capacity": {key: value for key, value in observed.items() if key != "tableCounts"}}
+        elif action == "abort-preflight":
+            require(events[-1]["stage"] in {"started", "preflight"},
+                    "Only an operation confirmed not to have started pausing can be aborted.")
+            predecessor = exact_predecessor(env, state)
+            require(state["control"] == events[0]["details"]["control"] and state["release"] == events[0]["details"]["release"])
+            authorized(target, env, "backup-abort-preflight:" + digest(contract), proof["revision"], predecessor, revision)
+            journal.append("failed", {"reason": "operator-aborted-before-pause", "uncertain": False}, int(time.time()))
+            anchor.release(pin["session"])
+            result = {"status": "aborted-before-pause", "action": action}
+        elif action == "plan-pause":
+            last(events, "preflight")
+            result = ctl.plan_pause()
+        elif action == "pause":
+            last(events, "preflight")
+            require(in_window(policy, datetime.now(timezone.utc)), "A new pause cannot start outside its approved UTC window.")
+            observed = events[-1]["details"]["capacity"]
+            capacity.require_within_limits(observed)
+            plan = ctl.plan_pause()
+            require(plan["control"] == events[0]["details"]["control"] and plan["release"] == events[0]["details"]["release"]
+                    and plan["configurationSha256"] == events[0]["details"]["configurationSha256"])
+            predecessor = exact_predecessor(env, plan)
+            ctl.approval(env.get("SUBS_BOT_APPROVAL_JSON", ""), "pause", predecessor)
+            bounded_guard()
+            journal.append("pause-intent", intent_metadata(env, plan), int(time.time()))
+            after = ctl.transition("pause", env.get("SUBS_BOT_APPROVAL_JSON", ""), predecessor)
+            journal.append("paused", {"control": after["control"]}, int(time.time()))
+            result = {"status": "paused", "action": action, "state": after}
+        elif action == "drain":
+            last(events, "paused")
+            require(state["control"]["admission"] == "closed" and not any(state["work"].values()))
+            result = {"status": "drained", "action": action, "state": state}
+        elif action == "freeze":
+            last(events, "paused")
+            require(state["control"] == events[-1]["details"]["control"]
+                    and state["release"] == events[0]["details"]["release"]
+                    and state["configurationSha256"] == events[0]["details"]["configurationSha256"])
+            predecessor = exact_predecessor(env, state)
+            ctl.approval(env.get("SUBS_BOT_APPROVAL_JSON", ""), "freeze", predecessor)
+            bounded_guard()
+            journal.append("freeze-intent", intent_metadata(env, state), int(time.time()))
+            after = ctl.transition("freeze", env.get("SUBS_BOT_APPROVAL_JSON", ""), predecessor)
+            journal.append("frozen", {"control": after["control"]}, int(time.time()))
+            journal.append("frozen-data", capacity.frozen_fingerprint(api, source), int(time.time()))
+            result = {"status": "frozen", "action": action, "state": after}
+        elif action == "fingerprint":
+            last(events, "frozen")
+            frozen_matches(events, state)
+            predecessor = exact_predecessor(env, state)
+            authorized(target, env, "backup-fingerprint:" + digest(contract), proof["revision"], predecessor, revision)
+            journal.append("frozen-data", capacity.frozen_fingerprint(api, source), int(time.time()))
+            result = {"status": "frozen-data-confirmed", "action": action}
+        elif action in {"plan-reconcile-transition", "reconcile-transition"}:
+            plan = transition_reconciliation(env, events, state, contract)
+            if action == "plan-reconcile-transition":
+                result = {"status": "plan-only", "action": action, **plan}
+            else:
+                predecessor = exact_predecessor(env, state)
+                authorized(target, env, plan["approvalAction"], proof["revision"], predecessor, revision)
+                guard()
+                require(transition_reconciliation(env, events, ctl.inspect(), contract) == plan,
+                        "The approved reconciliation observation changed.")
+                next_stage = {"pause-intent": "paused", "freeze-intent": "frozen", "resume-intent": "resumed"}[plan["phase"]]
+                details = {"control": state["control"], "reconciled": True}
+                if next_stage == "resumed":
+                    pause = next(event for event in events if event["stage"] == "pause-intent")
+                    elapsed = max(0, int(time.time()) - pause["timestamp"])
+                    details.update(pauseSeconds=elapsed, pauseLimitExceeded=elapsed > policy["pauseLimitSeconds"])
+                journal.append(next_stage, details, int(time.time()))
+                if next_stage == "resumed":
+                    anchor.release(pin["session"])
+                result = {"status": "reconciled", "action": action, "phase": next_stage}
+        elif action in {"plan-resume-failed", "resume-failed"}:
+            # No export may be inferred stopped from missing evidence. Before
+            # capture, require the complete journal and an absent recovery journal.
+            prior = events[-2] if events[-1]["stage"] == "failed" and len(events) > 1 else events[-1]
+            require(prior["stage"] in {"paused", "frozen", "frozen-data", "capture-intent"})
+            initial = events[0]["details"]
+            pause = next(item for item in events if item["stage"] == "pause-intent")
+            require_finished_intent(pause["details"])
+            common = {"initial": initial, "session": pin["session"]}
+            if prior["stage"] == "paused":
+                kwargs = {**common, "paused": prior["details"]["control"]}
+                plan = resume.plan_aborted_drain(ctl, **kwargs)
+            elif prior["stage"] in {"frozen", "frozen-data"}:
+                frozen_control, fingerprint = uncaptured_predecessor(events)
+                rj = recovery.RecoveryJournal(api, env["GITHUB_RUN_ID"] + "/" + env["GITHUB_RUN_ATTEMPT"], guard=guard)
+                kwargs = {**common, "frozen": frozen_control, "fingerprint": fingerprint}
+                plan = resume.plan_uncaptured_backup(ctl, api, source, rj, **kwargs)
+            else:
+                require_finished_intent(prior["details"])
+                frozen = next(item for item in events if item["stage"] == "frozen")
+                fingerprint = next(item for item in events if item["stage"] == "frozen-data")
+                rj = recovery.RecoveryJournal(api, env["GITHUB_RUN_ID"] + "/" + env["GITHUB_RUN_ATTEMPT"], guard=guard)
+                kwargs = {**common, "frozen": frozen["details"]["control"], "fingerprint": fingerprint["details"]}
+                plan = resume.plan_failed_backup(ctl, api, source, rj, **kwargs)
+            if action == "plan-resume-failed":
+                result = {"status": "plan-only", "action": action, **plan}
+            else:
+                require(exact_predecessor(env, state) == plan["stateSha256"])
+                def record_intent(state_sha, approval_action):
+                    require(state_sha == state["stateSha256"] and approval_action == plan["approvalAction"])
+                    journal.append("resume-intent", {**intent_metadata(env, state), "approvalAction": approval_action}, int(time.time()))
+                if prior["stage"] == "paused":
+                    after = resume.resume_aborted_drain(ctl, **kwargs, approval_envelope=env.get("SUBS_BOT_APPROVAL_JSON", ""), record_intent=record_intent)
+                elif prior["stage"] in {"frozen", "frozen-data"}:
+                    after = resume.resume_uncaptured_backup(ctl, api, source, rj, **kwargs, approval_envelope=env.get("SUBS_BOT_APPROVAL_JSON", ""), record_intent=record_intent)
+                else:
+                    after = resume.resume_failed_backup(ctl, api, source, rj, **kwargs, approval_envelope=env.get("SUBS_BOT_APPROVAL_JSON", ""), record_intent=record_intent)
+                elapsed = max(0, int(time.time()) - pause["timestamp"])
+                journal.append("resumed", {"control": after["control"], "pauseSeconds": elapsed,
+                               "pauseLimitExceeded": elapsed > policy["pauseLimitSeconds"], "backupVerified": False}, int(time.time()))
+                anchor.release(pin["session"])
+                result = {"status": "resumed-after-failure", "action": action, "pauseSeconds": elapsed,
+                          "pauseLimitExceeded": elapsed > policy["pauseLimitSeconds"]}
+        elif action == "capture":
+            last(events, "frozen-data")
+            frozen_matches(events, state)
+            predecessor = exact_predecessor(env, state)
+            for name, key in (("prepare", "SUBS_BOT_BACKUP_PREPARE_APPROVAL_JSON"), ("capture", "SUBS_BOT_BACKUP_CAPTURE_APPROVAL_JSON")):
+                authorized(target, env, "recovery-" + name + ":" + digest(contract), proof["revision"], predecessor, revision, key=key)
+            owner = env["GITHUB_RUN_ID"] + "/" + env["GITHUB_RUN_ATTEMPT"]
+            recovery_journal = recovery.RecoveryJournal(api, owner, guard=guard)
+            recovery_journal.load()
+            require(recovery_journal.value is None, "The capture checkpoint already exists; reconcile instead of restarting.")
+            bounded_guard()
+            journal.append("capture-intent", {**intent_metadata(env, state), "checkpointId": contract["checkpointId"]}, int(time.time()))
+            try:
+                engine = recovery.RecoveryEngine(api, source, recovery_journal, directory)
+                recovery.run_action("prepare", engine)
+                result = recovery.run_action("capture", engine)
+            finally:
+                recovery_journal.release()
+            result = {"status": "captured-unverified", "action": action, "backup": result["backup"]}
+        elif action == "poll-export":
+            last(events, "capture-intent")
+            frozen_matches(events, state)
+            require_finished_intent(events[-1]["details"])
+            predecessor = exact_predecessor(env, state)
+            owner = env["GITHUB_RUN_ID"] + "/" + env["GITHUB_RUN_ATTEMPT"]
+            rj = recovery.RecoveryJournal(api, owner, guard=guard)
+            rj.load()
+            saved = rj.value.get("export") if isinstance(rj.value, dict) else None
+            require(isinstance(saved, dict) and saved.get("state") == "polling"
+                    and recovery.matches(recovery.native.BOOKMARK, saved.get("bookmark")),
+                    "Only the original confirmed export bookmark may be polled.")
+            bookmark_sha = recovery.digest(saved["bookmark"].encode("utf-8"))
+            scope = "recovery-poll-export:" + digest(contract)
+            authorized(target, env, scope, proof["revision"], predecessor, revision)
+            guard()
+            rj.claim()
+            try:
+                saved = rj.value.get("export")
+                require(isinstance(saved, dict) and saved.get("state") == "polling"
+                        and recovery.digest(saved.get("bookmark", "").encode("utf-8")) == bookmark_sha)
+                journal.append("poll-intent", {**intent_metadata(env, state), "bookmarkSha256": bookmark_sha,
+                               "checkpointId": contract["checkpointId"]}, int(time.time()))
+                engine = recovery.RecoveryEngine(api, source, rj, directory)
+                outcome = recovery.run_action("poll-export", engine)
+                journal.append("capture-intent", {**intent_metadata(env, state), "checkpointId": contract["checkpointId"],
+                               "pollConfirmed": True}, int(time.time()))
+            finally:
+                rj.release()
+            result = {"status": "captured-unverified", "action": action, "backup": outcome["backup"]}
+        elif action == "verify":
+            last(events, "capture-intent")
+            frozen_matches(events, state)
+            predecessor = exact_predecessor(env, state)
+            authorized(target, env, "backup-verify:" + digest(contract), proof["revision"], predecessor, revision)
+            rj = recovery.RecoveryJournal(api, env["GITHUB_RUN_ID"] + "/" + env["GITHUB_RUN_ATTEMPT"], guard=guard)
+            rj.load()
+            engine = recovery.RecoveryEngine(api, source, rj, directory)
+            verified = recovery.run_action("verify-backup", engine)
+            manifest_sha = verified["backup"].get("manifestSha256")
+            from production_release_evidence import verify_activation_baseline
+            proof_result = verify_activation_baseline(ctl, env["SUBS_BOT_CF_DATA_TOKEN"], contract["checkpointId"], manifest_sha)
+            require(proof_result.get("baselineVerified") is True and proof_result.get("manifestSha256") == manifest_sha)
+            journal.append("verified", {"checkpointId": contract["checkpointId"], "manifestSha256": manifest_sha}, int(time.time()))
+            result = {"status": "verified", "action": action, "checkpointId": contract["checkpointId"], "manifestSha256": manifest_sha}
+        elif action in {"plan-activate", "activate"}:
+            last(events, "verified")
+            frozen_matches(events, state)
+            from production_release_evidence import verify_activation_baseline
+            checkpoint = events[-1]["details"]["checkpointId"]
+            manifest_sha = events[-1]["details"]["manifestSha256"]
+            ctl.activation_baseline_checker = lambda: verify_activation_baseline(ctl, env["SUBS_BOT_CF_DATA_TOKEN"], checkpoint, manifest_sha)
+            plan = ctl.plan_activate()
+            if action == "plan-activate":
+                result = plan
+            else:
+                predecessor = exact_predecessor(env, plan)
+                ctl.approval(env.get("SUBS_BOT_APPROVAL_JSON", ""), "activate", predecessor)
+                journal.append("resume-intent", intent_metadata(env, plan), int(time.time()))
+                after = ctl.transition("activate", env.get("SUBS_BOT_APPROVAL_JSON", ""), predecessor)
+                started = next(event for event in events if event["stage"] == "pause-intent")
+                elapsed = max(0, int(time.time()) - started["timestamp"])
+                journal.append("resumed", {"control": after["control"], "pauseSeconds": elapsed,
+                    "pauseLimitExceeded": elapsed > policy["pauseLimitSeconds"]}, int(time.time()))
+                anchor.release(pin["session"])
+                result = {"status": "resumed", "action": action, "pauseSeconds": elapsed,
+                          "pauseLimitExceeded": elapsed > policy["pauseLimitSeconds"]}
+        else:
+            raise ValueError("Unsupported backup action.")
+    result.setdefault("action", action)
+    return result
+
+
 def main(env=None):
     env = os.environ if env is None else env
     action = env.get("BACKUP_ACTION", "")
@@ -588,333 +923,9 @@ def main(env=None):
         if action in {"pause", "freeze", "capture"}:
             ctl.guard = bounded_guard
             source.guard = bounded_guard
-        seed = maintenance.Anchor(store, target.digest, "0" * 64)
-        genesis_sha = recovery.digest(seed.initial_material()[1])
-        supplied_genesis = env.get("SUBS_BOT_BACKUP_GENESIS_SHA256", "")
-        require(supplied_genesis == genesis_sha or action == "plan-initialize-anchor" and not supplied_genesis,
-                "The independently pinned maintenance genesis differs.")
-        anchor = maintenance.Anchor(store, target.digest, genesis_sha)
-        if action == "inspect-anchor-initialization":
-            plan, _initial, _etag = anchor.plan_initialization_reconciliation()
-            result = {"status": "unknown", "action": action, "anchorPlanSha256": digest(plan),
-                      "historyPresent": plan["historyPresent"], "pointerPresent": plan["pointerPresent"],
-                      "genesisSha256": genesis_sha, "stateSha256": state["stateSha256"], "mutationPermitted": False}
-        elif action == "inspect-anchor-unknown":
-            result = {**missing_started_observation(anchor, store, target), "action": action,
-                      "stateSha256": state["stateSha256"]}
-        elif action in {"plan-initialize-anchor", "initialize-anchor"}:
-            require(store.get(anchor.genesis_key, absent=True) is None and store.get_with_etag(anchor.key) == (None, None)
-                    and not store.list_backup_anchor_history(target.digest) and not store.list_backup_journals(),
-                    "An existing or partial maintenance anchor requires independent reconciliation.")
-            scope = digest({"policy": policy, "genesisSha256": genesis_sha, "contract": contract})
-            approval_action = "backup-initialize-anchor:" + scope
-            if action == "plan-initialize-anchor":
-                result = {"status": "plan-only", "action": action, "approvalAction": approval_action,
-                          "stateSha256": state["stateSha256"], "genesisSha256": genesis_sha}
-            else:
-                predecessor = exact_predecessor(env, state)
-                authorized(target, env, approval_action, proof["revision"], predecessor, revision)
-                guard()
-                anchor.initialize()
-                result = {"status": "initialized", "action": action}
-        elif action in {"plan-begin", "begin"}:
-            require(state["control"]["admission"] == "open" and state["control"]["workers"] == "run"
-                    and not any(state["terminal"].get(key, 0) for key in ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates")))
-            now = datetime.now(timezone.utc)
-            if action == "plan-begin":
-                require(env.get("GITHUB_RUN_ATTEMPT") == "1" and re.fullmatch(r"[1-9][0-9]{0,19}", env.get("GITHUB_RUN_ID", "")))
-                session, day = env["GITHUB_RUN_ID"] + "-1", now.strftime("%Y/%m/%d")
-            else:
-                session, day = session_input(env)
-                confirm_plan_run(session, day, revision)
-            require(day == now.strftime("%Y/%m/%d") and in_window(policy, now), "The selected maintenance window is not open.")
-            pin, anchor_raw, anchor_etag = anchor.read()
-            require(pin["state"] == "idle" and pin["session"] != session)
-            scope = digest({"policy": policy, "contract": contract, "session": session, "day": day,
-                            "anchorSha256": recovery.digest(anchor_raw)})
-            approval_action = "backup-begin:" + scope
-            if action == "plan-begin":
-                result = {"status": "plan-only", "action": action, "approvalAction": approval_action,
-                          "stateSha256": state["stateSha256"], "session": session, "day": day}
-            else:
-                predecessor = exact_predecessor(env, state)
-                authorized(target, env, approval_action, proof["revision"], predecessor, revision)
-                journal = maintenance.Transaction(store, session, day, target.digest, revision)
-                require(not journal.load())
-                guard()
-                started = {"configurationSha256": target.configuration_digest, "control": state["control"],
-                    "release": state["release"], "pauseLimitSeconds": policy["pauseLimitSeconds"],
-                    "checkpointId": contract["checkpointId"], "contractSha256": digest(contract), "policySha256": digest(policy)}
-                original = {"version": 1, "targetSha256": target.digest, "session": session, "day": day,
-                    "controlRevision": revision, "dispatcherRevision": revision, "dispatcherWorkflow": "worker-production-backup.yml",
-                    "writerRunId": env["GITHUB_RUN_ID"], "writerAttempt": env["GITHUB_RUN_ATTEMPT"],
-                    "anchorPredecessorSha256": recovery.digest(anchor_raw), "stateSha256": state["stateSha256"],
-                    "sourceRevision": proof["revision"], "approvalSha256": recovery.digest(env["SUBS_BOT_APPROVAL_JSON"].encode("utf-8")),
-                    "timestamp": int(time.time()), "startedDetails": started}
-                intent_sha = maintenance.write_begin(store, original)
-                guard()
-                require(ctl.inspect()["stateSha256"] == predecessor, "The approved begin predecessor changed.")
-                anchor._advance(pin, anchor_raw, anchor_etag, state="active", session=session, day=day, revision=revision)
-                journal.append("started", {**started, "beginIntentSha256": intent_sha}, int(time.time()))
-                result = {"status": "started", "action": action, "session": session, "day": day}
-        elif action in {"plan-abort-unstarted", "abort-unstarted"}:
-            candidate = env.get("BACKUP_ANCHOR_CANDIDATE_SHA256", "") or None
-            plan, original, journal = unstarted_abort_plan(anchor, store, target, ctl, contract, policy, candidate_sha=candidate)
-            if action == "plan-abort-unstarted":
-                result = {"status": "plan-only", "action": action, **plan}
-            else:
-                predecessor = exact_predecessor(env, plan)
-                authorized(target, env, plan["approvalAction"], proof["revision"], predecessor, revision)
-                claim = {"version": 1, "targetSha256": target.digest, "session": plan["session"],
-                         "beginIntentSha256": plan["beginIntentSha256"], "stateSha256": predecessor,
-                         "writerRunId": env["GITHUB_RUN_ID"], "writerAttempt": env["GITHUB_RUN_ATTEMPT"],
-                         "controlRevision": revision}
-                maintenance.claim_begin_reconciliation(store, target.digest, plan["session"], claim)
-                guard()
-                again, _original, _journal = unstarted_abort_plan(anchor, store, target, ctl, contract, policy,
-                    candidate_sha=candidate, reconciliation_raw=canonical(claim))
-                require(again == plan, "The approved begin recovery predecessor changed.")
-                if candidate:
-                    anchor.reconcile(candidate, plan["anchorPlanSha256"])
-                journal.append("started", {**original["startedDetails"], "beginIntentSha256": plan["beginIntentSha256"],
-                                           "reconciledUnstarted": True}, int(time.time()))
-                journal.append("failed", {"reason": "aborted-before-start-confirmation", "uncertain": False}, int(time.time()))
-                anchor.release(plan["session"])
-                result = {"status": "aborted-before-pause", "action": action, "session": plan["session"]}
-        elif action in {"plan-anchor-reconcile", "anchor-reconcile"}:
-            candidate = env.get("BACKUP_ANCHOR_CANDIDATE_SHA256", "")
-            plan = completed_anchor_reconciliation(anchor, store, target, ctl, candidate, contract, policy)
-            if action == "plan-anchor-reconcile":
-                result = {"status": "plan-only", "action": action, **plan}
-            else:
-                predecessor = exact_predecessor(env, plan)
-                authorized(target, env, plan["approvalAction"], proof["revision"], predecessor, revision)
-                guard()
-                require(completed_anchor_reconciliation(anchor, store, target, ctl, candidate, contract, policy) == plan,
-                        "The exact approved anchor reconciliation changed.")
-                anchor.reconcile(candidate, plan["anchorPlanSha256"])
-                result = {"status": "anchor-release-reconciled", "action": action,
-                          "candidateSha256": candidate, "anchorPlanSha256": plan["anchorPlanSha256"]}
-        else:
-            pin, journal, events = active_transaction(anchor, store, target)
-            require(events[0]["details"].get("contractSha256") == digest(contract)
-                    and events[0]["details"].get("policySha256") == digest(policy)
-                    and events[0]["details"].get("configurationSha256") == target.configuration_digest)
-            if action == "inspect":
-                result = {"status": "observed", "action": action, "phase": events[-1]["stage"], "state": state}
-            elif action == "preflight":
-                last(events, "started")
-                predecessor = exact_predecessor(env, state)
-                authorized(target, env, "backup-preflight:" + digest(contract), proof["revision"], predecessor, revision)
-                observed = capacity.observe(api, source, warning_percent=policy["warningPercent"])
-                guard()
-                journal.append("preflight", {"capacity": observed}, int(time.time()))
-                result = {"status": "observed", "action": action, "capacity": {key: value for key, value in observed.items() if key != "tableCounts"}}
-            elif action == "abort-preflight":
-                require(events[-1]["stage"] in {"started", "preflight"},
-                        "Only an operation confirmed not to have started pausing can be aborted.")
-                predecessor = exact_predecessor(env, state)
-                require(state["control"] == events[0]["details"]["control"] and state["release"] == events[0]["details"]["release"])
-                authorized(target, env, "backup-abort-preflight:" + digest(contract), proof["revision"], predecessor, revision)
-                journal.append("failed", {"reason": "operator-aborted-before-pause", "uncertain": False}, int(time.time()))
-                anchor.release(pin["session"])
-                result = {"status": "aborted-before-pause", "action": action}
-            elif action == "plan-pause":
-                last(events, "preflight")
-                result = ctl.plan_pause()
-            elif action == "pause":
-                last(events, "preflight")
-                require(in_window(policy, datetime.now(timezone.utc)), "A new pause cannot start outside its approved UTC window.")
-                observed = events[-1]["details"]["capacity"]
-                capacity.require_within_limits(observed)
-                plan = ctl.plan_pause()
-                require(plan["control"] == events[0]["details"]["control"] and plan["release"] == events[0]["details"]["release"]
-                        and plan["configurationSha256"] == events[0]["details"]["configurationSha256"])
-                predecessor = exact_predecessor(env, plan)
-                ctl.approval(env.get("SUBS_BOT_APPROVAL_JSON", ""), "pause", predecessor)
-                bounded_guard()
-                journal.append("pause-intent", intent_metadata(env, plan), int(time.time()))
-                after = ctl.transition("pause", env.get("SUBS_BOT_APPROVAL_JSON", ""), predecessor)
-                journal.append("paused", {"control": after["control"]}, int(time.time()))
-                result = {"status": "paused", "action": action, "state": after}
-            elif action == "drain":
-                last(events, "paused")
-                require(state["control"]["admission"] == "closed" and not any(state["work"].values()))
-                result = {"status": "drained", "action": action, "state": state}
-            elif action == "freeze":
-                last(events, "paused")
-                require(state["control"] == events[-1]["details"]["control"]
-                        and state["release"] == events[0]["details"]["release"]
-                        and state["configurationSha256"] == events[0]["details"]["configurationSha256"])
-                predecessor = exact_predecessor(env, state)
-                ctl.approval(env.get("SUBS_BOT_APPROVAL_JSON", ""), "freeze", predecessor)
-                bounded_guard()
-                journal.append("freeze-intent", intent_metadata(env, state), int(time.time()))
-                after = ctl.transition("freeze", env.get("SUBS_BOT_APPROVAL_JSON", ""), predecessor)
-                journal.append("frozen", {"control": after["control"]}, int(time.time()))
-                journal.append("frozen-data", capacity.frozen_fingerprint(api, source), int(time.time()))
-                result = {"status": "frozen", "action": action, "state": after}
-            elif action == "fingerprint":
-                last(events, "frozen")
-                frozen_matches(events, state)
-                predecessor = exact_predecessor(env, state)
-                authorized(target, env, "backup-fingerprint:" + digest(contract), proof["revision"], predecessor, revision)
-                journal.append("frozen-data", capacity.frozen_fingerprint(api, source), int(time.time()))
-                result = {"status": "frozen-data-confirmed", "action": action}
-            elif action in {"plan-reconcile-transition", "reconcile-transition"}:
-                plan = transition_reconciliation(env, events, state, contract)
-                if action == "plan-reconcile-transition":
-                    result = {"status": "plan-only", "action": action, **plan}
-                else:
-                    predecessor = exact_predecessor(env, state)
-                    authorized(target, env, plan["approvalAction"], proof["revision"], predecessor, revision)
-                    guard()
-                    require(transition_reconciliation(env, events, ctl.inspect(), contract) == plan,
-                            "The approved reconciliation observation changed.")
-                    next_stage = {"pause-intent": "paused", "freeze-intent": "frozen", "resume-intent": "resumed"}[plan["phase"]]
-                    details = {"control": state["control"], "reconciled": True}
-                    if next_stage == "resumed":
-                        pause = next(event for event in events if event["stage"] == "pause-intent")
-                        elapsed = max(0, int(time.time()) - pause["timestamp"])
-                        details.update(pauseSeconds=elapsed, pauseLimitExceeded=elapsed > policy["pauseLimitSeconds"])
-                    journal.append(next_stage, details, int(time.time()))
-                    if next_stage == "resumed":
-                        anchor.release(pin["session"])
-                    result = {"status": "reconciled", "action": action, "phase": next_stage}
-            elif action in {"plan-resume-failed", "resume-failed"}:
-                # No export may be inferred stopped from missing evidence. Before
-                # capture, require the complete journal and an absent recovery journal.
-                prior = events[-2] if events[-1]["stage"] == "failed" and len(events) > 1 else events[-1]
-                require(prior["stage"] in {"paused", "frozen", "frozen-data", "capture-intent"})
-                initial = events[0]["details"]
-                pause = next(item for item in events if item["stage"] == "pause-intent")
-                require_finished_intent(pause["details"])
-                common = {"initial": initial, "session": pin["session"]}
-                if prior["stage"] == "paused":
-                    kwargs = {**common, "paused": prior["details"]["control"]}
-                    plan = resume.plan_aborted_drain(ctl, **kwargs)
-                elif prior["stage"] in {"frozen", "frozen-data"}:
-                    frozen_control, fingerprint = uncaptured_predecessor(events)
-                    rj = recovery.RecoveryJournal(api, env["GITHUB_RUN_ID"] + "/" + env["GITHUB_RUN_ATTEMPT"], guard=guard)
-                    kwargs = {**common, "frozen": frozen_control, "fingerprint": fingerprint}
-                    plan = resume.plan_uncaptured_backup(ctl, api, source, rj, **kwargs)
-                else:
-                    require_finished_intent(prior["details"])
-                    frozen = next(item for item in events if item["stage"] == "frozen")
-                    fingerprint = next(item for item in events if item["stage"] == "frozen-data")
-                    rj = recovery.RecoveryJournal(api, env["GITHUB_RUN_ID"] + "/" + env["GITHUB_RUN_ATTEMPT"], guard=guard)
-                    kwargs = {**common, "frozen": frozen["details"]["control"], "fingerprint": fingerprint["details"]}
-                    plan = resume.plan_failed_backup(ctl, api, source, rj, **kwargs)
-                if action == "plan-resume-failed":
-                    result = {"status": "plan-only", "action": action, **plan}
-                else:
-                    require(exact_predecessor(env, state) == plan["stateSha256"])
-                    def record_intent(state_sha, approval_action):
-                        require(state_sha == state["stateSha256"] and approval_action == plan["approvalAction"])
-                        journal.append("resume-intent", {**intent_metadata(env, state), "approvalAction": approval_action}, int(time.time()))
-                    if prior["stage"] == "paused":
-                        after = resume.resume_aborted_drain(ctl, **kwargs, approval_envelope=env.get("SUBS_BOT_APPROVAL_JSON", ""), record_intent=record_intent)
-                    elif prior["stage"] in {"frozen", "frozen-data"}:
-                        after = resume.resume_uncaptured_backup(ctl, api, source, rj, **kwargs, approval_envelope=env.get("SUBS_BOT_APPROVAL_JSON", ""), record_intent=record_intent)
-                    else:
-                        after = resume.resume_failed_backup(ctl, api, source, rj, **kwargs, approval_envelope=env.get("SUBS_BOT_APPROVAL_JSON", ""), record_intent=record_intent)
-                    elapsed = max(0, int(time.time()) - pause["timestamp"])
-                    journal.append("resumed", {"control": after["control"], "pauseSeconds": elapsed,
-                                   "pauseLimitExceeded": elapsed > policy["pauseLimitSeconds"], "backupVerified": False}, int(time.time()))
-                    anchor.release(pin["session"])
-                    result = {"status": "resumed-after-failure", "action": action, "pauseSeconds": elapsed,
-                              "pauseLimitExceeded": elapsed > policy["pauseLimitSeconds"]}
-            elif action == "capture":
-                last(events, "frozen-data")
-                frozen_matches(events, state)
-                predecessor = exact_predecessor(env, state)
-                for name, key in (("prepare", "SUBS_BOT_BACKUP_PREPARE_APPROVAL_JSON"), ("capture", "SUBS_BOT_BACKUP_CAPTURE_APPROVAL_JSON")):
-                    authorized(target, env, "recovery-" + name + ":" + digest(contract), proof["revision"], predecessor, revision, key=key)
-                owner = env["GITHUB_RUN_ID"] + "/" + env["GITHUB_RUN_ATTEMPT"]
-                recovery_journal = recovery.RecoveryJournal(api, owner, guard=guard)
-                recovery_journal.load()
-                require(recovery_journal.value is None, "The capture checkpoint already exists; reconcile instead of restarting.")
-                bounded_guard()
-                journal.append("capture-intent", {**intent_metadata(env, state), "checkpointId": contract["checkpointId"]}, int(time.time()))
-                try:
-                    engine = recovery.RecoveryEngine(api, source, recovery_journal, directory)
-                    recovery.run_action("prepare", engine)
-                    result = recovery.run_action("capture", engine)
-                finally:
-                    recovery_journal.release()
-                result = {"status": "captured-unverified", "action": action, "backup": result["backup"]}
-            elif action == "poll-export":
-                last(events, "capture-intent")
-                frozen_matches(events, state)
-                require_finished_intent(events[-1]["details"])
-                predecessor = exact_predecessor(env, state)
-                owner = env["GITHUB_RUN_ID"] + "/" + env["GITHUB_RUN_ATTEMPT"]
-                rj = recovery.RecoveryJournal(api, owner, guard=guard)
-                rj.load()
-                saved = rj.value.get("export") if isinstance(rj.value, dict) else None
-                require(isinstance(saved, dict) and saved.get("state") == "polling"
-                        and recovery.matches(recovery.native.BOOKMARK, saved.get("bookmark")),
-                        "Only the original confirmed export bookmark may be polled.")
-                bookmark_sha = recovery.digest(saved["bookmark"].encode("utf-8"))
-                scope = "recovery-poll-export:" + digest(contract)
-                authorized(target, env, scope, proof["revision"], predecessor, revision)
-                guard()
-                rj.claim()
-                try:
-                    saved = rj.value.get("export")
-                    require(isinstance(saved, dict) and saved.get("state") == "polling"
-                            and recovery.digest(saved.get("bookmark", "").encode("utf-8")) == bookmark_sha)
-                    journal.append("poll-intent", {**intent_metadata(env, state), "bookmarkSha256": bookmark_sha,
-                                   "checkpointId": contract["checkpointId"]}, int(time.time()))
-                    engine = recovery.RecoveryEngine(api, source, rj, directory)
-                    outcome = recovery.run_action("poll-export", engine)
-                    journal.append("capture-intent", {**intent_metadata(env, state), "checkpointId": contract["checkpointId"],
-                                   "pollConfirmed": True}, int(time.time()))
-                finally:
-                    rj.release()
-                result = {"status": "captured-unverified", "action": action, "backup": outcome["backup"]}
-            elif action == "verify":
-                last(events, "capture-intent")
-                frozen_matches(events, state)
-                predecessor = exact_predecessor(env, state)
-                authorized(target, env, "backup-verify:" + digest(contract), proof["revision"], predecessor, revision)
-                rj = recovery.RecoveryJournal(api, env["GITHUB_RUN_ID"] + "/" + env["GITHUB_RUN_ATTEMPT"], guard=guard)
-                rj.load()
-                engine = recovery.RecoveryEngine(api, source, rj, directory)
-                verified = recovery.run_action("verify-backup", engine)
-                manifest_sha = verified["backup"].get("manifestSha256")
-                from production_release_evidence import verify_activation_baseline
-                proof_result = verify_activation_baseline(ctl, env["SUBS_BOT_CF_DATA_TOKEN"], contract["checkpointId"], manifest_sha)
-                require(proof_result.get("baselineVerified") is True and proof_result.get("manifestSha256") == manifest_sha)
-                journal.append("verified", {"checkpointId": contract["checkpointId"], "manifestSha256": manifest_sha}, int(time.time()))
-                result = {"status": "verified", "action": action, "checkpointId": contract["checkpointId"], "manifestSha256": manifest_sha}
-            elif action in {"plan-activate", "activate"}:
-                last(events, "verified")
-                frozen_matches(events, state)
-                from production_release_evidence import verify_activation_baseline
-                checkpoint = events[-1]["details"]["checkpointId"]
-                manifest_sha = events[-1]["details"]["manifestSha256"]
-                ctl.activation_baseline_checker = lambda: verify_activation_baseline(ctl, env["SUBS_BOT_CF_DATA_TOKEN"], checkpoint, manifest_sha)
-                plan = ctl.plan_activate()
-                if action == "plan-activate":
-                    result = plan
-                else:
-                    predecessor = exact_predecessor(env, plan)
-                    ctl.approval(env.get("SUBS_BOT_APPROVAL_JSON", ""), "activate", predecessor)
-                    journal.append("resume-intent", intent_metadata(env, plan), int(time.time()))
-                    after = ctl.transition("activate", env.get("SUBS_BOT_APPROVAL_JSON", ""), predecessor)
-                    started = next(event for event in events if event["stage"] == "pause-intent")
-                    elapsed = max(0, int(time.time()) - started["timestamp"])
-                    journal.append("resumed", {"control": after["control"], "pauseSeconds": elapsed,
-                        "pauseLimitExceeded": elapsed > policy["pauseLimitSeconds"]}, int(time.time()))
-                    anchor.release(pin["session"])
-                    result = {"status": "resumed", "action": action, "pauseSeconds": elapsed,
-                              "pauseLimitExceeded": elapsed > policy["pauseLimitSeconds"]}
-            else:
-                raise ValueError("Unsupported backup action.")
-        # Plans returned by the controller contain a state but no action label.
-        # The dispatch coordinator binds every result to the selected checkpoint.
-        result.setdefault("action", action)
+        result = execute_phase(action=action, env=env, target=target, revision=revision, policy=policy,
+                               contract=contract, proof=proof, state=state, store=store, guard=guard,
+                               bounded_guard=bounded_guard, ctl=ctl, source=source, api=api, directory=directory)
         return emit_result(result, target, revision, root, source_revision=proof["revision"])
 
 
