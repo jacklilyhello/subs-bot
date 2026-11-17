@@ -18,6 +18,11 @@ DAY = "2026/11/17"
 FAILED_PLAN_LOG_SHA = "06b7dc59ad424d1862233aca9290914bb1c67863569f5ef6908b2f99b3068852"
 
 
+def _legacy_plan_valid(plan):
+    return (isinstance(plan.get("legacyArchives"), dict)
+            and plan.get("legacyArchiveSha256") == sha256(canonical(plan["legacyArchives"])).hexdigest())
+
+
 def _pinned(env, key, pattern):
     value = env.get(key, "")
     require(pattern.fullmatch(value or ""), "An independent no-export proof pin is missing.")
@@ -115,6 +120,7 @@ def verify(store, target, genesis_sha, env):
             and plan.get("reviewSha256") == review_sha and plan.get("targetSha256") == target.digest
             and plan.get("oldTransactionSha256") == review.get("oldTransactionSha256")
             and plan.get("oldAnchorSha256") == review.get("oldAnchorSha256")
+            and _legacy_plan_valid(plan)
             and plan.get("exportDispatchedUnderCustodyAssumption") is False
             and sha256(originals["writer-inventory.json"]).hexdigest() == review.get("writerInventorySha256")
             and sha256(originals["protected-custody.json"]).hexdigest() == review.get("custodySha256"))

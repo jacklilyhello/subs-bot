@@ -69,14 +69,14 @@ def manual_no_prior_dispatch(env, run_id):
     """Reject any prior manual write attempt, including one with a lost response."""
     token = github._github_token()
     rows, count = [], None
-    for page in range(1, 11):
-        response = github._get_json("/actions/workflows/worker-backup-webhook-recovery.yml/runs?per_page=100&page=" + str(page), token)
+    for page in range(1, 21):
+        response = github._get_json("/actions/workflows/worker-backup-webhook-recovery.yml/runs?per_page=50&page=" + str(page), token)
         batch, total = response.get("workflow_runs"), response.get("total_count")
-        require(isinstance(batch, list) and len(batch) <= 100 and type(total) is int and 0 <= total < 1000)
+        require(isinstance(batch, list) and len(batch) <= 50 and type(total) is int and 0 <= total < 1000)
         require(count is None or count == total, "Recovery workflow history changed during inspection.")
         count = total
         rows.extend(batch)
-        if len(batch) < 100:
+        if len(batch) < 50:
             break
     else:
         require(False, "The recovery workflow history exceeds its safe bound.")

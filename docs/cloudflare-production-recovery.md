@@ -129,3 +129,12 @@ G0 之后发生任何新增、修改、删除、授权、领取、撤销、短�
 | 原生导出/导入轮询 | 每次循环期限 120 秒，不包含已在途请求的 HTTP timeout；保留已知书签供下次接续 |
 
 所有界限采用超限拒绝，不截断数据。工具备份完整 D1 与 D1 引用的 R2 闭包，不声称复制任意无引用孤儿对象或 Worker Secret。Secret 由受保护配置另行保管。任务超时可能留下已确认分片或独立目标；这些资料不会被自动删除。源码/配置/密钥不兼容、非支持 schema/元数据或无法完整读取资源时停止，不能用部分摘要宣布恢复成功。
+
+# Rehearsal webhook window
+
+The trusted rehearsal coordinator rejects `run` and `resume`, and the legacy
+reviewed-head gate rejects `open-backup`. Switching a Telegram webhook between
+independent D1 databases can redeliver an update whose original response was
+lost, even when the pending count is zero. Keep these actions disabled until
+the selected rehearsal approach establishes update safety. Read-only plans,
+diagnosis, and the separately approved recovery paths remain available.

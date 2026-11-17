@@ -64,6 +64,8 @@ def validate(env):
             and env.get("BACKUP_SOURCE_CHECKPOINT_ID") == spec["sourceCheckpointId"]
             and env.get("BACKUP_SOURCE_MANIFEST_SHA256") == spec["sourceManifestSha256"]
             and env.get("BACKUP_ACTION") in (STEPS if role == "child" else RECOVERY_ACTIONS if role in {"recovery", "recovery-readback", "recovery-verify"} else {"inspect", "plan-initialize", "initialize", "plan-webhook-history", "plan-webhook-anchor", "initialize-webhook-anchor", "plan-run", "run", "plan-resume", "resume", "plan-reconcile", "reconcile", "plan-abort", "abort"}))
+    require(role != "parent" or env["BACKUP_ACTION"] not in {"run", "resume"},
+            "Opening a rehearsal webhook window is disabled until cross-database update safety is established.")
     if role == "child":
         require(HEX64.fullmatch(env.get("BACKUP_DISPATCH_NONCE", "")))
         require(DECIMAL.fullmatch(env.get("BACKUP_COORDINATOR_SESSION", ""))

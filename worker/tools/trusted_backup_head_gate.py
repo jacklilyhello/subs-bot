@@ -42,7 +42,7 @@ def validate(env):
             and HEX40.fullmatch(main or "") is not None and re.fullmatch(r"[!-~]{1,4096}", token or "") is not None,
             "The trusted main dispatcher identity is invalid.")
     spec = parsed(env.get("HEAD_VALIDATION_JSON", ""))
-    require(spec.get("action") != "open-backup", "The legacy open-backup writer is disabled until it uses the shared persistent webhook lock.")
+    require(spec.get("action") != "open-backup", "The legacy open-backup writer is disabled until cross-database update safety is established.")
     require(set(spec) == KEYS and type(spec["version"]) is int and spec["version"] == 1
             and all(isinstance(spec[key], str) for key in KEYS - {"version"}))
     require(re.fullmatch(r"[1-9][0-9]{0,8}", spec["pr"]) is not None

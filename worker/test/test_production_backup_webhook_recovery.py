@@ -65,6 +65,22 @@ class WebhookRecoveryTests(unittest.TestCase):
              self.assertRaises(ContractError):
             recovery.manual_no_prior_dispatch(env, "123")
 
+    def test_manual_history_uses_bounded_fifty_item_pages(self):
+        current = {"id": 900, "display_title": "Backup webhook restore 123-1", "head_sha": "a" * 40,
+                   "run_attempt": 1, "path": recovery.RECOVERY, "head_branch": "main", "event": "workflow_dispatch",
+                   "repository": {"id": recovery.github.REPOSITORY_ID}, "head_repository": {"id": recovery.github.REPOSITORY_ID}}
+        rows = [{**current, "id": index + 1, "display_title": "Backup webhook inspect 456-1"} for index in range(50)] + [current]
+        def result(path, _token):
+            self.assertIn("per_page=50", path)
+            page = int(path.rsplit("=", 1)[1])
+            return {"total_count": 51, "workflow_runs": rows[(page - 1) * 50:page * 50]}
+        with patch.object(recovery.github, "_github_token", return_value="synthetic"), \
+             patch.object(recovery.github, "_get_json", side_effect=result):
+            recovery.manual_no_prior_dispatch({"GITHUB_SHA": "a" * 40, "GITHUB_RUN_ID": "900"}, "123")
+            rows[50] = rows[0]
+            with self.assertRaises(ContractError):
+                recovery.manual_no_prior_dispatch({"GITHUB_SHA": "a" * 40, "GITHUB_RUN_ID": "900"}, "123")
+
     def fixture(self):
         draft = Mock(digest="a" * 64, data={"workerName": "isolated"})
         pins = {key: "synthetic" for key in ("workerId", "workerCreatedOn", "d1Id", "d1CreatedAt", "bucketCreatedAt", "backupBucketCreatedAt")}

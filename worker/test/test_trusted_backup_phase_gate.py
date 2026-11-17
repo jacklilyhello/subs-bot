@@ -69,8 +69,11 @@ class TrustedPhaseGateTests(unittest.TestCase):
                   "GITHUB_WORKFLOW_REF": gate.github.REPOSITORY + "/" + gate.PARENT_FILE + "@" + gate.github.MAIN_REF,
                   "SUBS_BOT_BACKUP_PHASE_REHEARSAL_WRITES_ENABLED": ""}
         self.check(parent)
-        with self.assertRaises(ContractError):
-            self.check({**parent, "BACKUP_ACTION": "run"})
+        self.check({**parent, "BACKUP_ACTION": "plan-resume"})
+        for action in ("run", "resume"):
+            with self.subTest(action=action), self.assertRaises(ContractError):
+                self.check({**parent, "BACKUP_ACTION": action,
+                            "SUBS_BOT_BACKUP_PHASE_REHEARSAL_WRITES_ENABLED": "true"})
         with self.assertRaises(ContractError):
             self.check({**parent, "GITHUB_WORKFLOW_REF": self.env["GITHUB_WORKFLOW_REF"]})
 

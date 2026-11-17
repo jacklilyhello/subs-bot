@@ -164,7 +164,7 @@ def _restoration_boundary(env, store, prefix, draft, secrets, previous, token, c
 
 def _archived_log(run, workflow, record, store, prefix, token, controllers, env):
     """Recheck original bytes plus the exact fresh readback run and jobs."""
-    from trusted_backup_webhook_log_archive import REVIEWED_PRE_WEBHOOK, audit_key, audited_paths, classify
+    from trusted_backup_webhook_log_archive import REVIEWED_PRE_WEBHOOK, REVIEWED_FAILED_HEAD, audit_key, audited_paths, classify, verify_failed_head_source
     require(isinstance(record, dict) and set(record) == {"status", "sourceRunId", "sourceJobId", "sourceHeadSha",
             "sourceWorkflow", "classification", "logSha256", "planSha256", "completionSha256", "archiveRunId",
             "archiveControllerRevision", "archiveJobId", "readbackJobId"}
@@ -214,6 +214,17 @@ def _archived_log(run, workflow, record, store, prefix, token, controllers, env)
     require(len(source_job) == 1 and source_job[0].get("name") == ("webhook" if workflow == INLINE else "validate" if workflow == HEAD else "rehearse")
             and str(source_job[0].get("run_id")) == record["sourceRunId"] and source_job[0].get("run_attempt") == 1
             and source_job[0].get("head_sha") == record["sourceHeadSha"] and source_job[0].get("status") == "completed")
+    fixed = REVIEWED_FAILED_HEAD.get(record["sourceRunId"]) if workflow == HEAD else None
+    if fixed is not None:
+        require(record["sourceJobId"] == fixed["job"] and record["sourceHeadSha"] == fixed["main"]
+                and run.get("conclusion") == "failure" and isinstance(source_job[0].get("steps"), list))
+        for name in ("Verify the exact independently reviewed head before checkout",
+                     "Independently recheck trusted main and candidate checkout", "Confirm only the authorized isolated test identity",
+                     "Run the reviewed candidate against only dedicated isolation"):
+            matched = [step for step in source_job[0]["steps"] if isinstance(step, dict) and step.get("name") == name]
+            conclusion = "failure" if name == "Run the reviewed candidate against only dedicated isolation" else "success"
+            require(len(matched) == 1 and (matched[0].get("status"), matched[0].get("conclusion")) == ("completed", conclusion))
+        verify_failed_head_source(record["sourceRunId"], token)
     archive_run = github._get_json("/actions/runs/" + record["archiveRunId"] + "/attempts/1", token)
     latest = github._get_json("/actions/runs/" + record["archiveRunId"], token)
     require(str(archive_run.get("id")) == str(latest.get("id")) == record["archiveRunId"]

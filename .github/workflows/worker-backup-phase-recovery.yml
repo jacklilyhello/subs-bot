@@ -264,6 +264,7 @@ jobs:
           SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
         run: python3 -B trusted/worker/tools/trusted_backup_phase_gate.py
       - name: Independently inspect the original recovery evidence
+        id: inspect_original
         env:
           HEAD_TRUSTED_MAIN_SHA: ${{ github.sha }}
           HEAD_TRUSTED_REVIEWED_SHA: ${{ fromJSON(inputs.validation_json).headSha }}
@@ -279,3 +280,11 @@ jobs:
         run: |
           umask 077
           python3 -B candidate/worker/tools/production_backup_rehearsal_recovery.py
+      - name: Preserve the non-sensitive recovery observation
+        if: always() && steps.inspect_original.outcome != 'skipped'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: isolated-backup-recovery-observation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/rehearsal-backup-recovery-result.json
+          if-no-files-found: warn
+          retention-days: 7

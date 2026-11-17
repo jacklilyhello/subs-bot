@@ -13,6 +13,13 @@ from production_target import ContractError, canonical
 
 
 class TerminalProofTests(unittest.TestCase):
+    def test_legacy_archive_ledger_must_match_its_pinned_digest(self):
+        value = {"legacyArchives": {"123": {"action": "seal"}}}
+        value["legacyArchiveSha256"] = sha256(canonical(value["legacyArchives"])).hexdigest()
+        self.assertTrue(terminal._legacy_plan_valid(value))
+        self.assertFalse(terminal._legacy_plan_valid({**value, "legacyArchives": {}}))
+        self.assertFalse(terminal._legacy_plan_valid({**value, "legacyArchiveSha256": "0" * 64}))
+
     def test_full_terminal_proof_rejects_missing_fresh_job_or_receipt(self):
         target = SimpleNamespace(environment="rehearsal", digest="a" * 64)
         control = {"admission": "closed", "workers": "frozen", "epoch": 1}
@@ -35,6 +42,7 @@ class TerminalProofTests(unittest.TestCase):
         review_sha = sha256(review_raw).hexdigest()
         plan_raw = canonical({"reviewSha256": review_sha, "targetSha256": target.digest,
             "oldTransactionSha256": review["oldTransactionSha256"], "oldAnchorSha256": review["oldAnchorSha256"],
+            "legacyArchives": {}, "legacyArchiveSha256": sha256(canonical({})).hexdigest(),
             "exportDispatchedUnderCustodyAssumption": False})
         plan_sha = sha256(plan_raw).hexdigest()
         originals = {**{"candidate/" + path: b"candidate" for path in gate.CANDIDATE_PATHS},
