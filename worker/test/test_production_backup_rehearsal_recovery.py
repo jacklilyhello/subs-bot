@@ -11,6 +11,22 @@ from production_target import ContractError, canonical, digest
 
 
 class RehearsalRecoveryTests(unittest.TestCase):
+    def test_unknown_result_is_preserved_and_cannot_report_success(self):
+        import tempfile
+        from contextlib import redirect_stdout
+        from io import StringIO
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            summary = root / "summary.txt"
+            result = {"status": "unknown", "automaticReplay": False}
+            output = StringIO()
+            with redirect_stdout(output):
+                success = recovery.publish_result(result, {"RUNNER_TEMP": directory, "GITHUB_STEP_SUMMARY": str(summary)})
+            self.assertFalse(success)
+            self.assertEqual((root / "rehearsal-backup-recovery-result.json").read_bytes(), canonical(result))
+            self.assertIn("::warning::", output.getvalue())
+            self.assertIn("remains unknown", summary.read_text())
+
     def test_recovery_api_budget_is_checked_before_any_claim(self):
         response = Mock()
         response.read.return_value = b'{"resources":{"core":{"remaining":1000,"reset":9999999999}}}'

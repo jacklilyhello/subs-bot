@@ -497,20 +497,31 @@ def readback(env):
             "workObservationChanged": state["stateSha256"] != complete.get("stateSha256"), "automaticReplay": False}
 
 
+def publish_result(result, env):
+    root = Path(env["RUNNER_TEMP"])
+    require(root.is_absolute() and root.is_dir() and not root.is_symlink())
+    with (root / "rehearsal-backup-recovery-result.json").open("xb") as output:
+        output.write(canonical(result))
+    if result.get("status") == "completed-awaiting-independent-readback":
+        with open(env["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+            output.write("recovery_slot=" + result["slot"] + "\nrecovery_claim_sha256=" + result["claimSha256"]
+                         + "\nrecovery_completion_sha256=" + result["completionSha256"] + "\n")
+    print(json.dumps(result, sort_keys=True))
+    if result.get("status") == "unknown":
+        message = "The original recovery remains unknown; preserve its evidence and do not retry."
+        print("::warning::" + message)
+        if env.get("GITHUB_STEP_SUMMARY"):
+            with open(env["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
+                output.write(message + "\n")
+        return False
+    return True
+
+
 if __name__ == "__main__":
-    import json
     try:
         os.umask(0o077)
-        result = main()
-        root = Path(os.environ["RUNNER_TEMP"])
-        require(root.is_absolute() and root.is_dir() and not root.is_symlink())
-        with (root / "rehearsal-backup-recovery-result.json").open("xb") as output:
-            output.write(canonical(result))
-        if result.get("status") == "completed-awaiting-independent-readback":
-            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-                output.write("recovery_slot=" + result["slot"] + "\nrecovery_claim_sha256=" + result["claimSha256"]
-                             + "\nrecovery_completion_sha256=" + result["completionSha256"] + "\n")
-        print(json.dumps(result, sort_keys=True))
+        if not publish_result(main(), os.environ):
+            raise SystemExit(1)
     except Exception:
         print("::error::The isolated recovery is not confirmed; preserve its evidence and do not retry.")
         raise SystemExit(1) from None
