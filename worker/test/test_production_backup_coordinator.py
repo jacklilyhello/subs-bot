@@ -364,7 +364,8 @@ class CoordinatorTests(unittest.TestCase):
              patch.object(cli.artifact, "_get_json", return_value={"id": 789, "status": "completed"}), \
              self.assertRaises(ContractError):
             cli.coordinator_guard(env, target, store, {"pauseLimitSeconds": 60}, lambda: None)
-        with patch.object(cli.time, "time", return_value=1061), self.assertRaises(ContractError):
+        with patch.object(cli.time, "time", return_value=1061), \
+             patch.object(cli.artifact, "_github_token", return_value="token"), self.assertRaises(ContractError):
             cli.coordinator_guard(env, target, store, {"pauseLimitSeconds": 60}, lambda: None)
         env["BACKUP_ACTION"] = "activate"
         inputs["action"] = "activate"
