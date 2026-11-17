@@ -6,12 +6,15 @@ This tool does not create environments, tokens, or destination secrets.
 """
 import base64
 import ctypes
+import hmac
 from hashlib import sha256
+from http.client import HTTPSConnection
 import json
 import os
 from pathlib import Path
 import re
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 import prepare_isolation_artifact as github
 from production_target import TEST_BOT_ID, canonical, parsed, require
@@ -99,30 +102,83 @@ def operator_source_metadata(env, source, required, *, now=None):
     return digest
 
 
+def operator_resource_evidence(env, original, registration_sha, *, now=None):
+    """Validate a pinned operator observation; it is not a live D1/R2 check."""
+    evidence = parsed(env.get("SUBS_BOT_SEALED_SOURCE_EVIDENCE_JSON", ""))
+    timestamp = int(datetime.now(timezone.utc).timestamp()) if now is None else now
+    require(set(evidence) == {"version", "checkedAt", "sourceTarget", "databaseName", "bucketName",
+                              "bucketPublicAccessDisabled", "bucketDeletionRulesDisabled", "bucketJurisdiction", "registrationSha256"}
+            and type(evidence["version"]) is int and evidence["version"] == 1
+            and type(evidence["checkedAt"]) is int and evidence["checkedAt"] <= timestamp <= evidence["checkedAt"] + 1800
+            and evidence["sourceTarget"] == original and evidence["databaseName"] == "subs-bot-cf-dev-01"
+            and evidence["bucketName"] == "subs-bot-cf-dev-01" and evidence["bucketPublicAccessDisabled"] is True
+            and evidence["bucketDeletionRulesDisabled"] is True and evidence["bucketJurisdiction"] == "default"
+            and evidence["registrationSha256"] == registration_sha)
+    pin = env.get("TRANSFER_SOURCE_EVIDENCE_SHA256", "")
+    require(re.fullmatch(r"[a-f0-9]{64}", pin or "") and sha256(canonical(evidence)).hexdigest() == pin,
+            "The independently protected operator resource evidence differs.")
+    return pin
+
+
+def read_isolation_registration(env, account_id, key):
+    """One fixed-bucket S3 GET using only a bucket-scoped object-read key."""
+    access = env.get("SUBS_BOT_SEALED_R2_ACCESS_KEY_ID", "")
+    secret = env.get("SUBS_BOT_SEALED_R2_SECRET_ACCESS_KEY", "")
+    require(re.fullmatch(r"[a-f0-9]{32}", access or "") and re.fullmatch(r"[a-f0-9]{64}", secret or "")
+            and re.fullmatch(r"[a-f0-9]{32}", account_id or "")
+            and re.fullmatch(r"maintenance/production-control/evidence/lifecycle-[a-f0-9]{64}/registration\.json", key or ""))
+    host = account_id + ".r2.cloudflarestorage.com"
+    path = "/subs-bot-cf-dev-01/" + quote(key, safe="/-_.~")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    day, empty = timestamp[:8], sha256(b"").hexdigest()
+    signed = "host;x-amz-content-sha256;x-amz-date"
+    headers = {"host": host, "x-amz-content-sha256": empty, "x-amz-date": timestamp}
+    canon_headers = "".join(f"{name}:{headers[name]}\n" for name in sorted(headers))
+    request = "\n".join(("GET", path, "", canon_headers, signed, empty))
+    scope = f"{day}/auto/s3/aws4_request"
+    signing = "\n".join(("AWS4-HMAC-SHA256", timestamp, scope, sha256(request.encode("ascii")).hexdigest()))
+    signing_key = ("AWS4" + secret).encode("ascii")
+    for part in (day, "auto", "s3", "aws4_request"):
+        signing_key = hmac.digest(signing_key, part.encode("ascii"), "sha256")
+    signature = hmac.digest(signing_key, signing.encode("ascii"), "sha256").hex()
+    headers["Authorization"] = f"AWS4-HMAC-SHA256 Credential={access}/{scope}, SignedHeaders={signed}, Signature={signature}"
+    connection = HTTPSConnection(host, timeout=30)
+    try:
+        connection.request("GET", path, headers=headers)
+        response = connection.getresponse()
+        try:
+            require(response.status == 200 and response.getheader("Content-Encoding", "identity") == "identity")
+            raw = response.read(512 * 1024 + 1)
+            require(0 < len(raw) <= 512 * 1024)
+            return raw
+        finally:
+            response.close()
+    finally:
+        connection.close()
+
+
 def attest_isolation_source(env):
-    """Read existing private registration and live isolation identities only."""
+    """Check live Worker and S3 object; compare D1/R2 metadata to operator evidence."""
     from production_control import API, Telegram
     from production_lifecycle_drill import configuration, ORIGINAL_SERVICE
-    from production_storage import PrivateStore
     from production_target import validate_target
-    required = ("SUBS_BOT_CF_ISOLATION_TARGET_JSON", "SUBS_BOT_CONTROL_DRILL_KEYS",
-                "SUBS_BOT_TELEGRAM_TEST_CONFIG", "SUBS_BOT_CF_SEALED_SOURCE_READ_TOKEN")
+    source_names = ("SUBS_BOT_CF_ISOLATION_TARGET_JSON", "SUBS_BOT_CONTROL_DRILL_KEYS", "SUBS_BOT_TELEGRAM_TEST_CONFIG")
+    required = (*source_names, "SUBS_BOT_SEALED_WORKER_READ_TOKEN", "SUBS_BOT_SEALED_R2_ACCESS_KEY_ID",
+                "SUBS_BOT_SEALED_R2_SECRET_ACCESS_KEY", "SUBS_BOT_SEALED_SOURCE_EVIDENCE_JSON")
     metadata_sha = operator_source_metadata(env, "subs-bot-isolation", required)
     draft, secrets, previous, original = configuration(env)
     require(previous["botId"] == TEST_BOT_ID and previous["botUsername"] == "test_cfsubs_bot")
     target = {**draft.data, "d1Id": original["d1Id"], "d1Name": ORIGINAL_SERVICE,
               "backupBucketName": ORIGINAL_SERVICE, "backupBucketCreatedAt": original["r2CreatedOn"]}
-    reader = API(target, env.get("SUBS_BOT_CF_SEALED_SOURCE_READ_TOKEN", ""))
+    reader = API(target, env.get("SUBS_BOT_SEALED_WORKER_READ_TOKEN", ""))
     root = reader.root
     worker = reader("GET", root + "/workers/workers/" + original["workerId"])
-    db = reader("GET", root + "/d1/database/" + original["d1Id"])
     require((worker.get("id"), worker.get("name"), worker.get("created_on")) ==
-            (original["workerId"], ORIGINAL_SERVICE, original["workerCreatedOn"])
-            and (db.get("uuid"), db.get("name"), db.get("created_at")) ==
-            (original["d1Id"], ORIGINAL_SERVICE, original["d1CreatedAt"]))
-    store = PrivateStore(reader, ORIGINAL_SERVICE)
-    raw = store.get("maintenance/production-control/evidence/lifecycle-" + draft.digest + "/registration.json")
+            (original["workerId"], ORIGINAL_SERVICE, original["workerCreatedOn"]))
     pin = env.get("TRANSFER_REGISTRATION_SHA256", "")
+    evidence_sha = operator_resource_evidence(env, original, pin)
+    raw = read_isolation_registration(env, original["accountId"],
+          "maintenance/production-control/evidence/lifecycle-" + draft.digest + "/registration.json")
     require(re.fullmatch(r"[a-f0-9]{64}", pin or "") and sha256(raw).hexdigest() == pin)
     registration = parsed(raw)
     target = validate_target(registration.get("target"))
@@ -135,8 +191,8 @@ def attest_isolation_source(env):
             and validate_target(desired).configuration_digest == target.configuration_digest)
     Telegram(draft, secrets).identity()
     github.require_current_main(env["GITHUB_SHA"])
-    return {"metadataSha256": metadata_sha, "registrationSha256": pin,
-            "sourceHashes": {name: sha256(env[name].encode("utf-8")).hexdigest() for name in required[:-1]}}
+    return {"metadataSha256": metadata_sha, "registrationSha256": pin, "operatorResourceEvidenceSha256": evidence_sha,
+            "sourceHashes": {name: sha256(env[name].encode("utf-8")).hexdigest() for name in source_names}}
 
 
 def attest_provider_source(env):
