@@ -1,0 +1,88 @@
+name: Close and freeze the reviewed isolated backup window
+run-name: Backup admission recovery ${{ inputs.source_run_id }}-${{ inputs.source_attempt }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Read-only aborted plan, approved one-shot recovery, or finish a successful candidate
+        type: choice
+        options: [plan-aborted, execute-aborted, complete]
+        required: true
+      source_run_id:
+        description: Exact original reviewed-head dispatcher run
+        type: string
+        required: true
+      source_attempt:
+        description: Original attempt, must be one
+        type: string
+        required: true
+        default: '1'
+      source_main_sha:
+        description: Exact trusted main SHA used by the original run
+        type: string
+        required: true
+      source_candidate_sha:
+        description: Exact independently reviewed candidate SHA
+        type: string
+        required: true
+      source_checkpoint_id:
+        description: Exact private checkpoint carrying the active application source
+        type: string
+        required: true
+      source_manifest_sha256:
+        description: Independently pinned source manifest SHA256
+        type: string
+        required: true
+      webhook_snapshot_sha256:
+        description: Independently pinned original webhook snapshot SHA256
+        type: string
+        required: true
+      approved_plan_sha256:
+        description: Exact prior read-only plan SHA256 for execute-aborted
+        type: string
+        required: false
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: subs-bot-lifecycle-rehearsal
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && vars.SUBS_BOT_BACKUP_ADMISSION_RECOVERY_ENABLED == 'true'
+    environment: subs-bot-backup-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Close, drain and freeze once using trusted main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BACKUP_ADMISSION_ACTION: ${{ inputs.action }}
+          BACKUP_APPROVED_PLAN_SHA256: ${{ inputs.approved_plan_sha256 }}
+          WEBHOOK_SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          WEBHOOK_SOURCE_ATTEMPT: ${{ inputs.source_attempt }}
+          WEBHOOK_SOURCE_MAIN_SHA: ${{ inputs.source_main_sha }}
+          WEBHOOK_SOURCE_CANDIDATE_SHA: ${{ inputs.source_candidate_sha }}
+          WEBHOOK_REVIEWED_CANDIDATE_SHA: ${{ vars.SUBS_BOT_BACKUP_REVIEWED_HEAD_SHA }}
+          WEBHOOK_REGISTRATION_SHA256: ${{ vars.SUBS_BOT_REHEARSAL_REGISTRATION_SHA256 }}
+          WEBHOOK_SNAPSHOT_SHA256: ${{ inputs.webhook_snapshot_sha256 }}
+          BACKUP_SOURCE_CHECKPOINT_ID: ${{ inputs.source_checkpoint_id }}
+          BACKUP_SOURCE_MANIFEST_SHA256: ${{ inputs.source_manifest_sha256 }}
+          BACKUP_GENESIS_SHA256: ${{ vars.SUBS_BOT_REHEARSAL_BACKUP_GENESIS_SHA256 }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_REHEARSAL_DATA_TOKEN }}
+          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_REHEARSAL_WORKER_READ_TOKEN }}
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_CONTROL_DRILL_KEYS: ${{ secrets.SUBS_BOT_CONTROL_DRILL_KEYS }}
+          SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          python3 -B worker/tools/production_backup_admission_recovery.py
