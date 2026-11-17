@@ -36,6 +36,10 @@ def verify_archived_chain():
     control.guard_sources(target)
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="ascii") as output:
         output.write("target_sha256=" + control.digest(target) + "\n")
+    approvals = {operation: control.digest({"operation": operation, "target": target})
+                 for operation in ("prepare-image", "stage", "activate", "smoke")}
+    print(json.dumps({"status": "isolated-operation-approval-digests", "targetSha256": control.digest(target),
+                      "approvals": approvals, "authorizationGranted": False, "providerMutation": False}, sort_keys=True))
 
 
 def verify_source_fault_case():

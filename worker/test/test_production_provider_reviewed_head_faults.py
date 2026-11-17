@@ -21,6 +21,32 @@ from test_production_provider import config
 
 
 class ReviewedSourceFaultTests(unittest.TestCase):
+    def test_source_verified_operation_approvals_are_hashes_without_private_target(self):
+        target = config(active=True)
+        with tempfile.TemporaryDirectory() as root:
+            output_path = Path(root) / "outputs"
+            output_path.write_text("")
+            capture = io.StringIO()
+            with patch.dict(os.environ, {"RUNNER_TEMP": root, "GITHUB_OUTPUT": str(output_path)}, clear=True), \
+                    patch.object(harness.publish, "config", return_value=target), patch.object(harness.durable, "restore"), \
+                    patch.object(control, "guard_sources") as guard, patch.object(control, "prepare_durable"), \
+                    patch.object(control, "verify_previous_archives"), redirect_stdout(capture):
+                harness.verify_archived_chain()
+            self.assertEqual(guard.call_count, 2)
+            row = json.loads(capture.getvalue())
+            self.assertEqual(row["targetSha256"], control.digest(target))
+            self.assertEqual(row["approvals"], {operation: control.digest({"operation": operation, "target": target})
+                                                for operation in ("prepare-image", "stage", "activate", "smoke")})
+            self.assertFalse(row["authorizationGranted"])
+            self.assertNotIn(target["service"], capture.getvalue())
+            rejected = io.StringIO()
+            with patch.dict(os.environ, {"RUNNER_TEMP": root, "GITHUB_OUTPUT": str(output_path)}, clear=True), \
+                    patch.object(harness.publish, "config", return_value=target), patch.object(harness.durable, "restore"), \
+                    patch.object(control, "guard_sources", side_effect=control.ProviderError("fixture rejection")), \
+                    redirect_stdout(rejected), self.assertRaises(control.ProviderError):
+                harness.verify_archived_chain()
+            self.assertEqual(rejected.getvalue(), "")
+
     def test_previous_identity_fault_reaches_the_exact_source_guard(self):
         previous = config(active=True)
         build = deepcopy(previous["build"])
