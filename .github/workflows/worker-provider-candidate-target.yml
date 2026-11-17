@@ -1,0 +1,76 @@
+name: Seal isolated Provider upgrade target
+run-name: Seal isolated Provider target ${{ inputs.mapping }} at ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mapping:
+        description: One approved isolated destination
+        required: true
+        type: choice
+        options: [provider-archive-target, provider-live-target]
+      provider_ci_run_id:
+        description: Exact successful Provider CI run for current main
+        required: true
+        type: string
+      destination_key_id:
+        description: Public key ID independently read for destination
+        required: true
+        type: string
+      destination_environment_id:
+        description: Immutable destination Environment ID
+        required: true
+        type: string
+      destination_public_key:
+        description: Public key independently read for destination
+        required: true
+        type: string
+      source_metadata_json:
+        description: Fresh independently verified Provider source Environment metadata
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  seal:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && vars.SUBS_BOT_PROVIDER_CANDIDATE_TARGET_ENABLED == 'true'
+    environment: subs-bot-provider-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify original build and seal the isolated upgrade target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_CI_RUN_ID: ${{ inputs.provider_ci_run_id }}
+          SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          TRANSFER_MAPPING: ${{ inputs.mapping }}
+          TRANSFER_SOURCE_METADATA_JSON: ${{ inputs.source_metadata_json }}
+          TRANSFER_SOURCE_METADATA_SHA256: ${{ vars.SUBS_BOT_SEALED_SOURCE_METADATA_SHA256 }}
+          TRANSFER_SOURCE_ENVIRONMENT_ID: ${{ vars.SUBS_BOT_SEALED_SOURCE_ENVIRONMENT_ID }}
+          TRANSFER_PROVIDER_TARGET_SHA256: ${{ vars.SUBS_BOT_SEALED_PROVIDER_TARGET_SHA256 }}
+          TRANSFER_DESTINATION_ENVIRONMENT_ID: ${{ inputs.destination_environment_id }}
+          TRANSFER_SOURCE_ENVIRONMENT: subs-bot-provider-isolation
+          TRANSFER_DESTINATION_ENVIRONMENT: ${{ inputs.mapping == 'provider-archive-target' && 'subs-bot-provider-archive-head-isolation' || 'subs-bot-provider-head-isolation' }}
+          TRANSFER_SOURCE_NAME: SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON
+          TRANSFER_DESTINATION_NAME: SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON
+          TRANSFER_DESTINATION_KEY_PIN: ${{ inputs.mapping == 'provider-archive-target' && vars.SUBS_BOT_SEALED_PROVIDER_ARCHIVE_KEY_PIN || vars.SUBS_BOT_SEALED_PROVIDER_HEAD_KEY_PIN }}
+          TRANSFER_KEY_ID: ${{ inputs.destination_key_id }}
+          TRANSFER_PUBLIC_KEY: ${{ inputs.destination_public_key }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          python3 -B worker/tools/reviewed_provider_candidate.py
+      - name: Upload sealed ciphertext only
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: provider-candidate-target-${{ inputs.mapping }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/provider-candidate-target.json
+          if-no-files-found: error
+          retention-days: 1
