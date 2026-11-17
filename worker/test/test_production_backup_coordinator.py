@@ -108,6 +108,11 @@ class CoordinatorTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             coordinator.claim_resume_writer(store, "a" * 64, "123", "b" * 40, history, "456")
         store.put_once.assert_called_once()
+        store.put_once.reset_mock(side_effect=True)
+        store.get.return_value = (b"competing writer", '"etag"')
+        with self.assertRaises(ContractError):
+            coordinator.claim_resume_writer(store, "a" * 64, "123", "b" * 40, history, "457", action="reconcile")
+        store.put_once.assert_not_called()
 
     def test_legacy_begin_intent_can_identify_nonce_named_writer(self):
         title = "Production backup begin at " + "b" * 40 + " #" + "c" * 64

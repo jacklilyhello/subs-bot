@@ -380,7 +380,7 @@ def finished_controller(objects, target, session, revision, source_checkpoint, s
                 "position", "previousSha256", "writerRunId", "writerAttempt", "action"}
                 and value["version"] == 1 and value["targetSha256"] == target and value["session"] == session
                 and value["controlRevision"] == revision and value["position"] == position
-                and value["action"] in {"resume", "abort"}
+                and value["action"] in {"resume", "abort", "reconcile"}
                 and value["previousSha256"] == previous and DECIMAL.fullmatch(value["writerRunId"] or "")
                 and value["writerAttempt"] == "1")
         observed = artifact._get_json("/actions/runs/" + value["writerRunId"] + "/attempts/1", artifact._github_token())
@@ -401,7 +401,7 @@ def finished_controller(objects, target, session, revision, source_checkpoint, s
 
 def claim_resume_writer(objects, target, session, revision, history, run_id, *, action="resume"):
     """A single immutable slot serializes concurrent continuation attempts."""
-    require(action in {"resume", "abort"} and DECIMAL.fullmatch(run_id or "") and isinstance(history, dict) and isinstance(history.get("writers"), list)
+    require(action in {"resume", "abort", "reconcile"} and DECIMAL.fullmatch(run_id or "") and isinstance(history, dict) and isinstance(history.get("writers"), list)
             and len(history["writers"]) < 127 and HEX.fullmatch(history.get("lastSha256", "")))
     position = len(history["writers"]) + 1
     value = {"version": 1, "targetSha256": target, "session": session, "controlRevision": revision,
@@ -626,6 +626,7 @@ def main(env=None):
         plan["writerHistorySha256"] = digest(history)
         verified, _ = completed_results(objects, target.digest, session, revision, artifact._github_token(),
                                         source_checkpoint, source_sha, policy["pauseLimitSeconds"])
+        plan.update(completedResultsSha256=digest(verified), nextAction=STEPS[len(verified)] if len(verified) < len(STEPS) else "complete")
         return {"status": "planned", "planSha256": digest(plan), "session": session,
                 "verifiedCheckpoints": len(verified), "mutationPerformed": False}
     if action in {"plan-abort", "abort"}:
@@ -651,7 +652,7 @@ def main(env=None):
                 "productionMutation": False, "dispatchRetried": False}
     if action in {"plan-reconcile", "reconcile"}:
         require(pinned["state"] == "active" and pinned["session"] == session + "-1" and pinned["controlRevision"] == revision)
-        finished_controller(objects, target.digest, session, revision, source_checkpoint, source_sha, digest(policy))
+        history = finished_controller(objects, target.digest, session, revision, source_checkpoint, source_sha, digest(policy))
         sequence = int(env.get("BACKUP_COORDINATOR_SEQUENCE", "0"))
         stage = inspect_stage(objects, target.digest, session, sequence)
         require(stage["status"] == "unknown", "Only an unresolved original dispatch can be reconciled.")
@@ -672,16 +673,26 @@ def main(env=None):
         proof = receipt(intent, str(run["id"]), result, source["artifactId"], source["artifactSha256"])
         require_completed_receipt(intent, proof, run, workflow["id"], result)
         plan.update(sequence=sequence, intentSha256=sha256(intent_raw).hexdigest(),
-                    runId=str(run["id"]), resultSha256=proof["resultSha256"])
+                    runId=str(run["id"]), resultSha256=proof["resultSha256"], artifactId=source["artifactId"],
+                    artifactSha256=source["artifactSha256"], writerHistorySha256=digest(history))
         if action == "plan-reconcile":
             return {"status": "planned", "planSha256": digest(plan), "mutationPerformed": False}
         require(env.get("BACKUP_COORDINATOR_APPROVAL_SHA256") == digest(plan))
         artifact.require_current_main(revision)
+        require(finished_controller(objects, target.digest, session, revision, source_checkpoint, source_sha, digest(policy)) == history)
+        claim_resume_writer(objects, target.digest, session, revision, history, env["GITHUB_RUN_ID"], action="reconcile")
+        again = discover_run(intent, workflow["id"], token)
+        again_result, again_source, again_original = selected_result(str(again["id"]), revision, intent["action"], token)
+        require(again == run and again_result == result and again_source == source and again_original == original,
+                "The approved reconciliation evidence changed.")
         confirm_stage(objects, intent, run, workflow["id"], result, source, original)
         return {"status": "reconciled", "mutationPerformed": True, "dispatchRetried": False}
     if action == "resume":
         history = finished_controller(objects, target.digest, session, revision, source_checkpoint, source_sha, digest(policy))
         plan["writerHistorySha256"] = digest(history)
+        verified, _ = completed_results(objects, target.digest, session, revision, artifact._github_token(),
+                                        source_checkpoint, source_sha, policy["pauseLimitSeconds"])
+        plan.update(completedResultsSha256=digest(verified), nextAction=STEPS[len(verified)] if len(verified) < len(STEPS) else "complete")
     require(env.get("BACKUP_COORDINATOR_APPROVAL_SHA256") == digest(plan),
             "The exact independently approved coordinator plan is required.")
     if action == "run":
@@ -707,6 +718,9 @@ def main(env=None):
         require(finished_controller(objects, target.digest, session, revision, source_checkpoint, source_sha, digest(policy)) == history)
         artifact.require_current_main(revision)
         claim_resume_writer(objects, target.digest, session, revision, history, env["GITHUB_RUN_ID"])
+        again, _ = completed_results(objects, target.digest, session, revision, artifact._github_token(),
+                                     source_checkpoint, source_sha, policy["pauseLimitSeconds"])
+        require(again == verified, "The approved continuation results changed.")
     result = run_sequence(objects, anchor, target.digest, session, revision, source_checkpoint, source_sha,
                           artifact._github_token(), deadline=time.monotonic() + 5 * 3600,
                           pause_limit=policy["pauseLimitSeconds"], writer_run_id=env["GITHUB_RUN_ID"])
