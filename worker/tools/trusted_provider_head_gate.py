@@ -53,9 +53,10 @@ def validate(env):
             and 0 < len(spec["archiveRefs"]) <= 9)
     for ref in spec["archiveRefs"]:
         require(isinstance(ref, dict) and set(ref) == {"kind", "runId", "runAttempt", "manifestSha256", "targetSha256"}
-                and ref["kind"] in {"complete", "partial"}
+                and ref["kind"] in {"complete", "partial", "isolated-source"}
                 and all(isinstance(ref[key], str) and DECIMAL.fullmatch(ref[key]) is not None for key in ("runId", "runAttempt"))
-                and all(isinstance(ref[key], str) and HEX64.fullmatch(ref[key]) is not None for key in ("manifestSha256", "targetSha256")))
+                and all(isinstance(ref[key], str) and HEX64.fullmatch(ref[key]) is not None for key in ("manifestSha256", "targetSha256"))
+                and (ref["kind"] != "isolated-source" or ref["runAttempt"] == "1"))
     phase, environment = env.get("PROVIDER_HEAD_PHASE", ""), env.get("PROVIDER_HEAD_ENVIRONMENT", "")
     require(phase in PHASES and environment in ENVIRONMENTS
             and environment == ("subs-bot-provider-head-isolation" if phase in PROVIDER_PHASES else "subs-bot-provider-archive-head-isolation"))
