@@ -39,6 +39,13 @@ class SourceTransferTests(unittest.TestCase):
                            {"SUBS_BOT_PROVIDER_TRUSTED_ARCHIVE_REFS_JSON": "[]"}):
                 with self.subTest(change=change), patch.dict(os.environ, change), self.assertRaises(control.ProviderError):
                     transfer.execution_identity(main)
+            source_spec = {**spec, "simulateActionsUnavailable": False}
+            source_env = {"GITHUB_WORKFLOW_REF": f"{control.github.REPOSITORY}/{transfer.REVIEWED_SOURCE_WORKFLOW_PATH}@{control.github.MAIN_REF}",
+                          "PROVIDER_HEAD_VALIDATION_JSON": json.dumps(source_spec), "SUBS_BOT_PROVIDER_SIMULATE_ARTIFACT_UNAVAILABLE": "0"}
+            with patch.dict(os.environ, source_env):
+                self.assertEqual(transfer.execution_identity(main)["workflowPath"], transfer.REVIEWED_SOURCE_WORKFLOW_PATH)
+                with patch.dict(os.environ, {"SUBS_BOT_PROVIDER_SIMULATE_ARTIFACT_UNAVAILABLE": "1"}), self.assertRaises(control.ProviderError):
+                    transfer.execution_identity(main)
 
     def test_exact_target_approval_and_unbound_caller_are_required(self):
         target = config(active=True)

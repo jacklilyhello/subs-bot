@@ -231,7 +231,8 @@ def inventory(reader, *, current=None):
 
 
 def workflow_has_main_history(path, revision, token):
-    control.require(path in {transfer.WORKFLOW_PATH, transfer.REVIEWED_WORKFLOW_PATH}
+    control.require(path in {transfer.WORKFLOW_PATH, transfer.REVIEWED_WORKFLOW_PATH,
+                             ".github/workflows/worker-provider-isolated-source.yml", transfer.REVIEWED_SOURCE_WORKFLOW_PATH}
                     and control.match(control.provider.REVISION, revision))
     query = urlencode({"sha": revision, "path": path, "per_page": 1})
     request = control.github._api_request("/commits?" + query, token)

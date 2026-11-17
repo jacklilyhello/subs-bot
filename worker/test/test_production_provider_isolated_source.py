@@ -15,6 +15,7 @@ import archive_production_provider as archive
 import production_provider as control
 import provider_durable_source as durable
 import provider_isolated_source as isolated
+import provider_digest_journal as digest_journal
 from test_production_provider import config
 
 
@@ -46,12 +47,45 @@ class IsolatedSourceTests(unittest.TestCase):
         with self.assertRaises(control.ProviderError):
             isolated.manifest(reader, sha256(raw).hexdigest())
 
+    def test_reviewed_source_manifest_preserves_candidate_identity(self):
+        target = self.target()
+        value = {**self.manifest(target), "workflowPath": isolated.REVIEWED_SEAL_WORKFLOW,
+                 "candidateRevision": "c" * 40, "reviewedPr": "290"}
+        raw = control.canonical(value)
+        reader = Mock(run_id="101")
+        reader.read.return_value = raw
+        verified, _ = isolated.manifest(reader, sha256(raw).hexdigest())
+        self.assertEqual((verified["controllerRevision"], verified["candidateRevision"]), ("b" * 40, "c" * 40))
+        for change in ({"workflowPath": isolated.SEAL_WORKFLOW}, {"candidateRevision": "bad"}, {"reviewedPr": ""}):
+            with self.subTest(change=change):
+                raw = control.canonical({**value, **change})
+                reader.read.return_value = raw
+                with self.assertRaises(control.ProviderError):
+                    isolated.manifest(reader, sha256(raw).hexdigest())
+
     def test_incomplete_or_unknown_prior_intent_blocks_before_writes(self):
         reader = Mock()
         key = isolated.BASE + "100/1/source-intent.json"
         with patch.object(durable, "list_private_keys", return_value=[key]), self.assertRaises(control.ProviderError):
             isolated.inventory(reader)
         reader.put.assert_not_called()
+
+    def test_unregistered_other_source_dispatch_blocks(self):
+        revision = "b" * 40
+        common = {"head_sha": revision, "head_branch": "main", "event": "workflow_dispatch", "run_attempt": 1,
+                  "repository": {"id": control.github.REPOSITORY_ID}, "head_repository": {"id": control.github.REPOSITORY_ID}}
+        def get(path, _token):
+            reviewed = isolated.REVIEWED_SEAL_WORKFLOW.rsplit("/", 1)[-1] in path
+            row = {**common, "path": isolated.REVIEWED_SEAL_WORKFLOW if reviewed else isolated.SEAL_WORKFLOW,
+                   "id": 101 if reviewed else 102, "display_title": "Isolated Provider source seal " + ("999" if reviewed else "100"),
+                   "status": "completed" if reviewed else "in_progress", "conclusion": "failure" if reviewed else None}
+            return {"total_count": 1, "workflow_runs": [row]}
+        env = {"GITHUB_RUN_ID": "102", "GITHUB_SHA": revision}
+        with patch.dict(os.environ, env, clear=True), patch.object(control.github, "_github_token", return_value="synthetic"), \
+                patch.object(digest_journal, "workflow_has_main_history", return_value=True), \
+                patch.object(durable, "source_ancestor"), \
+                patch.object(control.github, "_get_json", side_effect=get), self.assertRaises(control.ProviderError):
+            isolated.history("100", {}, [revision])
 
     def test_duplicate_listing_is_not_treated_as_complete_inventory(self):
         reader = Mock()

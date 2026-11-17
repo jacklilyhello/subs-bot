@@ -24,6 +24,8 @@ import provider_private_handoff as handoff
 
 WORKFLOW_PATH = ".github/workflows/worker-provider-digest-rehearsal.yml"
 REVIEWED_WORKFLOW_PATH = ".github/workflows/worker-provider-reviewed-digest.yml"
+REVIEWED_SOURCE_WORKFLOW_PATH = ".github/workflows/worker-provider-reviewed-isolated-source.yml"
+REVIEWED_SOURCE_READBACK_WORKFLOW_PATH = ".github/workflows/worker-provider-reviewed-isolated-source-readback.yml"
 MAX_BUNDLE = 2 * 1024 * 1024 * 1024
 MAX_INDEX = 512 * 1024
 DISK_MARGIN = 512 * 1024 * 1024
@@ -37,7 +39,7 @@ def require_disk(root, required):
 
 def workflow_path():
     ref = os.environ.get("GITHUB_WORKFLOW_REF", "")
-    matches = [path for path in (WORKFLOW_PATH, REVIEWED_WORKFLOW_PATH)
+    matches = [path for path in (WORKFLOW_PATH, REVIEWED_WORKFLOW_PATH, REVIEWED_SOURCE_WORKFLOW_PATH, REVIEWED_SOURCE_READBACK_WORKFLOW_PATH)
                if ref == f"{control.github.REPOSITORY}/{path}@{control.github.MAIN_REF}"]
     control.require(len(matches) == 1)
     return matches[0]
@@ -48,7 +50,9 @@ def execution_identity(revision):
     ref = os.environ.get("GITHUB_WORKFLOW_REF", "")
     if not ref or ref == f"{control.github.REPOSITORY}/{WORKFLOW_PATH}@{control.github.MAIN_REF}":
         return {"workflowPath": WORKFLOW_PATH, "candidateRevision": revision, "reviewedPr": None}
-    control.require(workflow_path() == REVIEWED_WORKFLOW_PATH)
+    path = workflow_path()
+    control.require(path in {REVIEWED_WORKFLOW_PATH, REVIEWED_SOURCE_WORKFLOW_PATH, REVIEWED_SOURCE_READBACK_WORKFLOW_PATH})
+    simulation = path == REVIEWED_WORKFLOW_PATH
     spec = control.github._parse_object(os.environ.get("PROVIDER_HEAD_VALIDATION_JSON", ""), control.ERROR)
     head = os.environ.get("PROVIDER_HEAD_REVIEWED_SHA", "")
     control.require(set(spec) == {"version", "pr", "headSha", "providerCiRunId", "approvalSha256", "archiveRefs", "simulateActionsUnavailable"}
@@ -58,9 +62,9 @@ def execution_identity(revision):
                     and os.environ.get("PROVIDER_HEAD_TRUSTED_MAIN_SHA") == revision
                     and spec["providerCiRunId"] == os.environ.get("SUBS_BOT_PROVIDER_CI_RUN_ID")
                     and spec["approvalSha256"] == os.environ.get("SUBS_BOT_PROVIDER_DIGEST_APPROVAL")
-                    and spec["archiveRefs"] == refs() and spec["simulateActionsUnavailable"] is True
-                    and os.environ.get("SUBS_BOT_PROVIDER_SIMULATE_ARTIFACT_UNAVAILABLE") == "1")
-    return {"workflowPath": REVIEWED_WORKFLOW_PATH, "candidateRevision": head, "reviewedPr": spec["pr"]}
+                    and spec["archiveRefs"] == refs() and spec["simulateActionsUnavailable"] is simulation
+                    and os.environ.get("SUBS_BOT_PROVIDER_SIMULATE_ARTIFACT_UNAVAILABLE") == ("1" if simulation else "0"))
+    return {"workflowPath": path, "candidateRevision": head, "reviewedPr": spec["pr"]}
 
 
 def context():

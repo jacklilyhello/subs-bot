@@ -14,10 +14,13 @@ import tempfile
 import archive_production_provider as sealed
 import production_provider as control
 import provider_durable_source as durable
+import provider_source_transfer as transfer
 
 BASE = "maintenance/provider-isolated-source/"
 SEAL_WORKFLOW = ".github/workflows/worker-provider-isolated-source.yml"
 READBACK_WORKFLOW = ".github/workflows/worker-provider-isolated-source-readback.yml"
+REVIEWED_SEAL_WORKFLOW = transfer.REVIEWED_SOURCE_WORKFLOW_PATH
+REVIEWED_READBACK_WORKFLOW = transfer.REVIEWED_SOURCE_READBACK_WORKFLOW_PATH
 MAX_HISTORY = 32
 
 
@@ -28,8 +31,21 @@ class Store(durable.ProductionStore):
 
 
 def context(workflow, *, write=False):
-    durable.seal_context(workflow, mutation=write)
+    ref = os.environ.get("GITHUB_WORKFLOW_REF", "")
+    reviewed = REVIEWED_SEAL_WORKFLOW if workflow == SEAL_WORKFLOW else REVIEWED_READBACK_WORKFLOW
+    actual = reviewed if ref == f"{control.github.REPOSITORY}/{reviewed}@{control.github.MAIN_REF}" else workflow
+    durable.seal_context(actual, mutation=write)
+    if actual == reviewed:
+        control.require(transfer.execution_identity(os.environ["GITHUB_SHA"])["workflowPath"] == actual)
     control.require(os.environ.get("SUBS_BOT_PROVIDER_ISOLATED_SOURCE_ENABLED") == "true")
+
+
+def reviewed_identity(workflow):
+    ref = os.environ.get("GITHUB_WORKFLOW_REF", "")
+    reviewed = REVIEWED_SEAL_WORKFLOW if workflow == SEAL_WORKFLOW else REVIEWED_READBACK_WORKFLOW
+    if ref != f"{control.github.REPOSITORY}/{reviewed}@{control.github.MAIN_REF}":
+        return {}
+    return transfer.execution_identity(os.environ["GITHUB_SHA"])
 
 
 def target_config():
@@ -48,12 +64,17 @@ def ledger():
     value = control.github._parse_object(os.environ.get("SUBS_BOT_PROVIDER_ISOLATED_SOURCE_LEDGER_JSON", ""), sealed.ERROR)
     control.require(len(value) <= MAX_HISTORY)
     for operation_id, row in value.items():
+        standard = {"intentSha256", "manifestSha256", "runId", "controllerRevision", "targetSha256",
+                    "readbackRunId", "readbackRunAttempt", "readbackControllerRevision", "readbackSha256"}
+        extra = {"candidateRevision", "reviewedPr", "workflowPath", "readbackWorkflowPath"}
         control.require(control.match(control.provider.DECIMAL, operation_id) and isinstance(row, dict)
-                        and set(row) == {"intentSha256", "manifestSha256", "runId", "controllerRevision", "targetSha256",
-                                         "readbackRunId", "readbackRunAttempt", "readbackControllerRevision", "readbackSha256"}
+                        and set(row) in (standard, standard | extra)
                         and all(control.match(control.provider.HEX, row[k]) for k in ("intentSha256", "manifestSha256", "targetSha256", "readbackSha256"))
                         and all(control.match(control.provider.DECIMAL, row[k]) for k in ("runId", "readbackRunId", "readbackRunAttempt"))
-                        and all(control.match(control.provider.REVISION, row[k]) for k in ("controllerRevision", "readbackControllerRevision")))
+                        and all(control.match(control.provider.REVISION, row[k]) for k in ("controllerRevision", "readbackControllerRevision"))
+                        and (set(row) == standard or (control.match(control.provider.REVISION, row["candidateRevision"])
+                            and control.match(control.provider.DECIMAL, row["reviewedPr"])
+                            and row["workflowPath"] == REVIEWED_SEAL_WORKFLOW and row["readbackWorkflowPath"] == REVIEWED_READBACK_WORKFLOW)))
     return value
 
 
@@ -71,7 +92,7 @@ def plan(target, bucket, operation_id, inventory, allowed):
     return {"version": 1, "action": "seal-isolated-provider-source", "operationId": operation_id,
             "controllerRevision": os.environ["GITHUB_SHA"], "targetSha256": control.digest(target),
             "build": target["build"], "bucketSha256": control.digest(bucket), "prefixState": "intent-and-manifest-absent",
-            "inventorySha256": control.digest(inventory), "controllersSha256": control.digest(allowed)}
+            "inventorySha256": control.digest(inventory), "controllersSha256": control.digest(allowed), **reviewed_identity(SEAL_WORKFLOW)}
 
 
 def manifest(reader, expected):
@@ -79,10 +100,14 @@ def manifest(reader, expected):
     raw = reader.read("source-manifest.json")
     control.require(isinstance(raw, bytes) and len(raw) <= 65536 and sha256(raw).hexdigest() == expected)
     result = control.github._parse_object(raw, sealed.ERROR)
-    control.require(set(result) == {"version", "kind", "runId", "runAttempt", "controllerRevision", "target", "files"}
+    standard = {"version", "kind", "runId", "runAttempt", "controllerRevision", "target", "files"}
+    extra = {"candidateRevision", "reviewedPr", "workflowPath"}
+    control.require(set(result) in (standard, standard | extra)
                     and type(result["version"]) is int and result["version"] == 1 and result["kind"] == "subs-bot-isolated-provider-source"
                     and result["runId"] == reader.run_id and result["runAttempt"] == "1"
                     and control.match(control.provider.REVISION, result["controllerRevision"])
+                    and (set(result) == standard or (control.match(control.provider.REVISION, result["candidateRevision"])
+                        and control.match(control.provider.DECIMAL, result["reviewedPr"]) and result["workflowPath"] == REVIEWED_SEAL_WORKFLOW))
                     and isinstance(result["files"], dict) and set(result["files"]) == {"provider-source-archive.zip"})
     target = control.validate_config(result["target"])
     control.require(target["environment"] == "rehearsal" and target["caller"] is None)
@@ -119,6 +144,10 @@ def inventory(reader):
         value, target = manifest(prior, manifest_sha)
         details = intent.get("plan")
         fixed = plan(target, reader.target, operation_id, {}, [])
+        for key in ("workflowPath", "candidateRevision", "reviewedPr"):
+            fixed.pop(key, None)
+            if key in value:
+                fixed[key] = value[key]
         variable = {"controllerRevision", "inventorySha256", "controllersSha256"}
         control.require(set(intent) == {"version", "plan", "approvalSha256", "controllerRevision", "runId", "runAttempt", "status"}
                         and type(intent["version"]) is int and intent["version"] == 1
@@ -134,41 +163,54 @@ def inventory(reader):
         with open(os.devnull, "wb") as output:
             control.require(sealed.read_record(prior, value, "provider-source-archive.zip", output) == target["build"]["archiveSha256"])
         completed[operation_id] = {"intentSha256": sha256(intent_raw).hexdigest(), "manifestSha256": manifest_sha,
-                                   "runId": intent["runId"], "controllerRevision": value["controllerRevision"]}
+                                   "runId": intent["runId"], "controllerRevision": value["controllerRevision"],
+                                   **{key: value[key] for key in ("workflowPath", "candidateRevision", "reviewedPr") if key in value}}
     return completed
 
 
 def history(operation_id, completed, allowed):
+    import provider_digest_journal as digest_journal
     token, current = control.github._github_token(), os.environ["GITHUB_RUN_ID"]
     rows = []
-    for page in range(1, 11):
-        value = control.github._get_json(f"/actions/workflows/{SEAL_WORKFLOW.rsplit('/', 1)[-1]}/runs?per_page=100&page={page}", token)
-        batch = value.get("workflow_runs")
-        control.require(isinstance(batch, list) and len(batch) <= 100 and type(value.get("total_count")) is int
-                        and 0 <= value["total_count"] <= 1000)
-        rows.extend(batch)
-        if len(batch) < 100:
-            break
-    else:
-        raise control.ProviderError("Isolated source seal history is too large to verify safely.")
-    control.require(len(rows) == value["total_count"] and len({str(row.get("id")) for row in rows if isinstance(row, dict)}) == len(rows))
+    for path in (SEAL_WORKFLOW, REVIEWED_SEAL_WORKFLOW):
+        if not digest_journal.workflow_has_main_history(path, os.environ["GITHUB_SHA"], token):
+            control.require(not any(record.get("workflowPath", SEAL_WORKFLOW) == path for record in completed.values()))
+            continue
+        found_rows = []
+        for page in range(1, 11):
+            value = control.github._get_json(f"/actions/workflows/{path.rsplit('/', 1)[-1]}/runs?per_page=100&page={page}", token)
+            batch = value.get("workflow_runs")
+            control.require(isinstance(batch, list) and len(batch) <= 100 and type(value.get("total_count")) is int
+                            and 0 <= value["total_count"] <= 1000)
+            found_rows.extend(batch)
+            if len(batch) < 100:
+                break
+        else:
+            raise control.ProviderError("Isolated source seal history is too large to verify safely.")
+        control.require(len(found_rows) == value["total_count"])
+        rows.extend(found_rows)
+    control.require(len({str(row.get("id")) for row in rows if isinstance(row, dict)}) == len(rows))
     seen, found = set(), False
     for row in rows:
+        path = row.get("path", "").removesuffix("@refs/heads/main").removesuffix("@main") if isinstance(row, dict) else ""
         control.require(isinstance(row, dict) and row.get("head_sha") in allowed and row.get("head_branch") == "main"
                         and row.get("event") == "workflow_dispatch" and row.get("run_attempt") == 1
-                        and row.get("path") in (SEAL_WORKFLOW, SEAL_WORKFLOW + "@main", SEAL_WORKFLOW + "@refs/heads/main")
+                        and path in {SEAL_WORKFLOW, REVIEWED_SEAL_WORKFLOW}
                         and all(isinstance(row.get(k), dict) and row[k].get("id") == control.github.REPOSITORY_ID
                                 for k in ("repository", "head_repository")))
+        durable.source_ancestor({"revision": row["head_sha"]}, token)
         title = row.get("display_title")
         control.require(isinstance(title, str) and re.fullmatch(r"Isolated Provider source (?:plan|seal) [1-9][0-9]*", title))
         if title.startswith("Isolated Provider source plan "):
             continue
         observed_id = title.removeprefix("Isolated Provider source seal ")
         if str(row.get("id")) == current:
-            control.require(not found and observed_id == operation_id and row["head_sha"] == os.environ["GITHUB_SHA"])
+            current_path = reviewed_identity(SEAL_WORKFLOW).get("workflowPath", SEAL_WORKFLOW)
+            control.require(not found and path == current_path and observed_id == operation_id and row["head_sha"] == os.environ["GITHUB_SHA"])
             found = True
         else:
             control.require(observed_id != operation_id and observed_id not in seen and observed_id in completed
+                            and path == completed[observed_id].get("workflowPath", SEAL_WORKFLOW)
                             and str(row.get("id")) == completed[observed_id]["runId"]
                             and row["head_sha"] == completed[observed_id]["controllerRevision"]
                             and (row.get("status"), row.get("conclusion")) == ("completed", "success"),
@@ -180,8 +222,10 @@ def history(operation_id, completed, allowed):
 def verify_origin(operation_id, record):
     control.require(record["controllerRevision"] in controllers())
     run = control.github._get_json(f"/actions/runs/{record['runId']}/attempts/1", control.github._github_token())
+    path = record.get("workflowPath", SEAL_WORKFLOW)
+    control.require(path in {SEAL_WORKFLOW, REVIEWED_SEAL_WORKFLOW})
     control.require(str(run.get("id")) == record["runId"] and run.get("run_attempt") == 1
-                    and run.get("path") in (SEAL_WORKFLOW, SEAL_WORKFLOW + "@main", SEAL_WORKFLOW + "@refs/heads/main")
+                    and run.get("path") in (path, path + "@main", path + "@refs/heads/main")
                     and run.get("event") == "workflow_dispatch" and run.get("display_title") == "Isolated Provider source seal " + operation_id
                     and (run.get("status"), run.get("conclusion")) == ("completed", "success")
                     and run.get("head_branch") == "main" and run.get("head_sha") == record["controllerRevision"]
@@ -190,11 +234,12 @@ def verify_origin(operation_id, record):
     durable.source_ancestor({"revision": record["controllerRevision"]}, control.github._github_token())
 
 
-def readback_projection(operation_id, source, target_sha, run_id, attempt, revision):
+def readback_projection(operation_id, source, target_sha, run_id, attempt, revision, readback_path=None):
     return {"version": 1, "kind": "isolated-provider-source-readback", "status": "source-original-verified",
             "rehearsalCompletion": "not-evaluated", "operationId": operation_id, "manifestSha256": source["manifestSha256"],
             "targetSha256": target_sha, "seal": source, "readbackRunId": run_id, "readbackRunAttempt": attempt,
-            "readbackControllerRevision": revision}
+            "readbackControllerRevision": revision,
+            **({"readbackWorkflowPath": readback_path} if readback_path is not None else {})}
 
 
 def verify_registered(reader, completed, registered, *, current=None):
@@ -206,18 +251,21 @@ def verify_registered(reader, completed, registered, *, current=None):
         control.require(operation_id in completed)
         source = completed[operation_id]
         control.require(all(pin[key] == source[key] for key in ("intentSha256", "manifestSha256", "runId", "controllerRevision"))
+                        and all(pin.get(key) == source.get(key) for key in ("workflowPath", "candidateRevision", "reviewedPr"))
                         and pin["controllerRevision"] in allowed and pin["readbackControllerRevision"] in allowed)
         prior = Store(reader.target, reader.token, operation_id)
         _, target = manifest(prior, pin["manifestSha256"])
         control.require(control.digest(target) == pin["targetSha256"])
         report = readback_projection(operation_id, source, pin["targetSha256"], pin["readbackRunId"],
-                                     pin["readbackRunAttempt"], pin["readbackControllerRevision"])
+                                     pin["readbackRunAttempt"], pin["readbackControllerRevision"], pin.get("readbackWorkflowPath"))
         control.require(control.digest(report) == pin["readbackSha256"])
         run_id, attempt = pin["readbackRunId"], pin["readbackRunAttempt"]
+        path = pin.get("readbackWorkflowPath", READBACK_WORKFLOW)
+        control.require(path in {READBACK_WORKFLOW, REVIEWED_READBACK_WORKFLOW})
         run = control.github._get_json(f"/actions/runs/{run_id}/attempts/{attempt}", token)
         expected_title = f"Read isolated source {operation_id} 1 {pin['manifestSha256']} {pin['targetSha256']}"
         control.require(str(run.get("id")) == run_id and str(run.get("run_attempt")) == attempt
-                        and run.get("path") in (READBACK_WORKFLOW, READBACK_WORKFLOW + "@main", READBACK_WORKFLOW + "@refs/heads/main")
+                        and run.get("path") in (path, path + "@main", path + "@refs/heads/main")
                         and run.get("display_title") == expected_title and run.get("head_sha") == pin["readbackControllerRevision"]
                         and run.get("head_branch") == "main" and run.get("event") == "workflow_dispatch"
                         and (run.get("status"), run.get("conclusion")) == ("completed", "success")
@@ -322,7 +370,8 @@ def seal(write):
     control.require(size > 0 and hashed.hexdigest() == target["build"]["archiveSha256"])
     value = {"version": 1, "kind": "subs-bot-isolated-provider-source", "runId": operation_id, "runAttempt": "1",
              "controllerRevision": os.environ["GITHUB_SHA"], "target": target,
-             "files": {"provider-source-archive.zip": {"bytes": size, "sha256": hashed.hexdigest(), "chunks": chunks}}}
+             "files": {"provider-source-archive.zip": {"bytes": size, "sha256": hashed.hexdigest(), "chunks": chunks}},
+             **reviewed_identity(SEAL_WORKFLOW)}
     raw = control.canonical(value)
     control.require(len(raw) <= 65536)
     reader.put("source-manifest.json", raw)
@@ -345,6 +394,14 @@ def readback():
     complete, registered = inventory(reader), ledger()
     verify_registered(reader, complete, registered, current=operation_id)
     control.require(operation_id in complete and complete[operation_id]["manifestSha256"] == expected)
+    identity = reviewed_identity(READBACK_WORKFLOW)
+    source = complete[operation_id]
+    if identity:
+        control.require(source.get("workflowPath") == REVIEWED_SEAL_WORKFLOW
+                        and identity["candidateRevision"] == source.get("candidateRevision")
+                        and identity["reviewedPr"] == source.get("reviewedPr"))
+    else:
+        control.require("workflowPath" not in source)
     verify_origin(operation_id, complete[operation_id])
     value, target = manifest(reader, expected)
     control.require(control.digest(target) == target_sha)
@@ -353,9 +410,11 @@ def readback():
     readback_run, attempt, revision = os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"], os.environ["GITHUB_SHA"]
     control.require(control.match(control.provider.DECIMAL, readback_run) and control.match(control.provider.DECIMAL, attempt)
                     and control.match(control.provider.REVISION, revision))
-    projection = readback_projection(operation_id, complete[operation_id], target_sha, readback_run, attempt, revision)
+    projection = readback_projection(operation_id, complete[operation_id], target_sha, readback_run, attempt, revision,
+                                     identity.get("workflowPath"))
     pin = {**complete[operation_id], "targetSha256": target_sha, "readbackRunId": readback_run,
-           "readbackRunAttempt": attempt, "readbackControllerRevision": revision, "readbackSha256": control.digest(projection)}
+           "readbackRunAttempt": attempt, "readbackControllerRevision": revision, "readbackSha256": control.digest(projection),
+           **({"readbackWorkflowPath": identity["workflowPath"]} if identity else {})}
     print(json.dumps({**projection, "ledgerRecord": pin}, sort_keys=True))
 
 
