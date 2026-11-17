@@ -19,6 +19,8 @@ WORKFLOW_PATH = ".github/workflows/worker-provider-reviewed-head.yml"
 WORKFLOW = f"{github.REPOSITORY}/{WORKFLOW_PATH}@{github.MAIN_REF}"
 DIGEST_WORKFLOW_PATH = ".github/workflows/worker-provider-reviewed-digest.yml"
 DIGEST_WORKFLOW = f"{github.REPOSITORY}/{DIGEST_WORKFLOW_PATH}@{github.MAIN_REF}"
+DIGEST_RECONCILE_WORKFLOW_PATH = ".github/workflows/worker-provider-reviewed-digest-reconcile.yml"
+DIGEST_RECONCILE_WORKFLOW = f"{github.REPOSITORY}/{DIGEST_RECONCILE_WORKFLOW_PATH}@{github.MAIN_REF}"
 OPERATION_WORKFLOW_PATH = ".github/workflows/worker-provider-reviewed-operation.yml"
 OPERATION_WORKFLOW = f"{github.REPOSITORY}/{OPERATION_WORKFLOW_PATH}@{github.MAIN_REF}"
 OPERATION_RECONCILE_WORKFLOW_PATH = ".github/workflows/worker-provider-reviewed-operation-reconcile.yml"
@@ -59,7 +61,7 @@ def validate(env):
     require(env.get("GITHUB_REPOSITORY") == github.REPOSITORY
             and env.get("GITHUB_REPOSITORY_ID") == str(github.REPOSITORY_ID)
             and env.get("GITHUB_REF") == github.MAIN_REF and env.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
-            and env.get("GITHUB_WORKFLOW_REF") in {WORKFLOW, DIGEST_WORKFLOW, OPERATION_WORKFLOW, OPERATION_RECONCILE_WORKFLOW, RECOVERY_WORKFLOW, *SOURCE_WORKFLOWS}
+            and env.get("GITHUB_WORKFLOW_REF") in {WORKFLOW, DIGEST_WORKFLOW, DIGEST_RECONCILE_WORKFLOW, OPERATION_WORKFLOW, OPERATION_RECONCILE_WORKFLOW, RECOVERY_WORKFLOW, *SOURCE_WORKFLOWS}
             and env.get("GITHUB_WORKFLOW_SHA") == main
             and env.get("RUNNER_ENVIRONMENT") == "github-hosted" and env.get("GITHUB_RUN_ATTEMPT") == "1"
             and HEX40.fullmatch(main or "") is not None and re.fullmatch(r"[!-~]{1,4096}", token or "") is not None)
@@ -80,7 +82,7 @@ def validate(env):
                 and all(isinstance(ref[key], str) and HEX64.fullmatch(ref[key]) is not None for key in ("manifestSha256", "targetSha256"))
                 and (ref["kind"] != "isolated-source" or ref["runAttempt"] == "1"))
     phase, environment = env.get("PROVIDER_HEAD_PHASE", ""), env.get("PROVIDER_HEAD_ENVIRONMENT", "")
-    digest_workflow = env.get("GITHUB_WORKFLOW_REF") == DIGEST_WORKFLOW
+    digest_workflow = env.get("GITHUB_WORKFLOW_REF") in {DIGEST_WORKFLOW, DIGEST_RECONCILE_WORKFLOW}
     operation_workflow = env.get("GITHUB_WORKFLOW_REF") in {OPERATION_WORKFLOW, OPERATION_RECONCILE_WORKFLOW}
     recovery_workflow = env.get("GITHUB_WORKFLOW_REF") == RECOVERY_WORKFLOW
     if recovery_workflow:
@@ -89,7 +91,8 @@ def validate(env):
                 and policy["enabled"] is True and type(policy["writeEnabled"]) is bool
                 and (phase != "recovery-archive" or policy["writeEnabled"] is True))
     operation_phases = {"operation-reconcile"} if env.get("GITHUB_WORKFLOW_REF") == OPERATION_RECONCILE_WORKFLOW else OPERATION_PHASES
-    phases = DIGEST_PHASES if digest_workflow else operation_phases if operation_workflow else RECOVERY_PHASES if recovery_workflow else SOURCE_PHASES if source_workflow else PHASES
+    digest_phases = {"digest-reconcile"} if env.get("GITHUB_WORKFLOW_REF") == DIGEST_RECONCILE_WORKFLOW else DIGEST_PHASES
+    phases = digest_phases if digest_workflow else operation_phases if operation_workflow else RECOVERY_PHASES if recovery_workflow else SOURCE_PHASES if source_workflow else PHASES
     require(phase in phases and environment in ENVIRONMENTS
             and (not source_workflow or env.get("GITHUB_WORKFLOW_REF") ==
                  f"{github.REPOSITORY}/{SOURCE_WORKFLOW_PATH if phase == 'isolated-source' else SOURCE_READBACK_WORKFLOW_PATH}@{github.MAIN_REF}")

@@ -81,6 +81,14 @@ class TrustedProviderGateTests(unittest.TestCase):
                 self.assertNotIn("python3 -B worker/tools/production_provider_reviewed_head_harness.py", section)
                 self.assertIn("python3 -B trusted/worker/tools/trusted_provider_head_attestation.py", section)
 
+    def test_digest_reconcile_workflow_is_disabled_and_has_only_archive_read_credentials(self):
+        text = (Path(__file__).resolve().parents[2] / ".github/workflows/worker-provider-reviewed-digest-reconcile.yml").read_text()
+        self.assertIn("vars.SUBS_BOT_PROVIDER_REVIEWED_DIGEST_RECONCILE_ENABLED == 'true'", text)
+        self.assertIn("SUBS_BOT_SCOPED_R2_READ_JSON", text)
+        for forbidden in ("SUBS_BOT_SCOPED_R2_WRITE_JSON", "SUBS_BOT_CF_PROVIDER_CONTAINER_WRITE_TOKEN",
+                          "SUBS_BOT_CF_PROVIDER_WORKER_WRITE_TOKEN", "actions/upload-artifact@"):
+            self.assertNotIn(forbidden, text)
+
     def test_wrong_head_environment_or_attempt_is_rejected(self):
         for change in ({"PROVIDER_REVIEWED_HEAD_SHA": "f" * 40}, {"PROVIDER_HEAD_ENVIRONMENT": "subs-bot-production"},
                        {"GITHUB_RUN_ATTEMPT": "2"}, {"GITHUB_WORKFLOW_SHA": HEAD}, {"GITHUB_EVENT_NAME": "pull_request"}):
@@ -99,6 +107,13 @@ class TrustedProviderGateTests(unittest.TestCase):
                "SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON": json.dumps(bucket),
                "SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON": json.dumps(approved["archiveRefs"])}
         self.assertTrue(self.check(env)["checkoutVerified"])
+        reconcile = {**env, "GITHUB_WORKFLOW_REF": gate.DIGEST_RECONCILE_WORKFLOW,
+                     "PROVIDER_HEAD_PHASE": "digest-reconcile", "PROVIDER_HEAD_ENVIRONMENT": "subs-bot-provider-archive-head-isolation"}
+        self.assertTrue(self.check(reconcile)["checkoutVerified"])
+        with self.assertRaises(ContractError):
+            self.check({**reconcile, "PROVIDER_HEAD_PHASE": "digest-publish"})
+        with self.assertRaises(ContractError):
+            self.check({**reconcile, "PROVIDER_HEAD_ENVIRONMENT": "subs-bot-provider-head-isolation"})
         for change in ({"PROVIDER_HEAD_PHASE": "attest-provider"},
                        {"PROVIDER_HEAD_ENVIRONMENT": "subs-bot-provider-archive-head-isolation"},
                        {"PROVIDER_HEAD_VALIDATION_JSON": json.dumps(spec())},
