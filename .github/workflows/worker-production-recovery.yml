@@ -15,6 +15,9 @@ on:
         options: [inspect, preflight-capacity, prepare, prepare-restore, create-database, create-objects, pin-resource, capture, poll-export, restore-objects, start-import, verify-backup, verify-restore]
         default: inspect
         required: true
+      rehearsal_registration_sha256:
+        description: Explicit registered control-drill recovery only; independent private registration digest, never a production shortcut
+        type: string
       source_run_id:
         description: Successful exact frozen source main CI; omit only with private source manifest digest
         type: string
@@ -82,13 +85,28 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           SUBS_BOT_CONTROL_ENVIRONMENT: ${{ inputs.environment == 'production' && 'subs-bot-production' || 'subs-bot-isolation' }}
-          SUBS_BOT_TARGET_JSON: ${{ secrets.SUBS_BOT_TARGET_JSON }}
-          SUBS_BOT_CONTROL_SECRETS: ${{ secrets.SUBS_BOT_CONTROL_SECRETS }}
-          SUBS_BOT_CF_DATA_TOKEN: ${{ secrets.SUBS_BOT_CF_DATA_TOKEN }}
-          SUBS_BOT_CF_WORKER_TOKEN: ${{ secrets.SUBS_BOT_CF_WORKER_TOKEN }}
+          SUBS_BOT_TARGET_JSON: ${{ inputs.rehearsal_registration_sha256 == '' && secrets.SUBS_BOT_TARGET_JSON || '' }}
+          SUBS_BOT_CONTROL_SECRETS: ${{ inputs.rehearsal_registration_sha256 == '' && secrets.SUBS_BOT_CONTROL_SECRETS || '' }}
+          SUBS_BOT_CF_DATA_TOKEN: >-
+            ${{ inputs.environment == 'production' && contains(fromJSON('["capture","poll-export","create-database","start-import"]'), inputs.action) && secrets.SUBS_BOT_CF_DATA_TOKEN ||
+                inputs.environment == 'production' && !contains(fromJSON('["capture","poll-export","create-database","start-import"]'), inputs.action) && secrets.SUBS_BOT_CF_DATA_READ_TOKEN ||
+                inputs.environment == 'rehearsal' && contains(fromJSON('["capture","poll-export","create-database","start-import"]'), inputs.action) && secrets.SUBS_BOT_CF_ISOLATION_DATA_TOKEN ||
+                inputs.environment == 'rehearsal' && !contains(fromJSON('["capture","poll-export","create-database","start-import"]'), inputs.action) && secrets.SUBS_BOT_CF_ISOLATION_DATA_READ_TOKEN || '' }}
+          SUBS_BOT_CF_WORKER_TOKEN: ${{ inputs.environment == 'production' && secrets.SUBS_BOT_CF_WORKER_READ_TOKEN || inputs.environment == 'rehearsal' && secrets.SUBS_BOT_SEALED_WORKER_READ_TOKEN || '' }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+          SUBS_BOT_CF_R2_CREATE_TOKEN: ${{ inputs.action == 'create-objects' && secrets.SUBS_BOT_CF_R2_CREATE_TOKEN || '' }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_SCOPED_R2_EXTRA_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_EXTRA_READ_JSON }}
+          SUBS_BOT_SCOPED_R2_WRITE_JSON: ${{ !contains(fromJSON('["inspect","verify-backup"]'), inputs.action) && secrets.SUBS_BOT_SCOPED_R2_WRITE_JSON || '' }}
+          SUBS_BOT_SCOPED_R2_EXTRA_WRITE_JSON: ${{ !contains(fromJSON('["inspect","verify-backup"]'), inputs.action) && secrets.SUBS_BOT_SCOPED_R2_EXTRA_WRITE_JSON || '' }}
           SUBS_BOT_CF_DEPENDENCY_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPENDENCY_READ_TOKEN }}
-          SUBS_BOT_APPROVAL_JSON: ${{ secrets.SUBS_BOT_APPROVAL_JSON }}
+          SUBS_BOT_APPROVAL_JSON: ${{ inputs.rehearsal_registration_sha256 == '' && secrets.SUBS_BOT_APPROVAL_JSON || '' }}
           SUBS_BOT_RECOVERY_JSON: ${{ secrets.SUBS_BOT_RECOVERY_JSON }}
+          RECOVERY_REHEARSAL_REGISTRATION_SHA256: ${{ inputs.rehearsal_registration_sha256 }}
+          SUBS_BOT_REHEARSAL_REGISTRATION_SHA256: ${{ vars.SUBS_BOT_REHEARSAL_REGISTRATION_SHA256 }}
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ inputs.environment == 'rehearsal' && inputs.rehearsal_registration_sha256 != '' && secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON || '' }}
+          SUBS_BOT_CONTROL_DRILL_KEYS: ${{ inputs.environment == 'rehearsal' && inputs.rehearsal_registration_sha256 != '' && secrets.SUBS_BOT_CONTROL_DRILL_KEYS || '' }}
+          SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ inputs.environment == 'rehearsal' && inputs.rehearsal_registration_sha256 != '' && secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG || '' }}
           RECOVERY_ACTION: ${{ inputs.action }}
           SUBS_BOT_CI_RUN_ID: ${{ inputs.source_run_id }}
           SUBS_BOT_CI_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}

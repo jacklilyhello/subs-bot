@@ -16,6 +16,60 @@ from test_trusted_provider_head_gate import spec
 
 
 class AttestationTests(unittest.TestCase):
+    def test_fixed_stage_diagnostic_reports_only_bounded_status(self):
+        error = attest.scoped_r2.ScopedR2Error("private path and response body")
+        error.read_diagnostic = {"source": "r2", "phase": "get", "httpStatus": 403}
+        def fail():
+            raise error
+        output = StringIO()
+        with redirect_stdout(output), self.assertRaises(attest.scoped_r2.ScopedR2Error):
+            attest.diagnosed("archive-source", fail, index=1)
+        rows = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(rows[-1], {"category": "r2", "httpStatus": 403, "phase": "archive-source",
+                                   "sourceIndex": 1, "status": "rejected"})
+        self.assertNotIn("private path", output.getvalue())
+
+    def test_untrusted_diagnostic_cannot_print_response_or_invalid_status(self):
+        error = RuntimeError("private token")
+        error.read_diagnostic = {"httpStatus": "private body"}
+        def fail():
+            raise error
+        output = StringIO()
+        with redirect_stdout(output), self.assertRaises(RuntimeError):
+            attest.diagnosed("provider-state", fail)
+        self.assertNotIn("private", output.getvalue())
+        self.assertEqual(json.loads(output.getvalue().splitlines()[-1]),
+                         {"category": "other", "phase": "provider-state", "status": "rejected"})
+
+    def test_digest_witness_retrieves_and_verifies_complete_oci_closure(self):
+        target = config(active=True)
+        build = target["build"]
+        registry = Mock(repository="fixture", mint=Mock(return_value="pull"))
+        registry.manifest.return_value = build["ociManifestSha256"]
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"RUNNER_TEMP": temporary}, clear=True), \
+                patch.object(attest.provider.publication, "_write_auth", return_value=Path(temporary) / "auth"), \
+                patch.object(attest.provider.publication, "_skopeo_env", return_value={}), \
+                patch.object(attest.subprocess, "run") as copy, \
+                patch.object(attest.provider.provider, "verify_image", return_value=(build["ociManifestSha256"], build["ociConfigSha256"])) as verify:
+            self.assertTrue(attest.verify_registry(target, registry, "digest-only"))
+            self.assertEqual(registry.manifest.call_count, 1)
+            self.assertIn("--retry-times=0", copy.call_args.args[0])
+            verify.assert_called_once()
+            verify.return_value = ("0" * 64, build["ociConfigSha256"])
+            with self.assertRaises(attest.provider.ProviderError):
+                attest.verify_registry(target, registry, "digest-only")
+            with self.assertRaises(attest.provider.ProviderError):
+                attest.verify_registry(target, registry, "unknown")
+
+    def test_default_tag_witness_still_requires_exact_tag(self):
+        target = config(active=True)
+        registry = Mock(repository="fixture", mint=Mock(return_value="pull"))
+        registry.manifest.return_value = target["build"]["ociManifestSha256"]
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"RUNNER_TEMP": temporary}, clear=True), \
+                patch.object(attest.provider.publication, "_write_auth", return_value=Path(temporary) / "auth"), \
+                patch.object(attest.provider.publication, "_config", return_value=target["build"]["ociConfigSha256"]):
+            self.assertFalse(attest.verify_registry(target, registry, "tag"))
+            self.assertEqual(registry.manifest.call_count, 2)
     def test_source_job_must_pass_trusted_gate_and_verification(self):
         rows = [{"name": name, "run_id": 101, "run_attempt": 1, "head_sha": "a" * 40,
                  "status": "completed", "conclusion": "success", "steps": [
@@ -146,6 +200,28 @@ class AttestationTests(unittest.TestCase):
             with patch.dict(os.environ, {"SUBS_BOT_PROVIDER_ISOLATED_SOURCE_CONTROLLERS_JSON": json.dumps(["c" * 40])}), \
                     self.assertRaises(attest.provider.ProviderError):
                 attest.independent_isolated_source(ref, bucket, "synthetic")
+            identity = {"candidateRevision": "c" * 40, "reviewedPr": "290",
+                        "workflowPath": ".github/workflows/worker-provider-reviewed-isolated-source.yml"}
+            readback_path = ".github/workflows/worker-provider-reviewed-isolated-source-readback.yml"
+            plan.update(identity)
+            intent["approvalSha256"] = attest.provider.digest(plan)
+            manifest.update(identity)
+            raw_intent, raw_manifest = attest.provider.canonical(intent), attest.provider.canonical(manifest)
+            source = {"intentSha256": sha256(raw_intent).hexdigest(), "manifestSha256": sha256(raw_manifest).hexdigest(),
+                      "runId": "102", "controllerRevision": revision, **identity}
+            report.update({"seal": source, "manifestSha256": source["manifestSha256"], "readbackWorkflowPath": readback_path})
+            pin = {**source, "targetSha256": plan["targetSha256"], "readbackRunId": "103", "readbackRunAttempt": "1",
+                   "readbackControllerRevision": revision, "readbackSha256": attest.provider.digest(report), "readbackWorkflowPath": readback_path}
+            ref["manifestSha256"] = pin["manifestSha256"]
+            seal["path"] = identity["workflowPath"]
+            readback["path"] = readback_path
+            readback["display_title"] = f"Read isolated source 101 1 {pin['manifestSha256']} {pin['targetSha256']}"
+            with patch.dict(os.environ, {"SUBS_BOT_PROVIDER_ISOLATED_SOURCE_LEDGER_JSON": json.dumps({operation: pin})}):
+                self.assertEqual(attest.independent_isolated_source(ref, bucket, "synthetic")[2], target)
+                bad = {**pin, "candidateRevision": "d" * 40}
+                with patch.dict(os.environ, {"SUBS_BOT_PROVIDER_ISOLATED_SOURCE_LEDGER_JSON": json.dumps({operation: bad})}), \
+                        self.assertRaises(attest.provider.ProviderError):
+                    attest.independent_isolated_source(ref, bucket, "synthetic")
 
 
 if __name__ == "__main__":

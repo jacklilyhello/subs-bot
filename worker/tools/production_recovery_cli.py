@@ -28,7 +28,9 @@ def require_reviewed_ancestor(revision, control_revision, token):
     recovery.require(recovery.matches(artifact._REVISION, revision)
                      and recovery.matches(artifact._REVISION, control_revision))
     if revision != control_revision:
-        comparison = artifact._get_json("/compare/" + revision + "..." + control_revision, token)
+        # GitHub emits changed-file patches only on page one. Ancestry fields
+        # remain available on page two, including when its commit list is empty.
+        comparison = artifact.compare_commits_metadata(revision, control_revision, token)
         recovery.require(isinstance(comparison, dict) and comparison.get("status") in {"ahead", "identical"}
                          and comparison.get("base_commit", {}).get("sha") == revision
                          and comparison.get("merge_base_commit", {}).get("sha") == revision,
@@ -70,17 +72,47 @@ def unpack(body, proof, directory):
     return bundle, manifest
 
 
+def entry_configuration(env):
+    registration = env.get("RECOVERY_REHEARSAL_REGISTRATION_SHA256", "")
+    if not registration:
+        return validate_target(env.get("SUBS_BOT_TARGET_JSON", "")), parsed(env.get("SUBS_BOT_CONTROL_SECRETS", "")), False
+    # Explicit registered rehearsal mode reuses the existing private registration
+    # and signing configuration. It never derives a production target or identity.
+    recovery.require(env.get("SUBS_BOT_CONTROL_ENVIRONMENT") == "subs-bot-isolation"
+                     and env.get("RUNNER_ENVIRONMENT") == "github-hosted"
+                     and env.get("GITHUB_REF") == artifact.MAIN_REF
+                     and env.get("GITHUB_REPOSITORY") == artifact.REPOSITORY
+                     and recovery.matches(recovery.DIGEST, registration)
+                     and registration == env.get("SUBS_BOT_REHEARSAL_REGISTRATION_SHA256")
+                     and not env.get("SUBS_BOT_TARGET_JSON") and not env.get("SUBS_BOT_CONTROL_SECRETS")
+                     and not env.get("SUBS_BOT_APPROVAL_JSON"),
+                     "Registered rehearsal recovery requires one explicit isolated configuration source.")
+    from production_lifecycle_drill import Drill, SERVICE
+    tool = Drill({**env, "DRILL_REGISTRATION_SHA256": registration,
+                  "SUBS_BOT_CF_BOOTSTRAP_TOKEN": env.get("SUBS_BOT_CF_DATA_TOKEN", ""),
+                  "SUBS_BOT_CF_DEPLOY_TOKEN": env.get("SUBS_BOT_CF_WORKER_TOKEN", "")})
+    target = tool.registration()
+    recovery.require(target.environment == "rehearsal" and target.data["workerName"] == SERVICE)
+    desired = dict(tool.draft.data)
+    for key in ("workerId", "workerCreatedOn", "d1Id", "d1CreatedAt", "bucketCreatedAt", "backupBucketCreatedAt"):
+        desired[key] = target.data[key]
+    recovery.require(validate_target(desired).configuration_digest == target.configuration_digest,
+                     "Registered rehearsal secrets or configuration differ from the original draft.")
+    general_config(target, env.get("GITHUB_SHA", ""), tool.secrets)
+    return target, tool.secrets, True
+
+
 def main(env=None):
     env = os.environ if env is None else env
     recovery.require(env.get("GITHUB_WORKFLOW_REF") == WORKFLOW)
-    target = validate_target(env.get("SUBS_BOT_TARGET_JSON", ""))
+    action = env.get("RECOVERY_ACTION", "inspect")
+    recovery.require(action in recovery.ACTIONS, "The recovery action is unsupported.")
+    target, secrets, registered_rehearsal = entry_configuration(env)
     hosted_environment(target.environment)
     control_revision = env.get("GITHUB_SHA", "")
     guard = lambda: artifact.require_current_main(control_revision)
     guard()
-    action = env.get("RECOVERY_ACTION", "inspect")
     contract = recovery.recovery_contract(env.get("SUBS_BOT_RECOVERY_JSON", ""), target.data)
-    secrets = parsed(env.get("SUBS_BOT_CONTROL_SECRETS", ""))
     # Validate safe injection before creating any cloud-backed journal intent.
     general_config(target, control_revision, secrets)
     worker = API(target, env.get("SUBS_BOT_CF_WORKER_TOKEN", ""))
@@ -119,7 +151,11 @@ def main(env=None):
             recovery.require(before["stateSha256"] == env.get("RECOVERY_STATE_SHA256"),
                              "The current source predecessor differs; no mutation is authorized.")
             approved_action = "recovery-" + action + ":" + recovery.digest(recovery.canonical(contract))
-            approve(target, env.get("SUBS_BOT_APPROVAL_JSON", ""), approved_action, proof["revision"], before["stateSha256"],
+            approved = env.get("SUBS_BOT_APPROVAL_JSON", "")
+            if registered_rehearsal:
+                from production_lifecycle_drill import approval
+                approved = approval(target, approved_action, proof["revision"], before["stateSha256"], control_revision=control_revision)
+            approve(target, approved, approved_action, proof["revision"], before["stateSha256"],
                     control_revision=control_revision)
         source = recovery.RecoverySource(api, target.data, bundle, manifest, controller.inspect, guard)
         source.archive_body, source.code_proof = body, proof

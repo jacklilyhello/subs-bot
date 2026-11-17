@@ -72,6 +72,18 @@ class SealedTransferTests(unittest.TestCase):
             self.assertEqual(result["destination"], "subs-bot-backup-head-isolation")
             self.assertEqual(len(result["keyPinSha256"]), 64)
 
+    def test_candidate_workflow_only_accepts_fixed_provider_destinations(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(transfer.github, "require_current_main"):
+            env = environment("provider-archive-target", b"a" * 32, directory)
+            self.assertEqual(transfer.gate({**env, "GITHUB_WORKFLOW_REF": transfer.CANDIDATE_WORKFLOW})["mapping"],
+                             "provider-archive-target")
+            age = environment("provider-live-age-identity", b"a" * 32, directory)
+            self.assertEqual(transfer.gate({**age, "GITHUB_WORKFLOW_REF": transfer.CANDIDATE_WORKFLOW})["destinationName"],
+                             "SUBS_BOT_PROVIDER_SOURCE_AGE_IDENTITY")
+            backup = environment("backup-target", b"a" * 32, directory)
+            with self.assertRaises(ContractError):
+                transfer.gate({**backup, "GITHUB_WORKFLOW_REF": transfer.CANDIDATE_WORKFLOW})
+
     def test_source_metadata_requires_fresh_exact_operator_pin_and_no_fallback(self):
         value = {"version": 1, "repositoryId": transfer.github.REPOSITORY_ID, "environment": "subs-bot-provider-isolation",
                  "environmentId": "456", "branchPolicies": ["main"], "repositoryConflicts": [], "checkedAt": 1000,

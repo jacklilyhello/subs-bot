@@ -6,14 +6,46 @@ import json
 import os
 from pathlib import Path
 import re
+import resource
+import subprocess
 import tempfile
 
 import archive_production_provider as archive
+from cloudflare_isolation import CloudflareError
 import production_provider as provider
+import scoped_r2
 import trusted_provider_head_gate as gate
 
 
 JOB_STEPS = {"Reviewed Provider source verification": "Verify current and previous archived sources"}
+
+
+def diagnosed(phase, action, *, index=None):
+    """Emit fixed read stages and bounded numeric status, never request details."""
+    provider.require(phase in {"context", "target", "archive-source", "archive-closure", "provider-api", "provider-state",
+                               "previous-terminal", "caller-state", "stable-state", "previous-recheck", "registry-client", "registry"}
+                     and (index is None or type(index) is int and 0 <= index <= 8))
+    label = {"phase": phase, **({"sourceIndex": index} if index is not None else {})}
+    print(json.dumps({**label, "status": "started"}), flush=True)
+    try:
+        result = action()
+    except Exception as error:
+        category = ("r2" if isinstance(error, (scoped_r2.ScopedR2Error, scoped_r2.ScopedR2ReadError)) else
+                    "cloudflare" if isinstance(error, CloudflareError) else
+                    "github" if isinstance(error, provider.github.ArtifactError) else
+                    "provider" if isinstance(error, provider.ProviderError) else "other")
+        diagnostic = getattr(error, "read_diagnostic", None)
+        status = diagnostic.get("httpStatus") if isinstance(diagnostic, dict) else getattr(error, "http_status", None)
+        report = {**label, "status": "rejected", "category": category}
+        if type(status) is int and 100 <= status <= 599:
+            report["httpStatus"] = status
+        codes = diagnostic.get("cloudflareCodes") if isinstance(diagnostic, dict) else None
+        if isinstance(codes, list) and len(codes) <= 8 and all(type(code) is int and 1000 <= code <= 999999 for code in codes):
+            report["cloudflareCodes"] = codes
+        print(json.dumps(report, sort_keys=True), flush=True)
+        raise
+    print(json.dumps({**label, "status": "confirmed"}), flush=True)
+    return result
 
 
 def checks():
@@ -52,7 +84,7 @@ def source_run(build):
                      and all(isinstance(run.get(key), dict) and run[key].get("id") == provider.github.REPOSITORY_ID
                              for key in ("repository", "head_repository")))
     if build["revision"] != os.environ["GITHUB_SHA"]:
-        value = provider.github._get_json(f"/compare/{build['revision']}...{os.environ['GITHUB_SHA']}?per_page=1", os.environ["GH_TOKEN"])
+        value = provider.github.compare_commits_metadata(build["revision"], os.environ["GITHUB_SHA"], os.environ["GH_TOKEN"])
         provider.require(value.get("status") == "ahead" and value.get("behind_by") == 0
                          and all(isinstance(value.get(key), dict) and value[key].get("sha") == build["revision"]
                                  for key in ("base_commit", "merge_base_commit")))
@@ -85,7 +117,7 @@ def archive_run(ref, manifest):
                      and all(isinstance(run.get(key), dict) and run[key].get("id") == provider.github.REPOSITORY_ID
                              for key in ("repository", "head_repository")))
     if revision != os.environ["GITHUB_SHA"]:
-        comparison = provider.github._get_json(f"/compare/{revision}...{os.environ['GITHUB_SHA']}?per_page=1", os.environ["GH_TOKEN"])
+        comparison = provider.github.compare_commits_metadata(revision, os.environ["GITHUB_SHA"], os.environ["GH_TOKEN"])
         provider.require(comparison.get("status") == "ahead" and comparison.get("behind_by") == 0
                          and all(isinstance(comparison.get(key), dict) and comparison[key].get("sha") == revision
                                  for key in ("base_commit", "merge_base_commit")))
@@ -114,10 +146,15 @@ def independent_isolated_source(ref, bucket, token):
     record = ledger.get(ref["runId"])
     fields = {"intentSha256", "manifestSha256", "runId", "controllerRevision", "targetSha256",
               "readbackRunId", "readbackRunAttempt", "readbackControllerRevision", "readbackSha256"}
-    provider.require(isinstance(record, dict) and set(record) == fields
+    extra = {"candidateRevision", "reviewedPr", "workflowPath", "readbackWorkflowPath"}
+    provider.require(isinstance(record, dict) and set(record) in (fields, fields | extra)
                      and all(provider.match(provider.provider.HEX, record[k]) for k in ("intentSha256", "manifestSha256", "targetSha256", "readbackSha256"))
                      and all(provider.match(provider.provider.DECIMAL, record[k]) for k in ("runId", "readbackRunId", "readbackRunAttempt"))
                      and record["controllerRevision"] in allowed and record["readbackControllerRevision"] in allowed
+                     and (set(record) == fields or (provider.match(provider.provider.REVISION, record["candidateRevision"])
+                         and provider.match(provider.provider.DECIMAL, record["reviewedPr"])
+                         and record["workflowPath"] == ".github/workflows/worker-provider-reviewed-isolated-source.yml"
+                         and record["readbackWorkflowPath"] == ".github/workflows/worker-provider-reviewed-isolated-source-readback.yml"))
                      and record["manifestSha256"] == ref["manifestSha256"] and record["targetSha256"] == ref["targetSha256"]
                      and ref["runAttempt"] == "1")
     store = IsolatedSourceStore(bucket, token, ref["runId"])
@@ -129,11 +166,14 @@ def independent_isolated_source(ref, bucket, token):
                      and sha256(manifest_raw).hexdigest() == record["manifestSha256"])
     intent = provider.github._parse_object(intent_raw, archive.ERROR)
     manifest = provider.github._parse_object(manifest_raw, archive.ERROR)
-    provider.require(set(manifest) == {"version", "kind", "runId", "runAttempt", "controllerRevision", "target", "files"}
+    manifest_fields = {"version", "kind", "runId", "runAttempt", "controllerRevision", "target", "files"}
+    identity_fields = {"candidateRevision", "reviewedPr", "workflowPath"}
+    provider.require(set(manifest) == (manifest_fields | identity_fields if set(record) != fields else manifest_fields)
                      and type(manifest["version"]) is int and manifest["version"] == 1
                      and manifest["kind"] == "subs-bot-isolated-provider-source"
                      and manifest["runId"] == ref["runId"] and manifest["runAttempt"] == "1"
                      and manifest["controllerRevision"] == record["controllerRevision"]
+                     and all(manifest[key] == record[key] for key in identity_fields if key in manifest)
                      and isinstance(manifest["files"], dict) and set(manifest["files"]) == {"provider-source-archive.zip"})
     target = provider.validate_config(manifest["target"])
     provider.require(target["environment"] == "rehearsal" and target["caller"] is None and provider.digest(target) == ref["targetSha256"])
@@ -150,23 +190,27 @@ def independent_isolated_source(ref, bucket, token):
                      and type(intent["version"]) is int and intent["version"] == 1 and intent["status"] == "started-unknown"
                      and intent["runId"] == record["runId"] and intent["runAttempt"] == "1"
                      and intent["controllerRevision"] == record["controllerRevision"] and isinstance(plan, dict)
-                     and set(plan) == {"version", "action", "operationId", "controllerRevision", "targetSha256", "build",
-                                       "bucketSha256", "prefixState", "inventorySha256", "controllersSha256"}
+                     and set(plan) == ({"version", "action", "operationId", "controllerRevision", "targetSha256", "build",
+                                        "bucketSha256", "prefixState", "inventorySha256", "controllersSha256"}
+                                       | (identity_fields if set(record) != fields else set()))
                      and type(plan["version"]) is int and plan["version"] == 1
                      and plan["prefixState"] == "intent-and-manifest-absent"
                      and all(provider.match(provider.provider.HEX, plan[k]) for k in ("inventorySha256", "controllersSha256"))
                      and plan.get("action") == "seal-isolated-provider-source" and plan.get("operationId") == ref["runId"]
                      and plan.get("controllerRevision") == record["controllerRevision"] and plan.get("targetSha256") == ref["targetSha256"]
                      and plan.get("bucketSha256") == provider.digest(bucket) and plan.get("build") == target["build"]
+                     and all(plan[key] == record[key] for key in identity_fields if key in plan)
                      and intent["approvalSha256"] == provider.digest(plan))
     source = {k: record[k] for k in ("intentSha256", "manifestSha256", "runId", "controllerRevision")}
+    source.update({key: record[key] for key in identity_fields if key in record})
     report = {"version": 1, "kind": "isolated-provider-source-readback", "status": "source-original-verified",
               "rehearsalCompletion": "not-evaluated", "operationId": ref["runId"], "manifestSha256": record["manifestSha256"],
               "targetSha256": record["targetSha256"], "seal": source, "readbackRunId": record["readbackRunId"],
-              "readbackRunAttempt": record["readbackRunAttempt"], "readbackControllerRevision": record["readbackControllerRevision"]}
+              "readbackRunAttempt": record["readbackRunAttempt"], "readbackControllerRevision": record["readbackControllerRevision"],
+              **({"readbackWorkflowPath": record["readbackWorkflowPath"]} if "readbackWorkflowPath" in record else {})}
     provider.require(provider.digest(report) == record["readbackSha256"])
-    seal_path = ".github/workflows/worker-provider-isolated-source.yml"
-    readback_path = ".github/workflows/worker-provider-isolated-source-readback.yml"
+    seal_path = record.get("workflowPath", ".github/workflows/worker-provider-isolated-source.yml")
+    readback_path = record.get("readbackWorkflowPath", ".github/workflows/worker-provider-isolated-source-readback.yml")
     gh_token = os.environ["GH_TOKEN"]
     for run_id, attempt, revision, path, title in (
             (record["runId"], "1", record["controllerRevision"], seal_path, "Isolated Provider source seal " + ref["runId"]),
@@ -179,7 +223,7 @@ def independent_isolated_source(ref, bucket, token):
                          and run.get("event") == "workflow_dispatch" and (run.get("status"), run.get("conclusion")) == ("completed", "success")
                          and all(isinstance(run.get(k), dict) and run[k].get("id") == provider.github.REPOSITORY_ID for k in ("repository", "head_repository")))
         if revision != os.environ["GITHUB_SHA"]:
-            comparison = provider.github._get_json(f"/compare/{revision}...{os.environ['GITHUB_SHA']}?per_page=1", gh_token)
+            comparison = provider.github.compare_commits_metadata(revision, os.environ["GITHUB_SHA"], gh_token)
             provider.require(comparison.get("status") == "ahead" and comparison.get("behind_by") == 0
                              and all(isinstance(comparison.get(k), dict) and comparison[k].get("sha") == revision for k in ("base_commit", "merge_base_commit")))
     run_id, attempt = record["readbackRunId"], record["readbackRunAttempt"]
@@ -252,8 +296,8 @@ def source_ref(ref, target, token, root):
 
 
 def attest_r2():
-    result, spec = checks()
-    target = provider.read_config(os.environ.get("SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON", ""))
+    result, spec = diagnosed("context", checks)
+    target = diagnosed("target", lambda: provider.read_config(os.environ.get("SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON", "")))
     target_sha = provider.digest(target)
     provider.require(target_sha == os.environ.get("PROVIDER_HEAD_TARGET_SHA256")
                      and target["environment"] == "rehearsal" and target["caller"] is None
@@ -263,9 +307,11 @@ def attest_r2():
     found = set()
     for index, ref in enumerate(spec["archiveRefs"]):
         with tempfile.TemporaryDirectory(prefix=f".trusted-provider-source-{index}-", dir=os.environ["RUNNER_TEMP"]) as directory:
-            found.add(source_ref(ref, target, token, Path(directory)))
-    provider.require(len(found) == len(spec["archiveRefs"]) == len(provider.releases(target))
-                     and found == {release["build"]["archiveSha256"] for release in provider.releases(target)})
+            found.add(diagnosed("archive-source", lambda: source_ref(ref, target, token, Path(directory)), index=index))
+    def closure():
+        provider.require(len(found) == len(spec["archiveRefs"]) == len(provider.releases(target))
+                         and found == {release["build"]["archiveSha256"] for release in provider.releases(target)})
+    diagnosed("archive-closure", closure)
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="ascii") as output:
         output.write("target_sha256=" + target_sha + "\n")
     print(json.dumps({**result, "status": "trusted-r2-readback", "providerMutation": False,
@@ -273,38 +319,67 @@ def attest_r2():
                       "simulatedArtifactUnavailability": True}, sort_keys=True))
 
 
+def verify_registry(target, registry, mode):
+    """Independently verify the immutable image; digest mode reads every blob."""
+    provider.require(mode in {"tag", "digest-only"} and target["environment"] == "rehearsal" and target["caller"] is None)
+    pull, build = registry.mint(), target["build"]
+    digest_ref = "sha256:" + build["ociManifestSha256"]
+    provider.require(registry.manifest(digest_ref, pull) == build["ociManifestSha256"])
+    with tempfile.TemporaryDirectory(prefix=".trusted-provider-registry-", dir=os.environ["RUNNER_TEMP"]) as directory:
+        scratch = Path(directory)
+        auth = provider.publication._write_auth(scratch / "pull-auth.json", pull, registry.repository)
+        image = f"{provider.publication.HOST}/{registry.repository}@{digest_ref}"
+        if mode == "tag":
+            tag = f"git-{build['revision']}-{build['ociManifestSha256'][:12]}"
+            provider.require(registry.manifest(tag, pull) == build["ociManifestSha256"]
+                             and provider.publication._config(scratch, image, auth) == build["ociConfigSha256"])
+            return False
+        output = scratch / "readback-oci.tar"
+        def limit_file():
+            resource.setrlimit(resource.RLIMIT_FSIZE, (provider.provider.MAX_IMAGE, provider.provider.MAX_IMAGE))
+        try:
+            subprocess.run([provider.publication.SKOPEO, "copy", "--quiet", "--preserve-digests", "--retry-times=0",
+                            "--src-tls-verify=true", "--src-authfile", str(auth), "docker://" + image,
+                            "oci-archive:" + str(output)], env=provider.publication._skopeo_env(scratch),
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=900, check=True, preexec_fn=limit_file)
+        except (OSError, subprocess.SubprocessError):
+            raise provider.ProviderError("The independent OCI closure could not be read.") from None
+        try:
+            manifest, config = provider.provider.verify_image(output, build["revision"])
+        except provider.provider.VERIFICATION_ERRORS:
+            raise provider.ProviderError("The independent OCI closure did not match its source.") from None
+        provider.require(manifest == build["ociManifestSha256"] and config == build["ociConfigSha256"])
+        return True
+
+
 def attest_provider():
-    result, spec = checks()
-    target = provider.read_config(os.environ.get("SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON", ""))
+    result, spec = diagnosed("context", checks)
+    target = diagnosed("target", lambda: provider.read_config(os.environ.get("SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON", "")))
     expected_target = os.environ.get("PROVIDER_HEAD_TARGET_SHA256", "")
     provider.require(provider.digest(target) == expected_target
                      and spec["approvalSha256"] == provider.digest({"operation": "publish", "target": target})
                      and target["environment"] == "rehearsal" and target["caller"] is None)
-    api = provider.ProviderAPI(target, os.environ.get("SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN", ""),
-                               os.environ.get("SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN", ""))
-    first = provider.observe(api)
+    api = diagnosed("provider-api", lambda: provider.ProviderAPI(target, os.environ.get("SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN", ""),
+                               os.environ.get("SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN", "")))
+    first = diagnosed("provider-state", lambda: provider.observe(api))
     if target.get("previous") is not None and target["activation"] is None:
-        provider.unbound_upgrade(api, first)
+        diagnosed("previous-terminal", lambda: provider.unbound_upgrade(api, first))
     else:
         provider.require(target["activation"] is not None)
-        provider.verify_smoke(api, first, config=target)
-    caller = provider.caller_state(api, target, allow_unbound=True)
-    provider.require(caller == "unbound" and provider.observe(api) == first and provider.caller_state(api, target, allow_unbound=True) == caller)
+        diagnosed("previous-terminal", lambda: provider.verify_smoke(api, first, config=target))
+    caller = diagnosed("caller-state", lambda: provider.caller_state(api, target, allow_unbound=True))
+    def stable():
+        provider.require(caller == "unbound" and provider.observe(api) == first and provider.caller_state(api, target, allow_unbound=True) == caller)
+    diagnosed("stable-state", stable)
     if target.get("previous") is not None and target["activation"] is None:
-        provider.unbound_upgrade(api, first)
-    registry = provider.Registry(target, os.environ.get("SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN", ""))
-    pull = registry.mint()
-    build = target["build"]
-    tag = f"git-{build['revision']}-{build['ociManifestSha256'][:12]}"
-    with tempfile.TemporaryDirectory(prefix=".trusted-provider-registry-", dir=os.environ["RUNNER_TEMP"]) as directory:
-        scratch = Path(directory)
-        auth = provider.publication._write_auth(scratch / "pull-auth.json", pull, registry.repository)
-        image = f"{provider.publication.HOST}/{registry.repository}@sha256:{build['ociManifestSha256']}"
-        provider.require(registry.manifest(tag, pull) == build["ociManifestSha256"]
-                         and registry.manifest("sha256:" + build["ociManifestSha256"], pull) == build["ociManifestSha256"]
-                         and provider.publication._config(scratch, image, auth) == build["ociConfigSha256"])
+        diagnosed("previous-recheck", lambda: provider.unbound_upgrade(api, first))
+    mode = os.environ.get("SUBS_BOT_PROVIDER_WITNESS_REGISTRY_MODE", "")
+    registry = diagnosed("registry-client", lambda: provider.Registry(target, os.environ.get("SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN", "")))
+    all_blobs = diagnosed("registry", lambda: verify_registry(target, registry, mode))
     print(json.dumps({**result, "status": "trusted-provider-readback", "providerMutation": False,
-                      "registryMutation": False, "simulatedArtifactUnavailability": True}, sort_keys=True))
+                      "registryMutation": False, "registryMode": mode, "allReferencedBlobsVerified": all_blobs,
+                      "simulatedArtifactUnavailability": True}, sort_keys=True))
 
 
 if __name__ == "__main__":
