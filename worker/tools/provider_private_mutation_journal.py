@@ -41,7 +41,8 @@ class Store(sealed.PrivateProofStore):
 
     def key(self, relative):
         control.require(relative in {"intent.json", "response.age", "completion.json", "observation.age", "observation.json",
-                                     "failure-observation.age", "failure-observation.json", "failure-confirmed.age"})
+                                     "failure-observation.age", "failure-observation.json", "failure-confirmed.age"}
+                        or re.fullmatch(r"resolution-[1-9][0-9]*\.json", relative) is not None)
         return self.prefix + relative
 
     def put_once(self, relative, raw):
@@ -90,6 +91,15 @@ def resolutions():
                                 ("intentJobId", "dispatchJobId", "completionJobId", "failureJobId", "reconcileRunId", "reconcileRunAttempt"))
                         and all(control.match(control.provider.REVISION, row[k]) for k in ("controllerRevision", "reconcileRevision"))
                         and control.match(control.provider.HEX, row["readbackSha256"]))
+    return value
+
+
+def reconciled():
+    value = control.github._parse_object(os.environ.get("SUBS_BOT_PROVIDER_MUTATION_RECONCILED_JSON", ""), sealed.ERROR)
+    control.require(len(value) <= MAX_HISTORY)
+    for run_id, record in value.items():
+        control.require(control.match(control.provider.DECIMAL, run_id) and isinstance(record, dict)
+                        and isinstance(record.get("pin"), dict) and record["pin"].get("originalRunId") == run_id)
     return value
 
 
@@ -170,12 +180,22 @@ def projection(run_id, original, completion_sha, job_id):
 def inventory(reader, *, current=None):
     grouped = {}
     for key in durable.list_private_keys(reader, BASE):
-        match = re.fullmatch(re.escape(BASE) + r"([1-9][0-9]*)/1/(intent\.json|response\.age|completion\.json|observation\.age|observation\.json|failure-observation\.age|failure-observation\.json|failure-confirmed\.age)", key)
+        match = re.fullmatch(re.escape(BASE) + r"([1-9][0-9]*)/1/(intent\.json|response\.age|completion\.json|observation\.age|observation\.json|failure-observation\.age|failure-observation\.json|failure-confirmed\.age|resolution-[1-9][0-9]*\.json)", key)
         control.require(match is not None)
         grouped.setdefault(match.group(1), set()).add(match.group(2))
-    registered, allowed = ledger(), controllers()
-    control.require(len(grouped) <= MAX_HISTORY and set(grouped) - ({current} if current else set()) == set(registered) - ({current} if current else set()),
+    registered, recovered, allowed = ledger(), reconciled(), controllers()
+    control.require(not set(registered) & set(recovered) and len(grouped) <= MAX_HISTORY
+                    and set(grouped) - ({current} if current else set()) == (set(registered) | set(recovered)) - ({current} if current else set()),
                     "A prior private Provider mutation is unresolved; do not retry.")
+    import provider_private_mutation_reconcile as recovery
+    for run_id, record in recovered.items():
+        if run_id == current:
+            continue
+        names = grouped[run_id]
+        control.require({"intent.json", "failure-observation.age", "failure-observation.json",
+                         "resolution-" + record["reconcileRunId"] + ".json"} <= names
+                        and {name for name in names if name.startswith("resolution-")} == {"resolution-" + record["reconcileRunId"] + ".json"})
+        recovery.verify_reconciled(reader, run_id, record, allowed)
     for run_id, pin in registered.items():
         if run_id == current:
             continue
@@ -225,8 +245,9 @@ def inventory(reader, *, current=None):
 
 def history(registered, reader):
     token, current, allowed = control.github._github_token(), os.environ["GITHUB_RUN_ID"], controllers()
-    resolved = resolutions()
-    control.require(not set(resolved) & set(registered) and current not in resolved)
+    resolved, recovered = resolutions(), reconciled()
+    control.require(not (set(resolved) & set(registered) or set(resolved) & set(recovered) or set(registered) & set(recovered))
+                    and current not in resolved and current not in recovered)
     rows = []
     for page in range(1, 11):
         response = control.github._get_json(f"/actions/workflows/{WORKFLOW.rsplit('/', 1)[-1]}/runs?per_page=100&page={page}", token)
@@ -239,7 +260,7 @@ def history(registered, reader):
     else:
         raise control.ProviderError("Private Provider mutation history exceeds its safe bound.")
     control.require(len(rows) == response["total_count"] and len({str(row.get("id")) for row in rows if isinstance(row, dict)}) == len(rows))
-    seen, resolved_seen, found = set(), set(), False
+    seen, resolved_seen, recovered_seen, found = set(), set(), set(), False
     for row in rows:
         control.require(isinstance(row, dict) and row.get("path") in (WORKFLOW, WORKFLOW + "@main", WORKFLOW + "@refs/heads/main")
                         and row.get("head_sha") in allowed and row.get("head_branch") == "main" and row.get("event") == "workflow_dispatch"
@@ -251,6 +272,12 @@ def history(registered, reader):
             control.require(not found and row.get("head_sha") == os.environ["GITHUB_SHA"])
             found = True
         else:
+            if run_id in recovered:
+                control.require(run_id not in recovered_seen and row.get("status") == "completed"
+                                and row.get("head_sha") == recovered[run_id]["pin"]["originalControllerRevision"]
+                                and row.get("conclusion") in {"failure", "cancelled", "timed_out"})
+                recovered_seen.add(run_id)
+                continue
             if run_id in resolved:
                 control.require(run_id not in resolved_seen and row.get("status") == "completed"
                                 and row.get("head_sha") == resolved[run_id]["controllerRevision"])
@@ -261,7 +288,7 @@ def history(registered, reader):
                             and (row.get("status"), row.get("conclusion")) == ("completed", "success"),
                             "A prior private Provider mutation is unresolved; do not retry.")
             seen.add(run_id)
-    control.require(found and seen == set(registered) and resolved_seen == set(resolved))
+    control.require(found and seen == set(registered) and resolved_seen == set(resolved) and recovered_seen == set(recovered))
 
 
 def inputs():

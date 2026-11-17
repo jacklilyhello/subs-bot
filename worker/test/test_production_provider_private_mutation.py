@@ -21,7 +21,7 @@ class ProviderPrivateMutationTests(unittest.TestCase):
         image.write_bytes(b"fixture image")
         target["build"]["ociArchiveSha256"] = sha256(image.read_bytes()).hexdigest()
         target["build"]["workerSha256"] = sha256(module).hexdigest()
-        state = {"stateSha256": "1" * 64, "callerState": "unbound"}
+        state = {"stateSha256": "1" * 64, "deploymentHistorySha256": "2" * 64, "callerState": "unbound"}
         refs = [{"fixture": "pinned source"}]
         with patch.dict(os.environ, {"SUBS_BOT_PROVIDER_IMAGE_PREPARATION_SHA256": "3" * 64}, clear=True):
             original = mutation.intent(target, refs, "stage", state, "101", "b" * 40)
@@ -81,6 +81,17 @@ class ProviderPrivateMutationTests(unittest.TestCase):
         for change in ({"token": "synthetic"}, {"path": "/other"}, {"identities": {"versionId": "not-a-uuid"}}):
             with self.subTest(change=change), self.assertRaises(control.ProviderError):
                 mutation.checked_observation(target, "stage", {**value, **change})
+
+    def test_deployment_inventory_rejects_duplicates_and_full_boundary(self):
+        row = {"id": "11111111-1111-1111-1111-111111111111"}
+        api = Mock(worker_path="/workers/scripts/fixture")
+        api._request.return_value = {"result": {"deployments": [row, row]}, "result_info": {}}
+        with self.assertRaises(control.ProviderError):
+            mutation.deployment_history(api)
+        rows = [{"id": f"00000000-0000-0000-0000-{i:012x}"} for i in range(100)]
+        api._request.return_value = {"result": {"deployments": rows}, "result_info": {}}
+        with self.assertRaises(control.ProviderError):
+            mutation.deployment_history(api)
 
     def test_preparation_rechecks_before_each_confirmed_pending_followup(self):
         image = object.__new__(mutation.GuardedPreparation)

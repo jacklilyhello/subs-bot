@@ -14,6 +14,15 @@ from test_production_provider import config
 
 
 class ProviderMutationJournalTests(unittest.TestCase):
+    def test_reconciled_ledger_must_be_explicit_and_key_match_original_run(self):
+        with patch.dict(os.environ, {}, clear=True), self.assertRaises((ValueError, KeyError)):
+            journal.reconciled()
+        with patch.dict(os.environ, {"SUBS_BOT_PROVIDER_MUTATION_RECONCILED_JSON": '{"101":{"pin":{"originalRunId":"102"}}}'}, clear=True), \
+                self.assertRaises(control.ProviderError):
+            journal.reconciled()
+        with patch.dict(os.environ, {"SUBS_BOT_PROVIDER_MUTATION_RECONCILED_JSON": '{}'}, clear=True):
+            self.assertEqual(journal.reconciled(), {})
+
     def test_stage_requires_exact_independently_registered_image_preparation(self):
         value = {"targetSha256": "a" * 64, "imagePreparationSha256": "b" * 64}
         registered = {"100": {"operation": "prepare-image", "targetSha256": "a" * 64,
@@ -56,7 +65,8 @@ class ProviderMutationJournalTests(unittest.TestCase):
         reader = Mock()
         with patch.object(journal.durable, "list_private_keys", return_value=[
                 journal.BASE + "100/1/intent.json"]), patch.object(journal, "ledger", return_value={}), \
-                patch.object(journal, "controllers", return_value=["d" * 40]), self.assertRaises(control.ProviderError):
+                patch.object(journal, "reconciled", return_value={}), patch.object(journal, "controllers", return_value=["d" * 40]), \
+                self.assertRaises(control.ProviderError):
             journal.inventory(reader)
 
     def test_failure_evidence_is_single_write_and_does_not_create_completion(self):

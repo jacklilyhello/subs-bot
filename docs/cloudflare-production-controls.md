@@ -216,6 +216,10 @@ Provider 持久来源的独立 Worker 演练入口使用受信 main dispatcher `
 
 Provider 隔离交接使用一次性的临时 age 私钥；全部已取得的响应密文都须与严格白名单的 response-only 原件关联封存到私有 R2，并经独立解密和读回后，才能按本轮凭据期限清除临时身份。原件不含 API／Bot Token 或签名密钥；配置 Secret 仍不放入数据备份。若证据无法验证或仍有未决密文，保留现场并报告，不得声称已完成清理或结果成功。
 
+中断后仅当 `stage` 的准确 version ID 或 `activate` 的准确 deployment ID 已保全且可独立核实，才可使用默认关闭的隔离 `worker-provider-reviewed-recovery.yml` 先做只读对账：复核原 run/attempt、持久 intent、响应原件、完整来源链、全部版本及部署历史、caller 和 previous 终态。单独批准准确 plan 后再重新观察，单次追加不可变 resolution 并由新 runner 独立读回；经审核登记该 resolution 后，才可使用它生成的密封 next-target 审批后续动作。原 run 仍为失败／未知，不改旧 intent 或重发原写；响应 ID 缺失、现场漂移、额外版本／部署或结果歧义仍须停止并告警。
+
+隔离 Environment 的 `SUBS_BOT_PROVIDER_MUTATION_RECONCILED_JSON` 必须显式登记；仅在私有前缀及完整工作流历史均确认无记录时初始化为空对象，之后只能登记独立读回的精确 resolution，不能删改历史。读回 runner 分别使用受保护的两个 Environment 公钥密封完整合并账本，只输出账本及密文摘要；登记前须重新核验目标 Environment 的身份、公钥和密文摘要，两端登记相同账本。此步骤不代表原失败 run 成功。部署记录的单页盘点必须少于 100 条；达到边界时停止并先实施有界分页支持，不删历史来通过检查。
+
 `worker-production-lifecycle-rehearsal.yml` 的 `provider-binding` 仅接受已登记的 `subs-bot-cf-control-drill-01`，不操作原 dev 数据或 Provider 部署。先取得完整、未绑定的专用 Provider 私有归档与独立摘要，并通知操作者准备好既有管理员浏览器会话；操作者明确 ready 后才 dispatch。输入 `source_run_id` 为当前准确 main Worker CI，`active_run_id` 为当前专用应用准确源 CI，`registration_sha256` 保持原登记值。另必填 `provider_run_id`、`provider_run_attempt`、`provider_manifest_sha256`，`human_window_seconds` 选 60–540 秒，`provider_ready_ack` 精确为 `IAB ready for subs-bot-cf-control-drill-01 refresh`。不提供旧基线 pin；配置变化后先封存并核对新的 G0。
 
 流程通过正式 Controller 的 plan-deploy／deploy 保留身份、密钥和数据，仅开启 URL 导入和刷新；严格读回唯一调用者绑定后，执行正常 G0／Webhook／激活流程。合成 URL 导入必须保存完整三个节点并精确导出原 URI。出现 `provider-refresh-window-open` 后，管理员在测试 Bot 私聊找到本次带 run 标记的订阅，打开详情并点击真实刷新按钮；工具只接受该管理员、该订阅、同一来源与真实票据的成功请求，核对 generation 增加一次、三个节点、确认发送及精确导出。重复发送 URL 不算刷新。报告需再与浏览器独立观察交叉核对，窗口打开本身不等于真人通过。

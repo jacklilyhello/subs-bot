@@ -52,8 +52,9 @@ def checked_observation(target, operation, value):
 def intent(target, refs, operation, state, run_id, revision):
     preparation = os.environ.get("SUBS_BOT_PROVIDER_IMAGE_PREPARATION_SHA256", "") if operation == "stage" else None
     control.require(operation in OPERATIONS and isinstance(state, dict)
-                    and set(state) == {"stateSha256", "callerState"}
-                    and control.match(control.provider.HEX, state["stateSha256"]) and state["callerState"] == "unbound"
+                    and set(state) == {"stateSha256", "deploymentHistorySha256", "callerState"}
+                    and all(control.match(control.provider.HEX, state[k]) for k in ("stateSha256", "deploymentHistorySha256"))
+                    and state["callerState"] == "unbound"
                     and control.match(control.provider.DECIMAL, run_id) and control.match(control.provider.REVISION, revision)
                     and (preparation is None or control.match(control.provider.HEX, preparation)))
     return {"version": 1, "kind": "isolated-provider-mutation-intent", "operation": operation,
@@ -63,9 +64,19 @@ def intent(target, refs, operation, state, run_id, revision):
             "imagePreparationSha256": preparation, "prestate": state, "status": "started-unknown", **transfer.execution_identity(revision)}
 
 
+def deployment_history(api):
+    envelope = api._request(api.worker_path + "/deployments?page=1&per_page=100")
+    control.require(isinstance(envelope.get("result"), dict))
+    rows = control.legacy._page(envelope, envelope["result"].get("deployments"), 100)
+    control.require(len(rows) < 100 and all(isinstance(row, dict) and control.match(control.stage.VERSION_ID, row.get("id")) for row in rows)
+                    and len({row["id"] for row in rows}) == len(rows))
+    return rows
+
+
 def observe(target, operation, worker_token, container_token):
     control.require(operation in OPERATIONS and target["environment"] == "rehearsal" and target["caller"] is None)
     api = control.ProviderAPI(target, worker_token, container_token)
+    deployments = deployment_history(api)
     first = control.observe(api)
     if operation in {"prepare-image", "stage"}:
         control.require(target["versionId"] is None and target.get("previous") is not None)
@@ -77,9 +88,9 @@ def observe(target, operation, worker_token, container_token):
         control.require(all(target[key] is not None for key in ("versionId", "activation", "container", "workflow"))
                         and first["instance"] is None)
     caller = control.caller_state(api, target, allow_unbound=True)
-    control.require(caller == "unbound" and control.observe(api) == first
+    control.require(caller == "unbound" and control.observe(api) == first and deployment_history(api) == deployments
                     and control.caller_state(api, target, allow_unbound=True) == caller)
-    return {"stateSha256": control.digest(first), "callerState": caller}
+    return {"stateSha256": control.digest(first), "deploymentHistorySha256": control.digest(deployments), "callerState": caller}
 
 
 class PreparedImage(control.PublishedImage):
