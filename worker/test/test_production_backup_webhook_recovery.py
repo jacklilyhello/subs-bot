@@ -12,6 +12,27 @@ from production_target import ContractError
 
 
 class WebhookRecoveryTests(unittest.TestCase):
+    def test_phase_source_is_bound_to_exact_dispatcher_title_and_candidate(self):
+        main, candidate = "d" * 40, "c" * 40
+        env = {"WEBHOOK_SOURCE_RUN_ID": "123", "WEBHOOK_SOURCE_ATTEMPT": "1", "GITHUB_RUN_ID": "123",
+               "GITHUB_RUN_ATTEMPT": "1", "WEBHOOK_SOURCE_MAIN_SHA": main,
+               "WEBHOOK_SOURCE_CANDIDATE_SHA": candidate, "WEBHOOK_REVIEWED_CANDIDATE_SHA": candidate,
+               "WEBHOOK_SOURCE_KIND": "phase-coordinator", "GITHUB_WORKFLOW_REF": recovery.github.REPOSITORY + "/" +
+               recovery.PHASE_DISPATCHER + "@" + recovery.github.MAIN_REF}
+        run = {"id": 123, "run_attempt": 1, "path": recovery.PHASE_DISPATCHER, "head_sha": main,
+               "head_branch": "main", "event": "workflow_dispatch", "status": "in_progress",
+               "display_title": "Rehearsal backup coordinator run at " + main + " candidate " + candidate,
+               "repository": {"id": recovery.github.REPOSITORY_ID}, "head_repository": {"id": recovery.github.REPOSITORY_ID}}
+        with patch.object(recovery.github, "_github_token", return_value="synthetic"), \
+             patch.object(recovery.github, "_get_json", return_value=run):
+            self.assertEqual(recovery.source_run(env, True), ("123", "1", candidate))
+            for change in ({"WEBHOOK_SOURCE_KIND": "reviewed-head"}, {"WEBHOOK_REVIEWED_CANDIDATE_SHA": "e" * 40},
+                           {"GITHUB_WORKFLOW_REF": env["GITHUB_WORKFLOW_REF"].replace("coordinator", "unrelated")}):
+                with self.subTest(change=change), self.assertRaises(ContractError):
+                    recovery.source_run({**env, **change}, True)
+            with self.assertRaises(ContractError):
+                recovery.source_run({**env, "WEBHOOK_SOURCE_RUN_ID": "124"}, True)
+
     def test_manual_history_accepts_other_source_at_old_main_but_rejects_prior_same_source(self):
         def row(run_id, title, head, attempt=1):
             return {"id": run_id, "display_title": title, "head_sha": head, "run_attempt": attempt,

@@ -59,7 +59,7 @@ def validate(env):
                 ("checkpointId", "BACKUP_PHASE_CHECKPOINT_ID")))
             and env.get("BACKUP_SOURCE_CHECKPOINT_ID") == spec["sourceCheckpointId"]
             and env.get("BACKUP_SOURCE_MANIFEST_SHA256") == spec["sourceManifestSha256"]
-            and env.get("BACKUP_ACTION") in (STEPS if role == "child" else {"inspect", "plan-initialize", "initialize", "plan-run", "run", "plan-resume", "resume", "plan-reconcile", "reconcile", "plan-abort", "abort"}))
+            and env.get("BACKUP_ACTION") in (STEPS if role == "child" else {"inspect", "plan-initialize", "initialize", "plan-webhook-history", "plan-webhook-anchor", "initialize-webhook-anchor", "plan-run", "run", "plan-resume", "resume", "plan-reconcile", "reconcile", "plan-abort", "abort"}))
     if role == "child":
         require(HEX64.fullmatch(env.get("BACKUP_DISPATCH_NONCE", "")))
         require(DECIMAL.fullmatch(env.get("BACKUP_COORDINATOR_SESSION", ""))
@@ -67,7 +67,7 @@ def validate(env):
         # Even a read-only phase must create its exclusive private child claim.
         require(env.get("SUBS_BOT_BACKUP_PHASE_REHEARSAL_WRITES_ENABLED") == "true",
                 "Isolated phase claims and writes are disabled.")
-    elif env.get("BACKUP_ACTION") in {"initialize", "run", "resume", "reconcile", "abort"}:
+    elif env.get("BACKUP_ACTION") in {"initialize", "initialize-webhook-anchor", "run", "resume", "reconcile", "abort"}:
         require(env.get("SUBS_BOT_BACKUP_PHASE_REHEARSAL_WRITES_ENABLED") == "true",
                 "Isolated coordinator writes are disabled.")
     from production_target import canonical

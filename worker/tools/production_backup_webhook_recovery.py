@@ -18,6 +18,7 @@ from production_storage import PrivateStore
 from production_target import TEST_BOT_ID, canonical, parsed, require, validate_target
 
 DISPATCHER = ".github/workflows/worker-backup-reviewed-head.yml"
+PHASE_DISPATCHER = ".github/workflows/worker-backup-reviewed-coordinator.yml"
 RECOVERY = ".github/workflows/worker-backup-webhook-recovery.yml"
 ADMISSION_RECOVERY = ".github/workflows/worker-backup-admission-recovery.yml"
 DECIMAL = re.compile(r"[1-9][0-9]{0,19}")
@@ -32,9 +33,9 @@ def context(env):
             and env.get("GITHUB_REF") == github.MAIN_REF and env.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
             and env.get("RUNNER_ENVIRONMENT") == "github-hosted" and env.get("GITHUB_WORKFLOW_SHA") == revision
             and REV.fullmatch(revision or "") and env.get("GITHUB_RUN_ATTEMPT") == "1"
-            and ref in {github.REPOSITORY + "/" + path + "@" + github.MAIN_REF for path in (DISPATCHER, RECOVERY, ADMISSION_RECOVERY)})
+            and ref in {github.REPOSITORY + "/" + path + "@" + github.MAIN_REF for path in (DISPATCHER, PHASE_DISPATCHER, RECOVERY, ADMISSION_RECOVERY)})
     github.require_current_main(revision)
-    return ref.endswith(DISPATCHER + "@" + github.MAIN_REF)
+    return any(ref.endswith(path + "@" + github.MAIN_REF) for path in (DISPATCHER, PHASE_DISPATCHER))
 
 
 def source_run(env, automatic):
@@ -46,11 +47,18 @@ def source_run(env, automatic):
     require(REV.fullmatch(expected_main or "") and REV.fullmatch(expected_head or "")
             and expected_head == env.get("WEBHOOK_REVIEWED_CANDIDATE_SHA"),
             "The source candidate differs from the independent protected pin.")
+    source_kind = env.get("WEBHOOK_SOURCE_KIND", "reviewed-head")
+    require(source_kind in {"reviewed-head", "phase-coordinator"})
+    workflow = PHASE_DISPATCHER if source_kind == "phase-coordinator" else DISPATCHER
+    if automatic:
+        require(env.get("GITHUB_WORKFLOW_REF") == github.REPOSITORY + "/" + workflow + "@" + github.MAIN_REF)
     run = github._get_json("/actions/runs/" + run_id + "/attempts/1", github._github_token())
     require(str(run.get("id")) == run_id and run.get("run_attempt") == 1
-            and run.get("path") in (DISPATCHER, DISPATCHER + "@main", DISPATCHER + "@refs/heads/main")
+            and run.get("path") in (workflow, workflow + "@main", workflow + "@refs/heads/main")
             and run.get("head_sha") == expected_main and run.get("head_branch") == "main"
             and run.get("event") == "workflow_dispatch"
+            and (source_kind != "phase-coordinator" or run.get("display_title") ==
+                 "Rehearsal backup coordinator run at " + expected_main + " candidate " + expected_head)
             and all(isinstance(run.get(key), dict) and run[key].get("id") == github.REPOSITORY_ID
                     for key in ("repository", "head_repository"))
             and (automatic or run.get("status") == "completed"))
@@ -265,6 +273,26 @@ def inspect(env, *, execute=False):
                             "max_connections": candidate_settings["maxConnections"],
                             "allowed_updates": candidate_settings["allowedUpdates"]},
             "The preceding webhook confirmation is malformed.")
+    if env.get("WEBHOOK_SOURCE_KIND") == "phase-coordinator":
+        setup_prefix = prefix + "phase-coordinator-webhook-setup-" + suffix + "-"
+        setup_raw = store.get(setup_prefix + "intent.json")
+        setup_done_raw = store.get(setup_prefix + "confirmed.json")
+        setup, setup_done = parsed(setup_raw), parsed(setup_done_raw)
+        require(canonical(setup) == setup_raw and canonical(setup_done) == setup_done_raw
+                and set(setup) == {"version", "kind", "runId", "runAttempt", "controllerRevision", "dispatcherRevision",
+                    "targetSha256", "configurationSha256", "sourceCheckpointId", "sourceManifestSha256", "snapshotSha256",
+                    "predecessorSha256", "webhookSettingsSha256", "historySha256"}
+                and type(setup["version"]) is int and setup["version"] == 1 and setup["kind"] == "phase-webhook-setup-intent"
+                and setup["runId"] == run_id and setup["runAttempt"] == attempt and setup["controllerRevision"] == candidate
+                and setup["dispatcherRevision"] == env["WEBHOOK_SOURCE_MAIN_SHA"] and setup["targetSha256"] == target.digest
+                and setup["configurationSha256"] == target.configuration_digest and setup["snapshotSha256"] == pin
+                and all(SHA.fullmatch(setup.get(k, "")) for k in ("sourceManifestSha256", "predecessorSha256", "webhookSettingsSha256", "historySha256"))
+                and re.fullmatch(r"[a-f0-9]{32}", setup.get("sourceCheckpointId", ""))
+                and setup["webhookSettingsSha256"] == configured["webhookSha256"]
+                and setup_done == {"version": 1, "kind": "phase-webhook-setup-confirmed",
+                    "intentSha256": sha256(setup_raw).hexdigest(), "snapshotSha256": pin,
+                    "configuredSha256": sha256(configured_raw).hexdigest(), "targetSha256": target.digest},
+                "The one-shot webhook setup intent and confirmation are not independently verified.")
     if not execute:
         if automatic:
             require(intent is None and completion is None,

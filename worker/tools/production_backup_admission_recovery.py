@@ -97,7 +97,7 @@ def list_history(store, target_sha, *, prefix=None):
         cursor = next_cursor
 
 
-def idle_anchor(store, target, session, candidate, expected_genesis):
+def idle_anchor(store, target, session, candidate, expected_genesis, *, verify_session=True):
     require(re.fullmatch(r"[0-9a-f]{64}", expected_genesis or "") is not None)
     prefix = "maintenance/production-control/registrations/"
     genesis_raw = store.get(prefix + "daily-backup-genesis-" + target.digest + ".json")
@@ -144,7 +144,8 @@ def idle_anchor(store, target, session, candidate, expected_genesis):
                      or (current["state"] == "active" and previous.get("state") == "idle"
                          and current.get("session") != previous.get("session"))))
         current, raw = previous, prior_raw
-    verified_journal(store, target.digest, session, candidate, anchor["day"])
+    if verify_session:
+        verified_journal(store, target.digest, session, candidate, anchor["day"])
     return sha256(anchor_raw).hexdigest()
 
 
@@ -304,7 +305,6 @@ def run(env):
     token = env.get("SUBS_BOT_CF_BOOTSTRAP_TOKEN", "")
     backup_store = PrivateStore(API(target, token), target.data["backupBucketName"])
     session = run_id + "-" + attempt
-    anchor_sha = idle_anchor(backup_store, target, session, candidate, env.get("BACKUP_GENESIS_SHA256", ""))
     ready_raw = store.get(prefix + session + "-open-backup-ready-for-cleanup.json")
     ready = parsed(ready_raw)
     require(canonical(ready) == ready_raw and set(ready) == {"state"} and isinstance(ready["state"], dict))
@@ -315,8 +315,9 @@ def run(env):
     jobs = github._get_json("/actions/runs/" + run_id + "/attempts/1/jobs?per_page=100", github._github_token())
     require(isinstance(jobs.get("jobs"), list) and type(jobs.get("total_count")) is int
             and jobs["total_count"] == len(jobs["jobs"]) < 100)
-    steps = [step for job in jobs["jobs"] for step in job.get("steps", [])
-             if step.get("name") == "Run the reviewed candidate against only dedicated isolation"]
+    phase_source = env.get("WEBHOOK_SOURCE_KIND", "reviewed-head") == "phase-coordinator"
+    expected_step = "Coordinate reviewed isolated backup phases" if phase_source else "Run the reviewed candidate against only dedicated isolation"
+    steps = [step for job in jobs["jobs"] for step in job.get("steps", []) if step.get("name") == expected_step]
     require(len(steps) == 1 and steps[0].get("status") == "completed" and steps[0].get("conclusion") == "success",
             "The exact original candidate step is not independently confirmed successful.")
     receipt_raw = store.get(prefix + session + "-backup-head-acceptance.json")
@@ -329,6 +330,35 @@ def run(env):
             and receipt.get("admissionRestored") is True and receipt.get("authorizationUnchanged") is True
             and receipt.get("confirmedReceiptsNotRepeated") is True,
             "The private candidate acceptance receipt is missing or differs.")
+    if phase_source:
+        selected = [job for job in jobs["jobs"] if isinstance(job, dict) and job.get("name") == "coordinate"]
+        require(len(selected) == 1 and str(selected[0].get("run_id")) == run_id and selected[0].get("run_attempt") == 1
+                and selected[0].get("head_sha") == env.get("WEBHOOK_SOURCE_MAIN_SHA")
+                and (selected[0].get("status"), selected[0].get("conclusion")) == ("completed", "success")
+                and receipt.get("snapshotSha256") == webhook.get("snapshotSha256")
+                and receipt.get("sourceCheckpointId") == env.get("BACKUP_SOURCE_CHECKPOINT_ID")
+                and receipt.get("sourceManifestSha256") == env.get("BACKUP_SOURCE_MANIFEST_SHA256")
+                and re.fullmatch(r"[1-9][0-9]{0,19}", receipt.get("coordinatorSession", ""))
+                and re.fullmatch(r"[1-9][0-9]{0,19}-1", receipt.get("planBeginSession", ""))
+                and re.fullmatch(r"[0-9]{4}/[0-9]{2}/[0-9]{2}", receipt.get("planBeginDay", "")))
+    def observe_anchors():
+        app_session = receipt["planBeginSession"] if phase_source else session
+        app = idle_anchor(backup_store, target, app_session, candidate, env.get("BACKUP_GENESIS_SHA256", ""))
+        if not phase_source:
+            return {"app": app}
+        import trusted_backup_phase_cleanup as phase
+        policy = parsed(env.get("SUBS_BOT_BACKUP_POLICY_JSON", ""))
+        require(isinstance(policy, dict) and type(policy.get("pauseLimitSeconds")) is int)
+        coordinator = phase.coordinator_anchor(backup_store, target, receipt["coordinatorSession"], candidate,
+                                               env.get("SUBS_BOT_BACKUP_COORDINATOR_GENESIS_SHA256", ""))
+        children = phase.child_evidence(backup_store, target.digest, receipt["coordinatorSession"],
+            env["WEBHOOK_SOURCE_MAIN_SHA"], candidate, github._github_token(),
+            source_checkpoint=env.get("BACKUP_SOURCE_CHECKPOINT_ID", ""),
+            source_manifest=env.get("BACKUP_SOURCE_MANIFEST_SHA256", ""), validation_json=env.get("HEAD_VALIDATION_JSON", ""),
+            policy=policy, writer_run_id=run_id, parent_receipt=receipt)
+        return {"app": app, "coordinator": coordinator, "children": children}
+    observed_anchors = observe_anchors()
+    anchor_sha = sha256(canonical(observed_anchors)).hexdigest() if phase_source else observed_anchors["app"]
     root = Path(env["RUNNER_TEMP"])
     with tempfile.TemporaryDirectory(prefix="trusted-admission-source-", dir=root) as directory:
         archived = load_release(target, token, env.get("BACKUP_SOURCE_CHECKPOINT_ID", ""),
@@ -351,9 +381,9 @@ def run(env):
                   "readySha256": sha256(ready_raw).hexdigest(), "anchorSha256": anchor_sha,
                   "predecessorSha256": pause["stateSha256"]}
         guard()
-        require(idle_anchor(backup_store, target, session, candidate, env.get("BACKUP_GENESIS_SHA256", "")) == anchor_sha)
+        require(observe_anchors() == observed_anchors)
         claim_intent_once(store, intent_key, canonical(intent))
-        require(idle_anchor(backup_store, target, session, candidate, env.get("BACKUP_GENESIS_SHA256", "")) == anchor_sha)
+        require(observe_anchors() == observed_anchors)
         after = ctl.transition("pause", approval(target, "pause", ctl.revision, pause["stateSha256"]), pause["stateSha256"])
         confirmed = {"version": 1, "intentSha256": sha256(canonical(intent)).hexdigest(), "stateSha256": after["stateSha256"]}
         store.put(confirmed_key, canonical(confirmed))
@@ -367,7 +397,7 @@ def run(env):
                 break
             require(monotonic() < deadline, "Accepted work has not drained; keep the target closed and alert.")
             sleep(2)
-        require(idle_anchor(backup_store, target, session, candidate, env.get("BACKUP_GENESIS_SHA256", "")) == anchor_sha)
+        require(observe_anchors() == observed_anchors)
         freeze_key = prefix + "backup-admission-" + session + "-freeze-intent.json"
         freeze_confirmed = prefix + "backup-admission-" + session + "-freeze-confirmed.json"
         freeze_intent = {"version": 1, "targetSha256": target.digest, "session": session,
