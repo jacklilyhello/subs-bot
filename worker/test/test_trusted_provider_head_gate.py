@@ -113,6 +113,10 @@ class TrustedProviderGateTests(unittest.TestCase):
             self.check({**source, "PROVIDER_HEAD_PHASE": "isolated-source-readback"})
         with self.assertRaises(ContractError):
             self.check({**source, "PROVIDER_HEAD_VALIDATION_JSON": json.dumps(approved)})
+        operation = {**env, "GITHUB_WORKFLOW_REF": gate.OPERATION_WORKFLOW, "PROVIDER_HEAD_PHASE": "operation-dispatch"}
+        self.assertTrue(self.check(operation)["checkoutVerified"])
+        with self.assertRaises(ContractError):
+            self.check({**operation, "PROVIDER_HEAD_PHASE": "digest-publish"})
 
     def test_digest_dispatcher_uses_fresh_gated_jobs_and_is_default_off(self):
         workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/worker-provider-reviewed-digest.yml").read_text()
@@ -158,6 +162,28 @@ class TrustedProviderGateTests(unittest.TestCase):
         self.assertIn("vars.SUBS_BOT_PROVIDER_REVIEWED_SOURCE_WRITE_ENABLED == 'true'", seal)
         self.assertIn("SUBS_BOT_SCOPED_R2_WRITE_JSON", seal)
         self.assertNotIn("SUBS_BOT_SCOPED_R2_WRITE_JSON", readback)
+
+    def test_reviewed_operation_is_default_off_and_separates_write_domains(self):
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/worker-provider-reviewed-operation.yml").read_text()
+        self.assertIn("vars.SUBS_BOT_PROVIDER_REVIEWED_OPERATION_ENABLED == 'true'", workflow)
+        self.assertIn("vars.SUBS_BOT_PROVIDER_OPERATION_WRITE_ENABLED == 'true'", workflow)
+        self.assertEqual(workflow.count("uses: ./trusted/.github/actions/provider-reviewed-head-gate"), 10)
+        section = workflow.split("\n  dispatch:\n", 1)[1].split("\n  verify:\n", 1)[0]
+        self.assertIn("SUBS_BOT_CF_PROVIDER_WORKER_TOKEN", section)
+        self.assertNotIn("SUBS_BOT_SCOPED_R2_WRITE_JSON", section)
+        self.assertIn("Preserve encrypted response-only observation", section)
+        self.assertIn("if: always()", section)
+        self.assertIn("needs.evidence_readback.result != 'success'", workflow)
+        self.assertIn("SUBS_BOT_PROVIDER_MUTATION_ACTION: failure-readback", workflow)
+        self.assertIn("SUBS_BOT_PROVIDER_MUTATION_RESOLUTIONS_JSON", workflow)
+        prepare = section.split("- name: Prepare the exact image once", 1)[1].split("- name: Dispatch the exact approved Worker operation once", 1)[0]
+        self.assertIn("secrets.SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN", prepare)
+        self.assertNotIn("secrets.SUBS_BOT_CF_PROVIDER_WORKER_WRITE_TOKEN", prepare)
+        dispatch = section.split("- name: Dispatch the exact approved Worker operation once", 1)[1]
+        self.assertNotIn("secrets.SUBS_BOT_CF_PROVIDER_CONTAINER_WRITE_TOKEN", dispatch)
+        reconcile = (Path(__file__).resolve().parents[2] / ".github/workflows/worker-provider-reviewed-operation-reconcile.yml").read_text()
+        self.assertIn("vars.SUBS_BOT_PROVIDER_REVIEWED_OPERATION_RECONCILE_ENABLED == 'true'", reconcile)
+        self.assertNotIn("SUBS_BOT_SCOPED_R2_WRITE_JSON", reconcile)
 
     def test_production_archive_and_non_simulated_input_are_rejected(self):
         for change in ({"simulateActionsUnavailable": False},
