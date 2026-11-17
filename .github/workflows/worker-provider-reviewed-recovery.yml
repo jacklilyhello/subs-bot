@@ -1,0 +1,241 @@
+name: Reconcile isolated Provider interrupted write
+run-name: Reconcile isolated Provider ${{ fromJSON(inputs.reconcile_pin_json).originalRunId }}
+on:
+  workflow_dispatch:
+    inputs:
+      validation_json:
+        description: Exact reviewed candidate, source and private archive pins
+        required: true
+        type: string
+      reconcile_pin_json:
+        description: Original failed run and independently read-back evidence pins
+        required: true
+        type: string
+      action:
+        description: Plan is read-only; commit records one independently approved observation
+        required: true
+        type: choice
+        options: [plan, commit]
+      approval_sha256:
+        description: Exact independently approved plan digest, commit only
+        required: false
+        type: string
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+concurrency:
+  group: subs-bot-provider-isolation
+  cancel-in-progress: false
+env:
+  GH_TOKEN: ${{ github.token }}
+  PROVIDER_HEAD_VALIDATION_JSON: ${{ inputs.validation_json }}
+  PROVIDER_HEAD_TRUSTED_MAIN_SHA: ${{ github.sha }}
+  SUBS_BOT_PROVIDER_CI_RUN_ID: ${{ fromJSON(inputs.validation_json).providerCiRunId }}
+  SUBS_BOT_PROVIDER_ARCHIVE_REFS: ${{ toJSON(fromJSON(inputs.validation_json).archiveRefs) }}
+  SUBS_BOT_PROVIDER_DURABLE_REQUIRED: '1'
+  SUBS_BOT_PROVIDER_SIMULATE_ARTIFACT_UNAVAILABLE: '1'
+jobs:
+  inspect:
+    name: Provider interrupted write independent inspection
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && vars.SUBS_BOT_PROVIDER_RECOVERY_ENABLED == 'true'
+    environment: subs-bot-provider-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PROVIDER_HEAD_REVIEWED_SHA: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+    outputs:
+      plan_json: ${{ steps.inspect.outputs.plan_json }}
+      approval_sha256: ${{ steps.inspect.outputs.approval_sha256 }}
+      archive_payload_sha256: ${{ steps.inspect.outputs.archive_payload_sha256 }}
+      live_payload_sha256: ${{ steps.inspect.outputs.live_payload_sha256 }}
+      next_digest_approval_sha256: ${{ steps.inspect.outputs.next_digest_approval_sha256 }}
+      next_witness_approval_sha256: ${{ steps.inspect.outputs.next_witness_approval_sha256 }}
+      next_activate_approval_sha256: ${{ steps.inspect.outputs.next_activate_approval_sha256 }}
+      next_smoke_approval_sha256: ${{ steps.inspect.outputs.next_smoke_approval_sha256 }}
+    steps:
+      - name: Check out trusted current main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Verify independently approved Provider head and isolation contracts
+        uses: ./trusted/.github/actions/provider-reviewed-head-gate
+        with:
+          validation_json: ${{ inputs.validation_json }}
+          reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          phase: recovery-inspect
+          environment: subs-bot-provider-head-isolation
+          provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          archive_target_json: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          archive_refs_json: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+          recovery_policy_json: ${{ secrets.SUBS_BOT_PROVIDER_RECOVERY_POLICY_JSON }}
+      - name: Independently observe original response and live state
+        id: inspect
+        env:
+          SUBS_BOT_PROVIDER_RECONCILE_ACTION: ${{ inputs.action }}
+          SUBS_BOT_PROVIDER_RECONCILE_INPUT_JSON: ${{ inputs.reconcile_pin_json }}
+          SUBS_BOT_PROVIDER_RECONCILE_TRUSTED_PIN_JSON: ${{ secrets.SUBS_BOT_PROVIDER_RECONCILE_PIN_JSON }}
+          SUBS_BOT_PROVIDER_RECONCILE_APPROVAL: ${{ inputs.approval_sha256 }}
+          SUBS_BOT_PROVIDER_RECONCILE_TRUSTED_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_RECONCILE_APPROVAL }}
+          SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_TRUSTED_ARCHIVE_REFS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+          SUBS_BOT_PROVIDER_DIGEST_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_APPROVAL }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_ISOLATED_SOURCE_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ISOLATED_SOURCE_LEDGER_JSON }}
+          SUBS_BOT_PROVIDER_ISOLATED_SOURCE_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ISOLATED_SOURCE_CONTROLLERS_JSON }}
+          SUBS_BOT_PROVIDER_MUTATION_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_LEDGER_JSON }}
+          SUBS_BOT_PROVIDER_MUTATION_RESOLUTIONS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_RESOLUTIONS_JSON }}
+          SUBS_BOT_PROVIDER_MUTATION_RECONCILED_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_RECONCILED_JSON }}
+          SUBS_BOT_PROVIDER_MUTATION_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_CONTROLLERS_JSON }}
+          SUBS_BOT_PROVIDER_NEXT_TARGET_KEYS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_NEXT_TARGET_KEYS_JSON }}
+          SUBS_BOT_PROVIDER_NEXT_TARGET_KEY_PINS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_NEXT_TARGET_KEY_PINS_JSON }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+          SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN }}
+          SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN }}
+        working-directory: candidate
+        run: |
+          test "$(git rev-parse HEAD)" = "$PROVIDER_HEAD_REVIEWED_SHA"
+          umask 077
+          python3 -B worker/tools/provider_private_mutation_reconcile.py
+      - name: Upload sealed archive target only
+        if: inputs.action == 'commit'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: provider-reconciled-archive-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/provider-next-target-archive.json
+          if-no-files-found: error
+          retention-days: 1
+      - name: Upload sealed live target only
+        if: inputs.action == 'commit'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: provider-reconciled-live-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/provider-next-target-live.json
+          if-no-files-found: error
+          retention-days: 1
+  archive:
+    name: Provider reconciliation resolution archive
+    needs: [inspect]
+    if: inputs.action == 'commit' && vars.SUBS_BOT_PROVIDER_RECOVERY_WRITE_ENABLED == 'true'
+    environment: subs-bot-provider-archive-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      PROVIDER_HEAD_REVIEWED_SHA: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+    outputs:
+      resolution_sha256: ${{ steps.write.outputs.resolution_sha256 }}
+    steps:
+      - name: Check out trusted current main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Verify independently approved Provider head and isolation contracts
+        uses: ./trusted/.github/actions/provider-reviewed-head-gate
+        with:
+          validation_json: ${{ inputs.validation_json }}
+          reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          phase: recovery-archive
+          environment: subs-bot-provider-archive-head-isolation
+          provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          archive_target_json: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          archive_refs_json: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+          recovery_policy_json: ${{ secrets.SUBS_BOT_PROVIDER_RECOVERY_POLICY_JSON }}
+      - name: Append the separately approved resolution once
+        id: write
+        env:
+          SUBS_BOT_PROVIDER_RECONCILE_ACTION: write-resolution
+          SUBS_BOT_PROVIDER_RECONCILE_INPUT_JSON: ${{ inputs.reconcile_pin_json }}
+          SUBS_BOT_PROVIDER_RECONCILE_TRUSTED_PIN_JSON: ${{ secrets.SUBS_BOT_PROVIDER_RECONCILE_PIN_JSON }}
+          SUBS_BOT_PROVIDER_RECONCILE_APPROVAL: ${{ inputs.approval_sha256 }}
+          SUBS_BOT_PROVIDER_RECONCILE_TRUSTED_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_RECONCILE_APPROVAL }}
+          SUBS_BOT_PROVIDER_RECONCILE_PLAN_JSON: ${{ needs.inspect.outputs.plan_json }}
+          SUBS_BOT_PROVIDER_RECONCILE_ARCHIVE_PAYLOAD_SHA256: ${{ needs.inspect.outputs.archive_payload_sha256 }}
+          SUBS_BOT_PROVIDER_RECONCILE_LIVE_PAYLOAD_SHA256: ${{ needs.inspect.outputs.live_payload_sha256 }}
+          SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_TRUSTED_ARCHIVE_REFS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+          SUBS_BOT_PROVIDER_DIGEST_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_APPROVAL }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_MUTATION_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_LEDGER_JSON }}
+          SUBS_BOT_PROVIDER_MUTATION_RESOLUTIONS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_RESOLUTIONS_JSON }}
+          SUBS_BOT_PROVIDER_MUTATION_RECONCILED_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_RECONCILED_JSON }}
+          SUBS_BOT_PROVIDER_MUTATION_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_CONTROLLERS_JSON }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_SCOPED_R2_WRITE_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_WRITE_JSON }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+        working-directory: candidate
+        run: python3 -B worker/tools/provider_private_mutation_reconcile.py
+  readback:
+    name: Provider independent reconciliation readback
+    needs: [inspect, archive]
+    environment: subs-bot-provider-archive-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      PROVIDER_HEAD_REVIEWED_SHA: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+    outputs:
+      ledger_sha256: ${{ steps.readback.outputs.ledger_sha256 }}
+      archive_ledger_payload_sha256: ${{ steps.readback.outputs.archive_ledger_payload_sha256 }}
+      live_ledger_payload_sha256: ${{ steps.readback.outputs.live_ledger_payload_sha256 }}
+    steps:
+      - name: Check out trusted current main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Verify independently approved Provider head and isolation contracts
+        uses: ./trusted/.github/actions/provider-reviewed-head-gate
+        with:
+          validation_json: ${{ inputs.validation_json }}
+          reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          phase: recovery-readback
+          environment: subs-bot-provider-archive-head-isolation
+          provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          archive_target_json: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          archive_refs_json: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+          recovery_policy_json: ${{ secrets.SUBS_BOT_PROVIDER_RECOVERY_POLICY_JSON }}
+      - name: Independently read original evidence and resolution
+        id: readback
+        env:
+          SUBS_BOT_PROVIDER_RECONCILE_ACTION: readback-resolution
+          SUBS_BOT_PROVIDER_RECONCILE_INPUT_JSON: ${{ inputs.reconcile_pin_json }}
+          SUBS_BOT_PROVIDER_RECONCILE_TRUSTED_PIN_JSON: ${{ secrets.SUBS_BOT_PROVIDER_RECONCILE_PIN_JSON }}
+          SUBS_BOT_PROVIDER_RECONCILE_APPROVAL: ${{ inputs.approval_sha256 }}
+          SUBS_BOT_PROVIDER_RECONCILE_TRUSTED_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_RECONCILE_APPROVAL }}
+          SUBS_BOT_PROVIDER_RECONCILE_PLAN_JSON: ${{ needs.inspect.outputs.plan_json }}
+          SUBS_BOT_PROVIDER_RECONCILE_ARCHIVE_PAYLOAD_SHA256: ${{ needs.inspect.outputs.archive_payload_sha256 }}
+          SUBS_BOT_PROVIDER_RECONCILE_LIVE_PAYLOAD_SHA256: ${{ needs.inspect.outputs.live_payload_sha256 }}
+          SUBS_BOT_PROVIDER_RECONCILE_RESOLUTION_SHA256: ${{ needs.archive.outputs.resolution_sha256 }}
+          SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_TRUSTED_ARCHIVE_REFS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+          SUBS_BOT_PROVIDER_DIGEST_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_APPROVAL }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_MUTATION_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_LEDGER_JSON }}
+          SUBS_BOT_PROVIDER_MUTATION_RESOLUTIONS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_RESOLUTIONS_JSON }}
+          SUBS_BOT_PROVIDER_MUTATION_RECONCILED_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_RECONCILED_JSON }}
+          SUBS_BOT_PROVIDER_MUTATION_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_CONTROLLERS_JSON }}
+          SUBS_BOT_PROVIDER_NEXT_TARGET_KEYS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_NEXT_TARGET_KEYS_JSON }}
+          SUBS_BOT_PROVIDER_NEXT_TARGET_KEY_PINS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_NEXT_TARGET_KEY_PINS_JSON }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+        working-directory: candidate
+        run: python3 -B worker/tools/provider_private_mutation_reconcile.py
+      - name: Upload sealed archive ledger only
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: provider-reconciled-ledger-archive-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/provider-next-target-archive.json
+          if-no-files-found: error
+          retention-days: 1
+      - name: Upload sealed live ledger only
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: provider-reconciled-ledger-live-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/provider-next-target-live.json
+          if-no-files-found: error
+          retention-days: 1
