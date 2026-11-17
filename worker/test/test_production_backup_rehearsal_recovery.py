@@ -40,6 +40,9 @@ class RehearsalRecoveryTests(unittest.TestCase):
                 recovery.require_recovery_budget(11, 20)
             with self.assertRaises(ContractError):
                 recovery.require_recovery_budget(True, 0)
+            response.read.return_value = b'{"resources":{"core":{"remaining":700,"reset":9999999999}}}'
+            with self.assertRaises(ContractError):
+                recovery.require_recovery_budget(11, 0)  # 50-item pagination requires 737 requests of headroom
 
     def test_each_recovery_action_requires_approval_and_one_exclusive_stage_claim(self):
         from hashlib import sha256

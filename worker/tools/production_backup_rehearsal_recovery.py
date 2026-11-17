@@ -26,7 +26,9 @@ def require_recovery_budget(child_count, writer_count):
     """Fail before a claim if the remaining hosted API quota cannot cover rechecks."""
     require(type(child_count) is int and 0 <= child_count <= len(core.STEPS)
             and type(writer_count) is int and 0 <= writer_count < 127)
-    needed = 2 * child_count * child_count + 10 * child_count + 30 * (writer_count + 1) + 300
+    # Child discovery may need eleven 50-item pages at its fixed 500-run
+    # bound; reserve that extra pagination cost before the first claim.
+    needed = 2 * child_count * child_count + 15 * child_count + 30 * (writer_count + 1) + 300
     request = Request("https://api.github.com/rate_limit", headers={"Accept": "application/vnd.github+json",
         "Authorization": "Bearer " + github._github_token(), "Cache-Control": "no-cache",
         "X-GitHub-Api-Version": "2022-11-28"})
