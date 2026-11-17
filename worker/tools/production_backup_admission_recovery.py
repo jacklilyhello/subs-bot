@@ -422,8 +422,15 @@ if __name__ == "__main__":
     try:
         os.umask(0o077)
         action = os.environ.get("BACKUP_ADMISSION_ACTION", "complete")
-        require(action in {"complete", "plan-aborted", "execute-aborted"})
-        result = run(os.environ) if action == "complete" else aborted_plan_or_execute(os.environ, execute=action == "execute-aborted")
+        require(action in {"complete", "plan-aborted", "execute-aborted", "plan-phase-early", "execute-phase-early",
+                           "plan-phase-early-resume", "execute-phase-early-resume", "inspect-phase-early-freeze"})
+        if action in {"plan-phase-early", "execute-phase-early", "plan-phase-early-resume", "execute-phase-early-resume", "inspect-phase-early-freeze"}:
+            from trusted_backup_phase_early_cleanup import run as early_run
+            result = early_run(os.environ, execute=action in {"execute-phase-early", "execute-phase-early-resume"},
+                               resume=action in {"plan-phase-early-resume", "execute-phase-early-resume"},
+                               inspect_frozen=action == "inspect-phase-early-freeze")
+        else:
+            result = run(os.environ) if action == "complete" else aborted_plan_or_execute(os.environ, execute=action == "execute-aborted")
         print(json.dumps(result, sort_keys=True))
         if os.environ.get("GITHUB_OUTPUT"):
             with open(os.environ["GITHUB_OUTPUT"], "a", encoding="ascii") as output:
