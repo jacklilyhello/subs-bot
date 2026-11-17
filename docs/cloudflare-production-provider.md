@@ -78,6 +78,8 @@
 
 先用从未使用的十进制 operation ID、准确 CI run 执行 `plan`；plan 只读且返回绑定准确控制提交、完整目标、原 CI pins、桶身份、完整历史盘点和空前态的 `approvalSha256`。独立审查后在新 dispatch 的 `seal` 提交相同 ID 和精确批准摘要。seal 在同一受保护 job 核验原 CI、原 ZIP 及完整 OCI，不上传原件；写入前核对有界历史，拒绝已用 ID 和任何之前未成功的 seal，然后先向 R2 写入并读回不可变 `started-unknown` intent，再单次封存 chunks 和 manifest。未知写入不得重试；任一先前 seal 失败、取消或状态不明时，后续全部 seal 都会拒绝，直到形成另行审查的独立对账方案。必须保留该工作流 run 记录，历史被删除或不可完整查询时不能据此认定安全。原件封存后用新的 [独立读回工作流](../.github/workflows/worker-production-provider-source-readback.yml) 输入 operation ID（作为 `archive_run_id`）、attempt `1` 和独立记录的 manifest/target 摘要完成 R2-only 核验。该流程仍需代码审查和云端隔离验证，封存不代表 Provider 的生产发布验收。
 
+[失败只读检查](../.github/workflows/worker-production-provider-source-reconcile.yml) 可在新 dispatch 固定失败 run 和 operation ID，独立读取 GitHub job 与完整 R2 目录。仅当原 seal 步骤明确 skipped 且前缀为空时报告该步骤未执行；步骤已运行时，空前缀不能证明写入未发生。若已有完整原件，提供独立记录的 manifest/target 摘要可复验 CI、ZIP、OCI 并报告“失败 run 的完整原件已观察到”，不将失败 run 改成成功。部分 intent、缺块或不明状态保留并继续阻断。检查只输出证据摘要，不写 R2、不批准重试、不自动解除阻断；后续恢复必须另行制定并批准。
+
 当前完整盘点最多 32 份历史 source archive，plan 返回数量和上限；达到上限时在写入前拒绝，不删除旧档。扩容须先审查并实现可分页、分段登记和完整性验证，保留现有全部 pins。这个历史容量界限与单条 previous 链最多九代是两项不同限制。
 
 尚未绑定任何应用 caller 的 Provider 可以通过明确 `previous` 链修复/升级。操作前再次核对 Beta `references.workers=[]`，上一代资源身份、已完成 smoke 和 stopped/无 active instance；保留既有资源和版本。已绑定应用的 Provider 不能使用这个无 caller 升级路径：必须先制定并批准主应用冻结、排空及依赖更新计划，不能从一次空闲样本推断 caller 已暂停。主应用缺少正式依赖 pin 或依赖不符时仍拒绝激活 URL 导入/刷新。

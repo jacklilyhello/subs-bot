@@ -17,6 +17,7 @@ import production_provider as control
 
 SEAL_WORKFLOW = ".github/workflows/worker-production-provider-source.yml"
 READBACK_WORKFLOW = ".github/workflows/worker-production-provider-source-readback.yml"
+RECONCILE_WORKFLOW = ".github/workflows/worker-production-provider-source-reconcile.yml"
 
 
 def seal_context(workflow=SEAL_WORKFLOW, *, mutation=True):
@@ -97,15 +98,15 @@ def production_manifest(store, expected):
     return manifest, config
 
 
-def production_inventory(store, bucket):
-    """List every registered source intent; an incomplete/unknown entry blocks writes."""
+def list_private_keys(store, prefix):
+    """Bounded S3 listing with an explicit, verified terminal page."""
     store.verify()
     identity = sealed.verified_token_identity(store.api, store.target["accountId"])
     host = store.target["accountId"] + ".r2.cloudflarestorage.com"
     path = "/" + quote(store.bucket, safe="-_.~")
     rows, cursor, seen_cursors = [], None, set()
     for _page in range(16):
-        query = {"list-type": "2", "prefix": sealed.BASE, "max-keys": "1000"}
+        query = {"list-type": "2", "prefix": prefix, "max-keys": "1000"}
         if cursor is not None:
             query["continuation-token"] = cursor
         canonical_query = urlencode(sorted(query.items()), quote_via=quote, safe="-_.~")
@@ -139,7 +140,7 @@ def production_inventory(store, bucket):
         truncated = root.findall(ns + "IsTruncated")
         prefixes = root.findall(ns + "Prefix")
         control.require(len(truncated) == 1 and truncated[0].text in {"true", "false"}
-                        and len(prefixes) == 1 and prefixes[0].text == sealed.BASE
+                        and len(prefixes) == 1 and prefixes[0].text == prefix
                         and not root.findall(ns + "CommonPrefixes"))
         batch = []
         for entry in root.findall(ns + "Contents"):
@@ -158,10 +159,15 @@ def production_inventory(store, bucket):
         seen_cursors.add(cursor)
     else:
         raise control.ProviderError("Provider source archive listing exceeds its safe page limit.")
+    return [row["key"] for row in rows]
+
+
+def production_inventory(store, bucket, *, inspect_operation=None):
+    """List every registered source intent; an incomplete/unknown entry blocks writes."""
+    rows = list_private_keys(store, sealed.BASE)
     grouped = {}
     for row in rows:
-        key = row.get("key") if isinstance(row, dict) else None
-        match = re.fullmatch(re.escape(sealed.BASE) + r"([1-9][0-9]*)/1/(source-intent\.json|source-manifest\.json|blobs/[0-9a-f]{64})", key or "")
+        match = re.fullmatch(re.escape(sealed.BASE) + r"([1-9][0-9]*)/1/(source-intent\.json|source-manifest\.json|blobs/[0-9a-f]{64})", row)
         control.require(match is not None)
         grouped.setdefault(match.group(1), set())
         control.require(match.group(2) not in grouped[match.group(1)])
@@ -169,6 +175,8 @@ def production_inventory(store, bucket):
     control.require(len(grouped) <= 32, "Production Provider source archive inventory exceeds its safe bound.")
     completed = {}
     for operation_id, keys in grouped.items():
+        if operation_id == inspect_operation:
+            continue
         control.require({"source-intent.json", "source-manifest.json"} <= keys,
                         "A previous source seal is incomplete or its result is unknown.")
         existing = ProductionStore(control.canonical(bucket), store.token, operation_id, "1")
@@ -190,6 +198,8 @@ def production_inventory(store, bucket):
             control.require(sealed.read_record(existing, manifest, "provider-source-archive.zip", output) == target["build"]["archiveSha256"])
         completed[operation_id] = {"intentSha256": sha256(intent_raw).hexdigest(), "manifestSha256": sha256(manifest_raw).hexdigest(),
                                    "runId": intent["runId"], "controllerRevision": intent["controllerRevision"]}
+    if inspect_operation is not None:
+        return completed, grouped.get(inspect_operation, set())
     return completed
 
 
@@ -395,6 +405,93 @@ def verify_production():
                       "ledgerRecord": inventory[store.run_id]}, sort_keys=True))
 
 
+def failed_seal_origin(operation_id, run_id, controllers):
+    """Read the exact failed workflow attempt and its completed source job."""
+    control.require(control.match(control.provider.DECIMAL, operation_id) and control.match(control.provider.DECIMAL, run_id))
+    token = control.github._github_token()
+    run = control.github._get_json(f"/actions/runs/{run_id}/attempts/1", token)
+    revision = run.get("head_sha")
+    control.require(str(run.get("id")) == run_id and run.get("run_attempt") == 1
+                    and run.get("path") in (SEAL_WORKFLOW, SEAL_WORKFLOW + "@main", SEAL_WORKFLOW + "@refs/heads/main")
+                    and run.get("event") == "workflow_dispatch" and run.get("display_title") == "Provider source seal " + operation_id
+                    and run.get("status") == "completed" and run.get("conclusion") in {"failure", "cancelled", "timed_out"}
+                    and run.get("head_branch") == "main" and revision in controllers
+                    and all(isinstance(run.get(key), dict) and run[key].get("id") == control.github.REPOSITORY_ID
+                            for key in ("repository", "head_repository")))
+    source_ancestor({"revision": revision}, token)
+    result = control.github._get_json(f"/actions/runs/{run_id}/attempts/1/jobs?per_page=100", token)
+    jobs = result.get("jobs")
+    control.require(isinstance(jobs, list) and result.get("total_count") == len(jobs) == 1)
+    job = jobs[0]
+    control.require(isinstance(job, dict) and job.get("name") == "source" and job.get("status") == "completed"
+                    and isinstance(job.get("steps"), list))
+    steps = [step for step in job["steps"] if isinstance(step, dict)
+             and step.get("name") == "Seal once after exact approval and durable intent"]
+    control.require(len(steps) == 1 and steps[0].get("status") == "completed"
+                    and steps[0].get("conclusion") in {"skipped", "failure", "cancelled", "success"})
+    return {"runId": run_id, "controllerRevision": revision, "runConclusion": run["conclusion"],
+            "sealStepConclusion": steps[0]["conclusion"]}
+
+
+def inspect_production_failure():
+    """Diagnose an exact failed seal using GET only; never resolve or replay it."""
+    seal_context(RECONCILE_WORKFLOW, mutation=False)
+    operation_id = os.environ.get("SUBS_BOT_PROVIDER_SOURCE_OPERATION_ID", "")
+    run_id = os.environ.get("SUBS_BOT_PROVIDER_SOURCE_FAILED_RUN_ID", "")
+    bucket = control.github._parse_object(os.environ.get("SUBS_BOT_PROVIDER_ARCHIVE_BUCKET_JSON", ""), sealed.ERROR)
+    store = ProductionStore(control.canonical(bucket), os.environ.get("SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN", ""), operation_id, "1")
+    completed, keys = production_inventory(store, bucket, inspect_operation=operation_id)
+    ledger = source_ledger()
+    control.require(completed == {key: value for key, value in ledger.items() if key != operation_id})
+    origin = failed_seal_origin(operation_id, run_id, trusted_controllers())
+    projection = {"version": 1, "kind": "provider-source-failure-readback", "operationId": operation_id,
+                  "bucketSha256": control.digest(bucket), "origin": origin, "objectCount": len(keys)}
+    if not keys:
+        # A failed step may have an unconfirmed write even if a later GET is empty.
+        control.require(origin["sealStepConclusion"] == "skipped",
+                        "The seal step ran and its empty prefix is not proof that no write was dispatched.")
+        projection["classification"] = "seal-step-not-dispatched"
+    elif {"source-intent.json", "source-manifest.json"} <= keys:
+        expected = os.environ.get("SUBS_BOT_PROVIDER_ARCHIVE_MANIFEST_SHA256", "")
+        target_sha = os.environ.get("SUBS_BOT_PROVIDER_ARCHIVE_TARGET_SHA256", "")
+        control.require(control.match(control.provider.HEX, expected) and control.match(control.provider.HEX, target_sha))
+        all_completed = production_inventory(store, bucket)
+        record = all_completed.get(operation_id)
+        control.require(isinstance(record, dict) and record["manifestSha256"] == expected
+                        and record["runId"] == run_id and record["controllerRevision"] == origin["controllerRevision"]
+                        and (operation_id not in ledger or ledger[operation_id] == record))
+        manifest, config = production_manifest(store, expected)
+        control.require(control.digest(config) == target_sha)
+        build = config["build"]
+        token = control.github._github_token()
+        source_ancestor(build, token)
+        control.github.verify_main_run(build["runId"], build["revision"], token,
+            workflow_id=control.provenance.WORKFLOW_ID, workflow_path=control.provenance.WORKFLOW_PATH,
+            workflow_label="Provider Fetch CI", run_attempt=build["runAttempt"])
+        with tempfile.TemporaryDirectory(prefix=".provider-failure-readback-", dir=os.environ["RUNNER_TEMP"]) as temporary:
+            root = Path(temporary)
+            original, staged = root / "source.zip", root / "verified"
+            with control.provenance._write_private(original) as output:
+                control.require(sealed.read_record(store, manifest, "provider-source-archive.zip", output) == build["archiveSha256"])
+            staged.mkdir(mode=0o700)
+            control.provenance._unpack(original, staged)
+            with control.provenance.source_requirements(build["revision"]) as requirements:
+                release = control.provider.verify_release(staged, build["revision"], ref=control.github.MAIN_REF,
+                    run_id=build["runId"], run_attempt=build["runAttempt"], requirements=requirements)
+            control.require(all(release[key] == build[key] for key in control.publication.MANIFEST_FIELDS))
+        projection.update({"classification": "complete-original-observed-failed-run", "ledgerRecord": record,
+                           "targetSha256": target_sha})
+    else:
+        projection["classification"] = "incomplete-or-unknown"
+        intent = store.read("source-intent.json") if "source-intent.json" in keys else None
+        if intent is not None:
+            projection["intentSha256"] = sha256(intent).hexdigest()
+    store.verify()
+    control.github.require_current_main(os.environ["GITHUB_SHA"])
+    # A readback is evidence, never authority to replay or to mark a failed run successful.
+    print(json.dumps({**projection, "readbackSha256": control.digest(projection), "retryAuthorized": False}, sort_keys=True))
+
+
 def restore():
     refs = json.loads(os.environ.get("SUBS_BOT_PROVIDER_ARCHIVE_REFS", ""), object_pairs_hook=control.github._unique_json_object)
     control.require(isinstance(refs, list) and 0 < len(refs) <= 9)
@@ -468,6 +565,8 @@ if __name__ == "__main__":
             production_seal_action(False)
         elif os.environ.get("SUBS_BOT_PROVIDER_SOURCE_ACTION") == "verify-production":
             verify_production()
+        elif os.environ.get("SUBS_BOT_PROVIDER_SOURCE_ACTION") == "inspect-production-failure":
+            inspect_production_failure()
         else:
             restore()
     except (ValueError, KeyError, OSError, TypeError):

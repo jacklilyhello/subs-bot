@@ -2,9 +2,9 @@
 
 from copy import deepcopy
 from base64 import b64encode
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stdout
 from hashlib import sha1, sha256
-from io import BytesIO
+from io import BytesIO, StringIO
 import json
 import os
 from pathlib import Path
@@ -178,6 +178,39 @@ class DurableSourceTests(unittest.TestCase):
 
 
 class OriginalAttemptMetadataTests(unittest.TestCase):
+    def test_failed_seal_readback_never_writes_and_never_authorizes_retry(self):
+        origin = {"runId": "102", "controllerRevision": "b" * 40, "runConclusion": "failure",
+                  "sealStepConclusion": "skipped"}
+        env = {"SUBS_BOT_PROVIDER_SOURCE_OPERATION_ID": "1001", "SUBS_BOT_PROVIDER_SOURCE_FAILED_RUN_ID": "102",
+               "SUBS_BOT_PROVIDER_ARCHIVE_BUCKET_JSON": "{}", "GITHUB_SHA": "c" * 40}
+        store = Mock()
+        output = StringIO()
+        with patch.dict(os.environ, env, clear=True), patch.object(durable, "seal_context"), \
+                patch.object(durable, "ProductionStore", return_value=store), \
+                patch.object(durable, "production_inventory", return_value=({}, set())), \
+                patch.object(durable, "source_ledger", return_value={}), patch.object(durable, "trusted_controllers", return_value=[]), \
+                patch.object(durable, "failed_seal_origin", return_value=origin), \
+                patch.object(control.github, "require_current_main"), redirect_stdout(output):
+            durable.inspect_production_failure()
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["classification"], "seal-step-not-dispatched")
+        self.assertFalse(result["retryAuthorized"])
+        store.put.assert_not_called()
+
+    def test_missing_intent_after_executed_seal_never_proves_no_dispatch(self):
+        origin = {"runId": "102", "controllerRevision": "b" * 40, "runConclusion": "failure",
+                  "sealStepConclusion": "failure"}
+        env = {"SUBS_BOT_PROVIDER_SOURCE_OPERATION_ID": "1001", "SUBS_BOT_PROVIDER_SOURCE_FAILED_RUN_ID": "102",
+               "SUBS_BOT_PROVIDER_ARCHIVE_BUCKET_JSON": "{}", "GITHUB_SHA": "c" * 40}
+        store = Mock()
+        with patch.dict(os.environ, env, clear=True), patch.object(durable, "seal_context"), \
+                patch.object(durable, "ProductionStore", return_value=store), \
+                patch.object(durable, "production_inventory", return_value=({}, set())), \
+                patch.object(durable, "source_ledger", return_value={}), patch.object(durable, "trusted_controllers", return_value=[]), \
+                patch.object(durable, "failed_seal_origin", return_value=origin), self.assertRaises(control.ProviderError):
+            durable.inspect_production_failure()
+        store.put.assert_not_called()
+
     def test_historical_requirements_are_commit_pinned_and_blob_verified(self):
         revision = "b" * 40
         raw = b"historical-dependency==1.0\n"

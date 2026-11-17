@@ -39,7 +39,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: subs-bot-production-provider-${{ inputs.target_environment }}
+  group: ${{ inputs.target_environment == 'rehearsal' && 'subs-bot-provider-isolation' || 'subs-bot-production-provider-production' }}
   cancel-in-progress: false
 
 jobs:
