@@ -92,7 +92,9 @@ jobs:
           SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
           SUBS_BOT_CF_R2_CREATE_TOKEN: ${{ inputs.action == 'create-objects' && secrets.SUBS_BOT_CF_R2_CREATE_TOKEN || '' }}
           SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_SCOPED_R2_EXTRA_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_EXTRA_READ_JSON }}
           SUBS_BOT_SCOPED_R2_WRITE_JSON: ${{ !contains(fromJSON('["inspect","verify-backup"]'), inputs.action) && secrets.SUBS_BOT_SCOPED_R2_WRITE_JSON || '' }}
+          SUBS_BOT_SCOPED_R2_EXTRA_WRITE_JSON: ${{ !contains(fromJSON('["inspect","verify-backup"]'), inputs.action) && secrets.SUBS_BOT_SCOPED_R2_EXTRA_WRITE_JSON || '' }}
           SUBS_BOT_CF_DEPENDENCY_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPENDENCY_READ_TOKEN }}
           SUBS_BOT_APPROVAL_JSON: ${{ inputs.rehearsal_registration_sha256 == '' && secrets.SUBS_BOT_APPROVAL_JSON || '' }}
           SUBS_BOT_RECOVERY_JSON: ${{ secrets.SUBS_BOT_RECOVERY_JSON }}

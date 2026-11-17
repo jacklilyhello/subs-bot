@@ -14,7 +14,7 @@ from time import monotonic
 from urllib.parse import quote
 from xml.etree import ElementTree
 
-from production_target import parsed, require
+from production_target import canonical, parsed, require
 
 MAX_OBJECT = 16 * 1024 * 1024
 MAX_LIST = 2 * 1024 * 1024
@@ -23,7 +23,9 @@ MAX_LIST = 2 * 1024 * 1024
 def metadata_token(env=None):
     env = os.environ if env is None else env
     token = env.get("SUBS_BOT_CF_R2_METADATA_READ_TOKEN", "")
-    require(token or not (env.get("SUBS_BOT_SCOPED_R2_READ_JSON") or env.get("SUBS_BOT_SCOPED_R2_WRITE_JSON")),
+    require(token or not any(env.get(key) for key in (
+        "SUBS_BOT_SCOPED_R2_READ_JSON", "SUBS_BOT_SCOPED_R2_WRITE_JSON",
+        "SUBS_BOT_SCOPED_R2_EXTRA_READ_JSON", "SUBS_BOT_SCOPED_R2_EXTRA_WRITE_JSON")),
             "A separate R2 metadata credential is required with scoped object credentials.")
     return token
 
@@ -33,7 +35,8 @@ def creation_token(fallback, env=None):
     env = os.environ if env is None else env
     token = env.get("SUBS_BOT_CF_R2_CREATE_TOKEN", "")
     scoped = any(env.get(key) for key in (
-        "SUBS_BOT_SCOPED_R2_READ_JSON", "SUBS_BOT_SCOPED_R2_WRITE_JSON", "SUBS_BOT_CF_R2_METADATA_READ_TOKEN"))
+        "SUBS_BOT_SCOPED_R2_READ_JSON", "SUBS_BOT_SCOPED_R2_WRITE_JSON", "SUBS_BOT_CF_R2_METADATA_READ_TOKEN",
+        "SUBS_BOT_SCOPED_R2_EXTRA_READ_JSON", "SUBS_BOT_SCOPED_R2_EXTRA_WRITE_JSON"))
     require(token or not scoped, "A separate approved R2 creation credential is required with scoped storage credentials.")
     return token or fallback
 
@@ -81,11 +84,26 @@ def _credential(raw, bucket, *, required):
 
 def from_environment(account, bucket, env=None):
     env = os.environ if env is None else env
-    read = env.get("SUBS_BOT_SCOPED_R2_READ_JSON", "")
-    write = env.get("SUBS_BOT_SCOPED_R2_WRITE_JSON", "")
+    read = _combined_credentials(env.get("SUBS_BOT_SCOPED_R2_READ_JSON", ""), env.get("SUBS_BOT_SCOPED_R2_EXTRA_READ_JSON", ""))
+    write = _combined_credentials(env.get("SUBS_BOT_SCOPED_R2_WRITE_JSON", ""), env.get("SUBS_BOT_SCOPED_R2_EXTRA_WRITE_JSON", ""))
     if not read and not write:
         return None
     return ScopedR2(account, bucket, _credential(read, bucket, required=True), _credential(write, bucket, required=False))
+
+
+def _combined_credentials(primary, additional):
+    """Append separately injected target credentials without replacing old keys."""
+    if not additional:
+        return primary
+    base, extra = parsed(primary) if primary else {}, parsed(additional)
+    require(extra and not set(base).intersection(extra) and len(base) + len(extra) <= 32,
+            "Additional bucket credentials must be nonempty, disjoint and bounded.")
+    combined = canonical({**base, **extra})
+    for name in (*base, *extra):
+        require(re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", name) is not None,
+                "Additional bucket credential names are invalid.")
+        _credential(combined, name, required=True)
+    return combined
 
 
 class ScopedR2:

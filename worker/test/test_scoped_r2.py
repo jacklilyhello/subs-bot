@@ -31,6 +31,37 @@ def page(keys, *, truncated="false", cursor=None, prefix="test/"):
 
 
 class ScopedR2Tests(unittest.TestCase):
+    def test_new_restore_credentials_append_without_exposing_or_replacing_originals(self):
+        restored = "subs-bot-cf-restore-example"
+        reader = {"accessKeyId": "d" * 32, "secretAccessKey": "e" * 64}
+        writer = {"accessKeyId": "f" * 32, "secretAccessKey": "a" * 64}
+        env = {"SUBS_BOT_SCOPED_R2_READ_JSON": json.dumps({BUCKET: CREDENTIAL}),
+               "SUBS_BOT_SCOPED_R2_EXTRA_READ_JSON": json.dumps({restored: reader}),
+               "SUBS_BOT_SCOPED_R2_EXTRA_WRITE_JSON": json.dumps({restored: writer})}
+        self.assertEqual(scoped_r2.from_environment(ACCOUNT, BUCKET, env).read_credential, CREDENTIAL)
+        target = scoped_r2.from_environment(ACCOUNT, restored, env)
+        self.assertEqual((target.read_credential, target.write_credential), (reader, writer))
+        readonly = {key: value for key, value in env.items() if key != "SUBS_BOT_SCOPED_R2_EXTRA_WRITE_JSON"}
+        target = scoped_r2.from_environment(ACCOUNT, restored, readonly)
+        self.assertIsNone(target.write_credential)
+        with self.assertRaises(ContractError):
+            target.put_once(KEY, b"synthetic")
+
+    def test_additions_reject_overlap_malformed_data_and_missing_bucket_without_fallback(self):
+        primary = json.dumps({BUCKET: CREDENTIAL})
+        for extra in (primary, "{}", '{"invalid":{}}', "not-json",
+                      json.dumps({"fixture-bucket-" + str(index): CREDENTIAL for index in range(33)})):
+            with self.subTest(extra=extra[:40]), self.assertRaises(ContractError):
+                scoped_r2.from_environment(ACCOUNT, BUCKET, {"SUBS_BOT_SCOPED_R2_READ_JSON": primary,
+                    "SUBS_BOT_SCOPED_R2_EXTRA_READ_JSON": extra})
+        with self.assertRaises(ContractError):
+            scoped_r2.from_environment(ACCOUNT, "missing-bucket", {"SUBS_BOT_SCOPED_R2_EXTRA_READ_JSON": primary})
+        for key in ("SUBS_BOT_SCOPED_R2_EXTRA_READ_JSON", "SUBS_BOT_SCOPED_R2_EXTRA_WRITE_JSON"):
+            with self.subTest(key=key), self.assertRaises(ContractError):
+                scoped_r2.metadata_token({key: primary})
+            with self.subTest(key=key), self.assertRaises(ContractError):
+                scoped_r2.creation_token("synthetic-d1-token", {key: primary})
+
     def test_signature_matches_the_published_aws_s3_vector(self):
         # Public example from AWS's SigV4 S3 header-authentication reference.
         headers = scoped_r2._sign("GET", "examplebucket.s3.amazonaws.com", "/test.txt", "", {"range": "bytes=0-9"},
