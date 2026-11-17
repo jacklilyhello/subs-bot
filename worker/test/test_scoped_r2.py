@@ -11,6 +11,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import scoped_r2
 import production_storage
+import production_control
 import archive_production_provider
 import native_restore_rehearsal
 from production_target import ContractError
@@ -126,6 +127,21 @@ class ScopedR2Tests(unittest.TestCase):
             self.assertEqual(store.get(KEY), b"registered")
         privacy.assert_called_once_with(metadata, "/metadata", BUCKET, "created")
         objects.get.assert_called_once_with(KEY, absent=False, limit=512 * 1024)
+        source.assert_not_called()
+
+    def test_controller_privacy_reads_bucket_metadata_with_separate_token(self):
+        from unittest.mock import Mock
+        root = "/accounts/" + ACCOUNT
+        source = Mock(target={"accountId": ACCOUNT}, root=root)
+        metadata = Mock(root=root)
+        metadata.side_effect = [{"name": BUCKET, "creation_date": "created", "jurisdiction": "default"},
+                                {"enabled": False}, {"domains": []}, {"rules": []}]
+        with patch.dict(os.environ, {"SUBS_BOT_CF_R2_METADATA_READ_TOKEN": "metadata-only"}, clear=True), \
+             patch.object(production_control, "API", return_value=metadata) as make_api:
+            result = production_control.privacy(source, root, BUCKET, "created")
+        self.assertTrue(result["private"])
+        make_api.assert_called_once_with(source.target, "metadata-only")
+        self.assertEqual(metadata.call_count, 4)
         source.assert_not_called()
 
     def test_legacy_exclusive_intent_rejects_412_without_readback_or_retry(self):

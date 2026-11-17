@@ -236,6 +236,11 @@ def _mutate_sql(api, path, statements):
 
 
 def privacy(api, root, name, created):
+    metadata_token = os.environ.get("SUBS_BOT_CF_R2_METADATA_READ_TOKEN", "")
+    if metadata_token:
+        metadata_api = API(api.target, metadata_token)
+        require(metadata_api.root == root, "The bucket metadata account differs from the approved target.")
+        api = metadata_api
     path = root + "/r2/buckets/" + name
     identity = api("GET", path)
     require(isinstance(identity, dict) and identity.get("name") == name
