@@ -36,7 +36,8 @@ def require_mutation_enabled(env):
 
 def settings(raw):
     value = parsed(raw)
-    require(set(value) == {"version", "warningPercent", "pauseLimitSeconds", "overdueHours", "windowStartUtc", "windowMinutes", "frequencyHours"})
+    required = {"version", "warningPercent", "pauseLimitSeconds", "overdueHours", "windowStartUtc", "windowMinutes", "frequencyHours"}
+    require(required <= set(value) <= required | {"maximumPauseSeconds"})
     require(type(value["version"]) is int and value["version"] == 1
             and type(value["warningPercent"]) is int and 1 <= value["warningPercent"] <= 99
             and type(value["pauseLimitSeconds"]) is int and 60 <= value["pauseLimitSeconds"] <= 900
@@ -45,7 +46,25 @@ def settings(raw):
             and type(value["windowMinutes"]) is int and 1 <= value["windowMinutes"] <= 720
             and isinstance(value["windowStartUtc"], str)
             and re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value["windowStartUtc"]))
+    maximum_pause(value)
     return value
+
+
+def maximum_pause(policy):
+    """The alert threshold and the maximum permitted pause are distinct."""
+    maximum = policy.get("maximumPauseSeconds", 1800)
+    require(type(maximum) is int and 300 <= maximum <= 21600
+            and type(policy.get("pauseLimitSeconds")) is int and maximum >= policy["pauseLimitSeconds"])
+    return maximum
+
+
+def require_pause_window(events, policy):
+    pauses = [event for event in events if event.get("stage") == "pause-intent"]
+    now = int(time.time())
+    require(len(pauses) == 1 and type(pauses[0].get("timestamp")) is int
+            and 0 < pauses[0]["timestamp"] <= now
+            and now - pauses[0]["timestamp"] < maximum_pause(policy),
+            "The maximum pause elapsed; use the explicitly approved recovery path.")
 
 
 def session_input(env):
@@ -420,7 +439,7 @@ def emit_result(result, target, revision, root, *, source_revision=None):
     # GitHub logs and artifacts are visible to repository readers, so expose only
     # the exact predecessor digest and non-identifying operational aggregates.
     safe_keys = {"status", "action", "alerts", "latestVerifiedAt", "phase", "notification", "approvalAction",
-                 "stateSha256", "session", "day", "pauseSeconds", "pauseLimitExceeded", "capacity", "checkpointId", "manifestSha256",
+                 "stateSha256", "session", "day", "pauseSeconds", "pauseLimitExceeded", "capacity", "liveCapacity", "checkpointId", "manifestSha256",
                  "anchorPlanSha256", "candidateSha256", "genesisSha256", "historyPresent", "pointerPresent", "mutationPermitted"}
     observed = result.get("state")
     result = {key: value for key, value in result.items() if key in safe_keys}
@@ -468,6 +487,20 @@ def main(env=None):
                 result["alerts"].append("workflow-history-unknown")
         except Exception:
             result["alerts"].append("workflow-history-unknown")
+        try:
+            import production_backup_live_capacity as live_capacity
+            interval = int(env.get("MONITOR_CAPACITY_INTERVAL_MINUTES") or "15")
+            if live_capacity.due(env.get("GITHUB_EVENT_NAME", ""), env.get("MONITOR_SCHEDULE", ""), interval):
+                observed = live_capacity.sample(target, env.get("SUBS_BOT_CF_BACKUP_MONITOR_READ_TOKEN", ""),
+                    env.get("BACKUP_SOURCE_CHECKPOINT_ID", ""), env.get("BACKUP_SOURCE_MANIFEST_SHA256", ""),
+                    warning_percent=policy["warningPercent"], root=root, guard=lambda: artifact.require_current_main(revision))
+                result["liveCapacity"] = observed
+                result["alerts"] = sorted(set(result["alerts"]) | set(live_capacity.alerts(observed)))
+            else:
+                result["liveCapacity"] = {"status": "not-due", "intervalMinutes": interval}
+        except Exception:
+            result["liveCapacity"] = {"status": "unknown", "snapshot": False}
+            result["alerts"] = sorted(set(result["alerts"]) | {"live-capacity-unknown"})
         result["status"] = "alert" if result["alerts"] else "ok"
         return emit_result(result, target, revision, root)
     contract = recovery.recovery_contract(env.get("SUBS_BOT_RECOVERY_JSON", ""), target.data)
@@ -656,11 +689,17 @@ def main(env=None):
                 result = {"status": "drained", "action": action, "state": state}
             elif action == "freeze":
                 last(events, "paused")
+                require_pause_window(events, policy)
+                def freeze_guard():
+                    guard()
+                    require_pause_window(events, policy)
+                ctl.guard = freeze_guard
                 require(state["control"] == events[-1]["details"]["control"]
                         and state["release"] == events[0]["details"]["release"]
                         and state["configurationSha256"] == events[0]["details"]["configurationSha256"])
                 predecessor = exact_predecessor(env, state)
                 ctl.approval(env.get("SUBS_BOT_APPROVAL_JSON", ""), "freeze", predecessor)
+                freeze_guard()
                 journal.append("freeze-intent", intent_metadata(env, state), int(time.time()))
                 after = ctl.transition("freeze", env.get("SUBS_BOT_APPROVAL_JSON", ""), predecessor)
                 journal.append("frozen", {"control": after["control"]}, int(time.time()))
@@ -738,6 +777,11 @@ def main(env=None):
                               "pauseLimitExceeded": elapsed > policy["pauseLimitSeconds"]}
             elif action == "capture":
                 last(events, "frozen-data")
+                require_pause_window(events, policy)
+                def capture_guard():
+                    guard()
+                    require_pause_window(events, policy)
+                source.guard = capture_guard
                 frozen_matches(events, state)
                 predecessor = exact_predecessor(env, state)
                 for name, key in (("prepare", "SUBS_BOT_BACKUP_PREPARE_APPROVAL_JSON"), ("capture", "SUBS_BOT_BACKUP_CAPTURE_APPROVAL_JSON")):
@@ -746,6 +790,7 @@ def main(env=None):
                 recovery_journal = recovery.RecoveryJournal(api, owner, guard=guard)
                 recovery_journal.load()
                 require(recovery_journal.value is None, "The capture checkpoint already exists; reconcile instead of restarting.")
+                capture_guard()
                 journal.append("capture-intent", {**intent_metadata(env, state), "checkpointId": contract["checkpointId"]}, int(time.time()))
                 try:
                     engine = recovery.RecoveryEngine(api, source, recovery_journal, directory)

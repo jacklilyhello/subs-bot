@@ -19,6 +19,7 @@ from production_lifecycle_drill import configuration, ORIGINAL_SERVICE, SERVICE
 from production_storage import PrivateStore
 from production_target import require, parsed, validate_target
 from production_backup_transaction import Anchor, Transaction, interruption
+import production_backup_live_capacity as live_capacity
 
 WORKFLOW = ".github/workflows/worker-production-lifecycle-rehearsal.yml"
 MONITOR_WORKFLOW = "jacklilyhello/subs-bot/.github/workflows/worker-backup-monitor.yml@refs/heads/main"
@@ -200,6 +201,22 @@ def main():
         if not normally_running:
             result["alerts"] = sorted(set(result["alerts"]) | {"maintenance-transaction-unresolved"})
             result["status"] = "alert"
+    try:
+        interval = int(os.environ.get("MONITOR_CAPACITY_INTERVAL_MINUTES") or "15")
+        if live_capacity.due(os.environ.get("GITHUB_EVENT_NAME", ""), os.environ.get("MONITOR_SCHEDULE", ""), interval):
+            warning = int(os.environ.get("MONITOR_WARNING_PERCENT") or "80")
+            observed = live_capacity.sample(target, os.environ.get("SUBS_BOT_CF_BOOTSTRAP_TOKEN", ""),
+                os.environ.get("DRILL_BACKUP_SOURCE_CHECKPOINT_ID", ""),
+                os.environ.get("DRILL_BACKUP_SOURCE_MANIFEST_SHA256", ""), warning_percent=warning,
+                root=os.environ.get("RUNNER_TEMP", ""), guard=lambda: github.require_current_main(revision))
+            result["liveCapacity"] = observed
+            result["alerts"] = sorted(set(result["alerts"]) | set(live_capacity.alerts(observed)))
+        else:
+            result["liveCapacity"] = {"status": "not-due", "intervalMinutes": interval}
+    except Exception:
+        result["liveCapacity"] = {"status": "unknown", "snapshot": False}
+        result["alerts"] = sorted(set(result["alerts"]) | {"live-capacity-unknown"})
+    result["status"] = "alert" if result["alerts"] else "ok"
     github.require_current_main(revision)
     return result
 

@@ -64,6 +64,15 @@ class HeadGuardTests(unittest.TestCase):
         self.assertNotIn("synthetic-private", str(projected))
         self.assertNotIn("synthetic-secret", str(projected))
 
+    def test_live_capacity_projection_excludes_table_details(self):
+        value = harness.public_result({"status": "observed", "liveCapacity": {"rows": 123,
+            "snapshot": False, "rowStatus": "normal", "tableCounts": {"private-name": 1},
+            "unexpected": "private-data"}})
+        self.assertEqual(value["liveCapacity"]["rows"], 123)
+        self.assertIs(value["liveCapacity"]["snapshot"], False)
+        self.assertNotIn("private-name", str(value))
+        self.assertNotIn("private-data", str(value))
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)

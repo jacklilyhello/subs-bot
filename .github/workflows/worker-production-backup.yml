@@ -3,7 +3,10 @@ run-name: Production backup ${{ github.event_name == 'schedule' && 'monitor' || 
 
 on:
   schedule:
-    - cron: '17 * * * *'
+    - cron: '3 * * * *'
+    - cron: '18 * * * *'
+    - cron: '33 * * * *'
+    - cron: '48 * * * *'
   workflow_dispatch:
     inputs:
       action:
@@ -69,6 +72,10 @@ jobs:
           SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
           SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
           BACKUP_ACTION: monitor
+          MONITOR_SCHEDULE: ${{ github.event.schedule }}
+          MONITOR_CAPACITY_INTERVAL_MINUTES: ${{ vars.SUBS_BOT_PRODUCTION_CAPACITY_INTERVAL_MINUTES || '15' }}
+          BACKUP_SOURCE_CHECKPOINT_ID: ${{ inputs.source_checkpoint_id || vars.SUBS_BOT_PRODUCTION_BACKUP_SOURCE_CHECKPOINT_ID }}
+          BACKUP_SOURCE_MANIFEST_SHA256: ${{ inputs.source_manifest_sha256 || vars.SUBS_BOT_PRODUCTION_BACKUP_SOURCE_MANIFEST_SHA256 }}
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           umask 077

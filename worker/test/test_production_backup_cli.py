@@ -83,6 +83,21 @@ class ProductionBackupTests(unittest.TestCase):
             with self.subTest(update=update), self.assertRaises(ContractError):
                 backup.settings(json.dumps({**self.policy, **update}))
 
+    def test_pause_alarm_is_distinct_from_bounded_maximum(self):
+        legacy = backup.settings(json.dumps(self.policy))
+        self.assertEqual(legacy, self.policy)
+        self.assertEqual(backup.maximum_pause(legacy), 1800)
+        extended = backup.settings(json.dumps({**self.policy, "maximumPauseSeconds": 3600}))
+        self.assertEqual(backup.maximum_pause(extended), 3600)
+        for value in (True, 299, 21601):
+            with self.subTest(value=value), self.assertRaises(ContractError):
+                backup.settings(json.dumps({**self.policy, "maximumPauseSeconds": value}))
+        events = [{"stage": "pause-intent", "timestamp": 1000}]
+        with patch.object(backup.time, "time", return_value=1301):
+            backup.require_pause_window(events, legacy)  # the 300s alert is not a hard stop
+        with patch.object(backup.time, "time", return_value=2800), self.assertRaises(ContractError):
+            backup.require_pause_window(events, legacy)
+
     def test_unknown_predecessor_cannot_authorize_writes(self):
         with self.assertRaises(ContractError):
             backup.exact_predecessor({"BACKUP_STATE_SHA256": "a" * 64}, {"stateSha256": "b" * 64})

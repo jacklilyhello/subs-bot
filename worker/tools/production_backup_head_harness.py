@@ -52,7 +52,7 @@ def public_result(result):
     maintenance = result.get("dailyBackupAcceptance", result.get("backupMaintenance"))
     if isinstance(maintenance, dict):
         summary = {}
-        for key in ("pauseSeconds", "pauseLimitSeconds"):
+        for key in ("pauseSeconds", "pauseLimitSeconds", "maximumPauseSeconds"):
             if type(maintenance.get(key)) in (int, float) and 0 <= maintenance[key] <= 86400:
                 summary[key] = maintenance[key]
         for key in ("pauseLimitExceeded", "admissionRestored", "authorizationUnchanged", "initiallyFrozen"):
@@ -72,6 +72,12 @@ def public_result(result):
                 if capacity.get(key) in {"normal", "warning", "over-limit", "unknown", "not-checked", "unverified"}:
                     summary[key] = capacity[key]
         value["backupSummary"] = summary
+    live = result.get("liveCapacity")
+    if isinstance(live, dict):
+        value["liveCapacity"] = {key: live[key] for key in ("snapshot", "consistency", "rows", "rowLimit", "rowStatus",
+            "objectCount", "objectLimit", "objectBytes", "objectBytesLimit", "objectStatus", "objectBytesStatus",
+            "failureReason", "warningPercent", "backupVerified")
+            if key in live and (type(live[key]) in (int, bool) or isinstance(live[key], str))}
     boundary = result.get("capacityFixture")
     if isinstance(boundary, dict):
         value["capacityFixture"] = {key: boundary[key] for key in
@@ -198,7 +204,14 @@ def main(env=None):
             maintenance.Anchor(store, ctl.target.digest, pin).initialize()
             result.update(status="initialized", mutationPerformed=True)
     elif action == "inspect":
-        result = {"status": "observed", "stateSha256": state["stateSha256"], "mutationPerformed": False}
+        import production_backup_live_capacity as live_capacity
+        warning = int(env.get("DRILL_BACKUP_WARNING_PERCENT") or "80")
+        observed = live_capacity.sample(ctl.target, env.get("SUBS_BOT_CF_BOOTSTRAP_TOKEN", ""),
+            env["DRILL_BACKUP_SOURCE_CHECKPOINT_ID"], env["DRILL_BACKUP_SOURCE_MANIFEST_SHA256"],
+            warning_percent=warning, root=env["RUNNER_TEMP"], guard=tool.guard)
+        alerts = live_capacity.alerts(observed)
+        result = {"status": "warning" if alerts else "observed", "stateSha256": state["stateSha256"],
+                  "mutationPerformed": False, "liveCapacity": observed}
     elif action == "capacity-fixture":
         # This branch is unreachable through trusted main until its dedicated,
         # default-disabled fixture gate is separately reviewed and installed.

@@ -43,6 +43,16 @@ def backup_enabled(env, *, watchdog=False):
     return env.get(key) == "true"
 
 
+def backup_pause_limits(env):
+    alarm = env.get("DRILL_BACKUP_PAUSE_LIMIT_SECONDS", "300")
+    maximum = env.get("DRILL_BACKUP_MAX_PAUSE_SECONDS", "1800")
+    require(matches(r"[1-9][0-9]{1,2}", alarm) and 60 <= int(alarm) <= 900,
+            "The maintenance pause warning limit must be between 60 and 900 seconds.")
+    require(matches(r"[1-9][0-9]{2,4}", maximum) and 300 <= int(maximum) <= 21600
+            and int(maximum) >= int(alarm), "The maximum maintenance pause is invalid.")
+    return int(alarm), int(maximum)
+
+
 def checked_http_result(value, source):
     require(isinstance(value, dict) and value.get("version") == 1
             and value.get("status") == "passed"
@@ -900,10 +910,7 @@ class Drill:
                 "Synthetic backup faults require an explicit isolated dispatch.")
         require(not self.baseline_checkpoint, "Daily maintenance requires a new unique checkpoint.")
         before = ctl.inspect()
-        limit = self.env.get("DRILL_BACKUP_PAUSE_LIMIT_SECONDS", "300")
-        require(matches(r"[1-9][0-9]{1,2}", limit) and 60 <= int(limit) <= 900,
-                "The maintenance pause warning limit must be between 60 and 900 seconds.")
-        pause_limit = int(limit)
+        pause_limit, maximum_pause = backup_pause_limits(self.env)
         initially_open = before["control"]["admission"] == "open" and before["control"]["workers"] == "run"
         initially_frozen = before["control"]["admission"] == "closed" and before["control"]["workers"] == "frozen"
         require(initially_open or initially_frozen and not any(before["work"].values()),
@@ -950,7 +957,7 @@ class Drill:
         require(prior["state"] == "idle" and prior["session"] != session)
         started = {"configurationSha256": ctl.target.configuration_digest,
                        "release": before["release"], "control": before["control"],
-                       "pauseLimitSeconds": pause_limit, "checkpointId": checkpoint,
+                       "pauseLimitSeconds": pause_limit, "maximumPauseSeconds": maximum_pause, "checkpointId": checkpoint,
                        "dispatcherRevision": dispatcher_revision, "dispatcherWorkflow": evidence_workflow}
         original = {"version": 1, "targetSha256": ctl.target.digest, "session": session, "day": day,
                     "controlRevision": self.revision, "dispatcherRevision": dispatcher_revision,
@@ -985,10 +992,10 @@ class Drill:
                 paused = ctl.transition("pause", approval(ctl.target, "pause", ctl.revision, planned["stateSha256"], control_revision=ctl.control_revision),
                                         planned["stateSha256"])
                 journal.append("paused", {"control": paused["control"]}, int(time.time()))
-                remaining = pause_limit - (time.monotonic() - pause_started)
+                remaining = maximum_pause - (time.monotonic() - pause_started)
                 require(remaining > 0, "The pause window expired before drain began.")
                 self.quiet(seconds=min(180, remaining))
-                require(time.monotonic() - pause_started < pause_limit, "The pause window expired before freeze.")
+                require(time.monotonic() - pause_started < maximum_pause, "The maximum pause elapsed before freeze.")
                 frozen_before = ctl.inspect()
                 journal.append("freeze-intent", {"stateSha256": frozen_before["stateSha256"]}, int(time.time()))
                 frozen = ctl.transition("freeze", approval(ctl.target, "freeze", ctl.revision, frozen_before["stateSha256"], control_revision=ctl.control_revision),
@@ -999,6 +1006,8 @@ class Drill:
             journal.append("frozen", {"control": frozen["control"]}, int(time.time()))
             frozen_data = capacity.frozen_fingerprint(api, source)
             journal.append("frozen-data", frozen_data, int(time.time()))
+            if initially_open:
+                require(time.monotonic() - pause_started < maximum_pause, "The maximum pause elapsed before capture.")
             journal.append("capture-intent", {"checkpointId": checkpoint}, int(time.time()))
             # The intended checkpoint is pinned before capture and independently
             # read back by the existing activation-baseline verifier.
@@ -1025,7 +1034,7 @@ class Drill:
                            "pauseLimitExceeded": elapsed > pause_limit}, int(time.time()))
             anchor.release(session)
             self.report.update(status="warning" if elapsed > pause_limit else "passed", backupMaintenance={"session": session, "day": day,
-                "pauseSeconds": round(elapsed, 3), "pauseLimitSeconds": pause_limit,
+                "pauseSeconds": round(elapsed, 3), "pauseLimitSeconds": pause_limit, "maximumPauseSeconds": maximum_pause,
                 "pauseLimitExceeded": elapsed > pause_limit, "capacity": observed, "baseline": baseline})
         except Exception as error:
             # Do not hide an unconfirmed transition behind an automatic retry or
