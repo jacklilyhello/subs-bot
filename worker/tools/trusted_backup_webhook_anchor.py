@@ -1,12 +1,16 @@
 """Target-scoped immutable/CAS anchor for the isolated test webhook window.
 
-The production backup Anchor supplies the history chain and uncertain-write
-semantics; this adapter only maps it to the test Bot's private namespace.
+This deliberately implements only the test Bot lock, independently of the
+candidate's application backup transaction module.
 """
 from hashlib import sha256
 import re
 
-from production_target import require
+from production_target import canonical, parsed, require
+
+SHA = re.compile(r"[a-f0-9]{64}")
+SESSION = re.compile(r"[1-9][0-9]{0,19}-[1-9][0-9]{0,9}")
+REVISION = re.compile(r"[a-f0-9]{40}")
 
 
 class WebhookStore:
@@ -50,9 +54,121 @@ class WebhookStore:
         return self._list(prefix)
 
 
+class WebhookAnchor:
+    """The shared anchor wire format, restricted to the test webhook namespace."""
+    def __init__(self, store, target_sha, expected_genesis):
+        require(SHA.fullmatch(target_sha or "") and SHA.fullmatch(expected_genesis or ""))
+        self.store, self.target_sha256, self.genesis_sha256 = store, target_sha, expected_genesis
+        self.key = "maintenance/production-control/registrations/daily-backup-anchor-" + target_sha + ".json"
+        self.genesis_key = "maintenance/production-control/registrations/daily-backup-genesis-" + target_sha + ".json"
+
+    def initial_material(self):
+        value = {"version": 1, "targetSha256": self.target_sha256, "generation": 1, "previousSha256": None,
+                 "state": "idle", "session": "1-1", "day": "1970/01/01", "controlRevision": "0" * 40}
+        raw = canonical(value)
+        return raw, canonical({"version": 1, "targetSha256": self.target_sha256,
+                               "initialAnchorSha256": sha256(raw).hexdigest()})
+
+    def history_digest_key(self, generation, digest):
+        return ("maintenance/production-control/evidence/daily-backup-anchor/" + self.target_sha256 + "/"
+                + str(generation).zfill(12) + "-" + digest + ".json")
+
+    def history_key(self, generation, body):
+        return self.history_digest_key(generation, sha256(body).hexdigest())
+
+    def read(self):
+        initial, genesis = self.initial_material()
+        require(self.store.get(self.genesis_key, absent=True) == genesis
+                and sha256(genesis).hexdigest() == self.genesis_sha256)
+        keys = self.store.list_backup_anchor_history(self.target_sha256)
+        raw, etag = self.store.get_with_etag(self.key)
+        require(raw is not None and re.fullmatch(r'"[a-f0-9]{32}"', etag or ""))
+        value = parsed(raw)
+        require(canonical(value) == raw and set(value) == {"version", "targetSha256", "generation", "previousSha256",
+                "state", "session", "day", "controlRevision"} and type(value["version"]) is int and value["version"] == 1
+                and value["targetSha256"] == self.target_sha256 and type(value["generation"]) is int
+                and 1 <= value["generation"] <= 999999999999 and value["state"] in {"active", "idle"}
+                and SESSION.fullmatch(value["session"] or "") and REVISION.fullmatch(value["controlRevision"] or "")
+                and re.fullmatch(r"[0-9]{4}/[0-9]{2}/[0-9]{2}", value["day"] or ""))
+        prefix = "maintenance/production-control/evidence/daily-backup-anchor/" + self.target_sha256 + "/"
+        require(all(re.fullmatch(re.escape(prefix) + r"[0-9]{12}-[a-f0-9]{64}\.json", key)
+                    and int(key.rsplit("/", 1)[1][:12]) <= value["generation"] for key in keys)
+                and len(keys) == value["generation"] and len(set(keys)) == len(keys)
+                and self.history_key(value["generation"], raw) in keys
+                and self.store.get(self.history_key(value["generation"], raw)) == raw,
+                "The webhook anchor history is incomplete, forked or has an unresolved future generation.")
+        current = value
+        used_sessions = {value["session"]}
+        active_sessions = {value["session"]} if value["state"] == "active" else set()
+        while current["generation"] > 1:
+            prior_sha = current.get("previousSha256")
+            require(SHA.fullmatch(prior_sha or ""))
+            key = self.history_digest_key(current["generation"] - 1, prior_sha)
+            require(key in keys)
+            old_raw = self.store.get(key)
+            require(sha256(old_raw).hexdigest() == prior_sha)
+            old = parsed(old_raw)
+            require(canonical(old) == old_raw and set(old) == set(value)
+                    and type(old.get("version")) is int and old["version"] == 1
+                    and old.get("targetSha256") == self.target_sha256 and type(old.get("generation")) is int
+                    and old["generation"] == current["generation"] - 1
+                    and SESSION.fullmatch(old.get("session", "")) and REVISION.fullmatch(old.get("controlRevision", ""))
+                    and re.fullmatch(r"[0-9]{4}/[0-9]{2}/[0-9]{2}", old.get("day", ""))
+                    and ((current["state"] == "idle" and old.get("state") == "active"
+                          and all(current[k] == old.get(k) for k in ("session", "day", "controlRevision")))
+                         or (current["state"] == "active" and old.get("state") == "idle"
+                             and current["session"] != old.get("session"))))
+            if old["state"] == "active":
+                require(old["session"] not in active_sessions, "A webhook lock session was reused in its history.")
+                active_sessions.add(old["session"])
+            used_sessions.add(old["session"])
+            current = old
+        require(canonical(current) == initial)
+        self.used_sessions = used_sessions
+        return value, raw, etag
+
+    def initialize(self):
+        initial, genesis = self.initial_material()
+        require(sha256(genesis).hexdigest() == self.genesis_sha256
+                and self.store.get(self.genesis_key, absent=True) is None
+                and self.store.get_with_etag(self.key) == (None, None)
+                and not self.store.list_backup_anchor_history(self.target_sha256)
+                and not self.store.list_backup_journals())
+        self.store.put(self.genesis_key, genesis)
+        self.store.put(self.history_key(1, initial), initial)
+        self.store.compare_and_put(self.key, None, None, initial)
+        self.read()
+
+    def _advance(self, previous, raw, etag, *, state, session, day, revision):
+        generation = previous["generation"] + 1
+        require(generation <= 999999999999)
+        value = {"version": 1, "targetSha256": self.target_sha256, "generation": generation,
+                 "previousSha256": sha256(raw).hexdigest(), "state": state, "session": session,
+                 "day": day, "controlRevision": revision}
+        body = canonical(value)
+        self.store.put(self.history_key(generation, body), body)
+        self.store.compare_and_put(self.key, raw, etag, body)
+        observed, observed_raw, _ = self.read()
+        require(observed == value and observed_raw == body)
+        return value
+
+    def acquire(self, session, day, revision):
+        require(SESSION.fullmatch(session or "") and REVISION.fullmatch(revision or "")
+                and re.fullmatch(r"[0-9]{4}/[0-9]{2}/[0-9]{2}", day or ""))
+        previous, raw, etag = self.read()
+        require(previous["state"] == "idle" and session not in self.used_sessions,
+                "A prior webhook lock session cannot be replayed.")
+        return self._advance(previous, raw, etag, state="active", session=session, day=day, revision=revision)
+
+    def release(self, session):
+        previous, raw, etag = self.read()
+        require(previous["state"] == "active" and previous["session"] == session)
+        return self._advance(previous, raw, etag, state="idle", session=session,
+                             day=previous["day"], revision=previous["controlRevision"])
+
+
 def anchor(store, target_sha, expected_genesis):
-    from production_backup_transaction import Anchor
-    return Anchor(WebhookStore(store, target_sha), target_sha, expected_genesis)
+    return WebhookAnchor(WebhookStore(store, target_sha), target_sha, expected_genesis)
 
 
 def genesis_sha(store, target_sha):
