@@ -26,9 +26,12 @@ from production_target import approve, canonical, digest, parsed, require, valid
 WORKFLOW = artifact.REPOSITORY + "/.github/workflows/worker-production-backup.yml@" + artifact.MAIN_REF
 READ_ONLY = {"inspect", "monitor", "plan-initialize-anchor", "inspect-anchor-initialization", "inspect-anchor-unknown", "plan-begin", "plan-pause", "drain", "plan-activate", "plan-reconcile-transition", "plan-resume-failed", "plan-anchor-reconcile"}
 ACTIONS = READ_ONLY | {"initialize-anchor", "begin", "preflight", "abort-preflight", "pause", "freeze", "fingerprint", "capture", "poll-export", "verify", "activate", "reconcile-transition", "resume-failed", "anchor-reconcile"}
-# Production writes remain unavailable until the exact implementation is reviewed
-# and its corresponding isolated failure/recovery exercise has passed.
-PRODUCTION_MUTATIONS_ENABLED = False
+
+def require_mutation_enabled(env):
+    """A protected enable switch never replaces an action-specific approval."""
+    require(env.get("GITHUB_RUN_ATTEMPT") == "1", "Mutating maintenance runs cannot be re-run.")
+    require(env.get("SUBS_BOT_PRODUCTION_BACKUP_WRITES_ENABLED") == "true",
+            "Production backup mutations are disabled until explicitly enabled.")
 
 
 def settings(raw):
@@ -400,8 +403,7 @@ def main(env=None):
     target = validate_target(env.get("SUBS_BOT_TARGET_JSON", ""))
     revision = check_context(env, target)
     if action not in READ_ONLY:
-        require(env.get("GITHUB_RUN_ATTEMPT") == "1", "Mutating maintenance runs cannot be re-run.")
-        require(PRODUCTION_MUTATIONS_ENABLED, "Production backup mutations are disabled pending isolated acceptance and reviewed enablement.")
+        require_mutation_enabled(env)
     policy = settings(env.get("SUBS_BOT_BACKUP_POLICY_JSON", ""))
     root = Path(env["RUNNER_TEMP"])
     require(root.is_absolute() and root.is_dir())

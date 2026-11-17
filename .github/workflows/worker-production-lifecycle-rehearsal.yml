@@ -185,6 +185,8 @@ jobs:
       DRILL_BACKUP_SOURCE_CHECKPOINT_ID: ${{ inputs.backup_source_checkpoint_id || vars.SUBS_BOT_REHEARSAL_BACKUP_SOURCE_CHECKPOINT_ID }}
       DRILL_BACKUP_SOURCE_MANIFEST_SHA256: ${{ inputs.backup_source_manifest_sha256 || vars.SUBS_BOT_REHEARSAL_BACKUP_SOURCE_MANIFEST_SHA256 }}
       DRILL_BACKUP_GENESIS_SHA256: ${{ vars.SUBS_BOT_REHEARSAL_BACKUP_GENESIS_SHA256 }}
+      DRILL_BACKUP_WRITES_ENABLED: ${{ vars.SUBS_BOT_REHEARSAL_BACKUP_WRITES_ENABLED }}
+      DRILL_BACKUP_WATCHDOG_ENABLED: ${{ vars.SUBS_BOT_REHEARSAL_BACKUP_WATCHDOG_ENABLED }}
       DRILL_BACKUP_ANCHOR_CANDIDATE_SHA256: ${{ inputs.backup_anchor_candidate_sha256 }}
       DRILL_BACKUP_ANCHOR_APPROVAL_SHA256: ${{ inputs.backup_anchor_approval_sha256 }}
       DRILL_BACKUP_FAULT: ${{ github.event_name == 'schedule' && 'none' || inputs.backup_fault || 'none' }}

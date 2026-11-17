@@ -13,6 +13,14 @@ from production_target import ContractError
 
 
 class ProductionBackupTests(unittest.TestCase):
+    def test_production_mutation_switch_defaults_off_and_rejects_reruns(self):
+        for env in ({}, {"GITHUB_RUN_ATTEMPT": "1"},
+                    {"GITHUB_RUN_ATTEMPT": "2", "SUBS_BOT_PRODUCTION_BACKUP_WRITES_ENABLED": "true"},
+                    {"GITHUB_RUN_ATTEMPT": "1", "SUBS_BOT_PRODUCTION_BACKUP_WRITES_ENABLED": "True"}):
+            with self.assertRaises(ContractError):
+                backup.require_mutation_enabled(env)
+        backup.require_mutation_enabled({"GITHUB_RUN_ATTEMPT": "1", "SUBS_BOT_PRODUCTION_BACKUP_WRITES_ENABLED": "true"})
+
     def setUp(self):
         self.policy = {"version": 1, "warningPercent": 80, "pauseLimitSeconds": 300,
                        "overdueHours": 48, "windowStartUtc": "23:30", "windowMinutes": 90, "frequencyHours": 24}
@@ -208,7 +216,7 @@ class ProductionBackupTests(unittest.TestCase):
             with self.assertRaises(ContractError):
                 backup.monitor_workflow_runs(controllers, 1800000000, None)
 
-    def test_production_mutation_is_statically_disabled_before_any_setup(self):
+    def test_production_mutation_is_disabled_by_default_before_any_setup(self):
         with patch.object(backup, "validate_target", return_value=Mock()), patch.object(backup, "check_context", return_value="a" * 40):
             with self.assertRaises(ContractError):
                 backup.main({"BACKUP_ACTION": "resume-failed", "GITHUB_RUN_ATTEMPT": "1"})

@@ -45,6 +45,14 @@ class MemoryStore:
 
 
 class LifecycleDrillTests(unittest.TestCase):
+    def test_backup_and_watchdog_have_independent_default_off_switches(self):
+        self.assertFalse(drill.backup_enabled({}))
+        self.assertFalse(drill.backup_enabled({}, watchdog=True))
+        self.assertTrue(drill.backup_enabled({"DRILL_BACKUP_WRITES_ENABLED": "true"}))
+        self.assertFalse(drill.backup_enabled({"DRILL_BACKUP_WRITES_ENABLED": "true"}, watchdog=True))
+        self.assertTrue(drill.backup_enabled({"DRILL_BACKUP_WATCHDOG_ENABLED": "true"}, watchdog=True))
+        self.assertFalse(drill.backup_enabled({"DRILL_BACKUP_WATCHDOG_ENABLED": "true"}))
+
     def tool(self):
         value = drill.Drill(environment())
         value.store = MemoryStore()

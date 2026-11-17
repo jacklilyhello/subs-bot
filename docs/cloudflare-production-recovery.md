@@ -122,7 +122,9 @@ G0 之后发生任何新增、修改、删除、授权、领取、撤销、短�
 
 ## 隔离日常备份控制草案（尚未启用）
 
-仓库包含待验收的日常备份、私有事务锚、独立监控和中断检查实现；`BACKUP_ORCHESTRATION_ENABLED` 固定为 `False`，不可作为已经可用的生产或隔离备份服务。生产仍须逐次使用上文受保护操作和独立批准，不存在自动生成生产批准的路径。只有精确提交的托管测试、隔离故障演练、独立读回、代码审查以及实际 R2 条件写和分页响应核对全部完成后，才能单独决定启用隔离运行。
+仓库包含待验收的日常备份、私有事务锚、独立监控和中断检查实现，入口默认关闭；尚未完成精确提交的托管测试、隔离故障演练、独立读回、代码审查以及实际 R2 条件写和分页响应核对前，不应视为已经验收。隔离 Environment 的 `SUBS_BOT_REHEARSAL_BACKUP_WRITES_ENABLED` 只控制隔离备份写入及事务锚协调；独立的 `SUBS_BOT_REHEARSAL_BACKUP_WATCHDOG_ENABLED` 控制看护，使停止发起新备份不会同时关闭未决事务看护。日常定时触发还需单独设置 `SUBS_BOT_REHEARSAL_DAILY_BACKUP_ENABLED`，监控定时触发使用 `SUBS_BOT_REHEARSAL_BACKUP_MONITOR_ENABLED`。这些开关均须显式设置为 `true`，默认不启用。
+
+生产 Environment 的 `SUBS_BOT_PRODUCTION_BACKUP_WRITES_ENABLED` 默认关闭，仅允许在另行批准正式运维策略后启用。它只允许进入已选的单步受保护入口，不生成授权：每次仍须精确目标、动作、来源和前态的独立批准，且禁止重跑 mutation attempt。生产 schedule 仅可运行只读监控，不能自动启动生产备份。
 
 草案默认每日 01:00 UTC 备份，80% 容量预警、300 秒暂停告警门限；百分比和门限可配置。暂停门限是触发检查和报警的时间，并非对 Cloudflare 在途请求或 runner 中断的硬时限保证。预检统计迁移链中的所有表和数据库引用对象闭包；活跃现场的读数不是一致快照，SQL 导出大小须冻结后才能准确验证，行数超限时对象未检查会明确标记。最终仍须完整封存与独立读回，容量或读回未知均不能报告成功。30 天为待批准建议，不自动删除 G0、G1、未结案证据或任何备份。
 
@@ -130,9 +132,9 @@ G0 之后发生任何新增、修改、删除、授权、领取、撤销、短�
 
 隔离计划只允许固定 rehearsal 身份。原已关闭冻结的源完成后仍保持关闭冻结；仅在事务前确认 open/run 的源，才可在满足控制与依赖前置条件后恢复。已受理任务在排空时保留；不确定的外部结果或未确认写入须停止并告警，不重发。看护流程不会把缺失 recovery journal 或不明导出当作已停止。真实测试 Bot 的 webhook 与既有设置需在单独的受控验证窗口内恢复；每日后台计划不能擅自切换或占用它们。
 
-事务锚采用独立配置的 genesis 摘要、目标专用私有指针及不可变历史；指针缺失、历史断链、分页无法证明完整或存在未确认未来代时停止。当前历史盘点最多 10,000 个对象，接近该界限必须先执行经审查的外部锚及轮换方案；该轮换尚未实现。部分初始化或无法证实的并发候选不得通过删除历史解决。现有手动 `backup-anchor-reconcile-plan` 和 `backup-anchor-reconcile` 草案仅针对有确认证据的已完成事务 release，写入入口仍被禁用；原 run 已结束、journal 终态和当前配置/控制必须重新核验，计划 SHA 不替代这些检查。
+事务锚采用独立配置的 genesis 摘要、目标专用私有指针及不可变历史；指针缺失、历史断链、分页无法证明完整或存在未确认未来代时停止。当前历史盘点最多 10,000 个对象，接近该界限必须先执行经审查的外部锚及轮换方案；该轮换尚未实现。部分初始化或无法证实的并发候选不得通过删除历史解决。手动 `backup-anchor-reconcile-plan` 和 `backup-anchor-reconcile` 仅针对有确认证据的已完成事务 release，写入入口受隔离开关及精确批准保护；原 run 已结束、journal 终态和当前配置/控制必须重新核验，计划 SHA 不替代这些检查。
 
-生产 checkpoint 草案的 `plan-initialize-anchor` 会只读给出按目标身份计算的 genesis 摘要；首次初始化前须独立固定该摘要并逐动作批准。若初始化、anchor acquire 或其写响应不明，不能仅凭对象暂时缺失而重放：旧实现没有为 acquire 在 started journal 前记录完整执行身份，缺失 journal 的遗留现场保持 unknown。`plan-anchor-reconcile` / `anchor-reconcile` 仅针对原 resume intent 所属 run 已完成、完整 journal 已确认 resumed、未来 release 代唯一且当前控制／配置／版本与终态一致的情况；它不协调不明 acquire，不把失败备份改称成功。生产 mutation 仍受静态禁用保护。
+生产 checkpoint 草案的 `plan-initialize-anchor` 会只读给出按目标身份计算的 genesis 摘要；首次初始化前须独立固定该摘要并逐动作批准。若初始化、anchor acquire 或其写响应不明，不能仅凭对象暂时缺失而重放：旧实现没有为 acquire 在 started journal 前记录完整执行身份，缺失 journal 的遗留现场保持 unknown。`plan-anchor-reconcile` / `anchor-reconcile` 仅针对原 resume intent 所属 run 已完成、完整 journal 已确认 resumed、未来 release 代唯一且当前控制／配置／版本与终态一致的情况；它不协调不明 acquire，不把失败备份改称成功。生产 mutation 默认关闭，并要求上面所述的单步精确批准。
 
 在完整事务 journal 证明尚无 capture 或 poll intent、原 freeze run 已完成且该 checkpoint 的 recovery journal 不存在时，`plan-resume-failed` 可针对确认属于本次维护的 frozen 状态生成受限恢复计划；已完成 fingerprint 时还要重新核对完整冻结数据。恢复动作仍需精确审批，重验依赖和无未知外部结果后才执行一次 CAS。若 recovery journal 存在、导出状态未知、日志缺失或存在未确认写入，则停留并告警；该路径不替代新激活所需的完整基线。此草案不自动授权或保证暂停硬时限。
 

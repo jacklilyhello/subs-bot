@@ -36,9 +36,11 @@ SERVICE, BACKUP, HOSTNAME = NAMES["rehearsal"]
 ORIGIN = "https://" + HOSTNAME
 REPORT = "production-lifecycle-drill-result.json"
 FINAL_REPORT = "production-lifecycle-drill-final.json"
-# The coordination and recovery path is intentionally disabled until its
-# hosted fault tests, independent review and R2 pagination readback pass.
-BACKUP_ORCHESTRATION_ENABLED = False
+
+def backup_enabled(env, *, watchdog=False):
+    # Stopping new daily backups must not disable the independent watchdog.
+    key = "DRILL_BACKUP_WATCHDOG_ENABLED" if watchdog else "DRILL_BACKUP_WRITES_ENABLED"
+    return env.get(key) == "true"
 
 
 def checked_http_result(value, source):
@@ -1209,7 +1211,7 @@ class Drill:
             return
         anchor = maintenance.Anchor(store, target.digest, self.env.get("DRILL_BACKUP_GENESIS_SHA256", ""))
         if action == "backup-anchor-initialize":
-            require(BACKUP_ORCHESTRATION_ENABLED, "Backup anchor initialization is disabled before acceptance.")
+            require(backup_enabled(self.env), "Backup anchor initialization is disabled.")
             before = ctl.inspect()
             require(before["control"]["admission"] == "closed" and before["control"]["workers"] == "frozen"
                     and not any(before["work"].values())
@@ -1237,7 +1239,7 @@ class Drill:
             if action.endswith("-plan"):
                 self.report.update(status="planned", anchorPlan=plan, anchorPlanSha256=plan_sha, mutationPerformed=False)
                 return
-            require(BACKUP_ORCHESTRATION_ENABLED and self.env.get("DRILL_BACKUP_ANCHOR_APPROVAL_SHA256") == plan_sha,
+            require(backup_enabled(self.env) and self.env.get("DRILL_BACKUP_ANCHOR_APPROVAL_SHA256") == plan_sha,
                     "The exact initialization reconciliation approval is required after acceptance.")
             approved_action = "backup-anchor-initialize-reconcile:" + plan_sha
             ctl.approval(approval(target, approved_action, ctl.revision, before["stateSha256"]),
@@ -1287,7 +1289,7 @@ class Drill:
         if action == "backup-anchor-reconcile-plan":
             self.report.update(status="planned", anchorPlan=plan, anchorPlanSha256=plan_sha, mutationPerformed=False)
             return
-        require(action == "backup-anchor-reconcile" and BACKUP_ORCHESTRATION_ENABLED,
+        require(action == "backup-anchor-reconcile" and backup_enabled(self.env),
                 "Backup anchor reconciliation is disabled before acceptance.")
         require(self.env.get("DRILL_BACKUP_ANCHOR_APPROVAL_SHA256") == plan_sha,
                 "The independently reviewed exact anchor plan SHA is required.")
@@ -1445,7 +1447,8 @@ def main():
     require(env.get("GITHUB_WORKFLOW_REF") == WORKFLOW, "Only the protected dedicated hosted rehearsal workflow may run this drill.")
     action = env.get("DRILL_ACTION", "inspect")
     if action in {"daily-backup", "daily-backup-watchdog"}:
-        require(BACKUP_ORCHESTRATION_ENABLED, "Daily backup orchestration is not enabled before independent acceptance.")
+        require(backup_enabled(env, watchdog=action == "daily-backup-watchdog"),
+                "This isolated backup operation is not enabled.")
     if env.get("GITHUB_EVENT_NAME") == "schedule":
         require(action in {"daily-backup", "daily-backup-watchdog"} and env.get("GITHUB_REPOSITORY") == artifact.REPOSITORY
                 and env.get("GITHUB_REPOSITORY_ID") == str(artifact.REPOSITORY_ID)
