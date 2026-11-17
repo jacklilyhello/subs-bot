@@ -191,6 +191,18 @@ def _get_json(path, token):
         waited += delay
 
 
+def compare_commits_metadata(base, head, token):
+    """Fetch bounded comparison metadata without the first page's full file diff.
+
+    Callers must still verify the exact base, merge base and directional status.
+    GitHub returns the changed-file list only on page one.
+    """
+    if not (isinstance(base, str) and _REVISION.fullmatch(base)
+            and isinstance(head, str) and _REVISION.fullmatch(head)):
+        raise ArtifactError("A full base and head revision are required.")
+    return _get_json(f"/compare/{base}...{head}?per_page=1&page=2", token)
+
+
 def require_current_main(revision: str) -> None:
     """Raise ArtifactError unless the exact revision is the current GitHub main tip."""
     if not isinstance(revision, str) or not _REVISION.fullmatch(revision):

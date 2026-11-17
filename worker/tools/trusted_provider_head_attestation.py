@@ -54,7 +54,7 @@ def source_run(build):
                      and all(isinstance(run.get(key), dict) and run[key].get("id") == provider.github.REPOSITORY_ID
                              for key in ("repository", "head_repository")))
     if build["revision"] != os.environ["GITHUB_SHA"]:
-        value = provider.github._get_json(f"/compare/{build['revision']}...{os.environ['GITHUB_SHA']}?per_page=1", os.environ["GH_TOKEN"])
+        value = provider.github.compare_commits_metadata(build["revision"], os.environ["GITHUB_SHA"], os.environ["GH_TOKEN"])
         provider.require(value.get("status") == "ahead" and value.get("behind_by") == 0
                          and all(isinstance(value.get(key), dict) and value[key].get("sha") == build["revision"]
                                  for key in ("base_commit", "merge_base_commit")))
@@ -87,7 +87,7 @@ def archive_run(ref, manifest):
                      and all(isinstance(run.get(key), dict) and run[key].get("id") == provider.github.REPOSITORY_ID
                              for key in ("repository", "head_repository")))
     if revision != os.environ["GITHUB_SHA"]:
-        comparison = provider.github._get_json(f"/compare/{revision}...{os.environ['GITHUB_SHA']}?per_page=1", os.environ["GH_TOKEN"])
+        comparison = provider.github.compare_commits_metadata(revision, os.environ["GITHUB_SHA"], os.environ["GH_TOKEN"])
         provider.require(comparison.get("status") == "ahead" and comparison.get("behind_by") == 0
                          and all(isinstance(comparison.get(key), dict) and comparison[key].get("sha") == revision
                                  for key in ("base_commit", "merge_base_commit")))
@@ -193,7 +193,7 @@ def independent_isolated_source(ref, bucket, token):
                          and run.get("event") == "workflow_dispatch" and (run.get("status"), run.get("conclusion")) == ("completed", "success")
                          and all(isinstance(run.get(k), dict) and run[k].get("id") == provider.github.REPOSITORY_ID for k in ("repository", "head_repository")))
         if revision != os.environ["GITHUB_SHA"]:
-            comparison = provider.github._get_json(f"/compare/{revision}...{os.environ['GITHUB_SHA']}?per_page=1", gh_token)
+            comparison = provider.github.compare_commits_metadata(revision, os.environ["GITHUB_SHA"], gh_token)
             provider.require(comparison.get("status") == "ahead" and comparison.get("behind_by") == 0
                              and all(isinstance(comparison.get(k), dict) and comparison[k].get("sha") == revision for k in ("base_commit", "merge_base_commit")))
     run_id, attempt = record["readbackRunId"], record["readbackRunAttempt"]

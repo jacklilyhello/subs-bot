@@ -85,7 +85,7 @@ def _proof_bytes(value):
 def require_historical_provider_ancestor(provider_revision, main_revision, token):
     _require(provider_revision == HISTORICAL_PROVIDER_REVISION and _match(provider.REVISION, main_revision)
              and main_revision != provider_revision, HISTORICAL_ERROR)
-    comparison = github._get_json(f"/compare/{provider_revision}...{main_revision}?per_page=1", token)
+    comparison = github.compare_commits_metadata(provider_revision, main_revision, token)
     base = comparison.get("base_commit")
     merge_base = comparison.get("merge_base_commit")
     ahead, behind = comparison.get("ahead_by"), comparison.get("behind_by")

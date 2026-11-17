@@ -88,11 +88,13 @@ def configuration(env):
     return draft, secrets, previous, original
 
 
-def approval(target, action, revision, predecessor):
+def approval(target, action, revision, predecessor, *, control_revision=None):
     require(target.environment == "rehearsal" and target.data["workerName"] == SERVICE,
             "Automatic approvals are restricted to the dedicated rehearsal target.")
+    control_revision = os.environ.get("GITHUB_SHA", revision) if control_revision is None else control_revision
+    require(matches(r"[0-9a-f]{40}", control_revision), "The exact rehearsal controller revision is required.")
     return {"schemaVersion": 1, "environment": "rehearsal", "targetSha256": target.digest,
-        "configurationSha256": target.configuration_digest, "controlRevision": os.environ.get("GITHUB_SHA", revision),
+        "configurationSha256": target.configuration_digest, "controlRevision": control_revision,
         "revision": revision, "action": action, "stateSha256": predecessor,
         "authorization": "approve " + action + " for " + SERVICE}
 

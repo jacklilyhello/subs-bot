@@ -8,6 +8,7 @@ import sys
 from functools import cache
 
 import external_shortlink_release as external_shortlinks
+import scoped_r2
 from pathlib import Path
 
 from attest_api_status_container import ATTESTATION_ENV
@@ -67,6 +68,26 @@ def isolation_credentials():
     if not data_token or not deploy_token or data_token == deploy_token:
         raise ValueError("Separate Cloudflare data and deployment credentials are required.")
     return target, data_token, deploy_token
+
+
+def isolation_data_client(target, token):
+    """Keep D1 credentials out of R2 metadata requests during a release."""
+    data = CloudflareClient(token)
+    metadata_token = scoped_r2.metadata_token()
+    if not metadata_token:
+        return data
+    metadata = CloudflareClient(metadata_token)
+    bucket = f"/accounts/{target['accountId']}/r2/buckets/{WORKER_NAME}"
+    metadata_paths = {bucket + suffix for suffix in ("", "/domains/managed", "/domains/custom")}
+
+    def call(method, path, payload=None):
+        if path in metadata_paths:
+            if method != "GET" or payload is not None:
+                raise CloudflareError("R2 metadata release checks must be read only.")
+            return metadata(method, path)
+        return data(method, path, payload)
+
+    return call
 
 
 def inline_search_release_mode():
@@ -227,7 +248,7 @@ def release():
         target, data_token, deploy_token = isolation_credentials()
         guard = lambda: require_current_main(revision)
         guard()
-        worker_api, data_api = CloudflareClient(deploy_token), CloudflareClient(data_token)
+        worker_api, data_api = CloudflareClient(deploy_token), isolation_data_client(target, data_token)
         telegram_config = isolated_telegram_config()
         if recovery:
             evidence = prepare_recovery(worker_api, data_api, target, revision, telegram_config, guard,
@@ -310,7 +331,7 @@ def release():
         return load_api_status_gate(os.environ.get(API_STATUS_CONFIG_ENV, ""), target, deploy_token,
                                     os.environ.get(ATTESTATION_ENV, ""))
 
-    data_api = CloudflareClient(data_token)
+    data_api = isolation_data_client(target, data_token)
     worker_api = CloudflareClient(deploy_token)
     guard()
     if page_jump != "preserve":
