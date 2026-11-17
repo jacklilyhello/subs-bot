@@ -1,0 +1,381 @@
+name: Rehearse Provider publication with encrypted private evidence
+run-name: Encrypted Provider publication rehearsal at ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider_ci_run_id:
+        description: Exact original Provider CI run for the registered rehearsal target
+        required: true
+        type: string
+      approval_sha256:
+        description: SHA256 of the exact publish operation and full rehearsal target
+        required: true
+        type: string
+      archive_refs:
+        description: Independently recorded source archive references for the entire release chain
+        required: true
+        type: string
+      simulate_actions_unavailable:
+        description: Reject original Actions source artifact access without deleting artifacts
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: subs-bot-provider-isolation
+  cancel-in-progress: false
+
+env:
+  SUBS_BOT_PROVIDER_CONTROL_ENVIRONMENT: rehearsal
+  SUBS_BOT_PROVIDER_CONTROL_OPERATION: publish
+  SUBS_BOT_PROVIDER_CONTROL_APPROVAL: ${{ inputs.approval_sha256 }}
+  SUBS_BOT_PROVIDER_CI_RUN_ID: ${{ inputs.provider_ci_run_id }}
+  SUBS_BOT_PROVIDER_DURABLE_REQUIRED: '1'
+  SUBS_BOT_PROVIDER_SIMULATE_ARTIFACT_UNAVAILABLE: ${{ inputs.simulate_actions_unavailable && '1' || '0' }}
+
+jobs:
+  preflight:
+    name: Provider private preflight
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
+    environment: subs-bot-provider-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_sha256: ${{ steps.upload.outputs.artifact-digest }}
+      cipher_sha256: ${{ steps.prepare.outputs.cipher_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify pinned age before reading private data
+        run: bash worker/tools/install_provider_age.sh
+      - name: Read private source originals
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_ARCHIVE_REFS: ${{ inputs.archive_refs }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          python3 -B worker/tools/provider_durable_source.py
+      - name: Verify exact prestate and encrypt intent
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_ACTION: preflight
+          SUBS_BOT_PROVIDER_ARCHIVE_REFS: ${{ inputs.archive_refs }}
+          SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN }}
+          SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN }}
+          SUBS_BOT_PROVIDER_REHEARSAL_RECIPIENT: ${{ vars.SUBS_BOT_PROVIDER_REHEARSAL_RECIPIENT }}
+          SUBS_BOT_PROVIDER_REHEARSAL_RECIPIENT_SHA256: ${{ secrets.SUBS_BOT_PROVIDER_REHEARSAL_RECIPIENT_SHA256 }}
+        run: python3 -B worker/tools/production_provider_encrypted_publish.py
+      - name: Upload encrypted intent
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: provider-encrypted-intent-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/payload.age
+          retention-days: 1
+          if-no-files-found: error
+
+  archive_intent:
+    name: Provider private intent archive
+    needs: preflight
+    environment: subs-bot-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    outputs:
+      intent_sha256: ${{ steps.confirm.outputs.intent_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify pinned age before reading private data
+        run: bash worker/tools/install_provider_age.sh
+      - name: Authenticate and decrypt intent; verify private source closure
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_ACTION: prepare-intent
+          SUBS_BOT_PROVIDER_TRUSTED_UPSTREAM_ARTIFACT_ID: ${{ needs.preflight.outputs.artifact_id }}
+          SUBS_BOT_PROVIDER_TRUSTED_UPSTREAM_ARCHIVE_SHA256: ${{ needs.preflight.outputs.artifact_sha256 }}
+          SUBS_BOT_PROVIDER_TRUSTED_UPSTREAM_CIPHER_SHA256: ${{ needs.preflight.outputs.cipher_sha256 }}
+          SUBS_BOT_PROVIDER_ARCHIVE_REFS: ${{ inputs.archive_refs }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ENCRYPTED_LEDGER_JSON }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ENCRYPTED_CONTROLLERS_JSON }}
+          SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN }}
+          SUBS_BOT_PROVIDER_REHEARSAL_RECIPIENT: ${{ vars.SUBS_BOT_PROVIDER_REHEARSAL_RECIPIENT }}
+          SUBS_BOT_PROVIDER_REHEARSAL_RECIPIENT_SHA256: ${{ secrets.SUBS_BOT_PROVIDER_REHEARSAL_RECIPIENT_SHA256 }}
+          SUBS_BOT_PROVIDER_REHEARSAL_AGE_IDENTITY: ${{ secrets.SUBS_BOT_PROVIDER_REHEARSAL_AGE_IDENTITY }}
+        run: |
+          umask 077
+          python3 -B worker/tools/production_provider_encrypted_publish.py
+      - name: Persist intent once in private R2
+        id: persist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_ACTION: persist-intent
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_CF_PROVIDER_ARCHIVE_WRITE_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_ARCHIVE_WRITE_TOKEN }}
+        run: python3 -B worker/tools/production_provider_encrypted_publish.py
+      - name: Independently read back private intent
+        id: confirm
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_ACTION: confirm-intent
+          SUBS_BOT_PROVIDER_ENCRYPTED_EXPECTED_SHA256: ${{ steps.persist.outputs.intent_sha256 }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ENCRYPTED_LEDGER_JSON }}
+          SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN }}
+        run: python3 -B worker/tools/production_provider_encrypted_publish.py
+
+  dispatch:
+    name: Provider private dispatch
+    needs: archive_intent
+    environment: subs-bot-provider-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_sha256: ${{ steps.upload.outputs.artifact-digest }}
+      cipher_sha256: ${{ steps.execute.outputs.cipher_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify pinned clients before reading private data
+        run: |
+          bash worker/tools/install_provider_age.sh
+          bash worker/tools/install_provider_skopeo.sh
+      - name: Independently read intent and source chain
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_ACTION: read-intent
+          SUBS_BOT_PROVIDER_ENCRYPTED_INTENT_SHA256: ${{ needs.archive_intent.outputs.intent_sha256 }}
+          SUBS_BOT_PROVIDER_ARCHIVE_REFS: ${{ inputs.archive_refs }}
+          SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ENCRYPTED_LEDGER_JSON }}
+          SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN }}
+        run: |
+          umask 077
+          python3 -B worker/tools/production_provider_encrypted_publish.py
+      - name: Reverify the exact existing image and encrypt response
+        id: execute
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_ACTION: dispatch
+          SUBS_BOT_PROVIDER_ENCRYPTED_INTENT_SHA256: ${{ needs.archive_intent.outputs.intent_sha256 }}
+          SUBS_BOT_PROVIDER_ARCHIVE_REFS: ${{ inputs.archive_refs }}
+          SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN }}
+          SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN }}
+          SUBS_BOT_PROVIDER_REHEARSAL_RECIPIENT: ${{ vars.SUBS_BOT_PROVIDER_REHEARSAL_RECIPIENT }}
+          SUBS_BOT_PROVIDER_REHEARSAL_RECIPIENT_SHA256: ${{ secrets.SUBS_BOT_PROVIDER_REHEARSAL_RECIPIENT_SHA256 }}
+        run: python3 -B worker/tools/production_provider_encrypted_publish.py
+      - name: Upload encrypted response
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: provider-encrypted-response-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/payload.age
+          retention-days: 1
+          if-no-files-found: error
+
+  archive_response:
+    name: Provider private response archive
+    needs: [archive_intent, dispatch]
+    environment: subs-bot-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      response_sha256: ${{ steps.confirm.outputs.response_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify pinned age before reading private data
+        run: bash worker/tools/install_provider_age.sh
+      - name: Authenticate and decrypt exact response
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_ACTION: prepare-response
+          SUBS_BOT_PROVIDER_TRUSTED_UPSTREAM_ARTIFACT_ID: ${{ needs.dispatch.outputs.artifact_id }}
+          SUBS_BOT_PROVIDER_TRUSTED_UPSTREAM_ARCHIVE_SHA256: ${{ needs.dispatch.outputs.artifact_sha256 }}
+          SUBS_BOT_PROVIDER_TRUSTED_UPSTREAM_CIPHER_SHA256: ${{ needs.dispatch.outputs.cipher_sha256 }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_INTENT_SHA256: ${{ needs.archive_intent.outputs.intent_sha256 }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ENCRYPTED_LEDGER_JSON }}
+          SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN }}
+          SUBS_BOT_PROVIDER_REHEARSAL_RECIPIENT: ${{ vars.SUBS_BOT_PROVIDER_REHEARSAL_RECIPIENT }}
+          SUBS_BOT_PROVIDER_REHEARSAL_RECIPIENT_SHA256: ${{ secrets.SUBS_BOT_PROVIDER_REHEARSAL_RECIPIENT_SHA256 }}
+          SUBS_BOT_PROVIDER_REHEARSAL_AGE_IDENTITY: ${{ secrets.SUBS_BOT_PROVIDER_REHEARSAL_AGE_IDENTITY }}
+        run: python3 -B worker/tools/production_provider_encrypted_publish.py
+      - name: Persist response once in private R2
+        id: persist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_ACTION: persist-response
+          SUBS_BOT_PROVIDER_ENCRYPTED_INTENT_SHA256: ${{ needs.archive_intent.outputs.intent_sha256 }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_CF_PROVIDER_ARCHIVE_WRITE_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_ARCHIVE_WRITE_TOKEN }}
+        run: python3 -B worker/tools/production_provider_encrypted_publish.py
+      - name: Independently read back private response
+        id: confirm
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_ACTION: confirm-response
+          SUBS_BOT_PROVIDER_ENCRYPTED_EXPECTED_SHA256: ${{ steps.persist.outputs.response_sha256 }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_INTENT_SHA256: ${{ needs.archive_intent.outputs.intent_sha256 }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ENCRYPTED_LEDGER_JSON }}
+          SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN }}
+        run: python3 -B worker/tools/production_provider_encrypted_publish.py
+
+  verify:
+    name: Provider private verify
+    needs: [archive_intent, archive_response]
+    environment: subs-bot-provider-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_sha256: ${{ steps.upload.outputs.artifact-digest }}
+      cipher_sha256: ${{ steps.verify.outputs.cipher_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify pinned clients before reading private data
+        run: |
+          bash worker/tools/install_provider_age.sh
+          bash worker/tools/install_provider_skopeo.sh
+      - name: Independently read response and exact source chain
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_ACTION: read-response
+          SUBS_BOT_PROVIDER_ENCRYPTED_INTENT_SHA256: ${{ needs.archive_intent.outputs.intent_sha256 }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_RESPONSE_SHA256: ${{ needs.archive_response.outputs.response_sha256 }}
+          SUBS_BOT_PROVIDER_ARCHIVE_REFS: ${{ inputs.archive_refs }}
+          SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ENCRYPTED_LEDGER_JSON }}
+          SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN }}
+        run: |
+          umask 077
+          python3 -B worker/tools/production_provider_encrypted_publish.py
+      - name: Independently verify Provider and registry state
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_ACTION: verify-publication
+          SUBS_BOT_PROVIDER_ENCRYPTED_INTENT_SHA256: ${{ needs.archive_intent.outputs.intent_sha256 }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_RESPONSE_SHA256: ${{ needs.archive_response.outputs.response_sha256 }}
+          SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN }}
+          SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN }}
+          SUBS_BOT_PROVIDER_REHEARSAL_RECIPIENT: ${{ vars.SUBS_BOT_PROVIDER_REHEARSAL_RECIPIENT }}
+          SUBS_BOT_PROVIDER_REHEARSAL_RECIPIENT_SHA256: ${{ secrets.SUBS_BOT_PROVIDER_REHEARSAL_RECIPIENT_SHA256 }}
+        run: python3 -B worker/tools/production_provider_encrypted_publish.py
+      - name: Upload encrypted completion
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: provider-encrypted-completion-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/payload.age
+          retention-days: 1
+          if-no-files-found: error
+
+  archive_completion:
+    name: Provider private completion archive
+    needs: [archive_intent, archive_response, verify]
+    environment: subs-bot-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      completion_sha256: ${{ steps.confirm.outputs.completion_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify pinned age before reading private data
+        run: bash worker/tools/install_provider_age.sh
+      - name: Authenticate and decrypt exact completion evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_ACTION: prepare-completion
+          SUBS_BOT_PROVIDER_TRUSTED_UPSTREAM_ARTIFACT_ID: ${{ needs.verify.outputs.artifact_id }}
+          SUBS_BOT_PROVIDER_TRUSTED_UPSTREAM_ARCHIVE_SHA256: ${{ needs.verify.outputs.artifact_sha256 }}
+          SUBS_BOT_PROVIDER_TRUSTED_UPSTREAM_CIPHER_SHA256: ${{ needs.verify.outputs.cipher_sha256 }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_INTENT_SHA256: ${{ needs.archive_intent.outputs.intent_sha256 }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_RESPONSE_SHA256: ${{ needs.archive_response.outputs.response_sha256 }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ENCRYPTED_LEDGER_JSON }}
+          SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN }}
+          SUBS_BOT_PROVIDER_REHEARSAL_RECIPIENT: ${{ vars.SUBS_BOT_PROVIDER_REHEARSAL_RECIPIENT }}
+          SUBS_BOT_PROVIDER_REHEARSAL_RECIPIENT_SHA256: ${{ secrets.SUBS_BOT_PROVIDER_REHEARSAL_RECIPIENT_SHA256 }}
+          SUBS_BOT_PROVIDER_REHEARSAL_AGE_IDENTITY: ${{ secrets.SUBS_BOT_PROVIDER_REHEARSAL_AGE_IDENTITY }}
+        run: python3 -B worker/tools/production_provider_encrypted_publish.py
+      - name: Persist completion once in private R2
+        id: persist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_ACTION: persist-completion
+          SUBS_BOT_PROVIDER_ENCRYPTED_INTENT_SHA256: ${{ needs.archive_intent.outputs.intent_sha256 }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_RESPONSE_SHA256: ${{ needs.archive_response.outputs.response_sha256 }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_CF_PROVIDER_ARCHIVE_WRITE_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_ARCHIVE_WRITE_TOKEN }}
+        run: python3 -B worker/tools/production_provider_encrypted_publish.py
+      - name: Independently read back private completion
+        id: confirm
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_ACTION: confirm-completion
+          SUBS_BOT_PROVIDER_ENCRYPTED_EXPECTED_SHA256: ${{ steps.persist.outputs.completion_sha256 }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_INTENT_SHA256: ${{ needs.archive_intent.outputs.intent_sha256 }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_RESPONSE_SHA256: ${{ needs.archive_response.outputs.response_sha256 }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ENCRYPTED_LEDGER_JSON }}
+          SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN }}
+        run: python3 -B worker/tools/production_provider_encrypted_publish.py
+
+  independent_readback:
+    name: Provider private independent R2 readback
+    needs: [archive_intent, archive_response, archive_completion]
+    environment: subs-bot-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Independently read all evidence and source originals from R2
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_ACTION: independent-readback
+          SUBS_BOT_PROVIDER_ENCRYPTED_INTENT_SHA256: ${{ needs.archive_intent.outputs.intent_sha256 }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_RESPONSE_SHA256: ${{ needs.archive_response.outputs.response_sha256 }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_COMPLETION_SHA256: ${{ needs.archive_completion.outputs.completion_sha256 }}
+          SUBS_BOT_PROVIDER_ARCHIVE_REFS: ${{ inputs.archive_refs }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_ENCRYPTED_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ENCRYPTED_LEDGER_JSON }}
+          SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          python3 -B worker/tools/production_provider_encrypted_publish.py

@@ -11,6 +11,11 @@ on:
       - 'worker/tools/activate_provider_isolation.py'
       - 'worker/tools/activate_provider_api_status.py'
       - 'worker/tools/install_provider_skopeo.sh'
+      - 'worker/tools/install_provider_age.sh'
+      - 'worker/tools/provider_private_handoff.py'
+      - 'worker/tools/production_provider_encrypted_publish.py'
+      - 'worker/test/test_provider_private_handoff.py'
+      - 'worker/test/test_production_provider_encrypted_publish.py'
       - 'worker/tools/prepare_provider_artifact.py'
       - 'worker/tools/prepare_provider_api_status_artifact.py'
       - 'worker/tools/prepare_isolation_artifact.py'
@@ -31,6 +36,7 @@ on:
       - '.github/workflows/worker-production-provider-source-readback.yml'
       - '.github/workflows/worker-production-provider-source-reconcile.yml'
       - '.github/workflows/worker-production-provider-source.yml'
+      - '.github/workflows/worker-production-provider-encrypted-rehearsal.yml'
       - '.github/actions/provider-control-step/action.yml'
       - 'worker/tools/publish_provider_registry.py'
       - 'worker/tools/stage_provider_version.py'
@@ -64,6 +70,11 @@ on:
       - 'worker/tools/activate_provider_isolation.py'
       - 'worker/tools/activate_provider_api_status.py'
       - 'worker/tools/install_provider_skopeo.sh'
+      - 'worker/tools/install_provider_age.sh'
+      - 'worker/tools/provider_private_handoff.py'
+      - 'worker/tools/production_provider_encrypted_publish.py'
+      - 'worker/test/test_provider_private_handoff.py'
+      - 'worker/test/test_production_provider_encrypted_publish.py'
       - 'worker/tools/prepare_provider_artifact.py'
       - 'worker/tools/prepare_provider_api_status_artifact.py'
       - 'worker/tools/prepare_isolation_artifact.py'
@@ -84,6 +95,7 @@ on:
       - '.github/workflows/worker-production-provider-source-readback.yml'
       - '.github/workflows/worker-production-provider-source-reconcile.yml'
       - '.github/workflows/worker-production-provider-source.yml'
+      - '.github/workflows/worker-production-provider-encrypted-rehearsal.yml'
       - '.github/actions/provider-control-step/action.yml'
       - 'worker/tools/publish_provider_registry.py'
       - 'worker/tools/stage_provider_version.py'
@@ -123,6 +135,8 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.13'
+      - name: Verify pinned age package before private handoff checks
+        run: bash worker/tools/install_provider_age.sh
       - name: Install only the pinned transport wheels
         run: |
           python -m pip --isolated install --index-url https://pypi.org/simple --only-binary=:all: \
@@ -136,6 +150,7 @@ jobs:
         run: |
           python -B -m unittest discover -s worker/test -p 'test_production_provider*.py'
           python -B -m unittest discover -s worker/test -p 'test_archive_production_provider.py'
+          python -B -m unittest discover -s worker/test -p 'test_provider_private_handoff.py'
       - name: Test guarded registry publication without network access
         run: python -B -m unittest discover -s worker/test -p 'test_publish_provider_registry.py'
       - name: Test the private Worker bootstrap without network access
