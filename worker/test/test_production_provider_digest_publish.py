@@ -110,7 +110,8 @@ class DigestPublishTests(unittest.TestCase):
         target["build"]["ociArchiveSha256"] = sha256(archive.read_bytes()).hexdigest()
         state = {"dependencySha256": "1" * 64, "manifestSha256": None, "tagsSha256": "4" * 64}
         refs = [{"fixture": "original archive reference"}]
-        expected = digest_publish.intent(target, refs, state, "101", "b" * 40)
+        with patch.dict(os.environ, {}, clear=True):
+            expected = digest_publish.intent(target, refs, state, "101", "b" * 40)
         env = {"RUNNER_TEMP": root, "GITHUB_RUN_ID": "101", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_SHA": "b" * 40,
                "SUBS_BOT_PROVIDER_DIGEST_APPROVAL": expected["approvalSha256"]}
         return target, archive, state, refs, expected, env

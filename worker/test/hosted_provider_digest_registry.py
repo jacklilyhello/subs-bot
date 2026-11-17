@@ -139,7 +139,8 @@ def run(registry, artifact, revision, root):
         target["smoke"]["healthRevision"] = revision
         state = {"dependencySha256": "1" * 64, "manifestSha256": None, "tagsSha256": "4" * 64}
         refs = [{"fixture": "loopback only"}]
-        intent = publish.intent(target, refs, state, "101", "b" * 40)
+        with patch.dict(os.environ, {}, clear=True):
+            intent = publish.intent(target, refs, state, "101", "b" * 40)
         env = {"RUNNER_TEMP": str(root), "GITHUB_RUN_ID": "101", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_SHA": "b" * 40,
                "SUBS_BOT_PROVIDER_DIGEST_APPROVAL": intent["approvalSha256"]}
         writer, reader = Mock(), Mock()
