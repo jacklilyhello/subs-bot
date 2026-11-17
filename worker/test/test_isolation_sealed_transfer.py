@@ -60,15 +60,17 @@ class SealedTransferTests(unittest.TestCase):
     def test_key_plan_needs_no_source_secret_or_protected_pin(self):
         with tempfile.TemporaryDirectory() as directory:
             env = environment("backup-target", b"a" * 32, directory)
-            for name in ("TRANSFER_SOURCE_ENVIRONMENT", "TRANSFER_DESTINATION_ENVIRONMENT", "TRANSFER_SOURCE_NAME",
-                         "TRANSFER_DESTINATION_NAME", "TRANSFER_DESTINATION_KEY_PIN"):
+            source_names = ("TRANSFER_SOURCE_ENVIRONMENT", "TRANSFER_DESTINATION_ENVIRONMENT", "TRANSFER_SOURCE_NAME",
+                            "TRANSFER_DESTINATION_NAME")
+            source_fields = {name: env[name] for name in source_names}
+            for name in (*source_names, "TRANSFER_DESTINATION_KEY_PIN"):
                 env.pop(name)
             with patch.object(transfer.github, "require_current_main"):
                 result = transfer.key_plan(env)
+                with self.assertRaises(ContractError):
+                    transfer.gate({**env, **source_fields})
             self.assertEqual(result["destination"], "subs-bot-backup-head-isolation")
             self.assertEqual(len(result["keyPinSha256"]), 64)
-            with self.assertRaises(ContractError):
-                transfer.gate(env)
 
     def test_source_metadata_requires_fresh_exact_operator_pin_and_no_fallback(self):
         value = {"version": 1, "repositoryId": transfer.github.REPOSITORY_ID, "environment": "subs-bot-provider-isolation",
