@@ -46,7 +46,7 @@ jobs:
       SUBS_BOT_PROVIDER_ARCHIVE_REFS: ${{ toJSON(fromJSON(inputs.validation_json).archiveRefs) }}
       SUBS_BOT_PROVIDER_TRUSTED_ARCHIVE_REFS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
       SUBS_BOT_PROVIDER_DIGEST_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_APPROVAL }}
-      SUBS_BOT_PROVIDER_SIMULATE_ARTIFACT_UNAVAILABLE: '1'
+      SUBS_BOT_PROVIDER_SIMULATE_ARTIFACT_UNAVAILABLE: '0'
     steps:
       - name: Check out trusted current main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

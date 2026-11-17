@@ -51,6 +51,7 @@ def validate(env):
             and env.get("GITHUB_WORKFLOW_REF") in {WORKFLOW, DIGEST_WORKFLOW, *SOURCE_WORKFLOWS} and env.get("GITHUB_WORKFLOW_SHA") == main
             and env.get("RUNNER_ENVIRONMENT") == "github-hosted" and env.get("GITHUB_RUN_ATTEMPT") == "1"
             and HEX40.fullmatch(main or "") is not None and re.fullmatch(r"[!-~]{1,4096}", token or "") is not None)
+    source_workflow = env.get("GITHUB_WORKFLOW_REF") in SOURCE_WORKFLOWS
     spec = parsed(env.get("PROVIDER_HEAD_VALIDATION_JSON", ""))
     require(set(spec) == FIELDS and type(spec["version"]) is int and spec["version"] == 1
             and isinstance(spec["pr"], str) and re.fullmatch(r"[1-9][0-9]{0,8}", spec["pr"]) is not None
@@ -58,7 +59,7 @@ def validate(env):
             and env.get("PROVIDER_REVIEWED_HEAD_SHA") == spec["headSha"]
             and isinstance(spec["providerCiRunId"], str) and DECIMAL.fullmatch(spec["providerCiRunId"]) is not None
             and isinstance(spec["approvalSha256"], str) and HEX64.fullmatch(spec["approvalSha256"]) is not None
-            and spec["simulateActionsUnavailable"] is True and isinstance(spec["archiveRefs"], list)
+            and spec["simulateActionsUnavailable"] is (False if source_workflow else True) and isinstance(spec["archiveRefs"], list)
             and 0 < len(spec["archiveRefs"]) <= 9)
     for ref in spec["archiveRefs"]:
         require(isinstance(ref, dict) and set(ref) == {"kind", "runId", "runAttempt", "manifestSha256", "targetSha256"}
@@ -68,7 +69,6 @@ def validate(env):
                 and (ref["kind"] != "isolated-source" or ref["runAttempt"] == "1"))
     phase, environment = env.get("PROVIDER_HEAD_PHASE", ""), env.get("PROVIDER_HEAD_ENVIRONMENT", "")
     digest_workflow = env.get("GITHUB_WORKFLOW_REF") == DIGEST_WORKFLOW
-    source_workflow = env.get("GITHUB_WORKFLOW_REF") in SOURCE_WORKFLOWS
     phases = DIGEST_PHASES if digest_workflow else SOURCE_PHASES if source_workflow else PHASES
     require(phase in phases and environment in ENVIRONMENTS
             and (not source_workflow or env.get("GITHUB_WORKFLOW_REF") ==

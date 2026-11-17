@@ -103,10 +103,13 @@ class TrustedProviderGateTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ContractError):
                 self.check({**env, **change})
         source = {**env, "GITHUB_WORKFLOW_REF": f"{gate.github.REPOSITORY}/{gate.SOURCE_WORKFLOW_PATH}@{gate.github.MAIN_REF}",
-                  "PROVIDER_HEAD_PHASE": "isolated-source", "PROVIDER_HEAD_ENVIRONMENT": "subs-bot-provider-archive-head-isolation"}
+                  "PROVIDER_HEAD_PHASE": "isolated-source", "PROVIDER_HEAD_ENVIRONMENT": "subs-bot-provider-archive-head-isolation",
+                  "PROVIDER_HEAD_VALIDATION_JSON": json.dumps({**approved, "simulateActionsUnavailable": False})}
         self.assertTrue(self.check(source)["checkoutVerified"])
         with self.assertRaises(ContractError):
             self.check({**source, "PROVIDER_HEAD_PHASE": "isolated-source-readback"})
+        with self.assertRaises(ContractError):
+            self.check({**source, "PROVIDER_HEAD_VALIDATION_JSON": json.dumps(approved)})
 
     def test_digest_dispatcher_uses_fresh_gated_jobs_and_is_default_off(self):
         workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/worker-provider-reviewed-digest.yml").read_text()
