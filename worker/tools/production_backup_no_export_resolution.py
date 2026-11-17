@@ -1,8 +1,8 @@
 """Private evidence for one interrupted rehearsal backup; no export is retried.
 
 The custody assertion is an explicitly reviewed assumption, not an R2
-immutability guarantee. Writes are unavailable until the complete trusted
-workflow and independent readback have been reviewed together.
+immutability guarantee. A trusted main gate and separate protected switches
+are required for every read and write.
 """
 from __future__ import annotations
 
@@ -577,9 +577,8 @@ def run(env):
 
 
 def main():
-    # Keep the entire entrypoint unavailable until source job, seal, fresh
-    # reader and original-session release are reviewed as one protocol.
-    require(False, "No-export resolution is not enabled until its complete evidence and release path is reviewed.")
+    result = run(dict(os.environ))
+    print(json.dumps(result, sort_keys=True))
 
 
 if __name__ == "__main__":

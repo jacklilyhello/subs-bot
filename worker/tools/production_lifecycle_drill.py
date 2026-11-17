@@ -72,6 +72,12 @@ def backup_error_kind(error):
         kind = "unexpected"
     result = {"kind": kind, "uncertain": bool(getattr(error, "uncertain", True))}
     status = getattr(error, "http_status", None)
+    read_diagnostic = getattr(error, "read_diagnostic", None)
+    if isinstance(read_diagnostic, dict) and read_diagnostic.get("source") == "r2" \
+            and read_diagnostic.get("phase") in {"get", "list", "head"}:
+        result.update(source="r2", phase=read_diagnostic["phase"])
+        if status is None:
+            status = read_diagnostic.get("httpStatus")
     if type(status) is int and 100 <= status <= 599:
         result["httpStatus"] = status
     return result

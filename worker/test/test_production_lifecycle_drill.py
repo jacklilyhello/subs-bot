@@ -70,6 +70,13 @@ class LifecycleDrillTests(unittest.TestCase):
         self.assertTrue(journal.append.call_args.args[1]["uncertain"])
         anchor.release.assert_called_once_with("123-1")
 
+    def test_backup_failure_projects_only_bounded_scoped_read_diagnostics(self):
+        error = drill.ContractError("synthetic-private-body")
+        error.read_diagnostic = {"source": "r2", "phase": "get", "httpStatus": 403, "body": "synthetic-private-body"}
+        result = drill.backup_error_kind(error)
+        self.assertEqual(result, {"kind": "contract", "uncertain": True, "source": "r2", "phase": "get", "httpStatus": 403})
+        self.assertNotIn("synthetic-private-body", json.dumps(result))
+
     def test_legacy_webhook_actions_reject_before_opening_private_state(self):
         for action in ("exercise", "provider-binding", "provider-binding-resume", "recover-webhook"):
             with self.subTest(action=action), patch.dict(drill.os.environ, {

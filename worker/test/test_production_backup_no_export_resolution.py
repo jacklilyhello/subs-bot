@@ -74,9 +74,12 @@ class NoExportEvidenceTests(unittest.TestCase):
             resolution.read_originals(store, "private/", "a" * 64, {"original-job-log": b"two"}, SEAL, evidence)
         self.assertNotEqual(evidence, hashlib.sha256(b"one").hexdigest())
 
-    def test_current_entrypoint_is_fail_closed(self):
-        with self.assertRaises(Exception):
-            resolution.main()
+    def test_entrypoint_rejects_an_untrusted_action_before_gate(self):
+        with patch.dict(resolution.os.environ, {"NO_EXPORT_ACTION": "unreviewed"}, clear=True), \
+                patch.object(resolution, "checked_gate") as gate:
+            with self.assertRaises(Exception):
+                resolution.main()
+            gate.assert_not_called()
 
     def test_request_budget_rejects_low_quota_before_a_write(self):
         review = {"targetSha256": "a" * 64}
