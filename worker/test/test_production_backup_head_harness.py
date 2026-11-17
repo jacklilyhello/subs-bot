@@ -38,6 +38,20 @@ def github(path, _token):
 
 
 class HeadGuardTests(unittest.TestCase):
+    def test_public_result_does_not_expose_private_state_or_configuration(self):
+        result = {"status": "passed", "headRevision": HEAD, "targetSha256": "c" * 64,
+                  "state": {"control": {"bot_id": "synthetic-private-id"}},
+                  "webhookSecret": "synthetic-secret", "stages": [{"stage": "verified", "sha256": "d" * 64,
+                                                                    "private": "synthetic-private-data"}],
+                  "backupMaintenance": {"pauseSeconds": 3.5, "baseline": {"checkpointId": "e" * 32,
+                                          "manifestSha256": "f" * 64, "private": "synthetic-private-data"},
+                                        "capacity": {"rows": 19, "rowLimit": 20000, "private": "synthetic-private-data"}}}
+        projected = harness.public_result(result)
+        self.assertEqual(projected["backupSummary"]["rows"], 19)
+        self.assertEqual(projected["stages"], [{"stage": "verified", "sha256": "d" * 64}])
+        self.assertNotIn("synthetic-private", str(projected))
+        self.assertNotIn("synthetic-secret", str(projected))
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)

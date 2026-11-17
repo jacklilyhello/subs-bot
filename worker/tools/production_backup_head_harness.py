@@ -23,6 +23,58 @@ from production_target import canonical, parsed, require
 FILE = ".github/workflows/worker-backup-reviewed-head.yml"
 
 
+def public_result(result):
+    """Project only bounded evidence; full control and test identities stay private."""
+    value = {}
+    for key in ("headRevision", "dispatcherMainRevision"):
+        if isinstance(result.get(key), str) and re.fullmatch(r"[a-f0-9]{40}", result[key]):
+            value[key] = result[key]
+    for key in ("targetSha256", "stateSha256", "genesisSha256", "manifestSha256"):
+        if isinstance(result.get(key), str) and re.fullmatch(r"[a-f0-9]{64}", result[key]):
+            value[key] = result[key]
+    if result.get("status") in {"observed", "planned", "initialized", "passed", "warning",
+                                "awaiting-trusted-webhook-restoration"}:
+        value["status"] = result["status"]
+    for key in ("mutationPerformed", "productionMutated", "webhookTouched", "baselineVerified"):
+        if type(result.get(key)) is bool:
+            value[key] = result[key]
+    if result.get("environment") == "rehearsal":
+        value["environment"] = "rehearsal"
+    for key in ("runId", "runAttempt"):
+        if isinstance(result.get(key), str) and re.fullmatch(r"[1-9][0-9]{0,19}", result[key]):
+            value[key] = result[key]
+    stages = result.get("stages")
+    if isinstance(stages, list):
+        value["stages"] = [{"stage": stage["stage"], "sha256": stage["sha256"]} for stage in stages
+            if isinstance(stage, dict) and isinstance(stage.get("stage"), str)
+            and re.fullmatch(r"[a-z0-9-]{1,80}", stage["stage"])
+            and isinstance(stage.get("sha256"), str) and re.fullmatch(r"[a-f0-9]{64}", stage["sha256"])]
+    maintenance = result.get("dailyBackupAcceptance", result.get("backupMaintenance"))
+    if isinstance(maintenance, dict):
+        summary = {}
+        for key in ("pauseSeconds", "pauseLimitSeconds"):
+            if type(maintenance.get(key)) in (int, float) and 0 <= maintenance[key] <= 86400:
+                summary[key] = maintenance[key]
+        for key in ("pauseLimitExceeded", "admissionRestored", "authorizationUnchanged", "initiallyFrozen"):
+            if type(maintenance.get(key)) is bool:
+                summary[key] = maintenance[key]
+        baseline = maintenance.get("baseline")
+        if isinstance(baseline, dict):
+            for key, pattern in (("checkpointId", r"[a-f0-9]{32}"), ("manifestSha256", r"[a-f0-9]{64}")):
+                if isinstance(baseline.get(key), str) and re.fullmatch(pattern, baseline[key]):
+                    summary[key] = baseline[key]
+        capacity = maintenance.get("capacity")
+        if isinstance(capacity, dict):
+            for key in ("rows", "rowLimit", "objectCount", "objectLimit", "objectBytes", "objectBytesLimit"):
+                if type(capacity.get(key)) is int and 0 <= capacity[key] <= 1 << 50:
+                    summary[key] = capacity[key]
+            for key in ("rowStatus", "objectStatus", "objectBytesStatus"):
+                if capacity.get(key) in {"normal", "warning", "over-limit", "unknown", "not-checked", "unverified"}:
+                    summary[key] = capacity[key]
+        value["backupSummary"] = summary
+    return value
+
+
 def checkout_sha(directory):
     result = subprocess.run(["git", "-C", str(directory), "rev-parse", "--verify", "HEAD"],
                             check=True, capture_output=True, text=True, timeout=15)
@@ -203,6 +255,7 @@ def main(env=None):
         body = canonical(receipt)
         tool.store.put(key, body)
         require(tool.store.get(key) == body, "The private head acceptance evidence was not read back.")
+    result = public_result(result)
     output = Path(env["RUNNER_TEMP"]) / "production-backup-head-result.json"
     with output.open("xb") as stream:
         stream.write(canonical(result))
