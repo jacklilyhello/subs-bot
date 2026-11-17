@@ -6,6 +6,7 @@ import os
 from contextlib import redirect_stdout
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -16,6 +17,19 @@ import production_provider_reviewed_head_harness as harness
 
 
 class ReviewedSourceFaultTests(unittest.TestCase):
+    def test_all_scenarios_use_fresh_scratch_and_restore_environment(self):
+        seen = []
+        with tempfile.TemporaryDirectory() as root:
+            env = {"RUNNER_TEMP": root, "SUBS_BOT_PROVIDER_FAULT_SCENARIO": "all"}
+            def observe():
+                seen.append((os.environ["SUBS_BOT_PROVIDER_FAULT_SCENARIO"], os.environ["RUNNER_TEMP"]))
+            with patch.dict(os.environ, env, clear=True), patch.object(harness, "verify_source_fault_case", side_effect=observe):
+                harness.verify_source_fault()
+                self.assertEqual(os.environ["RUNNER_TEMP"], root)
+                self.assertEqual(os.environ["SUBS_BOT_PROVIDER_FAULT_SCENARIO"], "all")
+            self.assertEqual(len(seen), 8)
+            self.assertEqual(len({path for _, path in seen}), 8)
+
     def test_real_read_bytes_are_faulted_and_rejected_by_chunk_validation(self):
         raw = b"actual-object-fixture"
         digest = sha256(raw).hexdigest()

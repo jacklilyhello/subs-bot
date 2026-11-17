@@ -38,7 +38,7 @@ def verify_archived_chain():
         output.write("target_sha256=" + control.digest(target) + "\n")
 
 
-def verify_source_fault():
+def verify_source_fault_case():
     """Fault one already-read R2 object in memory; this job has no write credential."""
     scenario = os.environ.get("SUBS_BOT_PROVIDER_FAULT_SCENARIO", "")
     control.require(scenario in {f"{fault}-{where}" for fault in ("missing", "corrupt", "digest", "identity")
@@ -111,6 +111,23 @@ def verify_source_fault():
     print(json.dumps({"status": "simulated-source-fault-rejected", "scenario": scenario,
                       "source": "actual-private-r2-get", "faultInjection": "memory-only",
                       "actionsArtifacts": "simulated-unavailable", "providerWrites": False}, sort_keys=True))
+
+
+def verify_source_fault():
+    scenario = os.environ.get("SUBS_BOT_PROVIDER_FAULT_SCENARIO", "")
+    if scenario != "all":
+        return verify_source_fault_case()
+    original_temp = os.environ["RUNNER_TEMP"]
+    try:
+        for fault in ("missing", "corrupt", "digest", "identity"):
+            for where in ("current", "previous"):
+                with tempfile.TemporaryDirectory(prefix=".provider-fault-", dir=original_temp) as scratch:
+                    os.environ["RUNNER_TEMP"] = scratch
+                    os.environ["SUBS_BOT_PROVIDER_FAULT_SCENARIO"] = fault + "-" + where
+                    verify_source_fault_case()
+    finally:
+        os.environ["RUNNER_TEMP"] = original_temp
+        os.environ["SUBS_BOT_PROVIDER_FAULT_SCENARIO"] = scenario
 
 
 def run():
