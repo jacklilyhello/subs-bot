@@ -1,5 +1,6 @@
 """Synthetic failure-closed checks for the test webhook's history gate."""
 from pathlib import Path
+import json
 import sys
 import unittest
 from unittest.mock import Mock, patch
@@ -77,3 +78,14 @@ class WebhookHistoryTests(unittest.TestCase):
         row["updated_at"] = "2026-01-03T00:00:00Z"
         plan = self.inspect(self.environment(), inline_runs=[row], boundary=boundary)
         self.assertEqual(plan["status"], "needs-reconciliation")
+
+    def test_archived_unresolved_request_stays_unknown_after_boundary(self):
+        row = {"id": 456, "head_sha": "a" * 40, "display_title": "Inspect or append isolated Telegram inline webhook",
+               "status": "completed", "updated_at": "2026-01-01T00:00:00Z"}
+        boundary = {"runId": "999", "startedAt": "2026-01-02T00:00:00Z"}
+        env = {**self.environment(), "SUBS_BOT_PHASE_WEBHOOK_HISTORY_ARCHIVES_JSON": json.dumps({"456": {}})}
+        with patch.object(history, "_archived_log", return_value="unresolved"):
+            result = self.inspect(env, inline_runs=[row], boundary=boundary)
+        self.assertEqual(result["status"], "needs-reconciliation")
+        self.assertEqual(result["unknownRuns"][0]["reason"], "unresolved")
+        self.assertEqual(result["priorUnknownBeforeBoundary"], [])
