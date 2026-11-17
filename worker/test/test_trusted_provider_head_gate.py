@@ -90,6 +90,12 @@ class TrustedProviderGateTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ContractError):
                 self.check({**self.env, "PROVIDER_HEAD_VALIDATION_JSON": json.dumps({**spec(), **change})})
 
+    def test_independently_registered_isolated_source_accepts_only_first_attempt(self):
+        ref = {**spec()["archiveRefs"][0], "kind": "isolated-source", "runAttempt": "1"}
+        self.assertEqual(self.check({**self.env, "PROVIDER_HEAD_VALIDATION_JSON": json.dumps({**spec(), "archiveRefs": [ref]})})["reviewedHeadSha"], HEAD)
+        with self.assertRaises(ContractError):
+            self.check({**self.env, "PROVIDER_HEAD_VALIDATION_JSON": json.dumps({**spec(), "archiveRefs": [{**ref, "runAttempt": "2"}]})})
+
     def test_exact_isolated_contract_and_approval_are_required_before_credentials(self):
         target = config(active=True)
         bucket = {"accountId": "9431815bdb8beb2272f6668e06b7d3be", "namespace": "lilyya",
