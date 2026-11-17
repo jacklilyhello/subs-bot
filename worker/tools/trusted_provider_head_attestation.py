@@ -1,7 +1,7 @@
 """Independent read-only trusted-main verification of Provider archive and state."""
 
 import base64
-from hashlib import sha1
+from hashlib import sha1, sha256
 import json
 import os
 from pathlib import Path
@@ -91,9 +91,118 @@ def archive_run(ref, manifest):
                                  for key in ("base_commit", "merge_base_commit")))
 
 
+class IsolatedSourceStore(archive.PrivateProofStore):
+    def __init__(self, target, token, operation_id):
+        super().__init__(target, token, operation_id, "1")
+        self.prefix = f"maintenance/provider-isolated-source/{operation_id}/1/"
+
+    def key(self, relative):
+        provider.require(isinstance(relative, str) and (relative in {"source-intent.json", "source-manifest.json"}
+                         or re.fullmatch(r"blobs/[0-9a-f]{64}", relative) is not None))
+        return self.prefix + relative
+
+
+def independent_isolated_source(ref, bucket, token):
+    """Verify the source and registered readback without executing candidate code."""
+    ledger = gate.parsed(os.environ.get("SUBS_BOT_PROVIDER_ISOLATED_SOURCE_LEDGER_JSON", ""))
+    allowed = json.loads(os.environ.get("SUBS_BOT_PROVIDER_ISOLATED_SOURCE_CONTROLLERS_JSON", ""),
+                         object_pairs_hook=provider.github._unique_json_object)
+    provider.require(len(ledger) <= 32 and isinstance(allowed, list) and 0 < len(allowed) <= 16
+                     and len(set(allowed)) == len(allowed)
+                     and all(provider.match(provider.provider.REVISION, item) for item in allowed)
+                     and os.environ["GITHUB_SHA"] in allowed)
+    record = ledger.get(ref["runId"])
+    fields = {"intentSha256", "manifestSha256", "runId", "controllerRevision", "targetSha256",
+              "readbackRunId", "readbackRunAttempt", "readbackControllerRevision", "readbackSha256"}
+    provider.require(isinstance(record, dict) and set(record) == fields
+                     and all(provider.match(provider.provider.HEX, record[k]) for k in ("intentSha256", "manifestSha256", "targetSha256", "readbackSha256"))
+                     and all(provider.match(provider.provider.DECIMAL, record[k]) for k in ("runId", "readbackRunId", "readbackRunAttempt"))
+                     and record["controllerRevision"] in allowed and record["readbackControllerRevision"] in allowed
+                     and record["manifestSha256"] == ref["manifestSha256"] and record["targetSha256"] == ref["targetSha256"]
+                     and ref["runAttempt"] == "1")
+    store = IsolatedSourceStore(bucket, token, ref["runId"])
+    store.verify()
+    intent_raw, manifest_raw = store.read("source-intent.json"), store.read("source-manifest.json")
+    provider.require(isinstance(intent_raw, bytes) and isinstance(manifest_raw, bytes)
+                     and 0 < len(intent_raw) <= 65536 and 0 < len(manifest_raw) <= 65536
+                     and sha256(intent_raw).hexdigest() == record["intentSha256"]
+                     and sha256(manifest_raw).hexdigest() == record["manifestSha256"])
+    intent = provider.github._parse_object(intent_raw, archive.ERROR)
+    manifest = provider.github._parse_object(manifest_raw, archive.ERROR)
+    provider.require(set(manifest) == {"version", "kind", "runId", "runAttempt", "controllerRevision", "target", "files"}
+                     and type(manifest["version"]) is int and manifest["version"] == 1
+                     and manifest["kind"] == "subs-bot-isolated-provider-source"
+                     and manifest["runId"] == ref["runId"] and manifest["runAttempt"] == "1"
+                     and manifest["controllerRevision"] == record["controllerRevision"]
+                     and isinstance(manifest["files"], dict) and set(manifest["files"]) == {"provider-source-archive.zip"})
+    target = provider.validate_config(manifest["target"])
+    provider.require(target["environment"] == "rehearsal" and target["caller"] is None and provider.digest(target) == ref["targetSha256"])
+    entry = manifest["files"]["provider-source-archive.zip"]
+    provider.require(isinstance(entry, dict) and set(entry) == {"bytes", "sha256", "chunks"}
+                     and type(entry["bytes"]) is int and 0 < entry["bytes"] <= provider.provenance.MAX_ZIP
+                     and entry["sha256"] == target["build"]["archiveSha256"]
+                     and isinstance(entry["chunks"], list) and 0 < len(entry["chunks"]) <= archive.MAX_CHUNKS
+                     and all(isinstance(c, dict) and set(c) == {"bytes", "sha256"}
+                             and type(c["bytes"]) is int and 0 < c["bytes"] <= archive.CHUNK_BYTES
+                             and provider.match(provider.provider.HEX, c["sha256"]) for c in entry["chunks"]))
+    plan = intent.get("plan")
+    provider.require(set(intent) == {"version", "plan", "approvalSha256", "controllerRevision", "runId", "runAttempt", "status"}
+                     and type(intent["version"]) is int and intent["version"] == 1 and intent["status"] == "started-unknown"
+                     and intent["runId"] == record["runId"] and intent["runAttempt"] == "1"
+                     and intent["controllerRevision"] == record["controllerRevision"] and isinstance(plan, dict)
+                     and set(plan) == {"version", "action", "operationId", "controllerRevision", "targetSha256", "build",
+                                       "bucketSha256", "prefixState", "inventorySha256", "controllersSha256"}
+                     and type(plan["version"]) is int and plan["version"] == 1
+                     and plan["prefixState"] == "intent-and-manifest-absent"
+                     and all(provider.match(provider.provider.HEX, plan[k]) for k in ("inventorySha256", "controllersSha256"))
+                     and plan.get("action") == "seal-isolated-provider-source" and plan.get("operationId") == ref["runId"]
+                     and plan.get("controllerRevision") == record["controllerRevision"] and plan.get("targetSha256") == ref["targetSha256"]
+                     and plan.get("bucketSha256") == provider.digest(bucket) and plan.get("build") == target["build"]
+                     and intent["approvalSha256"] == provider.digest(plan))
+    source = {k: record[k] for k in ("intentSha256", "manifestSha256", "runId", "controllerRevision")}
+    report = {"version": 1, "kind": "isolated-provider-source-readback", "status": "source-original-verified",
+              "rehearsalCompletion": "not-evaluated", "operationId": ref["runId"], "manifestSha256": record["manifestSha256"],
+              "targetSha256": record["targetSha256"], "seal": source, "readbackRunId": record["readbackRunId"],
+              "readbackRunAttempt": record["readbackRunAttempt"], "readbackControllerRevision": record["readbackControllerRevision"]}
+    provider.require(provider.digest(report) == record["readbackSha256"])
+    seal_path = ".github/workflows/worker-provider-isolated-source.yml"
+    readback_path = ".github/workflows/worker-provider-isolated-source-readback.yml"
+    gh_token = os.environ["GH_TOKEN"]
+    for run_id, attempt, revision, path, title in (
+            (record["runId"], "1", record["controllerRevision"], seal_path, "Isolated Provider source seal " + ref["runId"]),
+            (record["readbackRunId"], record["readbackRunAttempt"], record["readbackControllerRevision"], readback_path,
+             f"Read isolated source {ref['runId']} 1 {record['manifestSha256']} {record['targetSha256']}")):
+        run = provider.github._get_json(f"/actions/runs/{run_id}/attempts/{attempt}", gh_token)
+        provider.require(str(run.get("id")) == run_id and str(run.get("run_attempt")) == attempt
+                         and run.get("path") in (path, path + "@main", path + "@refs/heads/main")
+                         and run.get("display_title") == title and run.get("head_sha") == revision and run.get("head_branch") == "main"
+                         and run.get("event") == "workflow_dispatch" and (run.get("status"), run.get("conclusion")) == ("completed", "success")
+                         and all(isinstance(run.get(k), dict) and run[k].get("id") == provider.github.REPOSITORY_ID for k in ("repository", "head_repository")))
+        if revision != os.environ["GITHUB_SHA"]:
+            comparison = provider.github._get_json(f"/compare/{revision}...{os.environ['GITHUB_SHA']}?per_page=1", gh_token)
+            provider.require(comparison.get("status") == "ahead" and comparison.get("behind_by") == 0
+                             and all(isinstance(comparison.get(k), dict) and comparison[k].get("sha") == revision for k in ("base_commit", "merge_base_commit")))
+    run_id, attempt = record["readbackRunId"], record["readbackRunAttempt"]
+    response = provider.github._get_json(f"/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100", gh_token)
+    jobs = response.get("jobs")
+    provider.require(isinstance(jobs, list) and response.get("total_count") == len(jobs) == 1)
+    job = jobs[0]
+    provider.require(isinstance(job, dict) and job.get("name") == "readback" and str(job.get("run_id")) == run_id
+                     and str(job.get("run_attempt")) == attempt and job.get("head_sha") == record["readbackControllerRevision"]
+                     and (job.get("status"), job.get("conclusion")) == ("completed", "success") and isinstance(job.get("steps"), list))
+    steps = [step for step in job["steps"] if isinstance(step, dict)
+             and step.get("name") == "Independently verify the pinned original from private R2"]
+    provider.require(len(steps) == 1 and (steps[0].get("status"), steps[0].get("conclusion")) == ("completed", "success"))
+    return store, manifest, target
+
+
 def source_ref(ref, target, token, root):
     bucket = gate.parsed(os.environ["SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON"])
-    store = archive.PrivateProofStore(bucket, token, ref["runId"], ref["runAttempt"])
+    if ref["kind"] == "isolated-source":
+        store, manifest, archived = independent_isolated_source(ref, bucket, token)
+        name = "provider-source-archive.zip"
+    else:
+        store = archive.PrivateProofStore(bucket, token, ref["runId"], ref["runAttempt"])
     if ref["kind"] == "complete":
         archive.verify_archive(store, ref["manifestSha256"])
         manifest = provider.github._parse_object(store.read("manifest.json"), archive.ERROR)
@@ -104,7 +213,7 @@ def source_ref(ref, target, token, root):
                          and provider.digest(proof) == manifest["proofSha256"]
                          and provider.github._parse_object(archive.read_record(store, manifest, "provider-rehearsal-target.json"), archive.ERROR) == archived)
         name = "provider-source-archive.zip"
-    else:
+    elif ref["kind"] == "partial":
         archive.verify_partial(store, ref["manifestSha256"])
         manifest = provider.github._parse_object(store.read("partial-manifest.json"), archive.ERROR)
         latest = manifest.get("latestCheckpoint")
@@ -116,7 +225,8 @@ def source_ref(ref, target, token, root):
                          and checkpoint["journal"].get("targetSha256") == latest["targetSha256"]
                          and checkpoint["journal"].get("runId") == store.run_id and checkpoint["journal"].get("runAttempt") == store.attempt)
         name = f"subs-bot-provider-attempt-source-{store.run_id}-{store.attempt}/provider-source-archive.zip"
-    archive_run(ref, manifest)
+    if ref["kind"] != "isolated-source":
+        archive_run(ref, manifest)
     provider.require(provider.digest(archived) == ref["targetSha256"] and archived["environment"] == "rehearsal" and archived["caller"] is None)
     builds = [item for item in provider.releases(target) if item["build"] == archived["build"]]
     provider.require(len(builds) == 1)

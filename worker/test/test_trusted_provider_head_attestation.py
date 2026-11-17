@@ -91,5 +91,62 @@ class AttestationTests(unittest.TestCase):
         origin.assert_not_called()
 
 
+    def test_isolated_source_independently_binds_seal_and_readback(self):
+        from hashlib import sha256
+        revision, target, operation = "b" * 40, config(active=True), "101"
+        bucket = {"fixture": "registered-isolation-bucket"}
+        plan = {"version": 1, "action": "seal-isolated-provider-source", "operationId": operation,
+                "controllerRevision": revision, "targetSha256": attest.provider.digest(target), "build": target["build"],
+                "bucketSha256": attest.provider.digest(bucket), "prefixState": "intent-and-manifest-absent",
+                "inventorySha256": "1" * 64, "controllersSha256": "2" * 64}
+        intent = {"version": 1, "plan": plan, "approvalSha256": attest.provider.digest(plan), "controllerRevision": revision,
+                  "runId": "102", "runAttempt": "1", "status": "started-unknown"}
+        manifest = {"version": 1, "kind": "subs-bot-isolated-provider-source", "runId": operation, "runAttempt": "1",
+                    "controllerRevision": revision, "target": target, "files": {"provider-source-archive.zip": {
+                        "bytes": 16, "sha256": target["build"]["archiveSha256"],
+                        "chunks": [{"bytes": 16, "sha256": "3" * 64}]}}}
+        raw_intent, raw_manifest = attest.provider.canonical(intent), attest.provider.canonical(manifest)
+        source = {"intentSha256": sha256(raw_intent).hexdigest(), "manifestSha256": sha256(raw_manifest).hexdigest(),
+                  "runId": "102", "controllerRevision": revision}
+        report = {"version": 1, "kind": "isolated-provider-source-readback", "status": "source-original-verified",
+                  "rehearsalCompletion": "not-evaluated", "operationId": operation, "manifestSha256": source["manifestSha256"],
+                  "targetSha256": plan["targetSha256"], "seal": source, "readbackRunId": "103", "readbackRunAttempt": "1",
+                  "readbackControllerRevision": revision}
+        pin = {**source, "targetSha256": plan["targetSha256"], "readbackRunId": "103", "readbackRunAttempt": "1",
+               "readbackControllerRevision": revision, "readbackSha256": attest.provider.digest(report)}
+        ref = {"kind": "isolated-source", "runId": operation, "runAttempt": "1", "manifestSha256": pin["manifestSha256"],
+               "targetSha256": pin["targetSha256"]}
+        repo = {"id": attest.provider.github.REPOSITORY_ID}
+        common = {"run_attempt": 1, "head_sha": revision, "head_branch": "main", "event": "workflow_dispatch",
+                  "status": "completed", "conclusion": "success", "repository": repo, "head_repository": repo}
+        seal = {**common, "id": 102, "path": ".github/workflows/worker-provider-isolated-source.yml",
+                "display_title": "Isolated Provider source seal 101"}
+        readback = {**common, "id": 103, "path": ".github/workflows/worker-provider-isolated-source-readback.yml",
+                    "display_title": f"Read isolated source 101 1 {pin['manifestSha256']} {pin['targetSha256']}"}
+        job = {"name": "readback", "run_id": 103, "run_attempt": 1, "head_sha": revision, "status": "completed",
+               "conclusion": "success", "steps": [{"name": "Independently verify the pinned original from private R2",
+                                                       "status": "completed", "conclusion": "success"}]}
+        def get(path, _token):
+            if path == "/actions/runs/102/attempts/1":
+                return seal
+            if path == "/actions/runs/103/attempts/1":
+                return readback
+            if path == "/actions/runs/103/attempts/1/jobs?per_page=100":
+                return {"total_count": 1, "jobs": [job]}
+            raise AssertionError("unexpected GitHub metadata")
+        store = Mock()
+        store.read.side_effect = lambda name: {"source-intent.json": raw_intent, "source-manifest.json": raw_manifest}[name]
+        env = {"GITHUB_SHA": revision, "GH_TOKEN": "synthetic", "SUBS_BOT_PROVIDER_ISOLATED_SOURCE_LEDGER_JSON": json.dumps({operation: pin}),
+               "SUBS_BOT_PROVIDER_ISOLATED_SOURCE_CONTROLLERS_JSON": json.dumps([revision])}
+        with patch.dict(os.environ, env, clear=True), patch.object(attest, "IsolatedSourceStore", return_value=store), \
+                patch.object(attest.provider.github, "_get_json", side_effect=get):
+            self.assertEqual(attest.independent_isolated_source(ref, bucket, "synthetic")[2], target)
+            with patch.dict(job, {"conclusion": "failure"}), self.assertRaises(attest.provider.ProviderError):
+                attest.independent_isolated_source(ref, bucket, "synthetic")
+            with patch.dict(os.environ, {"SUBS_BOT_PROVIDER_ISOLATED_SOURCE_CONTROLLERS_JSON": json.dumps(["c" * 40])}), \
+                    self.assertRaises(attest.provider.ProviderError):
+                attest.independent_isolated_source(ref, bucket, "synthetic")
+
+
 if __name__ == "__main__":
     unittest.main()
