@@ -4,7 +4,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import production_backup_no_export_resolution as resolution
@@ -53,7 +53,9 @@ class NoExportEvidenceTests(unittest.TestCase):
         store = MemoryStore()
         originals = {"candidate/code": b"private source", "original-job-log": b"private log" * 75000}
         guard = Mock()
-        evidence = resolution.seal_originals(store, "private/", "a" * 64, originals, SEAL, guard)
+        stages = []
+        evidence = resolution.seal_originals(store, "private/", "a" * 64, originals, SEAL, guard, stages.append)
+        self.assertEqual(stages, ["seal-intent", "seal-chunks", "seal-manifest"])
         self.assertEqual(resolution.read_originals(store, "private/", "a" * 64, originals, SEAL, evidence), evidence)
         self.assertGreater(guard.call_count, 3)
         with self.assertRaises(ValueError):
@@ -75,6 +77,20 @@ class NoExportEvidenceTests(unittest.TestCase):
     def test_current_entrypoint_is_fail_closed(self):
         with self.assertRaises(Exception):
             resolution.main()
+
+    def test_request_budget_rejects_low_quota_before_a_write(self):
+        review = {"targetSha256": "a" * 64}
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = json.dumps({"resources": {"core": {"remaining": 100, "reset": 2000}}}).encode()
+        with patch.object(resolution, "checked_gate", return_value=(review, 2)), \
+                patch.object(resolution.github, "_github_token", return_value="token"), \
+                patch.object(resolution.github._OPENER, "open", return_value=response), \
+                patch.object(resolution.time, "time", return_value=1000):
+            with self.assertRaises(Exception):
+                resolution.require_request_budget({"NO_EXPORT_ACTION": "seal"}, review, 20)
+            response.read.return_value = json.dumps({"resources": {"core": {"remaining": 5000, "reset": 2000}}}).encode()
+            self.assertGreater(resolution.require_request_budget({"NO_EXPORT_ACTION": "seal"}, review, 20)["required"], 100)
 
     def test_original_seal_and_fresh_reader_are_both_required(self):
         main, candidate, run_id = "c" * 40, "d" * 40, "123"
@@ -131,6 +147,7 @@ class NoExportEvidenceTests(unittest.TestCase):
                 patch.object(resolution, "historical_originals", return_value={"source": b"source"}), \
                 patch.object(resolution, "custody_original", return_value=b"custody"), \
                 patch.object(resolution, "inventory_original", return_value=b"inventory"), \
+                patch.object(resolution, "require_request_budget"), \
                 patch.object(resolution, "read_originals"), patch.object(resolution, "observe", return_value=observed), \
                 patch.object(resolution.github, "_github_token", return_value="token"):
             with self.assertRaises(RuntimeError):

@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 import subprocess
 import time
+from urllib.request import Request
 
 import prepare_isolation_artifact as github
 from production_target import canonical, parsed, require
@@ -33,9 +34,20 @@ SHA = re.compile(r"[a-f0-9]{64}")
 WORKFLOW = ".github/workflows/worker-backup-no-export-resolution.yml"
 GATES = ("Verify no-export identity before candidate checkout", "Verify exact reviewed no-export checkout",
          "Verify no-export test Bot identity")
+STAGES = {"setup", "gate", "originals", "observe", "budget", "seal-intent", "seal-chunks", "seal-manifest",
+          "claim", "append", "anchor-cas", "receipt", "readback"}
+CURRENT_STAGE = "setup"
 
 
-def checked_gate(env):
+def stage(value):
+    """A progress marker is not evidence that a write completed."""
+    global CURRENT_STAGE
+    require(value in STAGES)
+    CURRENT_STAGE = value
+    print(json.dumps({"noExportStage": value}, sort_keys=True), flush=True)
+
+
+def checked_gate(env, *, with_stats=False):
     """Invoke the separately checked-out, current-main gate, never candidate code."""
     workspace = Path(env.get("GITHUB_WORKSPACE", ""))
     gate = workspace / "trusted/worker/tools/trusted_backup_no_export_gate.py"
@@ -52,7 +64,35 @@ def checked_gate(env):
             and result.get("reviewSha256") == sha256(canonical(review)).hexdigest()
             and result.get("writerInventorySha256") == review.get("writerInventorySha256")
             and result.get("writerInventorySha256") == env.get("NO_EXPORT_WRITER_INVENTORY_SHA256"))
+    if with_stats:
+        writers = result.get("writerRunCount")
+        require(type(writers) is int and 0 <= writers <= 40)
+        return review, writers
     return review
+
+
+def require_request_budget(env, review, remaining_guards):
+    """Fail before an intent if the remaining hosted core quota is insufficient."""
+    checked, writers = checked_gate(env, with_stats=True)
+    require(checked == review and type(remaining_guards) is int and 1 <= remaining_guards <= 100)
+    # Gate's bounded fixed work is at most 19 GETs; allow two per known or
+    # two additional same-workflow runs, six for release's seal provenance,
+    # and 100 spare. Concurrent rate use or secondary limits remain unknown.
+    require(env.get("NO_EXPORT_ACTION") in {"seal", "release"})
+    per_guard = 19 + 2 * (writers + 2) + (6 if env["NO_EXPORT_ACTION"] == "release" else 0)
+    required = per_guard * remaining_guards + 100
+    request = Request("https://api.github.com/rate_limit", headers={
+        "Accept": "application/vnd.github+json", "Authorization": "Bearer " + github._github_token(),
+        "Cache-Control": "no-cache", "X-GitHub-Api-Version": "2022-11-28"})
+    with github._OPENER.open(request, timeout=20) as response:
+        raw = response.read(65537)
+    require(isinstance(raw, bytes) and len(raw) <= 65536)
+    data = json.loads(raw)
+    core = data.get("resources", {}).get("core", {})
+    require(type(core.get("remaining")) is int and type(core.get("reset")) is int
+            and core["reset"] > int(time.time()) and core["remaining"] >= required,
+            "Insufficient GitHub read quota for the bounded guarded operation; no intent was written.")
+    return {"required": required, "remaining": core["remaining"]}
 
 
 def log_reader(env):
@@ -239,17 +279,23 @@ def evidence_layout(plan_sha, originals, seal):
     return manifest, pieces
 
 
-def seal_originals(store, prefix, plan_sha, originals, seal, guard):
+def seal_originals(store, prefix, plan_sha, originals, seal, guard, stage_callback=None):
     """A single guarded claim, exact original chunks, and a final receipt."""
     manifest, pieces = evidence_layout(plan_sha, originals, seal)
     body = canonical(manifest)
     intent = canonical({"version": 1, "kind": "no-export-evidence-intent", "planSha256": plan_sha,
                         "manifestSha256": sha256(body).hexdigest()})
+    if stage_callback:
+        stage_callback("seal-intent")
     guard()
     store.put_exclusive(prefix + "evidence-intent.json", intent)
+    if stage_callback:
+        stage_callback("seal-chunks")
     for key, raw in pieces.items():
         guard()
         store.put_exclusive(prefix + key, raw)
+    if stage_callback:
+        stage_callback("seal-manifest")
     guard()
     store.put_exclusive(prefix + "evidence-manifest.json", body)
     return sha256(body).hexdigest()
@@ -390,6 +436,7 @@ def run(env):
     """Run one fixed action; all original evidence and the source are re-read."""
     action = env.get("NO_EXPORT_ACTION", "")
     require(action in {"plan", "seal", "evidence-readback", "verify-seal", "release", "release-readback", "verify-release"})
+    stage("gate")
     review = checked_gate(env)
     spec = parsed(env["NO_EXPORT_VALIDATION_JSON"])
     def guard():
@@ -419,6 +466,7 @@ def run(env):
         if action in {"evidence-readback", "release-readback"}:
             verify_jobs(env["GITHUB_RUN_ID"], env["GITHUB_SHA"], spec["headSha"],
                         "seal" if action == "evidence-readback" else "release", in_readback=True)
+    stage("originals")
     token = github._github_token()
     originals = historical_originals(review, spec, token, log_reader(env))
     originals["protected-custody.json"] = custody_original(env, review)
@@ -429,6 +477,7 @@ def run(env):
     finished = action in {"release-readback", "verify-release"}
     evidence = (env.get("NO_EXPORT_SEAL_EVIDENCE_SHA256", "") if action == "evidence-readback"
                 else env.get("NO_EXPORT_EVIDENCE_SHA256", ""))
+    stage("observe")
     tool, ctl, store, journal, anchor, state, plan = observe(env, review, guard, finished=finished,
         evidence_sha=evidence)
     plan_sha = sha256(canonical(plan)).hexdigest()
@@ -439,9 +488,13 @@ def run(env):
         return {"status": "planned", "planSha256": plan_sha, "mutationPerformed": False}
     require(plan_sha == env.get("NO_EXPORT_PLAN_SHA256") == env.get("NO_EXPORT_PROTECTED_PLAN_SHA256"))
     if action == "seal":
-        evidence = seal_originals(store, prefix, plan_sha, originals, seal, guard)
+        _manifest, pieces = evidence_layout(plan_sha, originals, seal)
+        stage("budget")
+        require_request_budget(env, review, len(pieces) + 4)
+        evidence = seal_originals(store, prefix, plan_sha, originals, seal, guard, stage_callback=stage)
         output("evidence_sha256", evidence)
         return {"status": "sealed", "planSha256": plan_sha, "evidenceSha256": evidence}
+    stage("readback")
     read_originals(store, prefix, plan_sha, originals, seal, evidence)
     if action == "evidence-readback":
         return {"status": "evidence-readback-confirmed", "planSha256": plan_sha, "evidenceSha256": evidence}
@@ -450,6 +503,8 @@ def run(env):
         return {"status": "seal-readback-confirmed", "planSha256": plan_sha, "evidenceSha256": evidence,
                 "sealRunId": seal_run}
     if action == "release":
+        stage("budget")
+        require_request_budget(env, review, 15)
         # Guard against ambiguous retries with a fixed per-original-session slot.
         intent = {"version": 1, "kind": "no-export-release-intent", "planSha256": plan_sha,
                   "evidenceSha256": evidence, "sealRunId": seal_run, "releaseRunId": env["GITHUB_RUN_ID"],
@@ -457,6 +512,7 @@ def run(env):
                   "targetSha256": review["targetSha256"], "originalRunId": OLD_RUN, "originalAttempt": "1"}
         intent_raw = canonical(intent)
         intent_sha = sha256(intent_raw).hexdigest()
+        stage("claim")
         guard()
         store.put_exclusive(prefix + "release-intent.json", intent_raw)
         tool, ctl, store, journal, anchor, state, next_plan = observe(env, review, guard)
@@ -467,9 +523,11 @@ def run(env):
             require(canonical(checked_plan) == canonical(plan)
                     and checked_store.get(prefix + "release-intent.json") == intent_raw)
             read_originals(checked_store, prefix, plan_sha, originals, seal, evidence)
+        stage("append")
         journal.append_no_export({"control": state["control"], "backupVerified": False,
             "noExportEvidenceSha256": evidence, "releaseIntentSha256": intent_sha,
             "threatModel": review["threatModel"]}, int(time.time()), guard=resolution_guard)
+        stage("anchor-cas")
         guard()
         pointer, raw, _etag = anchor.read()
         require(pointer["state"] == "active" and pointer["session"] == OLD_RUN + "-1"
@@ -485,6 +543,7 @@ def run(env):
                    "releaseRunId": env["GITHUB_RUN_ID"], "terminalJournalSha256": sha256(canonical(journal.load())).hexdigest(),
                    "anchorSha256": sha256(final_raw).hexdigest(), "backupVerified": False}
         require(final_anchor["state"] == "idle")
+        stage("receipt")
         guard()
         receipt_raw = canonical(receipt)
         store.put_exclusive(prefix + "release-complete.json", receipt_raw)
@@ -526,7 +585,10 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
+    except Exception as error:
+        from production_lifecycle_drill import backup_error_kind
+        print(json.dumps({"status": "stopped", "stage": CURRENT_STAGE,
+                          "error": backup_error_kind(error)}, sort_keys=True))
         if os.environ.get("NO_EXPORT_ACTION") in {"verify-seal", "verify-release"}:
             print(json.dumps({"status": "unknown", "action": os.environ["NO_EXPORT_ACTION"],
                               "mutationPerformed": False}, sort_keys=True))
