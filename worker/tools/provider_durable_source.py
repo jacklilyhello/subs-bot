@@ -78,6 +78,27 @@ class ProductionStore(sealed.PrivateProofStore):
                         or re.fullmatch(r"blobs/[0-9a-f]{64}", relative) is not None))
         return self.prefix + relative
 
+    def put(self, relative, raw):
+        if relative not in {"source-intent.json", "source-manifest.json"}:
+            return super().put(relative, raw)
+        control.require(isinstance(raw, bytes) and 0 < len(raw) <= sealed.CHUNK_BYTES
+                        and self.read(relative) is None)
+        if self.access_key is None:
+            self.access_key = sealed.verified_token_identity(self.api, self.target["accountId"])["id"]
+        host = self.target["accountId"] + ".r2.cloudflarestorage.com"
+        path = "/" + self.bucket + "/" + quote(self.key(relative), safe="/-_.~")
+        headers = sealed.signed_put_headers(host, path, self.access_key, self.token, raw,
+                    {"custom": {}, "http": {"cache-control": "no-store, private", "content-type": "application/octet-stream"}},
+                    datetime.now(timezone.utc))
+        try:
+            with sealed.closing(sealed.HTTPSConnection(host, timeout=45)) as connection:
+                connection.request("PUT", path, body=raw, headers=headers)
+                with sealed.closing(connection.getresponse()) as response:
+                    control.require(response.status == 200 and len(response.read(4097)) <= 4096)
+        except (OSError, sealed.HTTPException):
+            raise control.ProviderError("Provider source intent result is unknown; do not retry.") from None
+        control.require(self.read(relative) == raw)
+
 
 def production_manifest(store, expected):
     store.verify()
@@ -190,10 +211,11 @@ def production_inventory(store, bucket, *, inspect_operation=None):
         intent = control.github._parse_object(intent_raw, sealed.ERROR)
         manifest, target = production_manifest(existing, sha256(manifest_raw).hexdigest())
         plan = intent.get("plan")
-        control.require(isinstance(plan, dict) and set(plan) == {"version", "action", "operationId", "targetSha256", "build", "bucketSha256", "prefixState", "inventorySha256", "controllersSha256", "controllerRevision"}
-                        and {key: value for key, value in plan.items() if key not in {"inventorySha256", "controllersSha256"}}
-                        == {key: value for key, value in source_plan(target, bucket, operation_id, {}, [], intent.get("controllerRevision")).items() if key not in {"inventorySha256", "controllersSha256"}}
-                        and all(control.match(control.provider.HEX, plan[key]) for key in ("inventorySha256", "controllersSha256"))
+        mutable = {"inventorySha256", "controllersSha256", "resolutionsSha256"}
+        control.require(isinstance(plan, dict) and set(plan) == {"version", "action", "operationId", "targetSha256", "build", "bucketSha256", "prefixState", "inventorySha256", "controllersSha256", "resolutionsSha256", "controllerRevision"}
+                        and {key: value for key, value in plan.items() if key not in mutable}
+                        == {key: value for key, value in source_plan(target, bucket, operation_id, {}, [], intent.get("controllerRevision")).items() if key not in mutable}
+                        and all(control.match(control.provider.HEX, plan[key]) for key in mutable)
                         and intent.get("approvalSha256") == control.digest(plan) and intent.get("status") == "started-unknown"
                         and intent.get("controllerRevision") == manifest["controllerRevision"]
                         and control.match(control.provider.DECIMAL, intent.get("runId")) and intent.get("runAttempt") == "1")
@@ -230,7 +252,83 @@ def trusted_controllers():
     return values
 
 
-def seal_history(operation_id, completed, controllers):
+def source_resolutions():
+    raw = os.environ.get("SUBS_BOT_PROVIDER_SOURCE_RESOLUTIONS_JSON", "{}")
+    value = control.github._parse_object(raw, sealed.ERROR)
+    control.require(len(value) <= 32)
+    for operation_id, record in value.items():
+        control.require(control.match(control.provider.DECIMAL, operation_id) and isinstance(record, dict)
+                        and set(record) == {"classification", "sealRunId", "controllerRevision", "readbackSha256", "reconcileRunId",
+                                            "reconcileRevision", "manifestSha256", "targetSha256"}
+                        and record["classification"] in {"seal-step-not-dispatched", "complete-original-observed-failed-run"}
+                        and all(control.match(control.provider.DECIMAL, record[key]) for key in ("sealRunId", "reconcileRunId"))
+                        and all(control.match(control.provider.REVISION, record[key]) for key in ("controllerRevision", "reconcileRevision"))
+                        and control.match(control.provider.HEX, record["readbackSha256"])
+                        and (all(record[key] is None for key in ("manifestSha256", "targetSha256"))
+                             if record["classification"] == "seal-step-not-dispatched" else
+                             all(control.match(control.provider.HEX, record[key]) for key in ("manifestSha256", "targetSha256"))))
+    return value
+
+
+def verify_source_resolution(operation_id, record, bucket, controllers, completed, store):
+    """Recheck a separately approved GET-only diagnosis; never retry the old seal."""
+    control.require(record["reconcileRevision"] in controllers)
+    origin = failed_seal_origin(operation_id, record["sealRunId"], controllers)
+    control.require(origin["controllerRevision"] == record["controllerRevision"])
+    prefix = sealed.BASE + operation_id + "/1/"
+    listed = list_private_keys(store, prefix)
+    control.require(all(isinstance(key, str) and key.startswith(prefix) for key in listed))
+    keys = {key[len(prefix):] for key in listed}
+    projection = {"version": 1, "kind": "provider-source-failure-readback", "operationId": operation_id,
+                  "bucketSha256": control.digest(bucket), "origin": origin, "objectCount": len(keys)}
+    if record["classification"] == "seal-step-not-dispatched":
+        control.require(not keys and operation_id not in completed and origin["sealStepConclusion"] == "skipped"
+                        and record["manifestSha256"] is None and record["targetSha256"] is None)
+        projection["classification"] = "seal-step-not-dispatched"
+    else:
+        existing = completed.get(operation_id)
+        control.require(origin["sealStepConclusion"] in {"failure", "cancelled", "success"}
+                        and isinstance(existing, dict) and existing["runId"] == record["sealRunId"]
+                        and existing["controllerRevision"] == record["controllerRevision"]
+                        and existing["manifestSha256"] == record["manifestSha256"]
+                        and {"source-intent.json", "source-manifest.json"} <= keys)
+        prior = ProductionStore(control.canonical(bucket), store.token, operation_id, "1")
+        manifest, target = production_manifest(prior, record["manifestSha256"])
+        control.require(control.digest(target) == record["targetSha256"])
+        expected = {"source-intent.json", "source-manifest.json",
+                    *("blobs/" + chunk["sha256"] for chunk in manifest["files"]["provider-source-archive.zip"]["chunks"])}
+        control.require(keys == expected)
+        projection.update({"classification": "complete-original-observed-failed-run", "ledgerRecord": existing,
+                           "targetSha256": record["targetSha256"]})
+    control.require(control.digest(projection) == record["readbackSha256"])
+    token = control.github._github_token()
+    run_id = record["reconcileRunId"]
+    run = control.github._get_json(f"/actions/runs/{run_id}/attempts/1", token)
+    manifest_pin = record["manifestSha256"] or "none"
+    target_pin = record["targetSha256"] or "none"
+    expected_title = f"Inspect Provider source {operation_id} {record['sealRunId']} {manifest_pin} {target_pin}"
+    control.require(str(run.get("id")) == run_id and run.get("run_attempt") == 1
+                    and run.get("path") in (RECONCILE_WORKFLOW, RECONCILE_WORKFLOW + "@main", RECONCILE_WORKFLOW + "@refs/heads/main")
+                    and run.get("head_sha") == record["reconcileRevision"] and run.get("head_branch") == "main"
+                    and run.get("display_title") == expected_title
+                    and run.get("event") == "workflow_dispatch" and (run.get("status"), run.get("conclusion")) == ("completed", "success")
+                    and all(isinstance(run.get(key), dict) and run[key].get("id") == control.github.REPOSITORY_ID
+                            for key in ("repository", "head_repository")))
+    rows = control.github._get_json(f"/actions/runs/{run_id}/attempts/1/jobs?per_page=100", token)
+    jobs = rows.get("jobs")
+    control.require(isinstance(jobs, list) and rows.get("total_count") == len(jobs) == 1)
+    job = jobs[0]
+    control.require(isinstance(job, dict) and job.get("name") == "inspect"
+                    and str(job.get("run_id")) == run_id and job.get("run_attempt") == 1
+                    and job.get("head_sha") == record["reconcileRevision"]
+                    and (job.get("status"), job.get("conclusion")) == ("completed", "success")
+                    and isinstance(job.get("steps"), list))
+    steps = [step for step in job["steps"] if isinstance(step, dict)
+             and step.get("name") == "Independently inspect the failed run and private archive without writing"]
+    control.require(len(steps) == 1 and (steps[0].get("status"), steps[0].get("conclusion")) == ("completed", "success"))
+
+
+def seal_history(operation_id, completed, controllers, *, resolutions=None, bucket=None, store=None):
     """Reject reuse and block every later seal after an unresolved seal attempt."""
     token = control.github._github_token()
     current = os.environ["GITHUB_RUN_ID"]
@@ -246,7 +344,9 @@ def seal_history(operation_id, completed, controllers):
     else:
         raise control.ProviderError("Provider source seal history is too large to verify safely.")
     control.require(len(rows) == data["total_count"] and len({str(row.get("id")) for row in rows if isinstance(row, dict)}) == len(rows))
-    current_seen, seen = False, set()
+    resolutions = {} if resolutions is None else resolutions
+    control.require(operation_id not in resolutions)
+    current_seen, seen, resolved = False, set(), set()
     for row in rows:
         control.require(isinstance(row, dict))
         control.require(row.get("head_sha") in controllers and row.get("head_branch") == "main"
@@ -264,6 +364,19 @@ def seal_history(operation_id, completed, controllers):
                             and row.get("event") == "workflow_dispatch" and row.get("run_attempt") == 1)
             current_seen = True
         else:
+            if observed_id in resolutions:
+                record = resolutions[observed_id]
+                control.require(observed_id not in resolved
+                                and str(row.get("id")) == record["sealRunId"]
+                                and row.get("head_sha") == record["controllerRevision"]
+                                and row.get("status") == "completed"
+                                and row.get("conclusion") in {"failure", "cancelled", "timed_out"}
+                                and isinstance(bucket, dict) and store is not None)
+                verify_source_resolution(observed_id, record, bucket, controllers, completed, store)
+                resolved.add(observed_id)
+                if observed_id in completed:
+                    seen.add(observed_id)
+                continue
             control.require(observed_id != operation_id and observed_id not in seen and observed_id in completed
                             and str(row.get("id")) == completed[observed_id]["runId"]
                             and row.get("head_sha") == completed[observed_id]["controllerRevision"]
@@ -271,28 +384,37 @@ def seal_history(operation_id, completed, controllers):
                             "A prior Provider source seal is unresolved or the operation ID was used; reconcile before any new seal.")
             seen.add(observed_id)
     control.require(seen == set(completed), "Private source archive inventory and seal history disagree.")
+    control.require(resolved == set(resolutions), "A registered source resolution has no exact failed run.")
     control.require(current_seen, "The current source seal run is not yet independently visible; no write was attempted.")
 
 
-def source_plan(config, bucket, operation_id, inventory, controllers, controller_revision):
+def source_plan(config, bucket, operation_id, inventory, controllers, controller_revision, resolutions=None):
     control.require(control.match(control.provider.DECIMAL, operation_id) and control.match(control.provider.REVISION, controller_revision))
     return {"version": 1, "action": "seal-production-provider-source", "operationId": operation_id,
             "targetSha256": control.digest(config), "build": config["build"],
             "bucketSha256": control.digest(bucket), "prefixState": "intent-and-manifest-absent",
             "inventorySha256": control.digest(inventory), "controllersSha256": control.digest(controllers),
+            "resolutionsSha256": control.digest({} if resolutions is None else resolutions),
             "controllerRevision": controller_revision}
 
 
-def verify_seal_origin(operation_id, record):
+def verify_seal_origin(operation_id, record, *, bucket=None, store=None, inventory=None):
     run = control.github._get_json(f"/actions/runs/{record['runId']}/attempts/1", control.github._github_token())
     control.require(str(run.get("id")) == record["runId"] and run.get("run_attempt") == 1
                     and run.get("path") in (SEAL_WORKFLOW, SEAL_WORKFLOW + "@main", SEAL_WORKFLOW + "@refs/heads/main")
                     and run.get("event") == "workflow_dispatch" and run.get("display_title") == "Provider source seal " + operation_id
-                    and (run.get("status"), run.get("conclusion")) == ("completed", "success")
+                    and run.get("status") == "completed"
                     and run.get("head_branch") == "main" and run.get("head_sha") == record["controllerRevision"]
                     and all(isinstance(run.get(key), dict) and run[key].get("id") == control.github.REPOSITORY_ID
                             for key in ("repository", "head_repository")))
     source_ancestor({"revision": record["controllerRevision"]}, control.github._github_token())
+    if run.get("conclusion") != "success":
+        resolutions = source_resolutions()
+        resolution = resolutions.get(operation_id)
+        control.require(isinstance(resolution, dict) and resolution["classification"] == "complete-original-observed-failed-run"
+                        and isinstance(bucket, dict) and store is not None and isinstance(inventory, dict)
+                        and inventory.get(operation_id) == record)
+        verify_source_resolution(operation_id, resolution, bucket, trusted_controllers(), inventory, store)
 
 
 def production_seal_action(write):
@@ -307,9 +429,10 @@ def production_seal_action(write):
     completed = production_inventory(store, bucket)
     control.require(completed == source_ledger(), "The private source inventory differs from its independently registered ledger.")
     controllers = trusted_controllers()
+    resolutions = source_resolutions()
     control.require(store.read("source-intent.json") is None and store.read("source-manifest.json") is None,
                     "The selected source archive operation is occupied or unconfirmed.")
-    plan = source_plan(config, bucket, operation_id, completed, controllers, os.environ["GITHUB_SHA"])
+    plan = source_plan(config, bucket, operation_id, completed, controllers, os.environ["GITHUB_SHA"], resolutions)
     approval = control.digest(plan)
     if not write:
         print(json.dumps({"status": "plan-only", "approvalSha256": approval, "targetSha256": plan["targetSha256"],
@@ -319,7 +442,7 @@ def production_seal_action(write):
     control.require(len(completed) < 32, "Source archive registration is full; expand the reviewed inventory mechanism without deleting history.")
     control.require(os.environ.get("SUBS_BOT_PROVIDER_SOURCE_APPROVAL", "") == approval,
                     "The exact source seal plan was not approved.")
-    seal_history(operation_id, completed, controllers)
+    seal_history(operation_id, completed, controllers, resolutions=resolutions, bucket=bucket, store=store)
     build = config["build"]
     source = Path(os.environ["RUNNER_TEMP"]) / "provider-source-seal-input" / "provider-source-archive.zip"
     pin = source.with_name("target.sha256")
@@ -382,7 +505,7 @@ def verify_production():
     registered_others = {key: value for key, value in ledger.items() if key != store.run_id}
     control.require(others == registered_others and store.run_id in inventory and inventory[store.run_id]["manifestSha256"] == expected
                     and (store.run_id not in ledger or ledger[store.run_id] == inventory[store.run_id]))
-    verify_seal_origin(store.run_id, inventory[store.run_id])
+    verify_seal_origin(store.run_id, inventory[store.run_id], bucket=bucket, store=store, inventory=inventory)
     manifest, config = production_manifest(store, expected)
     control.require(control.digest(config) == target_sha)
     build = config["build"]
@@ -457,6 +580,8 @@ def inspect_production_failure():
                         "The seal step ran and its empty prefix is not proof that no write was dispatched.")
         projection["classification"] = "seal-step-not-dispatched"
     elif {"source-intent.json", "source-manifest.json"} <= keys:
+        control.require(origin["sealStepConclusion"] in {"failure", "cancelled", "success"},
+                        "A skipped seal step cannot own the observed source records.")
         expected = os.environ.get("SUBS_BOT_PROVIDER_ARCHIVE_MANIFEST_SHA256", "")
         target_sha = os.environ.get("SUBS_BOT_PROVIDER_ARCHIVE_TARGET_SHA256", "")
         control.require(control.match(control.provider.HEX, expected) and control.match(control.provider.HEX, target_sha))
@@ -502,10 +627,10 @@ def restore():
     control.require(isinstance(refs, list) and 0 < len(refs) <= 9)
     root = Path(os.environ["RUNNER_TEMP"]) / "provider-durable-sources"
     root.mkdir(mode=0o700)
-    builds, inventory = [], None
+    builds, inventory, isolated_inventory = [], None, None
     for ref in refs:
         control.require(isinstance(ref, dict) and set(ref) == {"runId", "runAttempt", "manifestSha256", "targetSha256", "kind"}
-                        and ref["kind"] in {"complete", "partial", "production"}
+                        and ref["kind"] in {"complete", "partial", "production", "isolated-source"}
                         and all(control.match(control.provider.HEX, ref[key]) for key in ("manifestSha256", "targetSha256")))
         environment = os.environ.get("SUBS_BOT_PROVIDER_ARCHIVE_ENVIRONMENT", "rehearsal")
         control.require(environment in {"production", "rehearsal"} and (ref["kind"] == "production") == (environment == "production"))
@@ -518,8 +643,21 @@ def restore():
                 control.require(inventory == source_ledger())
             control.require(ref["runId"] in inventory
                             and inventory[ref["runId"]]["manifestSha256"] == ref["manifestSha256"])
-            verify_seal_origin(ref["runId"], inventory[ref["runId"]])
+            verify_seal_origin(ref["runId"], inventory[ref["runId"]], bucket=bucket, store=store, inventory=inventory)
             manifest, config = production_manifest(store, ref["manifestSha256"])
+            name = "provider-source-archive.zip"
+        elif ref["kind"] == "isolated-source":
+            import provider_isolated_source as isolated
+            control.require(ref["runAttempt"] == "1")
+            target = control.github._parse_object(os.environ.get("SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON", ""), sealed.ERROR)
+            store = isolated.Store(target, os.environ.get("SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN", ""), ref["runId"])
+            if isolated_inventory is None:
+                isolated_inventory = isolated.inventory(store)
+                isolated.verify_registered(store, isolated_inventory, isolated.ledger())
+            control.require(ref["runId"] in isolated_inventory
+                            and isolated_inventory[ref["runId"]]["manifestSha256"] == ref["manifestSha256"])
+            isolated.verify_origin(ref["runId"], isolated_inventory[ref["runId"]])
+            manifest, config = isolated.manifest(store, ref["manifestSha256"])
             name = "provider-source-archive.zip"
         else:
             target = control.github._parse_object(os.environ.get("SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON", ""), sealed.ERROR)

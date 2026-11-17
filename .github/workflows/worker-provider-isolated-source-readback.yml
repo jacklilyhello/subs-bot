@@ -1,0 +1,55 @@
+name: Independently read isolated Provider source
+run-name: Read isolated source ${{ inputs.archive_run_id }} ${{ inputs.archive_run_attempt }} ${{ inputs.manifest_sha256 }} ${{ inputs.target_sha256 }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      archive_run_id:
+        description: Exact isolated source archive operation ID
+        required: true
+        type: string
+      archive_run_attempt:
+        description: Source archive attempt; must be 1
+        required: true
+        type: string
+      manifest_sha256:
+        description: Independently recorded source manifest SHA256
+        required: true
+        type: string
+      target_sha256:
+        description: Independently recorded full isolated target SHA256
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  readback:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && vars.SUBS_BOT_PROVIDER_ISOLATED_SOURCE_ENABLED == 'true'
+    environment: subs-bot-provider-archive-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Independently verify the pinned original from private R2
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_ISOLATED_SOURCE_ENABLED: ${{ vars.SUBS_BOT_PROVIDER_ISOLATED_SOURCE_ENABLED }}
+          SUBS_BOT_PROVIDER_ISOLATED_SOURCE_ACTION: readback
+          SUBS_BOT_PROVIDER_ARCHIVE_RUN_ID: ${{ inputs.archive_run_id }}
+          SUBS_BOT_PROVIDER_ARCHIVE_RUN_ATTEMPT: ${{ inputs.archive_run_attempt }}
+          SUBS_BOT_PROVIDER_ARCHIVE_MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_SHA256: ${{ inputs.target_sha256 }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_ISOLATED_SOURCE_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ISOLATED_SOURCE_LEDGER_JSON }}
+          SUBS_BOT_PROVIDER_ISOLATED_SOURCE_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ISOLATED_SOURCE_CONTROLLERS_JSON }}
+          SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          python3 -B worker/tools/provider_isolated_source.py

@@ -32,6 +32,21 @@ class DurableSourceTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(control.ProviderError):
                 store.key(name)
 
+    def test_production_intent_and_manifest_collisions_are_unknown_not_success(self):
+        for name in ("source-intent.json", "source-manifest.json"):
+            store = durable.ProductionStore.__new__(durable.ProductionStore)
+            store.prefix, store.bucket = "maintenance/production-provider/101/1/", "test-bucket"
+            store.target, store.token, store.access_key = {"accountId": "a" * 32}, "synthetic", "b" * 32
+            store.read = Mock(return_value=None)
+            connection, response = Mock(), Mock(status=412)
+            response.read.return_value = b""
+            connection.getresponse.return_value = response
+            with self.subTest(name=name), patch.object(archive, "HTTPSConnection", return_value=connection), \
+                    patch.object(archive, "signed_put_headers", return_value={}), self.assertRaises(control.ProviderError):
+                store.put(name, b"fixture")
+            connection.request.assert_called_once()
+            store.read.assert_called_once_with(name)
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -220,6 +235,22 @@ class OriginalAttemptMetadataTests(unittest.TestCase):
             durable.inspect_production_failure()
         store.put.assert_not_called()
 
+    def test_skipped_seal_never_claims_preexisting_complete_objects(self):
+        origin = {"runId": "102", "controllerRevision": "b" * 40, "runConclusion": "failure",
+                  "sealStepConclusion": "skipped"}
+        env = {"SUBS_BOT_PROVIDER_SOURCE_OPERATION_ID": "1001", "SUBS_BOT_PROVIDER_SOURCE_FAILED_RUN_ID": "102",
+               "SUBS_BOT_PROVIDER_ARCHIVE_BUCKET_JSON": "{}", "GITHUB_SHA": "c" * 40}
+        store = Mock()
+        with patch.dict(os.environ, env, clear=True), patch.object(durable, "seal_context"), \
+                patch.object(durable, "ProductionStore", return_value=store), \
+                patch.object(durable, "production_inventory", return_value=({}, {"source-intent.json", "source-manifest.json"})), \
+                patch.object(durable, "source_ledger", return_value={}), patch.object(durable, "trusted_controllers", return_value=[]), \
+                patch.object(durable, "failed_seal_origin", return_value=origin), \
+                patch.object(durable, "production_manifest") as manifest, self.assertRaises(control.ProviderError):
+            durable.inspect_production_failure()
+        manifest.assert_not_called()
+        store.put.assert_not_called()
+
     def test_historical_requirements_are_commit_pinned_and_blob_verified(self):
         revision = "b" * 40
         raw = b"historical-dependency==1.0\n"
@@ -281,6 +312,83 @@ class OriginalAttemptMetadataTests(unittest.TestCase):
         changed = durable.source_plan(target, {"fixture": "bucket"}, "1001", {}, ["b" * 40, "c" * 40], "c" * 40)
         self.assertNotEqual(control.digest(first), control.digest(changed))
 
+    def test_seal_approval_changes_when_failure_resolution_changes(self):
+        target = config(active=True)
+        before = durable.source_plan(target, {}, "1001", {}, ["b" * 40], "b" * 40, {})
+        after = durable.source_plan(target, {}, "1001", {}, ["b" * 40], "b" * 40, {"1000": {"fixture": "resolution"}})
+        self.assertNotEqual(control.digest(before), control.digest(after))
+
+    def test_skipped_resolution_requires_original_and_independent_readback(self):
+        revision, operation_id, seal_run, reconcile_run = "b" * 40, "1000", "101", "102"
+        origin = {"runId": seal_run, "controllerRevision": revision, "runConclusion": "failure", "sealStepConclusion": "skipped"}
+        bucket = {"fixture": "bucket"}
+        projection = {"version": 1, "kind": "provider-source-failure-readback", "operationId": operation_id,
+                      "bucketSha256": control.digest(bucket), "origin": origin, "objectCount": 0,
+                      "classification": "seal-step-not-dispatched"}
+        record = {"classification": "seal-step-not-dispatched", "sealRunId": seal_run, "controllerRevision": revision,
+                  "readbackSha256": control.digest(projection), "reconcileRunId": reconcile_run, "reconcileRevision": revision,
+                  "manifestSha256": None, "targetSha256": None}
+        run = {"id": 102, "run_attempt": 1, "path": durable.RECONCILE_WORKFLOW, "head_sha": revision,
+               "display_title": f"Inspect Provider source {operation_id} {seal_run} none none",
+               "head_branch": "main", "event": "workflow_dispatch", "status": "completed", "conclusion": "success",
+               "repository": {"id": control.github.REPOSITORY_ID}, "head_repository": {"id": control.github.REPOSITORY_ID}}
+        job = {"name": "inspect", "run_id": 102, "run_attempt": 1, "head_sha": revision,
+               "status": "completed", "conclusion": "success", "steps": [{
+                   "name": "Independently inspect the failed run and private archive without writing",
+                   "status": "completed", "conclusion": "success"}]}
+        def get(path, _token):
+            return {"total_count": 1, "jobs": [job]} if path.endswith("/jobs?per_page=100") else run
+        with patch.object(durable, "failed_seal_origin", return_value=origin), patch.object(durable, "list_private_keys", return_value=[]), \
+                patch.object(control.github, "_github_token", return_value="synthetic"), \
+                patch.object(control.github, "_get_json", side_effect=get):
+            durable.verify_source_resolution(operation_id, record, bucket, [revision], {}, Mock())
+            for bad in ({**record, "readbackSha256": "0" * 64}, {**record, "reconcileRevision": "c" * 40}):
+                with self.assertRaises(control.ProviderError):
+                    durable.verify_source_resolution(operation_id, bad, bucket, [revision], {}, Mock())
+            with patch.dict(origin, {"sealStepConclusion": "failure"}), self.assertRaises(control.ProviderError):
+                durable.verify_source_resolution(operation_id, record, bucket, [revision], {}, Mock())
+            with patch.object(durable, "list_private_keys", return_value=[archive.BASE + operation_id + "/1/source-intent.json"]), \
+                    self.assertRaises(control.ProviderError):
+                durable.verify_source_resolution(operation_id, record, bucket, [revision], {}, Mock())
+
+    def test_complete_failed_seal_keeps_failure_and_requires_exact_original_and_readback(self):
+        revision, operation_id, seal_run, reconcile_run = "b" * 40, "1000", "101", "102"
+        origin = {"runId": seal_run, "controllerRevision": revision, "runConclusion": "failure", "sealStepConclusion": "failure"}
+        bucket, target = {"fixture": "bucket"}, config(active=True)
+        manifest_sha, target_sha, blob = "1" * 64, control.digest(target), "2" * 64
+        original = {"intentSha256": "3" * 64, "manifestSha256": manifest_sha, "runId": seal_run, "controllerRevision": revision}
+        projection = {"version": 1, "kind": "provider-source-failure-readback", "operationId": operation_id,
+                      "bucketSha256": control.digest(bucket), "origin": origin, "objectCount": 3,
+                      "classification": "complete-original-observed-failed-run", "ledgerRecord": original, "targetSha256": target_sha}
+        record = {"classification": "complete-original-observed-failed-run", "sealRunId": seal_run, "controllerRevision": revision,
+                  "readbackSha256": control.digest(projection), "reconcileRunId": reconcile_run, "reconcileRevision": revision,
+                  "manifestSha256": manifest_sha, "targetSha256": target_sha}
+        manifest = {"files": {"provider-source-archive.zip": {"chunks": [{"sha256": blob}]}}}
+        prefix = archive.BASE + operation_id + "/1/"
+        keys = [prefix + name for name in ("source-intent.json", "source-manifest.json", "blobs/" + blob)]
+        run = {"id": 102, "run_attempt": 1, "path": durable.RECONCILE_WORKFLOW, "head_sha": revision,
+               "display_title": f"Inspect Provider source {operation_id} {seal_run} {manifest_sha} {target_sha}",
+               "head_branch": "main", "event": "workflow_dispatch", "status": "completed", "conclusion": "success",
+               "repository": {"id": control.github.REPOSITORY_ID}, "head_repository": {"id": control.github.REPOSITORY_ID}}
+        job = {"name": "inspect", "run_id": 102, "run_attempt": 1, "head_sha": revision, "status": "completed",
+               "conclusion": "success", "steps": [{"name": "Independently inspect the failed run and private archive without writing",
+                                                     "status": "completed", "conclusion": "success"}]}
+        def get(path, _token):
+            return {"total_count": 1, "jobs": [job]} if path.endswith("/jobs?per_page=100") else run
+        with patch.object(durable, "failed_seal_origin", return_value=origin), patch.object(durable, "list_private_keys", return_value=keys), \
+                patch.object(durable, "ProductionStore"), patch.object(durable, "production_manifest", return_value=(manifest, target)), \
+                patch.object(control.github, "_github_token", return_value="synthetic"), patch.object(control.github, "_get_json", side_effect=get):
+            durable.verify_source_resolution(operation_id, record, bucket, [revision], {operation_id: original}, Mock(token="synthetic"))
+            with self.assertRaises(control.ProviderError):
+                durable.verify_source_resolution(operation_id, {**record, "targetSha256": "0" * 64}, bucket,
+                                                 [revision], {operation_id: original}, Mock(token="synthetic"))
+            with patch.dict(run, {"conclusion": "failure"}), self.assertRaises(control.ProviderError):
+                durable.verify_source_resolution(operation_id, record, bucket, [revision], {operation_id: original}, Mock(token="synthetic"))
+            with patch.dict(run, {"display_title": "Inspect Provider source 999 101 none none"}), self.assertRaises(control.ProviderError):
+                durable.verify_source_resolution(operation_id, record, bucket, [revision], {operation_id: original}, Mock(token="synthetic"))
+            with patch.dict(origin, {"sealStepConclusion": "skipped"}), self.assertRaises(control.ProviderError):
+                durable.verify_source_resolution(operation_id, record, bucket, [revision], {operation_id: original}, Mock(token="synthetic"))
+
     def test_seal_history_rejects_reuse_and_any_unresolved_prior_seal(self):
         revision = "b" * 40
         common = {"event": "workflow_dispatch", "run_attempt": 1, "head_sha": revision, "head_branch": "main",
@@ -297,6 +405,25 @@ class OriginalAttemptMetadataTests(unittest.TestCase):
         for changed in ({**prior, "conclusion": "failure"}, {**prior, "display_title": current["display_title"]}):
             with self.subTest(changed=changed), self.assertRaises(control.ProviderError):
                 check([current, changed])
+
+    def test_skipped_resolution_cannot_reuse_operation_or_hide_existing_objects(self):
+        revision = "b" * 40
+        common = {"event": "workflow_dispatch", "run_attempt": 1, "head_sha": revision, "head_branch": "main",
+                  "path": durable.SEAL_WORKFLOW, "repository": {"id": control.github.REPOSITORY_ID},
+                  "head_repository": {"id": control.github.REPOSITORY_ID}}
+        rows = [{**common, "id": 102, "display_title": "Provider source seal 1001"},
+                {**common, "id": 101, "display_title": "Provider source seal 1000", "status": "completed", "conclusion": "failure"}]
+        record = {"sealRunId": "101", "controllerRevision": revision}
+        with patch.dict(os.environ, {"GITHUB_RUN_ID": "102"}, clear=True), \
+                patch.object(control.github, "_github_token", return_value="synthetic"), \
+                patch.object(control.github, "_get_json", return_value={"workflow_runs": rows, "total_count": 2}), \
+                patch.object(durable, "verify_source_resolution") as verify:
+            durable.seal_history("1001", {}, [revision], resolutions={"1000": record}, bucket={}, store=Mock())
+            verify.assert_called_once()
+            with self.assertRaises(control.ProviderError):
+                durable.seal_history("1001", {"1000": {}}, [revision], resolutions={}, bucket={}, store=Mock())
+            with self.assertRaises(control.ProviderError):
+                durable.seal_history("1000", {}, [revision], resolutions={"1000": record}, bucket={}, store=Mock())
 
     def test_unknown_intent_write_never_attempts_source_chunks(self):
         target = config(active=True)

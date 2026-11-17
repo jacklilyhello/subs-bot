@@ -1,5 +1,5 @@
 name: Inspect failed production Provider source seal
-run-name: Inspect failed Provider source seal at ${{ github.sha }}
+run-name: Inspect Provider source ${{ inputs.operation_id }} ${{ inputs.seal_run_id }} ${{ inputs.manifest_sha256 || 'none' }} ${{ inputs.target_sha256 || 'none' }}
 
 on:
   workflow_dispatch:
