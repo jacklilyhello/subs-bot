@@ -55,18 +55,7 @@ def original_history(reader, original_id, registered, allowed):
     token, resolved, recovered = control.github._github_token(), journal.resolutions(), journal.reconciled()
     control.require(not (set(registered) & set(resolved) or set(registered) & set(recovered) or set(resolved) & set(recovered))
                     and original_id not in registered and original_id not in resolved and original_id not in recovered)
-    rows = []
-    for page in range(1, 11):
-        response = control.github._get_json(f"/actions/workflows/{journal.WORKFLOW.rsplit('/', 1)[-1]}/runs?per_page=100&page={page}", token)
-        batch = response.get("workflow_runs")
-        control.require(isinstance(batch, list) and len(batch) <= 100 and type(response.get("total_count")) is int
-                        and 0 <= response["total_count"] <= 1000)
-        rows.extend(batch)
-        if len(batch) < 100:
-            break
-    else:
-        raise control.ProviderError("Provider mutation history exceeds its safe bound.")
-    control.require(len(rows) == response["total_count"] and len({str(row.get("id")) for row in rows if isinstance(row, dict)}) == len(rows))
+    rows = durable.workflow_runs(journal.WORKFLOW, token)
     found, seen, skipped, recovered_seen = False, set(), set(), set()
     for row in rows:
         control.require(isinstance(row, dict) and row.get("path") in (journal.WORKFLOW, journal.WORKFLOW + "@main", journal.WORKFLOW + "@refs/heads/main")

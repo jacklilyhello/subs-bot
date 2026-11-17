@@ -24,6 +24,28 @@ import test_prepare_provider_artifact as artifact_fixture
 
 
 class DurableSourceTests(unittest.TestCase):
+    def test_workflow_history_pages_are_bounded_stable_complete_and_unique(self):
+        path = durable.SEAL_WORKFLOW
+        first = [{"id": index} for index in range(1, 51)]
+        with patch.object(control.github, "_get_json", side_effect=[
+                {"total_count": 51, "workflow_runs": first}, {"total_count": 51, "workflow_runs": [{"id": 51}]}]) as get:
+            self.assertEqual(len(durable.workflow_runs(path, "fixture")), 51)
+            self.assertIn("per_page=50&page=1", get.call_args_list[0].args[0])
+            self.assertIn("per_page=50&page=2", get.call_args_list[1].args[0])
+        for second in ({"total_count": 52, "workflow_runs": [{"id": 51}]},
+                       {"total_count": 51, "workflow_runs": [{"id": 50}]},
+                       {"total_count": 51, "workflow_runs": []}):
+            with self.subTest(second=second), patch.object(control.github, "_get_json", side_effect=[
+                    {"total_count": 51, "workflow_runs": first}, second]), self.assertRaises(control.ProviderError):
+                durable.workflow_runs(path, "fixture")
+        pages = [{"total_count": 1000, "workflow_runs": [{"id": index} for index in range(start, start + 50)]}
+                 for start in range(1, 1001, 50)] + [{"total_count": 1000, "workflow_runs": []}]
+        with patch.object(control.github, "_get_json", side_effect=pages) as get:
+            self.assertEqual(len(durable.workflow_runs(path, "fixture")), 1000)
+            self.assertEqual(get.call_count, 21)
+        with self.assertRaises(control.ProviderError):
+            durable.workflow_runs(".github/workflows/../../other.yml", "fixture")
+
     def test_production_store_allows_only_source_records_and_digest_blobs(self):
         store = durable.ProductionStore.__new__(durable.ProductionStore)
         store.prefix = "maintenance/production-provider/101/1/"

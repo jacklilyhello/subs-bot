@@ -43,6 +43,27 @@ def source_ancestor(build, token):
                                 for key in ("base_commit", "merge_base_commit")))
 
 
+def workflow_runs(path, token):
+    """Read one workflow's complete bounded history without oversized API pages."""
+    control.require(isinstance(path, str) and re.fullmatch(r"\.github/workflows/[a-z0-9-]+\.yml", path) is not None)
+    rows, expected, seen = [], None, set()
+    for page in range(1, 22):
+        response = control.github._get_json(f"/actions/workflows/{path.rsplit('/', 1)[-1]}/runs?per_page=50&page={page}", token)
+        batch, total = response.get("workflow_runs"), response.get("total_count")
+        control.require(isinstance(batch, list) and len(batch) <= 50 and type(total) is int and 0 <= total <= 1000)
+        if expected is None:
+            expected = total
+        control.require(total == expected and len(rows) + len(batch) <= total)
+        for row in batch:
+            control.require(isinstance(row, dict) and type(row.get("id")) is int and row["id"] > 0 and row["id"] not in seen)
+            seen.add(row["id"])
+        rows.extend(batch)
+        if len(batch) < 50:
+            control.require(len(rows) == expected)
+            return rows
+    raise control.ProviderError("Provider workflow history exceeds its safe pagination bound.")
+
+
 def checked_transport_origin(value):
     fields = {"version", "kind", "runId", "runAttempt", "manifestSha256", "targetSha256", "bucketSha256", "ledgerRecordSha256"}
     control.require(isinstance(value, dict) and set(value) == fields and type(value["version"]) is int
@@ -398,18 +419,7 @@ def seal_history(operation_id, completed, controllers, *, resolutions=None, buck
                     for key, value in completed.items()))
     token = control.github._github_token()
     current = os.environ["GITHUB_RUN_ID"]
-    rows = []
-    for page in range(1, 11):
-        data = control.github._get_json(f"/actions/workflows/worker-production-provider-source.yml/runs?per_page=100&page={page}", token)
-        batch = data.get("workflow_runs")
-        control.require(isinstance(batch, list) and len(batch) <= 100 and type(data.get("total_count")) is int
-                        and 0 <= data["total_count"] <= 1000)
-        rows.extend(batch)
-        if len(batch) < 100:
-            break
-    else:
-        raise control.ProviderError("Provider source seal history is too large to verify safely.")
-    control.require(len(rows) == data["total_count"] and len({str(row.get("id")) for row in rows if isinstance(row, dict)}) == len(rows))
+    rows = workflow_runs(SEAL_WORKFLOW, token)
     resolutions = {} if resolutions is None else resolutions
     control.require(operation_id not in resolutions)
     current_seen, seen, resolved = False, set(), set()

@@ -276,19 +276,7 @@ def history(registered, reader):
             control.require(path != transfer.workflow_path() and not any(pin["workflowPath"] == path for pin in registered.values())
                             and not any(pin["workflowPath"] == path for pin in resolutions.values()))
             continue
-        workflow_rows = []
-        for page in range(1, 11):
-            response = control.github._get_json(f"/actions/workflows/{path.rsplit('/', 1)[-1]}/runs?per_page=100&page={page}", token)
-            batch = response.get("workflow_runs")
-            control.require(isinstance(batch, list) and len(batch) <= 100 and type(response.get("total_count")) is int
-                            and 0 <= response["total_count"] <= 1000)
-            workflow_rows.extend(batch)
-            if len(batch) < 100:
-                break
-        else:
-            raise control.ProviderError("Isolated digest history exceeds its safe bound.")
-        control.require(len(workflow_rows) == response["total_count"])
-        rows.extend(workflow_rows)
+        rows.extend(durable.workflow_runs(path, token))
     control.require(len({str(r.get("id")) for r in rows if isinstance(r, dict)}) == len(rows))
     control.require(not set(resolutions) & set(registered) and current not in resolutions)
     seen, resolved, current_seen = set(), set(), False

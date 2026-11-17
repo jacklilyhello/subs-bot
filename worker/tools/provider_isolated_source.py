@@ -176,19 +176,7 @@ def history(operation_id, completed, allowed):
         if not digest_journal.workflow_has_main_history(path, os.environ["GITHUB_SHA"], token):
             control.require(not any(record.get("workflowPath", SEAL_WORKFLOW) == path for record in completed.values()))
             continue
-        found_rows = []
-        for page in range(1, 11):
-            value = control.github._get_json(f"/actions/workflows/{path.rsplit('/', 1)[-1]}/runs?per_page=100&page={page}", token)
-            batch = value.get("workflow_runs")
-            control.require(isinstance(batch, list) and len(batch) <= 100 and type(value.get("total_count")) is int
-                            and 0 <= value["total_count"] <= 1000)
-            found_rows.extend(batch)
-            if len(batch) < 100:
-                break
-        else:
-            raise control.ProviderError("Isolated source seal history is too large to verify safely.")
-        control.require(len(found_rows) == value["total_count"])
-        rows.extend(found_rows)
+        rows.extend(durable.workflow_runs(path, token))
     control.require(len({str(row.get("id")) for row in rows if isinstance(row, dict)}) == len(rows))
     seen, found = set(), False
     for row in rows:

@@ -249,18 +249,7 @@ def history(registered, reader):
     resolved, recovered = resolutions(), reconciled()
     control.require(not (set(resolved) & set(registered) or set(resolved) & set(recovered) or set(registered) & set(recovered))
                     and current not in resolved and current not in recovered)
-    rows = []
-    for page in range(1, 11):
-        response = control.github._get_json(f"/actions/workflows/{WORKFLOW.rsplit('/', 1)[-1]}/runs?per_page=100&page={page}", token)
-        batch = response.get("workflow_runs")
-        control.require(isinstance(batch, list) and len(batch) <= 100 and type(response.get("total_count")) is int
-                        and 0 <= response["total_count"] <= 1000)
-        rows.extend(batch)
-        if len(batch) < 100:
-            break
-    else:
-        raise control.ProviderError("Private Provider mutation history exceeds its safe bound.")
-    control.require(len(rows) == response["total_count"] and len({str(row.get("id")) for row in rows if isinstance(row, dict)}) == len(rows))
+    rows = durable.workflow_runs(WORKFLOW, token)
     seen, resolved_seen, recovered_seen, found = set(), set(), set(), False
     for row in rows:
         control.require(isinstance(row, dict) and row.get("path") in (WORKFLOW, WORKFLOW + "@main", WORKFLOW + "@refs/heads/main")

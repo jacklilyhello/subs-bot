@@ -179,18 +179,7 @@ def require_complete_history():
     """Unknown prior runs remain a blocker even if no private object is observable."""
     trusted, registered = controllers(), ledger()
     token, current = control.github._github_token(), os.environ["GITHUB_RUN_ID"]
-    rows = []
-    for page in range(1, 11):
-        data = control.github._get_json(f"/actions/workflows/worker-production-provider-encrypted-rehearsal.yml/runs?per_page=100&page={page}", token)
-        batch = data.get("workflow_runs")
-        control.require(isinstance(batch, list) and len(batch) <= 100 and type(data.get("total_count")) is int
-                        and 0 <= data["total_count"] <= 1000)
-        rows.extend(batch)
-        if len(batch) < 100:
-            break
-    else:
-        raise control.ProviderError("Encrypted Provider rehearsal history exceeds its safe bound.")
-    control.require(len(rows) == data["total_count"] and len({str(row.get("id")) for row in rows if isinstance(row, dict)}) == len(rows))
+    rows = durable.workflow_runs(".github/workflows/worker-production-provider-encrypted-rehearsal.yml", token)
     seen, current_seen = set(), False
     for row in rows:
         control.require(isinstance(row, dict) and row.get("path") in (handoff.WORKFLOW_PATH, handoff.WORKFLOW_PATH + "@main",
