@@ -612,7 +612,7 @@ def validate(env):
     require(now >= review["auditWindowEnd"])
     # This is one bounded incident-resolution window, not a production
     # monitoring retention limit. A full or larger inventory remains unknown.
-    live = workflow_runs(review["auditWindowEnd"], now, token, maximum=149, live_metadata=True)
+    live = workflow_runs(review["auditWindowEnd"], now, token, maximum=400, live_metadata=True)
     writers = sum(row["path"] == WORKFLOW and str(row["id"]) != env.get("GITHUB_RUN_ID") for row in live)
     require(writers <= 40, "The no-export history exceeds this one-time resolution's bounded audit.")
     legacy_count = live_writer_boundary(live, env, token, spec["headSha"])

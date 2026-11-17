@@ -42,7 +42,7 @@ class NoExportGateTests(unittest.TestCase):
                "display_title": "safe", "workflow_id": 7, "head_branch": "main", "repository": repo, "head_repository": repo}
         with patch.object(gate.github, "_get_json", return_value={"total_count": 1, "workflow_runs": [row]}):
             historic = gate.workflow_runs("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", "x", maximum=150)
-            live = gate.workflow_runs("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", "x", maximum=149, live_metadata=True)
+            live = gate.workflow_runs("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", "x", maximum=400, live_metadata=True)
         self.assertNotIn("status", historic[0])
         self.assertEqual((live[0]["status"], live[0]["conclusion"], live[0]["repository"]), ("completed", "success", repo))
 
@@ -182,6 +182,11 @@ class NoExportGateTests(unittest.TestCase):
         with patch.object(gate.github, "_get_json", side_effect=full) as get:
             self.assertEqual(len(gate.workflow_runs(*env)), 400)
             self.assertEqual(get.call_count, 8)
+        with patch.object(gate.github, "_get_json", side_effect=full) as get:
+            live = gate.workflow_runs(*env, maximum=400, live_metadata=True)
+            self.assertEqual(len(live), 400)
+            self.assertEqual(get.call_count, 8)
+            self.assertTrue(all(row["status"] == "completed" for row in live))
         with patch.object(gate.github, "_get_json", return_value={"total_count": 401, "workflow_runs": [row(1)]}):
             with self.assertRaises(ContractError):
                 gate.workflow_runs(*env)
