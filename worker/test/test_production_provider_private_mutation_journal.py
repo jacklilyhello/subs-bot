@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import production_provider as control
 import provider_private_mutation_journal as journal
+from test_production_provider import config
 
 
 class ProviderMutationJournalTests(unittest.TestCase):
@@ -34,7 +35,22 @@ class ProviderMutationJournalTests(unittest.TestCase):
         env = {"SUBS_BOT_PROVIDER_MUTATION_VERIFICATION_JSON": json.dumps(verification),
                "SUBS_BOT_PROVIDER_MUTATION_RESPONSE_SHA256": "b" * 64}
         with patch.dict(os.environ, env, clear=True), self.assertRaises(control.ProviderError):
-            journal.completion_value(value)
+            journal.completion_value(value, {})
+
+    def test_completion_binds_safe_original_and_both_cipher_digests(self):
+        value = {"operation": "stage", "targetSha256": "a" * 64, "runId": "101"}
+        verified = {key: "1" * 64 for key in journal.VERIFICATION_HASH_FIELDS}
+        verified.update({"status": "independently-verified", "operation": "stage", "targetSha256": "a" * 64})
+        original = {"confirmedCipherSha256": "b" * 64, "observationCipherSha256": "c" * 64,
+                    "resultSha256": verified["resultSha256"]}
+        env = {"SUBS_BOT_PROVIDER_MUTATION_VERIFICATION_JSON": json.dumps(verified),
+               "SUBS_BOT_PROVIDER_MUTATION_RESPONSE_SHA256": "b" * 64}
+        with patch.dict(os.environ, env, clear=True):
+            completed = journal.completion_value(value, original)
+            self.assertEqual(completed["observationSha256"], "c" * 64)
+            self.assertEqual(completed["observationPlaintextSha256"], control.digest(original))
+            with self.assertRaises(control.ProviderError):
+                journal.completion_value(value, {**original, "confirmedCipherSha256": "0" * 64})
 
     def test_unknown_inventory_blocks_next_mutation(self):
         reader = Mock()
@@ -52,11 +68,13 @@ class ProviderMutationJournalTests(unittest.TestCase):
         reader.read.return_value = raw
         env = {"GITHUB_RUN_ID": "101", "GITHUB_SHA": "d" * 40,
                "SUBS_BOT_PROVIDER_MUTATION_INTENT_SHA256": sha256(raw).hexdigest()}
+        original = {"confirmedCipherSha256": None}
         with patch.dict(os.environ, env, clear=True), patch.object(journal, "planned", return_value=(None, None, "stage", value)), \
                 patch.object(journal, "store", return_value=reader), patch.object(journal, "inventory", return_value={"101": {"intent.json"}}), \
-                patch.object(journal, "download_response", return_value=b"encrypted observation"), patch.object(journal.digest_journal, "output"):
+                patch.object(journal, "download_response", return_value=b"encrypted observation"), \
+                patch.object(journal, "response_original", return_value=original), patch.object(journal.digest_journal, "output"):
             journal.failure_evidence()
-        reader.put_once.assert_called_once_with("failure-observation.age", b"encrypted observation")
+        self.assertEqual([call.args[0] for call in reader.put_once.call_args_list], ["failure-observation.age", "failure-observation.json"])
 
     def test_readonly_resolution_requires_every_writing_job_skipped_and_empty_prefix(self):
         revision, run_id = "d" * 40, "101"
@@ -81,6 +99,22 @@ class ProviderMutationJournalTests(unittest.TestCase):
             listing.return_value = [journal.BASE + run_id + "/1/intent.json"]
             with self.assertRaises(control.ProviderError):
                 journal.inspect_readonly_run(reader, run_id, [revision])
+
+    def test_decrypted_response_original_is_strict_and_bound_to_both_ciphers(self):
+        target = config(active=True)
+        value = {"runId": "101", "operation": "stage", "controllerRevision": "a" * 40,
+                 "candidateRevision": "b" * 40, "reviewedPr": "290", "targetSha256": control.digest(target)}
+        obs = {"kind": "response-only", "method": "POST", "path": f"/workers/scripts/{target['service']}/versions",
+               "identities": {"versionId": "11111111-1111-1111-1111-111111111111"}}
+        first = {"intentSha256": control.digest(value), "observation": obs}
+        confirmed = {"intentSha256": control.digest(value), "target": target, "operation": "stage", "observation": obs, "result": {}}
+        with patch.object(journal, "decrypt_record", side_effect=[first, confirmed]):
+            result = journal.response_original(target, value, b"observation", b"confirmed")
+        self.assertEqual(result["observation"], obs)
+        self.assertNotIn("target", result)
+        first["observation"] = {**obs, "token": "synthetic"}
+        with patch.object(journal, "decrypt_record", return_value=first), self.assertRaises(control.ProviderError):
+            journal.response_original(target, value, b"observation")
 
 
 if __name__ == "__main__":

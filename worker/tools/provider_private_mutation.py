@@ -20,6 +20,35 @@ import provider_source_transfer as transfer
 OPERATIONS = {"prepare-image", "stage", "activate", "smoke"}
 
 
+def checked_observation(target, operation, value):
+    """Accept only the response-only fields produced by the isolated API wrapper."""
+    control.require(operation in OPERATIONS and isinstance(value, dict) and value.get("kind") == "response-only"
+                    and value.get("method") == "POST" and target["environment"] == "rehearsal" and target["caller"] is None)
+    service = target["service"]
+    paths = {"prepare-image": "/containers/image-preparations", "stage": f"/workers/scripts/{service}/versions",
+             "activate": f"/workers/scripts/{service}/deployments", "smoke": f"/workflows/{service}-smoke/instances"}
+    control.require(value.get("path") == paths[operation])
+    if operation == "prepare-image":
+        control.require(set(value) == {"kind", "method", "path", "imageManifestSha256", "status"}
+                        and value["status"] == "ready" and value["imageManifestSha256"] == target["build"]["ociManifestSha256"])
+    elif operation == "stage":
+        control.require(set(value) == {"kind", "method", "path", "identities"}
+                        and isinstance(value["identities"], dict) and set(value["identities"]) == {"versionId"}
+                        and control.match(control.stage.VERSION_ID, value["identities"]["versionId"]))
+    else:
+        control.require(set(value) == {"kind", "method", "path", "identities", "responseSha256"}
+                        and control.match(control.provider.HEX, value["responseSha256"])
+                        and isinstance(value["identities"], dict)
+                        and set(value["identities"]) <= {"id", "version_id", "workflow_id", "account_id", "created_on", "created_at"})
+        for key, item in value["identities"].items():
+            if key in {"created_on", "created_at"}:
+                control.require(control.match(control.bootstrap.TIMESTAMP, item))
+            else:
+                control.require(control.match(control.publication.ACCOUNT, item) or control.match(control.stage.VERSION_ID, item)
+                                or (key == "id" and item == "provider-release-" + target["build"]["revision"]))
+    return value
+
+
 def intent(target, refs, operation, state, run_id, revision):
     preparation = os.environ.get("SUBS_BOT_PROVIDER_IMAGE_PREPARATION_SHA256", "") if operation == "stage" else None
     control.require(operation in OPERATIONS and isinstance(state, dict)
@@ -135,7 +164,8 @@ def dispatch(target, refs, operation, original, verified_intent_sha, archive, mo
                     and sha256(module).hexdigest() == target["build"]["workerSha256"])
     observations = []
     def sink(observation):
-        control.require(not observations and isinstance(observation, dict) and observation.get("kind") == "response-only")
+        control.require(not observations)
+        checked_observation(target, operation, observation)
         observations.append(observation)
         # This must happen before run_operation performs any subsequent readback.
         write_encrypted("observation", {"intentSha256": verified_intent_sha, "observation": observation})

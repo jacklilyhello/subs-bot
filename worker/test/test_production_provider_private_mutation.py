@@ -49,7 +49,8 @@ class ProviderPrivateMutationTests(unittest.TestCase):
                 api.sink = sink
                 return api
             def operate(client, _op, _module, _image, _guard):
-                client.sink({"kind": "response-only", "identities": {"versionId": "synthetic"}})
+                client.sink({"kind": "response-only", "method": "POST", "path": f"/workers/scripts/{target['service']}/versions",
+                             "identities": {"versionId": "11111111-1111-1111-1111-111111111111"}})
                 calls.append("subsequent-read")
                 raise control.ProviderError("unknown after response")
             def write(kind, _value):
@@ -71,6 +72,15 @@ class ProviderPrivateMutationTests(unittest.TestCase):
         with patch.object(mutation.rehearsal.ObservedAPI, "upload") as upload, self.assertRaises(control.ProviderError):
             api.upload(b"module")
         upload.assert_not_called()
+
+    def test_response_observation_rejects_unexpected_secret_or_path(self):
+        target = config(active=True)
+        value = {"kind": "response-only", "method": "POST", "path": f"/workers/scripts/{target['service']}/versions",
+                 "identities": {"versionId": "11111111-1111-1111-1111-111111111111"}}
+        self.assertEqual(mutation.checked_observation(target, "stage", value), value)
+        for change in ({"token": "synthetic"}, {"path": "/other"}, {"identities": {"versionId": "not-a-uuid"}}):
+            with self.subTest(change=change), self.assertRaises(control.ProviderError):
+                mutation.checked_observation(target, "stage", {**value, **change})
 
     def test_preparation_rechecks_before_each_confirmed_pending_followup(self):
         image = object.__new__(mutation.GuardedPreparation)

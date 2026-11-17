@@ -40,7 +40,8 @@ class Store(sealed.PrivateProofStore):
         self.prefix = f"{BASE}{run_id}/1/"
 
     def key(self, relative):
-        control.require(relative in {"intent.json", "response.age", "completion.json", "failure-observation.age"})
+        control.require(relative in {"intent.json", "response.age", "completion.json", "observation.age", "observation.json",
+                                     "failure-observation.age", "failure-observation.json", "failure-confirmed.age"})
         return self.prefix + relative
 
     def put_once(self, relative, raw):
@@ -60,11 +61,11 @@ def store(run_id=None):
 def ledger():
     value = control.github._parse_object(os.environ.get("SUBS_BOT_PROVIDER_MUTATION_LEDGER_JSON", ""), sealed.ERROR)
     control.require(len(value) <= MAX_HISTORY)
-    keys = {"intentSha256", "responseSha256", "completionSha256", "targetSha256", "controllerRevision", "candidateRevision",
+    keys = {"intentSha256", "responseSha256", "observationSha256", "observationPlaintextSha256", "completionSha256", "targetSha256", "controllerRevision", "candidateRevision",
             "reviewedPr", "operation", "readbackJobId", "readbackSha256"}
     for run_id, row in value.items():
         control.require(control.match(control.provider.DECIMAL, run_id) and isinstance(row, dict) and set(row) == keys
-                        and all(control.match(control.provider.HEX, row[k]) for k in ("intentSha256", "responseSha256", "completionSha256", "targetSha256", "readbackSha256"))
+                        and all(control.match(control.provider.HEX, row[k]) for k in ("intentSha256", "responseSha256", "observationSha256", "observationPlaintextSha256", "completionSha256", "targetSha256", "readbackSha256"))
                         and all(control.match(control.provider.REVISION, row[k]) for k in ("controllerRevision", "candidateRevision"))
                         and all(control.match(control.provider.DECIMAL, row[k]) for k in ("reviewedPr", "readbackJobId"))
                         and row["operation"] in mutation.OPERATIONS)
@@ -169,7 +170,7 @@ def projection(run_id, original, completion_sha, job_id):
 def inventory(reader, *, current=None):
     grouped = {}
     for key in durable.list_private_keys(reader, BASE):
-        match = re.fullmatch(re.escape(BASE) + r"([1-9][0-9]*)/1/(intent\.json|response\.age|completion\.json|failure-observation\.age)", key)
+        match = re.fullmatch(re.escape(BASE) + r"([1-9][0-9]*)/1/(intent\.json|response\.age|completion\.json|observation\.age|observation\.json|failure-observation\.age|failure-observation\.json|failure-confirmed\.age)", key)
         control.require(match is not None)
         grouped.setdefault(match.group(1), set()).add(match.group(2))
     registered, allowed = ledger(), controllers()
@@ -178,24 +179,43 @@ def inventory(reader, *, current=None):
     for run_id, pin in registered.items():
         if run_id == current:
             continue
-        control.require(grouped[run_id] == {"intent.json", "response.age", "completion.json"} and pin["controllerRevision"] in allowed)
+        control.require(grouped[run_id] == {"intent.json", "response.age", "observation.age", "observation.json", "completion.json"}
+                        and pin["controllerRevision"] in allowed)
         prior = Store(reader.target, run_id)
-        intent_raw, response_raw, done_raw = (prior.read(name) for name in ("intent.json", "response.age", "completion.json"))
+        intent_raw, response_raw, obs_cipher, obs_plain, done_raw = (prior.read(name) for name in
+                    ("intent.json", "response.age", "observation.age", "observation.json", "completion.json"))
         control.require(all(isinstance(raw, bytes) and sha256(raw).hexdigest() == pin[key] for raw, key in
-                            ((intent_raw, "intentSha256"), (response_raw, "responseSha256"), (done_raw, "completionSha256"))))
+                            ((intent_raw, "intentSha256"), (response_raw, "responseSha256"), (obs_cipher, "observationSha256"),
+                             (obs_plain, "observationPlaintextSha256"), (done_raw, "completionSha256"))))
         original = control.github._parse_object(intent_raw, sealed.ERROR)
         done = control.github._parse_object(done_raw, sealed.ERROR)
+        response_original_value = control.github._parse_object(obs_plain, sealed.ERROR)
         control.require(intent_raw == control.canonical(original) and done_raw == control.canonical(done)
                         and original.get("kind") == "isolated-provider-mutation-intent" and original.get("status") == "started-unknown"
                         and original.get("runId") == run_id and original.get("runAttempt") == "1"
                         and all(original.get(key) == pin[key] for key in ("controllerRevision", "candidateRevision", "reviewedPr", "operation", "targetSha256"))
                         and done == {"version": 1, "kind": "isolated-provider-mutation-completion", "runId": run_id,
                                      "intentSha256": pin["intentSha256"], "responseSha256": pin["responseSha256"],
+                                     "observationSha256": pin["observationSha256"], "observationPlaintextSha256": pin["observationPlaintextSha256"],
                                      "verification": done.get("verification")}
+                        and obs_plain == control.canonical(response_original_value)
+                        and set(response_original_value) == {"version", "kind", "runId", "operation", "controllerRevision", "candidateRevision",
+                                                             "reviewedPr", "targetSha256", "intentSha256", "observationCipherSha256",
+                                                             "confirmedCipherSha256", "resultSha256", "observation"}
+                        and type(response_original_value.get("version")) is int and response_original_value["version"] == 1
+                        and response_original_value.get("kind") == "isolated-provider-response-only"
+                        and response_original_value.get("runId") == run_id
+                        and all(response_original_value.get(key) == pin[key] for key in
+                                ("operation", "controllerRevision", "candidateRevision", "reviewedPr", "targetSha256"))
+                        and isinstance(response_original_value.get("observation"), dict)
+                        and response_original_value.get("intentSha256") == pin["intentSha256"]
+                        and response_original_value.get("observationCipherSha256") == pin["observationSha256"]
+                        and response_original_value.get("confirmedCipherSha256") == pin["responseSha256"]
                         and isinstance(done.get("verification"), dict) and done["verification"].get("status") == "independently-verified"
                         and set(done["verification"]) == VERIFICATION_FIELDS
                         and done["verification"].get("operation") == pin["operation"]
                         and done["verification"].get("targetSha256") == pin["targetSha256"]
+                        and response_original_value.get("resultSha256") == done["verification"].get("resultSha256")
                         and all(control.match(control.provider.HEX, done["verification"].get(key)) for key in
                                 VERIFICATION_HASH_FIELDS)
                         and control.digest(projection(run_id, original, pin["completionSha256"], pin["readbackJobId"])) == pin["readbackSha256"])
@@ -319,13 +339,15 @@ def dispatch():
 
 
 def download_response(*, observation=False):
-    artifact_id = os.environ.get("SUBS_BOT_PROVIDER_MUTATION_RESPONSE_ARTIFACT_ID", "")
-    archive_sha = os.environ.get("SUBS_BOT_PROVIDER_MUTATION_RESPONSE_ARTIFACT_SHA256", "")
-    cipher_sha = os.environ.get("SUBS_BOT_PROVIDER_MUTATION_RESPONSE_SHA256", "")
+    prefix = "SUBS_BOT_PROVIDER_MUTATION_OBSERVATION" if observation else "SUBS_BOT_PROVIDER_MUTATION_RESPONSE"
+    trusted = "SUBS_BOT_PROVIDER_MUTATION_TRUSTED_OBSERVATION" if observation else "SUBS_BOT_PROVIDER_MUTATION_TRUSTED"
+    artifact_id = os.environ.get(prefix + "_ARTIFACT_ID", "")
+    archive_sha = os.environ.get(prefix + "_ARTIFACT_SHA256", "")
+    cipher_sha = os.environ.get(prefix + "_SHA256", "")
     control.require(control.match(control.provider.DECIMAL, artifact_id) and all(control.match(control.provider.HEX, x) for x in (archive_sha, cipher_sha))
-                    and os.environ.get("SUBS_BOT_PROVIDER_MUTATION_TRUSTED_ARTIFACT_ID") == artifact_id
-                    and os.environ.get("SUBS_BOT_PROVIDER_MUTATION_TRUSTED_ARTIFACT_SHA256") == archive_sha
-                    and os.environ.get("SUBS_BOT_PROVIDER_MUTATION_TRUSTED_RESPONSE_SHA256") == cipher_sha)
+                    and os.environ.get(trusted + "_ARTIFACT_ID") == artifact_id
+                    and os.environ.get(trusted + "_ARTIFACT_SHA256") == archive_sha
+                    and os.environ.get(trusted + ("_SHA256" if observation else "_RESPONSE_SHA256")) == cipher_sha)
     run_id, revision, token = os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_SHA"], control.github._github_token()
     artifact = control.github._get_json("/actions/artifacts/" + artifact_id, token)
     origin = artifact.get("workflow_run")
@@ -375,6 +397,43 @@ def download_response(*, observation=False):
     return cipher
 
 
+def decrypt_record(cipher, label):
+    """Decrypt only in a protected fresh job; never print raw private content."""
+    import tempfile
+    control.require(label in {"observation", "confirmed"} and isinstance(cipher, bytes) and 0 < len(cipher) <= 512 * 1024)
+    with tempfile.TemporaryDirectory(prefix=".provider-observation-", dir=os.environ["RUNNER_TEMP"]) as directory:
+        source, target = Path(directory) / (label + ".age"), Path(directory) / (label + ".json")
+        with control.provenance._write_private(source) as output:
+            output.write(cipher)
+        transfer.age_identity(["age", "--decrypt", "--identity", "{identity}"], source, target)
+        raw = control.provider.checked_file(target, 256 * 1024).read_bytes()
+        value = control.github._parse_object(raw, sealed.ERROR)
+        control.require(raw == control.canonical(value))
+        return value
+
+
+def response_original(target, value, observation_cipher, confirmed_cipher=None):
+    intent_sha = control.digest(value)
+    observed = decrypt_record(observation_cipher, "observation")
+    control.require(set(observed) == {"intentSha256", "observation"} and observed["intentSha256"] == intent_sha)
+    observation = mutation.checked_observation(target, value["operation"], observed["observation"])
+    confirmed_sha, result_sha = None, None
+    if confirmed_cipher is not None:
+        confirmed = decrypt_record(confirmed_cipher, "confirmed")
+        control.require(set(confirmed) == {"intentSha256", "target", "operation", "observation", "result"}
+                        and confirmed["intentSha256"] == intent_sha and confirmed["target"] == target
+                        and confirmed["operation"] == value["operation"] and confirmed["observation"] == observation
+                        and isinstance(confirmed["result"], dict))
+        confirmed_sha = sha256(confirmed_cipher).hexdigest()
+        result_sha = control.digest(confirmed["result"])
+    return {"version": 1, "kind": "isolated-provider-response-only", "runId": value["runId"], "operation": value["operation"],
+            "controllerRevision": value["controllerRevision"], "candidateRevision": value["candidateRevision"],
+            "reviewedPr": value["reviewedPr"], "targetSha256": value["targetSha256"], "intentSha256": intent_sha,
+            "observationCipherSha256": sha256(observation_cipher).hexdigest(), "confirmedCipherSha256": confirmed_sha,
+            "resultSha256": result_sha,
+            "observation": observation}
+
+
 def verify():
     target, _refs, operation, value = planned()
     expected = os.environ.get("SUBS_BOT_PROVIDER_MUTATION_INTENT_SHA256", "")
@@ -391,6 +450,7 @@ def verify():
                     and record["intentSha256"] == expected and record["target"] == target and record["operation"] == operation
                     and isinstance(record["observation"], dict) and record["observation"].get("kind") == "response-only"
                     and isinstance(record["result"], dict))
+    mutation.checked_observation(target, operation, record["observation"])
     updated = rehearsal.confirmed_target(target, operation, record["result"])
     control.guard_sources(updated)
     api = control.ProviderAPI(updated, os.environ.get("SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN", ""),
@@ -451,20 +511,23 @@ VERIFICATION_HASH_FIELDS = {"targetSha256", "nextTargetSha256", "resultSha256", 
 VERIFICATION_FIELDS = VERIFICATION_HASH_FIELDS | {"status", "operation"}
 
 
-def completion_value(value):
+def completion_value(value, original):
     verified = control.github._parse_object(os.environ.get("SUBS_BOT_PROVIDER_MUTATION_VERIFICATION_JSON", ""), sealed.ERROR)
     control.require(set(verified) == VERIFICATION_FIELDS
                     and verified["status"] == "independently-verified" and verified["operation"] == value["operation"]
                     and verified["targetSha256"] == value["targetSha256"]
                     and all(control.match(control.provider.HEX, verified[k]) for k in VERIFICATION_HASH_FIELDS))
     response_sha = os.environ.get("SUBS_BOT_PROVIDER_MUTATION_RESPONSE_SHA256", "")
-    control.require(control.match(control.provider.HEX, response_sha))
+    control.require(control.match(control.provider.HEX, response_sha) and original["confirmedCipherSha256"] == response_sha
+                    and original["resultSha256"] == verified["resultSha256"])
     return {"version": 1, "kind": "isolated-provider-mutation-completion", "runId": value["runId"],
-            "intentSha256": control.digest(value), "responseSha256": response_sha, "verification": verified}
+            "intentSha256": control.digest(value), "responseSha256": response_sha,
+            "observationSha256": original["observationCipherSha256"], "observationPlaintextSha256": control.digest(original),
+            "verification": verified}
 
 
 def write_completion():
-    _target, _refs, _operation, value = planned()
+    target, _refs, _operation, value = planned()
     run_id, revision = os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_SHA"]
     digest_journal.workflow_job(run_id, revision, JOBS["verify"])
     writer = store()
@@ -473,29 +536,39 @@ def write_completion():
     raw_intent = writer.read("intent.json")
     control.require(isinstance(raw_intent, bytes) and raw_intent == control.canonical(value)
                     and os.environ.get("SUBS_BOT_PROVIDER_MUTATION_INTENT_SHA256") == sha256(raw_intent).hexdigest())
-    cipher = download_response()
+    cipher, observation = download_response(), download_response(observation=True)
+    original = response_original(target, value, observation, cipher)
+    completed = completion_value(value, original)
+    writer.put_once("observation.age", observation)
+    writer.put_once("observation.json", control.canonical(original))
     writer.put_once("response.age", cipher)
-    raw = control.canonical(completion_value(value))
+    raw = control.canonical(completed)
     writer.put_once("completion.json", raw)
     digest_journal.output("completion_sha256", sha256(raw).hexdigest())
 
 
 def independent_readback():
-    _target, _refs, _operation, value = planned()
+    target, _refs, _operation, value = planned()
     run_id, revision = os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_SHA"]
     for name in ("intent-readback", "dispatch", "verify", "completion-write"):
         digest_journal.workflow_job(run_id, revision, JOBS[name])
     reader = store()
     reader.verify()
-    control.require(inventory(reader, current=run_id).get(run_id) == {"intent.json", "response.age", "completion.json"})
-    raw_intent, cipher, raw_done = (reader.read(name) for name in ("intent.json", "response.age", "completion.json"))
+    control.require(inventory(reader, current=run_id).get(run_id) ==
+                    {"intent.json", "response.age", "observation.age", "observation.json", "completion.json"})
+    raw_intent, cipher, observation, raw_observation, raw_done = (reader.read(name) for name in
+                       ("intent.json", "response.age", "observation.age", "observation.json", "completion.json"))
+    original = response_original(target, value, observation, cipher)
     control.require(isinstance(raw_intent, bytes) and raw_intent == control.canonical(value)
                     and sha256(raw_intent).hexdigest() == os.environ.get("SUBS_BOT_PROVIDER_MUTATION_INTENT_SHA256")
                     and isinstance(cipher, bytes) and sha256(cipher).hexdigest() == os.environ.get("SUBS_BOT_PROVIDER_MUTATION_RESPONSE_SHA256")
-                    and isinstance(raw_done, bytes) and raw_done == control.canonical(completion_value(value))
+                    and isinstance(observation, bytes) and sha256(observation).hexdigest() == os.environ.get("SUBS_BOT_PROVIDER_MUTATION_OBSERVATION_SHA256")
+                    and isinstance(raw_observation, bytes) and raw_observation == control.canonical(original)
+                    and isinstance(raw_done, bytes) and raw_done == control.canonical(completion_value(value, original))
                     and sha256(raw_done).hexdigest() == os.environ.get("SUBS_BOT_PROVIDER_MUTATION_COMPLETION_SHA256"))
     job_id = digest_journal.workflow_job(run_id, revision, JOBS["readback"], running=True)
     result = {"intentSha256": sha256(raw_intent).hexdigest(), "responseSha256": sha256(cipher).hexdigest(),
+              "observationSha256": sha256(observation).hexdigest(), "observationPlaintextSha256": sha256(raw_observation).hexdigest(),
               "completionSha256": sha256(raw_done).hexdigest(), "targetSha256": value["targetSha256"],
               "controllerRevision": revision, "candidateRevision": value["candidateRevision"], "reviewedPr": value["reviewedPr"],
               "operation": value["operation"], "readbackJobId": job_id}
@@ -506,26 +579,38 @@ def independent_readback():
 
 def failure_evidence(*, readback=False):
     """Preserve an observed response while keeping the operation unresolved."""
-    _target, _refs, _operation, value = planned()
+    target, _refs, _operation, value = planned()
     run_id, revision = os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_SHA"]
     reader = store()
     reader.verify()
     keys = inventory(reader, current=run_id).get(run_id)
+    failure_keys = {"failure-observation.age", "failure-observation.json", "failure-confirmed.age"}
     control.require(isinstance(keys, set) and "intent.json" in keys
-                    and ("failure-observation.age" in keys) is readback
-                    and keys <= {"intent.json", "response.age", "completion.json", "failure-observation.age"})
+                    and (bool(keys & failure_keys) is readback)
+                    and keys <= {"intent.json", "response.age", "observation.age", "observation.json", "completion.json", *failure_keys})
     raw = reader.read("intent.json")
     control.require(isinstance(raw, bytes) and raw == control.canonical(value)
                     and sha256(raw).hexdigest() == os.environ.get("SUBS_BOT_PROVIDER_MUTATION_INTENT_SHA256"))
     cipher = download_response(observation=True)
+    confirmed = download_response() if os.environ.get("SUBS_BOT_PROVIDER_MUTATION_RESPONSE_ARTIFACT_ID", "") else None
+    original = response_original(target, value, cipher, confirmed)
+    plain = control.canonical(original)
     if readback:
         digest_journal.workflow_job(run_id, revision, JOBS["failure-write"])
-        control.require(reader.read("failure-observation.age") == cipher)
+        control.require(keys & failure_keys == ({"failure-observation.age", "failure-observation.json", "failure-confirmed.age"}
+                                                if confirmed is not None else {"failure-observation.age", "failure-observation.json"})
+                        and reader.read("failure-observation.age") == cipher and reader.read("failure-observation.json") == plain
+                        and (confirmed is None or reader.read("failure-confirmed.age") == confirmed))
         print(json.dumps({"status": "failure-observation-independently-read", "runId": run_id,
                           "intentSha256": sha256(raw).hexdigest(), "observationSha256": sha256(cipher).hexdigest(),
+                          "observationPlaintextSha256": sha256(plain).hexdigest(),
+                          "confirmedCipherSha256": original["confirmedCipherSha256"],
                           "operationOutcome": "unknown", "retryAuthorized": False}, sort_keys=True))
     else:
         reader.put_once("failure-observation.age", cipher)
+        if confirmed is not None:
+            reader.put_once("failure-confirmed.age", confirmed)
+        reader.put_once("failure-observation.json", plain)
         digest_journal.output("observation_sha256", sha256(cipher).hexdigest())
 
 
