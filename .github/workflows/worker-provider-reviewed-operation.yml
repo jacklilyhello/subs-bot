@@ -471,6 +471,8 @@ jobs:
           ref: ${{ github.sha }}
           path: trusted
           persist-credentials: false
+      - name: Verify pinned age before private evidence access
+        run: bash trusted/worker/tools/install_provider_age.sh
       - name: Verify independently approved Provider head and isolation contracts
         uses: ./trusted/.github/actions/provider-reviewed-head-gate
         with:
@@ -487,6 +489,12 @@ jobs:
           SUBS_BOT_PROVIDER_MUTATION_ACTION: write-completion
           SUBS_BOT_PROVIDER_MUTATION_PRESTATE_JSON: ${{ needs.preflight.outputs.prestate_json }}
           SUBS_BOT_PROVIDER_MUTATION_INTENT_SHA256: ${{ needs.intent_readback.outputs.intent_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_OBSERVATION_ARTIFACT_ID: ${{ needs.dispatch.outputs.observation_artifact_id }}
+          SUBS_BOT_PROVIDER_MUTATION_OBSERVATION_ARTIFACT_SHA256: ${{ needs.dispatch.outputs.observation_artifact_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_OBSERVATION_SHA256: ${{ needs.dispatch.outputs.observation_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_TRUSTED_OBSERVATION_ARTIFACT_ID: ${{ needs.dispatch.outputs.observation_artifact_id }}
+          SUBS_BOT_PROVIDER_MUTATION_TRUSTED_OBSERVATION_ARTIFACT_SHA256: ${{ needs.dispatch.outputs.observation_artifact_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_TRUSTED_OBSERVATION_SHA256: ${{ needs.dispatch.outputs.observation_sha256 }}
           SUBS_BOT_PROVIDER_MUTATION_RESPONSE_ARTIFACT_ID: ${{ needs.dispatch.outputs.artifact_id }}
           SUBS_BOT_PROVIDER_MUTATION_RESPONSE_ARTIFACT_SHA256: ${{ needs.dispatch.outputs.artifact_sha256 }}
           SUBS_BOT_PROVIDER_MUTATION_RESPONSE_SHA256: ${{ needs.dispatch.outputs.response_sha256 }}
@@ -500,6 +508,7 @@ jobs:
           SUBS_BOT_PROVIDER_MUTATION_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_APPROVAL }}
           SUBS_BOT_PROVIDER_IMAGE_PREPARATION_SHA256: ${{ secrets.SUBS_BOT_PROVIDER_IMAGE_PREPARATION_SHA256 }}
           SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_SOURCE_AGE_IDENTITY: ${{ secrets.SUBS_BOT_PROVIDER_SOURCE_AGE_IDENTITY }}
           SUBS_BOT_PROVIDER_MUTATION_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_LEDGER_JSON }}
           SUBS_BOT_PROVIDER_MUTATION_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_CONTROLLERS_JSON }}
           SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
@@ -525,6 +534,8 @@ jobs:
           ref: ${{ github.sha }}
           path: trusted
           persist-credentials: false
+      - name: Verify pinned age before private evidence access
+        run: bash trusted/worker/tools/install_provider_age.sh
       - name: Verify independently approved Provider head and isolation contracts
         uses: ./trusted/.github/actions/provider-reviewed-head-gate
         with:
@@ -541,6 +552,12 @@ jobs:
           SUBS_BOT_PROVIDER_MUTATION_PRESTATE_JSON: ${{ needs.preflight.outputs.prestate_json }}
           SUBS_BOT_PROVIDER_MUTATION_INTENT_SHA256: ${{ needs.intent_readback.outputs.intent_sha256 }}
           SUBS_BOT_PROVIDER_MUTATION_COMPLETION_SHA256: ${{ needs.completion_write.outputs.completion_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_OBSERVATION_ARTIFACT_ID: ${{ needs.dispatch.outputs.observation_artifact_id }}
+          SUBS_BOT_PROVIDER_MUTATION_OBSERVATION_ARTIFACT_SHA256: ${{ needs.dispatch.outputs.observation_artifact_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_OBSERVATION_SHA256: ${{ needs.dispatch.outputs.observation_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_TRUSTED_OBSERVATION_ARTIFACT_ID: ${{ needs.dispatch.outputs.observation_artifact_id }}
+          SUBS_BOT_PROVIDER_MUTATION_TRUSTED_OBSERVATION_ARTIFACT_SHA256: ${{ needs.dispatch.outputs.observation_artifact_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_TRUSTED_OBSERVATION_SHA256: ${{ needs.dispatch.outputs.observation_sha256 }}
           SUBS_BOT_PROVIDER_MUTATION_RESPONSE_ARTIFACT_ID: ${{ needs.dispatch.outputs.artifact_id }}
           SUBS_BOT_PROVIDER_MUTATION_RESPONSE_ARTIFACT_SHA256: ${{ needs.dispatch.outputs.artifact_sha256 }}
           SUBS_BOT_PROVIDER_MUTATION_RESPONSE_SHA256: ${{ needs.dispatch.outputs.response_sha256 }}
@@ -554,6 +571,7 @@ jobs:
           SUBS_BOT_PROVIDER_MUTATION_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_APPROVAL }}
           SUBS_BOT_PROVIDER_IMAGE_PREPARATION_SHA256: ${{ secrets.SUBS_BOT_PROVIDER_IMAGE_PREPARATION_SHA256 }}
           SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_SOURCE_AGE_IDENTITY: ${{ secrets.SUBS_BOT_PROVIDER_SOURCE_AGE_IDENTITY }}
           SUBS_BOT_PROVIDER_MUTATION_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_LEDGER_JSON }}
           SUBS_BOT_PROVIDER_MUTATION_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_CONTROLLERS_JSON }}
           SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
@@ -584,6 +602,8 @@ jobs:
           ref: ${{ github.sha }}
           path: trusted
           persist-credentials: false
+      - name: Verify pinned age before private evidence access
+        run: bash trusted/worker/tools/install_provider_age.sh
       - name: Verify independently approved Provider head and isolation contracts
         uses: ./trusted/.github/actions/provider-reviewed-head-gate
         with:
@@ -600,18 +620,25 @@ jobs:
           SUBS_BOT_PROVIDER_MUTATION_ACTION: failure-write
           SUBS_BOT_PROVIDER_MUTATION_PRESTATE_JSON: ${{ needs.preflight.outputs.prestate_json }}
           SUBS_BOT_PROVIDER_MUTATION_INTENT_SHA256: ${{ needs.intent_readback.outputs.intent_sha256 }}
-          SUBS_BOT_PROVIDER_MUTATION_RESPONSE_ARTIFACT_ID: ${{ needs.dispatch.outputs.observation_artifact_id }}
-          SUBS_BOT_PROVIDER_MUTATION_RESPONSE_ARTIFACT_SHA256: ${{ needs.dispatch.outputs.observation_artifact_sha256 }}
-          SUBS_BOT_PROVIDER_MUTATION_RESPONSE_SHA256: ${{ needs.dispatch.outputs.observation_sha256 }}
-          SUBS_BOT_PROVIDER_MUTATION_TRUSTED_ARTIFACT_ID: ${{ needs.dispatch.outputs.observation_artifact_id }}
-          SUBS_BOT_PROVIDER_MUTATION_TRUSTED_ARTIFACT_SHA256: ${{ needs.dispatch.outputs.observation_artifact_sha256 }}
-          SUBS_BOT_PROVIDER_MUTATION_TRUSTED_RESPONSE_SHA256: ${{ needs.dispatch.outputs.observation_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_RESPONSE_ARTIFACT_ID: ${{ needs.dispatch.outputs.artifact_id }}
+          SUBS_BOT_PROVIDER_MUTATION_RESPONSE_ARTIFACT_SHA256: ${{ needs.dispatch.outputs.artifact_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_RESPONSE_SHA256: ${{ needs.dispatch.outputs.response_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_TRUSTED_ARTIFACT_ID: ${{ needs.dispatch.outputs.artifact_id }}
+          SUBS_BOT_PROVIDER_MUTATION_TRUSTED_ARTIFACT_SHA256: ${{ needs.dispatch.outputs.artifact_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_TRUSTED_RESPONSE_SHA256: ${{ needs.dispatch.outputs.response_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_OBSERVATION_ARTIFACT_ID: ${{ needs.dispatch.outputs.observation_artifact_id }}
+          SUBS_BOT_PROVIDER_MUTATION_OBSERVATION_ARTIFACT_SHA256: ${{ needs.dispatch.outputs.observation_artifact_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_OBSERVATION_SHA256: ${{ needs.dispatch.outputs.observation_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_TRUSTED_OBSERVATION_ARTIFACT_ID: ${{ needs.dispatch.outputs.observation_artifact_id }}
+          SUBS_BOT_PROVIDER_MUTATION_TRUSTED_OBSERVATION_ARTIFACT_SHA256: ${{ needs.dispatch.outputs.observation_artifact_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_TRUSTED_OBSERVATION_SHA256: ${{ needs.dispatch.outputs.observation_sha256 }}
           SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
           SUBS_BOT_PROVIDER_TRUSTED_ARCHIVE_REFS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
           SUBS_BOT_PROVIDER_DIGEST_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_APPROVAL }}
           SUBS_BOT_PROVIDER_MUTATION_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_APPROVAL }}
           SUBS_BOT_PROVIDER_IMAGE_PREPARATION_SHA256: ${{ secrets.SUBS_BOT_PROVIDER_IMAGE_PREPARATION_SHA256 }}
           SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_SOURCE_AGE_IDENTITY: ${{ secrets.SUBS_BOT_PROVIDER_SOURCE_AGE_IDENTITY }}
           SUBS_BOT_PROVIDER_MUTATION_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_LEDGER_JSON }}
           SUBS_BOT_PROVIDER_MUTATION_RESOLUTIONS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_RESOLUTIONS_JSON }}
           SUBS_BOT_PROVIDER_MUTATION_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_CONTROLLERS_JSON }}
@@ -639,6 +666,8 @@ jobs:
           ref: ${{ github.sha }}
           path: trusted
           persist-credentials: false
+      - name: Verify pinned age before private evidence access
+        run: bash trusted/worker/tools/install_provider_age.sh
       - name: Verify independently approved Provider head and isolation contracts
         uses: ./trusted/.github/actions/provider-reviewed-head-gate
         with:
@@ -654,12 +683,18 @@ jobs:
         env:
           SUBS_BOT_PROVIDER_MUTATION_ACTION: failure-readback
           SUBS_BOT_PROVIDER_MUTATION_PRESTATE_JSON: ${{ needs.preflight.outputs.prestate_json }}
-          SUBS_BOT_PROVIDER_MUTATION_RESPONSE_ARTIFACT_ID: ${{ needs.dispatch.outputs.observation_artifact_id }}
-          SUBS_BOT_PROVIDER_MUTATION_RESPONSE_ARTIFACT_SHA256: ${{ needs.dispatch.outputs.observation_artifact_sha256 }}
-          SUBS_BOT_PROVIDER_MUTATION_RESPONSE_SHA256: ${{ needs.dispatch.outputs.observation_sha256 }}
-          SUBS_BOT_PROVIDER_MUTATION_TRUSTED_ARTIFACT_ID: ${{ needs.dispatch.outputs.observation_artifact_id }}
-          SUBS_BOT_PROVIDER_MUTATION_TRUSTED_ARTIFACT_SHA256: ${{ needs.dispatch.outputs.observation_artifact_sha256 }}
-          SUBS_BOT_PROVIDER_MUTATION_TRUSTED_RESPONSE_SHA256: ${{ needs.dispatch.outputs.observation_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_RESPONSE_ARTIFACT_ID: ${{ needs.dispatch.outputs.artifact_id }}
+          SUBS_BOT_PROVIDER_MUTATION_RESPONSE_ARTIFACT_SHA256: ${{ needs.dispatch.outputs.artifact_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_RESPONSE_SHA256: ${{ needs.dispatch.outputs.response_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_TRUSTED_ARTIFACT_ID: ${{ needs.dispatch.outputs.artifact_id }}
+          SUBS_BOT_PROVIDER_MUTATION_TRUSTED_ARTIFACT_SHA256: ${{ needs.dispatch.outputs.artifact_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_TRUSTED_RESPONSE_SHA256: ${{ needs.dispatch.outputs.response_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_OBSERVATION_ARTIFACT_ID: ${{ needs.dispatch.outputs.observation_artifact_id }}
+          SUBS_BOT_PROVIDER_MUTATION_OBSERVATION_ARTIFACT_SHA256: ${{ needs.dispatch.outputs.observation_artifact_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_OBSERVATION_SHA256: ${{ needs.dispatch.outputs.observation_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_TRUSTED_OBSERVATION_ARTIFACT_ID: ${{ needs.dispatch.outputs.observation_artifact_id }}
+          SUBS_BOT_PROVIDER_MUTATION_TRUSTED_OBSERVATION_ARTIFACT_SHA256: ${{ needs.dispatch.outputs.observation_artifact_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_TRUSTED_OBSERVATION_SHA256: ${{ needs.dispatch.outputs.observation_sha256 }}
           SUBS_BOT_PROVIDER_MUTATION_INTENT_SHA256: ${{ needs.intent_readback.outputs.intent_sha256 }}
           SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
           SUBS_BOT_PROVIDER_TRUSTED_ARCHIVE_REFS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
@@ -667,6 +702,7 @@ jobs:
           SUBS_BOT_PROVIDER_MUTATION_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_APPROVAL }}
           SUBS_BOT_PROVIDER_IMAGE_PREPARATION_SHA256: ${{ secrets.SUBS_BOT_PROVIDER_IMAGE_PREPARATION_SHA256 }}
           SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_SOURCE_AGE_IDENTITY: ${{ secrets.SUBS_BOT_PROVIDER_SOURCE_AGE_IDENTITY }}
           SUBS_BOT_PROVIDER_MUTATION_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_LEDGER_JSON }}
           SUBS_BOT_PROVIDER_MUTATION_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_CONTROLLERS_JSON }}
           SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}

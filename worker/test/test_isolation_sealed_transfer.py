@@ -77,6 +77,9 @@ class SealedTransferTests(unittest.TestCase):
             env = environment("provider-archive-target", b"a" * 32, directory)
             self.assertEqual(transfer.gate({**env, "GITHUB_WORKFLOW_REF": transfer.CANDIDATE_WORKFLOW})["mapping"],
                              "provider-archive-target")
+            age = environment("provider-live-age-identity", b"a" * 32, directory)
+            self.assertEqual(transfer.gate({**age, "GITHUB_WORKFLOW_REF": transfer.CANDIDATE_WORKFLOW})["destinationName"],
+                             "SUBS_BOT_PROVIDER_SOURCE_AGE_IDENTITY")
             backup = environment("backup-target", b"a" * 32, directory)
             with self.assertRaises(ContractError):
                 transfer.gate({**backup, "GITHUB_WORKFLOW_REF": transfer.CANDIDATE_WORKFLOW})

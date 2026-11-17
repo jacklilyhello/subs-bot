@@ -8,7 +8,7 @@ on:
         description: One approved isolated destination
         required: true
         type: choice
-        options: [provider-archive-target, provider-live-target]
+        options: [provider-archive-target, provider-live-target, provider-live-age-identity]
       provider_ci_run_id:
         description: Exact successful Provider CI run for current main
         required: true
@@ -29,6 +29,18 @@ on:
         description: Fresh independently verified Provider source Environment metadata
         required: true
         type: string
+      archive_environment_id:
+        description: Archive Environment ID for temporary age identity only
+        required: false
+        type: string
+      archive_key_id:
+        description: Archive Environment public key ID for temporary age identity only
+        required: false
+        type: string
+      archive_public_key:
+        description: Archive Environment public key for temporary age identity only
+        required: false
+        type: string
 
 permissions:
   actions: read
@@ -45,6 +57,9 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Verify pinned age before key generation
+        if: inputs.mapping == 'provider-live-age-identity'
+        run: bash worker/tools/install_provider_age.sh
       - name: Verify original build and seal the isolated upgrade target
         env:
           GH_TOKEN: ${{ github.token }}
@@ -59,10 +74,14 @@ jobs:
           TRANSFER_SOURCE_ENVIRONMENT: subs-bot-provider-isolation
           TRANSFER_DESTINATION_ENVIRONMENT: ${{ inputs.mapping == 'provider-archive-target' && 'subs-bot-provider-archive-head-isolation' || 'subs-bot-provider-head-isolation' }}
           TRANSFER_SOURCE_NAME: SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON
-          TRANSFER_DESTINATION_NAME: SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON
+          TRANSFER_DESTINATION_NAME: ${{ inputs.mapping == 'provider-live-age-identity' && 'SUBS_BOT_PROVIDER_SOURCE_AGE_IDENTITY' || 'SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON' }}
           TRANSFER_DESTINATION_KEY_PIN: ${{ inputs.mapping == 'provider-archive-target' && vars.SUBS_BOT_SEALED_PROVIDER_ARCHIVE_KEY_PIN || vars.SUBS_BOT_SEALED_PROVIDER_HEAD_KEY_PIN }}
           TRANSFER_KEY_ID: ${{ inputs.destination_key_id }}
           TRANSFER_PUBLIC_KEY: ${{ inputs.destination_public_key }}
+          TRANSFER_AGE_ARCHIVE_ENVIRONMENT_ID: ${{ inputs.archive_environment_id }}
+          TRANSFER_AGE_ARCHIVE_KEY_ID: ${{ inputs.archive_key_id }}
+          TRANSFER_AGE_ARCHIVE_PUBLIC_KEY: ${{ inputs.archive_public_key }}
+          TRANSFER_AGE_ARCHIVE_KEY_PIN: ${{ vars.SUBS_BOT_SEALED_PROVIDER_ARCHIVE_KEY_PIN }}
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           umask 077
@@ -72,5 +91,13 @@ jobs:
         with:
           name: provider-candidate-target-${{ inputs.mapping }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/provider-candidate-target.json
+          if-no-files-found: error
+          retention-days: 1
+      - name: Upload sealed archive age identity only
+        if: inputs.mapping == 'provider-live-age-identity'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: provider-candidate-age-archive-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/provider-candidate-age-archive.json
           if-no-files-found: error
           retention-days: 1

@@ -30,6 +30,8 @@ MAPPINGS = {
     "provider-live-location": ("subs-bot-isolation", "subs-bot-provider-head-isolation", "SUBS_BOT_CF_ISOLATION_TARGET_JSON", "SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON", True),
     "provider-archive-target": ("subs-bot-provider-isolation", "subs-bot-provider-archive-head-isolation", "SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON", "SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON", False),
     "provider-live-target": ("subs-bot-provider-isolation", "subs-bot-provider-head-isolation", "SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON", "SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON", False),
+    "provider-live-age-identity": ("subs-bot-provider-isolation", "subs-bot-provider-head-isolation", "SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON", "SUBS_BOT_PROVIDER_SOURCE_AGE_IDENTITY", False),
+    "provider-archive-age-identity": ("subs-bot-provider-isolation", "subs-bot-provider-archive-head-isolation", "SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON", "SUBS_BOT_PROVIDER_SOURCE_AGE_IDENTITY", False),
 }
 
 
@@ -42,7 +44,7 @@ def key_plan(env):
             and env.get("GITHUB_REF") == github.MAIN_REF and env.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
             and env.get("RUNNER_ENVIRONMENT") == "github-hosted"
             and (env.get("GITHUB_WORKFLOW_REF") == WORKFLOW
-                 or (env.get("GITHUB_WORKFLOW_REF") == CANDIDATE_WORKFLOW and mapping in {"provider-archive-target", "provider-live-target"}))
+                 or (env.get("GITHUB_WORKFLOW_REF") == CANDIDATE_WORKFLOW and mapping in {"provider-archive-target", "provider-live-target", "provider-live-age-identity", "provider-archive-age-identity"}))
             and env.get("GITHUB_WORKFLOW_SHA") == revision and re.fullmatch(r"[a-f0-9]{40}", revision or "")
             and re.fullmatch(r"[1-9][0-9]{0,19}", run_id or "") and env.get("GITHUB_RUN_ATTEMPT") == "1")
     environment_id, key_id, encoded = env.get("TRANSFER_DESTINATION_ENVIRONMENT_ID", ""), env.get("TRANSFER_KEY_ID", ""), env.get("TRANSFER_PUBLIC_KEY", "")
