@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import time
 from urllib.request import Request
@@ -71,24 +72,33 @@ def checked_gate(env, *, with_stats=False):
             and result.get("reviewSha256") == sha256(canonical(review)).hexdigest()
             and result.get("writerInventorySha256") == review.get("writerInventorySha256")
             and result.get("writerInventorySha256") == env.get("NO_EXPORT_WRITER_INVENTORY_SHA256"))
+    writers = result.get("writerRunCount")
+    legacy = result.get("legacyArchiveRunCount")
+    live = result.get("liveRunCount")
+    ledger = parsed(env.get("NO_EXPORT_LEGACY_ARCHIVES_JSON", "{}"))
+    require(type(writers) is int and 0 <= writers <= 40
+            and type(legacy) is int and 0 <= legacy <= 14
+            and type(live) is int and 0 <= live < 150 and legacy <= live
+            and isinstance(ledger, dict) and len(ledger) == legacy
+            and result.get("legacyArchiveSha256") == sha256(canonical(ledger)).hexdigest())
     if with_stats:
-        writers = result.get("writerRunCount")
-        require(type(writers) is int and 0 <= writers <= 40)
-        return review, writers
+        return review, writers, legacy
     return review
 
 
 def require_request_budget(env, review, remaining_guards):
     """Fail before an intent if the remaining hosted core quota is insufficient."""
-    checked, writers = checked_gate(env, with_stats=True)
+    checked, writers, legacy = checked_gate(env, with_stats=True)
     require(checked == review and type(remaining_guards) is int and 1 <= remaining_guards <= 100)
-    # Gate's bounded fixed work is at most 21 GETs, including the exact old
-    # Provider read; allow two per known or two extra same-workflow runs, six
-    # for release's seal provenance, and 100 spare. Concurrent rate use or
-    # secondary limits remain unknown.
+    # Gate's bounded fixed work is at most 17 GETs, including the exact old
+    # Provider read and the fresh complete live inventory (<150 runs), including legacy
+    # archive run metadata; allow two per known or two extra same-workflow
+    # runs, six for release's seal provenance, and 100 spare. Preserve an
+    # additional cold-cache allowance for legacy jobs/logs and source closure.
+    # Concurrent rate use or secondary limits remain unknown.
     require(env.get("NO_EXPORT_ACTION") in {"seal", "release"})
-    per_guard = 21 + 2 * (writers + 2) + (6 if env["NO_EXPORT_ACTION"] == "release" else 0)
-    required = per_guard * remaining_guards + 100
+    per_guard = 17 + 2 * (writers + 2) + (6 if env["NO_EXPORT_ACTION"] == "release" else 0)
+    required = per_guard * remaining_guards + 3 * legacy + 12 + 100
     request = Request("https://api.github.com/rate_limit", headers={
         "Accept": "application/vnd.github+json", "Authorization": "Bearer " + github._github_token(),
         "Cache-Control": "no-cache", "X-GitHub-Api-Version": "2022-11-28"})
@@ -100,7 +110,70 @@ def require_request_budget(env, review, remaining_guards):
     require(type(core.get("remaining")) is int and type(core.get("reset")) is int
             and core["reset"] > int(time.time()) and core["remaining"] >= required,
             "Insufficient GitHub read quota for the bounded guarded operation; no intent was written.")
-    return {"required": required, "remaining": core["remaining"]}
+    return {"required": required, "remaining": core["remaining"], "writerLimit": writers + 2}
+
+
+def verify_legacy_archives(env, spec):
+    """Independently verify each sealed historical log in the private dev bucket."""
+    import scoped_r2
+    from production_backup_webhook_recovery import open_store
+
+    ledger = parsed(env.get("NO_EXPORT_LEGACY_ARCHIVES_JSON", "{}"))
+    require(isinstance(ledger, dict) and len(ledger) <= 14)
+    if not ledger:
+        return ledger
+    _draft, _secrets, _previous, store, prefix = open_store(env)
+    readonly = dict(env)
+    readonly.pop("SUBS_BOT_SCOPED_R2_WRITE_JSON", None)
+    readonly.pop("SUBS_BOT_SCOPED_R2_EXTRA_WRITE_JSON", None)
+    store.objects = scoped_r2.from_environment(store.api.target["accountId"], store.bucket, readonly)
+    require(store.objects is not None and store.objects.write_credential is None,
+            "Historical evidence must use the scoped read-only bucket credential.")
+    registration = store.get(prefix + "registration.json")
+    require(sha256(registration).hexdigest() == spec["registrationSha256"])
+    seen = set()
+    for run_id, entry in sorted(ledger.items()):
+        require(re.fullmatch(r"[1-9][0-9]{0,19}", run_id or "") and isinstance(entry, dict)
+                and entry.get("action") in {"plan", "seal"})
+        if entry["action"] == "plan":
+            continue
+        source_id = entry.get("sourceRunId", "")
+        require(re.fullmatch(r"[1-9][0-9]{0,19}", source_id or "") and source_id not in seen
+                and all(SHA.fullmatch(entry.get(key, "")) for key in
+                        ("sourceLogSha256", "planSha256", "completionSha256")))
+        seen.add(source_id)
+        key = prefix + "history-log-" + source_id + "-"
+        intent_raw, _ = store.objects.get(key + "intent.json", limit=512 * 1024)
+        done_raw, _ = store.objects.get(key + "complete.json", limit=512 * 1024)
+        log_raw, _ = store.objects.get(key + "original.log", limit=MAX_LOG)
+        intent, done = parsed(intent_raw), parsed(done_raw)
+        require(canonical(intent) == intent_raw and canonical(done) == done_raw
+                and set(intent) == {"version", "plan", "planSha256", "archiveRunId", "archiveAttempt"}
+                and type(intent["version"]) is int and intent["version"] == 1
+                and intent["archiveRunId"] == run_id and intent["archiveAttempt"] == "1"
+                and isinstance(intent["plan"], dict)
+                and set(intent["plan"]) == {"version", "kind", "record", "registrationSha256"}
+                and type(intent["plan"]["version"]) is int and intent["plan"]["version"] == 1
+                and intent["plan"]["kind"] == "test-webhook-history-log-archive"
+                and intent["planSha256"] == entry["planSha256"] == sha256(canonical(intent["plan"])).hexdigest()
+                and intent["plan"].get("registrationSha256") == spec["registrationSha256"]
+                and isinstance(intent["plan"].get("record"), dict)
+                and intent["plan"]["record"].get("sourceRunId") == source_id
+                and intent["plan"]["record"].get("logSha256") == entry["sourceLogSha256"]
+                and sha256(log_raw).hexdigest() == entry["sourceLogSha256"]
+                and done == {"version": 1, "intentSha256": sha256(intent_raw).hexdigest(),
+                             "logSha256": entry["sourceLogSha256"]}
+                and type(done.get("version")) is int and sha256(done_raw).hexdigest() == entry["completionSha256"],
+                "A private historical log archive is missing or differs from its pinned evidence.")
+    store.verify()
+    return ledger
+
+
+def guarded_review(env, review, writer_limit, spec):
+    checked, writers, _legacy = checked_gate(env, with_stats=True)
+    require(checked == review and (writer_limit is None or writers <= writer_limit),
+            "The reviewed writer inventory exceeded the reserved request budget.")
+    verify_legacy_archives(env, spec)
 
 
 def log_reader(env):
@@ -199,24 +272,39 @@ def observe(env, review, guard, *, finished=False, evidence_sha=None, release_in
             "oldTransactionSha256": review["oldTransactionSha256"], "oldAnchorSha256": review["oldAnchorSha256"],
             "frozenDataSha256": sha256(canonical(fingerprint)).hexdigest(), "stateSha256": state["stateSha256"],
             "writerInventorySha256": review["writerInventorySha256"], "custodySha256": review["custodySha256"],
+            "legacyArchives": parsed(env.get("NO_EXPORT_LEGACY_ARCHIVES_JSON", "{}")),
+            "legacyArchiveSha256": sha256(canonical(parsed(env.get("NO_EXPORT_LEGACY_ARCHIVES_JSON", "{}")))).hexdigest(),
             "threatModel": review["threatModel"], "exportDispatchedUnderCustodyAssumption": False}
     return tool, ctl, store, journal, anchor, state, plan
 
 
-def historical_originals(review, spec, token, download_log):
-    """Re-fetch every independently pinned source byte, never output its content."""
+def reviewed_source_original(directory, revision, path, expected):
+    """Rehash the original fetched by the trusted gate in this fresh runner."""
+    root = Path(directory)
+    cache = root / "no-export-reviewed-source-cache"
+    require(root.is_absolute() and root.is_dir() and not root.is_symlink()
+            and cache.is_dir() and not cache.is_symlink() and cache.stat().st_mode & 0o077 == 0)
+    key = sha256((revision + "\n" + path).encode("utf-8")).hexdigest()
+    descriptor = os.open(cache / key, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as source:
+        metadata = os.fstat(source.fileno())
+        require(stat.S_ISREG(metadata.st_mode) and metadata.st_mode & 0o077 == 0
+                and 0 < metadata.st_size <= MAX_SOURCE)
+        raw = source.read(MAX_SOURCE + 1)
+    require(len(raw) == metadata.st_size and sha256(raw).hexdigest() == expected,
+            "The trusted runner's original source differs from the independent pin.")
+    return raw
+
+
+def historical_originals(review, spec, token, download_log, *, directory):
+    """Seal pinned source bytes and re-fetch the original hosted job log."""
     result = {}
     for name, revision, field in (("candidate", OLD_HEAD, "candidateCodeSha256"),
                                   ("dispatcher", OLD_MAIN, "dispatcherCodeSha256")):
         files = review[field]
         require(isinstance(files, dict) and files)
         for path in sorted(files):
-            entry = github._get_json("/contents/" + path + "?ref=" + revision, token)
-            require(entry.get("path") == path and entry.get("type") == "file"
-                    and entry.get("encoding") == "base64" and isinstance(entry.get("content"), str))
-            raw = base64.b64decode(entry["content"].replace("\n", ""), validate=True)
-            require(0 < len(raw) <= MAX_SOURCE and type(entry.get("size")) is int and entry["size"] == len(raw)
-                    and sha256(raw).hexdigest() == files[path])
+            raw = reviewed_source_original(directory, revision, path, files[path])
             result[name + "/" + path] = raw
     raw = download_log(OLD_JOB, token)
     require(isinstance(raw, bytes) and 0 < len(raw) <= MAX_LOG
@@ -509,8 +597,9 @@ def run(env):
     stage("gate")
     review = checked_gate(env)
     spec = parsed(env["NO_EXPORT_VALIDATION_JSON"])
+    writer_limit = None
     def guard():
-        require(checked_gate(env) == review)
+        guarded_review(env, review, writer_limit, spec)
     seal_run = env.get("GITHUB_RUN_ID", "") if action in {"seal", "evidence-readback"} else env.get("NO_EXPORT_SEAL_RUN_ID", "")
     require(re.fullmatch(r"[1-9][0-9]{0,19}", seal_run or "") is not None or action == "plan")
     if action in {"verify-seal", "release", "release-readback", "verify-release"}:
@@ -538,7 +627,7 @@ def run(env):
                         "seal" if action == "evidence-readback" else "release", in_readback=True)
     stage("originals")
     token = github._github_token()
-    originals = historical_originals(review, spec, token, log_reader(env))
+    originals = historical_originals(review, spec, token, log_reader(env), directory=env["RUNNER_TEMP"])
     originals.update(failed_plan_originals(token, log_reader(env)))
     originals["protected-custody.json"] = custody_original(env, review)
     originals["writer-inventory.json"] = inventory_original(env, review)
@@ -561,7 +650,7 @@ def run(env):
     if action == "seal":
         _manifest, pieces = evidence_layout(plan_sha, originals, seal)
         stage("budget")
-        require_request_budget(env, review, len(pieces) + 4)
+        writer_limit = require_request_budget(env, review, len(pieces) + 4)["writerLimit"]
         evidence = seal_originals(store, prefix, plan_sha, originals, seal, guard, stage_callback=stage)
         output("evidence_sha256", evidence)
         return {"status": "sealed", "planSha256": plan_sha, "evidenceSha256": evidence}
@@ -575,7 +664,7 @@ def run(env):
                 "sealRunId": seal_run}
     if action == "release":
         stage("budget")
-        require_request_budget(env, review, 15)
+        writer_limit = require_request_budget(env, review, 15)["writerLimit"]
         # Guard against ambiguous retries with a fixed per-original-session slot.
         intent = {"version": 1, "kind": "no-export-release-intent", "planSha256": plan_sha,
                   "evidenceSha256": evidence, "sealRunId": seal_run, "releaseRunId": env["GITHUB_RUN_ID"],
