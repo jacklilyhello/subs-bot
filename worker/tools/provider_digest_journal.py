@@ -19,9 +19,11 @@ import provider_source_transfer as transfer
 
 BASE = "maintenance/provider-digest-rehearsal/"
 MAX_HISTORY = 32
-JOBS = {"preflight": "Provider digest preflight", "intent-readback": "Provider digest intent readback",
+RECONCILE_WORKFLOW = ".github/workflows/worker-provider-digest-reconcile.yml"
+JOBS = {"source": "Provider private source transfer", "preflight": "Provider digest preflight",
+        "intent-write": "Provider digest intent archive", "intent-readback": "Provider digest intent readback",
         "publish": "Provider digest publish", "verify": "Provider digest independent OCI readback",
-        "readback": "Provider digest evidence readback"}
+        "completion-write": "Provider digest completion archive", "readback": "Provider digest evidence readback"}
 
 
 class Store(durable.ProductionStore):
@@ -53,6 +55,88 @@ def controllers():
                     and all(control.match(control.provider.REVISION, item) for item in values)
                     and os.environ.get("GITHUB_SHA") in values)
     return values
+
+
+def readonly_resolutions():
+    value = control.github._parse_object(os.environ.get("SUBS_BOT_PROVIDER_DIGEST_READONLY_RESOLUTIONS_JSON", ""), sealed.ERROR)
+    control.require(len(value) <= MAX_HISTORY)
+    for run_id, row in value.items():
+        control.require(control.match(control.provider.DECIMAL, run_id) and isinstance(row, dict)
+                        and set(row) == {"controllerRevision", "intentJobId", "publishJobId", "completionJobId", "readbackSha256",
+                                         "reconcileRunId", "reconcileRunAttempt", "reconcileRevision"}
+                        and all(control.match(control.provider.DECIMAL, row[k]) for k in
+                                ("intentJobId", "publishJobId", "completionJobId", "reconcileRunId", "reconcileRunAttempt"))
+                        and all(control.match(control.provider.REVISION, row[k]) for k in ("controllerRevision", "reconcileRevision"))
+                        and control.match(control.provider.HEX, row["readbackSha256"]))
+    return value
+
+
+def inspect_readonly_run(reader, run_id, allowed):
+    """Re-observe a finished prior run with an explicitly skipped intent job."""
+    control.require(control.match(control.provider.DECIMAL, run_id))
+    token = control.github._github_token()
+    run = control.github._get_json(f"/actions/runs/{run_id}/attempts/1", token)
+    revision = run.get("head_sha")
+    control.require(str(run.get("id")) == run_id and run.get("run_attempt") == 1 and revision in allowed
+                    and run.get("path") in (transfer.WORKFLOW_PATH, transfer.WORKFLOW_PATH + "@main", transfer.WORKFLOW_PATH + "@refs/heads/main")
+                    and run.get("head_branch") == "main" and run.get("event") == "workflow_dispatch" and run.get("status") == "completed"
+                    and run.get("conclusion") in {"success", "failure", "cancelled", "timed_out", "skipped"}
+                    and all(isinstance(run.get(k), dict) and run[k].get("id") == control.github.REPOSITORY_ID
+                            for k in ("repository", "head_repository")))
+    durable.source_ancestor({"revision": revision}, token)
+    response = control.github._get_json(f"/actions/runs/{run_id}/attempts/1/jobs?per_page=100", token)
+    jobs = response.get("jobs")
+    control.require(isinstance(jobs, list) and type(response.get("total_count")) is int
+                    and response["total_count"] == len(jobs) == len(JOBS)
+                    and all(isinstance(job, dict) and job.get("name") in JOBS.values() for job in jobs)
+                    and len({job["name"] for job in jobs}) == len(JOBS))
+    for job in jobs:
+        control.require(str(job.get("run_id")) == run_id and job.get("run_attempt") == 1 and job.get("head_sha") == revision
+                        and control.match(control.provider.DECIMAL, str(job.get("id"))) and job.get("status") == "completed"
+                        and isinstance(job.get("conclusion"), str))
+    writes = {}
+    for key in ("intent-write", "publish", "completion-write"):
+        job = next(item for item in jobs if item["name"] == JOBS[key])
+        steps = job.get("steps")
+        control.require(job.get("conclusion") == "skipped" and isinstance(steps, list)
+                        and all(isinstance(step, dict) and (step.get("status"), step.get("conclusion")) == ("completed", "skipped")
+                                for step in steps))
+        writes[key] = str(job["id"])
+    prefix = BASE + run_id + "/1/"
+    control.require(durable.list_private_keys(reader, prefix) == [],
+                    "An executed or occupied digest attempt cannot be resolved as read-only.")
+    return {"version": 1, "kind": "isolated-provider-digest-readonly-resolution", "classification": "intent-job-skipped-empty-prefix",
+            "runId": run_id, "controllerRevision": revision, "runConclusion": run["conclusion"],
+            "intentJobId": writes["intent-write"], "publishJobId": writes["publish"], "completionJobId": writes["completion-write"],
+            "bucketSha256": control.digest(reader.target), "objectCount": 0}
+
+
+def verify_readonly_resolution(reader, run_id, pin, allowed):
+    control.require(pin["controllerRevision"] in allowed and pin["reconcileRevision"] in allowed)
+    report = inspect_readonly_run(reader, run_id, allowed)
+    control.require(report["controllerRevision"] == pin["controllerRevision"]
+                    and all(report[k] == pin[k] for k in ("intentJobId", "publishJobId", "completionJobId"))
+                    and control.digest(report) == pin["readbackSha256"])
+    token, reconciliation, attempt = control.github._github_token(), pin["reconcileRunId"], pin["reconcileRunAttempt"]
+    run = control.github._get_json(f"/actions/runs/{reconciliation}/attempts/{attempt}", token)
+    control.require(str(run.get("id")) == reconciliation and str(run.get("run_attempt")) == attempt
+                    and run.get("path") in (RECONCILE_WORKFLOW, RECONCILE_WORKFLOW + "@main", RECONCILE_WORKFLOW + "@refs/heads/main")
+                    and run.get("display_title") == "Inspect isolated digest " + run_id
+                    and run.get("head_sha") == pin["reconcileRevision"] and run.get("head_branch") == "main"
+                    and run.get("event") == "workflow_dispatch" and (run.get("status"), run.get("conclusion")) == ("completed", "success")
+                    and all(isinstance(run.get(k), dict) and run[k].get("id") == control.github.REPOSITORY_ID
+                            for k in ("repository", "head_repository")))
+    durable.source_ancestor({"revision": pin["reconcileRevision"]}, token)
+    response = control.github._get_json(f"/actions/runs/{reconciliation}/attempts/{attempt}/jobs?per_page=100", token)
+    jobs = response.get("jobs")
+    control.require(isinstance(jobs, list) and response.get("total_count") == len(jobs) == 1)
+    job = jobs[0]
+    control.require(isinstance(job, dict) and job.get("name") == "Digest read-only reconciliation"
+                    and str(job.get("run_id")) == reconciliation and str(job.get("run_attempt")) == attempt
+                    and job.get("head_sha") == pin["reconcileRevision"] and (job.get("status"), job.get("conclusion")) == ("completed", "success")
+                    and isinstance(job.get("steps"), list))
+    steps = [step for step in job["steps"] if isinstance(step, dict) and step.get("name") == "Inspect skipped intent without writes"]
+    control.require(len(steps) == 1 and (steps[0].get("status"), steps[0].get("conclusion")) == ("completed", "success"))
 
 
 def projection(run_id, source, completion_sha, job_id):
@@ -103,10 +187,10 @@ def inventory(reader, *, current=None):
         done = control.github._parse_object(raw_done, sealed.ERROR)
         control.require(raw_intent == control.canonical(original) and raw_done == control.canonical(done)
                         and set(original) == {"version", "kind", "operation", "runId", "runAttempt", "controllerRevision", "targetSha256",
-                                              "archiveRefsSha256", "approvalSha256", "simulatedActionsUnavailable", "prestate", "status"}
+                                              "archiveRefsSha256", "approvalSha256", "resolutionLedgerSha256", "simulatedActionsUnavailable", "prestate", "status"}
                         and type(original["version"]) is int and original["version"] == 1 and original["operation"] == "publish-digest"
                         and type(original["simulatedActionsUnavailable"]) is bool
-                        and all(control.match(control.provider.HEX, original[k]) for k in ("targetSha256", "archiveRefsSha256", "approvalSha256"))
+                        and all(control.match(control.provider.HEX, original[k]) for k in ("targetSha256", "archiveRefsSha256", "approvalSha256", "resolutionLedgerSha256"))
                         and isinstance(original["prestate"], dict) and set(original["prestate"]) == {"dependencySha256", "manifestSha256"}
                         and control.match(control.provider.HEX, original["prestate"]["dependencySha256"])
                         and original["prestate"]["manifestSha256"] is None
@@ -130,7 +214,7 @@ def inventory(reader, *, current=None):
     return grouped
 
 
-def history(registered):
+def history(registered, reader):
     token, current, allowed = control.github._github_token(), os.environ["GITHUB_RUN_ID"], controllers()
     rows = []
     for page in range(1, 11):
@@ -144,7 +228,9 @@ def history(registered):
     else:
         raise control.ProviderError("Isolated digest history exceeds its safe bound.")
     control.require(len(rows) == response["total_count"] and len({str(r.get("id")) for r in rows if isinstance(r, dict)}) == len(rows))
-    seen, current_seen = set(), False
+    resolutions = readonly_resolutions()
+    control.require(not set(resolutions) & set(registered) and current not in resolutions)
+    seen, resolved, current_seen = set(), set(), False
     for row in rows:
         control.require(isinstance(row, dict) and row.get("path") in (transfer.WORKFLOW_PATH, transfer.WORKFLOW_PATH + "@main", transfer.WORKFLOW_PATH + "@refs/heads/main")
                         and row.get("head_sha") in allowed and row.get("head_branch") == "main" and row.get("event") == "workflow_dispatch"
@@ -155,11 +241,17 @@ def history(registered):
             control.require(not current_seen and row.get("head_sha") == os.environ["GITHUB_SHA"])
             current_seen = True
         else:
+            if run_id in resolutions:
+                control.require(run_id not in resolved and row.get("status") == "completed"
+                                and row.get("head_sha") == resolutions[run_id]["controllerRevision"])
+                verify_readonly_resolution(reader, run_id, resolutions[run_id], allowed)
+                resolved.add(run_id)
+                continue
             control.require(run_id in registered and run_id not in seen and row.get("head_sha") == registered[run_id]["controllerRevision"]
                             and (row.get("status"), row.get("conclusion")) == ("completed", "success"),
                             "An earlier isolated digest attempt is unresolved; do not retry it.")
             seen.add(run_id)
-    control.require(current_seen and seen == set(registered))
+    control.require(current_seen and seen == set(registered) and resolved == set(resolutions))
 
 
 def parse_intent():
@@ -197,7 +289,7 @@ def write_intent():
     reader.verify()
     grouped = inventory(reader)
     control.require(len(grouped) < MAX_HISTORY and run_id not in grouped)
-    history(ledger())
+    history(ledger(), reader)
     raw = control.canonical(value)
     control.require(reader.read("source-intent.json") is None and reader.read("source-manifest.json") is None)
     reader.put("source-intent.json", raw)
@@ -308,10 +400,28 @@ def independent_readback():
                       "simulatedActionsUnavailable": value["simulatedActionsUnavailable"]}, sort_keys=True))
 
 
+def reconcile_readonly():
+    durable.seal_context(RECONCILE_WORKFLOW, mutation=False)
+    control.require(os.environ.get("SUBS_BOT_PROVIDER_DIGEST_REHEARSAL_ENABLED") == "true")
+    run_id = os.environ.get("SUBS_BOT_PROVIDER_DIGEST_PRIOR_RUN_ID", "")
+    reader = store("SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN", run_id)
+    reader.verify()
+    report = inspect_readonly_run(reader, run_id, controllers())
+    reconcile_id, attempt, revision = os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"], os.environ["GITHUB_SHA"]
+    control.require(control.match(control.provider.DECIMAL, reconcile_id) and control.match(control.provider.DECIMAL, attempt)
+                    and control.match(control.provider.REVISION, revision))
+    pin = {"controllerRevision": report["controllerRevision"], "intentJobId": report["intentJobId"],
+           "publishJobId": report["publishJobId"], "completionJobId": report["completionJobId"],
+           "readbackSha256": control.digest(report), "reconcileRunId": reconcile_id,
+           "reconcileRunAttempt": attempt, "reconcileRevision": revision}
+    control.github.require_current_main(revision)
+    print(json.dumps({**report, "resolutionRecord": pin, "retryAuthorized": False}, sort_keys=True))
+
+
 if __name__ == "__main__":
     try:
         {"preflight": preflight, "write-intent": write_intent, "read-intent": read_intent,
          "publish": publish, "verify": verify, "write-completion": write_completion,
-         "independent-readback": independent_readback}[os.environ.get("SUBS_BOT_PROVIDER_DIGEST_JOURNAL_ACTION", "")]()
+         "independent-readback": independent_readback, "reconcile-readonly": reconcile_readonly}[os.environ.get("SUBS_BOT_PROVIDER_DIGEST_JOURNAL_ACTION", "")]()
     except Exception:
         raise SystemExit("Isolated digest rehearsal stopped; preserve intent and never retry an unknown write.") from None

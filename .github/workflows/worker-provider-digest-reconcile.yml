@@ -1,0 +1,40 @@
+name: Inspect isolated Provider digest read-only run
+run-name: Inspect isolated digest ${{ inputs.prior_run_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      prior_run_id:
+        description: Exact earlier digest rehearsal run whose intent job was skipped
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  reconcile:
+    name: Digest read-only reconciliation
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && vars.SUBS_BOT_PROVIDER_DIGEST_REHEARSAL_ENABLED == 'true'
+    environment: subs-bot-provider-archive-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Inspect skipped intent without writes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_DIGEST_REHEARSAL_ENABLED: ${{ vars.SUBS_BOT_PROVIDER_DIGEST_REHEARSAL_ENABLED }}
+          SUBS_BOT_PROVIDER_DIGEST_JOURNAL_ACTION: reconcile-readonly
+          SUBS_BOT_PROVIDER_DIGEST_PRIOR_RUN_ID: ${{ inputs.prior_run_id }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_DIGEST_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_CONTROLLERS_JSON }}
+          SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          python3 -B worker/tools/provider_digest_journal.py

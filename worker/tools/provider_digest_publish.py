@@ -71,6 +71,7 @@ def observe(target, worker_token, registry_token):
 
 def intent(target, refs, state, run_id, revision):
     simulation = os.environ.get("SUBS_BOT_PROVIDER_SIMULATE_ARTIFACT_UNAVAILABLE", "0")
+    resolutions = control.github._parse_object(os.environ.get("SUBS_BOT_PROVIDER_DIGEST_READONLY_RESOLUTIONS_JSON", "{}"), control.ERROR)
     control.require(control.match(control.provider.DECIMAL, run_id) and control.match(control.provider.REVISION, revision)
                     and simulation in {"0", "1"}
                     and isinstance(state, dict) and set(state) == {"dependencySha256", "manifestSha256"}
@@ -80,6 +81,7 @@ def intent(target, refs, state, run_id, revision):
             "runId": run_id, "runAttempt": "1", "controllerRevision": revision,
             "targetSha256": control.digest(target), "archiveRefsSha256": control.digest(refs),
             "approvalSha256": control.digest({"operation": "publish-digest", "target": target}),
+            "resolutionLedgerSha256": control.digest(resolutions),
             "simulatedActionsUnavailable": simulation == "1", "prestate": state, "status": "started-unknown"}
 
 
