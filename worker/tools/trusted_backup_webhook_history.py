@@ -7,6 +7,7 @@ assertion that an unresolved operation succeeded.
 from hashlib import sha256
 from io import BytesIO
 from datetime import datetime, timezone
+import base64
 import json
 import os
 import re
@@ -24,6 +25,7 @@ PHASE = ".github/workflows/worker-backup-reviewed-coordinator.yml"
 RECOVERY = ".github/workflows/worker-backup-webhook-recovery.yml"
 CONTROL = ".github/workflows/worker-production-control.yml"
 INLINE = ".github/workflows/worker-isolation-telegram-inline-webhook.yml"
+ARCHIVE = ".github/workflows/worker-backup-webhook-history-archive.yml"
 REV = re.compile(r"[a-f0-9]{40}")
 SHA = re.compile(r"[a-f0-9]{64}")
 
@@ -160,6 +162,83 @@ def _restoration_boundary(env, store, prefix, draft, secrets, previous, token, c
             "reportSha256": pin["reportSha256"], "settingsSha256": recovery["restoredSettingsSha256"]}
 
 
+def _archived_log(run, workflow, record, store, prefix, token, controllers, env):
+    """Recheck original bytes plus the exact fresh readback run and jobs."""
+    from trusted_backup_webhook_log_archive import classify
+    require(isinstance(record, dict) and set(record) == {"status", "sourceRunId", "sourceJobId", "sourceHeadSha",
+            "sourceWorkflow", "classification", "logSha256", "planSha256", "completionSha256", "archiveRunId",
+            "archiveControllerRevision", "archiveJobId", "readbackJobId"}
+            and record.get("status") == "independently-read-back" and record.get("sourceRunId") == str(run["id"])
+            and record.get("sourceHeadSha") == run["head_sha"] and record.get("sourceWorkflow") == workflow
+            and record.get("classification") in {"no-write-independently-confirmed", "response-independently-confirmed"}
+            and all(SHA.fullmatch(record.get(k, "")) for k in ("logSha256", "planSha256", "completionSha256"))
+            and all(re.fullmatch(r"[1-9][0-9]{0,19}", record.get(k, "")) for k in ("sourceJobId", "archiveRunId", "archiveJobId", "readbackJobId"))
+            and record.get("archiveControllerRevision") in controllers)
+    key = prefix + "history-log-" + record["sourceRunId"] + "-"
+    intent_raw, done_raw = store.get(key + "intent.json"), store.get(key + "complete.json")
+    raw, _ = store.objects.get(key + "original.log")
+    intent, done = parsed(intent_raw), parsed(done_raw)
+    require(canonical(intent) == intent_raw and canonical(done) == done_raw and isinstance(raw, bytes)
+            and sha256(raw).hexdigest() == record["logSha256"] and sha256(done_raw).hexdigest() == record["completionSha256"]
+            and done == {"version": 1, "intentSha256": sha256(intent_raw).hexdigest(), "logSha256": record["logSha256"]}
+            and intent.get("archiveRunId") == record["archiveRunId"] and intent.get("archiveAttempt") == "1"
+            and intent.get("planSha256") == record["planSha256"] == sha256(canonical(intent.get("plan"))).hexdigest())
+    plan = intent["plan"]
+    item = plan.get("record", {})
+    require(plan.get("kind") == "test-webhook-history-log-archive"
+            and plan.get("registrationSha256") == env.get("BACKUP_PHASE_REGISTRATION_SHA256")
+            and item.get("sourceRunId") == record["sourceRunId"]
+            and item.get("sourceJobId") == record["sourceJobId"] and item.get("sourceControllerRevision") == record["sourceHeadSha"]
+            and item.get("sourceWorkflow") == workflow and item.get("sourceAttempt") == "1"
+            and item.get("logSha256") == record["logSha256"] and item.get("logBytes") == len(raw)
+            and item.get("classification") == record["classification"] == classify(raw, workflow, record["sourceRunId"],
+                main_sha=record["sourceHeadSha"], candidates=json.loads(env.get("SUBS_BOT_PHASE_WEBHOOK_CANDIDATES_JSON", "[]"))))
+    audit = parsed(env.get("SUBS_BOT_PHASE_WEBHOOK_LOG_AUDIT_JSON", "")).get(record["sourceHeadSha"])
+    paths = ({"worker/tools/telegram_inline_webhook.py"} if workflow == INLINE else
+             {"worker/tools/trusted_backup_head_gate.py"} if workflow == HEAD else
+             {"worker/tools/production_lifecycle_drill.py", "worker/tools/production_control.py"})
+    require(isinstance(audit, dict) and set(audit) == paths
+            and sha256(canonical(audit)).hexdigest() == item.get("auditedSourceSha256"))
+    for path in sorted(paths):
+        source = github._get_json("/contents/" + path + "?ref=" + record["sourceHeadSha"], token)
+        require(source.get("path") == path and source.get("type") == "file" and source.get("encoding") == "base64"
+                and isinstance(source.get("content"), str) and SHA.fullmatch(audit.get(path, "")))
+        body = base64.b64decode(source["content"].replace("\n", ""), validate=True)
+        require(len(body) <= 512 * 1024 and sha256(body).hexdigest() == audit[path])
+    original_jobs = github._get_json("/actions/runs/" + record["sourceRunId"] + "/attempts/1/jobs?per_page=100", token)
+    require(isinstance(original_jobs.get("jobs"), list) and type(original_jobs.get("total_count")) is int
+            and original_jobs["total_count"] == len(original_jobs["jobs"]) < 100)
+    source_job = [job for job in original_jobs["jobs"] if isinstance(job, dict) and str(job.get("id")) == record["sourceJobId"]]
+    require(len(source_job) == 1 and source_job[0].get("name") == ("webhook" if workflow == INLINE else "validate" if workflow == HEAD else "rehearse")
+            and str(source_job[0].get("run_id")) == record["sourceRunId"] and source_job[0].get("run_attempt") == 1
+            and source_job[0].get("head_sha") == record["sourceHeadSha"] and source_job[0].get("status") == "completed")
+    archive_run = github._get_json("/actions/runs/" + record["archiveRunId"] + "/attempts/1", token)
+    latest = github._get_json("/actions/runs/" + record["archiveRunId"], token)
+    require(str(archive_run.get("id")) == str(latest.get("id")) == record["archiveRunId"]
+            and archive_run.get("run_attempt") == latest.get("run_attempt") == 1
+            and archive_run.get("path") in (ARCHIVE, ARCHIVE + "@main", ARCHIVE + "@refs/heads/main")
+            and archive_run.get("head_sha") == record["archiveControllerRevision"] and archive_run.get("head_branch") == "main"
+            and archive_run.get("event") == "workflow_dispatch" and (archive_run.get("status"), archive_run.get("conclusion")) == ("completed", "success")
+            and all(isinstance(archive_run.get(k), dict) and archive_run[k].get("id") == github.REPOSITORY_ID
+                    for k in ("repository", "head_repository")))
+    comparison = github.compare_commits_metadata(record["archiveControllerRevision"], env["GITHUB_SHA"], token)
+    require(comparison.get("status") in {"ahead", "identical"} and comparison.get("behind_by") == 0
+            and comparison.get("base_commit", {}).get("sha") == record["archiveControllerRevision"]
+            and comparison.get("merge_base_commit", {}).get("sha") == record["archiveControllerRevision"])
+    jobs = github._get_json("/actions/runs/" + record["archiveRunId"] + "/attempts/1/jobs?per_page=100", token)
+    require(isinstance(jobs.get("jobs"), list) and type(jobs.get("total_count")) is int
+            and jobs["total_count"] == len(jobs["jobs"]) < 100)
+    for name, identifier, step_name in (("archive", record["archiveJobId"], "Plan or conditionally seal the exact original job log"),
+                                         ("readback", record["readbackJobId"], "Independently compare the retained original log")):
+        selected = [job for job in jobs["jobs"] if isinstance(job, dict) and job.get("name") == name and str(job.get("id")) == identifier]
+        require(len(selected) == 1 and str(selected[0].get("run_id")) == record["archiveRunId"]
+                and selected[0].get("run_attempt") == 1 and selected[0].get("head_sha") == record["archiveControllerRevision"]
+                and (selected[0].get("status"), selected[0].get("conclusion")) == ("completed", "success"))
+        steps = [step for step in selected[0].get("steps", []) if isinstance(step, dict) and step.get("name") == step_name]
+        require(len(steps) == 1 and (steps[0].get("status"), steps[0].get("conclusion")) == ("completed", "success"))
+    return record["classification"]
+
+
 def inspect(env):
     require(context(env) is True and env.get("BACKUP_GATE_ROLE") == "parent")
     token = github._github_token()
@@ -169,6 +248,9 @@ def inspect(env):
             and all(isinstance(item, str) and REV.fullmatch(item) for item in controllers)
             and isinstance(candidates, list) and len(candidates) <= 128 and len(set(candidates)) == len(candidates)
             and all(isinstance(item, str) and REV.fullmatch(item) for item in candidates))
+    archives = parsed(env.get("SUBS_BOT_PHASE_WEBHOOK_HISTORY_ARCHIVES_JSON", "{}"))
+    require(len(archives) <= 128 and all(re.fullmatch(r"[1-9][0-9]{0,19}", key) and isinstance(value, dict)
+                                        for key, value in archives.items()))
     draft, secrets, previous, store, prefix = open_store(env)
     registration_raw = store.get(prefix + "registration.json")
     require(sha256(registration_raw).hexdigest() == env.get("BACKUP_PHASE_REGISTRATION_SHA256"))
@@ -185,7 +267,7 @@ def inspect(env):
     keys = store.objects.list(prefix + "webhook-", maximum=10000)
     snapshots = {key[len(prefix):] for key in keys if re.fullmatch(r"webhook-[1-9][0-9]{0,19}-1\.json", key[len(prefix):])}
     boundary = _restoration_boundary(env, store, prefix, draft, secrets, previous, token, controllers)
-    observed_snapshots, evidence, unknown, finished, ancestor_cache = set(), [], [], {}, set()
+    observed_snapshots, evidence, unknown, finished, ancestor_cache, used_archives = set(), [], [], {}, set(), set()
     for workflow in (LIFECYCLE, HEAD, PHASE, RECOVERY, CONTROL, INLINE):
         workflow_id, runs = _runs(workflow, token)
         for run in runs:
@@ -216,7 +298,11 @@ def inspect(env):
                 # Inputs are not present in the runs API and the legacy workflow
                 # did not retain a private original. Explicit forward evidence
                 # is required rather than guessing inspect versus append.
-                unknown.append({"workflow": workflow, "runId": run_id, "reason": "inline-request-needs-forward-resolution"})
+                reason = "inline-request-needs-forward-resolution"
+                if run_id in archives:
+                    reason = _archived_log(run, workflow, archives[run_id], store, prefix, token, controllers, env)
+                    used_archives.add(run_id)
+                unknown.append({"workflow": workflow, "runId": run_id, "reason": reason})
                 continue
             if workflow == CONTROL:
                 match = re.fullmatch(r"Lifecycle (rehearsal|production) ([a-z-]+) at ([a-f0-9]{40})", title or "")
@@ -265,6 +351,13 @@ def inspect(env):
                 action = "reviewed-head"
             require(run.get("status") == "completed")
             if workflow == HEAD:
+                if run_id in archives:
+                    reason = _archived_log(run, workflow, archives[run_id], store, prefix, token, controllers, env)
+                    require(reason == "no-write-independently-confirmed")
+                    used_archives.add(run_id)
+                    evidence.append({"workflow": workflow, "runId": run_id, "headSha": head,
+                                     "kind": "no-webhook-archived", "proofSha256": archives[run_id]["completionSha256"]})
+                    continue
                 try:
                     proof = _no_webhook_artifact(run, workflow_id, token, candidates)
                     evidence.append({"workflow": workflow, "runId": run_id, "headSha": head, "kind": "no-webhook", "proofSha256": proof})
@@ -273,13 +366,34 @@ def inspect(env):
                     # A failed or expired artifact is unknown unless private
                     # restoration evidence can independently resolve the run.
                     pass
+            if workflow == LIFECYCLE and action == "recover-webhook":
+                recovered_raw = store.get(prefix + run_id + "-1-production-lifecycle-drill-result.json", absent=True)
+                if recovered_raw is not None:
+                    recovered = parsed(recovered_raw)
+                    proof = recovered.get("webhookRecovery")
+                    if (canonical(recovered) == recovered_raw and recovered.get("runId") == run_id
+                            and recovered.get("runAttempt") == "1" and recovered.get("controlRevision") == head
+                            and recovered.get("status") == "passed" and isinstance(proof, dict)
+                            and proof.get("webhookRestored") is True and proof.get("dropPendingUpdates") is False
+                            and proof.get("originalWebhookAuthProbe", {}).get("status") == 400
+                            and (boundary is None or proof.get("restoredSettingsSha256") == boundary["settingsSha256"])):
+                        evidence.append({"workflow": workflow, "runId": run_id, "headSha": head,
+                                         "kind": "confirmed-original-restoration", "proofSha256": sha256(recovered_raw).hexdigest()})
+                        continue
+                unknown.append({"workflow": workflow, "runId": run_id, "reason": "recovery-source-not-confirmed"})
+                continue
             suffix = run_id + "-1"
             if workflow == RECOVERY:
                 suffix = match[2] + "-1"
             snapshot_name = "webhook-" + suffix + ".json"
             snapshot_raw = store.get(prefix + snapshot_name, absent=True)
             if snapshot_raw is None:
-                unknown.append({"workflow": workflow, "runId": run_id, "reason": "snapshot-or-resolution-missing"})
+                reason = "snapshot-or-resolution-missing"
+                if workflow == LIFECYCLE and run_id in archives:
+                    reason = _archived_log(run, workflow, archives[run_id], store, prefix, token, controllers, env)
+                    require(reason == "no-write-independently-confirmed")
+                    used_archives.add(run_id)
+                unknown.append({"workflow": workflow, "runId": run_id, "reason": reason})
                 continue
             observed_snapshots.add(snapshot_name)
             snapshot = parsed(snapshot_raw)
@@ -319,7 +433,11 @@ def inspect(env):
                             and recovery.get("originalWebhookAuthProbe", {}).get("status") == 400):
                         usable.append(sha256(raw).hexdigest())
                 if not usable:
-                    unknown.append({"workflow": workflow, "runId": run_id, "reason": "restoration-unconfirmed"})
+                    reason = "restoration-unconfirmed"
+                    if run_id in archives:
+                        reason = _archived_log(run, workflow, archives[run_id], store, prefix, token, controllers, env)
+                        used_archives.add(run_id)
+                    unknown.append({"workflow": workflow, "runId": run_id, "reason": reason})
                     continue
                 proof = usable[0]
             else:
@@ -329,6 +447,7 @@ def inspect(env):
                              "snapshotSha256": sha256(snapshot_raw).hexdigest(), "proofSha256": proof})
     for missing in sorted(snapshots - observed_snapshots):
         unknown.append({"workflow": "private-snapshot", "runId": missing, "reason": "source-not-accounted"})
+    require(used_archives == set(archives), "A protected history archive does not correspond to a classified source run.")
     superseded = []
     if boundary is not None:
         for item in unknown[:]:

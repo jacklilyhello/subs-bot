@@ -1,0 +1,118 @@
+name: Preserve historical isolated webhook evidence
+run-name: Preserve isolated webhook evidence ${{ inputs.source_run_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        type: choice
+        options: [plan, seal]
+        required: true
+      source_run_id:
+        type: string
+        required: true
+      source_job_id:
+        type: string
+        required: true
+      source_head_sha:
+        type: string
+        required: true
+      source_workflow:
+        type: choice
+        options: [.github/workflows/worker-isolation-telegram-inline-webhook.yml, .github/workflows/worker-production-lifecycle-rehearsal.yml, .github/workflows/worker-backup-reviewed-head.yml]
+        required: true
+      source_log_sha256:
+        type: string
+      approval_sha256:
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+concurrency:
+  group: subs-bot-lifecycle-rehearsal
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
+    environment: subs-bot-backup-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require the protected evidence archive switch
+        env:
+          ARCHIVE_ENABLED: ${{ vars.SUBS_BOT_PHASE_WEBHOOK_HISTORY_ARCHIVE_ENABLED }}
+        run: test "$ARCHIVE_ENABLED" = 'true'
+      - name: Plan or conditionally seal the exact original job log
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PHASE_WEBHOOK_HISTORY_ARCHIVE_ENABLED: ${{ vars.SUBS_BOT_PHASE_WEBHOOK_HISTORY_ARCHIVE_ENABLED }}
+          SUBS_BOT_PHASE_WEBHOOK_HISTORY_ARCHIVE_APPROVAL_SHA256: ${{ vars.SUBS_BOT_PHASE_WEBHOOK_HISTORY_ARCHIVE_APPROVAL_SHA256 }}
+          SUBS_BOT_PHASE_WEBHOOK_CONTROLLERS_JSON: ${{ vars.SUBS_BOT_PHASE_WEBHOOK_CONTROLLERS_JSON }}
+          SUBS_BOT_PHASE_WEBHOOK_CANDIDATES_JSON: ${{ vars.SUBS_BOT_PHASE_WEBHOOK_CANDIDATES_JSON }}
+          SUBS_BOT_PHASE_WEBHOOK_LOG_AUDIT_JSON: ${{ vars.SUBS_BOT_PHASE_WEBHOOK_LOG_AUDIT_JSON }}
+          HISTORY_ARCHIVE_ACTION: ${{ inputs.action }}
+          HISTORY_SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          HISTORY_SOURCE_JOB_ID: ${{ inputs.source_job_id }}
+          HISTORY_SOURCE_HEAD_SHA: ${{ inputs.source_head_sha }}
+          HISTORY_SOURCE_WORKFLOW: ${{ inputs.source_workflow }}
+          HISTORY_SOURCE_LOG_SHA256: ${{ inputs.source_log_sha256 }}
+          HISTORY_ARCHIVE_APPROVAL_SHA256: ${{ inputs.approval_sha256 }}
+          WEBHOOK_REGISTRATION_SHA256: ${{ vars.SUBS_BOT_REHEARSAL_REGISTRATION_SHA256 }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_SCOPED_R2_WRITE_JSON: ${{ inputs.action == 'seal' && secrets.SUBS_BOT_SCOPED_R2_WRITE_JSON || '' }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_REHEARSAL_DATA_READ_TOKEN }}
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_CONTROL_DRILL_KEYS: ${{ secrets.SUBS_BOT_CONTROL_DRILL_KEYS }}
+          SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          python3 -B worker/tools/trusted_backup_webhook_log_archive.py
+  readback:
+    needs: [archive]
+    if: inputs.action == 'seal'
+    environment: subs-bot-backup-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require the protected evidence archive switch
+        env:
+          ARCHIVE_ENABLED: ${{ vars.SUBS_BOT_PHASE_WEBHOOK_HISTORY_ARCHIVE_ENABLED }}
+        run: test "$ARCHIVE_ENABLED" = 'true'
+      - name: Independently compare the retained original log
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PHASE_WEBHOOK_HISTORY_ARCHIVE_ENABLED: ${{ vars.SUBS_BOT_PHASE_WEBHOOK_HISTORY_ARCHIVE_ENABLED }}
+          SUBS_BOT_PHASE_WEBHOOK_HISTORY_ARCHIVE_APPROVAL_SHA256: ${{ vars.SUBS_BOT_PHASE_WEBHOOK_HISTORY_ARCHIVE_APPROVAL_SHA256 }}
+          SUBS_BOT_PHASE_WEBHOOK_CONTROLLERS_JSON: ${{ vars.SUBS_BOT_PHASE_WEBHOOK_CONTROLLERS_JSON }}
+          SUBS_BOT_PHASE_WEBHOOK_CANDIDATES_JSON: ${{ vars.SUBS_BOT_PHASE_WEBHOOK_CANDIDATES_JSON }}
+          SUBS_BOT_PHASE_WEBHOOK_LOG_AUDIT_JSON: ${{ vars.SUBS_BOT_PHASE_WEBHOOK_LOG_AUDIT_JSON }}
+          HISTORY_ARCHIVE_ACTION: readback
+          HISTORY_SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          HISTORY_SOURCE_JOB_ID: ${{ inputs.source_job_id }}
+          HISTORY_SOURCE_HEAD_SHA: ${{ inputs.source_head_sha }}
+          HISTORY_SOURCE_WORKFLOW: ${{ inputs.source_workflow }}
+          HISTORY_SOURCE_LOG_SHA256: ${{ inputs.source_log_sha256 }}
+          HISTORY_ARCHIVE_APPROVAL_SHA256: ${{ inputs.approval_sha256 }}
+          WEBHOOK_REGISTRATION_SHA256: ${{ vars.SUBS_BOT_REHEARSAL_REGISTRATION_SHA256 }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_REHEARSAL_DATA_READ_TOKEN }}
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_CONTROL_DRILL_KEYS: ${{ secrets.SUBS_BOT_CONTROL_DRILL_KEYS }}
+          SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          python3 -B worker/tools/trusted_backup_webhook_log_archive.py
