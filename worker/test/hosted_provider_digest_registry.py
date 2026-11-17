@@ -5,12 +5,14 @@ It is invoked by GitHub hosted CI after building the exact Provider OCI archive.
 """
 
 from hashlib import sha256
+from io import BytesIO
 import json
 import os
 from pathlib import Path
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 from unittest.mock import Mock, patch
@@ -48,6 +50,21 @@ def copy(source, destination, scratch, *, pull=False):
 
 def tags(port, repo):
     return json.loads(get(port, f"{repo}/tags/list"))
+
+
+def sentinel_archive():
+    # The synthetic test helper emits root-owned tar headers. Skopeo extracts
+    # the outer OCI archive as the unprivileged runner and cannot chown files
+    # to root. Normalize only those outer headers; every OCI blob stays intact.
+    output = BytesIO()
+    with tarfile.open(fileobj=BytesIO(oci_fixture()), mode="r:") as source, \
+            tarfile.open(fileobj=output, mode="w:") as destination:
+        for member in source:
+            assert member.isfile()
+            member.uid, member.gid = os.getuid(), os.getgid()
+            member.uname = member.gname = ""
+            destination.addfile(member, source.extractfile(member))
+    return output.getvalue()
 
 
 def check_closure(port, repo, digest, expected_config):
@@ -89,7 +106,7 @@ def run(registry, artifact, revision, root):
             raise RuntimeError("Local registry did not become ready")
 
         sentinel = root / "sentinel.tar"
-        sentinel.write_bytes(oci_fixture())
+        sentinel.write_bytes(sentinel_archive())
         repo = "fixture/provider"
         host = f"127.0.0.1:{port}"
         copy("oci-archive:" + str(sentinel), f"docker://{host}/{repo}:sentinel", root)
