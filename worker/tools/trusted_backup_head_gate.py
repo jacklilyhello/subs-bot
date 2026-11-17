@@ -111,22 +111,30 @@ def validate(env):
         database = fixture.get("databaseId", "")
         excluded = env.get("CAPACITY_FIXTURE_REHEARSAL_D1_ID", "")
         uuid = r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}"
-        require(set(fixture) == {"version", "accountId", "databaseId", "databaseName", "createdAt", "bucketName", "bucketCreatedAt"}
+        require(set(fixture) == {"version", "accountId", "databaseId", "databaseName", "createdAt", "bucketName", "bucketCreatedAt",
+                "probeDatabaseId", "probeDatabaseName", "probeCreatedAt"}
                 and type(fixture["version"]) is int and fixture["version"] == 1 and fixture["accountId"] == ACCOUNT
                 and fixture["databaseName"] == "subs-bot-cf-backup-capacity-20261118" and fixture["bucketName"] == "subs-bot-cf-dev-01"
+                and fixture["probeDatabaseName"] == "subs-bot-cf-backup-permission-20261118"
+                and re.fullmatch(uuid, fixture["probeDatabaseId"] or "")
+                and fixture["probeDatabaseId"] not in {database, excluded, original.get("d1Id")}
+                and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z", fixture["probeCreatedAt"] or "")
                 and re.fullmatch(uuid, database) and re.fullmatch(uuid, excluded)
                 and isinstance(original, dict) and original.get("accountId") == ACCOUNT
                 and re.fullmatch(uuid, original.get("d1Id", "")) and database not in {excluded, original["d1Id"]}
                 and fixture["bucketCreatedAt"] == original.get("r2CreatedOn")
                 and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z", fixture["createdAt"] or "")
                 and HEX64.fullmatch(fixture_sha or "") and sha256(canonical(fixture)).hexdigest() == fixture_sha)
-        require(set(witness) == {"version", "accountId", "databaseId", "observedAt", "workerBindingCount"}
+        require(set(witness) == {"version", "accountId", "databaseId", "observedAt", "workerBindingCount", "probeDatabaseId", "probeWorkerBindingCount"}
                 and type(witness["version"]) is int and witness["version"] == 1 and witness["accountId"] == ACCOUNT
                 and witness["databaseId"] == database and type(witness["observedAt"]) is int
                 and 0 <= int(time.time()) - witness["observedAt"] <= 900
                 and type(witness["workerBindingCount"]) is int and witness["workerBindingCount"] == 0
+                and witness["probeDatabaseId"] == fixture["probeDatabaseId"]
+                and type(witness["probeWorkerBindingCount"]) is int and witness["probeWorkerBindingCount"] == 0
                 and HEX64.fullmatch(witness_sha or "") and sha256(canonical(witness)).hexdigest() == witness_sha
-                and mode in {"initialize", "16000", "20000", "20001", "verify-16000", "verify-20000", "verify-20001"}
+                and mode in {"initialize", "16000", "20000", "20001", "verify-16000", "verify-20000", "verify-20001", "probe-read-token"}
+                and ((mode == "probe-read-token") == (spec["checkpointId"] == "0" * 31 + "1"))
                 and spec["approvalSha256"] == digest({"registrationSha256": fixture_sha, "witnessSha256": witness_sha, "mode": mode}),
                 "The independently pinned fixture, no-binding witness or exact mode differs.")
     return {"status": "validated", "environment": ENVIRONMENT, "dispatcherMainSha": main,
