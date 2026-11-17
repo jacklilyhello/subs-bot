@@ -37,10 +37,85 @@ ORIGIN = "https://" + HOSTNAME
 REPORT = "production-lifecycle-drill-result.json"
 FINAL_REPORT = "production-lifecycle-drill-final.json"
 
+BACKUP_DIAGNOSTIC_STAGES = {"source-setup", "anchor-admission", "begin-intent", "anchor-acquire", "journal-start",
+    "preflight", "pause", "drain", "freeze",
+    "frozen-fingerprint", "capture-intent", "recovery-api-setup", "recovery-journal-load", "recovery-prepare",
+    "recovery-capture", "recovery-verify-backup", "recovery-journal-release", "independent-readback",
+    "simulated-readback-failure", "simulated-process-kill", "resume", "terminal-readback"}
+
+
+class BackupDiagnosticError(Exception):
+    """Only bounded, non-secret failure metadata may leave the runner."""
+    def __init__(self, diagnostic):
+        self.diagnostic = diagnostic
+        super().__init__("Backup maintenance failed; preserve its private evidence.")
+
+
+def backup_stage(tool, stage):
+    require(stage in BACKUP_DIAGNOSTIC_STAGES)
+    tool.backup_diagnostic_stage = stage
+    print(json.dumps({"backupStage": stage}, sort_keys=True), flush=True)
+
+
+def backup_error_kind(error):
+    if isinstance(error, ContractError):
+        kind = "contract"
+    elif isinstance(error, OperationError):
+        kind = "operation"
+    elif isinstance(error, artifact.ArtifactError):
+        kind = "artifact"
+    elif isinstance(error, native.RehearsalError):
+        kind = "recovery"
+    elif isinstance(error, (TimeoutError, HTTPException)):
+        kind = "transport"
+    else:
+        kind = "unexpected"
+    result = {"kind": kind, "uncertain": bool(getattr(error, "uncertain", True))}
+    status = getattr(error, "http_status", None)
+    read_diagnostic = getattr(error, "read_diagnostic", None)
+    if isinstance(read_diagnostic, dict) and read_diagnostic.get("source") == "r2" \
+            and read_diagnostic.get("phase") in {"get", "list", "head"}:
+        result.update(source="r2", phase=read_diagnostic["phase"])
+        if status is None:
+            status = read_diagnostic.get("httpStatus")
+    if type(status) is int and 100 <= status <= 599:
+        result["httpStatus"] = status
+    return result
+
+
+def record_backup_failure(journal, anchor, error, stage):
+    """Attempt the existing failure append once; never retry an unknown write."""
+    require(stage in BACKUP_DIAGNOSTIC_STAGES)
+    diagnostic = {"status": "stopped", "stage": stage, "error": backup_error_kind(error),
+                  "failedJournal": "unconfirmed", "anchorRelease": "not-attempted"}
+    try:
+        journal.append("failed", {"uncertain": diagnostic["error"]["uncertain"],
+                                  "diagnostic": {"stage": stage, "error": diagnostic["error"]}}, int(time()))
+        diagnostic["failedJournal"] = "confirmed"
+        failed_events = journal.load()
+        if len(failed_events) >= 2 and failed_events[-2]["stage"] in {"started", "preflight"}:
+            diagnostic["anchorRelease"] = "unconfirmed"
+            anchor.release(journal.session)
+            diagnostic["anchorRelease"] = "confirmed"
+    except Exception as evidence_error:
+        diagnostic["evidenceError"] = backup_error_kind(evidence_error)
+    return diagnostic
+
+
 def backup_enabled(env, *, watchdog=False):
     # Stopping new daily backups must not disable the independent watchdog.
     key = "DRILL_BACKUP_WATCHDOG_ENABLED" if watchdog else "DRILL_BACKUP_WRITES_ENABLED"
     return env.get(key) == "true"
+
+
+def backup_pause_limits(env):
+    alarm = env.get("DRILL_BACKUP_PAUSE_LIMIT_SECONDS", "300")
+    maximum = env.get("DRILL_BACKUP_MAX_PAUSE_SECONDS", "1800")
+    require(matches(r"[1-9][0-9]{1,2}", alarm) and 60 <= int(alarm) <= 900,
+            "The maintenance pause warning limit must be between 60 and 900 seconds.")
+    require(matches(r"[1-9][0-9]{2,4}", maximum) and 300 <= int(maximum) <= 21600
+            and int(maximum) >= int(alarm), "The maximum maintenance pause is invalid.")
+    return int(alarm), int(maximum)
 
 
 def checked_http_result(value, source):
@@ -567,7 +642,8 @@ class Drill:
         return target, archived["bundle"], archived["manifest"]
 
     def activation_baseline(self, *, stage_prefix="activation-baseline", checkpoint_id=None, preloaded_code=None,
-                            simulate_readback_failure=False, simulate_process_kill=False):
+                            simulate_readback_failure=False, simulate_process_kill=False, capture_guard=None,
+                            diagnostic_stage=None):
         import production_recovery as recovery
         from production_release_evidence import verify_activation_baseline
         require(stage_prefix in ("activation-baseline", "latest-off-baseline"), "Unknown baseline evidence stage.")
@@ -596,25 +672,49 @@ class Drill:
                     "The latest off snapshot must use a distinct checkpoint.")
             name = "subs-bot-cf-restore-control-" + checkpoint[:16]
             contract = {"version": 1, "checkpointId": checkpoint, "databaseName": name, "objectsName": name, "purpose": "baseline"}
+            if diagnostic_stage:
+                diagnostic_stage("recovery-api-setup")
             api = recovery.RecoveryAPI(ctl.target.data, data_token, ctl.worker, contract)
-            source = recovery.RecoverySource(api, ctl.target.data, ctl.bundle, ctl.manifest, ctl.inspect, ctl.guard)
+            source = recovery.RecoverySource(api, ctl.target.data, ctl.bundle, ctl.manifest, ctl.inspect,
+                                             ctl.guard if capture_guard is None else capture_guard)
             source.archive_body, source.code_proof = archive, proof
             journal = recovery.RecoveryJournal(api, self.run + "/" + self.attempt, guard=ctl.guard)
+            if diagnostic_stage:
+                diagnostic_stage("recovery-journal-load")
             journal.load()
+            capture_error = None
             try:
                 with tempfile.TemporaryDirectory(prefix="lifecycle-activation-baseline-", dir=self.env["RUNNER_TEMP"]) as directory:
                     engine = recovery.RecoveryEngine(api, source, journal, Path(directory))
                     for action in ("prepare", "capture", "verify-backup"):
+                        if diagnostic_stage:
+                            diagnostic_stage("recovery-" + action)
                         result = recovery.run_action(action, engine)
                         self.save(stage_prefix + "-" + action, result)
                 manifest_sha = result["backup"]["manifestSha256"]
+            except BaseException as error:
+                capture_error = error
+                raise
             finally:
-                journal.release()
+                if diagnostic_stage and capture_error is None:
+                    diagnostic_stage("recovery-journal-release")
+                try:
+                    journal.release()
+                except BaseException:
+                    if diagnostic_stage:
+                        diagnostic_stage("recovery-journal-release")
+                    raise
         require(not (simulate_readback_failure or simulate_process_kill) or ctl.target.environment == "rehearsal")
         if simulate_process_kill:
+            if diagnostic_stage:
+                diagnostic_stage("simulated-process-kill")
             os._exit(73)  # isolated runner: simulate loss after confirmed export
         if simulate_readback_failure:
+            if diagnostic_stage:
+                diagnostic_stage("simulated-readback-failure")
             raise ContractError("Synthetic independent backup readback failure; preserve this checkpoint.")
+        if diagnostic_stage:
+            diagnostic_stage("independent-readback")
         ctl.activation_baseline_checker = lambda: verify_activation_baseline(ctl, data_token, checkpoint, manifest_sha)
         verified = ctl.activation_baseline_checker()
         require(isinstance(verified, dict) and verified.get("baselineVerified") is True
@@ -901,12 +1001,24 @@ class Drill:
 
     def daily_backup(self):
         """Rehearsal-only maintenance; never synthesizes a production approval."""
+        try:
+            return self._daily_backup()
+        except BackupDiagnosticError:
+            raise
+        except Exception as error:
+            diagnostic = {"status": "stopped", "stage": getattr(self, "backup_diagnostic_stage", "source-setup"),
+                          "error": backup_error_kind(error), "failedJournal": "not-attempted", "anchorRelease": "not-attempted"}
+            self.report["backupFailure"] = diagnostic
+            raise BackupDiagnosticError(diagnostic) from None
+
+    def _daily_backup(self):
         from datetime import datetime, timezone
         import time
         import production_backup_capacity as capacity
         import production_backup_transaction as maintenance
         import production_recovery as recovery
 
+        backup_stage(self, "source-setup")
         target, bundle, manifest = self.prepare_maintenance()
         ctl = self.bind(target, bundle, manifest)
         require(ctl.target.environment == "rehearsal" and ctl.target.data["workerName"] == SERVICE)
@@ -917,10 +1029,7 @@ class Drill:
                 "Synthetic backup faults require an explicit isolated dispatch.")
         require(not self.baseline_checkpoint, "Daily maintenance requires a new unique checkpoint.")
         before = ctl.inspect()
-        limit = self.env.get("DRILL_BACKUP_PAUSE_LIMIT_SECONDS", "300")
-        require(matches(r"[1-9][0-9]{1,2}", limit) and 60 <= int(limit) <= 900,
-                "The maintenance pause warning limit must be between 60 and 900 seconds.")
-        pause_limit = int(limit)
+        pause_limit, maximum_pause = backup_pause_limits(self.env)
         initially_open = before["control"]["admission"] == "open" and before["control"]["workers"] == "run"
         initially_frozen = before["control"]["admission"] == "closed" and before["control"]["workers"] == "frozen"
         require(initially_open or initially_frozen and not any(before["work"].values()),
@@ -963,11 +1072,12 @@ class Drill:
         journal = maintenance.Transaction(store, session, day, ctl.target.digest, self.revision)
         require(not journal.load(), "A previous daily maintenance session already occupies this run identity.")
         anchor = maintenance.Anchor(store, ctl.target.digest, self.env.get("DRILL_BACKUP_GENESIS_SHA256", ""))
+        backup_stage(self, "anchor-admission")
         prior, prior_raw, prior_etag = anchor.read()
         require(prior["state"] == "idle" and prior["session"] != session)
         started = {"configurationSha256": ctl.target.configuration_digest,
                        "release": before["release"], "control": before["control"],
-                       "pauseLimitSeconds": pause_limit, "checkpointId": checkpoint,
+                       "pauseLimitSeconds": pause_limit, "maximumPauseSeconds": maximum_pause, "checkpointId": checkpoint,
                        "dispatcherRevision": dispatcher_revision, "dispatcherWorkflow": evidence_workflow}
         original = {"version": 1, "targetSha256": ctl.target.digest, "session": session, "day": day,
                     "controlRevision": self.revision, "dispatcherRevision": dispatcher_revision,
@@ -976,12 +1086,16 @@ class Drill:
                     "sourceRevision": manifest["revision"], "approvalSha256": sha256(canonical({"targetSha256": ctl.target.digest,
                         "session": session, "environment": "rehearsal"})).hexdigest(),
                     "timestamp": timestamp, "startedDetails": started}
+        backup_stage(self, "begin-intent")
         intent_sha = maintenance.write_begin(store, original)
         self.guard()
         require(ctl.inspect()["stateSha256"] == before["stateSha256"], "The isolated begin predecessor changed.")
+        backup_stage(self, "anchor-acquire")
         anchor._advance(prior, prior_raw, prior_etag, state="active", session=session, day=day, revision=self.revision)
+        backup_stage(self, "journal-start")
         journal.append("started", {**started, "beginIntentSha256": intent_sha}, timestamp)
         try:
+            backup_stage(self, "preflight")
             threshold = self.env.get("DRILL_BACKUP_WARNING_PERCENT", "80")
             require(matches(r"[1-9][0-9]?", threshold))
             observed = capacity.observe(api, source, warning_percent=int(threshold))
@@ -993,6 +1107,7 @@ class Drill:
             journal.append("preflight", {"capacity": observed}, int(time.time()))
             capacity.require_within_limits(observed)
             if initially_open:
+                backup_stage(self, "pause")
                 # Confirm there was no intervening control/configuration/deployment change.
                 planned = ctl.plan_pause()
                 require(planned["control"] == before["control"] and planned["release"] == before["release"]
@@ -1002,30 +1117,51 @@ class Drill:
                 paused = ctl.transition("pause", approval(ctl.target, "pause", ctl.revision, planned["stateSha256"], control_revision=ctl.control_revision),
                                         planned["stateSha256"])
                 journal.append("paused", {"control": paused["control"]}, int(time.time()))
-                remaining = pause_limit - (time.monotonic() - pause_started)
+                backup_stage(self, "drain")
+                remaining = maximum_pause - (time.monotonic() - pause_started)
                 require(remaining > 0, "The pause window expired before drain began.")
                 self.quiet(seconds=min(180, remaining))
-                require(time.monotonic() - pause_started < pause_limit, "The pause window expired before freeze.")
+                require(time.monotonic() - pause_started < maximum_pause, "The maximum pause elapsed before freeze.")
+                backup_stage(self, "freeze")
                 frozen_before = ctl.inspect()
+                def freeze_guard():
+                    self.guard()
+                    require(time.monotonic() - pause_started < maximum_pause, "The maximum pause elapsed before freeze.")
+                freeze_guard()
                 journal.append("freeze-intent", {"stateSha256": frozen_before["stateSha256"]}, int(time.time()))
-                frozen = ctl.transition("freeze", approval(ctl.target, "freeze", ctl.revision, frozen_before["stateSha256"], control_revision=ctl.control_revision),
-                                        frozen_before["stateSha256"])
+                old_guard = ctl.guard
+                ctl.guard = freeze_guard
+                try:
+                    frozen = ctl.transition("freeze", approval(ctl.target, "freeze", ctl.revision, frozen_before["stateSha256"], control_revision=ctl.control_revision),
+                                            frozen_before["stateSha256"])
+                finally:
+                    ctl.guard = old_guard
             else:
                 frozen = ctl.inspect()
                 require(frozen["stateSha256"] == before["stateSha256"])
             journal.append("frozen", {"control": frozen["control"]}, int(time.time()))
+            backup_stage(self, "frozen-fingerprint")
             frozen_data = capacity.frozen_fingerprint(api, source)
             journal.append("frozen-data", frozen_data, int(time.time()))
+            if initially_open:
+                require(time.monotonic() - pause_started < maximum_pause, "The maximum pause elapsed before capture.")
+            backup_stage(self, "capture-intent")
             journal.append("capture-intent", {"checkpointId": checkpoint}, int(time.time()))
             # The intended checkpoint is pinned before capture and independently
             # read back by the existing activation-baseline verifier.
+            def capture_guard():
+                self.guard()
+                if initially_open:
+                    require(time.monotonic() - pause_started < maximum_pause, "The maximum pause elapsed before a capture operation.")
             self.activation_baseline(checkpoint_id=checkpoint, preloaded_code=(proof, archive),
                                      simulate_readback_failure=fault == "readback-failure",
-                                     simulate_process_kill=fault == "process-kill")
+                                     simulate_process_kill=fault == "process-kill", capture_guard=capture_guard,
+                                     diagnostic_stage=lambda stage: backup_stage(self, stage))
             baseline = self.report["activationBaseline"]
             journal.append("verified", {"checkpointId": baseline["checkpointId"],
                            "manifestSha256": baseline["manifestSha256"]}, int(time.time()))
             if initially_frozen:
+                backup_stage(self, "terminal-readback")
                 after = ctl.inspect()
                 require(after["control"] == before["control"] and not any(after["work"].values()))
                 journal.append("preserved-frozen", {"control": after["control"]}, int(time.time()))
@@ -1033,28 +1169,26 @@ class Drill:
                 self.report.update(status="passed", backupMaintenance={"session": session, "day": day,
                     "initiallyFrozen": True, "pauseSeconds": 0, "capacity": observed, "baseline": baseline})
                 return
+            backup_stage(self, "resume")
             plan = ctl.plan_activate()
             journal.append("resume-intent", {"stateSha256": plan["stateSha256"]}, int(time.time()))
             resumed = ctl.transition("activate", approval(ctl.target, "activate", ctl.revision, plan["stateSha256"], control_revision=ctl.control_revision),
                                      plan["stateSha256"])
             elapsed = time.monotonic() - pause_started
             journal.append("resumed", {"control": resumed["control"], "pauseSeconds": round(elapsed, 3),
-                           "pauseLimitExceeded": elapsed > pause_limit}, int(time.time()))
+                           "pauseLimitExceeded": elapsed > pause_limit, "maximumPauseExceeded": elapsed > maximum_pause}, int(time.time()))
             anchor.release(session)
             self.report.update(status="warning" if elapsed > pause_limit else "passed", backupMaintenance={"session": session, "day": day,
-                "pauseSeconds": round(elapsed, 3), "pauseLimitSeconds": pause_limit,
-                "pauseLimitExceeded": elapsed > pause_limit, "capacity": observed, "baseline": baseline})
+                "pauseSeconds": round(elapsed, 3), "pauseLimitSeconds": pause_limit, "maximumPauseSeconds": maximum_pause,
+                "pauseLimitExceeded": elapsed > pause_limit, "maximumPauseExceeded": elapsed > maximum_pause,
+                "capacity": observed, "baseline": baseline})
         except Exception as error:
             # Do not hide an unconfirmed transition behind an automatic retry or
             # resume. A separate observer must reconcile the durable intent.
-            try:
-                journal.append("failed", {"uncertain": bool(getattr(error, "uncertain", False))}, int(time.time()))
-                failed_events = journal.load()
-                if len(failed_events) >= 2 and failed_events[-2]["stage"] in {"started", "preflight"}:
-                    anchor.release(session)
-            except Exception:
-                pass
-            raise
+            diagnostic = record_backup_failure(journal, anchor, error,
+                getattr(self, "backup_diagnostic_stage", "source-setup"))
+            self.report["backupFailure"] = diagnostic
+            raise BackupDiagnosticError(diagnostic) from None
 
     def daily_backup_watchdog(self):
         """Resume only a fully verified baseline with no prior resume attempt."""
@@ -1171,8 +1305,13 @@ class Drill:
                 proof = verify_activation_baseline(ctl, token, verified_event["details"]["checkpointId"],
                                                    verified_event["details"]["manifestSha256"])
                 require(proof.get("baselineVerified") is True)
-            journal.append("preserved-frozen", {"control": current["control"],
-                           "backupVerified": verified_event is not None, "confirmedByWatchdog": True}, int(time.time()))
+            details = {"control": current["control"], "backupVerified": verified_event is not None,
+                       "confirmedByWatchdog": True}
+            if verified_event is None:
+                journal.append_stopped_export(details, int(time.time()), source_journal=source_journal,
+                                              source=source, controller=ctl)
+            else:
+                journal.append("preserved-frozen", details, int(time.time()))
             anchor.release(session)
             self.report.update(status="reconciled", watchdog="frozen-source-preserved",
                                session=session, backupVerified=verified_event is not None)
@@ -1194,8 +1333,10 @@ class Drill:
             elapsed = max(0, int(time.time()) - pause_intent["timestamp"])
             limit = initial.get("pauseLimitSeconds")
             require(type(limit) is int and 60 <= limit <= 900)
+            maximum = initial.get("maximumPauseSeconds", 1800)
+            require(type(maximum) is int and 300 <= maximum <= 21600 and maximum >= limit)
             journal.append("resumed", {"control": resumed["control"], "pauseSeconds": elapsed,
-                           "pauseLimitExceeded": elapsed > limit, "confirmedByWatchdog": True}, int(time.time()))
+                           "pauseLimitExceeded": elapsed > limit, "maximumPauseExceeded": elapsed > maximum, "confirmedByWatchdog": True}, int(time.time()))
             anchor.release(session)
             self.report.update(status="reconciled", watchdog="aborted-drain-resumed", session=session,
                                pauseSeconds=elapsed, pauseLimitExceeded=elapsed > limit)
@@ -1255,8 +1396,10 @@ class Drill:
         elapsed = max(0, int(time.time()) - pause["timestamp"])
         limit = initial.get("pauseLimitSeconds")
         require(type(limit) is int and 60 <= limit <= 900)
+        maximum = initial.get("maximumPauseSeconds", 1800)
+        require(type(maximum) is int and 300 <= maximum <= 21600 and maximum >= limit)
         journal.append("resumed", {"control": resumed["control"], "pauseSeconds": elapsed,
-                       "pauseLimitExceeded": elapsed > limit, "confirmedByWatchdog": True}, int(time.time()))
+                       "pauseLimitExceeded": elapsed > limit, "maximumPauseExceeded": elapsed > maximum, "confirmedByWatchdog": True}, int(time.time()))
         anchor.release(session)
         self.report.update(status="reconciled", watchdog=resume_kind, session=session,
                            pauseSeconds=elapsed, pauseLimitExceeded=elapsed > limit)
@@ -1514,6 +1657,8 @@ def main():
     env = os.environ
     require(env.get("GITHUB_WORKFLOW_REF") == WORKFLOW, "Only the protected dedicated hosted rehearsal workflow may run this drill.")
     action = env.get("DRILL_ACTION", "inspect")
+    require(action not in {"exercise", "provider-binding", "provider-binding-resume", "recover-webhook"},
+            "Legacy test webhook writes are disabled until they share the protected webhook lock; use the trusted recovery entry for an existing incident.")
     if action in {"daily-backup", "daily-backup-watchdog"}:
         require(backup_enabled(env, watchdog=action == "daily-backup-watchdog"),
                 "This isolated backup operation is not enabled.")

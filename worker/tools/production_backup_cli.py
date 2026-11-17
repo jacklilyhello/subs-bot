@@ -15,6 +15,7 @@ from urllib.parse import urlencode
 
 import prepare_isolation_artifact as artifact
 import production_backup_capacity as capacity
+import production_backup_notification as notification
 import production_backup_transaction as maintenance
 import production_backup_resume as resume
 import production_recovery as recovery
@@ -51,11 +52,30 @@ def settings(raw):
 
 
 def maximum_pause(policy):
-    """The legacy 300s alarm remains separate from the operational stop limit."""
+    """The alert threshold and the maximum permitted pause are distinct."""
     maximum = policy.get("maximumPauseSeconds", 1800)
     require(type(maximum) is int and 300 <= maximum <= 21600
             and type(policy.get("pauseLimitSeconds")) is int and maximum >= policy["pauseLimitSeconds"])
     return maximum
+
+
+def session_maximum(events):
+    require(events and events[0]["stage"] == "started")
+    details = events[0]["details"]
+    warning = details.get("pauseLimitSeconds")
+    maximum = details.get("maximumPauseSeconds", 1800)
+    require(type(warning) is int and 60 <= warning <= 900 and type(maximum) is int
+            and 300 <= maximum <= 21600 and maximum >= warning)
+    return maximum
+
+
+def require_pause_window(events, policy):
+    pauses = [event for event in events if event.get("stage") == "pause-intent"]
+    now = int(time.time())
+    require(len(pauses) == 1 and type(pauses[0].get("timestamp")) is int
+            and 0 < pauses[0]["timestamp"] <= now
+            and now - pauses[0]["timestamp"] < maximum_pause(policy),
+            "The maximum pause elapsed; use the explicitly approved recovery path.")
 
 
 def session_input(env):
@@ -384,7 +404,7 @@ def require_finished_intent(details, *, allowed_actions=None, rehearsal=False):
 def monitor_anchor(anchor, store, target, policy, now):
     """Read committed anchor history; missing or malformed evidence fails closed."""
     pin, _raw, _etag = anchor.read()
-    history, current, seen, latest_capacity, latest_completed_failed, latest_pause_exceeded = [], pin, set(), None, None, False
+    history, current, seen, latest_capacity, latest_completed_failed, latest_pause_exceeded, latest_maximum_exceeded = [], pin, set(), None, None, False, False
     while current["generation"] > 1:
         if current["state"] == "idle":
             session = current["session"]
@@ -399,6 +419,12 @@ def monitor_anchor(anchor, store, target, policy, now):
             if latest_completed_failed is None:
                 latest_completed_failed = not (verified and events[-1]["stage"] in {"resumed", "preserved-frozen"})
                 latest_pause_exceeded = events[-1]["details"].get("pauseLimitExceeded") is True
+                maximum_exceeded = events[-1]["details"].get("maximumPauseExceeded")
+                require(maximum_exceeded is None or type(maximum_exceeded) is bool)
+                pauses = [event for event in events if event["stage"] == "pause-intent"]
+                latest_maximum_exceeded = maximum_exceeded is True or (maximum_exceeded is None
+                    and events[-1]["stage"] == "resumed" and pauses
+                    and events[-1]["timestamp"] - pauses[0]["timestamp"] > session_maximum(events))
             preflight = [event for event in events if event["stage"] == "preflight"]
             if latest_capacity is None and preflight:
                 latest_capacity = preflight[0]["details"].get("capacity")
@@ -415,6 +441,8 @@ def monitor_anchor(anchor, store, target, policy, now):
         alerts.append("backup-failed")
     if latest_pause_exceeded:
         alerts.append("pause-limit-exceeded")
+    if latest_maximum_exceeded:
+        alerts.append("pause-maximum-exceeded")
     if latest is None or now - latest > policy["overdueHours"] * 3600:
         alerts.append("backup-overdue")
     elif now - latest > policy["frequencyHours"] * 3600:
@@ -434,9 +462,13 @@ def monitor_anchor(anchor, store, target, policy, now):
         if phase == "failed":
             alerts.append("backup-failed")
         pauses = [event for event in events if event["stage"] == "pause-intent"]
-        if pauses and phase not in {"resumed", "preserved-frozen"} and now - pauses[0]["timestamp"] > policy["pauseLimitSeconds"]:
+        maximum = session_maximum(events) if pauses else None
+        if pauses and phase not in {"resumed", "preserved-frozen"} and now - pauses[0]["timestamp"] > events[0]["details"]["pauseLimitSeconds"]:
             if "pause-limit-exceeded" not in alerts:
                 alerts.append("pause-limit-exceeded")
+        if pauses and phase not in {"resumed", "preserved-frozen"} and now - pauses[0]["timestamp"] > maximum:
+            if "pause-maximum-exceeded" not in alerts:
+                alerts.append("pause-maximum-exceeded")
     if isinstance(latest_capacity, dict):
         levels = [latest_capacity.get(key) for key in ("rowStatus", "objectStatus", "objectBytesStatus")]
         if "over-limit" in levels or latest_capacity.get("failureReason") == "object-too-large":
@@ -573,7 +605,7 @@ def emit_result(result, target, revision, root, *, source_revision=None):
     # GitHub logs and artifacts are visible to repository readers, so expose only
     # the exact predecessor digest and non-identifying operational aggregates.
     safe_keys = {"status", "action", "alerts", "latestVerifiedAt", "phase", "notification", "approvalAction",
-                 "stateSha256", "session", "day", "pauseSeconds", "pauseLimitExceeded", "capacity", "checkpointId", "manifestSha256",
+                 "stateSha256", "session", "day", "pauseSeconds", "pauseLimitExceeded", "maximumPauseExceeded", "capacity", "liveCapacity", "checkpointId", "manifestSha256",
                  "anchorPlanSha256", "candidateSha256", "genesisSha256", "historyPresent", "pointerPresent", "mutationPermitted"}
     observed = result.get("state")
     result = {key: value for key, value in result.items() if key in safe_keys}
@@ -584,8 +616,12 @@ def emit_result(result, target, revision, root, *, source_revision=None):
     if source_revision is not None:
         result["sourceRevision"] = source_revision
     artifact.require_current_main(revision)
-    with recovery.native.private_file(root / "production-backup-result.json") as output:
-        output.write(canonical(result))
+    if result.get("action") == "monitor":
+        notification.prepare(result, os.environ.get("MONITOR_NOTIFICATION_FILTER", "*"))
+        notification.write(result, root / "production-backup-result.json", os.environ.get("GITHUB_OUTPUT"))
+    else:
+        with recovery.native.private_file(root / "production-backup-result.json") as output:
+            output.write(canonical(result))
     print(json.dumps(result, sort_keys=True))
     if result.get("action") == "monitor" and result["status"] == "alert":
         print("::warning::Production backup monitoring requires attention.")
@@ -674,6 +710,7 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
             guard()
             started = {"configurationSha256": target.configuration_digest, "control": state["control"],
                 "release": state["release"], "pauseLimitSeconds": policy["pauseLimitSeconds"],
+                "maximumPauseSeconds": maximum_pause(policy),
                 "checkpointId": contract["checkpointId"], "contractSha256": digest(contract), "policySha256": digest(policy)}
             if runtime is not None:
                 started.update(runtime.begin_evidence())
@@ -775,14 +812,23 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
             result = {"status": "drained", "action": action, "state": state}
         elif action == "freeze":
             last(events, "paused")
+            require_pause_window(events, policy)
+            def freeze_guard():
+                bounded_guard()
+                require_pause_window(events, policy)
             require(state["control"] == events[-1]["details"]["control"]
                     and state["release"] == events[0]["details"]["release"]
                     and state["configurationSha256"] == events[0]["details"]["configurationSha256"])
             predecessor = exact_predecessor(env, state)
             ctl.approval(phase_envelope("freeze", predecessor), "freeze", predecessor)
-            bounded_guard()
+            freeze_guard()
             journal.append("freeze-intent", phase_metadata(state), int(time.time()))
-            after = ctl.transition("freeze", phase_envelope("freeze", predecessor), predecessor)
+            previous_ctl_guard = ctl.guard
+            ctl.guard = freeze_guard
+            try:
+                after = ctl.transition("freeze", phase_envelope("freeze", predecessor), predecessor)
+            finally:
+                ctl.guard = previous_ctl_guard
             journal.append("frozen", {"control": after["control"]}, int(time.time()))
             journal.append("frozen-data", capacity.frozen_fingerprint(api, source), int(time.time()))
             result = {"status": "frozen", "action": action, "state": after}
@@ -808,7 +854,8 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
                 if next_stage == "resumed":
                     pause = next(event for event in events if event["stage"] == "pause-intent")
                     elapsed = max(0, int(time.time()) - pause["timestamp"])
-                    details.update(pauseSeconds=elapsed, pauseLimitExceeded=elapsed > policy["pauseLimitSeconds"])
+                    details.update(pauseSeconds=elapsed, pauseLimitExceeded=elapsed > policy["pauseLimitSeconds"],
+                                   maximumPauseExceeded=elapsed > maximum_pause(policy))
                 journal.append(next_stage, details, int(time.time()))
                 if next_stage == "resumed":
                     anchor.release(pin["session"])
@@ -853,12 +900,18 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
                     after = resume.resume_failed_backup(ctl, api, source, rj, **kwargs, approval_envelope=phase_envelope(plan["approvalAction"], predecessor), record_intent=record_intent)
                 elapsed = max(0, int(time.time()) - pause["timestamp"])
                 journal.append("resumed", {"control": after["control"], "pauseSeconds": elapsed,
-                               "pauseLimitExceeded": elapsed > policy["pauseLimitSeconds"], "backupVerified": False}, int(time.time()))
+                               "pauseLimitExceeded": elapsed > policy["pauseLimitSeconds"],
+                               "maximumPauseExceeded": elapsed > maximum_pause(policy), "backupVerified": False}, int(time.time()))
                 anchor.release(pin["session"])
                 result = {"status": "resumed-after-failure", "action": action, "pauseSeconds": elapsed,
-                          "pauseLimitExceeded": elapsed > policy["pauseLimitSeconds"]}
+                          "pauseLimitExceeded": elapsed > policy["pauseLimitSeconds"],
+                          "maximumPauseExceeded": elapsed > maximum_pause(policy)}
         elif action == "capture":
             last(events, "frozen-data")
+            require_pause_window(events, policy)
+            def capture_guard():
+                bounded_guard()
+                require_pause_window(events, policy)
             frozen_matches(events, state)
             predecessor = exact_predecessor(env, state)
             for name, key in (("prepare", "SUBS_BOT_BACKUP_PREPARE_APPROVAL_JSON"), ("capture", "SUBS_BOT_BACKUP_CAPTURE_APPROVAL_JSON")):
@@ -867,14 +920,19 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
             recovery_journal = recovery.RecoveryJournal(api, owner, guard=guard)
             recovery_journal.load()
             require(recovery_journal.value is None, "The capture checkpoint already exists; reconcile instead of restarting.")
-            bounded_guard()
+            capture_guard()
             journal.append("capture-intent", {**phase_metadata(state), "checkpointId": contract["checkpointId"]}, int(time.time()))
+            previous_source_guard = source.guard
+            source.guard = capture_guard
             try:
                 engine = recovery.RecoveryEngine(api, source, recovery_journal, directory)
                 recovery.run_action("prepare", engine)
                 result = recovery.run_action("capture", engine)
             finally:
-                recovery_journal.release()
+                try:
+                    recovery_journal.release()
+                finally:
+                    source.guard = previous_source_guard
             result = {"status": "captured-unverified", "action": action, "backup": result["backup"]}
         elif action == "poll-export":
             last(events, "capture-intent")
@@ -941,10 +999,12 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
                 started = next(event for event in events if event["stage"] == "pause-intent")
                 elapsed = max(0, int(time.time()) - started["timestamp"])
                 journal.append("resumed", {"control": after["control"], "pauseSeconds": elapsed,
-                    "pauseLimitExceeded": elapsed > policy["pauseLimitSeconds"]}, int(time.time()))
+                    "pauseLimitExceeded": elapsed > policy["pauseLimitSeconds"],
+                    "maximumPauseExceeded": elapsed > maximum_pause(policy)}, int(time.time()))
                 anchor.release(pin["session"])
                 result = {"status": "resumed", "action": action, "pauseSeconds": elapsed,
-                          "pauseLimitExceeded": elapsed > policy["pauseLimitSeconds"]}
+                          "pauseLimitExceeded": elapsed > policy["pauseLimitSeconds"],
+                          "maximumPauseExceeded": elapsed > maximum_pause(policy)}
         else:
             raise ValueError("Unsupported backup action.")
     result.setdefault("action", action)
@@ -979,6 +1039,20 @@ def main(env=None):
                 result["alerts"].append("workflow-history-unknown")
         except Exception:
             result["alerts"].append("workflow-history-unknown")
+        try:
+            import production_backup_live_capacity as live_capacity
+            interval = int(env.get("MONITOR_CAPACITY_INTERVAL_MINUTES") or "15")
+            if live_capacity.due(env.get("GITHUB_EVENT_NAME", ""), env.get("MONITOR_SCHEDULE", ""), interval):
+                observed = live_capacity.sample(target, env.get("SUBS_BOT_CF_BACKUP_MONITOR_READ_TOKEN", ""),
+                    env.get("BACKUP_SOURCE_CHECKPOINT_ID", ""), env.get("BACKUP_SOURCE_MANIFEST_SHA256", ""),
+                    warning_percent=policy["warningPercent"], root=root, guard=lambda: artifact.require_current_main(revision))
+                result["liveCapacity"] = observed
+                result["alerts"] = sorted(set(result["alerts"]) | set(live_capacity.alerts(observed)))
+            else:
+                result["liveCapacity"] = {"status": "not-due", "intervalMinutes": interval}
+        except Exception:
+            result["liveCapacity"] = {"status": "unknown", "snapshot": False}
+            result["alerts"] = sorted(set(result["alerts"]) | {"live-capacity-unknown"})
         result["status"] = "alert" if result["alerts"] else "ok"
         return emit_result(result, target, revision, root)
     contract = recovery.recovery_contract(env.get("SUBS_BOT_RECOVERY_JSON", ""), target.data)
@@ -1028,5 +1102,10 @@ if __name__ == "__main__":
     try:
         main()
     except Exception:
+        if os.environ.get("BACKUP_ACTION") == "monitor" and os.environ.get("RUNNER_TEMP"):
+            report = notification.prepare({"version": 1, "scope": "production", "status": "alert",
+                "action": "monitor", "alerts": ["monitor-unknown"]}, os.environ.get("MONITOR_NOTIFICATION_FILTER", "*"))
+            notification.write(report, Path(os.environ["RUNNER_TEMP"]) / "production-backup-result.json",
+                               os.environ.get("GITHUB_OUTPUT"))
         print(json.dumps({"status": "stopped", "reason": "The backup checkpoint was not confirmed; retain its private intent and inspect before continuing."}))
         raise SystemExit(1) from None

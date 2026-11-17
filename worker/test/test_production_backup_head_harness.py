@@ -32,8 +32,8 @@ def github(path, _token):
                 "repo": {"id": harness.artifact.REPOSITORY_ID}}}
     if path == "/git/ref/heads/main":
         return {"ref": "refs/heads/main", "object": {"type": "commit", "sha": MAIN}}
-    if path == "/compare/" + MAIN + "..." + HEAD:
-        return {"status": "ahead", "base_commit": {"sha": MAIN}, "merge_base_commit": {"sha": MAIN}}
+    if path == "/compare/" + MAIN + "..." + HEAD + "?per_page=1&page=2":
+        return {"status": "ahead", "behind_by": 0, "base_commit": {"sha": MAIN}, "merge_base_commit": {"sha": MAIN}}
     raise AssertionError("unexpected request")
 
 
@@ -63,6 +63,15 @@ class HeadGuardTests(unittest.TestCase):
         self.assertEqual(projected["stages"], [{"stage": "verified", "sha256": "d" * 64}])
         self.assertNotIn("synthetic-private", str(projected))
         self.assertNotIn("synthetic-secret", str(projected))
+
+    def test_live_capacity_projection_excludes_table_details(self):
+        value = harness.public_result({"status": "observed", "liveCapacity": {"rows": 123,
+            "snapshot": False, "rowStatus": "normal", "tableCounts": {"private-name": 1},
+            "unexpected": "private-data"}})
+        self.assertEqual(value["liveCapacity"]["rows"], 123)
+        self.assertIs(value["liveCapacity"]["snapshot"], False)
+        self.assertNotIn("private-name", str(value))
+        self.assertNotIn("private-data", str(value))
 
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()

@@ -45,6 +45,46 @@ class MemoryStore:
 
 
 class LifecycleDrillTests(unittest.TestCase):
+    def test_backup_failure_diagnostics_never_repeat_or_print_error_details(self):
+        journal = Mock(session="123-1")
+        journal.append.side_effect = drill.OperationError("synthetic-private-evidence", uncertain=True, status=503)
+        anchor = Mock()
+        error = drill.ContractError("synthetic-private-payload")
+        diagnostic = drill.record_backup_failure(journal, anchor, error, "recovery-prepare")
+        self.assertEqual(diagnostic["stage"], "recovery-prepare")
+        self.assertEqual(diagnostic["failedJournal"], "unconfirmed")
+        self.assertEqual(diagnostic["anchorRelease"], "not-attempted")
+        self.assertEqual(diagnostic["evidenceError"], {"kind": "operation", "uncertain": True, "httpStatus": 503})
+        self.assertNotIn("synthetic-private", json.dumps(diagnostic))
+        journal.append.assert_called_once()
+        anchor.release.assert_not_called()
+
+    def test_backup_failure_records_confirmation_before_single_anchor_release(self):
+        journal = Mock(session="123-1")
+        journal.load.return_value = [{"stage": "preflight"}, {"stage": "failed"}]
+        anchor = Mock()
+        anchor.release.side_effect = drill.OperationError("synthetic-private", uncertain=True)
+        diagnostic = drill.record_backup_failure(journal, anchor, drill.ContractError("synthetic"), "preflight")
+        self.assertEqual(diagnostic["failedJournal"], "confirmed")
+        self.assertEqual(diagnostic["anchorRelease"], "unconfirmed")
+        self.assertTrue(journal.append.call_args.args[1]["uncertain"])
+        anchor.release.assert_called_once_with("123-1")
+
+    def test_backup_failure_projects_only_bounded_scoped_read_diagnostics(self):
+        error = drill.ContractError("synthetic-private-body")
+        error.read_diagnostic = {"source": "r2", "phase": "get", "httpStatus": 403, "body": "synthetic-private-body"}
+        result = drill.backup_error_kind(error)
+        self.assertEqual(result, {"kind": "contract", "uncertain": True, "source": "r2", "phase": "get", "httpStatus": 403})
+        self.assertNotIn("synthetic-private-body", json.dumps(result))
+
+    def test_legacy_webhook_actions_reject_before_opening_private_state(self):
+        for action in ("exercise", "provider-binding", "provider-binding-resume", "recover-webhook"):
+            with self.subTest(action=action), patch.dict(drill.os.environ, {
+                    "GITHUB_WORKFLOW_REF": drill.WORKFLOW, "DRILL_ACTION": action}, clear=True), \
+                    patch.object(drill, "Drill") as target, self.assertRaises(contract.ContractError):
+                drill.main()
+            target.assert_not_called()
+
     def test_private_share_readback_uses_scoped_s3_without_rest_fallback(self):
         import scoped_r2
         key = "private-shares/00000000-0000-4000-8000-000000000001.txt"

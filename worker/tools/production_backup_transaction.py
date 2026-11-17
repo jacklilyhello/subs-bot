@@ -123,9 +123,21 @@ class Transaction:
         return events
 
     def append(self, stage, details, timestamp):
+        return self._append(stage, details, timestamp, resolved_capture=False)
+
+    def _append(self, stage, details, timestamp, *, resolved_capture, expected_events=None):
         require(stage in STAGES and isinstance(details, dict) and type(timestamp) is int and timestamp > 0)
         events = self.load()
         require(len(events) < 63)
+        require(expected_events is None or events == expected_events,
+                "The backup transaction changed before the restricted terminal append.")
+        prior = events[-1]["stage"] if events else None
+        unresolved_capture = prior == "capture-intent" or (prior == "failed" and len(events) > 1
+                                                            and events[-2]["stage"] == "capture-intent")
+        if stage == "preserved-frozen" and unresolved_capture:
+            require(resolved_capture, "An unconfirmed capture cannot use the generic terminal append.")
+        else:
+            require(not resolved_capture, "The restricted capture resolution has a different predecessor.")
         previous = sha256(canonical(events[-1])).hexdigest() if events else None
         event = {"version": 1, "session": self.session, "targetSha256": self.target_sha256,
                  "controlRevision": self.control_revision, "sequence": len(events) + 1,
@@ -144,6 +156,73 @@ class Transaction:
         require(len(observed) == len(events) + 1 and observed[-1] == event,
                 "Backup journal append was not independently confirmed.")
         return event
+
+    def append_stopped_export(self, details, timestamp, *, source_journal, source, controller):
+        """Watchdog path: independently re-read the exact stopped export and frozen source."""
+        import production_backup_capacity as capacity
+        import production_recovery as recovery
+        from production_control import Controller
+        require(type(source_journal) is recovery.RecoveryJournal and type(source) is recovery.RecoverySource
+                and isinstance(controller, Controller) and source_journal.api is source.api)
+        events = self.load()
+        require(events and events[-1]["stage"] in {"capture-intent", "failed"})
+        current = events[-2] if events[-1]["stage"] == "failed" else events[-1]
+        checkpoint = events[0]["details"].get("checkpointId")
+        require(current["stage"] == "capture-intent" and current["details"].get("checkpointId") == checkpoint
+                and source.api.cohort == checkpoint and source.scope_sha256 == self.target_sha256)
+        # Use a new reader: RecoveryJournal.load() on an already populated
+        # instance retains its prior value if its entire listing disappears.
+        fresh = recovery.RecoveryJournal(source_journal.api, source_journal.owner, guard=source_journal.guard)
+        value = fresh.load()
+        require(isinstance(value, dict) and isinstance(value.get("export"), dict)
+                and value["export"].get("state") in {"download-ready", "sql-archived", "complete"}
+                and isinstance(fresh.raw, bytes))
+        frozen = next((event for event in events if event["stage"] == "frozen-data"), None)
+        observed = controller.inspect()
+        initial = events[0]["details"]
+        require(frozen is not None and observed["control"] == initial["control"]
+                and observed["release"] == initial["release"]
+                and observed["configurationSha256"] == initial["configurationSha256"]
+                and not any(observed["work"].values())
+                and not any(observed["terminal"].get(key, 0) for key in
+                            ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates"))
+                and capacity.frozen_fingerprint(source.api, source) == frozen["details"]
+                and details == {"control": observed["control"], "backupVerified": False, "confirmedByWatchdog": True})
+        require(self.load() == events, "The capture transaction changed during its stopped-export proof.")
+        return self._append("preserved-frozen", details, timestamp, resolved_capture=True, expected_events=events)
+
+    def append_no_export(self, details, timestamp, *, guard):
+        """The one reviewed no-export incident requires sealed evidence and a unique intent."""
+        require(self.session == "44164739374-1" and self.control_revision == "7aa685990859cffb30d47c5a6e593d969f1d0452"
+                and callable(guard) and set(details) == {"control", "backupVerified", "noExportEvidenceSha256",
+                    "releaseIntentSha256", "threatModel"} and details["backupVerified"] is False
+                and details["threatModel"] == "reviewed-writers-no-unapproved-deletion"
+                and all(SHA.fullmatch(details[key] or "") for key in ("noExportEvidenceSha256", "releaseIntentSha256")))
+        events = self.load()
+        require(events and events[-1]["stage"] == "capture-intent"
+                and events[-1]["details"].get("checkpointId") == "1bbadaa9755d1733ddd80fe12192420a")
+        prefix = "maintenance/production-control/evidence/no-export-resolution/" + self.target_sha256 + "/" + self.session + "/"
+        raw = self.store.get(prefix + "release-intent.json")
+        intent = parsed(raw)
+        manifest_raw = self.store.get(prefix + "evidence-manifest.json")
+        manifest = parsed(manifest_raw)
+        evidence_intent_raw = self.store.get(prefix + "evidence-intent.json")
+        evidence_intent = parsed(evidence_intent_raw)
+        require(canonical(intent) == raw and sha256(raw).hexdigest() == details["releaseIntentSha256"]
+                and intent.get("kind") == "no-export-release-intent" and intent.get("targetSha256") == self.target_sha256
+                and intent.get("originalRunId") == "44164739374" and intent.get("originalAttempt") == "1"
+                and intent.get("evidenceSha256") == details["noExportEvidenceSha256"]
+                and sha256(manifest_raw).hexdigest() == details["noExportEvidenceSha256"]
+                and canonical(manifest) == manifest_raw and manifest.get("kind") == "no-export-original-evidence"
+                and manifest.get("originalRunId") == "44164739374" and manifest.get("originalAttempt") == "1"
+                and manifest.get("planSha256") == intent.get("planSha256")
+                and manifest.get("threatModel") == details["threatModel"]
+                and canonical(evidence_intent) == evidence_intent_raw
+                and evidence_intent == {"version": 1, "kind": "no-export-evidence-intent",
+                    "planSha256": manifest["planSha256"], "manifestSha256": details["noExportEvidenceSha256"]})
+        guard()
+        require(self.load() == events, "The capture transaction changed during its no-export proof.")
+        return self._append("preserved-frozen", details, timestamp, resolved_capture=True, expected_events=events)
 
 
 def interruption(events):

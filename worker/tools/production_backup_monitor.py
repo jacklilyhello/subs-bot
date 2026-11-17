@@ -19,6 +19,8 @@ from production_lifecycle_drill import configuration, ORIGINAL_SERVICE, SERVICE
 from production_storage import PrivateStore
 from production_target import require, parsed, validate_target
 from production_backup_transaction import Anchor, Transaction, interruption
+import production_backup_live_capacity as live_capacity
+import production_backup_notification as notification
 
 WORKFLOW = ".github/workflows/worker-production-lifecycle-rehearsal.yml"
 MONITOR_WORKFLOW = "jacklilyhello/subs-bot/.github/workflows/worker-backup-monitor.yml@refs/heads/main"
@@ -115,14 +117,24 @@ def evaluate(runs, journals, now, *, overdue_hours=48, timeout_minutes=30):
             resumed = [event for event in events if event["stage"] == "resumed"]
             if paused:
                 require(events[0]["stage"] == "started")
-                maximum = events[0]["details"].get("pauseLimitSeconds")
-                require(type(maximum) is int and 60 <= maximum <= 900 and len(paused) == 1 and len(resumed) <= 1)
+                warning = events[0]["details"].get("pauseLimitSeconds")
+                maximum = events[0]["details"].get("maximumPauseSeconds", 1800)
+                require(type(warning) is int and 60 <= warning <= 900 and type(maximum) is int
+                        and 300 <= maximum <= 21600 and maximum >= warning and len(paused) == 1 and len(resumed) <= 1)
+                started = intents[0]["timestamp"] if intents else paused[0]["timestamp"]
                 if resumed:
                     require(type(resumed[0]["details"].get("pauseLimitExceeded")) is bool)
                     if resumed[0]["details"]["pauseLimitExceeded"]:
                         alerts.add("pause-limit-exceeded")
-                elif now - (intents[0]["timestamp"] if intents else paused[0]["timestamp"]) > maximum:
-                    alerts.add("pause-limit-exceeded")
+                    maximum_exceeded = resumed[0]["details"].get("maximumPauseExceeded")
+                    require(maximum_exceeded is None or type(maximum_exceeded) is bool)
+                    if maximum_exceeded is True or (maximum_exceeded is None and resumed[0]["timestamp"] - started > maximum):
+                        alerts.add("pause-maximum-exceeded")
+                else:
+                    if now - started > warning:
+                        alerts.add("pause-limit-exceeded")
+                    if now - started > maximum:
+                        alerts.add("pause-maximum-exceeded")
             elif intents:
                 alerts.add("pause-state-unconfirmed")
             if run["status"] == "completed":
@@ -200,6 +212,22 @@ def main():
         if not normally_running:
             result["alerts"] = sorted(set(result["alerts"]) | {"maintenance-transaction-unresolved"})
             result["status"] = "alert"
+    try:
+        interval = int(os.environ.get("MONITOR_CAPACITY_INTERVAL_MINUTES") or "15")
+        if live_capacity.due(os.environ.get("GITHUB_EVENT_NAME", ""), os.environ.get("MONITOR_SCHEDULE", ""), interval):
+            warning = int(os.environ.get("MONITOR_WARNING_PERCENT") or "80")
+            observed = live_capacity.sample(target, os.environ.get("SUBS_BOT_CF_BOOTSTRAP_TOKEN", ""),
+                os.environ.get("DRILL_BACKUP_SOURCE_CHECKPOINT_ID", ""),
+                os.environ.get("DRILL_BACKUP_SOURCE_MANIFEST_SHA256", ""), warning_percent=warning,
+                root=os.environ.get("RUNNER_TEMP", ""), guard=lambda: github.require_current_main(revision))
+            result["liveCapacity"] = observed
+            result["alerts"] = sorted(set(result["alerts"]) | set(live_capacity.alerts(observed)))
+        else:
+            result["liveCapacity"] = {"status": "not-due", "intervalMinutes": interval}
+    except Exception:
+        result["liveCapacity"] = {"status": "unknown", "snapshot": False}
+        result["alerts"] = sorted(set(result["alerts"]) | {"live-capacity-unknown"})
+    result["status"] = "alert" if result["alerts"] else "ok"
     github.require_current_main(revision)
     return result
 
@@ -210,10 +238,10 @@ if __name__ == "__main__":
     except Exception:
         report = {"version": 1, "scope": "registered-rehearsal-only", "status": "alert",
                   "alerts": ["monitor-unknown"], "notification": "github-check-only", "archiveRereadByMonitor": False}
+    report = notification.prepare(report, os.environ.get("MONITOR_NOTIFICATION_FILTER", "*"))
     encoded = json.dumps(report, sort_keys=True, separators=(",", ":"))
     output = Path(os.environ["RUNNER_TEMP"]) / "production-backup-monitor.json"
-    output.write_text(encoded + "\n", encoding="utf-8")
-    output.chmod(0o600)
+    notification.write(report, output, os.environ.get("GITHUB_OUTPUT"))
     print(encoded)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:

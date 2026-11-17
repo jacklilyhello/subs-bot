@@ -83,6 +83,30 @@ class ProductionBackupTests(unittest.TestCase):
             with self.subTest(update=update), self.assertRaises(ContractError):
                 backup.settings(json.dumps({**self.policy, **update}))
 
+    def test_pause_alarm_is_distinct_from_bounded_maximum(self):
+        legacy = backup.settings(json.dumps(self.policy))
+        self.assertEqual(legacy, self.policy)
+        self.assertEqual(backup.maximum_pause(legacy), 1800)
+        extended = backup.settings(json.dumps({**self.policy, "maximumPauseSeconds": 3600}))
+        self.assertEqual(backup.maximum_pause(extended), 3600)
+        for value in (True, 299, 21601):
+            with self.subTest(value=value), self.assertRaises(ContractError):
+                backup.settings(json.dumps({**self.policy, "maximumPauseSeconds": value}))
+        events = [{"stage": "pause-intent", "timestamp": 1000}]
+        with patch.object(backup.time, "time", return_value=1301):
+            backup.require_pause_window(events, legacy)  # the 300s alert is not a hard stop
+        with patch.object(backup.time, "time", return_value=2800), self.assertRaises(ContractError):
+            backup.require_pause_window(events, legacy)
+
+    def test_maximum_uses_the_journaled_session_value_with_legacy_default(self):
+        event = {"stage": "started", "details": {"pauseLimitSeconds": 300, "maximumPauseSeconds": 3600}}
+        self.assertEqual(backup.session_maximum([event]), 3600)
+        del event["details"]["maximumPauseSeconds"]
+        self.assertEqual(backup.session_maximum([event]), 1800)
+        event["details"]["maximumPauseSeconds"] = True
+        with self.assertRaises(ContractError):
+            backup.session_maximum([event])
+
     def test_unknown_predecessor_cannot_authorize_writes(self):
         with self.assertRaises(ContractError):
             backup.exact_predecessor({"BACKUP_STATE_SHA256": "a" * 64}, {"stateSha256": "b" * 64})
@@ -176,6 +200,23 @@ class ProductionBackupTests(unittest.TestCase):
             result = backup.monitor_anchor(anchor, store, target, self.policy, 1000)
         self.assertIn("backup-failed", result["alerts"])
         self.assertNotIn("backup-overdue", result["alerts"])
+
+    def test_monitor_uses_active_session_pause_limits_after_policy_changes(self):
+        pin = {"generation": 2, "state": "active", "session": "1-1", "day": "2026/01/01",
+               "controlRevision": "b" * 40, "previousSha256": "c" * 64}
+        anchor, store, target = Mock(), Mock(), Mock(digest="a" * 64)
+        anchor.read.return_value = (pin, b"", '"etag"')
+        anchor.history_digest_key.return_value = "previous"
+        store.get.return_value = backup.canonical({"generation": 1})
+        events = [{"stage": "started", "timestamp": 1000,
+                   "details": {"pauseLimitSeconds": 60, "maximumPauseSeconds": 300}},
+                  {"stage": "pause-intent", "timestamp": 1000, "details": {}}]
+        with patch.object(backup.maintenance, "Transaction") as transaction:
+            transaction.return_value.load.return_value = events
+            result = backup.monitor_anchor(anchor, store, target,
+                                           {**self.policy, "maximumPauseSeconds": 3600}, 1301)
+        self.assertIn("pause-limit-exceeded", result["alerts"])
+        self.assertIn("pause-maximum-exceeded", result["alerts"])
 
     def test_transition_reconciliation_requires_exact_successor_and_finished_run(self):
         previous = {"admission": "open", "workers": "run", "epoch": 8}
