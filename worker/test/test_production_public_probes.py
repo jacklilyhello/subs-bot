@@ -271,6 +271,7 @@ class PublicProbeTests(unittest.TestCase):
         ready = {"control": {"admission": "open", "workers": "run"}, "work": {"invocations": 0},
                  "terminal": {}, "stateSha256": "a" * 64}
         controller.inspect.side_effect = [initial, ready]
+        tool.transition.return_value = {"control": ready["control"], "stateSha256": ready["stateSha256"]}
         tool.restore_webhook = Mock()
         body = b"synthetic fixture payload"
         states = [{"update_id": 1, "state": "sent", "attempts": 1}, {"update_id": 2, "state": "sent", "attempts": 1}]

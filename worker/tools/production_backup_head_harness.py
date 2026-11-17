@@ -187,6 +187,22 @@ def main(env=None):
     result.update(headRevision=env["HEAD_VALIDATION_SHA"], dispatcherMainRevision=env["GITHUB_SHA"], targetSha256=ctl.target.digest,
                   environment="rehearsal", productionMutated=False, webhookTouched=action == "open-backup",
                   runId=env["GITHUB_RUN_ID"], runAttempt=env["GITHUB_RUN_ATTEMPT"])
+    if action == "open-backup":
+        ready = [item for item in tool.report["stages"] if item.get("stage") == "open-backup-ready-for-cleanup"]
+        accepted = tool.report["dailyBackupAcceptance"]
+        require(len(ready) == 1 and accepted["admissionRestored"] is True and accepted["authorizationUnchanged"] is True)
+        receipt = {"version": 1, "status": "candidate-complete-before-trusted-cleanup", "runId": tool.run,
+                   "runAttempt": tool.attempt, "controllerRevision": tool.revision,
+                   "dispatcherRevision": env["GITHUB_SHA"], "targetSha256": ctl.target.digest,
+                   "readySha256": ready[0]["sha256"], "snapshotSha256": tool.report["webhookSnapshotSha256"],
+                   "checkpointId": accepted["baseline"]["checkpointId"],
+                   "manifestSha256": accepted["baseline"]["manifestSha256"],
+                   "pauseSeconds": accepted["pauseSeconds"], "pauseLimitExceeded": accepted["pauseLimitExceeded"],
+                   "admissionRestored": True, "authorizationUnchanged": True, "confirmedReceiptsNotRepeated": True}
+        key = tool.prefix + tool.run + "-" + tool.attempt + "-backup-head-acceptance.json"
+        body = canonical(receipt)
+        tool.store.put(key, body)
+        require(tool.store.get(key) == body, "The private head acceptance evidence was not read back.")
     output = Path(env["RUNNER_TEMP"]) / "production-backup-head-result.json"
     with output.open("xb") as stream:
         stream.write(canonical(result))
