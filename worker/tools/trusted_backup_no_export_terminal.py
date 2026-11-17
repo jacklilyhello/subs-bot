@@ -35,6 +35,38 @@ def _originals(store, prefix, manifest):
     require(isinstance(records, list) and 1 <= len(records) <= 64)
     names = [record.get("name") if isinstance(record, dict) else None for record in records]
     require(all(isinstance(name, str) and name for name in names) and names == sorted(set(names)))
+    if manifest.get("version", 1) == 2:
+        packs = manifest.get("packs")
+        require(isinstance(packs, list) and 1 <= len(packs) <= 512 and store.objects is not None)
+        keys = store.objects.list(prefix, maximum=516)
+        metadata = {prefix + name for name in ("evidence-intent.json", "evidence-manifest.json",
+                                               "release-intent.json", "release-complete.json")}
+        expected = {prefix + "packs/" + str(i).zfill(3) for i in range(1, len(packs) + 1)}
+        require(isinstance(keys, list) and len(keys) == len(set(keys)) and set(keys) - metadata == expected,
+                "The complete original pack inventory differs.")
+        bodies = []
+        for index, part in enumerate(packs, 1):
+            key = "packs/" + str(index).zfill(3)
+            require(isinstance(part, dict) and set(part) == {"key", "bytes", "sha256"} and part["key"] == key
+                    and type(part["bytes"]) is int and 0 < part["bytes"] <= 512 * 1024
+                    and (index == len(packs) or part["bytes"] == 512 * 1024)
+                    and SHA.fullmatch(part["sha256"] or ""))
+            raw = store.get(prefix + key)
+            require(isinstance(raw, bytes) and len(raw) == part["bytes"] and sha256(raw).hexdigest() == part["sha256"])
+            bodies.append(raw)
+        packed = b"".join(bodies)
+        output, offset = {}, 0
+        for record in records:
+            require(set(record) == {"name", "offset", "bytes", "sha256"}
+                    and type(record["offset"]) is int and record["offset"] == offset
+                    and type(record["bytes"]) is int and 0 < record["bytes"] <= 4 * 1024 * 1024
+                    and SHA.fullmatch(record["sha256"] or ""))
+            body = packed[offset:offset + record["bytes"]]
+            require(len(body) == record["bytes"] and sha256(body).hexdigest() == record["sha256"])
+            output[record["name"]] = body
+            offset += record["bytes"]
+        require(offset == len(packed), "Original pack contains unclaimed bytes.")
+        return output
     output = {}
     for index, record in enumerate(records, 1):
         require(set(record) == {"name", "bytes", "sha256", "chunks"} and type(record["bytes"]) is int
@@ -92,10 +124,11 @@ def verify(store, target, genesis_sha, env):
     prefix = "maintenance/production-control/evidence/no-export-resolution/" + target.digest + "/" + OLD_SESSION + "/"
     manifest_raw = store.get(prefix + "evidence-manifest.json")
     manifest = parsed(manifest_raw)
+    fields = {"version", "kind", "planSha256", "originalRunId", "originalAttempt", "originalJobId",
+              "threatModel", "seal", "originals"}
     require(canonical(manifest) == manifest_raw and sha256(manifest_raw).hexdigest() == evidence_sha
-            and set(manifest) == {"version", "kind", "planSha256", "originalRunId", "originalAttempt", "originalJobId",
-                                  "threatModel", "seal", "originals"}
-            and type(manifest["version"]) is int and manifest["version"] == 1
+            and type(manifest.get("version")) is int and manifest["version"] in {1, 2}
+            and set(manifest) == fields | ({"packs"} if manifest["version"] == 2 else set())
             and manifest["kind"] == "no-export-original-evidence" and manifest["planSha256"] == plan_sha
             and manifest["originalRunId"] == gate.OLD_RUN and manifest["originalAttempt"] == "1"
             and manifest["originalJobId"] == gate.OLD_JOB and manifest["threatModel"] == "reviewed-writers-no-unapproved-deletion"

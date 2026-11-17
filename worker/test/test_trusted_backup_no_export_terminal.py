@@ -1,5 +1,6 @@
 """Trusted early cleanup never treats another capture as the old no-export proof."""
 from hashlib import sha256
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -13,6 +14,65 @@ from production_target import ContractError, canonical
 
 
 class TerminalProofTests(unittest.TestCase):
+    def test_packed_originals_reject_overlap_gaps_unknown_objects_and_corrupt_bytes(self):
+        packed = b"firstsecond"
+        manifest = {"version": 2, "originals": [
+            {"name": "first", "offset": 0, "bytes": 5, "sha256": sha256(b"first").hexdigest()},
+            {"name": "second", "offset": 5, "bytes": 6, "sha256": sha256(b"second").hexdigest()}],
+            "packs": [{"key": "packs/001", "bytes": len(packed), "sha256": sha256(packed).hexdigest()}]}
+        values = {"private/packs/001": packed}
+        store = SimpleNamespace(get=lambda key: values[key], objects=SimpleNamespace(
+            list=lambda prefix, **_kwargs: sorted(key for key in values if key.startswith(prefix))))
+        self.assertEqual(terminal._originals(store, "private/", manifest), {"first": b"first", "second": b"second"})
+        for offset in (4, 6, -1, True):
+            bad = deepcopy(manifest)
+            bad["originals"][1]["offset"] = offset
+            with self.subTest(offset=offset), self.assertRaises(ContractError):
+                terminal._originals(store, "private/", bad)
+        for alteration in ("duplicate-name", "unordered", "duplicate-pack", "overlong"):
+            bad = deepcopy(manifest)
+            if alteration == "duplicate-name":
+                bad["originals"][1]["name"] = "first"
+            elif alteration == "unordered":
+                bad["originals"].reverse()
+            elif alteration == "duplicate-pack":
+                bad["packs"].append(dict(bad["packs"][0]))
+            else:
+                bad["originals"][1]["bytes"] += 1
+            with self.subTest(alteration=alteration), self.assertRaises(ContractError):
+                terminal._originals(store, "private/", bad)
+        for extra in ("private/packs/002", "private/objects/001/001"):
+            values[extra] = b"unregistered"
+            with self.subTest(extra=extra), self.assertRaises(ContractError):
+                terminal._originals(store, "private/", manifest)
+            del values[extra]
+        values["private/packs/001"] = b"corrupt"
+        with self.assertRaises(ContractError):
+            terminal._originals(store, "private/", manifest)
+        values["private/packs/001"] = packed + b"unclaimed"
+        bad = deepcopy(manifest)
+        bad["packs"][0].update(bytes=len(values["private/packs/001"]),
+                               sha256=sha256(values["private/packs/001"]).hexdigest())
+        with self.assertRaises(ContractError):
+            terminal._originals(store, "private/", bad)
+        del values["private/packs/001"]
+        with self.assertRaises(ContractError):
+            terminal._originals(store, "private/", manifest)
+
+    def test_an_original_can_span_two_full_verified_packs(self):
+        first, second = b"a" * (512 * 1024 - 2), b"0123456789"
+        packed = first + second
+        one, two = packed[:512 * 1024], packed[512 * 1024:]
+        manifest = {"version": 2, "originals": [
+            {"name": "first", "offset": 0, "bytes": len(first), "sha256": sha256(first).hexdigest()},
+            {"name": "second", "offset": len(first), "bytes": len(second), "sha256": sha256(second).hexdigest()}],
+            "packs": [{"key": "packs/001", "bytes": len(one), "sha256": sha256(one).hexdigest()},
+                      {"key": "packs/002", "bytes": len(two), "sha256": sha256(two).hexdigest()}]}
+        values = {"private/packs/001": one, "private/packs/002": two}
+        store = SimpleNamespace(get=lambda key: values[key], objects=SimpleNamespace(
+            list=lambda prefix, **_kwargs: sorted(key for key in values if key.startswith(prefix))))
+        self.assertEqual(terminal._originals(store, "private/", manifest), {"first": first, "second": second})
+
     def test_legacy_archive_ledger_must_match_its_pinned_digest(self):
         value = {"legacyArchives": {"123": {"action": "seal"}}}
         value["legacyArchiveSha256"] = sha256(canonical(value["legacyArchives"])).hexdigest()
