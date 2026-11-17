@@ -60,6 +60,7 @@ on:
       - 'worker/test/test_bootstrap_provider_worker.py'
       - 'worker/test/test_activate_provider_isolation.py'
       - 'worker/test/test_prepare_provider_artifact.py'
+      - 'worker/test/hosted_provider_digest_registry.py'
       - 'worker/test/test_publish_provider_registry.py'
       - 'worker/test/test_stage_provider_version.py'
       - '.github/workflows/worker-provider-artifact-preflight.yml'
@@ -134,6 +135,7 @@ on:
       - 'worker/test/test_bootstrap_provider_worker.py'
       - 'worker/test/test_activate_provider_isolation.py'
       - 'worker/test/test_prepare_provider_artifact.py'
+      - 'worker/test/hosted_provider_digest_registry.py'
       - 'worker/test/test_publish_provider_registry.py'
       - 'worker/test/test_stage_provider_version.py'
       - '.github/workflows/worker-provider-artifact-preflight.yml'
@@ -255,6 +257,18 @@ jobs:
           sudo unshare --net --setgid="$(id -g)" --setuid="$(id -u)" -- \
             /usr/bin/python3 -B worker/tools/verify_provider_skopeo.py \
               "$RUNNER_TEMP/subs-bot-provider" "$RUNNER_TEMP"
+      - name: Exercise digest publication against a disposable loopback registry
+        run: |
+          set -euo pipefail
+          fixture="$RUNNER_TEMP/provider-distribution-fixture"
+          mkdir -m 700 "$fixture"
+          curl --fail --location --silent --show-error --retry 2 \
+            https://github.com/distribution/distribution/releases/download/v3.1.2/registry_3.1.2_linux_amd64.tar.gz \
+            --output "$fixture/registry.tar.gz"
+          echo '40df2224d410f72ae425c3371873b078bbdbda3b8b612be9571f0e6751f3acc8  '"$fixture/registry.tar.gz" | sha256sum --check --status
+          tar -xzf "$fixture/registry.tar.gz" -C "$fixture" registry
+          python3 -B worker/test/hosted_provider_digest_registry.py \
+            "$fixture/registry" "$RUNNER_TEMP/subs-bot-provider" "$BUILD_REVISION"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: subs-bot-provider-${{ env.BUILD_REVISION }}-${{ github.run_attempt }}
