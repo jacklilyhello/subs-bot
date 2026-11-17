@@ -631,23 +631,27 @@ class Journal:
         return sorted(keys)
 
     def load(self):
+        # A failed or empty fresh listing must never leave a previously verified
+        # export or lease visible to a later safety check. Poisoning persists.
+        self.generation, self.key, self.raw, self.value = 0, None, None, None
         keys = self.keys()
         require([journal_key(self.api.journal_prefix, key) for key in keys] == list(range(1, len(keys) + 1)),
                 "Private rehearsal journal contains conflicting or missing checkpoints.")
         if not keys:
             return None
-        self.generation, self.key = len(keys), keys[-1]
-        self.raw, _ = self.api.object_or_none(WORKER_NAME, self.key)
-        checkpoint = parsed(self.raw, JOURNAL_BYTES)
-        require(set(checkpoint) == {"generation", "previous", "value"} and canonical(checkpoint) == self.raw
-                and type(checkpoint["generation"]) is int and checkpoint["generation"] == self.generation)
-        if self.generation == 1:
+        generation, key = len(keys), keys[-1]
+        raw, _ = self.api.object_or_none(WORKER_NAME, key)
+        checkpoint = parsed(raw, JOURNAL_BYTES)
+        require(set(checkpoint) == {"generation", "previous", "value"} and canonical(checkpoint) == raw
+                and type(checkpoint["generation"]) is int and checkpoint["generation"] == generation)
+        if generation == 1:
             require(checkpoint["previous"] is None)
         else:
             predecessor, _ = self.api.object_or_none(WORKER_NAME, keys[-2])
             require(predecessor is not None and checkpoint["previous"] == {"key": keys[-2], "sha256": digest(predecessor)})
-        self.value = checkpoint["value"]
-        require(isinstance(self.value, dict) and self.value.get("version") == 1 and self.value.get("cohort") == self.api.cohort)
+        value = checkpoint["value"]
+        require(isinstance(value, dict) and value.get("version") == 1 and value.get("cohort") == self.api.cohort)
+        self.generation, self.key, self.raw, self.value = generation, key, raw, value
         return self.value
 
     def save(self, value):
