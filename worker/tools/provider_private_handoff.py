@@ -46,7 +46,8 @@ def reviewed_head():
     refs = json.loads(os.environ.get("SUBS_BOT_PROVIDER_ARCHIVE_REFS", ""), object_pairs_hook=control.github._unique_json_object)
     control.require(set(spec) == {"version", "pr", "headSha", "providerCiRunId", "approvalSha256", "archiveRefs", "simulateActionsUnavailable"}
                     and type(spec["version"]) is int and spec["version"] == 1
-                    and control.match(control.provider.DECIMAL, spec["pr"])
+                    and (control.match(control.provider.DECIMAL, spec["pr"])
+                         or (spec["pr"] == "main" and head == os.environ.get("GITHUB_SHA")))
                     and control.match(control.provider.REVISION, head) and spec["headSha"] == head
                     and os.environ.get("PROVIDER_HEAD_TRUSTED_MAIN_SHA") == os.environ.get("GITHUB_SHA")
                     and spec["providerCiRunId"] == os.environ.get("SUBS_BOT_PROVIDER_CI_RUN_ID")

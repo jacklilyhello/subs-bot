@@ -17,6 +17,14 @@ from test_production_provider import config
 
 
 class ReconcileTests(unittest.TestCase):
+    def test_main_self_failure_pin_requires_same_original_controller(self):
+        pin = {"version": 1, "originalRunId": "101", "readbackJobId": "201", "reviewedPr": "main",
+               "originalControllerRevision": "a" * 40, "originalCandidateRevision": "a" * 40, "operation": "stage"}
+        pin.update({key: "b" * 64 for key in ("intentSha256", "observationSha256", "observationPlaintextSha256", "targetSha256")})
+        self.assertEqual(reconcile.validate_pin(pin), pin)
+        with self.assertRaises(control.ProviderError):
+            reconcile.validate_pin({**pin, "originalCandidateRevision": "c" * 40})
+
     def fixture(self):
         previous = config(active=True)
         target = deepcopy(previous)

@@ -208,7 +208,9 @@ Webhook 配置顺序为 `plan-webhook → 明确批准其 stateSha256 → webhoo
 
 ## 专用主应用 Provider 绑定演练
 
-Provider 持久来源的独立 Worker 演练入口使用受信 main dispatcher `worker-provider-reviewed-operation.yml`，默认关闭，仅接受已审准确 PR head、项目隔离目标及独立登记的当前／previous 原始归档。先独立完成隔离镜像发布及全量读回，再分别审批并执行 `prepare-image`、`stage`、`activate`、`smoke`；镜像准备完成证明必须先经私有归档独立读回并登记，才能执行 stage。每次都重新核对准确来源、前态、旧版本终态和无 caller，先单次写入意图、独立读回，再发起对应请求；相应凭据使用隔离资源的短期最小权限。写前观察不能充当外部并发的原子锁，必须确保隔离目标没有其他写者。
+Provider 持久来源的独立 Worker 演练入口使用受信 main dispatcher `worker-provider-reviewed-operation.yml`，默认关闭，接受已审准确 PR head、项目隔离目标及独立登记的当前／previous 原始归档。最终 main 的准确 CI 原件可在合并后由 `worker-provider-isolated-source.yml` 封存，并由 `worker-provider-isolated-source-readback.yml` 独立读回、登记；随后可使用同一受保护演练 DAG 的 main-self 模式。该模式必须在各隔离 Environment 显式设置 `SUBS_BOT_PROVIDER_MAIN_SELF_POLICY_JSON`，其 `version=1`、`enabled=true`，`environment` 为该环境的准确名称、`mainSha` 为当前 main；独立核实仓库层不存在同名变量，以免回退。各环境的 `SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA` 也须固定同一提交，验证输入设置 `pr` 为 `main`、`headSha` 为该提交。两环境的 fresh job 各自于使用凭据前核对自身配置；实际写入之前的 DAG 须已通过两侧 gate，不能将其理解为跨环境原子锁。完成后关闭该模式。此模式仅用于登记的隔离目标，历史记录以 `reviewedPr=main` 明确区分，不伪造 PR 或改写旧证据。
+
+先独立完成隔离镜像发布及全量读回，再分别审批并执行 `prepare-image`、`stage`、`activate`、`smoke`；镜像准备完成证明必须先经私有归档独立读回并登记，才能执行 stage。每次都重新核对准确来源、前态、旧版本终态和无 caller，先单次写入意图、独立读回，再发起对应请求；相应凭据使用隔离资源的短期最小权限。写前观察不能充当外部并发的原子锁，必须确保隔离目标没有其他写者。
 
 私有来源归档保留原始 CI ZIP（含 Worker 模块与 OCI 镜像归档），并按独立固定摘要重新核验目标和原件；它不把归档存在本身当作可信来源。校验仍依赖 GitHub 的原 CI run／attempt、工作流与 main 祖先元数据，以及对应原提交的 requirements 原文；这些信息不可读时安全停止，不能重建旧版或改写来源。正式及隔离来源库存各以 32 次封存为当前上限，当前版本与 previous 合计最多 9 代；达到边界前须实施经审查的分页或分段扩容，不删除历史证据。演练中模拟 Actions 产物不可用应明确标为模拟，不代表产物真实过期。
 

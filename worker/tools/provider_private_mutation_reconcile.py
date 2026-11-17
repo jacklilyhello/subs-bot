@@ -33,8 +33,9 @@ def validate_pin(pin):
     keys = {"version", "originalRunId", "intentSha256", "observationSha256", "observationPlaintextSha256",
             "targetSha256", "originalControllerRevision", "originalCandidateRevision", "reviewedPr", "operation", "readbackJobId"}
     control.require(isinstance(pin, dict) and set(pin) == keys and type(pin["version"]) is int and pin["version"] == 1
-                    and all(control.match(control.provider.DECIMAL, pin[k]) for k in ("originalRunId", "reviewedPr", "readbackJobId"))
+                    and all(control.match(control.provider.DECIMAL, pin[k]) for k in ("originalRunId", "readbackJobId"))
                     and all(control.match(control.provider.REVISION, pin[k]) for k in ("originalControllerRevision", "originalCandidateRevision"))
+                    and transfer.valid_review_identity(pin["reviewedPr"], pin["originalCandidateRevision"], pin["originalControllerRevision"])
                     and all(control.match(control.provider.HEX, pin[k]) for k in
                             ("intentSha256", "observationSha256", "observationPlaintextSha256", "targetSha256"))
                     and pin["operation"] in {"stage", "activate"})
@@ -314,8 +315,8 @@ def verify_reconciled(reader, original_id, record, allowed):
     pin = validate_pin(record["pin"])
     control.require(pin["originalRunId"] == original_id and record["controllerRevision"] in allowed
                     and pin["originalControllerRevision"] in allowed
-                    and all(control.match(control.provider.DECIMAL, record[k]) for k in ("reconcileRunId", "reviewedPr", "readbackJobId"))
-                    and control.match(control.provider.REVISION, record["candidateRevision"])
+                    and all(control.match(control.provider.DECIMAL, record[k]) for k in ("reconcileRunId", "readbackJobId"))
+                    and transfer.valid_review_identity(record["reviewedPr"], record["candidateRevision"], record["controllerRevision"])
                     and all(control.match(control.provider.HEX, record[k]) for k in ("resolutionSha256", "readbackSha256", "nextTargetSha256")))
     prior = journal.Store(reader.target, original_id)
     intent_raw, obs_cipher, obs_raw, raw = (prior.read(name) for name in

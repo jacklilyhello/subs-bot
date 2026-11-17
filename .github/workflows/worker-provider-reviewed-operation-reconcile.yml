@@ -38,6 +38,7 @@ jobs:
         with:
           validation_json: ${{ inputs.validation_json }}
           reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          main_self_policy_json: ${{ vars.SUBS_BOT_PROVIDER_MAIN_SELF_POLICY_JSON }}
           phase: operation-reconcile
           environment: subs-bot-provider-archive-head-isolation
           provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}

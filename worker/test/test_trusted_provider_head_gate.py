@@ -95,6 +95,39 @@ class TrustedProviderGateTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ContractError):
                 self.check({**self.env, **change})
 
+    def test_main_self_requires_explicit_environment_opt_in_and_exact_current_main(self):
+        own = {**spec(), "pr": "main", "headSha": MAIN}
+        policy = {"version": 1, "enabled": True, "environment": "subs-bot-provider-archive-head-isolation", "mainSha": MAIN}
+        env = {**self.env, "PROVIDER_REVIEWED_HEAD_SHA": MAIN, "PROVIDER_MAIN_SELF_POLICY_JSON": json.dumps(policy),
+               "PROVIDER_HEAD_VALIDATION_JSON": json.dumps(own)}
+
+        def get_json(path, token):
+            if path == "/compare/" + MAIN + "..." + MAIN + "?per_page=1&page=2":
+                return {"status": "identical", "base_commit": {"sha": MAIN}, "merge_base_commit": {"sha": MAIN}}
+            return github(path, token)
+
+        with patch.object(gate.github, "_get_json", side_effect=get_json), \
+                patch.object(gate, "checkout_sha", return_value=MAIN):
+            self.assertEqual(gate.validate(env)["pr"], "main")
+            for change in ({"PROVIDER_MAIN_SELF_POLICY_JSON": ""}, {"PROVIDER_MAIN_SELF_POLICY_JSON": "false"},
+                           {"PROVIDER_MAIN_SELF_POLICY_JSON": json.dumps({**policy, "enabled": False})},
+                           {"PROVIDER_MAIN_SELF_POLICY_JSON": json.dumps({**policy, "mainSha": HEAD})},
+                           {"PROVIDER_MAIN_SELF_POLICY_JSON": json.dumps({**policy, "environment": "subs-bot-provider-head-isolation"})},
+                           {"PROVIDER_REVIEWED_HEAD_SHA": HEAD}, {"GITHUB_WORKFLOW_SHA": HEAD},
+                           {"PROVIDER_HEAD_ENVIRONMENT": "subs-bot-production"},
+                           {"PROVIDER_HEAD_VALIDATION_JSON": json.dumps({**own, "headSha": HEAD})},
+                           {"GITHUB_WORKFLOW_REF": f"{gate.github.REPOSITORY}/{gate.SOURCE_WORKFLOW_PATH}@{gate.github.MAIN_REF}",
+                            "PROVIDER_HEAD_PHASE": "isolated-source"}):
+                with self.subTest(change=change), self.assertRaises(ContractError):
+                    gate.validate({**env, **change})
+
+    def test_each_maintenance_gate_receives_the_environment_main_self_opt_in(self):
+        root = Path(__file__).resolve().parents[2] / ".github/workflows"
+        for name in ("head", "digest", "digest-reconcile", "operation", "operation-reconcile", "recovery"):
+            workflow = (root / f"worker-provider-reviewed-{name}.yml").read_text()
+            self.assertEqual(workflow.count("uses: ./trusted/.github/actions/provider-reviewed-head-gate"),
+                             workflow.count("main_self_policy_json: ${{ vars.SUBS_BOT_PROVIDER_MAIN_SELF_POLICY_JSON }}"))
+
     def test_digest_dispatcher_requires_the_exact_isolated_phase_and_digest_approval(self):
         target = config(active=True)
         bucket = {"accountId": "9431815bdb8beb2272f6668e06b7d3be", "namespace": "lilyya",

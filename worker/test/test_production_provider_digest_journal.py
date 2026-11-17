@@ -1,6 +1,7 @@
 """Hosted-only one-shot isolated digest journal refusal tests."""
 
 import os
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -14,6 +15,18 @@ from test_production_provider import config
 
 
 class DigestJournalTests(unittest.TestCase):
+    def test_main_self_ledger_binds_candidate_to_dispatcher(self):
+        row = {key: "a" * 64 for key in ("intentSha256", "completionSha256", "targetSha256", "readbackSha256")}
+        row.update(controllerRevision="b" * 40, candidateRevision="b" * 40, reviewedPr="main",
+                   workflowPath=journal.transfer.REVIEWED_WORKFLOW_PATH, readbackJobId="201")
+        env = {"SUBS_BOT_PROVIDER_DIGEST_LEDGER_JSON": json.dumps({"101": row})}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(journal.ledger()["101"]["reviewedPr"], "main")
+            row["candidateRevision"] = "c" * 40
+            with patch.dict(os.environ, {"SUBS_BOT_PROVIDER_DIGEST_LEDGER_JSON": json.dumps({"101": row})}), \
+                    self.assertRaises(control.ProviderError):
+                journal.ledger()
+
     def test_output_accepts_sha256_names_but_refuses_injection(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "output"

@@ -58,6 +58,7 @@ jobs:
         with:
           validation_json: ${{ inputs.validation_json }}
           reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          main_self_policy_json: ${{ vars.SUBS_BOT_PROVIDER_MAIN_SELF_POLICY_JSON }}
           phase: operation-source
           environment: subs-bot-provider-archive-head-isolation
           provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
@@ -117,6 +118,7 @@ jobs:
         with:
           validation_json: ${{ inputs.validation_json }}
           reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          main_self_policy_json: ${{ vars.SUBS_BOT_PROVIDER_MAIN_SELF_POLICY_JSON }}
           phase: operation-preflight
           environment: subs-bot-provider-head-isolation
           provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
@@ -176,6 +178,7 @@ jobs:
         with:
           validation_json: ${{ inputs.validation_json }}
           reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          main_self_policy_json: ${{ vars.SUBS_BOT_PROVIDER_MAIN_SELF_POLICY_JSON }}
           phase: operation-intent-write
           environment: subs-bot-provider-archive-head-isolation
           provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
@@ -226,6 +229,7 @@ jobs:
         with:
           validation_json: ${{ inputs.validation_json }}
           reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          main_self_policy_json: ${{ vars.SUBS_BOT_PROVIDER_MAIN_SELF_POLICY_JSON }}
           phase: operation-intent-readback
           environment: subs-bot-provider-archive-head-isolation
           provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
@@ -280,6 +284,7 @@ jobs:
         with:
           validation_json: ${{ inputs.validation_json }}
           reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          main_self_policy_json: ${{ vars.SUBS_BOT_PROVIDER_MAIN_SELF_POLICY_JSON }}
           phase: operation-dispatch
           environment: subs-bot-provider-head-isolation
           provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
@@ -396,6 +401,7 @@ jobs:
         with:
           validation_json: ${{ inputs.validation_json }}
           reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          main_self_policy_json: ${{ vars.SUBS_BOT_PROVIDER_MAIN_SELF_POLICY_JSON }}
           phase: operation-verify
           environment: subs-bot-provider-head-isolation
           provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
@@ -480,6 +486,7 @@ jobs:
         with:
           validation_json: ${{ inputs.validation_json }}
           reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          main_self_policy_json: ${{ vars.SUBS_BOT_PROVIDER_MAIN_SELF_POLICY_JSON }}
           phase: operation-completion-write
           environment: subs-bot-provider-archive-head-isolation
           provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
@@ -544,6 +551,7 @@ jobs:
         with:
           validation_json: ${{ inputs.validation_json }}
           reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          main_self_policy_json: ${{ vars.SUBS_BOT_PROVIDER_MAIN_SELF_POLICY_JSON }}
           phase: operation-evidence-readback
           environment: subs-bot-provider-archive-head-isolation
           provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
@@ -613,6 +621,7 @@ jobs:
         with:
           validation_json: ${{ inputs.validation_json }}
           reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          main_self_policy_json: ${{ vars.SUBS_BOT_PROVIDER_MAIN_SELF_POLICY_JSON }}
           phase: operation-failure-write
           environment: subs-bot-provider-archive-head-isolation
           provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
@@ -678,6 +687,7 @@ jobs:
         with:
           validation_json: ${{ inputs.validation_json }}
           reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          main_self_policy_json: ${{ vars.SUBS_BOT_PROVIDER_MAIN_SELF_POLICY_JSON }}
           phase: operation-failure-readback
           environment: subs-bot-provider-archive-head-isolation
           provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}

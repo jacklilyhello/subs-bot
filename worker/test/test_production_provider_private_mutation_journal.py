@@ -14,6 +14,18 @@ from test_production_provider import config
 
 
 class ProviderMutationJournalTests(unittest.TestCase):
+    def test_main_self_mutation_ledger_binds_candidate_to_dispatcher(self):
+        row = {key: "a" * 64 for key in ("intentSha256", "responseSha256", "observationSha256", "observationPlaintextSha256",
+                                          "completionSha256", "targetSha256", "readbackSha256")}
+        row.update(controllerRevision="b" * 40, candidateRevision="b" * 40, reviewedPr="main",
+                   operation="stage", readbackJobId="201")
+        with patch.dict(os.environ, {"SUBS_BOT_PROVIDER_MUTATION_LEDGER_JSON": json.dumps({"101": row})}, clear=True):
+            self.assertEqual(journal.ledger()["101"]["reviewedPr"], "main")
+            row["candidateRevision"] = "c" * 40
+            with patch.dict(os.environ, {"SUBS_BOT_PROVIDER_MUTATION_LEDGER_JSON": json.dumps({"101": row})}), \
+                    self.assertRaises(control.ProviderError):
+                journal.ledger()
+
     def test_reconciled_ledger_must_be_explicit_and_key_match_original_run(self):
         with patch.dict(os.environ, {}, clear=True), self.assertRaises((ValueError, KeyError)):
             journal.reconciled()

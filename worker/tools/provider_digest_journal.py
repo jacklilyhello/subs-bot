@@ -52,7 +52,7 @@ def ledger():
                         and ((row["workflowPath"] == transfer.WORKFLOW_PATH and row["reviewedPr"] is None
                               and row["candidateRevision"] == row["controllerRevision"])
                              or (row["workflowPath"] == transfer.REVIEWED_WORKFLOW_PATH
-                                 and control.match(control.provider.DECIMAL, row["reviewedPr"])))
+                                 and transfer.valid_review_identity(row["reviewedPr"], row["candidateRevision"], row["controllerRevision"])))
                         and control.match(control.provider.DECIMAL, row["readbackJobId"]))
     return value
 
@@ -80,8 +80,7 @@ def readonly_resolutions():
                         and row["workflowPath"] in {transfer.WORKFLOW_PATH, transfer.REVIEWED_WORKFLOW_PATH}
                         and control.match(control.provider.HEX, row["readbackSha256"])
                         and (set(row) == base or (row["reconcileWorkflowPath"] == transfer.REVIEWED_DIGEST_RECONCILE_WORKFLOW_PATH
-                             and control.match(control.provider.REVISION, row["reconcileCandidateRevision"])
-                             and control.match(control.provider.DECIMAL, row["reconcileReviewedPr"])
+                             and transfer.valid_review_identity(row["reconcileReviewedPr"], row["reconcileCandidateRevision"], row["reconcileRevision"])
                              and row["reconcileRunAttempt"] == "1")))
     return value
 

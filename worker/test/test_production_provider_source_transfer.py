@@ -21,6 +21,14 @@ import test_prepare_provider_artifact as artifact_fixture
 
 
 class SourceTransferTests(unittest.TestCase):
+    def test_main_self_identity_requires_exact_same_controller_and_candidate(self):
+        main, other = "a" * 40, "b" * 40
+        self.assertTrue(transfer.valid_review_identity("main", main, main))
+        self.assertFalse(transfer.valid_review_identity("main", other, main))
+        self.assertFalse(transfer.valid_review_identity("main", main, other))
+        self.assertTrue(transfer.valid_review_identity("290", other, main))
+        self.assertFalse(transfer.valid_review_identity("0", main, main))
+
     def test_reviewed_dispatch_keeps_candidate_and_main_separate(self):
         main, head = "a" * 40, "b" * 40
         refs = [{"fixture": "pinned"}]
@@ -45,6 +53,14 @@ class SourceTransferTests(unittest.TestCase):
             with patch.dict(os.environ, source_env):
                 self.assertEqual(transfer.execution_identity(main)["workflowPath"], transfer.REVIEWED_SOURCE_WORKFLOW_PATH)
                 with patch.dict(os.environ, {"SUBS_BOT_PROVIDER_SIMULATE_ARTIFACT_UNAVAILABLE": "1"}), self.assertRaises(control.ProviderError):
+                    transfer.execution_identity(main)
+            main_spec = {**spec, "pr": "main", "headSha": main}
+            with patch.dict(os.environ, {"PROVIDER_HEAD_VALIDATION_JSON": json.dumps(main_spec),
+                                         "PROVIDER_HEAD_REVIEWED_SHA": main}):
+                self.assertEqual(transfer.execution_identity(main)["reviewedPr"], "main")
+                with patch.dict(os.environ, {"PROVIDER_HEAD_REVIEWED_SHA": head,
+                                            "PROVIDER_HEAD_VALIDATION_JSON": json.dumps({**main_spec, "headSha": head})}), \
+                        self.assertRaises(control.ProviderError):
                     transfer.execution_identity(main)
 
     def test_exact_target_approval_and_unbound_caller_are_required(self):

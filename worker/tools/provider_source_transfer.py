@@ -50,6 +50,12 @@ def workflow_path():
     return matches[0]
 
 
+def valid_review_identity(pr, candidate, controller):
+    return (control.match(control.provider.REVISION, candidate)
+            and control.match(control.provider.REVISION, controller)
+            and (control.match(control.provider.DECIMAL, pr) or (pr == "main" and candidate == controller)))
+
+
 def execution_identity(revision):
     """Distinguish the actual main dispatcher from the reviewed PR code."""
     ref = os.environ.get("GITHUB_WORKFLOW_REF", "")
@@ -63,7 +69,7 @@ def execution_identity(revision):
     head = os.environ.get("PROVIDER_HEAD_REVIEWED_SHA", "")
     control.require(set(spec) == {"version", "pr", "headSha", "providerCiRunId", "approvalSha256", "archiveRefs", "simulateActionsUnavailable"}
                     and type(spec["version"]) is int and spec["version"] == 1
-                    and control.match(control.provider.DECIMAL, spec["pr"])
+                    and valid_review_identity(spec["pr"], head, revision)
                     and control.match(control.provider.REVISION, head) and spec["headSha"] == head
                     and os.environ.get("PROVIDER_HEAD_TRUSTED_MAIN_SHA") == revision
                     and spec["providerCiRunId"] == os.environ.get("SUBS_BOT_PROVIDER_CI_RUN_ID")

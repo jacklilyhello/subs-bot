@@ -68,7 +68,8 @@ def ledger():
         control.require(control.match(control.provider.DECIMAL, run_id) and isinstance(row, dict) and set(row) == keys
                         and all(control.match(control.provider.HEX, row[k]) for k in ("intentSha256", "responseSha256", "observationSha256", "observationPlaintextSha256", "completionSha256", "targetSha256", "readbackSha256"))
                         and all(control.match(control.provider.REVISION, row[k]) for k in ("controllerRevision", "candidateRevision"))
-                        and all(control.match(control.provider.DECIMAL, row[k]) for k in ("reviewedPr", "readbackJobId"))
+                        and control.match(control.provider.DECIMAL, row["readbackJobId"])
+                        and transfer.valid_review_identity(row["reviewedPr"], row["candidateRevision"], row["controllerRevision"])
                         and row["operation"] in mutation.OPERATIONS)
     return value
 
