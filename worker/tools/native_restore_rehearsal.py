@@ -32,6 +32,7 @@ from urllib.request import ProxyHandler, Request, build_opener
 import d1_migrations as migrations
 import prepare_isolation_artifact as artifact
 import prepare_native_restore_artifact as native_artifact
+import scoped_r2
 from cloudflare_isolation import (
     API_ORIGIN, CloudflareClient, CloudflareError, DIGEST, HEX_ID, REVISION, TIMESTAMP, UUID,
     WORKER_NAME, ISOLATION_RELEASE_USER_AGENT, _Isolation, _NoRedirect, _verify_health, validate_aggregate_key,
@@ -231,24 +232,13 @@ def listed_metadata(row):
 
 def signed_put_headers(host, path, token_id, token, raw, metadata, now, *, if_match=None):
     """One S3 SigV4 PUT using the verified account token's derived key."""
-    timestamp = now.strftime("%Y%m%dT%H%M%SZ")
-    day = timestamp[:8]
     payload_sha = digest(raw)
     condition = {"if-none-match": "*"} if if_match is None else {"if-match": if_match}
-    headers = {"host": host, "content-length": str(len(raw)), **condition,
-               "x-amz-date": timestamp, "x-amz-content-sha256": payload_sha, "x-amz-storage-class": "STANDARD", **metadata["http"],
+    headers = {"content-length": str(len(raw)), **condition,
+               "x-amz-storage-class": "STANDARD", **metadata["http"],
                **{f"x-amz-meta-{name}": value for name, value in metadata["custom"].items()}}
-    signed_headers = ";".join(sorted(headers))
-    canonical_headers = "".join(f"{name}:{' '.join(headers[name].split())}\n" for name in sorted(headers))
-    canonical_request = "\n".join(("PUT", path, "", canonical_headers, signed_headers, payload_sha))
-    scope = f"{day}/auto/s3/aws4_request"
-    string_to_sign = "\n".join(("AWS4-HMAC-SHA256", timestamp, scope, digest(canonical_request.encode("ascii"))))
-    key = ("AWS4" + digest(token.encode("ascii"))).encode("ascii")
-    for part in (day, "auto", "s3", "aws4_request"):
-        key = hmac.digest(key, part.encode("ascii"), "sha256")
-    signature = hmac.digest(key, string_to_sign.encode("ascii"), "sha256").hex()
-    headers["Authorization"] = (f"AWS4-HMAC-SHA256 Credential={token_id}/{scope}, "
-                                f"SignedHeaders={signed_headers}, Signature={signature}")
+    headers = scoped_r2.sign("PUT", host, path, "", headers, payload_sha, token_id, digest(token.encode("ascii")), now)
+    headers["Authorization"] = headers.pop("authorization")
     return headers
 
 

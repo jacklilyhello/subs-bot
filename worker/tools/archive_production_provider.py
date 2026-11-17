@@ -19,6 +19,7 @@ from evidence_archive import verify_lifecycle
 from native_restore_rehearsal import signed_put_headers
 import production_provider as provider
 import production_provider_rehearsal as rehearsal
+import scoped_r2
 
 CHUNK_BYTES = 16 * 1024 * 1024
 MAX_TOTAL_BYTES = 600 * 1024 * 1024
@@ -56,17 +57,20 @@ class PrivateProofStore:
         self.run_id, self.attempt = run_id, attempt
         self.prefix = f"{BASE}{run_id}/{attempt}/"
         self.base = f"/accounts/{target['accountId']}/r2/buckets/{self.bucket}"
-        self.api = CloudflareClient(token)
+        metadata_token = os.environ.get("SUBS_BOT_CF_R2_METADATA_READ_TOKEN", "")
+        self.api = CloudflareClient(token or metadata_token)
+        self.metadata_api = CloudflareClient(metadata_token) if metadata_token else self.api
+        self.objects = scoped_r2.from_environment(target["accountId"], self.bucket)
         self.opener = build_opener(ProxyHandler({}), _NoRedirect())
         self.access_key = None
 
     def verify(self):
-        bucket = self.api("GET", self.base)
+        bucket = self.metadata_api("GET", self.base)
         require(isinstance(bucket, dict) and bucket.get("name") == self.bucket
                 and bucket.get("creation_date") == self.target["r2CreatedOn"] and bucket.get("jurisdiction") == "default")
-        require(self.api("GET", self.base + "/domains/managed").get("enabled") is False
-                and self.api("GET", self.base + "/domains/custom") in ([], {"domains": []}))
-        verify_lifecycle(self.api("GET", self.base + "/lifecycle"), self.prefix)
+        require(self.metadata_api("GET", self.base + "/domains/managed").get("enabled") is False
+                and self.metadata_api("GET", self.base + "/domains/custom") in ([], {"domains": []}))
+        verify_lifecycle(self.metadata_api("GET", self.base + "/lifecycle"), self.prefix)
 
     def key(self, relative):
         require(relative in {"manifest.json", "partial-manifest.json"} | TERMINAL_KEYS
@@ -74,6 +78,9 @@ class PrivateProofStore:
         return self.prefix + relative
 
     def read(self, relative):
+        if self.objects is not None:
+            raw, _etag = self.objects.get(self.key(relative), absent=True, limit=CHUNK_BYTES)
+            return raw
         request = Request(API_ORIGIN + self.base + "/objects/" + quote(self.key(relative), safe="/"), headers={
             "Authorization": "Bearer " + self.token, "Accept-Encoding": "identity", "cf-r2-jurisdiction": "default"})
         try:
@@ -96,6 +103,10 @@ class PrivateProofStore:
         observed = self.read(relative)
         if observed is not None:
             require(observed == raw)
+            return
+        if self.objects is not None:
+            self.objects.put_once(self.key(relative), raw,
+                metadata={"cache-control": "no-store, private", "content-type": "application/octet-stream"})
             return
         if self.access_key is None:
             identity = self.api("GET", "/user/tokens/verify")
