@@ -101,6 +101,15 @@ class TrustedGateTests(unittest.TestCase):
         self.assertIn("SUBS_BOT_BACKUP_CAPACITY_VALIDATION_ENABLED", workflow)
         self.assertIn("CAPACITY_FIXTURE_D1_READ_TOKEN", workflow)
         self.assertIn("CAPACITY_FIXTURE_D1_WRITE_TOKEN", workflow)
+        self.assertNotIn("secrets.CAPACITY_FIXTURE_D1_READ_TOKEN", workflow)
+        self.assertNotIn("secrets.CAPACITY_FIXTURE_D1_WRITE_TOKEN", workflow)
+        for line in workflow.splitlines():
+            if "CAPACITY_FIXTURE_D1_READ_TOKEN:" in line:
+                self.assertIn("secrets.SUBS_BOT_CF_REHEARSAL_DATA_READ_TOKEN", line)
+                self.assertNotIn("secrets.SUBS_BOT_CF_REHEARSAL_DATA_TOKEN", line)
+            if "CAPACITY_FIXTURE_D1_WRITE_TOKEN:" in line:
+                self.assertIn("secrets.SUBS_BOT_CF_REHEARSAL_DATA_TOKEN", line)
+                self.assertIn("!startsWith(vars.SUBS_BOT_BACKUP_CAPACITY_MODE, 'verify-')", line)
         self.assertIn("!startsWith(vars.SUBS_BOT_BACKUP_CAPACITY_MODE, 'verify-')", workflow)
         self.assertIn("SUBS_BOT_CF_REHEARSAL_DATA_READ_TOKEN", workflow)
         self.assertIn('contains(fromJSON(\'["inspect","genesis-plan","verify","capacity-fixture"]\'), fromJSON(inputs.validation_json).action) && secrets.SUBS_BOT_CF_REHEARSAL_DATA_READ_TOKEN', workflow)

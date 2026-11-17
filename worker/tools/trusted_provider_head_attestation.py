@@ -11,11 +11,41 @@ import subprocess
 import tempfile
 
 import archive_production_provider as archive
+from cloudflare_isolation import CloudflareError
 import production_provider as provider
+import scoped_r2
 import trusted_provider_head_gate as gate
 
 
 JOB_STEPS = {"Reviewed Provider source verification": "Verify current and previous archived sources"}
+
+
+def diagnosed(phase, action, *, index=None):
+    """Emit fixed read stages and bounded numeric status, never request details."""
+    provider.require(phase in {"context", "target", "archive-source", "archive-closure", "provider-api", "provider-state",
+                               "previous-terminal", "caller-state", "stable-state", "previous-recheck", "registry-client", "registry"}
+                     and (index is None or type(index) is int and 0 <= index <= 8))
+    label = {"phase": phase, **({"sourceIndex": index} if index is not None else {})}
+    print(json.dumps({**label, "status": "started"}), flush=True)
+    try:
+        result = action()
+    except Exception as error:
+        category = ("r2" if isinstance(error, (scoped_r2.ScopedR2Error, scoped_r2.ScopedR2ReadError)) else
+                    "cloudflare" if isinstance(error, CloudflareError) else
+                    "github" if isinstance(error, provider.github.ArtifactError) else
+                    "provider" if isinstance(error, provider.ProviderError) else "other")
+        diagnostic = getattr(error, "read_diagnostic", None)
+        status = diagnostic.get("httpStatus") if isinstance(diagnostic, dict) else getattr(error, "http_status", None)
+        report = {**label, "status": "rejected", "category": category}
+        if type(status) is int and 100 <= status <= 599:
+            report["httpStatus"] = status
+        codes = diagnostic.get("cloudflareCodes") if isinstance(diagnostic, dict) else None
+        if isinstance(codes, list) and len(codes) <= 8 and all(type(code) is int and 1000 <= code <= 999999 for code in codes):
+            report["cloudflareCodes"] = codes
+        print(json.dumps(report, sort_keys=True), flush=True)
+        raise
+    print(json.dumps({**label, "status": "confirmed"}), flush=True)
+    return result
 
 
 def checks():
@@ -266,8 +296,8 @@ def source_ref(ref, target, token, root):
 
 
 def attest_r2():
-    result, spec = checks()
-    target = provider.read_config(os.environ.get("SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON", ""))
+    result, spec = diagnosed("context", checks)
+    target = diagnosed("target", lambda: provider.read_config(os.environ.get("SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON", "")))
     target_sha = provider.digest(target)
     provider.require(target_sha == os.environ.get("PROVIDER_HEAD_TARGET_SHA256")
                      and target["environment"] == "rehearsal" and target["caller"] is None
@@ -277,9 +307,11 @@ def attest_r2():
     found = set()
     for index, ref in enumerate(spec["archiveRefs"]):
         with tempfile.TemporaryDirectory(prefix=f".trusted-provider-source-{index}-", dir=os.environ["RUNNER_TEMP"]) as directory:
-            found.add(source_ref(ref, target, token, Path(directory)))
-    provider.require(len(found) == len(spec["archiveRefs"]) == len(provider.releases(target))
-                     and found == {release["build"]["archiveSha256"] for release in provider.releases(target)})
+            found.add(diagnosed("archive-source", lambda: source_ref(ref, target, token, Path(directory)), index=index))
+    def closure():
+        provider.require(len(found) == len(spec["archiveRefs"]) == len(provider.releases(target))
+                         and found == {release["build"]["archiveSha256"] for release in provider.releases(target)})
+    diagnosed("archive-closure", closure)
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="ascii") as output:
         output.write("target_sha256=" + target_sha + "\n")
     print(json.dumps({**result, "status": "trusted-r2-readback", "providerMutation": False,
@@ -322,27 +354,29 @@ def verify_registry(target, registry, mode):
 
 
 def attest_provider():
-    result, spec = checks()
-    target = provider.read_config(os.environ.get("SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON", ""))
+    result, spec = diagnosed("context", checks)
+    target = diagnosed("target", lambda: provider.read_config(os.environ.get("SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON", "")))
     expected_target = os.environ.get("PROVIDER_HEAD_TARGET_SHA256", "")
     provider.require(provider.digest(target) == expected_target
                      and spec["approvalSha256"] == provider.digest({"operation": "publish", "target": target})
                      and target["environment"] == "rehearsal" and target["caller"] is None)
-    api = provider.ProviderAPI(target, os.environ.get("SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN", ""),
-                               os.environ.get("SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN", ""))
-    first = provider.observe(api)
+    api = diagnosed("provider-api", lambda: provider.ProviderAPI(target, os.environ.get("SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN", ""),
+                               os.environ.get("SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN", "")))
+    first = diagnosed("provider-state", lambda: provider.observe(api))
     if target.get("previous") is not None and target["activation"] is None:
-        provider.unbound_upgrade(api, first)
+        diagnosed("previous-terminal", lambda: provider.unbound_upgrade(api, first))
     else:
         provider.require(target["activation"] is not None)
-        provider.verify_smoke(api, first, config=target)
-    caller = provider.caller_state(api, target, allow_unbound=True)
-    provider.require(caller == "unbound" and provider.observe(api) == first and provider.caller_state(api, target, allow_unbound=True) == caller)
+        diagnosed("previous-terminal", lambda: provider.verify_smoke(api, first, config=target))
+    caller = diagnosed("caller-state", lambda: provider.caller_state(api, target, allow_unbound=True))
+    def stable():
+        provider.require(caller == "unbound" and provider.observe(api) == first and provider.caller_state(api, target, allow_unbound=True) == caller)
+    diagnosed("stable-state", stable)
     if target.get("previous") is not None and target["activation"] is None:
-        provider.unbound_upgrade(api, first)
+        diagnosed("previous-recheck", lambda: provider.unbound_upgrade(api, first))
     mode = os.environ.get("SUBS_BOT_PROVIDER_WITNESS_REGISTRY_MODE", "")
-    registry = provider.Registry(target, os.environ.get("SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN", ""))
-    all_blobs = verify_registry(target, registry, mode)
+    registry = diagnosed("registry-client", lambda: provider.Registry(target, os.environ.get("SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN", "")))
+    all_blobs = diagnosed("registry", lambda: verify_registry(target, registry, mode))
     print(json.dumps({**result, "status": "trusted-provider-readback", "providerMutation": False,
                       "registryMutation": False, "registryMode": mode, "allReferencedBlobsVerified": all_blobs,
                       "simulatedArtifactUnavailability": True}, sort_keys=True))
