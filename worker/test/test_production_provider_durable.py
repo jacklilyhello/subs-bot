@@ -421,6 +421,9 @@ class OriginalAttemptMetadataTests(unittest.TestCase):
             durable.seal_history("1001", {}, [revision], resolutions={"1000": record}, bucket={}, store=Mock())
             verify.assert_called_once()
             with self.assertRaises(control.ProviderError):
+                durable.seal_history("1001", {"1000": {"runId": "101", "controllerRevision": revision}},
+                                     [revision], resolutions={}, bucket={}, store=Mock())
+            with self.assertRaises(control.ProviderError):
                 durable.seal_history("1001", {"1000": {}}, [revision], resolutions={}, bucket={}, store=Mock())
             with self.assertRaises(control.ProviderError):
                 durable.seal_history("1000", {}, [revision], resolutions={"1000": record}, bucket={}, store=Mock())

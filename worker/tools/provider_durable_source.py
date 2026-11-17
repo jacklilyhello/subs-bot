@@ -330,6 +330,10 @@ def verify_source_resolution(operation_id, record, bucket, controllers, complete
 
 def seal_history(operation_id, completed, controllers, *, resolutions=None, bucket=None, store=None):
     """Reject reuse and block every later seal after an unresolved seal attempt."""
+    control.require(isinstance(completed, dict) and all(control.match(control.provider.DECIMAL, key)
+                    and isinstance(value, dict) and control.match(control.provider.DECIMAL, value.get("runId"))
+                    and control.match(control.provider.REVISION, value.get("controllerRevision"))
+                    for key, value in completed.items()))
     token = control.github._github_token()
     current = os.environ["GITHUB_RUN_ID"]
     rows = []
