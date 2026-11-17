@@ -32,12 +32,18 @@ jobs:
     environment: subs-bot-isolation
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    outputs:
+      status: ${{ steps.monitor.outputs.status }}
+      alerts_json: ${{ steps.monitor.outputs.alerts_json }}
+      report_sha256: ${{ steps.monitor.outputs.report_sha256 }}
+      notification_relevant: ${{ steps.monitor.outputs.notification_relevant }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Read registered backup journals and hosted run status
+        id: monitor
         env:
           GH_TOKEN: ${{ github.token }}
           SUBS_BOT_CONTROL_ENVIRONMENT: subs-bot-isolation
@@ -53,6 +59,7 @@ jobs:
           MONITOR_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
           MONITOR_CAPACITY_INTERVAL_MINUTES: ${{ vars.SUBS_BOT_REHEARSAL_CAPACITY_INTERVAL_MINUTES || '15' }}
           MONITOR_WARNING_PERCENT: ${{ vars.SUBS_BOT_REHEARSAL_BACKUP_WARNING_PERCENT || '80' }}
+          MONITOR_NOTIFICATION_FILTER: ${{ vars.SUBS_BOT_REHEARSAL_BACKUP_NOTIFICATION_FILTER || '*' }}
           MONITOR_SCHEDULE: ${{ github.event.schedule }}
           DRILL_BACKUP_SOURCE_CHECKPOINT_ID: ${{ vars.SUBS_BOT_REHEARSAL_BACKUP_SOURCE_CHECKPOINT_ID }}
           DRILL_BACKUP_SOURCE_MANIFEST_SHA256: ${{ vars.SUBS_BOT_REHEARSAL_BACKUP_SOURCE_MANIFEST_SHA256 }}

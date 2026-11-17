@@ -20,6 +20,7 @@ from production_storage import PrivateStore
 from production_target import require, parsed, validate_target
 from production_backup_transaction import Anchor, Transaction, interruption
 import production_backup_live_capacity as live_capacity
+import production_backup_notification as notification
 
 WORKFLOW = ".github/workflows/worker-production-lifecycle-rehearsal.yml"
 MONITOR_WORKFLOW = "jacklilyhello/subs-bot/.github/workflows/worker-backup-monitor.yml@refs/heads/main"
@@ -237,10 +238,10 @@ if __name__ == "__main__":
     except Exception:
         report = {"version": 1, "scope": "registered-rehearsal-only", "status": "alert",
                   "alerts": ["monitor-unknown"], "notification": "github-check-only", "archiveRereadByMonitor": False}
+    report = notification.prepare(report, os.environ.get("MONITOR_NOTIFICATION_FILTER", "*"))
     encoded = json.dumps(report, sort_keys=True, separators=(",", ":"))
     output = Path(os.environ["RUNNER_TEMP"]) / "production-backup-monitor.json"
-    output.write_text(encoded + "\n", encoding="utf-8")
-    output.chmod(0o600)
+    notification.write(report, output, os.environ.get("GITHUB_OUTPUT"))
     print(encoded)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:

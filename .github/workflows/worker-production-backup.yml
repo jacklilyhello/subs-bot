@@ -54,12 +54,18 @@ jobs:
     environment: subs-bot-production
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    outputs:
+      status: ${{ steps.monitor.outputs.status }}
+      alerts_json: ${{ steps.monitor.outputs.alerts_json }}
+      report_sha256: ${{ steps.monitor.outputs.report_sha256 }}
+      notification_relevant: ${{ steps.monitor.outputs.notification_relevant }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Monitor without production write or Bot credentials
+        id: monitor
         if: github.event_name == 'schedule' || inputs.action == 'monitor'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -74,6 +80,7 @@ jobs:
           BACKUP_ACTION: monitor
           MONITOR_SCHEDULE: ${{ github.event.schedule }}
           MONITOR_CAPACITY_INTERVAL_MINUTES: ${{ vars.SUBS_BOT_PRODUCTION_CAPACITY_INTERVAL_MINUTES || '15' }}
+          MONITOR_NOTIFICATION_FILTER: ${{ vars.SUBS_BOT_PRODUCTION_BACKUP_NOTIFICATION_FILTER || '*' }}
           BACKUP_SOURCE_CHECKPOINT_ID: ${{ inputs.source_checkpoint_id || vars.SUBS_BOT_PRODUCTION_BACKUP_SOURCE_CHECKPOINT_ID }}
           BACKUP_SOURCE_MANIFEST_SHA256: ${{ inputs.source_manifest_sha256 || vars.SUBS_BOT_PRODUCTION_BACKUP_SOURCE_MANIFEST_SHA256 }}
         run: |

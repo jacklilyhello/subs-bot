@@ -15,6 +15,7 @@ from urllib.parse import urlencode
 
 import prepare_isolation_artifact as artifact
 import production_backup_capacity as capacity
+import production_backup_notification as notification
 import production_backup_transaction as maintenance
 import production_backup_resume as resume
 import production_recovery as recovery
@@ -472,8 +473,12 @@ def emit_result(result, target, revision, root, *, source_revision=None):
     if source_revision is not None:
         result["sourceRevision"] = source_revision
     artifact.require_current_main(revision)
-    with recovery.native.private_file(root / "production-backup-result.json") as output:
-        output.write(canonical(result))
+    if result.get("action") == "monitor":
+        notification.prepare(result, os.environ.get("MONITOR_NOTIFICATION_FILTER", "*"))
+        notification.write(result, root / "production-backup-result.json", os.environ.get("GITHUB_OUTPUT"))
+    else:
+        with recovery.native.private_file(root / "production-backup-result.json") as output:
+            output.write(canonical(result))
     print(json.dumps(result, sort_keys=True))
     if result.get("action") == "monitor" and result["status"] == "alert":
         print("::warning::Production backup monitoring requires attention.")
@@ -900,5 +905,10 @@ if __name__ == "__main__":
     try:
         main()
     except Exception:
+        if os.environ.get("BACKUP_ACTION") == "monitor" and os.environ.get("RUNNER_TEMP"):
+            report = notification.prepare({"version": 1, "scope": "production", "status": "alert",
+                "action": "monitor", "alerts": ["monitor-unknown"]}, os.environ.get("MONITOR_NOTIFICATION_FILTER", "*"))
+            notification.write(report, Path(os.environ["RUNNER_TEMP"]) / "production-backup-result.json",
+                               os.environ.get("GITHUB_OUTPUT"))
         print(json.dumps({"status": "stopped", "reason": "The backup checkpoint was not confirmed; retain its private intent and inspect before continuing."}))
         raise SystemExit(1) from None
