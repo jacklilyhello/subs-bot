@@ -121,9 +121,9 @@ jobs:
   intent_write:
     name: Provider digest intent archive
     needs: [preflight]
-    # Keep all writes disabled until digest-only capability and this workflow are
-    # independently reviewed and verified in a separate isolated fixture.
-    if: ${{ false }}
+    # Default off. An explicit isolated-environment policy must enable writes;
+    # unsupported digest PUT leaves the one-shot intent unresolved.
+    if: ${{ vars.SUBS_BOT_PROVIDER_DIGEST_WRITE_ENABLED == 'true' }}
     environment: subs-bot-provider-archive-head-isolation
     runs-on: ubuntu-24.04
     timeout-minutes: 30

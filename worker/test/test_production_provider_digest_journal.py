@@ -98,7 +98,7 @@ class DigestJournalTests(unittest.TestCase):
     def test_workflow_statically_disables_all_digest_and_journal_writes(self):
         workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/worker-provider-digest-rehearsal.yml").read_text()
         intent = workflow.split("\n  intent_write:\n", 1)[1].split("\n  intent_readback:\n", 1)[0]
-        self.assertIn("if: ${{ false }}", intent)
+        self.assertIn("if: ${{ vars.SUBS_BOT_PROVIDER_DIGEST_WRITE_ENABLED == 'true' }}", intent)
         self.assertIn("needs: [source, preflight, intent_readback]", workflow)
         self.assertEqual(workflow.count("uses: actions/upload-artifact@"), 1)
         self.assertIn("path: ${{ runner.temp }}/provider-source-transfer.age", workflow)
@@ -117,7 +117,7 @@ class DigestJournalTests(unittest.TestCase):
 
     def test_intent_pins_readonly_resolution_ledger(self):
         target = config(active=True)
-        state = {"dependencySha256": "1" * 64, "manifestSha256": None}
+        state = {"dependencySha256": "1" * 64, "manifestSha256": None, "tagsSha256": "4" * 64}
         refs = [{"fixture": "source"}]
         with patch.dict(os.environ, {"SUBS_BOT_PROVIDER_DIGEST_READONLY_RESOLUTIONS_JSON": "{}"}, clear=True):
             before = journal.digest.intent(target, refs, state, "101", "b" * 40)
@@ -127,7 +127,7 @@ class DigestJournalTests(unittest.TestCase):
 
     def test_existing_digest_does_not_count_as_write_rehearsal(self):
         target = config(active=True)
-        state = {"dependencySha256": "1" * 64, "manifestSha256": target["build"]["ociManifestSha256"]}
+        state = {"dependencySha256": "1" * 64, "manifestSha256": target["build"]["ociManifestSha256"], "tagsSha256": "4" * 64}
         with patch.dict(os.environ, {"GITHUB_RUN_ID": "101", "GITHUB_SHA": "b" * 40}, clear=True), \
                 patch.object(journal.transfer, "context"), patch.object(journal.transfer, "target", return_value=target), \
                 patch.object(journal.transfer, "refs", return_value=[{"fixture": "source"}]), patch.object(journal.transfer, "receive"), \

@@ -137,7 +137,7 @@ def run(registry, artifact, revision, root):
         target["build"].update({"revision": revision, "ociArchiveSha256": sha256(image.read_bytes()).hexdigest(),
                                 "ociManifestSha256": manifest, "ociConfigSha256": config_digest})
         target["smoke"]["healthRevision"] = revision
-        state = {"dependencySha256": "1" * 64, "manifestSha256": None}
+        state = {"dependencySha256": "1" * 64, "manifestSha256": None, "tagsSha256": "4" * 64}
         refs = [{"fixture": "loopback only"}]
         intent = publish.intent(target, refs, state, "101", "b" * 40)
         env = {"RUNNER_TEMP": str(root), "GITHUB_RUN_ID": "101", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_SHA": "b" * 40,

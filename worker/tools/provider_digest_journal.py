@@ -191,8 +191,9 @@ def inventory(reader, *, current=None):
                         and type(original["version"]) is int and original["version"] == 1 and original["operation"] == "publish-digest"
                         and type(original["simulatedActionsUnavailable"]) is bool
                         and all(control.match(control.provider.HEX, original[k]) for k in ("targetSha256", "archiveRefsSha256", "approvalSha256", "resolutionLedgerSha256"))
-                        and isinstance(original["prestate"], dict) and set(original["prestate"]) == {"dependencySha256", "manifestSha256"}
+                        and isinstance(original["prestate"], dict) and set(original["prestate"]) == {"dependencySha256", "manifestSha256", "tagsSha256"}
                         and control.match(control.provider.HEX, original["prestate"]["dependencySha256"])
+                        and control.match(control.provider.HEX, original["prestate"]["tagsSha256"])
                         and original["prestate"]["manifestSha256"] is None
                         and original.get("runId") == run_id and original.get("runAttempt") == "1"
                         and original.get("kind") == "isolated-provider-digest-intent" and original.get("status") == "started-unknown"
@@ -208,7 +209,8 @@ def inventory(reader, *, current=None):
                         and done["verification"] == {"manifestSha256": done["response"]["manifestSha256"],
                                                      "configSha256": done["response"]["configSha256"],
                                                      "allReferencedBlobsVerified": True,
-                                                     "dependencySha256": original["prestate"]["dependencySha256"]})
+                                                     "dependencySha256": original["prestate"]["dependencySha256"],
+                                                     "tagsSha256": original["prestate"]["tagsSha256"]})
         control.require(control.digest(projection(run_id, original, pin["completionSha256"], pin["readbackJobId"])) == pin["readbackSha256"])
         workflow_job(run_id, pin["controllerRevision"], JOBS["readback"], job_id=pin["readbackJobId"])
     return grouped
@@ -336,11 +338,12 @@ def verify():
     state = digest.observe(target, os.environ.get("SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN", ""),
                            os.environ.get("SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN", ""))
     control.require(state["dependencySha256"] == value["prestate"]["dependencySha256"]
+                    and state["tagsSha256"] == value["prestate"]["tagsSha256"]
                     and state["manifestSha256"] == target["build"]["ociManifestSha256"])
     result = digest.verify_remote_closure(target, os.environ.get("SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN", ""))
     control.require(digest.observe(target, os.environ.get("SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN", ""),
                                    os.environ.get("SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN", "")) == state)
-    output("verification_json", {**result, "dependencySha256": state["dependencySha256"]})
+    output("verification_json", {**result, "dependencySha256": state["dependencySha256"], "tagsSha256": state["tagsSha256"]})
 
 
 def completion_value(value, target):
@@ -352,7 +355,8 @@ def completion_value(value, target):
                                  "providerMutation": False, "registryMutation": expected_status == "published-digest"}
                     and verify_result == {"manifestSha256": target["build"]["ociManifestSha256"],
                                           "configSha256": target["build"]["ociConfigSha256"], "allReferencedBlobsVerified": True,
-                                          "dependencySha256": value["prestate"]["dependencySha256"]})
+                                          "dependencySha256": value["prestate"]["dependencySha256"],
+                                          "tagsSha256": value["prestate"]["tagsSha256"]})
     return {"version": 1, "kind": "isolated-provider-digest-completion", "runId": value["runId"], "runAttempt": "1",
             "controllerRevision": value["controllerRevision"], "intentSha256": control.digest(value),
             "response": response, "verification": verify_result}

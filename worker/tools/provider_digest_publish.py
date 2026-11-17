@@ -7,11 +7,45 @@ a fresh runner. A failed/unknown result is never automatically retried.
 
 import os
 from pathlib import Path
+import re
 import resource
 import subprocess
 import tempfile
+from urllib.parse import quote
+from urllib.request import Request
 
 import production_provider as control
+
+
+def tag_snapshot(registry, credentials):
+    """Hash a bounded, complete tag-to-manifest map without exposing its names."""
+    error = "The isolated registry tag inventory is incomplete or changed."
+    control.require(registry._read_authorization is not None, error)
+    headers = {"Authorization": registry._read_authorization, "Cache-Control": "no-cache", "Accept": "application/json"}
+    url = f"https://{control.publication.HOST}/v2/{registry.repository}/tags/list?n=101"
+    status, result_headers, raw = control.publication._response(Request(url, headers=headers), registry._opener, error)
+    control.require(status == 200 and not result_headers.get_all("Link", []), error)
+    data = control.github._parse_object(raw, error)
+    tags = data.get("tags")
+    control.require(set(data) == {"name", "tags"} and data.get("name") == registry.repository
+                    and (tags is None or isinstance(tags, list)), error)
+    tags = [] if tags is None else tags
+    control.require(len(tags) < 101 and all(isinstance(tag, str) and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", tag)
+                                               for tag in tags) and len(set(tags)) == len(tags), error)
+    accepts = ", ".join((control.provider.OCI_MANIFEST, "application/vnd.oci.image.index.v1+json",
+                         "application/vnd.docker.distribution.manifest.v2+json",
+                         "application/vnd.docker.distribution.manifest.list.v2+json"))
+    rows = []
+    for tag in sorted(tags):
+        request = Request(f"https://{control.publication.HOST}/v2/{registry.repository}/manifests/{quote(tag, safe='')}",
+                          headers={"Authorization": registry._read_authorization, "Cache-Control": "no-cache", "Accept": accepts})
+        status, result_headers, body = control.publication._response(request, registry._opener, error)
+        actual = control.publication.sha256(body).hexdigest()
+        claimed = result_headers.get_all("Docker-Content-Digest", [])
+        control.require(status == 200 and body and result_headers.get_content_type() in accepts.split(", ")
+                        and (not claimed or claimed == ["sha256:" + actual]), error)
+        rows.append({"tag": tag, "manifestSha256": actual})
+    return control.digest(rows)
 
 
 def verify_remote_closure(target, registry_token):
@@ -66,7 +100,7 @@ def observe(target, worker_token, registry_token):
     observed = registry.manifest("sha256:" + expected, pull, allow_missing=True)
     control.require(observed is None or observed == expected)
     return {"dependencySha256": control.digest({"target": target, "state": first, "callerState": caller}),
-            "manifestSha256": observed}
+            "manifestSha256": observed, "tagsSha256": tag_snapshot(registry, pull)}
 
 
 def intent(target, refs, state, run_id, revision):
@@ -74,8 +108,9 @@ def intent(target, refs, state, run_id, revision):
     resolutions = control.github._parse_object(os.environ.get("SUBS_BOT_PROVIDER_DIGEST_READONLY_RESOLUTIONS_JSON", "{}"), control.ERROR)
     control.require(control.match(control.provider.DECIMAL, run_id) and control.match(control.provider.REVISION, revision)
                     and simulation in {"0", "1"}
-                    and isinstance(state, dict) and set(state) == {"dependencySha256", "manifestSha256"}
+                    and isinstance(state, dict) and set(state) == {"dependencySha256", "manifestSha256", "tagsSha256"}
                     and control.match(control.provider.HEX, state["dependencySha256"])
+                    and control.match(control.provider.HEX, state["tagsSha256"])
                     and (state["manifestSha256"] is None or state["manifestSha256"] == target["build"]["ociManifestSha256"]))
     return {"version": 1, "kind": "isolated-provider-digest-intent", "operation": "publish-digest",
             "runId": run_id, "runAttempt": "1", "controllerRevision": revision,

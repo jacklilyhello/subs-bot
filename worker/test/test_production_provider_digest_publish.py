@@ -1,6 +1,8 @@
 """Hosted checks for isolated content-addressed Provider image publication."""
 
 from hashlib import sha256
+from email.message import Message
+import json
 import os
 from pathlib import Path
 import sys
@@ -16,6 +18,43 @@ import test_prepare_provider_artifact as artifact_fixture
 
 
 class DigestPublishTests(unittest.TestCase):
+    def test_tag_inventory_binds_every_tag_and_manifest_and_rejects_pagination(self):
+        registry = Mock()
+        registry.repository = "fixture/provider"
+        registry._read_authorization = "fixture"
+        headers = Message()
+        headers["Content-Type"] = control.provider.OCI_MANIFEST
+        listing = json.dumps({"name": registry.repository, "tags": ["old", "stable"]}).encode()
+        with patch.object(control.publication, "_response", side_effect=[(200, headers, listing),
+                (200, headers, b"old manifest"), (200, headers, b"stable manifest")]):
+            first = digest_publish.tag_snapshot(registry, "fixture")
+        with patch.object(control.publication, "_response", side_effect=[(200, headers, listing),
+                (200, headers, b"old manifest"), (200, headers, b"changed manifest")]):
+            second = digest_publish.tag_snapshot(registry, "fixture")
+        self.assertNotEqual(first, second)
+        headers["Link"] = '</v2/fixture/provider/tags/list?n=101&last=stable>; rel="next"'
+        with patch.object(control.publication, "_response", return_value=(200, headers, listing)), \
+                self.assertRaises(control.ProviderError):
+            digest_publish.tag_snapshot(registry, "fixture")
+        del headers["Link"]
+        with patch.object(control.publication, "_response", return_value=(200, headers, b'{"name":"fixture/provider"}')), \
+                self.assertRaises(control.ProviderError):
+            digest_publish.tag_snapshot(registry, "fixture")
+        headers["Docker-Content-Digest"] = "sha256:" + "0" * 64
+        with patch.object(control.publication, "_response", side_effect=[(200, headers, listing), (200, headers, b"old manifest")]), \
+                self.assertRaises(control.ProviderError):
+            digest_publish.tag_snapshot(registry, "fixture")
+
+    def test_changed_tags_stop_before_digest_copy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            target, image, state, refs, intent, env = self.fixture(temporary)
+            changed = {**state, "tagsSha256": "5" * 64}
+            with patch.dict(os.environ, env, clear=True), patch.object(control, "guard_sources"), \
+                    patch.object(digest_publish, "observe", return_value=changed), \
+                    patch.object(control.publication, "_copy_image") as copy, self.assertRaises(control.ProviderError):
+                digest_publish.publish_once(target, refs, image, intent, control.digest(intent), "worker", "read", "write")
+            copy.assert_not_called()
+
     def test_independent_readback_verifies_full_oci_archive_and_never_pushes(self):
         with tempfile.TemporaryDirectory() as temporary:
             target, _image, _state, _refs, _intent, env = self.fixture(temporary)
@@ -69,7 +108,7 @@ class DigestPublishTests(unittest.TestCase):
         archive = Path(root) / "image.tar"
         archive.write_bytes(b"fixture-oci-original")
         target["build"]["ociArchiveSha256"] = sha256(archive.read_bytes()).hexdigest()
-        state = {"dependencySha256": "1" * 64, "manifestSha256": None}
+        state = {"dependencySha256": "1" * 64, "manifestSha256": None, "tagsSha256": "4" * 64}
         refs = [{"fixture": "original archive reference"}]
         expected = digest_publish.intent(target, refs, state, "101", "b" * 40)
         env = {"RUNNER_TEMP": root, "GITHUB_RUN_ID": "101", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_SHA": "b" * 40,
