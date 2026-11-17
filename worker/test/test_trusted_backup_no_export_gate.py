@@ -1,6 +1,7 @@
 """Hosted fail-closed tests for the one fixed no-export evidence gate."""
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -10,6 +11,20 @@ from production_target import ContractError
 
 
 class NoExportGateTests(unittest.TestCase):
+    def test_local_inventory_is_private_immutable_and_not_a_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "no-export-writer-inventory.json"
+            gate.save_inventory(directory, b'[{"id":1}]')
+            self.assertEqual(path.stat().st_mode & 0o077, 0)
+            gate.save_inventory(directory, b'[{"id":1}]')
+            with self.assertRaises(ContractError):
+                gate.save_inventory(directory, b'[{"id":2}]')
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "no-export-writer-inventory.json"
+            path.symlink_to(Path(directory) / "other")
+            with self.assertRaises(OSError):
+                gate.save_inventory(directory, b'[]')
+
     def test_writer_inventory_rejects_incomplete_pages_and_duplicates(self):
         def row(number):
             return {"id": number, "path": ".github/workflows/python-ci.yml", "event": "pull_request",

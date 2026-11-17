@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 from urllib.parse import urlencode
 
@@ -185,6 +186,24 @@ def reviewed_run(run_id, action, main, candidate, token, *, successful, jobs_req
                          else steps[0].get("conclusion") in {"success", "failure", "cancelled", "timed_out"}))
 
 
+def save_inventory(directory, inventory):
+    temporary = Path(directory)
+    require(temporary.is_absolute() and temporary.is_dir() and not temporary.is_symlink())
+    path = temporary / "no-export-writer-inventory.json"
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, "rb") as existing:
+            metadata = os.fstat(existing.fileno())
+            require(stat.S_ISREG(metadata.st_mode) and metadata.st_size == len(inventory)
+                    and metadata.st_mode & 0o077 == 0 and existing.read() == inventory,
+                    "The local writer inventory changed.")
+    else:
+        with os.fdopen(descriptor, "wb") as saved:
+            saved.write(inventory)
+
+
 def validate(env):
     main, token, action = env.get("GITHUB_SHA", ""), env.get("GH_TOKEN", ""), env.get("NO_EXPORT_ACTION", "")
     require(env.get("GITHUB_REPOSITORY") == github.REPOSITORY and env.get("GITHUB_REPOSITORY_ID") == str(github.REPOSITORY_ID)
@@ -281,11 +300,14 @@ def validate(env):
         reviewed_run(env["NO_EXPORT_RELEASE_RUN_ID"], "release", main, spec["headSha"], token, successful=False,
                      jobs_required=[("resolution", "Plan or apply the no-export resolution", False)])
     historic = workflow_runs(review["auditWindowStart"], review["auditWindowEnd"], token)
-    inventory_sha = sha256(canonical(historic)).hexdigest()
+    inventory = canonical(historic)
+    inventory_sha = sha256(inventory).hexdigest()
     require(action == "audit-writers" or inventory_sha == review["writerInventorySha256"], "The reviewed writer inventory changed.")
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     require(now >= review["auditWindowEnd"])
     live_writer_boundary(workflow_runs(review["auditWindowEnd"], now, token), env, token, spec["headSha"])
+    if check == "credential":
+        save_inventory(env.get("RUNNER_TEMP", ""), inventory)
     return {"status": "validated", "writerInventorySha256": inventory_sha, "oldRunId": OLD_RUN,
             "reviewSha256": sha256(canonical(review)).hexdigest()}
 
