@@ -106,6 +106,19 @@ class TrustedPhaseGateTests(unittest.TestCase):
                        {"BACKUP_ACTION": "plan-resume-failed"}):
             with self.subTest(change=change), self.assertRaises(ContractError):
                 self.check({**readback, **change})
+        verify = {**readback, "BACKUP_GATE_ROLE": "recovery-verify", "BACKUP_RECOVERY_MODE": "verify",
+                  "BACKUP_RECOVERY_SOURCE_RUN_ID": "901", "BACKUP_RECOVERY_COMPLETION_SHA256": "",
+                  "SUBS_BOT_BACKUP_RECOVERY_VERIFY_RUN_ID": "901", "SUBS_BOT_BACKUP_RECOVERY_VERIFY_ACTION": "resume-failed",
+                  "SUBS_BOT_BACKUP_RECOVERY_VERIFY_SLOT": "123-1-0003",
+                  "SUBS_BOT_BACKUP_RECOVERY_VERIFY_CLAIM_SHA256": "c" * 64,
+                  "SUBS_BOT_BACKUP_RECOVERY_VERIFY_COMPLETION_SHA256": ""}
+        self.check(verify)
+        for change in ({"BACKUP_RECOVERY_SOURCE_RUN_ID": "900"}, {"BACKUP_RECOVERY_SOURCE_RUN_ID": "902"},
+                       {"SUBS_BOT_BACKUP_RECOVERY_VERIFY_ACTION": "abort-unstarted"},
+                       {"SUBS_BOT_BACKUP_RECOVERY_VERIFY_CLAIM_SHA256": "d" * 64},
+                       {"BACKUP_RECOVERY_COMPLETION_SHA256": "f" * 64}):
+            with self.subTest(change=change), self.assertRaises(ContractError):
+                self.check({**verify, **change})
 
     def test_rehearsal_workflows_gate_before_candidate_secrets(self):
         root = Path(__file__).resolve().parents[2] / ".github/workflows"
@@ -126,9 +139,15 @@ class TrustedPhaseGateTests(unittest.TestCase):
 
     def test_recovery_readback_has_a_fresh_runner_without_write_credentials(self):
         workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/worker-backup-phase-recovery.yml").read_text()
-        readback = workflow.split("\n  readback:\n", 1)[1]
+        readback = workflow.split("\n  readback:\n", 1)[1].split("\n  verify_recovery:\n", 1)[0]
         self.assertIn("BACKUP_GATE_ROLE: recovery-readback", readback)
         self.assertIn("BACKUP_RECOVERY_MODE: readback", readback)
         self.assertIn("SUBS_BOT_CF_REHEARSAL_DATA_READ_TOKEN", readback)
         self.assertNotIn("SUBS_BOT_CF_REHEARSAL_DATA_TOKEN", readback)
         self.assertNotIn("SUBS_BOT_SCOPED_R2_WRITE_JSON", readback)
+        verify = workflow.split("\n  verify_recovery:\n", 1)[1]
+        self.assertIn("BACKUP_GATE_ROLE: recovery-verify", verify)
+        self.assertIn("BACKUP_RECOVERY_MODE: verify", verify)
+        self.assertIn("SUBS_BOT_CF_REHEARSAL_DATA_READ_TOKEN", verify)
+        self.assertNotIn("SUBS_BOT_CF_REHEARSAL_DATA_TOKEN", verify)
+        self.assertNotIn("SUBS_BOT_SCOPED_R2_WRITE_JSON", verify)
