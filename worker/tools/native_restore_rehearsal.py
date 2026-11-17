@@ -422,6 +422,8 @@ class RehearsalAPI:
         token = self.token
         if method == "GET" and route.startswith(self.root + "/r2/buckets") and not route.endswith("/objects"):
             token = scoped_r2.metadata_token() or token
+        elif method == "POST" and route == self.root + "/r2/buckets":
+            token = scoped_r2.creation_token(token)
         headers = {"Authorization": "Bearer " + token, "Accept": "application/json", "Cache-Control": "no-cache",
                    "cf-r2-jurisdiction": "default"}
         body = None if payload is None else canonical(payload)

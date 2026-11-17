@@ -2,6 +2,10 @@
 
 `worker/tools/production_recovery.py` 和 `production_recovery_cli.py` 是独立的生产控制实现，使用与部署控制相同的 `production_target.py` 配置契约。`worker-production-recovery.yml` 在 GitHub 托管 runner 执行。生产与明确登记的 rehearsal 运行相同的代码；不修改历史隔离恢复脚本的账户、资源或源版本保护，也不自动采用已有 dev 目标。
 
+恢复 Environment 必须分别配置 `SUBS_BOT_CF_DATA_READ_TOKEN`、`SUBS_BOT_CF_DATA_TOKEN`（D1 写）、`SUBS_BOT_CF_WORKER_READ_TOKEN`、`SUBS_BOT_CF_R2_METADATA_READ_TOKEN` 及按准确桶登记的 `SUBS_BOT_SCOPED_R2_READ_JSON`／`SUBS_BOT_SCOPED_R2_WRITE_JSON`。仅创建数据库、导出及导入步骤得到 D1 写凭据；Worker 始终只读，`inspect`／`verify-backup` 不注入对象写凭据。其余恢复步骤仍可能追加私有 journal，不能因为 D1 只读就称整个步骤没有写入。缺失的只读配置不回退到写凭据。
+
+`create-objects` 另需经批准的 `SUBS_BOT_CF_R2_CREATE_TOKEN`，仅向该步骤注入；D1、对象 S3 或 metadata read 凭据不能替代创建权限。隔离 native 恢复的两个建桶动作使用相同规则。创建新目标仍受原始 intent、精确名称、独立身份读回和无消费者检查约束；新桶在任何对象读写前必须加入对应的准确桶 S3 凭据配置。该配置项不构成创建资源或扩大平台权限的授权。
+
 工具完成备份和独立目标恢复，不授权切换正式消费者。首次上线仍须填写真实正式配置并另行批准，不能通过选择 workflow 的 `production` 选项取得生产授权。
 
 ## 运行前配置

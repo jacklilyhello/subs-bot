@@ -162,7 +162,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
-          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPLOY_TOKEN }}
+          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_SEALED_WORKER_READ_TOKEN }}
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           python3 -B worker/tools/attest_api_status_container.py inspect
@@ -249,8 +249,9 @@ jobs:
           SUBS_BOT_PAGE_JUMP_CHECKPOINT: ${{ inputs.page_jump_checkpoint }}
           SUBS_BOT_API_STATUS_CONTAINER_ATTESTATION: ${{ needs.attest-api-status.outputs.attestation }}
           SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
-          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
-          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPLOY_TOKEN }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_ISOLATION_DATA_TOKEN }}
+          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_ISOLATION_WORKER_TOKEN }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
           SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
           SUBS_BOT_TELEGRAM_AGGREGATE_KEY: ${{ secrets.SUBS_BOT_TELEGRAM_AGGREGATE_KEY }}
           SUBS_BOT_TELEGRAM_PRIVATE_SHARE_CREATION_KEY: ${{ secrets.SUBS_BOT_TELEGRAM_PRIVATE_SHARE_CREATION_KEY }}
