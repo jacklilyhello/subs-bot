@@ -82,11 +82,12 @@ def require_request_budget(env, review, remaining_guards):
     """Fail before an intent if the remaining hosted core quota is insufficient."""
     checked, writers = checked_gate(env, with_stats=True)
     require(checked == review and type(remaining_guards) is int and 1 <= remaining_guards <= 100)
-    # Gate's bounded fixed work is at most 19 GETs; allow two per known or
-    # two additional same-workflow runs, six for release's seal provenance,
-    # and 100 spare. Concurrent rate use or secondary limits remain unknown.
+    # Gate's bounded fixed work is at most 21 GETs, including the exact old
+    # Provider read; allow two per known or two extra same-workflow runs, six
+    # for release's seal provenance, and 100 spare. Concurrent rate use or
+    # secondary limits remain unknown.
     require(env.get("NO_EXPORT_ACTION") in {"seal", "release"})
-    per_guard = 19 + 2 * (writers + 2) + (6 if env["NO_EXPORT_ACTION"] == "release" else 0)
+    per_guard = 21 + 2 * (writers + 2) + (6 if env["NO_EXPORT_ACTION"] == "release" else 0)
     required = per_guard * remaining_guards + 100
     request = Request("https://api.github.com/rate_limit", headers={
         "Accept": "application/vnd.github+json", "Authorization": "Bearer " + github._github_token(),
