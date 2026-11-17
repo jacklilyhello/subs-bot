@@ -90,6 +90,21 @@ class JournalTests(unittest.TestCase):
         self.assertEqual(transaction.interruption(self.journal.load()), "reconciliation-required")
         self.journal.append("capture-intent", {}, 111)
 
+    def test_failed_frozen_checkpoint_requires_confirmed_read_only_failure(self):
+        for uncertain in (False, True):
+            store = Store()
+            journal = transaction.Transaction(store, "123-1", "2026/11/17", "a" * 64, "b" * 40)
+            stages = [("started", {}), ("preflight", {"capacity": {}}), ("pause-intent", {}), ("paused", {}),
+                      ("freeze-intent", {}), ("frozen", {}), ("failed", {"uncertain": uncertain})]
+            for timestamp, (stage, details) in enumerate(stages, 100):
+                journal.append(stage, details, timestamp)
+            if uncertain:
+                with self.assertRaises(ContractError):
+                    journal.append("resume-intent", {}, 110)
+            else:
+                journal.append("resume-intent", {}, 110)
+                self.assertEqual(journal.load()[-1]["stage"], "resume-intent")
+
     def test_anchor_blocks_new_sessions_until_exact_release(self):
         anchor = self.anchor()
         anchor.initialize()
@@ -114,6 +129,18 @@ class JournalTests(unittest.TestCase):
         self.store.objects[history[0]] = b'{}'
         with self.assertRaises(ContractError):
             anchor.read()
+
+    def test_same_generation_fork_blocks_all_future_anchor_operations(self):
+        anchor = self.anchor()
+        anchor.initialize()
+        anchor.acquire("123-1", "2026/11/17", "b" * 40)
+        current, raw, _etag = anchor.read()
+        competing = transaction.canonical({**current, "session": "124-1"})
+        self.store.put(anchor.history_key(current["generation"], competing), competing)
+        with self.assertRaises(ContractError):
+            anchor.read()
+        with self.assertRaises(ContractError):
+            anchor.release("123-1")
 
     def test_approved_reconciliation_needs_terminal_journal_and_exact_plan(self):
         anchor = self.anchor()

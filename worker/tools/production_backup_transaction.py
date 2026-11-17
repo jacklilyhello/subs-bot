@@ -19,7 +19,7 @@ STAGES = {"started", "preflight", "pause-intent", "paused", "freeze-intent", "fr
 NEXT = {None: {"started"}, "started": {"preflight", "failed"},
         "preflight": {"pause-intent", "frozen", "failed"}, "pause-intent": {"paused", "failed"},
         "paused": {"freeze-intent", "failed", "resume-intent"}, "freeze-intent": {"frozen", "failed"},
-        "frozen": {"frozen-data", "failed"}, "frozen-data": {"capture-intent", "failed", "resume-intent"},
+        "frozen": {"frozen-data", "failed", "resume-intent"}, "frozen-data": {"capture-intent", "failed", "resume-intent"},
         "capture-intent": {"poll-intent", "verified", "failed", "resume-intent", "preserved-frozen"},
         "poll-intent": {"capture-intent"},
         "verified": {"resume-intent", "preserved-frozen", "failed"}, "resume-intent": {"resumed", "failed"},
@@ -67,8 +67,10 @@ class Transaction:
                 require(event["timestamp"] >= events[-1]["timestamp"], "Backup journal time moved backwards.")
             validate_step(events[-1]["stage"] if events else None, event)
             if events and events[-1]["stage"] == "failed" and event["stage"] == "resume-intent":
-                require(len(events) >= 2 and events[-2]["stage"] in {"paused", "verified", "frozen-data", "capture-intent"},
+                require(len(events) >= 2 and events[-2]["stage"] in {"paused", "verified", "frozen", "frozen-data", "capture-intent"},
                         "A failed unresolved operation cannot be automatically retried.")
+                if events[-2]["stage"] == "frozen":
+                    require(events[-1]["details"].get("uncertain") is False)
             if events and events[-1]["stage"] == "failed" and event["stage"] == "preserved-frozen":
                 require(len(events) >= 2 and events[-2]["stage"] in {"verified", "capture-intent"})
             previous = sha256(raw).hexdigest()
@@ -85,8 +87,10 @@ class Transaction:
                  "previousSha256": previous, "timestamp": timestamp, "stage": stage, "details": details}
         validate_step(events[-1]["stage"] if events else None, event)
         if events and events[-1]["stage"] == "failed" and stage == "resume-intent":
-            require(len(events) >= 2 and events[-2]["stage"] in {"paused", "verified", "frozen-data", "capture-intent"},
+            require(len(events) >= 2 and events[-2]["stage"] in {"paused", "verified", "frozen", "frozen-data", "capture-intent"},
                     "A failed unresolved operation cannot be automatically retried.")
+            if events[-2]["stage"] == "frozen":
+                require(events[-1]["details"].get("uncertain") is False)
         if events and events[-1]["stage"] == "failed" and stage == "preserved-frozen":
             require(len(events) >= 2 and events[-2]["stage"] in {"verified", "capture-intent"})
         body = canonical(event)
@@ -209,6 +213,8 @@ class Anchor:
                                 + r"[0-9]{12}-[a-f0-9]{64}\.json", key)
                     and (allow_future or int(key.rsplit("/", 1)[1][:12]) <= value["generation"]) for key in history),
                 "An unconfirmed future anchor generation requires reconciliation.")
+        require(sum(int(key.rsplit("/", 1)[1][:12]) <= value["generation"] for key in history) == value["generation"],
+                "The committed anchor history is missing a generation or has a fork.")
         current = value
         while current["generation"] > 1:
             previous_sha = current["previousSha256"]

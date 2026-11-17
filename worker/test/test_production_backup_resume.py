@@ -23,6 +23,16 @@ def controller():
 
 
 class ResumeTests(unittest.TestCase):
+    def test_atomic_resume_rechecks_ambiguous_terminal_edit(self):
+        ctl = controller()
+        frozen = {"admission": "closed", "workers": "frozen", "epoch": 3}
+        ctl.inspect.return_value = {"control": {"admission": "open", "workers": "run", "epoch": 4}}
+        with patch.object(resume, "_mutate_sql") as mutate:
+            resume._commit(ctl, frozen)
+        sql = " ".join(mutate.call_args.args[2])
+        self.assertIn("telegram_group_share_cards.shown<101", sql)
+        self.assertIn("telegram_group_share_cards.attempts>=4", sql)
+
     def test_failed_backup_rechecks_full_data_after_intent_before_single_cas(self):
         ctl = controller()
         frozen = {"admission": "closed", "workers": "frozen", "epoch": 3}

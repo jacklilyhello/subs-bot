@@ -78,6 +78,34 @@ def plan_aborted_drain(ctl, *, initial, paused, session):
             "stateSha256": before["stateSha256"]}
 
 
+def plan_uncaptured_backup(ctl, api, source, recovery_journal, *, initial, frozen, fingerprint, session):
+    """Resume only when the full maintenance journal proves capture never started."""
+    _target(ctl)
+    require(maintenance.SESSION.fullmatch(session or "") is not None
+            and initial.get("control", {}).get("admission") == "open" and initial["control"].get("workers") == "run"
+            and frozen.get("admission") == "closed" and frozen.get("workers") == "frozen")
+    recovery_journal.load()
+    require(recovery_journal.value is None, "A recovery journal exists; export initiation cannot be ruled out.")
+    before = _quiet_state(ctl, initial, frozen)
+    if fingerprint is not None:
+        require(capacity.frozen_fingerprint(api, source) == fingerprint,
+                "The confirmed frozen data or referenced object closure changed.")
+    _dependencies(ctl)
+    action = "maintenance-resume-uncaptured:" + digest({"session": session, "frozen": frozen, "fingerprint": fingerprint})
+    return {"approvalAction": action, "stateSha256": before["stateSha256"]}
+
+
+def resume_uncaptured_backup(ctl, api, source, recovery_journal, *, initial, frozen, fingerprint, session,
+                             approval_envelope, record_intent):
+    kwargs = {"initial": initial, "frozen": frozen, "fingerprint": fingerprint, "session": session}
+    plan = plan_uncaptured_backup(ctl, api, source, recovery_journal, **kwargs)
+    ctl.approval(approval_envelope, plan["approvalAction"], plan["stateSha256"])
+    record_intent(plan["stateSha256"], plan["approvalAction"])
+    require(plan_uncaptured_backup(ctl, api, source, recovery_journal, **kwargs) == plan,
+            "The approved uncaptured backup predecessor changed after its intent.")
+    return _commit(ctl, frozen)
+
+
 def _commit(ctl, control):
     predicate = " AND ".join(f"{key} IS {migrations._literal(value) if isinstance(value, str) else value}" for key, value in control.items())
     quiet, fields = work_sql(ctl.target.data["botId"])
@@ -87,7 +115,7 @@ def _commit(ctl, control):
                   f"NOT EXISTS(SELECT 1 FROM {INVOCATIONS} WHERE state IN ('running','uncertain'))",
                   "NOT EXISTS(SELECT 1 FROM subs_bot_production_updates WHERE state IN ('processing','uncertain'))",
                   f"NOT EXISTS(SELECT 1 FROM telegram_outbox JOIN telegram_inbox USING(receipt_id) WHERE bot_id={bot} AND state='uncertain')",
-                  f"NOT EXISTS(SELECT 1 FROM telegram_group_share_cards JOIN telegram_private_share_creations USING(receipt_id) WHERE bot_id={bot} AND telegram_group_share_cards.state='uncertain')"]
+                  f"NOT EXISTS(SELECT 1 FROM telegram_group_share_cards JOIN telegram_private_share_creations USING(receipt_id) WHERE bot_id={bot} AND (telegram_group_share_cards.state='uncertain' OR (telegram_group_share_cards.state='sent' AND telegram_group_share_cards.shown<101 AND telegram_group_share_cards.attempts>=4)))"]
     ctl.guard()
     _mutate_sql(ctl.data, ctl.database, [migrations._assert_sql(" AND ".join(conditions)),
         f"UPDATE {CONTROL} SET admission='open',workers='run',epoch=epoch+1 WHERE singleton=1"])

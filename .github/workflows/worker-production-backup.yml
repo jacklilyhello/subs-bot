@@ -10,7 +10,7 @@ on:
         description: One reviewed checkpoint; scheduled production operation is disabled
         required: true
         type: choice
-        options: [monitor, plan-initialize-anchor, initialize-anchor, plan-begin, begin, inspect, preflight, abort-preflight, plan-pause, pause, drain, freeze, fingerprint, capture, poll-export, verify, plan-activate, activate, plan-reconcile-transition, reconcile-transition, plan-resume-failed, resume-failed]
+        options: [monitor, plan-initialize-anchor, initialize-anchor, inspect-anchor-initialization, inspect-anchor-unknown, plan-begin, begin, inspect, preflight, abort-preflight, plan-pause, pause, drain, freeze, fingerprint, capture, poll-export, verify, plan-activate, activate, plan-reconcile-transition, reconcile-transition, plan-resume-failed, resume-failed, plan-anchor-reconcile, anchor-reconcile]
       state_sha256:
         description: Exact predecessor state returned by the corresponding plan or inspect
         type: string
@@ -19,6 +19,9 @@ on:
         type: string
       session_day:
         description: UTC session date YYYY/MM/DD chosen before plan-begin
+        type: string
+      anchor_candidate_sha256:
+        description: Exact unconfirmed anchor release generation SHA256, reconciliation only
         type: string
       source_run_id:
         description: Exact active application CI run when no private source checkpoint is selected
@@ -92,6 +95,7 @@ jobs:
           BACKUP_STATE_SHA256: ${{ inputs.state_sha256 }}
           BACKUP_SESSION: ${{ inputs.session }}
           BACKUP_SESSION_DAY: ${{ inputs.session_day }}
+          BACKUP_ANCHOR_CANDIDATE_SHA256: ${{ inputs.anchor_candidate_sha256 }}
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           umask 077

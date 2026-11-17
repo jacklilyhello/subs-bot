@@ -24,8 +24,8 @@ from production_storage import PrivateStore
 from production_target import approve, canonical, digest, parsed, require, validate_target
 
 WORKFLOW = artifact.REPOSITORY + "/.github/workflows/worker-production-backup.yml@" + artifact.MAIN_REF
-READ_ONLY = {"inspect", "monitor", "plan-initialize-anchor", "plan-begin", "plan-pause", "drain", "plan-activate", "plan-reconcile-transition", "plan-resume-failed"}
-ACTIONS = READ_ONLY | {"initialize-anchor", "begin", "preflight", "abort-preflight", "pause", "freeze", "fingerprint", "capture", "poll-export", "verify", "activate", "reconcile-transition", "resume-failed"}
+READ_ONLY = {"inspect", "monitor", "plan-initialize-anchor", "inspect-anchor-initialization", "inspect-anchor-unknown", "plan-begin", "plan-pause", "drain", "plan-activate", "plan-reconcile-transition", "plan-resume-failed", "plan-anchor-reconcile"}
+ACTIONS = READ_ONLY | {"initialize-anchor", "begin", "preflight", "abort-preflight", "pause", "freeze", "fingerprint", "capture", "poll-export", "verify", "activate", "reconcile-transition", "resume-failed", "anchor-reconcile"}
 # Production writes remain unavailable until the exact implementation is reviewed
 # and its corresponding isolated failure/recovery exercise has passed.
 PRODUCTION_MUTATIONS_ENABLED = False
@@ -84,6 +84,15 @@ def active_transaction(anchor, store, target):
     return pin, journal, events
 
 
+def missing_started_observation(anchor, store, target):
+    pin, _raw, _etag = anchor.read()
+    require(pin["state"] == "active")
+    journal = maintenance.Transaction(store, pin["session"], pin["day"], target.digest, pin["controlRevision"])
+    require(not journal.load(), "A transaction journal exists; inspect its exact stage instead.")
+    return {"status": "unknown", "phase": "started-journal-missing", "session": pin["session"],
+            "day": pin["day"], "mutationPermitted": False}
+
+
 def exact_predecessor(env, state):
     supplied = env.get("BACKUP_STATE_SHA256", "")
     require(re.fullmatch(r"[0-9a-f]{64}", supplied or "") and state.get("stateSha256") == supplied,
@@ -107,6 +116,21 @@ def frozen_matches(events, state):
             and not any(state.get("work", {}).values())
             and not any(state.get("terminal", {}).get(key, 0) for key in
                         ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates")))
+
+
+def uncaptured_predecessor(events):
+    require(events and (events[-1]["stage"] in {"frozen", "frozen-data"}
+            or (len(events) >= 2 and events[-1]["stage"] == "failed"
+                and events[-1]["details"].get("uncertain") is False
+                and events[-2]["stage"] in {"frozen", "frozen-data"}))
+            and not any(event["stage"] in {"capture-intent", "poll-intent"} for event in events),
+            "Capture may have started; do not infer an empty export.")
+    freeze_intents = [event for event in events if event["stage"] == "freeze-intent"]
+    frozen = [event for event in events if event["stage"] == "frozen"]
+    fingerprints = [event for event in events if event["stage"] == "frozen-data"]
+    require(len(freeze_intents) == len(frozen) == 1 and len(fingerprints) <= 1)
+    require_finished_intent(freeze_intents[0]["details"], allowed_actions={"freeze"})
+    return frozen[0]["details"]["control"], fingerprints[0]["details"] if fingerprints else None
 
 
 def confirm_plan_run(session, day, revision):
@@ -135,7 +159,7 @@ def intent_metadata(env, state):
             "runId": env["GITHUB_RUN_ID"], "runAttempt": "1", "controlRevision": env["GITHUB_SHA"]}
 
 
-def require_finished_intent(details):
+def require_finished_intent(details, *, allowed_actions=None):
     require(isinstance(details, dict) and details.get("runAttempt") == "1"
             and re.fullmatch(r"[1-9][0-9]{0,19}", details.get("runId", ""))
             and re.fullmatch(r"[0-9a-f]{40}", details.get("controlRevision", "")))
@@ -148,6 +172,11 @@ def require_finished_intent(details):
             and run.get("head_sha") == details["controlRevision"] and run.get("status") == "completed"
             and all(isinstance(run.get(key), dict) and run[key].get("id") == artifact.REPOSITORY_ID
                     for key in ("repository", "head_repository")), "The original operation has not independently finished.")
+    if allowed_actions is not None:
+        require(isinstance(allowed_actions, set) and bool(allowed_actions)
+                and run.get("display_title") in {"Production backup " + action + " at " + details["controlRevision"]
+                                                for action in allowed_actions},
+                "The finished run is not the exact intended backup action.")
 
 
 def monitor_anchor(anchor, store, target, policy, now):
@@ -178,6 +207,8 @@ def monitor_anchor(anchor, store, target, policy, now):
         current = parsed(store.get(previous))
     latest, latest_plan_run = max(history) if history else (None, None)
     alerts = []
+    if type(getattr(anchor, "last_history_count", None)) is int and anchor.last_history_count >= 8000:
+        alerts.append("anchor-history-near-limit")
     if latest_completed_failed:
         alerts.append("backup-failed")
     if latest_pause_exceeded:
@@ -310,12 +341,40 @@ def transition_reconciliation(env, events, state, contract):
     return {"phase": phase, "approvalAction": "backup-reconcile-transition:" + scope, "stateSha256": state["stateSha256"]}
 
 
+def completed_anchor_reconciliation(anchor, store, target, ctl, candidate_sha, contract, policy):
+    """Only reconcile a confirmed release after a finished resume operation."""
+    plan, _raw, _etag, _candidate_raw = anchor.plan_reconciliation(candidate_sha)
+    candidate = plan["candidate"]
+    require(candidate["state"] == "idle", "An unconfirmed anchor acquisition requires manual investigation.")
+    events = maintenance.Transaction(store, candidate["session"], candidate["day"], target.digest,
+                                     candidate["controlRevision"]).load()
+    require(len(events) >= 2 and events[-1]["stage"] == "resumed" and events[-2]["stage"] == "resume-intent"
+            and events[0]["details"].get("contractSha256") == digest(contract)
+            and events[0]["details"].get("policySha256") == digest(policy),
+            "Only a fully recorded resume can reconcile an anchor release.")
+    require_finished_intent(events[-2]["details"], allowed_actions={"activate", "resume-failed"})
+    state = ctl.inspect()
+    require(state["control"] == events[-1]["details"].get("control")
+            and state["release"] == events[0]["details"].get("release")
+            and state["configurationSha256"] == events[0]["details"].get("configurationSha256")
+            and not any(state["work"].values())
+            and not any(state["terminal"].get(key, 0) for key in
+                        ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates")),
+            "The completed transaction or current predecessor is not independently confirmed.")
+    anchor_plan_sha = digest(plan)
+    scope = digest({"anchorPlanSha256": anchor_plan_sha, "contractSha256": digest(contract),
+                    "stateSha256": state["stateSha256"]})
+    return {"approvalAction": "backup-anchor-reconcile:" + scope, "stateSha256": state["stateSha256"],
+            "anchorPlanSha256": anchor_plan_sha, "candidateSha256": candidate_sha}
+
+
 def emit_result(result, target, revision, root, *, source_revision=None):
     # Controller observations contain the real Bot identifier and release details.
     # GitHub logs and artifacts are visible to repository readers, so expose only
     # the exact predecessor digest and non-identifying operational aggregates.
     safe_keys = {"status", "action", "alerts", "latestVerifiedAt", "phase", "notification", "approvalAction",
-                 "stateSha256", "session", "day", "pauseSeconds", "pauseLimitExceeded", "capacity", "checkpointId", "manifestSha256"}
+                 "stateSha256", "session", "day", "pauseSeconds", "pauseLimitExceeded", "capacity", "checkpointId", "manifestSha256",
+                 "anchorPlanSha256", "candidateSha256", "genesisSha256", "historyPresent", "pointerPresent", "mutationPermitted"}
     observed = result.get("state")
     result = {key: value for key, value in result.items() if key in safe_keys}
     if isinstance(observed, dict) and "stateSha256" in observed:
@@ -397,15 +456,29 @@ def main(env=None):
         require(state["release"]["revision"] == proof["revision"] and state["release"]["moduleSha256"] == manifest["bundleSha256"],
                 "The archived source is not the active release.")
         store = PrivateStore(data, target.data["backupBucketName"])
-        anchor = maintenance.Anchor(store, target.digest, env.get("SUBS_BOT_BACKUP_GENESIS_SHA256", ""))
-        if action in {"plan-initialize-anchor", "initialize-anchor"}:
+        seed = maintenance.Anchor(store, target.digest, "0" * 64)
+        genesis_sha = recovery.digest(seed.initial_material()[1])
+        supplied_genesis = env.get("SUBS_BOT_BACKUP_GENESIS_SHA256", "")
+        require(supplied_genesis == genesis_sha or action == "plan-initialize-anchor" and not supplied_genesis,
+                "The independently pinned maintenance genesis differs.")
+        anchor = maintenance.Anchor(store, target.digest, genesis_sha)
+        if action == "inspect-anchor-initialization":
+            plan, _initial, _etag = anchor.plan_initialization_reconciliation()
+            result = {"status": "unknown", "action": action, "anchorPlanSha256": digest(plan),
+                      "historyPresent": plan["historyPresent"], "pointerPresent": plan["pointerPresent"],
+                      "genesisSha256": genesis_sha, "stateSha256": state["stateSha256"], "mutationPermitted": False}
+        elif action == "inspect-anchor-unknown":
+            result = {**missing_started_observation(anchor, store, target), "action": action,
+                      "stateSha256": state["stateSha256"]}
+        elif action in {"plan-initialize-anchor", "initialize-anchor"}:
             require(store.get(anchor.genesis_key, absent=True) is None and store.get_with_etag(anchor.key) == (None, None)
                     and not store.list_backup_anchor_history(target.digest) and not store.list_backup_journals(),
                     "An existing or partial maintenance anchor requires independent reconciliation.")
-            scope = digest({"policy": policy, "genesisSha256": env.get("SUBS_BOT_BACKUP_GENESIS_SHA256"), "contract": contract})
+            scope = digest({"policy": policy, "genesisSha256": genesis_sha, "contract": contract})
             approval_action = "backup-initialize-anchor:" + scope
             if action == "plan-initialize-anchor":
-                result = {"status": "plan-only", "action": action, "approvalAction": approval_action, "stateSha256": state["stateSha256"]}
+                result = {"status": "plan-only", "action": action, "approvalAction": approval_action,
+                          "stateSha256": state["stateSha256"], "genesisSha256": genesis_sha}
             else:
                 predecessor = exact_predecessor(env, state)
                 authorized(target, env, approval_action, proof["revision"], predecessor, revision)
@@ -442,6 +515,20 @@ def main(env=None):
                     "release": state["release"], "pauseLimitSeconds": policy["pauseLimitSeconds"],
                     "checkpointId": contract["checkpointId"], "contractSha256": digest(contract), "policySha256": digest(policy)}, int(time.time()))
                 result = {"status": "started", "action": action, "session": session, "day": day}
+        elif action in {"plan-anchor-reconcile", "anchor-reconcile"}:
+            candidate = env.get("BACKUP_ANCHOR_CANDIDATE_SHA256", "")
+            plan = completed_anchor_reconciliation(anchor, store, target, ctl, candidate, contract, policy)
+            if action == "plan-anchor-reconcile":
+                result = {"status": "plan-only", "action": action, **plan}
+            else:
+                predecessor = exact_predecessor(env, plan)
+                authorized(target, env, plan["approvalAction"], proof["revision"], predecessor, revision)
+                guard()
+                require(completed_anchor_reconciliation(anchor, store, target, ctl, candidate, contract, policy) == plan,
+                        "The exact approved anchor reconciliation changed.")
+                anchor.reconcile(candidate, plan["anchorPlanSha256"])
+                result = {"status": "anchor-release-reconciled", "action": action,
+                          "candidateSha256": candidate, "anchorPlanSha256": plan["anchorPlanSha256"]}
         else:
             pin, journal, events = active_transaction(anchor, store, target)
             require(events[0]["details"].get("contractSha256") == digest(contract)
@@ -527,10 +614,10 @@ def main(env=None):
                         anchor.release(pin["session"])
                     result = {"status": "reconciled", "action": action, "phase": next_stage}
             elif action in {"plan-resume-failed", "resume-failed"}:
-                # Only a confirmed paused drain or a stopped original export can
-                # be resumed here. An unresolved transition or poll never retries.
+                # No export may be inferred stopped from missing evidence. Before
+                # capture, require the complete journal and an absent recovery journal.
                 prior = events[-2] if events[-1]["stage"] == "failed" and len(events) > 1 else events[-1]
-                require(prior["stage"] in {"paused", "capture-intent"})
+                require(prior["stage"] in {"paused", "frozen", "frozen-data", "capture-intent"})
                 initial = events[0]["details"]
                 pause = next(item for item in events if item["stage"] == "pause-intent")
                 require_finished_intent(pause["details"])
@@ -538,6 +625,11 @@ def main(env=None):
                 if prior["stage"] == "paused":
                     kwargs = {**common, "paused": prior["details"]["control"]}
                     plan = resume.plan_aborted_drain(ctl, **kwargs)
+                elif prior["stage"] in {"frozen", "frozen-data"}:
+                    frozen_control, fingerprint = uncaptured_predecessor(events)
+                    rj = recovery.RecoveryJournal(api, env["GITHUB_RUN_ID"] + "/" + env["GITHUB_RUN_ATTEMPT"], guard=guard)
+                    kwargs = {**common, "frozen": frozen_control, "fingerprint": fingerprint}
+                    plan = resume.plan_uncaptured_backup(ctl, api, source, rj, **kwargs)
                 else:
                     require_finished_intent(prior["details"])
                     frozen = next(item for item in events if item["stage"] == "frozen")
@@ -554,6 +646,8 @@ def main(env=None):
                         journal.append("resume-intent", {**intent_metadata(env, state), "approvalAction": approval_action}, int(time.time()))
                     if prior["stage"] == "paused":
                         after = resume.resume_aborted_drain(ctl, **kwargs, approval_envelope=env.get("SUBS_BOT_APPROVAL_JSON", ""), record_intent=record_intent)
+                    elif prior["stage"] in {"frozen", "frozen-data"}:
+                        after = resume.resume_uncaptured_backup(ctl, api, source, rj, **kwargs, approval_envelope=env.get("SUBS_BOT_APPROVAL_JSON", ""), record_intent=record_intent)
                     else:
                         after = resume.resume_failed_backup(ctl, api, source, rj, **kwargs, approval_envelope=env.get("SUBS_BOT_APPROVAL_JSON", ""), record_intent=record_intent)
                     elapsed = max(0, int(time.time()) - pause["timestamp"])

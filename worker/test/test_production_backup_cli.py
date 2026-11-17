@@ -35,6 +35,21 @@ class ProductionBackupTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             backup.active_transaction(anchor, Mock(), Mock())
 
+    def test_missing_started_remains_read_only_unknown(self):
+        pin = {"state": "active", "session": "123-1", "day": "2026/11/17", "controlRevision": "a" * 40}
+        anchor, store, target = Mock(), Mock(), Mock(digest="b" * 64)
+        anchor.read.return_value = (pin, b"", '"etag"')
+        with patch.object(backup.maintenance, "Transaction") as transaction:
+            transaction.return_value.load.return_value = []
+            result = backup.missing_started_observation(anchor, store, target)
+            self.assertEqual(result["status"], "unknown")
+            self.assertIs(result["mutationPermitted"], False)
+            transaction.return_value.load.return_value = [{"stage": "started"}]
+            with self.assertRaises(ContractError):
+                backup.missing_started_observation(anchor, store, target)
+        anchor.reconcile.assert_not_called()
+        store.put.assert_not_called()
+
     def test_invalid_or_unresolved_stage_cannot_progress(self):
         with self.assertRaises(ContractError):
             backup.last([{"stage": "capture-intent"}], "verified")
@@ -46,6 +61,38 @@ class ProductionBackupTests(unittest.TestCase):
                  "terminal": {"terminalEditFailure": 1}}
         with self.assertRaises(ContractError):
             backup.frozen_matches(events, state)
+
+    def test_uncaptured_predecessor_requires_finished_freeze_and_no_capture_intent(self):
+        frozen = {"admission": "closed", "workers": "frozen", "epoch": 3}
+        events = [{"stage": "freeze-intent", "details": {"runId": "123"}},
+                  {"stage": "frozen", "details": {"control": frozen}}]
+        with patch.object(backup, "require_finished_intent") as finished:
+            self.assertEqual(backup.uncaptured_predecessor(events), (frozen, None))
+            finished.assert_called_once_with(events[0]["details"], allowed_actions={"freeze"})
+            self.assertEqual(backup.uncaptured_predecessor([*events, {"stage": "failed", "details": {"uncertain": False}}]), (frozen, None))
+            fingerprint = {"dataSha256": "f" * 64}
+            self.assertEqual(backup.uncaptured_predecessor([*events, {"stage": "frozen-data", "details": fingerprint},
+                {"stage": "failed", "details": {"uncertain": False}}]), (frozen, fingerprint))
+            for bad in (events + [{"stage": "capture-intent", "details": {}}],
+                        [*events, {"stage": "failed", "details": {}}],
+                        [*events, {"stage": "failed", "details": {"uncertain": True}}]):
+                with self.assertRaises(ContractError):
+                    backup.uncaptured_predecessor(bad)
+
+    def test_uncaptured_resume_requires_empty_recovery_journal_and_exact_recheck(self):
+        ctl, journal = Mock(), Mock(value=None)
+        initial = {"control": {"admission": "open", "workers": "run"}}
+        frozen = {"admission": "closed", "workers": "frozen", "epoch": 3}
+        with patch.object(backup.resume, "_target"), patch.object(backup.resume, "_quiet_state", return_value={"stateSha256": "b" * 64}), \
+             patch.object(backup.resume, "_dependencies"), patch.object(backup.resume, "_commit") as commit:
+            plan = backup.resume.plan_uncaptured_backup(ctl, Mock(), Mock(), journal, initial=initial,
+                                                        frozen=frozen, fingerprint=None, session="123-1")
+            self.assertTrue(plan["approvalAction"].startswith("maintenance-resume-uncaptured:"))
+            journal.value = {"export": {"state": "unknown"}}
+            with self.assertRaises(ContractError):
+                backup.resume.plan_uncaptured_backup(ctl, Mock(), Mock(), journal, initial=initial,
+                                                    frozen=frozen, fingerprint=None, session="123-1")
+            commit.assert_not_called()
 
     def test_approval_is_passed_through_without_synthesis(self):
         target, envelope = Mock(), '{"explicit":"approval"}'
@@ -85,6 +132,31 @@ class ProductionBackupTests(unittest.TestCase):
             finished.assert_called_once_with(details)
             with self.assertRaises(ContractError):
                 backup.transition_reconciliation({}, events, {**state, "control": previous}, {"checkpointId": "e"})
+
+    def test_anchor_reconciliation_rejects_unfinished_or_changed_successor(self):
+        target, ctl, anchor, store = Mock(digest="a" * 64), Mock(), Mock(), Mock()
+        contract, policy = {"checkpointId": "e" * 32}, self.policy
+        candidate = {"state": "idle", "session": "123-1", "day": "2026/11/17", "controlRevision": "b" * 40}
+        anchor.plan_reconciliation.return_value = ({"candidate": candidate}, b"old", '"etag"', b"new")
+        state = {"control": {"admission": "open", "workers": "run", "epoch": 4}, "release": {"revision": "c"},
+                 "configurationSha256": "d", "stateSha256": "e" * 64, "work": {}, "terminal": {}}
+        ctl.inspect.return_value = state
+        events = [{"stage": "started", "details": {"contractSha256": backup.digest(contract), "policySha256": backup.digest(policy),
+                   "release": state["release"], "configurationSha256": "d"}},
+                  {"stage": "resume-intent", "details": {"runId": "123"}},
+                  {"stage": "resumed", "details": {"control": state["control"]}}]
+        with patch.object(backup.maintenance, "Transaction") as transaction, patch.object(backup, "require_finished_intent") as finished:
+            transaction.return_value.load.return_value = events
+            result = backup.completed_anchor_reconciliation(anchor, store, target, ctl, "f" * 64, contract, policy)
+            self.assertEqual(result["stateSha256"], state["stateSha256"])
+            finished.assert_called_once_with(events[-2]["details"], allowed_actions={"activate", "resume-failed"})
+            ctl.inspect.return_value = {**state, "control": {**state["control"], "epoch": 5}}
+            with self.assertRaises(ContractError):
+                backup.completed_anchor_reconciliation(anchor, store, target, ctl, "f" * 64, contract, policy)
+            transaction.return_value.load.return_value = events[:-1]
+            with self.assertRaises(ContractError):
+                backup.completed_anchor_reconciliation(anchor, store, target, ctl, "f" * 64, contract, policy)
+        anchor.reconcile.assert_not_called()
 
     def test_monitor_rejects_future_journal_time(self):
         pin = {"generation": 2, "state": "active", "session": "1-1", "day": "2026/01/01",
