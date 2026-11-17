@@ -228,7 +228,7 @@ class NoExportEvidenceTests(unittest.TestCase):
                "NO_EXPORT_SEAL_RUN_ID": "123", "SUBS_BOT_BACKUP_NO_EXPORT_SEAL_RUN_ID": "123",
                "NO_EXPORT_PLAN_SHA256": plan_sha, "NO_EXPORT_PROTECTED_PLAN_SHA256": plan_sha,
                "NO_EXPORT_EVIDENCE_SHA256": "c" * 64, "NO_EXPORT_PROTECTED_EVIDENCE_SHA256": "c" * 64,
-               "GITHUB_RUN_ID": "456", "GITHUB_SHA": "d" * 40}
+               "GITHUB_RUN_ID": "456", "GITHUB_SHA": "d" * 40, "RUNNER_TEMP": "/synthetic"}
         store, journal, anchor, controller = Mock(), Mock(), Mock(), Mock()
         state = {"control": {"admission": "closed", "workers": "frozen"}, "stateSha256": "e" * 64}
         observed = (Mock(), controller, store, journal, anchor, state, plan)
