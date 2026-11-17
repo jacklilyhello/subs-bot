@@ -12,12 +12,15 @@ from production_target import parsed, require
 
 FILE = ".github/workflows/worker-backup-phase-rehearsal.yml"
 PARENT_FILE = ".github/workflows/worker-backup-reviewed-coordinator.yml"
+RECOVERY_FILE = ".github/workflows/worker-backup-phase-recovery.yml"
 ENVIRONMENT = "subs-bot-backup-head-isolation"
 HEX32 = re.compile(r"[a-f0-9]{32}")
 HEX40 = re.compile(r"[a-f0-9]{40}")
 HEX64 = re.compile(r"[a-f0-9]{64}")
 DECIMAL = re.compile(r"[1-9][0-9]{0,19}")
 STEPS = ("plan-begin", "begin", "preflight", "plan-pause", "pause", "drain", "freeze", "capture", "verify", "plan-activate", "activate")
+RECOVERY_ACTIONS = {"plan-resume-failed", "resume-failed", "plan-reconcile-transition", "reconcile-transition",
+                    "plan-abort-unstarted", "abort-unstarted"}
 KEYS = {"version", "pr", "headSha", "registrationSha256", "sourceCheckpointId", "sourceManifestSha256", "genesisSha256", "checkpointId"}
 
 
@@ -32,8 +35,8 @@ def checkout_sha(directory):
 def validate(env):
     main = env.get("GITHUB_SHA", "")
     role = env.get("BACKUP_GATE_ROLE", "")
-    require(role in {"child", "parent"})
-    workflow = FILE if role == "child" else PARENT_FILE
+    require(role in {"child", "parent", "recovery", "recovery-readback"})
+    workflow = {"child": FILE, "parent": PARENT_FILE, "recovery": RECOVERY_FILE, "recovery-readback": RECOVERY_FILE}[role]
     require(env.get("GITHUB_REPOSITORY") == github.REPOSITORY
             and env.get("GITHUB_REPOSITORY_ID") == str(github.REPOSITORY_ID)
             and env.get("GITHUB_REF") == github.MAIN_REF and env.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
@@ -59,7 +62,7 @@ def validate(env):
                 ("checkpointId", "BACKUP_PHASE_CHECKPOINT_ID")))
             and env.get("BACKUP_SOURCE_CHECKPOINT_ID") == spec["sourceCheckpointId"]
             and env.get("BACKUP_SOURCE_MANIFEST_SHA256") == spec["sourceManifestSha256"]
-            and env.get("BACKUP_ACTION") in (STEPS if role == "child" else {"inspect", "plan-initialize", "initialize", "plan-webhook-history", "plan-webhook-anchor", "initialize-webhook-anchor", "plan-run", "run", "plan-resume", "resume", "plan-reconcile", "reconcile", "plan-abort", "abort"}))
+            and env.get("BACKUP_ACTION") in (STEPS if role == "child" else RECOVERY_ACTIONS if role in {"recovery", "recovery-readback"} else {"inspect", "plan-initialize", "initialize", "plan-webhook-history", "plan-webhook-anchor", "initialize-webhook-anchor", "plan-run", "run", "plan-resume", "resume", "plan-reconcile", "reconcile", "plan-abort", "abort"}))
     if role == "child":
         require(HEX64.fullmatch(env.get("BACKUP_DISPATCH_NONCE", "")))
         require(DECIMAL.fullmatch(env.get("BACKUP_COORDINATOR_SESSION", ""))
@@ -67,6 +70,27 @@ def validate(env):
         # Even a read-only phase must create its exclusive private child claim.
         require(env.get("SUBS_BOT_BACKUP_PHASE_REHEARSAL_WRITES_ENABLED") == "true",
                 "Isolated phase claims and writes are disabled.")
+    elif role in {"recovery", "recovery-readback"}:
+        require(env.get("SUBS_BOT_BACKUP_PHASE_RECOVERY_ENABLED") == "true"
+                and DECIMAL.fullmatch(env.get("BACKUP_COORDINATOR_SESSION", ""))
+                and re.fullmatch(r"[1-9][0-9]{0,19}-1", env.get("BACKUP_SESSION", ""))
+                and re.fullmatch(r"[0-9]{4}/[0-9]{2}/[0-9]{2}", env.get("BACKUP_SESSION_DAY", ""))
+                and (not env.get("BACKUP_ANCHOR_CANDIDATE_SHA256") or
+                     env["BACKUP_ACTION"] in {"plan-abort-unstarted", "abort-unstarted"}
+                     and HEX64.fullmatch(env["BACKUP_ANCHOR_CANDIDATE_SHA256"])))
+        if not env["BACKUP_ACTION"].startswith("plan-"):
+            require((role == "recovery-readback" or env.get("SUBS_BOT_BACKUP_PHASE_RECOVERY_WRITES_ENABLED") == "true")
+                    and HEX64.fullmatch(env.get("BACKUP_RECOVERY_PLAN_SHA256", ""))
+                    and env.get("SUBS_BOT_BACKUP_PHASE_RECOVERY_APPROVAL_SHA256") == env["BACKUP_RECOVERY_PLAN_SHA256"],
+                    "The exact independently approved isolated recovery plan is required.")
+        if role == "recovery-readback":
+            require(not env["BACKUP_ACTION"].startswith("plan-") and env.get("BACKUP_RECOVERY_MODE") == "readback"
+                    and DECIMAL.fullmatch(env.get("GITHUB_RUN_ID", ""))
+                    and env.get("BACKUP_RECOVERY_SOURCE_RUN_ID") == env["GITHUB_RUN_ID"]
+                    and re.fullmatch(r"[1-9][0-9]{0,19}-1-[0-9]{4}", env.get("BACKUP_RECOVERY_SLOT", ""))
+                    and env["BACKUP_RECOVERY_SLOT"].startswith(env["BACKUP_SESSION"] + "-")
+                    and all(HEX64.fullmatch(env.get(key, "")) for key in
+                            ("BACKUP_RECOVERY_CLAIM_SHA256", "BACKUP_RECOVERY_COMPLETION_SHA256")))
     elif env.get("BACKUP_ACTION") in {"initialize", "initialize-webhook-anchor", "run", "resume", "reconcile", "abort"}:
         require(env.get("SUBS_BOT_BACKUP_PHASE_REHEARSAL_WRITES_ENABLED") == "true",
                 "Isolated coordinator writes are disabled.")
@@ -84,8 +108,8 @@ def validate(env):
             and pull["head"].get("ref") == "codex/backup-coordinator"
             and all(isinstance(pull[k].get("repo"), dict) and pull[k]["repo"].get("id") == github.REPOSITORY_ID
                     for k in ("head", "base")))
-    comparison = github._get_json("/compare/" + main + "..." + spec["headSha"], token)
-    require(comparison.get("status") in {"ahead", "identical"}
+    comparison = github.compare_commits_metadata(main, spec["headSha"], token)
+    require(comparison.get("status") in {"ahead", "identical"} and comparison.get("behind_by") == 0
             and comparison.get("base_commit", {}).get("sha") == main
             and comparison.get("merge_base_commit", {}).get("sha") == main)
     workspace = Path(env.get("GITHUB_WORKSPACE", ""))

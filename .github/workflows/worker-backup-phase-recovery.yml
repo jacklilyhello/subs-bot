@@ -1,0 +1,188 @@
+name: Reconcile one reviewed isolated backup phase
+run-name: Rehearsal backup recovery ${{ inputs.action }} at ${{ github.sha }} candidate ${{ fromJSON(inputs.validation_json).headSha }} session ${{ inputs.coordinator_session }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      validation_json:
+        description: Exact protected rehearsal target and reviewed candidate
+        type: string
+        required: true
+      action:
+        type: choice
+        options: [plan-resume-failed, resume-failed, plan-reconcile-transition, reconcile-transition, plan-abort-unstarted, abort-unstarted]
+        required: true
+      coordinator_session:
+        type: string
+        required: true
+      session:
+        type: string
+        required: true
+      session_day:
+        type: string
+        required: true
+      anchor_candidate_sha256:
+        type: string
+      plan_sha256:
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+concurrency:
+  group: subs-bot-lifecycle-rehearsal
+  cancel-in-progress: false
+
+jobs:
+  recovery:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    environment: subs-bot-backup-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      recovery_slot: ${{ steps.perform.outputs.recovery_slot }}
+      recovery_claim_sha256: ${{ steps.perform.outputs.recovery_claim_sha256 }}
+      recovery_completion_sha256: ${{ steps.perform.outputs.recovery_completion_sha256 }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BACKUP_HEAD_ENVIRONMENT: subs-bot-backup-head-isolation
+      BACKUP_GATE_ROLE: recovery
+      SUBS_BOT_CONTROL_ENVIRONMENT: subs-bot-isolation
+      SUBS_BOT_BACKUP_PHASE_REHEARSAL_ENABLED: ${{ vars.SUBS_BOT_BACKUP_PHASE_REHEARSAL_ENABLED }}
+      SUBS_BOT_BACKUP_PHASE_RECOVERY_ENABLED: ${{ vars.SUBS_BOT_BACKUP_PHASE_RECOVERY_ENABLED }}
+      SUBS_BOT_BACKUP_PHASE_RECOVERY_WRITES_ENABLED: ${{ vars.SUBS_BOT_BACKUP_PHASE_RECOVERY_WRITES_ENABLED }}
+      SUBS_BOT_BACKUP_PHASE_RECOVERY_APPROVAL_SHA256: ${{ vars.SUBS_BOT_BACKUP_PHASE_RECOVERY_APPROVAL_SHA256 }}
+      BACKUP_REVIEWED_HEAD_SHA: ${{ vars.SUBS_BOT_BACKUP_REVIEWED_HEAD_SHA }}
+      BACKUP_PHASE_REGISTRATION_SHA256: ${{ vars.SUBS_BOT_BACKUP_PHASE_REGISTRATION_SHA256 }}
+      BACKUP_PHASE_SOURCE_CHECKPOINT_ID: ${{ vars.SUBS_BOT_BACKUP_PHASE_SOURCE_CHECKPOINT_ID }}
+      BACKUP_PHASE_SOURCE_MANIFEST_SHA256: ${{ vars.SUBS_BOT_BACKUP_PHASE_SOURCE_MANIFEST_SHA256 }}
+      BACKUP_PHASE_GENESIS_SHA256: ${{ vars.SUBS_BOT_BACKUP_PHASE_GENESIS_SHA256 }}
+      BACKUP_PHASE_CHECKPOINT_ID: ${{ vars.SUBS_BOT_BACKUP_PHASE_CHECKPOINT_ID }}
+      SUBS_BOT_PHASE_WEBHOOK_ANCHOR_GENESIS_SHA256: ${{ vars.SUBS_BOT_PHASE_WEBHOOK_ANCHOR_GENESIS_SHA256 }}
+      HEAD_VALIDATION_JSON: ${{ inputs.validation_json }}
+      BACKUP_ACTION: ${{ inputs.action }}
+      BACKUP_COORDINATOR_SESSION: ${{ inputs.coordinator_session }}
+      BACKUP_SESSION: ${{ inputs.session }}
+      BACKUP_SESSION_DAY: ${{ inputs.session_day }}
+      BACKUP_ANCHOR_CANDIDATE_SHA256: ${{ inputs.anchor_candidate_sha256 }}
+      BACKUP_RECOVERY_PLAN_SHA256: ${{ inputs.plan_sha256 }}
+      BACKUP_SOURCE_CHECKPOINT_ID: ${{ fromJSON(inputs.validation_json).sourceCheckpointId }}
+      BACKUP_SOURCE_MANIFEST_SHA256: ${{ fromJSON(inputs.validation_json).sourceManifestSha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Verify recovery identity before candidate checkout
+        env:
+          BACKUP_CHECKOUT_PHASE: before
+        run: python3 -B trusted/worker/tools/trusted_backup_phase_gate.py
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ fromJSON(inputs.validation_json).headSha }}
+          path: candidate
+          persist-credentials: false
+      - name: Verify exact reviewed recovery checkout
+        env:
+          BACKUP_CHECKOUT_PHASE: ready
+        run: python3 -B trusted/worker/tools/trusted_backup_phase_gate.py
+      - name: Verify isolated recovery test Bot identity
+        env:
+          BACKUP_CHECKOUT_PHASE: credential-check
+          SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
+        run: python3 -B trusted/worker/tools/trusted_backup_phase_gate.py
+      - name: Plan or execute one reviewed recovery phase
+        id: perform
+        env:
+          HEAD_TRUSTED_MAIN_SHA: ${{ github.sha }}
+          HEAD_TRUSTED_REVIEWED_SHA: ${{ fromJSON(inputs.validation_json).headSha }}
+          SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
+          SUBS_BOT_CONTROL_DRILL_KEYS: ${{ secrets.SUBS_BOT_CONTROL_DRILL_KEYS }}
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ (inputs.action != 'resume-failed' && secrets.SUBS_BOT_CF_REHEARSAL_DATA_READ_TOKEN) || (inputs.action == 'resume-failed' && secrets.SUBS_BOT_CF_REHEARSAL_DATA_TOKEN) || '' }}
+          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_REHEARSAL_WORKER_READ_TOKEN }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_SCOPED_R2_WRITE_JSON: ${{ !startsWith(inputs.action, 'plan-') && secrets.SUBS_BOT_SCOPED_R2_WRITE_JSON || '' }}
+          SUBS_BOT_BACKUP_POLICY_JSON: ${{ secrets.SUBS_BOT_BACKUP_POLICY_JSON }}
+          PYTHONPATH: ${{ github.workspace }}/trusted/worker/tools
+        run: |
+          umask 077
+          python3 -B candidate/worker/tools/production_backup_rehearsal_recovery.py
+  readback:
+    needs: [recovery]
+    if: needs.recovery.result == 'success' && !startsWith(inputs.action, 'plan-')
+    environment: subs-bot-backup-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BACKUP_HEAD_ENVIRONMENT: subs-bot-backup-head-isolation
+      BACKUP_GATE_ROLE: recovery-readback
+      SUBS_BOT_CONTROL_ENVIRONMENT: subs-bot-isolation
+      SUBS_BOT_BACKUP_PHASE_REHEARSAL_ENABLED: ${{ vars.SUBS_BOT_BACKUP_PHASE_REHEARSAL_ENABLED }}
+      SUBS_BOT_BACKUP_PHASE_RECOVERY_ENABLED: ${{ vars.SUBS_BOT_BACKUP_PHASE_RECOVERY_ENABLED }}
+      SUBS_BOT_BACKUP_PHASE_RECOVERY_APPROVAL_SHA256: ${{ vars.SUBS_BOT_BACKUP_PHASE_RECOVERY_APPROVAL_SHA256 }}
+      BACKUP_REVIEWED_HEAD_SHA: ${{ vars.SUBS_BOT_BACKUP_REVIEWED_HEAD_SHA }}
+      BACKUP_PHASE_REGISTRATION_SHA256: ${{ vars.SUBS_BOT_BACKUP_PHASE_REGISTRATION_SHA256 }}
+      BACKUP_PHASE_SOURCE_CHECKPOINT_ID: ${{ vars.SUBS_BOT_BACKUP_PHASE_SOURCE_CHECKPOINT_ID }}
+      BACKUP_PHASE_SOURCE_MANIFEST_SHA256: ${{ vars.SUBS_BOT_BACKUP_PHASE_SOURCE_MANIFEST_SHA256 }}
+      BACKUP_PHASE_GENESIS_SHA256: ${{ vars.SUBS_BOT_BACKUP_PHASE_GENESIS_SHA256 }}
+      BACKUP_PHASE_CHECKPOINT_ID: ${{ vars.SUBS_BOT_BACKUP_PHASE_CHECKPOINT_ID }}
+      SUBS_BOT_PHASE_WEBHOOK_ANCHOR_GENESIS_SHA256: ${{ vars.SUBS_BOT_PHASE_WEBHOOK_ANCHOR_GENESIS_SHA256 }}
+      HEAD_VALIDATION_JSON: ${{ inputs.validation_json }}
+      BACKUP_ACTION: ${{ inputs.action }}
+      BACKUP_COORDINATOR_SESSION: ${{ inputs.coordinator_session }}
+      BACKUP_SESSION: ${{ inputs.session }}
+      BACKUP_SESSION_DAY: ${{ inputs.session_day }}
+      BACKUP_ANCHOR_CANDIDATE_SHA256: ${{ inputs.anchor_candidate_sha256 }}
+      BACKUP_RECOVERY_PLAN_SHA256: ${{ inputs.plan_sha256 }}
+      BACKUP_RECOVERY_MODE: readback
+      BACKUP_RECOVERY_SLOT: ${{ needs.recovery.outputs.recovery_slot }}
+      BACKUP_RECOVERY_CLAIM_SHA256: ${{ needs.recovery.outputs.recovery_claim_sha256 }}
+      BACKUP_RECOVERY_COMPLETION_SHA256: ${{ needs.recovery.outputs.recovery_completion_sha256 }}
+      BACKUP_RECOVERY_SOURCE_RUN_ID: ${{ github.run_id }}
+      BACKUP_SOURCE_CHECKPOINT_ID: ${{ fromJSON(inputs.validation_json).sourceCheckpointId }}
+      BACKUP_SOURCE_MANIFEST_SHA256: ${{ fromJSON(inputs.validation_json).sourceManifestSha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Verify recovery readback identity before candidate checkout
+        env:
+          BACKUP_CHECKOUT_PHASE: before
+        run: python3 -B trusted/worker/tools/trusted_backup_phase_gate.py
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ fromJSON(inputs.validation_json).headSha }}
+          path: candidate
+          persist-credentials: false
+      - name: Verify exact reviewed recovery readback checkout
+        env:
+          BACKUP_CHECKOUT_PHASE: ready
+        run: python3 -B trusted/worker/tools/trusted_backup_phase_gate.py
+      - name: Verify recovery readback test Bot identity
+        env:
+          BACKUP_CHECKOUT_PHASE: credential-check
+          SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
+        run: python3 -B trusted/worker/tools/trusted_backup_phase_gate.py
+      - name: Independently read back the recovery evidence
+        env:
+          HEAD_TRUSTED_MAIN_SHA: ${{ github.sha }}
+          HEAD_TRUSTED_REVIEWED_SHA: ${{ fromJSON(inputs.validation_json).headSha }}
+          SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
+          SUBS_BOT_CONTROL_DRILL_KEYS: ${{ secrets.SUBS_BOT_CONTROL_DRILL_KEYS }}
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_REHEARSAL_DATA_READ_TOKEN }}
+          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_REHEARSAL_WORKER_READ_TOKEN }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_BACKUP_POLICY_JSON: ${{ secrets.SUBS_BOT_BACKUP_POLICY_JSON }}
+          PYTHONPATH: ${{ github.workspace }}/trusted/worker/tools
+        run: |
+          umask 077
+          python3 -B candidate/worker/tools/production_backup_rehearsal_recovery.py

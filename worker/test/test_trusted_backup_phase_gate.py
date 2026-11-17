@@ -50,6 +50,8 @@ class TrustedPhaseGateTests(unittest.TestCase):
 
     def check(self, env):
         with patch.object(gate.github, "_get_json", side_effect=github), \
+             patch.object(gate.github, "compare_commits_metadata", return_value={"status": "ahead", "behind_by": 0,
+                          "base_commit": {"sha": MAIN}, "merge_base_commit": {"sha": MAIN}}), \
              patch.object(gate, "checkout_sha", side_effect=lambda path: MAIN if path.name == "trusted" else HEAD):
             return gate.validate(env)
 
@@ -78,10 +80,55 @@ class TrustedPhaseGateTests(unittest.TestCase):
             self.check({**self.env, "HEAD_VALIDATION_JSON": canonical(spec).decode(),
                         "BACKUP_PHASE_CHECKPOINT_ID": spec["checkpointId"]})
 
+    def test_recovery_is_separately_disabled_and_requires_exact_approval(self):
+        env = {**self.env, "BACKUP_GATE_ROLE": "recovery", "BACKUP_ACTION": "plan-resume-failed",
+               "GITHUB_WORKFLOW_REF": gate.github.REPOSITORY + "/" + gate.RECOVERY_FILE + "@" + gate.github.MAIN_REF,
+               "BACKUP_SESSION": "123-1", "BACKUP_SESSION_DAY": "2026/11/18",
+               "SUBS_BOT_BACKUP_PHASE_RECOVERY_ENABLED": "true"}
+        self.check(env)
+        for change in ({"SUBS_BOT_BACKUP_PHASE_RECOVERY_ENABLED": ""}, {"BACKUP_ACTION": "resume-failed"},
+                       {"BACKUP_ACTION": "plan-resume-failed", "BACKUP_ANCHOR_CANDIDATE_SHA256": "a" * 64}):
+            with self.subTest(change=change), self.assertRaises(ContractError):
+                self.check({**env, **change})
+        approved = {**env, "BACKUP_ACTION": "resume-failed", "BACKUP_RECOVERY_PLAN_SHA256": "a" * 64,
+                    "SUBS_BOT_BACKUP_PHASE_RECOVERY_APPROVAL_SHA256": "a" * 64,
+                    "SUBS_BOT_BACKUP_PHASE_RECOVERY_WRITES_ENABLED": "true"}
+        self.check(approved)
+        with self.assertRaises(ContractError):
+            self.check({**approved, "SUBS_BOT_BACKUP_PHASE_RECOVERY_APPROVAL_SHA256": "b" * 64})
+        readback = {**approved, "BACKUP_GATE_ROLE": "recovery-readback", "BACKUP_RECOVERY_MODE": "readback",
+                    "GITHUB_RUN_ID": "900", "BACKUP_RECOVERY_SOURCE_RUN_ID": "900",
+                    "BACKUP_RECOVERY_SLOT": "123-1-0003", "BACKUP_RECOVERY_CLAIM_SHA256": "c" * 64,
+                    "BACKUP_RECOVERY_COMPLETION_SHA256": "d" * 64, "SUBS_BOT_BACKUP_PHASE_RECOVERY_WRITES_ENABLED": ""}
+        self.check(readback)
+        for change in ({"BACKUP_RECOVERY_SLOT": "124-1-0003"}, {"BACKUP_RECOVERY_CLAIM_SHA256": ""},
+                       {"BACKUP_RECOVERY_SOURCE_RUN_ID": "901"},
+                       {"BACKUP_ACTION": "plan-resume-failed"}):
+            with self.subTest(change=change), self.assertRaises(ContractError):
+                self.check({**readback, **change})
+
     def test_rehearsal_workflows_gate_before_candidate_secrets(self):
         root = Path(__file__).resolve().parents[2] / ".github/workflows"
-        for workflow in ("worker-backup-phase-rehearsal.yml", "worker-backup-reviewed-coordinator.yml"):
+        for workflow in ("worker-backup-phase-rehearsal.yml", "worker-backup-reviewed-coordinator.yml", "worker-backup-phase-recovery.yml"):
             text = (root / workflow).read_text()
             self.assertLess(text.index("BACKUP_CHECKOUT_PHASE: ready"), text.index("SUBS_BOT_CONTROL_DRILL_KEYS:"))
             self.assertIn("SUBS_BOT_BACKUP_PHASE_REHEARSAL_ENABLED: ${{ vars.SUBS_BOT_BACKUP_PHASE_REHEARSAL_ENABLED }}", text)
             self.assertNotIn("subs-bot-lifecycle-production", text)
+
+    def test_observation_phases_use_only_the_d1_read_credential(self):
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/worker-backup-phase-rehearsal.yml").read_text()
+        read_actions = '["plan-begin","begin","preflight","plan-pause","drain","verify","plan-activate"]'
+        route = next(line for line in workflow.splitlines() if "SUBS_BOT_CF_BOOTSTRAP_TOKEN:" in line)
+        self.assertEqual(route.count(read_actions), 2)
+        self.assertIn("&& secrets.SUBS_BOT_CF_REHEARSAL_DATA_READ_TOKEN", route)
+        self.assertIn("!contains(fromJSON(" + "'" + read_actions + "'" + "), inputs.action) && secrets.SUBS_BOT_CF_REHEARSAL_DATA_TOKEN", route)
+        self.assertIn("SUBS_BOT_SCOPED_R2_WRITE_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_WRITE_JSON }}", workflow)
+
+    def test_recovery_readback_has_a_fresh_runner_without_write_credentials(self):
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/worker-backup-phase-recovery.yml").read_text()
+        readback = workflow.split("\n  readback:\n", 1)[1]
+        self.assertIn("BACKUP_GATE_ROLE: recovery-readback", readback)
+        self.assertIn("BACKUP_RECOVERY_MODE: readback", readback)
+        self.assertIn("SUBS_BOT_CF_REHEARSAL_DATA_READ_TOKEN", readback)
+        self.assertNotIn("SUBS_BOT_CF_REHEARSAL_DATA_TOKEN", readback)
+        self.assertNotIn("SUBS_BOT_SCOPED_R2_WRITE_JSON", readback)
