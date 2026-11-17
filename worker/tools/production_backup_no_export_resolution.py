@@ -98,7 +98,7 @@ def require_request_budget(env, review, remaining_guards):
     # Concurrent rate use or secondary limits remain unknown.
     require(env.get("NO_EXPORT_ACTION") in {"seal", "release"})
     per_guard = 17 + 2 * (writers + 2) + (6 if env["NO_EXPORT_ACTION"] == "release" else 0)
-    required = per_guard * remaining_guards + 3 * legacy + 12 + 100
+    required = per_guard * remaining_guards + 3 * legacy + 13 + 100
     request = Request("https://api.github.com/rate_limit", headers={
         "Accept": "application/vnd.github+json", "Authorization": "Bearer " + github._github_token(),
         "Cache-Control": "no-cache", "X-GitHub-Api-Version": "2022-11-28"})
