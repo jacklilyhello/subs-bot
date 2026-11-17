@@ -83,6 +83,12 @@ class ProductionStore(sealed.PrivateProofStore):
             return super().put(relative, raw)
         control.require(isinstance(raw, bytes) and 0 < len(raw) <= sealed.CHUNK_BYTES
                         and self.read(relative) is None)
+        objects = getattr(self, "objects", None)
+        if objects is not None:
+            objects.put_once(self.key(relative), raw,
+                             metadata={"cache-control": "no-store, private", "content-type": "application/octet-stream"})
+            control.require(self.read(relative) == raw)
+            return
         if self.access_key is None:
             self.access_key = sealed.verified_token_identity(self.api, self.target["accountId"])["id"]
         host = self.target["accountId"] + ".r2.cloudflarestorage.com"
@@ -127,6 +133,9 @@ def production_manifest(store, expected):
 def list_private_keys(store, prefix):
     """Bounded S3 listing with an explicit, verified terminal page."""
     store.verify()
+    objects = getattr(store, "objects", None)
+    if objects is not None:
+        return objects.list(prefix, maximum=10000)
     identity = sealed.verified_token_identity(store.api, store.target["accountId"])
     host = store.target["accountId"] + ".r2.cloudflarestorage.com"
     path = "/" + quote(store.bucket, safe="-_.~")

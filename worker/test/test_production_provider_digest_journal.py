@@ -112,6 +112,11 @@ class DigestJournalTests(unittest.TestCase):
         publish = workflow.split("\n  publish:\n", 1)[1].split("\n  verify:\n", 1)[0]
         self.assertNotIn("SUBS_BOT_CF_PROVIDER_ARCHIVE_WRITE_TOKEN", publish)
         self.assertNotIn("SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN", publish)
+        self.assertNotIn("SUBS_BOT_SCOPED_R2_READ_JSON", publish)
+        self.assertNotIn("SUBS_BOT_SCOPED_R2_WRITE_JSON", publish)
+        self.assertIn("SUBS_BOT_SCOPED_R2_READ_JSON", intent)
+        self.assertIn("SUBS_BOT_SCOPED_R2_WRITE_JSON", intent)
+        self.assertIn("SUBS_BOT_CF_R2_METADATA_READ_TOKEN", intent)
 
     def test_unregistered_other_dispatcher_run_blocks(self):
         revision = "b" * 40

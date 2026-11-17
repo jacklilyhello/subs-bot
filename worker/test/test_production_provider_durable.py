@@ -47,6 +47,31 @@ class DurableSourceTests(unittest.TestCase):
             connection.request.assert_called_once()
             store.read.assert_called_once_with(name)
 
+    def test_scoped_intent_is_single_conditional_write_and_rejects_unknown(self):
+        store = Mock()
+        store.key.return_value = "maintenance/production-provider/101/1/source-intent.json"
+        store.read.side_effect = [None, b"fixture"]
+        durable.ProductionStore.put(store, "source-intent.json", b"fixture")
+        store.objects.put_once.assert_called_once_with(store.key.return_value, b"fixture",
+            metadata={"cache-control": "no-store, private", "content-type": "application/octet-stream"})
+        self.assertEqual(store.read.call_count, 2)
+        store.reset_mock()
+        store.read.side_effect = [None]
+        store.objects.put_once.side_effect = ValueError("unknown or conflict")
+        with self.assertRaises(ValueError):
+            durable.ProductionStore.put(store, "source-intent.json", b"fixture")
+        store.objects.put_once.assert_called_once()
+        store.read.assert_called_once_with("source-intent.json")
+
+    def test_scoped_inventory_uses_bounded_complete_listing_without_token_identity(self):
+        store = Mock()
+        store.objects.list.return_value = ["maintenance/production-provider/101/1/source-intent.json"]
+        with patch.object(archive, "verified_token_identity") as identity:
+            keys = durable.list_private_keys(store, "maintenance/production-provider/")
+        self.assertEqual(keys, store.objects.list.return_value)
+        store.objects.list.assert_called_once_with("maintenance/production-provider/", maximum=10000)
+        identity.assert_not_called()
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -273,6 +298,7 @@ class OriginalAttemptMetadataTests(unittest.TestCase):
             status = 200
             headers = {}
         store = Mock()
+        store.objects = None
         store.target = {"accountId": "a" * 32}
         store.bucket = "fixture"
         store.token = "synthetic"
@@ -291,6 +317,7 @@ class OriginalAttemptMetadataTests(unittest.TestCase):
         repeated = b'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Prefix>maintenance/production-provider/</Prefix><IsTruncated>true</IsTruncated><NextContinuationToken>same</NextContinuationToken></ListBucketResult>'
         for pages in ([no_state], [repeated, repeated]):
             store = Mock()
+            store.objects = None
             store.target = {"accountId": "a" * 32}
             store.bucket = "fixture"
             store.token = "synthetic"
