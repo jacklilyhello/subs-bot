@@ -14,13 +14,16 @@ from urllib.parse import quote
 from zipfile import BadZipFile, ZipFile
 
 import prepare_isolation_artifact as github
-from production_backup_webhook_recovery import (open_store, context, ORIGINAL_ORIGIN, webhook_settings)
+from production_backup_webhook_recovery import (open_store, context, ORIGINAL_ORIGIN, webhook_settings,
+                                                 probe_original_webhook, Telegram)
 from production_target import canonical, parsed, require, validate_target
 
 LIFECYCLE = ".github/workflows/worker-production-lifecycle-rehearsal.yml"
 HEAD = ".github/workflows/worker-backup-reviewed-head.yml"
 PHASE = ".github/workflows/worker-backup-reviewed-coordinator.yml"
 RECOVERY = ".github/workflows/worker-backup-webhook-recovery.yml"
+CONTROL = ".github/workflows/worker-production-control.yml"
+INLINE = ".github/workflows/worker-isolation-telegram-inline-webhook.yml"
 REV = re.compile(r"[a-f0-9]{40}")
 SHA = re.compile(r"[a-f0-9]{64}")
 
@@ -102,16 +105,71 @@ def _no_webhook_artifact(run, workflow_id, token, candidates):
     return selected[2]
 
 
+def _restoration_boundary(env, store, prefix, draft, secrets, previous, token, controllers):
+    """Verify a later known restoration without changing older run conclusions."""
+    supplied = env.get("SUBS_BOT_PHASE_WEBHOOK_BOUNDARY_JSON", "")
+    if not supplied:
+        return None
+    pin = parsed(supplied)
+    require(set(pin) == {"version", "runId", "controllerRevision", "reportName", "reportSha256"}
+            and type(pin["version"]) is int and pin["version"] == 1
+            and re.fullmatch(r"[1-9][0-9]{0,19}", pin.get("runId", ""))
+            and pin.get("controllerRevision") in controllers and SHA.fullmatch(pin.get("reportSha256", ""))
+            and pin.get("reportName") in {"production-lifecycle-drill-cleanup.json", "production-lifecycle-drill-result.json"})
+    run_id, revision = pin["runId"], pin["controllerRevision"]
+    run = github._get_json("/actions/runs/" + run_id + "/attempts/1", token)
+    latest = github._get_json("/actions/runs/" + run_id, token)
+    require(str(run.get("id")) == str(latest.get("id")) == run_id and run.get("run_attempt") == latest.get("run_attempt") == 1
+            and run.get("path") in (LIFECYCLE, LIFECYCLE + "@main", LIFECYCLE + "@refs/heads/main")
+            and run.get("head_sha") == revision and run.get("head_branch") == "main" and run.get("event") == "workflow_dispatch"
+            and run.get("status") == latest.get("status") == "completed"
+            and all(isinstance(run.get(k), dict) and run[k].get("id") == github.REPOSITORY_ID
+                    for k in ("repository", "head_repository")))
+    title = run.get("display_title", "")
+    require(isinstance(title, str) and re.fullmatch(
+        r"Production lifecycle rehearsal (?:exercise|provider-binding|provider-binding-resume|recover-webhook) at " + revision, title))
+    comparison = github.compare_commits_metadata(revision, env["GITHUB_SHA"], token)
+    require(comparison.get("status") in {"ahead", "identical"} and comparison.get("behind_by") == 0
+            and comparison.get("base_commit", {}).get("sha") == revision
+            and comparison.get("merge_base_commit", {}).get("sha") == revision)
+    jobs = github._get_json("/actions/runs/" + run_id + "/attempts/1/jobs?per_page=100", token)
+    require(isinstance(jobs.get("jobs"), list) and type(jobs.get("total_count")) is int
+            and jobs["total_count"] == len(jobs["jobs"]) < 100)
+    step_name = ("Independently restore the original test webhook after the exercise"
+                 if pin["reportName"].endswith("cleanup.json") else "Execute the registered production lifecycle code path")
+    steps = [step for job in jobs["jobs"] if isinstance(job, dict) for step in job.get("steps", [])
+             if isinstance(step, dict) and step.get("name") == step_name]
+    require(len(steps) == 1 and (steps[0].get("status"), steps[0].get("conclusion")) == ("completed", "success"))
+    created = run.get("created_at", "")
+    require(isinstance(created, str) and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", created))
+    raw = store.get(prefix + run_id + "-1-" + pin["reportName"])
+    report = parsed(raw)
+    recovery = report.get("webhookRecovery")
+    require(canonical(report) == raw and sha256(raw).hexdigest() == pin["reportSha256"]
+            and report.get("runId") == run_id and report.get("runAttempt") == "1"
+            and report.get("controlRevision") == revision and isinstance(recovery, dict)
+            and recovery.get("webhookRestored") is True and recovery.get("dropPendingUpdates") is False
+            and recovery.get("originalWebhookAuthProbe", {}).get("status") == 400)
+    telegram = Telegram(draft, {**secrets, "webhookSecret": previous["webhookSecret"]})
+    telegram.identity()
+    current = webhook_settings(telegram.call("getWebhookInfo"))
+    require(current["url"] == ORIGINAL_ORIGIN + "/telegram/webhook"
+            and sha256(canonical(current)).hexdigest() == recovery.get("restoredSettingsSha256")
+            and probe_original_webhook(previous["webhookSecret"]) == 400)
+    return {"runId": run_id, "controllerRevision": revision, "startedAt": created,
+            "reportSha256": pin["reportSha256"], "settingsSha256": recovery["restoredSettingsSha256"]}
+
+
 def inspect(env):
     require(context(env) is True and env.get("BACKUP_GATE_ROLE") == "parent")
     token = github._github_token()
-    controllers = parsed(env.get("SUBS_BOT_PHASE_WEBHOOK_CONTROLLERS_JSON", ""))
-    candidates = parsed(env.get("SUBS_BOT_PHASE_WEBHOOK_CANDIDATES_JSON", ""))
+    controllers = json.loads(env.get("SUBS_BOT_PHASE_WEBHOOK_CONTROLLERS_JSON", ""))
+    candidates = json.loads(env.get("SUBS_BOT_PHASE_WEBHOOK_CANDIDATES_JSON", ""))
     require(isinstance(controllers, list) and 0 < len(controllers) <= 128 and len(set(controllers)) == len(controllers)
             and all(isinstance(item, str) and REV.fullmatch(item) for item in controllers)
             and isinstance(candidates, list) and len(candidates) <= 128 and len(set(candidates)) == len(candidates)
             and all(isinstance(item, str) and REV.fullmatch(item) for item in candidates))
-    draft, _secrets, previous, store, prefix = open_store(env)
+    draft, secrets, previous, store, prefix = open_store(env)
     registration_raw = store.get(prefix + "registration.json")
     require(sha256(registration_raw).hexdigest() == env.get("BACKUP_PHASE_REGISTRATION_SHA256"))
     registration = parsed(registration_raw)
@@ -126,12 +184,35 @@ def inspect(env):
     # unrelated daily backup stages to exhaust this query's capacity.
     keys = store.objects.list(prefix + "webhook-", maximum=10000)
     snapshots = {key[len(prefix):] for key in keys if re.fullmatch(r"webhook-[1-9][0-9]{0,19}-1\.json", key[len(prefix):])}
-    observed_snapshots, evidence, unknown = set(), [], []
-    for workflow in (LIFECYCLE, HEAD, PHASE, RECOVERY):
+    boundary = _restoration_boundary(env, store, prefix, draft, secrets, previous, token, controllers)
+    observed_snapshots, evidence, unknown, finished = set(), [], [], {}
+    for workflow in (LIFECYCLE, HEAD, PHASE, RECOVERY, CONTROL, INLINE):
         workflow_id, runs = _runs(workflow, token)
         for run in runs:
             run_id, head, title = str(run["id"]), run["head_sha"], run.get("display_title", "")
+            updated = run.get("updated_at", "")
+            if run.get("status") == "completed" and isinstance(updated, str) and re.fullmatch(
+                    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", updated):
+                finished[run_id] = updated
             if workflow == PHASE and run_id == env.get("GITHUB_RUN_ID"):
+                continue
+            if workflow == LIFECYCLE and boundary is not None and run_id == boundary["runId"]:
+                continue
+            if workflow == INLINE:
+                require(title == "Inspect or append isolated Telegram inline webhook")
+                require(run.get("status") == "completed")
+                # Inputs are not present in the runs API and the legacy workflow
+                # did not retain a private original. Explicit forward evidence
+                # is required rather than guessing inspect versus append.
+                unknown.append({"workflow": workflow, "runId": run_id, "reason": "inline-request-needs-forward-resolution"})
+                continue
+            if workflow == CONTROL:
+                match = re.fullmatch(r"Lifecycle (rehearsal|production) ([a-z-]+) at ([a-f0-9]{40})", title or "")
+                require(match is not None and match[3] == head)
+                if match[1] != "rehearsal" or match[2] != "webhook":
+                    continue
+                require(run.get("status") == "completed")
+                unknown.append({"workflow": workflow, "runId": run_id, "reason": "control-request-needs-forward-resolution"})
                 continue
             if workflow == LIFECYCLE:
                 match = re.fullmatch(r"Production lifecycle rehearsal ([a-z-]+) at ([a-f0-9]{40})", title or "")
@@ -227,12 +308,25 @@ def inspect(env):
                              "snapshotSha256": sha256(snapshot_raw).hexdigest(), "proofSha256": proof})
     for missing in sorted(snapshots - observed_snapshots):
         unknown.append({"workflow": "private-snapshot", "runId": missing, "reason": "source-not-accounted"})
-    inventory = {"version": 1, "targetSha256": target.digest, "evidence": sorted(evidence, key=lambda x: (x["workflow"], x["runId"])),
+    superseded = []
+    if boundary is not None:
+        for item in unknown[:]:
+            source = item["runId"]
+            if item["workflow"] == "private-snapshot":
+                match = re.fullmatch(r"webhook-([1-9][0-9]{0,19})-1\.json", source)
+                source = match[1] if match else ""
+            if source in finished and finished[source] < boundary["startedAt"]:
+                superseded.append(item)
+                unknown.remove(item)
+    inventory = {"version": 1, "targetSha256": target.digest, "boundary": boundary,
+                 "evidence": sorted(evidence, key=lambda x: (x["workflow"], x["runId"])),
+                 "priorUnknownBeforeBoundary": sorted(superseded, key=lambda x: (x["workflow"], x["runId"])),
                  "unknown": sorted(unknown, key=lambda x: (x["workflow"], x["runId"]))}
     pin = sha256(canonical(inventory)).hexdigest()
     if env.get("BACKUP_ACTION") == "plan-webhook-history":
         return {"status": "resolved" if not unknown else "needs-reconciliation", "historySha256": pin,
-                "unknownRuns": unknown, "evidenceCount": len(evidence)}
+                "unknownRuns": unknown, "priorUnknownBeforeBoundary": superseded,
+                "boundary": boundary, "evidenceCount": len(evidence)}
     require(not unknown and SHA.fullmatch(env.get("SUBS_BOT_PHASE_WEBHOOK_HISTORY_SHA256", ""))
             and env["SUBS_BOT_PHASE_WEBHOOK_HISTORY_SHA256"] == pin,
             "Historical webhook operations are unknown or the independently pinned inventory changed.")
