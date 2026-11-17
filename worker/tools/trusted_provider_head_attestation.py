@@ -111,7 +111,8 @@ def source_ref(ref, target, token, root):
         provider.require(isinstance(latest, dict))
         checkpoint = provider.github._parse_object(archive.read_record(store, manifest, latest["record"]), archive.ERROR)
         archived = provider.validate_config(checkpoint["target"])
-        provider.require(checkpoint.get("version") == 2 and checkpoint["journal"].get("source") == archived["build"]
+        provider.require(checkpoint.get("version") == 2 and provider.digest(archived) == latest["targetSha256"]
+                         and checkpoint["journal"].get("source") == archived["build"]
                          and checkpoint["journal"].get("targetSha256") == latest["targetSha256"]
                          and checkpoint["journal"].get("runId") == store.run_id and checkpoint["journal"].get("runAttempt") == store.attempt)
         name = f"subs-bot-provider-attempt-source-{store.run_id}-{store.attempt}/provider-source-archive.zip"

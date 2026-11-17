@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import trusted_provider_head_attestation as attest
@@ -69,6 +69,26 @@ class AttestationTests(unittest.TestCase):
                     attest.archive_run(ref, {"controllerRevision": revision})
             with patch.dict(run, {"conclusion": "failure"}):
                 attest.archive_run({**ref, "kind": "partial"}, {"controllerRevision": revision})
+
+    def test_partial_checkpoint_must_bind_its_own_target_digest(self):
+        target = config(active=True)
+        mismatch = "0" * 64
+        manifest = {"latestCheckpoint": {"record": "checkpoint", "targetSha256": mismatch}}
+        checkpoint = {"version": 2, "target": target,
+                      "journal": {"source": target["build"], "targetSha256": mismatch,
+                                  "runId": "101", "runAttempt": "1"}}
+        store = Mock(run_id="101", attempt="1")
+        store.read.return_value = json.dumps(manifest).encode()
+        ref = {"kind": "partial", "runId": "101", "runAttempt": "1", "manifestSha256": "1" * 64,
+               "targetSha256": attest.provider.digest(target)}
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.dict(os.environ, {"SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON": "{}"}, clear=True), \
+                patch.object(attest.archive, "PrivateProofStore", return_value=store), \
+                patch.object(attest.archive, "verify_partial"), \
+                patch.object(attest.archive, "read_record", return_value=json.dumps(checkpoint).encode()), \
+                patch.object(attest, "archive_run") as origin, self.assertRaises(attest.provider.ProviderError):
+            attest.source_ref(ref, target, "synthetic", Path(temporary))
+        origin.assert_not_called()
 
 
 if __name__ == "__main__":
