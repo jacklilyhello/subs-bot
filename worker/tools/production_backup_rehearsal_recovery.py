@@ -7,6 +7,9 @@ from hashlib import sha256
 import os
 from pathlib import Path
 import re
+import json
+import time
+from urllib.request import Request
 
 import prepare_isolation_artifact as github
 import production_backup_cli as backup
@@ -17,6 +20,23 @@ from production_target import canonical, digest, parsed, require
 RECOVERY_FILE = ".github/workflows/worker-backup-phase-recovery.yml"
 PAIRS = {"plan-resume-failed": "resume-failed", "plan-reconcile-transition": "reconcile-transition",
          "plan-abort-unstarted": "abort-unstarted"}
+
+
+def require_recovery_budget(child_count, writer_count):
+    """Fail before a claim if the remaining hosted API quota cannot cover rechecks."""
+    require(type(child_count) is int and 0 <= child_count <= len(core.STEPS)
+            and type(writer_count) is int and 0 <= writer_count < 127)
+    needed = 2 * child_count * child_count + 10 * child_count + 30 * (writer_count + 1) + 300
+    request = Request("https://api.github.com/rate_limit", headers={"Accept": "application/vnd.github+json",
+        "Authorization": "Bearer " + github._github_token(), "Cache-Control": "no-cache",
+        "X-GitHub-Api-Version": "2022-11-28"})
+    with github._OPENER.open(request, timeout=20) as response:
+        raw = response.read(65537)
+    require(isinstance(raw, bytes) and len(raw) <= 65536)
+    value = json.loads(raw).get("resources", {}).get("core", {})
+    require(type(value.get("remaining")) is int and value["remaining"] >= needed
+            and type(value.get("reset")) is int and value["reset"] > int(time.time()),
+            "Insufficient hosted API quota for recovery rechecks; no claim was issued.")
 
 
 def require_recovery_result(action, status, pinned, events, state, app_session, day):
@@ -37,6 +57,29 @@ def require_recovery_result(action, status, pinned, events, state, app_session, 
                 and last.get("stage") in {"paused", "frozen", "resumed"}
                 and last["details"].get("reconciled") is True and last["details"].get("control") == state["control"]
                 and pinned.get("state") == ("idle" if last["stage"] == "resumed" else "active"))
+
+
+def unknown_observation(tool, target, context, store, app_session, day, candidate, genesis):
+    """Report only bounded digests when an original completion is unconfirmed."""
+    try:
+        ctl = tool.bind(target, context["bundle"], context["manifest"])
+        state = ctl.inspect()
+        anchor = backup.maintenance.Anchor(store, target.digest, genesis)
+        pinned, raw, _ = anchor.read()
+        events = backup.maintenance.Transaction(store, app_session, day, target.digest, candidate).load()
+        require(isinstance(state, dict) and rehearsal.HEX64.fullmatch(state.get("stateSha256", ""))
+                and isinstance(state.get("terminal"), dict) and isinstance(events, list)
+                and isinstance(pinned, dict) and pinned.get("state") in {"idle", "active"}
+                and isinstance(raw, bytes))
+        phase = events[-1].get("stage") if events else "none"
+        require(phase == "none" or phase in backup.maintenance.NEXT)
+        return {"observation": "read", "stateSha256": state["stateSha256"],
+                "anchorSha256": sha256(raw).hexdigest(), "anchorState": pinned["state"],
+                "journalSha256": digest(events), "journalLength": len(events), "phase": phase,
+                "terminalUnknown": any(state["terminal"].get(key, 0) for key in
+                    ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates"))}
+    except Exception:
+        return {"observation": "unavailable"}
 
 
 def require_owned_writer(objects, target, session, main, candidate, spec, policy, raw_spec, writer, plan, *, mode):
@@ -185,7 +228,7 @@ def main(env=None):
     from production_storage import PrivateStore
 
     env = dict(os.environ if env is None else env)
-    if env.get("BACKUP_RECOVERY_MODE") == "readback":
+    if env.get("BACKUP_RECOVERY_MODE") in {"readback", "verify"}:
         return readback(env)
     require(env.get("BACKUP_RECOVERY_MODE", "execute") == "execute")
     action = env.get("BACKUP_ACTION", "")
@@ -259,15 +302,12 @@ def main(env=None):
             and env.get("BACKUP_RECOVERY_PLAN_SHA256") == plan_sha
             and env.get("SUBS_BOT_BACKUP_PHASE_RECOVERY_APPROVAL_SHA256") == plan_sha
             and env.get("GITHUB_RUN_ATTEMPT") == "1")
-    # Until the separate readback and recovery-origin reconciliation are fully
-    # linked, no automatic recovery mutation may be issued.
-    require(False, "Recovery execution is disabled pending the independent readback path.")
-
     # Both the global writer generation and the original application stage
     # are claimed once. The slot deliberately does not contain the plan SHA:
     # a changed plan cannot authorize repeating an unknown external operation.
     require(main({**env, "BACKUP_ACTION": planned_action})["planSha256"] == plan_sha)
     require_live_recovery_job(env, main_sha, candidate, session, token)
+    require_recovery_budget(len(children["children"]), len(history["writers"]))
     writer = core.claim_resume_writer(objects, target.digest, session, main_sha, history, env["GITHUB_RUN_ID"],
         action="recovery", profile="rehearsal", candidate_revision=candidate,
         recovery_action=action, recovery_plan_sha=plan_sha)
@@ -323,7 +363,9 @@ def main(env=None):
 
 def readback(env):
     """Independently read private originals and the completed recovery job."""
-    gate_env = {**env, "BACKUP_GATE_ROLE": "recovery-readback", "BACKUP_CHECKOUT_PHASE": "ready"}
+    verify = env.get("BACKUP_RECOVERY_MODE") == "verify"
+    gate_env = {**env, "BACKUP_GATE_ROLE": "recovery-verify" if verify else "recovery-readback",
+                "BACKUP_CHECKOUT_PHASE": "ready"}
     def guard():
         rehearsal.verify_trusted_gate(gate_env)
     guard()
@@ -337,25 +379,40 @@ def readback(env):
     require(objects is not None and objects.write_credential is None
             and not env.get("SUBS_BOT_SCOPED_R2_WRITE_JSON")
             and not env.get("SUBS_BOT_SCOPED_R2_EXTRA_WRITE_JSON")
-            and env.get("BACKUP_RECOVERY_SOURCE_RUN_ID") == env.get("GITHUB_RUN_ID"),
+            and rehearsal.DECIMAL.fullmatch(env.get("BACKUP_RECOVERY_SOURCE_RUN_ID", ""))
+            and ((verify and env.get("BACKUP_RECOVERY_SOURCE_RUN_ID") != env.get("GITHUB_RUN_ID"))
+                 or (not verify and env.get("BACKUP_RECOVERY_SOURCE_RUN_ID") == env.get("GITHUB_RUN_ID"))),
             "Independent readback requires the original run and read-only object credentials.")
     app_session, day, slot = env.get("BACKUP_SESSION", ""), env.get("BACKUP_SESSION_DAY", ""), env.get("BACKUP_RECOVERY_SLOT", "")
     require(rehearsal.DECIMAL.fullmatch(session or "") and backup.maintenance.SESSION.fullmatch(app_session or "")
             and re.fullmatch(re.escape(app_session) + r"-[0-9]{4}", slot or "")
             and re.fullmatch(r"[0-9]{4}/[0-9]{2}/[0-9]{2}", day or "")
-            and rehearsal.HEX64.fullmatch(env.get("BACKUP_RECOVERY_CLAIM_SHA256", ""))
-            and rehearsal.HEX64.fullmatch(env.get("BACKUP_RECOVERY_COMPLETION_SHA256", "")))
+            and (verify and not env.get("BACKUP_RECOVERY_CLAIM_SHA256")
+                 or rehearsal.HEX64.fullmatch(env.get("BACKUP_RECOVERY_CLAIM_SHA256", "")))
+            and (verify and not env.get("BACKUP_RECOVERY_COMPLETION_SHA256")
+                 or rehearsal.HEX64.fullmatch(env.get("BACKUP_RECOVERY_COMPLETION_SHA256", ""))))
     prefix = core.BASE + target.digest + "/" + session + "/recovery/" + slot
-    claim_raw, _ = objects.get(prefix + "-intent.json")
-    complete_raw, _ = objects.get(prefix + "-complete.json")
-    claim, complete = parsed(claim_raw), parsed(complete_raw)
-    require(canonical(claim) == claim_raw and canonical(complete) == complete_raw
+    claim_raw, _ = objects.get(prefix + "-intent.json", absent=verify)
+    if verify and not env.get("BACKUP_RECOVERY_CLAIM_SHA256"):
+        require(claim_raw is None and not env.get("BACKUP_RECOVERY_COMPLETION_SHA256")
+                and rehearsal.HEX64.fullmatch(env.get("BACKUP_RECOVERY_PLAN_SHA256", "")))
+        history = core.finished_controller(objects, target.digest, session, main_sha, spec["sourceCheckpointId"],
+            spec["sourceManifestSha256"], digest(context["policy"]), profile="rehearsal", candidate_revision=candidate,
+            validation_sha=sha256(raw_spec.encode()).hexdigest())
+        require(history["writers"] and history["writers"][-1].get("action") == "recovery"
+                and history["writers"][-1].get("writerRunId") == env["BACKUP_RECOVERY_SOURCE_RUN_ID"]
+                and history["writers"][-1].get("recoveryAction") == env["BACKUP_ACTION"]
+                and history["writers"][-1].get("recoveryPlanSha256") == env["BACKUP_RECOVERY_PLAN_SHA256"])
+        observation = unknown_observation(tool, target, context, store, app_session, day, candidate, spec["genesisSha256"])
+        guard()
+        return {"status": "unknown", "action": env["BACKUP_ACTION"], "planSha256": env["BACKUP_RECOVERY_PLAN_SHA256"],
+                "slot": slot, "claimStatus": "absent", "automaticReplay": False, "observation": observation}
+    require(isinstance(claim_raw, bytes), "The original recovery claim is unavailable.")
+    claim = parsed(claim_raw)
+    require(canonical(claim) == claim_raw
             and sha256(claim_raw).hexdigest() == env["BACKUP_RECOVERY_CLAIM_SHA256"]
-            and sha256(complete_raw).hexdigest() == env["BACKUP_RECOVERY_COMPLETION_SHA256"]
-            and claim.get("writerRunId") == env.get("GITHUB_RUN_ID") and claim.get("writerAttempt") == "1"
-            and claim.get("planSha256") == digest(claim.get("plan")) == env.get("BACKUP_RECOVERY_PLAN_SHA256")
-            and complete.get("claimSha256") == sha256(claim_raw).hexdigest()
-            and complete.get("planSha256") == claim["planSha256"])
+            and claim.get("writerRunId") == env.get("BACKUP_RECOVERY_SOURCE_RUN_ID") and claim.get("writerAttempt") == "1"
+            and claim.get("planSha256") == digest(claim.get("plan")) == env.get("BACKUP_RECOVERY_PLAN_SHA256"))
     plan = claim["plan"]
     require(plan.get("action") == env.get("BACKUP_ACTION") and plan.get("targetSha256") == target.digest
             and plan.get("dispatcherRevision") == main_sha and plan.get("candidateRevision") == candidate
@@ -363,10 +420,23 @@ def readback(env):
             and plan.get("day") == day and slot == app_session + "-" + str(plan.get("journalLength")).zfill(4)
             and plan.get("sourceCheckpointId") == spec["sourceCheckpointId"]
             and plan.get("sourceManifestSha256") == spec["sourceManifestSha256"])
-    require_owned_writer(objects, target.digest, session, main_sha, candidate, spec, context["policy"], raw_spec,
-                         claim["writer"], plan, mode="readback")
+    if verify:
+        history = core.finished_controller(objects, target.digest, session, main_sha, spec["sourceCheckpointId"],
+            spec["sourceManifestSha256"], digest(context["policy"]), profile="rehearsal", candidate_revision=candidate,
+            validation_sha=sha256(raw_spec.encode()).hexdigest())
+        writer_record = claim.get("writer")
+        require(isinstance(writer_record, dict) and history["writers"] and history["writers"][-1] == writer_record
+                and writer_record.get("action") == "recovery" and writer_record.get("writerRunId") == claim["writerRunId"]
+                and writer_record.get("recoveryAction") == plan["action"]
+                and writer_record.get("recoveryPlanSha256") == claim["planSha256"])
+        prior = {"startSha256": history["startSha256"], "lastSha256": writer_record["previousSha256"],
+                 "writers": history["writers"][:-1]}
+        require(digest(prior) == plan["writerHistorySha256"], "The original recovery writer chain changed.")
+    else:
+        require_owned_writer(objects, target.digest, session, main_sha, candidate, spec, context["policy"], raw_spec,
+                             claim["writer"], plan, mode="readback")
     token = github._github_token()
-    run_id = env["GITHUB_RUN_ID"]
+    run_id = env["BACKUP_RECOVERY_SOURCE_RUN_ID"]
     run = github._get_json("/actions/runs/" + run_id + "/attempts/1", token)
     require(str(run.get("id")) == run_id and run.get("run_attempt") == 1 and run.get("head_sha") == main_sha
             and run.get("path") in {RECOVERY_FILE, RECOVERY_FILE + "@main", RECOVERY_FILE + "@refs/heads/main"}
@@ -380,14 +450,30 @@ def readback(env):
             and jobs["total_count"] == len(jobs["jobs"]) < 100)
     writer = [job for job in jobs["jobs"] if isinstance(job, dict) and job.get("name") == "recovery"]
     reader = [job for job in jobs["jobs"] if isinstance(job, dict) and job.get("name") == "readback"]
-    require(len(writer) == len(reader) == 1 and (writer[0].get("status"), writer[0].get("conclusion")) == ("completed", "success")
-            and reader[0].get("status") == "in_progress"
+    require(len(writer) == 1 and writer[0].get("status") == "completed"
+            and (verify or writer[0].get("conclusion") == "success" and len(reader) == 1
+                 and reader[0].get("status") == "in_progress")
             and all(str(job.get("run_id")) == run_id and job.get("run_attempt") == 1 and job.get("head_sha") == main_sha
-                    for job in (writer[0], reader[0])))
+                    for job in ([writer[0]] if verify else [writer[0], reader[0]])))
     for name in ("Verify recovery identity before candidate checkout", "Verify exact reviewed recovery checkout",
                  "Verify isolated recovery test Bot identity", "Plan or execute one reviewed recovery phase"):
         steps = [step for step in writer[0].get("steps", []) if isinstance(step, dict) and step.get("name") == name]
-        require(len(steps) == 1 and (steps[0].get("status"), steps[0].get("conclusion")) == ("completed", "success"))
+        require(len(steps) == 1 and steps[0].get("status") == "completed"
+                and (steps[0].get("conclusion") in {"success", "failure", "cancelled", "timed_out"}
+                     if verify and name == "Plan or execute one reviewed recovery phase"
+                     else steps[0].get("conclusion") == "success"))
+    complete_raw, _ = objects.get(prefix + "-complete.json", absent=verify)
+    if verify and (complete_raw is None or not env.get("BACKUP_RECOVERY_COMPLETION_SHA256")):
+        observation = unknown_observation(tool, target, context, store, app_session, day, candidate, spec["genesisSha256"])
+        guard()
+        return {"status": "unknown", "action": env["BACKUP_ACTION"], "planSha256": claim["planSha256"],
+                "slot": slot, "claimSha256": sha256(claim_raw).hexdigest(), "automaticReplay": False,
+                "observation": observation}
+    complete = parsed(complete_raw)
+    require(canonical(complete) == complete_raw
+            and sha256(complete_raw).hexdigest() == env["BACKUP_RECOVERY_COMPLETION_SHA256"]
+            and complete.get("claimSha256") == sha256(claim_raw).hexdigest()
+            and complete.get("planSha256") == claim["planSha256"])
     ctl = tool.bind(target, context["bundle"], context["manifest"])
     state = ctl.inspect()
     anchor = backup.maintenance.Anchor(store, target.digest, spec["genesisSha256"])
@@ -405,7 +491,7 @@ def readback(env):
     original, _ = objects.get(core.BASE + target.digest + "/" + session + "/start-intent.json")
     rehearsal.verify_owned_webhook_window({**context, "controller": ctl}, parsed(original), main_sha, candidate)
     guard()
-    return {"status": "independently-read-back", "action": env["BACKUP_ACTION"], "planSha256": claim["planSha256"],
+    return {"status": "confirmed" if verify else "independently-read-back", "action": env["BACKUP_ACTION"], "planSha256": claim["planSha256"],
             "slot": slot, "claimSha256": sha256(claim_raw).hexdigest(),
             "completionSha256": sha256(complete_raw).hexdigest(),
             "workObservationChanged": state["stateSha256"] != complete.get("stateSha256"), "automaticReplay": False}
