@@ -51,6 +51,11 @@ def audited_paths(workflow, revision):
     return paths
 
 
+def audit_key(workflow, revision):
+    require(workflow in {INLINE, LIFECYCLE, HEAD} and REV.fullmatch(revision or ""))
+    return revision + ":" + workflow
+
+
 def context(env):
     main = env.get("GITHUB_SHA", "")
     require(env.get("GITHUB_REPOSITORY") == github.REPOSITORY and env.get("GITHUB_REPOSITORY_ID") == str(github.REPOSITORY_ID)
@@ -163,7 +168,7 @@ def source(env):
     approved = json.loads(env.get("SUBS_BOT_PHASE_WEBHOOK_CONTROLLERS_JSON", ""))
     require(isinstance(approved, list) and revision in approved and all(isinstance(item, str) and REV.fullmatch(item) for item in approved))
     audits = parsed(env.get("SUBS_BOT_PHASE_WEBHOOK_LOG_AUDIT_JSON", ""))
-    audited_files = audits.get(revision)
+    audited_files = audits.get(audit_key(workflow, revision))
     expected_paths = audited_paths(workflow, revision)
     require(isinstance(audited_files, dict) and set(audited_files) == expected_paths
             and all(isinstance(value, str) and SHA.fullmatch(value) for value in audited_files.values()),
