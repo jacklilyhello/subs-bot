@@ -73,6 +73,11 @@ class ProductionStore(sealed.PrivateProofStore):
         self.bucket = value["bucket"]
         self.base = f"/accounts/{value['accountId']}/r2/buckets/{self.bucket}"
 
+    def key(self, relative):
+        control.require(isinstance(relative, str) and (relative in {"source-intent.json", "source-manifest.json"}
+                        or re.fullmatch(r"blobs/[0-9a-f]{64}", relative) is not None))
+        return self.prefix + relative
+
 
 def production_manifest(store, expected):
     store.verify()

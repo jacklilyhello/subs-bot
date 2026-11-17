@@ -21,12 +21,42 @@ from zipfile import BadZipFile, ZIP_DEFLATED, ZIP_STORED, ZipFile
 import production_provider as control
 
 WORKFLOW_PATH = ".github/workflows/worker-production-provider-encrypted-rehearsal.yml"
+REVIEWED_WORKFLOW_PATH = ".github/workflows/worker-provider-reviewed-head.yml"
 MAX_PLAINTEXT = 256 * 1024
 MAX_CIPHERTEXT = MAX_PLAINTEXT + 32 * 1024
 MAX_ARTIFACT_ZIP = MAX_CIPHERTEXT + 1024 * 1024
 PHASES = {"intent": ("Provider private preflight", "Upload encrypted intent"),
           "response": ("Provider private dispatch", "Upload encrypted response"),
           "completion": ("Provider private verify", "Upload encrypted completion")}
+
+
+def workflow_path():
+    ref = os.environ.get("GITHUB_WORKFLOW_REF", "")
+    paths = (WORKFLOW_PATH, REVIEWED_WORKFLOW_PATH)
+    matches = [path for path in paths if ref == f"{control.github.REPOSITORY}/{path}@{control.github.MAIN_REF}"]
+    control.require(len(matches) == 1)
+    return matches[0]
+
+
+def reviewed_head():
+    if workflow_path() != REVIEWED_WORKFLOW_PATH:
+        return None
+    spec = control.github._parse_object(os.environ.get("PROVIDER_HEAD_VALIDATION_JSON", ""), "Invalid reviewed Provider input.")
+    head = os.environ.get("PROVIDER_HEAD_REVIEWED_SHA", "")
+    refs = json.loads(os.environ.get("SUBS_BOT_PROVIDER_ARCHIVE_REFS", ""), object_pairs_hook=control.github._unique_json_object)
+    control.require(set(spec) == {"version", "pr", "headSha", "providerCiRunId", "approvalSha256", "archiveRefs", "simulateActionsUnavailable"}
+                    and type(spec["version"]) is int and spec["version"] == 1
+                    and control.match(control.provider.DECIMAL, spec["pr"])
+                    and control.match(control.provider.REVISION, head) and spec["headSha"] == head
+                    and os.environ.get("PROVIDER_HEAD_TRUSTED_MAIN_SHA") == os.environ.get("GITHUB_SHA")
+                    and spec["providerCiRunId"] == os.environ.get("SUBS_BOT_PROVIDER_CI_RUN_ID")
+                    and spec["approvalSha256"] == os.environ.get("SUBS_BOT_PROVIDER_CONTROL_APPROVAL")
+                    and spec["archiveRefs"] == refs and spec["simulateActionsUnavailable"] is True
+                    and os.environ.get("SUBS_BOT_PROVIDER_SIMULATE_ARTIFACT_UNAVAILABLE") == "1"
+                    and os.environ.get("SUBS_BOT_PROVIDER_DURABLE_REQUIRED") == "1"
+                    and os.environ.get("SUBS_BOT_PROVIDER_CONTROL_ENVIRONMENT") == "rehearsal"
+                    and os.environ.get("SUBS_BOT_PROVIDER_CONTROL_OPERATION") == "publish")
+    return head
 
 
 def context():
@@ -37,9 +67,10 @@ def context():
                     and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"
                     and os.environ.get("GITHUB_WORKFLOW_SHA") == revision
                     and os.environ.get("GITHUB_RUN_ATTEMPT") == "1"
-                    and os.environ.get("GITHUB_WORKFLOW_REF") == f"{control.github.REPOSITORY}/{WORKFLOW_PATH}@{control.github.MAIN_REF}"
                     and control.match(control.provider.REVISION, revision)
                     and control.match(control.provider.DECIMAL, os.environ.get("GITHUB_RUN_ID", "")))
+    workflow_path()
+    reviewed_head()
     control.github.require_current_main(revision)
 
 

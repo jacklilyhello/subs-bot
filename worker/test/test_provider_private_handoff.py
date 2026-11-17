@@ -39,6 +39,27 @@ def message():
 
 
 class OriginTests(unittest.TestCase):
+    def test_reviewed_wrapper_binds_both_shas_and_exact_input(self):
+        head = "c" * 40
+        refs = [{"kind": "complete", "runId": "7", "runAttempt": "1",
+                 "manifestSha256": "1" * 64, "targetSha256": "2" * 64}]
+        spec = {"version": 1, "pr": "290", "headSha": head, "providerCiRunId": "7",
+                "approvalSha256": "3" * 64, "archiveRefs": refs, "simulateActionsUnavailable": True}
+        env = {**environment(), "GITHUB_WORKFLOW_REF": f"{control.github.REPOSITORY}/{handoff.REVIEWED_WORKFLOW_PATH}@{control.github.MAIN_REF}",
+               "PROVIDER_HEAD_VALIDATION_JSON": json.dumps(spec), "PROVIDER_HEAD_REVIEWED_SHA": head,
+               "PROVIDER_HEAD_TRUSTED_MAIN_SHA": REVISION, "SUBS_BOT_PROVIDER_CI_RUN_ID": "7",
+               "SUBS_BOT_PROVIDER_CONTROL_APPROVAL": "3" * 64, "SUBS_BOT_PROVIDER_ARCHIVE_REFS": json.dumps(refs),
+               "SUBS_BOT_PROVIDER_SIMULATE_ARTIFACT_UNAVAILABLE": "1", "SUBS_BOT_PROVIDER_DURABLE_REQUIRED": "1",
+               "SUBS_BOT_PROVIDER_CONTROL_ENVIRONMENT": "rehearsal", "SUBS_BOT_PROVIDER_CONTROL_OPERATION": "publish"}
+        with patch.dict(os.environ, env, clear=True), patch.object(control.github, "require_current_main"):
+            handoff.context()
+            self.assertEqual(handoff.reviewed_head(), head)
+            for key, changed in (("PROVIDER_HEAD_REVIEWED_SHA", "d" * 40),
+                                 ("PROVIDER_HEAD_TRUSTED_MAIN_SHA", "d" * 40),
+                                 ("SUBS_BOT_PROVIDER_SIMULATE_ARTIFACT_UNAVAILABLE", "0")):
+                with self.subTest(key=key), patch.dict(os.environ, {key: changed}), self.assertRaises(control.ProviderError):
+                    handoff.context()
+
     def test_original_zip_hash_and_single_ciphertext_are_required(self):
         def bundle(extra=False):
             output = BytesIO()

@@ -11,10 +11,53 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import production_provider as control
 import production_provider_encrypted_publish as encrypted
+import production_provider_reviewed_head_harness as reviewed
 from test_production_provider import config
 
 
 class PrivatePublishTests(unittest.TestCase):
+    def test_reviewed_adapter_rejects_cross_job_action(self):
+        with patch.dict(os.environ, {"GITHUB_JOB": "verify_sources", "SUBS_BOT_PROVIDER_REVIEWED_ACTION": "persist-intent"}, clear=True), \
+                patch.object(reviewed.handoff, "context"), \
+                patch.object(reviewed.handoff, "workflow_path", return_value=reviewed.handoff.REVIEWED_WORKFLOW_PATH), \
+                patch.object(reviewed.publish, "persist_intent") as writer, self.assertRaises(control.ProviderError):
+            reviewed.run()
+        writer.assert_not_called()
+
+    def test_reviewed_source_path_checks_current_and_all_previous_before_output(self):
+        target = config(active=True)
+        events = []
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "output"
+            output.write_text("")
+            env = {"RUNNER_TEMP": temporary, "GITHUB_OUTPUT": str(output), "GITHUB_JOB": "verify_sources",
+                   "SUBS_BOT_PROVIDER_REVIEWED_ACTION": "verify-archived-chain"}
+            with patch.dict(os.environ, env, clear=True), patch.object(reviewed.handoff, "context"), \
+                    patch.object(reviewed.handoff, "workflow_path", return_value=reviewed.handoff.REVIEWED_WORKFLOW_PATH), \
+                    patch.object(reviewed.publish, "config", return_value=target), \
+                    patch.object(reviewed.durable, "restore", side_effect=lambda: events.append("restore")), \
+                    patch.object(control, "guard_sources", side_effect=lambda _target: events.append("guard")), \
+                    patch.object(control, "prepare_durable", side_effect=lambda _build: events.append("current")), \
+                    patch.object(control, "verify_previous_archives", side_effect=lambda _target, _root: events.append("previous")), \
+                    patch.object(reviewed.publish, "persist_intent") as writer:
+                reviewed.run()
+            self.assertEqual(events, ["restore", "guard", "current", "previous", "guard"])
+            self.assertEqual(output.read_text(), "target_sha256=" + control.digest(target) + "\n")
+            writer.assert_not_called()
+
+    def test_reviewed_source_failure_does_not_emit_attestation(self):
+        target = config(active=True)
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "output"
+            output.write_text("")
+            with patch.dict(os.environ, {"RUNNER_TEMP": temporary, "GITHUB_OUTPUT": str(output)}, clear=True), \
+                    patch.object(reviewed.publish, "config", return_value=target), patch.object(reviewed.durable, "restore"), \
+                    patch.object(control, "guard_sources"), patch.object(control, "prepare_durable"), \
+                    patch.object(control, "verify_previous_archives", side_effect=control.ProviderError("damaged source")), \
+                    self.assertRaises(control.ProviderError):
+                reviewed.verify_archived_chain()
+            self.assertEqual(output.read_text(), "")
+
     def test_new_candidate_reads_exact_previous_unbound_dependency(self):
         previous = config(active=True)
         target = config()

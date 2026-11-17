@@ -23,6 +23,15 @@ import test_prepare_provider_artifact as artifact_fixture
 
 
 class DurableSourceTests(unittest.TestCase):
+    def test_production_store_allows_only_source_records_and_digest_blobs(self):
+        store = durable.ProductionStore.__new__(durable.ProductionStore)
+        store.prefix = "maintenance/production-provider/101/1/"
+        for name in ("source-intent.json", "source-manifest.json", "blobs/" + "a" * 64):
+            self.assertEqual(store.key(name), store.prefix + name)
+        for name in ("../source-intent.json", "manifest.json", "blobs/../source-intent.json", "blobs/" + "g" * 64, None):
+            with self.subTest(name=name), self.assertRaises(control.ProviderError):
+                store.key(name)
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
