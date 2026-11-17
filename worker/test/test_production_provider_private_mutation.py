@@ -2,6 +2,7 @@
 
 from hashlib import sha256
 import os
+from copy import deepcopy
 from pathlib import Path
 import sys
 import tempfile
@@ -81,6 +82,44 @@ class ProviderPrivateMutationTests(unittest.TestCase):
         for change in ({"token": "synthetic"}, {"path": "/other"}, {"identities": {"versionId": "not-a-uuid"}}):
             with self.subTest(change=change), self.assertRaises(control.ProviderError):
                 mutation.checked_observation(target, "stage", {**value, **change})
+
+    def test_confirmed_plaintext_rejects_unknown_or_secret_fields(self):
+        target = config(active=True)
+        result = {"activation": target["activation"], "container": target["container"], "workflow": target["workflow"],
+                  "instance": None, "versionId": "11111111-1111-1111-1111-111111111111"}
+        self.assertEqual(mutation.checked_result(target, "stage", result), result)
+        for bad in ({**result, "token": "synthetic"}, {**result, "activation": {**result["activation"], "secret": "synthetic"}},
+                    {**result, "instance": {"status": "complete", "apiToken": "synthetic"}}):
+            with self.subTest(bad=bad), self.assertRaises(control.ProviderError):
+                mutation.checked_result(target, "stage", bad)
+        instance = {"params": control.smoke_params(target), "trigger": {"source": "api"},
+                    "versionId": target["workflow"]["versionId"], "start": target["workflow"]["createdOn"],
+                    "end": target["workflow"]["createdOn"], "success": True, "error": None, "status": "complete",
+                    "steps": [], "rollback": None, "step_count": 1,
+                    "output": {"ok": True, "stopped": True, "revision": target["build"]["revision"],
+                               "imageSha256": target["build"]["ociManifestSha256"],
+                               **{key: target["smoke"][key] for key in ("healthRevision", "healthSha256", "healthBytes")},
+                               "blockedPrivateTargets": 3, "rpcVerified": True}}
+        good = {**result, "instance": instance}
+        self.assertEqual(mutation.checked_result(target, "stage", good), good)
+        altered = deepcopy(good)
+        altered["instance"]["params"]["token"] = "synthetic"
+        with self.assertRaises(control.ProviderError):
+            mutation.checked_result(target, "stage", altered)
+
+    def test_unpreservable_previous_state_is_rejected_before_mutation(self):
+        previous = config(active=True)
+        target = deepcopy(previous)
+        target.update(previous=previous, versionId=None, activation=None, workflow=None)
+        state = {"activation": previous["activation"], "container": previous["container"], "workflow": previous["workflow"],
+                 "instance": {"status": "failed", "error": "untrusted remote detail"}}
+        api = Mock()
+        with patch.object(control, "ProviderAPI", return_value=api), patch.object(mutation, "deployment_history", return_value=[]), \
+                patch.object(control, "observe", return_value=state), patch.object(control, "unbound_upgrade") as guard, \
+                self.assertRaises(control.ProviderError):
+            mutation.observe(target, "stage", "fixture", "fixture")
+        guard.assert_not_called()
+        api.upload.assert_not_called()
 
     def test_deployment_inventory_rejects_duplicates_and_full_boundary(self):
         row = {"id": "11111111-1111-1111-1111-111111111111"}

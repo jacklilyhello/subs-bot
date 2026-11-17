@@ -32,14 +32,40 @@ class ReadOnlyAPI(control.ProviderAPI):
 def validate_pin(pin):
     keys = {"version", "originalRunId", "intentSha256", "observationSha256", "observationPlaintextSha256",
             "targetSha256", "originalControllerRevision", "originalCandidateRevision", "reviewedPr", "operation", "readbackJobId"}
-    control.require(isinstance(pin, dict) and set(pin) == keys and type(pin["version"]) is int and pin["version"] == 1
+    extra = {"evidenceVersion", "keyedReceiptSha256", "keylessReadbackJobId", "keylessReceiptSha256"}
+    control.require(isinstance(pin, dict) and set(pin) in (keys, keys | extra) and type(pin["version"]) is int and pin["version"] == 1
                     and all(control.match(control.provider.DECIMAL, pin[k]) for k in ("originalRunId", "readbackJobId"))
                     and all(control.match(control.provider.REVISION, pin[k]) for k in ("originalControllerRevision", "originalCandidateRevision"))
                     and transfer.valid_review_identity(pin["reviewedPr"], pin["originalCandidateRevision"], pin["originalControllerRevision"])
                     and all(control.match(control.provider.HEX, pin[k]) for k in
                             ("intentSha256", "observationSha256", "observationPlaintextSha256", "targetSha256"))
+                    and (set(pin) == keys or (type(pin["evidenceVersion"]) is int and pin["evidenceVersion"] == 2
+                         and control.match(control.provider.DECIMAL, pin["keylessReadbackJobId"])
+                         and all(control.match(control.provider.HEX, pin[k]) for k in ("keyedReceiptSha256", "keylessReceiptSha256"))))
                     and pin["operation"] in {"stage", "activate"})
     return pin
+
+
+def verify_failure_keyless(reader, keys, intent, pin):
+    """A v2 failure cannot be reconciled until both independent readers succeeded."""
+    # Any new-format object makes this a v2 prefix: a missing target or
+    # plaintext must not silently downgrade it to legacy evidence.
+    version_two = bool(keys & journal.FAILURE_ORIGINALS)
+    control.require(version_two == (pin.get("evidenceVersion") == 2))
+    if not version_two:
+        return
+    control.require({"failure-target.json", "failure-observation-plaintext.json",
+                     "failure-observation.age", "failure-observation.json"} <= keys)
+    names = keys & ({"failure-observation.age", "failure-observation.json", "failure-confirmed.age"} | journal.FAILURE_ORIGINALS)
+    files = {name: reader.read(name) for name in names}
+    control.require(all(isinstance(raw, bytes) and 0 < len(raw) <= 512 * 1024 for raw in files.values()))
+    keyed = journal.failure_keyed_projection(pin["originalRunId"], intent, files, pin["readbackJobId"])
+    control.require(control.digest(keyed) == pin["keyedReceiptSha256"])
+    keyless = journal.failure_keyless_projection(pin["originalRunId"], intent, pin["readbackJobId"],
+                                                  pin["keyedReceiptSha256"], pin["keylessReadbackJobId"])
+    control.require(control.digest(keyless) == pin["keylessReceiptSha256"])
+    digest_journal.workflow_job(pin["originalRunId"], pin["originalControllerRevision"],
+                                journal.JOBS["failure-keyless-readback"], job_id=pin["keylessReadbackJobId"])
 
 
 def protected_pin():
@@ -120,6 +146,7 @@ def original_evidence(target, pin, *, expected_resolution_id=None):
     control.require(all(isinstance(raw, bytes) and sha256(raw).hexdigest() == pin[key] for raw, key in
                         ((raw_intent, "intentSha256"), (cipher, "observationSha256"), (raw_observation, "observationPlaintextSha256"))))
     intent, original = (control.github._parse_object(raw, control.ERROR) for raw in (raw_intent, raw_observation))
+    verify_failure_keyless(reader, keys, intent, pin)
     control.require(raw_intent == control.canonical(intent) and raw_observation == control.canonical(original)
                     and intent.get("runId") == run_id and intent.get("runAttempt") == "1"
                     and intent.get("controllerRevision") == pin["originalControllerRevision"]
@@ -296,7 +323,7 @@ def resolution_projection(pin, raw_sha, run_id, revision, candidate, reviewed_pr
             "readbackJobId": readback_job_id, "originalRunConclusion": "not-success"}
 
 
-def verify_reconciled(reader, original_id, record, allowed):
+def verify_reconciled(reader, original_id, record, allowed, keys):
     """Recheck immutable resolution, original failure evidence, and independent run."""
     fields = {"pin", "resolutionSha256", "reconcileRunId", "controllerRevision", "candidateRevision", "reviewedPr",
               "readbackJobId", "readbackSha256", "nextTargetSha256"}
@@ -314,6 +341,7 @@ def verify_reconciled(reader, original_id, record, allowed):
                         ((intent_raw, pin["intentSha256"]), (obs_cipher, pin["observationSha256"]),
                          (obs_raw, pin["observationPlaintextSha256"]), (raw, record["resolutionSha256"]))))
     intent, original, resolved = (control.github._parse_object(value, control.ERROR) for value in (intent_raw, obs_raw, raw))
+    verify_failure_keyless(prior, keys, intent, pin)
     control.require(all(raw_value == control.canonical(value) for raw_value, value in ((intent_raw, intent), (obs_raw, original), (raw, resolved)))
                     and set(resolved) == {"version", "kind", "plan", "pin", "approvalSha256", "runId", "runAttempt", "controllerRevision",
                                           "candidateRevision", "reviewedPr", "archivePayloadSha256", "livePayloadSha256", "status"}

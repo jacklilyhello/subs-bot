@@ -49,6 +49,68 @@ def checked_observation(target, operation, value):
     return value
 
 
+def checked_result(target, operation, result):
+    """Reject unknown or secret-shaped fields before encrypting a confirmed result."""
+    target = control.validate_config(target)
+    fields = {"activation", "container", "workflow", "instance"}
+    if operation == "stage":
+        fields.add("versionId")
+    elif operation == "prepare-image":
+        fields.add("imagePrepared")
+    control.require(operation in OPERATIONS and isinstance(result, dict) and set(result) == fields)
+    if operation == "stage":
+        control.require(control.match(control.stage.VERSION_ID, result["versionId"]))
+    if operation == "prepare-image":
+        control.require(result["imagePrepared"] is True)
+    checked_state(target, {key: result[key] for key in ("activation", "container", "workflow", "instance")})
+    rehearsal.confirmed_target(target, operation, result)
+    return result
+
+
+def checked_state(target, result):
+    """Reject state that cannot be preserved safely before starting a mutation."""
+    control.require(isinstance(result, dict) and set(result) == {"activation", "container", "workflow", "instance"})
+    active = control.pin(result["activation"], {"deploymentId", "namespaceId"},
+                         (("deploymentId", control.stage.VERSION_ID), ("namespaceId", control.publication.ACCOUNT)))
+    container = control.pin(result["container"], {"applicationId", "createdAt"}, (("applicationId", control.publication.ACCOUNT),))
+    workflow = control.pin(result["workflow"], {"workflowId", "createdOn", "versionId"},
+                           (("workflowId", control.stage.VERSION_ID), ("versionId", control.stage.VERSION_ID)))
+    if container is not None:
+        control.bootstrap._timestamp(container["createdAt"])
+        control.require(active is not None and container["applicationId"] == active["namespaceId"])
+    if workflow is not None:
+        control.bootstrap._timestamp(workflow["createdOn"])
+        control.require(container is not None)
+    instance = result["instance"]
+    if instance is not None:
+        required = {"params", "trigger", "versionId", "start", "end", "success", "error", "output", "status"}
+        optional = {"queued", "schedule", "steps", "rollback", "step_count"}
+        control.require(isinstance(instance, dict) and required <= set(instance) <= required | optional
+                        and instance["status"] == "complete" and instance["success"] is True
+                        and instance["error"] in (None, {}) and instance["trigger"] == {"source": "api"}
+                        and instance.get("schedule") is None and instance.get("steps", []) == []
+                        and instance.get("rollback") is None and ("step_count" not in instance or
+                             (type(instance["step_count"]) is int and 0 <= instance["step_count"] <= 1000)))
+        for key in ("start", "end", "queued"):
+            if key in instance:
+                control.bootstrap._timestamp(instance[key])
+        releases = [row for row in control.releases(target) if instance["params"] == control.smoke_params(row)]
+        control.require(len(releases) == 1 and workflow is not None and instance["versionId"] == workflow["versionId"])
+        source = releases[0]
+        output = instance["output"]
+        if isinstance(output, str):
+            control.require(len(output) <= 2048)
+            output = control.github._parse_object(output, control.ERROR)
+        control.require(isinstance(output, dict) and output.get("ok") is True and output.get("stopped") is True
+                        and output.get("rpcVerified") is True and type(output.get("blockedPrivateTargets")) is int
+                        and type(output.get("healthBytes")) is int
+                        and output == {"ok": True, "stopped": True, "revision": source["build"]["revision"],
+                        "imageSha256": source["build"]["ociManifestSha256"], "healthRevision": source["smoke"]["healthRevision"],
+                        "healthSha256": source["smoke"]["healthSha256"], "healthBytes": source["smoke"]["healthBytes"],
+                        "blockedPrivateTargets": 3, "rpcVerified": True})
+    return result
+
+
 def intent(target, refs, operation, state, run_id, revision):
     preparation = os.environ.get("SUBS_BOT_PROVIDER_IMAGE_PREPARATION_SHA256", "") if operation == "stage" else None
     control.require(operation in OPERATIONS and isinstance(state, dict)
@@ -78,6 +140,7 @@ def observe(target, operation, worker_token, container_token):
     api = control.ProviderAPI(target, worker_token, container_token)
     deployments = deployment_history(api)
     first = control.observe(api)
+    checked_state(target, first)
     if operation in {"prepare-image", "stage"}:
         control.require(target["versionId"] is None and target.get("previous") is not None)
         control.unbound_upgrade(api, first)
@@ -200,5 +263,6 @@ def dispatch(target, refs, operation, original, verified_intent_sha, archive, mo
             image = PreparedImage(target, container, scratch) if operation == "stage" else control.PublishedImage(target, container, scratch)
             result = control.run_operation(api, operation, module, image, guard)
     control.require(len(observations) == 1)
+    checked_result(target, operation, result)
     return write_encrypted("confirmed", {"intentSha256": verified_intent_sha, "target": target,
                                          "operation": operation, "observation": observations[0], "result": result})
