@@ -3,6 +3,7 @@
 import base64
 from copy import deepcopy
 from hashlib import sha256
+from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -10,7 +11,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
+from zipfile import ZipFile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import production_provider as control
@@ -288,6 +290,50 @@ class ProviderMutationJournalTests(unittest.TestCase):
                 self.assertRaises(control.ProviderError):
             journal.failure_evidence()
         reader.put_once.assert_called_once_with("failure-observation.age", b"authenticated cipher")
+
+    def test_failure_can_preserve_confirmed_artifact_from_failed_dispatch_without_promoting_success(self):
+        cipher = b"confirmed cipher"
+        buffer = BytesIO()
+        with ZipFile(buffer, "w") as archive:
+            archive.writestr("provider-mutation-confirmed.age", cipher)
+        zipped = buffer.getvalue()
+        run_id, revision, artifact_id = "101", "d" * 40, "400"
+        env = {"GITHUB_RUN_ID": run_id, "GITHUB_SHA": revision}
+        for prefix in ("SUBS_BOT_PROVIDER_MUTATION_RESPONSE", "SUBS_BOT_PROVIDER_MUTATION_TRUSTED"):
+            env[prefix + "_ARTIFACT_ID"] = artifact_id
+            env[prefix + "_ARTIFACT_SHA256"] = sha256(zipped).hexdigest()
+        env["SUBS_BOT_PROVIDER_MUTATION_RESPONSE_SHA256"] = env["SUBS_BOT_PROVIDER_MUTATION_TRUSTED_RESPONSE_SHA256"] = sha256(cipher).hexdigest()
+        repo = {"id": control.github.REPOSITORY_ID}
+        run = {"id": 101, "run_attempt": 1, "path": journal.WORKFLOW, "head_sha": revision, "head_branch": "main",
+               "event": "workflow_dispatch", "repository": repo, "head_repository": repo}
+        origin = {"id": 101, "head_branch": "main", "head_sha": revision, "repository_id": repo["id"], "head_repository_id": repo["id"]}
+        artifact = {"id": 400, "expired": False, "name": "provider-mutation-confirmed-101-1",
+                    "digest": "sha256:" + sha256(zipped).hexdigest(), "workflow_run": origin}
+        job = {"name": journal.JOBS["dispatch"], "run_id": 101, "run_attempt": 1, "head_sha": revision,
+               "status": "completed", "conclusion": "failure",
+               "steps": [{"name": "Upload encrypted confirmed response", "status": "completed", "conclusion": "success"}]}
+        response = Mock(status=200, headers={})
+        response.read.side_effect = [zipped, b""]
+        opener = MagicMock()
+        opener.open.return_value.__enter__.return_value = response
+        opener.open.return_value.__exit__.return_value = False
+        def get(path, _token):
+            if path.startswith("/actions/artifacts/"):
+                return artifact
+            if path.endswith("/jobs?per_page=100"):
+                return {"total_count": 1, "jobs": [job]}
+            return run
+        with patch.dict(os.environ, env, clear=True), patch.object(control.github, "_github_token", return_value="fixture"), \
+                patch.object(control.github, "_get_json", side_effect=get), \
+                patch.object(control.github, "artifact_storage_request", return_value=object()), \
+                patch.object(control.provenance, "STORAGE_OPENER", opener), \
+                patch.object(journal.digest_journal, "workflow_job", side_effect=control.ProviderError("failed dispatch")):
+            with self.assertRaises(control.ProviderError):
+                journal.download_response()
+            self.assertEqual(journal.download_response(allow_failed=True), cipher)
+            job["steps"][0]["conclusion"] = "failure"
+            with self.assertRaises(control.ProviderError):
+                journal.download_response(allow_failed=True)
 
     def test_readonly_resolution_requires_every_writing_job_skipped_and_empty_prefix(self):
         revision, run_id = "d" * 40, "101"

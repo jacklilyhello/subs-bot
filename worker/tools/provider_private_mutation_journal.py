@@ -396,7 +396,7 @@ def dispatch():
     digest_journal.output("response_sha256", result)
 
 
-def download_response(*, observation=False):
+def download_response(*, observation=False, allow_failed=False):
     prefix = "SUBS_BOT_PROVIDER_MUTATION_OBSERVATION" if observation else "SUBS_BOT_PROVIDER_MUTATION_RESPONSE"
     trusted = "SUBS_BOT_PROVIDER_MUTATION_TRUSTED_OBSERVATION" if observation else "SUBS_BOT_PROVIDER_MUTATION_TRUSTED"
     artifact_id = os.environ.get(prefix + "_ARTIFACT_ID", "")
@@ -420,14 +420,14 @@ def download_response(*, observation=False):
                     and run.get("head_sha") == revision and run.get("head_branch") == "main" and run.get("event") == "workflow_dispatch"
                     and all(isinstance(run.get(k), dict) and run[k].get("id") == control.github.REPOSITORY_ID
                             for k in ("repository", "head_repository")))
-    if not observation:
+    if not observation and not allow_failed:
         digest_journal.workflow_job(run_id, revision, JOBS["dispatch"])
     listing = control.github._get_json(f"/actions/runs/{run_id}/attempts/1/jobs?per_page=100", token)
     jobs = listing.get("jobs")
     control.require(isinstance(jobs, list) and listing.get("total_count") == len(jobs) < 100)
     matched = [job for job in jobs if isinstance(job, dict) and job.get("name") == JOBS["dispatch"]]
     control.require(len(matched) == 1 and isinstance(matched[0].get("steps"), list))
-    if observation:
+    if observation or allow_failed:
         job = matched[0]
         control.require(str(job.get("run_id")) == run_id and job.get("run_attempt") == 1 and job.get("head_sha") == revision
                         and job.get("status") == "completed"
@@ -912,7 +912,7 @@ def failure_evidence(*, readback=False):
         for name, body in core.items():
             if name != "failure-observation.age":
                 reader.put_once(name, body)
-    confirmed = download_response() if os.environ.get("SUBS_BOT_PROVIDER_MUTATION_RESPONSE_ARTIFACT_ID", "") else None
+    confirmed = download_response(allow_failed=True) if os.environ.get("SUBS_BOT_PROVIDER_MUTATION_RESPONSE_ARTIFACT_ID", "") else None
     if not readback:
         if confirmed is not None:
             # Preserve ciphertext before parsing: an unexpected secret-shaped
