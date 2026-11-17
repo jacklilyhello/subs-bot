@@ -597,9 +597,10 @@ jobs:
   failure_write:
     name: Provider mutation failure evidence archive
     needs: [preflight, intent_readback, dispatch, verify, completion_write, evidence_readback]
-    # Default off. An explicit isolated-environment policy must enable writes;
-    # Any unconfirmed Worker or image-preparation result leaves its intent unresolved.
-    if: ${{ always() && vars.SUBS_BOT_PROVIDER_OPERATION_WRITE_ENABLED == 'true' && needs.evidence_readback.result != 'success' && needs.dispatch.outputs.observation_artifact_id != '' && needs.dispatch.outputs.observation_sha256 != '' }}
+    # Persist response-only failure evidence under the already committed intent,
+    # even if the operator has since closed the dispatch switch. The failed
+    # operation remains unknown and this never authorizes another mutation.
+    if: ${{ always() && needs.intent_readback.result == 'success' && needs.evidence_readback.result != 'success' && needs.dispatch.outputs.observation_artifact_id != '' && needs.dispatch.outputs.observation_sha256 != '' }}
     environment: subs-bot-provider-archive-head-isolation
     runs-on: ubuntu-24.04
     timeout-minutes: 30

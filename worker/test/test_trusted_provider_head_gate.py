@@ -231,6 +231,15 @@ class TrustedProviderGateTests(unittest.TestCase):
         self.assertNotIn("SUBS_BOT_SCOPED_R2_WRITE_JSON", section)
         self.assertIn("Preserve encrypted response-only observation", section)
         self.assertIn("if: always()", section)
+        failure = workflow.split("\n  failure_write:\n", 1)[1].split("\n  failure_readback:\n", 1)[0]
+        self.assertIn("needs.intent_readback.result == 'success'", failure)
+        self.assertIn("needs.dispatch.outputs.observation_artifact_id != ''", failure)
+        self.assertNotIn("vars.SUBS_BOT_PROVIDER_OPERATION_WRITE_ENABLED", failure)
+        failure_readback = workflow.split("\n  failure_readback:\n", 1)[1]
+        self.assertIn("needs.failure_write.result == 'success'", failure_readback)
+        self.assertNotIn("vars.SUBS_BOT_PROVIDER_OPERATION_WRITE_ENABLED", failure_readback)
+        self.assertIn("SUBS_BOT_SCOPED_R2_READ_JSON", failure_readback)
+        self.assertNotIn("SUBS_BOT_SCOPED_R2_WRITE_JSON", failure_readback)
         self.assertIn("needs.evidence_readback.result != 'success'", workflow)
         self.assertIn("SUBS_BOT_PROVIDER_MUTATION_ACTION: failure-readback", workflow)
         self.assertIn("SUBS_BOT_PROVIDER_MUTATION_RESOLUTIONS_JSON", workflow)
