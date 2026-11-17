@@ -38,6 +38,18 @@ def github(path, _token):
 
 
 class HeadGuardTests(unittest.TestCase):
+    def test_watchdog_can_observe_paused_drain_or_confirmed_open_without_opening_other_actions(self):
+        for admission, workers, work in (("closed", "run", {"accepted": 1}), ("open", "run", {}), ("closed", "frozen", {})):
+            state = {"control": {"admission": admission, "workers": workers}, "work": work, "terminal": {}}
+            harness.allowed_initial_state("watchdog", state)
+            if (admission, workers) != ("closed", "frozen"):
+                with self.assertRaises(ContractError):
+                    harness.allowed_initial_state("backup", state)
+        for state in ({"control": {"admission": "open", "workers": "frozen"}, "work": {}, "terminal": {}},
+                      {"control": {"admission": "closed", "workers": "run"}, "work": {}, "terminal": {"terminalEditFailure": 1}}):
+            with self.assertRaises(ContractError):
+                harness.allowed_initial_state("watchdog", state)
+
     def test_public_result_does_not_expose_private_state_or_configuration(self):
         result = {"status": "passed", "headRevision": HEAD, "targetSha256": "c" * 64,
                   "state": {"control": {"bot_id": "synthetic-private-id"}},

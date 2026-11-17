@@ -127,6 +127,20 @@ def verified_head(env):
     return head, pull["head"]["ref"]
 
 
+def allowed_initial_state(action, current):
+    control = current["control"]
+    if action == "watchdog":
+        require((control["admission"], control["workers"]) in {("open", "run"), ("closed", "run"), ("closed", "frozen")},
+                "The maintenance watchdog cannot inspect an unsupported control state.")
+    else:
+        require(control["admission"] == "closed" and control["workers"] == "frozen"
+                and not any(current["work"].values()),
+                "The head harness requires the independently verified closed and frozen rehearsal.")
+    require(not any(current["terminal"].get(key, 0) for key in
+                    ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates")),
+            "Unconfirmed external results prevent this maintenance operation.")
+
+
 def setup(env):
     head, branch = verified_head(env)
     require(re.fullmatch(r"[0-9a-f]{32}", env.get("DRILL_BACKUP_SOURCE_CHECKPOINT_ID", ""))
@@ -141,11 +155,7 @@ def setup(env):
     ctl = tool.bind(target, bundle, manifest)
     require(target.environment == "rehearsal" and target.data["workerName"] == SERVICE)
     current = ctl.inspect()
-    require(current["control"]["admission"] == "closed" and current["control"]["workers"] == "frozen"
-            and not any(current["work"].values())
-            and not any(current["terminal"].get(key, 0) for key in
-                        ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates")),
-            "The head harness only operates on the independently verified closed and frozen rehearsal.")
+    allowed_initial_state(env.get("HEAD_VALIDATION_ACTION", ""), current)
     require(current["release"]["revision"] == manifest["revision"]
             and current["release"]["moduleSha256"] == manifest["bundleSha256"])
     return tool, ctl, current
