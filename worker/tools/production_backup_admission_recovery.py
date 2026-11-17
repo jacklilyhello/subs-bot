@@ -32,6 +32,8 @@ def list_history(store, target_sha, *, prefix=None):
     require(re.fullmatch(r"[0-9a-f]{64}", target_sha or "") is not None)
     prefix = prefix or "maintenance/production-control/evidence/daily-backup-anchor/" + target_sha + "/"
     store.verify()
+    if store.objects is not None:
+        return store.objects.list(prefix, maximum=10000)
     try:
         token = store.api("GET", store.api.root + "/tokens/verify")
     except Exception as error:
