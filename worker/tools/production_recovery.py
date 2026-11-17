@@ -37,6 +37,8 @@ SCRIPT = re.compile(r"[a-zA-Z0-9_][a-zA-Z0-9_-]{0,62}")
 CHECKPOINT = re.compile(r"[a-f0-9]{32}")
 MAX_CONSUMERS = 1000
 MAX_ENVIRONMENTS = 32
+ACTIONS = {"inspect", "prepare", "prepare-restore", "create-database", "create-objects", "pin-resource", "capture",
+           "poll-export", "restore-objects", "start-import", "verify-backup", "verify-restore"}
 LIMITS = {"sqlBytes": native.SQL_BYTES, "rows": native.MAX_ROWS,
           "referencedObjects": native.MAX_OBJECTS, "objectBytes": native.OBJECT_BYTES,
           "totalObjectBytes": native.TOTAL_OBJECT_BYTES, "manifestBytes": native.MANIFEST_BYTES,
@@ -699,6 +701,11 @@ class RecoveryEngine(native.Rehearsal):
             self.api.consumer_proof()
             self._consumer_checked = True
 
+    def create(self, kind):
+        if self.journal.value.get("backup") is not None:
+            self.verify_preservation()
+        return super().create(kind)
+
     def verify_preservation(self):
         self.source.before_write()
         if self.api.contract["purpose"] == "recovery":
@@ -709,6 +716,12 @@ class RecoveryEngine(native.Rehearsal):
             document, _ = self.manifest()
             require(native.remote_summary(self.api, self.api.target["d1Id"], document["layout"]) == document["summary"],
                     "The current source differs from this baseline; seal G1 before recovery.")
+            for entry in document["objects"]:
+                body, _ = self.api.object_or_none(self.api.target["bucketName"], entry["key"])
+                require(body is not None and len(body) == entry["bytes"] and digest(body) == entry["sha256"]
+                        and self.object_metadata(self.api.target["bucketName"], entry["key"], len(body)) == entry["metadata"],
+                        "A current source object differs from this baseline; preserve the incident before recovery.")
+            self.source.before_write()
 
     def restore_objects(self):
         self.verify_resources(all_required=True)
@@ -772,8 +785,7 @@ class RecoveryEngine(native.Rehearsal):
 
 def run_action(action, engine, *, resource=None, identity_sha256=None):
     """Called by the protected production control workflow after its target gate."""
-    require(action in {"inspect", "prepare", "prepare-restore", "create-database", "create-objects", "pin-resource", "capture",
-                       "poll-export", "restore-objects", "start-import", "verify-backup", "verify-restore"})
+    require(action in ACTIONS)
     source, api, journal = engine.source, engine.api, engine.journal
     capture = action in {"prepare", "capture", "poll-export"}
     pin = source.verify(capture=capture)
