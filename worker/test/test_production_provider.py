@@ -50,6 +50,13 @@ def worker_profile(value):
 
 
 class TargetTests(unittest.TestCase):
+    def test_read_endpoint_family_is_fixed_and_never_contains_resource_path(self):
+        for path, container, expected in (("/workers/workers/private-id/versions?page=1", False, "worker-versions"),
+                                           ("/workers/durable_objects/namespaces?page=1", False, "namespace-inventory"),
+                                           ("/workflows/private-name", False, "workflow"),
+                                           ("/containers/applications/private-id", True, "container-detail")):
+            self.assertEqual(control.read_endpoint_family(path, container=container), expected)
+
     def test_production_and_rehearsal_are_separate(self):
         value = config()
         self.assertEqual(control.validate_config(value), value)

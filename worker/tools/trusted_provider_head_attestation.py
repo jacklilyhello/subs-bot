@@ -37,6 +37,9 @@ def diagnosed(phase, action, *, index=None):
         diagnostic = getattr(error, "read_diagnostic", None)
         status = diagnostic.get("httpStatus") if isinstance(diagnostic, dict) else getattr(error, "http_status", None)
         report = {**label, "status": "rejected", "category": category}
+        family = getattr(error, "read_endpoint_family", None)
+        if isinstance(family, str) and family in provider.READ_ENDPOINT_FAMILIES:
+            report["endpointFamily"] = family
         if type(status) is int and 100 <= status <= 599:
             report["httpStatus"] = status
         codes = diagnostic.get("cloudflareCodes") if isinstance(diagnostic, dict) else None
