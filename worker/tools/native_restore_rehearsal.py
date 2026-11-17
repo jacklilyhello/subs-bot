@@ -1028,13 +1028,16 @@ def open_export(path, source, *, scratch=None):
         raise RehearsalError("Private native export validation failed.") from None
 
 
-def object_references(db, read_object, save_object=lambda _key, _hash, _raw: None):
+def object_references(db, read_object, save_object=lambda _key, _hash, _raw: None, *, observe_reference=lambda _count: None):
     result = []
     seen = set()
     total = 0
 
     def add(key, expected_hash, expected_size=None, maximum=OBJECT_BYTES, custom=None):
         nonlocal total
+        # Observation cannot relax any recovery bound. It permits a read-only
+        # inventory to classify the first reference beyond the hard limit.
+        observe_reference(len(result) + 1)
         require(matches(KEY, key) and matches(DIGEST, expected_hash) and key not in seen and len(result) < MAX_OBJECTS)
         raw, metadata = read_object(key)
         require(isinstance(raw, bytes) and 0 < len(raw) <= maximum and digest(raw) == expected_hash

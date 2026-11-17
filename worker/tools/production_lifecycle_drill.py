@@ -36,6 +36,9 @@ SERVICE, BACKUP, HOSTNAME = NAMES["rehearsal"]
 ORIGIN = "https://" + HOSTNAME
 REPORT = "production-lifecycle-drill-result.json"
 FINAL_REPORT = "production-lifecycle-drill-final.json"
+# The coordination and recovery path is intentionally disabled until its
+# hosted fault tests, independent review and R2 pagination readback pass.
+BACKUP_ORCHESTRATION_ENABLED = False
 
 
 def checked_http_result(value, source):
@@ -95,6 +98,111 @@ def approval(target, action, revision, predecessor):
         "configurationSha256": target.configuration_digest, "controlRevision": os.environ.get("GITHUB_SHA", revision),
         "revision": revision, "action": action, "stateSha256": predecessor,
         "authorization": "approve " + action + " for " + SERVICE}
+
+
+def _verify_resume_dependencies(ctl):
+    require(ctl.telegram is not None)
+    ctl.verify_dependency()
+    ctl.telegram.identity()
+    ctl.telegram.group_permissions()
+    webhook = ctl.telegram.call("getWebhookInfo")
+    ctl.telegram.webhook_info(webhook)
+    require(webhook.get("url") == "https://" + ctl.target.data["hostname"] + "/telegram/webhook"
+            and webhook.get("max_connections") == ctl.target.data["webhook"]["maxConnections"]
+            and set(webhook.get("allowed_updates", [])) == set(ctl.target.data["webhook"]["allowedUpdates"])
+            and webhook.get("has_custom_certificate") is False)
+    ctl.verify_domain()
+
+
+def resume_failed_backup(ctl, api, source, recovery_journal, *, initial, frozen, fingerprint, session, record_intent):
+    """Single-use rehearsal continuation, not a general activation or retry."""
+    from general_isolation_window import work_sql
+    import production_backup_capacity as capacity
+    from production_control import CONTROL, INVOCATIONS, _mutate_sql
+
+    require(ctl.target.environment == "rehearsal" and ctl.target.data["workerName"] == SERVICE)
+    require(initial.get("control", {}).get("admission") == "open" and initial["control"].get("workers") == "run")
+
+    def checked():
+        recovery_journal.load()
+        state = recovery_journal.value
+        require(isinstance(state, dict), "The recovery journal is missing; export state is unknown.")
+        export = state.get("export")
+        require(isinstance(export, dict) and export.get("state") in {"download-ready", "sql-archived", "complete"},
+                "Native export is not independently confirmed stopped; preserve the checkpoint and keep admission closed.")
+        current = ctl.inspect()
+        require(current["control"] == frozen and current["release"] == initial.get("release")
+                and current["configurationSha256"] == initial.get("configurationSha256")
+                and not any(current["work"].values())
+                and not any(current["terminal"].get(key, 0) for key in
+                            ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates")),
+                "The exact frozen predecessor or external-result state changed.")
+        require(capacity.frozen_fingerprint(api, source) == fingerprint,
+                "The complete frozen data or referenced object closure changed.")
+        return current
+
+    before = checked()
+    _verify_resume_dependencies(ctl)
+    scope = digest({"session": session, "frozen": frozen, "fingerprint": fingerprint})
+    action = "maintenance-resume:" + scope
+    ctl.approval(approval(ctl.target, action, ctl.revision, before["stateSha256"]), action, before["stateSha256"])
+    record_intent(before["stateSha256"], action)
+    current = checked()
+    require(current["stateSha256"] == before["stateSha256"], "The resume predecessor changed after its intent.")
+    control = current["control"]
+    predicate = " AND ".join(f"{key} IS {migrations._literal(value) if isinstance(value, str) else value}" for key, value in control.items())
+    quiet, fields = work_sql(ctl.target.data["botId"])
+    bot = migrations._literal(ctl.target.data["botId"])
+    conditions = [f"EXISTS(SELECT 1 FROM {CONTROL} WHERE {predicate})",
+                  "EXISTS(SELECT 1 FROM (" + quiet + ") WHERE " + " AND ".join(f"{field}=0" for field in fields) + ")",
+                  f"NOT EXISTS(SELECT 1 FROM {INVOCATIONS} WHERE state='uncertain' OR state='running')",
+                  "NOT EXISTS(SELECT 1 FROM subs_bot_production_updates WHERE state IN ('processing','uncertain'))",
+                  f"NOT EXISTS(SELECT 1 FROM telegram_outbox JOIN telegram_inbox USING(receipt_id) WHERE bot_id={bot} AND state='uncertain')",
+                  f"NOT EXISTS(SELECT 1 FROM telegram_group_share_cards JOIN telegram_private_share_creations USING(receipt_id) WHERE bot_id={bot} AND telegram_group_share_cards.state='uncertain')"]
+    ctl.guard()
+    _mutate_sql(ctl.data, ctl.database, [migrations._assert_sql(" AND ".join(conditions)),
+        f"UPDATE {CONTROL} SET admission='open',workers='run',epoch=epoch+1 WHERE singleton=1"])
+    after = ctl.inspect()
+    require(after["control"]["epoch"] == control["epoch"] + 1 and after["control"]["admission"] == "open"
+            and after["control"]["workers"] == "run", "Maintenance resume needs independent reconciliation.")
+    return after
+
+
+def resume_aborted_drain(ctl, *, initial, paused, session, record_intent):
+    """Resume a confirmed pause before any freeze/export was attempted."""
+    from general_isolation_window import work_sql
+    from production_control import CONTROL, INVOCATIONS, _mutate_sql
+    require(ctl.target.environment == "rehearsal" and ctl.target.data["workerName"] == SERVICE
+            and initial.get("control", {}).get("admission") == "open" and initial["control"].get("workers") == "run"
+            and paused.get("admission") == "closed" and paused.get("workers") == "run")
+    before = ctl.inspect()
+    require(before["control"] == paused and before["release"] == initial.get("release")
+            and before["configurationSha256"] == initial.get("configurationSha256")
+            and not any(before["work"].values())
+            and not any(before["terminal"].get(key, 0) for key in
+                        ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates")))
+    _verify_resume_dependencies(ctl)
+    action = "maintenance-resume-drain:" + digest({"session": session, "paused": paused})
+    ctl.approval(approval(ctl.target, action, ctl.revision, before["stateSha256"]), action, before["stateSha256"])
+    record_intent(before["stateSha256"], action)
+    current = ctl.inspect()
+    require(current["stateSha256"] == before["stateSha256"])
+    predicate = " AND ".join(f"{key} IS {migrations._literal(value) if isinstance(value, str) else value}" for key, value in paused.items())
+    quiet, fields = work_sql(ctl.target.data["botId"])
+    bot = migrations._literal(ctl.target.data["botId"])
+    conditions = [f"EXISTS(SELECT 1 FROM {CONTROL} WHERE {predicate})",
+                  "EXISTS(SELECT 1 FROM (" + quiet + ") WHERE " + " AND ".join(f"{field}=0" for field in fields) + ")",
+                  f"NOT EXISTS(SELECT 1 FROM {INVOCATIONS} WHERE state IN ('running','uncertain'))",
+                  "NOT EXISTS(SELECT 1 FROM subs_bot_production_updates WHERE state IN ('processing','uncertain'))",
+                  f"NOT EXISTS(SELECT 1 FROM telegram_outbox JOIN telegram_inbox USING(receipt_id) WHERE bot_id={bot} AND state='uncertain')",
+                  f"NOT EXISTS(SELECT 1 FROM telegram_group_share_cards JOIN telegram_private_share_creations USING(receipt_id) WHERE bot_id={bot} AND telegram_group_share_cards.state='uncertain')"]
+    ctl.guard()
+    _mutate_sql(ctl.data, ctl.database, [migrations._assert_sql(" AND ".join(conditions)),
+        f"UPDATE {CONTROL} SET admission='open',workers='run',epoch=epoch+1 WHERE singleton=1"])
+    after = ctl.inspect()
+    require(after["control"]["epoch"] == paused["epoch"] + 1 and after["control"]["admission"] == "open"
+            and after["control"]["workers"] == "run")
+    return after
 
 
 def webhook_settings(info):
@@ -489,6 +597,10 @@ class Drill:
             sleep(2)
 
     def code_archive(self):
+        if getattr(self, "archived_code", None) is not None:
+            proof, archive = self.archived_code
+            require(sha256(archive).hexdigest() == proof["archiveSha256"])
+            return proof, archive
         proof = {key: str(self.proof[key]) for key in ("revision", "runId", "runAttempt", "artifactId", "archiveSha256")}
         token = artifact._github_token()
         expected = (proof["runAttempt"], proof["artifactId"], proof["archiveSha256"])
@@ -499,7 +611,28 @@ class Drill:
                 "The frozen source CI ZIP changed or its digest did not verify.")
         return proof, archive
 
-    def activation_baseline(self, *, stage_prefix="activation-baseline"):
+    def prepare_maintenance(self):
+        """Load the exact active application release from CI or a pinned private checkpoint."""
+        checkpoint = self.env.get("DRILL_BACKUP_SOURCE_CHECKPOINT_ID", "")
+        manifest_sha = self.env.get("DRILL_BACKUP_SOURCE_MANIFEST_SHA256", "")
+        require(bool(checkpoint) == bool(manifest_sha), "Both private source checkpoint pins are required.")
+        target = self.registration()
+        if not checkpoint:
+            bundle, manifest = self.prepare(active=True)
+            return target, bundle, manifest
+        from production_release_evidence import load_release
+        self.maintenance_source_dir = tempfile.TemporaryDirectory(prefix="daily-backup-source-", dir=self.env["RUNNER_TEMP"])
+        archived = load_release(target, self.env["SUBS_BOT_CF_BOOTSTRAP_TOKEN"], checkpoint, manifest_sha,
+                                Path(self.maintenance_source_dir.name))
+        require(archived["sourceTarget"].configuration_digest == target.configuration_digest,
+                "The privately archived source configuration differs from the registered target.")
+        self.proof = {key: str(archived["proof"][key]) for key in ("revision", "runId", "runAttempt", "artifactId", "archiveSha256")}
+        self.archived_code = (self.proof, archived["body"])
+        self.report.update(releaseRevision=archived["manifest"]["revision"], releaseSourceBackend="private-r2")
+        return target, archived["bundle"], archived["manifest"]
+
+    def activation_baseline(self, *, stage_prefix="activation-baseline", checkpoint_id=None, preloaded_code=None,
+                            simulate_readback_failure=False):
         import production_recovery as recovery
         from production_release_evidence import verify_activation_baseline
         require(stage_prefix in ("activation-baseline", "latest-off-baseline"), "Unknown baseline evidence stage.")
@@ -521,8 +654,9 @@ class Drill:
         if self.baseline_checkpoint:
             checkpoint, manifest_sha = self.baseline_checkpoint, self.baseline_manifest_sha
         else:
-            proof, archive = self.code_archive()
-            checkpoint = token_hex(16)
+            proof, archive = preloaded_code if preloaded_code is not None else self.code_archive()
+            checkpoint = checkpoint_id or token_hex(16)
+            require(matches(r"[0-9a-f]{32}", checkpoint))
             require(not latest_off or checkpoint != self.report["onActivationBaseline"]["checkpointId"],
                     "The latest off snapshot must use a distinct checkpoint.")
             name = "subs-bot-cf-restore-control-" + checkpoint[:16]
@@ -541,6 +675,9 @@ class Drill:
                 manifest_sha = result["backup"]["manifestSha256"]
             finally:
                 journal.release()
+        require(not simulate_readback_failure or ctl.target.environment == "rehearsal")
+        if simulate_readback_failure:
+            raise ContractError("Synthetic independent backup readback failure; preserve this checkpoint.")
         ctl.activation_baseline_checker = lambda: verify_activation_baseline(ctl, data_token, checkpoint, manifest_sha)
         verified = ctl.activation_baseline_checker()
         require(isinstance(verified, dict) and verified.get("baselineVerified") is True
@@ -767,6 +904,383 @@ class Drill:
                 "activationPermitted": False, "webhookTouched": False})
         self.save("stabilization-confirmed", self.report["stabilization"])
 
+    def daily_backup(self):
+        """Rehearsal-only maintenance; never synthesizes a production approval."""
+        from datetime import datetime, timezone
+        import time
+        import production_backup_capacity as capacity
+        import production_backup_transaction as maintenance
+        import production_recovery as recovery
+
+        target, bundle, manifest = self.prepare_maintenance()
+        ctl = self.bind(target, bundle, manifest)
+        require(ctl.target.environment == "rehearsal" and ctl.target.data["workerName"] == SERVICE)
+        require(self.attempt == "1", "Maintenance mutation runs cannot be re-run as a new attempt.")
+        fault = self.env.get("DRILL_BACKUP_FAULT") or "none"
+        require(fault in {"none", "capacity-near", "capacity-over", "readback-failure", "process-kill"}
+                and (fault == "none" or self.env.get("GITHUB_EVENT_NAME") == "workflow_dispatch"),
+                "Synthetic backup faults require an explicit isolated dispatch.")
+        require(not self.baseline_checkpoint, "Daily maintenance requires a new unique checkpoint.")
+        before = ctl.inspect()
+        limit = self.env.get("DRILL_BACKUP_PAUSE_LIMIT_SECONDS", "300")
+        require(matches(r"[1-9][0-9]{1,2}", limit) and 60 <= int(limit) <= 900,
+                "The maintenance pause warning limit must be between 60 and 900 seconds.")
+        pause_limit = int(limit)
+        initially_open = before["control"]["admission"] == "open" and before["control"]["workers"] == "run"
+        initially_frozen = before["control"]["admission"] == "closed" and before["control"]["workers"] == "frozen"
+        require(initially_open or initially_frozen and not any(before["work"].values()),
+                "Maintenance requires either open/running or already closed/frozen with no work.")
+        require(not any(before["terminal"].get(key, 0) for key in
+                        ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates")),
+                "Unresolved external results prevent automated maintenance.")
+        # Validate the exact original CI before closing admission.
+        proof, archive = self.code_archive()
+        require(before["release"]["revision"] == manifest["revision"]
+                and before["release"]["moduleSha256"] == manifest["bundleSha256"])
+        checkpoint = token_hex(16)
+        name = "subs-bot-cf-restore-control-" + checkpoint[:16]
+        contract = {"version": 1, "checkpointId": checkpoint, "databaseName": name,
+                    "objectsName": name, "purpose": "baseline"}
+        api = recovery.RecoveryAPI(ctl.target.data, self.env["SUBS_BOT_CF_BOOTSTRAP_TOKEN"], ctl.worker, contract)
+        api.verify_backup()
+        source = recovery.RecoverySource(api, ctl.target.data, bundle, manifest, ctl.inspect, ctl.guard)
+        source.archive_body, source.code_proof = archive, proof
+        recovery_journal = recovery.RecoveryJournal(api, self.run + "/" + self.attempt, guard=ctl.guard)
+        recovery_journal.load()
+        require(recovery_journal.value is None, "The fresh checkpoint identity is already occupied.")
+        engine = recovery.RecoveryEngine(api, source, recovery_journal, Path(self.env["RUNNER_TEMP"]))
+        require(all(engine.observe(kind) is None for kind in engine.resource_kinds),
+                "The proposed independent recovery names are occupied.")
+        timestamp = int(time.time())
+        run_metadata = artifact._get_json("/actions/runs/" + self.run, artifact._github_token())
+        require(run_metadata.get("id") == int(self.run) and run_metadata.get("head_sha") == self.revision
+                and isinstance(run_metadata.get("created_at"), str), "The exact hosted maintenance run was not verified.")
+        try:
+            created = datetime.strptime(run_metadata["created_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except ValueError:
+            raise ContractError("The hosted maintenance run time is invalid.") from None
+        require(created.timestamp() <= timestamp, "The hosted maintenance run time is in the future.")
+        day = created.strftime("%Y/%m/%d")
+        session = self.run + "-" + self.attempt
+        store = PrivateStore(ctl.data, ctl.target.data["backupBucketName"])
+        journal = maintenance.Transaction(store, session, day, ctl.target.digest, self.revision)
+        require(not journal.load(), "A previous daily maintenance session already occupies this run identity.")
+        anchor = maintenance.Anchor(store, ctl.target.digest, self.env.get("DRILL_BACKUP_GENESIS_SHA256", ""))
+        anchor.acquire(session, day, self.revision)
+        journal.append("started", {"configurationSha256": ctl.target.configuration_digest,
+                       "release": before["release"], "control": before["control"],
+                       "pauseLimitSeconds": pause_limit, "checkpointId": checkpoint}, timestamp)
+        try:
+            threshold = self.env.get("DRILL_BACKUP_WARNING_PERCENT", "80")
+            require(matches(r"[1-9][0-9]?", threshold))
+            observed = capacity.observe(api, source, warning_percent=int(threshold))
+            if fault in {"capacity-near", "capacity-over"}:
+                require(observed["rowStatus"] in {"normal", "warning"} and observed["objectStatus"] in {"normal", "warning"})
+                observed = {**observed, "simulation": fault,
+                    "rows": observed["rowLimit"] + 1 if fault == "capacity-over" else observed["rowLimit"] * int(threshold) // 100,
+                    "rowStatus": "over-limit" if fault == "capacity-over" else "warning"}
+            journal.append("preflight", {"capacity": observed}, int(time.time()))
+            require(observed["rowStatus"] in {"normal", "warning"} and observed["objectStatus"] in {"normal", "warning"}
+                    and observed.get("objectBytesStatus") in {"normal", "warning"},
+                    "Capacity preflight prevents this backup before pause.")
+            if initially_open:
+                # Confirm there was no intervening control/configuration/deployment change.
+                planned = ctl.plan_pause()
+                require(planned["control"] == before["control"] and planned["release"] == before["release"]
+                        and planned["configurationSha256"] == before["configurationSha256"])
+                journal.append("pause-intent", {"stateSha256": planned["stateSha256"]}, int(time.time()))
+                pause_started = time.monotonic()
+                paused = ctl.transition("pause", approval(ctl.target, "pause", ctl.revision, planned["stateSha256"]),
+                                        planned["stateSha256"])
+                journal.append("paused", {"control": paused["control"]}, int(time.time()))
+                remaining = pause_limit - (time.monotonic() - pause_started)
+                require(remaining > 0, "The pause window expired before drain began.")
+                self.quiet(seconds=min(180, remaining))
+                require(time.monotonic() - pause_started < pause_limit, "The pause window expired before freeze.")
+                frozen_before = ctl.inspect()
+                journal.append("freeze-intent", {"stateSha256": frozen_before["stateSha256"]}, int(time.time()))
+                frozen = ctl.transition("freeze", approval(ctl.target, "freeze", ctl.revision, frozen_before["stateSha256"]),
+                                        frozen_before["stateSha256"])
+            else:
+                frozen = ctl.inspect()
+                require(frozen["stateSha256"] == before["stateSha256"])
+            journal.append("frozen", {"control": frozen["control"]}, int(time.time()))
+            frozen_data = capacity.frozen_fingerprint(api, source)
+            journal.append("frozen-data", frozen_data, int(time.time()))
+            if fault == "process-kill":
+                os._exit(73)  # isolated runner: simulate loss without finally handlers
+            journal.append("capture-intent", {"checkpointId": checkpoint}, int(time.time()))
+            # The intended checkpoint is pinned before capture and independently
+            # read back by the existing activation-baseline verifier.
+            self.activation_baseline(checkpoint_id=checkpoint, preloaded_code=(proof, archive),
+                                     simulate_readback_failure=fault == "readback-failure")
+            baseline = self.report["activationBaseline"]
+            journal.append("verified", {"checkpointId": baseline["checkpointId"],
+                           "manifestSha256": baseline["manifestSha256"]}, int(time.time()))
+            if initially_frozen:
+                after = ctl.inspect()
+                require(after["control"] == before["control"] and not any(after["work"].values()))
+                journal.append("preserved-frozen", {"control": after["control"]}, int(time.time()))
+                anchor.release(session)
+                self.report.update(status="passed", backupMaintenance={"session": session, "day": day,
+                    "initiallyFrozen": True, "pauseSeconds": 0, "capacity": observed, "baseline": baseline})
+                return
+            plan = ctl.plan_activate()
+            journal.append("resume-intent", {"stateSha256": plan["stateSha256"]}, int(time.time()))
+            resumed = ctl.transition("activate", approval(ctl.target, "activate", ctl.revision, plan["stateSha256"]),
+                                     plan["stateSha256"])
+            elapsed = time.monotonic() - pause_started
+            journal.append("resumed", {"control": resumed["control"], "pauseSeconds": round(elapsed, 3),
+                           "pauseLimitExceeded": elapsed > pause_limit}, int(time.time()))
+            anchor.release(session)
+            self.report.update(status="warning" if elapsed > pause_limit else "passed", backupMaintenance={"session": session, "day": day,
+                "pauseSeconds": round(elapsed, 3), "pauseLimitSeconds": pause_limit,
+                "pauseLimitExceeded": elapsed > pause_limit, "capacity": observed, "baseline": baseline})
+        except Exception as error:
+            # Do not hide an unconfirmed transition behind an automatic retry or
+            # resume. A separate observer must reconcile the durable intent.
+            try:
+                journal.append("failed", {"uncertain": bool(getattr(error, "uncertain", False))}, int(time.time()))
+                failed_events = journal.load()
+                if len(failed_events) >= 2 and failed_events[-2]["stage"] in {"started", "preflight"}:
+                    anchor.release(session)
+            except Exception:
+                pass
+            raise
+
+    def daily_backup_watchdog(self):
+        """Resume only a fully verified baseline with no prior resume attempt."""
+        from datetime import datetime, timezone
+        import time
+        import production_backup_monitor as monitor
+        import production_backup_transaction as maintenance
+        import production_recovery as recovery
+        from production_release_evidence import verify_activation_baseline
+
+        target, bundle, manifest = self.prepare_maintenance()
+        ctl = self.bind(target, bundle, manifest)
+        require(ctl.target.environment == "rehearsal" and ctl.target.data["workerName"] == SERVICE)
+        store = PrivateStore(ctl.data, ctl.target.data["backupBucketName"])
+        anchor = maintenance.Anchor(store, ctl.target.digest, self.env.get("DRILL_BACKUP_GENESIS_SHA256", ""))
+        pinned, _raw, _etag = anchor.read()
+        if pinned is None or pinned["state"] == "idle":
+            self.report.update(status="observed", watchdog="no-confirmed-pending-resume")
+            return
+        session = pinned["session"]
+        run_id, attempt = session.split("-")
+        token = artifact._github_token()
+        run = artifact._get_json("/actions/runs/" + run_id + "/attempts/" + attempt, token)
+        workflow = artifact._get_json("/actions/workflows/worker-production-lifecycle-rehearsal.yml", token)
+        require(run.get("id") == int(run_id) and run.get("run_attempt") == int(attempt)
+                and workflow.get("path") == monitor.WORKFLOW and run.get("workflow_id") == workflow.get("id")
+                and run.get("event") in {"workflow_dispatch", "schedule"} and run.get("head_branch") == "main"
+                and run.get("head_sha") == pinned["controlRevision"]
+                and all(isinstance(run.get(k), dict) and run[k].get("id") == artifact.REPOSITORY_ID
+                        for k in ("repository", "head_repository"))
+                and datetime.fromtimestamp(monitor._timestamp(run.get("created_at")), timezone.utc).strftime("%Y/%m/%d") == pinned["day"])
+        if run.get("status") != "completed":
+            self.report.update(status="observed", watchdog="backup-run-still-active")
+            return
+        journal = maintenance.Transaction(store, session, pinned["day"], ctl.target.digest, pinned["controlRevision"])
+        events = journal.load()
+        require(events, "The active backup transaction journal is missing; preserve the anchor.")
+        if events[-1]["stage"] in {"resumed", "preserved-frozen"} or (len(events) >= 2
+                and events[-1]["stage"] == "failed" and events[-2]["stage"] in {"started", "preflight"}):
+            anchor.release(session)
+            self.report.update(status="reconciled", watchdog="completed-anchor-released", session=session)
+            return
+        effective = events[-2]["stage"] if events[-1]["stage"] == "failed" and len(events) >= 2 else events[-1]["stage"]
+        if effective == "paused":
+            paused_event = next(event for event in events if event["stage"] == "paused")
+            pause_intent = next(event for event in events if event["stage"] == "pause-intent")
+            initial = events[0]["details"]
+            observed = ctl.inspect()
+            if any(observed["work"].values()) or any(observed["terminal"].get(key, 0) for key in
+                    ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates")):
+                self.report.update(status="stopped", watchdog="drain-or-unknown-results-pending", session=session)
+                return
+            def record_drain_intent(state_sha, action):
+                journal.append("resume-intent", {"stateSha256": state_sha, "action": action,
+                               "watchdogRevision": self.revision}, int(time.time()))
+            resumed = resume_aborted_drain(ctl, initial=initial, paused=paused_event["details"]["control"],
+                                           session=session, record_intent=record_drain_intent)
+            elapsed = max(0, int(time.time()) - pause_intent["timestamp"])
+            limit = initial.get("pauseLimitSeconds")
+            require(type(limit) is int and 60 <= limit <= 900)
+            journal.append("resumed", {"control": resumed["control"], "pauseSeconds": elapsed,
+                           "pauseLimitExceeded": elapsed > limit, "confirmedByWatchdog": True}, int(time.time()))
+            anchor.release(session)
+            self.report.update(status="reconciled", watchdog="aborted-drain-resumed", session=session,
+                               pauseSeconds=elapsed, pauseLimitExceeded=elapsed > limit)
+            return
+        # A pending intent is never reissued. A completed failure may only be
+        # followed when verification was the immediately preceding event.
+        if events[-1]["stage"] == "verified":
+            verified = events[-1]
+        elif len(events) >= 2 and events[-1]["stage"] == "failed" and events[-2]["stage"] == "verified":
+            verified = events[-2]
+        elif events[-1]["stage"] in {"frozen-data", "capture-intent"} or (
+                len(events) >= 2 and events[-1]["stage"] == "failed"
+                and events[-2]["stage"] in {"frozen-data", "capture-intent"}):
+            verified = None
+        else:
+            self.report.update(status="stopped", watchdog="independent-reconciliation-required", session=session)
+            return
+        frozen = next((event for event in events if event["stage"] == "frozen"), None)
+        pause = next((event for event in events if event["stage"] == "pause-intent"), None)
+        require(frozen is not None and pause is not None and events[0]["stage"] == "started")
+        initial = events[0]["details"]
+        observed = ctl.inspect()
+        require(initial.get("control", {}).get("admission") == "open" and initial["control"].get("workers") == "run"
+                and initial.get("configurationSha256") == observed["configurationSha256"]
+                and initial.get("release") == observed["release"]
+                and frozen["details"].get("control") == observed["control"]
+                and not any(observed["work"].values()),
+                "The original open source or exact frozen predecessor no longer matches.")
+        token = self.env["SUBS_BOT_CF_BOOTSTRAP_TOKEN"]
+        if verified is not None:
+            checkpoint, manifest_sha = verified["details"]["checkpointId"], verified["details"]["manifestSha256"]
+            ctl.activation_baseline_checker = lambda: verify_activation_baseline(ctl, token, checkpoint, manifest_sha)
+            plan = ctl.plan_activate()
+            journal.append("resume-intent", {"stateSha256": plan["stateSha256"], "watchdogRevision": self.revision}, int(time.time()))
+            resumed = ctl.transition("activate", approval(ctl.target, "activate", ctl.revision, plan["stateSha256"]),
+                                     plan["stateSha256"])
+            resume_kind = "verified-baseline-resumed"
+        else:
+            data_event = next((event for event in events if event["stage"] == "frozen-data"), None)
+            checkpoint = initial.get("checkpointId")
+            require(data_event is not None and matches(r"[0-9a-f]{32}", checkpoint))
+            name = "subs-bot-cf-restore-control-" + checkpoint[:16]
+            contract = {"version": 1, "checkpointId": checkpoint, "databaseName": name, "objectsName": name, "purpose": "baseline"}
+            api = recovery.RecoveryAPI(ctl.target.data, token, ctl.worker, contract)
+            api.verify_backup()
+            source = recovery.RecoverySource(api, ctl.target.data, bundle, manifest, ctl.inspect, ctl.guard)
+            source_journal = recovery.RecoveryJournal(api, self.run + "/" + self.attempt, guard=ctl.guard)
+            def record_intent(state_sha, action):
+                journal.append("resume-intent", {"stateSha256": state_sha, "action": action,
+                               "watchdogRevision": self.revision}, int(time.time()))
+            resumed = resume_failed_backup(ctl, api, source, source_journal, initial=initial,
+                frozen=frozen["details"]["control"], fingerprint=data_event["details"], session=session,
+                record_intent=record_intent)
+            resume_kind = "failed-backup-resumed-after-readback"
+        elapsed = max(0, int(time.time()) - pause["timestamp"])
+        limit = initial.get("pauseLimitSeconds")
+        require(type(limit) is int and 60 <= limit <= 900)
+        journal.append("resumed", {"control": resumed["control"], "pauseSeconds": elapsed,
+                       "pauseLimitExceeded": elapsed > limit, "confirmedByWatchdog": True}, int(time.time()))
+        anchor.release(session)
+        self.report.update(status="reconciled", watchdog=resume_kind, session=session,
+                           pauseSeconds=elapsed, pauseLimitExceeded=elapsed > limit)
+
+    def backup_anchor_action(self):
+        """Isolated, individually pinned genesis and reconciliation entry."""
+        import production_backup_transaction as maintenance
+        target, bundle, manifest = self.prepare_maintenance()
+        ctl = self.bind(target, bundle, manifest)
+        require(ctl.target.environment == "rehearsal" and ctl.target.data["workerName"] == SERVICE)
+        store = PrivateStore(ctl.data, ctl.target.data["backupBucketName"])
+        action = self.env.get("DRILL_ACTION")
+        seed = maintenance.Anchor(store, target.digest, "0" * 64)
+        _initial, genesis = seed.initial_material()
+        genesis_sha = sha256(genesis).hexdigest()
+        if action == "backup-anchor-genesis-plan":
+            ctl.inspect()
+            self.report.update(status="planned", targetSha256=target.digest, genesisSha256=genesis_sha,
+                               mutationPerformed=False)
+            return
+        anchor = maintenance.Anchor(store, target.digest, self.env.get("DRILL_BACKUP_GENESIS_SHA256", ""))
+        if action == "backup-anchor-initialize":
+            require(BACKUP_ORCHESTRATION_ENABLED, "Backup anchor initialization is disabled before acceptance.")
+            before = ctl.inspect()
+            require(before["control"]["admission"] == "closed" and before["control"]["workers"] == "frozen"
+                    and not any(before["work"].values())
+                    and not any(before["terminal"].get(key, 0) for key in
+                                ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates")))
+            require(self.env.get("DRILL_BACKUP_ANCHOR_APPROVAL_SHA256") == genesis_sha
+                    and anchor.genesis_sha256 == genesis_sha, "The exact independently pinned genesis approval is required.")
+            approved_action = "backup-anchor-initialize:" + genesis_sha
+            ctl.approval(approval(target, approved_action, ctl.revision, before["stateSha256"]),
+                         approved_action, before["stateSha256"])
+            ctl.guard()
+            require(ctl.inspect()["stateSha256"] == before["stateSha256"])
+            anchor.initialize()
+            self.report.update(status="initialized", targetSha256=target.digest, genesisSha256=genesis_sha)
+            return
+
+        if action in {"backup-anchor-initialize-reconcile-plan", "backup-anchor-initialize-reconcile"}:
+            before = ctl.inspect()
+            require(before["control"]["admission"] == "closed" and before["control"]["workers"] == "frozen"
+                    and not any(before["work"].values())
+                    and not any(before["terminal"].get(key, 0) for key in
+                                ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates")))
+            plan, _initial, _etag = anchor.plan_initialization_reconciliation()
+            plan_sha = sha256(canonical(plan)).hexdigest()
+            if action.endswith("-plan"):
+                self.report.update(status="planned", anchorPlan=plan, anchorPlanSha256=plan_sha, mutationPerformed=False)
+                return
+            require(BACKUP_ORCHESTRATION_ENABLED and self.env.get("DRILL_BACKUP_ANCHOR_APPROVAL_SHA256") == plan_sha,
+                    "The exact initialization reconciliation approval is required after acceptance.")
+            approved_action = "backup-anchor-initialize-reconcile:" + plan_sha
+            ctl.approval(approval(target, approved_action, ctl.revision, before["stateSha256"]),
+                         approved_action, before["stateSha256"])
+            again, _initial, _etag = anchor.plan_initialization_reconciliation()
+            require(again == plan and ctl.inspect()["stateSha256"] == before["stateSha256"])
+            ctl.guard()
+            anchor.reconcile_initialization(plan_sha)
+            self.report.update(status="reconciled", anchorPlanSha256=plan_sha, targetSha256=target.digest)
+            return
+
+        candidate = self.env.get("DRILL_BACKUP_ANCHOR_CANDIDATE_SHA256", "")
+        def checked_plan():
+            plan, _raw, _etag, _candidate_raw = anchor.plan_reconciliation(candidate)
+            prior, _prior_raw, _prior_etag = anchor.read(allow_future=True)
+            # A competing active claim without its own full journal cannot be
+            # inferred safe from an absent record. Keep it for manual evidence.
+            require(prior["state"] == "active" and plan["candidate"]["state"] == "idle",
+                    "Only an already completed transaction's anchor release can be reconciled automatically.")
+            run_id, attempt = prior["session"].split("-")
+            token = artifact._github_token()
+            run = artifact._get_json("/actions/runs/" + run_id + "/attempts/" + attempt, token)
+            wf = artifact._get_json("/actions/workflows/worker-production-lifecycle-rehearsal.yml", token)
+            require(run.get("id") == int(run_id) and run.get("run_attempt") == int(attempt)
+                    and run.get("status") == "completed" and run.get("workflow_id") == wf.get("id")
+                    and wf.get("path") == ".github/workflows/worker-production-lifecycle-rehearsal.yml"
+                    and run.get("head_sha") == prior["controlRevision"] and run.get("head_branch") == "main"
+                    and run.get("event") in {"workflow_dispatch", "schedule"}
+                    and all(isinstance(run.get(key), dict) and run[key].get("id") == artifact.REPOSITORY_ID
+                            for key in ("repository", "head_repository")))
+            events = maintenance.Transaction(store, prior["session"], prior["day"], target.digest,
+                                             prior["controlRevision"]).load()
+            require(events and events[0]["stage"] == "started")
+            initial = events[0]["details"]
+            observed = ctl.inspect()
+            expected_control = (events[-1]["details"].get("control") if events[-1]["stage"] in
+                                {"resumed", "preserved-frozen"} else initial.get("control"))
+            require(observed["control"] == expected_control and observed["release"] == initial.get("release")
+                    and observed["configurationSha256"] == initial.get("configurationSha256")
+                    and not any(observed["terminal"].get(key, 0) for key in
+                                ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates")),
+                    "The completed transaction's exact observed state cannot be confirmed.")
+            return plan, observed
+
+        plan, before = checked_plan()
+        plan_sha = sha256(canonical(plan)).hexdigest()
+        if action == "backup-anchor-reconcile-plan":
+            self.report.update(status="planned", anchorPlan=plan, anchorPlanSha256=plan_sha, mutationPerformed=False)
+            return
+        require(action == "backup-anchor-reconcile" and BACKUP_ORCHESTRATION_ENABLED,
+                "Backup anchor reconciliation is disabled before acceptance.")
+        require(self.env.get("DRILL_BACKUP_ANCHOR_APPROVAL_SHA256") == plan_sha,
+                "The independently reviewed exact anchor plan SHA is required.")
+        approved_action = "backup-anchor-reconcile:" + plan_sha
+        ctl.approval(approval(target, approved_action, ctl.revision, before["stateSha256"]),
+                     approved_action, before["stateSha256"])
+        plan_again, current = checked_plan()
+        require(plan_again == plan and current["stateSha256"] == before["stateSha256"])
+        ctl.guard()
+        anchor.reconcile(candidate, plan_sha)
+        self.report.update(status="reconciled", anchorPlanSha256=plan_sha, targetSha256=target.digest)
+
     def human_receipts(self):
         """Project bounded receipt metadata; a person must still correlate the IAB messages."""
         ctl = self.controller
@@ -909,10 +1423,19 @@ class Drill:
 
 def main():
     env = os.environ
-    hosted_environment("rehearsal")
     require(env.get("GITHUB_WORKFLOW_REF") == WORKFLOW, "Only the protected dedicated hosted rehearsal workflow may run this drill.")
     action = env.get("DRILL_ACTION", "inspect")
-    require(action in ("bootstrap", "exercise", "inspect", "stabilize", "recover-webhook", "seed-fixture", "recovery", "finalize-recovery", "provider-binding", "provider-binding-resume", "provider-binding-reconcile"))
+    if action in {"daily-backup", "daily-backup-watchdog"}:
+        require(BACKUP_ORCHESTRATION_ENABLED, "Daily backup orchestration is not enabled before independent acceptance.")
+    if env.get("GITHUB_EVENT_NAME") == "schedule":
+        require(action in {"daily-backup", "daily-backup-watchdog"} and env.get("GITHUB_REPOSITORY") == artifact.REPOSITORY
+                and env.get("GITHUB_REPOSITORY_ID") == str(artifact.REPOSITORY_ID)
+                and env.get("GITHUB_REF") == artifact.MAIN_REF and env.get("RUNNER_ENVIRONMENT") == "github-hosted"
+                and env.get("SUBS_BOT_CONTROL_ENVIRONMENT") == "subs-bot-isolation",
+                "Scheduled maintenance requires the exact protected rehearsal workflow on hosted main.")
+    else:
+        hosted_environment("rehearsal")
+    require(action in ("bootstrap", "exercise", "inspect", "stabilize", "daily-backup", "daily-backup-watchdog", "backup-anchor-genesis-plan", "backup-anchor-initialize", "backup-anchor-initialize-reconcile-plan", "backup-anchor-initialize-reconcile", "backup-anchor-reconcile-plan", "backup-anchor-reconcile", "recover-webhook", "seed-fixture", "recovery", "finalize-recovery", "provider-binding", "provider-binding-resume", "provider-binding-reconcile"))
     tool = Drill(env)
     try:
         if action == "recover-webhook":
@@ -923,7 +1446,10 @@ def main():
                 tool.report["originalWebhookAuthProbe"] = recovered["originalWebhookAuthProbe"]
         else:
             artifact.require_current_main(tool.revision)
-            getattr(tool, action.replace("-", "_"))()
+            if action.startswith("backup-anchor-"):
+                tool.backup_anchor_action()
+            else:
+                getattr(tool, action.replace("-", "_"))()
     except Exception as error:
         tool.report["status"] = "stopped"
         if isinstance(error, DeploymentReconciliationRequired):
