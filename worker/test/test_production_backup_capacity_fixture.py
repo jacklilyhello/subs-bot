@@ -11,6 +11,10 @@ from production_target import ContractError
 from test_production_backup_transaction import Store
 
 
+class FixtureStore(Store):
+    put_once = Store.put_exclusive
+
+
 class CapacityFixtureTests(unittest.TestCase):
     def test_seed_is_bound_to_every_table_count_and_only_appends_finished_rows(self):
         counts = {"subs_bot_production_invocations": 0, "subscriptions": 3}
@@ -61,7 +65,7 @@ class CapacityFixtureTests(unittest.TestCase):
                 fixture.capacity.require_within_limits(value)
 
     def test_exact_real_over_limit_result_uses_the_shared_pre_pause_gate(self):
-        api, source, store = Mock(), Mock(), Store()
+        api, source, store = Mock(), Mock(), FixtureStore()
         source.migrations = [None] * 56
         api.fixture_rows_verified.return_value = True
         before = {"tableCounts": {"subs_bot_production_invocations": 19944, "subs_bot_schema_migrations": 56}, "rowStatus": "warning",
