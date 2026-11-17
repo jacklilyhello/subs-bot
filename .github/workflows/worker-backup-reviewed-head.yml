@@ -151,8 +151,8 @@ jobs:
           HEAD_ACTION: ${{ fromJSON(inputs.validation_json).action }}
           SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
           SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
-          SUBS_BOT_SCOPED_R2_WRITE_JSON: ${{ (fromJSON(inputs.validation_json).action != 'capacity-fixture' || (!startsWith(vars.SUBS_BOT_BACKUP_CAPACITY_MODE, 'verify-') && vars.SUBS_BOT_BACKUP_CAPACITY_MODE != 'probe-read-token')) && secrets.SUBS_BOT_SCOPED_R2_WRITE_JSON || '' }}
-          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ (fromJSON(inputs.validation_json).action == 'capacity-fixture' && secrets.SUBS_BOT_CF_REHEARSAL_DATA_READ_TOKEN) || (fromJSON(inputs.validation_json).action != 'capacity-fixture' && secrets.SUBS_BOT_CF_REHEARSAL_DATA_TOKEN) || '' }}
+          SUBS_BOT_SCOPED_R2_WRITE_JSON: ${{ (contains(fromJSON('["genesis-initialize","backup","watchdog","open-backup"]'), fromJSON(inputs.validation_json).action) || (fromJSON(inputs.validation_json).action == 'capacity-fixture' && !startsWith(vars.SUBS_BOT_BACKUP_CAPACITY_MODE, 'verify-') && vars.SUBS_BOT_BACKUP_CAPACITY_MODE != 'probe-read-token')) && secrets.SUBS_BOT_SCOPED_R2_WRITE_JSON || '' }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ (contains(fromJSON('["inspect","genesis-plan","verify","capacity-fixture"]'), fromJSON(inputs.validation_json).action) && secrets.SUBS_BOT_CF_REHEARSAL_DATA_READ_TOKEN) || (contains(fromJSON('["genesis-initialize","backup","watchdog","open-backup"]'), fromJSON(inputs.validation_json).action) && secrets.SUBS_BOT_CF_REHEARSAL_DATA_TOKEN) || '' }}
           SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_REHEARSAL_WORKER_READ_TOKEN }}
           SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
           SUBS_BOT_CONTROL_DRILL_KEYS: ${{ secrets.SUBS_BOT_CONTROL_DRILL_KEYS }}
