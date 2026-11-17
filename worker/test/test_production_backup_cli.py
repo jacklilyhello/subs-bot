@@ -40,7 +40,7 @@ class ProductionBackupTests(unittest.TestCase):
             backup.last([{"stage": "capture-intent"}], "verified")
 
     def test_ambiguous_edit_failure_blocks_frozen_maintenance(self):
-        events = [{"details": {"configurationSha256": "a", "release": {}}},
+        events = [{"stage": "started", "details": {"configurationSha256": "a", "release": {}}},
                   {"stage": "frozen", "details": {"control": {"epoch": 1}}}]
         state = {"control": {"epoch": 1}, "configurationSha256": "a", "release": {}, "work": {},
                  "terminal": {"terminalEditFailure": 1}}
