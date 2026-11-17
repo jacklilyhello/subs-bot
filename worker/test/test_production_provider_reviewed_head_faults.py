@@ -1,5 +1,6 @@
 """Hosted checks for the isolated, read-only source-fault harness."""
 from hashlib import sha256
+from copy import deepcopy
 import io
 import json
 import os
@@ -14,9 +15,37 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import archive_production_provider as archive
 import production_provider as control
 import production_provider_reviewed_head_harness as harness
+import reviewed_provider_candidate as candidate
+from test_production_provider import config
 
 
 class ReviewedSourceFaultTests(unittest.TestCase):
+    def test_previous_identity_fault_reaches_the_exact_source_guard(self):
+        previous = config(active=True)
+        build = deepcopy(previous["build"])
+        build["revision"] = "7" * 40
+        build["archiveSha256"] = "8" * 64
+        target = candidate.candidate(previous, build)
+        records = [{"build": row["build"], "target": row} for row in control.releases(target)]
+        refs = [{"runId": "101", "runAttempt": "1", "kind": "isolated-source", "manifestSha256": "a" * 64},
+                {"runId": "102", "runAttempt": "1", "kind": "complete", "manifestSha256": "b" * 64}]
+        env = {"GITHUB_SHA": "9" * 40, "SUBS_BOT_PROVIDER_FAULT_SCENARIO": "identity-previous",
+               "SUBS_BOT_PROVIDER_ARCHIVE_REFS": json.dumps(refs)}
+        def compare(revision, _head, _token):
+            return {"status": "ahead", "ahead_by": 1, "behind_by": 0,
+                    "base_commit": {"sha": revision}, "merge_base_commit": {"sha": revision}}
+        output = io.StringIO()
+        with patch.dict(os.environ, env, clear=True), patch.object(harness.publish, "config", return_value=target), \
+                patch.object(harness.durable, "restore"), patch.object(control, "durable_builds", return_value=records), \
+                patch.object(control, "durable_archive"), patch.object(control.github, "require_current_main"), \
+                patch.object(control.github, "_github_token", return_value="fixture"), \
+                patch.object(control.github, "verify_main_run"), patch.object(control.github, "compare_commits_metadata", side_effect=compare), \
+                redirect_stdout(output):
+            harness.verify_source_fault()
+        rows = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertTrue(any(row.get("phase") == "mutated-guard-rejected" and row.get("category") == "identity" for row in rows))
+        self.assertEqual(rows[-1]["status"], "simulated-source-fault-rejected")
+
     def test_all_scenarios_use_fresh_scratch_and_restore_environment(self):
         seen = []
         with tempfile.TemporaryDirectory() as root:

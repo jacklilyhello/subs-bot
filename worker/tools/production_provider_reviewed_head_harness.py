@@ -51,15 +51,26 @@ def verify_source_fault_case():
     selected = refs[index]
     control.require(selected["kind"] in {"isolated-source", "complete", "partial"})
     if fault == "identity":
+        print(json.dumps({"scenario": scenario, "phase": "restore-started"}), flush=True)
         durable.restore()
+        print(json.dumps({"scenario": scenario, "phase": "restore-complete"}), flush=True)
         control.guard_sources(target)
+        print(json.dumps({"scenario": scenario, "phase": "original-chain-confirmed"}), flush=True)
         wrong = deepcopy(target)
         release = control.releases(wrong)[index]
         old = release["smoke"]["healthSha256"]
         release["smoke"]["healthSha256"] = ("0" if old[0] != "0" else "1") + old[1:]
         try:
+            print(json.dumps({"scenario": scenario, "phase": "mutated-guard-started"}), flush=True)
             control.guard_sources(wrong)
         except control.ProviderError as error:
+            category = {
+                "The archived Provider target identity does not match the requested release.": "identity",
+                "The frozen provider source is not an exact reviewed main ancestor.": "ancestor",
+                "The private Provider original digest differs.": "source-digest",
+                "The frozen source CI attempt or archive digest changed.": "source-ci",
+            }.get(str(error), "other")
+            print(json.dumps({"scenario": scenario, "phase": "mutated-guard-rejected", "category": category}), flush=True)
             control.require(str(error) == "The archived Provider target identity does not match the requested release.")
         else:
             raise control.ProviderError("A simulated Provider identity mismatch was not rejected.")
