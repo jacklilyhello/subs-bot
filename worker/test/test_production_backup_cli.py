@@ -307,6 +307,47 @@ class ProductionBackupTests(unittest.TestCase):
             with self.assertRaises(ContractError):
                 backup.monitor_workflow_runs(controllers, 1800000000, None)
 
+    def test_seven_days_of_monitor_runs_do_not_hide_a_failed_checkpoint(self):
+        from urllib.parse import parse_qs, urlsplit
+        revision, now = "a" * 40, 1800000000
+        workflow = {"id": 123, "path": ".github/workflows/worker-production-backup.yml"}
+        template = {"run_attempt": 1, "workflow_id": 123, "head_branch": "main", "head_sha": revision,
+                    "event": "schedule", "repository": {"id": backup.artifact.REPOSITORY_ID},
+                    "head_repository": {"id": backup.artifact.REPOSITORY_ID},
+                    "display_title": "Production backup monitor at " + revision,
+                    "updated_at": datetime.fromtimestamp(now - 1, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "status": "completed", "conclusion": "success"}
+        rows = [{**template, "id": index + 1} for index in range(672)]
+        rows.append({**template, "id": 673, "event": "workflow_dispatch",
+                     "display_title": "Production backup begin at " + revision, "conclusion": "failure"})
+        calls = []
+        def github(path, _token):
+            if "?" not in path:
+                return workflow
+            query = parse_qs(urlsplit(path).query)
+            self.assertEqual(query["per_page"], ["50"])
+            page = int(query["page"][0])
+            calls.append(page)
+            return {"total_count": len(rows), "workflow_runs": rows[(page - 1) * 50:page * 50]}
+        controllers = json.dumps({"version": 1, "revisions": [revision]})
+        with patch.object(backup.artifact, "_github_token", return_value="synthetic"), \
+             patch.object(backup.artifact, "_get_json", side_effect=github):
+            result = backup.monitor_workflow_runs(controllers, now, now - 100)
+            self.assertEqual(result["runsObserved"], 673)
+            self.assertTrue(result["failed"])
+            self.assertFalse(result["unknown"])
+            self.assertEqual(calls, list(range(1, 15)))
+            rows[50] = {**rows[50], "id": rows[0]["id"]}
+            with self.assertRaises(ContractError):
+                backup.monitor_workflow_runs(controllers, now, now - 100)
+            def at_bound(path, token):
+                response = github(path, token)
+                if "?" in path:
+                    response["total_count"] = 1000
+                return response
+            with patch.object(backup.artifact, "_get_json", side_effect=at_bound), self.assertRaises(ContractError):
+                backup.monitor_workflow_runs(controllers, now, now - 100)
+
     def test_production_mutation_is_disabled_by_default_before_any_setup(self):
         with patch.object(backup, "validate_target", return_value=Mock()), patch.object(backup, "check_context", return_value="a" * 40):
             with self.assertRaises(ContractError):
