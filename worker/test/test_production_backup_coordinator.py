@@ -31,6 +31,7 @@ class CoordinatorTests(unittest.TestCase):
         coordinator.write_dispatch_once(store, value)
         store.put_once.assert_called_once_with(coordinator.event_key("a" * 64, "123", 1), canonical(value))
         store.reset_mock()
+        store.get.side_effect = None
         store.get.return_value = (canonical(value), '"etag"')
         with self.assertRaises(ContractError):
             coordinator.write_dispatch_once(store, value)
