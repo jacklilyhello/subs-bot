@@ -104,7 +104,9 @@ def frozen_matches(events, state):
     require(frozen is not None and state.get("control") == frozen["details"].get("control")
             and state.get("configurationSha256") == events[0]["details"].get("configurationSha256")
             and state.get("release") == events[0]["details"].get("release")
-            and not any(state.get("work", {}).values()))
+            and not any(state.get("work", {}).values())
+            and not any(state.get("terminal", {}).get(key, 0) for key in
+                        ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates")))
 
 
 def confirm_plan_run(session, day, revision):
@@ -300,7 +302,9 @@ def transition_reconciliation(env, events, state, contract):
                "resume-intent": ("open", "run")}[phase]
     expected = {**before, "admission": desired[0], "workers": desired[1], "epoch": before["epoch"] + 1}
     require(state.get("control") == expected and state.get("release") == events[0]["details"].get("release")
-            and state.get("configurationSha256") == events[0]["details"].get("configurationSha256"),
+            and state.get("configurationSha256") == events[0]["details"].get("configurationSha256")
+            and not any(state.get("terminal", {}).get(key, 0) for key in
+                        ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates")),
             "The exact successor is not confirmed; do not replay the original write.")
     scope = digest({"contract": contract, "intent": details, "successor": expected})
     return {"phase": phase, "approvalAction": "backup-reconcile-transition:" + scope, "stateSha256": state["stateSha256"]}
@@ -410,7 +414,7 @@ def main(env=None):
                 result = {"status": "initialized", "action": action}
         elif action in {"plan-begin", "begin"}:
             require(state["control"]["admission"] == "open" and state["control"]["workers"] == "run"
-                    and not any(state["terminal"].get(key, 0) for key in ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates")))
+                    and not any(state["terminal"].get(key, 0) for key in ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates")))
             now = datetime.now(timezone.utc)
             if action == "plan-begin":
                 require(env.get("GITHUB_RUN_ATTEMPT") == "1" and re.fullmatch(r"[1-9][0-9]{0,19}", env.get("GITHUB_RUN_ID", "")))

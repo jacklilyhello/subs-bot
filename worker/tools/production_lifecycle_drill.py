@@ -741,7 +741,7 @@ class Drill:
                 require(ready["control"]["admission"] == "open" and ready["control"]["workers"] == "run"
                         and not any(ready["work"].values())
                         and not any(ready["terminal"].get(key, 0) for key in
-                                    ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates")))
+                                    ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates")))
                 final_states = rows(ctl.data, ctl.database, f"SELECT inbox.update_id,outbox.state,outbox.attempts FROM telegram_inbox AS inbox "
                     f"JOIN telegram_outbox AS outbox USING(receipt_id) WHERE inbox.update_id IN ({base + 1},{base + 3}) ORDER BY inbox.update_id")
                 require(final_states == states, "A completed synthetic reply was executed again during backup.")
@@ -895,7 +895,7 @@ class Drill:
         require(initially_open or initially_frozen and not any(before["work"].values()),
                 "Maintenance requires either open/running or already closed/frozen with no work.")
         require(not any(before["terminal"].get(key, 0) for key in
-                        ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates")),
+                        ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates")),
                 "Unresolved external results prevent automated maintenance.")
         # Validate the exact original CI before closing admission.
         proof, archive = self.code_archive()
@@ -1093,6 +1093,8 @@ class Drill:
             current = ctl.inspect()
             require(current["control"] == original["control"] and current["release"] == original["release"]
                     and current["configurationSha256"] == original["configurationSha256"]
+                    and not any(current["terminal"].get(key, 0) for key in
+                                ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates"))
                     and capacity.frozen_fingerprint(api, source) == frozen_data["details"])
             verified_event = next((item for item in events if item["stage"] == "verified"), None)
             if verified_event is not None:
@@ -1111,7 +1113,7 @@ class Drill:
             initial = events[0]["details"]
             observed = ctl.inspect()
             if any(observed["work"].values()) or any(observed["terminal"].get(key, 0) for key in
-                    ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates")):
+                    ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates")):
                 self.report.update(status="stopped", watchdog="drain-or-unknown-results-pending", session=session)
                 return
             def record_drain_intent(state_sha, action):
@@ -1150,7 +1152,9 @@ class Drill:
                 and initial.get("configurationSha256") == observed["configurationSha256"]
                 and initial.get("release") == observed["release"]
                 and frozen["details"].get("control") == observed["control"]
-                and not any(observed["work"].values()),
+                and not any(observed["work"].values())
+                and not any(observed["terminal"].get(key, 0) for key in
+                            ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates")),
                 "The original open source or exact frozen predecessor no longer matches.")
         token = self.env["SUBS_BOT_CF_BOOTSTRAP_TOKEN"]
         if verified is not None:
@@ -1210,7 +1214,7 @@ class Drill:
             require(before["control"]["admission"] == "closed" and before["control"]["workers"] == "frozen"
                     and not any(before["work"].values())
                     and not any(before["terminal"].get(key, 0) for key in
-                                ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates")))
+                                ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates")))
             require(self.env.get("DRILL_BACKUP_ANCHOR_APPROVAL_SHA256") == genesis_sha
                     and anchor.genesis_sha256 == genesis_sha, "The exact independently pinned genesis approval is required.")
             approved_action = "backup-anchor-initialize:" + genesis_sha
@@ -1227,7 +1231,7 @@ class Drill:
             require(before["control"]["admission"] == "closed" and before["control"]["workers"] == "frozen"
                     and not any(before["work"].values())
                     and not any(before["terminal"].get(key, 0) for key in
-                                ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates")))
+                                ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates")))
             plan, _initial, _etag = anchor.plan_initialization_reconciliation()
             plan_sha = sha256(canonical(plan)).hexdigest()
             if action.endswith("-plan"):
@@ -1274,7 +1278,7 @@ class Drill:
             require(observed["control"] == expected_control and observed["release"] == initial.get("release")
                     and observed["configurationSha256"] == initial.get("configurationSha256")
                     and not any(observed["terminal"].get(key, 0) for key in
-                                ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates")),
+                                ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates")),
                     "The completed transaction's exact observed state cannot be confirmed.")
             return plan, observed
 

@@ -88,6 +88,17 @@ class ResumeTests(unittest.TestCase):
                 "release": {}, "configurationSha256": "x"}, paused=paused, session="1-1", record_intent=record)
         record.assert_not_called()
 
+    def test_unknown_terminal_edit_never_opens_admission(self):
+        ctl = controller()
+        paused = {"admission": "closed", "workers": "run"}
+        ctl.inspect.return_value = {"control": paused, "release": {}, "configurationSha256": "x",
+                                    "work": {"invocations": 0}, "terminal": {"terminalEditFailure": 1}}
+        record = Mock()
+        with self.assertRaises(ContractError):
+            drill.resume_aborted_drain(ctl, initial={"control": {"admission": "open", "workers": "run"},
+                "release": {}, "configurationSha256": "x"}, paused=paused, session="1-1", record_intent=record)
+        record.assert_not_called()
+
     def test_production_target_cannot_use_automatic_rehearsal_resume(self):
         ctl = controller()
         ctl.target.environment = "production"

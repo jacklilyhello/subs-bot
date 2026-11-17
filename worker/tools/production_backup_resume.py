@@ -38,7 +38,7 @@ def _quiet_state(ctl, initial, expected_control):
             and current["configurationSha256"] == initial.get("configurationSha256")
             and not any(current["work"].values())
             and not any(current["terminal"].get(key, 0) for key in
-                        ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates")),
+                        ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates")),
             "The exact predecessor or external-result state changed.")
     return current
 

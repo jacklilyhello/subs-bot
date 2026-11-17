@@ -39,6 +39,14 @@ class ProductionBackupTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             backup.last([{"stage": "capture-intent"}], "verified")
 
+    def test_ambiguous_edit_failure_blocks_frozen_maintenance(self):
+        events = [{"details": {"configurationSha256": "a", "release": {}}},
+                  {"stage": "frozen", "details": {"control": {"epoch": 1}}}]
+        state = {"control": {"epoch": 1}, "configurationSha256": "a", "release": {}, "work": {},
+                 "terminal": {"terminalEditFailure": 1}}
+        with self.assertRaises(ContractError):
+            backup.frozen_matches(events, state)
+
     def test_approval_is_passed_through_without_synthesis(self):
         target, envelope = Mock(), '{"explicit":"approval"}'
         with patch.object(backup, "approve") as approve:

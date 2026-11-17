@@ -92,7 +92,7 @@ def setup(env):
     require(current["control"]["admission"] == "closed" and current["control"]["workers"] == "frozen"
             and not any(current["work"].values())
             and not any(current["terminal"].get(key, 0) for key in
-                        ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates")),
+                        ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates")),
             "The head harness only operates on the independently verified closed and frozen rehearsal.")
     require(current["release"]["revision"] == manifest["revision"]
             and current["release"]["moduleSha256"] == manifest["bundleSha256"])
@@ -162,7 +162,7 @@ def main(env=None):
             after = tool.controller.inspect()
             require(after["control"]["admission"] == "open" and after["control"]["workers"] == "run"
                     and not any(after["terminal"].get(key, 0) for key in
-                                ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates"))
+                                ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates"))
                     and authorization_state(tool.controller) == before_auth,
                     "The backup did not restore admission or preserve the exact authorization state.")
             observed = tool.report.get("backupMaintenance")
