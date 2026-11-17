@@ -146,6 +146,28 @@ class AttestationTests(unittest.TestCase):
             with patch.dict(os.environ, {"SUBS_BOT_PROVIDER_ISOLATED_SOURCE_CONTROLLERS_JSON": json.dumps(["c" * 40])}), \
                     self.assertRaises(attest.provider.ProviderError):
                 attest.independent_isolated_source(ref, bucket, "synthetic")
+            identity = {"candidateRevision": "c" * 40, "reviewedPr": "290",
+                        "workflowPath": ".github/workflows/worker-provider-reviewed-isolated-source.yml"}
+            readback_path = ".github/workflows/worker-provider-reviewed-isolated-source-readback.yml"
+            plan.update(identity)
+            intent["approvalSha256"] = attest.provider.digest(plan)
+            manifest.update(identity)
+            raw_intent, raw_manifest = attest.provider.canonical(intent), attest.provider.canonical(manifest)
+            source = {"intentSha256": sha256(raw_intent).hexdigest(), "manifestSha256": sha256(raw_manifest).hexdigest(),
+                      "runId": "102", "controllerRevision": revision, **identity}
+            report.update({"seal": source, "manifestSha256": source["manifestSha256"], "readbackWorkflowPath": readback_path})
+            pin = {**source, "targetSha256": plan["targetSha256"], "readbackRunId": "103", "readbackRunAttempt": "1",
+                   "readbackControllerRevision": revision, "readbackSha256": attest.provider.digest(report), "readbackWorkflowPath": readback_path}
+            ref["manifestSha256"] = pin["manifestSha256"]
+            seal["path"] = identity["workflowPath"]
+            readback["path"] = readback_path
+            readback["display_title"] = f"Read isolated source 101 1 {pin['manifestSha256']} {pin['targetSha256']}"
+            with patch.dict(os.environ, {"SUBS_BOT_PROVIDER_ISOLATED_SOURCE_LEDGER_JSON": json.dumps({operation: pin})}):
+                self.assertEqual(attest.independent_isolated_source(ref, bucket, "synthetic")[2], target)
+                bad = {**pin, "candidateRevision": "d" * 40}
+                with patch.dict(os.environ, {"SUBS_BOT_PROVIDER_ISOLATED_SOURCE_LEDGER_JSON": json.dumps({operation: bad})}), \
+                        self.assertRaises(attest.provider.ProviderError):
+                    attest.independent_isolated_source(ref, bucket, "synthetic")
 
 
 if __name__ == "__main__":

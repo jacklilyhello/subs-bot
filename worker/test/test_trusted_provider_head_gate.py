@@ -102,6 +102,11 @@ class TrustedProviderGateTests(unittest.TestCase):
                        {"GITHUB_WORKFLOW_SHA": HEAD}, {"PROVIDER_REVIEWED_HEAD_SHA": MAIN}):
             with self.subTest(change=change), self.assertRaises(ContractError):
                 self.check({**env, **change})
+        source = {**env, "GITHUB_WORKFLOW_REF": f"{gate.github.REPOSITORY}/{gate.SOURCE_WORKFLOW_PATH}@{gate.github.MAIN_REF}",
+                  "PROVIDER_HEAD_PHASE": "isolated-source", "PROVIDER_HEAD_ENVIRONMENT": "subs-bot-provider-archive-head-isolation"}
+        self.assertTrue(self.check(source)["checkoutVerified"])
+        with self.assertRaises(ContractError):
+            self.check({**source, "PROVIDER_HEAD_PHASE": "isolated-source-readback"})
 
     def test_digest_dispatcher_uses_fresh_gated_jobs_and_is_default_off(self):
         workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/worker-provider-reviewed-digest.yml").read_text()
@@ -119,12 +124,31 @@ class TrustedProviderGateTests(unittest.TestCase):
             if name in ("preflight", "publish", "verify"):
                 self.assertNotIn("SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN", section)
                 self.assertNotIn("SUBS_BOT_CF_PROVIDER_ARCHIVE_WRITE_TOKEN", section)
+                self.assertNotIn("SUBS_BOT_SCOPED_R2_READ_JSON", section)
+                self.assertNotIn("SUBS_BOT_SCOPED_R2_WRITE_JSON", section)
             else:
                 self.assertNotIn("SUBS_BOT_CF_PROVIDER_CONTAINER_WRITE_TOKEN", section)
                 self.assertNotIn("SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN", section)
+            self.assertNotIn("SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN", section)
+            self.assertNotIn("SUBS_BOT_CF_PROVIDER_ARCHIVE_WRITE_TOKEN", section)
         self.assertEqual(workflow.count("uses: actions/upload-artifact@"), 1)
         self.assertIn("path: ${{ runner.temp }}/provider-source-transfer.age", workflow)
         self.assertIn("needs: [source, preflight, intent_readback]", workflow)
+
+    def test_reviewed_source_seal_and_readback_are_default_off_and_scoped(self):
+        root = Path(__file__).resolve().parents[2] / ".github/workflows"
+        seal = (root / "worker-provider-reviewed-isolated-source.yml").read_text()
+        readback = (root / "worker-provider-reviewed-isolated-source-readback.yml").read_text()
+        for text in (seal, readback):
+            self.assertIn("vars.SUBS_BOT_PROVIDER_REVIEWED_SOURCE_ENABLED == 'true'", text)
+            self.assertIn("uses: ./trusted/.github/actions/provider-reviewed-head-gate", text)
+            self.assertIn("SUBS_BOT_SCOPED_R2_READ_JSON", text)
+            self.assertIn("SUBS_BOT_CF_R2_METADATA_READ_TOKEN", text)
+            self.assertNotIn("SUBS_BOT_CF_PROVIDER_ARCHIVE_WRITE_TOKEN", text)
+            self.assertNotIn("SUBS_BOT_CF_PROVIDER_CONTAINER_WRITE_TOKEN", text)
+        self.assertIn("vars.SUBS_BOT_PROVIDER_REVIEWED_SOURCE_WRITE_ENABLED == 'true'", seal)
+        self.assertIn("SUBS_BOT_SCOPED_R2_WRITE_JSON", seal)
+        self.assertNotIn("SUBS_BOT_SCOPED_R2_WRITE_JSON", readback)
 
     def test_production_archive_and_non_simulated_input_are_rejected(self):
         for change in ({"simulateActionsUnavailable": False},

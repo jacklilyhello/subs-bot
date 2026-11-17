@@ -19,6 +19,9 @@ WORKFLOW_PATH = ".github/workflows/worker-provider-reviewed-head.yml"
 WORKFLOW = f"{github.REPOSITORY}/{WORKFLOW_PATH}@{github.MAIN_REF}"
 DIGEST_WORKFLOW_PATH = ".github/workflows/worker-provider-reviewed-digest.yml"
 DIGEST_WORKFLOW = f"{github.REPOSITORY}/{DIGEST_WORKFLOW_PATH}@{github.MAIN_REF}"
+SOURCE_WORKFLOW_PATH = ".github/workflows/worker-provider-reviewed-isolated-source.yml"
+SOURCE_READBACK_WORKFLOW_PATH = ".github/workflows/worker-provider-reviewed-isolated-source-readback.yml"
+SOURCE_WORKFLOWS = {f"{github.REPOSITORY}/{path}@{github.MAIN_REF}" for path in (SOURCE_WORKFLOW_PATH, SOURCE_READBACK_WORKFLOW_PATH)}
 ENVIRONMENTS = {"subs-bot-provider-head-isolation", "subs-bot-provider-archive-head-isolation"}
 HEX40 = re.compile(r"[0-9a-f]{40}")
 HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -29,6 +32,7 @@ PROVIDER_PHASES = {"attest-provider"}
 DIGEST_PHASES = {"digest-source", "digest-preflight", "digest-intent-write", "digest-intent-readback",
                  "digest-publish", "digest-verify", "digest-completion-write", "digest-evidence-readback"}
 DIGEST_PROVIDER_PHASES = {"digest-preflight", "digest-publish", "digest-verify"}
+SOURCE_PHASES = {"isolated-source", "isolated-source-readback"}
 
 
 def checkout_sha(directory):
@@ -44,7 +48,7 @@ def validate(env):
     require(env.get("GITHUB_REPOSITORY") == github.REPOSITORY
             and env.get("GITHUB_REPOSITORY_ID") == str(github.REPOSITORY_ID)
             and env.get("GITHUB_REF") == github.MAIN_REF and env.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
-            and env.get("GITHUB_WORKFLOW_REF") in {WORKFLOW, DIGEST_WORKFLOW} and env.get("GITHUB_WORKFLOW_SHA") == main
+            and env.get("GITHUB_WORKFLOW_REF") in {WORKFLOW, DIGEST_WORKFLOW, *SOURCE_WORKFLOWS} and env.get("GITHUB_WORKFLOW_SHA") == main
             and env.get("RUNNER_ENVIRONMENT") == "github-hosted" and env.get("GITHUB_RUN_ATTEMPT") == "1"
             and HEX40.fullmatch(main or "") is not None and re.fullmatch(r"[!-~]{1,4096}", token or "") is not None)
     spec = parsed(env.get("PROVIDER_HEAD_VALIDATION_JSON", ""))
@@ -64,7 +68,11 @@ def validate(env):
                 and (ref["kind"] != "isolated-source" or ref["runAttempt"] == "1"))
     phase, environment = env.get("PROVIDER_HEAD_PHASE", ""), env.get("PROVIDER_HEAD_ENVIRONMENT", "")
     digest_workflow = env.get("GITHUB_WORKFLOW_REF") == DIGEST_WORKFLOW
-    require(phase in (DIGEST_PHASES if digest_workflow else PHASES) and environment in ENVIRONMENTS
+    source_workflow = env.get("GITHUB_WORKFLOW_REF") in SOURCE_WORKFLOWS
+    phases = DIGEST_PHASES if digest_workflow else SOURCE_PHASES if source_workflow else PHASES
+    require(phase in phases and environment in ENVIRONMENTS
+            and (not source_workflow or env.get("GITHUB_WORKFLOW_REF") ==
+                 f"{github.REPOSITORY}/{SOURCE_WORKFLOW_PATH if phase == 'isolated-source' else SOURCE_READBACK_WORKFLOW_PATH}@{github.MAIN_REF}")
             and environment == ("subs-bot-provider-head-isolation" if phase in (DIGEST_PROVIDER_PHASES if digest_workflow else PROVIDER_PHASES)
                                 else "subs-bot-provider-archive-head-isolation"))
     ref = github._get_json("/git/ref/heads/main", token)
@@ -98,7 +106,7 @@ def validate(env):
         require(target["environment"] == "rehearsal" and target["caller"] is None
                 and target["service"] == "subs-bot-provider-fetch-control-drill-01"
                 and target["build"]["runId"] == spec["providerCiRunId"]
-                and spec["approvalSha256"] == provider.digest({"operation": "publish-digest" if digest_workflow else "publish", "target": target}))
+                and spec["approvalSha256"] == provider.digest({"operation": "publish-digest" if digest_workflow or source_workflow else "publish", "target": target}))
         bucket = parsed(env.get("SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON", ""))
         require(bucket.get("accountId") == "9431815bdb8beb2272f6668e06b7d3be" and bucket.get("namespace") == "lilyya"
                 and isinstance(bucket.get("r2CreatedOn"), str)

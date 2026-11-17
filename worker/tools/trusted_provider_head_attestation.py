@@ -114,10 +114,15 @@ def independent_isolated_source(ref, bucket, token):
     record = ledger.get(ref["runId"])
     fields = {"intentSha256", "manifestSha256", "runId", "controllerRevision", "targetSha256",
               "readbackRunId", "readbackRunAttempt", "readbackControllerRevision", "readbackSha256"}
-    provider.require(isinstance(record, dict) and set(record) == fields
+    extra = {"candidateRevision", "reviewedPr", "workflowPath", "readbackWorkflowPath"}
+    provider.require(isinstance(record, dict) and set(record) in (fields, fields | extra)
                      and all(provider.match(provider.provider.HEX, record[k]) for k in ("intentSha256", "manifestSha256", "targetSha256", "readbackSha256"))
                      and all(provider.match(provider.provider.DECIMAL, record[k]) for k in ("runId", "readbackRunId", "readbackRunAttempt"))
                      and record["controllerRevision"] in allowed and record["readbackControllerRevision"] in allowed
+                     and (set(record) == fields or (provider.match(provider.provider.REVISION, record["candidateRevision"])
+                         and provider.match(provider.provider.DECIMAL, record["reviewedPr"])
+                         and record["workflowPath"] == ".github/workflows/worker-provider-reviewed-isolated-source.yml"
+                         and record["readbackWorkflowPath"] == ".github/workflows/worker-provider-reviewed-isolated-source-readback.yml"))
                      and record["manifestSha256"] == ref["manifestSha256"] and record["targetSha256"] == ref["targetSha256"]
                      and ref["runAttempt"] == "1")
     store = IsolatedSourceStore(bucket, token, ref["runId"])
@@ -129,11 +134,14 @@ def independent_isolated_source(ref, bucket, token):
                      and sha256(manifest_raw).hexdigest() == record["manifestSha256"])
     intent = provider.github._parse_object(intent_raw, archive.ERROR)
     manifest = provider.github._parse_object(manifest_raw, archive.ERROR)
-    provider.require(set(manifest) == {"version", "kind", "runId", "runAttempt", "controllerRevision", "target", "files"}
+    manifest_fields = {"version", "kind", "runId", "runAttempt", "controllerRevision", "target", "files"}
+    identity_fields = {"candidateRevision", "reviewedPr", "workflowPath"}
+    provider.require(set(manifest) == (manifest_fields | identity_fields if set(record) != fields else manifest_fields)
                      and type(manifest["version"]) is int and manifest["version"] == 1
                      and manifest["kind"] == "subs-bot-isolated-provider-source"
                      and manifest["runId"] == ref["runId"] and manifest["runAttempt"] == "1"
                      and manifest["controllerRevision"] == record["controllerRevision"]
+                     and all(manifest[key] == record[key] for key in identity_fields if key in manifest)
                      and isinstance(manifest["files"], dict) and set(manifest["files"]) == {"provider-source-archive.zip"})
     target = provider.validate_config(manifest["target"])
     provider.require(target["environment"] == "rehearsal" and target["caller"] is None and provider.digest(target) == ref["targetSha256"])
@@ -150,23 +158,27 @@ def independent_isolated_source(ref, bucket, token):
                      and type(intent["version"]) is int and intent["version"] == 1 and intent["status"] == "started-unknown"
                      and intent["runId"] == record["runId"] and intent["runAttempt"] == "1"
                      and intent["controllerRevision"] == record["controllerRevision"] and isinstance(plan, dict)
-                     and set(plan) == {"version", "action", "operationId", "controllerRevision", "targetSha256", "build",
-                                       "bucketSha256", "prefixState", "inventorySha256", "controllersSha256"}
+                     and set(plan) == ({"version", "action", "operationId", "controllerRevision", "targetSha256", "build",
+                                        "bucketSha256", "prefixState", "inventorySha256", "controllersSha256"}
+                                       | (identity_fields if set(record) != fields else set()))
                      and type(plan["version"]) is int and plan["version"] == 1
                      and plan["prefixState"] == "intent-and-manifest-absent"
                      and all(provider.match(provider.provider.HEX, plan[k]) for k in ("inventorySha256", "controllersSha256"))
                      and plan.get("action") == "seal-isolated-provider-source" and plan.get("operationId") == ref["runId"]
                      and plan.get("controllerRevision") == record["controllerRevision"] and plan.get("targetSha256") == ref["targetSha256"]
                      and plan.get("bucketSha256") == provider.digest(bucket) and plan.get("build") == target["build"]
+                     and all(plan[key] == record[key] for key in identity_fields if key in plan)
                      and intent["approvalSha256"] == provider.digest(plan))
     source = {k: record[k] for k in ("intentSha256", "manifestSha256", "runId", "controllerRevision")}
+    source.update({key: record[key] for key in identity_fields if key in record})
     report = {"version": 1, "kind": "isolated-provider-source-readback", "status": "source-original-verified",
               "rehearsalCompletion": "not-evaluated", "operationId": ref["runId"], "manifestSha256": record["manifestSha256"],
               "targetSha256": record["targetSha256"], "seal": source, "readbackRunId": record["readbackRunId"],
-              "readbackRunAttempt": record["readbackRunAttempt"], "readbackControllerRevision": record["readbackControllerRevision"]}
+              "readbackRunAttempt": record["readbackRunAttempt"], "readbackControllerRevision": record["readbackControllerRevision"],
+              **({"readbackWorkflowPath": record["readbackWorkflowPath"]} if "readbackWorkflowPath" in record else {})}
     provider.require(provider.digest(report) == record["readbackSha256"])
-    seal_path = ".github/workflows/worker-provider-isolated-source.yml"
-    readback_path = ".github/workflows/worker-provider-isolated-source-readback.yml"
+    seal_path = record.get("workflowPath", ".github/workflows/worker-provider-isolated-source.yml")
+    readback_path = record.get("readbackWorkflowPath", ".github/workflows/worker-provider-isolated-source-readback.yml")
     gh_token = os.environ["GH_TOKEN"]
     for run_id, attempt, revision, path, title in (
             (record["runId"], "1", record["controllerRevision"], seal_path, "Isolated Provider source seal " + ref["runId"]),

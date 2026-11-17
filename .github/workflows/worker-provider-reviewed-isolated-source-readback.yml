@@ -1,0 +1,83 @@
+name: Independently read reviewed isolated Provider source
+run-name: Read isolated source ${{ inputs.operation_id }} 1 ${{ inputs.manifest_sha256 }} ${{ inputs.target_sha256 }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      validation_json:
+        description: Independently approved PR head, target and existing private source pins
+        required: true
+        type: string
+      operation_id:
+        description: Original isolated source operation ID
+        required: true
+        type: string
+      manifest_sha256:
+        description: Independently recorded sealed manifest SHA-256
+        required: true
+        type: string
+      target_sha256:
+        description: Independently recorded target SHA-256
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: subs-bot-provider-isolated-source
+  cancel-in-progress: false
+
+jobs:
+  readback:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && vars.SUBS_BOT_PROVIDER_REVIEWED_SOURCE_ENABLED == 'true'
+    environment: subs-bot-provider-archive-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PROVIDER_HEAD_VALIDATION_JSON: ${{ inputs.validation_json }}
+      PROVIDER_HEAD_REVIEWED_SHA: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+      PROVIDER_HEAD_TRUSTED_MAIN_SHA: ${{ github.sha }}
+      SUBS_BOT_PROVIDER_ISOLATED_SOURCE_ENABLED: 'true'
+      SUBS_BOT_PROVIDER_CI_RUN_ID: ${{ fromJSON(inputs.validation_json).providerCiRunId }}
+      SUBS_BOT_PROVIDER_ARCHIVE_REFS: ${{ toJSON(fromJSON(inputs.validation_json).archiveRefs) }}
+      SUBS_BOT_PROVIDER_TRUSTED_ARCHIVE_REFS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+      SUBS_BOT_PROVIDER_DIGEST_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_APPROVAL }}
+      SUBS_BOT_PROVIDER_SIMULATE_ARTIFACT_UNAVAILABLE: '1'
+    steps:
+      - name: Check out trusted current main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Verify independently approved Provider head and isolation contracts
+        uses: ./trusted/.github/actions/provider-reviewed-head-gate
+        with:
+          validation_json: ${{ inputs.validation_json }}
+          reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          phase: isolated-source-readback
+          environment: subs-bot-provider-archive-head-isolation
+          provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          archive_target_json: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          archive_refs_json: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+      - name: Independently verify the pinned original from private R2
+        working-directory: candidate
+        env:
+          SUBS_BOT_PROVIDER_ISOLATED_SOURCE_ACTION: readback
+          SUBS_BOT_PROVIDER_ARCHIVE_RUN_ID: ${{ inputs.operation_id }}
+          SUBS_BOT_PROVIDER_ARCHIVE_RUN_ATTEMPT: '1'
+          SUBS_BOT_PROVIDER_ARCHIVE_MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_SHA256: ${{ inputs.target_sha256 }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_ISOLATED_SOURCE_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ISOLATED_SOURCE_LEDGER_JSON }}
+          SUBS_BOT_PROVIDER_ISOLATED_SOURCE_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ISOLATED_SOURCE_CONTROLLERS_JSON }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$PROVIDER_HEAD_REVIEWED_SHA"
+          umask 077
+          python3 -B worker/tools/provider_isolated_source.py
