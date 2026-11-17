@@ -16,6 +16,19 @@ from test_trusted_provider_head_gate import spec
 
 
 class AttestationTests(unittest.TestCase):
+    def test_provider_failure_reports_fixed_endpoint_family_and_numbers_only(self):
+        error = attest.provider.read_failure("response-envelope", 403,
+            {"errors": [{"code": 10000, "message": "private-response"}]}, family="workflow")
+        def fail():
+            raise error
+        output = StringIO()
+        with redirect_stdout(output), self.assertRaises(attest.provider.ProviderError):
+            attest.diagnosed("provider-state", fail)
+        rows = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(rows[-1], {"phase": "provider-state", "status": "rejected", "category": "provider",
+                                   "endpointFamily": "workflow", "httpStatus": 403, "cloudflareCodes": [10000]})
+        self.assertNotIn("private-response", output.getvalue())
+
     def test_fixed_stage_diagnostic_reports_only_bounded_status(self):
         error = attest.scoped_r2.ScopedR2Error("private path and response body")
         error.read_diagnostic = {"source": "r2", "phase": "get", "httpStatus": 403}
