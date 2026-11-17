@@ -22,7 +22,7 @@ class CoordinatorTests(unittest.TestCase):
 
     def intent(self):
         return coordinator.dispatch_intent(target="a" * 64, session="123", sequence=1,
-            revision="b" * 40, nonce="c" * 64, input_sha256="d" * 64, created_at=1000)
+            revision="b" * 40, nonce="c" * 64, input_sha256="d" * 64, created_at=1000, writer_run_id="789")
 
     def test_single_use_intent_is_read_back_and_existing_intent_cannot_be_reissued(self):
         value = self.intent()
@@ -75,7 +75,7 @@ class CoordinatorTests(unittest.TestCase):
 
     def test_pause_deadline_starts_before_dispatch_and_rejects_future_intent(self):
         value = coordinator.dispatch_intent(target="a" * 64, session="123", sequence=5,
-            revision="b" * 40, nonce="c" * 64, input_sha256="d" * 64, created_at=1000)
+            revision="b" * 40, nonce="c" * 64, input_sha256="d" * 64, created_at=1000, writer_run_id="789")
         self.assertEqual(coordinator.pause_deadline(value, 900, now=1005), 1900)
         with self.assertRaises(ContractError):
             coordinator.pause_deadline(value, 900, now=900)
@@ -85,7 +85,7 @@ class CoordinatorTests(unittest.TestCase):
         prior = [{"action": "plan-begin", "status": "plan-only", "session": "456-1",
                   "day": "2026/11/18", "stateSha256": "e" * 64}]
         intent = coordinator.dispatch_intent(target="a" * 64, session="123", sequence=2,
-            revision="b" * 40, nonce="c" * 64, input_sha256="d" * 64, created_at=1000)
+            revision="b" * 40, nonce="c" * 64, input_sha256="d" * 64, created_at=1000, writer_run_id="789")
         value, deadline = coordinator.stage_inputs(prior, "1" * 32, "2" * 64, "123", intent, 900, None)
         self.assertIsNone(deadline)
         self.assertEqual(value["state_sha256"], "e" * 64)
@@ -108,11 +108,37 @@ class CoordinatorTests(unittest.TestCase):
             coordinator.claim_resume_writer(store, "a" * 64, "123", "b" * 40, history, "456")
         store.put_once.assert_called_once()
 
+    def test_legacy_begin_intent_can_identify_nonce_named_writer(self):
+        title = "Production backup begin at " + "b" * 40 + " #" + "c" * 64
+        self.assertEqual(cli.run_action(title, "b" * 40), "begin")
+        self.assertEqual(cli.run_action(title, "b" * 40, nonce="c" * 64), "begin")
+        with self.assertRaises(ContractError):
+            cli.run_action(title, "b" * 40, nonce="d" * 64)
+
+    def test_finished_legacy_begin_keeps_full_run_identity_checks(self):
+        revision, nonce = "b" * 40, "c" * 64
+        workflow = {"id": 7, "path": ".github/workflows/worker-production-backup.yml"}
+        run = {"id": 456, "run_attempt": 1, "workflow_id": 7, "event": "workflow_dispatch",
+               "head_branch": "main", "head_sha": revision, "status": "completed",
+               "display_title": "Production backup begin at " + revision + " #" + nonce,
+               "repository": {"id": cli.artifact.REPOSITORY_ID}, "head_repository": {"id": cli.artifact.REPOSITORY_ID}}
+        details = {"runId": "456", "runAttempt": "1", "controlRevision": revision}
+        def checked(candidate, provided=details):
+            with patch.object(cli.artifact, "_github_token", return_value="token"), \
+                 patch.object(cli.artifact, "_get_json", side_effect=[candidate, workflow]):
+                cli.require_finished_intent(provided, allowed_actions={"begin"})
+        checked(run)
+        for change in ({"id": 457}, {"run_attempt": 2}, {"head_sha": "d" * 40}):
+            with self.subTest(change=change), self.assertRaises(ContractError):
+                checked({**run, **change})
+        with self.assertRaises(ContractError):
+            checked(run, {**details, "dispatchNonce": "d" * 64})
+
     def test_expired_dispatched_pause_is_rejected_but_activation_is_allowed(self):
         from hashlib import sha256
         target, store = Mock(digest="a" * 64), Mock()
         pause = coordinator.dispatch_intent(target=target.digest, session="123", sequence=5,
-            revision="b" * 40, nonce="c" * 64, input_sha256="d" * 64, created_at=1000)
+            revision="b" * 40, nonce="c" * 64, input_sha256="d" * 64, created_at=1000, writer_run_id="789")
         env = {"GITHUB_SHA": "b" * 40, "BACKUP_ACTION": "pause", "BACKUP_DISPATCH_NONCE": "c" * 64,
                "BACKUP_COORDINATOR_SESSION": "123", "BACKUP_DISPATCH_DEADLINE": "1060",
                "BACKUP_SOURCE_CHECKPOINT_ID": "e" * 32, "BACKUP_SOURCE_MANIFEST_SHA256": "f" * 64,
@@ -122,12 +148,56 @@ class CoordinatorTests(unittest.TestCase):
                   "session": "456-1", "session_day": "2026/11/18", "state_sha256": "1" * 64}
         pause["inputSha256"] = sha256(canonical(inputs)).hexdigest()
         store.objects.get.return_value = (canonical(pause), '"etag"')
+        parent = {"id": 789, "run_attempt": 1, "path": ".github/workflows/worker-production-backup-coordinator.yml",
+                  "head_sha": "b" * 40, "head_branch": "main", "event": "workflow_dispatch", "status": "in_progress",
+                  "display_title": "Production backup coordinator run at " + "b" * 40,
+                  "repository": {"id": cli.artifact.REPOSITORY_ID}, "head_repository": {"id": cli.artifact.REPOSITORY_ID}}
+        jobs = {"total_count": 1, "jobs": [{"name": "coordinate", "run_id": 789, "run_attempt": 1,
+                "head_sha": "b" * 40, "status": "in_progress", "conclusion": None,
+                "steps": [{"name": "Coordinate one explicitly approved operation", "status": "in_progress", "conclusion": None}]}]}
+        with patch.object(cli.time, "time", return_value=1001), \
+             patch.object(cli.artifact, "_github_token", return_value="token"), \
+             patch.object(cli.artifact, "_get_json", side_effect=[parent, jobs, {**parent, "status": "completed"}]):
+            guard = cli.coordinator_guard(env, target, store, {"pauseLimitSeconds": 60}, lambda: None)
+            with self.assertRaises(ContractError):
+                guard()
+        resumed = {**parent, "display_title": "Production backup coordinator resume at " + "b" * 40}
+        with patch.object(cli.time, "time", return_value=1001) as clock, \
+             patch.object(cli.artifact, "_github_token", return_value="token"), \
+             patch.object(cli.artifact, "_get_json", side_effect=[resumed, jobs]):
+            guard = cli.coordinator_guard(env, target, store, {"pauseLimitSeconds": 60}, lambda: None)
+            clock.return_value = 1061
+            with self.assertRaises(ContractError):
+                guard()
+        ended = {"total_count": 1, "jobs": [{**jobs["jobs"][0],
+                 "steps": [{"name": "Coordinate one explicitly approved operation", "status": "completed", "conclusion": "failure"}]}]}
+        with patch.object(cli.time, "time", return_value=1001), \
+             patch.object(cli.artifact, "_github_token", return_value="token"), \
+             patch.object(cli.artifact, "_get_json", side_effect=[parent, ended]), \
+             self.assertRaises(ContractError):
+            cli.coordinator_guard(env, target, store, {"pauseLimitSeconds": 60}, lambda: None)
+        for change in ({"run_attempt": 2}, {"head_sha": "d" * 40}, {"repository": {"id": -1}}):
+            with self.subTest(change=change), patch.object(cli.time, "time", return_value=1001), \
+                 patch.object(cli.artifact, "_github_token", return_value="token"), \
+                 patch.object(cli.artifact, "_get_json", return_value={**parent, **change}), \
+                 self.assertRaises(ContractError):
+                cli.coordinator_guard(env, target, store, {"pauseLimitSeconds": 60}, lambda: None)
+        with patch.object(cli.time, "time", return_value=1001), \
+             patch.object(cli.artifact, "_github_token", return_value="token"), \
+             patch.object(cli.artifact, "_get_json", side_effect=OSError("unavailable")), \
+             self.assertRaises(OSError):
+            cli.coordinator_guard(env, target, store, {"pauseLimitSeconds": 60}, lambda: None)
+        with patch.object(cli.time, "time", return_value=1001), \
+             patch.object(cli.artifact, "_github_token", return_value="token"), \
+             patch.object(cli.artifact, "_get_json", return_value={"id": 789, "status": "completed"}), \
+             self.assertRaises(ContractError):
+            cli.coordinator_guard(env, target, store, {"pauseLimitSeconds": 60}, lambda: None)
         with patch.object(cli.time, "time", return_value=1061), self.assertRaises(ContractError):
             cli.coordinator_guard(env, target, store, {"pauseLimitSeconds": 60}, lambda: None)
         env["BACKUP_ACTION"] = "activate"
         inputs["action"] = "activate"
         activate = coordinator.dispatch_intent(target=target.digest, session="123", sequence=11,
-            revision="b" * 40, nonce="c" * 64, input_sha256=sha256(canonical(inputs)).hexdigest(), created_at=1050)
+            revision="b" * 40, nonce="c" * 64, input_sha256=sha256(canonical(inputs)).hexdigest(), created_at=1050, writer_run_id="789")
         store.objects.get.side_effect = [(canonical(activate), '"etag"'), (canonical(pause), '"etag"')]
         with patch.object(cli.time, "time", return_value=1061):
             guard = cli.coordinator_guard(env, target, store, {"pauseLimitSeconds": 60}, lambda: None)
@@ -137,7 +207,7 @@ class CoordinatorTests(unittest.TestCase):
         from hashlib import sha256
         target, objects, app_store = Mock(digest="a" * 64), Mock(), Mock()
         provisional = coordinator.dispatch_intent(target=target.digest, session="123", sequence=1,
-            revision="b" * 40, nonce="c" * 64, input_sha256="0" * 64, created_at=1000)
+            revision="b" * 40, nonce="c" * 64, input_sha256="0" * 64, created_at=1000, writer_run_id="789")
         inputs, _ = coordinator.stage_inputs([], "1" * 32, "2" * 64, "123", provisional, 900, None)
         intent = {**provisional, "inputSha256": sha256(canonical(inputs)).hexdigest()}
         objects.get.return_value = (canonical(intent), '"etag"')

@@ -36,21 +36,23 @@ def result_archive_key(target, session, sequence):
     return event_key(target, session, sequence).replace("-intent.json", "-result.zip")
 
 
-def dispatch_intent(*, target, session, sequence, revision, nonce, input_sha256, created_at):
+def dispatch_intent(*, target, session, sequence, revision, nonce, input_sha256, created_at, writer_run_id):
     valid_target(target)
     require(DECIMAL.fullmatch(session or "") and type(sequence) is int and 1 <= sequence <= len(STEPS)
             and REVISION.fullmatch(revision or "") and HEX.fullmatch(nonce or "") and HEX.fullmatch(input_sha256 or "")
-            and type(created_at) is int and created_at > 0)
+            and type(created_at) is int and created_at > 0 and DECIMAL.fullmatch(writer_run_id or ""))
     return {"version": 1, "kind": "production-backup-dispatch-intent", "targetSha256": target,
             "session": session, "sequence": sequence, "action": STEPS[sequence - 1],
-            "controllerRevision": revision, "nonce": nonce, "inputSha256": input_sha256, "createdAt": created_at}
+            "controllerRevision": revision, "nonce": nonce, "inputSha256": input_sha256, "createdAt": created_at,
+            "writerRunId": writer_run_id, "writerAttempt": "1"}
 
 
 def write_dispatch_once(store, intent):
     """Claim a single stage; callers must not dispatch unless readback succeeds."""
     require(isinstance(intent, dict) and intent == dispatch_intent(target=intent.get("targetSha256"),
         session=intent.get("session"), sequence=intent.get("sequence"), revision=intent.get("controllerRevision"),
-        nonce=intent.get("nonce"), input_sha256=intent.get("inputSha256"), created_at=intent.get("createdAt")))
+        nonce=intent.get("nonce"), input_sha256=intent.get("inputSha256"), created_at=intent.get("createdAt"),
+        writer_run_id=intent.get("writerRunId")))
     key = event_key(intent["targetSha256"], intent["session"], intent["sequence"])
     existing, _ = store.get(key, absent=True)
     require(existing is None, "A dispatch intent already exists; inspect it rather than reissue it.")
@@ -82,7 +84,7 @@ def inspect_stage(store, target, session, sequence):
     intent = parsed(raw)
     require(canonical(intent) == raw and intent == dispatch_intent(target=target, session=session, sequence=sequence,
         revision=intent.get("controllerRevision"), nonce=intent.get("nonce"), input_sha256=intent.get("inputSha256"),
-        created_at=intent.get("createdAt")))
+        created_at=intent.get("createdAt"), writer_run_id=intent.get("writerRunId")))
     if result is None:
         return {"status": "unknown", "intentSha256": sha256(raw).hexdigest(), "dispatchPermitted": False}
     value = parsed(result)
@@ -529,7 +531,7 @@ def pause_deadline(intent, pause_limit, *, now):
     return intent["createdAt"] + pause_limit
 
 
-def run_sequence(store, anchor, target, session, revision, source_checkpoint_id, source_manifest_sha256, token, *, deadline, pause_limit):
+def run_sequence(store, anchor, target, session, revision, source_checkpoint_id, source_manifest_sha256, token, *, deadline, pause_limit, writer_run_id):
     """Drive the fixed checkpoint sequence; unknown external writes are never replayed."""
     from secrets import token_hex
     import time
@@ -542,7 +544,7 @@ def run_sequence(store, anchor, target, session, revision, source_checkpoint_id,
         nonce = token_hex(32)
         now = int(time.time())
         provisional = dispatch_intent(target=target, session=session, sequence=len(results) + 1, revision=revision,
-                                      nonce=nonce, input_sha256="0" * 64, created_at=now)
+                                      nonce=nonce, input_sha256="0" * 64, created_at=now, writer_run_id=writer_run_id)
         inputs, pause_until = stage_inputs(results, source_checkpoint_id, source_manifest_sha256, session,
                                            provisional, pause_limit, pause_until)
         intent = {**provisional, "inputSha256": sha256(canonical(inputs)).hexdigest()}
@@ -707,7 +709,7 @@ def main(env=None):
         claim_resume_writer(objects, target.digest, session, revision, history, env["GITHUB_RUN_ID"])
     result = run_sequence(objects, anchor, target.digest, session, revision, source_checkpoint, source_sha,
                           artifact._github_token(), deadline=time.monotonic() + 5 * 3600,
-                          pause_limit=policy["pauseLimitSeconds"])
+                          pause_limit=policy["pauseLimitSeconds"], writer_run_id=env["GITHUB_RUN_ID"])
     return result
 
 

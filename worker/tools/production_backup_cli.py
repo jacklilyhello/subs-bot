@@ -238,7 +238,7 @@ def coordinator_guard(env, target, store, policy, base_guard):
     intent = parsed(raw)
     require(canonical(intent) == raw and intent == coordinator.dispatch_intent(target=target.digest, session=session,
         sequence=sequence, revision=env["GITHUB_SHA"], nonce=nonce, input_sha256=intent.get("inputSha256"),
-        created_at=intent.get("createdAt")))
+        created_at=intent.get("createdAt"), writer_run_id=intent.get("writerRunId")))
     inputs = {"action": action, "source_checkpoint_id": env.get("BACKUP_SOURCE_CHECKPOINT_ID", ""),
               "source_manifest_sha256": env.get("BACKUP_SOURCE_MANIFEST_SHA256", ""),
               "dispatch_nonce": nonce, "coordinator_session": session, "dispatch_deadline": raw_deadline}
@@ -253,7 +253,7 @@ def coordinator_guard(env, target, store, policy, base_guard):
         pause = parsed(pause_raw)
         require(canonical(pause) == pause_raw and pause == coordinator.dispatch_intent(target=target.digest, session=session,
                 sequence=coordinator.STEPS.index("pause") + 1, revision=env["GITHUB_SHA"], nonce=pause.get("nonce"),
-                input_sha256=pause.get("inputSha256"), created_at=pause.get("createdAt"))
+                input_sha256=pause.get("inputSha256"), created_at=pause.get("createdAt"), writer_run_id=pause.get("writerRunId"))
                 and coordinator.pause_deadline(pause, policy["pauseLimitSeconds"], now=int(time.time())) == deadline)
     else:
         require(deadline == 0)
@@ -261,6 +261,32 @@ def coordinator_guard(env, target, store, policy, base_guard):
         base_guard()
         if action in {"pause", "freeze", "capture"}:
             require(deadline > int(time.time()), "The coordinator deadline elapsed; this mutation cannot start.")
+            run = artifact._get_json("/actions/runs/" + intent["writerRunId"], artifact._github_token())
+            path = ".github/workflows/worker-production-backup-coordinator.yml"
+            require(str(run.get("id")) == intent["writerRunId"] and run.get("run_attempt") == 1
+                    and run.get("path") in (path, path + "@main", path + "@refs/heads/main")
+                    and run.get("head_sha") == env["GITHUB_SHA"] and run.get("head_branch") == "main"
+                    and run.get("event") == "workflow_dispatch" and run.get("status") == "in_progress"
+                    and run.get("display_title") in {"Production backup coordinator run at " + env["GITHUB_SHA"],
+                                                    "Production backup coordinator resume at " + env["GITHUB_SHA"]}
+                    and all(isinstance(run.get(k), dict) and run[k].get("id") == artifact.REPOSITORY_ID
+                            for k in ("repository", "head_repository")),
+                    "The exact coordinator writer is no longer running; do not start this mutation.")
+            response = artifact._get_json("/actions/runs/" + intent["writerRunId"] + "/attempts/1/jobs?per_page=100",
+                                          artifact._github_token())
+            jobs = response.get("jobs")
+            require(isinstance(jobs, list) and type(response.get("total_count")) is int
+                    and response["total_count"] == len(jobs) < 100)
+            matched = [job for job in jobs if isinstance(job, dict) and job.get("name") == "coordinate"]
+            require(len(matched) == 1 and str(matched[0].get("run_id")) == intent["writerRunId"]
+                    and matched[0].get("run_attempt") == 1 and matched[0].get("head_sha") == env["GITHUB_SHA"]
+                    and matched[0].get("status") == "in_progress" and matched[0].get("conclusion") is None
+                    and isinstance(matched[0].get("steps"), list))
+            steps = [step for step in matched[0]["steps"] if isinstance(step, dict)
+                     and step.get("name") == "Coordinate one explicitly approved operation"]
+            require(len(steps) == 1 and steps[0].get("status") == "in_progress" and steps[0].get("conclusion") is None,
+                    "The exact coordinator step is no longer running; do not start this mutation.")
+            require(deadline > int(time.time()), "The coordinator deadline elapsed before the mutation.")
     guard()
     return guard
 
@@ -280,7 +306,7 @@ def require_finished_intent(details, *, allowed_actions=None):
                     for key in ("repository", "head_repository")), "The original operation has not independently finished.")
     if allowed_actions is not None:
         require(isinstance(allowed_actions, set) and bool(allowed_actions)
-                and run_action(run.get("display_title"), details["controlRevision"], nonce=details.get("dispatchNonce", "")) in allowed_actions,
+                and run_action(run.get("display_title"), details["controlRevision"], nonce=details.get("dispatchNonce")) in allowed_actions,
                 "The finished run is not the exact intended backup action.")
 
 
