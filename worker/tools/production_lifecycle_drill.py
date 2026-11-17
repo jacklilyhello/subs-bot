@@ -1282,8 +1282,13 @@ class Drill:
                 proof = verify_activation_baseline(ctl, token, verified_event["details"]["checkpointId"],
                                                    verified_event["details"]["manifestSha256"])
                 require(proof.get("baselineVerified") is True)
-            journal.append("preserved-frozen", {"control": current["control"],
-                           "backupVerified": verified_event is not None, "confirmedByWatchdog": True}, int(time.time()))
+            details = {"control": current["control"], "backupVerified": verified_event is not None,
+                       "confirmedByWatchdog": True}
+            if verified_event is None:
+                journal.append_stopped_export(details, int(time.time()), source_journal=source_journal,
+                                              source=source, controller=ctl)
+            else:
+                journal.append("preserved-frozen", details, int(time.time()))
             anchor.release(session)
             self.report.update(status="reconciled", watchdog="frozen-source-preserved",
                                session=session, backupVerified=verified_event is not None)

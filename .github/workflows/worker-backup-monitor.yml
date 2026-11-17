@@ -28,22 +28,39 @@ permissions:
 
 jobs:
   observe:
-    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && (github.event_name != 'schedule' || vars.SUBS_BOT_REHEARSAL_BACKUP_MONITOR_ENABLED == 'true')
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
     environment: subs-bot-isolation
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     outputs:
-      status: ${{ steps.monitor.outputs.status }}
-      alerts_json: ${{ steps.monitor.outputs.alerts_json }}
+      status: ${{ steps.gate.outputs.status || steps.monitor.outputs.status }}
+      alerts_json: ${{ steps.gate.outputs.alerts_json || steps.monitor.outputs.alerts_json }}
       report_sha256: ${{ steps.monitor.outputs.report_sha256 }}
-      notification_relevant: ${{ steps.monitor.outputs.notification_relevant }}
+      notification_relevant: ${{ steps.gate.outputs.notification_relevant || steps.monitor.outputs.notification_relevant }}
     steps:
+      - name: Check whether scheduled monitoring is enabled
+        id: gate
+        env:
+          MONITOR_ENABLED: ${{ vars.SUBS_BOT_REHEARSAL_BACKUP_MONITOR_ENABLED }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = schedule ] && [ "$MONITOR_ENABLED" != true ]; then
+            echo 'enabled=false' >> "$GITHUB_OUTPUT"
+            echo 'status=disabled' >> "$GITHUB_OUTPUT"
+            echo 'alerts_json=["monitor-disabled"]' >> "$GITHUB_OUTPUT"
+            echo 'notification_relevant=true' >> "$GITHUB_OUTPUT"
+            echo '::warning::Scheduled rehearsal backup monitoring is disabled; no health observation was made.'
+            echo 'Scheduled rehearsal backup monitoring is disabled; no health observation was made.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'enabled=true' >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.gate.outputs.enabled == 'true'
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Read registered backup journals and hosted run status
         id: monitor
+        if: steps.gate.outputs.enabled == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           SUBS_BOT_CONTROL_ENVIRONMENT: subs-bot-isolation
@@ -68,7 +85,7 @@ jobs:
           umask 077
           python3 -B worker/tools/production_backup_monitor.py
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: always()
+        if: always() && steps.gate.outputs.enabled == 'true'
         with:
           name: subs-bot-backup-monitor-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/production-backup-monitor.json

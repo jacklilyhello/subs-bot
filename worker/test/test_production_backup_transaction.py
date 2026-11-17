@@ -117,6 +117,75 @@ class JournalTests(unittest.TestCase):
         self.assertEqual(transaction.interruption(self.journal.load()), "reconciliation-required")
         self.journal.append("capture-intent", {}, 111)
 
+    def test_unconfirmed_capture_cannot_use_generic_terminal_append(self):
+        for timestamp, (stage, details) in enumerate((("started", {}), ("preflight", {"capacity": {}}),
+                ("frozen", {}), ("frozen-data", {}), ("capture-intent", {"checkpointId": "a" * 32})), 100):
+            self.journal.append(stage, details, timestamp)
+        with self.assertRaises(ContractError):
+            self.journal.append("preserved-frozen", {"control": {}}, 110)
+        self.journal.append("failed", {"uncertain": True}, 111)
+        with self.assertRaises(ContractError):
+            self.journal.append("preserved-frozen", {"control": {}}, 112)
+        self.assertEqual(self.journal.load()[-1]["stage"], "failed")
+
+    def test_stopped_export_requires_fresh_full_source_proof(self):
+        import production_backup_capacity as capacity
+        import production_control
+        import production_recovery as recovery
+        checkpoint = "a" * 32
+        initial = {"checkpointId": checkpoint, "control": {"workers": "frozen"},
+                   "release": {"revision": "b" * 40}, "configurationSha256": "c" * 64}
+        fingerprint = {"dataSha256": "d" * 64, "rowCount": 1, "objectClosureSha256": "e" * 64}
+        for timestamp, (stage, details) in enumerate((("started", initial), ("preflight", {"capacity": {}}),
+                ("frozen", {}), ("frozen-data", fingerprint), ("capture-intent", {"checkpointId": checkpoint})), 100):
+            self.journal.append(stage, details, timestamp)
+        class FakeAPI:
+            cohort = checkpoint
+        class FakeSource:
+            api, scope_sha256 = FakeAPI(), "a" * 64
+        class FakeJournal:
+            api, raw = FakeSource.api, b"journal"
+            def load(self):
+                return {"export": {"state": "complete"}}
+        class FakeController:
+            def inspect(self):
+                return {"control": initial["control"], "release": initial["release"],
+                        "configurationSha256": initial["configurationSha256"], "work": {"pending": 0}, "terminal": {}}
+        details = {"control": initial["control"], "backupVerified": False, "confirmedByWatchdog": True}
+        with patch.object(recovery, "RecoverySource", FakeSource), patch.object(recovery, "RecoveryJournal", FakeJournal), \
+                patch.object(production_control, "Controller", FakeController), \
+                patch.object(capacity, "frozen_fingerprint", return_value=fingerprint):
+            self.journal.append_stopped_export(details, 110, source_journal=FakeJournal(),
+                                               source=FakeSource(), controller=FakeController())
+        self.assertEqual(self.journal.load()[-1]["stage"], "preserved-frozen")
+
+    def test_no_export_requires_exact_private_release_intent_and_manifest(self):
+        store = Store()
+        journal = transaction.Transaction(store, "44164739374-1", "2026/11/17", "a" * 64,
+                    "7aa685990859cffb30d47c5a6e593d969f1d0452")
+        for timestamp, (stage, details) in enumerate((("started", {}), ("preflight", {"capacity": {}}),
+                ("frozen", {}), ("frozen-data", {}),
+                ("capture-intent", {"checkpointId": "1bbadaa9755d1733ddd80fe12192420a"})), 100):
+            journal.append(stage, details, timestamp)
+        prefix = "maintenance/production-control/evidence/no-export-resolution/" + "a" * 64 + "/44164739374-1/"
+        manifest = {"kind": "no-export-original-evidence", "originalRunId": "44164739374", "originalAttempt": "1",
+                    "planSha256": "b" * 64, "threatModel": "reviewed-writers-no-unapproved-deletion"}
+        manifest_raw = transaction.canonical(manifest)
+        evidence = sha256(manifest_raw).hexdigest()
+        intent = {"kind": "no-export-release-intent", "targetSha256": "a" * 64, "originalRunId": "44164739374",
+                  "originalAttempt": "1", "evidenceSha256": evidence, "planSha256": "b" * 64}
+        intent_raw = transaction.canonical(intent)
+        store.put(prefix + "evidence-manifest.json", manifest_raw)
+        store.put(prefix + "evidence-intent.json", transaction.canonical({"version": 1, "kind": "no-export-evidence-intent",
+                  "planSha256": "b" * 64, "manifestSha256": evidence}))
+        store.put(prefix + "release-intent.json", intent_raw)
+        details = {"control": {}, "backupVerified": False, "noExportEvidenceSha256": evidence,
+                   "releaseIntentSha256": sha256(intent_raw).hexdigest(), "threatModel": manifest["threatModel"]}
+        called = []
+        journal.append_no_export(details, 110, guard=lambda: called.append(True))
+        self.assertEqual(called, [True])
+        self.assertEqual(journal.load()[-1]["stage"], "preserved-frozen")
+
     def test_failed_frozen_checkpoint_requires_confirmed_read_only_failure(self):
         for uncertain in (False, True):
             store = Store()

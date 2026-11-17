@@ -167,6 +167,6 @@ G0 之后发生任何新增、修改、删除、授权、领取、撤销、短�
 
 15 分钟采样会执行全部表的 D1 计数、迁移/控制核验以及引用对象的列表与内容读取；在 512 个对象、256 MiB 上限附近，每日最多约 96 次扫描、49,152 次对象内容读取和 24 GiB 引用对象读取，另有列表、元数据及源代码读取。实际请求数与耗时取决于数据和失败重试；启用前应按账户费率评估，必要时配置 30/60 分钟并相应扩大容量余量。平台延迟或扫描超过调度间隔时应告警并停止将旧状态当作最新容量。
 
-只读监控提供 GitHub 失败检查、annotation、摘要以及保留 7 天的 JSON artifact；任务输出 `status`、`alerts_json`、`report_sha256`、`notification_relevant` 供同一 workflow 的受控步骤接入。外部接收器可按受信的 workflow run ID 下载 artifact、核对摘要并根据 alert 分类路由；它必须自行处理重复或缺失 run，不能把未取得 artifact 当作健康。隔离和生产环境分别可用 `SUBS_BOT_REHEARSAL_BACKUP_NOTIFICATION_FILTER` 与 `SUBS_BOT_PRODUCTION_BACKUP_NOTIFICATION_FILTER` 配置逗号分隔的通知类别，默认 `*`；过滤仅决定路由标记，不移除原告警或改变失败检查。监控 unknown 和无效过滤配置始终标记相关。此接口不发送外部消息，本轮没有配置通知端点或实际投递；已授权的测试 Bot 和管理员并不意味着此处已接入 Telegram。生产监控仍默认关闭，启用及接收器归属须另行批准。
+只读监控提供 GitHub 失败检查、annotation、摘要以及保留 7 天的 JSON artifact；任务输出 `status`、`alerts_json`、`report_sha256`、`notification_relevant` 供同一 workflow 的受控步骤接入。定时监控关闭时输出 `disabled`/`monitor-disabled` 并提示未进行观察，不生成健康报告；该 job 的成功结束只表示开关检查完成，不表示备份健康。外部接收器可按受信的 workflow run ID 下载 artifact、核对摘要并根据 alert 分类路由；它必须自行处理重复或缺失 run，不能把未取得 artifact 当作健康。隔离和生产环境分别可用 `SUBS_BOT_REHEARSAL_BACKUP_NOTIFICATION_FILTER` 与 `SUBS_BOT_PRODUCTION_BACKUP_NOTIFICATION_FILTER` 配置逗号分隔的通知类别，默认 `*`；过滤仅决定路由标记，不移除原告警或改变失败检查。监控 unknown 和无效过滤配置始终标记相关。此接口不发送外部消息，本轮没有配置通知端点或实际投递；已授权的测试 Bot 和管理员并不意味着此处已接入 Telegram。生产监控仍默认关闭，启用及接收器归属须另行批准。
 
 容量采样只使用 D1 Read 与私有 R2 对象/metadata 只读凭据；代码也拒绝非只读 D1 SQL 与 R2 写操作。平台对 D1 Read 令牌的实际负向写入拒绝必须在独立专用 probe D1 实测，不能仅凭权限名称或本工具自身的 SQL 限制声称已验证；probe 未通过前应保留该权限边界的未验收状态。

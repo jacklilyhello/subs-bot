@@ -11,6 +11,17 @@ import production_backup_notification as notification
 
 
 class NotificationTests(unittest.TestCase):
+    def test_schedule_switch_is_checked_after_environment_is_loaded(self):
+        root = Path(__file__).resolve().parents[2]
+        for workflow in ("worker-backup-monitor.yml", "worker-production-backup.yml"):
+            content = (root / ".github/workflows" / workflow).read_text()
+            job_if = next(line for line in content.splitlines() if line.startswith("    if:"))
+            self.assertNotIn("MONITOR_ENABLED", job_if)
+            self.assertIn("id: gate", content)
+            self.assertIn("status=disabled", content)
+            self.assertIn("no health observation was made", content)
+            self.assertIn("steps.gate.outputs.enabled == 'true'", content)
+
     def test_default_and_configured_filter_preserve_all_alerts(self):
         self.assertFalse(notification.prepare({"status": "ok", "alerts": []}, "*")["notificationRelevant"])
         report = {"status": "alert", "alerts": ["backup-overdue", "capacity-near-limit"]}
