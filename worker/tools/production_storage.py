@@ -4,27 +4,36 @@ from datetime import datetime, timezone
 from hashlib import sha256
 import hmac
 from http.client import HTTPSConnection, HTTPException
+import os
 from urllib.parse import quote, urlencode
 from urllib.request import Request
 import xml.etree.ElementTree as ET
 
 import native_restore_rehearsal as native
-from production_control import API_ROOT, OperationError, NoRedirect, privacy
+from production_control import API, API_ROOT, OperationError, NoRedirect, privacy
 from production_target import canonical, matches, require, parsed
+import scoped_r2
 
 
 class PrivateStore:
     def __init__(self, api, bucket):
         require(bucket == api.target["backupBucketName"])
         self.api, self.bucket = api, bucket
+        self.objects = scoped_r2.from_environment(api.target["accountId"], bucket)
+        metadata_token = scoped_r2.metadata_token()
+        self.metadata_api = API(api.target, metadata_token) if metadata_token else api
 
     def verify(self):
-        return privacy(self.api, self.api.root, self.bucket, self.api.target["backupBucketCreatedAt"])
+        return privacy(self.metadata_api, self.metadata_api.root, self.bucket, self.api.target["backupBucketCreatedAt"])
 
     def list(self, prefix, maximum=128):
         self.verify()
         require(matches(r"maintenance/production-control/(?:registrations|evidence)/[a-zA-Z0-9/_.-]{1,200}", prefix))
         require(not any(p in (".", "..") for p in prefix.split("/")))
+        if self.objects is not None:
+            keys = self.objects.list(prefix, maximum=maximum)
+            require(len(keys) < maximum, "Lifecycle registration listing exceeds capacity.")
+            return keys
         result = self.api("GET", self.api.root + "/r2/buckets/" + self.bucket + "/objects?" + urlencode({"prefix": prefix, "per_page": maximum}), envelope=True)
         rows, info = result.get("result"), result.get("result_info", {})
         require(isinstance(rows, list) and len(rows) < maximum and not info.get("cursor")
@@ -51,6 +60,8 @@ class PrivateStore:
                 matches(r"maintenance/production-control/evidence/daily-backup-anchor/[a-f0-9]{64}/", prefix) or
                 matches(r"maintenance/production-control/evidence/daily-backup/[0-9]{4}/[0-9]{2}/[0-9]{2}/[1-9][0-9]{0,19}-[1-9][0-9]{0,9}/", prefix))
         self.verify()
+        if self.objects is not None:
+            return self.objects.list(prefix, maximum=10000)
         try:
             token = self.api("GET", self.api.root + "/tokens/verify")
         except OperationError as error:
@@ -120,6 +131,9 @@ class PrivateStore:
         require(matches(r"maintenance/production-control/(?:registrations|evidence)/[a-zA-Z0-9/_.-]{1,240}", key))
         require(not any(p in (".", "..") for p in key.split("/")))
         self.verify()
+        if self.objects is not None:
+            raw, _etag = self.objects.get(key, absent=absent, limit=512 * 1024)
+            return raw
         request = Request(API_ROOT + self.api.root + "/r2/buckets/" + self.bucket + "/objects/" + quote(key, safe="/"),
             headers={"Authorization": "Bearer " + self.api.token, "Accept-Encoding": "identity", "cf-r2-jurisdiction": "default"})
         try:
@@ -134,6 +148,10 @@ class PrivateStore:
         """Read a single private mutable coordination pointer and its ETag."""
         require(matches(r"maintenance/production-control/registrations/daily-backup-anchor-[a-f0-9]{64}\.json", key))
         self.verify()
+        if self.objects is not None:
+            raw, etag = self.objects.get(key, absent=True, limit=32768)
+            require(raw is None or matches(r'"[a-f0-9]{32}"', etag))
+            return raw, etag
         request = Request(API_ROOT + self.api.root + "/r2/buckets/" + self.bucket + "/objects/" + quote(key, safe="/"),
             headers={"Authorization": "Bearer " + self.api.token, "Accept-Encoding": "identity", "cf-r2-jurisdiction": "default"})
         try:
@@ -148,7 +166,11 @@ class PrivateStore:
 
     def compare_and_put(self, key, expected_body, expected_etag, body):
         """Conditionally advance a single pointer; unknown results are never retried."""
-        require(isinstance(body, bytes) and 0 < len(body) <= 32768)
+        require(matches(r"maintenance/production-control/registrations/daily-backup-anchor-[a-f0-9]{64}\.json", key)
+                and isinstance(body, bytes) and 0 < len(body) <= 32768)
+        if self.objects is not None:
+            self.verify()
+            return self.objects.compare_and_put(key, expected_body, expected_etag, body)
         actual, etag = self.get_with_etag(key)
         require(actual == expected_body and etag == expected_etag, "The backup coordination predecessor changed.")
         try:
@@ -173,11 +195,41 @@ class PrivateStore:
         require(observed == body and observed_etag is not None, "The backup coordination readback differs.")
         return observed_etag
 
+    def put_exclusive(self, key, body):
+        """Claim a unique intent once; 412 or unknown results never authorize writes."""
+        require(isinstance(body, bytes) and 0 < len(body) <= 512 * 1024)
+        require(self.get(key, absent=True) is None, "The private intent is already occupied.")
+        if self.objects is not None:
+            self.objects.put_once(key, body)
+            return
+        try:
+            token = self.api("GET", self.api.root + "/tokens/verify")
+        except OperationError as error:
+            require(error.http_status in (400, 401, 403, 404))
+            token = self.api("GET", "/user/tokens/verify")
+        require(isinstance(token, dict) and token.get("status") == "active" and matches(r"[a-f0-9]{32}", token.get("id")))
+        host = self.api.target["accountId"] + ".r2.cloudflarestorage.com"
+        path = "/" + self.bucket + "/" + quote(key, safe="/-_.~")
+        headers = native.signed_put_headers(host, path, token["id"], self.api.token, body,
+                                            {"custom": {}, "http": {}}, datetime.now(timezone.utc))
+        try:
+            with closing(HTTPSConnection(host, timeout=30)) as connection:
+                connection.request("PUT", path, body=body, headers=headers)
+                with closing(connection.getresponse()) as response:
+                    require(response.status == 200 and len(response.read(4097)) <= 4096,
+                            "The private intent was not uniquely claimed; do not retry.")
+        except (OSError, HTTPException, ValueError):
+            raise OperationError("The private intent result is unknown; do not retry.", uncertain=True) from None
+        require(self.get(key) == body, "The private intent was not independently confirmed.")
+
     def put(self, key, body):
         require(isinstance(body, bytes) and 0 < len(body) <= 512*1024)
         existing = self.get(key, absent=True)
         if existing is not None:
             require(existing == body, "Immutable lifecycle registration is occupied by different bytes.")
+            return sha256(body).hexdigest()
+        if self.objects is not None:
+            self.objects.put_once(key, body)
             return sha256(body).hexdigest()
         try:
             token = self.api("GET", self.api.root + "/tokens/verify")
@@ -197,32 +249,3 @@ class PrivateStore:
             raise OperationError("Private lifecycle write is unconfirmed; independently read back before retry.", uncertain=True) from None
         require(self.get(key) == body, "Private lifecycle storage readback differs.")
         return sha256(body).hexdigest()
-
-    def put_once(self, key, body):
-        """Claim an exclusive intent; conflict or lost response never grants it."""
-        require(isinstance(body, bytes) and 0 < len(body) <= 512 * 1024
-                and self.get(key, absent=True) is None)
-        objects = getattr(self, "objects", None)
-        if objects is not None:
-            objects.put_once(key, body)
-            require(self.get(key) == body)
-            return
-        try:
-            token = self.api("GET", self.api.root + "/tokens/verify")
-        except OperationError as error:
-            require(error.http_status in (400, 401, 403, 404))
-            token = self.api("GET", "/user/tokens/verify")
-        require(isinstance(token, dict) and token.get("status") == "active" and matches(r"[a-f0-9]{32}", token.get("id")))
-        host = self.api.target["accountId"] + ".r2.cloudflarestorage.com"
-        path = "/" + self.bucket + "/" + quote(key, safe="/-_.~")
-        headers = native.signed_put_headers(host, path, token["id"], self.api.token, body,
-                                            {"custom": {}, "http": {}}, datetime.now(timezone.utc))
-        try:
-            with closing(HTTPSConnection(host, timeout=30)) as connection:
-                connection.request("PUT", path, body=body, headers=headers)
-                with closing(connection.getresponse()) as response:
-                    require(response.status == 200 and len(response.read(4097)) <= 4096,
-                            "The exclusive intent write conflicted or is unknown; do not retry.")
-        except (OSError, HTTPException, ValueError):
-            raise OperationError("The exclusive intent write is unknown; do not retry.", uncertain=True) from None
-        require(self.get(key) == body, "The exclusive intent readback was not confirmed.")

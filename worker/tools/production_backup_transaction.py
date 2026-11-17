@@ -40,7 +40,7 @@ def write_begin(store, value):
     key = begin_key(value["targetSha256"], value["session"])
     require(store.get(key, absent=True) is None, "A begin intent already exists; inspect it without retrying.")
     raw = canonical(value)
-    store.put_once(key, raw)
+    store.put_exclusive(key, raw)
     require(store.get(key) == raw, "The original begin intent was not independently confirmed.")
     return sha256(raw).hexdigest()
 
@@ -67,7 +67,7 @@ def claim_begin_reconciliation(store, target_sha256, session, value):
     key = begin_key(target_sha256, session, reconciliation=True)
     require(store.get(key, absent=True) is None, "A prior begin reconciliation is unresolved; do not retry it.")
     raw = canonical(value)
-    store.put_once(key, raw)
+    store.put_exclusive(key, raw)
     require(store.get(key) == raw, "The begin reconciliation intent was not independently confirmed.")
 
 

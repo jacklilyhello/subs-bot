@@ -30,7 +30,7 @@ class Store:
             raise ContractError("conflict")
         self.objects[key] = body
 
-    def put_once(self, key, body):
+    def put_exclusive(self, key, body):
         if key in self.objects:
             raise ContractError("exclusive conflict")
         self.objects[key] = body

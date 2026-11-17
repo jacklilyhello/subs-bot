@@ -124,6 +124,20 @@ def resume_aborted_drain(ctl, *, initial, paused, session, record_intent):
                                        approval_envelope=envelope, record_intent=record_intent)
 
 
+def read_rehearsal_private_object(env, ctl, key):
+    """Independently read a fixed private-share key with scoped S3 when configured."""
+    import scoped_r2
+    require(isinstance(key, str) and native.matches(native.KEY, key) and key.startswith("private-shares/"))
+    objects = scoped_r2.from_environment(ACCOUNT, SERVICE, env)
+    if objects is not None:
+        body, _etag = objects.get(key, limit=64 * 1024)
+        return body
+    request = Request("https://api.cloudflare.com/client/v4/accounts/" + ACCOUNT + "/r2/buckets/" + SERVICE + "/objects/" + key,
+        headers={"Authorization": "Bearer " + env["SUBS_BOT_CF_BOOTSTRAP_TOKEN"], "Accept-Encoding": "identity", "cf-r2-jurisdiction": "default"})
+    _, _, body = native._response(ctl.data.opener, request, 64 * 1024)
+    return body
+
+
 def webhook_settings(info):
     require(isinstance(info, dict) and isinstance(info.get("url"), str)
             and info.get("has_custom_certificate") is False
@@ -715,9 +729,7 @@ class Drill:
                 f"JOIN telegram_inbox USING(receipt_id) WHERE telegram_inbox.update_id={base + 3}")
             require(len(private) == 1 and private[0]["state"] == "published", "The fixture object was not published.")
             key = "private-shares/" + private[0]["payload_id"] + ".txt"
-            request = Request("https://api.cloudflare.com/client/v4/accounts/" + ACCOUNT + "/r2/buckets/" + SERVICE + "/objects/" + key,
-                headers={"Authorization": "Bearer " + self.env["SUBS_BOT_CF_BOOTSTRAP_TOKEN"], "Accept-Encoding": "identity", "cf-r2-jurisdiction": "default"})
-            _, _, body = native._response(ctl.data.opener, request, 64 * 1024)
+            body = read_rehearsal_private_object(self.env, ctl, key)
             require(sha256(body).hexdigest() == private[0]["payload_sha256"], "Independent R2 bytes do not match the durable fixture digest.")
             states = rows(ctl.data, ctl.database, f"SELECT inbox.update_id,outbox.state,outbox.attempts FROM telegram_inbox AS inbox "
                 f"JOIN telegram_outbox AS outbox USING(receipt_id) WHERE inbox.update_id IN ({base + 1},{base + 3}) ORDER BY inbox.update_id")
