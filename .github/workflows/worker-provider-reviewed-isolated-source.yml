@@ -1,0 +1,102 @@
+name: Plan and seal reviewed isolated Provider source
+run-name: Isolated Provider source ${{ inputs.action }} ${{ inputs.operation_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      validation_json:
+        description: Independently approved PR head, target and existing private source pins
+        required: true
+        type: string
+      action:
+        description: Plan is read-only; seal requires the exact reviewed plan digest
+        required: true
+        type: choice
+        options: [plan, seal]
+      operation_id:
+        description: New decimal operation ID; never reuse after any seal dispatch
+        required: true
+        type: string
+      approval_sha256:
+        description: Exact plan approval digest, seal only
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: subs-bot-provider-isolated-source
+  cancel-in-progress: false
+
+jobs:
+  source:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && vars.SUBS_BOT_PROVIDER_REVIEWED_SOURCE_ENABLED == 'true'
+    environment: subs-bot-provider-archive-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PROVIDER_HEAD_VALIDATION_JSON: ${{ inputs.validation_json }}
+      PROVIDER_HEAD_REVIEWED_SHA: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+      PROVIDER_HEAD_TRUSTED_MAIN_SHA: ${{ github.sha }}
+      SUBS_BOT_PROVIDER_ISOLATED_SOURCE_ENABLED: 'true'
+      SUBS_BOT_PROVIDER_CI_RUN_ID: ${{ fromJSON(inputs.validation_json).providerCiRunId }}
+      SUBS_BOT_PROVIDER_ARCHIVE_REFS: ${{ toJSON(fromJSON(inputs.validation_json).archiveRefs) }}
+      SUBS_BOT_PROVIDER_TRUSTED_ARCHIVE_REFS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+      SUBS_BOT_PROVIDER_DIGEST_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_APPROVAL }}
+      SUBS_BOT_PROVIDER_SIMULATE_ARTIFACT_UNAVAILABLE: '0'
+      SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+    steps:
+      - name: Check out trusted current main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Verify independently approved Provider head and isolation contracts
+        uses: ./trusted/.github/actions/provider-reviewed-head-gate
+        with:
+          validation_json: ${{ inputs.validation_json }}
+          reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          phase: isolated-source
+          environment: subs-bot-provider-archive-head-isolation
+          provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          archive_target_json: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          archive_refs_json: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+      - name: Verify exact original Provider CI before archive access
+        working-directory: candidate
+        env:
+          SUBS_BOT_PROVIDER_ISOLATED_SOURCE_ACTION: prepare
+        run: |
+          test "$(git rev-parse HEAD)" = "$PROVIDER_HEAD_REVIEWED_SHA"
+          umask 077
+          python3 -B worker/tools/provider_isolated_source.py
+      - name: Plan without writing
+        if: inputs.action == 'plan'
+        working-directory: candidate
+        env:
+          SUBS_BOT_PROVIDER_ISOLATED_SOURCE_ACTION: plan
+          SUBS_BOT_PROVIDER_ISOLATED_SOURCE_OPERATION_ID: ${{ inputs.operation_id }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_ISOLATED_SOURCE_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ISOLATED_SOURCE_LEDGER_JSON }}
+          SUBS_BOT_PROVIDER_ISOLATED_SOURCE_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ISOLATED_SOURCE_CONTROLLERS_JSON }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+        run: python3 -B worker/tools/provider_isolated_source.py
+      - name: Seal once after exact approval and durable intent
+        if: inputs.action == 'seal' && vars.SUBS_BOT_PROVIDER_REVIEWED_SOURCE_WRITE_ENABLED == 'true'
+        working-directory: candidate
+        env:
+          SUBS_BOT_PROVIDER_ISOLATED_SOURCE_ACTION: seal
+          SUBS_BOT_PROVIDER_ISOLATED_SOURCE_OPERATION_ID: ${{ inputs.operation_id }}
+          SUBS_BOT_PROVIDER_ISOLATED_SOURCE_APPROVAL: ${{ inputs.approval_sha256 }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_ISOLATED_SOURCE_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ISOLATED_SOURCE_LEDGER_JSON }}
+          SUBS_BOT_PROVIDER_ISOLATED_SOURCE_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ISOLATED_SOURCE_CONTROLLERS_JSON }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_SCOPED_R2_WRITE_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_WRITE_JSON }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+        run: python3 -B worker/tools/provider_isolated_source.py
