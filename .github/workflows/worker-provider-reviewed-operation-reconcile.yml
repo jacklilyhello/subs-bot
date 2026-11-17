@@ -1,0 +1,58 @@
+name: Inspect isolated Provider operation read-only
+run-name: Inspect isolated Provider operation ${{ inputs.prior_run_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      validation_json:
+        description: Independently approved exact reviewed PR head and archive references
+        required: true
+        type: string
+      prior_run_id:
+        description: Exact previous operation run to inspect without writes
+        required: true
+        type: string
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+jobs:
+  reconcile:
+    name: Provider operation read-only reconciliation
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && vars.SUBS_BOT_PROVIDER_REVIEWED_OPERATION_RECONCILE_ENABLED == 'true'
+    environment: subs-bot-provider-archive-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PROVIDER_HEAD_REVIEWED_SHA: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+      PROVIDER_HEAD_VALIDATION_JSON: ${{ inputs.validation_json }}
+    steps:
+      - name: Check out trusted current main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Verify independently approved Provider head and isolation contracts
+        uses: ./trusted/.github/actions/provider-reviewed-head-gate
+        with:
+          validation_json: ${{ inputs.validation_json }}
+          reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          phase: operation-reconcile
+          environment: subs-bot-provider-archive-head-isolation
+          provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          archive_target_json: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          archive_refs_json: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+      - name: Inspect skipped operation without writes
+        env:
+          SUBS_BOT_PROVIDER_MUTATION_ACTION: reconcile-readonly
+          SUBS_BOT_PROVIDER_MUTATION_PRIOR_RUN_ID: ${{ inputs.prior_run_id }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_MUTATION_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_CONTROLLERS_JSON }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+        working-directory: candidate
+        run: |
+          test "$(git rev-parse HEAD)" = "$PROVIDER_HEAD_REVIEWED_SHA"
+          umask 077
+          python3 -B worker/tools/provider_private_mutation_journal.py

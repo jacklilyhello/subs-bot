@@ -18,11 +18,23 @@ on:
       - 'worker/test/test_provider_private_handoff.py'
       - 'worker/test/test_production_provider_encrypted_publish.py'
       - 'worker/tools/trusted_provider_head_gate.py'
+      - 'worker/tools/reviewed_provider_candidate.py'
+      - 'worker/tools/isolation_sealed_transfer.py'
+      - 'worker/test/test_reviewed_provider_candidate.py'
       - 'worker/tools/trusted_provider_head_attestation.py'
+      - 'worker/tools/trusted_provider_inventory.py'
+      - 'worker/test/test_trusted_provider_inventory.py'
+      - '.github/workflows/worker-provider-isolated-inventory.yml'
       - 'worker/test/test_trusted_provider_head_gate.py'
       - 'worker/test/test_trusted_provider_head_attestation.py'
       - '.github/actions/provider-reviewed-head-gate/action.yml'
       - '.github/workflows/worker-provider-reviewed-head.yml'
+      - '.github/workflows/worker-provider-reviewed-digest.yml'
+      - '.github/workflows/worker-provider-reviewed-operation.yml'
+      - '.github/workflows/worker-provider-reviewed-operation-reconcile.yml'
+      - '.github/workflows/worker-provider-reviewed-isolated-source.yml'
+      - '.github/workflows/worker-provider-reviewed-isolated-source-readback.yml'
+      - '.github/workflows/worker-provider-candidate-target.yml'
       - 'worker/tools/prepare_provider_artifact.py'
       - 'worker/tools/prepare_provider_api_status_artifact.py'
       - 'worker/tools/prepare_isolation_artifact.py'
@@ -103,11 +115,23 @@ on:
       - 'worker/test/test_provider_private_handoff.py'
       - 'worker/test/test_production_provider_encrypted_publish.py'
       - 'worker/tools/trusted_provider_head_gate.py'
+      - 'worker/tools/reviewed_provider_candidate.py'
+      - 'worker/tools/isolation_sealed_transfer.py'
+      - 'worker/test/test_reviewed_provider_candidate.py'
       - 'worker/tools/trusted_provider_head_attestation.py'
+      - 'worker/tools/trusted_provider_inventory.py'
+      - 'worker/test/test_trusted_provider_inventory.py'
+      - '.github/workflows/worker-provider-isolated-inventory.yml'
       - 'worker/test/test_trusted_provider_head_gate.py'
       - 'worker/test/test_trusted_provider_head_attestation.py'
       - '.github/actions/provider-reviewed-head-gate/action.yml'
       - '.github/workflows/worker-provider-reviewed-head.yml'
+      - '.github/workflows/worker-provider-reviewed-digest.yml'
+      - '.github/workflows/worker-provider-reviewed-operation.yml'
+      - '.github/workflows/worker-provider-reviewed-operation-reconcile.yml'
+      - '.github/workflows/worker-provider-reviewed-isolated-source.yml'
+      - '.github/workflows/worker-provider-reviewed-isolated-source-readback.yml'
+      - '.github/workflows/worker-provider-candidate-target.yml'
       - 'worker/tools/prepare_provider_artifact.py'
       - 'worker/tools/prepare_provider_api_status_artifact.py'
       - 'worker/tools/prepare_isolation_artifact.py'
@@ -187,7 +211,7 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.13'
-      - name: Verify pinned age package before private handoff checks
+      - name: Verify pinned age package for private source handoff
         run: bash worker/tools/install_provider_age.sh
       - name: Install only the pinned transport wheels
         run: |
@@ -204,6 +228,8 @@ jobs:
           python -B -m unittest discover -s worker/test -p 'test_archive_production_provider.py'
           python -B -m unittest discover -s worker/test -p 'test_provider_private_handoff.py'
           python -B -m unittest discover -s worker/test -p 'test_trusted_provider_head*.py'
+          python -B -m unittest discover -s worker/test -p 'test_trusted_provider_inventory.py'
+          python -B -m unittest discover -s worker/test -p 'test_reviewed_provider_candidate.py'
       - name: Test guarded registry publication without network access
         run: python -B -m unittest discover -s worker/test -p 'test_publish_provider_registry.py'
       - name: Test the private Worker bootstrap without network access
