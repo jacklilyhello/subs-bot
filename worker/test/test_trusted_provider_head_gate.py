@@ -84,6 +84,48 @@ class TrustedProviderGateTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ContractError):
                 self.check({**self.env, **change})
 
+    def test_digest_dispatcher_requires_the_exact_isolated_phase_and_digest_approval(self):
+        target = config(active=True)
+        bucket = {"accountId": "9431815bdb8beb2272f6668e06b7d3be", "namespace": "lilyya",
+                  "r2CreatedOn": "2026-11-16T00:00:00.123Z"}
+        approved = {**spec(), "approvalSha256": gate.provider.digest({"operation": "publish-digest", "target": target})}
+        env = {**self.env, "GITHUB_WORKFLOW_REF": gate.DIGEST_WORKFLOW,
+               "PROVIDER_HEAD_PHASE": "digest-publish", "PROVIDER_HEAD_ENVIRONMENT": "subs-bot-provider-head-isolation",
+               "PROVIDER_HEAD_CHECK": "credential", "PROVIDER_HEAD_VALIDATION_JSON": json.dumps(approved),
+               "SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON": json.dumps(target),
+               "SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON": json.dumps(bucket),
+               "SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON": json.dumps(approved["archiveRefs"])}
+        self.assertTrue(self.check(env)["checkoutVerified"])
+        for change in ({"PROVIDER_HEAD_PHASE": "attest-provider"},
+                       {"PROVIDER_HEAD_ENVIRONMENT": "subs-bot-provider-archive-head-isolation"},
+                       {"PROVIDER_HEAD_VALIDATION_JSON": json.dumps(spec())},
+                       {"GITHUB_WORKFLOW_SHA": HEAD}, {"PROVIDER_REVIEWED_HEAD_SHA": MAIN}):
+            with self.subTest(change=change), self.assertRaises(ContractError):
+                self.check({**env, **change})
+
+    def test_digest_dispatcher_uses_fresh_gated_jobs_and_is_default_off(self):
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/worker-provider-reviewed-digest.yml").read_text()
+        self.assertIn("vars.SUBS_BOT_PROVIDER_REVIEWED_DIGEST_ENABLED == 'true'", workflow)
+        self.assertIn("vars.SUBS_BOT_PROVIDER_DIGEST_WRITE_ENABLED == 'true'", workflow)
+        jobs = ("source", "preflight", "intent_write", "intent_readback", "publish", "verify", "completion_write", "evidence_readback")
+        self.assertEqual(workflow.count("uses: ./trusted/.github/actions/provider-reviewed-head-gate"), len(jobs))
+        self.assertEqual(workflow.count("path: trusted"), len(jobs))
+        self.assertEqual(workflow.count("reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}"), len(jobs))
+        for index, name in enumerate(jobs):
+            section = workflow.split(f"\n  {name}:\n", 1)[1]
+            if index + 1 < len(jobs):
+                section = section.split(f"\n  {jobs[index + 1]}:\n", 1)[0]
+            self.assertLess(section.index("uses: ./trusted/.github/actions/provider-reviewed-head-gate"), section.index("working-directory: candidate"))
+            if name in ("preflight", "publish", "verify"):
+                self.assertNotIn("SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN", section)
+                self.assertNotIn("SUBS_BOT_CF_PROVIDER_ARCHIVE_WRITE_TOKEN", section)
+            else:
+                self.assertNotIn("SUBS_BOT_CF_PROVIDER_CONTAINER_WRITE_TOKEN", section)
+                self.assertNotIn("SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN", section)
+        self.assertEqual(workflow.count("uses: actions/upload-artifact@"), 1)
+        self.assertIn("path: ${{ runner.temp }}/provider-source-transfer.age", workflow)
+        self.assertIn("needs: [source, preflight, intent_readback]", workflow)
+
     def test_production_archive_and_non_simulated_input_are_rejected(self):
         for change in ({"simulateActionsUnavailable": False},
                        {"archiveRefs": [{**spec()["archiveRefs"][0], "kind": "production"}]}):
