@@ -140,4 +140,6 @@ G0 之后发生任何新增、修改、删除、授权、领取、撤销、短�
 
 `capacity-near`、`capacity-over`、`readback-failure` 和 `process-kill` 仅是手动隔离 dispatch 的合成故障模式：它们分别模拟阈值、独立读回失败和 runner 进程中断，不表示真实数据达到阈值或真实 R2 对象被损坏。托管 fixture、Cloudflare 实际验收和生产配置是独立结论，不能以其中任何单项代替整体验收。
 
+另有待接入可信 main gate 的 `capacity-fixture` 候选入口：只针对独立登记、与现有业务 D1 不同的专用 D1 和私有桶，验证准确迁移链，逐次追加合成 finished invocation，测量全库达到 16,000、20,000 和 20,001 行时的真实预检；超限复用日常备份的同一暂停前拒绝条件。每次 schema 或 seed 写入前记录独占私有 intent，意外或未知结果不重发，也不清理数据；每个边界需在追加下一批前用独立 run 复读相同数据与原 run 证据。该入口的实际资源创建、可信 gate、平台侧最小权限和 Cloudflare 执行仍需独立完成。无 Worker 绑定 witness 是有时效的独立观察，不是禁止新绑定的实时平台锁；验收时须独立复读并排除并发绑定。只测行数不能宣称真实对象数量和字节上限已验证。
+
 候选的托管隔离验收拟使用受信 main 的 `worker-backup-reviewed-head.yml`，由专用 `subs-bot-backup-head-isolation` Environment 另行固定已审查候选 SHA；入口默认关闭。可信 main guard 在注入凭据前后核对同仓库 PR、当前 main 祖先、受保护 pin 和两个独立 checkout。候选代码将 GitHub dispatcher main SHA 与 candidate controller SHA 分开记录，不改写 GitHub 提供的 `GITHUB_*`。每次 watchdog 必须核对相同候选、原 run 的可信 dispatcher 和 journal；不能用新 head 推断旧写入的结果。专用环境只提供本项目隔离 D1/R2 所需凭据、Worker 只读凭据和用户授权的测试 Bot 配置；确切权限及有效期须在启用前独立核实。closed/frozen 演练不修改 webhook；open 状态恢复接收仍需独立的短期受控 webhook 窗口和最终恢复证据。

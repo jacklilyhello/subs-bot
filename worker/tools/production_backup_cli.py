@@ -640,7 +640,7 @@ def main(env=None):
                 last(events, "preflight")
                 require(in_window(policy, datetime.now(timezone.utc)), "A new pause cannot start outside its approved UTC window.")
                 observed = events[-1]["details"]["capacity"]
-                require(all(observed.get(key) in {"normal", "warning"} for key in ("rowStatus", "objectStatus", "objectBytesStatus")))
+                capacity.require_within_limits(observed)
                 plan = ctl.plan_pause()
                 require(plan["control"] == events[0]["details"]["control"] and plan["release"] == events[0]["details"]["release"]
                         and plan["configurationSha256"] == events[0]["details"]["configurationSha256"])

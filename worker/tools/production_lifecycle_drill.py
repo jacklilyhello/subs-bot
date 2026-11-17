@@ -962,9 +962,7 @@ class Drill:
                     "rows": observed["rowLimit"] + 1 if fault == "capacity-over" else observed["rowLimit"] * int(threshold) // 100,
                     "rowStatus": "over-limit" if fault == "capacity-over" else "warning"}
             journal.append("preflight", {"capacity": observed}, int(time.time()))
-            require(observed["rowStatus"] in {"normal", "warning"} and observed["objectStatus"] in {"normal", "warning"}
-                    and observed.get("objectBytesStatus") in {"normal", "warning"},
-                    "Capacity preflight prevents this backup before pause.")
+            capacity.require_within_limits(observed)
             if initially_open:
                 # Confirm there was no intervening control/configuration/deployment change.
                 planned = ctl.plan_pause()
