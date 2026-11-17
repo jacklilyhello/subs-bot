@@ -6,7 +6,6 @@ This tool does not create environments, tokens, or destination secrets.
 """
 import base64
 import ctypes
-import hmac
 from hashlib import sha256
 from http.client import HTTPSConnection
 import json
@@ -17,6 +16,7 @@ from datetime import datetime, timezone
 from urllib.parse import quote
 
 import prepare_isolation_artifact as github
+import scoped_r2
 from production_target import TEST_BOT_ID, canonical, parsed, require
 
 WORKFLOW = github.REPOSITORY + "/.github/workflows/worker-isolation-sealed-transfer.yml@" + github.MAIN_REF
@@ -132,19 +132,8 @@ def read_isolation_registration(env, account_id, key):
             and re.fullmatch(r"maintenance/production-control/evidence/lifecycle-[a-f0-9]{64}/registration\.json", key or ""))
     host = account_id + ".r2.cloudflarestorage.com"
     path = "/subs-bot-cf-dev-01/" + quote(key, safe="/-_.~")
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    day, empty = timestamp[:8], sha256(b"").hexdigest()
-    signed = "host;x-amz-content-sha256;x-amz-date"
-    headers = {"host": host, "x-amz-content-sha256": empty, "x-amz-date": timestamp}
-    canon_headers = "".join(f"{name}:{headers[name]}\n" for name in sorted(headers))
-    request = "\n".join(("GET", path, "", canon_headers, signed, empty))
-    scope = f"{day}/auto/s3/aws4_request"
-    signing = "\n".join(("AWS4-HMAC-SHA256", timestamp, scope, sha256(request.encode("ascii")).hexdigest()))
-    signing_key = ("AWS4" + secret).encode("ascii")
-    for part in (day, "auto", "s3", "aws4_request"):
-        signing_key = hmac.digest(signing_key, part.encode("ascii"), "sha256")
-    signature = hmac.digest(signing_key, signing.encode("ascii"), "sha256").hex()
-    headers["Authorization"] = f"AWS4-HMAC-SHA256 Credential={access}/{scope}, SignedHeaders={signed}, Signature={signature}"
+    headers = scoped_r2.sign("GET", host, path, "", {}, sha256(b"").hexdigest(), access, secret, datetime.now(timezone.utc))
+    headers["Authorization"] = headers.pop("authorization")
     connection = HTTPSConnection(host, timeout=30)
     try:
         connection.request("GET", path, headers=headers)

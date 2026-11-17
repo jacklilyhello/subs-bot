@@ -158,19 +158,18 @@ class WebhookRecoveryTests(unittest.TestCase):
 
     def test_conflicting_conditional_claim_never_authorizes_telegram(self):
         store = Mock()
-        store.get.return_value = None
-        store.api.root = "/accounts/" + "a" * 32
-        store.api.target = {"accountId": "a" * 32}
-        store.api.token = "synthetic"
-        store.api.return_value = {"status": "active", "id": "b" * 32}
-        store.bucket = "isolated"
-        response = Mock(status=412)
-        with patch.object(recovery.native, "signed_put_headers", return_value={}), \
-             patch.object(recovery, "HTTPSConnection") as connection:
-            connection.return_value.getresponse.return_value = response
-            with self.assertRaises(ContractError):
-                recovery.claim_intent_once(store, "maintenance/production-control/evidence/example", b"intent")
-        connection.return_value.request.assert_called_once()
+        store.put_exclusive.side_effect = ContractError("conflict")
+        with self.assertRaises(ContractError):
+            recovery.claim_intent_once(store, "maintenance/production-control/evidence/example", b"intent")
+        store.put_exclusive.assert_called_once()
+
+    def test_scoped_conditional_claim_does_not_retry_unknown_result(self):
+        store = Mock()
+        store.put_exclusive.side_effect = ContractError("unknown")
+        with self.assertRaises(ContractError):
+            recovery.claim_intent_once(store, "maintenance/production-control/evidence/example", b"intent")
+        store.put_exclusive.assert_called_once()
+        store.api.assert_not_called()
 
     def test_open_target_is_never_a_valid_restore_predecessor(self):
         target = Mock(digest="b" * 64, configuration_digest="c" * 64)
