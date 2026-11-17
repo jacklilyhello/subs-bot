@@ -577,7 +577,7 @@ class Drill:
         return target, archived["bundle"], archived["manifest"]
 
     def activation_baseline(self, *, stage_prefix="activation-baseline", checkpoint_id=None, preloaded_code=None,
-                            simulate_readback_failure=False, simulate_process_kill=False):
+                            simulate_readback_failure=False, simulate_process_kill=False, capture_guard=None):
         import production_recovery as recovery
         from production_release_evidence import verify_activation_baseline
         require(stage_prefix in ("activation-baseline", "latest-off-baseline"), "Unknown baseline evidence stage.")
@@ -607,7 +607,8 @@ class Drill:
             name = "subs-bot-cf-restore-control-" + checkpoint[:16]
             contract = {"version": 1, "checkpointId": checkpoint, "databaseName": name, "objectsName": name, "purpose": "baseline"}
             api = recovery.RecoveryAPI(ctl.target.data, data_token, ctl.worker, contract)
-            source = recovery.RecoverySource(api, ctl.target.data, ctl.bundle, ctl.manifest, ctl.inspect, ctl.guard)
+            source = recovery.RecoverySource(api, ctl.target.data, ctl.bundle, ctl.manifest, ctl.inspect,
+                                             ctl.guard if capture_guard is None else capture_guard)
             source.archive_body, source.code_proof = archive, proof
             journal = recovery.RecoveryJournal(api, self.run + "/" + self.attempt, guard=ctl.guard)
             journal.load()
@@ -997,9 +998,18 @@ class Drill:
                 self.quiet(seconds=min(180, remaining))
                 require(time.monotonic() - pause_started < maximum_pause, "The maximum pause elapsed before freeze.")
                 frozen_before = ctl.inspect()
+                def freeze_guard():
+                    self.guard()
+                    require(time.monotonic() - pause_started < maximum_pause, "The maximum pause elapsed before freeze.")
+                freeze_guard()
                 journal.append("freeze-intent", {"stateSha256": frozen_before["stateSha256"]}, int(time.time()))
-                frozen = ctl.transition("freeze", approval(ctl.target, "freeze", ctl.revision, frozen_before["stateSha256"], control_revision=ctl.control_revision),
-                                        frozen_before["stateSha256"])
+                old_guard = ctl.guard
+                ctl.guard = freeze_guard
+                try:
+                    frozen = ctl.transition("freeze", approval(ctl.target, "freeze", ctl.revision, frozen_before["stateSha256"], control_revision=ctl.control_revision),
+                                            frozen_before["stateSha256"])
+                finally:
+                    ctl.guard = old_guard
             else:
                 frozen = ctl.inspect()
                 require(frozen["stateSha256"] == before["stateSha256"])
@@ -1011,9 +1021,13 @@ class Drill:
             journal.append("capture-intent", {"checkpointId": checkpoint}, int(time.time()))
             # The intended checkpoint is pinned before capture and independently
             # read back by the existing activation-baseline verifier.
+            def capture_guard():
+                self.guard()
+                if initially_open:
+                    require(time.monotonic() - pause_started < maximum_pause, "The maximum pause elapsed before a capture operation.")
             self.activation_baseline(checkpoint_id=checkpoint, preloaded_code=(proof, archive),
                                      simulate_readback_failure=fault == "readback-failure",
-                                     simulate_process_kill=fault == "process-kill")
+                                     simulate_process_kill=fault == "process-kill", capture_guard=capture_guard)
             baseline = self.report["activationBaseline"]
             journal.append("verified", {"checkpointId": baseline["checkpointId"],
                            "manifestSha256": baseline["manifestSha256"]}, int(time.time()))

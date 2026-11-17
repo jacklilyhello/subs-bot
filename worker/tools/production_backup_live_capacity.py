@@ -5,6 +5,7 @@ It uses the same table and object-closure checks as backup preflight.
 """
 from pathlib import Path
 import re
+import time
 from tempfile import TemporaryDirectory
 
 import production_backup_capacity as capacity
@@ -30,6 +31,7 @@ def sample(target, token, checkpoint_id, manifest_sha256, *, warning_percent, ro
             and re.fullmatch(r"[a-f0-9]{32}", checkpoint_id or "")
             and re.fullmatch(r"[a-f0-9]{64}", manifest_sha256 or "")
             and type(warning_percent) is int and 1 <= warning_percent <= 99)
+    started_at = int(time.time())
     root = Path(root)
     require(root.is_absolute() and root.is_dir() and not root.is_symlink())
     guard()
@@ -66,6 +68,7 @@ def sample(target, token, checkpoint_id, manifest_sha256, *, warning_percent, ro
         api.verify_bucket(target.data["bucketName"], target.data["bucketCreatedAt"])
         guard()
         # Per-table data and target identity never enter public Actions artifacts.
+        observed.update(sampleStartedAt=started_at, sampleCompletedAt=int(time.time()))
         return {key: value for key, value in observed.items() if key != "tableCounts"}
 
 

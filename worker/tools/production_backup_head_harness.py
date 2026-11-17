@@ -76,7 +76,7 @@ def public_result(result):
     if isinstance(live, dict):
         value["liveCapacity"] = {key: live[key] for key in ("snapshot", "consistency", "rows", "rowLimit", "rowStatus",
             "objectCount", "objectLimit", "objectBytes", "objectBytesLimit", "objectStatus", "objectBytesStatus",
-            "failureReason", "warningPercent", "backupVerified")
+            "failureReason", "warningPercent", "backupVerified", "sampleStartedAt", "sampleCompletedAt")
             if key in live and (type(live[key]) in (int, bool) or isinstance(live[key], str))}
     boundary = result.get("capacityFixture")
     if isinstance(boundary, dict):
