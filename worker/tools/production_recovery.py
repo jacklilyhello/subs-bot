@@ -392,10 +392,14 @@ class RecoveryJournal(native.Journal):
     """Append-only hash chain in the fixed private backup bucket, never source R2."""
 
     def load(self):
+        # Reset before even listing: an absent or unreadable journal cannot
+        # inherit the previous stopped-export/lease observation.
+        self.generation, self.key, self.raw, self.value = 0, None, None, None
         keys = self.keys()
         require([native.journal_key(self.api.journal_prefix, key) for key in keys] == list(range(1, len(keys) + 1)),
                 "The recovery journal has missing or conflicting checkpoints.")
         previous = None
+        generation, key, raw, value = 0, None, None, None
         for generation, key in enumerate(keys, 1):
             raw, _ = self.api.object_or_none(self.api.names["backup"], key)
             checkpoint = native.parsed(raw, native.JOURNAL_BYTES)
@@ -405,8 +409,8 @@ class RecoveryJournal(native.Journal):
             value = checkpoint["value"]
             require(isinstance(value, dict) and value.get("version") == 1 and value.get("cohort") == self.api.cohort
                     and value.get("contractSha256") == contract_identity(self.api.contract))
-            self.generation, self.key, self.raw, self.value = generation, key, raw, value
             previous = {"key": key, "sha256": digest(raw)}
+        self.generation, self.key, self.raw, self.value = generation, key, raw, value
         return self.value
 
     def save(self, value):

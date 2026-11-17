@@ -172,6 +172,32 @@ class HarnessTests(unittest.TestCase):
             self.engine.create(kind)
         self.engine.verify_resources(all_required=True)
 
+    def test_reloading_missing_or_unreadable_journal_clears_prior_observation(self):
+        self.assertIsNotNone(self.journal.value)
+        self.journal.poisoned = True
+        with patch.object(self.journal, "keys", return_value=[]):
+            self.assertIsNone(self.journal.load())
+        self.assertEqual((self.journal.generation, self.journal.key, self.journal.raw, self.journal.value),
+                         (0, None, None, None))
+        self.assertTrue(self.journal.poisoned)
+        self.journal.generation, self.journal.key, self.journal.raw, self.journal.value = 1, "old", b"old", {"old": True}
+        with patch.object(self.journal, "keys", side_effect=OSError("synthetic read error")), self.assertRaises(OSError):
+            self.journal.load()
+        self.assertEqual((self.journal.generation, self.journal.key, self.journal.raw, self.journal.value),
+                         (0, None, None, None))
+        self.assertTrue(self.journal.poisoned)
+
+    def test_corrupt_predecessor_never_leaves_partial_journal_state(self):
+        self.journal.update(phase="safe")
+        keys = self.journal.keys()
+        self.assertGreaterEqual(len(keys), 2)
+        last = self.api.object_or_none(native.WORKER_NAME, keys[-1])
+        with patch.object(self.api, "object_or_none", side_effect=[last, (b"{}", None)]), \
+                self.assertRaises(native.RehearsalError):
+            self.journal.load()
+        self.assertEqual((self.journal.generation, self.journal.key, self.journal.raw, self.journal.value),
+                         (0, None, None, None))
+
     def test_private_link_input_uses_verified_sql_and_restored_bytes_without_public_output(self):
         fixture = SnapshotTests()
         fixture.setUp()

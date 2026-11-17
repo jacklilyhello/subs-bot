@@ -73,6 +73,26 @@ class ResumeTests(unittest.TestCase):
         record.assert_called_once()
         mutate.assert_not_called()
 
+    def test_export_journal_disappearing_after_intent_never_opens_admission(self):
+        ctl = controller()
+        frozen = {"admission": "closed", "workers": "frozen", "epoch": 3}
+        state = {"control": frozen, "release": {}, "configurationSha256": "b" * 64,
+                 "work": {"invocations": 0}, "terminal": {}, "stateSha256": "d" * 64}
+        ctl.inspect.return_value = state
+        initial = {"control": {"admission": "open", "workers": "run"}, "release": {},
+                   "configurationSha256": "b" * 64}
+        journal = Mock()
+        journal.value = {"scopeSha256": "a" * 64, "export": {"state": "complete"}}
+        record = Mock(side_effect=lambda *_: setattr(journal, "value", None))
+        with patch.object(resume, "_dependencies"), \
+                patch("production_backup_capacity.frozen_fingerprint", return_value={"data": "same"}), \
+                patch.object(resume, "_mutate_sql") as mutate:
+            with self.assertRaises(ContractError):
+                resume.resume_failed_backup(ctl, Mock(), Mock(), journal, initial=initial, frozen=frozen,
+                    fingerprint={"data": "same"}, session="1-1", approval_envelope={"explicit": True}, record_intent=record)
+        record.assert_called_once()
+        mutate.assert_not_called()
+
     def test_unknown_or_running_export_never_opens_or_records_resume_intent(self):
         for state in (None, "started", "unknown", "polling"):
             with self.subTest(state=state):

@@ -373,6 +373,32 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(other.load()["phase"], "safe")
         self.assertTrue(all(bucket == self.api.names["backup"] for bucket, _key in self.api.objects))
 
+    def test_reloading_missing_or_unreadable_journal_clears_prior_observation(self):
+        self.assertIsNotNone(self.journal.value)
+        self.journal.poisoned = True
+        with patch.object(self.journal, "keys", return_value=[]):
+            self.assertIsNone(self.journal.load())
+        self.assertEqual((self.journal.generation, self.journal.key, self.journal.raw, self.journal.value),
+                         (0, None, None, None))
+        self.assertTrue(self.journal.poisoned)
+        self.journal.generation, self.journal.key, self.journal.raw, self.journal.value = 1, "old", b"old", {"old": True}
+        with patch.object(self.journal, "keys", side_effect=OSError("synthetic read error")), self.assertRaises(OSError):
+            self.journal.load()
+        self.assertEqual((self.journal.generation, self.journal.key, self.journal.raw, self.journal.value),
+                         (0, None, None, None))
+        self.assertTrue(self.journal.poisoned)
+
+    def test_corrupt_later_generation_never_leaves_partial_journal_state(self):
+        self.journal.update(phase="safe")
+        keys = self.journal.keys()
+        self.assertGreaterEqual(len(keys), 2)
+        first = self.api.object_or_none(self.api.names["backup"], keys[0])
+        with patch.object(self.api, "object_or_none", side_effect=[first, (b"{}", None)]), \
+                self.assertRaises(recovery.RecoveryError):
+            self.journal.load()
+        self.assertEqual((self.journal.generation, self.journal.key, self.journal.raw, self.journal.value),
+                         (0, None, None, None))
+
     def test_unconfirmed_journal_blocks_all_following_writes(self):
         self.api.journal_failure = "uncommitted"
         with self.assertRaises(recovery.RecoveryError) as caught:
