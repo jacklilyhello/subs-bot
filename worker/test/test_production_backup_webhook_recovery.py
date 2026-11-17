@@ -119,6 +119,36 @@ class WebhookRecoveryTests(unittest.TestCase):
         store.put.assert_not_called()
         self.assertNotIn("setWebhook", [call.args[0] for call in telegram.call.call_args_list])
 
+    def test_phase_setup_binds_original_and_new_webhook_separately(self):
+        draft, target, previous, store, prefix, data, env, telegram, before, changed = self.fixture()
+        env["WEBHOOK_SOURCE_KIND"] = "phase-coordinator"
+        prior = {"url": before["url"], "hasCustomCertificate": False,
+                 "maxConnections": before["max_connections"], "allowedUpdates": before["allowed_updates"]}
+        prior_sha = sha256(recovery.canonical(prior)).hexdigest()
+        configured_raw = data[prefix + "123-1-webhook-configured.json"]
+        intent = {"version": 1, "kind": "phase-webhook-setup-intent", "runId": "123", "runAttempt": "1",
+                  "controllerRevision": "c" * 40, "dispatcherRevision": "d" * 40,
+                  "targetSha256": target.digest, "configurationSha256": target.configuration_digest,
+                  "sourceCheckpointId": "1" * 32, "sourceManifestSha256": "2" * 64,
+                  "snapshotSha256": env["WEBHOOK_SNAPSHOT_SHA256"], "predecessorSha256": "3" * 64,
+                  "webhookSettingsSha256": prior_sha, "historySha256": "4" * 64}
+        setup_key = prefix + "phase-coordinator-webhook-setup-123-1-"
+        def set_intent(value):
+            raw = recovery.canonical(value)
+            data[setup_key + "intent.json"] = raw
+            data[setup_key + "confirmed.json"] = recovery.canonical({"version": 1, "kind": "phase-webhook-setup-confirmed",
+                "intentSha256": sha256(raw).hexdigest(), "snapshotSha256": env["WEBHOOK_SNAPSHOT_SHA256"],
+                "configuredSha256": sha256(configured_raw).hexdigest(), "targetSha256": target.digest})
+        set_intent(intent)
+        with patch.object(recovery, "context", return_value=False), patch.object(recovery, "source_run", return_value=("123", "1", "c" * 40)), \
+             patch.object(recovery, "open_store", return_value=(draft, {}, previous, store, prefix)), \
+             patch.object(recovery, "validate_target", return_value=target), patch.object(recovery, "Telegram", return_value=telegram):
+            self.assertEqual(recovery.inspect(env)["status"], "observed")
+            set_intent({**intent, "webhookSettingsSha256": recovery.parsed(configured_raw)["webhookSha256"]})
+            with self.assertRaises(ContractError):
+                recovery.inspect(env)
+        self.assertNotIn("setWebhook", [call.args[0] for call in telegram.call.call_args_list])
+
     def test_existing_intent_blocks_retry(self):
         draft, target, previous, store, prefix, data, env, telegram, *_ = self.fixture()
         data[prefix + "webhook-recovery-123-1-intent.json"] = b"unknown"

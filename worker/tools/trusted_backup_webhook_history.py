@@ -164,7 +164,7 @@ def _restoration_boundary(env, store, prefix, draft, secrets, previous, token, c
 
 def _archived_log(run, workflow, record, store, prefix, token, controllers, env):
     """Recheck original bytes plus the exact fresh readback run and jobs."""
-    from trusted_backup_webhook_log_archive import REVIEWED_PRE_WEBHOOK, audited_paths, classify
+    from trusted_backup_webhook_log_archive import REVIEWED_PRE_WEBHOOK, audit_key, audited_paths, classify
     require(isinstance(record, dict) and set(record) == {"status", "sourceRunId", "sourceJobId", "sourceHeadSha",
             "sourceWorkflow", "classification", "logSha256", "planSha256", "completionSha256", "archiveRunId",
             "archiveControllerRevision", "archiveJobId", "readbackJobId"}
@@ -193,7 +193,7 @@ def _archived_log(run, workflow, record, store, prefix, token, controllers, env)
             and item.get("logSha256") == record["logSha256"] and item.get("logBytes") == len(raw)
             and item.get("classification") == record["classification"] == classify(raw, workflow, record["sourceRunId"],
                 main_sha=record["sourceHeadSha"], candidates=json.loads(env.get("SUBS_BOT_PHASE_WEBHOOK_CANDIDATES_JSON", "[]"))))
-    audit = parsed(env.get("SUBS_BOT_PHASE_WEBHOOK_LOG_AUDIT_JSON", "")).get(record["sourceHeadSha"])
+    audit = parsed(env.get("SUBS_BOT_PHASE_WEBHOOK_LOG_AUDIT_JSON", "")).get(audit_key(workflow, record["sourceHeadSha"]))
     paths = audited_paths(workflow, record["sourceHeadSha"])
     reviewed = REVIEWED_PRE_WEBHOOK.get(record["sourceRunId"])
     if workflow == LIFECYCLE and reviewed:

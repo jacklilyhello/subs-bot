@@ -288,7 +288,9 @@ def inspect(env, *, execute=False):
                 and setup["configurationSha256"] == target.configuration_digest and setup["snapshotSha256"] == pin
                 and all(SHA.fullmatch(setup.get(k, "")) for k in ("sourceManifestSha256", "predecessorSha256", "webhookSettingsSha256", "historySha256"))
                 and re.fullmatch(r"[a-f0-9]{32}", setup.get("sourceCheckpointId", ""))
-                and setup["webhookSettingsSha256"] == configured["webhookSha256"]
+                and setup["webhookSettingsSha256"] == sha256(canonical({"url": before["url"],
+                    "hasCustomCertificate": before["has_custom_certificate"], "maxConnections": before["max_connections"],
+                    "allowedUpdates": before["allowed_updates"]})).hexdigest()
                 and setup_done == {"version": 1, "kind": "phase-webhook-setup-confirmed",
                     "intentSha256": sha256(setup_raw).hexdigest(), "snapshotSha256": pin,
                     "configuredSha256": sha256(configured_raw).hexdigest(), "targetSha256": target.digest},

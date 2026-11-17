@@ -12,6 +12,10 @@ class WebhookLogArchiveTests(unittest.TestCase):
     def log(self, *values):
         return b"\n".join(b"2026-11-18T00:00:00Z " + canonical(value) for value in values)
 
+    def test_audit_pin_distinguishes_workflows_at_same_source_revision(self):
+        revision = "a" * 40
+        self.assertNotEqual(archive.audit_key(archive.HEAD, revision), archive.audit_key(archive.LIFECYCLE, revision))
+
     def test_inline_inspection_and_acknowledged_write_are_distinct(self):
         no_write = {"mode": "inspect", "writeAttempted": False, "writeAcknowledged": None}
         acknowledged = {"mode": "append", "writeAttempted": True, "writeAcknowledged": True, "inlineQuerySubscribed": True}
