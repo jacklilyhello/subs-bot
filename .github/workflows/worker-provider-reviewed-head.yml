@@ -1,0 +1,152 @@
+name: Verify reviewed Provider sources in isolation
+run-name: Reviewed Provider source verification at ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      validation_json:
+        description: Exact reviewed PR head, original Provider CI, approval and private source pins
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: subs-bot-provider-isolation
+  cancel-in-progress: false
+
+jobs:
+  verify_sources:
+    name: Reviewed Provider source verification
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && vars.SUBS_BOT_PROVIDER_HEAD_VALIDATION_ENABLED == 'true'
+    environment: subs-bot-provider-archive-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      target_sha256: ${{ steps.verify.outputs.target_sha256 }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out trusted current main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Verify reviewed Provider head using trusted main
+        uses: ./trusted/.github/actions/provider-reviewed-head-gate
+        with:
+          validation_json: ${{ inputs.validation_json }}
+          reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          phase: sources
+          environment: subs-bot-provider-archive-head-isolation
+          provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          archive_target_json: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          archive_refs_json: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+      - name: Verify current and previous archived sources
+        id: verify
+        working-directory: candidate
+        env:
+          PROVIDER_HEAD_VALIDATION_JSON: ${{ inputs.validation_json }}
+          PROVIDER_HEAD_TRUSTED_MAIN_SHA: ${{ github.sha }}
+          PROVIDER_HEAD_REVIEWED_SHA: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          SUBS_BOT_PROVIDER_CONTROL_ENVIRONMENT: rehearsal
+          SUBS_BOT_PROVIDER_CONTROL_OPERATION: publish
+          SUBS_BOT_PROVIDER_CONTROL_APPROVAL: ${{ fromJSON(inputs.validation_json).approvalSha256 }}
+          SUBS_BOT_PROVIDER_CI_RUN_ID: ${{ fromJSON(inputs.validation_json).providerCiRunId }}
+          SUBS_BOT_PROVIDER_ARCHIVE_REFS: ${{ toJSON(fromJSON(inputs.validation_json).archiveRefs) }}
+          SUBS_BOT_PROVIDER_DURABLE_REQUIRED: '1'
+          SUBS_BOT_PROVIDER_SIMULATE_ARTIFACT_UNAVAILABLE: '1'
+          SUBS_BOT_PROVIDER_REVIEWED_ACTION: verify-archived-chain
+          SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN }}
+        run: |
+          umask 077
+          python3 -B worker/tools/production_provider_reviewed_head_harness.py
+  attest_r2:
+    name: Trusted Provider R2 attestation
+    needs: [verify_sources]
+    environment: subs-bot-provider-archive-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      target_sha256: ${{ steps.attest.outputs.target_sha256 }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out trusted current main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Verify reviewed Provider head using trusted main
+        uses: ./trusted/.github/actions/provider-reviewed-head-gate
+        with:
+          validation_json: ${{ inputs.validation_json }}
+          reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          phase: attest-r2
+          environment: subs-bot-provider-archive-head-isolation
+          provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          archive_target_json: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          archive_refs_json: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+      - name: Independently verify every private original
+        id: attest
+        env:
+          PROVIDER_HEAD_VALIDATION_JSON: ${{ inputs.validation_json }}
+          PROVIDER_REVIEWED_HEAD_SHA: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          PROVIDER_HEAD_PHASE: attest-r2
+          PROVIDER_HEAD_ENVIRONMENT: subs-bot-provider-archive-head-isolation
+          PROVIDER_HEAD_CHECK: ready
+          PROVIDER_HEAD_TARGET_SHA256: ${{ needs.verify_sources.outputs.target_sha256 }}
+          SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN }}
+        run: |
+          umask 077
+          python3 -B trusted/worker/tools/trusted_provider_head_attestation.py
+  attest_provider:
+    name: Trusted Provider live attestation
+    needs: [verify_sources, attest_r2]
+    environment: subs-bot-provider-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out trusted current main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Verify trusted pinned registry client before private data
+        run: bash trusted/worker/tools/install_provider_skopeo.sh
+      - name: Verify reviewed Provider head using trusted main
+        uses: ./trusted/.github/actions/provider-reviewed-head-gate
+        with:
+          validation_json: ${{ inputs.validation_json }}
+          reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          phase: attest-provider
+          environment: subs-bot-provider-head-isolation
+          provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          archive_target_json: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          archive_refs_json: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+      - name: Independently verify isolated Provider and OCI state
+        env:
+          PROVIDER_HEAD_VALIDATION_JSON: ${{ inputs.validation_json }}
+          PROVIDER_REVIEWED_HEAD_SHA: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          PROVIDER_HEAD_PHASE: attest-provider
+          PROVIDER_HEAD_ENVIRONMENT: subs-bot-provider-head-isolation
+          PROVIDER_HEAD_CHECK: ready
+          PROVIDER_HEAD_TARGET_SHA256: ${{ needs.attest_r2.outputs.target_sha256 }}
+          SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN }}
+          SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN }}
+        run: |
+          umask 077
+          python3 -B trusted/worker/tools/trusted_provider_head_attestation.py
