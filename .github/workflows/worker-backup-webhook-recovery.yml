@@ -7,7 +7,7 @@ on:
       action:
         type: choice
         required: true
-        options: [diagnose, inspect, restore]
+        options: [diagnose, inspect, restore, plan-phase-unstarted, release-phase-unstarted]
       source_run_id:
         description: Exact original reviewed-head dispatcher run
         type: string
@@ -37,6 +37,9 @@ on:
       source_manifest_sha256:
         description: Independently recorded active source manifest SHA256
         type: string
+      approval_sha256:
+        description: Exact independently reviewed unstarted lock release plan digest
+        type: string
 
 permissions:
   actions: read
@@ -48,7 +51,7 @@ concurrency:
 
 jobs:
   recover:
-    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && vars.SUBS_BOT_BACKUP_WEBHOOK_RECOVERY_ENABLED == 'true'
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
     environment: subs-bot-backup-head-isolation
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -57,10 +60,18 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Require the protected recovery switch
+        env:
+          RECOVERY_ENABLED: ${{ vars.SUBS_BOT_BACKUP_WEBHOOK_RECOVERY_ENABLED }}
+        run: test "$RECOVERY_ENABLED" = 'true'
       - name: Observe or restore once using trusted main
         env:
           GH_TOKEN: ${{ github.token }}
           WEBHOOK_RECOVERY_ACTION: ${{ inputs.action }}
+          WEBHOOK_SOURCE_KIND: ${{ contains(fromJSON('["plan-phase-unstarted","release-phase-unstarted"]'), inputs.action) && 'phase-coordinator' || 'reviewed-head' }}
+          WEBHOOK_RECOVERY_APPROVAL_SHA256: ${{ inputs.approval_sha256 }}
+          SUBS_BOT_PHASE_WEBHOOK_UNSTARTED_APPROVAL_SHA256: ${{ vars.SUBS_BOT_PHASE_WEBHOOK_UNSTARTED_APPROVAL_SHA256 }}
+          SUBS_BOT_PHASE_WEBHOOK_UNSTARTED_REVIEW_JSON: ${{ vars.SUBS_BOT_PHASE_WEBHOOK_UNSTARTED_REVIEW_JSON }}
           WEBHOOK_SOURCE_RUN_ID: ${{ inputs.source_run_id }}
           WEBHOOK_SOURCE_ATTEMPT: ${{ inputs.source_attempt }}
           WEBHOOK_SOURCE_MAIN_SHA: ${{ inputs.source_main_sha }}
@@ -83,4 +94,7 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           umask 077
-          python3 -B worker/tools/production_backup_webhook_recovery.py
+          case "$WEBHOOK_RECOVERY_ACTION" in
+            plan-phase-unstarted|release-phase-unstarted) python3 -B worker/tools/trusted_backup_webhook_unstarted.py ;;
+            *) python3 -B worker/tools/production_backup_webhook_recovery.py ;;
+          esac

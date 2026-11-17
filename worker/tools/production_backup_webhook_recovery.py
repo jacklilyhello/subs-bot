@@ -98,7 +98,7 @@ def manual_no_prior_dispatch(env, run_id):
         elif row.get("display_title") == title:
             require(False, "A prior manual restore may have been dispatched; reconcile without replay.")
         else:
-            require(re.fullmatch(r"Backup webhook (?:diagnose|inspect|restore) [1-9][0-9]{0,19}-1", row.get("display_title", "")))
+            require(re.fullmatch(r"Backup webhook (?:diagnose|inspect|restore|plan-phase-unstarted|release-phase-unstarted) [1-9][0-9]{0,19}-1", row.get("display_title", "")))
     require(current_seen, "The current recovery run is not visible in complete history.")
 
 

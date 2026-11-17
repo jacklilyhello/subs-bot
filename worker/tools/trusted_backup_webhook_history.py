@@ -185,7 +185,7 @@ def inspect(env):
     keys = store.objects.list(prefix + "webhook-", maximum=10000)
     snapshots = {key[len(prefix):] for key in keys if re.fullmatch(r"webhook-[1-9][0-9]{0,19}-1\.json", key[len(prefix):])}
     boundary = _restoration_boundary(env, store, prefix, draft, secrets, previous, token, controllers)
-    observed_snapshots, evidence, unknown, finished = set(), [], [], {}
+    observed_snapshots, evidence, unknown, finished, ancestor_cache = set(), [], [], {}, set()
     for workflow in (LIFECYCLE, HEAD, PHASE, RECOVERY, CONTROL, INLINE):
         workflow_id, runs = _runs(workflow, token)
         for run in runs:
@@ -198,6 +198,18 @@ def inspect(env):
                 continue
             if workflow == LIFECYCLE and boundary is not None and run_id == boundary["runId"]:
                 continue
+            if run.get("status") != "completed":
+                unknown.append({"workflow": workflow, "runId": run_id, "reason": "workflow-still-active"})
+                continue
+            if head not in controllers:
+                unknown.append({"workflow": workflow, "runId": run_id, "reason": "controller-not-reviewed"})
+                continue
+            if head not in ancestor_cache:
+                comparison = github.compare_commits_metadata(head, env["GITHUB_SHA"], token)
+                require(comparison.get("status") in {"ahead", "identical"} and comparison.get("behind_by") == 0
+                        and comparison.get("base_commit", {}).get("sha") == head
+                        and comparison.get("merge_base_commit", {}).get("sha") == head)
+                ancestor_cache.add(head)
             if workflow == INLINE:
                 require(title == "Inspect or append isolated Telegram inline webhook")
                 require(run.get("status") == "completed")
@@ -221,8 +233,24 @@ def inspect(env):
                 if action not in {"exercise", "provider-binding", "provider-binding-resume", "recover-webhook"}:
                     continue
             elif workflow == RECOVERY:
-                match = re.fullmatch(r"Backup webhook (diagnose|inspect|restore) ([1-9][0-9]{0,19})-1", title or "")
+                match = re.fullmatch(r"Backup webhook (diagnose|inspect|restore|plan-phase-unstarted|release-phase-unstarted) ([1-9][0-9]{0,19})-1", title or "")
                 require(match is not None)
+                if match[1] == "release-phase-unstarted":
+                    base = prefix + "phase-webhook-unstarted-" + match[2] + "-1-"
+                    claim_raw = store.get(base + "intent.json", absent=True)
+                    done_raw = store.get(base + "complete.json", absent=True)
+                    if claim_raw is None or done_raw is None:
+                        unknown.append({"workflow": workflow, "runId": run_id, "reason": "lock-release-outcome-unconfirmed"})
+                        continue
+                    claim, done = parsed(claim_raw), parsed(done_raw)
+                    require(canonical(claim) == claim_raw and canonical(done) == done_raw
+                            and claim.get("writerRunId") == run_id and claim.get("writerAttempt") == "1"
+                            and done.get("intentSha256") == sha256(claim_raw).hexdigest()
+                            and done.get("planSha256") == claim.get("planSha256")
+                            and done.get("status") == "released-before-webhook-setup" and done.get("oldOutcome") == "not-promoted")
+                    evidence.append({"workflow": workflow, "runId": run_id, "headSha": head,
+                                     "kind": "lock-released-without-webhook", "proofSha256": sha256(done_raw).hexdigest()})
+                    continue
                 if match[1] != "restore":
                     continue
                 action = "restore"
@@ -236,13 +264,6 @@ def inspect(env):
                 require(title == "Reviewed backup head validation at " + head)
                 action = "reviewed-head"
             require(run.get("status") == "completed")
-            if head not in controllers:
-                unknown.append({"workflow": workflow, "runId": run_id, "reason": "controller-not-reviewed"})
-                continue
-            comparison = github.compare_commits_metadata(head, env["GITHUB_SHA"], token)
-            require(comparison.get("status") in {"ahead", "identical"} and comparison.get("behind_by") == 0
-                    and comparison.get("base_commit", {}).get("sha") == head
-                    and comparison.get("merge_base_commit", {}).get("sha") == head)
             if workflow == HEAD:
                 try:
                     proof = _no_webhook_artifact(run, workflow_id, token, candidates)
@@ -315,7 +336,8 @@ def inspect(env):
             if item["workflow"] == "private-snapshot":
                 match = re.fullmatch(r"webhook-([1-9][0-9]{0,19})-1\.json", source)
                 source = match[1] if match else ""
-            if source in finished and finished[source] < boundary["startedAt"]:
+            if (item.get("reason") in {"no-write-independently-confirmed", "response-independently-confirmed"}
+                    and source in finished and finished[source] < boundary["startedAt"]):
                 superseded.append(item)
                 unknown.remove(item)
     inventory = {"version": 1, "targetSha256": target.digest, "boundary": boundary,

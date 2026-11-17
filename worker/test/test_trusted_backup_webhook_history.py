@@ -44,6 +44,8 @@ class WebhookHistoryTests(unittest.TestCase):
         with patch.object(history, "context", return_value=True), patch.object(history.github, "_github_token", return_value="synthetic"), \
              patch.object(history, "open_store", return_value=(draft, {}, previous, store, prefix)), \
              patch.object(history, "validate_target", return_value=target), \
+             patch.object(history.github, "compare_commits_metadata", create=True, return_value={"status": "identical", "behind_by": 0,
+                          "base_commit": {"sha": "a" * 40}, "merge_base_commit": {"sha": "a" * 40}}), \
              patch.object(history, "_restoration_boundary", return_value=boundary), \
              patch.object(history, "_runs", side_effect=lambda path, _token: (1, list(runs) if path == history.LIFECYCLE else list(inline_runs) if path == history.INLINE else [])):
             return history.inspect(env)
@@ -65,13 +67,13 @@ class WebhookHistoryTests(unittest.TestCase):
             self.inspect({**self.environment(), "BACKUP_ACTION": "run", "SUBS_BOT_PHASE_WEBHOOK_HISTORY_SHA256": result["historySha256"]},
                          keys=["webhook-456-1.json"])
 
-    def test_later_confirmed_boundary_keeps_earlier_unknown_as_history(self):
+    def test_later_boundary_does_not_resolve_an_unknown_prior_request(self):
         row = {"id": 456, "head_sha": "a" * 40, "display_title": "Inspect or append isolated Telegram inline webhook",
                "status": "completed", "updated_at": "2026-01-01T00:00:00Z"}
         boundary = {"runId": "999", "startedAt": "2026-01-02T00:00:00Z"}
         plan = self.inspect(self.environment(), inline_runs=[row], boundary=boundary)
-        self.assertEqual(plan["status"], "resolved")
-        self.assertEqual(plan["priorUnknownBeforeBoundary"][0]["reason"], "inline-request-needs-forward-resolution")
+        self.assertEqual(plan["status"], "needs-reconciliation")
+        self.assertEqual(plan["unknownRuns"][0]["reason"], "inline-request-needs-forward-resolution")
         row["updated_at"] = "2026-01-03T00:00:00Z"
         plan = self.inspect(self.environment(), inline_runs=[row], boundary=boundary)
         self.assertEqual(plan["status"], "needs-reconciliation")
