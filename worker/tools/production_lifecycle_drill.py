@@ -934,11 +934,24 @@ class Drill:
         journal = maintenance.Transaction(store, session, day, ctl.target.digest, self.revision)
         require(not journal.load(), "A previous daily maintenance session already occupies this run identity.")
         anchor = maintenance.Anchor(store, ctl.target.digest, self.env.get("DRILL_BACKUP_GENESIS_SHA256", ""))
-        anchor.acquire(session, day, self.revision)
-        journal.append("started", {"configurationSha256": ctl.target.configuration_digest,
+        prior, prior_raw, prior_etag = anchor.read()
+        require(prior["state"] == "idle" and prior["session"] != session)
+        started = {"configurationSha256": ctl.target.configuration_digest,
                        "release": before["release"], "control": before["control"],
                        "pauseLimitSeconds": pause_limit, "checkpointId": checkpoint,
-                       "dispatcherRevision": dispatcher_revision, "dispatcherWorkflow": evidence_workflow}, timestamp)
+                       "dispatcherRevision": dispatcher_revision, "dispatcherWorkflow": evidence_workflow}
+        original = {"version": 1, "targetSha256": ctl.target.digest, "session": session, "day": day,
+                    "controlRevision": self.revision, "dispatcherRevision": dispatcher_revision,
+                    "dispatcherWorkflow": evidence_workflow, "writerRunId": self.run, "writerAttempt": self.attempt,
+                    "anchorPredecessorSha256": sha256(prior_raw).hexdigest(), "stateSha256": before["stateSha256"],
+                    "sourceRevision": manifest["revision"], "approvalSha256": sha256(canonical({"targetSha256": ctl.target.digest,
+                        "session": session, "environment": "rehearsal"})).hexdigest(),
+                    "timestamp": timestamp, "startedDetails": started}
+        intent_sha = maintenance.write_begin(store, original)
+        self.guard()
+        require(ctl.inspect()["stateSha256"] == before["stateSha256"], "The isolated begin predecessor changed.")
+        anchor._advance(prior, prior_raw, prior_etag, state="active", session=session, day=day, revision=self.revision)
+        journal.append("started", {**started, "beginIntentSha256": intent_sha}, timestamp)
         try:
             threshold = self.env.get("DRILL_BACKUP_WARNING_PERCENT", "80")
             require(matches(r"[1-9][0-9]?", threshold))
@@ -1049,9 +1062,8 @@ class Drill:
         workflow = artifact._get_json("/actions/workflows/" + workflow_file, token)
         journal = maintenance.Transaction(store, session, pinned["day"], ctl.target.digest, pinned["controlRevision"])
         events = journal.load()
-        require(events, "The active backup transaction journal is missing; preserve the anchor.")
         dispatcher_revision = getattr(self, "backup_dispatcher_revision", pinned["controlRevision"])
-        if trusted_dispatcher:
+        if trusted_dispatcher and events:
             require(events[0]["details"].get("dispatcherRevision") == dispatcher_revision
                     and events[0]["details"].get("dispatcherWorkflow") == workflow_file,
                     "The original trusted dispatcher identity differs from the pinned transaction.")
@@ -1064,6 +1076,35 @@ class Drill:
                 and datetime.fromtimestamp(monitor._timestamp(run.get("created_at")), timezone.utc).strftime("%Y/%m/%d") == pinned["day"])
         if run.get("status") != "completed":
             self.report.update(status="observed", watchdog="backup-run-still-active")
+            return
+        if not events:
+            original, intent_sha = maintenance.read_begin(store, ctl.target.digest, session)
+            details = original["startedDetails"]
+            observed = ctl.inspect()
+            require(original["writerRunId"] == run_id and original["writerAttempt"] == attempt
+                    and original["day"] == pinned["day"] and original["controlRevision"] == pinned["controlRevision"]
+                    and original["controlRevision"] == self.revision
+                    and original["dispatcherRevision"] == dispatcher_revision and original["dispatcherWorkflow"] == workflow_file
+                    and original["sourceRevision"] == manifest["revision"]
+                    and original["anchorPredecessorSha256"] == pinned["previousSha256"]
+                    and original["stateSha256"] == observed["stateSha256"] and details.get("control") == observed["control"]
+                    and details.get("release") == observed["release"]
+                    and details.get("configurationSha256") == observed["configurationSha256"]
+                    and not any(observed["work"].values())
+                    and not any(observed["terminal"].get(key, 0) for key in
+                                ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates")),
+                    "The original unstarted transaction or its live predecessor cannot be verified.")
+            claim = {"version": 1, "targetSha256": ctl.target.digest, "session": session, "beginIntentSha256": intent_sha,
+                     "stateSha256": observed["stateSha256"], "writerRunId": self.run, "writerAttempt": self.attempt,
+                     "controlRevision": self.revision}
+            maintenance.claim_begin_reconciliation(store, ctl.target.digest, session, claim)
+            self.guard()
+            require(ctl.inspect()["stateSha256"] == observed["stateSha256"] and not journal.load(),
+                    "The unstarted transaction changed after its recovery intent.")
+            journal.append("started", {**details, "beginIntentSha256": intent_sha, "reconciledUnstarted": True}, int(time.time()))
+            journal.append("failed", {"reason": "aborted-before-start-confirmation", "uncertain": False}, int(time.time()))
+            anchor.release(session)
+            self.report.update(status="reconciled", watchdog="unstarted-anchor-released", session=session)
             return
         if events[-1]["stage"] in {"resumed", "preserved-frozen"} or (len(events) >= 2
                 and events[-1]["stage"] == "failed" and events[-2]["stage"] in {"started", "preflight"}):

@@ -24,8 +24,8 @@ from production_storage import PrivateStore
 from production_target import approve, canonical, digest, parsed, require, validate_target
 
 WORKFLOW = artifact.REPOSITORY + "/.github/workflows/worker-production-backup.yml@" + artifact.MAIN_REF
-READ_ONLY = {"inspect", "monitor", "plan-initialize-anchor", "inspect-anchor-initialization", "inspect-anchor-unknown", "plan-begin", "plan-pause", "drain", "plan-activate", "plan-reconcile-transition", "plan-resume-failed", "plan-anchor-reconcile"}
-ACTIONS = READ_ONLY | {"initialize-anchor", "begin", "preflight", "abort-preflight", "pause", "freeze", "fingerprint", "capture", "poll-export", "verify", "activate", "reconcile-transition", "resume-failed", "anchor-reconcile"}
+READ_ONLY = {"inspect", "monitor", "plan-initialize-anchor", "inspect-anchor-initialization", "inspect-anchor-unknown", "plan-abort-unstarted", "plan-begin", "plan-pause", "drain", "plan-activate", "plan-reconcile-transition", "plan-resume-failed", "plan-anchor-reconcile"}
+ACTIONS = READ_ONLY | {"initialize-anchor", "begin", "abort-unstarted", "preflight", "abort-preflight", "pause", "freeze", "fingerprint", "capture", "poll-export", "verify", "activate", "reconcile-transition", "resume-failed", "anchor-reconcile"}
 
 def require_mutation_enabled(env):
     """A protected enable switch never replaces an action-specific approval."""
@@ -94,6 +94,50 @@ def missing_started_observation(anchor, store, target):
     require(not journal.load(), "A transaction journal exists; inspect its exact stage instead.")
     return {"status": "unknown", "phase": "started-journal-missing", "session": pin["session"],
             "day": pin["day"], "mutationPermitted": False}
+
+
+def unstarted_abort_plan(anchor, store, target, ctl, contract, policy, *, candidate_sha=None, reconciliation_raw=None):
+    """Prove the actual begin writer ended before recovering an empty journal."""
+    pin, raw, _etag = anchor.read(allow_future=True)
+    pending_anchor_plan = None
+    if pin["state"] == "idle":
+        require(isinstance(candidate_sha, str) and re.fullmatch(r"[a-f0-9]{64}", candidate_sha),
+                "The exact unconfirmed anchor acquisition candidate is required.")
+        pending_anchor_plan, _prior, _etag, candidate_raw = anchor.plan_reconciliation(candidate_sha)
+        pin, raw = pending_anchor_plan["candidate"], candidate_raw
+        require(pin["state"] == "active")
+    else:
+        require(not candidate_sha)
+        anchor.read()  # A competing future generation must not be ignored.
+    txn = maintenance.Transaction(store, pin["session"], pin["day"], target.digest, pin["controlRevision"])
+    require(not txn.load(), "A transaction exists; use its normal recovery path.")
+    original, intent_sha = maintenance.read_begin(store, target.digest, pin["session"])
+    details = original["startedDetails"]
+    require(original["day"] == pin["day"] and original["controlRevision"] == pin["controlRevision"]
+            and original["controlRevision"] == ctl.control_revision
+            and original["dispatcherRevision"] == pin["controlRevision"]
+            and original["dispatcherWorkflow"] == "worker-production-backup.yml"
+            and original["sourceRevision"] == ctl.revision
+            and original["anchorPredecessorSha256"] == pin["previousSha256"]
+            and details.get("configurationSha256") == target.configuration_digest
+            and details.get("contractSha256") == digest(contract) and details.get("policySha256") == digest(policy)
+            and details.get("checkpointId") == contract["checkpointId"]
+            and details.get("pauseLimitSeconds") == policy["pauseLimitSeconds"])
+    require_finished_intent({"runId": original["writerRunId"], "runAttempt": original["writerAttempt"],
+                             "controlRevision": original["dispatcherRevision"]}, allowed_actions={"begin"})
+    current = ctl.inspect()
+    require(current["stateSha256"] == original["stateSha256"] and current["control"] == details.get("control")
+            and current["release"] == details.get("release") and current["configurationSha256"] == details["configurationSha256"]
+            and not any(current["terminal"].get(key, 0) for key in
+                        ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates")))
+    previous_reconcile = store.get(maintenance.begin_key(target.digest, pin["session"], reconciliation=True), absent=True)
+    require(previous_reconcile == reconciliation_raw, "A prior begin recovery is unresolved; do not replay it.")
+    scope = digest({"beginIntentSha256": intent_sha, "anchorSha256": recovery.digest(raw),
+                    "stateSha256": current["stateSha256"], "contractSha256": digest(contract), "policySha256": digest(policy)})
+    return {"approvalAction": "backup-abort-unstarted:" + scope, "stateSha256": current["stateSha256"],
+            "beginIntentSha256": intent_sha, "session": pin["session"], "day": pin["day"],
+            "candidateSha256": candidate_sha or None,
+            "anchorPlanSha256": digest(pending_anchor_plan) if pending_anchor_plan is not None else None}, original, txn
 
 
 def exact_predecessor(env, state):
@@ -512,11 +556,45 @@ def main(env=None):
                 journal = maintenance.Transaction(store, session, day, target.digest, revision)
                 require(not journal.load())
                 guard()
-                anchor._advance(pin, anchor_raw, anchor_etag, state="active", session=session, day=day, revision=revision)
-                journal.append("started", {"configurationSha256": target.configuration_digest, "control": state["control"],
+                started = {"configurationSha256": target.configuration_digest, "control": state["control"],
                     "release": state["release"], "pauseLimitSeconds": policy["pauseLimitSeconds"],
-                    "checkpointId": contract["checkpointId"], "contractSha256": digest(contract), "policySha256": digest(policy)}, int(time.time()))
+                    "checkpointId": contract["checkpointId"], "contractSha256": digest(contract), "policySha256": digest(policy)}
+                original = {"version": 1, "targetSha256": target.digest, "session": session, "day": day,
+                    "controlRevision": revision, "dispatcherRevision": revision, "dispatcherWorkflow": "worker-production-backup.yml",
+                    "writerRunId": env["GITHUB_RUN_ID"], "writerAttempt": env["GITHUB_RUN_ATTEMPT"],
+                    "anchorPredecessorSha256": recovery.digest(anchor_raw), "stateSha256": state["stateSha256"],
+                    "sourceRevision": proof["revision"], "approvalSha256": recovery.digest(env["SUBS_BOT_APPROVAL_JSON"].encode("utf-8")),
+                    "timestamp": int(time.time()), "startedDetails": started}
+                intent_sha = maintenance.write_begin(store, original)
+                guard()
+                require(ctl.inspect()["stateSha256"] == predecessor, "The approved begin predecessor changed.")
+                anchor._advance(pin, anchor_raw, anchor_etag, state="active", session=session, day=day, revision=revision)
+                journal.append("started", {**started, "beginIntentSha256": intent_sha}, int(time.time()))
                 result = {"status": "started", "action": action, "session": session, "day": day}
+        elif action in {"plan-abort-unstarted", "abort-unstarted"}:
+            candidate = env.get("BACKUP_ANCHOR_CANDIDATE_SHA256", "") or None
+            plan, original, journal = unstarted_abort_plan(anchor, store, target, ctl, contract, policy, candidate_sha=candidate)
+            if action == "plan-abort-unstarted":
+                result = {"status": "plan-only", "action": action, **plan}
+            else:
+                predecessor = exact_predecessor(env, plan)
+                authorized(target, env, plan["approvalAction"], proof["revision"], predecessor, revision)
+                claim = {"version": 1, "targetSha256": target.digest, "session": plan["session"],
+                         "beginIntentSha256": plan["beginIntentSha256"], "stateSha256": predecessor,
+                         "writerRunId": env["GITHUB_RUN_ID"], "writerAttempt": env["GITHUB_RUN_ATTEMPT"],
+                         "controlRevision": revision}
+                maintenance.claim_begin_reconciliation(store, target.digest, plan["session"], claim)
+                guard()
+                again, _original, _journal = unstarted_abort_plan(anchor, store, target, ctl, contract, policy,
+                    candidate_sha=candidate, reconciliation_raw=canonical(claim))
+                require(again == plan, "The approved begin recovery predecessor changed.")
+                if candidate:
+                    anchor.reconcile(candidate, plan["anchorPlanSha256"])
+                journal.append("started", {**original["startedDetails"], "beginIntentSha256": plan["beginIntentSha256"],
+                                           "reconciledUnstarted": True}, int(time.time()))
+                journal.append("failed", {"reason": "aborted-before-start-confirmation", "uncertain": False}, int(time.time()))
+                anchor.release(plan["session"])
+                result = {"status": "aborted-before-pause", "action": action, "session": plan["session"]}
         elif action in {"plan-anchor-reconcile", "anchor-reconcile"}:
             candidate = env.get("BACKUP_ANCHOR_CANDIDATE_SHA256", "")
             plan = completed_anchor_reconciliation(anchor, store, target, ctl, candidate, contract, policy)

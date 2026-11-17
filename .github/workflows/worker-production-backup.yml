@@ -10,7 +10,7 @@ on:
         description: One reviewed checkpoint; scheduled production operation is disabled
         required: true
         type: choice
-        options: [monitor, plan-initialize-anchor, initialize-anchor, inspect-anchor-initialization, inspect-anchor-unknown, plan-begin, begin, inspect, preflight, abort-preflight, plan-pause, pause, drain, freeze, fingerprint, capture, poll-export, verify, plan-activate, activate, plan-reconcile-transition, reconcile-transition, plan-resume-failed, resume-failed, plan-anchor-reconcile, anchor-reconcile]
+        options: [monitor, plan-initialize-anchor, initialize-anchor, inspect-anchor-initialization, inspect-anchor-unknown, plan-abort-unstarted, abort-unstarted, plan-begin, begin, inspect, preflight, abort-preflight, plan-pause, pause, drain, freeze, fingerprint, capture, poll-export, verify, plan-activate, activate, plan-reconcile-transition, reconcile-transition, plan-resume-failed, resume-failed, plan-anchor-reconcile, anchor-reconcile]
       state_sha256:
         description: Exact predecessor state returned by the corresponding plan or inspect
         type: string

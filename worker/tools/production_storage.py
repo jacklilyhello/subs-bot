@@ -197,3 +197,32 @@ class PrivateStore:
             raise OperationError("Private lifecycle write is unconfirmed; independently read back before retry.", uncertain=True) from None
         require(self.get(key) == body, "Private lifecycle storage readback differs.")
         return sha256(body).hexdigest()
+
+    def put_once(self, key, body):
+        """Claim an exclusive intent; conflict or lost response never grants it."""
+        require(isinstance(body, bytes) and 0 < len(body) <= 512 * 1024
+                and self.get(key, absent=True) is None)
+        objects = getattr(self, "objects", None)
+        if objects is not None:
+            objects.put_once(key, body)
+            require(self.get(key) == body)
+            return
+        try:
+            token = self.api("GET", self.api.root + "/tokens/verify")
+        except OperationError as error:
+            require(error.http_status in (400, 401, 403, 404))
+            token = self.api("GET", "/user/tokens/verify")
+        require(isinstance(token, dict) and token.get("status") == "active" and matches(r"[a-f0-9]{32}", token.get("id")))
+        host = self.api.target["accountId"] + ".r2.cloudflarestorage.com"
+        path = "/" + self.bucket + "/" + quote(key, safe="/-_.~")
+        headers = native.signed_put_headers(host, path, token["id"], self.api.token, body,
+                                            {"custom": {}, "http": {}}, datetime.now(timezone.utc))
+        try:
+            with closing(HTTPSConnection(host, timeout=30)) as connection:
+                connection.request("PUT", path, body=body, headers=headers)
+                with closing(connection.getresponse()) as response:
+                    require(response.status == 200 and len(response.read(4097)) <= 4096,
+                            "The exclusive intent write conflicted or is unknown; do not retry.")
+        except (OSError, HTTPException, ValueError):
+            raise OperationError("The exclusive intent write is unknown; do not retry.", uncertain=True) from None
+        require(self.get(key) == body, "The exclusive intent readback was not confirmed.")

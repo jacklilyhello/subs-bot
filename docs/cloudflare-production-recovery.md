@@ -134,7 +134,7 @@ G0 之后发生任何新增、修改、删除、授权、领取、撤销、短�
 
 事务锚采用独立配置的 genesis 摘要、目标专用私有指针及不可变历史；指针缺失、历史断链、分页无法证明完整或存在未确认未来代时停止。当前历史盘点最多 10,000 个对象，接近该界限必须先执行经审查的外部锚及轮换方案；该轮换尚未实现。部分初始化或无法证实的并发候选不得通过删除历史解决。手动 `backup-anchor-reconcile-plan` 和 `backup-anchor-reconcile` 仅针对有确认证据的已完成事务 release，写入入口受隔离开关及精确批准保护；原 run 已结束、journal 终态和当前配置/控制必须重新核验，计划 SHA 不替代这些检查。
 
-生产 checkpoint 草案的 `plan-initialize-anchor` 会只读给出按目标身份计算的 genesis 摘要；首次初始化前须独立固定该摘要并逐动作批准。若初始化、anchor acquire 或其写响应不明，不能仅凭对象暂时缺失而重放：旧实现没有为 acquire 在 started journal 前记录完整执行身份，缺失 journal 的遗留现场保持 unknown。`plan-anchor-reconcile` / `anchor-reconcile` 仅针对原 resume intent 所属 run 已完成、完整 journal 已确认 resumed、未来 release 代唯一且当前控制／配置／版本与终态一致的情况；它不协调不明 acquire，不把失败备份改称成功。生产 mutation 默认关闭，并要求上面所述的单步精确批准。
+生产 checkpoint 的 `plan-initialize-anchor` 会只读给出按目标身份计算的 genesis 摘要；首次初始化前须独立固定该摘要并逐动作批准。新 begin 在 acquire 前先独占封存实际 writer、来源、批准摘要、准确控制前态和 anchor 前驱。若原 writer 已结束、完整 journal 确认为空、该 intent 与当前源码和现场均精确匹配，`plan-abort-unstarted` 可生成只读计划，`abort-unstarted` 经独立批准与单次恢复 intent 后终结此会话；唯一可核对的 future acquire 候选也可按摘要显式协调。任何恢复 intent 响应不明或重试、缺失 intent 的旧现场、跨控制版本、日志分叉或在途写入均保持 unknown，不能凭对象暂时缺失重放。`plan-anchor-reconcile` / `anchor-reconcile` 仍只处理原 resume intent 所属 run 已完成、完整 journal 已确认 resumed 且终态精确匹配的 release，不把失败备份改称成功。生产 mutation 默认关闭，并要求上面所述的单步精确批准。
 
 在完整事务 journal 证明尚无 capture 或 poll intent、原 freeze run 已完成且该 checkpoint 的 recovery journal 不存在时，`plan-resume-failed` 可针对确认属于本次维护的 frozen 状态生成受限恢复计划；已完成 fingerprint 时还要重新核对完整冻结数据。恢复动作仍需精确审批，重验依赖和无未知外部结果后才执行一次 CAS。若 recovery journal 存在、导出状态未知、日志缺失或存在未确认写入，则停留并告警；该路径不替代新激活所需的完整基线。此草案不自动授权或保证暂停硬时限。
 

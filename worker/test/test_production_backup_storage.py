@@ -2,7 +2,7 @@
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import production_storage as storage
@@ -53,6 +53,21 @@ def page(truncated, key=None, cursor=None):
 
 
 class S3ListingTests(unittest.TestCase):
+    def test_exclusive_intent_conflict_or_lost_response_never_confirms_or_retries(self):
+        private = storage.PrivateStore(API(), "private-test-bucket")
+        for failure in (False, True):
+            connection, response = Mock(), Mock(status=412)
+            connection.getresponse.return_value = response
+            if failure:
+                connection.request.side_effect = OSError("synthetic lost response")
+            with patch.object(private, "get", return_value=None) as read, \
+                 patch.object(storage, "HTTPSConnection", return_value=connection), \
+                 self.assertRaises(storage.OperationError):
+                private.put_once("maintenance/production-control/evidence/example.json", b"intent")
+            connection.request.assert_called_once()
+            self.assertEqual(connection.request.call_args.kwargs["headers"]["if-none-match"], "*")
+            read.assert_called_once()
+
     def run_pages(self, pages):
         Connection.pages = list(pages)
         private = storage.PrivateStore(API(), "private-test-bucket")

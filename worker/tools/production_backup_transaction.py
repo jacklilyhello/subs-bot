@@ -26,6 +26,51 @@ NEXT = {None: {"started"}, "started": {"preflight", "failed"},
         "resumed": set(), "preserved-frozen": set(), "failed": {"resume-intent", "preserved-frozen"}}
 
 
+def begin_key(target_sha256, session, *, reconciliation=False):
+    require(SHA.fullmatch(target_sha256 or "") and SESSION.fullmatch(session or ""))
+    suffix = "reconciliation" if reconciliation else "intent"
+    return f"maintenance/production-control/evidence/daily-backup-begin/{target_sha256}/{session}-{suffix}.json"
+
+
+def write_begin(store, value):
+    """Record the actual writer before claiming the global transaction anchor."""
+    require(isinstance(value, dict) and set(value) == {"version", "targetSha256", "session", "day", "controlRevision",
+            "dispatcherRevision", "dispatcherWorkflow", "writerRunId", "writerAttempt", "anchorPredecessorSha256",
+            "stateSha256", "sourceRevision", "approvalSha256", "timestamp", "startedDetails"})
+    key = begin_key(value["targetSha256"], value["session"])
+    require(store.get(key, absent=True) is None, "A begin intent already exists; inspect it without retrying.")
+    raw = canonical(value)
+    store.put_once(key, raw)
+    require(store.get(key) == raw, "The original begin intent was not independently confirmed.")
+    return sha256(raw).hexdigest()
+
+
+def read_begin(store, target_sha256, session):
+    raw = store.get(begin_key(target_sha256, session), absent=True)
+    require(isinstance(raw, bytes), "The original begin intent is unavailable; preserve the active anchor.")
+    value = parsed(raw)
+    require(canonical(value) == raw and isinstance(value, dict) and set(value) == {"version", "targetSha256", "session", "day",
+            "controlRevision", "dispatcherRevision", "dispatcherWorkflow", "writerRunId", "writerAttempt",
+            "anchorPredecessorSha256", "stateSha256", "sourceRevision", "approvalSha256", "timestamp", "startedDetails"}
+            and value["version"] == 1 and value["targetSha256"] == target_sha256 and value["session"] == session
+            and REVISION.fullmatch(value["controlRevision"] or "") and REVISION.fullmatch(value["dispatcherRevision"] or "")
+            and isinstance(value["dispatcherWorkflow"], str) and re.fullmatch(r"[1-9][0-9]{0,19}", value["writerRunId"] or "")
+            and value["writerAttempt"] == "1" and SHA.fullmatch(value["anchorPredecessorSha256"] or "")
+            and SHA.fullmatch(value["stateSha256"] or "") and REVISION.fullmatch(value["sourceRevision"] or "")
+            and SHA.fullmatch(value["approvalSha256"] or "") and type(value["timestamp"]) is int and value["timestamp"] > 0
+            and isinstance(value["startedDetails"], dict))
+    return value, sha256(raw).hexdigest()
+
+
+def claim_begin_reconciliation(store, target_sha256, session, value):
+    """One recovery intent; an earlier uncertain recovery cannot be replayed."""
+    key = begin_key(target_sha256, session, reconciliation=True)
+    require(store.get(key, absent=True) is None, "A prior begin reconciliation is unresolved; do not retry it.")
+    raw = canonical(value)
+    store.put_once(key, raw)
+    require(store.get(key) == raw, "The begin reconciliation intent was not independently confirmed.")
+
+
 def validate_step(previous, event):
     require(event["stage"] in NEXT[previous], "Backup journal phase is out of sequence.")
     details = event["details"]
