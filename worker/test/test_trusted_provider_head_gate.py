@@ -140,6 +140,9 @@ class TrustedProviderGateTests(unittest.TestCase):
         self.assertEqual(workflow.count("uses: actions/upload-artifact@"), 1)
         self.assertIn("path: ${{ runner.temp }}/provider-source-transfer.age", workflow)
         self.assertIn("needs: [source, preflight, intent_readback]", workflow)
+        installer = Path(__file__).resolve().parents[1] / "tools/install_provider_age.sh"
+        self.assertTrue(installer.is_file())
+        self.assertIn("22ed034e16d8a7662d94dbb8d9f644f01284c6d87bc6b619903e38ba91125337", installer.read_text())
 
     def test_reviewed_source_seal_and_readback_are_default_off_and_scoped(self):
         root = Path(__file__).resolve().parents[2] / ".github/workflows"

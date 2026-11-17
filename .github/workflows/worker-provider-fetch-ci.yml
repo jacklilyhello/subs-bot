@@ -11,6 +11,7 @@ on:
       - 'worker/tools/activate_provider_isolation.py'
       - 'worker/tools/activate_provider_api_status.py'
       - 'worker/tools/install_provider_skopeo.sh'
+      - 'worker/tools/install_provider_age.sh'
       - 'worker/tools/trusted_provider_head_gate.py'
       - 'worker/tools/reviewed_provider_candidate.py'
       - 'worker/tools/isolation_sealed_transfer.py'
@@ -72,6 +73,7 @@ on:
       - 'worker/tools/activate_provider_isolation.py'
       - 'worker/tools/activate_provider_api_status.py'
       - 'worker/tools/install_provider_skopeo.sh'
+      - 'worker/tools/install_provider_age.sh'
       - 'worker/tools/trusted_provider_head_gate.py'
       - 'worker/tools/reviewed_provider_candidate.py'
       - 'worker/tools/isolation_sealed_transfer.py'
@@ -139,6 +141,8 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.13'
+      - name: Verify pinned age package for trusted source transfer
+        run: bash worker/tools/install_provider_age.sh
       - name: Install only the pinned transport wheels
         run: |
           python -m pip --isolated install --index-url https://pypi.org/simple --only-binary=:all: \
