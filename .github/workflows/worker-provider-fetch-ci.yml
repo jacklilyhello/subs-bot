@@ -19,13 +19,17 @@ on:
       - 'worker/tools/production_provider_terminal.py'
       - 'worker/tools/production_provider_forward.py'
       - 'worker/tools/archive_production_provider.py'
+      - 'worker/tools/provider_durable_source.py'
       - 'worker/test/test_production_provider.py'
+      - 'worker/test/test_production_provider_durable.py'
       - 'worker/test/test_production_provider_rehearsal.py'
       - 'worker/test/test_production_provider_terminal.py'
       - 'worker/test/test_production_provider_forward.py'
       - 'worker/test/test_archive_production_provider.py'
       - '.github/workflows/worker-production-provider.yml'
       - '.github/workflows/worker-production-provider-rehearsal.yml'
+      - '.github/workflows/worker-production-provider-source-readback.yml'
+      - '.github/workflows/worker-production-provider-source.yml'
       - '.github/actions/provider-control-step/action.yml'
       - 'worker/tools/publish_provider_registry.py'
       - 'worker/tools/stage_provider_version.py'
@@ -67,13 +71,17 @@ on:
       - 'worker/tools/production_provider_terminal.py'
       - 'worker/tools/production_provider_forward.py'
       - 'worker/tools/archive_production_provider.py'
+      - 'worker/tools/provider_durable_source.py'
       - 'worker/test/test_production_provider.py'
+      - 'worker/test/test_production_provider_durable.py'
       - 'worker/test/test_production_provider_rehearsal.py'
       - 'worker/test/test_production_provider_terminal.py'
       - 'worker/test/test_production_provider_forward.py'
       - 'worker/test/test_archive_production_provider.py'
       - '.github/workflows/worker-production-provider.yml'
       - '.github/workflows/worker-production-provider-rehearsal.yml'
+      - '.github/workflows/worker-production-provider-source-readback.yml'
+      - '.github/workflows/worker-production-provider-source.yml'
       - '.github/actions/provider-control-step/action.yml'
       - 'worker/tools/publish_provider_registry.py'
       - 'worker/tools/stage_provider_version.py'
@@ -108,6 +116,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:

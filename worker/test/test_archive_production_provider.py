@@ -58,6 +58,24 @@ def fixture(directory):
 
 
 class ArchiveTests(unittest.TestCase):
+    def test_token_identity_prefers_account_and_only_falls_back_on_explicit_denial(self):
+        account, token_id = "a" * 32, "b" * 32
+        account_path = f"/accounts/{account}/tokens/verify"
+        identity = {"status": "active", "id": token_id}
+        api = Mock(return_value=identity)
+        self.assertEqual(archive.verified_token_identity(api, account), identity)
+        api.assert_called_once_with("GET", account_path)
+        api = Mock(side_effect=[archive.CloudflareError("denied", http_status=401), identity])
+        self.assertEqual(archive.verified_token_identity(api, account), identity)
+        self.assertEqual(api.call_args_list, [unittest.mock.call("GET", account_path), unittest.mock.call("GET", "/user/tokens/verify")])
+        api = Mock(side_effect=archive.CloudflareError("transport"))
+        with self.assertRaises(control.ProviderError):
+            archive.verified_token_identity(api, account)
+        api.assert_called_once_with("GET", account_path)
+        for invalid in ({"status": "disabled", "id": token_id}, {"status": "active", "id": "bad"}):
+            with self.subTest(invalid=invalid), self.assertRaises(control.ProviderError):
+                archive.verified_token_identity(Mock(return_value=invalid), account)
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)

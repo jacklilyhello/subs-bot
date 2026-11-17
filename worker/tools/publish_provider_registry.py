@@ -100,8 +100,9 @@ def _verified_input(root, revision, run_id, *, profile=provider.FETCH_PROFILE, a
         _private_path(directory / name, 0o600, limit)
     profile_args = {"profile": profile} if status else {}
     try:
-        manifest = provider.verify_release(directory, revision, ref=github.MAIN_REF, run_id=run_id,
-                                           run_attempt=evidence["runAttempt"], **profile_args)
+        with provenance.source_requirements(revision) as requirements:
+            manifest = provider.verify_release(directory, revision, ref=github.MAIN_REF, run_id=run_id,
+                                               run_attempt=evidence["runAttempt"], requirements=requirements, **profile_args)
     except provider.VERIFICATION_ERRORS:
         raise PublicationError("The private provider release files no longer verify.") from None
     fields = (*MANIFEST_FIELDS, *API_STATUS_FIELDS) if status else MANIFEST_FIELDS

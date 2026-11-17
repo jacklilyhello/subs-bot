@@ -1,0 +1,78 @@
+name: Plan and seal production Provider source
+run-name: Provider source ${{ inputs.action }} ${{ inputs.operation_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Plan is read-only; seal requires the independently reviewed plan digest
+        required: true
+        type: choice
+        options: [plan, seal]
+      operation_id:
+        description: Unique decimal archive operation ID, never reuse after any seal dispatch
+        required: true
+        type: string
+      provider_ci_run_id:
+        description: Exact original successful Provider CI run in the registered target
+        required: true
+        type: string
+      approval_sha256:
+        description: Exact approvalSha256 returned by the matching read-only plan, seal only
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: subs-bot-production-provider-source
+  cancel-in-progress: false
+
+jobs:
+  source:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
+    environment: subs-bot-production-provider-archive
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify the exact original CI source and target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_SOURCE_ACTION: prepare-production
+          SUBS_BOT_PROVIDER_CI_RUN_ID: ${{ inputs.provider_ci_run_id }}
+          SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          python3 -B worker/tools/provider_durable_source.py
+      - name: Plan without writing
+        if: inputs.action == 'plan'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_SOURCE_ACTION: plan-production
+          SUBS_BOT_PROVIDER_SOURCE_OPERATION_ID: ${{ inputs.operation_id }}
+          SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_ARCHIVE_BUCKET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_BUCKET_JSON }}
+          SUBS_BOT_PROVIDER_SOURCE_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_SOURCE_LEDGER_JSON }}
+          SUBS_BOT_PROVIDER_SOURCE_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_SOURCE_CONTROLLERS_JSON }}
+          SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN }}
+        run: python3 -B worker/tools/provider_durable_source.py
+      - name: Seal once after exact approval and durable intent
+        if: inputs.action == 'seal'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_SOURCE_ACTION: seal-production
+          SUBS_BOT_PROVIDER_SOURCE_OPERATION_ID: ${{ inputs.operation_id }}
+          SUBS_BOT_PROVIDER_SOURCE_APPROVAL: ${{ inputs.approval_sha256 }}
+          SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_ARCHIVE_BUCKET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_BUCKET_JSON }}
+          SUBS_BOT_PROVIDER_SOURCE_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_SOURCE_LEDGER_JSON }}
+          SUBS_BOT_PROVIDER_SOURCE_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_SOURCE_CONTROLLERS_JSON }}
+          SUBS_BOT_CF_PROVIDER_ARCHIVE_WRITE_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_ARCHIVE_WRITE_TOKEN }}
+        run: python3 -B worker/tools/provider_durable_source.py

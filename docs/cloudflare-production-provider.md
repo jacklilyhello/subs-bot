@@ -66,7 +66,19 @@
 
 任何写结果不明、响应错误、读回身份或摘要不符，都以失败退出。mutation 不做自动重试，也不删除资源或已存 admission 标记来制造成功。新开 `verify` dispatch 只读观察；将观察状态独立核对后再更新契约。一个执行进程最多一次 Worker/Container/Workflow 创建、上传或部署；镜像准备仅在平台明确返回 pending 时继续轮询同一个 digest。registry 可能已经保留准确镜像，应读回确认，不覆盖不同 tag。
 
-当前发布、升级及 `previous` 链检查仍要求每代原 GitHub Provider CI artifact 存在且未过期；CI 工作流目前设置 14 天保留期。冻结源可随 main 控制工具前进继续使用，但不会免除这项[原始源检查](../worker/tools/production_provider.py)。私有 R2 的候选保全、恢复与独立读回不等于已支持从私有归档自动发布源代码，也不代表可以无限期回退。源产物过期、被删除或无法核验时，受影响操作会拒绝；必须先明确审查处置方案，不能用新 CI run ID 替换历史 pins、改写旧摘要或自动采用 dev。首次正式部署使用新准确 main 的成功 CI，不能用过期隔离源代替。
+发布、升级及 `previous` 链的归档来源读取已提供控制路径，但**尚未完成正式候选封存及隔离维护验收**，不得将其视为生产就绪。每代仍须固定原 CI revision、run/attempt、artifact ID、ZIP、Worker 和 OCI 摘要；归档只提供原始字节，不替代目标批准或来源证明。控制端逐代检查当前 main 的祖先关系、GitHub 上原 CI attempt 的成功元数据、目标身份、完整 ZIP 和 OCI，缺少任一项即在操作前拒绝。历史 requirements 按固定提交从 GitHub 读取并核对 Git blob 摘要；若原 CI run 或提交文件不再可核验，仍须停止。目前最多保留九代链，CI 工作流原 artifact 保留期为 14 天。
+
+生产控制工作流及隔离演练工作流的 `archive_refs` 为空时保留原 CI 来源路径；非空时传 JSON 数组，每代一项，字段严格为 `kind`、`runId`、`runAttempt`、`manifestSha256`、`targetSha256`。`manifestSha256` 必须是归档时独立记录的 R2 manifest 摘要，`targetSha256` 必须是当时独立记录的完整归档目标摘要；不可从待验证对象中现算后作为信任依据。隔离来源的 `kind` 为 `complete` 或 `partial`；partial 仅保留原始字节和失败现场，绝不代表演练成功。正式来源必须使用 `production`，禁止引用隔离桶或隔离 target。不能凭文件名、同名 Worker 或归档存在推断授权。
+
+控制 job 通过专用最小权限只读归档凭据，在独立步骤直接读取 R2 并核验桶身份、私有状态、生命周期和固定 manifest；不将原件或完整目标上传至公开仓库 artifact。随后控制步骤重新核验目标、原 CI 元数据、ZIP、模块和 OCI，Provider 写凭据不注入归档读取步骤。配置需在对应受保护 Provider Environment 单独提供 `SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN` 和隔离桶身份 `SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON`；正式环境需提供 `SUBS_BOT_PROVIDER_ARCHIVE_BUCKET_JSON`。不得复制高权限凭据替代只读 token。非空 `archive_refs` 必须覆盖当前及整个 previous 链。隔离演练的归档来源目前强制拒绝，因为旧演练的 intent 和 source artifact 通道会暴露完整目标及原件；在这些证据改用私密通道前不能启用，也不能声称完成隔离验收。
+
+正式来源封存提供 [plan/seal 工作流](../.github/workflows/worker-production-provider-source.yml)：在 `subs-bot-production-provider-archive` 配置经过独立核对的完整 Provider target、正式桶身份、专用只读和写入 token。正式桶身份格式为 `{"version":1,"accountId":"<项目账户ID>","namespace":"lilyya","bucket":"subs-bot-cf-prod-backup-01","createdOn":"<已核对的创建时间>"}`；桶必须已获批创建且保持私有，不能使用隔离桶作为回退。本轮不会创建、配置或运行正式资源。
+
+受保护配置须显式设置 `SUBS_BOT_PROVIDER_SOURCE_LEDGER_JSON` 为经独立登记的历史映射（首次为空对象 `{}`，缺失并非空），以及 `SUBS_BOT_PROVIDER_SOURCE_CONTROLLERS_JSON` 为允许的已审查准确控制提交数组。历史每项映射的字段为 `intentSha256`、`manifestSha256`、原 seal `runId`、`controllerRevision`。每次 seal 前完整读取私有 intent、manifest 和 ZIP，并与独立 ledger 及已审查控制提交的 workflow 历史逐项比对；未知历史、缺失或不一致一律停止。新封存尚未独立读回并安全登记到 ledger 时，后续 seal 会停止，读回工具不自动更新 ledger。
+
+先用从未使用的十进制 operation ID、准确 CI run 执行 `plan`；plan 只读且返回绑定准确控制提交、完整目标、原 CI pins、桶身份、完整历史盘点和空前态的 `approvalSha256`。独立审查后在新 dispatch 的 `seal` 提交相同 ID 和精确批准摘要。seal 在同一受保护 job 核验原 CI、原 ZIP 及完整 OCI，不上传原件；写入前核对有界历史，拒绝已用 ID 和任何之前未成功的 seal，然后先向 R2 写入并读回不可变 `started-unknown` intent，再单次封存 chunks 和 manifest。未知写入不得重试；任一先前 seal 失败、取消或状态不明时，后续全部 seal 都会拒绝，直到形成另行审查的独立对账方案。必须保留该工作流 run 记录，历史被删除或不可完整查询时不能据此认定安全。原件封存后用新的 [独立读回工作流](../.github/workflows/worker-production-provider-source-readback.yml) 输入 operation ID（作为 `archive_run_id`）、attempt `1` 和独立记录的 manifest/target 摘要完成 R2-only 核验。该流程仍需代码审查和云端隔离验证，封存不代表 Provider 的生产发布验收。
+
+当前完整盘点最多 32 份历史 source archive，plan 返回数量和上限；达到上限时在写入前拒绝，不删除旧档。扩容须先审查并实现可分页、分段登记和完整性验证，保留现有全部 pins。这个历史容量界限与单条 previous 链最多九代是两项不同限制。
 
 尚未绑定任何应用 caller 的 Provider 可以通过明确 `previous` 链修复/升级。操作前再次核对 Beta `references.workers=[]`，上一代资源身份、已完成 smoke 和 stopped/无 active instance；保留既有资源和版本。已绑定应用的 Provider 不能使用这个无 caller 升级路径：必须先制定并批准主应用冻结、排空及依赖更新计划，不能从一次空闲样本推断 caller 已暂停。主应用缺少正式依赖 pin 或依赖不符时仍拒绝激活 URL 导入/刷新。
 

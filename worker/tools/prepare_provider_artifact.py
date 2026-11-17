@@ -1,6 +1,8 @@
 """Verify the exact main-branch Provider Fetch CI artifact without deploying it."""
 
 import hashlib
+import base64
+from contextlib import contextmanager
 from http.client import HTTPException
 import json
 import os
@@ -36,7 +38,36 @@ STORAGE_TIMEOUT_SECONDS = 120
 STORAGE_OPENER = build_opener(ProxyHandler({}), github._NoRedirect())
 
 
-def _select_artifact(run_id, revision, token, *, profile=provider.FETCH_PROFILE):
+@contextmanager
+def source_requirements(revision):
+    """Read the file at the pinned Git commit, never the current file for an old source."""
+    if revision == os.environ.get("GITHUB_SHA"):
+        yield Path(provider.__file__).with_name("requirements.txt")
+        return
+    if not provider.REVISION.fullmatch(revision):
+        raise github.ArtifactError("The historical provider revision is invalid.")
+    body = github._get_json(f"/contents/worker/provider_fetch/requirements.txt?ref={revision}", github._github_token())
+    try:
+        if (body.get("type") != "file" or body.get("path") != "worker/provider_fetch/requirements.txt"
+                or body.get("encoding") != "base64" or not isinstance(body.get("content"), str)
+                or not isinstance(body.get("sha"), str) or not re.fullmatch(r"[0-9a-f]{40}", body["sha"])
+                or type(body.get("size")) is not int or not 0 < body["size"] <= provider.MAX_METADATA):
+            raise ValueError()
+        raw = base64.b64decode("".join(body["content"].splitlines()), validate=True)
+        if len(raw) != body["size"] or hashlib.sha1(b"blob " + str(len(raw)).encode("ascii") + b"\0" + raw).hexdigest() != body["sha"]:
+            raise ValueError()
+    except (ValueError, TypeError):
+        raise github.ArtifactError("Historical provider requirements could not be verified at the pinned commit.") from None
+    with tempfile.TemporaryDirectory(prefix=".provider-requirements-", dir=os.environ["RUNNER_TEMP"]) as temp:
+        path = Path(temp) / "requirements.txt"
+        with _write_private(path) as output:
+            output.write(raw)
+        yield path
+
+
+def _select_artifact(run_id, revision, token, *, profile=provider.FETCH_PROFILE, run_attempt=None):
+    if os.environ.get("SUBS_BOT_PROVIDER_SIMULATE_ARTIFACT_UNAVAILABLE") == "1":
+        raise github.ArtifactError("Provider Actions artifact access is deliberately disabled for this rehearsal.")
     if profile == provider.FETCH_PROFILE:
         prefix, label = "subs-bot-provider", "Provider Fetch CI"
     elif profile == provider.API_STATUS_PROFILE:
@@ -44,7 +75,7 @@ def _select_artifact(run_id, revision, token, *, profile=provider.FETCH_PROFILE)
     else:
         raise github.ArtifactError("Unknown provider release profile.")
     return github.select_main_artifact(run_id, revision, token, workflow_id=WORKFLOW_ID, workflow_path=WORKFLOW_PATH,
-                                       artifact_prefix=prefix, workflow_label=label)
+                                       artifact_prefix=prefix, workflow_label=label, run_attempt=run_attempt)
 
 
 def _write_private(path):
@@ -52,6 +83,8 @@ def _write_private(path):
 
 
 def _download_zip(artifact_id, token, expected_digest, path):
+    if os.environ.get("SUBS_BOT_PROVIDER_SIMULATE_ARTIFACT_UNAVAILABLE") == "1":
+        raise github.ArtifactError("Provider Actions artifact access is deliberately disabled for this rehearsal.")
     error = "Could not download the verified provider archive."
     try:
         request = github.artifact_storage_request(artifact_id, token)
@@ -117,7 +150,7 @@ def _unpack(path, staged):
         raise github.ArtifactError(error) from None
 
 
-def prepare(*, provider_revision=None, profile=provider.FETCH_PROFILE):
+def prepare(*, provider_revision=None, provider_attempt=None, profile=provider.FETCH_PROFILE):
     main_revision = os.environ.get("GITHUB_SHA", "")
     revision = provider_revision if provider_revision is not None else main_revision
     run_id = os.environ.get("SUBS_BOT_PROVIDER_CI_RUN_ID", "")
@@ -135,7 +168,10 @@ def prepare(*, provider_revision=None, profile=provider.FETCH_PROFILE):
         raise github.ArtifactError("Unknown provider release profile.")
     token = github._github_token()
     github.require_current_main(main_revision)
-    attempt, artifact_id, digest = _select_artifact(run_id, revision, token, profile=profile)
+    selection = {"profile": profile}
+    if provider_attempt is not None:
+        selection["run_attempt"] = provider_attempt
+    attempt, artifact_id, digest = _select_artifact(run_id, revision, token, **selection)
     destination = Path(runner_temp) / directory_name
     if os.path.lexists(destination):
         raise github.ArtifactError("The verified provider artifact directory already exists.")
@@ -147,11 +183,12 @@ def prepare(*, provider_revision=None, profile=provider.FETCH_PROFILE):
         _download_zip(artifact_id, token, digest, archive)
         _unpack(archive, staged)
         try:
-            manifest = provider.verify_release(staged, revision, ref=github.MAIN_REF, run_id=run_id, run_attempt=attempt,
-                                               profile=profile)
+            with source_requirements(revision) as requirements:
+                manifest = provider.verify_release(staged, revision, ref=github.MAIN_REF, run_id=run_id, run_attempt=attempt,
+                                                   profile=profile, requirements=requirements)
         except provider.VERIFICATION_ERRORS:
             raise github.ArtifactError("The provider release manifest or its exact contents did not verify.") from None
-        if _select_artifact(run_id, revision, token, profile=profile) != (attempt, artifact_id, digest):
+        if _select_artifact(run_id, revision, token, **selection) != (attempt, artifact_id, digest):
             raise github.ArtifactError("The trusted provider build artifact changed during verification.")
         github.require_current_main(main_revision)
         if os.path.lexists(destination):
