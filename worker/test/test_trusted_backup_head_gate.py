@@ -62,9 +62,12 @@ class TrustedGateTests(unittest.TestCase):
     def test_capacity_gate_requires_independent_fixture_and_fresh_binding_witness(self):
         fixture = {"version": 1, "accountId": ACCOUNT, "databaseId": "00000000-0000-4000-8000-000000000001",
                    "databaseName": "subs-bot-cf-backup-capacity-20261118", "createdAt": "2026-11-18T00:00:00Z",
-                   "bucketName": "subs-bot-cf-dev-01", "bucketCreatedAt": "2026-11-17T00:00:00Z"}
+                   "bucketName": "subs-bot-cf-dev-01", "bucketCreatedAt": "2026-11-17T00:00:00Z",
+                   "probeDatabaseId": "00000000-0000-4000-8000-000000000004",
+                   "probeDatabaseName": "subs-bot-cf-backup-permission-20261118", "probeCreatedAt": "2026-11-18T00:00:00Z"}
         witness = {"version": 1, "accountId": ACCOUNT, "databaseId": fixture["databaseId"],
-                   "observedAt": 1000, "workerBindingCount": 0}
+                   "observedAt": 1000, "workerBindingCount": 0,
+                   "probeDatabaseId": fixture["probeDatabaseId"], "probeWorkerBindingCount": 0}
         original = {"accountId": ACCOUNT, "d1Id": "00000000-0000-4000-8000-000000000002", "r2CreatedOn": fixture["bucketCreatedAt"]}
         fixture_pin, witness_pin = sha256(canonical(fixture)).hexdigest(), sha256(canonical(witness)).hexdigest()
         selection = {**spec(), "action": "capacity-fixture", "approvalSha256": digest({"registrationSha256": fixture_pin,
@@ -81,6 +84,13 @@ class TrustedGateTests(unittest.TestCase):
                            {"CAPACITY_FIXTURE_MODE": "20001"}, {"CAPACITY_FIXTURE_BINDING_WITNESS_SHA256": "0" * 64}):
                 with self.subTest(change=change), self.assertRaises(ContractError):
                     self.check({**env, **change})
+            probe_spec = {**selection, "checkpointId": "0" * 31 + "1",
+                          "approvalSha256": digest({"registrationSha256": fixture_pin, "witnessSha256": witness_pin,
+                                                    "mode": "probe-read-token"})}
+            probe = {**env, "HEAD_VALIDATION_JSON": json.dumps(probe_spec), "CAPACITY_FIXTURE_MODE": "probe-read-token"}
+            self.assertTrue(self.check(probe)["checkoutVerified"])
+            with self.assertRaises(ContractError):
+                self.check({**probe, "HEAD_VALIDATION_JSON": json.dumps({**probe_spec, "checkpointId": ""})})
         with patch.object(gate.time, "time", return_value=2000), self.assertRaises(ContractError):
             self.check(env)
 
@@ -93,6 +103,8 @@ class TrustedGateTests(unittest.TestCase):
         self.assertIn("CAPACITY_FIXTURE_D1_WRITE_TOKEN", workflow)
         self.assertIn("!startsWith(vars.SUBS_BOT_BACKUP_CAPACITY_MODE, 'verify-')", workflow)
         self.assertIn("SUBS_BOT_CF_REHEARSAL_DATA_READ_TOKEN", workflow)
+        self.assertIn("needs: [probe_intent]", workflow)
+        self.assertIn("CAPACITY_FIXTURE_PROBE_INTENT_SHA256: ${{ needs.probe_intent.outputs.intent_sha256 }}", workflow)
 
     def test_wrong_pin_environment_or_attempt_fails_before_checkout(self):
         for changed in ({"BACKUP_REVIEWED_HEAD_SHA": "f" * 40}, {"BACKUP_HEAD_ENVIRONMENT": "subs-bot-production"},
