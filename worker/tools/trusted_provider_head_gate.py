@@ -42,7 +42,8 @@ DIGEST_PHASES = {"digest-source", "digest-preflight", "digest-intent-write", "di
 DIGEST_PROVIDER_PHASES = {"digest-preflight", "digest-publish", "digest-verify"}
 OPERATION_PHASES = {"operation-source", "operation-preflight", "operation-intent-write", "operation-intent-readback",
                     "operation-dispatch", "operation-verify", "operation-completion-write", "operation-evidence-readback",
-                    "operation-failure-write", "operation-failure-readback"}
+                    "operation-keyless-readback", "operation-failure-write", "operation-failure-readback",
+                    "operation-failure-keyless-readback"}
 OPERATION_PROVIDER_PHASES = {"operation-preflight", "operation-dispatch", "operation-verify"}
 RECOVERY_PHASES = {"recovery-inspect", "recovery-archive", "recovery-readback"}
 SOURCE_PHASES = {"isolated-source", "isolated-source-readback"}
@@ -120,6 +121,10 @@ def validate(env):
     require(check in {"before", "ready", "credential", "after"})
     if check != "before":
         require(candidate.is_dir() and not candidate.is_symlink() and checkout_sha(candidate) == spec["headSha"])
+        if env.get("GITHUB_WORKFLOW_REF") == OPERATION_WORKFLOW:
+            module = candidate / "worker/tools/provider_private_mutation_journal.py"
+            require(module.is_file() and not module.is_symlink() and module.stat().st_size <= 1024 * 1024
+                    and "PROVIDER_KEYLESS_EVIDENCE_PROTOCOL = 2" in module.read_text(encoding="utf-8").splitlines())
     if check == "credential":
         # These are resource contracts, not credentials. The gate intentionally
         # never receives or prints any Cloudflare or age secret.
