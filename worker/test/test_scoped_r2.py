@@ -6,7 +6,7 @@ from hashlib import sha256
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import scoped_r2
@@ -61,6 +61,31 @@ class ScopedR2Tests(unittest.TestCase):
                 scoped_r2.metadata_token({key: primary})
             with self.subTest(key=key), self.assertRaises(ContractError):
                 scoped_r2.creation_token("synthetic-d1-token", {key: primary})
+    def test_failed_get_reports_only_status_and_does_not_read_error_body_or_retry(self):
+        store = scoped_r2.ScopedR2(ACCOUNT, BUCKET, CREDENTIAL)
+        response = Mock(status=403)
+        response.getheader.return_value = None
+        connection = Mock()
+        connection.getresponse.return_value = response
+        with patch.object(scoped_r2, "HTTPSConnection", return_value=connection):
+            with self.assertRaises(scoped_r2.ScopedR2ReadError) as raised:
+                store.get(KEY)
+        self.assertEqual(raised.exception.read_diagnostic, {"source": "r2", "phase": "get", "httpStatus": 403})
+        self.assertIsInstance(raised.exception, ContractError)
+        connection.request.assert_called_once()
+        response.read1.assert_not_called()
+
+    def test_missing_absent_and_other_read_phases_remain_distinct(self):
+        store = scoped_r2.ScopedR2(ACCOUNT, BUCKET, CREDENTIAL)
+        with patch.object(store, "_request", return_value=(404, None, b"")) as request:
+            self.assertEqual(store.get(KEY, absent=True), (None, None))
+            request.assert_called_once()
+        with patch.object(store, "_request", return_value=(503, None, b"")), self.assertRaises(scoped_r2.ScopedR2ReadError) as raised:
+            store.list("test/")
+        self.assertEqual(raised.exception.read_diagnostic, {"source": "r2", "phase": "list", "httpStatus": 503})
+        with patch.object(store, "_request", return_value=(403, None, b"", [])), self.assertRaises(scoped_r2.ScopedR2ReadError) as raised:
+            store.head(KEY)
+        self.assertEqual(raised.exception.read_diagnostic, {"source": "r2", "phase": "head", "httpStatus": 403})
 
     def test_signature_matches_the_published_aws_s3_vector(self):
         # Public example from AWS's SigV4 S3 header-authentication reference.

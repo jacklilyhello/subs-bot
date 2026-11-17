@@ -14,7 +14,7 @@ from time import monotonic
 from urllib.parse import quote
 from xml.etree import ElementTree
 
-from production_target import canonical, parsed, require
+from production_target import ContractError, canonical, parsed, require
 
 MAX_OBJECT = 16 * 1024 * 1024
 MAX_LIST = 2 * 1024 * 1024
@@ -43,6 +43,20 @@ def creation_token(fallback, env=None):
 
 class ScopedR2Error(ValueError):
     """An operation was not confirmed; never infer a failed write was absent."""
+
+
+class ScopedR2ReadError(ContractError):
+    """A failed read retains the pre-existing target-contract error category."""
+
+
+def read_status(status, phase):
+    """Attach only a bounded HTTP status to a failed object-read operation."""
+    require(phase in {"get", "list", "head"})
+    if status != 200:
+        error = ScopedR2ReadError("The scoped R2 read was not confirmed.")
+        error.read_diagnostic = {"source": "r2", "phase": phase,
+                                 "httpStatus": status if type(status) is int and 100 <= status <= 599 else None}
+        raise error
 
 
 def sign(method, host, path, query, headers, payload_sha, access, secret, now):
@@ -128,6 +142,8 @@ class ScopedR2:
                 connection.request(method, path + ("?" + encoded if encoded else ""), body=raw if method == "PUT" else None, headers=headers)
                 with closing(connection.getresponse()) as response:
                     status, etag = response.status, response.getheader("ETag")
+                    if method in {"GET", "HEAD"} and status != 200:
+                        return (status, etag, b"", []) if include_headers else (status, etag, b"")
                     deadline, body = monotonic() + 45, bytearray()
                     while monotonic() < deadline:
                         chunk = response.read1(min(65536, limit + 1 - len(body)))
@@ -144,7 +160,8 @@ class ScopedR2:
         status, etag, raw = self._request("GET", key, limit=limit)
         if status == 404 and absent:
             return None, None
-        require(status == 200 and etag and not any(c in etag for c in "\r\n"))
+        read_status(status, "get")
+        require(etag and not any(c in etag for c in "\r\n"))
         return raw, etag
 
     def put_once(self, key, raw, *, etag=None, metadata=None):
@@ -182,7 +199,8 @@ class ScopedR2:
             if cursor is not None:
                 query["continuation-token"] = cursor
             status, _etag, raw = self._request("GET", "", query=query, limit=MAX_LIST)
-            require(status == 200 and b"<!" not in raw)
+            read_status(status, "list")
+            require(b"<!" not in raw)
             try:
                 root = ElementTree.fromstring(raw)
             except ElementTree.ParseError:
@@ -219,7 +237,8 @@ class ScopedR2:
 
     def head(self, key):
         status, etag, _body, headers = self._request("HEAD", key, limit=0, include_headers=True)
-        require(status == 200 and isinstance(etag, str))
+        read_status(status, "head")
+        require(isinstance(etag, str))
         seen = {}
         for name, value in headers:
             name = name.lower()
