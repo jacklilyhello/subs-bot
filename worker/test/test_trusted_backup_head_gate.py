@@ -76,6 +76,15 @@ class TrustedGateTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             self.check({**self.env, "HEAD_VALIDATION_JSON": json.dumps(bad)})
 
+    def test_open_backup_requires_genesis_and_rejects_injected_faults(self):
+        missing = {**spec(), "action": "open-backup"}
+        with self.assertRaises(ContractError):
+            self.check({**self.env, "HEAD_VALIDATION_JSON": json.dumps(missing)})
+        valid = {**missing, "genesisSha256": "f" * 64}
+        self.assertTrue(self.check({**self.env, "HEAD_VALIDATION_JSON": json.dumps(valid)})["checkoutVerified"])
+        with self.assertRaises(ContractError):
+            self.check({**self.env, "HEAD_VALIDATION_JSON": json.dumps({**valid, "fault": "process-kill"})})
+
     def test_forked_pr_is_rejected(self):
         def fork(path, token):
             value = github(path, token)
@@ -98,6 +107,18 @@ class TrustedGateTests(unittest.TestCase):
             self.check({**env, "SUBS_BOT_TELEGRAM_TEST_CONFIG": json.dumps({**test, "botId": "1000000000"})})
         with self.assertRaises(ContractError):
             self.check({**env, "SUBS_BOT_TELEGRAM_TEST_CONFIG": json.dumps({**test, "botToken": "1000000000:OTHER_BOT_TOKEN_123456789"})})
+
+    def test_cleanup_runs_in_a_distinct_trusted_job_after_candidate(self):
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/worker-backup-reviewed-head.yml").read_text()
+        candidate, cleanup = workflow.split("\n  trusted_cleanup:\n", 1)
+        self.assertIn("needs: [validate]", cleanup)
+        self.assertIn("Check out trusted current main on a fresh runner", cleanup)
+        self.assertNotIn("production_backup_admission_recovery.py", candidate)
+        self.assertNotIn("production_backup_webhook_recovery.py", candidate)
+        self.assertNotIn("working-directory: candidate", cleanup)
+        self.assertLess(cleanup.index("Trusted inspect original webhook snapshot"), cleanup.index("Trusted close and freeze isolated admission"))
+        self.assertLess(cleanup.index("Trusted close and freeze isolated admission"), cleanup.index("Trusted restore original test webhook"))
+        self.assertIn("${{ needs.validate.outputs.snapshot_sha256 }}", cleanup)
 
 
 if __name__ == "__main__":
