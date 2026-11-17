@@ -13,7 +13,7 @@ import subprocess
 
 import prepare_isolation_artifact as artifact
 import production_backup_transaction as maintenance
-from production_lifecycle_drill import Drill, SERVICE
+from production_lifecycle_drill import BackupDiagnosticError, Drill, SERVICE
 from production_control import API, privacy, rows
 from production_release_evidence import verify_activation_baseline
 from production_storage import PrivateStore
@@ -124,8 +124,8 @@ def verified_head(env):
     current = ref.get("object", {})
     require(ref.get("ref") == artifact.MAIN_REF and current.get("type") == "commit"
             and current.get("sha") == main)
-    comparison = artifact._get_json("/compare/" + current["sha"] + "..." + head, token)
-    require(comparison.get("status") in {"ahead", "identical"}
+    comparison = artifact.compare_commits_metadata(current["sha"], head, token)
+    require(comparison.get("status") in {"ahead", "identical"} and comparison.get("behind_by") == 0
             and comparison.get("base_commit", {}).get("sha") == current["sha"]
             and comparison.get("merge_base_commit", {}).get("sha") == current["sha"],
             "The reviewed head is no longer based on current main.")
@@ -360,6 +360,12 @@ if __name__ == "__main__":
     try:
         os.umask(0o077)
         main()
+    except BackupDiagnosticError as error:
+        # The exception contains only fixed stage/category labels, bounded HTTP
+        # status and journal confirmation state; it never includes the original
+        # exception text, data, control rows or credentials.
+        print(json.dumps(error.diagnostic, sort_keys=True))
+        raise SystemExit(1) from None
     except Exception:
         print(json.dumps({"status": "stopped", "reason": "Head validation was not confirmed; preserve its private intent and inspect before retry."}))
         raise SystemExit(1) from None

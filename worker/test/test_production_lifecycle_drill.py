@@ -45,6 +45,31 @@ class MemoryStore:
 
 
 class LifecycleDrillTests(unittest.TestCase):
+    def test_backup_failure_diagnostics_never_repeat_or_print_error_details(self):
+        journal = Mock(session="123-1")
+        journal.append.side_effect = drill.OperationError("synthetic-private-evidence", uncertain=True, status=503)
+        anchor = Mock()
+        error = drill.ContractError("synthetic-private-payload")
+        diagnostic = drill.record_backup_failure(journal, anchor, error, "recovery-prepare")
+        self.assertEqual(diagnostic["stage"], "recovery-prepare")
+        self.assertEqual(diagnostic["failedJournal"], "unconfirmed")
+        self.assertEqual(diagnostic["anchorRelease"], "not-attempted")
+        self.assertEqual(diagnostic["evidenceError"], {"kind": "operation", "uncertain": True, "httpStatus": 503})
+        self.assertNotIn("synthetic-private", json.dumps(diagnostic))
+        journal.append.assert_called_once()
+        anchor.release.assert_not_called()
+
+    def test_backup_failure_records_confirmation_before_single_anchor_release(self):
+        journal = Mock(session="123-1")
+        journal.load.return_value = [{"stage": "preflight"}, {"stage": "failed"}]
+        anchor = Mock()
+        anchor.release.side_effect = drill.OperationError("synthetic-private", uncertain=True)
+        diagnostic = drill.record_backup_failure(journal, anchor, drill.ContractError("synthetic"), "preflight")
+        self.assertEqual(diagnostic["failedJournal"], "confirmed")
+        self.assertEqual(diagnostic["anchorRelease"], "unconfirmed")
+        self.assertTrue(journal.append.call_args.args[1]["uncertain"])
+        anchor.release.assert_called_once_with("123-1")
+
     def test_legacy_webhook_actions_reject_before_opening_private_state(self):
         for action in ("exercise", "provider-binding", "provider-binding-resume", "recover-webhook"):
             with self.subTest(action=action), patch.dict(drill.os.environ, {
