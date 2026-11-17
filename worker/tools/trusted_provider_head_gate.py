@@ -23,6 +23,8 @@ OPERATION_WORKFLOW_PATH = ".github/workflows/worker-provider-reviewed-operation.
 OPERATION_WORKFLOW = f"{github.REPOSITORY}/{OPERATION_WORKFLOW_PATH}@{github.MAIN_REF}"
 OPERATION_RECONCILE_WORKFLOW_PATH = ".github/workflows/worker-provider-reviewed-operation-reconcile.yml"
 OPERATION_RECONCILE_WORKFLOW = f"{github.REPOSITORY}/{OPERATION_RECONCILE_WORKFLOW_PATH}@{github.MAIN_REF}"
+RECOVERY_WORKFLOW_PATH = ".github/workflows/worker-provider-reviewed-recovery.yml"
+RECOVERY_WORKFLOW = f"{github.REPOSITORY}/{RECOVERY_WORKFLOW_PATH}@{github.MAIN_REF}"
 SOURCE_WORKFLOW_PATH = ".github/workflows/worker-provider-reviewed-isolated-source.yml"
 SOURCE_READBACK_WORKFLOW_PATH = ".github/workflows/worker-provider-reviewed-isolated-source-readback.yml"
 SOURCE_WORKFLOWS = {f"{github.REPOSITORY}/{path}@{github.MAIN_REF}" for path in (SOURCE_WORKFLOW_PATH, SOURCE_READBACK_WORKFLOW_PATH)}
@@ -40,6 +42,7 @@ OPERATION_PHASES = {"operation-source", "operation-preflight", "operation-intent
                     "operation-dispatch", "operation-verify", "operation-completion-write", "operation-evidence-readback",
                     "operation-failure-write", "operation-failure-readback"}
 OPERATION_PROVIDER_PHASES = {"operation-preflight", "operation-dispatch", "operation-verify"}
+RECOVERY_PHASES = {"recovery-inspect", "recovery-archive", "recovery-readback"}
 SOURCE_PHASES = {"isolated-source", "isolated-source-readback"}
 
 
@@ -56,7 +59,7 @@ def validate(env):
     require(env.get("GITHUB_REPOSITORY") == github.REPOSITORY
             and env.get("GITHUB_REPOSITORY_ID") == str(github.REPOSITORY_ID)
             and env.get("GITHUB_REF") == github.MAIN_REF and env.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
-            and env.get("GITHUB_WORKFLOW_REF") in {WORKFLOW, DIGEST_WORKFLOW, OPERATION_WORKFLOW, OPERATION_RECONCILE_WORKFLOW, *SOURCE_WORKFLOWS}
+            and env.get("GITHUB_WORKFLOW_REF") in {WORKFLOW, DIGEST_WORKFLOW, OPERATION_WORKFLOW, OPERATION_RECONCILE_WORKFLOW, RECOVERY_WORKFLOW, *SOURCE_WORKFLOWS}
             and env.get("GITHUB_WORKFLOW_SHA") == main
             and env.get("RUNNER_ENVIRONMENT") == "github-hosted" and env.get("GITHUB_RUN_ATTEMPT") == "1"
             and HEX40.fullmatch(main or "") is not None and re.fullmatch(r"[!-~]{1,4096}", token or "") is not None)
@@ -79,13 +82,19 @@ def validate(env):
     phase, environment = env.get("PROVIDER_HEAD_PHASE", ""), env.get("PROVIDER_HEAD_ENVIRONMENT", "")
     digest_workflow = env.get("GITHUB_WORKFLOW_REF") == DIGEST_WORKFLOW
     operation_workflow = env.get("GITHUB_WORKFLOW_REF") in {OPERATION_WORKFLOW, OPERATION_RECONCILE_WORKFLOW}
+    recovery_workflow = env.get("GITHUB_WORKFLOW_REF") == RECOVERY_WORKFLOW
+    if recovery_workflow:
+        policy = parsed(env.get("PROVIDER_RECOVERY_POLICY_JSON", ""))
+        require(set(policy) == {"version", "enabled", "writeEnabled"} and type(policy["version"]) is int and policy["version"] == 1
+                and policy["enabled"] is True and type(policy["writeEnabled"]) is bool
+                and (phase != "recovery-archive" or policy["writeEnabled"] is True))
     operation_phases = {"operation-reconcile"} if env.get("GITHUB_WORKFLOW_REF") == OPERATION_RECONCILE_WORKFLOW else OPERATION_PHASES
-    phases = DIGEST_PHASES if digest_workflow else operation_phases if operation_workflow else SOURCE_PHASES if source_workflow else PHASES
+    phases = DIGEST_PHASES if digest_workflow else operation_phases if operation_workflow else RECOVERY_PHASES if recovery_workflow else SOURCE_PHASES if source_workflow else PHASES
     require(phase in phases and environment in ENVIRONMENTS
             and (not source_workflow or env.get("GITHUB_WORKFLOW_REF") ==
                  f"{github.REPOSITORY}/{SOURCE_WORKFLOW_PATH if phase == 'isolated-source' else SOURCE_READBACK_WORKFLOW_PATH}@{github.MAIN_REF}")
             and environment == ("subs-bot-provider-head-isolation" if phase in (DIGEST_PROVIDER_PHASES if digest_workflow else
-                                OPERATION_PROVIDER_PHASES if operation_workflow else PROVIDER_PHASES)
+                                OPERATION_PROVIDER_PHASES if operation_workflow else {"recovery-inspect"} if recovery_workflow else PROVIDER_PHASES)
                                 else "subs-bot-provider-archive-head-isolation"))
     ref = github._get_json("/git/ref/heads/main", token)
     require(ref.get("ref") == github.MAIN_REF and ref.get("object", {}).get("type") == "commit" and ref["object"].get("sha") == main)
@@ -118,7 +127,7 @@ def validate(env):
         require(target["environment"] == "rehearsal" and target["caller"] is None
                 and target["service"] == "subs-bot-provider-fetch-control-drill-01"
                 and target["build"]["runId"] == spec["providerCiRunId"]
-                and spec["approvalSha256"] == provider.digest({"operation": "publish-digest" if digest_workflow or operation_workflow or source_workflow else "publish", "target": target}))
+                and spec["approvalSha256"] == provider.digest({"operation": "publish-digest" if digest_workflow or operation_workflow or recovery_workflow or source_workflow else "publish", "target": target}))
         bucket = parsed(env.get("SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON", ""))
         require(bucket.get("accountId") == "9431815bdb8beb2272f6668e06b7d3be" and bucket.get("namespace") == "lilyya"
                 and isinstance(bucket.get("r2CreatedOn"), str)

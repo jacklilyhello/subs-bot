@@ -117,6 +117,16 @@ class TrustedProviderGateTests(unittest.TestCase):
         self.assertTrue(self.check(operation)["checkoutVerified"])
         with self.assertRaises(ContractError):
             self.check({**operation, "PROVIDER_HEAD_PHASE": "digest-publish"})
+        recovery = {**env, "GITHUB_WORKFLOW_REF": gate.RECOVERY_WORKFLOW, "PROVIDER_HEAD_PHASE": "recovery-inspect",
+                    "PROVIDER_RECOVERY_POLICY_JSON": json.dumps({"version": 1, "enabled": True, "writeEnabled": False})}
+        self.assertTrue(self.check(recovery)["checkoutVerified"])
+        with self.assertRaises(ContractError):
+            self.check({**recovery, "PROVIDER_HEAD_PHASE": "operation-dispatch"})
+        with self.assertRaises(ContractError):
+            self.check({**recovery, "PROVIDER_RECOVERY_POLICY_JSON": ""})
+        with self.assertRaises(ContractError):
+            self.check({**recovery, "PROVIDER_HEAD_PHASE": "recovery-archive",
+                        "PROVIDER_HEAD_ENVIRONMENT": "subs-bot-provider-archive-head-isolation"})
 
     def test_digest_dispatcher_uses_fresh_gated_jobs_and_is_default_off(self):
         workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/worker-provider-reviewed-digest.yml").read_text()
@@ -190,6 +200,22 @@ class TrustedProviderGateTests(unittest.TestCase):
                        {"archiveRefs": [{**spec()["archiveRefs"][0], "kind": "production"}]}):
             with self.subTest(change=change), self.assertRaises(ContractError):
                 self.check({**self.env, "PROVIDER_HEAD_VALIDATION_JSON": json.dumps({**spec(), **change})})
+
+    def test_recovery_is_default_off_and_contains_no_provider_write_credential(self):
+        root = Path(__file__).resolve().parents[2] / ".github/workflows"
+        workflow = (root / "worker-provider-reviewed-recovery.yml").read_text()
+        self.assertIn("vars.SUBS_BOT_PROVIDER_RECOVERY_ENABLED == 'true'", workflow)
+        self.assertIn("vars.SUBS_BOT_PROVIDER_RECOVERY_WRITE_ENABLED == 'true'", workflow)
+        self.assertEqual(workflow.count("uses: ./trusted/.github/actions/provider-reviewed-head-gate"), 3)
+        self.assertNotIn("SUBS_BOT_CF_PROVIDER_WORKER_WRITE_TOKEN", workflow)
+        self.assertNotIn("SUBS_BOT_CF_PROVIDER_CONTAINER_WRITE_TOKEN", workflow)
+        inspect = workflow.split("\n  inspect:\n", 1)[1].split("\n  archive:\n", 1)[0]
+        self.assertNotIn("SUBS_BOT_SCOPED_R2_WRITE_JSON", inspect)
+        archive = workflow.split("\n  archive:\n", 1)[1].split("\n  readback:\n", 1)[0]
+        self.assertIn("SUBS_BOT_SCOPED_R2_WRITE_JSON", archive)
+        self.assertNotIn("SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN", archive)
+        readback = workflow.split("\n  readback:\n", 1)[1]
+        self.assertNotIn("SUBS_BOT_SCOPED_R2_WRITE_JSON", readback)
 
     def test_independently_registered_isolated_source_accepts_only_first_attempt(self):
         ref = {**spec()["archiveRefs"][0], "kind": "isolated-source", "runAttempt": "1"}
