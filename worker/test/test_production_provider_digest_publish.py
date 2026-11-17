@@ -2,6 +2,8 @@
 
 from hashlib import sha256
 from email.message import Message
+from contextlib import redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
@@ -18,6 +20,27 @@ import test_prepare_provider_artifact as artifact_fixture
 
 
 class DigestPublishTests(unittest.TestCase):
+    def test_preflight_diagnostic_only_reports_bounded_numeric_read_details(self):
+        output = io.StringIO()
+        error = control.read_failure("response-envelope", 403, {"errors": [{"code": 9109, "message": "private-response"}]})
+        def fail():
+            raise error
+        with redirect_stdout(output), self.assertRaises(control.ProviderError):
+            digest_publish.observed_step("provider-state", fail)
+        rows = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(rows[-1], {"phase": "provider-state", "status": "rejected", "readDiagnostic":
+                                  {"phase": "response-envelope", "httpStatus": 403, "cloudflareCodes": [9109]}})
+        self.assertNotIn("private-response", output.getvalue())
+
+    def test_preflight_diagnostic_does_not_echo_untrusted_exception_details(self):
+        output = io.StringIO()
+        def fail():
+            raise RuntimeError("private-token-and-path")
+        with redirect_stdout(output), self.assertRaises(RuntimeError):
+            digest_publish.observed_step("registry-auth", fail)
+        self.assertNotIn("private-token-and-path", output.getvalue())
+        self.assertEqual(json.loads(output.getvalue().splitlines()[-1]), {"phase": "registry-auth", "status": "rejected"})
+
     def test_tag_inventory_binds_every_tag_and_manifest_and_rejects_pagination(self):
         registry = Mock()
         registry.repository = "fixture/provider"

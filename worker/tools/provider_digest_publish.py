@@ -5,6 +5,7 @@ independently read back an exact single-use intent, then invoke this code once i
 a fresh runner. A failed/unknown result is never automatically retried.
 """
 
+import json
 import os
 from pathlib import Path
 import re
@@ -16,6 +17,29 @@ from urllib.request import Request
 
 import production_provider as control
 import provider_source_transfer as transfer
+
+
+def observed_step(phase, action):
+    """Report only fixed stages and already-bounded numeric Provider GET diagnostics."""
+    control.require(phase in {"provider-api", "provider-state", "previous-terminal", "caller-state", "stable-state",
+                              "previous-recheck", "registry-client", "registry-auth", "registry-digest", "registry-tags"})
+    print(json.dumps({"phase": phase, "status": "started"}), flush=True)
+    try:
+        result = action()
+    except Exception as error:
+        report = {"phase": phase, "status": "rejected"}
+        diagnostic = getattr(error, "read_diagnostic", None)
+        if (isinstance(diagnostic, dict) and set(diagnostic) == {"phase", "httpStatus", "cloudflareCodes"}
+                and diagnostic["phase"] in {"transport", "response-json", "response-envelope", "absence"}
+                and (diagnostic["httpStatus"] is None or type(diagnostic["httpStatus"]) is int
+                     and 100 <= diagnostic["httpStatus"] <= 599)
+                and isinstance(diagnostic["cloudflareCodes"], list) and len(diagnostic["cloudflareCodes"]) <= 8
+                and all(type(code) is int and 1000 <= code <= 999999 for code in diagnostic["cloudflareCodes"])):
+            report["readDiagnostic"] = diagnostic
+        print(json.dumps(report, sort_keys=True), flush=True)
+        raise
+    print(json.dumps({"phase": phase, "status": "confirmed"}), flush=True)
+    return result
 
 
 def tag_snapshot(registry, credentials):
@@ -83,25 +107,27 @@ def verify_remote_closure(target, registry_token):
 
 def observe(target, worker_token, registry_token):
     control.require(target["environment"] == "rehearsal" and target["caller"] is None)
-    api = control.ProviderAPI(target, worker_token, registry_token)
-    first = control.observe(api)
+    api = observed_step("provider-api", lambda: control.ProviderAPI(target, worker_token, registry_token))
+    first = observed_step("provider-state", lambda: control.observe(api))
     if target.get("previous") is not None and target["activation"] is None:
-        control.unbound_upgrade(api, first)
+        observed_step("previous-terminal", lambda: control.unbound_upgrade(api, first))
     else:
         control.require(target["activation"] is not None)
-        control.verify_smoke(api, first, config=target)
-    caller = control.caller_state(api, target, allow_unbound=True)
-    control.require(caller == "unbound" and control.observe(api) == first
-                    and control.caller_state(api, target, allow_unbound=True) == caller)
+        observed_step("previous-terminal", lambda: control.verify_smoke(api, first, config=target))
+    caller = observed_step("caller-state", lambda: control.caller_state(api, target, allow_unbound=True))
+    def stable():
+        control.require(caller == "unbound" and control.observe(api) == first
+                        and control.caller_state(api, target, allow_unbound=True) == caller)
+    observed_step("stable-state", stable)
     if target.get("previous") is not None and target["activation"] is None:
-        control.unbound_upgrade(api, first)
-    registry = control.Registry(target, registry_token)
-    pull = registry.mint()
+        observed_step("previous-recheck", lambda: control.unbound_upgrade(api, first))
+    registry = observed_step("registry-client", lambda: control.Registry(target, registry_token))
+    pull = observed_step("registry-auth", registry.mint)
     expected = target["build"]["ociManifestSha256"]
-    observed = registry.manifest("sha256:" + expected, pull, allow_missing=True)
+    observed = observed_step("registry-digest", lambda: registry.manifest("sha256:" + expected, pull, allow_missing=True))
     control.require(observed is None or observed == expected)
     return {"dependencySha256": control.digest({"target": target, "state": first, "callerState": caller}),
-            "manifestSha256": observed, "tagsSha256": tag_snapshot(registry, pull)}
+            "manifestSha256": observed, "tagsSha256": observed_step("registry-tags", lambda: tag_snapshot(registry, pull))}
 
 
 def intent(target, refs, state, run_id, revision):
