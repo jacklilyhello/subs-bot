@@ -127,6 +127,7 @@ class EarlyCleanupTests(unittest.TestCase):
     def test_plan_then_once_close_and_freeze_preserves_restore_contract(self):
         target = SimpleNamespace(environment="rehearsal", digest="a" * 64, configuration_digest="c" * 64,
             data={"workerName": early.SERVICE, "botId": early.TEST_BOT_ID, "botUsername": "test_cfsubs_bot",
+                  "backupBucketName": "synthetic-backup",
                   **{key: "pinned" for key in ("workerId", "workerCreatedOn", "d1Id", "d1CreatedAt", "bucketCreatedAt", "backupBucketCreatedAt")}})
         draft = SimpleNamespace(data=dict(target.data), digest="d" * 64)
         previous = {"botId": early.TEST_BOT_ID}
