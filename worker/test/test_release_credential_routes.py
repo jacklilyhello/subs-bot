@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import release_isolation as release
 import scoped_r2
+import native_restore_rehearsal as native
 from production_target import ContractError
 
 
@@ -47,6 +48,18 @@ class ReleaseCredentialRoutes(unittest.TestCase):
             with self.assertRaises(ContractError):
                 release.isolation_data_client({"accountId": "a" * 32}, "d1-writer")
             client.return_value.assert_not_called()
+
+    def test_missing_provisioner_does_not_create_an_unresolved_resource_intent(self):
+        engine = object.__new__(native.Rehearsal)
+        engine.resource_kinds = ("objects",)
+        engine.api = Mock(token="d1-reader")
+        engine.journal = Mock(value={"resources": {"objects": {"pin": None, "intent": None}}})
+        engine.observe = Mock(return_value=None)
+        with patch.dict(os.environ, {"SUBS_BOT_CF_R2_METADATA_READ_TOKEN": "metadata-reader"}, clear=True):
+            with self.assertRaises(ContractError):
+                engine.create("objects")
+        engine.journal.update.assert_not_called()
+        engine.api.json.assert_not_called()
 
 
 if __name__ == "__main__":

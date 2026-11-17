@@ -1221,6 +1221,10 @@ class Rehearsal:
         require(record["intent"] is None or record["intent"].get("state") == "rejected",
                 "A resource create remains unpinned; inspect its private intent before another mutation.")
         require(self.observe(kind) is None, "The proposed rehearsal resource already exists; it was not adopted.")
+        if kind != "database":
+            # Reject known missing provisioning configuration before recording
+            # a started external request that could never have been dispatched.
+            scoped_r2.creation_token(getattr(self.api, "token", ""))
         resources = deepcopy(self.journal.value["resources"])
         resources[kind]["intent"] = {"state": "started", "at": int(time.time()), "owner": self.journal.owner}
         self.journal.update(resources=resources)
