@@ -10,9 +10,59 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import production_backup_cli as backup
 from production_target import ContractError
+from test_production_backup_transaction import Store
 
 
 class ProductionBackupTests(unittest.TestCase):
+    def test_unstarted_abort_requires_exact_original_writer_and_unchanged_state(self):
+        target = Mock(digest="a" * 64, configuration_digest="c" * 64)
+        store = Store()
+        initial = backup.maintenance.Anchor(store, target.digest, "0" * 64)
+        genesis = backup.recovery.digest(initial.initial_material()[1])
+        anchor = backup.maintenance.Anchor(store, target.digest, genesis)
+        anchor.initialize()
+        before_pin, before_raw, before_etag = anchor.read()
+        policy = {"pauseLimitSeconds": 300}
+        contract = {"checkpointId": "e" * 32}
+        state = {"stateSha256": "d" * 64, "control": {"admission": "open", "workers": "run"},
+                 "release": {"revision": "f" * 40}, "configurationSha256": target.configuration_digest, "terminal": {}}
+        details = {"configurationSha256": target.configuration_digest, "control": state["control"], "release": state["release"],
+                   "pauseLimitSeconds": 300, "checkpointId": contract["checkpointId"],
+                   "contractSha256": backup.digest(contract), "policySha256": backup.digest(policy)}
+        original = {"version": 1, "targetSha256": target.digest, "session": "123-1", "day": "2026/11/17",
+            "controlRevision": "b" * 40, "dispatcherRevision": "b" * 40, "dispatcherWorkflow": "worker-production-backup.yml",
+            "writerRunId": "456", "writerAttempt": "1", "anchorPredecessorSha256": backup.recovery.digest(before_raw),
+            "stateSha256": state["stateSha256"], "sourceRevision": "f" * 40, "approvalSha256": "e" * 64,
+            "timestamp": 100, "startedDetails": details}
+        backup.maintenance.write_begin(store, original)
+        ctl = Mock(revision="f" * 40, control_revision="b" * 40)
+        ctl.inspect.return_value = state
+        with patch.object(backup, "require_finished_intent") as finished:
+            with patch.object(store, "compare_and_put", side_effect=ContractError("response unknown")):
+                with self.assertRaises(ContractError):
+                    anchor._advance(before_pin, before_raw, before_etag, state="active", session="123-1", day="2026/11/17", revision="b" * 40)
+            future = [key for key in store.list_backup_anchor_history(target.digest) if "/000000000002-" in key]
+            self.assertEqual(len(future), 1)
+            candidate = future[0].rsplit("-", 1)[1][:-5]
+            planned, _, _ = backup.unstarted_abort_plan(anchor, store, target, ctl, contract, policy, candidate_sha=candidate)
+            self.assertEqual(planned["candidateSha256"], candidate)
+            anchor.reconcile(candidate, planned["anchorPlanSha256"])
+            plan, _, journal = backup.unstarted_abort_plan(anchor, store, target, ctl, contract, policy)
+            self.assertTrue(plan["approvalAction"].startswith("backup-abort-unstarted:"))
+            self.assertEqual(journal.load(), [])
+            self.assertEqual(finished.call_count, 2)
+            ctl.inspect.return_value = {**state, "stateSha256": "0" * 64}
+            with self.assertRaises(ContractError):
+                backup.unstarted_abort_plan(anchor, store, target, ctl, contract, policy)
+            ctl.inspect.return_value = state
+            backup.maintenance.claim_begin_reconciliation(store, target.digest, "123-1", {"writerRunId": "789"})
+            with self.assertRaises(ContractError):
+                backup.unstarted_abort_plan(anchor, store, target, ctl, contract, policy)
+        with patch.object(backup, "require_finished_intent", side_effect=ContractError("writer still active")):
+            with self.assertRaises(ContractError):
+                backup.unstarted_abort_plan(anchor, store, target, ctl, contract, policy)
+        self.assertEqual(anchor.read()[0]["state"], "active")
+
     def test_production_mutation_switch_defaults_off_and_rejects_reruns(self):
         for env in ({}, {"GITHUB_RUN_ATTEMPT": "1"},
                     {"GITHUB_RUN_ATTEMPT": "2", "SUBS_BOT_PRODUCTION_BACKUP_WRITES_ENABLED": "true"},

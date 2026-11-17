@@ -30,6 +30,11 @@ class Store:
             raise ContractError("conflict")
         self.objects[key] = body
 
+    def put_exclusive(self, key, body):
+        if key in self.objects:
+            raise ContractError("exclusive conflict")
+        self.objects[key] = body
+
     def get_with_etag(self, key):
         value = self.objects.get(key)
         return value, None if value is None else '"' + __import__("hashlib").md5(value).hexdigest() + '"'
@@ -54,6 +59,28 @@ class JournalTests(unittest.TestCase):
     def setUp(self):
         self.store = Store()
         self.journal = transaction.Transaction(self.store, "123-1", "2026/11/17", "a" * 64, "b" * 40)
+
+    def test_begin_intent_is_unique_and_recovery_claim_cannot_be_replayed(self):
+        original = {"version": 1, "targetSha256": "a" * 64, "session": "123-1", "day": "2026/11/17",
+            "controlRevision": "b" * 40, "dispatcherRevision": "b" * 40, "dispatcherWorkflow": "worker-production-backup.yml",
+            "writerRunId": "456", "writerAttempt": "1", "anchorPredecessorSha256": "c" * 64,
+            "stateSha256": "d" * 64, "sourceRevision": "f" * 40, "approvalSha256": "e" * 64,
+            "timestamp": 100, "startedDetails": {}}
+        digest = transaction.write_begin(self.store, original)
+        self.assertEqual(transaction.read_begin(self.store, "a" * 64, "123-1"), (original, digest))
+        with self.assertRaises(ContractError):
+            transaction.write_begin(self.store, original)
+        transaction.claim_begin_reconciliation(self.store, "a" * 64, "123-1", {"writerRunId": "789"})
+        with self.assertRaises(ContractError):
+            transaction.claim_begin_reconciliation(self.store, "a" * 64, "123-1", {"writerRunId": "789"})
+        with self.assertRaises(ContractError):
+            transaction.read_begin(self.store, "a" * 64, "124-1")
+
+    def test_invalid_begin_intent_does_not_become_recovery_evidence(self):
+        key = transaction.begin_key("a" * 64, "123-1")
+        self.store.objects[key] = b'{}'
+        with self.assertRaises(ContractError):
+            transaction.read_begin(self.store, "a" * 64, "123-1")
 
     def test_pending_write_is_not_treated_as_completed(self):
         self.journal.append("started", {}, 100)

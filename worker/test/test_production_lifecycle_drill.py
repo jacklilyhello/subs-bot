@@ -45,6 +45,22 @@ class MemoryStore:
 
 
 class LifecycleDrillTests(unittest.TestCase):
+    def test_private_share_readback_uses_scoped_s3_without_rest_fallback(self):
+        import scoped_r2
+        key = "private-shares/00000000-0000-4000-8000-000000000001.txt"
+        objects, ctl = Mock(), Mock()
+        objects.get.return_value = (b"synthetic object", '"etag"')
+        with patch.object(scoped_r2, "from_environment", return_value=objects), \
+             patch.object(drill.native, "_response") as rest:
+            self.assertEqual(drill.read_rehearsal_private_object({}, ctl, key), b"synthetic object")
+        objects.get.assert_called_once_with(key, limit=64 * 1024)
+        rest.assert_not_called()
+        with patch.object(scoped_r2, "from_environment", return_value=None), \
+             patch.object(drill.native, "_response", return_value=(200, {}, b"legacy")):
+            self.assertEqual(drill.read_rehearsal_private_object({"SUBS_BOT_CF_BOOTSTRAP_TOKEN": "synthetic-token"}, ctl, key), b"legacy")
+        with self.assertRaises(contract.ContractError):
+            drill.read_rehearsal_private_object({}, ctl, "unrelated/object")
+
     def test_backup_and_watchdog_have_independent_default_off_switches(self):
         self.assertFalse(drill.backup_enabled({}))
         self.assertFalse(drill.backup_enabled({}, watchdog=True))

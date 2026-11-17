@@ -1,6 +1,7 @@
 """Synthetic trust-boundary checks for the main-only reviewed-head gate."""
 from pathlib import Path
 import json
+from hashlib import sha256
 import sys
 import tempfile
 import unittest
@@ -8,7 +9,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import trusted_backup_head_gate as gate
-from production_target import ContractError
+from production_target import ACCOUNT, ContractError, canonical, digest
 
 
 MAIN, HEAD = "a" * 40, "b" * 40
@@ -58,6 +59,41 @@ class TrustedGateTests(unittest.TestCase):
         self.assertEqual(result["dispatcherMainSha"], MAIN)
         self.assertTrue(result["checkoutVerified"])
 
+    def test_capacity_gate_requires_independent_fixture_and_fresh_binding_witness(self):
+        fixture = {"version": 1, "accountId": ACCOUNT, "databaseId": "00000000-0000-4000-8000-000000000001",
+                   "databaseName": "subs-bot-cf-backup-capacity-20261118", "createdAt": "2026-11-18T00:00:00Z",
+                   "bucketName": "subs-bot-cf-dev-01", "bucketCreatedAt": "2026-11-17T00:00:00Z"}
+        witness = {"version": 1, "accountId": ACCOUNT, "databaseId": fixture["databaseId"],
+                   "observedAt": 1000, "workerBindingCount": 0}
+        original = {"accountId": ACCOUNT, "d1Id": "00000000-0000-4000-8000-000000000002", "r2CreatedOn": fixture["bucketCreatedAt"]}
+        fixture_pin, witness_pin = sha256(canonical(fixture)).hexdigest(), sha256(canonical(witness)).hexdigest()
+        selection = {**spec(), "action": "capacity-fixture", "approvalSha256": digest({"registrationSha256": fixture_pin,
+                     "witnessSha256": witness_pin, "mode": "verify-16000"})}
+        env = {**self.env, "HEAD_VALIDATION_JSON": json.dumps(selection), "BACKUP_CAPACITY_ENABLED": "true",
+               "BACKUP_CHECKOUT_PHASE": "fixture-credential-check", "CAPACITY_FIXTURE_MODE": "verify-16000",
+               "CAPACITY_FIXTURE_REGISTRATION_JSON": json.dumps(fixture), "CAPACITY_FIXTURE_REGISTRATION_SHA256": fixture_pin,
+               "CAPACITY_FIXTURE_BINDING_WITNESS_JSON": json.dumps(witness), "CAPACITY_FIXTURE_BINDING_WITNESS_SHA256": witness_pin,
+               "CAPACITY_FIXTURE_REHEARSAL_D1_ID": "00000000-0000-4000-8000-000000000003",
+               "SUBS_BOT_CF_ISOLATION_TARGET_JSON": json.dumps(original)}
+        with patch.object(gate.time, "time", return_value=1100):
+            self.assertTrue(self.check(env)["checkoutVerified"])
+            for change in ({"BACKUP_CAPACITY_ENABLED": ""}, {"CAPACITY_FIXTURE_REHEARSAL_D1_ID": fixture["databaseId"]},
+                           {"CAPACITY_FIXTURE_MODE": "20001"}, {"CAPACITY_FIXTURE_BINDING_WITNESS_SHA256": "0" * 64}):
+                with self.subTest(change=change), self.assertRaises(ContractError):
+                    self.check({**env, **change})
+        with patch.object(gate.time, "time", return_value=2000), self.assertRaises(ContractError):
+            self.check(env)
+
+    def test_capacity_credentials_are_conditionally_injected_after_trusted_gate(self):
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/worker-backup-reviewed-head.yml").read_text()
+        self.assertLess(workflow.index("Confirm independently pinned capacity fixture identity"),
+                        workflow.index("Run the reviewed candidate against only dedicated isolation"))
+        self.assertIn("SUBS_BOT_BACKUP_CAPACITY_VALIDATION_ENABLED", workflow)
+        self.assertIn("CAPACITY_FIXTURE_D1_READ_TOKEN", workflow)
+        self.assertIn("CAPACITY_FIXTURE_D1_WRITE_TOKEN", workflow)
+        self.assertIn("!startsWith(vars.SUBS_BOT_BACKUP_CAPACITY_MODE, 'verify-')", workflow)
+        self.assertIn("SUBS_BOT_CF_REHEARSAL_DATA_READ_TOKEN", workflow)
+
     def test_wrong_pin_environment_or_attempt_fails_before_checkout(self):
         for changed in ({"BACKUP_REVIEWED_HEAD_SHA": "f" * 40}, {"BACKUP_HEAD_ENVIRONMENT": "subs-bot-production"},
                         {"GITHUB_RUN_ATTEMPT": "2"}, {"GITHUB_REF": "refs/heads/codex/backup-orchestration"},
@@ -75,6 +111,15 @@ class TrustedGateTests(unittest.TestCase):
         bad = {**spec(), "fault": "process-kill"}
         with self.assertRaises(ContractError):
             self.check({**self.env, "HEAD_VALIDATION_JSON": json.dumps(bad)})
+
+    def test_open_backup_requires_genesis_and_rejects_injected_faults(self):
+        missing = {**spec(), "action": "open-backup"}
+        with self.assertRaises(ContractError):
+            self.check({**self.env, "HEAD_VALIDATION_JSON": json.dumps(missing)})
+        valid = {**missing, "genesisSha256": "f" * 64}
+        self.assertTrue(self.check({**self.env, "HEAD_VALIDATION_JSON": json.dumps(valid)})["checkoutVerified"])
+        with self.assertRaises(ContractError):
+            self.check({**self.env, "HEAD_VALIDATION_JSON": json.dumps({**valid, "fault": "process-kill"})})
 
     def test_forked_pr_is_rejected(self):
         def fork(path, token):
@@ -98,6 +143,18 @@ class TrustedGateTests(unittest.TestCase):
             self.check({**env, "SUBS_BOT_TELEGRAM_TEST_CONFIG": json.dumps({**test, "botId": "1000000000"})})
         with self.assertRaises(ContractError):
             self.check({**env, "SUBS_BOT_TELEGRAM_TEST_CONFIG": json.dumps({**test, "botToken": "1000000000:OTHER_BOT_TOKEN_123456789"})})
+
+    def test_cleanup_runs_in_a_distinct_trusted_job_after_candidate(self):
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/worker-backup-reviewed-head.yml").read_text()
+        candidate, cleanup = workflow.split("\n  trusted_cleanup:\n", 1)
+        self.assertIn("needs: [validate]", cleanup)
+        self.assertIn("Check out trusted current main on a fresh runner", cleanup)
+        self.assertNotIn("production_backup_admission_recovery.py", candidate)
+        self.assertNotIn("production_backup_webhook_recovery.py", candidate)
+        self.assertNotIn("working-directory: candidate", cleanup)
+        self.assertLess(cleanup.index("Trusted inspect original webhook snapshot"), cleanup.index("Trusted close and freeze isolated admission"))
+        self.assertLess(cleanup.index("Trusted close and freeze isolated admission"), cleanup.index("Trusted restore original test webhook"))
+        self.assertIn("${{ needs.validate.outputs.snapshot_sha256 }}", cleanup)
 
 
 if __name__ == "__main__":

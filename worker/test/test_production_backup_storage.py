@@ -2,7 +2,7 @@
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import production_storage as storage
@@ -53,6 +53,40 @@ def page(truncated, key=None, cursor=None):
 
 
 class S3ListingTests(unittest.TestCase):
+    def test_scoped_anchor_list_get_and_cas_do_not_use_rest_object_token(self):
+        private = storage.PrivateStore(API(), "private-test-bucket")
+        objects = Mock()
+        etag = '"' + 'd' * 32 + '"'
+        objects.list.return_value = [PREFIX + "000000000001-" + "e" * 64 + ".json"]
+        objects.get.return_value = (b"old", etag)
+        objects.compare_and_put.return_value = etag
+        private.objects = objects
+        key = "maintenance/production-control/registrations/daily-backup-anchor-" + TARGET + ".json"
+        with patch.object(private, "verify"), patch.object(storage, "HTTPSConnection") as rest:
+            self.assertEqual(private.list_backup_anchor_history(TARGET), objects.list.return_value)
+            self.assertEqual(private.get_with_etag(key), (b"old", etag))
+            self.assertEqual(private.compare_and_put(key, b"old", etag, b"new"), etag)
+        objects.compare_and_put.assert_called_once_with(key, b"old", etag, b"new")
+        rest.assert_not_called()
+        with self.assertRaises(ContractError):
+            private.compare_and_put("maintenance/production-control/registrations/unrelated.json", b"old", etag, b"new")
+        objects.compare_and_put.assert_called_once()
+
+    def test_exclusive_intent_conflict_or_lost_response_never_confirms_or_retries(self):
+        private = storage.PrivateStore(API(), "private-test-bucket")
+        for failure in (False, True):
+            connection, response = Mock(), Mock(status=412)
+            connection.getresponse.return_value = response
+            if failure:
+                connection.request.side_effect = OSError("synthetic lost response")
+            with patch.object(private, "get", return_value=None) as read, \
+                 patch.object(storage, "HTTPSConnection", return_value=connection), \
+                 self.assertRaises(storage.OperationError):
+                private.put_exclusive("maintenance/production-control/evidence/example.json", b"intent")
+            connection.request.assert_called_once()
+            self.assertEqual(connection.request.call_args.kwargs["headers"]["if-none-match"], "*")
+            read.assert_called_once()
+
     def run_pages(self, pages):
         Connection.pages = list(pages)
         private = storage.PrivateStore(API(), "private-test-bucket")

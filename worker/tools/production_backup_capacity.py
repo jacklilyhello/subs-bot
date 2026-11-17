@@ -34,6 +34,13 @@ def level(value, maximum, warning_percent):
     return "over-limit" if value > maximum else "warning" if value * 100 >= maximum * warning_percent else "normal"
 
 
+def require_within_limits(observed):
+    """The shared pre-pause gate rejects unknown or incomplete capacity."""
+    native.require(isinstance(observed, dict) and all(observed.get(key) in {"normal", "warning"}
+                   for key in ("rowStatus", "objectStatus", "objectBytesStatus")),
+                   "Capacity preflight prevents this backup before pause.")
+
+
 def observe(api, source, *, warning_percent=80):
     try:
         return _observe(api, source, warning_percent=warning_percent)

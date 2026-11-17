@@ -14,10 +14,10 @@ import subprocess
 import prepare_isolation_artifact as artifact
 import production_backup_transaction as maintenance
 from production_lifecycle_drill import Drill, SERVICE
-from production_control import rows
+from production_control import API, privacy, rows
 from production_release_evidence import verify_activation_baseline
 from production_storage import PrivateStore
-from production_target import canonical, parsed, require
+from production_target import canonical, digest, parsed, require
 
 
 FILE = ".github/workflows/worker-backup-reviewed-head.yml"
@@ -72,6 +72,11 @@ def public_result(result):
                 if capacity.get(key) in {"normal", "warning", "over-limit", "unknown", "not-checked", "unverified"}:
                     summary[key] = capacity[key]
         value["backupSummary"] = summary
+    boundary = result.get("capacityFixture")
+    if isinstance(boundary, dict):
+        value["capacityFixture"] = {key: boundary[key] for key in
+            ("fixtureSha256", "schemaVerified", "migrationCount", "rows", "rowStatus", "objectStatus", "prePauseRejected", "fixtureOnly", "pausePerformed", "intentSha256", "receiptSha256", "independentReadback", "permissionDenied", "httpStatus", "probeWriteAttempted")
+            if key in boundary and (type(boundary[key]) in (int, bool) or isinstance(boundary[key], str))}
     return value
 
 
@@ -177,7 +182,7 @@ def main(env=None):
                HEAD_VALIDATION_MANIFEST_SHA256=spec["manifestSha256"],
                DRILL_ACTION="daily-backup-watchdog" if spec["action"] == "watchdog" else "daily-backup")
     action = env.get("HEAD_VALIDATION_ACTION", "")
-    require(action in {"inspect", "genesis-plan", "genesis-initialize", "backup", "open-backup", "watchdog", "verify"})
+    require(action in {"inspect", "genesis-plan", "genesis-initialize", "backup", "open-backup", "watchdog", "verify", "capacity-fixture"})
     tool, ctl, state = setup(env)
     store = PrivateStore(ctl.data, ctl.target.data["backupBucketName"])
     if action in {"genesis-plan", "genesis-initialize"}:
@@ -194,6 +199,70 @@ def main(env=None):
             result.update(status="initialized", mutationPerformed=True)
     elif action == "inspect":
         result = {"status": "observed", "stateSha256": state["stateSha256"], "mutationPerformed": False}
+    elif action == "capacity-fixture":
+        # This branch is unreachable through trusted main until its dedicated,
+        # default-disabled fixture gate is separately reviewed and installed.
+        import time
+        import scoped_r2
+        import production_backup_capacity_fixture as fixture
+        registration = parsed(env.get("CAPACITY_FIXTURE_REGISTRATION_JSON", ""))
+        witness = parsed(env.get("CAPACITY_FIXTURE_BINDING_WITNESS_JSON", ""))
+        registration_sha = env.get("CAPACITY_FIXTURE_REGISTRATION_SHA256", "")
+        witness_sha = env.get("CAPACITY_FIXTURE_BINDING_WITNESS_SHA256", "")
+        mode = env.get("CAPACITY_FIXTURE_MODE", "")
+        require(mode in {"initialize", "16000", "20000", "20001", "verify-16000", "verify-20000", "verify-20001", "probe-read-token"} and spec["fault"] == "none"
+                and ((mode == "probe-read-token") == (spec["checkpointId"] == "0" * 31 + "1"))
+                and spec["approvalSha256"] == digest({"registrationSha256": registration_sha,
+                    "witnessSha256": witness_sha, "mode": mode}), "The exact isolated fixture plan was not approved.")
+        def fixture_guard():
+            tool.guard()
+            fixture.validate_registration(registration, registration_sha, witness, witness_sha, now=int(time.time()),
+                                          excluded_database_ids=[ctl.target.data["d1Id"], tool.original["d1Id"]])
+            require(registration["bucketCreatedAt"] == tool.original["r2CreatedOn"],
+                    "The fixture evidence bucket differs from the registered private project bucket.")
+        fixture_guard()
+        metadata_api = API(ctl.target, env.get("SUBS_BOT_CF_R2_METADATA_READ_TOKEN", ""))
+        privacy(metadata_api, metadata_api.root, registration["bucketName"], registration["bucketCreatedAt"])
+        objects = scoped_r2.from_environment(registration["accountId"], registration["bucketName"], env)
+        readonly = mode.startswith("verify-") or mode == "probe-read-token"
+        require(objects is not None and (readonly or objects.write_credential is not None)
+                and (not readonly or objects.write_credential is None and not env.get("CAPACITY_FIXTURE_D1_WRITE_TOKEN")),
+                "Independent fixture readback must not receive a write credential.")
+        class FixtureStore:
+            def get(self, key, *, absent=False):
+                return objects.get(key, absent=absent)[0]
+            def put_once(self, key, raw):
+                return objects.put_once(key, raw)
+        api_registration = registration
+        if mode == "probe-read-token":
+            fixture.probe_intent(FixtureStore(), registration_sha, probe_database_id=registration["probeDatabaseId"],
+                run_id=tool.run, dispatcher_revision=env["GITHUB_SHA"], controller_revision=tool.revision,
+                witness_sha=witness_sha, approval_sha=spec["approvalSha256"],
+                expected_sha=env.get("CAPACITY_FIXTURE_PROBE_INTENT_SHA256", ""))
+            fixture.verify_trusted_probe_job(tool.run, env["GITHUB_SHA"])
+            api_registration = {**registration, "databaseId": registration["probeDatabaseId"],
+                                "databaseName": registration["probeDatabaseName"], "createdAt": registration["probeCreatedAt"]}
+        api = fixture.FixtureAPI(api_registration, env.get("CAPACITY_FIXTURE_D1_READ_TOKEN" if readonly else "CAPACITY_FIXTURE_D1_WRITE_TOKEN", ""))
+        api.verify_identity()
+        if mode == "probe-read-token":
+            boundary = fixture.read_token_probe(api, guard=fixture_guard)
+            boundary["intentSha256"] = env["CAPACITY_FIXTURE_PROBE_INTENT_SHA256"]
+        elif mode == "initialize":
+            source = fixture.FixtureSource(api, ctl.bundle, ctl.manifest)
+            boundary = fixture.initialize_schema_once(api, FixtureStore(), source, target_sha256=registration_sha,
+                                                      run_id=tool.run, guard=fixture_guard)
+        elif mode.startswith("verify-"):
+            source = fixture.FixtureSource(api, ctl.bundle, ctl.manifest)
+            boundary = fixture.verify_seed(api, FixtureStore(), source, target_sha256=registration_sha,
+                desired=int(mode.removeprefix("verify-")), controller_revision=tool.revision,
+                dispatcher_revision=env["GITHUB_SHA"], guard=fixture_guard)
+        else:
+            source = fixture.FixtureSource(api, ctl.bundle, ctl.manifest)
+            boundary = fixture.seed_once(api, FixtureStore(), source, target_sha256=registration_sha,
+                database_id=registration["databaseId"], desired=int(mode), now=int(time.time()), run_id=tool.run, guard=fixture_guard,
+                controller_revision=tool.revision, dispatcher_revision=env["GITHUB_SHA"])
+        result = {"status": "passed", "capacityFixture": {**boundary, "fixtureSha256": registration_sha},
+                  "mutationPerformed": not readonly}
     elif action == "verify":
         checkpoint = env.get("HEAD_VALIDATION_CHECKPOINT_ID", "")
         manifest_sha = env.get("HEAD_VALIDATION_MANIFEST_SHA256", "")
