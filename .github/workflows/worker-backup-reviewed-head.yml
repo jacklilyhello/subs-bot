@@ -163,8 +163,8 @@ jobs:
           CAPACITY_FIXTURE_BINDING_WITNESS_JSON: ${{ fromJSON(inputs.validation_json).action == 'capacity-fixture' && secrets.CAPACITY_FIXTURE_BINDING_WITNESS_JSON || '' }}
           CAPACITY_FIXTURE_BINDING_WITNESS_SHA256: ${{ fromJSON(inputs.validation_json).action == 'capacity-fixture' && secrets.CAPACITY_FIXTURE_BINDING_WITNESS_SHA256 || '' }}
           CAPACITY_FIXTURE_PROBE_INTENT_SHA256: ${{ needs.probe_intent.outputs.intent_sha256 }}
-          CAPACITY_FIXTURE_D1_READ_TOKEN: ${{ fromJSON(inputs.validation_json).action == 'capacity-fixture' && (startsWith(vars.SUBS_BOT_BACKUP_CAPACITY_MODE, 'verify-') || vars.SUBS_BOT_BACKUP_CAPACITY_MODE == 'probe-read-token') && secrets.CAPACITY_FIXTURE_D1_READ_TOKEN || '' }}
-          CAPACITY_FIXTURE_D1_WRITE_TOKEN: ${{ fromJSON(inputs.validation_json).action == 'capacity-fixture' && !startsWith(vars.SUBS_BOT_BACKUP_CAPACITY_MODE, 'verify-') && vars.SUBS_BOT_BACKUP_CAPACITY_MODE != 'probe-read-token' && secrets.CAPACITY_FIXTURE_D1_WRITE_TOKEN || '' }}
+          CAPACITY_FIXTURE_D1_READ_TOKEN: ${{ fromJSON(inputs.validation_json).action == 'capacity-fixture' && (startsWith(vars.SUBS_BOT_BACKUP_CAPACITY_MODE, 'verify-') || vars.SUBS_BOT_BACKUP_CAPACITY_MODE == 'probe-read-token') && secrets.SUBS_BOT_CF_REHEARSAL_DATA_READ_TOKEN || '' }}
+          CAPACITY_FIXTURE_D1_WRITE_TOKEN: ${{ fromJSON(inputs.validation_json).action == 'capacity-fixture' && !startsWith(vars.SUBS_BOT_BACKUP_CAPACITY_MODE, 'verify-') && vars.SUBS_BOT_BACKUP_CAPACITY_MODE != 'probe-read-token' && secrets.SUBS_BOT_CF_REHEARSAL_DATA_TOKEN || '' }}
         run: |
           umask 077
           python3 -B worker/tools/production_backup_head_harness.py
@@ -214,7 +214,7 @@ jobs:
           CAPACITY_FIXTURE_BINDING_WITNESS_SHA256: ${{ secrets.CAPACITY_FIXTURE_BINDING_WITNESS_SHA256 }}
           CAPACITY_FIXTURE_REHEARSAL_D1_ID: ${{ secrets.CAPACITY_FIXTURE_REHEARSAL_D1_ID }}
           CAPACITY_FIXTURE_PROBE_INTENT_SHA256: ${{ needs.probe_intent.outputs.intent_sha256 }}
-          CAPACITY_FIXTURE_D1_READ_TOKEN: ${{ secrets.CAPACITY_FIXTURE_D1_READ_TOKEN }}
+          CAPACITY_FIXTURE_D1_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_REHEARSAL_DATA_READ_TOKEN }}
           SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
           SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
           SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
