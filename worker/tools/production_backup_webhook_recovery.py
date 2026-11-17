@@ -301,6 +301,19 @@ def inspect(env, *, execute=False):
                 "completionPresent": completion is not None, "settingsMatchOriginal": current == before,
                 "telegramSecretReadback": "not-available", "restoreAuthorized": False}
     require(intent is None and completion is None, "An earlier restore is present or uncertain; do not retry.")
+    # A separate legacy recovery must never cross an unresolved phase window.
+    # A phase cleanup may restore only its own active lock; an old source may
+    # restore only after the complete shared lock history proves idle.
+    from trusted_backup_webhook_anchor import anchor as webhook_anchor
+    lock_pin = env.get("SUBS_BOT_PHASE_WEBHOOK_ANCHOR_GENESIS_SHA256", "")
+    require(SHA.fullmatch(lock_pin or ""), "The protected shared webhook lock is not configured.")
+    lock = webhook_anchor(store, target.digest, lock_pin)
+    lock_before, _, _ = lock.read()
+    if env.get("WEBHOOK_SOURCE_KIND") == "phase-coordinator":
+        require(lock_before["state"] == "active" and lock_before["session"] == suffix
+                and lock_before["controlRevision"] == candidate)
+    else:
+        require(lock_before["state"] == "idle", "An unresolved webhook window blocks legacy restoration.")
     freeze_sha = env.get("WEBHOOK_FREEZE_CONFIRMATION_SHA256", "")
     require(SHA.fullmatch(freeze_sha or ""))
     freeze_raw = store.get(prefix + "backup-admission-" + suffix + "-freeze-confirmed.json")
@@ -335,11 +348,24 @@ def inspect(env, *, execute=False):
                  if step.get("name") == "Trusted restore original test webhook"]
         require(len(steps) == 1 and steps[0].get("conclusion") == "skipped",
                 "The original cleanup may have run; do not repeat an unknown write.")
+    phase_source = env.get("WEBHOOK_SOURCE_KIND") == "phase-coordinator"
+    if not phase_source:
+        from datetime import datetime, timezone
+        owner = env.get("GITHUB_RUN_ID", "") + "-" + env.get("GITHUB_RUN_ATTEMPT", "")
+        require(re.fullmatch(r"[1-9][0-9]{0,19}-1", owner or "") and REV.fullmatch(env.get("GITHUB_SHA", "")))
+        lock.acquire(owner, datetime.now(timezone.utc).strftime("%Y/%m/%d"), env["GITHUB_SHA"])
+        lock_before, _, _ = lock.read()
+        require(lock_before["state"] == "active" and lock_before["session"] == owner
+                and lock_before["controlRevision"] == env["GITHUB_SHA"])
+        require(require_exact_freeze(target, secrets, env, freeze) == frozen
+                and webhook_settings(telegram.call("getWebhookInfo")) == current)
     planned = {"version": 1, "sourceRunId": run_id, "sourceAttempt": attempt, "candidateRevision": candidate,
                "snapshotSha256": pin, "beforeSha256": sha256(canonical(before)).hexdigest(),
                "predecessorSha256": sha256(canonical(current)).hexdigest()}
     github.require_current_main(env["GITHUB_SHA"])
     claim_intent_once(store, intent_key, canonical(planned))
+    lock_after, _, _ = lock.read()
+    require(lock_after == lock_before, "The shared webhook lock changed after the restore intent.")
     require(require_exact_freeze(target, secrets, env, freeze) == frozen,
             "The complete isolated predecessor changed after its restore intent.")
     require(webhook_settings(telegram.call("getWebhookInfo")) == current, "Webhook predecessor changed after intent.")
@@ -353,6 +379,13 @@ def inspect(env, *, execute=False):
             "telegramSecretReadback": "not-available"}
     store.put(completion_key, canonical(done))
     require(store.get(completion_key) == canonical(done))
+    if not phase_source:
+        require(require_exact_freeze(target, secrets, env, freeze) == frozen
+                and webhook_settings(telegram.call("getWebhookInfo")) == before
+                and probe_original_webhook(previous["webhookSecret"]) == 400)
+        lock.release(owner)
+        released, _, _ = lock.read()
+        require(released["state"] == "idle" and released["session"] == owner)
     return {"status": "settings-restored", "snapshotSha256": pin, "completionSha256": sha256(canonical(done)).hexdigest(),
             "dropPendingUpdates": False, "telegramSecretReadback": "not-available"}
 

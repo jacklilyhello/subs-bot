@@ -99,9 +99,10 @@ class WebhookRecoveryTests(unittest.TestCase):
         store = Mock()
         store.get.side_effect = lambda key, **_: data.get(key)
         store.put.side_effect = lambda key, value: data.update({key: value})
-        env = {"GITHUB_SHA": "d" * 40, "WEBHOOK_SOURCE_MAIN_SHA": "d" * 40,
+        env = {"GITHUB_SHA": "d" * 40, "GITHUB_RUN_ID": "900", "GITHUB_RUN_ATTEMPT": "1", "WEBHOOK_SOURCE_MAIN_SHA": "d" * 40,
                "WEBHOOK_FREEZE_CONFIRMATION_SHA256": sha256(freeze).hexdigest(), "WEBHOOK_SNAPSHOT_SHA256": sha256(raw).hexdigest(),
-               "WEBHOOK_REGISTRATION_SHA256": sha256(registration).hexdigest()}
+               "WEBHOOK_REGISTRATION_SHA256": sha256(registration).hexdigest(),
+               "SUBS_BOT_PHASE_WEBHOOK_ANCHOR_GENESIS_SHA256": "e" * 64}
         telegram = Mock()
         telegram.call.side_effect = lambda method, *_: {"getWebhookInfo": changed, "setWebhook": True}[method]
         return draft, target, previous, store, prefix, data, env, telegram, before, changed
@@ -140,9 +141,14 @@ class WebhookRecoveryTests(unittest.TestCase):
         cls.assert_not_called()
         store.put.assert_not_called()
 
-    def test_confirmed_change_restores_once_without_dropping_pending_updates(self):
+    @patch("trusted_backup_webhook_anchor.anchor")
+    def test_confirmed_change_restores_once_without_dropping_pending_updates(self, anchor):
+        idle = ({"state": "idle"}, b"pointer", '"etag"')
+        active = ({"state": "active", "session": "900-1", "controlRevision": "d" * 40}, b"pointer", '"etag"')
+        released = ({"state": "idle", "session": "900-1"}, b"pointer", '"etag"')
+        anchor.return_value.read.side_effect = [idle, active, active, released]
         draft, target, previous, store, prefix, data, env, telegram, before, changed = self.fixture()
-        telegram.call.side_effect = [changed, changed, True, before]
+        telegram.call.side_effect = [changed, changed, changed, True, before, before]
         jobs = {"total_count": 1, "jobs": [{"steps": [{"name": "Trusted restore original test webhook", "conclusion": "skipped"}]}]}
         with patch.object(recovery, "context", return_value=False), patch.object(recovery, "source_run", return_value=("123", "1", "c" * 40)), \
              patch.object(recovery, "open_store", return_value=(draft, {}, previous, store, prefix)), \
@@ -157,12 +163,17 @@ class WebhookRecoveryTests(unittest.TestCase):
         self.assertEqual(len(writes), 1)
         self.assertIs(writes[0].args[1]["drop_pending_updates"], False)
         self.assertEqual(result["status"], "settings-restored")
+        anchor.return_value.release.assert_called_once_with("900-1")
         self.assertIn(prefix + "webhook-recovery-123-1-intent.json", data)
         self.assertIn(prefix + "webhook-recovery-123-1-complete.json", data)
 
-    def test_lost_restore_response_retains_intent_and_never_retries(self):
+    @patch("trusted_backup_webhook_anchor.anchor")
+    def test_lost_restore_response_retains_intent_and_never_retries(self, anchor):
+        idle = ({"state": "idle"}, b"pointer", '"etag"')
+        active = ({"state": "active", "session": "900-1", "controlRevision": "d" * 40}, b"pointer", '"etag"')
+        anchor.return_value.read.side_effect = [idle, active, active]
         draft, target, previous, store, prefix, data, env, telegram, _before, changed = self.fixture()
-        telegram.call.side_effect = [changed, changed, RuntimeError("unknown")]
+        telegram.call.side_effect = [changed, changed, changed, RuntimeError("unknown")]
         jobs = {"total_count": 1, "jobs": [{"steps": [{"name": "Trusted restore original test webhook", "conclusion": "skipped"}]}]}
         with patch.object(recovery, "context", return_value=False), patch.object(recovery, "source_run", return_value=("123", "1", "c" * 40)), \
              patch.object(recovery, "open_store", return_value=(draft, {}, previous, store, prefix)), \
@@ -176,6 +187,18 @@ class WebhookRecoveryTests(unittest.TestCase):
         self.assertIn(prefix + "webhook-recovery-123-1-intent.json", data)
         self.assertNotIn(prefix + "webhook-recovery-123-1-complete.json", data)
         self.assertEqual(sum(call.args[0] == "setWebhook" for call in telegram.call.call_args_list), 1)
+        anchor.return_value.release.assert_not_called()
+
+    @patch("trusted_backup_webhook_anchor.anchor")
+    def test_active_phase_lock_blocks_legacy_webhook_restore(self, anchor):
+        draft, target, previous, store, prefix, data, env, telegram, *_ = self.fixture()
+        anchor.return_value.read.return_value = ({"state": "active", "session": "999-1"}, b"pointer", '"etag"')
+        with patch.object(recovery, "context", return_value=False), patch.object(recovery, "source_run", return_value=("123", "1", "c" * 40)), \
+             patch.object(recovery, "open_store", return_value=(draft, {}, previous, store, prefix)), \
+             patch.object(recovery, "validate_target", return_value=target), patch.object(recovery, "Telegram", return_value=telegram), \
+             self.assertRaises(ContractError):
+            recovery.inspect(env, execute=True)
+        self.assertNotIn("setWebhook", [call.args[0] for call in telegram.call.call_args_list])
 
     def test_conflicting_conditional_claim_never_authorizes_telegram(self):
         store = Mock()
