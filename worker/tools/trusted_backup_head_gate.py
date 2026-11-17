@@ -45,7 +45,7 @@ def validate(env):
     require(re.fullmatch(r"[1-9][0-9]{0,8}", spec["pr"]) is not None
             and HEX40.fullmatch(spec["headSha"]) is not None
             and env.get("BACKUP_REVIEWED_HEAD_SHA") == spec["headSha"]
-            and spec["action"] in {"inspect", "genesis-plan", "genesis-initialize", "backup", "watchdog", "verify"}
+            and spec["action"] in {"inspect", "genesis-plan", "genesis-initialize", "backup", "watchdog", "verify", "open-backup"}
             and HEX64.fullmatch(spec["registrationSha256"]) is not None
             and HEX32.fullmatch(spec["sourceCheckpointId"]) is not None
             and HEX64.fullmatch(spec["sourceManifestSha256"]) is not None
@@ -54,7 +54,7 @@ def validate(env):
             and spec["fault"] in {"none", "capacity-near", "capacity-over", "readback-failure", "process-kill"}
             and (spec["action"] == "backup" or spec["fault"] == "none"),
             "The reviewed head, exact source pins or bounded action is invalid.")
-    if spec["action"] in {"genesis-initialize", "backup", "watchdog"}:
+    if spec["action"] in {"genesis-initialize", "backup", "watchdog", "open-backup"}:
         require(HEX64.fullmatch(spec["genesisSha256"]) is not None)
     if spec["action"] == "genesis-initialize":
         require(spec["approvalSha256"] == spec["genesisSha256"])
