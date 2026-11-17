@@ -242,6 +242,30 @@ def signed_put_headers(host, path, token_id, token, raw, metadata, now, *, if_ma
     return headers
 
 
+def scoped_object_store(api, bucket):
+    require(bucket in api.buckets)
+    return scoped_r2.from_environment(api.account_id, bucket)
+
+
+def scoped_metadata_headers(metadata):
+    validate_metadata(metadata)
+    return {**metadata["http"], **{"x-amz-meta-" + key: value for key, value in metadata["custom"].items()}}
+
+
+def scoped_object_rows(store, prefix, maximum):
+    rows = store.list_entries(prefix, maximum=maximum)
+    for index, row in enumerate(rows):
+        # Journal and archive inventories need names only. Referenced business
+        # objects need exact metadata, which S3 LIST does not return.
+        if matches(KEY, row["key"]):
+            observed = store.head(row["key"])
+            require(observed["size"] == row["size"] and observed["etag"] == row["etag"],
+                    "The referenced R2 object changed during metadata observation.")
+            listed_metadata(observed)
+            rows[index] = observed
+    return rows
+
+
 def _response(opener, request, maximum, *, allow_aggregate_content_denial=False):
     if allow_aggregate_content_denial:
         # This exception is only for the fixed public read-only application
@@ -395,7 +419,10 @@ class RehearsalAPI:
                             and all(len(values) == 1 for values in query.values()))
                 elif route not in {self.root + "/d1/database", self.root + "/r2/buckets"}:
                     require(path == route)
-        headers = {"Authorization": "Bearer " + self.token, "Accept": "application/json", "Cache-Control": "no-cache",
+        metadata_token = os.environ.get("SUBS_BOT_CF_R2_METADATA_READ_TOKEN", "")
+        token = metadata_token if metadata_token and method == "GET" and route.startswith(self.root + "/r2/buckets") \
+                and not route.endswith("/objects") else self.token
+        headers = {"Authorization": "Bearer " + token, "Accept": "application/json", "Cache-Control": "no-cache",
                    "cf-r2-jurisdiction": "default"}
         body = None if payload is None else canonical(payload)
         if body is not None:
@@ -411,6 +438,9 @@ class RehearsalAPI:
 
     def list_objects(self, bucket, *, prefix="", maximum):
         require(bucket in self.buckets)
+        objects = scoped_object_store(self, bucket)
+        if objects is not None:
+            return scoped_object_rows(objects, prefix, maximum)
         base = self.root + f"/r2/buckets/{bucket}/objects?"
         rows, cursors, cursor = [], set(), None
         while True:
@@ -445,6 +475,16 @@ class RehearsalAPI:
             if self.profile in UNIFIED_CANDIDATE_PROFILES:
                 require(self.restore_bucket == bucket)
         require(method != "GET" or body is None)
+        objects = scoped_object_store(self, bucket)
+        if objects is not None:
+            if method == "GET":
+                value = objects.get(key, absent=True, limit=OBJECT_BYTES)
+                if value == (None, None):
+                    raise RehearsalError("The scoped R2 object is absent.", http_status=404)
+                return value
+            require(isinstance(body, bytes) and 0 < len(body) <= max(OBJECT_BYTES, MANIFEST_BYTES))
+            objects.put_once(key, body)
+            return None
         headers = {"Authorization": "Bearer " + self.token, "Accept": "application/octet-stream",
                    "Accept-Encoding": "identity", "cf-r2-jurisdiction": "default"}
         if method == "PUT":
@@ -474,6 +514,10 @@ class RehearsalAPI:
                 and key in self.restore_keys and matches(KEY, key))
         require(isinstance(body, bytes) and 0 < len(body) <= OBJECT_BYTES)
         validate_metadata(metadata)
+        objects = scoped_object_store(self, self.restore_bucket)
+        if objects is not None:
+            objects.put_once(key, body, metadata=scoped_metadata_headers(metadata))
+            return
         if self.s3_access_key is None:
             try:
                 result = self.json("GET", self.root + "/tokens/verify")

@@ -10,6 +10,7 @@ import hmac
 from http.client import HTTPSConnection, HTTPException
 import os
 import re
+from time import monotonic
 from urllib.parse import quote
 from xml.etree import ElementTree
 
@@ -73,25 +74,31 @@ class ScopedR2:
                 and re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", bucket or ""))
         self.host, self.bucket, self.read_credential, self.write_credential = account + ".r2.cloudflarestorage.com", bucket, read, write
 
-    def _request(self, method, key, *, query=None, raw=b"", headers=None, limit=MAX_OBJECT):
-        require(method in {"GET", "PUT"} and isinstance(key, str) and len(key) <= 1024
+    def _request(self, method, key, *, query=None, raw=b"", headers=None, limit=MAX_OBJECT, include_headers=False):
+        require(method in {"GET", "HEAD", "PUT"} and isinstance(key, str) and len(key) <= 1024
                 and not any(part in {".", ".."} for part in key.split("/")))
-        credential = self.read_credential if method == "GET" else self.write_credential
+        credential = self.read_credential if method in {"GET", "HEAD"} else self.write_credential
         require(isinstance(credential, dict), "The bucket-scoped write credential is unavailable.")
         path = "/" + self.bucket + ("/" + quote(key, safe="/-_.~") if key else "")
         encoded = "&".join(quote(str(k), safe="-_.~") + "=" + quote(str(v), safe="-_.~")
                            for k, v in sorted((query or {}).items()))
-        headers = sign(method, self.host, path, encoded, headers or {}, sha256(raw).hexdigest(),
+        request_headers = {"accept-encoding": "identity", **(headers or {})}
+        headers = sign(method, self.host, path, encoded, request_headers, sha256(raw).hexdigest(),
                        credential["accessKeyId"], credential["secretAccessKey"], datetime.now(timezone.utc))
         try:
-            with closing(HTTPSConnection(self.host, timeout=45)) as connection:
+            with closing(HTTPSConnection(self.host, timeout=15)) as connection:
                 connection.request(method, path + ("?" + encoded if encoded else ""), body=raw if method == "PUT" else None, headers=headers)
                 with closing(connection.getresponse()) as response:
                     status, etag = response.status, response.getheader("ETag")
-                    require(response.getheader("Content-Encoding", "identity") == "identity")
-                    body = response.read(limit + 1)
-                    require(len(body) <= limit)
-                    return status, etag, body
+                    deadline, body = monotonic() + 45, bytearray()
+                    while monotonic() < deadline:
+                        chunk = response.read1(min(65536, limit + 1 - len(body)))
+                        if not chunk:
+                            result = bytes(body)
+                            return (status, etag, result, response.getheaders()) if include_headers else (status, etag, result)
+                        body.extend(chunk)
+                        require(len(body) <= limit)
+                    raise ScopedR2Error("The scoped R2 response timed out; do not retry a write.")
         except (OSError, HTTPException, ValueError):
             raise ScopedR2Error("The scoped R2 request is unconfirmed; do not retry a write.") from None
 
@@ -103,11 +110,13 @@ class ScopedR2:
         return raw, etag
 
     def put_once(self, key, raw, *, etag=None, metadata=None):
-        require(isinstance(raw, bytes) and 0 < len(raw) <= MAX_OBJECT)
+        require(isinstance(raw, bytes) and len(raw) <= MAX_OBJECT)
         require(etag is None or re.fullmatch(r'"[a-f0-9]{32}"', etag) is not None)
         metadata = {} if metadata is None else metadata
-        require(isinstance(metadata, dict) and set(metadata) <= {"cache-control", "content-type"}
-                and all(isinstance(value, str) and not any(c in value for c in "\r\n") for value in metadata.values()))
+        allowed = {"cache-control", "content-type", "content-disposition", "content-encoding", "content-language", "expires"}
+        require(isinstance(metadata, dict) and all(key in allowed or re.fullmatch(r"x-amz-meta-[a-z0-9_-]{1,64}", key)
+                    for key in metadata) and all(isinstance(value, str) and not any(c in value for c in "\r\n")
+                    for value in metadata.values()))
         condition = {"if-none-match": "*"} if etag is None else {"if-match": etag}
         status, _etag, _body = self._request("PUT", key, raw=raw,
             headers={**condition, "content-length": str(len(raw)), **metadata}, limit=4096)
@@ -125,8 +134,11 @@ class ScopedR2:
         return confirmed_etag
 
     def list(self, prefix, *, maximum=10000):
-        require(isinstance(prefix, str) and prefix and type(maximum) is int and 0 < maximum <= 10000)
-        cursor, cursors, keys = None, set(), []
+        return [row["key"] for row in self.list_entries(prefix, maximum=maximum, detailed=False)]
+
+    def list_entries(self, prefix, *, maximum=10000, detailed=True):
+        require(isinstance(prefix, str) and type(maximum) is int and 0 < maximum <= 10000)
+        cursor, cursors, keys, entries = None, set(), [], []
         for _ in range(16):
             query = {"list-type": "2", "prefix": prefix, "max-keys": "1000"}
             if cursor is not None:
@@ -149,12 +161,41 @@ class ScopedR2:
             require(all(isinstance(k, str) and k.startswith(prefix) for k in batch)
                     and len(set(batch)) == len(batch) and not set(batch).intersection(keys))
             keys.extend(batch)
+            if detailed:
+                for node, key in zip(contents, batch):
+                    require(all(len(node.findall(ns + name)) == 1 for name in ("Size", "ETag", "StorageClass")))
+                    size, etag, storage = (node.findtext(ns + name) for name in ("Size", "ETag", "StorageClass"))
+                    require(isinstance(size, str) and size.isdigit() and int(size) <= 2**63 - 1
+                            and isinstance(etag, str) and re.fullmatch(r'"[a-f0-9]{32}(?:-[1-9][0-9]*)?"', etag)
+                            and storage == "STANDARD")
+                    entries.append({"key": key, "size": int(size), "etag": etag, "storage_class": "Standard"})
             require(len(keys) <= maximum)
             next_cursor = root.findtext(ns + "NextContinuationToken")
             if truncated == "false":
                 require(next_cursor is None)
-                return sorted(keys)
+                return sorted(entries, key=lambda row: row["key"]) if detailed else [{"key": key} for key in sorted(keys)]
             require(isinstance(next_cursor, str) and 0 < len(next_cursor) <= 4096 and next_cursor not in cursors and batch)
             cursors.add(next_cursor)
             cursor = next_cursor
         raise ScopedR2Error("The complete bucket listing exceeds its verified bound.")
+
+    def head(self, key):
+        status, etag, _body, headers = self._request("HEAD", key, limit=0, include_headers=True)
+        require(status == 200 and isinstance(etag, str))
+        seen = {}
+        for name, value in headers:
+            name = name.lower()
+            if name.startswith("x-amz-meta-") or name in {"content-length", "content-type", "content-encoding",
+                    "content-language", "content-disposition", "cache-control", "expires",
+                    "x-amz-server-side-encryption-customer-algorithm"}:
+                require(name not in seen and isinstance(value, str) and not any(c in value for c in "\r\n"))
+                seen[name] = value
+        size = seen.pop("content-length", "")
+        require(size.isdigit() and int(size) <= 2**63 - 1)
+        custom = {key.removeprefix("x-amz-meta-"): value for key, value in seen.items() if key.startswith("x-amz-meta-")}
+        names = {"content-type": "contentType", "content-encoding": "contentEncoding", "content-language": "contentLanguage",
+                 "content-disposition": "contentDisposition", "cache-control": "cacheControl", "expires": "cacheExpiry"}
+        http = {names[key]: value for key, value in seen.items() if key in names}
+        return {"key": key, "size": int(size), "etag": etag, "storage_class": "Standard",
+                "ssec": "x-amz-server-side-encryption-customer-algorithm" in seen,
+                "custom_metadata": custom, "http_metadata": http}

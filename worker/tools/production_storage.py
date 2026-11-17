@@ -57,6 +57,33 @@ class PrivateStore:
                 return None
             raise
 
+    def put_exclusive(self, key, body):
+        """Claim a unique intent once; 412 or unknown results never authorize writes."""
+        require(isinstance(body, bytes) and 0 < len(body) <= 512 * 1024)
+        require(self.get(key, absent=True) is None, "The private intent is already occupied.")
+        if self.objects is not None:
+            self.objects.put_once(key, body)
+            return
+        try:
+            token = self.api("GET", self.api.root + "/tokens/verify")
+        except OperationError as error:
+            require(error.http_status in (400, 401, 403, 404))
+            token = self.api("GET", "/user/tokens/verify")
+        require(isinstance(token, dict) and token.get("status") == "active" and matches(r"[a-f0-9]{32}", token.get("id")))
+        host = self.api.target["accountId"] + ".r2.cloudflarestorage.com"
+        path = "/" + self.bucket + "/" + quote(key, safe="/-_.~")
+        headers = native.signed_put_headers(host, path, token["id"], self.api.token, body,
+                                            {"custom": {}, "http": {}}, datetime.now(timezone.utc))
+        try:
+            with closing(HTTPSConnection(host, timeout=30)) as connection:
+                connection.request("PUT", path, body=body, headers=headers)
+                with closing(connection.getresponse()) as response:
+                    require(response.status == 200 and len(response.read(4097)) <= 4096,
+                            "The private intent was not uniquely claimed; do not retry.")
+        except (OSError, HTTPException, ValueError):
+            raise OperationError("The private intent result is unknown; do not retry.", uncertain=True) from None
+        require(self.get(key) == body, "The private intent was not independently confirmed.")
+
     def put(self, key, body):
         require(isinstance(body, bytes) and 0 < len(body) <= 512*1024)
         existing = self.get(key, absent=True)

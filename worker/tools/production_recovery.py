@@ -18,6 +18,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from hashlib import sha256
 from http.client import HTTPSConnection, HTTPException
+import os
 import re
 from secrets import token_hex
 import time
@@ -174,7 +175,10 @@ class RecoveryAPI:
                            and ("etag" not in payload or re.fullmatch(r"[a-f0-9]{32}", payload["etag"] or "") is not None)
                            and all(matches(native.BOOKMARK, payload[key]) for key in ("filename", "current_bookmark") if key in payload))
         require(allowed, "The recovery API rejected an out-of-scope operation.")
-        headers = {"Authorization": "Bearer " + self.token, "Accept": "application/json",
+        metadata_token = os.environ.get("SUBS_BOT_CF_R2_METADATA_READ_TOKEN", "")
+        token = metadata_token if metadata_token and method == "GET" and route.startswith(self.root + "/r2/buckets") \
+                and not route.endswith("/objects") else self.token
+        headers = {"Authorization": "Bearer " + token, "Accept": "application/json",
                    "Cache-Control": "no-cache", "cf-r2-jurisdiction": "default"}
         body = None if payload is None else canonical(payload)
         if body is not None:
@@ -213,6 +217,12 @@ class RecoveryAPI:
             self._conditional_put(bucket, key, body, {"custom": {}, "http": {}})
             return None
         require(body is None)
+        objects = native.scoped_object_store(self, bucket)
+        if objects is not None:
+            value = objects.get(key, absent=True, limit=native.OBJECT_BYTES)
+            if value == (None, None):
+                raise RecoveryError("The scoped R2 object is absent.", http_status=404)
+            return value
         request = Request(API_ORIGIN + self.root + "/r2/buckets/" + bucket + "/objects/" + quote(key, safe="/"),
                           headers={"Authorization": "Bearer " + self.token, "Accept": "application/octet-stream",
                                    "Accept-Encoding": "identity", "cf-r2-jurisdiction": "default"})
@@ -230,6 +240,10 @@ class RecoveryAPI:
     def _conditional_put(self, bucket, key, body, metadata):
         native.validate_metadata(metadata)
         require(isinstance(body, bytes) and 0 < len(body) <= native.OBJECT_BYTES)
+        objects = native.scoped_object_store(self, bucket)
+        if objects is not None:
+            objects.put_once(key, body, metadata=native.scoped_metadata_headers(metadata))
+            return
         if self.s3_access_key is None:
             try:
                 result = self.json("GET", self.root + "/tokens/verify")

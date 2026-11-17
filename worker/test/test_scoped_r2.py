@@ -77,6 +77,14 @@ class ScopedR2Tests(unittest.TestCase):
         request.assert_called_once()
         readback.assert_not_called()
 
+    def test_transport_does_not_drop_empty_objects(self):
+        store = scoped_r2.ScopedR2(ACCOUNT, BUCKET, CREDENTIAL, CREDENTIAL)
+        with patch.object(store, "_request", return_value=(200, None, b"")) as request, \
+             patch.object(store, "get", return_value=(b"", '"' + 'd' * 32 + '"')):
+            store.put_once(KEY, b"")
+        self.assertEqual(request.call_args.kwargs["raw"], b"")
+        self.assertEqual(request.call_args.kwargs["headers"]["content-length"], "0")
+
     def test_cas_checks_predecessor_and_exact_etag_before_one_write(self):
         store = scoped_r2.ScopedR2(ACCOUNT, BUCKET, CREDENTIAL, CREDENTIAL)
         etag = '"' + 'd' * 32 + '"'
@@ -119,6 +127,60 @@ class ScopedR2Tests(unittest.TestCase):
         privacy.assert_called_once_with(metadata, "/metadata", BUCKET, "created")
         objects.get.assert_called_once_with(KEY, absent=False, limit=512 * 1024)
         source.assert_not_called()
+
+    def test_legacy_exclusive_intent_rejects_412_without_readback_or_retry(self):
+        from unittest.mock import Mock
+        store = object.__new__(production_storage.PrivateStore)
+        store.api = Mock(root="/accounts/" + ACCOUNT, target={"accountId": ACCOUNT}, token="synthetic")
+        store.api.return_value = {"status": "active", "id": "b" * 32}
+        store.bucket, store.objects = BUCKET, None
+        with patch.object(store, "get", return_value=None) as read, \
+             patch.object(production_storage.native, "signed_put_headers", return_value={}), \
+             patch.object(production_storage, "HTTPSConnection") as connection, \
+             self.assertRaises(production_storage.OperationError):
+            connection.return_value.getresponse.return_value.status = 412
+            store.put_exclusive(KEY, b"intent")
+        connection.return_value.request.assert_called_once()
+        read.assert_called_once_with(KEY, absent=True)
+
+    def test_referenced_object_metadata_requires_matching_etag_and_size(self):
+        from unittest.mock import Mock
+        key = "private-shares/00000000-0000-0000-0000-000000000000.txt"
+        etag = '"' + 'd' * 32 + '"'
+        listing = {"key": key, "size": 7, "etag": etag, "storage_class": "Standard"}
+        observed = {**listing, "ssec": False, "custom_metadata": {"purpose": native_restore_rehearsal.PRIVATE_SHARE_PURPOSE,
+                    "receipt": "123"}, "http_metadata": {"contentType": "text/plain"}}
+        store = Mock()
+        store.list_entries.return_value = [listing]
+        store.head.return_value = observed
+        result = native_restore_rehearsal.scoped_object_rows(store, key, 2)
+        self.assertEqual(native_restore_rehearsal.listed_metadata(result[0]),
+                         {"custom": observed["custom_metadata"], "http": {"content-type": "text/plain"}})
+        store.head.return_value = {**observed, "etag": '"' + 'e' * 32 + '"'}
+        with self.assertRaises(native_restore_rehearsal.RehearsalError):
+            native_restore_rehearsal.scoped_object_rows(store, key, 2)
+
+    def test_head_preserves_supported_http_and_custom_metadata(self):
+        store = scoped_r2.ScopedR2(ACCOUNT, BUCKET, CREDENTIAL)
+        etag = '"' + 'd' * 32 + '"'
+        headers = [("Content-Length", "7"), ("Content-Type", "text/plain"),
+                   ("x-amz-meta-purpose", native_restore_rehearsal.PRIVATE_SHARE_PURPOSE), ("x-amz-meta-receipt", "123")]
+        with patch.object(store, "_request", return_value=(200, etag, b"", headers)):
+            result = store.head("private-shares/fixture.txt")
+        self.assertEqual(result["http_metadata"], {"contentType": "text/plain"})
+        self.assertEqual(result["custom_metadata"], {"purpose": native_restore_rehearsal.PRIVATE_SHARE_PURPOSE, "receipt": "123"})
+
+    def test_detailed_listing_refuses_unknown_or_nonstandard_storage(self):
+        store = scoped_r2.ScopedR2(ACCOUNT, BUCKET, CREDENTIAL)
+        etag = '"' + 'd' * 32 + '"'
+        raw = (f'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>{BUCKET}</Name>'
+               f'<Prefix>test/</Prefix><IsTruncated>false</IsTruncated><Contents><Key>test/a</Key>'
+               f'<Size>7</Size><ETag>{etag}</ETag><StorageClass>STANDARD</StorageClass></Contents></ListBucketResult>').encode()
+        with patch.object(store, "_request", return_value=(200, None, raw)):
+            self.assertEqual(store.list_entries("test/"), [{"key": "test/a", "size": 7, "etag": etag, "storage_class": "Standard"}])
+        with patch.object(store, "_request", return_value=(200, None, raw.replace(b"STANDARD", b"UNKNOWN"))), \
+             self.assertRaises(ContractError):
+            store.list_entries("test/")
 
     def test_provider_store_keeps_metadata_api_separate_from_object_keys(self):
         from unittest.mock import Mock

@@ -4,19 +4,14 @@ An absent or uncertain intent never authorizes a retry. This entry point does
 not alter application admission or consume Telegram updates.
 """
 from hashlib import sha256
-from contextlib import closing
-from datetime import datetime, timezone
-from http.client import HTTPSConnection
 import json
 import os
 from pathlib import Path
 import re
 import tempfile
-from urllib.parse import quote
 
 import prepare_isolation_artifact as github
-from production_control import API, Controller, Telegram, OperationError
-import native_restore_rehearsal as native
+from production_control import API, Controller, Telegram
 from production_lifecycle_drill import (configuration, ORIGINAL_ORIGIN, ORIGINAL_SERVICE, ORIGIN,
                                         probe_original_webhook, webhook_settings)
 from production_storage import PrivateStore
@@ -110,23 +105,7 @@ def open_store(env):
 
 def claim_intent_once(store, key, raw):
     """A 412 or transport failure never grants authority to call Telegram."""
-    require(store.get(key, absent=True) is None)
-    try:
-        identity = store.api("GET", store.api.root + "/tokens/verify")
-    except OperationError as error:
-        require(error.http_status in (400, 401, 403, 404))
-        identity = store.api("GET", "/user/tokens/verify")
-    require(identity.get("status") == "active" and re.fullmatch(r"[a-f0-9]{32}", identity.get("id", "")))
-    host = store.api.target["accountId"] + ".r2.cloudflarestorage.com"
-    path = "/" + store.bucket + "/" + quote(key, safe="/-_.~")
-    headers = native.signed_put_headers(host, path, identity["id"], store.api.token, raw,
-                                        {"custom": {}, "http": {}}, datetime.now(timezone.utc))
-    with closing(HTTPSConnection(host, timeout=30)) as connection:
-        connection.request("PUT", path, body=raw, headers=headers)
-        with closing(connection.getresponse()) as response:
-            require(response.status == 200 and len(response.read(4097)) <= 4096,
-                    "Webhook restore intent was not uniquely claimed; do not retry.")
-    require(store.get(key) == raw, "Webhook restore intent readback differs; do not retry.")
+    store.put_exclusive(key, raw)
 
 
 def require_exact_freeze(target, secrets, env, freeze):
