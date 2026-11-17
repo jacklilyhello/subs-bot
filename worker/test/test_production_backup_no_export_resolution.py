@@ -25,6 +25,41 @@ class MemoryStore:
 
 
 class NoExportEvidenceTests(unittest.TestCase):
+    def test_failed_plan_originals_require_candidate_steps_skipped(self):
+        run = {"id": int(resolution.FAILED_PLAN_RUN), "run_attempt": 1, "head_sha": resolution.FAILED_PLAN_MAIN,
+               "head_branch": "main", "event": "workflow_dispatch", "status": "completed", "conclusion": "failure",
+               "path": resolution.WORKFLOW, "display_title": "No-export plan at " + resolution.FAILED_PLAN_MAIN
+                    + " candidate " + resolution.FAILED_PLAN_HEAD,
+               "repository": {"id": resolution.github.REPOSITORY_ID}, "head_repository": {"id": resolution.github.REPOSITORY_ID}}
+        checkout = "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+        steps = [{"number": number, "name": name, "status": "completed", "conclusion": conclusion}
+                 for number, name, conclusion in ((2, checkout, "success"), (3, resolution.GATES[0], "failure"),
+                    (4, checkout, "skipped"), (5, resolution.GATES[1], "skipped"),
+                    (6, resolution.GATES[2], "skipped"), (7, "Plan or apply the no-export resolution", "skipped"))]
+        jobs = [{"name": "resolution", "id": int(resolution.FAILED_PLAN_JOB), "run_id": int(resolution.FAILED_PLAN_RUN),
+                 "run_attempt": 1, "head_sha": resolution.FAILED_PLAN_MAIN, "status": "completed",
+                 "conclusion": "failure", "steps": steps},
+                {"name": "readback", "run_id": int(resolution.FAILED_PLAN_RUN), "run_attempt": 1,
+                 "head_sha": resolution.FAILED_PLAN_MAIN, "status": "completed", "conclusion": "skipped"}]
+        log = b'prefix GitHub metadata read diagnostic {"family":"other","phase":"response","httpStatus":200}\n'
+        body = b"reviewed workflow"
+        def get(path, _token):
+            if "/contents/" in path:
+                name = path.split("/contents/", 1)[1].split("?", 1)[0]
+                return {"path": name, "type": "file", "encoding": "base64", "size": len(body),
+                        "content": base64.b64encode(body).decode()}
+            if "/jobs?" in path:
+                return {"total_count": 2, "jobs": jobs}
+            return run
+        with patch.object(resolution.github, "_get_json", side_effect=get), \
+                patch.object(resolution, "FAILED_PLAN_LOG_SHA", hashlib.sha256(log).hexdigest()), \
+                patch.object(resolution, "FAILED_PLAN_WORKFLOW_SHA", hashlib.sha256(body).hexdigest()), \
+                patch.object(resolution, "FAILED_PLAN_GATE_SHA", hashlib.sha256(body).hexdigest()):
+            self.assertEqual(resolution.failed_plan_originals("token", lambda *_: log)["known-preflight-failure-job-log"], log)
+            steps[-1]["conclusion"] = "success"
+            with self.assertRaises(Exception):
+                resolution.failed_plan_originals("token", lambda *_: log)
+
     def test_original_log_binds_exact_old_candidate_and_private_source(self):
         spec = {"version": 1, "pr": "291", "headSha": resolution.OLD_HEAD, "action": "backup",
                 "fault": "readback-failure", "approvalSha256": "f" * 64, "checkpointId": "",
@@ -148,6 +183,7 @@ class NoExportEvidenceTests(unittest.TestCase):
         with patch.object(resolution, "checked_gate", return_value=review), \
                 patch.object(resolution, "verify_jobs"), patch.object(resolution, "log_reader", return_value=Mock()), \
                 patch.object(resolution, "historical_originals", return_value={"source": b"source"}), \
+                patch.object(resolution, "failed_plan_originals", return_value={"failed-log": b"log"}), \
                 patch.object(resolution, "custody_original", return_value=b"custody"), \
                 patch.object(resolution, "inventory_original", return_value=b"inventory"), \
                 patch.object(resolution, "require_request_budget"), \

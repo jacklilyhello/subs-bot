@@ -27,6 +27,13 @@ OLD_MAIN = "43ec8cc22c3f51eedde5569e8025e26f3244091a"
 OLD_HEAD = "7aa685990859cffb30d47c5a6e593d969f1d0452"
 OLD_CHECKPOINT = "1bbadaa9755d1733ddd80fe12192420a"
 OLD_LOG_SHA = "6bc155ec5a2dac24b96a036bb0b884fe98ecb07ff82092f3992ca8d6983c194a"
+FAILED_PLAN_RUN = "44180277055"
+FAILED_PLAN_JOB = "134382463410"
+FAILED_PLAN_MAIN = "777bf60f8881755802a957777f55b7e3e9ff273a"
+FAILED_PLAN_HEAD = "98562f7cbef35a6847db1bd342abf689b31eacc0"
+FAILED_PLAN_LOG_SHA = "06b7dc59ad424d1862233aca9290914bb1c67863569f5ef6908b2f99b3068852"
+FAILED_PLAN_WORKFLOW_SHA = "8b46e11408866e5369013d2715b2339df9d37794753b6b61cdc067dade523355"
+FAILED_PLAN_GATE_SHA = "dec99713970c4259161ed038b1e02fa96e620bfa1d739a794cdfd162d937ba3f"
 CHUNK = 512 * 1024
 MAX_SOURCE = 1024 * 1024
 MAX_LOG = 4 * 1024 * 1024
@@ -230,6 +237,68 @@ def historical_originals(review, spec, token, download_log):
                     ("registrationSha256", "sourceCheckpointId", "sourceManifestSha256", "genesisSha256")))
     result["original-job-log"] = raw
     return result
+
+
+def failed_plan_originals(token, download_log):
+    """Preserve the separate, proven pre-candidate 100-item pagination failure."""
+    run = github._get_json("/actions/runs/" + FAILED_PLAN_RUN + "/attempts/1", token)
+    latest = github._get_json("/actions/runs/" + FAILED_PLAN_RUN, token)
+    require(run.get("id") == latest.get("id") == int(FAILED_PLAN_RUN)
+            and run.get("run_attempt") == latest.get("run_attempt") == 1
+            and run.get("head_sha") == FAILED_PLAN_MAIN and run.get("head_branch") == "main"
+            and run.get("event") == "workflow_dispatch" and (run.get("status"), run.get("conclusion")) == ("completed", "failure")
+            and latest.get("status") == "completed"
+            and run.get("path") in {WORKFLOW, WORKFLOW + "@main", WORKFLOW + "@refs/heads/main"}
+            and run.get("display_title") == "No-export plan at " + FAILED_PLAN_MAIN + " candidate " + FAILED_PLAN_HEAD
+            and all(isinstance(run.get(key), dict) and run[key].get("id") == github.REPOSITORY_ID
+                    for key in ("repository", "head_repository")))
+    response = github._get_json("/actions/runs/" + FAILED_PLAN_RUN + "/attempts/1/jobs?per_page=100", token)
+    jobs = response.get("jobs")
+    require(isinstance(jobs, list) and response.get("total_count") == len(jobs) == 2
+            and {job.get("name") for job in jobs} == {"resolution", "readback"})
+    selected = next(job for job in jobs if job.get("name") == "resolution")
+    reader = next(job for job in jobs if job.get("name") == "readback")
+    require(selected.get("id") == int(FAILED_PLAN_JOB) and selected.get("run_id") == int(FAILED_PLAN_RUN)
+            and selected.get("run_attempt") == 1 and selected.get("head_sha") == FAILED_PLAN_MAIN
+            and (selected.get("status"), selected.get("conclusion")) == ("completed", "failure")
+            and reader.get("run_id") == int(FAILED_PLAN_RUN) and reader.get("run_attempt") == 1
+            and reader.get("head_sha") == FAILED_PLAN_MAIN
+            and (reader.get("status"), reader.get("conclusion")) == ("completed", "skipped"))
+    expected = {2: ("Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1", "success"),
+                3: (GATES[0], "failure"),
+                4: ("Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1", "skipped"),
+                5: (GATES[1], "skipped"), 6: (GATES[2], "skipped"),
+                7: ("Plan or apply the no-export resolution", "skipped")}
+    steps = selected.get("steps")
+    require(isinstance(steps, list))
+    for number, (name, conclusion) in expected.items():
+        matched = [step for step in steps if step.get("number") == number]
+        require(len(matched) == 1 and matched[0].get("name") == name
+                and (matched[0].get("status"), matched[0].get("conclusion")) == ("completed", conclusion))
+    originals = {}
+    for path, name, expected_sha in ((WORKFLOW, "known-preflight-failure-workflow.yml", FAILED_PLAN_WORKFLOW_SHA),
+            ("worker/tools/trusted_backup_no_export_gate.py", "known-preflight-failure-gate.py", FAILED_PLAN_GATE_SHA)):
+        entry = github._get_json("/contents/" + path + "?ref=" + FAILED_PLAN_MAIN, token)
+        require(entry.get("path") == path and entry.get("type") == "file" and entry.get("encoding") == "base64")
+        raw = base64.b64decode(entry.get("content", "").replace("\n", ""), validate=True)
+        require(0 < len(raw) <= MAX_SOURCE and entry.get("size") == len(raw) and sha256(raw).hexdigest() == expected_sha)
+        originals[name] = raw
+    log_raw = download_log(FAILED_PLAN_JOB, token)
+    require(isinstance(log_raw, bytes) and 0 < len(log_raw) <= MAX_LOG
+            and sha256(log_raw).hexdigest() == FAILED_PLAN_LOG_SHA)
+    marker = b"GitHub metadata read diagnostic "
+    matches = [json.loads(line.split(marker, 1)[1]) for line in log_raw.splitlines() if marker in line]
+    require(len(matches) == 1 and matches[0].get("family") == "other" and matches[0].get("phase") == "response"
+            and matches[0].get("httpStatus") == 200)
+    evidence = {"version": 1, "kind": "failed-plan-before-candidate", "runId": FAILED_PLAN_RUN,
+                "attempt": "1", "jobId": FAILED_PLAN_JOB, "dispatcherRevision": FAILED_PLAN_MAIN,
+                "controlRevision": FAILED_PLAN_HEAD, "workflowSha256": FAILED_PLAN_WORKFLOW_SHA,
+                "gateSha256": FAILED_PLAN_GATE_SHA, "logSha256": FAILED_PLAN_LOG_SHA,
+                "failure": "github-metadata-response-unconfirmed", "httpStatus": 200,
+                "candidateCheckout": "skipped", "candidateExecution": "skipped"}
+    originals.update({"known-preflight-failure-job-log": log_raw,
+                      "known-preflight-failure-evidence.json": canonical(evidence)})
+    return originals
 
 
 def custody_original(env, review):
@@ -469,6 +538,7 @@ def run(env):
     stage("originals")
     token = github._github_token()
     originals = historical_originals(review, spec, token, log_reader(env))
+    originals.update(failed_plan_originals(token, log_reader(env)))
     originals["protected-custody.json"] = custody_original(env, review)
     originals["writer-inventory.json"] = inventory_original(env, review)
     seal = {"runId": seal_run, "runAttempt": "1", "dispatcherRevision": env["GITHUB_SHA"],
