@@ -27,7 +27,9 @@ def require_reviewed_ancestor(revision, control_revision, token):
     recovery.require(recovery.matches(artifact._REVISION, revision)
                      and recovery.matches(artifact._REVISION, control_revision))
     if revision != control_revision:
-        comparison = artifact._get_json("/compare/" + revision + "..." + control_revision, token)
+        # GitHub emits changed-file patches only on page one. Ancestry fields
+        # remain available on page two, including when its commit list is empty.
+        comparison = artifact.compare_commits_metadata(revision, control_revision, token)
         recovery.require(isinstance(comparison, dict) and comparison.get("status") in {"ahead", "identical"}
                          and comparison.get("base_commit", {}).get("sha") == revision
                          and comparison.get("merge_base_commit", {}).get("sha") == revision,

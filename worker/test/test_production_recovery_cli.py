@@ -21,8 +21,9 @@ class RecoverySourceLineageTests(unittest.TestCase):
 
     def test_older_source_requires_both_exact_base_and_merge_base(self):
         allowed = {"status": "ahead", "base_commit": {"sha": SOURCE}, "merge_base_commit": {"sha": SOURCE}}
-        with patch.object(cli.artifact, "_get_json", return_value=allowed):
+        with patch.object(cli.artifact, "_get_json", return_value=allowed) as get:
             cli.require_reviewed_ancestor(SOURCE, CONTROL, "synthetic-read-token")
+        get.assert_called_once_with("/compare/" + SOURCE + "..." + CONTROL + "?per_page=1&page=2", "synthetic-read-token")
         for wrong in ({**allowed, "status": "diverged"},
                       {**allowed, "base_commit": {"sha": CONTROL}},
                       {**allowed, "merge_base_commit": {"sha": CONTROL}}):
