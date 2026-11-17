@@ -5,6 +5,7 @@ protected main workflow, pinned configuration and every checkpoint result. An
 unconfirmed dispatch is intentionally not retried.
 """
 from hashlib import sha256
+import os
 import re
 
 import prepare_isolation_artifact as artifact
@@ -15,6 +16,34 @@ REVISION = re.compile(r"[a-f0-9]{40}")
 DECIMAL = re.compile(r"[1-9][0-9]{0,19}")
 STEPS = ("plan-begin", "begin", "preflight", "plan-pause", "pause", "drain", "freeze", "capture", "verify", "plan-activate", "activate")
 BASE = "maintenance/production-control/evidence/backup-coordinator/"
+PROFILES = {"production": {"child": ".github/workflows/worker-production-backup.yml",
+                            "parent": ".github/workflows/worker-production-backup-coordinator.yml",
+                            "artifact": "subs-bot-production-backup-"},
+            "rehearsal": {"child": ".github/workflows/worker-backup-phase-rehearsal.yml",
+                          "parent": ".github/workflows/worker-backup-reviewed-coordinator.yml",
+                          "artifact": "subs-bot-rehearsal-backup-"}}
+
+
+def profile_config(profile):
+    require(profile in PROFILES)
+    return PROFILES[profile]
+
+
+def child_title(intent):
+    if intent["profile"] == "production":
+        return "Production backup " + intent["action"] + " at " + intent["controllerRevision"] + " #" + intent["nonce"]
+    return ("Rehearsal backup " + intent["action"] + " at " + intent["controllerRevision"]
+            + " candidate " + intent["candidateRevision"] + " #" + intent["nonce"])
+
+
+def parent_title(profile, action, revision, candidate_revision):
+    profile_config(profile)
+    require(action in {"run", "resume", "abort", "reconcile"} and REVISION.fullmatch(revision or "")
+            and REVISION.fullmatch(candidate_revision or ""))
+    if profile == "production":
+        require(candidate_revision == revision)
+        return "Production backup coordinator " + action + " at " + revision
+    return "Rehearsal backup coordinator " + action + " at " + revision + " candidate " + candidate_revision
 
 
 def valid_target(target):
@@ -36,14 +65,55 @@ def result_archive_key(target, session, sequence):
     return event_key(target, session, sequence).replace("-intent.json", "-result.zip")
 
 
-def dispatch_intent(*, target, session, sequence, revision, nonce, input_sha256, created_at, writer_run_id):
+def child_claim_key(target, session, sequence):
+    return event_key(target, session, sequence).replace("-intent.json", "-child-claim.json")
+
+
+def child_claim(intent, child_run_id, child_attempt):
+    require(isinstance(intent, dict) and DECIMAL.fullmatch(child_run_id or "") and child_attempt == "1")
+    require(intent == dispatch_intent(target=intent.get("targetSha256"), session=intent.get("session"),
+        sequence=intent.get("sequence"), revision=intent.get("controllerRevision"), nonce=intent.get("nonce"),
+        input_sha256=intent.get("inputSha256"), created_at=intent.get("createdAt"), writer_run_id=intent.get("writerRunId"),
+        profile=intent.get("profile"), candidate_revision=intent.get("candidateRevision")))
+    return {"version": 1, "kind": "backup-dispatch-child-claim", "intentSha256": sha256(canonical(intent)).hexdigest(),
+            "targetSha256": intent["targetSha256"], "session": intent["session"], "sequence": intent["sequence"],
+            "nonce": intent["nonce"], "profile": intent["profile"], "controllerRevision": intent["controllerRevision"],
+            "candidateRevision": intent["candidateRevision"], "childRunId": child_run_id, "childAttempt": child_attempt}
+
+
+def claim_child_once(store, intent, child_run_id, child_attempt):
+    """A coordinator-dispatched child acquires exactly one immutable slot."""
+    value = child_claim(intent, child_run_id, child_attempt)
+    key = child_claim_key(intent["targetSha256"], intent["session"], intent["sequence"])
+    existing, _ = store.get(key, absent=True)
+    require(existing is None, "A child already claimed this dispatch; do not retry.")
+    raw = canonical(value)
+    store.put_once(key, raw)
+    observed, _ = store.get(key)
+    require(observed == raw, "The exclusive child claim was not independently confirmed.")
+    return value
+
+
+def verify_child_claim(store, intent, child_run_id, child_attempt="1"):
+    raw, _ = store.get(child_claim_key(intent["targetSha256"], intent["session"], intent["sequence"]))
+    require(isinstance(raw, bytes) and raw == canonical(child_claim(intent, child_run_id, child_attempt)),
+            "The exact exclusive child claim is missing or differs.")
+    return sha256(raw).hexdigest()
+
+
+def dispatch_intent(*, target, session, sequence, revision, nonce, input_sha256, created_at, writer_run_id,
+                    profile="production", candidate_revision=None):
     valid_target(target)
+    profile_config(profile)
+    candidate_revision = revision if candidate_revision is None and profile == "production" else candidate_revision
     require(DECIMAL.fullmatch(session or "") and type(sequence) is int and 1 <= sequence <= len(STEPS)
             and REVISION.fullmatch(revision or "") and HEX.fullmatch(nonce or "") and HEX.fullmatch(input_sha256 or "")
+            and REVISION.fullmatch(candidate_revision or "") and (profile != "production" or candidate_revision == revision)
             and type(created_at) is int and created_at > 0 and DECIMAL.fullmatch(writer_run_id or ""))
-    return {"version": 1, "kind": "production-backup-dispatch-intent", "targetSha256": target,
+    return {"version": 1, "kind": "backup-dispatch-intent", "targetSha256": target,
             "session": session, "sequence": sequence, "action": STEPS[sequence - 1],
-            "controllerRevision": revision, "nonce": nonce, "inputSha256": input_sha256, "createdAt": created_at,
+            "controllerRevision": revision, "candidateRevision": candidate_revision, "profile": profile,
+            "nonce": nonce, "inputSha256": input_sha256, "createdAt": created_at,
             "writerRunId": writer_run_id, "writerAttempt": "1"}
 
 
@@ -52,7 +122,7 @@ def write_dispatch_once(store, intent):
     require(isinstance(intent, dict) and intent == dispatch_intent(target=intent.get("targetSha256"),
         session=intent.get("session"), sequence=intent.get("sequence"), revision=intent.get("controllerRevision"),
         nonce=intent.get("nonce"), input_sha256=intent.get("inputSha256"), created_at=intent.get("createdAt"),
-        writer_run_id=intent.get("writerRunId")))
+        writer_run_id=intent.get("writerRunId"), profile=intent.get("profile"), candidate_revision=intent.get("candidateRevision")))
     key = event_key(intent["targetSha256"], intent["session"], intent["sequence"])
     existing, _ = store.get(key, absent=True)
     require(existing is None, "A dispatch intent already exists; inspect it rather than reissue it.")
@@ -68,7 +138,7 @@ def receipt(intent, run_id, result, artifact_id, archive_sha256):
             and HEX.fullmatch(archive_sha256 or "") and isinstance(result, dict))
     raw = canonical(result)
     require(0 < len(raw) <= 65536)
-    return {"version": 1, "kind": "production-backup-dispatch-receipt", "intentSha256": sha256(canonical(intent)).hexdigest(),
+    return {"version": 1, "kind": "backup-dispatch-receipt", "intentSha256": sha256(canonical(intent)).hexdigest(),
             "runId": run_id, "runAttempt": "1", "resultSha256": sha256(raw).hexdigest(), "result": result,
             "artifactId": artifact_id, "artifactSha256": archive_sha256}
 
@@ -78,20 +148,23 @@ def inspect_stage(store, target, session, sequence):
     raw, _ = store.get(event_key(target, session, sequence), absent=True)
     result, _ = store.get(receipt_key(target, session, sequence), absent=True)
     original, _ = store.get(result_archive_key(target, session, sequence), absent=True)
+    claim, _ = store.get(child_claim_key(target, session, sequence), absent=True)
     if raw is None:
-        require(result is None and original is None, "A result without its dispatch intent is invalid.")
+        require(result is None and original is None and claim is None, "A result or claim without its dispatch intent is invalid.")
         return {"status": "not-recorded", "dispatchPermitted": False}
     intent = parsed(raw)
     require(canonical(intent) == raw and intent == dispatch_intent(target=target, session=session, sequence=sequence,
         revision=intent.get("controllerRevision"), nonce=intent.get("nonce"), input_sha256=intent.get("inputSha256"),
-        created_at=intent.get("createdAt"), writer_run_id=intent.get("writerRunId")))
+        created_at=intent.get("createdAt"), writer_run_id=intent.get("writerRunId"),
+        profile=intent.get("profile"), candidate_revision=intent.get("candidateRevision")))
     if result is None:
         return {"status": "unknown", "intentSha256": sha256(raw).hexdigest(), "dispatchPermitted": False}
     value = parsed(result)
     require(canonical(value) == result and value == receipt(intent, value.get("runId"), value.get("result"),
                                                              value.get("artifactId"), value.get("artifactSha256"))
             and isinstance(original, bytes) and sha256(original).hexdigest() == value["artifactSha256"]
-            and archive_result(original) == value["result"])
+            and archive_result(original) == value["result"] and isinstance(claim, bytes)
+            and claim == canonical(child_claim(intent, value["runId"], "1")))
     return {"status": "receipt-needs-independent-run-verification", "intentSha256": sha256(raw).hexdigest(),
             "runId": value["runId"], "dispatchPermitted": False}
 
@@ -145,7 +218,7 @@ def require_completed_receipt(intent, value, run, workflow_id, result):
     """Authenticate an exact dispatch before any later checkpoint can run."""
     require(isinstance(intent, dict) and isinstance(value, dict) and isinstance(run, dict) and isinstance(result, dict))
     require(value == receipt(intent, str(run.get("id")), result, value.get("artifactId"), value.get("artifactSha256")))
-    expected = "Production backup " + intent["action"] + " at " + intent["controllerRevision"] + " #" + intent["nonce"]
+    expected = child_title(intent)
     require(run.get("display_title") == expected and run.get("run_attempt") == 1
             and run.get("workflow_id") == workflow_id and run.get("head_branch") == "main"
             and run.get("head_sha") == intent["controllerRevision"] and run.get("event") == "workflow_dispatch"
@@ -154,7 +227,8 @@ def require_completed_receipt(intent, value, run, workflow_id, result):
                     for key in ("repository", "head_repository")),
             "The unique original checkpoint run did not finish successfully.")
     require(result.get("action") == intent["action"] and result.get("targetSha256") == intent["targetSha256"]
-            and result.get("controlRevision") == intent["controllerRevision"]
+            and result.get("controlRevision") == intent["candidateRevision"]
+            and (intent["profile"] == "production" or result.get("dispatcherRevision") == intent["controllerRevision"])
             and result.get("consumerSwitch") == "not-authorized" and result.get("automaticReplay") is False)
     return True
 
@@ -162,7 +236,7 @@ def require_completed_receipt(intent, value, run, workflow_id, result):
 def matching_run(rows, intent, workflow_id):
     """Find only the unique nonce-bound run; absence or ambiguity is not success."""
     require(isinstance(rows, list) and type(workflow_id) is int)
-    title = "Production backup " + intent["action"] + " at " + intent["controllerRevision"] + " #" + intent["nonce"]
+    title = child_title(intent)
     matches = [row for row in rows if isinstance(row, dict) and row.get("display_title") == title]
     require(len(matches) == 1, "The unique dispatched run is unavailable or ambiguous.")
     run = matches[0]
@@ -184,7 +258,7 @@ def dispatch_once(token, intent, inputs, store):
     write_dispatch_once(store, intent)
     artifact.require_current_main(intent["controllerRevision"])
     body = json.dumps({"ref": "main", "inputs": inputs}, separators=(",", ":")).encode("utf-8")
-    request = Request(artifact.API_ROOT + "/actions/workflows/worker-production-backup.yml/dispatches", data=body,
+    request = Request(artifact.API_ROOT + "/actions/workflows/" + profile_config(intent["profile"])["child"].rsplit("/", 1)[-1] + "/dispatches", data=body,
                       headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
                                "Content-Type": "application/json", "X-GitHub-Api-Version": "2022-11-28"}, method="POST")
     # No retries: an exception or non-204 response is an unknown dispatch and
@@ -193,14 +267,14 @@ def dispatch_once(token, intent, inputs, store):
         require(response.status == 204 and not response.read(1), "The dispatch outcome is not confirmed.")
 
 
-def selected_result(run_id, revision, action, token):
+def selected_result(run_id, revision, action, token, *, profile="production"):
     """Read one bounded GitHub artifact tied to the successful original run."""
     require(DECIMAL.fullmatch(run_id or "") and REVISION.fullmatch(revision or "") and action in STEPS)
     listing = artifact._get_json("/actions/runs/" + run_id + "/artifacts?per_page=100", token)
     entries = listing.get("artifacts")
     require(isinstance(entries, list) and type(listing.get("total_count")) is int
             and listing["total_count"] == len(entries) < 100)
-    name = "subs-bot-production-backup-" + action + "-" + run_id + "-1"
+    name = profile_config(profile)["artifact"] + action + "-" + run_id + "-1"
     selected = [item for item in entries if isinstance(item, dict) and item.get("name") == name]
     require(len(selected) == 1)
     item = selected[0]
@@ -260,7 +334,7 @@ def next_inputs(results, *, source_checkpoint_id, source_manifest_sha256):
     return inputs
 
 
-def stage_inputs(results, source_checkpoint_id, source_manifest_sha256, session, intent, pause_limit, pause_until):
+def stage_inputs(results, source_checkpoint_id, source_manifest_sha256, session, intent, pause_limit, pause_until, *, validation_json=None):
     """Reconstruct the exact input digest from verified predecessors."""
     require(intent["sequence"] == len(results) + 1 and intent["action"] == STEPS[len(results)])
     if intent["action"] == "pause":
@@ -268,13 +342,22 @@ def stage_inputs(results, source_checkpoint_id, source_manifest_sha256, session,
     inputs = next_inputs(results, source_checkpoint_id=source_checkpoint_id, source_manifest_sha256=source_manifest_sha256)
     inputs.update(dispatch_nonce=intent["nonce"], coordinator_session=session,
                   dispatch_deadline=str(pause_until or 0))
+    if intent["profile"] == "rehearsal":
+        require(isinstance(validation_json, str) and 0 < len(validation_json) <= 16384)
+        inputs["validation_json"] = validation_json
+    else:
+        require(validation_json is None)
     return inputs, pause_until
 
 
-def completed_results(store, target, session, revision, token, source_checkpoint_id, source_manifest_sha256, pause_limit, *, stop_before=None):
+def completed_results(store, target, session, revision, token, source_checkpoint_id, source_manifest_sha256, pause_limit, *,
+                      stop_before=None, profile="production", candidate_revision=None, validation_json=None):
     """Revalidate the complete ordered receipt chain against GitHub and original artifacts."""
-    workflow = artifact._get_json("/actions/workflows/worker-production-backup.yml", token)
-    require(workflow.get("path") == ".github/workflows/worker-production-backup.yml" and type(workflow.get("id")) is int)
+    child = profile_config(profile)["child"]
+    candidate_revision = revision if candidate_revision is None and profile == "production" else candidate_revision
+    require(REVISION.fullmatch(candidate_revision or ""))
+    workflow = artifact._get_json("/actions/workflows/" + child.rsplit("/", 1)[-1], token)
+    require(workflow.get("path") == child and type(workflow.get("id")) is int)
     values, pause_until = [], None
     for sequence in range(1, len(STEPS) + 1):
         if stop_before is not None and sequence == stop_before:
@@ -290,8 +373,9 @@ def completed_results(store, target, session, revision, token, source_checkpoint
         raw, _ = store.get(event_key(target, session, sequence))
         raw_receipt, _ = store.get(receipt_key(target, session, sequence))
         intent, proof = parsed(raw), parsed(raw_receipt)
-        require(intent["controllerRevision"] == revision)
-        inputs, pause_until = stage_inputs(values, source_checkpoint_id, source_manifest_sha256, session, intent, pause_limit, pause_until)
+        require(intent["controllerRevision"] == revision and intent["candidateRevision"] == candidate_revision and intent["profile"] == profile)
+        inputs, pause_until = stage_inputs(values, source_checkpoint_id, source_manifest_sha256, session, intent, pause_limit,
+                                           pause_until, validation_json=validation_json)
         require(sha256(canonical(inputs)).hexdigest() == intent["inputSha256"],
                 "The dispatched inputs do not match verified predecessor results.")
         run = artifact._get_json("/actions/runs/" + status["runId"] + "/attempts/1", token)
@@ -307,6 +391,19 @@ def completed_results(store, target, session, revision, token, source_checkpoint
     return values, pause_until
 
 
+def verified_plan_begin(store, target, session, revision, token, source_checkpoint_id, source_manifest_sha256,
+                        pause_limit, *, profile, candidate_revision, validation_json):
+    """Recheck the original plan receipt and GitHub run before a child begin."""
+    values, _ = completed_results(store, target, session, revision, token, source_checkpoint_id,
+                                  source_manifest_sha256, pause_limit, stop_before=2, profile=profile,
+                                  candidate_revision=candidate_revision, validation_json=validation_json)
+    require(len(values) == 1 and values[0].get("action") == "plan-begin" and values[0].get("status") == "plan-only")
+    raw, _ = store.get(receipt_key(target, session, 1))
+    proof = parsed(raw)
+    require(canonical(proof) == raw and values[0].get("session") == proof["runId"] + "-1")
+    return {"result": values[0], "runId": proof["runId"]}
+
+
 def confirm_stage(store, intent, run, workflow_id, result, source, original):
     """Record a verified completion exactly once; a prior receipt is never replaced."""
     key = receipt_key(intent["targetSha256"], intent["session"], intent["sequence"])
@@ -317,6 +414,7 @@ def confirm_stage(store, intent, run, workflow_id, result, source, original):
             and archive_result(original) == result)
     proof = receipt(intent, str(run.get("id")), result, source["artifactId"], source["artifactSha256"])
     require_completed_receipt(intent, proof, run, workflow_id, result)
+    verify_child_claim(store, intent, str(run.get("id")))
     original_key = result_archive_key(intent["targetSha256"], intent["session"], intent["sequence"])
     saved, _ = store.get(original_key, absent=True)
     if saved is None:
@@ -345,22 +443,32 @@ def verify_context(env):
     return revision
 
 
-def finished_controller(objects, target, session, revision, source_checkpoint, source_sha, policy_sha):
+def finished_controller(objects, target, session, revision, source_checkpoint, source_sha, policy_sha, *,
+                        profile="production", candidate_revision=None, validation_sha=None, current_writer=None, current_mode=None):
+    parent_path = profile_config(profile)["parent"]
+    candidate_revision = revision if candidate_revision is None and profile == "production" else candidate_revision
+    require(REVISION.fullmatch(candidate_revision or "") and (profile != "production" or candidate_revision == revision)
+            and (validation_sha is None if profile == "production" else HEX.fullmatch(validation_sha or ""))
+            and ((current_writer is None and current_mode is None) or
+                 (profile == "rehearsal" and isinstance(current_writer, dict) and current_mode in {"execute", "readback"})))
     raw, _ = objects.get(BASE + target + "/" + session + "/start-intent.json")
     start = parsed(raw)
     require(canonical(start) == raw and set(start) == {"version", "action", "targetSha256", "controlRevision", "session",
-            "sourceCheckpointId", "sourceManifestSha256", "anchorSha256", "policySha256", "writerRunId", "writerAttempt"}
-            and start.get("version") == 1 and start.get("action") == "run"
+            "sourceCheckpointId", "sourceManifestSha256", "anchorSha256", "policySha256", "writerRunId", "writerAttempt",
+            "profile", "candidateRevision", "validationSha256"}
+            and type(start.get("version")) is int and start.get("version") == 1 and start.get("action") == "run"
             and HEX.fullmatch(start.get("anchorSha256", "")) and start.get("targetSha256") == target and start.get("session") == session
             and start.get("sourceCheckpointId") == source_checkpoint and start.get("sourceManifestSha256") == source_sha
             and start.get("controlRevision") == revision and start.get("policySha256") == policy_sha
+            and start.get("profile") == profile and start.get("candidateRevision") == candidate_revision
+            and start.get("validationSha256") == validation_sha
             and DECIMAL.fullmatch(start.get("writerRunId", ""))
             and start.get("writerAttempt") == "1")
     run = artifact._get_json("/actions/runs/" + start["writerRunId"] + "/attempts/1", artifact._github_token())
-    path = ".github/workflows/worker-production-backup-coordinator.yml"
+    path = parent_path
     require(str(run.get("id")) == start["writerRunId"] and run.get("head_sha") == revision
             and run.get("path") in {path, path + "@main", path + "@refs/heads/main"}
-            and run.get("display_title") == "Production backup coordinator run at " + revision
+            and run.get("display_title") == parent_title(profile, "run", revision, candidate_revision)
             and run.get("event") == "workflow_dispatch" and run.get("head_branch") == "main"
             and run.get("status") == "completed" and run.get("run_attempt") == 1
             and all(isinstance(run.get(key), dict) and run[key].get("id") == artifact.REPOSITORY_ID
@@ -371,41 +479,104 @@ def finished_controller(objects, target, session, revision, source_checkpoint, s
     prefix = BASE + target + "/" + session + "/writers/"
     keys = objects.list(prefix, maximum=128)
     require(len(keys) < 128)
-    previous, writers = sha256(raw).hexdigest(), []
+    previous, writers, current_seen = sha256(raw).hexdigest(), [], False
     for position, key in enumerate(keys, 1):
         require(key == prefix + str(position).zfill(4) + ".json")
         body, _ = objects.get(key)
         value = parsed(body)
-        require(canonical(value) == body and set(value) == {"version", "targetSha256", "session", "controlRevision",
-                "position", "previousSha256", "writerRunId", "writerAttempt", "action"}
-                and value["version"] == 1 and value["targetSha256"] == target and value["session"] == session
+        fields = {"version", "targetSha256", "session", "controlRevision", "position", "previousSha256",
+                  "writerRunId", "writerAttempt", "action", "profile", "candidateRevision"}
+        if value.get("action") == "recovery":
+            fields |= {"recoveryAction", "recoveryPlanSha256"}
+        require(canonical(value) == body and set(value) == fields
+                and type(value["version"]) is int and value["version"] == 1 and value["targetSha256"] == target and value["session"] == session
                 and value["controlRevision"] == revision and value["position"] == position
-                and value["action"] in {"resume", "abort", "reconcile"}
+                and value["profile"] == profile and value["candidateRevision"] == candidate_revision
+                and value["action"] in {"resume", "abort", "reconcile", "recovery"}
+                and (value["action"] != "recovery" or profile == "rehearsal"
+                     and value.get("recoveryAction") in {"resume-failed", "reconcile-transition", "abort-unstarted"}
+                     and HEX.fullmatch(value.get("recoveryPlanSha256", "")))
                 and value["previousSha256"] == previous and DECIMAL.fullmatch(value["writerRunId"] or "")
                 and value["writerAttempt"] == "1")
+        is_current = current_writer is not None and value == current_writer
+        if is_current:
+            require(not current_seen and position == len(keys) and value["action"] == "recovery"
+                    and value["writerRunId"] == os.environ.get("GITHUB_RUN_ID") and os.environ.get("GITHUB_RUN_ATTEMPT") == "1"
+                    and os.environ.get("GITHUB_SHA") == revision and os.environ.get("BACKUP_ACTION") == value["recoveryAction"]
+                    and os.environ.get("BACKUP_RECOVERY_PLAN_SHA256") == value["recoveryPlanSha256"]
+                    and os.environ.get("BACKUP_GATE_ROLE") == ("recovery" if current_mode == "execute" else "recovery-readback")
+                    and (current_mode == "execute" or os.environ.get("BACKUP_RECOVERY_MODE") == "readback")
+                    and os.environ.get("GITHUB_WORKFLOW_REF") == artifact.REPOSITORY + "/.github/workflows/worker-backup-phase-recovery.yml@" + artifact.MAIN_REF)
+            current_seen = True
         observed = artifact._get_json("/actions/runs/" + value["writerRunId"] + "/attempts/1", artifact._github_token())
+        recovery_path = ".github/workflows/worker-backup-phase-recovery.yml"
+        writer_path = recovery_path if value["action"] == "recovery" else path
+        title = ("Rehearsal backup recovery " + value["recoveryAction"] + " at " + revision + " candidate " + candidate_revision
+                 + " session " + session) if value["action"] == "recovery" else parent_title(profile, value["action"], revision, candidate_revision)
         require(str(observed.get("id")) == value["writerRunId"] and observed.get("head_sha") == revision
-                and observed.get("path") in {path, path + "@main", path + "@refs/heads/main"}
-                and observed.get("display_title") == "Production backup coordinator " + value["action"] + " at " + revision
+                and observed.get("path") in {writer_path, writer_path + "@main", writer_path + "@refs/heads/main"}
+                and observed.get("display_title") == title
                 and observed.get("event") == "workflow_dispatch" and observed.get("head_branch") == "main"
-                and observed.get("status") == "completed" and observed.get("run_attempt") == 1
+                and observed.get("status") == ("in_progress" if is_current else "completed") and observed.get("run_attempt") == 1
                 and all(isinstance(observed.get(k), dict) and observed[k].get("id") == artifact.REPOSITORY_ID
                         for k in ("repository", "head_repository")), "A prior coordinator writer has not finished.")
+        if value["action"] == "recovery":
+            jobs = artifact._get_json("/actions/runs/" + value["writerRunId"] + "/attempts/1/jobs?per_page=100", artifact._github_token())
+            require(isinstance(jobs.get("jobs"), list) and type(jobs.get("total_count")) is int
+                    and jobs["total_count"] == len(jobs["jobs"]) < 100)
+            matching = [job for job in jobs["jobs"] if isinstance(job, dict) and job.get("name") == "recovery"]
+            require(len(matching) == 1 and str(matching[0].get("run_id")) == value["writerRunId"]
+                    and matching[0].get("run_attempt") == 1 and matching[0].get("head_sha") == revision
+                    and matching[0].get("status") == ("in_progress" if is_current and current_mode == "execute" else "completed")
+                    and (not is_current or current_mode != "readback" or matching[0].get("conclusion") == "success")
+                    and isinstance(matching[0].get("steps"), list))
+            for name in ("Verify recovery identity before candidate checkout", "Verify exact reviewed recovery checkout",
+                         "Verify isolated recovery test Bot identity", "Plan or execute one reviewed recovery phase"):
+                steps = [step for step in matching[0]["steps"] if isinstance(step, dict) and step.get("name") == name]
+                executing = is_current and current_mode == "execute" and name == "Plan or execute one reviewed recovery phase"
+                require(len(steps) == 1)
+                if is_current:
+                    require((steps[0].get("status"), steps[0].get("conclusion")) ==
+                            (("in_progress", None) if executing else ("completed", "success")))
+                else:
+                    require(steps[0].get("status") == "completed" and
+                            (steps[0].get("conclusion") in {"success", "failure", "cancelled", "timed_out"}
+                             if name == "Plan or execute one reviewed recovery phase" else steps[0].get("conclusion") == "success"))
+            if is_current and current_mode == "readback":
+                readers = [job for job in jobs["jobs"] if isinstance(job, dict) and job.get("name") == "readback"]
+                require(len(readers) == 1 and str(readers[0].get("run_id")) == value["writerRunId"]
+                        and readers[0].get("run_attempt") == 1 and readers[0].get("head_sha") == revision
+                        and readers[0].get("status") == "in_progress" and isinstance(readers[0].get("steps"), list))
+                for name in ("Verify recovery readback identity before candidate checkout", "Verify exact reviewed recovery readback checkout",
+                             "Verify recovery readback test Bot identity", "Independently read back the recovery evidence"):
+                    steps = [step for step in readers[0]["steps"] if isinstance(step, dict) and step.get("name") == name]
+                    require(len(steps) == 1 and (steps[0].get("status"), steps[0].get("conclusion")) ==
+                            (("in_progress", None) if name == "Independently read back the recovery evidence" else ("completed", "success")))
         latest = artifact._get_json("/actions/runs/" + value["writerRunId"], artifact._github_token())
         require(str(latest.get("id")) == value["writerRunId"] and latest.get("run_attempt") == 1
-                and latest.get("status") == "completed", "A later coordinator run attempt requires independent reconciliation.")
+                and latest.get("status") == ("in_progress" if is_current else "completed"), "A later coordinator run attempt requires independent reconciliation.")
         previous = sha256(body).hexdigest()
         writers.append(value)
+    require(current_writer is None or current_seen, "The exact current recovery writer is missing from the complete chain.")
     return {"startSha256": sha256(raw).hexdigest(), "lastSha256": previous, "writers": writers}
 
 
-def claim_resume_writer(objects, target, session, revision, history, run_id, *, action="resume"):
+def claim_resume_writer(objects, target, session, revision, history, run_id, *, action="resume",
+                        profile="production", candidate_revision=None, recovery_action=None, recovery_plan_sha=None):
     """A single immutable slot serializes concurrent continuation attempts."""
-    require(action in {"resume", "abort", "reconcile"} and DECIMAL.fullmatch(run_id or "") and isinstance(history, dict) and isinstance(history.get("writers"), list)
+    profile_config(profile)
+    candidate_revision = revision if candidate_revision is None and profile == "production" else candidate_revision
+    require(REVISION.fullmatch(candidate_revision or "") and (profile != "production" or candidate_revision == revision)
+            and action in {"resume", "abort", "reconcile", "recovery"} and DECIMAL.fullmatch(run_id or "") and isinstance(history, dict) and isinstance(history.get("writers"), list)
+            and (action == "recovery" and profile == "rehearsal" and recovery_action in {"resume-failed", "reconcile-transition", "abort-unstarted"}
+                 and HEX.fullmatch(recovery_plan_sha or "") or action != "recovery" and recovery_action is None and recovery_plan_sha is None)
             and len(history["writers"]) < 127 and HEX.fullmatch(history.get("lastSha256", "")))
     position = len(history["writers"]) + 1
     value = {"version": 1, "targetSha256": target, "session": session, "controlRevision": revision,
-             "position": position, "previousSha256": history["lastSha256"], "writerRunId": run_id, "writerAttempt": "1", "action": action}
+             "position": position, "previousSha256": history["lastSha256"], "writerRunId": run_id, "writerAttempt": "1",
+             "action": action, "profile": profile, "candidateRevision": candidate_revision}
+    if action == "recovery":
+        value.update(recoveryAction=recovery_action, recoveryPlanSha256=recovery_plan_sha)
     key = BASE + target + "/" + session + "/writers/" + str(position).zfill(4) + ".json"
     existing, _ = objects.get(key, absent=True)
     require(existing is None, "A continuation writer already owns this slot.")
@@ -416,12 +587,16 @@ def claim_resume_writer(objects, target, session, revision, history, run_id, *, 
     return value
 
 
-def abort_observation(objects, app_store, target, session, revision, source_checkpoint, source_sha, pause_limit, genesis):
+def abort_observation(objects, app_store, target, session, revision, source_checkpoint, source_sha, pause_limit, genesis, *,
+                      profile="production", candidate_revision=None, validation_json=None):
     """Only abandon coordination after all child runs and application state are known."""
     import production_backup_transaction as maintenance
+    child = profile_config(profile)["child"]
+    candidate_revision = revision if candidate_revision is None and profile == "production" else candidate_revision
+    require(REVISION.fullmatch(candidate_revision or "") and (profile != "production" or candidate_revision == revision))
     token = artifact._github_token()
-    workflow = artifact._get_json("/actions/workflows/worker-production-backup.yml", token)
-    require(workflow.get("path") == ".github/workflows/worker-production-backup.yml" and type(workflow.get("id")) is int)
+    workflow = artifact._get_json("/actions/workflows/" + child.rsplit("/", 1)[-1], token)
+    require(workflow.get("path") == child and type(workflow.get("id")) is int)
     verified, children, pause_until, stopped = [], [], None, False
     for sequence in range(1, len(STEPS) + 1):
         status = inspect_stage(objects, target.digest, session, sequence)
@@ -432,8 +607,9 @@ def abort_observation(objects, app_store, target, session, revision, source_chec
         require(not stopped, "A later child exists after an unresolved result.")
         raw, _ = objects.get(event_key(target.digest, session, sequence))
         intent = parsed(raw)
-        require(intent["controllerRevision"] == revision)
-        inputs, pause_until = stage_inputs(verified, source_checkpoint, source_sha, session, intent, pause_limit, pause_until)
+        require(intent["controllerRevision"] == revision and intent["candidateRevision"] == candidate_revision and intent["profile"] == profile)
+        inputs, pause_until = stage_inputs(verified, source_checkpoint, source_sha, session, intent, pause_limit,
+                                           pause_until, validation_json=validation_json)
         require(sha256(canonical(inputs)).hexdigest() == intent["inputSha256"])
         run = discover_run(intent, workflow["id"], token)
         require(run.get("status") == "completed" and isinstance(run.get("conclusion"), str),
@@ -458,8 +634,8 @@ def abort_observation(objects, app_store, target, session, revision, source_chec
         require(verified and verified[0].get("action") == "plan-begin")
         first = verified[0]
         require(pin["session"] == first["session"] and pin["day"] == first["day"]
-                and pin["controlRevision"] == revision)
-        events = maintenance.Transaction(app_store, pin["session"], pin["day"], target.digest, revision).load()
+                and pin["controlRevision"] == candidate_revision)
+        events = maintenance.Transaction(app_store, pin["session"], pin["day"], target.digest, candidate_revision).load()
         require(events and (events[-1]["stage"] in {"resumed", "preserved-frozen"}
                 or (events[-1]["stage"] == "failed" and len(events) >= 2
                     and events[-2]["stage"] in {"started", "preflight"}
@@ -482,7 +658,8 @@ def discover_run(intent, workflow_id, token):
     rows, total = [], None
     for page in range(1, 7):
         query = urlencode({"branch": "main", "created": start + ".." + end, "per_page": 100, "page": page})
-        response = artifact._get_json("/actions/workflows/worker-production-backup.yml/runs?" + query, token)
+        child = profile_config(intent["profile"])["child"].rsplit("/", 1)[-1]
+        response = artifact._get_json("/actions/workflows/" + child + "/runs?" + query, token)
         batch, count = response.get("workflow_runs"), response.get("total_count")
         require(isinstance(batch, list) and len(batch) <= 100 and type(count) is int and 0 <= count <= 500
                 and (total is None or total == count))
@@ -503,11 +680,16 @@ def discover_run(intent, workflow_id, token):
     require(False, "The complete checkpoint workflow history could not be enumerated.")
 
 
-def wait_for_run(intent, token, *, deadline):
+def wait_for_run(intent, token, *, deadline, pause_alarm_at=None):
     import time
-    workflow = artifact._get_json("/actions/workflows/worker-production-backup.yml", token)
-    require(workflow.get("path") == ".github/workflows/worker-production-backup.yml" and type(workflow.get("id")) is int)
+    child = profile_config(intent["profile"])["child"]
+    workflow = artifact._get_json("/actions/workflows/" + child.rsplit("/", 1)[-1], token)
+    require(workflow.get("path") == child and type(workflow.get("id")) is int)
+    pause_reported = False
     while time.monotonic() < deadline:
+        if pause_alarm_at is not None and not pause_reported and int(time.time()) >= pause_alarm_at:
+            print("::warning::The configured alert interval elapsed since pause dispatch; independently observe actual admission and continue only verified recovery steps.", flush=True)
+            pause_reported = True
         try:
             run = discover_run(intent, workflow["id"], token)
         except Exception:
@@ -526,39 +708,57 @@ def wait_for_run(intent, token, *, deadline):
 def pause_deadline(intent, pause_limit, *, now):
     """Use the pre-dispatch intent time, a conservative bound before pause starts."""
     require(isinstance(intent, dict) and intent.get("action") == "pause" and type(intent.get("createdAt")) is int
-            and type(pause_limit) is int and 60 <= pause_limit <= 900 and type(now) is int
+            and type(pause_limit) is int and 60 <= pause_limit <= 21600 and type(now) is int
             and 0 < intent["createdAt"] <= now + 60)
     return intent["createdAt"] + pause_limit
 
 
-def run_sequence(store, anchor, target, session, revision, source_checkpoint_id, source_manifest_sha256, token, *, deadline, pause_limit, writer_run_id):
+def checkpoint_wait_deadline(action, deadline, pause_until, *, now, monotonic_now):
+    """Stop waiting for drain as well as pause-side mutations at the limit."""
+    if pause_until is not None and action in {"pause", "drain", "freeze", "capture"}:
+        remaining = pause_until - now
+        if remaining <= 0:
+            print("::error::The approved pause limit elapsed; inspect the private journal and use the explicitly approved recovery plan.", flush=True)
+            require(False, "The pause deadline elapsed; do not dispatch another checkpoint.")
+        return min(deadline, monotonic_now + remaining)
+    return deadline
+
+
+def run_sequence(store, anchor, target, session, revision, source_checkpoint_id, source_manifest_sha256, token, *,
+                 deadline, pause_limit, writer_run_id, pause_alarm_seconds=300, profile="production", candidate_revision=None, validation_json=None):
     """Drive the fixed checkpoint sequence; unknown external writes are never replayed."""
     from secrets import token_hex
     import time
+    profile_config(profile)
+    candidate_revision = revision if candidate_revision is None and profile == "production" else candidate_revision
+    require(REVISION.fullmatch(candidate_revision or "") and (profile != "production" or candidate_revision == revision)
+            and type(pause_alarm_seconds) is int and 1 <= pause_alarm_seconds <= pause_limit)
     pinned, _raw, _etag = anchor.read()
-    require(pinned["state"] == "active" and pinned["session"] == session + "-1" and pinned["controlRevision"] == revision)
+    require(pinned["state"] == "active" and pinned["session"] == session + "-1" and pinned["controlRevision"] == candidate_revision)
     results, pause_until = completed_results(store, target, session, revision, token, source_checkpoint_id,
-                                             source_manifest_sha256, pause_limit)
+                                             source_manifest_sha256, pause_limit, profile=profile,
+                                             candidate_revision=candidate_revision, validation_json=validation_json)
+    pause_alarm_at = None
+    if len(results) >= STEPS.index("pause") + 1:
+        raw_pause, _ = store.get(event_key(target, session, STEPS.index("pause") + 1))
+        pause_alarm_at = parsed(raw_pause)["createdAt"] + pause_alarm_seconds
     while len(results) < len(STEPS):
         artifact.require_current_main(revision)
         nonce = token_hex(32)
         now = int(time.time())
         provisional = dispatch_intent(target=target, session=session, sequence=len(results) + 1, revision=revision,
-                                      nonce=nonce, input_sha256="0" * 64, created_at=now, writer_run_id=writer_run_id)
+                                      nonce=nonce, input_sha256="0" * 64, created_at=now, writer_run_id=writer_run_id,
+                                      profile=profile, candidate_revision=candidate_revision)
         inputs, pause_until = stage_inputs(results, source_checkpoint_id, source_manifest_sha256, session,
-                                           provisional, pause_limit, pause_until)
+                                           provisional, pause_limit, pause_until, validation_json=validation_json)
         intent = {**provisional, "inputSha256": sha256(canonical(inputs)).hexdigest()}
-        stage_deadline = deadline
-        if pause_until is not None and intent["action"] in {"pause", "freeze", "capture"}:
-            remaining = pause_until - now
-            if remaining <= 0:
-                print("::error::The approved pause limit elapsed; inspect the private journal and use the explicitly approved recovery plan.", flush=True)
-                require(False, "The pause deadline elapsed; do not dispatch another checkpoint.")
-            stage_deadline = min(deadline, time.monotonic() + remaining)
+        if intent["action"] == "pause":
+            pause_alarm_at = intent["createdAt"] + pause_alarm_seconds
+        stage_deadline = checkpoint_wait_deadline(intent["action"], deadline, pause_until, now=now, monotonic_now=time.monotonic())
         dispatch_once(token, intent, inputs, store)
         print("::notice::A protected backup checkpoint was dispatched; exact action approval remains required.", flush=True)
-        run, workflow_id = wait_for_run(intent, token, deadline=stage_deadline)
-        result, source, original = selected_result(str(run["id"]), revision, intent["action"], token)
+        run, workflow_id = wait_for_run(intent, token, deadline=stage_deadline, pause_alarm_at=pause_alarm_at)
+        result, source, original = selected_result(str(run["id"]), revision, intent["action"], token, profile=profile)
         confirm_stage(store, intent, run, workflow_id, result, source, original)
         results.append(result)
     require(results[-1].get("status") == "resumed" and results[-1].get("action") == "activate")
@@ -616,7 +816,8 @@ def main(env=None):
     normalized = {"plan-run": "run", "plan-resume": "resume", "plan-reconcile": "reconcile", "plan-abort": "abort"}.get(action, action)
     plan = {"version": 1, "action": normalized, "targetSha256": target.digest, "controlRevision": revision,
             "session": session, "sourceCheckpointId": source_checkpoint, "sourceManifestSha256": source_sha,
-            "anchorSha256": sha256(raw).hexdigest(), "policySha256": digest(policy)}
+            "anchorSha256": sha256(raw).hexdigest(), "policySha256": digest(policy),
+            "profile": "production", "candidateRevision": revision, "validationSha256": None}
     if action == "plan-run":
         require(pinned["state"] == "idle" and pinned["session"] != session + "-1")
         return {"status": "planned", "planSha256": digest(plan), "session": session, "mutationPerformed": False}
@@ -625,7 +826,7 @@ def main(env=None):
         history = finished_controller(objects, target.digest, session, revision, source_checkpoint, source_sha, digest(policy))
         plan["writerHistorySha256"] = digest(history)
         verified, _ = completed_results(objects, target.digest, session, revision, artifact._github_token(),
-                                        source_checkpoint, source_sha, policy["pauseLimitSeconds"])
+                                        source_checkpoint, source_sha, backup_cli.maximum_pause(policy))
         plan.update(completedResultsSha256=digest(verified), nextAction=STEPS[len(verified)] if len(verified) < len(STEPS) else "complete")
         return {"status": "planned", "planSha256": digest(plan), "session": session,
                 "verifiedCheckpoints": len(verified), "mutationPerformed": False}
@@ -635,7 +836,7 @@ def main(env=None):
         app_store = PrivateStore(metadata, target.data["backupBucketName"])
         app_genesis = env.get("SUBS_BOT_BACKUP_GENESIS_SHA256", "")
         observed = abort_observation(objects, app_store, target, session, revision, source_checkpoint, source_sha,
-                                     policy["pauseLimitSeconds"], app_genesis)
+                                     backup_cli.maximum_pause(policy), app_genesis)
         plan.update(writerHistorySha256=digest(history), abortObservationSha256=digest(observed))
         if action == "plan-abort":
             return {"status": "planned", "planSha256": digest(plan), "terminal": observed["terminal"], "mutationPerformed": False}
@@ -643,10 +844,10 @@ def main(env=None):
         artifact.require_current_main(revision)
         require(finished_controller(objects, target.digest, session, revision, source_checkpoint, source_sha, digest(policy)) == history
                 and abort_observation(objects, app_store, target, session, revision, source_checkpoint, source_sha,
-                                      policy["pauseLimitSeconds"], app_genesis) == observed)
+                                      backup_cli.maximum_pause(policy), app_genesis) == observed)
         claim_resume_writer(objects, target.digest, session, revision, history, env["GITHUB_RUN_ID"], action="abort")
         require(abort_observation(objects, app_store, target, session, revision, source_checkpoint, source_sha,
-                                  policy["pauseLimitSeconds"], app_genesis) == observed)
+                                  backup_cli.maximum_pause(policy), app_genesis) == observed)
         anchor.release(session + "-1")
         return {"status": "abandoned-after-confirmed-terminal", "terminal": observed["terminal"],
                 "productionMutation": False, "dispatchRetried": False}
@@ -657,12 +858,12 @@ def main(env=None):
         stage = inspect_stage(objects, target.digest, session, sequence)
         require(stage["status"] == "unknown", "Only an unresolved original dispatch can be reconciled.")
         prior, prior_pause = completed_results(objects, target.digest, session, revision, artifact._github_token(),
-                                              source_checkpoint, source_sha, policy["pauseLimitSeconds"], stop_before=sequence)
+                                              source_checkpoint, source_sha, backup_cli.maximum_pause(policy), stop_before=sequence)
         require(len(prior) == sequence - 1, "An earlier coordinator stage has not been independently verified.")
         intent_raw, _ = objects.get(event_key(target.digest, session, sequence))
         intent = parsed(intent_raw)
         expected_inputs, _ = stage_inputs(prior, source_checkpoint, source_sha, session, intent,
-                                          policy["pauseLimitSeconds"], prior_pause)
+                                          backup_cli.maximum_pause(policy), prior_pause)
         require(sha256(canonical(expected_inputs)).hexdigest() == intent["inputSha256"])
         token = artifact._github_token()
         workflow = artifact._get_json("/actions/workflows/worker-production-backup.yml", token)
@@ -691,7 +892,7 @@ def main(env=None):
         history = finished_controller(objects, target.digest, session, revision, source_checkpoint, source_sha, digest(policy))
         plan["writerHistorySha256"] = digest(history)
         verified, _ = completed_results(objects, target.digest, session, revision, artifact._github_token(),
-                                        source_checkpoint, source_sha, policy["pauseLimitSeconds"])
+                                        source_checkpoint, source_sha, backup_cli.maximum_pause(policy))
         plan.update(completedResultsSha256=digest(verified), nextAction=STEPS[len(verified)] if len(verified) < len(STEPS) else "complete")
     require(env.get("BACKUP_COORDINATOR_APPROVAL_SHA256") == digest(plan),
             "The exact independently approved coordinator plan is required.")
@@ -719,11 +920,12 @@ def main(env=None):
         artifact.require_current_main(revision)
         claim_resume_writer(objects, target.digest, session, revision, history, env["GITHUB_RUN_ID"])
         again, _ = completed_results(objects, target.digest, session, revision, artifact._github_token(),
-                                     source_checkpoint, source_sha, policy["pauseLimitSeconds"])
+                                     source_checkpoint, source_sha, backup_cli.maximum_pause(policy))
         require(again == verified, "The approved continuation results changed.")
     result = run_sequence(objects, anchor, target.digest, session, revision, source_checkpoint, source_sha,
                           artifact._github_token(), deadline=time.monotonic() + 5 * 3600,
-                          pause_limit=policy["pauseLimitSeconds"], writer_run_id=env["GITHUB_RUN_ID"])
+                          pause_limit=backup_cli.maximum_pause(policy), pause_alarm_seconds=policy["pauseLimitSeconds"],
+                          writer_run_id=env["GITHUB_RUN_ID"])
     return result
 
 

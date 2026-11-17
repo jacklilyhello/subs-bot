@@ -45,7 +45,7 @@ class CoordinatorTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             coordinator.write_dispatch_once(store, value)
         store.put_once.assert_called_once()
-        store.get.side_effect = [(canonical(value), '"etag"'), (None, None), (None, None)]
+        store.get.side_effect = [(canonical(value), '"etag"'), (None, None), (None, None), (None, None)]
         result = coordinator.inspect_stage(store, "a" * 64, "123", 1)
         self.assertEqual(result["status"], "unknown")
         self.assertFalse(result["dispatchPermitted"])
@@ -56,7 +56,8 @@ class CoordinatorTests(unittest.TestCase):
         original = self.archive(result_value)
         done = coordinator.receipt(value, "456", result_value, "789", sha256(original).hexdigest())
         store = Mock()
-        store.get.side_effect = [(canonical(value), '"etag"'), (canonical(done), '"etag"'), (original, '"etag"')]
+        claim = canonical(coordinator.child_claim(value, "456", "1"))
+        store.get.side_effect = [(canonical(value), '"etag"'), (canonical(done), '"etag"'), (original, '"etag"'), (claim, '"etag"')]
         result = coordinator.inspect_stage(store, "a" * 64, "123", 1)
         self.assertEqual(result["status"], "receipt-needs-independent-run-verification")
         self.assertFalse(result["dispatchPermitted"])
@@ -70,7 +71,39 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(saved["result"], result)
         changed = {**saved, "result": {"action": "plan-begin", "stateSha256": "f" * 64}}
         store = Mock()
-        store.get.side_effect = [(canonical(value), '"etag"'), (canonical(changed), '"etag"'), (original, '"etag"')]
+        store.get.side_effect = [(canonical(value), '"etag"'), (canonical(changed), '"etag"'), (original, '"etag"'), (None, None)]
+        with self.assertRaises(ContractError):
+            coordinator.inspect_stage(store, "a" * 64, "123", 1)
+
+    def test_child_claim_is_single_use_and_bound_to_the_exact_run(self):
+        value = self.intent()
+        store = Mock()
+        raw = canonical(coordinator.child_claim(value, "456", "1"))
+        store.get.side_effect = [(None, None), (raw, '"etag"')]
+        coordinator.claim_child_once(store, value, "456", "1")
+        store.put_once.assert_called_once_with(coordinator.child_claim_key("a" * 64, "123", 1), raw)
+        store.get.side_effect = None
+        store.get.return_value = (raw, '"etag"')
+        coordinator.verify_child_claim(store, value, "456")
+        with self.assertRaises(ContractError):
+            coordinator.verify_child_claim(store, value, "457")
+        store.put_once.reset_mock()
+        with self.assertRaises(ContractError):
+            coordinator.claim_child_once(store, value, "457", "1")
+        store.put_once.assert_not_called()
+
+    def test_child_claim_unknown_write_never_retries_or_accepts_receipt(self):
+        value = self.intent()
+        store = Mock()
+        store.get.return_value = (None, None)
+        store.put_once.side_effect = RuntimeError("uncertain conditional write")
+        with self.assertRaises(RuntimeError):
+            coordinator.claim_child_once(store, value, "456", "1")
+        store.put_once.assert_called_once()
+        result = {"action": "plan-begin"}
+        original = self.archive(result)
+        done = coordinator.receipt(value, "456", result, "789", sha256(original).hexdigest())
+        store.get.side_effect = [(canonical(value), '"etag"'), (canonical(done), '"etag"'), (original, '"etag"'), (None, None)]
         with self.assertRaises(ContractError):
             coordinator.inspect_stage(store, "a" * 64, "123", 1)
 
@@ -80,6 +113,19 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(coordinator.pause_deadline(value, 900, now=1005), 1900)
         with self.assertRaises(ContractError):
             coordinator.pause_deadline(value, 900, now=900)
+
+    def test_drain_cannot_hold_the_parent_past_pause_deadline(self):
+        self.assertEqual(coordinator.checkpoint_wait_deadline("drain", 5000, 1100, now=1050, monotonic_now=2000), 2050)
+        with self.assertRaises(ContractError):
+            coordinator.checkpoint_wait_deadline("drain", 5000, 1100, now=1100, monotonic_now=2000)
+        self.assertEqual(coordinator.checkpoint_wait_deadline("activate", 5000, 1100, now=1101, monotonic_now=2000), 5000)
+
+    def test_alarm_threshold_does_not_become_the_maximum_pause(self):
+        intent = coordinator.dispatch_intent(target="a" * 64, session="123", sequence=5,
+            revision="b" * 40, nonce="c" * 64, input_sha256="d" * 64, created_at=1000, writer_run_id="789")
+        maximum = coordinator.pause_deadline(intent, 1800, now=1301)
+        self.assertEqual(maximum, 2800)
+        self.assertEqual(coordinator.checkpoint_wait_deadline("drain", 5000, maximum, now=1301, monotonic_now=2000), 3499)
 
     def test_stage_inputs_bind_prior_predecessor_and_source(self):
         from hashlib import sha256
@@ -95,6 +141,22 @@ class CoordinatorTests(unittest.TestCase):
         self.assertNotEqual(sha256(canonical(value)).hexdigest(), sha256(canonical(changed)).hexdigest())
         changed_source, _ = coordinator.stage_inputs(prior, "1" * 32, "3" * 64, "123", intent, 900, None)
         self.assertNotEqual(sha256(canonical(value)).hexdigest(), sha256(canonical(changed_source)).hexdigest())
+
+    def test_rehearsal_binds_real_dispatcher_and_separate_candidate(self):
+        value = coordinator.dispatch_intent(target="a" * 64, session="123", sequence=1,
+            revision="b" * 40, candidate_revision="c" * 40, profile="rehearsal", nonce="d" * 64,
+            input_sha256="e" * 64, created_at=1000, writer_run_id="789")
+        self.assertEqual(value["controllerRevision"], "b" * 40)
+        self.assertEqual(value["candidateRevision"], "c" * 40)
+        self.assertEqual(coordinator.child_title(value), "Rehearsal backup plan-begin at " + "b" * 40
+                         + " candidate " + "c" * 40 + " #" + "d" * 64)
+        inputs, _ = coordinator.stage_inputs([], "1" * 32, "2" * 64, "123", value, 900, None,
+                                              validation_json='{"version":1}')
+        self.assertEqual(inputs["validation_json"], '{"version":1}')
+        with self.assertRaises(ContractError):
+            coordinator.dispatch_intent(target="a" * 64, session="123", sequence=1, revision="b" * 40,
+                candidate_revision="c" * 40, profile="production", nonce="d" * 64,
+                input_sha256="e" * 64, created_at=1000, writer_run_id="789")
 
     def test_resume_writer_claim_does_not_retry_an_existing_or_ambiguous_slot(self):
         history = {"writers": [], "lastSha256": "e" * 64}
@@ -113,6 +175,89 @@ class CoordinatorTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             coordinator.claim_resume_writer(store, "a" * 64, "123", "b" * 40, history, "457", action="reconcile")
         store.put_once.assert_not_called()
+
+    def test_recovery_writer_uses_the_same_exclusive_slot_and_is_rehearsal_only(self):
+        history = {"writers": [], "lastSha256": "c" * 64}
+        store = Mock()
+        objects = {}
+        store.get.side_effect = lambda key, **_: (objects.get(key), '"etag"')
+        store.put_once.side_effect = lambda key, body: objects.update({key: body})
+        args = (store, "a" * 64, "123", "b" * 40, history, "456")
+        with self.assertRaises(ContractError):
+            coordinator.claim_resume_writer(*args, action="recovery", recovery_action="resume-failed", recovery_plan_sha="d" * 64)
+        coordinator.claim_resume_writer(*args, action="recovery", profile="rehearsal", candidate_revision="e" * 40,
+                                        recovery_action="resume-failed", recovery_plan_sha="d" * 64)
+        with self.assertRaises(ContractError):
+            coordinator.claim_resume_writer(*args, action="resume", profile="rehearsal", candidate_revision="e" * 40)
+        self.assertEqual(store.put_once.call_count, 1)
+
+    def test_only_exact_in_progress_recovery_writer_can_extend_a_stopped_chain(self):
+        target, revision, candidate, session = "a" * 64, "b" * 40, "c" * 40, "123"
+        source, manifest, policy, validation, plan = "d" * 32, "e" * 64, "f" * 64, "1" * 64, "2" * 64
+        start = {"version": 1, "action": "run", "targetSha256": target, "controlRevision": revision,
+                 "session": session, "sourceCheckpointId": source, "sourceManifestSha256": manifest,
+                 "anchorSha256": "3" * 64, "policySha256": policy, "writerRunId": "700", "writerAttempt": "1",
+                 "profile": "rehearsal", "candidateRevision": candidate, "validationSha256": validation}
+        writer = {"version": 1, "targetSha256": target, "session": session, "controlRevision": revision,
+                  "position": 1, "previousSha256": sha256(canonical(start)).hexdigest(), "writerRunId": "701",
+                  "writerAttempt": "1", "action": "recovery", "profile": "rehearsal", "candidateRevision": candidate,
+                  "recoveryAction": "resume-failed", "recoveryPlanSha256": plan}
+        base = coordinator.BASE + target + "/" + session + "/"
+        objects = {base + "start-intent.json": canonical(start), base + "writers/0001.json": canonical(writer)}
+        store = Mock()
+        store.get.side_effect = lambda key, **_: (objects[key], '"etag"')
+        store.list.return_value = [base + "writers/0001.json"]
+        repo = {"id": coordinator.artifact.REPOSITORY_ID}
+        original = {"id": 700, "head_sha": revision, "path": coordinator.PROFILES["rehearsal"]["parent"],
+                    "display_title": coordinator.parent_title("rehearsal", "run", revision, candidate), "event": "workflow_dispatch",
+                    "head_branch": "main", "status": "completed", "run_attempt": 1, "repository": repo, "head_repository": repo}
+        current = {**original, "id": 701, "path": ".github/workflows/worker-backup-phase-recovery.yml", "status": "in_progress",
+                   "display_title": "Rehearsal backup recovery resume-failed at " + revision + " candidate " + candidate + " session " + session}
+        names = ("Verify recovery identity before candidate checkout", "Verify exact reviewed recovery checkout",
+                 "Verify isolated recovery test Bot identity", "Plan or execute one reviewed recovery phase")
+        steps = [{"name": name, "status": "completed", "conclusion": "success"} for name in names[:-1]]
+        steps.append({"name": names[-1], "status": "in_progress", "conclusion": None})
+        job = {"name": "recovery", "run_id": 701, "run_attempt": 1, "head_sha": revision, "status": "in_progress", "steps": steps}
+        job_list = [job]
+        def api(path, _token):
+            if path.endswith("/jobs?per_page=100"):
+                return {"total_count": len(job_list), "jobs": job_list}
+            return original if "/700" in path else current
+        env = {"GITHUB_RUN_ID": "701", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_SHA": revision,
+               "GITHUB_WORKFLOW_REF": coordinator.artifact.REPOSITORY + "/.github/workflows/worker-backup-phase-recovery.yml@" + coordinator.artifact.MAIN_REF,
+               "BACKUP_ACTION": "resume-failed", "BACKUP_RECOVERY_PLAN_SHA256": plan, "BACKUP_GATE_ROLE": "recovery"}
+        args = (store, target, session, revision, source, manifest, policy)
+        kwargs = {"profile": "rehearsal", "candidate_revision": candidate, "validation_sha": validation}
+        with patch.dict("os.environ", env, clear=True), patch.object(coordinator.artifact, "_github_token", return_value="synthetic"), \
+             patch.object(coordinator.artifact, "_get_json", side_effect=api):
+            result = coordinator.finished_controller(*args, **kwargs, current_writer=writer, current_mode="execute")
+            self.assertEqual(result["writers"], [writer])
+            objects[base + "writers/0001.json"] = canonical({**writer, "version": True})
+            with self.assertRaises(ContractError):
+                coordinator.finished_controller(*args, **kwargs, current_writer=writer, current_mode="execute")
+            objects[base + "writers/0001.json"] = canonical(writer)
+            with self.assertRaises(ContractError):
+                coordinator.finished_controller(*args, **kwargs)
+            with patch.dict("os.environ", {"BACKUP_RECOVERY_PLAN_SHA256": "9" * 64}):
+                with self.assertRaises(ContractError):
+                    coordinator.finished_controller(*args, **kwargs, current_writer=writer, current_mode="execute")
+            steps[-1] = {"name": names[-1], "status": "completed", "conclusion": "failure"}
+            with self.assertRaises(ContractError):
+                coordinator.finished_controller(*args, **kwargs, current_writer=writer, current_mode="execute")
+            steps[-1]["conclusion"] = "success"
+            job["status"] = "completed"
+            job["conclusion"] = "success"
+            read_names = ("Verify recovery readback identity before candidate checkout", "Verify exact reviewed recovery readback checkout",
+                          "Verify recovery readback test Bot identity", "Independently read back the recovery evidence")
+            read_steps = [{"name": name, "status": "completed", "conclusion": "success"} for name in read_names[:-1]]
+            read_steps.append({"name": read_names[-1], "status": "in_progress", "conclusion": None})
+            job_list.append({"name": "readback", "run_id": 701, "run_attempt": 1, "head_sha": revision,
+                             "status": "in_progress", "steps": read_steps})
+            with patch.dict("os.environ", {"BACKUP_GATE_ROLE": "recovery-readback", "BACKUP_RECOVERY_MODE": "readback"}):
+                coordinator.finished_controller(*args, **kwargs, current_writer=writer, current_mode="readback")
+                read_steps[0]["conclusion"] = "failure"
+                with self.assertRaises(ContractError):
+                    coordinator.finished_controller(*args, **kwargs, current_writer=writer, current_mode="readback")
 
     def test_legacy_begin_intent_can_identify_nonce_named_writer(self):
         title = "Production backup begin at " + "b" * 40 + " #" + "c" * 64
@@ -140,12 +285,14 @@ class CoordinatorTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             checked(run, {**details, "dispatchNonce": "d" * 64})
 
-    def test_expired_dispatched_pause_is_rejected_but_activation_is_allowed(self):
+    @patch.object(coordinator, "verify_child_claim")
+    @patch.object(coordinator, "claim_child_once")
+    def test_expired_dispatched_pause_is_rejected_but_activation_is_allowed(self, _claim, _verify):
         from hashlib import sha256
         target, store = Mock(digest="a" * 64), Mock()
         pause = coordinator.dispatch_intent(target=target.digest, session="123", sequence=5,
             revision="b" * 40, nonce="c" * 64, input_sha256="d" * 64, created_at=1000, writer_run_id="789")
-        env = {"GITHUB_SHA": "b" * 40, "BACKUP_ACTION": "pause", "BACKUP_DISPATCH_NONCE": "c" * 64,
+        env = {"GITHUB_SHA": "b" * 40, "GITHUB_RUN_ID": "456", "GITHUB_RUN_ATTEMPT": "1", "BACKUP_ACTION": "pause", "BACKUP_DISPATCH_NONCE": "c" * 64,
                "BACKUP_COORDINATOR_SESSION": "123", "BACKUP_DISPATCH_DEADLINE": "1060",
                "BACKUP_SOURCE_CHECKPOINT_ID": "e" * 32, "BACKUP_SOURCE_MANIFEST_SHA256": "f" * 64,
                "BACKUP_SESSION": "456-1", "BACKUP_SESSION_DAY": "2026/11/18", "BACKUP_STATE_SHA256": "1" * 64}
@@ -163,14 +310,14 @@ class CoordinatorTests(unittest.TestCase):
                 "steps": [{"name": "Coordinate one explicitly approved operation", "status": "in_progress", "conclusion": None}]}]}
         with patch.object(cli.time, "time", return_value=1001), \
              patch.object(cli.artifact, "_github_token", return_value="token"), \
-             patch.object(cli.artifact, "_get_json", side_effect=[parent, jobs, {**parent, "status": "completed"}]):
+             patch.object(cli.artifact, "_get_json", side_effect=[parent, jobs, parent, jobs, {**parent, "status": "completed"}]):
             guard = cli.coordinator_guard(env, target, store, {"pauseLimitSeconds": 60}, lambda: None)
             with self.assertRaises(ContractError):
                 guard()
         resumed = {**parent, "display_title": "Production backup coordinator resume at " + "b" * 40}
         with patch.object(cli.time, "time", return_value=1001) as clock, \
              patch.object(cli.artifact, "_github_token", return_value="token"), \
-             patch.object(cli.artifact, "_get_json", side_effect=[resumed, jobs]):
+             patch.object(cli.artifact, "_get_json", side_effect=[resumed, jobs, resumed, jobs]):
             guard = cli.coordinator_guard(env, target, store, {"pauseLimitSeconds": 60}, lambda: None)
             clock.return_value = 1061
             with self.assertRaises(ContractError):
@@ -205,7 +352,9 @@ class CoordinatorTests(unittest.TestCase):
         activate = coordinator.dispatch_intent(target=target.digest, session="123", sequence=11,
             revision="b" * 40, nonce="c" * 64, input_sha256=sha256(canonical(inputs)).hexdigest(), created_at=1050, writer_run_id="789")
         store.objects.get.side_effect = [(canonical(activate), '"etag"'), (canonical(pause), '"etag"')]
-        with patch.object(cli.time, "time", return_value=1061):
+        with patch.object(cli.time, "time", return_value=1061), \
+             patch.object(cli.artifact, "_github_token", return_value="token"), \
+             patch.object(cli.artifact, "_get_json", side_effect=[parent, jobs, parent, jobs, parent, jobs]):
             guard = cli.coordinator_guard(env, target, store, {"pauseLimitSeconds": 60}, lambda: None)
             guard()
 

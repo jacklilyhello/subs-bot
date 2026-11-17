@@ -36,7 +36,8 @@ def require_mutation_enabled(env):
 
 def settings(raw):
     value = parsed(raw)
-    require(set(value) == {"version", "warningPercent", "pauseLimitSeconds", "overdueHours", "windowStartUtc", "windowMinutes", "frequencyHours"})
+    required = {"version", "warningPercent", "pauseLimitSeconds", "overdueHours", "windowStartUtc", "windowMinutes", "frequencyHours"}
+    require(required <= set(value) <= required | {"maximumPauseSeconds"})
     require(type(value["version"]) is int and value["version"] == 1
             and type(value["warningPercent"]) is int and 1 <= value["warningPercent"] <= 99
             and type(value["pauseLimitSeconds"]) is int and 60 <= value["pauseLimitSeconds"] <= 900
@@ -45,7 +46,16 @@ def settings(raw):
             and type(value["windowMinutes"]) is int and 1 <= value["windowMinutes"] <= 720
             and isinstance(value["windowStartUtc"], str)
             and re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value["windowStartUtc"]))
+    maximum_pause(value)
     return value
+
+
+def maximum_pause(policy):
+    """The legacy 300s alarm remains separate from the operational stop limit."""
+    maximum = policy.get("maximumPauseSeconds", 1800)
+    require(type(maximum) is int and 300 <= maximum <= 21600
+            and type(policy.get("pauseLimitSeconds")) is int and maximum >= policy["pauseLimitSeconds"])
+    return maximum
 
 
 def session_input(env):
@@ -99,7 +109,7 @@ def missing_started_observation(anchor, store, target):
             "day": pin["day"], "mutationPermitted": False}
 
 
-def unstarted_abort_plan(anchor, store, target, ctl, contract, policy, *, candidate_sha=None, reconciliation_raw=None):
+def unstarted_abort_plan(anchor, store, target, ctl, contract, policy, *, candidate_sha=None, reconciliation_raw=None, runtime=None):
     """Prove the actual begin writer ended before recovering an empty journal."""
     pin, raw, _etag = anchor.read(allow_future=True)
     pending_anchor_plan = None
@@ -118,16 +128,28 @@ def unstarted_abort_plan(anchor, store, target, ctl, contract, policy, *, candid
     details = original["startedDetails"]
     require(original["day"] == pin["day"] and original["controlRevision"] == pin["controlRevision"]
             and original["controlRevision"] == ctl.control_revision
-            and original["dispatcherRevision"] == pin["controlRevision"]
-            and original["dispatcherWorkflow"] == "worker-production-backup.yml"
             and original["sourceRevision"] == ctl.revision
             and original["anchorPredecessorSha256"] == pin["previousSha256"]
             and details.get("configurationSha256") == target.configuration_digest
             and details.get("contractSha256") == digest(contract) and details.get("policySha256") == digest(policy)
             and details.get("checkpointId") == contract["checkpointId"]
             and details.get("pauseLimitSeconds") == policy["pauseLimitSeconds"])
-    require_finished_intent({"runId": original["writerRunId"], "runAttempt": original["writerAttempt"],
-                             "controlRevision": original["dispatcherRevision"]}, allowed_actions={"begin"})
+    if target.environment == "production":
+        require(runtime is None and original["dispatcherRevision"] == pin["controlRevision"]
+                and original["dispatcherWorkflow"] == "worker-production-backup.yml")
+        require_finished_intent({"runId": original["writerRunId"], "runAttempt": original["writerAttempt"],
+                                 "controlRevision": original["dispatcherRevision"]}, allowed_actions={"begin"})
+    else:
+        from production_backup_rehearsal_phase import RehearsalPhaseRuntime
+        require(isinstance(runtime, RehearsalPhaseRuntime) and runtime.target is target
+                and original["dispatcherRevision"] == runtime.dispatcher_revision
+                and original["dispatcherWorkflow"] == runtime.dispatcher_workflow)
+        evidence = {key: details.get(key) for key in ("coordinatorSession", "dispatchSequence", "dispatchIntentSha256",
+                                                       "childClaimSha256", "dispatchNonce")}
+        evidence.update(runId=original["writerRunId"], runAttempt=original["writerAttempt"],
+                        controlRevision=original["controlRevision"], dispatcherRevision=original["dispatcherRevision"],
+                        dispatcherWorkflow=original["dispatcherWorkflow"])
+        runtime.require_finished(evidence, allowed_actions={"begin"})
     current = ctl.inspect()
     require(current["stateSha256"] == original["stateSha256"] and current["control"] == details.get("control")
             and current["release"] == details.get("release") and current["configurationSha256"] == details["configurationSha256"]
@@ -168,7 +190,7 @@ def frozen_matches(events, state):
                         ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates")))
 
 
-def uncaptured_predecessor(events):
+def uncaptured_predecessor(events, *, finished=None):
     require(events and (events[-1]["stage"] in {"frozen", "frozen-data"}
             or (len(events) >= 2 and events[-1]["stage"] == "failed"
                 and events[-1]["details"].get("uncertain") is False
@@ -179,7 +201,7 @@ def uncaptured_predecessor(events):
     frozen = [event for event in events if event["stage"] == "frozen"]
     fingerprints = [event for event in events if event["stage"] == "frozen-data"]
     require(len(freeze_intents) == len(frozen) == 1 and len(fingerprints) <= 1)
-    require_finished_intent(freeze_intents[0]["details"], allowed_actions={"freeze"})
+    (finished or require_finished_intent)(freeze_intents[0]["details"], allowed_actions={"freeze"})
     return frozen[0]["details"]["control"], fingerprints[0]["details"] if fingerprints else None
 
 
@@ -247,54 +269,103 @@ def coordinator_guard(env, target, store, policy, base_guard):
     if env.get("BACKUP_STATE_SHA256"):
         inputs["state_sha256"] = env["BACKUP_STATE_SHA256"]
     require(digest(inputs) == intent["inputSha256"], "Coordinator inputs differ from the immutable dispatch intent.")
+    prior, pause_until = coordinator.completed_results(store.objects, target.digest, session, env["GITHUB_SHA"],
+        artifact._github_token(), inputs["source_checkpoint_id"], inputs["source_manifest_sha256"],
+        maximum_pause(policy), stop_before=sequence, profile="production", candidate_revision=env["GITHUB_SHA"])
+    require(len(prior) == sequence - 1, "A prior phase has not been independently verified.")
+    expected, pause_until = coordinator.stage_inputs(prior, inputs["source_checkpoint_id"], inputs["source_manifest_sha256"],
+        session, intent, maximum_pause(policy), pause_until)
+    require(expected == inputs and digest(expected) == intent["inputSha256"],
+            "The phase inputs differ from the complete verified predecessor chain.")
     deadline = int(raw_deadline)
-    if sequence >= coordinator.STEPS.index("pause") + 1:
-        pause_raw, _ = store.objects.get(coordinator.event_key(target.digest, session, coordinator.STEPS.index("pause") + 1))
-        pause = parsed(pause_raw)
-        require(canonical(pause) == pause_raw and pause == coordinator.dispatch_intent(target=target.digest, session=session,
-                sequence=coordinator.STEPS.index("pause") + 1, revision=env["GITHUB_SHA"], nonce=pause.get("nonce"),
-                input_sha256=pause.get("inputSha256"), created_at=pause.get("createdAt"), writer_run_id=pause.get("writerRunId"))
-                and coordinator.pause_deadline(pause, policy["pauseLimitSeconds"], now=int(time.time())) == deadline)
-    else:
-        require(deadline == 0)
-    def guard():
+    require(deadline == (pause_until or 0), "The exact predecessor pause deadline differs.")
+    def parent_guard():
         base_guard()
         if action in {"pause", "freeze", "capture"}:
             require(deadline > int(time.time()), "The coordinator deadline elapsed; this mutation cannot start.")
-            run = artifact._get_json("/actions/runs/" + intent["writerRunId"], artifact._github_token())
-            path = ".github/workflows/worker-production-backup-coordinator.yml"
-            require(str(run.get("id")) == intent["writerRunId"] and run.get("run_attempt") == 1
-                    and run.get("path") in (path, path + "@main", path + "@refs/heads/main")
-                    and run.get("head_sha") == env["GITHUB_SHA"] and run.get("head_branch") == "main"
-                    and run.get("event") == "workflow_dispatch" and run.get("status") == "in_progress"
-                    and run.get("display_title") in {"Production backup coordinator run at " + env["GITHUB_SHA"],
-                                                    "Production backup coordinator resume at " + env["GITHUB_SHA"]}
-                    and all(isinstance(run.get(k), dict) and run[k].get("id") == artifact.REPOSITORY_ID
-                            for k in ("repository", "head_repository")),
-                    "The exact coordinator writer is no longer running; do not start this mutation.")
-            response = artifact._get_json("/actions/runs/" + intent["writerRunId"] + "/attempts/1/jobs?per_page=100",
-                                          artifact._github_token())
-            jobs = response.get("jobs")
-            require(isinstance(jobs, list) and type(response.get("total_count")) is int
-                    and response["total_count"] == len(jobs) < 100)
-            matched = [job for job in jobs if isinstance(job, dict) and job.get("name") == "coordinate"]
-            require(len(matched) == 1 and str(matched[0].get("run_id")) == intent["writerRunId"]
-                    and matched[0].get("run_attempt") == 1 and matched[0].get("head_sha") == env["GITHUB_SHA"]
-                    and matched[0].get("status") == "in_progress" and matched[0].get("conclusion") is None
-                    and isinstance(matched[0].get("steps"), list))
-            steps = [step for step in matched[0]["steps"] if isinstance(step, dict)
-                     and step.get("name") == "Coordinate one explicitly approved operation"]
-            require(len(steps) == 1 and steps[0].get("status") == "in_progress" and steps[0].get("conclusion") is None,
-                    "The exact coordinator step is no longer running; do not start this mutation.")
+        run = artifact._get_json("/actions/runs/" + intent["writerRunId"], artifact._github_token())
+        path = ".github/workflows/worker-production-backup-coordinator.yml"
+        require(str(run.get("id")) == intent["writerRunId"] and run.get("run_attempt") == 1
+                and run.get("path") in (path, path + "@main", path + "@refs/heads/main")
+                and run.get("head_sha") == env["GITHUB_SHA"] and run.get("head_branch") == "main"
+                and run.get("event") == "workflow_dispatch" and run.get("status") == "in_progress"
+                and run.get("display_title") in {"Production backup coordinator run at " + env["GITHUB_SHA"],
+                                                "Production backup coordinator resume at " + env["GITHUB_SHA"]}
+                and all(isinstance(run.get(k), dict) and run[k].get("id") == artifact.REPOSITORY_ID
+                        for k in ("repository", "head_repository")),
+                "The exact coordinator writer is no longer running; do not start this mutation.")
+        response = artifact._get_json("/actions/runs/" + intent["writerRunId"] + "/attempts/1/jobs?per_page=100",
+                                      artifact._github_token())
+        jobs = response.get("jobs")
+        require(isinstance(jobs, list) and type(response.get("total_count")) is int
+                and response["total_count"] == len(jobs) < 100)
+        matched = [job for job in jobs if isinstance(job, dict) and job.get("name") == "coordinate"]
+        require(len(matched) == 1 and str(matched[0].get("run_id")) == intent["writerRunId"]
+                and matched[0].get("run_attempt") == 1 and matched[0].get("head_sha") == env["GITHUB_SHA"]
+                and matched[0].get("status") == "in_progress" and matched[0].get("conclusion") is None
+                and isinstance(matched[0].get("steps"), list))
+        steps = [step for step in matched[0]["steps"] if isinstance(step, dict)
+                 and step.get("name") == "Coordinate one explicitly approved operation"]
+        require(len(steps) == 1 and steps[0].get("status") == "in_progress" and steps[0].get("conclusion") is None,
+                "The exact coordinator step is no longer running; do not start this mutation.")
+        if action in {"pause", "freeze", "capture"}:
             require(deadline > int(time.time()), "The coordinator deadline elapsed before the mutation.")
+    parent_guard()
+    coordinator.claim_child_once(store.objects, intent, env.get("GITHUB_RUN_ID", ""), env.get("GITHUB_RUN_ATTEMPT", ""))
+    def guard():
+        parent_guard()
+        coordinator.verify_child_claim(store.objects, intent, env.get("GITHUB_RUN_ID", ""), env.get("GITHUB_RUN_ATTEMPT", ""))
     guard()
     return guard
 
 
-def require_finished_intent(details, *, allowed_actions=None):
+def require_finished_intent(details, *, allowed_actions=None, rehearsal=False):
     require(isinstance(details, dict) and details.get("runAttempt") == "1"
             and re.fullmatch(r"[1-9][0-9]{0,19}", details.get("runId", ""))
             and re.fullmatch(r"[0-9a-f]{40}", details.get("controlRevision", "")))
+    if details.get("dispatcherWorkflow") == "worker-backup-phase-rehearsal.yml":
+        require(rehearsal is True, "Rehearsal runs cannot authorize production recovery.")
+        from production_backup_rehearsal_phase import PHASE_FILE
+        main_sha, candidate_sha, nonce = (details.get("dispatcherRevision", ""), details["controlRevision"],
+                                           details.get("dispatchNonce", ""))
+        require(re.fullmatch(r"[a-f0-9]{40}", main_sha or "") and re.fullmatch(r"[a-f0-9]{64}", nonce or ""))
+        token = artifact._github_token()
+        run_id = details["runId"]
+        run = artifact._get_json("/actions/runs/" + run_id + "/attempts/1", token)
+        latest = artifact._get_json("/actions/runs/" + run_id, token)
+        workflow = artifact._get_json("/actions/workflows/worker-backup-phase-rehearsal.yml", token)
+        prefix, suffix = "Rehearsal backup ", " at " + main_sha + " candidate " + candidate_sha + " #" + nonce
+        title = run.get("display_title", "")
+        require(isinstance(title, str) and title.startswith(prefix) and title.endswith(suffix))
+        action = title[len(prefix):-len(suffix)]
+        from production_backup_rehearsal_phase import STEPS
+        require(action in STEPS and (allowed_actions is None or action in allowed_actions)
+                and str(run.get("id")) == run_id and run.get("run_attempt") == 1
+                and str(latest.get("id")) == run_id and latest.get("run_attempt") == 1
+                and latest.get("status") == "completed" and run.get("status") == "completed"
+                and workflow.get("path") == PHASE_FILE and run.get("workflow_id") == workflow.get("id")
+                and run.get("event") == "workflow_dispatch" and run.get("head_branch") == "main"
+                and run.get("head_sha") == main_sha
+                and all(isinstance(run.get(k), dict) and run[k].get("id") == artifact.REPOSITORY_ID
+                        for k in ("repository", "head_repository")))
+        inventory = artifact._get_json("/actions/runs/" + run_id + "/attempts/1/jobs?per_page=100", token)
+        jobs = inventory.get("jobs")
+        require(isinstance(jobs, list) and type(inventory.get("total_count")) is int
+                and inventory["total_count"] == len(jobs) < 100)
+        phases = [job for job in jobs if isinstance(job, dict) and job.get("name") == "phase"]
+        require(len(phases) == 1 and str(phases[0].get("run_id")) == run_id and phases[0].get("run_attempt") == 1
+                and phases[0].get("head_sha") == main_sha and phases[0].get("status") == "completed"
+                and isinstance(phases[0].get("steps"), list))
+        for name in ("Verify trusted phase identity before candidate checkout", "Verify exact reviewed phase checkout",
+                     "Verify isolated test Bot identity"):
+            selected = [step for step in phases[0]["steps"] if isinstance(step, dict) and step.get("name") == name]
+            require(len(selected) == 1 and selected[0].get("status") == "completed" and selected[0].get("conclusion") == "success")
+        selected = [step for step in phases[0]["steps"] if isinstance(step, dict)
+                    and step.get("name") == "Execute one reviewed rehearsal phase"]
+        require(len(selected) == 1 and selected[0].get("status") == "completed")
+        return
+    require(rehearsal is False and "dispatcherWorkflow" not in details and "dispatcherRevision" not in details,
+            "An unknown dispatcher cannot authorize production recovery.")
     token = artifact._github_token()
     run = artifact._get_json("/actions/runs/" + details["runId"] + "/attempts/1", token)
     workflow = artifact._get_json("/actions/workflows/worker-production-backup.yml", token)
@@ -447,7 +518,7 @@ def monitor_workflow_runs(raw_controllers, now, latest_verified, expected_plan_r
             "runsObserved": len(observed)}
 
 
-def transition_reconciliation(env, events, state, contract):
+def transition_reconciliation(env, events, state, contract, *, finished=None):
     event = events[-1]
     phase = event["stage"]
     require(phase in {"pause-intent", "freeze-intent", "resume-intent"})
@@ -455,7 +526,7 @@ def transition_reconciliation(env, events, state, contract):
     require(isinstance(details, dict) and isinstance(details.get("control"), dict)
             and details.get("runAttempt") == "1" and re.fullmatch(r"[1-9][0-9]{0,19}", details.get("runId", ""))
             and re.fullmatch(r"[0-9a-f]{40}", details.get("controlRevision", "")))
-    require_finished_intent(details)
+    (finished or require_finished_intent)(details)
     before = details["control"]
     require(type(before.get("epoch")) is int)
     desired = {"pause-intent": ("closed", before.get("workers")), "freeze-intent": ("closed", "frozen"),
@@ -470,7 +541,7 @@ def transition_reconciliation(env, events, state, contract):
     return {"phase": phase, "approvalAction": "backup-reconcile-transition:" + scope, "stateSha256": state["stateSha256"]}
 
 
-def completed_anchor_reconciliation(anchor, store, target, ctl, candidate_sha, contract, policy):
+def completed_anchor_reconciliation(anchor, store, target, ctl, candidate_sha, contract, policy, *, finished=None):
     """Only reconcile a confirmed release after a finished resume operation."""
     plan, _raw, _etag, _candidate_raw = anchor.plan_reconciliation(candidate_sha)
     candidate = plan["candidate"]
@@ -481,7 +552,7 @@ def completed_anchor_reconciliation(anchor, store, target, ctl, candidate_sha, c
             and events[0]["details"].get("contractSha256") == digest(contract)
             and events[0]["details"].get("policySha256") == digest(policy),
             "Only a fully recorded resume can reconcile an anchor release.")
-    require_finished_intent(events[-2]["details"], allowed_actions={"activate", "resume-failed"})
+    (finished or require_finished_intent)(events[-2]["details"], allowed_actions={"activate", "resume-failed"})
     state = ctl.inspect()
     require(state["control"] == events[-1]["details"].get("control")
             and state["release"] == events[0]["details"].get("release")
@@ -523,12 +594,30 @@ def emit_result(result, target, revision, root, *, source_revision=None):
 
 
 def execute_phase(*, action, env, target, revision, policy, contract, proof, state, store,
-                  guard, bounded_guard, ctl, source, api, directory):
+                  guard, bounded_guard, ctl, source, api, directory, runtime=None):
     """Run one phase after its caller has validated identity and dependencies.
 
     This function retains the phase-specific authorization and state checks.
     Production and isolation wrappers must provide their own verified context.
     """
+    if target.environment == "production":
+        require(runtime is None, "Production phases cannot use a rehearsal authorization adapter.")
+        phase_authorized = authorized
+        phase_envelope = lambda action, predecessor, key="SUBS_BOT_APPROVAL_JSON": env.get(key, "")
+        phase_confirm_plan = confirm_plan_run
+        phase_require_finished = require_finished_intent
+        phase_metadata = lambda state: intent_metadata(env, state)
+        dispatcher_revision, dispatcher_workflow = revision, "worker-production-backup.yml"
+    else:
+        from production_backup_rehearsal_phase import RehearsalPhaseRuntime
+        require(isinstance(runtime, RehearsalPhaseRuntime) and runtime.target is target
+                and runtime.controller_revision == revision, "An independently verified rehearsal runtime is required.")
+        phase_authorized = runtime.authorized
+        phase_envelope = runtime.envelope
+        phase_confirm_plan = runtime.confirm_plan_run
+        phase_require_finished = runtime.require_finished
+        phase_metadata = runtime.intent_metadata
+        dispatcher_revision, dispatcher_workflow = runtime.dispatcher_revision, runtime.dispatcher_workflow
     seed = maintenance.Anchor(store, target.digest, "0" * 64)
     genesis_sha = recovery.digest(seed.initial_material()[1])
     supplied_genesis = env.get("SUBS_BOT_BACKUP_GENESIS_SHA256", "")
@@ -554,7 +643,7 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
                       "stateSha256": state["stateSha256"], "genesisSha256": genesis_sha}
         else:
             predecessor = exact_predecessor(env, state)
-            authorized(target, env, approval_action, proof["revision"], predecessor, revision)
+            phase_authorized(target, env, approval_action, proof["revision"], predecessor, revision)
             guard()
             anchor.initialize()
             result = {"status": "initialized", "action": action}
@@ -567,7 +656,7 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
             session, day = env["GITHUB_RUN_ID"] + "-1", now.strftime("%Y/%m/%d")
         else:
             session, day = session_input(env)
-            confirm_plan_run(session, day, revision)
+            phase_confirm_plan(session, day, revision)
         require(day == now.strftime("%Y/%m/%d") and in_window(policy, now), "The selected maintenance window is not open.")
         pin, anchor_raw, anchor_etag = anchor.read()
         require(pin["state"] == "idle" and pin["session"] != session)
@@ -579,18 +668,20 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
                       "stateSha256": state["stateSha256"], "session": session, "day": day}
         else:
             predecessor = exact_predecessor(env, state)
-            authorized(target, env, approval_action, proof["revision"], predecessor, revision)
+            phase_authorized(target, env, approval_action, proof["revision"], predecessor, revision)
             journal = maintenance.Transaction(store, session, day, target.digest, revision)
             require(not journal.load())
             guard()
             started = {"configurationSha256": target.configuration_digest, "control": state["control"],
                 "release": state["release"], "pauseLimitSeconds": policy["pauseLimitSeconds"],
                 "checkpointId": contract["checkpointId"], "contractSha256": digest(contract), "policySha256": digest(policy)}
+            if runtime is not None:
+                started.update(runtime.begin_evidence())
             original = {"version": 1, "targetSha256": target.digest, "session": session, "day": day,
-                "controlRevision": revision, "dispatcherRevision": revision, "dispatcherWorkflow": "worker-production-backup.yml",
+                "controlRevision": revision, "dispatcherRevision": dispatcher_revision, "dispatcherWorkflow": dispatcher_workflow,
                 "writerRunId": env["GITHUB_RUN_ID"], "writerAttempt": env["GITHUB_RUN_ATTEMPT"],
                 "anchorPredecessorSha256": recovery.digest(anchor_raw), "stateSha256": state["stateSha256"],
-                "sourceRevision": proof["revision"], "approvalSha256": recovery.digest(env["SUBS_BOT_APPROVAL_JSON"].encode("utf-8")),
+                "sourceRevision": proof["revision"], "approvalSha256": recovery.digest(phase_envelope(approval_action, predecessor).encode("utf-8")),
                 "timestamp": int(time.time()), "startedDetails": started}
             intent_sha = maintenance.write_begin(store, original)
             guard()
@@ -600,12 +691,12 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
             result = {"status": "started", "action": action, "session": session, "day": day}
     elif action in {"plan-abort-unstarted", "abort-unstarted"}:
         candidate = env.get("BACKUP_ANCHOR_CANDIDATE_SHA256", "") or None
-        plan, original, journal = unstarted_abort_plan(anchor, store, target, ctl, contract, policy, candidate_sha=candidate)
+        plan, original, journal = unstarted_abort_plan(anchor, store, target, ctl, contract, policy, candidate_sha=candidate, runtime=runtime)
         if action == "plan-abort-unstarted":
             result = {"status": "plan-only", "action": action, **plan}
         else:
             predecessor = exact_predecessor(env, plan)
-            authorized(target, env, plan["approvalAction"], proof["revision"], predecessor, revision)
+            phase_authorized(target, env, plan["approvalAction"], proof["revision"], predecessor, revision)
             claim = {"version": 1, "targetSha256": target.digest, "session": plan["session"],
                      "beginIntentSha256": plan["beginIntentSha256"], "stateSha256": predecessor,
                      "writerRunId": env["GITHUB_RUN_ID"], "writerAttempt": env["GITHUB_RUN_ATTEMPT"],
@@ -613,7 +704,7 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
             maintenance.claim_begin_reconciliation(store, target.digest, plan["session"], claim)
             guard()
             again, _original, _journal = unstarted_abort_plan(anchor, store, target, ctl, contract, policy,
-                candidate_sha=candidate, reconciliation_raw=canonical(claim))
+                candidate_sha=candidate, reconciliation_raw=canonical(claim), runtime=runtime)
             require(again == plan, "The approved begin recovery predecessor changed.")
             if candidate:
                 anchor.reconcile(candidate, plan["anchorPlanSha256"])
@@ -624,14 +715,14 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
             result = {"status": "aborted-before-pause", "action": action, "session": plan["session"]}
     elif action in {"plan-anchor-reconcile", "anchor-reconcile"}:
         candidate = env.get("BACKUP_ANCHOR_CANDIDATE_SHA256", "")
-        plan = completed_anchor_reconciliation(anchor, store, target, ctl, candidate, contract, policy)
+        plan = completed_anchor_reconciliation(anchor, store, target, ctl, candidate, contract, policy, finished=phase_require_finished)
         if action == "plan-anchor-reconcile":
             result = {"status": "plan-only", "action": action, **plan}
         else:
             predecessor = exact_predecessor(env, plan)
-            authorized(target, env, plan["approvalAction"], proof["revision"], predecessor, revision)
+            phase_authorized(target, env, plan["approvalAction"], proof["revision"], predecessor, revision)
             guard()
-            require(completed_anchor_reconciliation(anchor, store, target, ctl, candidate, contract, policy) == plan,
+            require(completed_anchor_reconciliation(anchor, store, target, ctl, candidate, contract, policy, finished=phase_require_finished) == plan,
                     "The exact approved anchor reconciliation changed.")
             anchor.reconcile(candidate, plan["anchorPlanSha256"])
             result = {"status": "anchor-release-reconciled", "action": action,
@@ -646,7 +737,7 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
         elif action == "preflight":
             last(events, "started")
             predecessor = exact_predecessor(env, state)
-            authorized(target, env, "backup-preflight:" + digest(contract), proof["revision"], predecessor, revision)
+            phase_authorized(target, env, "backup-preflight:" + digest(contract), proof["revision"], predecessor, revision)
             observed = capacity.observe(api, source, warning_percent=policy["warningPercent"])
             guard()
             journal.append("preflight", {"capacity": observed}, int(time.time()))
@@ -656,7 +747,7 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
                     "Only an operation confirmed not to have started pausing can be aborted.")
             predecessor = exact_predecessor(env, state)
             require(state["control"] == events[0]["details"]["control"] and state["release"] == events[0]["details"]["release"])
-            authorized(target, env, "backup-abort-preflight:" + digest(contract), proof["revision"], predecessor, revision)
+            phase_authorized(target, env, "backup-abort-preflight:" + digest(contract), proof["revision"], predecessor, revision)
             journal.append("failed", {"reason": "operator-aborted-before-pause", "uncertain": False}, int(time.time()))
             anchor.release(pin["session"])
             result = {"status": "aborted-before-pause", "action": action}
@@ -672,10 +763,10 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
             require(plan["control"] == events[0]["details"]["control"] and plan["release"] == events[0]["details"]["release"]
                     and plan["configurationSha256"] == events[0]["details"]["configurationSha256"])
             predecessor = exact_predecessor(env, plan)
-            ctl.approval(env.get("SUBS_BOT_APPROVAL_JSON", ""), "pause", predecessor)
+            ctl.approval(phase_envelope("pause", predecessor), "pause", predecessor)
             bounded_guard()
-            journal.append("pause-intent", intent_metadata(env, plan), int(time.time()))
-            after = ctl.transition("pause", env.get("SUBS_BOT_APPROVAL_JSON", ""), predecessor)
+            journal.append("pause-intent", phase_metadata(plan), int(time.time()))
+            after = ctl.transition("pause", phase_envelope("pause", predecessor), predecessor)
             journal.append("paused", {"control": after["control"]}, int(time.time()))
             result = {"status": "paused", "action": action, "state": after}
         elif action == "drain":
@@ -688,10 +779,10 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
                     and state["release"] == events[0]["details"]["release"]
                     and state["configurationSha256"] == events[0]["details"]["configurationSha256"])
             predecessor = exact_predecessor(env, state)
-            ctl.approval(env.get("SUBS_BOT_APPROVAL_JSON", ""), "freeze", predecessor)
+            ctl.approval(phase_envelope("freeze", predecessor), "freeze", predecessor)
             bounded_guard()
-            journal.append("freeze-intent", intent_metadata(env, state), int(time.time()))
-            after = ctl.transition("freeze", env.get("SUBS_BOT_APPROVAL_JSON", ""), predecessor)
+            journal.append("freeze-intent", phase_metadata(state), int(time.time()))
+            after = ctl.transition("freeze", phase_envelope("freeze", predecessor), predecessor)
             journal.append("frozen", {"control": after["control"]}, int(time.time()))
             journal.append("frozen-data", capacity.frozen_fingerprint(api, source), int(time.time()))
             result = {"status": "frozen", "action": action, "state": after}
@@ -699,18 +790,18 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
             last(events, "frozen")
             frozen_matches(events, state)
             predecessor = exact_predecessor(env, state)
-            authorized(target, env, "backup-fingerprint:" + digest(contract), proof["revision"], predecessor, revision)
+            phase_authorized(target, env, "backup-fingerprint:" + digest(contract), proof["revision"], predecessor, revision)
             journal.append("frozen-data", capacity.frozen_fingerprint(api, source), int(time.time()))
             result = {"status": "frozen-data-confirmed", "action": action}
         elif action in {"plan-reconcile-transition", "reconcile-transition"}:
-            plan = transition_reconciliation(env, events, state, contract)
+            plan = transition_reconciliation(env, events, state, contract, finished=phase_require_finished)
             if action == "plan-reconcile-transition":
                 result = {"status": "plan-only", "action": action, **plan}
             else:
                 predecessor = exact_predecessor(env, state)
-                authorized(target, env, plan["approvalAction"], proof["revision"], predecessor, revision)
+                phase_authorized(target, env, plan["approvalAction"], proof["revision"], predecessor, revision)
                 guard()
-                require(transition_reconciliation(env, events, ctl.inspect(), contract) == plan,
+                require(transition_reconciliation(env, events, ctl.inspect(), contract, finished=phase_require_finished) == plan,
                         "The approved reconciliation observation changed.")
                 next_stage = {"pause-intent": "paused", "freeze-intent": "frozen", "resume-intent": "resumed"}[plan["phase"]]
                 details = {"control": state["control"], "reconciled": True}
@@ -729,18 +820,18 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
             require(prior["stage"] in {"paused", "frozen", "frozen-data", "capture-intent"})
             initial = events[0]["details"]
             pause = next(item for item in events if item["stage"] == "pause-intent")
-            require_finished_intent(pause["details"])
+            phase_require_finished(pause["details"])
             common = {"initial": initial, "session": pin["session"]}
             if prior["stage"] == "paused":
                 kwargs = {**common, "paused": prior["details"]["control"]}
                 plan = resume.plan_aborted_drain(ctl, **kwargs)
             elif prior["stage"] in {"frozen", "frozen-data"}:
-                frozen_control, fingerprint = uncaptured_predecessor(events)
+                frozen_control, fingerprint = uncaptured_predecessor(events, finished=phase_require_finished)
                 rj = recovery.RecoveryJournal(api, env["GITHUB_RUN_ID"] + "/" + env["GITHUB_RUN_ATTEMPT"], guard=guard)
                 kwargs = {**common, "frozen": frozen_control, "fingerprint": fingerprint}
                 plan = resume.plan_uncaptured_backup(ctl, api, source, rj, **kwargs)
             else:
-                require_finished_intent(prior["details"])
+                phase_require_finished(prior["details"])
                 frozen = next(item for item in events if item["stage"] == "frozen")
                 fingerprint = next(item for item in events if item["stage"] == "frozen-data")
                 rj = recovery.RecoveryJournal(api, env["GITHUB_RUN_ID"] + "/" + env["GITHUB_RUN_ATTEMPT"], guard=guard)
@@ -749,16 +840,17 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
             if action == "plan-resume-failed":
                 result = {"status": "plan-only", "action": action, **plan}
             else:
-                require(exact_predecessor(env, state) == plan["stateSha256"])
+                predecessor = exact_predecessor(env, state)
+                require(predecessor == plan["stateSha256"])
                 def record_intent(state_sha, approval_action):
                     require(state_sha == state["stateSha256"] and approval_action == plan["approvalAction"])
-                    journal.append("resume-intent", {**intent_metadata(env, state), "approvalAction": approval_action}, int(time.time()))
+                    journal.append("resume-intent", {**phase_metadata(state), "approvalAction": approval_action}, int(time.time()))
                 if prior["stage"] == "paused":
-                    after = resume.resume_aborted_drain(ctl, **kwargs, approval_envelope=env.get("SUBS_BOT_APPROVAL_JSON", ""), record_intent=record_intent)
+                    after = resume.resume_aborted_drain(ctl, **kwargs, approval_envelope=phase_envelope(plan["approvalAction"], predecessor), record_intent=record_intent)
                 elif prior["stage"] in {"frozen", "frozen-data"}:
-                    after = resume.resume_uncaptured_backup(ctl, api, source, rj, **kwargs, approval_envelope=env.get("SUBS_BOT_APPROVAL_JSON", ""), record_intent=record_intent)
+                    after = resume.resume_uncaptured_backup(ctl, api, source, rj, **kwargs, approval_envelope=phase_envelope(plan["approvalAction"], predecessor), record_intent=record_intent)
                 else:
-                    after = resume.resume_failed_backup(ctl, api, source, rj, **kwargs, approval_envelope=env.get("SUBS_BOT_APPROVAL_JSON", ""), record_intent=record_intent)
+                    after = resume.resume_failed_backup(ctl, api, source, rj, **kwargs, approval_envelope=phase_envelope(plan["approvalAction"], predecessor), record_intent=record_intent)
                 elapsed = max(0, int(time.time()) - pause["timestamp"])
                 journal.append("resumed", {"control": after["control"], "pauseSeconds": elapsed,
                                "pauseLimitExceeded": elapsed > policy["pauseLimitSeconds"], "backupVerified": False}, int(time.time()))
@@ -770,13 +862,13 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
             frozen_matches(events, state)
             predecessor = exact_predecessor(env, state)
             for name, key in (("prepare", "SUBS_BOT_BACKUP_PREPARE_APPROVAL_JSON"), ("capture", "SUBS_BOT_BACKUP_CAPTURE_APPROVAL_JSON")):
-                authorized(target, env, "recovery-" + name + ":" + digest(contract), proof["revision"], predecessor, revision, key=key)
+                phase_authorized(target, env, "recovery-" + name + ":" + digest(contract), proof["revision"], predecessor, revision, key=key)
             owner = env["GITHUB_RUN_ID"] + "/" + env["GITHUB_RUN_ATTEMPT"]
             recovery_journal = recovery.RecoveryJournal(api, owner, guard=guard)
             recovery_journal.load()
             require(recovery_journal.value is None, "The capture checkpoint already exists; reconcile instead of restarting.")
             bounded_guard()
-            journal.append("capture-intent", {**intent_metadata(env, state), "checkpointId": contract["checkpointId"]}, int(time.time()))
+            journal.append("capture-intent", {**phase_metadata(state), "checkpointId": contract["checkpointId"]}, int(time.time()))
             try:
                 engine = recovery.RecoveryEngine(api, source, recovery_journal, directory)
                 recovery.run_action("prepare", engine)
@@ -787,7 +879,7 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
         elif action == "poll-export":
             last(events, "capture-intent")
             frozen_matches(events, state)
-            require_finished_intent(events[-1]["details"])
+            phase_require_finished(events[-1]["details"])
             predecessor = exact_predecessor(env, state)
             owner = env["GITHUB_RUN_ID"] + "/" + env["GITHUB_RUN_ATTEMPT"]
             rj = recovery.RecoveryJournal(api, owner, guard=guard)
@@ -798,18 +890,18 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
                     "Only the original confirmed export bookmark may be polled.")
             bookmark_sha = recovery.digest(saved["bookmark"].encode("utf-8"))
             scope = "recovery-poll-export:" + digest(contract)
-            authorized(target, env, scope, proof["revision"], predecessor, revision)
+            phase_authorized(target, env, scope, proof["revision"], predecessor, revision)
             guard()
             rj.claim()
             try:
                 saved = rj.value.get("export")
                 require(isinstance(saved, dict) and saved.get("state") == "polling"
                         and recovery.digest(saved.get("bookmark", "").encode("utf-8")) == bookmark_sha)
-                journal.append("poll-intent", {**intent_metadata(env, state), "bookmarkSha256": bookmark_sha,
+                journal.append("poll-intent", {**phase_metadata(state), "bookmarkSha256": bookmark_sha,
                                "checkpointId": contract["checkpointId"]}, int(time.time()))
                 engine = recovery.RecoveryEngine(api, source, rj, directory)
                 outcome = recovery.run_action("poll-export", engine)
-                journal.append("capture-intent", {**intent_metadata(env, state), "checkpointId": contract["checkpointId"],
+                journal.append("capture-intent", {**phase_metadata(state), "checkpointId": contract["checkpointId"],
                                "pollConfirmed": True}, int(time.time()))
             finally:
                 rj.release()
@@ -818,7 +910,7 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
             last(events, "capture-intent")
             frozen_matches(events, state)
             predecessor = exact_predecessor(env, state)
-            authorized(target, env, "backup-verify:" + digest(contract), proof["revision"], predecessor, revision)
+            phase_authorized(target, env, "backup-verify:" + digest(contract), proof["revision"], predecessor, revision)
             rj = recovery.RecoveryJournal(api, env["GITHUB_RUN_ID"] + "/" + env["GITHUB_RUN_ATTEMPT"], guard=guard)
             rj.load()
             engine = recovery.RecoveryEngine(api, source, rj, directory)
@@ -827,6 +919,7 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
             from production_release_evidence import verify_activation_baseline
             proof_result = verify_activation_baseline(ctl, env["SUBS_BOT_CF_DATA_TOKEN"], contract["checkpointId"], manifest_sha)
             require(proof_result.get("baselineVerified") is True and proof_result.get("manifestSha256") == manifest_sha)
+            bounded_guard()
             journal.append("verified", {"checkpointId": contract["checkpointId"], "manifestSha256": manifest_sha}, int(time.time()))
             result = {"status": "verified", "action": action, "checkpointId": contract["checkpointId"], "manifestSha256": manifest_sha}
         elif action in {"plan-activate", "activate"}:
@@ -841,9 +934,10 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
                 result = plan
             else:
                 predecessor = exact_predecessor(env, plan)
-                ctl.approval(env.get("SUBS_BOT_APPROVAL_JSON", ""), "activate", predecessor)
-                journal.append("resume-intent", intent_metadata(env, plan), int(time.time()))
-                after = ctl.transition("activate", env.get("SUBS_BOT_APPROVAL_JSON", ""), predecessor)
+                ctl.approval(phase_envelope("activate", predecessor), "activate", predecessor)
+                bounded_guard()
+                journal.append("resume-intent", phase_metadata(plan), int(time.time()))
+                after = ctl.transition("activate", phase_envelope("activate", predecessor), predecessor)
                 started = next(event for event in events if event["stage"] == "pause-intent")
                 elapsed = max(0, int(time.time()) - started["timestamp"])
                 journal.append("resumed", {"control": after["control"], "pauseSeconds": elapsed,
@@ -920,7 +1014,8 @@ def main(env=None):
                 "The archived source is not the active release.")
         store = PrivateStore(data, target.data["backupBucketName"])
         bounded_guard = coordinator_guard(env, target, store, policy, guard)
-        if action in {"pause", "freeze", "capture"}:
+        if env.get("BACKUP_DISPATCH_NONCE"):
+            guard = bounded_guard
             ctl.guard = bounded_guard
             source.guard = bounded_guard
         result = execute_phase(action=action, env=env, target=target, revision=revision, policy=policy,

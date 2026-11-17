@@ -630,11 +630,22 @@ class Drill:
             self.report["baselineReused"] = bool(self.baseline_checkpoint)
         self.save(stage_prefix + ("-reused-verified" if self.baseline_checkpoint else "-verified"), self.report[key])
 
-    def exercise(self, *, provided_controller=None, verify_extra=None, external_webhook_cleanup=False):
+    def exercise(self, *, provided_controller=None, verify_extra=None, external_webhook_cleanup=False,
+                 external_webhook_setup=None, external_webhook_confirm=None):
+        coordinator_cleanup = False
         if external_webhook_cleanup:
+            workflow = getattr(self, "backup_evidence_workflow", "")
             require(self.env.get("HEAD_TRUSTED_WEBHOOK_CLEANUP") == "configured-v1"
-                    and getattr(self, "backup_evidence_workflow", "") == "worker-backup-reviewed-head.yml",
-                    "Only the trusted dispatcher may own external webhook cleanup.")
+                    and workflow in {"worker-backup-reviewed-head.yml", "worker-backup-reviewed-coordinator.yml"},
+                    "Only a fixed trusted dispatcher may own external webhook cleanup.")
+            coordinator_cleanup = workflow == "worker-backup-reviewed-coordinator.yml"
+            if coordinator_cleanup:
+                require(callable(external_webhook_setup) and callable(external_webhook_confirm),
+                        "The coordinator requires exclusive webhook setup and confirmation callbacks.")
+            else:
+                require(external_webhook_setup is None and external_webhook_confirm is None)
+        else:
+            require(external_webhook_setup is None and external_webhook_confirm is None)
         if provided_controller is None:
             bundle, manifest = self.prepare(active=True)
             ctl = self.bind(self.registration(), bundle, manifest)
@@ -674,6 +685,8 @@ class Drill:
             "revision": self.revision, "runId": self.run, "runAttempt": self.attempt}
         snapshot_raw = canonical(snapshot)
         self.store.put(self.snapshot_key(), snapshot_raw)
+        if coordinator_cleanup:
+            require(self.store.get(self.snapshot_key()) == snapshot_raw, "The original webhook snapshot was not independently confirmed.")
         snapshot_sha = sha256(snapshot_raw).hexdigest()
         self.report.update(webhookCheckpoint=self.run + "/" + self.attempt, webhookSnapshotSha256=snapshot_sha)
         if external_webhook_cleanup:
@@ -689,11 +702,15 @@ class Drill:
         primary_error = None
         phase = "configure-webhook"
         try:
+            if coordinator_cleanup:
+                external_webhook_setup(ctl, webhook_plan, snapshot_sha)
             configured = ctl.configure_webhook(approval(ctl.target, "webhook", ctl.revision, webhook_plan["stateSha256"],
                                                        control_revision=ctl.control_revision),
                 webhook_plan["stateSha256"], webhook_plan["webhook"]["settingsSha256"])
             changed = True
             self.save("webhook-configured", configured)
+            if coordinator_cleanup:
+                external_webhook_confirm(ctl, configured, snapshot_sha)
             # The new production code path is present but still denies new work.
             now = one(ctl.data, ctl.database, "SELECT unixepoch() AS n")["n"]
             base = 7_000_000_000_000_000 + (int(self.run) % 1_000_000_000) * 1000 + int(self.attempt) * 100

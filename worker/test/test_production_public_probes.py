@@ -258,6 +258,37 @@ class PublicProbeTests(unittest.TestCase):
         tool.restore_webhook.assert_not_called()
         self.assertEqual(tool.report["webhookRecovery"]["status"], "pending-trusted-dispatcher")
 
+    def test_coordinator_requires_single_use_webhook_hooks_before_any_setup(self):
+        tool, controller = self.tool()
+        tool.env["HEAD_TRUSTED_WEBHOOK_CLEANUP"] = "configured-v1"
+        tool.backup_evidence_workflow = "worker-backup-reviewed-coordinator.yml"
+        with self.assertRaises(contract.ContractError):
+            tool.exercise(external_webhook_cleanup=True)
+        controller.configure_webhook.assert_not_called()
+
+    def test_coordinator_claim_precedes_webhook_and_confirm_is_not_retried(self):
+        tool, controller = self.tool()
+        tool.env["HEAD_TRUSTED_WEBHOOK_CLEANUP"] = "configured-v1"
+        tool.backup_evidence_workflow = "worker-backup-reviewed-coordinator.yml"
+        tool.anchors = Mock(return_value={"admin": 1, "member": 2})
+        controller.telegram.call.return_value = {"url": drill.ORIGINAL_ORIGIN + "/telegram/webhook",
+            "has_custom_certificate": False, "max_connections": 40,
+            "allowed_updates": ["message", "callback_query"], "pending_update_count": 0}
+        controller.configure_webhook.return_value = {"configured": True}
+        setup, confirm = Mock(), Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            tool.env["RUNNER_TEMP"] = directory
+            with patch.object(release_evidence, "verify_activation_baseline", return_value=self.proof(tool)), \
+                 patch.object(drill, "one", return_value={"n": 1000}), patch.object(drill, "post_update", return_value=403):
+                with self.assertRaises(drill.ProbeStatusError):
+                    tool.exercise(external_webhook_cleanup=True, external_webhook_setup=setup,
+                                  external_webhook_confirm=confirm)
+        setup.assert_called_once()
+        confirm.assert_called_once()
+        controller.configure_webhook.assert_called_once()
+        self.assertEqual(setup.call_args.args[2], tool.report["webhookSnapshotSha256"])
+        self.assertEqual(confirm.call_args.args[2], tool.report["webhookSnapshotSha256"])
+
     def test_successful_open_window_leaves_confirmed_ready_state_to_trusted_cleanup(self):
         tool, controller = self.tool()
         tool.env["HEAD_TRUSTED_WEBHOOK_CLEANUP"] = "configured-v1"

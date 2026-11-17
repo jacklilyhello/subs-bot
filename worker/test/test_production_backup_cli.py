@@ -15,7 +15,7 @@ from test_production_backup_transaction import Store
 
 class ProductionBackupTests(unittest.TestCase):
     def test_unstarted_abort_requires_exact_original_writer_and_unchanged_state(self):
-        target = Mock(digest="a" * 64, configuration_digest="c" * 64)
+        target = Mock(digest="a" * 64, configuration_digest="c" * 64, environment="production")
         store = Store()
         initial = backup.maintenance.Anchor(store, target.digest, "0" * 64)
         genesis = backup.recovery.digest(initial.initial_material()[1])
