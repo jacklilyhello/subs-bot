@@ -1,0 +1,142 @@
+name: Coordinate explicitly approved production backup checkpoints
+run-name: Production backup coordinator ${{ github.event_name == 'schedule' && 'inspect' || inputs.action }} at ${{ github.sha }}
+
+on:
+  schedule:
+    - cron: '37 1 * * *'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: One independently approved coordinator operation
+        required: true
+        type: choice
+        options: [inspect, plan-initialize, initialize, plan-run, run, plan-resume, resume, plan-reconcile, reconcile, plan-abort, abort]
+      session:
+        description: Original coordinator plan run ID for continuation
+        type: string
+      sequence:
+        description: Exact unresolved dispatch sequence for reconciliation
+        type: string
+      approval_sha256:
+        description: Exact reviewed coordinator plan digest
+        type: string
+      source_checkpoint_id:
+        description: Independently verified active source checkpoint
+        type: string
+      source_manifest_sha256:
+        description: Independently recorded source manifest digest
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'schedule' && 'subs-bot-production-backup-coordinator-monitor' || 'subs-bot-production-backup-coordinator' }}
+  cancel-in-progress: false
+
+jobs:
+  coordinate:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && (inputs.action == 'run' || inputs.action == 'resume')
+    permissions:
+      actions: write
+      contents: read
+    environment: subs-bot-production-backup-coordinator
+    runs-on: ubuntu-24.04
+    timeout-minutes: 310
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Coordinate one explicitly approved operation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CONTROL_ENVIRONMENT: subs-bot-production-backup-coordinator
+          SUBS_BOT_PRODUCTION_BACKUP_COORDINATOR_ENABLED: ${{ vars.SUBS_BOT_PRODUCTION_BACKUP_COORDINATOR_ENABLED }}
+          SUBS_BOT_TARGET_JSON: ${{ secrets.SUBS_BOT_TARGET_JSON }}
+          SUBS_BOT_BACKUP_POLICY_JSON: ${{ secrets.SUBS_BOT_BACKUP_POLICY_JSON }}
+          SUBS_BOT_BACKUP_COORDINATOR_GENESIS_SHA256: ${{ secrets.SUBS_BOT_BACKUP_COORDINATOR_GENESIS_SHA256 }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_SCOPED_R2_WRITE_JSON: ${{ github.event_name == 'workflow_dispatch' && (inputs.action == 'initialize' || inputs.action == 'run' || inputs.action == 'resume' || inputs.action == 'reconcile') && secrets.SUBS_BOT_SCOPED_R2_WRITE_JSON || '' }}
+          BACKUP_COORDINATOR_ACTION: ${{ github.event_name == 'schedule' && 'inspect' || inputs.action }}
+          BACKUP_COORDINATOR_SESSION: ${{ inputs.session }}
+          BACKUP_COORDINATOR_SEQUENCE: ${{ inputs.sequence }}
+          BACKUP_COORDINATOR_APPROVAL_SHA256: ${{ inputs.approval_sha256 }}
+          BACKUP_SOURCE_CHECKPOINT_ID: ${{ inputs.source_checkpoint_id }}
+          BACKUP_SOURCE_MANIFEST_SHA256: ${{ inputs.source_manifest_sha256 }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          python3 -B worker/tools/production_backup_coordinator.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: production-backup-coordinator-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/production-backup-coordinator-result.json
+          if-no-files-found: warn
+          retention-days: 7
+  inspect_or_reconcile:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.action != 'run' && inputs.action != 'resume'
+    environment: subs-bot-production-backup-coordinator
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Inspect or reconcile without workflow dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CONTROL_ENVIRONMENT: subs-bot-production-backup-coordinator
+          SUBS_BOT_PRODUCTION_BACKUP_COORDINATOR_ENABLED: ${{ vars.SUBS_BOT_PRODUCTION_BACKUP_COORDINATOR_ENABLED }}
+          SUBS_BOT_TARGET_JSON: ${{ secrets.SUBS_BOT_TARGET_JSON }}
+          SUBS_BOT_BACKUP_POLICY_JSON: ${{ secrets.SUBS_BOT_BACKUP_POLICY_JSON }}
+          SUBS_BOT_BACKUP_COORDINATOR_GENESIS_SHA256: ${{ secrets.SUBS_BOT_BACKUP_COORDINATOR_GENESIS_SHA256 }}
+          SUBS_BOT_BACKUP_GENESIS_SHA256: ${{ secrets.SUBS_BOT_BACKUP_GENESIS_SHA256 }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_SCOPED_R2_WRITE_JSON: ${{ (inputs.action == 'initialize' || inputs.action == 'reconcile' || inputs.action == 'abort') && secrets.SUBS_BOT_SCOPED_R2_WRITE_JSON || '' }}
+          BACKUP_COORDINATOR_ACTION: ${{ inputs.action }}
+          BACKUP_COORDINATOR_SESSION: ${{ inputs.session }}
+          BACKUP_COORDINATOR_SEQUENCE: ${{ inputs.sequence }}
+          BACKUP_COORDINATOR_APPROVAL_SHA256: ${{ inputs.approval_sha256 }}
+          BACKUP_SOURCE_CHECKPOINT_ID: ${{ inputs.source_checkpoint_id }}
+          BACKUP_SOURCE_MANIFEST_SHA256: ${{ inputs.source_manifest_sha256 }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          python3 -B worker/tools/production_backup_coordinator.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: production-backup-coordinator-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/production-backup-coordinator-result.json
+          if-no-files-found: warn
+          retention-days: 7
+  monitor:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && github.event_name == 'schedule' && vars.SUBS_BOT_PRODUCTION_BACKUP_COORDINATOR_MONITOR_ENABLED == 'true'
+    environment: subs-bot-production-backup-coordinator
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Inspect without dispatch or object writes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CONTROL_ENVIRONMENT: subs-bot-production-backup-coordinator
+          SUBS_BOT_TARGET_JSON: ${{ secrets.SUBS_BOT_TARGET_JSON }}
+          SUBS_BOT_BACKUP_POLICY_JSON: ${{ secrets.SUBS_BOT_BACKUP_POLICY_JSON }}
+          SUBS_BOT_BACKUP_COORDINATOR_GENESIS_SHA256: ${{ secrets.SUBS_BOT_BACKUP_COORDINATOR_GENESIS_SHA256 }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          BACKUP_COORDINATOR_ACTION: inspect
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          python3 -B worker/tools/production_backup_coordinator.py

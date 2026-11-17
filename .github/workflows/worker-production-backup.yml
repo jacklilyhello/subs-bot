@@ -1,5 +1,5 @@
 name: Run an explicitly approved production backup checkpoint
-run-name: Production backup ${{ github.event_name == 'schedule' && 'monitor' || inputs.action }} at ${{ github.sha }}
+run-name: Production backup ${{ github.event_name == 'schedule' && 'monitor' || inputs.action }} at ${{ github.sha }}${{ inputs.dispatch_nonce && format(' #{0}', inputs.dispatch_nonce) || '' }}
 
 on:
   schedule:
@@ -22,6 +22,15 @@ on:
         type: string
       anchor_candidate_sha256:
         description: Exact unconfirmed anchor release generation SHA256, reconciliation only
+        type: string
+      dispatch_nonce:
+        description: Immutable coordinator nonce; empty for an ordinary manual checkpoint
+        type: string
+      coordinator_session:
+        description: Exact coordinator plan run ID when dispatched by the coordinator
+        type: string
+      dispatch_deadline:
+        description: Intent-bound Unix deadline; zero before admission pause
         type: string
       source_run_id:
         description: Exact active application CI run when no private source checkpoint is selected
@@ -97,6 +106,9 @@ jobs:
           BACKUP_SESSION: ${{ inputs.session }}
           BACKUP_SESSION_DAY: ${{ inputs.session_day }}
           BACKUP_ANCHOR_CANDIDATE_SHA256: ${{ inputs.anchor_candidate_sha256 }}
+          BACKUP_DISPATCH_NONCE: ${{ inputs.dispatch_nonce }}
+          BACKUP_COORDINATOR_SESSION: ${{ inputs.coordinator_session }}
+          BACKUP_DISPATCH_DEADLINE: ${{ inputs.dispatch_deadline }}
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           umask 077

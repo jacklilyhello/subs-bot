@@ -66,6 +66,9 @@ def in_window(policy, now):
 
 def check_context(env, target):
     require(target.environment == "production" and env.get("GITHUB_WORKFLOW_REF") == WORKFLOW)
+    nonce = env.get("BACKUP_DISPATCH_NONCE", "")
+    require(not nonce or re.fullmatch(r"[a-f0-9]{64}", nonce) is not None,
+            "The dispatch nonce is malformed.")
     if env.get("GITHUB_EVENT_NAME") == "schedule":
         require(env.get("BACKUP_ACTION") == "monitor" and env.get("GITHUB_REPOSITORY") == artifact.REPOSITORY
                 and env.get("GITHUB_REPOSITORY_ID") == str(artifact.REPOSITORY_ID)
@@ -145,7 +148,7 @@ def confirm_plan_run(session, day, revision):
     require(str(run.get("id")) == run_id and run.get("run_attempt") == 1
             and run.get("workflow_id") == workflow.get("id") and workflow.get("path") == ".github/workflows/worker-production-backup.yml"
             and run.get("event") == "workflow_dispatch" and run.get("head_branch") == "main"
-            and run.get("head_sha") == revision and run.get("display_title") == "Production backup plan-begin at " + revision
+            and run.get("head_sha") == revision and run_action(run.get("display_title"), revision) == "plan-begin"
             and (run.get("status"), run.get("conclusion")) == ("completed", "success")
             and all(isinstance(run.get(key), dict) and run[key].get("id") == artifact.REPOSITORY_ID
                     for key in ("repository", "head_repository")))
@@ -158,8 +161,64 @@ def confirm_plan_run(session, day, revision):
 
 def intent_metadata(env, state):
     require(env.get("GITHUB_RUN_ATTEMPT") == "1" and re.fullmatch(r"[1-9][0-9]{0,19}", env.get("GITHUB_RUN_ID", "")))
-    return {"stateSha256": state["stateSha256"], "control": state["control"],
-            "runId": env["GITHUB_RUN_ID"], "runAttempt": "1", "controlRevision": env["GITHUB_SHA"]}
+    result = {"stateSha256": state["stateSha256"], "control": state["control"],
+              "runId": env["GITHUB_RUN_ID"], "runAttempt": "1", "controlRevision": env["GITHUB_SHA"]}
+    if env.get("BACKUP_DISPATCH_NONCE"):
+        require(re.fullmatch(r"[a-f0-9]{64}", env["BACKUP_DISPATCH_NONCE"]))
+        result["dispatchNonce"] = env["BACKUP_DISPATCH_NONCE"]
+    return result
+
+
+def run_action(title, revision, *, nonce=None):
+    require(isinstance(title, str) and re.fullmatch(r"[a-f0-9]{40}", revision or ""))
+    pattern = r"Production backup ([a-z-]+) at " + revision + r"(?: #([a-f0-9]{64}))?"
+    match = re.fullmatch(pattern, title)
+    require(match is not None and (nonce is None or (match.group(2) or "") == nonce))
+    return match.group(1)
+
+
+def coordinator_guard(env, target, store, policy, base_guard):
+    """Bind a child to one immutable dispatch and its pre-pause deadline."""
+    nonce, session, raw_deadline = (env.get("BACKUP_DISPATCH_NONCE", ""),
+        env.get("BACKUP_COORDINATOR_SESSION", ""), env.get("BACKUP_DISPATCH_DEADLINE", ""))
+    if not nonce:
+        require(not session and not raw_deadline, "Unbound coordinator inputs are not accepted.")
+        return base_guard
+    import production_backup_coordinator as coordinator
+    require(re.fullmatch(r"[a-f0-9]{64}", nonce or "") and coordinator.DECIMAL.fullmatch(session or "")
+            and re.fullmatch(r"0|[1-9][0-9]{0,19}", raw_deadline or ""))
+    action = env.get("BACKUP_ACTION", "")
+    require(action in coordinator.STEPS and store.objects is not None)
+    sequence = coordinator.STEPS.index(action) + 1
+    raw, _ = store.objects.get(coordinator.event_key(target.digest, session, sequence))
+    intent = parsed(raw)
+    require(canonical(intent) == raw and intent == coordinator.dispatch_intent(target=target.digest, session=session,
+        sequence=sequence, revision=env["GITHUB_SHA"], nonce=nonce, input_sha256=intent.get("inputSha256"),
+        created_at=intent.get("createdAt")))
+    inputs = {"action": action, "source_checkpoint_id": env.get("BACKUP_SOURCE_CHECKPOINT_ID", ""),
+              "source_manifest_sha256": env.get("BACKUP_SOURCE_MANIFEST_SHA256", ""),
+              "dispatch_nonce": nonce, "coordinator_session": session, "dispatch_deadline": raw_deadline}
+    if env.get("BACKUP_SESSION"):
+        inputs.update(session=env["BACKUP_SESSION"], session_day=env.get("BACKUP_SESSION_DAY", ""))
+    if env.get("BACKUP_STATE_SHA256"):
+        inputs["state_sha256"] = env["BACKUP_STATE_SHA256"]
+    require(digest(inputs) == intent["inputSha256"], "Coordinator inputs differ from the immutable dispatch intent.")
+    deadline = int(raw_deadline)
+    if sequence >= coordinator.STEPS.index("pause") + 1:
+        pause_raw, _ = store.objects.get(coordinator.event_key(target.digest, session, coordinator.STEPS.index("pause") + 1))
+        pause = parsed(pause_raw)
+        require(canonical(pause) == pause_raw and pause == coordinator.dispatch_intent(target=target.digest, session=session,
+                sequence=coordinator.STEPS.index("pause") + 1, revision=env["GITHUB_SHA"], nonce=pause.get("nonce"),
+                input_sha256=pause.get("inputSha256"), created_at=pause.get("createdAt"))
+                and coordinator.pause_deadline(pause, policy["pauseLimitSeconds"], now=int(time.time())) == deadline)
+    else:
+        require(deadline == 0)
+    def guard():
+        base_guard()
+        if action in {"pause", "freeze", "capture"}:
+            require(deadline > int(time.time()), "The coordinator deadline elapsed; this mutation cannot start.")
+    guard()
+    return guard
 
 
 def require_finished_intent(details, *, allowed_actions=None):
@@ -177,8 +236,7 @@ def require_finished_intent(details, *, allowed_actions=None):
                     for key in ("repository", "head_repository")), "The original operation has not independently finished.")
     if allowed_actions is not None:
         require(isinstance(allowed_actions, set) and bool(allowed_actions)
-                and run.get("display_title") in {"Production backup " + action + " at " + details["controlRevision"]
-                                                for action in allowed_actions},
+                and run_action(run.get("display_title"), details["controlRevision"], nonce=details.get("dispatchNonce", "")) in allowed_actions,
                 "The finished run is not the exact intended backup action.")
 
 
@@ -291,9 +349,7 @@ def monitor_workflow_runs(raw_controllers, now, latest_verified, expected_plan_r
         revision = run.get("head_sha", "")
         require(isinstance(revision, str) and re.fullmatch(r"[a-f0-9]{40}", revision))
         title = run.get("display_title", "")
-        prefix, suffix = "Production backup ", " at " + revision
-        require(isinstance(title, str) and title.startswith(prefix) and title.endswith(suffix))
-        action = title[len(prefix):-len(suffix)]
+        action = run_action(title, revision)
         require(action in ACTIONS)
         if str(run["id"]) == expected_plan_run:
             require(action == "plan-begin" and run.get("status") == "completed" and run.get("conclusion") == "success")
@@ -458,6 +514,10 @@ def main(env=None):
         require(state["release"]["revision"] == proof["revision"] and state["release"]["moduleSha256"] == manifest["bundleSha256"],
                 "The archived source is not the active release.")
         store = PrivateStore(data, target.data["backupBucketName"])
+        bounded_guard = coordinator_guard(env, target, store, policy, guard)
+        if action in {"pause", "freeze", "capture"}:
+            ctl.guard = bounded_guard
+            source.guard = bounded_guard
         seed = maintenance.Anchor(store, target.digest, "0" * 64)
         genesis_sha = recovery.digest(seed.initial_material()[1])
         supplied_genesis = env.get("SUBS_BOT_BACKUP_GENESIS_SHA256", "")
@@ -568,6 +628,7 @@ def main(env=None):
                         and plan["configurationSha256"] == events[0]["details"]["configurationSha256"])
                 predecessor = exact_predecessor(env, plan)
                 ctl.approval(env.get("SUBS_BOT_APPROVAL_JSON", ""), "pause", predecessor)
+                bounded_guard()
                 journal.append("pause-intent", intent_metadata(env, plan), int(time.time()))
                 after = ctl.transition("pause", env.get("SUBS_BOT_APPROVAL_JSON", ""), predecessor)
                 journal.append("paused", {"control": after["control"]}, int(time.time()))
@@ -583,6 +644,7 @@ def main(env=None):
                         and state["configurationSha256"] == events[0]["details"]["configurationSha256"])
                 predecessor = exact_predecessor(env, state)
                 ctl.approval(env.get("SUBS_BOT_APPROVAL_JSON", ""), "freeze", predecessor)
+                bounded_guard()
                 journal.append("freeze-intent", intent_metadata(env, state), int(time.time()))
                 after = ctl.transition("freeze", env.get("SUBS_BOT_APPROVAL_JSON", ""), predecessor)
                 journal.append("frozen", {"control": after["control"]}, int(time.time()))
@@ -668,6 +730,7 @@ def main(env=None):
                 recovery_journal = recovery.RecoveryJournal(api, owner, guard=guard)
                 recovery_journal.load()
                 require(recovery_journal.value is None, "The capture checkpoint already exists; reconcile instead of restarting.")
+                bounded_guard()
                 journal.append("capture-intent", {**intent_metadata(env, state), "checkpointId": contract["checkpointId"]}, int(time.time()))
                 try:
                     engine = recovery.RecoveryEngine(api, source, recovery_journal, directory)
@@ -745,6 +808,9 @@ def main(env=None):
                               "pauseLimitExceeded": elapsed > policy["pauseLimitSeconds"]}
             else:
                 raise ValueError("Unsupported backup action.")
+        # Plans returned by the controller contain a state but no action label.
+        # The dispatch coordinator binds every result to the selected checkpoint.
+        result.setdefault("action", action)
         return emit_result(result, target, revision, root, source_revision=proof["revision"])
 
 
