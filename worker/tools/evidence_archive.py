@@ -23,6 +23,7 @@ import prepare_isolation_artifact as artifact
 import production_candidate as candidate
 from cloudflare_isolation import API_ORIGIN, CloudflareClient, CloudflareError, WORKER_NAME, _NoRedirect
 from native_restore_rehearsal import ACCOUNT_SHA256, signed_put_headers
+import scoped_r2
 
 ERROR = "Private release evidence could not be verified; preserve existing objects and investigate."
 WORKFLOW = artifact.REPOSITORY + "/.github/workflows/worker-evidence-archive.yml@refs/heads/main"
@@ -448,19 +449,22 @@ class PrivateStore:
         self.target, self.token, self.prefix = target, token, prefix
         self.root = "/accounts/" + target["accountId"]
         self.bucket = self.root + "/r2/buckets/" + WORKER_NAME
-        self.api = CloudflareClient(token)
+        metadata_token = scoped_r2.metadata_token()
+        self.api = CloudflareClient(token or metadata_token)
+        self.metadata_api = CloudflareClient(metadata_token) if metadata_token else self.api
+        self.objects = scoped_r2.from_environment(target["accountId"], WORKER_NAME)
         self.opener = build_opener(ProxyHandler({}), _NoRedirect())
         self.access_key = None
 
     def verify(self):
         stage("store-private")
-        bucket = self.api("GET", self.bucket)
+        bucket = self.metadata_api("GET", self.bucket)
         require(isinstance(bucket, dict) and bucket.get("name") == WORKER_NAME
             and bucket.get("creation_date") == self.target["r2CreatedOn"] and bucket.get("jurisdiction") == "default")
-        require(self.api("GET", self.bucket + "/domains/managed").get("enabled") is False
-            and self.api("GET", self.bucket + "/domains/custom") in ([], {"domains": []}))
+        require(self.metadata_api("GET", self.bucket + "/domains/managed").get("enabled") is False
+            and self.metadata_api("GET", self.bucket + "/domains/custom") in ([], {"domains": []}))
         stage("lifecycle")
-        verify_lifecycle(self.api("GET", self.bucket + "/lifecycle"), self.prefix)
+        verify_lifecycle(self.metadata_api("GET", self.bucket + "/lifecycle"), self.prefix)
 
     def key(self, relative):
         require(relative == "manifest.json" or re.fullmatch(r"blobs/[0-9a-f]{64}", relative))
@@ -468,6 +472,9 @@ class PrivateStore:
 
     def read(self, relative):
         key = self.key(relative)
+        if self.objects is not None:
+            raw, _etag = self.objects.get(key, absent=True, limit=MAX_BLOB)
+            return raw
         request = Request(API_ORIGIN + self.bucket + "/objects/" + quote(key, safe="/"), headers={
             "Authorization": "Bearer " + self.token, "Accept-Encoding": "identity", "cf-r2-jurisdiction": "default"})
         try:
@@ -485,6 +492,10 @@ class PrivateStore:
     def put(self, relative, raw):
         key = self.key(relative)
         require(isinstance(raw, bytes) and 0 < len(raw) <= MAX_BLOB)
+        if self.objects is not None:
+            self.objects.put_once(key, raw,
+                metadata={"cache-control": "no-store, private", "content-type": "application/octet-stream"})
+            return
         if self.access_key is None:
             # The protected environment uses a scoped user API token. This
             # read-only endpoint provides its R2 S3 access-key identity.
