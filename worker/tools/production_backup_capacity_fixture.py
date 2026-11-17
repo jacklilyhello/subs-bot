@@ -17,22 +17,31 @@ PREFIX = "maintenance/production-control/evidence/capacity-fixture/"
 
 def validate_registration(registration, expected_sha256, witness, witness_sha256, *, now, excluded_database_ids):
     """Require independent pins for the dedicated D1 and its binding inventory."""
-    require(isinstance(registration, dict) and set(registration) == {"version", "accountId", "databaseId", "databaseName", "createdAt", "bucketName", "bucketCreatedAt"}
+    require(isinstance(registration, dict) and set(registration) == {"version", "accountId", "databaseId", "databaseName", "createdAt", "bucketName", "bucketCreatedAt",
+            "probeDatabaseId", "probeDatabaseName", "probeCreatedAt"}
             and type(registration["version"]) is int and registration["version"] == 1
             and registration["accountId"] == ACCOUNT
             and re.fullmatch(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}", registration["databaseId"] or "")
             and registration["databaseName"] == "subs-bot-cf-backup-capacity-20261118"
             and registration["bucketName"] == "subs-bot-cf-dev-01"
+            and registration["probeDatabaseName"] == "subs-bot-cf-backup-permission-20261118"
+            and re.fullmatch(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}", registration["probeDatabaseId"] or "")
+            and registration["probeDatabaseId"] != registration["databaseId"]
+            and registration["probeDatabaseId"] not in excluded_database_ids
             and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z", registration["createdAt"] or "")
+            and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z", registration["probeCreatedAt"] or "")
             and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z", registration["bucketCreatedAt"] or "")
             and registration["databaseId"] not in excluded_database_ids
             and re.fullmatch(r"[a-f0-9]{64}", expected_sha256 or "")
             and sha256(canonical(registration)).hexdigest() == expected_sha256)
-    require(isinstance(witness, dict) and set(witness) == {"version", "accountId", "databaseId", "observedAt", "workerBindingCount"}
+    require(isinstance(witness, dict) and set(witness) == {"version", "accountId", "databaseId", "observedAt", "workerBindingCount",
+            "probeDatabaseId", "probeWorkerBindingCount"}
             and type(witness["version"]) is int and witness["version"] == 1 and witness["accountId"] == ACCOUNT
             and witness["databaseId"] == registration["databaseId"] and type(witness["observedAt"]) is int
             and type(now) is int and 0 <= now - witness["observedAt"] <= 900
             and type(witness["workerBindingCount"]) is int and witness["workerBindingCount"] == 0
+            and witness["probeDatabaseId"] == registration["probeDatabaseId"]
+            and type(witness["probeWorkerBindingCount"]) is int and witness["probeWorkerBindingCount"] == 0
             and re.fullmatch(r"[a-f0-9]{64}", witness_sha256 or "")
             and sha256(canonical(witness)).hexdigest() == witness_sha256,
             "The independent, recent no-binding proof is missing or differs.")
@@ -296,3 +305,70 @@ def initialize_schema_once(api, store, source, *, target_sha256, run_id, guard):
         kind = "managed"
     source.schema()
     return {"schemaVerified": True, "migrationCount": len(history), "fixtureOnly": True}
+
+
+PROBE_SQL = "CREATE TABLE subs_bot_d1_read_permission_probe (value INTEGER) STRICT"
+
+
+def probe_intent(store, registration_sha, *, probe_database_id, run_id, dispatcher_revision, controller_revision, witness_sha, approval_sha, expected_sha):
+    from production_target import parsed
+    key = PREFIX + "read-token-probe/" + probe_database_id + "/intent.json"
+    raw = store.get(key)
+    require(isinstance(raw, bytes) and sha256(raw).hexdigest() == expected_sha)
+    intent = parsed(raw)
+    require(canonical(intent) == raw and set(intent) == {"version", "kind", "targetSha256", "probeDatabaseId", "runId", "runAttempt",
+            "dispatcherRevision", "controllerRevision", "witnessSha256", "approvalSha256"}
+            and intent["version"] == 1 and intent["kind"] == "d1-read-token-negative-probe"
+            and intent["targetSha256"] == registration_sha and intent["runId"] == run_id and intent["runAttempt"] == "1"
+            and intent["probeDatabaseId"] == probe_database_id
+            and intent["dispatcherRevision"] == dispatcher_revision and intent["controllerRevision"] == controller_revision
+            and intent["witnessSha256"] == witness_sha and intent["approvalSha256"] == approval_sha)
+    return intent
+
+
+def verify_trusted_probe_job(run_id, dispatcher_revision):
+    import prepare_isolation_artifact as github
+    require(re.fullmatch(r"[1-9][0-9]{0,19}", run_id or ""))
+    token = github._github_token()
+    run = github._get_json("/actions/runs/" + run_id + "/attempts/1", token)
+    workflow = github._get_json("/actions/workflows/worker-backup-reviewed-head.yml", token)
+    require(str(run.get("id")) == run_id and run.get("run_attempt") == 1 and run.get("head_sha") == dispatcher_revision
+            and run.get("workflow_id") == workflow.get("id") and workflow.get("path") == ".github/workflows/worker-backup-reviewed-head.yml"
+            and run.get("head_branch") == "main" and run.get("event") == "workflow_dispatch"
+            and all(isinstance(run.get(k), dict) and run[k].get("id") == github.REPOSITORY_ID
+                    for k in ("repository", "head_repository")))
+    response = github._get_json("/actions/runs/" + run_id + "/attempts/1/jobs?per_page=100", token)
+    jobs = response.get("jobs")
+    require(isinstance(jobs, list) and type(response.get("total_count")) is int and response["total_count"] == len(jobs) < 100)
+    matches = [job for job in jobs if isinstance(job, dict) and job.get("name") == "probe_intent"]
+    require(len(matches) == 1)
+    job = matches[0]
+    require(str(job.get("run_id")) == run_id and job.get("run_attempt") == 1 and job.get("head_sha") == dispatcher_revision
+            and (job.get("status"), job.get("conclusion")) == ("completed", "success") and isinstance(job.get("steps"), list))
+    steps = [step for step in job["steps"] if isinstance(step, dict) and step.get("name") == "Record the one-shot read-token probe intent"]
+    require(len(steps) == 1 and (steps[0].get("status"), steps[0].get("conclusion")) == ("completed", "success"))
+    return run
+
+
+def read_token_probe(api, *, guard):
+    """Exactly one fixed CREATE on the dedicated probe D1; denial is required."""
+    from cloudflare_isolation import CloudflareError
+    guard()
+    api.verify_identity()
+    require(api.rows(api.registration["databaseId"], "SELECT 1 AS matches") == [{"matches": 1}])
+    query = "SELECT name FROM sqlite_schema WHERE type='table' AND name='subs_bot_d1_read_permission_probe'"
+    require(api.rows(api.registration["databaseId"], query) == [], "A prior capability probe table exists; do not retry.")
+    guard()
+    api.verify_identity()
+    try:
+        result = api.client("POST", api.path + "/query", {"sql": PROBE_SQL})
+    except CloudflareError as error:
+        require(error.http_status == 403 and not error.uncertain,
+                "The capability probe did not return a confirmed authorization denial.")
+    else:
+        # A successful or unexpected response is not cleaned up and is never
+        # followed by another CREATE. An independent inspection is required.
+        require(False, "D1 Read did not reject the fixed write probe; preserve the probe database.")
+    guard()
+    require(api.rows(api.registration["databaseId"], query) == [], "The denied capability probe left an unexpected table.")
+    return {"fixtureOnly": True, "permissionDenied": True, "httpStatus": 403, "probeWriteAttempted": True}

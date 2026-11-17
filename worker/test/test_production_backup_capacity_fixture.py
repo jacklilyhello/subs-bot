@@ -16,6 +16,47 @@ class FixtureStore(Store):
 
 
 class CapacityFixtureTests(unittest.TestCase):
+    def test_probe_intent_requires_exact_probe_identity_and_original_run(self):
+        from hashlib import sha256
+        from production_target import canonical
+        registration_sha, probe_id = "a" * 64, "00000000-0000-4000-8000-000000000004"
+        intent = {"version": 1, "kind": "d1-read-token-negative-probe", "targetSha256": registration_sha,
+                  "probeDatabaseId": probe_id, "runId": "123", "runAttempt": "1", "dispatcherRevision": "b" * 40,
+                  "controllerRevision": "c" * 40, "witnessSha256": "d" * 64, "approvalSha256": "e" * 64}
+        raw = canonical(intent)
+        store = FixtureStore()
+        store.put_once(fixture.PREFIX + "read-token-probe/" + probe_id + "/intent.json", raw)
+        kwargs = {"probe_database_id": probe_id, "run_id": "123", "dispatcher_revision": "b" * 40,
+                  "controller_revision": "c" * 40, "witness_sha": "d" * 64,
+                  "approval_sha": "e" * 64, "expected_sha": sha256(raw).hexdigest()}
+        self.assertEqual(fixture.probe_intent(store, registration_sha, **kwargs), intent)
+        with self.assertRaises(ContractError):
+            fixture.probe_intent(store, registration_sha, **{**kwargs, "run_id": "456"})
+
+    def test_read_token_probe_attempts_only_fixed_create_once_and_requires_denial(self):
+        from cloudflare_isolation import CloudflareError
+        api = Mock()
+        api.registration = {"databaseId": "00000000-0000-4000-8000-000000000004"}
+        api.path = "/accounts/fixture/d1/database/probe"
+        api.rows.side_effect = [[{"matches": 1}], [], []]
+        api.client.side_effect = CloudflareError("synthetic forbidden", http_status=403)
+        result = fixture.read_token_probe(api, guard=lambda: None)
+        self.assertTrue(result["permissionDenied"])
+        api.client.assert_called_once_with("POST", api.path + "/query", {"sql": fixture.PROBE_SQL})
+
+        for response in ([{"success": True}], CloudflareError("synthetic unknown", uncertain=True, http_status=500)):
+            api = Mock()
+            api.registration = {"databaseId": "00000000-0000-4000-8000-000000000004"}
+            api.path = "/accounts/fixture/d1/database/probe"
+            api.rows.side_effect = [[{"matches": 1}], []]
+            if isinstance(response, Exception):
+                api.client.side_effect = response
+            else:
+                api.client.return_value = response
+            with self.assertRaises(ContractError):
+                fixture.read_token_probe(api, guard=lambda: None)
+            api.client.assert_called_once()
+
     def test_seed_is_bound_to_every_table_count_and_only_appends_finished_rows(self):
         counts = {"subs_bot_production_invocations": 0, "subscriptions": 3}
         plan = fixture.seed_plan(target_sha256="a" * 64, database_id="00000000-0000-4000-8000-000000000001", counts=counts, desired=16000)
@@ -95,9 +136,11 @@ class CapacityFixtureTests(unittest.TestCase):
         from production_target import ACCOUNT, canonical
         registration = {"version": 1, "accountId": ACCOUNT, "databaseId": "00000000-0000-4000-8000-000000000001",
                         "databaseName": "subs-bot-cf-backup-capacity-20261118", "createdAt": "2026-11-18T00:00:00Z",
-                        "bucketName": "subs-bot-cf-dev-01", "bucketCreatedAt": "2026-11-18T00:00:00Z"}
+                        "bucketName": "subs-bot-cf-dev-01", "bucketCreatedAt": "2026-11-18T00:00:00Z",
+                        "probeDatabaseId": "00000000-0000-4000-8000-000000000004",
+                        "probeDatabaseName": "subs-bot-cf-backup-permission-20261118", "probeCreatedAt": "2026-11-18T00:00:00Z"}
         witness = {"version": 1, "accountId": ACCOUNT, "databaseId": registration["databaseId"], "observedAt": 1000,
-                   "workerBindingCount": 0}
+                   "workerBindingCount": 0, "probeDatabaseId": registration["probeDatabaseId"], "probeWorkerBindingCount": 0}
         pin = sha256(canonical(registration)).hexdigest()
         witness_pin = sha256(canonical(witness)).hexdigest()
         self.assertEqual(fixture.validate_registration(registration, pin, witness, witness_pin, now=1100, excluded_database_ids=[]), pin)

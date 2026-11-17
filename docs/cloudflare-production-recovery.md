@@ -142,4 +142,6 @@ G0 之后发生任何新增、修改、删除、授权、领取、撤销、短�
 
 另有待接入可信 main gate 的 `capacity-fixture` 候选入口：只针对独立登记、与现有业务 D1 不同的专用 D1 和私有桶，验证准确迁移链，逐次追加合成 finished invocation，测量全库达到 16,000、20,000 和 20,001 行时的真实预检；超限复用日常备份的同一暂停前拒绝条件。每次 schema 或 seed 写入前记录独占私有 intent，意外或未知结果不重发，也不清理数据；每个边界需在追加下一批前用独立 run 复读相同数据与原 run 证据。该入口的实际资源创建、可信 gate、平台侧最小权限和 Cloudflare 执行仍需独立完成。无 Worker 绑定 witness 是有时效的独立观察，不是禁止新绑定的实时平台锁；验收时须独立复读并排除并发绑定。只测行数不能宣称真实对象数量和字节上限已验证。
 
+读取令牌权限探针使用另一独立登记且无 Worker 绑定的 D1，可信 main 先按 probe D1 ID 独占记录不可重用 intent；候选只携带 D1 Read 凭据，对该 D1 仅尝试一次固定 CREATE。只有前置只读查询成功、写请求明确返回 HTTP 403 且复读确认表不存在，才可报告请求被拒；成功或其他未知结果保留现场，不重新发送。另一个 fresh trusted runner 再用只读凭据检查同一 D1、私有 intent 和表不存在。受限 token 的平台策略还须独立检查，probe 的结果不能外推为其他 token 或其他账户的权限保证。
+
 候选的托管隔离验收拟使用受信 main 的 `worker-backup-reviewed-head.yml`，由专用 `subs-bot-backup-head-isolation` Environment 另行固定已审查候选 SHA；入口默认关闭。可信 main guard 在注入凭据前后核对同仓库 PR、当前 main 祖先、受保护 pin 和两个独立 checkout。候选代码将 GitHub dispatcher main SHA 与 candidate controller SHA 分开记录，不改写 GitHub 提供的 `GITHUB_*`。每次 watchdog 必须核对相同候选、原 run 的可信 dispatcher 和 journal；不能用新 head 推断旧写入的结果。专用环境只提供本项目隔离 D1/R2 所需凭据、Worker 只读凭据和用户授权的测试 Bot 配置；确切权限及有效期须在启用前独立核实。closed/frozen 演练不修改 webhook；open 状态恢复接收仍需独立的短期受控 webhook 窗口和最终恢复证据。
