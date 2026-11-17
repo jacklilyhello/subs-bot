@@ -117,16 +117,34 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
   monitor:
-    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && github.event_name == 'schedule' && vars.SUBS_BOT_PRODUCTION_BACKUP_COORDINATOR_MONITOR_ENABLED == 'true'
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && github.event_name == 'schedule'
     environment: subs-bot-production-backup-coordinator
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    outputs:
+      status: ${{ steps.gate.outputs.status }}
     steps:
+      - name: Check whether coordinator monitoring is enabled
+        id: gate
+        env:
+          MONITOR_ENABLED: ${{ vars.SUBS_BOT_PRODUCTION_BACKUP_COORDINATOR_MONITOR_ENABLED }}
+        run: |
+          if [ "$MONITOR_ENABLED" = true ]; then
+            echo 'enabled=true' >> "$GITHUB_OUTPUT"
+            echo 'status=enabled' >> "$GITHUB_OUTPUT"
+          else
+            echo 'enabled=false' >> "$GITHUB_OUTPUT"
+            echo 'status=disabled' >> "$GITHUB_OUTPUT"
+            echo '::warning::Coordinator monitoring is disabled; no observation was made.'
+            echo 'Coordinator monitoring is disabled; no observation was made.' >> "$GITHUB_STEP_SUMMARY"
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.gate.outputs.enabled == 'true'
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Inspect without dispatch or object writes
+        if: steps.gate.outputs.enabled == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           SUBS_BOT_CONTROL_ENVIRONMENT: subs-bot-production-backup-coordinator

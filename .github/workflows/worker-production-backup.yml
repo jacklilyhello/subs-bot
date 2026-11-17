@@ -1,5 +1,5 @@
 name: Run an explicitly approved production backup checkpoint
-run-name: Production backup ${{ github.event_name == 'schedule' && 'monitor' || inputs.action }} at ${{ github.sha }}${{ inputs.dispatch_nonce && format(' #{0}', inputs.dispatch_nonce) || '' }}
+run-name: "Production backup ${{ github.event_name == 'schedule' && 'monitor' || inputs.action }} at ${{ github.sha }}${{ inputs.dispatch_nonce && format(' #{0}', inputs.dispatch_nonce) || '' }}"
 
 on:
   schedule:

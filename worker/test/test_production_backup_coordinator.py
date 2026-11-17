@@ -14,6 +14,21 @@ from production_target import ContractError, canonical
 
 
 class CoordinatorTests(unittest.TestCase):
+    def test_scheduled_monitor_checks_environment_before_read_credentials(self):
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/worker-production-backup-coordinator.yml").read_text()
+        monitor = workflow.split("  monitor:\n", 1)[1]
+        job_condition = monitor.split("    environment:", 1)[0]
+        self.assertNotIn("vars.SUBS_BOT_PRODUCTION_BACKUP_COORDINATOR_MONITOR_ENABLED", job_condition)
+        self.assertIn("MONITOR_ENABLED: ${{ vars.SUBS_BOT_PRODUCTION_BACKUP_COORDINATOR_MONITOR_ENABLED }}", monitor)
+        self.assertIn("echo 'status=disabled'", monitor)
+        self.assertEqual(monitor.count("if: steps.gate.outputs.enabled == 'true'"), 2)
+
+    def test_backup_run_name_quotes_nonce_expression(self):
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/worker-production-backup.yml").read_text()
+        run_name = next(line for line in workflow.splitlines() if line.startswith("run-name:"))
+        self.assertTrue(run_name.startswith('run-name: "') and run_name.endswith('"'))
+        self.assertIn("format(' #{0}', inputs.dispatch_nonce)", run_name)
+
     def archive(self, result):
         raw = BytesIO()
         with ZipFile(raw, "w") as archive:
@@ -285,9 +300,11 @@ class CoordinatorTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             checked(run, {**details, "dispatchNonce": "d" * 64})
 
+    @patch.object(coordinator, "stage_inputs")
+    @patch.object(coordinator, "completed_results")
     @patch.object(coordinator, "verify_child_claim")
     @patch.object(coordinator, "claim_child_once")
-    def test_expired_dispatched_pause_is_rejected_but_activation_is_allowed(self, _claim, _verify):
+    def test_expired_dispatched_pause_is_rejected_but_activation_is_allowed(self, _claim, _verify, completed, stage):
         from hashlib import sha256
         target, store = Mock(digest="a" * 64), Mock()
         pause = coordinator.dispatch_intent(target=target.digest, session="123", sequence=5,
@@ -299,6 +316,8 @@ class CoordinatorTests(unittest.TestCase):
         inputs = {"action": "pause", "source_checkpoint_id": "e" * 32, "source_manifest_sha256": "f" * 64,
                   "dispatch_nonce": "c" * 64, "coordinator_session": "123", "dispatch_deadline": "1060",
                   "session": "456-1", "session_day": "2026/11/18", "state_sha256": "1" * 64}
+        completed.side_effect = lambda *_args, **kwargs: ([{}] * (kwargs["stop_before"] - 1), 1060)
+        stage.side_effect = lambda *_args, **_kwargs: (dict(inputs), 1060)
         pause["inputSha256"] = sha256(canonical(inputs)).hexdigest()
         store.objects.get.return_value = (canonical(pause), '"etag"')
         parent = {"id": 789, "run_attempt": 1, "path": ".github/workflows/worker-production-backup-coordinator.yml",
