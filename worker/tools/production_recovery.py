@@ -175,9 +175,9 @@ class RecoveryAPI:
                            and ("etag" not in payload or re.fullmatch(r"[a-f0-9]{32}", payload["etag"] or "") is not None)
                            and all(matches(native.BOOKMARK, payload[key]) for key in ("filename", "current_bookmark") if key in payload))
         require(allowed, "The recovery API rejected an out-of-scope operation.")
-        metadata_token = os.environ.get("SUBS_BOT_CF_R2_METADATA_READ_TOKEN", "")
-        token = metadata_token if metadata_token and method == "GET" and route.startswith(self.root + "/r2/buckets") \
-                and not route.endswith("/objects") else self.token
+        token = self.token
+        if method == "GET" and route.startswith(self.root + "/r2/buckets") and not route.endswith("/objects"):
+            token = native.scoped_r2.metadata_token() or token
         headers = {"Authorization": "Bearer " + token, "Accept": "application/json",
                    "Cache-Control": "no-cache", "cf-r2-jurisdiction": "default"}
         body = None if payload is None else canonical(payload)

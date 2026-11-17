@@ -28,6 +28,7 @@ import prepare_control_artifact
 from cloudflare_isolation import ISOLATION_RELEASE_USER_AGENT
 from general_isolation_window import work_sql, terminal_card_sql
 from production_target import Target, ContractError, approve, canonical, digest, matches, parsed, require, validate_target, SHA, REV, UUID
+import scoped_r2
 
 API_ROOT = "https://api.cloudflare.com/client/v4"
 MAX_API = 8 * 1024 * 1024
@@ -236,7 +237,7 @@ def _mutate_sql(api, path, statements):
 
 
 def privacy(api, root, name, created):
-    metadata_token = os.environ.get("SUBS_BOT_CF_R2_METADATA_READ_TOKEN", "")
+    metadata_token = scoped_r2.metadata_token()
     if metadata_token:
         metadata_api = API(api.target, metadata_token)
         require(metadata_api.root == root, "The bucket metadata account differs from the approved target.")

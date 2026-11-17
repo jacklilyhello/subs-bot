@@ -57,7 +57,7 @@ class PrivateProofStore:
         self.run_id, self.attempt = run_id, attempt
         self.prefix = f"{BASE}{run_id}/{attempt}/"
         self.base = f"/accounts/{target['accountId']}/r2/buckets/{self.bucket}"
-        metadata_token = os.environ.get("SUBS_BOT_CF_R2_METADATA_READ_TOKEN", "")
+        metadata_token = scoped_r2.metadata_token()
         self.api = CloudflareClient(token or metadata_token)
         self.metadata_api = CloudflareClient(metadata_token) if metadata_token else self.api
         self.objects = scoped_r2.from_environment(target["accountId"], self.bucket)

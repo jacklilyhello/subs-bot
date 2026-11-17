@@ -144,6 +144,15 @@ class ScopedR2Tests(unittest.TestCase):
         self.assertEqual(metadata.call_count, 4)
         source.assert_not_called()
 
+    def test_scoped_objects_require_explicit_metadata_credential(self):
+        self.assertEqual(scoped_r2.metadata_token({}), "")
+        self.assertEqual(scoped_r2.metadata_token({"SUBS_BOT_SCOPED_R2_READ_JSON": "configured",
+                                                   "SUBS_BOT_CF_R2_METADATA_READ_TOKEN": "metadata-only"}), "metadata-only")
+        with self.assertRaises(ContractError):
+            scoped_r2.metadata_token({"SUBS_BOT_SCOPED_R2_READ_JSON": "configured"})
+        with self.assertRaises(ContractError):
+            scoped_r2.metadata_token({"SUBS_BOT_SCOPED_R2_WRITE_JSON": "configured"})
+
     def test_legacy_exclusive_intent_rejects_412_without_readback_or_retry(self):
         from unittest.mock import Mock
         store = object.__new__(production_storage.PrivateStore)

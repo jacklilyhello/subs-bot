@@ -449,7 +449,7 @@ class PrivateStore:
         self.target, self.token, self.prefix = target, token, prefix
         self.root = "/accounts/" + target["accountId"]
         self.bucket = self.root + "/r2/buckets/" + WORKER_NAME
-        metadata_token = os.environ.get("SUBS_BOT_CF_R2_METADATA_READ_TOKEN", "")
+        metadata_token = scoped_r2.metadata_token()
         self.api = CloudflareClient(token or metadata_token)
         self.metadata_api = CloudflareClient(metadata_token) if metadata_token else self.api
         self.objects = scoped_r2.from_environment(target["accountId"], WORKER_NAME)

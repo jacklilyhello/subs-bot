@@ -419,9 +419,9 @@ class RehearsalAPI:
                             and all(len(values) == 1 for values in query.values()))
                 elif route not in {self.root + "/d1/database", self.root + "/r2/buckets"}:
                     require(path == route)
-        metadata_token = os.environ.get("SUBS_BOT_CF_R2_METADATA_READ_TOKEN", "")
-        token = metadata_token if metadata_token and method == "GET" and route.startswith(self.root + "/r2/buckets") \
-                and not route.endswith("/objects") else self.token
+        token = self.token
+        if method == "GET" and route.startswith(self.root + "/r2/buckets") and not route.endswith("/objects"):
+            token = scoped_r2.metadata_token() or token
         headers = {"Authorization": "Bearer " + token, "Accept": "application/json", "Cache-Control": "no-cache",
                    "cf-r2-jurisdiction": "default"}
         body = None if payload is None else canonical(payload)

@@ -20,6 +20,14 @@ MAX_OBJECT = 16 * 1024 * 1024
 MAX_LIST = 2 * 1024 * 1024
 
 
+def metadata_token(env=None):
+    env = os.environ if env is None else env
+    token = env.get("SUBS_BOT_CF_R2_METADATA_READ_TOKEN", "")
+    require(token or not (env.get("SUBS_BOT_SCOPED_R2_READ_JSON") or env.get("SUBS_BOT_SCOPED_R2_WRITE_JSON")),
+            "A separate R2 metadata credential is required with scoped object credentials.")
+    return token
+
+
 class ScopedR2Error(ValueError):
     """An operation was not confirmed; never infer a failed write was absent."""
 

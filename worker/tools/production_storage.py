@@ -18,7 +18,7 @@ class PrivateStore:
         require(bucket == api.target["backupBucketName"])
         self.api, self.bucket = api, bucket
         self.objects = scoped_r2.from_environment(api.target["accountId"], bucket)
-        metadata_token = os.environ.get("SUBS_BOT_CF_R2_METADATA_READ_TOKEN", "")
+        metadata_token = scoped_r2.metadata_token()
         self.metadata_api = API(api.target, metadata_token) if metadata_token else api
 
     def verify(self):
