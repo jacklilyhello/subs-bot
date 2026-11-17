@@ -71,7 +71,10 @@ class TrustedProviderGateTests(unittest.TestCase):
             self.assertNotIn("SUBS_BOT_CF_PROVIDER_ARCHIVE_WRITE_TOKEN", section)
             if name == "attest_provider":
                 self.assertNotIn("SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN", section)
+                self.assertNotIn("SUBS_BOT_SCOPED_R2_READ_JSON", section)
             else:
+                self.assertIn("SUBS_BOT_SCOPED_R2_READ_JSON", section)
+                self.assertIn("SUBS_BOT_CF_R2_METADATA_READ_TOKEN", section)
                 self.assertNotIn("SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN", section)
                 self.assertNotIn("SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN", section)
             if name.startswith("attest_"):
