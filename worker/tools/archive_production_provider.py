@@ -60,9 +60,14 @@ class PrivateProofStore:
         metadata_token = scoped_r2.metadata_token()
         self.api = CloudflareClient(token or metadata_token)
         self.metadata_api = CloudflareClient(metadata_token) if metadata_token else self.api
-        self.objects = scoped_r2.from_environment(target["accountId"], self.bucket)
         self.opener = build_opener(ProxyHandler({}), _NoRedirect())
         self.access_key = None
+
+    @property
+    def objects(self):
+        # Subclasses may bind an independently registered bucket after base
+        # initialization; select credentials only for that final bucket.
+        return scoped_r2.from_environment(self.target["accountId"], self.bucket)
 
     def verify(self):
         bucket = self.metadata_api("GET", self.base)

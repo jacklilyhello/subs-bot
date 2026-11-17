@@ -221,6 +221,23 @@ class ScopedR2Tests(unittest.TestCase):
             self.assertEqual(store.read("manifest.json"), b"original")
         objects.get.assert_called_once_with(store.prefix + "manifest.json", absent=True, limit=archive_production_provider.CHUNK_BYTES)
 
+    def test_provider_subclass_binds_only_its_final_registered_bucket(self):
+        from unittest.mock import Mock
+        target = {"accountId": "9431815bdb8beb2272f6668e06b7d3be", "namespace": "lilyya", "r2CreatedOn": "created"}
+        backup_bucket = "subs-bot-cf-prod-backup-01"
+        class BoundStore(archive_production_provider.PrivateProofStore):
+            def __init__(self):
+                super().__init__(target, "", "123", "1")
+                self.bucket = backup_bucket
+        env = {"SUBS_BOT_CF_R2_METADATA_READ_TOKEN": "metadata-only",
+               "SUBS_BOT_SCOPED_R2_READ_JSON": json.dumps({backup_bucket: CREDENTIAL})}
+        with patch.dict(os.environ, env, clear=True), patch.object(archive_production_provider, "CloudflareClient", return_value=Mock()):
+            store = BoundStore()
+            self.assertEqual(store.objects.bucket, backup_bucket)
+            original = archive_production_provider.PrivateProofStore(target, "", "123", "1")
+            with self.assertRaises(ContractError):
+                _ = original.objects
+
 
 if __name__ == "__main__":
     unittest.main()
