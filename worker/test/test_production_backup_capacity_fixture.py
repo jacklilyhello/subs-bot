@@ -90,8 +90,8 @@ class CapacityFixtureTests(unittest.TestCase):
         from hashlib import sha256
         from production_target import ACCOUNT, canonical
         registration = {"version": 1, "accountId": ACCOUNT, "databaseId": "00000000-0000-4000-8000-000000000001",
-                        "databaseName": "subs-bot-capacity-fixture-one", "createdAt": "2026-11-18T00:00:00Z",
-                        "bucketName": "subs-bot-capacity-fixture-one", "bucketCreatedAt": "2026-11-18T00:00:00Z"}
+                        "databaseName": "subs-bot-cf-backup-capacity-20261118", "createdAt": "2026-11-18T00:00:00Z",
+                        "bucketName": "subs-bot-cf-dev-01", "bucketCreatedAt": "2026-11-18T00:00:00Z"}
         witness = {"version": 1, "accountId": ACCOUNT, "databaseId": registration["databaseId"], "observedAt": 1000,
                    "workerBindingCount": 0}
         pin = sha256(canonical(registration)).hexdigest()

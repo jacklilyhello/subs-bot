@@ -217,6 +217,8 @@ def main(env=None):
             tool.guard()
             fixture.validate_registration(registration, registration_sha, witness, witness_sha, now=int(time.time()),
                                           excluded_database_ids=[ctl.target.data["d1Id"], tool.original["d1Id"]])
+            require(registration["bucketCreatedAt"] == tool.original["r2CreatedOn"],
+                    "The fixture evidence bucket differs from the registered private project bucket.")
         fixture_guard()
         metadata_api = API(ctl.target, env.get("SUBS_BOT_CF_R2_METADATA_READ_TOKEN", ""))
         privacy(metadata_api, metadata_api.root, registration["bucketName"], registration["bucketCreatedAt"])

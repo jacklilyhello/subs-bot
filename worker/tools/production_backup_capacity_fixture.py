@@ -21,8 +21,8 @@ def validate_registration(registration, expected_sha256, witness, witness_sha256
             and type(registration["version"]) is int and registration["version"] == 1
             and registration["accountId"] == ACCOUNT
             and re.fullmatch(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}", registration["databaseId"] or "")
-            and re.fullmatch(r"subs-bot-capacity-fixture-[a-z0-9-]{1,24}", registration["databaseName"] or "")
-            and re.fullmatch(r"subs-bot-capacity-fixture-[a-z0-9-]{1,24}", registration["bucketName"] or "")
+            and registration["databaseName"] == "subs-bot-cf-backup-capacity-20261118"
+            and registration["bucketName"] == "subs-bot-cf-dev-01"
             and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z", registration["createdAt"] or "")
             and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z", registration["bucketCreatedAt"] or "")
             and registration["databaseId"] not in excluded_database_ids
