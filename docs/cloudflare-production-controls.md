@@ -208,6 +208,12 @@ Webhook 配置顺序为 `plan-webhook → 明确批准其 stateSha256 → webhoo
 
 ## 专用主应用 Provider 绑定演练
 
+Provider 持久来源的独立 Worker 演练入口使用受信 main dispatcher `worker-provider-reviewed-operation.yml`，默认关闭，仅接受已审准确 PR head、项目隔离目标及独立登记的当前／previous 原始归档。先独立完成隔离镜像发布及全量读回，再分别审批并执行 `prepare-image`、`stage`、`activate`、`smoke`；镜像准备完成证明必须先经私有归档独立读回并登记，才能执行 stage。每次都重新核对准确来源、前态、旧版本终态和无 caller，先单次写入意图、独立读回，再发起对应请求；相应凭据使用隔离资源的短期最小权限。写前观察不能充当外部并发的原子锁，必须确保隔离目标没有其他写者。
+
+每步完成后独立读回 Provider 状态及私有意图／密文证据，审核后登记 ledger 并安全注入两个目标环境的加密下一配置和准确审批摘要，再进入下一步。密文 artifact 只用于短时交接，不能当作长期私有归档。响应已收到而后续失败时，流程尝试单次追加加密观察并独立读回；若进程死亡或写入结果不明，保留原 intent 和全部现场，不推断成功、不重发。`worker-provider-reviewed-operation-reconcile.yml` 只诊断写入 job 均明确跳过且私有前缀为空的 run；不得用它解除已执行或结果不明的操作。此入口及各项隔离验收以对应准确提交的实际检查和独立证据为准，不代表正式资源获得授权。
+
+该隔离操作 ledger 和只读对账列表各以上限 32 条为界；达到边界前须完成经审查的分页或分段扩容，不能删除旧意图、证据或登记记录以继续写入。新增限制只约束这个演练 journal，不改变历史版本链的独立上限。
+
 `worker-production-lifecycle-rehearsal.yml` 的 `provider-binding` 仅接受已登记的 `subs-bot-cf-control-drill-01`，不操作原 dev 数据或 Provider 部署。先取得完整、未绑定的专用 Provider 私有归档与独立摘要，并通知操作者准备好既有管理员浏览器会话；操作者明确 ready 后才 dispatch。输入 `source_run_id` 为当前准确 main Worker CI，`active_run_id` 为当前专用应用准确源 CI，`registration_sha256` 保持原登记值。另必填 `provider_run_id`、`provider_run_attempt`、`provider_manifest_sha256`，`human_window_seconds` 选 60–540 秒，`provider_ready_ack` 精确为 `IAB ready for subs-bot-cf-control-drill-01 refresh`。不提供旧基线 pin；配置变化后先封存并核对新的 G0。
 
 流程通过正式 Controller 的 plan-deploy／deploy 保留身份、密钥和数据，仅开启 URL 导入和刷新；严格读回唯一调用者绑定后，执行正常 G0／Webhook／激活流程。合成 URL 导入必须保存完整三个节点并精确导出原 URI。出现 `provider-refresh-window-open` 后，管理员在测试 Bot 私聊找到本次带 run 标记的订阅，打开详情并点击真实刷新按钮；工具只接受该管理员、该订阅、同一来源与真实票据的成功请求，核对 generation 增加一次、三个节点、确认发送及精确导出。重复发送 URL 不算刷新。报告需再与浏览器独立观察交叉核对，窗口打开本身不等于真人通过。
