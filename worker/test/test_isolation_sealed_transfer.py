@@ -98,7 +98,9 @@ class SealedTransferTests(unittest.TestCase):
             metadata = {"version": 1, "repositoryId": transfer.github.REPOSITORY_ID, "environment": "subs-bot-isolation",
                         "environmentId": "456", "branchPolicies": ["main"], "repositoryConflicts": [], "checkedAt": int(time.time()),
                         "environmentSecrets": [{"name": name, "updatedAt": "2026-01-01T00:00:00Z"} for name in
-                            ("SUBS_BOT_CF_ISOLATION_TARGET_JSON", "SUBS_BOT_CONTROL_DRILL_KEYS", "SUBS_BOT_TELEGRAM_TEST_CONFIG", "SUBS_BOT_CF_SEALED_SOURCE_READ_TOKEN")]}
+                            ("SUBS_BOT_CF_ISOLATION_TARGET_JSON", "SUBS_BOT_CONTROL_DRILL_KEYS", "SUBS_BOT_TELEGRAM_TEST_CONFIG",
+                             "SUBS_BOT_SEALED_WORKER_READ_TOKEN", "SUBS_BOT_SEALED_R2_ACCESS_KEY_ID",
+                             "SUBS_BOT_SEALED_R2_SECRET_ACCESS_KEY", "SUBS_BOT_SEALED_SOURCE_EVIDENCE_JSON")]}
             metadata_sha = sha256(transfer.canonical(metadata)).hexdigest()
             env = {**environment("backup-bot", public, directory), "TRANSFER_SOURCE_VALUE": secret,
                    "TRANSFER_SOURCE_METADATA_JSON": json.dumps(metadata), "TRANSFER_SOURCE_METADATA_SHA256": metadata_sha,
@@ -163,7 +165,6 @@ class SealedTransferTests(unittest.TestCase):
     def test_registered_configuration_binds_signing_key_digests(self):
         import production_control
         import production_lifecycle_drill
-        import production_storage
         import production_target
         pins = {key: "registered-" + key for key in
                 ("workerId", "workerCreatedOn", "d1Id", "d1CreatedAt", "bucketCreatedAt", "backupBucketCreatedAt")}
@@ -172,7 +173,7 @@ class SealedTransferTests(unittest.TestCase):
                                      data={**pins, "botId": transfer.TEST_BOT_ID})
         draft = SimpleNamespace(data={"keyDigests": {"aggregate": "approved"}}, digest="draft-digest")
         previous = {"botId": transfer.TEST_BOT_ID, "botUsername": "test_cfsubs_bot"}
-        original = {"workerId": "original-worker", "workerCreatedOn": "worker-created",
+        original = {"accountId": "a" * 32, "workerId": "original-worker", "workerCreatedOn": "worker-created",
                     "d1Id": "original-d1", "d1CreatedAt": "d1-created", "r2CreatedOn": "bucket-created"}
         registration = transfer.canonical({"target": {}, "draftSha256": draft.digest, "targetSha256": registered.digest,
                                            "configurationSha256": registered.configuration_digest})
@@ -192,12 +193,6 @@ class SealedTransferTests(unittest.TestCase):
                 return {"uuid": original["d1Id"], "name": production_lifecycle_drill.ORIGINAL_SERVICE,
                         "created_at": original["d1CreatedAt"]}
 
-        class FakeStore:
-            def __init__(self, api, bucket):
-                pass
-            def get(self, key):
-                return registration
-
         def validate(value):
             if not value:
                 return registered
@@ -208,7 +203,8 @@ class SealedTransferTests(unittest.TestCase):
              patch.object(production_lifecycle_drill, "configuration", return_value=(draft, {}, previous, original)), \
              patch.object(production_control, "API", FakeAPI), \
              patch.object(production_control, "Telegram") as telegram, \
-             patch.object(production_storage, "PrivateStore", FakeStore), \
+             patch.object(transfer, "operator_resource_evidence", return_value="evidence"), \
+             patch.object(transfer, "read_isolation_registration", return_value=registration), \
              patch.object(production_target, "validate_target", side_effect=validate), \
              patch.object(transfer.github, "require_current_main"):
             self.assertEqual(transfer.attest_isolation_source(env)["registrationSha256"], env["TRANSFER_REGISTRATION_SHA256"])
@@ -216,6 +212,42 @@ class SealedTransferTests(unittest.TestCase):
             draft.data["keyDigests"]["aggregate"] = "changed"
             with self.assertRaises(ContractError):
                 transfer.attest_isolation_source(env)
+
+    def test_resource_observation_is_pinned_fresh_and_never_called_live(self):
+        original = {"workerId": "original", "d1Id": "database"}
+        evidence = {"version": 1, "checkedAt": 1000, "sourceTarget": original,
+                    "databaseName": "subs-bot-cf-dev-01", "bucketName": "subs-bot-cf-dev-01",
+                    "bucketPublicAccessDisabled": True, "bucketDeletionRulesDisabled": True, "bucketJurisdiction": "default",
+                    "registrationSha256": "c" * 64}
+        env = {"SUBS_BOT_SEALED_SOURCE_EVIDENCE_JSON": json.dumps(evidence),
+               "TRANSFER_SOURCE_EVIDENCE_SHA256": sha256(transfer.canonical(evidence)).hexdigest()}
+        self.assertEqual(transfer.operator_resource_evidence(env, original, "c" * 64, now=1001), env["TRANSFER_SOURCE_EVIDENCE_SHA256"])
+        for changed, pin, timestamp in ((original, "c" * 64, 2801), ({**original, "d1Id": "wrong"}, "c" * 64, 1001),
+                                        (original, "d" * 64, 1001)):
+            with self.assertRaises(ContractError):
+                transfer.operator_resource_evidence(env, changed, pin, now=timestamp)
+        for field in ("bucketPublicAccessDisabled", "bucketDeletionRulesDisabled"):
+            unsafe = {**evidence, field: False}
+            changed_env = {"SUBS_BOT_SEALED_SOURCE_EVIDENCE_JSON": json.dumps(unsafe),
+                           "TRANSFER_SOURCE_EVIDENCE_SHA256": sha256(transfer.canonical(unsafe)).hexdigest()}
+            with self.assertRaises(ContractError):
+                transfer.operator_resource_evidence(changed_env, original, "c" * 64, now=1001)
+
+    def test_s3_registration_get_is_fixed_and_bounded(self):
+        env = {"SUBS_BOT_SEALED_R2_ACCESS_KEY_ID": "a" * 32, "SUBS_BOT_SEALED_R2_SECRET_ACCESS_KEY": "b" * 64}
+        key = "maintenance/production-control/evidence/lifecycle-" + "c" * 64 + "/registration.json"
+        with patch.object(transfer, "HTTPSConnection") as client:
+            response = client.return_value.getresponse.return_value
+            response.status = 200
+            response.getheader.return_value = "identity"
+            response.read.return_value = b"registration"
+            self.assertEqual(transfer.read_isolation_registration(env, "d" * 32, key), b"registration")
+            args, kwargs = client.return_value.request.call_args
+            self.assertEqual(args[:2], ("GET", "/subs-bot-cf-dev-01/" + key))
+            self.assertTrue(kwargs["headers"]["Authorization"].startswith("AWS4-HMAC-SHA256 "))
+            response.read.assert_called_once_with(512 * 1024 + 1)
+            with self.assertRaises(ContractError):
+                transfer.read_isolation_registration(env, "d" * 32, "../other-bucket")
 
 
 if __name__ == "__main__":
