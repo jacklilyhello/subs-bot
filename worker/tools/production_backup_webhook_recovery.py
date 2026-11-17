@@ -291,7 +291,7 @@ def inspect(env, *, execute=False):
                 and setup["webhookSettingsSha256"] == sha256(canonical({"url": before["url"],
                     "hasCustomCertificate": before["has_custom_certificate"], "maxConnections": before["max_connections"],
                     "allowedUpdates": before["allowed_updates"]})).hexdigest()
-                and setup_done == {"version": 1, "kind": "phase-webhook-setup-confirmed",
+                and type(setup_done.get("version")) is int and setup_done == {"version": 1, "kind": "phase-webhook-setup-confirmed",
                     "intentSha256": sha256(setup_raw).hexdigest(), "snapshotSha256": pin,
                     "configuredSha256": sha256(configured_raw).hexdigest(), "targetSha256": target.digest},
                 "The one-shot webhook setup intent and confirmation are not independently verified.")

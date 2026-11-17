@@ -147,6 +147,11 @@ class WebhookRecoveryTests(unittest.TestCase):
             set_intent({**intent, "webhookSettingsSha256": recovery.parsed(configured_raw)["webhookSha256"]})
             with self.assertRaises(ContractError):
                 recovery.inspect(env)
+            set_intent(intent)
+            done = recovery.parsed(data[setup_key + "confirmed.json"])
+            data[setup_key + "confirmed.json"] = recovery.canonical({**done, "version": True})
+            with self.assertRaises(ContractError):
+                recovery.inspect(env)
         self.assertNotIn("setWebhook", [call.args[0] for call in telegram.call.call_args_list])
 
     def test_existing_intent_blocks_retry(self):
