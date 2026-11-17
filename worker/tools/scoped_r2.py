@@ -28,6 +28,16 @@ def metadata_token(env=None):
     return token
 
 
+def creation_token(fallback, env=None):
+    """Bucket provisioning is separate from D1 and object credentials."""
+    env = os.environ if env is None else env
+    token = env.get("SUBS_BOT_CF_R2_CREATE_TOKEN", "")
+    scoped = any(env.get(key) for key in (
+        "SUBS_BOT_SCOPED_R2_READ_JSON", "SUBS_BOT_SCOPED_R2_WRITE_JSON", "SUBS_BOT_CF_R2_METADATA_READ_TOKEN"))
+    require(token or not scoped, "A separate approved R2 creation credential is required with scoped storage credentials.")
+    return token or fallback
+
+
 class ScopedR2Error(ValueError):
     """An operation was not confirmed; never infer a failed write was absent."""
 

@@ -1,0 +1,28 @@
+name: Inspect isolated Provider journal prefixes
+run-name: Inspect isolated Provider journal prefixes at ${{ github.sha }}
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inventory:
+    name: Read-only isolated Provider inventory
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && vars.SUBS_BOT_PROVIDER_ISOLATED_INVENTORY_ENABLED == 'true'
+    environment: subs-bot-provider-archive-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Read complete fixed-prefix inventory
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          python3 -B worker/tools/trusted_provider_inventory.py

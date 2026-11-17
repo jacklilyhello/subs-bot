@@ -422,6 +422,8 @@ class RehearsalAPI:
         token = self.token
         if method == "GET" and route.startswith(self.root + "/r2/buckets") and not route.endswith("/objects"):
             token = scoped_r2.metadata_token() or token
+        elif method == "POST" and route == self.root + "/r2/buckets":
+            token = scoped_r2.creation_token(token)
         headers = {"Authorization": "Bearer " + token, "Accept": "application/json", "Cache-Control": "no-cache",
                    "cf-r2-jurisdiction": "default"}
         body = None if payload is None else canonical(payload)
@@ -1219,6 +1221,10 @@ class Rehearsal:
         require(record["intent"] is None or record["intent"].get("state") == "rejected",
                 "A resource create remains unpinned; inspect its private intent before another mutation.")
         require(self.observe(kind) is None, "The proposed rehearsal resource already exists; it was not adopted.")
+        if kind != "database":
+            # Reject known missing provisioning configuration before recording
+            # a started external request that could never have been dispatched.
+            scoped_r2.creation_token(getattr(self.api, "token", ""))
         resources = deepcopy(self.journal.value["resources"])
         resources[kind]["intent"] = {"state": "started", "at": int(time.time()), "owner": self.journal.owner}
         self.journal.update(resources=resources)

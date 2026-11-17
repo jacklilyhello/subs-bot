@@ -1,0 +1,447 @@
+name: Reviewed isolated Provider digest rehearsal
+run-name: Reviewed isolated Provider digest at ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      validation_json:
+        description: Independently approved exact PR head, original CI, target and private archive refs
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: subs-bot-provider-isolation
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  SUBS_BOT_PROVIDER_CI_RUN_ID: ${{ fromJSON(inputs.validation_json).providerCiRunId }}
+  SUBS_BOT_PROVIDER_ARCHIVE_REFS: ${{ toJSON(fromJSON(inputs.validation_json).archiveRefs) }}
+  SUBS_BOT_PROVIDER_DURABLE_REQUIRED: '1'
+  SUBS_BOT_PROVIDER_SIMULATE_ARTIFACT_UNAVAILABLE: '1'
+  PROVIDER_HEAD_VALIDATION_JSON: ${{ inputs.validation_json }}
+  PROVIDER_HEAD_TRUSTED_MAIN_SHA: ${{ github.sha }}
+
+jobs:
+  source:
+    name: Provider private source transfer
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && vars.SUBS_BOT_PROVIDER_REVIEWED_DIGEST_ENABLED == 'true'
+    environment: subs-bot-provider-archive-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PROVIDER_HEAD_REVIEWED_SHA: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_sha256: ${{ steps.upload.outputs.artifact-digest }}
+      cipher_sha256: ${{ steps.bundle.outputs.cipher_sha256 }}
+    steps:
+      - name: Check out trusted current main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Verify independently approved Provider head and isolation contracts
+        uses: ./trusted/.github/actions/provider-reviewed-head-gate
+        with:
+          validation_json: ${{ inputs.validation_json }}
+          reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          phase: digest-source
+          environment: subs-bot-provider-archive-head-isolation
+          provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          archive_target_json: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          archive_refs_json: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+      - name: Verify pinned age before private source access
+        working-directory: candidate
+        run: |
+          test "$(git rev-parse HEAD)" = "$PROVIDER_HEAD_REVIEWED_SHA"
+          bash ../trusted/worker/tools/install_provider_age.sh
+      - name: Verify complete private source chain and encrypt transfer
+        id: bundle
+        env:
+          SUBS_BOT_PROVIDER_SOURCE_TRANSFER_ACTION: produce
+          SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_TRUSTED_ARCHIVE_REFS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+          SUBS_BOT_PROVIDER_DIGEST_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_APPROVAL }}
+          SUBS_BOT_PROVIDER_DIGEST_READONLY_RESOLUTIONS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_READONLY_RESOLUTIONS_JSON }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_ISOLATED_SOURCE_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ISOLATED_SOURCE_LEDGER_JSON }}
+          SUBS_BOT_PROVIDER_ISOLATED_SOURCE_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ISOLATED_SOURCE_CONTROLLERS_JSON }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+          SUBS_BOT_PROVIDER_SOURCE_RECIPIENT: ${{ vars.SUBS_BOT_PROVIDER_SOURCE_RECIPIENT }}
+          SUBS_BOT_PROVIDER_SOURCE_RECIPIENT_SHA256: ${{ secrets.SUBS_BOT_PROVIDER_SOURCE_RECIPIENT_SHA256 }}
+        working-directory: candidate
+        run: |
+          umask 077
+          python3 -B worker/tools/provider_source_transfer.py
+      - name: Upload encrypted source bundle
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: provider-encrypted-source-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/provider-source-transfer.age
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+  preflight:
+    name: Provider digest preflight
+    needs: [source]
+    environment: subs-bot-provider-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PROVIDER_HEAD_REVIEWED_SHA: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+    outputs:
+      prestate_json: ${{ steps.preflight.outputs.prestate_json }}
+    steps:
+      - name: Check out trusted current main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Verify independently approved Provider head and isolation contracts
+        uses: ./trusted/.github/actions/provider-reviewed-head-gate
+        with:
+          validation_json: ${{ inputs.validation_json }}
+          reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          phase: digest-preflight
+          environment: subs-bot-provider-head-isolation
+          provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          archive_target_json: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          archive_refs_json: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+      - name: Verify pinned age before private source access
+        working-directory: candidate
+        run: |
+          test "$(git rev-parse HEAD)" = "$PROVIDER_HEAD_REVIEWED_SHA"
+          bash ../trusted/worker/tools/install_provider_age.sh
+      - name: Verify source and isolated prestate
+        id: preflight
+        env:
+          SUBS_BOT_PROVIDER_DIGEST_JOURNAL_ACTION: preflight
+          SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_TRUSTED_ARCHIVE_REFS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+          SUBS_BOT_PROVIDER_DIGEST_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_APPROVAL }}
+          SUBS_BOT_PROVIDER_DIGEST_READONLY_RESOLUTIONS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_READONLY_RESOLUTIONS_JSON }}
+          SUBS_BOT_PROVIDER_SOURCE_ARTIFACT_ID: ${{ needs.source.outputs.artifact_id }}
+          SUBS_BOT_PROVIDER_SOURCE_ARTIFACT_SHA256: ${{ needs.source.outputs.artifact_sha256 }}
+          SUBS_BOT_PROVIDER_SOURCE_CIPHER_SHA256: ${{ needs.source.outputs.cipher_sha256 }}
+          SUBS_BOT_PROVIDER_TRUSTED_SOURCE_ARTIFACT_ID: ${{ needs.source.outputs.artifact_id }}
+          SUBS_BOT_PROVIDER_TRUSTED_SOURCE_ARTIFACT_SHA256: ${{ needs.source.outputs.artifact_sha256 }}
+          SUBS_BOT_PROVIDER_TRUSTED_SOURCE_CIPHER_SHA256: ${{ needs.source.outputs.cipher_sha256 }}
+          SUBS_BOT_PROVIDER_SOURCE_RECIPIENT: ${{ vars.SUBS_BOT_PROVIDER_SOURCE_RECIPIENT }}
+          SUBS_BOT_PROVIDER_SOURCE_RECIPIENT_SHA256: ${{ secrets.SUBS_BOT_PROVIDER_SOURCE_RECIPIENT_SHA256 }}
+          SUBS_BOT_PROVIDER_SOURCE_AGE_IDENTITY: ${{ secrets.SUBS_BOT_PROVIDER_SOURCE_AGE_IDENTITY }}
+          SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN }}
+          SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN }}
+        working-directory: candidate
+        run: |
+          umask 077
+          python3 -B worker/tools/provider_digest_journal.py
+  intent_write:
+    name: Provider digest intent archive
+    needs: [preflight]
+    # Default off. An explicit isolated-environment policy must enable writes;
+    # unsupported digest PUT leaves the one-shot intent unresolved.
+    if: ${{ vars.SUBS_BOT_PROVIDER_DIGEST_WRITE_ENABLED == 'true' }}
+    environment: subs-bot-provider-archive-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PROVIDER_HEAD_REVIEWED_SHA: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+    outputs:
+      intent_sha256: ${{ steps.write.outputs.intent_sha256 }}
+    steps:
+      - name: Check out trusted current main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Verify independently approved Provider head and isolation contracts
+        uses: ./trusted/.github/actions/provider-reviewed-head-gate
+        with:
+          validation_json: ${{ inputs.validation_json }}
+          reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          phase: digest-intent-write
+          environment: subs-bot-provider-archive-head-isolation
+          provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          archive_target_json: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          archive_refs_json: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+      - name: Persist the single-use intent
+        id: write
+        env:
+          SUBS_BOT_PROVIDER_DIGEST_JOURNAL_ACTION: write-intent
+          SUBS_BOT_PROVIDER_DIGEST_PRESTATE_JSON: ${{ needs.preflight.outputs.prestate_json }}
+          SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_TRUSTED_ARCHIVE_REFS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+          SUBS_BOT_PROVIDER_DIGEST_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_APPROVAL }}
+          SUBS_BOT_PROVIDER_DIGEST_READONLY_RESOLUTIONS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_READONLY_RESOLUTIONS_JSON }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_DIGEST_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_LEDGER_JSON }}
+          SUBS_BOT_PROVIDER_DIGEST_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_CONTROLLERS_JSON }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_SCOPED_R2_WRITE_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_WRITE_JSON }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+        working-directory: candidate
+        run: |
+          test "$(git rev-parse HEAD)" = "$PROVIDER_HEAD_REVIEWED_SHA"
+          umask 077
+          python3 -B worker/tools/provider_digest_journal.py
+  intent_readback:
+    name: Provider digest intent readback
+    needs: [preflight, intent_write]
+    environment: subs-bot-provider-archive-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PROVIDER_HEAD_REVIEWED_SHA: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+    outputs:
+      intent_sha256: ${{ steps.read.outputs.intent_sha256 }}
+    steps:
+      - name: Check out trusted current main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Verify independently approved Provider head and isolation contracts
+        uses: ./trusted/.github/actions/provider-reviewed-head-gate
+        with:
+          validation_json: ${{ inputs.validation_json }}
+          reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          phase: digest-intent-readback
+          environment: subs-bot-provider-archive-head-isolation
+          provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          archive_target_json: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          archive_refs_json: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+      - name: Independently read the exact intent
+        id: read
+        env:
+          SUBS_BOT_PROVIDER_DIGEST_JOURNAL_ACTION: read-intent
+          SUBS_BOT_PROVIDER_DIGEST_PRESTATE_JSON: ${{ needs.preflight.outputs.prestate_json }}
+          SUBS_BOT_PROVIDER_DIGEST_INTENT_SHA256: ${{ needs.intent_write.outputs.intent_sha256 }}
+          SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_TRUSTED_ARCHIVE_REFS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+          SUBS_BOT_PROVIDER_DIGEST_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_APPROVAL }}
+          SUBS_BOT_PROVIDER_DIGEST_READONLY_RESOLUTIONS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_READONLY_RESOLUTIONS_JSON }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_DIGEST_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_LEDGER_JSON }}
+          SUBS_BOT_PROVIDER_DIGEST_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_CONTROLLERS_JSON }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+        working-directory: candidate
+        run: |
+          test "$(git rev-parse HEAD)" = "$PROVIDER_HEAD_REVIEWED_SHA"
+          umask 077
+          python3 -B worker/tools/provider_digest_journal.py
+  publish:
+    name: Provider digest publish
+    needs: [source, preflight, intent_readback]
+    environment: subs-bot-provider-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PROVIDER_HEAD_REVIEWED_SHA: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+    outputs:
+      response_json: ${{ steps.publish.outputs.response_json }}
+    steps:
+      - name: Check out trusted current main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Verify independently approved Provider head and isolation contracts
+        uses: ./trusted/.github/actions/provider-reviewed-head-gate
+        with:
+          validation_json: ${{ inputs.validation_json }}
+          reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          phase: digest-publish
+          environment: subs-bot-provider-head-isolation
+          provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          archive_target_json: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          archive_refs_json: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+      - name: Verify pinned clients before private access
+        working-directory: candidate
+        run: |
+          test "$(git rev-parse HEAD)" = "$PROVIDER_HEAD_REVIEWED_SHA"
+          bash ../trusted/worker/tools/install_provider_age.sh
+          bash ../trusted/worker/tools/install_provider_skopeo.sh
+      - name: Recheck and copy by immutable digest once
+        id: publish
+        env:
+          SUBS_BOT_PROVIDER_DIGEST_JOURNAL_ACTION: publish
+          SUBS_BOT_PROVIDER_DIGEST_PRESTATE_JSON: ${{ needs.preflight.outputs.prestate_json }}
+          SUBS_BOT_PROVIDER_DIGEST_INTENT_SHA256: ${{ needs.intent_readback.outputs.intent_sha256 }}
+          SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_TRUSTED_ARCHIVE_REFS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+          SUBS_BOT_PROVIDER_DIGEST_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_APPROVAL }}
+          SUBS_BOT_PROVIDER_DIGEST_READONLY_RESOLUTIONS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_READONLY_RESOLUTIONS_JSON }}
+          SUBS_BOT_PROVIDER_SOURCE_ARTIFACT_ID: ${{ needs.source.outputs.artifact_id }}
+          SUBS_BOT_PROVIDER_SOURCE_ARTIFACT_SHA256: ${{ needs.source.outputs.artifact_sha256 }}
+          SUBS_BOT_PROVIDER_SOURCE_CIPHER_SHA256: ${{ needs.source.outputs.cipher_sha256 }}
+          SUBS_BOT_PROVIDER_TRUSTED_SOURCE_ARTIFACT_ID: ${{ needs.source.outputs.artifact_id }}
+          SUBS_BOT_PROVIDER_TRUSTED_SOURCE_ARTIFACT_SHA256: ${{ needs.source.outputs.artifact_sha256 }}
+          SUBS_BOT_PROVIDER_TRUSTED_SOURCE_CIPHER_SHA256: ${{ needs.source.outputs.cipher_sha256 }}
+          SUBS_BOT_PROVIDER_SOURCE_RECIPIENT: ${{ vars.SUBS_BOT_PROVIDER_SOURCE_RECIPIENT }}
+          SUBS_BOT_PROVIDER_SOURCE_RECIPIENT_SHA256: ${{ secrets.SUBS_BOT_PROVIDER_SOURCE_RECIPIENT_SHA256 }}
+          SUBS_BOT_PROVIDER_SOURCE_AGE_IDENTITY: ${{ secrets.SUBS_BOT_PROVIDER_SOURCE_AGE_IDENTITY }}
+          SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN }}
+          SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN }}
+          SUBS_BOT_CF_PROVIDER_CONTAINER_WRITE_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_CONTAINER_WRITE_TOKEN }}
+        working-directory: candidate
+        run: |
+          umask 077
+          python3 -B worker/tools/provider_digest_journal.py
+  verify:
+    name: Provider digest independent OCI readback
+    needs: [preflight, publish]
+    environment: subs-bot-provider-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PROVIDER_HEAD_REVIEWED_SHA: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+    outputs:
+      verification_json: ${{ steps.verify.outputs.verification_json }}
+    steps:
+      - name: Check out trusted current main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Verify independently approved Provider head and isolation contracts
+        uses: ./trusted/.github/actions/provider-reviewed-head-gate
+        with:
+          validation_json: ${{ inputs.validation_json }}
+          reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          phase: digest-verify
+          environment: subs-bot-provider-head-isolation
+          provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          archive_target_json: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          archive_refs_json: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+      - name: Verify pinned client before private access
+        working-directory: candidate
+        run: |
+          test "$(git rev-parse HEAD)" = "$PROVIDER_HEAD_REVIEWED_SHA"
+          bash ../trusted/worker/tools/install_provider_skopeo.sh
+      - name: Independently read every OCI layer and prestate
+        id: verify
+        env:
+          SUBS_BOT_PROVIDER_DIGEST_JOURNAL_ACTION: verify
+          SUBS_BOT_PROVIDER_DIGEST_PRESTATE_JSON: ${{ needs.preflight.outputs.prestate_json }}
+          SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_TRUSTED_ARCHIVE_REFS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+          SUBS_BOT_PROVIDER_DIGEST_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_APPROVAL }}
+          SUBS_BOT_PROVIDER_DIGEST_READONLY_RESOLUTIONS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_READONLY_RESOLUTIONS_JSON }}
+          SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN }}
+          SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN }}
+        working-directory: candidate
+        run: |
+          umask 077
+          python3 -B worker/tools/provider_digest_journal.py
+  completion_write:
+    name: Provider digest completion archive
+    needs: [preflight, intent_readback, publish, verify]
+    environment: subs-bot-provider-archive-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PROVIDER_HEAD_REVIEWED_SHA: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+    outputs:
+      completion_sha256: ${{ steps.write.outputs.completion_sha256 }}
+    steps:
+      - name: Check out trusted current main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Verify independently approved Provider head and isolation contracts
+        uses: ./trusted/.github/actions/provider-reviewed-head-gate
+        with:
+          validation_json: ${{ inputs.validation_json }}
+          reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          phase: digest-completion-write
+          environment: subs-bot-provider-archive-head-isolation
+          provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          archive_target_json: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          archive_refs_json: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+      - name: Persist exact digest completion
+        id: write
+        env:
+          SUBS_BOT_PROVIDER_DIGEST_JOURNAL_ACTION: write-completion
+          SUBS_BOT_PROVIDER_DIGEST_PRESTATE_JSON: ${{ needs.preflight.outputs.prestate_json }}
+          SUBS_BOT_PROVIDER_DIGEST_INTENT_SHA256: ${{ needs.intent_readback.outputs.intent_sha256 }}
+          SUBS_BOT_PROVIDER_DIGEST_RESPONSE_JSON: ${{ needs.publish.outputs.response_json }}
+          SUBS_BOT_PROVIDER_DIGEST_VERIFICATION_JSON: ${{ needs.verify.outputs.verification_json }}
+          SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_TRUSTED_ARCHIVE_REFS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+          SUBS_BOT_PROVIDER_DIGEST_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_APPROVAL }}
+          SUBS_BOT_PROVIDER_DIGEST_READONLY_RESOLUTIONS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_READONLY_RESOLUTIONS_JSON }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_DIGEST_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_LEDGER_JSON }}
+          SUBS_BOT_PROVIDER_DIGEST_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_CONTROLLERS_JSON }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_SCOPED_R2_WRITE_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_WRITE_JSON }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+        working-directory: candidate
+        run: |
+          test "$(git rev-parse HEAD)" = "$PROVIDER_HEAD_REVIEWED_SHA"
+          umask 077
+          python3 -B worker/tools/provider_digest_journal.py
+  evidence_readback:
+    name: Provider digest evidence readback
+    needs: [preflight, intent_readback, publish, verify, completion_write]
+    environment: subs-bot-provider-archive-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PROVIDER_HEAD_REVIEWED_SHA: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+    steps:
+      - name: Check out trusted current main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Verify independently approved Provider head and isolation contracts
+        uses: ./trusted/.github/actions/provider-reviewed-head-gate
+        with:
+          validation_json: ${{ inputs.validation_json }}
+          reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          phase: digest-evidence-readback
+          environment: subs-bot-provider-archive-head-isolation
+          provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          archive_target_json: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          archive_refs_json: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+      - name: Independently read all exact journal evidence
+        env:
+          SUBS_BOT_PROVIDER_DIGEST_JOURNAL_ACTION: independent-readback
+          SUBS_BOT_PROVIDER_DIGEST_PRESTATE_JSON: ${{ needs.preflight.outputs.prestate_json }}
+          SUBS_BOT_PROVIDER_DIGEST_INTENT_SHA256: ${{ needs.intent_readback.outputs.intent_sha256 }}
+          SUBS_BOT_PROVIDER_DIGEST_COMPLETION_SHA256: ${{ needs.completion_write.outputs.completion_sha256 }}
+          SUBS_BOT_PROVIDER_DIGEST_RESPONSE_JSON: ${{ needs.publish.outputs.response_json }}
+          SUBS_BOT_PROVIDER_DIGEST_VERIFICATION_JSON: ${{ needs.verify.outputs.verification_json }}
+          SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_TRUSTED_ARCHIVE_REFS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+          SUBS_BOT_PROVIDER_DIGEST_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_APPROVAL }}
+          SUBS_BOT_PROVIDER_DIGEST_READONLY_RESOLUTIONS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_READONLY_RESOLUTIONS_JSON }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_DIGEST_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_LEDGER_JSON }}
+          SUBS_BOT_PROVIDER_DIGEST_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_CONTROLLERS_JSON }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+        working-directory: candidate
+        run: |
+          test "$(git rev-parse HEAD)" = "$PROVIDER_HEAD_REVIEWED_SHA"
+          umask 077
+          python3 -B worker/tools/provider_digest_journal.py
