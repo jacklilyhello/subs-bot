@@ -73,7 +73,41 @@ def workflow_runs(start, end, token):
     require(False, "The complete writer-window inventory exceeded its bound.")
 
 
-def original_source(review, token, main):
+def reviewed_source(revision, path, expected, token, directory):
+    """Fetch a pinned immutable source once per runner; always rehash on use."""
+    root = Path(directory)
+    require(root.is_absolute() and root.is_dir() and not root.is_symlink())
+    cache = root / "no-export-reviewed-source-cache"
+    try:
+        cache.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    require(cache.is_dir() and not cache.is_symlink() and cache.stat().st_mode & 0o077 == 0)
+    key = sha256((revision + "\n" + path).encode("utf-8")).hexdigest()
+    name = cache / key
+    try:
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        item = github._get_json("/contents/" + path + "?ref=" + revision, token)
+        require(item.get("path") == path and item.get("type") == "file" and item.get("encoding") == "base64"
+                and isinstance(item.get("content"), str))
+        body = base64.b64decode(item["content"].replace("\n", ""), validate=True)
+        require(0 < len(body) <= 1024 * 1024 and sha256(body).hexdigest() == expected,
+                "An independently reviewed source differs.")
+        descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "wb") as saved:
+            saved.write(body)
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as cached:
+        metadata = os.fstat(cached.fileno())
+        require(stat.S_ISREG(metadata.st_mode) and 0 < metadata.st_size <= 1024 * 1024
+                and metadata.st_mode & 0o077 == 0)
+        body = cached.read(1024 * 1024 + 1)
+    require(len(body) == metadata.st_size and sha256(body).hexdigest() == expected,
+            "A cached reviewed source differs.")
+
+
+def original_source(review, token, main, directory):
     source = github._get_json("/actions/runs/" + OLD_RUN + "/attempts/1", token)
     latest = github._get_json("/actions/runs/" + OLD_RUN, token)
     require(str(source.get("id")) == str(latest.get("id")) == OLD_RUN and source.get("run_attempt") == latest.get("run_attempt") == 1
@@ -98,20 +132,9 @@ def original_source(review, token, main):
                 and comparison.get("base_commit", {}).get("sha") == OLD_MAIN and comparison.get("merge_base_commit", {}).get("sha") == OLD_MAIN)
     for revision, entries in ((OLD_CANDIDATE, review["candidateCodeSha256"]), (OLD_MAIN, review["dispatcherCodeSha256"])):
         for path, expected in sorted(entries.items()):
-            item = github._get_json("/contents/" + path + "?ref=" + revision, token)
-            require(item.get("path") == path and item.get("type") == "file" and item.get("encoding") == "base64"
-                    and isinstance(item.get("content"), str))
-            body = base64.b64decode(item["content"].replace("\n", ""), validate=True)
-            require(0 < len(body) <= 1024 * 1024 and sha256(body).hexdigest() == expected,
-                    "An independently reviewed historical source differs.")
+            reviewed_source(revision, path, expected, token, directory)
     provider_path = ".github/workflows/worker-provider-reviewed-head.yml"
-    provider = github._get_json("/contents/" + provider_path + "?ref=" + main, token)
-    require(provider.get("path") == provider_path and provider.get("type") == "file" and provider.get("encoding") == "base64"
-            and isinstance(provider.get("content"), str))
-    provider_body = base64.b64decode(provider["content"].replace("\n", ""), validate=True)
-    require(0 < len(provider_body) <= 1024 * 1024
-            and sha256(provider_body).hexdigest() == review["dispatcherCodeSha256"][provider_path],
-            "The Provider read-only workflow differs from its reviewed source.")
+    reviewed_source(main, provider_path, review["dispatcherCodeSha256"][provider_path], token, directory)
 
 
 def live_writer_boundary(rows, env, token, candidate):
@@ -193,11 +216,11 @@ def save_inventory(directory, inventory):
     try:
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     except FileExistsError:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(descriptor, "rb") as existing:
             metadata = os.fstat(existing.fileno())
             require(stat.S_ISREG(metadata.st_mode) and metadata.st_size == len(inventory)
-                    and metadata.st_mode & 0o077 == 0 and existing.read() == inventory,
+                    and metadata.st_mode & 0o077 == 0 and existing.read(len(inventory) + 1) == inventory,
                     "The local writer inventory changed.")
     else:
         with os.fdopen(descriptor, "wb") as saved:
@@ -284,7 +307,7 @@ def validate(env):
                 and test["adminId"] == "8813701954" and test["memberId"] == "8653767757" and test["groupId"] == "-5114255828"
                 and re.fullmatch(r"9293938370:[A-Za-z0-9_-]{20,128}", test["botToken"] or "")
                 and re.fullmatch(r"[A-Za-z0-9_-]{32,256}", test["webhookSecret"] or ""))
-    original_source(review, token, main)
+    original_source(review, token, main, env.get("RUNNER_TEMP", ""))
     if action in {"verify-seal", "release", "release-readback", "verify-release"}:
         reader = env.get("NO_EXPORT_SEAL_READER_RUN_ID", "") if action != "verify-seal" else ""
         independent = action == "verify-seal" or bool(reader)
@@ -305,10 +328,14 @@ def validate(env):
     require(action == "audit-writers" or inventory_sha == review["writerInventorySha256"], "The reviewed writer inventory changed.")
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     require(now >= review["auditWindowEnd"])
-    live_writer_boundary(workflow_runs(review["auditWindowEnd"], now, token), env, token, spec["headSha"])
+    live = workflow_runs(review["auditWindowEnd"], now, token)
+    writers = sum(row["path"] == WORKFLOW and str(row["id"]) != env.get("GITHUB_RUN_ID") for row in live)
+    require(writers <= 40, "The no-export history exceeds this one-time resolution's bounded audit.")
+    live_writer_boundary(live, env, token, spec["headSha"])
     if check == "credential":
         save_inventory(env.get("RUNNER_TEMP", ""), inventory)
     return {"status": "validated", "writerInventorySha256": inventory_sha, "oldRunId": OLD_RUN,
+            "liveRunCount": len(live), "writerRunCount": writers,
             "reviewSha256": sha256(canonical(review)).hexdigest()}
 
 

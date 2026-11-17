@@ -1,5 +1,8 @@
 """Hosted fail-closed tests for the one fixed no-export evidence gate."""
 from pathlib import Path
+import base64
+from hashlib import sha256
+import os
 import sys
 import tempfile
 import unittest
@@ -11,6 +14,26 @@ from production_target import ContractError
 
 
 class NoExportGateTests(unittest.TestCase):
+    def test_pinned_source_cache_rehashes_and_never_overwrites(self):
+        body = b"synthetic pinned source"
+        source = {"path": "safe.py", "type": "file", "encoding": "base64",
+                  "content": base64.b64encode(body).decode()}
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(gate.github, "_get_json", return_value=source) as get:
+                gate.reviewed_source("a" * 40, "safe.py", sha256(body).hexdigest(), "synthetic", directory)
+                gate.reviewed_source("a" * 40, "safe.py", sha256(body).hexdigest(), "synthetic", directory)
+                self.assertEqual(get.call_count, 1)
+                cached = next((Path(directory) / "no-export-reviewed-source-cache").iterdir())
+                cached.write_bytes(b"corrupted")
+                with self.assertRaises(ContractError):
+                    gate.reviewed_source("a" * 40, "safe.py", sha256(body).hexdigest(), "synthetic", directory)
+                self.assertEqual(get.call_count, 1)
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "no-export-reviewed-source-cache"
+            cache.symlink_to(Path(directory))
+            with self.assertRaises(ContractError):
+                gate.reviewed_source("a" * 40, "safe.py", sha256(body).hexdigest(), "synthetic", directory)
+
     def test_local_inventory_is_private_immutable_and_not_a_symlink(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "no-export-writer-inventory.json"
@@ -23,6 +46,10 @@ class NoExportGateTests(unittest.TestCase):
             path = Path(directory) / "no-export-writer-inventory.json"
             path.symlink_to(Path(directory) / "other")
             with self.assertRaises(OSError):
+                gate.save_inventory(directory, b'[]')
+        with tempfile.TemporaryDirectory() as directory:
+            os.mkfifo(Path(directory) / "no-export-writer-inventory.json", 0o600)
+            with self.assertRaises(ContractError):
                 gate.save_inventory(directory, b'[]')
 
     def test_writer_inventory_rejects_incomplete_pages_and_duplicates(self):
