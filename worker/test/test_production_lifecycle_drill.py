@@ -50,6 +50,15 @@ class LifecycleDrillTests(unittest.TestCase):
         value.store = MemoryStore()
         return value
 
+    def test_reviewed_controller_revision_does_not_change_dispatcher_github_sha(self):
+        env = environment()
+        dispatcher = env["GITHUB_SHA"]
+        candidate = "f" * 40
+        tool = drill.Drill(env, control_revision=candidate)
+        self.assertEqual(tool.revision, candidate)
+        self.assertEqual(tool.report["controlRevision"], candidate)
+        self.assertEqual(env["GITHUB_SHA"], dispatcher)
+
     def snapshot(self, tool):
         info = {"url": drill.ORIGINAL_ORIGIN + "/telegram/webhook", "has_custom_certificate": False,
                 "max_connections": 40, "allowed_updates": ["message", "callback_query", "inline_query"], "pending_update_count": 7}

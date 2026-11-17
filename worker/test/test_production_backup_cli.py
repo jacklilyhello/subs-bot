@@ -90,6 +90,44 @@ class ProductionBackupTests(unittest.TestCase):
             with self.assertRaises(ContractError):
                 backup.monitor_anchor(anchor, store, target, self.policy, 1000)
 
+    def test_failed_run_before_anchor_is_visible_even_with_recent_backup(self):
+        revision, now = "a" * 40, 1800000000
+        workflow = {"id": 123, "path": ".github/workflows/worker-production-backup.yml"}
+        run = {"id": 456, "run_attempt": 1, "workflow_id": 123, "head_branch": "main", "head_sha": revision,
+               "event": "workflow_dispatch", "repository": {"id": backup.artifact.REPOSITORY_ID},
+               "head_repository": {"id": backup.artifact.REPOSITORY_ID},
+               "display_title": "Production backup begin at " + revision,
+               "updated_at": datetime.fromtimestamp(now - 1, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+               "status": "completed", "conclusion": "failure"}
+        def github(path, _token):
+            if "?" not in path:
+                return workflow
+            return {"total_count": 1, "workflow_runs": [run]}
+        with patch.object(backup.artifact, "_github_token", return_value="synthetic"), \
+             patch.object(backup.artifact, "_get_json", side_effect=github):
+            result = backup.monitor_workflow_runs(json.dumps({"version": 1, "revisions": [revision]}), now, now - 100)
+            self.assertTrue(result["failed"])
+            self.assertFalse(result["unknown"])
+            unknown = backup.monitor_workflow_runs(json.dumps({"version": 1, "revisions": ["b" * 40]}), now, now - 100)
+            self.assertTrue(unknown["unknown"])
+            missing = backup.monitor_workflow_runs(json.dumps({"version": 1, "revisions": [revision]}), now, now - 100, "999")
+            self.assertTrue(missing["unknown"])
+
+    def test_missing_or_incomplete_workflow_history_is_unknown(self):
+        controllers = json.dumps({"version": 1, "revisions": ["a" * 40]})
+        workflow = {"id": 123, "path": ".github/workflows/worker-production-backup.yml"}
+        def empty(path, _token):
+            return workflow if "?" not in path else {"total_count": 0, "workflow_runs": []}
+        with patch.object(backup.artifact, "_github_token", return_value="synthetic"), \
+             patch.object(backup.artifact, "_get_json", side_effect=empty):
+            self.assertTrue(backup.monitor_workflow_runs(controllers, 1800000000, None)["unknown"])
+        def incomplete(path, _token):
+            return workflow if "?" not in path else {"total_count": 2, "workflow_runs": [{}]}
+        with patch.object(backup.artifact, "_github_token", return_value="synthetic"), \
+             patch.object(backup.artifact, "_get_json", side_effect=incomplete):
+            with self.assertRaises(ContractError):
+                backup.monitor_workflow_runs(controllers, 1800000000, None)
+
     def test_production_mutation_is_statically_disabled_before_any_setup(self):
         with patch.object(backup, "validate_target", return_value=Mock()), patch.object(backup, "check_context", return_value="a" * 40):
             with self.assertRaises(ContractError):

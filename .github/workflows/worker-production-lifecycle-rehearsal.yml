@@ -12,7 +12,7 @@ on:
         type: choice
         required: true
         default: inspect
-        options: [bootstrap, exercise, inspect, stabilize, daily-backup, daily-backup-watchdog, backup-anchor-genesis-plan, backup-anchor-initialize, backup-anchor-initialize-reconcile-plan, backup-anchor-initialize-reconcile, backup-anchor-reconcile-plan, backup-anchor-reconcile, seed-fixture, recovery, recover-webhook, provider-binding, provider-binding-resume, provider-binding-reconcile]
+        options: [bootstrap, exercise, inspect, stabilize, daily-backup, daily-backup-watchdog, backup-head-harness, backup-anchor-genesis-plan, backup-anchor-initialize, backup-anchor-initialize-reconcile-plan, backup-anchor-initialize-reconcile, backup-anchor-reconcile-plan, backup-anchor-reconcile, seed-fixture, recovery, recover-webhook, provider-binding, provider-binding-resume, provider-binding-reconcile]
       source_run_id:
         description: Successful exact-main Worker CI run
         type: string
@@ -103,6 +103,9 @@ on:
       backup_anchor_approval_sha256:
         description: Independently reviewed genesis or reconciliation plan SHA-256
         type: string
+      head_validation_json:
+        description: Exact reviewed PR-head harness identity and action pins
+        type: string
 
 permissions:
   actions: read
@@ -113,6 +116,46 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  head-validation:
+    # Disabled until a trusted-main dispatcher or equivalent SHA-bound secret
+    # boundary is installed and the exact head is independently reviewed.
+    if: false && github.repository == 'jacklilyhello/subs-bot' && github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/codex/') && inputs.action == 'backup-head-harness'
+    environment: subs-bot-backup-head-isolation
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11.18'
+      - name: Verify exact reviewed head and dedicated frozen source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CONTROL_ENVIRONMENT: subs-bot-isolation
+          HEAD_VALIDATION_JSON: ${{ inputs.head_validation_json }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
+          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPLOY_TOKEN }}
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
+          SUBS_BOT_CONTROL_DRILL_KEYS: ${{ secrets.SUBS_BOT_CONTROL_DRILL_KEYS }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          python3 -B worker/tools/production_backup_head_harness.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: subs-bot-backup-head-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/production-backup-head-result.json
+          if-no-files-found: warn
+          retention-days: 7
   rehearse:
     if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
     environment: subs-bot-isolation

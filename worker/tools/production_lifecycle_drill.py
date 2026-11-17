@@ -231,7 +231,7 @@ def update_payload(update_id, actor, message_id, text, date):
 
 
 class Drill:
-    def __init__(self, env):
+    def __init__(self, env, *, control_revision=None):
         self.env = env
         self.draft, self.secrets, self.previous, self.original = configuration(env)
         data_token, worker_token = env.get("SUBS_BOT_CF_BOOTSTRAP_TOKEN", ""), env.get("SUBS_BOT_CF_DEPLOY_TOKEN", "")
@@ -245,7 +245,8 @@ class Drill:
         self.run = env.get("GITHUB_RUN_ID", "")
         self.attempt = env.get("GITHUB_RUN_ATTEMPT", "")
         require(matches(r"[1-9][0-9]{0,19}", self.run) and matches(r"[1-9][0-9]{0,5}", self.attempt))
-        self.revision = env.get("GITHUB_SHA", "")
+        self.revision = env.get("GITHUB_SHA", "") if control_revision is None else control_revision
+        require(matches(r"[0-9a-f]{40}", self.revision), "The exact control revision is required.")
         window = env.get("DRILL_HUMAN_WINDOW_SECONDS") or "0"
         maximum_window = 540 if env.get("DRILL_ACTION") in ("provider-binding", "provider-binding-resume", "recover-webhook") else 180
         require(matches(r"0|[1-9][0-9]{0,2}", window) and int(window) <= maximum_window,
@@ -870,7 +871,9 @@ class Drill:
                 "The proposed independent recovery names are occupied.")
         timestamp = int(time.time())
         run_metadata = artifact._get_json("/actions/runs/" + self.run, artifact._github_token())
-        require(run_metadata.get("id") == int(self.run) and run_metadata.get("head_sha") == self.revision
+        dispatcher_revision = getattr(self, "backup_dispatcher_revision", self.revision)
+        evidence_workflow = getattr(self, "backup_evidence_workflow", "worker-production-lifecycle-rehearsal.yml")
+        require(run_metadata.get("id") == int(self.run) and run_metadata.get("head_sha") == dispatcher_revision
                 and isinstance(run_metadata.get("created_at"), str), "The exact hosted maintenance run was not verified.")
         try:
             created = datetime.strptime(run_metadata["created_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
@@ -886,7 +889,8 @@ class Drill:
         anchor.acquire(session, day, self.revision)
         journal.append("started", {"configurationSha256": ctl.target.configuration_digest,
                        "release": before["release"], "control": before["control"],
-                       "pauseLimitSeconds": pause_limit, "checkpointId": checkpoint}, timestamp)
+                       "pauseLimitSeconds": pause_limit, "checkpointId": checkpoint,
+                       "dispatcherRevision": dispatcher_revision, "dispatcherWorkflow": evidence_workflow}, timestamp)
         try:
             threshold = self.env.get("DRILL_BACKUP_WARNING_PERCENT", "80")
             require(matches(r"[1-9][0-9]?", threshold))
@@ -988,25 +992,31 @@ class Drill:
         run = artifact._get_json("/actions/runs/" + run_id + "/attempts/" + attempt, token)
         workflow_file = getattr(self, "backup_evidence_workflow", "worker-production-lifecycle-rehearsal.yml")
         branch = getattr(self, "backup_evidence_branch", "main")
-        require(workflow_file == "worker-production-lifecycle-rehearsal.yml"
-                and (branch == "main" or matches(r"codex/[a-z0-9._/-]{1,120}", branch)))
-        if branch != "main":
+        trusted_dispatcher = workflow_file == "worker-backup-reviewed-head.yml"
+        require((workflow_file == "worker-production-lifecycle-rehearsal.yml" and branch == "main")
+                or (trusted_dispatcher and branch == "main"))
+        if trusted_dispatcher:
             require(pinned["controlRevision"] == self.revision,
                     "An interrupted head rehearsal cannot be resumed by a different unreviewed head.")
         workflow = artifact._get_json("/actions/workflows/" + workflow_file, token)
+        journal = maintenance.Transaction(store, session, pinned["day"], ctl.target.digest, pinned["controlRevision"])
+        events = journal.load()
+        require(events, "The active backup transaction journal is missing; preserve the anchor.")
+        dispatcher_revision = getattr(self, "backup_dispatcher_revision", pinned["controlRevision"])
+        if trusted_dispatcher:
+            require(events[0]["details"].get("dispatcherRevision") == dispatcher_revision
+                    and events[0]["details"].get("dispatcherWorkflow") == workflow_file,
+                    "The original trusted dispatcher identity differs from the pinned transaction.")
         require(run.get("id") == int(run_id) and run.get("run_attempt") == int(attempt)
                 and workflow.get("path") == ".github/workflows/" + workflow_file and run.get("workflow_id") == workflow.get("id")
                 and run.get("event") in {"workflow_dispatch", "schedule"} and run.get("head_branch") == branch
-                and run.get("head_sha") == pinned["controlRevision"]
+                and run.get("head_sha") == dispatcher_revision
                 and all(isinstance(run.get(k), dict) and run[k].get("id") == artifact.REPOSITORY_ID
                         for k in ("repository", "head_repository"))
                 and datetime.fromtimestamp(monitor._timestamp(run.get("created_at")), timezone.utc).strftime("%Y/%m/%d") == pinned["day"])
         if run.get("status") != "completed":
             self.report.update(status="observed", watchdog="backup-run-still-active")
             return
-        journal = maintenance.Transaction(store, session, pinned["day"], ctl.target.digest, pinned["controlRevision"])
-        events = journal.load()
-        require(events, "The active backup transaction journal is missing; preserve the anchor.")
         if events[-1]["stage"] in {"resumed", "preserved-frozen"} or (len(events) >= 2
                 and events[-1]["stage"] == "failed" and events[-2]["stage"] in {"started", "preflight"}):
             anchor.release(session)

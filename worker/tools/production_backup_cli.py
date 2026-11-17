@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import tempfile
 import time
+from urllib.parse import urlencode
 
 import prepare_isolation_artifact as artifact
 import production_backup_capacity as capacity
@@ -170,10 +171,10 @@ def monitor_anchor(anchor, store, target, policy, now):
                 latest_capacity = preflight[0]["details"].get("capacity")
             require(len(verified) <= 1)
             if verified and events[-1]["stage"] in {"resumed", "preserved-frozen"}:
-                history.append(verified[0]["timestamp"])
+                history.append((verified[0]["timestamp"], session.split("-")[0]))
         previous = anchor.history_digest_key(current["generation"] - 1, current["previousSha256"])
         current = parsed(store.get(previous))
-    latest = max(history) if history else None
+    latest, latest_plan_run = max(history) if history else (None, None)
     alerts = []
     if latest_completed_failed:
         alerts.append("backup-failed")
@@ -212,7 +213,76 @@ def monitor_anchor(anchor, store, target, policy, now):
     else:
         alerts.append("capacity-unknown")
     return {"status": "alert" if alerts else "ok", "action": "monitor", "alerts": alerts,
-            "latestVerifiedAt": latest, "phase": phase, "notification": "github-check-only"}
+            "latestVerifiedAt": latest, "latestPlanRunId": latest_plan_run, "phase": phase, "notification": "github-check-only"}
+
+
+def monitor_workflow_runs(raw_controllers, now, latest_verified, expected_plan_run=None):
+    """Bounded GitHub history supplements, but never replaces, private journals."""
+    configured = parsed(raw_controllers)
+    require(set(configured) == {"version", "revisions"} and type(configured["version"]) is int
+            and configured["version"] == 1 and isinstance(configured["revisions"], list)
+            and 0 < len(configured["revisions"]) <= 32
+            and len(set(configured["revisions"])) == len(configured["revisions"])
+            and all(isinstance(item, str) and re.fullmatch(r"[a-f0-9]{40}", item) for item in configured["revisions"]))
+    token = artifact._github_token()
+    workflow = artifact._get_json("/actions/workflows/worker-production-backup.yml", token)
+    require(workflow.get("path") == ".github/workflows/worker-production-backup.yml" and type(workflow.get("id")) is int)
+    since = datetime.fromtimestamp(max(0, now - 7 * 86400), timezone.utc).strftime("%Y-%m-%d")
+    rows, total = [], None
+    for page in range(1, 7):
+        query = urlencode({"branch": "main", "created": ">=" + since, "per_page": 100, "page": page})
+        response = artifact._get_json("/actions/workflows/worker-production-backup.yml/runs?" + query, token)
+        batch = response.get("workflow_runs")
+        count = response.get("total_count")
+        require(type(count) is int and 0 <= count <= 500 and isinstance(batch, list) and len(batch) <= 100)
+        require(total is None or total == count, "The workflow history changed during observation.")
+        total = count
+        rows.extend(batch)
+        require(len(rows) <= total)
+        if len(rows) == total:
+            break
+        require(len(batch) == 100, "The workflow history is incomplete.")
+    require(total is not None and len(rows) == total)
+    observed, failed, unknown, relevant, expected_seen = set(), False, False, 0, False
+    for run in rows:
+        require(isinstance(run, dict) and type(run.get("id")) is int and run["id"] not in observed
+                and run.get("run_attempt") == 1
+                and run.get("workflow_id") == workflow["id"] and run.get("head_branch") == "main"
+                and run.get("event") in {"workflow_dispatch", "schedule"}
+                and all(isinstance(run.get(key), dict) and run[key].get("id") == artifact.REPOSITORY_ID
+                        for key in ("repository", "head_repository")))
+        observed.add(run["id"])
+        revision = run.get("head_sha", "")
+        require(isinstance(revision, str) and re.fullmatch(r"[a-f0-9]{40}", revision))
+        title = run.get("display_title", "")
+        prefix, suffix = "Production backup ", " at " + revision
+        require(isinstance(title, str) and title.startswith(prefix) and title.endswith(suffix))
+        action = title[len(prefix):-len(suffix)]
+        require(action in ACTIONS)
+        if str(run["id"]) == expected_plan_run:
+            require(action == "plan-begin" and run.get("status") == "completed" and run.get("conclusion") == "success")
+            expected_seen = True
+        if action == "monitor":
+            continue
+        relevant += 1
+        if revision not in configured["revisions"]:
+            unknown = True
+            continue
+        try:
+            updated = int(datetime.strptime(run["updated_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp())
+        except (KeyError, TypeError, ValueError):
+            require(False, "The workflow update time is unavailable.")
+        require(updated <= now and run.get("status") in {"queued", "in_progress", "completed", "waiting", "pending", "requested"})
+        if latest_verified is not None and updated < latest_verified:
+            continue
+        if run["status"] == "completed":
+            require(run.get("conclusion") in {"success", "failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale", "skipped", "neutral"})
+            if run["conclusion"] != "success":
+                failed = True
+        elif now - updated > 1800:
+            unknown = True
+    return {"failed": failed, "unknown": unknown or relevant == 0 or (expected_plan_run is not None and not expected_seen),
+            "runsObserved": len(observed)}
 
 
 def transition_reconciliation(env, events, state, contract):
@@ -278,7 +348,19 @@ def main(env=None):
         data = API(target, env.get("SUBS_BOT_CF_BACKUP_MONITOR_READ_TOKEN", ""))
         store = PrivateStore(data, target.data["backupBucketName"])
         anchor = maintenance.Anchor(store, target.digest, env.get("SUBS_BOT_BACKUP_GENESIS_SHA256", ""))
-        return emit_result(monitor_anchor(anchor, store, target, policy, int(time.time())), target, revision, root)
+        now = int(time.time())
+        result = monitor_anchor(anchor, store, target, policy, now)
+        try:
+            scan = monitor_workflow_runs(env.get("SUBS_BOT_BACKUP_MONITOR_CONTROLLERS_JSON", ""), now,
+                                         result["latestVerifiedAt"], result["latestPlanRunId"])
+            if scan["failed"]:
+                result["alerts"].append("backup-workflow-failed")
+            if scan["unknown"]:
+                result["alerts"].append("workflow-history-unknown")
+        except Exception:
+            result["alerts"].append("workflow-history-unknown")
+        result["status"] = "alert" if result["alerts"] else "ok"
+        return emit_result(result, target, revision, root)
     contract = recovery.recovery_contract(env.get("SUBS_BOT_RECOVERY_JSON", ""), target.data)
     require(contract.get("purpose") == "baseline" and "sessionId" not in contract,
             "Routine backup requires a fresh baseline checkpoint and no restore session.")
