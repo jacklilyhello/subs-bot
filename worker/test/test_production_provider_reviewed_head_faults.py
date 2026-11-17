@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import archive_production_provider as archive
 import production_provider as control
 import production_provider_reviewed_head_harness as harness
+import provider_isolated_source as isolated
 import reviewed_provider_candidate as candidate
 from test_production_provider import config
 
@@ -52,12 +53,34 @@ class ReviewedSourceFaultTests(unittest.TestCase):
             env = {"RUNNER_TEMP": root, "SUBS_BOT_PROVIDER_FAULT_SCENARIO": "all"}
             def observe():
                 seen.append((os.environ["SUBS_BOT_PROVIDER_FAULT_SCENARIO"], os.environ["RUNNER_TEMP"]))
-            with patch.dict(os.environ, env, clear=True), patch.object(harness, "verify_source_fault_case", side_effect=observe):
+            with patch.dict(os.environ, env, clear=True), patch.object(harness, "verify_source_fault_case", side_effect=observe), \
+                    patch.object(harness, "verify_archived_transport_fixture") as transport:
                 harness.verify_source_fault()
+                transport.assert_called_once()
                 self.assertEqual(os.environ["RUNNER_TEMP"], root)
                 self.assertEqual(os.environ["SUBS_BOT_PROVIDER_FAULT_SCENARIO"], "all")
             self.assertEqual(len(seen), 8)
             self.assertEqual(len({path for _, path in seen}), 8)
+
+    def test_origin_fixture_uses_only_the_pinned_rehearsal_build_and_protected_source(self):
+        target, bucket = config(active=True), {"fixture": "isolated-bucket"}
+        ref = {"kind": "isolated-source", "runId": "101", "runAttempt": "1",
+               "manifestSha256": "a" * 64, "targetSha256": "b" * 64}
+        record = {"fixture": "protected-independent-readback"}
+        with tempfile.TemporaryDirectory() as temp:
+            env = {"RUNNER_TEMP": temp, "SUBS_BOT_PROVIDER_ARCHIVE_REFS": json.dumps([ref]),
+                   "SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON": json.dumps(bucket)}
+            output = io.StringIO()
+            with patch.dict(os.environ, env, clear=True), patch.object(harness.publish, "config", return_value=target), \
+                    patch.object(isolated, "ledger", return_value={"101": record}), \
+                    patch.object(harness.durable, "prepare_archived_transport") as verify, redirect_stdout(output):
+                harness.verify_archived_transport_fixture()
+            passed_target, origin, root = verify.call_args.args
+            self.assertEqual(passed_target, {"build": target["build"]})
+            self.assertEqual(origin["bucketSha256"], control.digest(bucket))
+            self.assertEqual(origin["ledgerRecordSha256"], control.digest(record))
+            self.assertEqual(root, Path(temp))
+            self.assertEqual(json.loads(output.getvalue())["productionTarget"], "not-evaluated")
 
     def test_real_read_bytes_are_faulted_and_rejected_by_chunk_validation(self):
         raw = b"actual-object-fixture"

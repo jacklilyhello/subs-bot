@@ -136,9 +136,31 @@ def verify_source_fault():
                     os.environ["RUNNER_TEMP"] = scratch
                     os.environ["SUBS_BOT_PROVIDER_FAULT_SCENARIO"] = fault + "-" + where
                     verify_source_fault_case()
+        with tempfile.TemporaryDirectory(prefix=".provider-origin-", dir=original_temp) as scratch:
+            os.environ["RUNNER_TEMP"] = scratch
+            verify_archived_transport_fixture()
     finally:
         os.environ["RUNNER_TEMP"] = original_temp
         os.environ["SUBS_BOT_PROVIDER_FAULT_SCENARIO"] = scenario
+
+
+def verify_archived_transport_fixture():
+    """Exercise production's source-only transport on the real isolated R2 original."""
+    import provider_isolated_source as isolated
+    target = publish.config()
+    refs = json.loads(os.environ["SUBS_BOT_PROVIDER_ARCHIVE_REFS"], object_pairs_hook=control.github._unique_json_object)
+    bucket = control.github._parse_object(os.environ["SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON"], control.ERROR)
+    control.require(isinstance(refs, list) and refs and refs[0]["kind"] == "isolated-source")
+    ref = refs[0]
+    record = isolated.ledger().get(ref["runId"])
+    control.require(isinstance(record, dict))
+    origin = {"version": 1, "kind": "isolated-source", "runId": ref["runId"], "runAttempt": ref["runAttempt"],
+              "manifestSha256": ref["manifestSha256"], "targetSha256": ref["targetSha256"],
+              "bucketSha256": control.digest(bucket), "ledgerRecordSha256": control.digest(record)}
+    durable.prepare_archived_transport({"build": target["build"]}, origin, Path(os.environ["RUNNER_TEMP"]))
+    print(json.dumps({"status": "private-origin-transport-verified", "source": "actual-private-r2-get",
+                      "actionsArtifacts": "simulated-unavailable", "productionTarget": "not-evaluated",
+                      "productionSeal": False, "providerWrites": False}, sort_keys=True))
 
 
 def run():
