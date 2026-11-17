@@ -170,7 +170,7 @@ def _archived_log(run, workflow, record, store, prefix, token, controllers, env)
             "archiveControllerRevision", "archiveJobId", "readbackJobId"}
             and record.get("status") == "independently-read-back" and record.get("sourceRunId") == str(run["id"])
             and record.get("sourceHeadSha") == run["head_sha"] and record.get("sourceWorkflow") == workflow
-            and record.get("classification") in {"no-write-independently-confirmed", "response-independently-confirmed"}
+            and record.get("classification") in {"no-write-independently-confirmed", "response-independently-confirmed", "unresolved"}
             and all(SHA.fullmatch(record.get(k, "")) for k in ("logSha256", "planSha256", "completionSha256"))
             and all(re.fullmatch(r"[1-9][0-9]{0,19}", record.get(k, "")) for k in ("sourceJobId", "archiveRunId", "archiveJobId", "readbackJobId"))
             and record.get("archiveControllerRevision") in controllers)
@@ -391,7 +391,7 @@ def inspect(env):
                 reason = "snapshot-or-resolution-missing"
                 if workflow == LIFECYCLE and run_id in archives:
                     reason = _archived_log(run, workflow, archives[run_id], store, prefix, token, controllers, env)
-                    require(reason == "no-write-independently-confirmed")
+                    require(reason in {"no-write-independently-confirmed", "unresolved"})
                     used_archives.add(run_id)
                 unknown.append({"workflow": workflow, "runId": run_id, "reason": reason})
                 continue

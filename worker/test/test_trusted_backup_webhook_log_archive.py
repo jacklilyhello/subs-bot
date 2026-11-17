@@ -37,8 +37,7 @@ class WebhookLogArchiveTests(unittest.TestCase):
     def test_legacy_missing_stage_and_cleanup_claim_do_not_prove_no_write(self):
         report = {"runId": "123", "stages": []}
         cleanup = {"runId": "123", "webhookRecovery": {"webhookWasNotChanged": True, "webhookRestored": True}}
-        with self.assertRaises(ContractError):
-            archive.classify(self.log(report, cleanup), archive.LIFECYCLE, "123")
+        self.assertEqual(archive.classify(self.log(report, cleanup), archive.LIFECYCLE, "123"), "unresolved")
 
     def test_reviewed_head_requires_exact_candidate_and_explicit_no_webhook(self):
         result = {"runId": "123", "runAttempt": "1", "dispatcherMainRevision": "a" * 40,

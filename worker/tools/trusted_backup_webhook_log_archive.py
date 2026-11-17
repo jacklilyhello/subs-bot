@@ -99,8 +99,15 @@ def classify(raw, workflow, run_id, *, main_sha="", candidates=()):
     require(workflow == LIFECYCLE)
     reports = [value for value in documents if value.get("runId") == run_id and isinstance(value.get("stages"), list)]
     # A missing snapshot or configured stage does not prove that an earlier
-    # request was never sent. Unknown legacy runs remain blocked unless their
-    # original evidence proves a determinate result.
+    # request was never sent. Preserve the original log while keeping such a
+    # run unresolved; only a determinate result can clear the history gate.
+    no_change = [value for value in documents if isinstance(value.get("webhookRecovery"), dict)
+                 and value.get("runId") == run_id
+                 and value["webhookRecovery"].get("webhookWasNotChanged") is True
+                 and value["webhookRecovery"].get("webhookRestored") is True]
+    if len(no_change) == 1 and not any(any(stage.get("stage") == "webhook-configured" for stage in value["stages"] if isinstance(stage, dict))
+                                       for value in reports):
+        return "unresolved"
     # The exact reviewed legacy implementation raises this message only after
     # setWebhook returned and the original settings were read back; it does not
     # claim that the old authentication probe succeeded.
