@@ -6,7 +6,7 @@ from hashlib import sha256
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import scoped_r2
@@ -31,6 +31,62 @@ def page(keys, *, truncated="false", cursor=None, prefix="test/"):
 
 
 class ScopedR2Tests(unittest.TestCase):
+    def test_new_restore_credentials_append_without_exposing_or_replacing_originals(self):
+        restored = "subs-bot-cf-restore-example"
+        reader = {"accessKeyId": "d" * 32, "secretAccessKey": "e" * 64}
+        writer = {"accessKeyId": "f" * 32, "secretAccessKey": "a" * 64}
+        env = {"SUBS_BOT_SCOPED_R2_READ_JSON": json.dumps({BUCKET: CREDENTIAL}),
+               "SUBS_BOT_SCOPED_R2_EXTRA_READ_JSON": json.dumps({restored: reader}),
+               "SUBS_BOT_SCOPED_R2_EXTRA_WRITE_JSON": json.dumps({restored: writer})}
+        self.assertEqual(scoped_r2.from_environment(ACCOUNT, BUCKET, env).read_credential, CREDENTIAL)
+        target = scoped_r2.from_environment(ACCOUNT, restored, env)
+        self.assertEqual((target.read_credential, target.write_credential), (reader, writer))
+        readonly = {key: value for key, value in env.items() if key != "SUBS_BOT_SCOPED_R2_EXTRA_WRITE_JSON"}
+        target = scoped_r2.from_environment(ACCOUNT, restored, readonly)
+        self.assertIsNone(target.write_credential)
+        with self.assertRaises(ContractError):
+            target.put_once(KEY, b"synthetic")
+
+    def test_additions_reject_overlap_malformed_data_and_missing_bucket_without_fallback(self):
+        primary = json.dumps({BUCKET: CREDENTIAL})
+        for extra in (primary, "{}", '{"invalid":{}}', "not-json",
+                      json.dumps({"fixture-bucket-" + str(index): CREDENTIAL for index in range(33)})):
+            with self.subTest(extra=extra[:40]), self.assertRaises(ContractError):
+                scoped_r2.from_environment(ACCOUNT, BUCKET, {"SUBS_BOT_SCOPED_R2_READ_JSON": primary,
+                    "SUBS_BOT_SCOPED_R2_EXTRA_READ_JSON": extra})
+        with self.assertRaises(ContractError):
+            scoped_r2.from_environment(ACCOUNT, "missing-bucket", {"SUBS_BOT_SCOPED_R2_EXTRA_READ_JSON": primary})
+        for key in ("SUBS_BOT_SCOPED_R2_EXTRA_READ_JSON", "SUBS_BOT_SCOPED_R2_EXTRA_WRITE_JSON"):
+            with self.subTest(key=key), self.assertRaises(ContractError):
+                scoped_r2.metadata_token({key: primary})
+            with self.subTest(key=key), self.assertRaises(ContractError):
+                scoped_r2.creation_token("synthetic-d1-token", {key: primary})
+    def test_failed_get_reports_only_status_and_does_not_read_error_body_or_retry(self):
+        store = scoped_r2.ScopedR2(ACCOUNT, BUCKET, CREDENTIAL)
+        response = Mock(status=403)
+        response.getheader.return_value = None
+        connection = Mock()
+        connection.getresponse.return_value = response
+        with patch.object(scoped_r2, "HTTPSConnection", return_value=connection):
+            with self.assertRaises(scoped_r2.ScopedR2ReadError) as raised:
+                store.get(KEY)
+        self.assertEqual(raised.exception.read_diagnostic, {"source": "r2", "phase": "get", "httpStatus": 403})
+        self.assertIsInstance(raised.exception, ContractError)
+        connection.request.assert_called_once()
+        response.read1.assert_not_called()
+
+    def test_missing_absent_and_other_read_phases_remain_distinct(self):
+        store = scoped_r2.ScopedR2(ACCOUNT, BUCKET, CREDENTIAL)
+        with patch.object(store, "_request", return_value=(404, None, b"")) as request:
+            self.assertEqual(store.get(KEY, absent=True), (None, None))
+            request.assert_called_once()
+        with patch.object(store, "_request", return_value=(503, None, b"")), self.assertRaises(scoped_r2.ScopedR2ReadError) as raised:
+            store.list("test/")
+        self.assertEqual(raised.exception.read_diagnostic, {"source": "r2", "phase": "list", "httpStatus": 503})
+        with patch.object(store, "_request", return_value=(403, None, b"", [])), self.assertRaises(scoped_r2.ScopedR2ReadError) as raised:
+            store.head(KEY)
+        self.assertEqual(raised.exception.read_diagnostic, {"source": "r2", "phase": "head", "httpStatus": 403})
+
     def test_signature_matches_the_published_aws_s3_vector(self):
         # Public example from AWS's SigV4 S3 header-authentication reference.
         headers = scoped_r2._sign("GET", "examplebucket.s3.amazonaws.com", "/test.txt", "", {"range": "bytes=0-9"},
