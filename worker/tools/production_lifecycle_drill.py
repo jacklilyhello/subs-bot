@@ -100,109 +100,24 @@ def approval(target, action, revision, predecessor):
         "authorization": "approve " + action + " for " + SERVICE}
 
 
-def _verify_resume_dependencies(ctl):
-    require(ctl.telegram is not None)
-    ctl.verify_dependency()
-    ctl.telegram.identity()
-    ctl.telegram.group_permissions()
-    webhook = ctl.telegram.call("getWebhookInfo")
-    ctl.telegram.webhook_info(webhook)
-    require(webhook.get("url") == "https://" + ctl.target.data["hostname"] + "/telegram/webhook"
-            and webhook.get("max_connections") == ctl.target.data["webhook"]["maxConnections"]
-            and set(webhook.get("allowed_updates", [])) == set(ctl.target.data["webhook"]["allowedUpdates"])
-            and webhook.get("has_custom_certificate") is False)
-    ctl.verify_domain()
-
-
 def resume_failed_backup(ctl, api, source, recovery_journal, *, initial, frozen, fingerprint, session, record_intent):
-    """Single-use rehearsal continuation, not a general activation or retry."""
-    from general_isolation_window import work_sql
-    import production_backup_capacity as capacity
-    from production_control import CONTROL, INVOCATIONS, _mutate_sql
-
+    """Use shared resume checks with rehearsal-only generated approval."""
+    import production_backup_resume as resume
     require(ctl.target.environment == "rehearsal" and ctl.target.data["workerName"] == SERVICE)
-    require(initial.get("control", {}).get("admission") == "open" and initial["control"].get("workers") == "run")
-
-    def checked():
-        recovery_journal.load()
-        state = recovery_journal.value
-        require(isinstance(state, dict), "The recovery journal is missing; export state is unknown.")
-        export = state.get("export")
-        require(isinstance(export, dict) and export.get("state") in {"download-ready", "sql-archived", "complete"},
-                "Native export is not independently confirmed stopped; preserve the checkpoint and keep admission closed.")
-        current = ctl.inspect()
-        require(current["control"] == frozen and current["release"] == initial.get("release")
-                and current["configurationSha256"] == initial.get("configurationSha256")
-                and not any(current["work"].values())
-                and not any(current["terminal"].get(key, 0) for key in
-                            ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates")),
-                "The exact frozen predecessor or external-result state changed.")
-        require(capacity.frozen_fingerprint(api, source) == fingerprint,
-                "The complete frozen data or referenced object closure changed.")
-        return current
-
-    before = checked()
-    _verify_resume_dependencies(ctl)
-    scope = digest({"session": session, "frozen": frozen, "fingerprint": fingerprint})
-    action = "maintenance-resume:" + scope
-    ctl.approval(approval(ctl.target, action, ctl.revision, before["stateSha256"]), action, before["stateSha256"])
-    record_intent(before["stateSha256"], action)
-    current = checked()
-    require(current["stateSha256"] == before["stateSha256"], "The resume predecessor changed after its intent.")
-    control = current["control"]
-    predicate = " AND ".join(f"{key} IS {migrations._literal(value) if isinstance(value, str) else value}" for key, value in control.items())
-    quiet, fields = work_sql(ctl.target.data["botId"])
-    bot = migrations._literal(ctl.target.data["botId"])
-    conditions = [f"EXISTS(SELECT 1 FROM {CONTROL} WHERE {predicate})",
-                  "EXISTS(SELECT 1 FROM (" + quiet + ") WHERE " + " AND ".join(f"{field}=0" for field in fields) + ")",
-                  f"NOT EXISTS(SELECT 1 FROM {INVOCATIONS} WHERE state='uncertain' OR state='running')",
-                  "NOT EXISTS(SELECT 1 FROM subs_bot_production_updates WHERE state IN ('processing','uncertain'))",
-                  f"NOT EXISTS(SELECT 1 FROM telegram_outbox JOIN telegram_inbox USING(receipt_id) WHERE bot_id={bot} AND state='uncertain')",
-                  f"NOT EXISTS(SELECT 1 FROM telegram_group_share_cards JOIN telegram_private_share_creations USING(receipt_id) WHERE bot_id={bot} AND telegram_group_share_cards.state='uncertain')"]
-    ctl.guard()
-    _mutate_sql(ctl.data, ctl.database, [migrations._assert_sql(" AND ".join(conditions)),
-        f"UPDATE {CONTROL} SET admission='open',workers='run',epoch=epoch+1 WHERE singleton=1"])
-    after = ctl.inspect()
-    require(after["control"]["epoch"] == control["epoch"] + 1 and after["control"]["admission"] == "open"
-            and after["control"]["workers"] == "run", "Maintenance resume needs independent reconciliation.")
-    return after
+    plan = resume.plan_failed_backup(ctl, api, source, recovery_journal, initial=initial, frozen=frozen,
+                                     fingerprint=fingerprint, session=session)
+    envelope = approval(ctl.target, plan["approvalAction"], ctl.revision, plan["stateSha256"])
+    return resume.resume_failed_backup(ctl, api, source, recovery_journal, initial=initial, frozen=frozen,
+        fingerprint=fingerprint, session=session, approval_envelope=envelope, record_intent=record_intent)
 
 
 def resume_aborted_drain(ctl, *, initial, paused, session, record_intent):
-    """Resume a confirmed pause before any freeze/export was attempted."""
-    from general_isolation_window import work_sql
-    from production_control import CONTROL, INVOCATIONS, _mutate_sql
-    require(ctl.target.environment == "rehearsal" and ctl.target.data["workerName"] == SERVICE
-            and initial.get("control", {}).get("admission") == "open" and initial["control"].get("workers") == "run"
-            and paused.get("admission") == "closed" and paused.get("workers") == "run")
-    before = ctl.inspect()
-    require(before["control"] == paused and before["release"] == initial.get("release")
-            and before["configurationSha256"] == initial.get("configurationSha256")
-            and not any(before["work"].values())
-            and not any(before["terminal"].get(key, 0) for key in
-                        ("uncertain", "terminalUnknown", "unknownInvocations", "unknownUpdates")))
-    _verify_resume_dependencies(ctl)
-    action = "maintenance-resume-drain:" + digest({"session": session, "paused": paused})
-    ctl.approval(approval(ctl.target, action, ctl.revision, before["stateSha256"]), action, before["stateSha256"])
-    record_intent(before["stateSha256"], action)
-    current = ctl.inspect()
-    require(current["stateSha256"] == before["stateSha256"])
-    predicate = " AND ".join(f"{key} IS {migrations._literal(value) if isinstance(value, str) else value}" for key, value in paused.items())
-    quiet, fields = work_sql(ctl.target.data["botId"])
-    bot = migrations._literal(ctl.target.data["botId"])
-    conditions = [f"EXISTS(SELECT 1 FROM {CONTROL} WHERE {predicate})",
-                  "EXISTS(SELECT 1 FROM (" + quiet + ") WHERE " + " AND ".join(f"{field}=0" for field in fields) + ")",
-                  f"NOT EXISTS(SELECT 1 FROM {INVOCATIONS} WHERE state IN ('running','uncertain'))",
-                  "NOT EXISTS(SELECT 1 FROM subs_bot_production_updates WHERE state IN ('processing','uncertain'))",
-                  f"NOT EXISTS(SELECT 1 FROM telegram_outbox JOIN telegram_inbox USING(receipt_id) WHERE bot_id={bot} AND state='uncertain')",
-                  f"NOT EXISTS(SELECT 1 FROM telegram_group_share_cards JOIN telegram_private_share_creations USING(receipt_id) WHERE bot_id={bot} AND telegram_group_share_cards.state='uncertain')"]
-    ctl.guard()
-    _mutate_sql(ctl.data, ctl.database, [migrations._assert_sql(" AND ".join(conditions)),
-        f"UPDATE {CONTROL} SET admission='open',workers='run',epoch=epoch+1 WHERE singleton=1"])
-    after = ctl.inspect()
-    require(after["control"]["epoch"] == paused["epoch"] + 1 and after["control"]["admission"] == "open"
-            and after["control"]["workers"] == "run")
-    return after
+    import production_backup_resume as resume
+    require(ctl.target.environment == "rehearsal" and ctl.target.data["workerName"] == SERVICE)
+    plan = resume.plan_aborted_drain(ctl, initial=initial, paused=paused, session=session)
+    envelope = approval(ctl.target, plan["approvalAction"], ctl.revision, plan["stateSha256"])
+    return resume.resume_aborted_drain(ctl, initial=initial, paused=paused, session=session,
+                                       approval_envelope=envelope, record_intent=record_intent)
 
 
 def webhook_settings(info):
@@ -1071,10 +986,17 @@ class Drill:
         run_id, attempt = session.split("-")
         token = artifact._github_token()
         run = artifact._get_json("/actions/runs/" + run_id + "/attempts/" + attempt, token)
-        workflow = artifact._get_json("/actions/workflows/worker-production-lifecycle-rehearsal.yml", token)
+        workflow_file = getattr(self, "backup_evidence_workflow", "worker-production-lifecycle-rehearsal.yml")
+        branch = getattr(self, "backup_evidence_branch", "main")
+        require(workflow_file == "worker-production-lifecycle-rehearsal.yml"
+                and (branch == "main" or matches(r"codex/[a-z0-9._/-]{1,120}", branch)))
+        if branch != "main":
+            require(pinned["controlRevision"] == self.revision,
+                    "An interrupted head rehearsal cannot be resumed by a different unreviewed head.")
+        workflow = artifact._get_json("/actions/workflows/" + workflow_file, token)
         require(run.get("id") == int(run_id) and run.get("run_attempt") == int(attempt)
-                and workflow.get("path") == monitor.WORKFLOW and run.get("workflow_id") == workflow.get("id")
-                and run.get("event") in {"workflow_dispatch", "schedule"} and run.get("head_branch") == "main"
+                and workflow.get("path") == ".github/workflows/" + workflow_file and run.get("workflow_id") == workflow.get("id")
+                and run.get("event") in {"workflow_dispatch", "schedule"} and run.get("head_branch") == branch
                 and run.get("head_sha") == pinned["controlRevision"]
                 and all(isinstance(run.get(k), dict) and run[k].get("id") == artifact.REPOSITORY_ID
                         for k in ("repository", "head_repository"))

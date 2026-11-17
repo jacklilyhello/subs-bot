@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import production_lifecycle_drill as drill
+import production_backup_resume as resume
 from production_target import ContractError
 
 
@@ -32,14 +33,14 @@ class ResumeTests(unittest.TestCase):
         initial = {"control": {"admission": "open", "workers": "run"}, "release": before["release"],
                    "configurationSha256": before["configurationSha256"]}
         journal = Mock()
-        journal.value = {"export": {"state": "complete"}}
+        journal.value = {"scopeSha256": "a" * 64, "export": {"state": "complete"}}
         trace = []
         record = Mock(side_effect=lambda *_args: trace.append("intent"))
-        with patch.object(drill, "_verify_resume_dependencies"), \
+        with patch.object(resume, "_dependencies"), \
              patch("production_backup_capacity.frozen_fingerprint", return_value={"dataSha256": "e" * 64}) as fingerprint, \
-             patch("production_control._mutate_sql", side_effect=lambda *_args: trace.append("cas")):
-            drill.resume_failed_backup(ctl, Mock(), Mock(), journal, initial=initial, frozen=frozen,
-                fingerprint={"dataSha256": "e" * 64}, session="1-1", record_intent=record)
+             patch.object(resume, "_mutate_sql", side_effect=lambda *_args: trace.append("cas")):
+            resume.resume_failed_backup(ctl, Mock(), Mock(), journal, initial=initial, frozen=frozen,
+                fingerprint={"dataSha256": "e" * 64}, session="1-1", approval_envelope={"explicit": True}, record_intent=record)
         self.assertEqual(trace, ["intent", "cas"])
         self.assertEqual(fingerprint.call_count, 2)
 
@@ -51,14 +52,14 @@ class ResumeTests(unittest.TestCase):
         ctl.inspect.return_value = state
         initial = {"control": {"admission": "open", "workers": "run"}, "release": {}, "configurationSha256": "b" * 64}
         journal = Mock()
-        journal.value = {"export": {"state": "complete"}}
+        journal.value = {"scopeSha256": "a" * 64, "export": {"state": "complete"}}
         record = Mock()
-        with patch.object(drill, "_verify_resume_dependencies"), \
+        with patch.object(resume, "_dependencies"), \
              patch("production_backup_capacity.frozen_fingerprint", side_effect=[{"data": "same"}, {"data": "changed"}]), \
-             patch("production_control._mutate_sql") as mutate:
+             patch.object(resume, "_mutate_sql") as mutate:
             with self.assertRaises(ContractError):
-                drill.resume_failed_backup(ctl, Mock(), Mock(), journal, initial=initial, frozen=frozen,
-                    fingerprint={"data": "same"}, session="1-1", record_intent=record)
+                resume.resume_failed_backup(ctl, Mock(), Mock(), journal, initial=initial, frozen=frozen,
+                    fingerprint={"data": "same"}, session="1-1", approval_envelope={"explicit": True}, record_intent=record)
         record.assert_called_once()
         mutate.assert_not_called()
 
@@ -67,7 +68,7 @@ class ResumeTests(unittest.TestCase):
             with self.subTest(state=state):
                 ctl = controller()
                 journal = Mock()
-                journal.value = None if state is None else {"export": {"state": state}}
+                journal.value = None if state is None else {"scopeSha256": "a" * 64, "export": {"state": state}}
                 record = Mock()
                 with self.assertRaises(ContractError):
                     drill.resume_failed_backup(ctl, Mock(), Mock(), journal,
