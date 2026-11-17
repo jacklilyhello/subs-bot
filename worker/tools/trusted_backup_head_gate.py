@@ -4,13 +4,15 @@ The final check validates the explicitly authorized test Bot identity without
 printing its credential. The gate never reads Cloudflare credentials.
 """
 from pathlib import Path
+from hashlib import sha256
 import json
 import os
 import re
 import subprocess
+import time
 
 import prepare_isolation_artifact as github
-from production_target import parsed, require
+from production_target import ACCOUNT, canonical, digest, parsed, require
 
 
 WORKFLOW = github.REPOSITORY + "/.github/workflows/worker-backup-reviewed-head.yml@" + github.MAIN_REF
@@ -45,7 +47,7 @@ def validate(env):
     require(re.fullmatch(r"[1-9][0-9]{0,8}", spec["pr"]) is not None
             and HEX40.fullmatch(spec["headSha"]) is not None
             and env.get("BACKUP_REVIEWED_HEAD_SHA") == spec["headSha"]
-            and spec["action"] in {"inspect", "genesis-plan", "genesis-initialize", "backup", "watchdog", "verify", "open-backup"}
+            and spec["action"] in {"inspect", "genesis-plan", "genesis-initialize", "backup", "watchdog", "verify", "open-backup", "capacity-fixture"}
             and HEX64.fullmatch(spec["registrationSha256"]) is not None
             and HEX32.fullmatch(spec["sourceCheckpointId"]) is not None
             and HEX64.fullmatch(spec["sourceManifestSha256"]) is not None
@@ -60,6 +62,9 @@ def validate(env):
         require(spec["approvalSha256"] == spec["genesisSha256"])
     if spec["action"] == "verify":
         require(HEX32.fullmatch(spec["checkpointId"]) is not None and HEX64.fullmatch(spec["manifestSha256"]) is not None)
+    if spec["action"] == "capacity-fixture":
+        require(env.get("BACKUP_CAPACITY_ENABLED") == "true" and HEX64.fullmatch(spec["approvalSha256"] or ""),
+                "The dedicated capacity gate is disabled or lacks its exact plan pin.")
     ref = github._get_json("/git/ref/heads/main", token)
     require(ref.get("ref") == github.MAIN_REF and ref.get("object", {}).get("type") == "commit"
             and ref["object"].get("sha") == main, "The trusted dispatcher is no longer current main.")
@@ -83,8 +88,8 @@ def validate(env):
     require(trusted.is_dir() and not trusted.is_symlink() and _sha(trusted) == main,
             "The trusted gate checkout differs from current main.")
     phase = env.get("BACKUP_CHECKOUT_PHASE", "")
-    require(phase in {"before", "ready", "credential-check"})
-    if phase in {"ready", "credential-check"}:
+    require(phase in {"before", "ready", "credential-check", "fixture-credential-check"})
+    if phase in {"ready", "credential-check", "fixture-credential-check"}:
         require(candidate.is_dir() and not candidate.is_symlink() and _sha(candidate) == spec["headSha"],
                 "The candidate checkout differs from the exact independently reviewed head.")
     if phase == "credential-check":
@@ -95,6 +100,43 @@ def validate(env):
                 and re.fullmatch(r"9293938370:[A-Za-z0-9_-]{20,128}", test["botToken"]) is not None
                 and re.fullmatch(r"[A-Za-z0-9_-]{32,256}", test["webhookSecret"]) is not None,
                 "The isolated Telegram configuration does not match the authorized test identity.")
+    if phase == "fixture-credential-check":
+        require(spec["action"] == "capacity-fixture")
+        fixture = parsed(env.get("CAPACITY_FIXTURE_REGISTRATION_JSON", ""))
+        witness = parsed(env.get("CAPACITY_FIXTURE_BINDING_WITNESS_JSON", ""))
+        original = parsed(env.get("SUBS_BOT_CF_ISOLATION_TARGET_JSON", ""))
+        fixture_sha = env.get("CAPACITY_FIXTURE_REGISTRATION_SHA256", "")
+        witness_sha = env.get("CAPACITY_FIXTURE_BINDING_WITNESS_SHA256", "")
+        mode = env.get("CAPACITY_FIXTURE_MODE", "")
+        database = fixture.get("databaseId", "")
+        excluded = env.get("CAPACITY_FIXTURE_REHEARSAL_D1_ID", "")
+        uuid = r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}"
+        require(set(fixture) == {"version", "accountId", "databaseId", "databaseName", "createdAt", "bucketName", "bucketCreatedAt",
+                "probeDatabaseId", "probeDatabaseName", "probeCreatedAt"}
+                and type(fixture["version"]) is int and fixture["version"] == 1 and fixture["accountId"] == ACCOUNT
+                and fixture["databaseName"] == "subs-bot-cf-backup-capacity-20261118" and fixture["bucketName"] == "subs-bot-cf-dev-01"
+                and fixture["probeDatabaseName"] == "subs-bot-cf-backup-permission-20261118"
+                and re.fullmatch(uuid, fixture["probeDatabaseId"] or "")
+                and fixture["probeDatabaseId"] not in {database, excluded, original.get("d1Id")}
+                and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z", fixture["probeCreatedAt"] or "")
+                and re.fullmatch(uuid, database) and re.fullmatch(uuid, excluded)
+                and isinstance(original, dict) and original.get("accountId") == ACCOUNT
+                and re.fullmatch(uuid, original.get("d1Id", "")) and database not in {excluded, original["d1Id"]}
+                and fixture["bucketCreatedAt"] == original.get("r2CreatedOn")
+                and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z", fixture["createdAt"] or "")
+                and HEX64.fullmatch(fixture_sha or "") and sha256(canonical(fixture)).hexdigest() == fixture_sha)
+        require(set(witness) == {"version", "accountId", "databaseId", "observedAt", "workerBindingCount", "probeDatabaseId", "probeWorkerBindingCount"}
+                and type(witness["version"]) is int and witness["version"] == 1 and witness["accountId"] == ACCOUNT
+                and witness["databaseId"] == database and type(witness["observedAt"]) is int
+                and 0 <= int(time.time()) - witness["observedAt"] <= 900
+                and type(witness["workerBindingCount"]) is int and witness["workerBindingCount"] == 0
+                and witness["probeDatabaseId"] == fixture["probeDatabaseId"]
+                and type(witness["probeWorkerBindingCount"]) is int and witness["probeWorkerBindingCount"] == 0
+                and HEX64.fullmatch(witness_sha or "") and sha256(canonical(witness)).hexdigest() == witness_sha
+                and mode in {"initialize", "16000", "20000", "20001", "verify-16000", "verify-20000", "verify-20001", "probe-read-token"}
+                and ((mode == "probe-read-token") == (spec["checkpointId"] == "0" * 31 + "1"))
+                and spec["approvalSha256"] == digest({"registrationSha256": fixture_sha, "witnessSha256": witness_sha, "mode": mode}),
+                "The independently pinned fixture, no-binding witness or exact mode differs.")
     return {"status": "validated", "environment": ENVIRONMENT, "dispatcherMainSha": main,
             "reviewedHeadSha": spec["headSha"], "pr": spec["pr"], "checkoutVerified": phase != "before"}
 

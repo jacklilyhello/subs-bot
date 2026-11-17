@@ -1,6 +1,7 @@
 """Synthetic trust-boundary checks for the main-only reviewed-head gate."""
 from pathlib import Path
 import json
+from hashlib import sha256
 import sys
 import tempfile
 import unittest
@@ -8,7 +9,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import trusted_backup_head_gate as gate
-from production_target import ContractError
+from production_target import ACCOUNT, ContractError, canonical, digest
 
 
 MAIN, HEAD = "a" * 40, "b" * 40
@@ -57,6 +58,53 @@ class TrustedGateTests(unittest.TestCase):
         self.assertEqual(result["reviewedHeadSha"], HEAD)
         self.assertEqual(result["dispatcherMainSha"], MAIN)
         self.assertTrue(result["checkoutVerified"])
+
+    def test_capacity_gate_requires_independent_fixture_and_fresh_binding_witness(self):
+        fixture = {"version": 1, "accountId": ACCOUNT, "databaseId": "00000000-0000-4000-8000-000000000001",
+                   "databaseName": "subs-bot-cf-backup-capacity-20261118", "createdAt": "2026-11-18T00:00:00Z",
+                   "bucketName": "subs-bot-cf-dev-01", "bucketCreatedAt": "2026-11-17T00:00:00Z",
+                   "probeDatabaseId": "00000000-0000-4000-8000-000000000004",
+                   "probeDatabaseName": "subs-bot-cf-backup-permission-20261118", "probeCreatedAt": "2026-11-18T00:00:00Z"}
+        witness = {"version": 1, "accountId": ACCOUNT, "databaseId": fixture["databaseId"],
+                   "observedAt": 1000, "workerBindingCount": 0,
+                   "probeDatabaseId": fixture["probeDatabaseId"], "probeWorkerBindingCount": 0}
+        original = {"accountId": ACCOUNT, "d1Id": "00000000-0000-4000-8000-000000000002", "r2CreatedOn": fixture["bucketCreatedAt"]}
+        fixture_pin, witness_pin = sha256(canonical(fixture)).hexdigest(), sha256(canonical(witness)).hexdigest()
+        selection = {**spec(), "action": "capacity-fixture", "approvalSha256": digest({"registrationSha256": fixture_pin,
+                     "witnessSha256": witness_pin, "mode": "verify-16000"})}
+        env = {**self.env, "HEAD_VALIDATION_JSON": json.dumps(selection), "BACKUP_CAPACITY_ENABLED": "true",
+               "BACKUP_CHECKOUT_PHASE": "fixture-credential-check", "CAPACITY_FIXTURE_MODE": "verify-16000",
+               "CAPACITY_FIXTURE_REGISTRATION_JSON": json.dumps(fixture), "CAPACITY_FIXTURE_REGISTRATION_SHA256": fixture_pin,
+               "CAPACITY_FIXTURE_BINDING_WITNESS_JSON": json.dumps(witness), "CAPACITY_FIXTURE_BINDING_WITNESS_SHA256": witness_pin,
+               "CAPACITY_FIXTURE_REHEARSAL_D1_ID": "00000000-0000-4000-8000-000000000003",
+               "SUBS_BOT_CF_ISOLATION_TARGET_JSON": json.dumps(original)}
+        with patch.object(gate.time, "time", return_value=1100):
+            self.assertTrue(self.check(env)["checkoutVerified"])
+            for change in ({"BACKUP_CAPACITY_ENABLED": ""}, {"CAPACITY_FIXTURE_REHEARSAL_D1_ID": fixture["databaseId"]},
+                           {"CAPACITY_FIXTURE_MODE": "20001"}, {"CAPACITY_FIXTURE_BINDING_WITNESS_SHA256": "0" * 64}):
+                with self.subTest(change=change), self.assertRaises(ContractError):
+                    self.check({**env, **change})
+            probe_spec = {**selection, "checkpointId": "0" * 31 + "1",
+                          "approvalSha256": digest({"registrationSha256": fixture_pin, "witnessSha256": witness_pin,
+                                                    "mode": "probe-read-token"})}
+            probe = {**env, "HEAD_VALIDATION_JSON": json.dumps(probe_spec), "CAPACITY_FIXTURE_MODE": "probe-read-token"}
+            self.assertTrue(self.check(probe)["checkoutVerified"])
+            with self.assertRaises(ContractError):
+                self.check({**probe, "HEAD_VALIDATION_JSON": json.dumps({**probe_spec, "checkpointId": ""})})
+        with patch.object(gate.time, "time", return_value=2000), self.assertRaises(ContractError):
+            self.check(env)
+
+    def test_capacity_credentials_are_conditionally_injected_after_trusted_gate(self):
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/worker-backup-reviewed-head.yml").read_text()
+        self.assertLess(workflow.index("Confirm independently pinned capacity fixture identity"),
+                        workflow.index("Run the reviewed candidate against only dedicated isolation"))
+        self.assertIn("SUBS_BOT_BACKUP_CAPACITY_VALIDATION_ENABLED", workflow)
+        self.assertIn("CAPACITY_FIXTURE_D1_READ_TOKEN", workflow)
+        self.assertIn("CAPACITY_FIXTURE_D1_WRITE_TOKEN", workflow)
+        self.assertIn("!startsWith(vars.SUBS_BOT_BACKUP_CAPACITY_MODE, 'verify-')", workflow)
+        self.assertIn("SUBS_BOT_CF_REHEARSAL_DATA_READ_TOKEN", workflow)
+        self.assertIn("needs: [probe_intent]", workflow)
+        self.assertIn("CAPACITY_FIXTURE_PROBE_INTENT_SHA256: ${{ needs.probe_intent.outputs.intent_sha256 }}", workflow)
 
     def test_wrong_pin_environment_or_attempt_fails_before_checkout(self):
         for changed in ({"BACKUP_REVIEWED_HEAD_SHA": "f" * 40}, {"BACKUP_HEAD_ENVIRONMENT": "subs-bot-production"},
