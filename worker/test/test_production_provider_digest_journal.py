@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -13,6 +14,18 @@ from test_production_provider import config
 
 
 class DigestJournalTests(unittest.TestCase):
+    def test_output_accepts_sha256_names_but_refuses_injection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "output"
+            path.write_text("")
+            with patch.dict(os.environ, {"GITHUB_OUTPUT": str(path)}, clear=True):
+                journal.output("intent_sha256", "a" * 64)
+                self.assertEqual(path.read_text(), "intent_sha256=" + "a" * 64 + "\n")
+                for name, value in (("_invalid", "safe"), ("a" * 65, "safe"), ("name\ninjected", "safe"),
+                                    ("safe", "bad\nvalue"), ("safe", "x" * 4097)):
+                    with self.subTest(name=name), self.assertRaises(control.ProviderError):
+                        journal.output(name, value)
+
     def test_only_skipped_intent_and_empty_prefix_can_be_resolved_readonly(self):
         revision, run_id = "b" * 40, "101"
         run = {"id": 101, "run_attempt": 1, "path": journal.transfer.WORKFLOW_PATH, "head_sha": revision,

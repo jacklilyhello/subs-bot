@@ -304,7 +304,7 @@ def parse_intent():
 
 
 def output(name, value):
-    control.require(re.fullmatch(r"[a-z_]+", name) is not None)
+    control.require(isinstance(name, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", name) is not None)
     text = value if isinstance(value, str) else control.canonical(value).decode("ascii")
     control.require("\n" not in text and "\r" not in text and len(text) <= 4096)
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="ascii") as file:

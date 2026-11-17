@@ -771,7 +771,7 @@ def guard_sources(config):
         build = source["build"]
         revision = build["revision"]
         if revision != current:
-            comparison = github._get_json(f"/compare/{revision}...{current}?per_page=1", token)
+            comparison = github.compare_commits_metadata(revision, current, token)
             require(comparison.get("status") == "ahead" and type(comparison.get("ahead_by")) is int
                     and comparison["ahead_by"] > 0 and type(comparison.get("behind_by")) is int and comparison["behind_by"] == 0
                     and all(isinstance(comparison.get(key), dict) and comparison[key].get("sha") == revision

@@ -36,7 +36,7 @@ def source_ancestor(build, token):
     current = os.environ["GITHUB_SHA"]
     revision = build["revision"]
     if revision != current:
-        comparison = control.github._get_json(f"/compare/{revision}...{current}?per_page=1", token)
+        comparison = control.github.compare_commits_metadata(revision, current, token)
         control.require(comparison.get("status") == "ahead" and type(comparison.get("ahead_by")) is int
                         and comparison["ahead_by"] > 0 and comparison.get("behind_by") == 0
                         and all(isinstance(comparison.get(key), dict) and comparison[key].get("sha") == revision
