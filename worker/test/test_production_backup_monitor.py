@@ -105,6 +105,47 @@ class MonitorTests(unittest.TestCase):
             with self.assertRaises(Exception):
                 monitor.read_runs(1100, lookback_hours=1, token="x")
 
+    def test_inventory_pages_fifty_and_rejects_duplicate_or_changed_history(self):
+        from urllib.parse import parse_qs, urlsplit
+        revision = "a" * 40
+        record = {"run_attempt": 1, "head_sha": revision,
+                  "display_title": "Production lifecycle rehearsal daily-backup at " + revision,
+                  "workflow_id": 321, "path": monitor.WORKFLOW, "event": "schedule", "head_branch": "main",
+                  "repository": {"id": monitor.github.REPOSITORY_ID}, "head_repository": {"id": monitor.github.REPOSITORY_ID},
+                  "created_at": "1970-01-01T00:15:00Z", "status": "completed", "conclusion": "success"}
+        rows = [{**record, "id": index + 1} for index in range(102)]
+        calls = []
+        def read(path, _token):
+            if "?" not in path:
+                return {"id": 321, "path": monitor.WORKFLOW}
+            query = parse_qs(urlsplit(path).query)
+            self.assertEqual(query["per_page"], ["50"])
+            page = int(query["page"][0])
+            calls.append(page)
+            return {"total_count": len(rows), "workflow_runs": rows[(page - 1) * 50:page * 50]}
+        with patch.object(monitor.github, "_get_json", side_effect=read):
+            self.assertEqual(len(monitor.read_runs(1100, lookback_hours=1, token="x")), 102)
+            self.assertEqual(calls, [1, 2, 3])
+            rows[50] = {**rows[50], "id": rows[0]["id"]}
+            with self.assertRaises(Exception):
+                monitor.read_runs(1100, lookback_hours=1, token="x")
+            rows[50] = {**rows[50], "id": 51}
+            rows.pop()
+            def changed(path, token):
+                response = read(path, token)
+                if "page=2" in path:
+                    response["total_count"] += 1
+                return response
+            with patch.object(monitor.github, "_get_json", side_effect=changed), self.assertRaises(Exception):
+                monitor.read_runs(1100, lookback_hours=1, token="x")
+            def at_bound(path, token):
+                response = read(path, token)
+                if "?" in path:
+                    response["total_count"] = 1000
+                return response
+            with patch.object(monitor.github, "_get_json", side_effect=at_bound), self.assertRaises(Exception):
+                monitor.read_runs(1100, lookback_hours=1, token="x")
+
 
 if __name__ == "__main__":
     unittest.main()

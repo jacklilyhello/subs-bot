@@ -496,23 +496,24 @@ def monitor_workflow_runs(raw_controllers, now, latest_verified, expected_plan_r
     require(workflow.get("path") == ".github/workflows/worker-production-backup.yml" and type(workflow.get("id")) is int)
     since = datetime.fromtimestamp(max(0, now - 7 * 86400), timezone.utc).strftime("%Y-%m-%d")
     rows, total = [], None
-    for page in range(1, 7):
-        query = urlencode({"branch": "main", "created": ">=" + since, "per_page": 100, "page": page})
+    for page in range(1, 21):
+        query = urlencode({"branch": "main", "created": ">=" + since, "per_page": 50, "page": page})
         response = artifact._get_json("/actions/workflows/worker-production-backup.yml/runs?" + query, token)
         batch = response.get("workflow_runs")
         count = response.get("total_count")
-        require(type(count) is int and 0 <= count <= 500 and isinstance(batch, list) and len(batch) <= 100)
+        require(type(count) is int and 0 <= count < 1000 and isinstance(batch, list) and len(batch) <= 50,
+                "Workflow history reached its bound; completeness is unknown.")
         require(total is None or total == count, "The workflow history changed during observation.")
         total = count
         rows.extend(batch)
         require(len(rows) <= total)
         if len(rows) == total:
             break
-        require(len(batch) == 100, "The workflow history is incomplete.")
+        require(len(batch) == 50, "The workflow history is incomplete.")
     require(total is not None and len(rows) == total)
     observed, failed, unknown, relevant, expected_seen = set(), False, False, 0, False
     for run in rows:
-        require(isinstance(run, dict) and type(run.get("id")) is int and run["id"] not in observed
+        require(isinstance(run, dict) and type(run.get("id")) is int and run["id"] > 0 and run["id"] not in observed
                 and run.get("run_attempt") == 1
                 and run.get("workflow_id") == workflow["id"] and run.get("head_branch") == "main"
                 and run.get("event") in {"workflow_dispatch", "schedule"}

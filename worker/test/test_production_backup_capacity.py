@@ -31,6 +31,25 @@ class API:
 
 
 class CapacityTests(unittest.TestCase):
+    def test_hosted_sql_dump_of_twenty_thousand_finished_cron_invocations(self):
+        # Representative SQLite serialization, not a claim about Cloudflare's
+        # native export size or about unrelated business tables/large cells.
+        import sqlite3
+        migration = Path(__file__).resolve().parents[1] / "migrations" / "0055_production_control.sql"
+        with sqlite3.connect(":memory:") as database:
+            database.executescript(migration.read_text(encoding="utf-8"))
+            database.executemany("INSERT INTO subs_bot_production_invocations VALUES(?,?,?,?,?,?,?,?,?)",
+                ((f"{index:032x}", "a" * 64, "1234567890123456789", 1, "scheduled",
+                  1800000000, 1800000960, "finished", 1800000001) for index in range(20000)))
+            database.commit()
+            dump = "\n".join(database.iterdump()).encode("utf-8")
+        with sqlite3.connect(":memory:") as restored:
+            restored.executescript(dump.decode("utf-8"))
+            self.assertEqual(restored.execute("SELECT count(*) FROM subs_bot_production_invocations").fetchone()[0], 20000)
+        self.assertLess(len(dump), 20000 * 512 + 100000)
+        self.assertLess(len(dump), capacity.native.SQL_BYTES)
+        print(f"Synthetic SQLite dump: 20000 finished Cron rows, {len(dump)} bytes (native SQL limit {capacity.native.SQL_BYTES}).")
+
     def test_thresholds_have_explicit_boundary_behavior(self):
         self.assertEqual(capacity.level(79, 100, 80), "normal")
         self.assertEqual(capacity.level(80, 100, 80), "warning")

@@ -171,4 +171,6 @@ G0 之后发生任何新增、修改、删除、授权、领取、撤销、短�
 
 只读监控提供 GitHub 失败检查、annotation、摘要以及保留 7 天的 JSON artifact；任务输出 `status`、`alerts_json`、`report_sha256`、`notification_relevant` 供同一 workflow 的受控步骤接入。定时监控关闭时输出 `disabled`/`monitor-disabled` 并提示未进行观察，不生成健康报告；该 job 的成功结束只表示开关检查完成，不表示备份健康。外部接收器可按受信的 workflow run ID 下载 artifact、核对摘要并根据 alert 分类路由；它必须自行处理重复或缺失 run，不能把未取得 artifact 当作健康。隔离和生产环境分别可用 `SUBS_BOT_REHEARSAL_BACKUP_NOTIFICATION_FILTER` 与 `SUBS_BOT_PRODUCTION_BACKUP_NOTIFICATION_FILTER` 配置逗号分隔的通知类别，默认 `*`；过滤仅决定路由标记，不移除原告警或改变失败检查。监控 unknown 和无效过滤配置始终标记相关。此接口不发送外部消息，本轮没有配置通知端点或实际投递；已授权的测试 Bot 和管理员并不意味着此处已接入 Telegram。生产监控仍默认关闭，启用及接收器归属须另行批准。
 
+监控按每页 50 条完整盘点受限的 GitHub 工作流历史；生产查询覆盖最近七天及起始 UTC 日期的余量。若结果总数达到 1,000、分页期间总数变化、记录重复或无法读全，完整性无法证明，监控报告 unknown 并失败，不把截断结果当成健康。默认每 15 分钟的监控自身也计入该数量；接近该边界须先调整经审查的历史盘点方案，不能忽略失败的 run。
+
 容量采样只使用 D1 Read 与私有 R2 对象/metadata 只读凭据；代码也拒绝非只读 D1 SQL 与 R2 写操作。平台对 D1 Read 令牌的实际负向写入拒绝必须在独立专用 probe D1 实测，不能仅凭权限名称或本工具自身的 SQL 限制声称已验证；probe 未通过前应保留该权限边界的未验收状态。

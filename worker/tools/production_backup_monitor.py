@@ -42,19 +42,21 @@ def read_runs(now, *, lookback_hours, token):
     since = (datetime.fromtimestamp(now, timezone.utc) - timedelta(hours=lookback_hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
     workflow = github._get_json("/actions/workflows/worker-production-lifecycle-rehearsal.yml", token)
     require(type(workflow.get("id")) is int and workflow.get("path") == WORKFLOW)
-    selected, total, count = [], None, 0
-    for page in range(1, 11):
-        query = urlencode({"per_page": 100, "page": page, "branch": "main", "created": ">=" + since})
+    selected, total, count, seen = [], None, 0, set()
+    for page in range(1, 21):
+        query = urlencode({"per_page": 50, "page": page, "branch": "main", "created": ">=" + since})
         result = github._get_json("/actions/workflows/" + str(workflow["id"]) + "/runs?" + query, token)
         rows = result.get("workflow_runs")
-        require(isinstance(rows, list) and len(rows) <= 100 and type(result.get("total_count")) is int)
+        require(isinstance(rows, list) and len(rows) <= 50 and type(result.get("total_count")) is int)
         if total is None:
             total = result["total_count"]
-            require(total <= 1000, "Backup run inventory exceeds the monitoring bound.")
+            require(0 <= total < 1000, "Backup run inventory reached the monitoring bound; completeness is unknown.")
         require(result["total_count"] == total, "Backup run inventory changed during pagination.")
         count += len(rows)
         for run in rows:
-            require(isinstance(run, dict))
+            require(isinstance(run, dict) and type(run.get("id")) is int and run["id"] > 0
+                    and run["id"] not in seen, "The backup run inventory is duplicated or malformed.")
+            seen.add(run["id"])
             sha = run.get("head_sha")
             if run.get("display_title") != "Production lifecycle rehearsal daily-backup at " + str(sha):
                 continue
@@ -69,7 +71,7 @@ def read_runs(now, *, lookback_hours, token):
                              "revision": sha, "created": created, "status": run.get("status"), "conclusion": run.get("conclusion")})
         if count == total:
             break
-        require(len(rows) == 100 and count < total)
+        require(len(rows) == 50 and count < total)
     require(count == total, "Backup run inventory was truncated.")
     return sorted(selected, key=lambda item: (item["created"], int(item["runId"])), reverse=True)
 
