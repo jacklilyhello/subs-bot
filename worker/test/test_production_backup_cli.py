@@ -201,6 +201,23 @@ class ProductionBackupTests(unittest.TestCase):
         self.assertIn("backup-failed", result["alerts"])
         self.assertNotIn("backup-overdue", result["alerts"])
 
+    def test_monitor_uses_active_session_pause_limits_after_policy_changes(self):
+        pin = {"generation": 2, "state": "active", "session": "1-1", "day": "2026/01/01",
+               "controlRevision": "b" * 40, "previousSha256": "c" * 64}
+        anchor, store, target = Mock(), Mock(), Mock(digest="a" * 64)
+        anchor.read.return_value = (pin, b"", '"etag"')
+        anchor.history_digest_key.return_value = "previous"
+        store.get.return_value = backup.canonical({"generation": 1})
+        events = [{"stage": "started", "timestamp": 1000,
+                   "details": {"pauseLimitSeconds": 60, "maximumPauseSeconds": 300}},
+                  {"stage": "pause-intent", "timestamp": 1000, "details": {}}]
+        with patch.object(backup.maintenance, "Transaction") as transaction:
+            transaction.return_value.load.return_value = events
+            result = backup.monitor_anchor(anchor, store, target,
+                                           {**self.policy, "maximumPauseSeconds": 3600}, 1301)
+        self.assertIn("pause-limit-exceeded", result["alerts"])
+        self.assertIn("pause-maximum-exceeded", result["alerts"])
+
     def test_transition_reconciliation_requires_exact_successor_and_finished_run(self):
         previous = {"admission": "open", "workers": "run", "epoch": 8}
         details = {"control": previous, "runAttempt": "1", "runId": "123", "controlRevision": "a" * 40}
