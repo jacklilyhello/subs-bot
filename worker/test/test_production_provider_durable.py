@@ -38,11 +38,14 @@ class DurableSourceTests(unittest.TestCase):
             with self.subTest(second=second), patch.object(control.github, "_get_json", side_effect=[
                     {"total_count": 51, "workflow_runs": first}, second]), self.assertRaises(control.ProviderError):
                 durable.workflow_runs(path, "fixture")
-        pages = [{"total_count": 1000, "workflow_runs": [{"id": index} for index in range(start, start + 50)]}
-                 for start in range(1, 1001, 50)] + [{"total_count": 1000, "workflow_runs": []}]
+        pages = [{"total_count": 999, "workflow_runs": [{"id": index} for index in range(start, min(start + 50, 1000))]}
+                 for start in range(1, 1000, 50)]
         with patch.object(control.github, "_get_json", side_effect=pages) as get:
-            self.assertEqual(len(durable.workflow_runs(path, "fixture")), 1000)
-            self.assertEqual(get.call_count, 21)
+            self.assertEqual(len(durable.workflow_runs(path, "fixture")), 999)
+            self.assertEqual(get.call_count, 20)
+        with patch.object(control.github, "_get_json", return_value={"total_count": 1000, "workflow_runs": first}), \
+                self.assertRaises(control.ProviderError):
+            durable.workflow_runs(path, "fixture")
         with self.assertRaises(control.ProviderError):
             durable.workflow_runs(".github/workflows/../../other.yml", "fixture")
 

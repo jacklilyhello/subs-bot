@@ -47,10 +47,12 @@ def workflow_runs(path, token):
     """Read one workflow's complete bounded history without oversized API pages."""
     control.require(isinstance(path, str) and re.fullmatch(r"\.github/workflows/[a-z0-9-]+\.yml", path) is not None)
     rows, expected, seen = [], None, set()
-    for page in range(1, 22):
+    # GitHub may cap workflow-run search at 1,000; that boundary cannot prove
+    # complete history even if the reported last page looks terminal.
+    for page in range(1, 21):
         response = control.github._get_json(f"/actions/workflows/{path.rsplit('/', 1)[-1]}/runs?per_page=50&page={page}", token)
         batch, total = response.get("workflow_runs"), response.get("total_count")
-        control.require(isinstance(batch, list) and len(batch) <= 50 and type(total) is int and 0 <= total <= 1000)
+        control.require(isinstance(batch, list) and len(batch) <= 50 and type(total) is int and 0 <= total < 1000)
         if expected is None:
             expected = total
         control.require(total == expected and len(rows) + len(batch) <= total)
