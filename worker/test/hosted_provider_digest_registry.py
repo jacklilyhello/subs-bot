@@ -59,6 +59,15 @@ def sentinel_archive():
     output = BytesIO()
     with tarfile.open(fileobj=BytesIO(oci_fixture()), mode="r:") as source, \
             tarfile.open(fileobj=output, mode="w:") as destination:
+        # Explicit parents prevent Skopeo from creating implicit root-owned
+        # directory headers while extracting the synthetic archive.
+        for name in ("blobs", "blobs/sha256"):
+            directory = tarfile.TarInfo(name)
+            directory.type = tarfile.DIRTYPE
+            directory.mode = 0o755
+            directory.uid, directory.gid = os.getuid(), os.getgid()
+            directory.uname = directory.gname = ""
+            destination.addfile(directory)
         for member in source:
             assert member.isfile()
             member.uid, member.gid = os.getuid(), os.getgid()
