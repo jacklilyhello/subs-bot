@@ -1,0 +1,96 @@
+name: Run a reviewed backup head in isolated rehearsal
+run-name: Reviewed backup head validation at ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: The dedicated isolated backup validation environment
+        type: choice
+        options: [subs-bot-backup-head-isolation]
+        required: true
+      validation_json:
+        description: Exact reviewed PR head, action and private source pins
+        type: string
+        required: true
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: subs-bot-lifecycle-rehearsal
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    # The enable switch is a repository variable and is absent by default.
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.environment == 'subs-bot-backup-head-isolation' && vars.SUBS_BOT_BACKUP_HEAD_VALIDATION_ENABLED == 'true'
+    environment: subs-bot-backup-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out the trusted current main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11.18'
+      - name: Verify the exact independently reviewed head before checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BACKUP_HEAD_ENVIRONMENT: subs-bot-backup-head-isolation
+          BACKUP_REVIEWED_HEAD_SHA: ${{ vars.SUBS_BOT_BACKUP_REVIEWED_HEAD_SHA }}
+          BACKUP_CHECKOUT_PHASE: before
+          HEAD_VALIDATION_JSON: ${{ inputs.validation_json }}
+        run: python3 -B trusted/worker/tools/trusted_backup_head_gate.py
+      - name: Check out the immutable reviewed candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ fromJSON(inputs.validation_json).headSha }}
+          path: candidate
+          persist-credentials: false
+      - name: Independently recheck trusted main and candidate checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BACKUP_HEAD_ENVIRONMENT: subs-bot-backup-head-isolation
+          BACKUP_REVIEWED_HEAD_SHA: ${{ vars.SUBS_BOT_BACKUP_REVIEWED_HEAD_SHA }}
+          BACKUP_CHECKOUT_PHASE: ready
+          HEAD_VALIDATION_JSON: ${{ inputs.validation_json }}
+        run: python3 -B trusted/worker/tools/trusted_backup_head_gate.py
+      - name: Confirm only the authorized isolated test identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BACKUP_HEAD_ENVIRONMENT: subs-bot-backup-head-isolation
+          BACKUP_REVIEWED_HEAD_SHA: ${{ vars.SUBS_BOT_BACKUP_REVIEWED_HEAD_SHA }}
+          BACKUP_CHECKOUT_PHASE: credential-check
+          HEAD_VALIDATION_JSON: ${{ inputs.validation_json }}
+          SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
+        run: python3 -B trusted/worker/tools/trusted_backup_head_gate.py
+      - name: Run the reviewed candidate against only dedicated isolation
+        working-directory: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CONTROL_ENVIRONMENT: subs-bot-isolation
+          HEAD_VALIDATION_JSON: ${{ inputs.validation_json }}
+          HEAD_TRUSTED_MAIN_SHA: ${{ github.sha }}
+          HEAD_TRUSTED_REVIEWED_SHA: ${{ vars.SUBS_BOT_BACKUP_REVIEWED_HEAD_SHA }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_REHEARSAL_DATA_TOKEN }}
+          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_REHEARSAL_WORKER_READ_TOKEN }}
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_CONTROL_DRILL_KEYS: ${{ secrets.SUBS_BOT_CONTROL_DRILL_KEYS }}
+          SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
+        run: |
+          umask 077
+          python3 -B worker/tools/production_backup_head_harness.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: subs-bot-reviewed-backup-head-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/production-backup-head-result.json
+          if-no-files-found: warn
+          retention-days: 7
