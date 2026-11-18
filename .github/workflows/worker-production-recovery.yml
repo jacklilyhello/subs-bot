@@ -12,7 +12,7 @@ on:
       action:
         description: One protected checkpoint; no source data mutation or consumer switch
         type: choice
-        options: [inspect, prepare, prepare-restore, create-database, create-objects, pin-resource, capture, poll-export, restore-objects, start-import, verify-backup, verify-restore]
+        options: [inspect, preflight-capacity, prepare, prepare-restore, create-database, create-objects, pin-resource, capture, poll-export, restore-objects, start-import, verify-backup, verify-restore]
         default: inspect
         required: true
       rehearsal_registration_sha256:
@@ -46,6 +46,10 @@ on:
       identity_sha256:
         description: Independently verified resource identity digest for pin-resource only
         type: string
+      warning_percent:
+        description: Capacity warning threshold percentage, 1-99
+        type: string
+        default: '80'
 
 permissions:
   actions: read
@@ -112,6 +116,7 @@ jobs:
           RECOVERY_STATE_SHA256: ${{ inputs.state_sha256 }}
           RECOVERY_RESOURCE: ${{ inputs.resource }}
           RECOVERY_IDENTITY_SHA256: ${{ inputs.identity_sha256 }}
+          RECOVERY_WARNING_PERCENT: ${{ inputs.warning_percent }}
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           umask 077

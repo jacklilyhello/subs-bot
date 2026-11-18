@@ -17,10 +17,11 @@ import prepare_isolation_artifact as artifact
 from production_control import API, Controller, OperationError, Telegram, general_config, hosted_environment
 from production_target import ContractError, approve, canonical as target_canonical, parsed, validate_target
 import production_recovery as recovery
+import production_backup_capacity as capacity
 
 
 WORKFLOW = artifact.REPOSITORY + "/.github/workflows/worker-production-recovery.yml@" + artifact.MAIN_REF
-READ_ONLY = {"inspect", "verify-backup"}
+READ_ONLY = {"inspect", "preflight-capacity", "verify-backup"}
 
 
 def require_reviewed_ancestor(revision, control_revision, token):
@@ -158,6 +159,21 @@ def main(env=None):
                     control_revision=control_revision)
         source = recovery.RecoverySource(api, target.data, bundle, manifest, controller.inspect, guard)
         source.archive_body, source.code_proof = body, proof
+        if action == "preflight-capacity":
+            recovery.require(before["release"]["revision"] == manifest["revision"]
+                             and before["release"]["moduleSha256"] == manifest["bundleSha256"],
+                             "Capacity preflight requires the exact active release artifact.")
+            warning = env.get("RECOVERY_WARNING_PERCENT", "80")
+            recovery.require(re.fullmatch(r"[1-9][0-9]?", warning) is not None)
+            result = capacity.observe(api, source, warning_percent=int(warning))
+            result.update(action=action, targetSha256=target.digest, sourceRevision=proof["revision"],
+                          sourceStateSha256=before["stateSha256"], controlRevision=control_revision,
+                          environment=target.environment, runId=env["GITHUB_RUN_ID"], runAttempt=env["GITHUB_RUN_ATTEMPT"])
+            output = root / "production-recovery-result.json"
+            with recovery.native.private_file(output) as stream:
+                stream.write(target_canonical(result))
+            print(json.dumps(result, sort_keys=True))
+            return
         owner = env.get("GITHUB_RUN_ID", "") + "/" + env.get("GITHUB_RUN_ATTEMPT", "")
         recovery.require(re.fullmatch(r"[1-9][0-9]{0,19}/[1-9][0-9]{0,9}", owner))
         journal = recovery.RecoveryJournal(api, owner, guard=guard)

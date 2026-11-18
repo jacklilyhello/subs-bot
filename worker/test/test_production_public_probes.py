@@ -4,6 +4,7 @@ from io import BytesIO
 import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import Mock, call, patch
 from urllib.error import HTTPError
@@ -44,7 +45,7 @@ class PublicProbeTests(unittest.TestCase):
         tool = drill.Drill(env)
         tool.store = fixtures.MemoryStore()
         target, _ = control_fixtures.fixture()
-        controller = Mock(target=target, revision=control_fixtures.REVISION)
+        controller = Mock(target=target, revision=control_fixtures.REVISION, control_revision=control_fixtures.REVISION)
         controller.inspect.return_value = {"control": {"admission": "closed", "workers": "frozen"}, "work": {"invocations": 0}}
         controller.plan_webhook.return_value = {"stateSha256": "c" * 64, "webhook": {"settingsSha256": "d" * 64}}
         tool.controller = controller
@@ -213,6 +214,88 @@ class PublicProbeTests(unittest.TestCase):
         self.assertNotIn("oldWebhookSecret", report)
         self.assertEqual(drill.safe_failure(drill.OperationError(SECRET, uncertain=True), "cleanup-pause"),
             {"phase": "cleanup-pause", "kind": "operation", "uncertain": True})
+
+    def test_external_cleanup_requires_trusted_dispatcher(self):
+        tool, controller = self.tool()
+        with self.assertRaises(contract.ContractError):
+            tool.exercise(external_webhook_cleanup=True)
+        controller.telegram.call.assert_not_called()
+
+    def test_open_window_refuses_existing_telegram_pending_updates_before_mutation(self):
+        tool, controller = self.tool()
+        tool.env["HEAD_TRUSTED_WEBHOOK_CLEANUP"] = "configured-v1"
+        tool.backup_evidence_workflow = "worker-backup-reviewed-head.yml"
+        tool.anchors = Mock(return_value={"admin": 1, "member": 2})
+        controller.telegram.call.return_value = {"url": drill.ORIGINAL_ORIGIN + "/telegram/webhook",
+            "has_custom_certificate": False, "max_connections": 40,
+            "allowed_updates": ["message", "callback_query"], "pending_update_count": 1}
+        with patch.object(release_evidence, "verify_activation_baseline", return_value=self.proof(tool)):
+            with self.assertRaises(contract.ContractError):
+                tool.exercise(external_webhook_cleanup=True)
+        controller.configure_webhook.assert_not_called()
+
+    def test_open_window_pins_snapshot_before_write_and_delegates_restore(self):
+        tool, controller = self.tool()
+        tool.env["HEAD_TRUSTED_WEBHOOK_CLEANUP"] = "configured-v1"
+        tool.backup_evidence_workflow = "worker-backup-reviewed-head.yml"
+        tool.anchors = Mock(return_value={"admin": 1, "member": 2})
+        controller.telegram.call.return_value = {"url": drill.ORIGINAL_ORIGIN + "/telegram/webhook",
+            "has_custom_certificate": False, "max_connections": 40,
+            "allowed_updates": ["message", "callback_query"], "pending_update_count": 0}
+        controller.configure_webhook.return_value = {"configured": True}
+        tool.restore_webhook = Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            tool.env["RUNNER_TEMP"] = directory
+            with patch.object(release_evidence, "verify_activation_baseline", return_value=self.proof(tool)), \
+                 patch.object(drill, "one", return_value={"n": 1000}), patch.object(drill, "post_update", return_value=403):
+                with self.assertRaises(drill.ProbeStatusError):
+                    tool.exercise(external_webhook_cleanup=True)
+            pin = json.loads((Path(directory) / "backup-webhook-snapshot-pin.json").read_text())
+        self.assertEqual(pin["snapshotSha256"], tool.report["webhookSnapshotSha256"])
+        self.assertEqual(pin["controllerRevision"], tool.revision)
+        self.assertEqual(pin["dispatcherRevision"], tool.env["GITHUB_SHA"])
+        self.assertNotIn(tool.previous["webhookSecret"], json.dumps(pin))
+        tool.restore_webhook.assert_not_called()
+        self.assertEqual(tool.report["webhookRecovery"]["status"], "pending-trusted-dispatcher")
+
+    def test_successful_open_window_leaves_confirmed_ready_state_to_trusted_cleanup(self):
+        tool, controller = self.tool()
+        tool.env["HEAD_TRUSTED_WEBHOOK_CLEANUP"] = "configured-v1"
+        tool.backup_evidence_workflow = "worker-backup-reviewed-head.yml"
+        tool.anchors = Mock(return_value={"admin": 1, "member": 2})
+        controller.telegram.call.return_value = {"url": drill.ORIGINAL_ORIGIN + "/telegram/webhook",
+            "has_custom_certificate": False, "max_connections": 40,
+            "allowed_updates": ["message", "callback_query"], "pending_update_count": 0}
+        controller.configure_webhook.return_value = {"configured": True}
+        initial = {"control": {"admission": "closed", "workers": "frozen"}, "work": {"invocations": 0}}
+        ready = {"control": {"admission": "open", "workers": "run"}, "work": {"invocations": 0},
+                 "terminal": {}, "stateSha256": "a" * 64}
+        controller.inspect.side_effect = [initial, ready]
+        tool.transition.return_value = {"control": ready["control"], "stateSha256": ready["stateSha256"]}
+        tool.restore_webhook = Mock()
+        body = b"synthetic fixture payload"
+        states = [{"update_id": 1, "state": "sent", "attempts": 1}, {"update_id": 2, "state": "sent", "attempts": 1}]
+        def synthetic_rows(_api, _database, sql):
+            if sql.startswith("SELECT * FROM telegram_general_actors"):
+                return []
+            if "SELECT creation.payload_id" in sql:
+                return [{"payload_id": "11111111-1111-4111-8111-111111111111",
+                         "payload_sha256": sha256(body).hexdigest(), "state": "published"}]
+            if "SELECT inbox.update_id,outbox.state" in sql:
+                return states
+            raise AssertionError("unexpected synthetic query")
+        with tempfile.TemporaryDirectory() as directory:
+            tool.env["RUNNER_TEMP"] = directory
+            with patch.object(release_evidence, "verify_activation_baseline", return_value=self.proof(tool)), \
+                 patch.object(drill, "one", return_value={"n": 1000}), \
+                 patch.object(drill, "rows", side_effect=synthetic_rows), \
+                 patch.object(drill, "post_update", side_effect=[503, 401, 200, 200, 409, 204, 200]), \
+                 patch.object(drill.native, "_response", return_value=(200, {}, body)):
+                tool.exercise(verify_extra=lambda *_args: None, external_webhook_cleanup=True)
+        self.assertEqual(tool.report["status"], "awaiting-trusted-cleanup")
+        self.assertTrue(any(stage["stage"] == "open-backup-ready-for-cleanup" for stage in tool.report["stages"]))
+        tool.restore_webhook.assert_not_called()
+        self.assertEqual(tool.transition.call_args_list, [call("activate")])
 
 
 if __name__ == "__main__":

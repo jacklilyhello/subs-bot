@@ -45,10 +45,83 @@ class MemoryStore:
 
 
 class LifecycleDrillTests(unittest.TestCase):
+    def test_backup_failure_diagnostics_never_repeat_or_print_error_details(self):
+        journal = Mock(session="123-1")
+        journal.append.side_effect = drill.OperationError("synthetic-private-evidence", uncertain=True, status=503)
+        anchor = Mock()
+        error = drill.ContractError("synthetic-private-payload")
+        diagnostic = drill.record_backup_failure(journal, anchor, error, "recovery-prepare")
+        self.assertEqual(diagnostic["stage"], "recovery-prepare")
+        self.assertEqual(diagnostic["failedJournal"], "unconfirmed")
+        self.assertEqual(diagnostic["anchorRelease"], "not-attempted")
+        self.assertEqual(diagnostic["evidenceError"], {"kind": "operation", "uncertain": True, "httpStatus": 503})
+        self.assertNotIn("synthetic-private", json.dumps(diagnostic))
+        journal.append.assert_called_once()
+        anchor.release.assert_not_called()
+
+    def test_backup_failure_records_confirmation_before_single_anchor_release(self):
+        journal = Mock(session="123-1")
+        journal.load.return_value = [{"stage": "preflight"}, {"stage": "failed"}]
+        anchor = Mock()
+        anchor.release.side_effect = drill.OperationError("synthetic-private", uncertain=True)
+        diagnostic = drill.record_backup_failure(journal, anchor, drill.ContractError("synthetic"), "preflight")
+        self.assertEqual(diagnostic["failedJournal"], "confirmed")
+        self.assertEqual(diagnostic["anchorRelease"], "unconfirmed")
+        self.assertTrue(journal.append.call_args.args[1]["uncertain"])
+        anchor.release.assert_called_once_with("123-1")
+
+    def test_backup_failure_projects_only_bounded_scoped_read_diagnostics(self):
+        error = drill.ContractError("synthetic-private-body")
+        error.read_diagnostic = {"source": "r2", "phase": "get", "httpStatus": 403, "body": "synthetic-private-body"}
+        result = drill.backup_error_kind(error)
+        self.assertEqual(result, {"kind": "contract", "uncertain": True, "source": "r2", "phase": "get", "httpStatus": 403})
+        self.assertNotIn("synthetic-private-body", json.dumps(result))
+
+    def test_legacy_webhook_actions_reject_before_opening_private_state(self):
+        for action in ("exercise", "provider-binding", "provider-binding-resume", "recover-webhook"):
+            with self.subTest(action=action), patch.dict(drill.os.environ, {
+                    "GITHUB_WORKFLOW_REF": drill.WORKFLOW, "DRILL_ACTION": action}, clear=True), \
+                    patch.object(drill, "Drill") as target, self.assertRaises(contract.ContractError):
+                drill.main()
+            target.assert_not_called()
+
+    def test_private_share_readback_uses_scoped_s3_without_rest_fallback(self):
+        import scoped_r2
+        key = "private-shares/00000000-0000-4000-8000-000000000001.txt"
+        objects, ctl = Mock(), Mock()
+        objects.get.return_value = (b"synthetic object", '"etag"')
+        with patch.object(scoped_r2, "from_environment", return_value=objects), \
+             patch.object(drill.native, "_response") as rest:
+            self.assertEqual(drill.read_rehearsal_private_object({}, ctl, key), b"synthetic object")
+        objects.get.assert_called_once_with(key, limit=64 * 1024)
+        rest.assert_not_called()
+        with patch.object(scoped_r2, "from_environment", return_value=None), \
+             patch.object(drill.native, "_response", return_value=(200, {}, b"legacy")):
+            self.assertEqual(drill.read_rehearsal_private_object({"SUBS_BOT_CF_BOOTSTRAP_TOKEN": "synthetic-token"}, ctl, key), b"legacy")
+        with self.assertRaises(contract.ContractError):
+            drill.read_rehearsal_private_object({}, ctl, "unrelated/object")
+
+    def test_backup_and_watchdog_have_independent_default_off_switches(self):
+        self.assertFalse(drill.backup_enabled({}))
+        self.assertFalse(drill.backup_enabled({}, watchdog=True))
+        self.assertTrue(drill.backup_enabled({"DRILL_BACKUP_WRITES_ENABLED": "true"}))
+        self.assertFalse(drill.backup_enabled({"DRILL_BACKUP_WRITES_ENABLED": "true"}, watchdog=True))
+        self.assertTrue(drill.backup_enabled({"DRILL_BACKUP_WATCHDOG_ENABLED": "true"}, watchdog=True))
+        self.assertFalse(drill.backup_enabled({"DRILL_BACKUP_WATCHDOG_ENABLED": "true"}))
+
     def tool(self):
         value = drill.Drill(environment())
         value.store = MemoryStore()
         return value
+
+    def test_reviewed_controller_revision_does_not_change_dispatcher_github_sha(self):
+        env = environment()
+        dispatcher = env["GITHUB_SHA"]
+        candidate = "f" * 40
+        tool = drill.Drill(env, control_revision=candidate)
+        self.assertEqual(tool.revision, candidate)
+        self.assertEqual(tool.report["controlRevision"], candidate)
+        self.assertEqual(env["GITHUB_SHA"], dispatcher)
 
     def snapshot(self, tool):
         info = {"url": drill.ORIGINAL_ORIGIN + "/telegram/webhook", "has_custom_certificate": False,
@@ -90,12 +163,21 @@ class LifecycleDrillTests(unittest.TestCase):
         with self.assertRaises(contract.ContractError):
             drill.approval(formal, "deploy", REVISION, "f" * 64)
 
+    def test_reviewed_rehearsal_controller_approval_keeps_dispatcher_sha_separate(self):
+        target, _, _, _ = drill.configuration(environment())
+        dispatcher, candidate = "a" * 40, "b" * 40
+        with patch.dict(drill.os.environ, {"GITHUB_SHA": dispatcher}):
+            envelope = drill.approval(target, "pause", REVISION, "f" * 64, control_revision=candidate)
+        self.assertEqual(envelope["controlRevision"], candidate)
+        self.assertTrue(contract.approve(target, envelope, "pause", REVISION, "f" * 64, control_revision=candidate))
+
     def test_activation_approval_uses_the_baseline_bound_plan(self):
         tool = self.tool()
         target, _ = fixture()
         controller = Mock()
         controller.target = target
         controller.revision = REVISION
+        controller.control_revision = REVISION
         controller.plan_activate.return_value = {"stateSha256": "c" * 64,
             "activationBaseline": {"checkpointId": "d" * 32, "manifestSha256": "e" * 64}}
         controller.transition.return_value = {"stateSha256": "f" * 64}
@@ -111,7 +193,7 @@ class LifecycleDrillTests(unittest.TestCase):
 
     def planned_controller(self, tool):
         target, _ = fixture()
-        controller = Mock(target=target, revision=REVISION)
+        controller = Mock(target=target, revision=REVISION, control_revision=REVISION)
         controller.plan_pause.return_value = {"stateSha256": "a" * 64, "control": {"admission": "open", "workers": "run"}}
         controller.transition.return_value = {"stateSha256": "b" * 64, "control": {"admission": "closed", "workers": "run"}}
         tool.controller = controller

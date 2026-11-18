@@ -1,0 +1,145 @@
+name: Run an explicitly approved production backup checkpoint
+run-name: Production backup ${{ github.event_name == 'schedule' && 'monitor' || inputs.action }} at ${{ github.sha }}
+
+on:
+  schedule:
+    - cron: '3 * * * *'
+    - cron: '18 * * * *'
+    - cron: '33 * * * *'
+    - cron: '48 * * * *'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: One reviewed checkpoint; scheduled production operation is disabled
+        required: true
+        type: choice
+        options: [monitor, plan-initialize-anchor, initialize-anchor, inspect-anchor-initialization, inspect-anchor-unknown, plan-abort-unstarted, abort-unstarted, plan-begin, begin, inspect, preflight, abort-preflight, plan-pause, pause, drain, freeze, fingerprint, capture, poll-export, verify, plan-activate, activate, plan-reconcile-transition, reconcile-transition, plan-resume-failed, resume-failed, plan-anchor-reconcile, anchor-reconcile]
+      state_sha256:
+        description: Exact predecessor state returned by the corresponding plan or inspect
+        type: string
+      session:
+        description: Unique decimal-decimal maintenance session chosen before plan-begin
+        type: string
+      session_day:
+        description: UTC session date YYYY/MM/DD chosen before plan-begin
+        type: string
+      anchor_candidate_sha256:
+        description: Exact unconfirmed anchor release generation SHA256, reconciliation only
+        type: string
+      source_run_id:
+        description: Exact active application CI run when no private source checkpoint is selected
+        type: string
+      source_run_attempt:
+        description: Exact active application CI attempt
+        type: string
+        default: '1'
+      source_checkpoint_id:
+        description: Previously verified private checkpoint carrying the active source
+        type: string
+      source_manifest_sha256:
+        description: Independently recorded manifest SHA for the selected private source
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: ${{ (github.event_name == 'schedule' || inputs.action == 'monitor') && 'subs-bot-backup-monitor-production' || 'subs-bot-lifecycle-production' }}
+  cancel-in-progress: false
+
+jobs:
+  checkpoint:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
+    environment: subs-bot-production
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      status: ${{ steps.gate.outputs.status || steps.monitor.outputs.status }}
+      alerts_json: ${{ steps.gate.outputs.alerts_json || steps.monitor.outputs.alerts_json }}
+      report_sha256: ${{ steps.monitor.outputs.report_sha256 }}
+      notification_relevant: ${{ steps.gate.outputs.notification_relevant || steps.monitor.outputs.notification_relevant }}
+    steps:
+      - name: Check whether scheduled monitoring is enabled
+        id: gate
+        env:
+          MONITOR_ENABLED: ${{ vars.SUBS_BOT_PRODUCTION_BACKUP_MONITOR_ENABLED }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = schedule ] && [ "$MONITOR_ENABLED" != true ]; then
+            echo 'enabled=false' >> "$GITHUB_OUTPUT"
+            echo 'status=disabled' >> "$GITHUB_OUTPUT"
+            echo 'alerts_json=["monitor-disabled"]' >> "$GITHUB_OUTPUT"
+            echo 'notification_relevant=true' >> "$GITHUB_OUTPUT"
+            echo '::warning::Scheduled production backup monitoring is disabled; no health observation was made.'
+            echo 'Scheduled production backup monitoring is disabled; no health observation was made.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'enabled=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.gate.outputs.enabled == 'true'
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Monitor without production write or Bot credentials
+        id: monitor
+        if: steps.gate.outputs.enabled == 'true' && (github.event_name == 'schedule' || inputs.action == 'monitor')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CONTROL_ENVIRONMENT: subs-bot-production
+          SUBS_BOT_TARGET_JSON: ${{ secrets.SUBS_BOT_TARGET_JSON }}
+          SUBS_BOT_BACKUP_POLICY_JSON: ${{ secrets.SUBS_BOT_BACKUP_POLICY_JSON }}
+          SUBS_BOT_BACKUP_GENESIS_SHA256: ${{ secrets.SUBS_BOT_BACKUP_GENESIS_SHA256 }}
+          SUBS_BOT_BACKUP_MONITOR_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_BACKUP_MONITOR_CONTROLLERS_JSON }}
+          SUBS_BOT_CF_BACKUP_MONITOR_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_BACKUP_MONITOR_READ_TOKEN }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          BACKUP_ACTION: monitor
+          MONITOR_SCHEDULE: ${{ github.event.schedule }}
+          MONITOR_CAPACITY_INTERVAL_MINUTES: ${{ vars.SUBS_BOT_PRODUCTION_CAPACITY_INTERVAL_MINUTES || '15' }}
+          MONITOR_NOTIFICATION_FILTER: ${{ vars.SUBS_BOT_PRODUCTION_BACKUP_NOTIFICATION_FILTER || '*' }}
+          BACKUP_SOURCE_CHECKPOINT_ID: ${{ inputs.source_checkpoint_id || vars.SUBS_BOT_PRODUCTION_BACKUP_SOURCE_CHECKPOINT_ID }}
+          BACKUP_SOURCE_MANIFEST_SHA256: ${{ inputs.source_manifest_sha256 || vars.SUBS_BOT_PRODUCTION_BACKUP_SOURCE_MANIFEST_SHA256 }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          python3 -B worker/tools/production_backup_cli.py
+      - name: Run one explicitly selected production checkpoint
+        if: steps.gate.outputs.enabled == 'true' && github.event_name != 'schedule' && inputs.action != 'monitor'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CONTROL_ENVIRONMENT: subs-bot-production
+          SUBS_BOT_TARGET_JSON: ${{ secrets.SUBS_BOT_TARGET_JSON }}
+          SUBS_BOT_CONTROL_SECRETS: ${{ secrets.SUBS_BOT_CONTROL_SECRETS }}
+          SUBS_BOT_CF_DATA_TOKEN: ${{ secrets.SUBS_BOT_CF_DATA_TOKEN }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_SCOPED_R2_WRITE_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_WRITE_JSON }}
+          SUBS_BOT_CF_WORKER_TOKEN: ${{ secrets.SUBS_BOT_CF_WORKER_TOKEN }}
+          SUBS_BOT_CF_DEPENDENCY_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPENDENCY_READ_TOKEN }}
+          SUBS_BOT_RECOVERY_JSON: ${{ secrets.SUBS_BOT_RECOVERY_JSON }}
+          SUBS_BOT_APPROVAL_JSON: ${{ secrets.SUBS_BOT_APPROVAL_JSON }}
+          SUBS_BOT_BACKUP_PREPARE_APPROVAL_JSON: ${{ secrets.SUBS_BOT_BACKUP_PREPARE_APPROVAL_JSON }}
+          SUBS_BOT_BACKUP_CAPTURE_APPROVAL_JSON: ${{ secrets.SUBS_BOT_BACKUP_CAPTURE_APPROVAL_JSON }}
+          SUBS_BOT_BACKUP_POLICY_JSON: ${{ secrets.SUBS_BOT_BACKUP_POLICY_JSON }}
+          SUBS_BOT_BACKUP_GENESIS_SHA256: ${{ secrets.SUBS_BOT_BACKUP_GENESIS_SHA256 }}
+          SUBS_BOT_PRODUCTION_BACKUP_WRITES_ENABLED: ${{ vars.SUBS_BOT_PRODUCTION_BACKUP_WRITES_ENABLED }}
+          SUBS_BOT_CI_RUN_ID: ${{ inputs.source_run_id || vars.SUBS_BOT_PRODUCTION_BACKUP_SOURCE_RUN_ID }}
+          SUBS_BOT_CI_RUN_ATTEMPT: ${{ inputs.source_run_attempt || vars.SUBS_BOT_PRODUCTION_BACKUP_SOURCE_RUN_ATTEMPT || '1' }}
+          BACKUP_SOURCE_CHECKPOINT_ID: ${{ inputs.source_checkpoint_id || vars.SUBS_BOT_PRODUCTION_BACKUP_SOURCE_CHECKPOINT_ID }}
+          BACKUP_SOURCE_MANIFEST_SHA256: ${{ inputs.source_manifest_sha256 || vars.SUBS_BOT_PRODUCTION_BACKUP_SOURCE_MANIFEST_SHA256 }}
+          BACKUP_ACTION: ${{ github.event_name == 'schedule' && 'monitor' || inputs.action }}
+          BACKUP_STATE_SHA256: ${{ inputs.state_sha256 }}
+          BACKUP_SESSION: ${{ inputs.session }}
+          BACKUP_SESSION_DAY: ${{ inputs.session_day }}
+          BACKUP_ANCHOR_CANDIDATE_SHA256: ${{ inputs.anchor_candidate_sha256 }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          python3 -B worker/tools/production_backup_cli.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.gate.outputs.enabled == 'true'
+        with:
+          name: subs-bot-production-backup-${{ inputs.action }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/production-backup-result.json
+          if-no-files-found: warn
+          retention-days: 7

@@ -1,7 +1,10 @@
 name: Rehearse production lifecycle on registered isolation
-run-name: Production lifecycle rehearsal ${{ inputs.action }} at ${{ github.sha }}
+run-name: Production lifecycle rehearsal ${{ github.event_name == 'schedule' && (github.event.schedule == '0 1 * * *' && 'daily-backup' || 'daily-backup-watchdog') || inputs.action }} at ${{ github.sha }}
 
 on:
+  schedule:
+    - cron: '0 1 * * *'
+    - cron: '7,22,37,52 * * * *'
   workflow_dispatch:
     inputs:
       action:
@@ -9,7 +12,7 @@ on:
         type: choice
         required: true
         default: inspect
-        options: [bootstrap, exercise, inspect, stabilize, seed-fixture, recovery, recover-webhook, provider-binding, provider-binding-resume, provider-binding-reconcile]
+        options: [bootstrap, exercise, inspect, stabilize, daily-backup, daily-backup-watchdog, backup-head-harness, backup-anchor-genesis-plan, backup-anchor-initialize, backup-anchor-initialize-reconcile-plan, backup-anchor-initialize-reconcile, backup-anchor-reconcile-plan, backup-anchor-reconcile, seed-fixture, recovery, recover-webhook, provider-binding, provider-binding-resume, provider-binding-reconcile]
       source_run_id:
         description: Successful exact-main Worker CI run
         type: string
@@ -75,6 +78,34 @@ on:
         description: Explicit interrupted run/attempt/intent SHA and independently confirmed active version/deployment; never re-uploads
         type: string
         required: false
+      backup_warning_percent:
+        description: Daily backup capacity warning percentage, 1-99
+        type: string
+        default: '80'
+      backup_pause_limit_seconds:
+        description: Alert if confirmed pause exceeds this duration, 60-900 seconds
+        type: string
+        default: '300'
+      backup_source_checkpoint_id:
+        description: Pinned private application checkpoint holding the exact active CI source
+        type: string
+      backup_source_manifest_sha256:
+        description: Independent manifest SHA paired with backup_source_checkpoint_id
+        type: string
+      backup_fault:
+        description: Isolated synthetic fault for a manually dispatched daily-backup rehearsal
+        type: choice
+        options: [none, capacity-near, capacity-over, readback-failure, process-kill]
+        default: none
+      backup_anchor_candidate_sha256:
+        description: Exact immutable candidate digest for an interrupted anchor release
+        type: string
+      backup_anchor_approval_sha256:
+        description: Independently reviewed genesis or reconciliation plan SHA-256
+        type: string
+      head_validation_json:
+        description: Exact reviewed PR-head harness identity and action pins
+        type: string
 
 permissions:
   actions: read
@@ -85,6 +116,49 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  head-validation:
+    # Disabled until a trusted-main dispatcher or equivalent SHA-bound secret
+    # boundary is installed and the exact head is independently reviewed.
+    if: false && github.repository == 'jacklilyhello/subs-bot' && github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/codex/') && inputs.action == 'backup-head-harness'
+    environment: subs-bot-backup-head-isolation
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11.18'
+      - name: Verify exact reviewed head and dedicated frozen source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_CONTROL_ENVIRONMENT: subs-bot-isolation
+          HEAD_VALIDATION_JSON: ${{ inputs.head_validation_json }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_SCOPED_R2_WRITE_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_WRITE_JSON }}
+          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPLOY_TOKEN }}
+          SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
+          SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
+          SUBS_BOT_CONTROL_DRILL_KEYS: ${{ secrets.SUBS_BOT_CONTROL_DRILL_KEYS }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          python3 -B worker/tools/production_backup_head_harness.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: subs-bot-backup-head-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/production-backup-head-result.json
+          if-no-files-found: warn
+          retention-days: 7
   rehearse:
     if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
     environment: subs-bot-isolation
@@ -93,9 +167,9 @@ jobs:
     env:
       SUBS_BOT_CI_RUN_ID: ${{ inputs.source_run_id }}
       SUBS_BOT_CONTROL_ENVIRONMENT: subs-bot-isolation
-      DRILL_ACTION: ${{ inputs.action }}
-      DRILL_REGISTRATION_SHA256: ${{ inputs.registration_sha256 }}
-      DRILL_ACTIVE_CI_RUN_ID: ${{ inputs.active_run_id }}
+      DRILL_ACTION: ${{ github.event_name == 'schedule' && (github.event.schedule == '0 1 * * *' && 'daily-backup' || 'daily-backup-watchdog') || inputs.action }}
+      DRILL_REGISTRATION_SHA256: ${{ inputs.registration_sha256 || vars.SUBS_BOT_REHEARSAL_REGISTRATION_SHA256 }}
+      DRILL_ACTIVE_CI_RUN_ID: ${{ inputs.active_run_id || vars.SUBS_BOT_REHEARSAL_ACTIVE_CI_RUN_ID }}
       DRILL_ADMIN_MESSAGE_ID: ${{ inputs.admin_message_id }}
       DRILL_MEMBER_MESSAGE_ID: ${{ inputs.member_message_id }}
       DRILL_HUMAN_WINDOW_SECONDS: ${{ inputs.human_window_seconds }}
@@ -109,7 +183,28 @@ jobs:
       DRILL_PROVIDER_MANIFEST_SHA256: ${{ inputs.provider_manifest_sha256 }}
       DRILL_PROVIDER_READY_ACK: ${{ inputs.provider_ready_ack }}
       DRILL_PROVIDER_BINDING_RESUME_JSON: ${{ inputs.provider_binding_resume_json }}
+      DRILL_BACKUP_WARNING_PERCENT: ${{ inputs.backup_warning_percent || vars.SUBS_BOT_REHEARSAL_BACKUP_WARNING_PERCENT || '80' }}
+      DRILL_BACKUP_PAUSE_LIMIT_SECONDS: ${{ inputs.backup_pause_limit_seconds || vars.SUBS_BOT_REHEARSAL_BACKUP_PAUSE_SECONDS || '300' }}
+      DRILL_BACKUP_MAX_PAUSE_SECONDS: ${{ vars.SUBS_BOT_REHEARSAL_BACKUP_MAX_PAUSE_SECONDS || '1800' }}
+      DRILL_BACKUP_SOURCE_CHECKPOINT_ID: ${{ inputs.backup_source_checkpoint_id || vars.SUBS_BOT_REHEARSAL_BACKUP_SOURCE_CHECKPOINT_ID }}
+      DRILL_BACKUP_SOURCE_MANIFEST_SHA256: ${{ inputs.backup_source_manifest_sha256 || vars.SUBS_BOT_REHEARSAL_BACKUP_SOURCE_MANIFEST_SHA256 }}
+      DRILL_BACKUP_GENESIS_SHA256: ${{ vars.SUBS_BOT_REHEARSAL_BACKUP_GENESIS_SHA256 }}
+      DRILL_BACKUP_WRITES_ENABLED: ${{ vars.SUBS_BOT_REHEARSAL_BACKUP_WRITES_ENABLED }}
+      DRILL_BACKUP_WATCHDOG_ENABLED: ${{ vars.SUBS_BOT_REHEARSAL_BACKUP_WATCHDOG_ENABLED }}
+      DRILL_BACKUP_ANCHOR_CANDIDATE_SHA256: ${{ inputs.backup_anchor_candidate_sha256 }}
+      DRILL_BACKUP_ANCHOR_APPROVAL_SHA256: ${{ inputs.backup_anchor_approval_sha256 }}
+      DRILL_BACKUP_FAULT: ${{ github.event_name == 'schedule' && 'none' || inputs.backup_fault || 'none' }}
     steps:
+      - name: Reject legacy test webhook writes before loading credentials
+        env:
+          REQUESTED_ACTION: ${{ github.event_name == 'schedule' && '' || inputs.action }}
+        run: |
+          case "$REQUESTED_ACTION" in
+            exercise|provider-binding|provider-binding-resume|recover-webhook)
+              echo 'Legacy test webhook writes are disabled pending the shared durable lock.' >&2
+              exit 1
+              ;;
+          esac
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
@@ -126,10 +221,14 @@ jobs:
         working-directory: worker
         run: npm ci --ignore-scripts
       - name: Execute the registered production lifecycle code path
+        if: github.event_name != 'schedule' || (github.event.schedule == '0 1 * * *' && vars.SUBS_BOT_REHEARSAL_DAILY_BACKUP_ENABLED == 'true') || (github.event.schedule != '0 1 * * *' && vars.SUBS_BOT_REHEARSAL_BACKUP_WATCHDOG_ENABLED == 'true')
         env:
           GH_TOKEN: ${{ github.token }}
-          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
-          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPLOY_TOKEN }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ (github.event_name != 'schedule' && contains(fromJSON('["inspect","backup-anchor-genesis-plan","backup-anchor-initialize-reconcile-plan","backup-anchor-reconcile-plan","recover-webhook"]'), inputs.action) && secrets.SUBS_BOT_CF_ISOLATION_DATA_READ_TOKEN) || ((github.event_name == 'schedule' || contains(fromJSON('["bootstrap","exercise","stabilize","daily-backup","daily-backup-watchdog","backup-anchor-initialize","backup-anchor-initialize-reconcile","backup-anchor-reconcile","seed-fixture","recovery","provider-binding","provider-binding-resume","provider-binding-reconcile"]'), inputs.action)) && secrets.SUBS_BOT_CF_ISOLATION_DATA_TOKEN) || '' }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_SCOPED_R2_WRITE_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_WRITE_JSON }}
+          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ ((github.event_name == 'schedule' || contains(fromJSON('["exercise","inspect","stabilize","daily-backup","daily-backup-watchdog","backup-anchor-genesis-plan","backup-anchor-initialize","backup-anchor-initialize-reconcile-plan","backup-anchor-initialize-reconcile","backup-anchor-reconcile-plan","backup-anchor-reconcile","recover-webhook","seed-fixture","recovery"]'), inputs.action)) && secrets.SUBS_BOT_SEALED_WORKER_READ_TOKEN) || (contains(fromJSON('["bootstrap","provider-binding","provider-binding-resume","provider-binding-reconcile"]'), inputs.action) && secrets.SUBS_BOT_CF_ISOLATION_WORKER_TOKEN) || '' }}
           SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
           SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
           SUBS_BOT_CONTROL_DRILL_KEYS: ${{ secrets.SUBS_BOT_CONTROL_DRILL_KEYS }}
@@ -139,14 +238,18 @@ jobs:
           umask 077
           python3 -B worker/tools/production_lifecycle_drill.py
       - name: Independently restore the original test webhook after the exercise
-        if: always() && (inputs.action == 'exercise' || inputs.action == 'provider-binding' || inputs.action == 'provider-binding-resume')
+        # The legacy writer is blocked above; always() must never bypass that block.
+        if: ${{ false }}
         env:
           DRILL_ACTION: recover-webhook
           DRILL_AUTOMATIC_CLEANUP: '1'
           DRILL_REPORT_NAME: production-lifecycle-drill-cleanup.json
           GH_TOKEN: ${{ github.token }}
-          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
-          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPLOY_TOKEN }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_ISOLATION_DATA_READ_TOKEN }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_SCOPED_R2_WRITE_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_WRITE_JSON }}
+          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_SEALED_WORKER_READ_TOKEN }}
           SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
           SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
           SUBS_BOT_CONTROL_DRILL_KEYS: ${{ secrets.SUBS_BOT_CONTROL_DRILL_KEYS }}
@@ -178,8 +281,11 @@ jobs:
           DRILL_ACTION: finalize-recovery
           DRILL_REPORT_NAME: production-lifecycle-drill-final.json
           GH_TOKEN: ${{ github.token }}
-          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_BOOTSTRAP_TOKEN }}
-          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPLOY_TOKEN }}
+          SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_ISOLATION_DATA_READ_TOKEN }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_SCOPED_R2_WRITE_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_WRITE_JSON }}
+          SUBS_BOT_CF_DEPLOY_TOKEN: ${{ secrets.SUBS_BOT_SEALED_WORKER_READ_TOKEN }}
           SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON }}
           SUBS_BOT_TELEGRAM_TEST_CONFIG: ${{ secrets.SUBS_BOT_TELEGRAM_TEST_CONFIG }}
           SUBS_BOT_CONTROL_DRILL_KEYS: ${{ secrets.SUBS_BOT_CONTROL_DRILL_KEYS }}
