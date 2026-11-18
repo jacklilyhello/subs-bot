@@ -208,6 +208,30 @@ Webhook 配置顺序为 `plan-webhook → 明确批准其 stateSha256 → webhoo
 
 ## 专用主应用 Provider 绑定演练
 
+Provider 持久来源的独立 Worker 演练入口使用受信 main dispatcher `worker-provider-reviewed-operation.yml`，默认关闭，接受已审准确 PR head、项目隔离目标及独立登记的当前／previous 原始归档。最终 main 的准确 CI 原件可在合并后由 `worker-provider-isolated-source.yml` 封存，并由 `worker-provider-isolated-source-readback.yml` 独立读回、登记；随后可使用同一受保护演练 DAG 的 main-self 模式。该模式必须在各隔离 Environment 显式设置 `SUBS_BOT_PROVIDER_MAIN_SELF_POLICY_JSON`，其 `version=1`、`enabled=true`，`environment` 为该环境的准确名称、`mainSha` 为当前 main；独立核实仓库层不存在同名变量，以免回退。各环境的 `SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA` 也须固定同一提交，验证输入设置 `pr` 为 `main`、`headSha` 为该提交。两环境的 fresh job 各自于使用凭据前核对自身配置；实际写入之前的 DAG 须已通过两侧 gate，不能将其理解为跨环境原子锁。完成后关闭该模式。此模式仅用于登记的隔离目标，历史记录以 `reviewedPr=main` 明确区分，不伪造 PR 或改写旧证据。
+
+先独立完成隔离镜像发布及全量读回，再分别审批并执行 `prepare-image`、`stage`、`activate`、`smoke`；镜像准备完成证明必须先经私有归档独立读回并登记，才能执行 stage。每次都重新核对准确来源、前态、旧版本终态和无 caller，先单次写入意图、独立读回，再发起对应请求；相应凭据使用隔离资源的短期最小权限。写前观察不能充当外部并发的原子锁，必须确保隔离目标没有其他写者。
+
+私有来源归档保留原始 CI ZIP（含 Worker 模块与 OCI 镜像归档），并按独立固定摘要重新核验目标和原件；它不把归档存在本身当作可信来源。校验仍依赖 GitHub 的原 CI run／attempt、工作流与 main 祖先元数据，以及对应原提交的 requirements 原文；这些信息不可读时安全停止，不能重建旧版或改写来源。正式及隔离来源库存各以 32 次封存为当前上限，当前版本与 previous 合计最多 9 代；来源、镜像和 Worker 操作各自的 controller 允许列表最多 16 个版本。达到边界前须实施经审查的分页或分段扩容，不删除历史证据。演练中模拟 Actions 产物不可用应明确标为模拟，不代表产物真实过期。
+
+首次正式来源封存可使用单独登记的 `isolated-source` 归档作为原 CI ZIP 的运输来源：在正式归档 Environment 的 `SUBS_BOT_PROVIDER_SOURCE_ORIGIN_JSON` 中固定其 kind、run／attempt、manifest／目标／桶及独立读回 ledger 记录摘要，同时单独配置该项目来源桶的只读凭据、桶身份和完整隔离来源 ledger／controller；来源读取步骤不持正式桶写凭据。工具复验原封存和独立读回 run、原 CI 元数据、ZIP 及 Worker／OCI 全部摘要，要求原 build 与正式目标中的 build 完全一致；正式目标、调用方、桶和批准仍独立核对。来源 pin 被记录在正式 plan、intent 和 manifest，且不会把隔离目标当作正式授权。未配置 origin 时仍使用原 Actions 产物；配置不完整或任何来源不符即停止，不回退下载或写入。即使 ZIP 持久保存，原 GitHub run／attempt 元数据或原 requirements 不可验证时仍不能继续。
+
+来源 pin 的字段为 `version`、`kind`、`runId`、`runAttempt`、`manifestSha256`、`targetSha256`、`bucketSha256` 和 `ledgerRecordSha256`；版本固定为 1、kind 为 `isolated-source`、attempt 为 `1`。桶摘要针对登记的完整来源桶配置，ledger 摘要针对原封存对应的完整独立读回登记记录，均按工具的 canonical JSON 计算。原桶配置、ledger 和 controller 分别由 `SUBS_BOT_PROVIDER_SOURCE_ORIGIN_ARCHIVE_TARGET_JSON`、`SUBS_BOT_PROVIDER_SOURCE_ORIGIN_LEDGER_JSON`、`SUBS_BOT_PROVIDER_SOURCE_ORIGIN_CONTROLLERS_JSON` 提供；`SUBS_BOT_PROVIDER_SOURCE_ORIGIN_R2_READ_JSON` 是仅来源桶的只读映射，`SUBS_BOT_PROVIDER_SOURCE_ORIGIN_METADATA_READ_TOKEN` 用于核对桶身份。正式桶写凭据仅用于后续获批准的封存步骤。配置前须独立核对 Environment 身份和同名 repository secret 不产生意外回退。
+
+每步完成后独立读回 Provider 状态及私有意图／密文证据，审核后登记 ledger 并安全注入两个目标环境的加密下一配置和准确审批摘要，再进入下一步。密文 artifact 只用于短时交接，不能当作长期私有归档。响应已收到而后续失败时，流程尝试单次追加加密观察并独立读回；若进程死亡或写入结果不明，保留原 intent 和全部现场，不推断成功、不重发。`worker-provider-reviewed-operation-reconcile.yml` 只诊断写入 job 均明确跳过且私有前缀为空的 run；不得用它解除已执行或结果不明的操作。此入口及各项隔离验收以对应准确提交的实际检查和独立证据为准，不代表正式资源获得授权。
+
+新 v2 隔离操作证据将原密文和经严格字段校验的完整非 Secret 明文共同保存在私有 R2，绑定原 intent、目标和各原件摘要；先由持临时 age 身份的独立 runner 解密逐字节比对，再由另一无该身份的 fresh runner 重建目标并复验当前与 previous 来源，才允许登记成功 ledger。已收到响应但后续失败时，仅追加可验证的原件并保留 unknown，绝不覆盖已有完成记录或授权重试；进程死亡、产物丢失或字段不符合安全 schema 时仍可能无法保全响应。旧 v1 密文不会改写，若需再次解密仍依赖原身份；不得假设它已取得 v2 的无密钥保全。操作预检拒绝旧现场中无法安全保全的字段；操作后出现新的非白名单字段也会停止，保留 unknown。Secret 和签名密钥继续另行保管。上述 v2 入口须先完成其准确提交的托管检查、独立审查及隔离实测，默认保持关闭。
+
+这里的原文指控制器实际加密的 canonical response-only 记录、目标和结果，并非完整 Cloudflare HTTP 响应正文；控制器只记录允许的响应身份字段和正文摘要。删除临时 age 身份后，原密文不再保证可解密；已通过两次读回的明文副本及其与密文的绑定可用于独立维护，不能据此声称保留了未取得的 API 正文。
+
+该隔离操作 ledger 和只读对账列表各以上限 32 条为界；每个相关 GitHub workflow 的历史盘点要求总数少于 1,000，按每页 50 条完整读取且核对稳定总数及重复项。达到边界前须完成经审查的分页或分段扩容，不能删除旧意图、证据或登记记录以继续写入。演练 journal 与历史版本链的上限分别计算。
+
+Provider 隔离交接使用一次性的临时 age 私钥；全部已取得的响应密文都须与严格白名单的 response-only 原件关联封存到私有 R2，并经独立解密和读回后，才能按本轮凭据期限清除临时身份。原件不含 API／Bot Token 或签名密钥；配置 Secret 仍不放入数据备份。若证据无法验证或仍有未决密文，保留现场并报告，不得声称已完成清理或结果成功。
+
+中断后仅当 `stage` 的准确 version ID 或 `activate` 的准确 deployment ID 已保全且可独立核实，才可使用默认关闭的隔离 `worker-provider-reviewed-recovery.yml` 先做只读对账：复核原 run/attempt、持久 intent、响应原件、完整来源链、全部版本及部署历史、caller 和 previous 终态。单独批准准确 plan 后再重新观察，单次追加不可变 resolution 并由新 runner 独立读回；经审核登记该 resolution 后，才可使用它生成的密封 next-target 审批后续动作。原 run 仍为失败／未知，不改旧 intent 或重发原写；响应 ID 缺失、现场漂移、额外版本／部署或结果歧义仍须停止并告警。
+
+隔离 Environment 的 `SUBS_BOT_PROVIDER_MUTATION_RECONCILED_JSON` 必须显式登记；仅在私有前缀及完整工作流历史均确认无记录时初始化为空对象，之后只能登记独立读回的精确 resolution，不能删改历史。读回 runner 分别使用受保护的两个 Environment 公钥密封完整合并账本，只输出账本及密文摘要；登记前须重新核验目标 Environment 的身份、公钥和密文摘要，两端登记相同账本。此步骤不代表原失败 run 成功。部署记录的单页盘点必须少于 100 条；达到边界时停止并先实施有界分页支持，不删历史来通过检查。
+
 `worker-production-lifecycle-rehearsal.yml` 的 `provider-binding` 仅接受已登记的 `subs-bot-cf-control-drill-01`，不操作原 dev 数据或 Provider 部署。先取得完整、未绑定的专用 Provider 私有归档与独立摘要，并通知操作者准备好既有管理员浏览器会话；操作者明确 ready 后才 dispatch。输入 `source_run_id` 为当前准确 main Worker CI，`active_run_id` 为当前专用应用准确源 CI，`registration_sha256` 保持原登记值。另必填 `provider_run_id`、`provider_run_attempt`、`provider_manifest_sha256`，`human_window_seconds` 选 60–540 秒，`provider_ready_ack` 精确为 `IAB ready for subs-bot-cf-control-drill-01 refresh`。不提供旧基线 pin；配置变化后先封存并核对新的 G0。
 
 流程通过正式 Controller 的 plan-deploy／deploy 保留身份、密钥和数据，仅开启 URL 导入和刷新；严格读回唯一调用者绑定后，执行正常 G0／Webhook／激活流程。合成 URL 导入必须保存完整三个节点并精确导出原 URI。出现 `provider-refresh-window-open` 后，管理员在测试 Bot 私聊找到本次带 run 标记的订阅，打开详情并点击真实刷新按钮；工具只接受该管理员、该订阅、同一来源与真实票据的成功请求，核对 generation 增加一次、三个节点、确认发送及精确导出。重复发送 URL 不算刷新。报告需再与浏览器独立观察交叉核对，窗口打开本身不等于真人通过。
@@ -216,7 +240,7 @@ Webhook 配置顺序为 `plan-webhook → 明确批准其 stateSha256 → webhoo
 
 整体通过还要求 off 后再次独立检查 closed/frozen、所有 work 为零、无未知终态，并通过既有 prepare／capture／verify-backup 和完整基线读回封存当前配置、准确 CI、全部受支持数据及对象闭包。这不创建恢复资源或再触碰 Webhook。报告以 `onActivationBaseline` 保留启用前基线，`latestOffBaseline` 记录新增导入／刷新后的新快照；两者使用不同 checkpoint、journal 和私有阶段键，不以旧 G0 或候选 ZIP 代替新写入保全。任何备份或独立读回失败都会停止整体通过，并保留已经恢复的 off 现场与两份资料。
 
-依赖读取 Secret `SUBS_BOT_CF_DEPENDENCY_READ_TOKEN` 只在 `provider-binding`、下述 `provider-binding-resume` 和 `provider-binding-reconcile` 注入，所需权限组为 Workers Scripts Read 与 Workers Containers Read。平台只能按账户授予这些读权限；工具再限制到已验证的 Provider 当前／历史准确 ID 与实际盘点所得对象，GET-only，拒绝其他项目、写操作、D1、R2、Zone 和 Registry。使用短期凭据并核对到期时间，不复制 Provider 运行 Secret。
+依赖读取 Secret `SUBS_BOT_CF_DEPENDENCY_READ_TOKEN` 只在 `provider-binding`、下述 `provider-binding-resume` 和 `provider-binding-reconcile` 注入，所需权限组为 Workers Scripts Read 与 Workers Containers Read。Workers Scripts Read 可使用 account-owned granular token 限定准确 Worker 资源；Containers Read 本轮仅核实到账号级产品权限，必须单独评估并批准其范围。工具按已验证的 Provider 当前／历史准确 ID 与实际盘点所得对象限制 GET，不把工具白名单当作平台级资源隔离。使用短期凭据并核对到期时间，不复制 Provider 运行 Secret。
 
 每个完整 Provider 配置与应用提交组合只允许一个私有持久 on-intent。部署结果未知时不能重跑 `provider-binding`，也不能删除标记以重发。若关闭配置的部署未知，同样保留两份契约和 intent；下述 on 续接不代替未知 off 的处置，不能用原 Provider=null 登记的检查失败声称已经恢复，也不能盲目重新部署或恢复 Webhook。所有 G0、业务记录、票据和私有部分结果保留。
 

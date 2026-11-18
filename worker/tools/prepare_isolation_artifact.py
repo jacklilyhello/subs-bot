@@ -215,8 +215,8 @@ def require_current_main(revision: str) -> None:
         raise ArtifactError("The requested revision is no longer current on main.")
 
 
-def select_main_artifact(run_id, revision, token, *, workflow_id, workflow_path, artifact_prefix, workflow_label,
-                         events=("push", "workflow_dispatch"), revision_in_name=True, run_attempt=None):
+def verify_main_run(run_id, revision, token, *, workflow_id, workflow_path, workflow_label,
+                    events=("push", "workflow_dispatch"), run_attempt=None):
     if run_attempt is not None and (not isinstance(run_attempt, str) or not _DECIMAL.fullmatch(run_attempt)):
         raise ArtifactError("A valid source workflow attempt is required.")
     path = f"/actions/runs/{run_id}"
@@ -235,6 +235,13 @@ def select_main_artifact(run_id, revision, token, *, workflow_id, workflow_path,
         or (run_attempt is not None and str(attempt) != run_attempt)
     ):
         raise ArtifactError(f"The selected run is not a successful {workflow_label} build of current main.")
+    return str(attempt)
+
+
+def select_main_artifact(run_id, revision, token, *, workflow_id, workflow_path, artifact_prefix, workflow_label,
+                         events=("push", "workflow_dispatch"), revision_in_name=True, run_attempt=None):
+    attempt = verify_main_run(run_id, revision, token, workflow_id=workflow_id, workflow_path=workflow_path,
+                              workflow_label=workflow_label, events=events, run_attempt=run_attempt)
     name = f"{artifact_prefix}-{revision}-{attempt}" if revision_in_name else f"{artifact_prefix}-{attempt}"
     query = urlencode({"name": name, "per_page": 2})
     listing = _get_json(f"/actions/runs/{run_id}/artifacts?{query}", token)

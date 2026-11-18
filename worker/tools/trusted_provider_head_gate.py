@@ -69,7 +69,7 @@ def validate(env):
     source_workflow = env.get("GITHUB_WORKFLOW_REF") in SOURCE_WORKFLOWS
     spec = parsed(env.get("PROVIDER_HEAD_VALIDATION_JSON", ""))
     require(set(spec) == FIELDS and type(spec["version"]) is int and spec["version"] == 1
-            and isinstance(spec["pr"], str) and re.fullmatch(r"[1-9][0-9]{0,8}", spec["pr"]) is not None
+            and isinstance(spec["pr"], str) and (spec["pr"] == "main" or re.fullmatch(r"[1-9][0-9]{0,8}", spec["pr"]) is not None)
             and isinstance(spec["headSha"], str) and HEX40.fullmatch(spec["headSha"]) is not None
             and env.get("PROVIDER_REVIEWED_HEAD_SHA") == spec["headSha"]
             and isinstance(spec["providerCiRunId"], str) and DECIMAL.fullmatch(spec["providerCiRunId"]) is not None
@@ -102,14 +102,22 @@ def validate(env):
                                 else "subs-bot-provider-archive-head-isolation"))
     ref = github._get_json("/git/ref/heads/main", token)
     require(ref.get("ref") == github.MAIN_REF and ref.get("object", {}).get("type") == "commit" and ref["object"].get("sha") == main)
-    pull = github._get_json("/pulls/" + spec["pr"], token)
-    require(pull.get("number") == int(spec["pr"]) and pull.get("state") == "open"
-            and isinstance(pull.get("head"), dict) and isinstance(pull.get("base"), dict)
-            and pull["head"].get("sha") == spec["headSha"]
-            and re.fullmatch(r"codex/[a-z0-9._/-]{1,120}", pull["head"].get("ref", "")) is not None
-            and pull["base"].get("ref") == "main"
-            and all(isinstance(pull[key].get("repo"), dict) and pull[key]["repo"].get("id") == github.REPOSITORY_ID
-                    for key in ("head", "base")))
+    if spec["pr"] == "main":
+        # Explicit protected-environment opt-in, never an invented PR identity.
+        # The independently pinned code and the dispatcher must be this exact main.
+        policy = parsed(env.get("PROVIDER_MAIN_SELF_POLICY_JSON", ""))
+        require(not source_workflow and set(policy) == {"version", "enabled", "environment", "mainSha"}
+                and type(policy["version"]) is int and policy["version"] == 1 and policy["enabled"] is True
+                and policy["environment"] == environment and policy["mainSha"] == main and spec["headSha"] == main)
+    else:
+        pull = github._get_json("/pulls/" + spec["pr"], token)
+        require(pull.get("number") == int(spec["pr"]) and pull.get("state") == "open"
+                and isinstance(pull.get("head"), dict) and isinstance(pull.get("base"), dict)
+                and pull["head"].get("sha") == spec["headSha"]
+                and re.fullmatch(r"codex/[a-z0-9._/-]{1,120}", pull["head"].get("ref", "")) is not None
+                and pull["base"].get("ref") == "main"
+                and all(isinstance(pull[key].get("repo"), dict) and pull[key]["repo"].get("id") == github.REPOSITORY_ID
+                        for key in ("head", "base")))
     comparison = github.compare_commits_metadata(main, spec["headSha"], token)
     require(comparison.get("status") in {"ahead", "identical"} and comparison.get("base_commit", {}).get("sha") == main
             and comparison.get("merge_base_commit", {}).get("sha") == main)

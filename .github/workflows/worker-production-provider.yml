@@ -24,13 +24,22 @@ on:
         description: SHA256 of canonical operation and complete target contract for mutations
         required: false
         type: string
+      archive_refs:
+        description: Optional JSON array of independently recorded private source archive pins for every release in the chain
+        required: false
+        type: string
+      simulate_actions_unavailable:
+        description: Rehearsal verify only; reject source Actions artifact access without deleting artifacts
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   actions: read
   contents: read
 
 concurrency:
-  group: subs-bot-production-provider-${{ inputs.target_environment }}
+  group: ${{ inputs.target_environment == 'rehearsal' && 'subs-bot-provider-isolation' || 'subs-bot-production-provider-production' }}
   cancel-in-progress: false
 
 jobs:
@@ -39,6 +48,9 @@ jobs:
     environment: ${{ inputs.target_environment == 'production' && 'subs-bot-production-provider' || 'subs-bot-provider-isolation' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      SUBS_BOT_PROVIDER_DURABLE_REQUIRED: ${{ inputs.archive_refs != '' && '1' || '0' }}
+      SUBS_BOT_PROVIDER_SIMULATE_ARTIFACT_UNAVAILABLE: ${{ inputs.simulate_actions_unavailable && '1' || '0' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -46,6 +58,26 @@ jobs:
           persist-credentials: false
       - name: Install and verify the pinned registry client
         run: bash worker/tools/install_provider_skopeo.sh
+      - name: Read pinned private originals with the archive read-only credential
+        if: inputs.archive_refs != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_ARCHIVE_REFS: ${{ inputs.archive_refs }}
+          SUBS_BOT_PROVIDER_ARCHIVE_ENVIRONMENT: ${{ inputs.target_environment }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_ARCHIVE_BUCKET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_BUCKET_JSON }}
+          SUBS_BOT_PROVIDER_SOURCE_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_SOURCE_LEDGER_JSON }}
+          SUBS_BOT_PROVIDER_SOURCE_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_SOURCE_CONTROLLERS_JSON }}
+          SUBS_BOT_PROVIDER_SOURCE_RESOLUTIONS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_SOURCE_RESOLUTIONS_JSON }}
+          SUBS_BOT_PROVIDER_ISOLATED_SOURCE_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ISOLATED_SOURCE_LEDGER_JSON }}
+          SUBS_BOT_PROVIDER_ISOLATED_SOURCE_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ISOLATED_SOURCE_CONTROLLERS_JSON }}
+          SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          python3 -B worker/tools/provider_durable_source.py
       - name: Verify exact main artifact and its OCI closure
         env:
           GH_TOKEN: ${{ github.token }}
