@@ -28,7 +28,7 @@
 
 首次 G0 还需下节的共享 Secret。创建 R2 桶的 API 权限、只读 metadata 和按单桶隔离的对象权限各自独立；在 Cloudflare 中核对实际权限。客户端的目标约束不改变平台能力。对象 map 格式见[单桶 R2 凭据](cloudflare-scoped-r2.md)。
 
-启用外部短链时，在 `SUBS_BOT_TARGET_JSON` 固定 `flags.externalShortlinks` 与匹配的 `keyDigests.shortlink`，在 `SUBS_BOT_CONTROL_SECRETS` 提供 `shortlinkToken`。应用部署从同一配置产生绑定 `SHORTLINK`（`shortlink-new`／`ShortlinkService`）及运行时 secret `SHORTLINK_BUSINESS_TOKEN`；该运行时名不是 GitHub 需要新增的键。内部短链由各自的目标 flags 控制。展示默认 UTC，保留管理员修改权限，`/ai` 首发关闭，无需填写 AI 凭据。
+启用外部短链时，在 `SUBS_BOT_TARGET_JSON` 固定 `features.externalShortlinks` 与匹配的 `keyDigests.shortlink`，在 `SUBS_BOT_CONTROL_SECRETS` 提供 `shortlinkToken`。应用部署从同一配置产生绑定 `SHORTLINK`（`shortlink-new`／`ShortlinkService`）及运行时 secret `SHORTLINK_BUSINESS_TOKEN`；该运行时名不是 GitHub 需要新增的键。内部短链由 `features.subscriptionShorts` 控制。展示默认 UTC，保留管理员修改权限，`/ai` 首发关闭，无需填写 AI 凭据。
 
 ## 两个 Environment 共用的备份 Secret
 

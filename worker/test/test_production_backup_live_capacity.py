@@ -11,13 +11,13 @@ from production_target import ContractError
 
 
 class LiveCapacityTests(unittest.TestCase):
-    def sample(self, changed=False):
+    def sample(self, changed=False, *, paused=False, require_open=False):
         target = Mock(environment="rehearsal", digest="a" * 64, configuration_digest="b" * 64)
         target.data = {"d1Id": "db", "d1Name": "db-name", "d1CreatedAt": "created", "botId": "1",
                        "generation": 1, "bucketName": "nodes", "bucketCreatedAt": "bucket-date",
                        "backupBucketName": "backup", "backupBucketCreatedAt": "backup-date"}
         control = {"target_sha256": target.digest, "bot_id": "1", "release_revision": "c" * 40,
-                   "generation": 1, "epoch": 1, "admission": "open", "workers": "run"}
+                   "generation": 1, "epoch": 1, "admission": "closed" if paused else "open", "workers": "run"}
         api = Mock(source="/accounts/a/d1/database/db")
         api.json.return_value = {"uuid": "db", "name": "db-name", "created_at": "created"}
         def read(_database, sql, *_args):
@@ -38,7 +38,7 @@ class LiveCapacityTests(unittest.TestCase):
              patch.object(live.recovery, "RecoverySource", return_value=schema), \
              patch.object(live.capacity, "observe", return_value=observed):
             result = live.sample(target, "synthetic-read-token", "d" * 32, "e" * 64,
-                                 warning_percent=80, root=directory, guard=lambda: None)
+                                 warning_percent=80, root=directory, guard=lambda: None, require_open=require_open)
         return result, api
 
     def test_complete_observation_is_explicitly_not_a_snapshot(self):
@@ -52,6 +52,12 @@ class LiveCapacityTests(unittest.TestCase):
         result, _api = self.sample(changed=True)
         self.assertEqual(result["failureReason"], "source-changed-during-scan")
         self.assertIn("live-capacity-unknown", live.alerts(result))
+
+    def test_scheduled_capacity_check_rejects_paused_source_before_claim(self):
+        with self.assertRaisesRegex(ContractError, "paused or frozen"):
+            self.sample(paused=True, require_open=True)
+        result, _api = self.sample(paused=True)
+        self.assertEqual(live.alerts(result), [])
 
     def test_limit_and_incomplete_object_scan_both_alert(self):
         self.assertEqual(live.alerts({"rowStatus": "warning", "objectStatus": "normal", "objectBytesStatus": "normal"}),

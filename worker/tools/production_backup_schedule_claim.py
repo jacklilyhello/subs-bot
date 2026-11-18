@@ -128,7 +128,7 @@ def plan_start(env, target, objects, app_store, scope_anchor, target_anchor, pol
     from production_backup_live_capacity import alerts, sample
     capacity = sample(target, env.get("SUBS_BOT_CF_BACKUP_MONITOR_READ_TOKEN", ""), authority["sourceCheckpointId"],
                       authority["sourceManifestSha256"], warning_percent=policy["warningPercent"],
-                      root=env["RUNNER_TEMP"], guard=lambda: github.require_current_main(revision))
+                      root=env["RUNNER_TEMP"], guard=lambda: github.require_current_main(revision), require_open=True)
     for alert in alerts(capacity):
         print("::warning::" + alert, flush=True)
     backup.capacity.require_within_limits(capacity)

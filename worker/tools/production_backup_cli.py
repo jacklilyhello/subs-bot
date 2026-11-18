@@ -1172,6 +1172,7 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
             last(events, "started")
             if type(runtime) is ScheduledBackupRuntime:
                 state = scheduled_begin_state(state)
+                ctl.verify_dependency()
             predecessor = exact_predecessor(env, state)
             phase_authorized(target, env, "backup-preflight:" + digest(contract), proof["revision"], predecessor, revision)
             observed = capacity.observe(api, source, warning_percent=policy["warningPercent"])
@@ -1196,6 +1197,8 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
             observed = events[-1]["details"]["capacity"]
             capacity.require_within_limits(observed)
             plan = ctl.plan_pause()
+            if type(runtime) is ScheduledBackupRuntime:
+                scheduled_begin_state(plan)
             require(plan["control"] == events[0]["details"]["control"] and plan["release"] == events[0]["details"]["release"]
                     and plan["configurationSha256"] == events[0]["details"]["configurationSha256"])
             predecessor = exact_predecessor(env, plan)
