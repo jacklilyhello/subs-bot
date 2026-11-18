@@ -352,7 +352,60 @@ def historical_manual_source_review(env, revision):
     return scheduled_source_review(env, revision, historical=True)
 
 
-def verify_scheduled_parent(env, slot, mode="finished"):
+def scheduled_continuation(objects, slot):
+    """Read the only supported continuation of an original scheduled writer."""
+    target, session = valid_target(slot["targetSha256"]), slot["session"]
+    require(DECIMAL.fullmatch(session or ""))
+    prefix = BASE + target + "/" + session + "/writers/"
+    key = prefix + "0001.json"
+    keys = objects.list(prefix, maximum=2)
+    require(keys in ([], [key]), "A scheduled continuation has unexpected writer evidence.")
+    if not keys:
+        return None
+    raw, _ = objects.get(key)
+    value = parsed(raw)
+    require(isinstance(value, dict) and canonical(value) == raw and value == {
+        "version": 1, "kind": "scheduled-backup-continuation", "slotSha256": sha256(canonical(slot)).hexdigest(),
+        "writerRunId": value.get("writerRunId"), "writerAttempt": "1", "firstSequence": value.get("firstSequence"),
+        "planSha256": value.get("planSha256")}
+        and type(value["version"]) is int and DECIMAL.fullmatch(value["writerRunId"] or "")
+        and value["writerRunId"] != slot["writerRunId"] and HEX.fullmatch(value["planSha256"] or "")
+        and type(value["firstSequence"]) is int and 1 <= value["firstSequence"] <= len(STEPS) + 1)
+    return value
+
+
+def scheduled_writer_id(slot, continuation, sequence):
+    require(type(sequence) is int and 1 <= sequence <= len(STEPS))
+    if continuation is not None and sequence >= continuation["firstSequence"]:
+        return continuation["writerRunId"]
+    return slot["writerRunId"]
+
+
+def scheduled_run_identity(run, run_id, revision, *, continuation=False):
+    path = PROFILES["production"]["parent"]
+    action = "resume-scheduled" if continuation else "scheduled-run"
+    require(isinstance(run, dict) and str(run.get("id")) == run_id and run.get("run_attempt") == 1
+            and run.get("head_sha") == revision and run.get("head_branch") == "main"
+            and run.get("event") == ("workflow_dispatch" if continuation else "schedule")
+            and run.get("path") in {path, path + "@main", path + "@refs/heads/main"}
+            and run.get("display_title") == "Production backup coordinator " + action + " at " + revision
+            and all(isinstance(run.get(key), dict) and run[key].get("id") == artifact.REPOSITORY_ID
+                    for key in ("repository", "head_repository")), "The scheduled writer identity differs.")
+
+
+def stopped_scheduled_writer(slot, token):
+    revision, run_id = slot["authority"]["controlRevision"], slot["writerRunId"]
+    original = artifact._get_json("/actions/runs/" + run_id + "/attempts/1", token)
+    latest = artifact._get_json("/actions/runs/" + run_id, token)
+    for run in (original, latest):
+        scheduled_run_identity(run, run_id, revision)
+        require(run.get("status") == "completed" and run.get("conclusion") in
+                {"success", "failure", "cancelled", "timed_out"}, "The original scheduled writer is not confirmed stopped.")
+    require(original["conclusion"] == latest["conclusion"])
+    return original
+
+
+def verify_scheduled_parent(env, slot, mode="finished", *, continuation=None):
     """Read the exact scheduled coordinator and independent reader job from GitHub."""
     require(mode in {"fresh-reader", "finished"} and isinstance(slot, dict)
             and DECIMAL.fullmatch(slot.get("writerRunId", "")) and slot.get("writerAttempt") == "1"
@@ -361,22 +414,19 @@ def verify_scheduled_parent(env, slot, mode="finished"):
     require(REVISION.fullmatch(revision or "") and env.get("GITHUB_REPOSITORY") == artifact.REPOSITORY
             and env.get("GITHUB_REPOSITORY_ID") == str(artifact.REPOSITORY_ID)
             and env.get("GITHUB_REF") == artifact.MAIN_REF and env.get("RUNNER_ENVIRONMENT") == "github-hosted")
+    event = "schedule" if continuation is None else "workflow_dispatch"
+    token = artifact._github_token()
+    run_id = slot["writerRunId"] if continuation is None else continuation["writerRunId"]
     if mode == "fresh-reader":
-        require(env.get("GITHUB_SHA") == revision and env.get("GITHUB_RUN_ID") == slot["writerRunId"] and env.get("GITHUB_RUN_ATTEMPT") == "1"
-                and env.get("GITHUB_EVENT_NAME") == "schedule"
-                and env.get("GITHUB_WORKFLOW_REF") == artifact.REPOSITORY + "/.github/workflows/worker-production-backup-coordinator.yml@" + artifact.MAIN_REF)
-    token, run_id = artifact._github_token(), slot["writerRunId"]
+        require(env.get("GITHUB_SHA") == revision and env.get("GITHUB_RUN_ID") == run_id
+                and env.get("GITHUB_RUN_ATTEMPT") == "1" and env.get("GITHUB_EVENT_NAME") == event
+                and env.get("GITHUB_WORKFLOW_REF") == artifact.REPOSITORY + "/" + PROFILES["production"]["parent"] + "@" + artifact.MAIN_REF)
+    prior = None if continuation is None else stopped_scheduled_writer(slot, token)
     original = artifact._get_json("/actions/runs/" + run_id + "/attempts/1", token)
     latest = artifact._get_json("/actions/runs/" + run_id, token)
-    path = ".github/workflows/worker-production-backup-coordinator.yml"
     for run in (original, latest):
-        require(str(run.get("id")) == run_id and run.get("run_attempt") == 1
-                and run.get("head_sha") == revision and run.get("head_branch") == "main"
-                and run.get("event") == "schedule" and run.get("path") in {path, path + "@main", path + "@refs/heads/main"}
-                and run.get("display_title") == "Production backup coordinator scheduled-run at " + revision
-                and run.get("status") == ("in_progress" if mode == "fresh-reader" else "completed")
-                and all(isinstance(run.get(key), dict) and run[key].get("id") == artifact.REPOSITORY_ID
-                        for key in ("repository", "head_repository")))
+        scheduled_run_identity(run, run_id, revision, continuation=continuation is not None)
+        require(run.get("status") == ("in_progress" if mode == "fresh-reader" else "completed"))
         if mode == "finished":
             require(run.get("conclusion") == "success")
     response = artifact._get_json("/actions/runs/" + run_id + "/attempts/1/jobs?per_page=100", token)
@@ -404,8 +454,11 @@ def verify_scheduled_parent(env, slot, mode="finished"):
     reader = exact_job("schedule_readback", running=mode == "fresh-reader", steps=[
         ("Check out trusted current main", False),
         ("Independently verify completed scheduled backup", mode == "fresh-reader")])
-    return {"originalRun": original, "latestRun": latest, "jobs": response,
-            "coordinateJobId": coordinate["id"], "readerJobId": reader["id"]}
+    result = {"originalRun": original, "latestRun": latest, "jobs": response,
+              "coordinateJobId": coordinate["id"], "readerJobId": reader["id"]}
+    if continuation is not None:
+        result.update(continuation=continuation, stoppedOriginalRun=prior)
+    return result
 
 
 def require_completed_receipt(intent, value, run, workflow_id, result):
@@ -925,19 +978,28 @@ def wait_for_run(intent, token, *, deadline, pause_alarm_at=None):
     workflow = artifact._get_json("/actions/workflows/" + child.rsplit("/", 1)[-1], token)
     require(workflow.get("path") == child and type(workflow.get("id")) is int)
     pause_reported = False
+    run_id = None
     while time.monotonic() < deadline:
         if pause_alarm_at is not None and not pause_reported and int(time.time()) >= pause_alarm_at:
             print("::warning::The configured alert interval elapsed since pause dispatch; independently observe actual admission and continue only verified recovery steps.", flush=True)
             pause_reported = True
         try:
-            run = discover_run(intent, workflow["id"], token)
+            if run_id is None:
+                run = discover_run(intent, workflow["id"], token)
+                run_id = run["id"]
+            else:
+                live = artifact._get_json("/actions/runs/" + str(run_id), token)
+                run = matching_run([live], intent, workflow["id"])
+                require(run["id"] == run_id)
         except Exception:
             # An unavailable or ambiguous run never authorizes a second POST.
             time.sleep(15)
             continue
         if run.get("status") == "completed":
             require(run.get("conclusion") == "success", "The dispatched checkpoint did not complete successfully.")
-            return run, workflow["id"]
+            original = discover_run(intent, workflow["id"], token)
+            require(original["id"] == run_id and (original.get("status"), original.get("conclusion")) == ("completed", "success"))
+            return original, workflow["id"]
         require(run.get("status") in {"queued", "in_progress", "waiting", "pending", "requested"})
         time.sleep(15)
     print("::error::A backup checkpoint did not complete within its allowed window; inspect its private intent before any recovery.", flush=True)
@@ -1120,28 +1182,28 @@ def scheduled_start_material(target, policy, authority, authority_sha256, day, s
             "scopeActive": scope_active, "targetActive": target_active}
 
 
-def scheduled_running_parent(env, slot, token):
+def scheduled_running_parent(env, slot, token, *, continuation=None):
     """Identify the live fixed coordinator job before any scheduled claim."""
     require(isinstance(slot, dict) and isinstance(slot.get("authority"), dict)
-            and slot.get("writerRunId") == slot.get("session") == env.get("GITHUB_RUN_ID")
-            and slot.get("writerAttempt") == env.get("GITHUB_RUN_ATTEMPT") == "1"
-            and env.get("GITHUB_EVENT_NAME") == "schedule" and env.get("GITHUB_REF") == artifact.MAIN_REF
+            and slot.get("writerRunId") == slot.get("session") and slot.get("writerAttempt") == "1"
+            and env.get("GITHUB_RUN_ATTEMPT") == "1" and env.get("GITHUB_REF") == artifact.MAIN_REF
             and env.get("GITHUB_REPOSITORY") == artifact.REPOSITORY
             and env.get("GITHUB_REPOSITORY_ID") == str(artifact.REPOSITORY_ID)
             and env.get("RUNNER_ENVIRONMENT") == "github-hosted"
-            and env.get("GITHUB_WORKFLOW_REF") == artifact.REPOSITORY + "/.github/workflows/worker-production-backup-coordinator.yml@" + artifact.MAIN_REF
+            and env.get("GITHUB_WORKFLOW_REF") == artifact.REPOSITORY + "/" + PROFILES["production"]["parent"] + "@" + artifact.MAIN_REF
             and env.get("GITHUB_WORKFLOW_SHA") == env.get("GITHUB_SHA") == slot["authority"].get("controlRevision"))
-    run_id, revision = slot["session"], env["GITHUB_SHA"]
+    run_id, revision = env["GITHUB_RUN_ID"], env["GITHUB_SHA"]
     require(DECIMAL.fullmatch(run_id or "") and REVISION.fullmatch(revision or ""))
+    if continuation is None:
+        require(env.get("GITHUB_EVENT_NAME") == "schedule" and run_id == slot["writerRunId"])
+    else:
+        require(env.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+                and env.get("BACKUP_COORDINATOR_ACTION") == "resume-scheduled"
+                and continuation["writerRunId"] == run_id
+                and continuation["planSha256"] == env.get("BACKUP_COORDINATOR_APPROVAL_SHA256"))
     run = artifact._get_json("/actions/runs/" + run_id, token)
-    path = ".github/workflows/worker-production-backup-coordinator.yml"
-    require(str(run.get("id")) == run_id and run.get("run_attempt") == 1
-            and run.get("head_sha") == revision and run.get("head_branch") == "main"
-            and run.get("event") == "schedule" and run.get("path") in {path, path + "@main", path + "@refs/heads/main"}
-            and run.get("display_title") == "Production backup coordinator scheduled-run at " + revision
-            and run.get("status") == "in_progress" and run.get("conclusion") is None
-            and all(isinstance(run.get(k), dict) and run[k].get("id") == artifact.REPOSITORY_ID
-                    for k in ("repository", "head_repository")))
+    scheduled_run_identity(run, run_id, revision, continuation=continuation is not None)
+    require(run.get("status") == "in_progress" and run.get("conclusion") is None)
     response = artifact._get_json("/actions/runs/" + run_id + "/attempts/1/jobs?per_page=100", token)
     jobs = response.get("jobs")
     require(isinstance(jobs, list) and type(response.get("total_count")) is int
@@ -1171,7 +1233,7 @@ def scheduled_running_job(job, run_id, revision, job_id):
 
 class ScheduledScopeOwner:
     """Recheck a claimed scheduled owner before a parent dispatch or finalization."""
-    def __init__(self, env, target, objects, scope_anchor, target_anchor, material, scope_keys, job_id):
+    def __init__(self, env, target, objects, scope_anchor, target_anchor, material, scope_keys, job_id, *, continuation=None):
         from production_backup_fresh_github import FreshConditionalJSON
         import production_backup_schedule as scheduled
         require(isinstance(material, dict) and set(material) == {"slot", "scopeStart", "targetStart", "scopeActive", "targetActive"}
@@ -1182,15 +1244,17 @@ class ScheduledScopeOwner:
                 and type(job_id) is int and job_id > 0
                 and env.get("GITHUB_REPOSITORY") == artifact.REPOSITORY
                 and env.get("GITHUB_REPOSITORY_ID") == str(artifact.REPOSITORY_ID)
-                and env.get("GITHUB_REF") == artifact.MAIN_REF and env.get("GITHUB_EVENT_NAME") == "schedule"
+                and env.get("GITHUB_REF") == artifact.MAIN_REF
+                and env.get("GITHUB_EVENT_NAME") == ("schedule" if continuation is None else "workflow_dispatch")
                 and env.get("RUNNER_ENVIRONMENT") == "github-hosted" and env.get("GITHUB_RUN_ATTEMPT") == "1"
                 and env.get("GITHUB_WORKFLOW_REF") == artifact.REPOSITORY + "/.github/workflows/worker-production-backup-coordinator.yml@" + artifact.MAIN_REF
                 and env.get("GITHUB_WORKFLOW_SHA") == env.get("GITHUB_SHA"))
         self.env, self.target, self.objects = env, target, objects
+        self.continuation = continuation
         self.scope_anchor, self.target_anchor, self.material = scope_anchor, target_anchor, material
         self.scope_keys, self.job_id, self.client = set(scope_keys), job_id, FreshConditionalJSON()
 
-    def guard(self, *, target_released=False):
+    def guard(self, *, target_released=False, scope_released=False):
         import production_backup_cli as backup
         import production_backup_schedule as scheduled
         slot, start, scope_start = self.material["slot"], self.material["targetStart"], self.material["scopeStart"]
@@ -1214,17 +1278,29 @@ class ScheduledScopeOwner:
                 and self.scope_anchor.bucket_created_at == self.target.data["backupBucketCreatedAt"]
                 and authority["validFrom"] <= int(time.time()) < authority["validUntil"])
         backup.scheduled_main_guard(self.env["GITHUB_SHA"], self.client)
+        run_id = self.env["GITHUB_RUN_ID"]
         self.client.get("/actions/jobs/" + str(self.job_id),
-            verify=lambda value: scheduled_running_job(value, slot["session"], self.env["GITHUB_SHA"], self.job_id))
+            verify=lambda value: scheduled_running_job(value, run_id, self.env["GITHUB_SHA"], self.job_id))
+        require(scheduled_continuation(self.objects, slot) == self.continuation)
+        if self.continuation is None:
+            require(run_id == slot["writerRunId"])
+        else:
+            require(self.continuation["writerRunId"] == run_id
+                    and self.continuation["planSha256"] == self.env.get("BACKUP_COORDINATOR_APPROVAL_SHA256"))
         scope_value, scope_raw, _etag = self.scope_anchor.read()
         target_value, target_raw, _etag = self.target_anchor.read()
-        require(type(target_released) is bool and scope_value == self.material["scopeActive"]
-                and sha256(scope_raw).hexdigest() == slot["scopeAnchorSha256"]
-                and scope_value.get("state") == "active"
+        require(type(target_released) is bool and type(scope_released) is bool
                 and scope_value.get("session") == target_value.get("session") == slot["session"] + "-1"
                 and scope_value.get("controlRevision") == target_value.get("controlRevision") == self.env["GITHUB_SHA"]
-                and scope_value.get("day") == target_value.get("day") == slot["slotDay"].replace("-", "/")
-                and scope_value.get("previousSha256") == start.get("scopePredecessorSha256"))
+                and scope_value.get("day") == target_value.get("day") == slot["slotDay"].replace("-", "/"))
+        if scope_released:
+            require(target_released and self.continuation is not None and scope_value["state"] == "idle"
+                    and scope_value["generation"] == self.material["scopeActive"]["generation"] + 1
+                    and scope_value["previousSha256"] == slot["scopeAnchorSha256"])
+        else:
+            require(scope_value == self.material["scopeActive"] and scope_value["state"] == "active"
+                    and sha256(scope_raw).hexdigest() == slot["scopeAnchorSha256"]
+                    and scope_value["previousSha256"] == start["scopePredecessorSha256"])
         if target_released:
             require(target_value.get("state") == "idle"
                     and target_value.get("generation") == self.material["targetActive"]["generation"] + 1
@@ -1244,9 +1320,9 @@ class ScheduledScopeOwner:
             "profile": "production", "candidateRevision": self.env["GITHUB_SHA"], "validationSha256": None,
             "writerRunId": slot["session"], "writerAttempt": "1", "authoritySha256": pin,
             "slotDay": slot["slotDay"], "slotSha256": sha256(canonical(slot)).hexdigest(),
-            "scopePredecessorSha256": scope_value["previousSha256"]}
+            "scopePredecessorSha256": self.material["scopeActive"]["previousSha256"]}
         require(scope_key in self.scope_keys and slot_key in self.scope_keys
-                and slot["writerRunId"] == slot["session"] == self.env.get("GITHUB_RUN_ID")
+                and slot["writerRunId"] == slot["session"]
                 and slot["writerAttempt"] == "1" and start == expected_start
                 and scope_start == scheduled.scope_start(authority, slot["slotDay"], session=slot["session"],
                     scope_predecessor_sha256=start.get("scopePredecessorSha256"),
@@ -1263,7 +1339,7 @@ class ScheduledScopeOwner:
                 "The scheduled scope inventory changed; do not dispatch another phase.")
 
 
-def finish_scheduled_sequence(owner, app_store, token):
+def finish_scheduled_sequence(owner, app_store, token, *, scope_released=False):
     """Publish only a completely verified scheduled terminal, without retrying writes."""
     import time
     import production_backup_cli as backup
@@ -1272,11 +1348,12 @@ def finish_scheduled_sequence(owner, app_store, token):
     require(type(owner) is ScheduledScopeOwner)
     env, target, objects = owner.env, owner.target, owner.objects
     slot, authority = owner.material["slot"], owner.material["slot"]["authority"]
-    owner.guard(target_released=True)
+    owner.guard(target_released=True, scope_released=scope_released)
     key = scheduled.terminal_key(slot["scopeSha256"], slot["slotDay"])
     witness_key = terminal.witness_key(slot["scopeSha256"], slot["slotDay"])
-    require(objects.get(key, absent=True)[0] is None and objects.get(witness_key, absent=True)[0] is None,
-            "An existing scheduled terminal requires inspection, not a repeated write.")
+    existing, _ = objects.get(key, absent=True)
+    require((existing is None or scope_released) and objects.get(witness_key, absent=True)[0] is None,
+            "An existing scheduled witness requires inspection, not a repeated write.")
     phase = terminal.collect_phase_evidence(objects, target, slot, token)
     chain_sha = terminal.verify_phase_evidence(objects, target, slot, phase)
     app = terminal.collect_app_terminal(objects, app_store, target, slot, phase, authority["applicationGenesisSha256"])
@@ -1287,14 +1364,15 @@ def finish_scheduled_sequence(owner, app_store, token):
     require(type(core.get("remaining")) is int and core["remaining"] >= 106
             and type(core.get("reset")) is int and core["reset"] > int(time.time()),
             "Insufficient GitHub read quota for scheduled terminal publication.")
-    owner.guard(target_released=True)
+    owner.guard(target_released=True, scope_released=scope_released)
     require(terminal.collect_app_terminal(objects, app_store, target, slot, phase, authority["applicationGenesisSha256"]) == app
             and terminal.verify_phase_evidence(objects, target, slot, phase) == chain_sha)
-    owner.guard(target_released=True)
+    owner.guard(target_released=True, scope_released=scope_released)
     target_value, target_raw, _etag = owner.target_anchor.read()
     target_idle_sha = sha256(target_raw).hexdigest()
     require(target_value.get("state") == "idle" and target_value.get("previousSha256") == slot["coordinatorAnchorSha256"])
-    owner.scope_anchor.release(slot["session"] + "-1")
+    if not scope_released:
+        owner.scope_anchor.release(slot["session"] + "-1")
     idle, idle_raw, _etag = owner.scope_anchor.read()
     require(idle.get("state") == "idle" and idle.get("session") == slot["session"] + "-1"
             and idle.get("previousSha256") == slot["scopeAnchorSha256"])
@@ -1303,13 +1381,16 @@ def finish_scheduled_sequence(owner, app_store, token):
         result="success")
     backup.scheduled_main_guard(env["GITHUB_SHA"], owner.client)
     owner.client.get("/actions/jobs/" + str(owner.job_id),
-        verify=lambda value: scheduled_running_job(value, slot["session"], env["GITHUB_SHA"], owner.job_id))
+        verify=lambda value: scheduled_running_job(value, env["GITHUB_RUN_ID"], env["GITHUB_SHA"], owner.job_id))
     again_scope, again_scope_raw, _etag = owner.scope_anchor.read()
     again_target, again_target_raw, _etag = owner.target_anchor.read()
     require(again_scope == idle and again_scope_raw == idle_raw and again_target == target_value and again_target_raw == target_raw
-            and objects.get(key, absent=True)[0] is None and objects.get(witness_key, absent=True)[0] is None)
+            and objects.get(key, absent=True)[0] == existing and objects.get(witness_key, absent=True)[0] is None)
     body = canonical(done)
-    objects.put_once(key, body)
+    if existing is None:
+        objects.put_once(key, body)
+    else:
+        require(existing == body, "The retained terminal does not match the independently verified completion.")
     confirmed, _etag = objects.get(key)
     require(confirmed == body, "The scheduled terminal was not independently confirmed.")
     return {"status": "completed", "slotDay": slot["slotDay"], "verifiedCheckpoints": len(STEPS),
@@ -1318,10 +1399,6 @@ def finish_scheduled_sequence(owner, app_store, token):
 
 def scope_initialization(env, action, target, objects, revision, target_anchor, target_genesis):
     """Plan or initialize only a new, explicitly approved project scope."""
-    # Kept closed until the first-launch verifier and its hosted fixtures have
-    # completed independent review. A partial initialization is never retried.
-    if action == "initialize-schedule-anchor":
-        require(False, "The first-launch verifier is awaiting independent review; scope initialization is disabled.")
     import production_backup_schedule as scheduled
     import production_backup_scope_bootstrap as bootstrap
     import scoped_r2
@@ -1369,7 +1446,9 @@ def scope_initialization(env, action, target, objects, revision, target_anchor, 
     if action == "plan-schedule-anchor":
         return {"status": "planned", "planSha256": plan_sha, "scopeGenesisSha256": scope_genesis,
                 "scopeSha256": scope, "targetSha256": target.digest, "configurationSha256": target.configuration_digest,
-                "targetCoordinatorGenesisSha256": target_genesis, "controlRevision": revision, "mutationPerformed": False}
+                "targetCoordinatorGenesisSha256": target_genesis,
+                "applicationGenesisSha256": sha256(maintenance.Anchor(None, target.digest, "0" * 64).initial_material()[1]).hexdigest(),
+                "controlRevision": revision, "mutationPerformed": False}
     require(env.get("SUBS_BOT_BACKUP_COORDINATOR_GENESIS_SHA256") == target_genesis
             and env.get("SUBS_BOT_BACKUP_SCHEDULE_SCOPE_GENESIS_SHA256") == scope_genesis
             and env.get("BACKUP_COORDINATOR_APPROVAL_SHA256") == plan_sha
@@ -1407,9 +1486,12 @@ def main(env=None):
     revision = verify_context(env)
     action = env.get("BACKUP_COORDINATOR_ACTION", "inspect")
     require(action in {"inspect", "plan-initialize", "initialize", "plan-schedule-anchor", "initialize-schedule-anchor",
-                       "plan-run", "run", "plan-resume", "resume", "plan-reconcile", "reconcile", "plan-abort", "abort"})
+                       "scheduled-run", "plan-resume-scheduled", "resume-scheduled", "plan-run", "run",
+                       "plan-resume", "resume", "plan-reconcile", "reconcile", "plan-abort", "abort"})
     if env.get("GITHUB_EVENT_NAME") == "schedule":
-        require(action == "inspect", "A scheduled coordinator cannot authorize production writes.")
+        require(action in {"inspect", "scheduled-run"}, "The cron event cannot select a manual action.")
+    else:
+        require(action != "scheduled-run", "A scheduled start requires the fixed cron event.")
     target = validate_target(env.get("SUBS_BOT_TARGET_JSON", ""))
     require(target.environment == "production")
     policy = backup_cli.settings(env.get("SUBS_BOT_BACKUP_POLICY_JSON", ""))
@@ -1424,11 +1506,19 @@ def main(env=None):
     anchor = maintenance.Anchor(CoordinatorStore(objects, target.digest), target.digest, expected)
     if action == "plan-initialize":
         return {"status": "planned", "genesisSha256": expected, "mutationPerformed": False}
-    if action in {"initialize", "initialize-schedule-anchor", "run", "resume", "reconcile", "abort"}:
+    if action in {"initialize", "initialize-schedule-anchor", "scheduled-run", "resume-scheduled", "run", "resume", "reconcile", "abort"}:
         require(env.get("SUBS_BOT_PRODUCTION_BACKUP_COORDINATOR_ENABLED") == "true"
                 and objects.write_credential is not None, "The production coordinator is disabled.")
     if action in {"plan-schedule-anchor", "initialize-schedule-anchor"}:
         return scope_initialization(env, action, target, objects, revision, anchor, expected)
+    if action in {"scheduled-run", "plan-resume-scheduled", "resume-scheduled"}:
+        from production_backup_schedule_claim import run_scheduled
+        from production_backup_schedule_resume import resume_scheduled
+
+        app_store = PrivateStore(metadata, target.data["backupBucketName"])
+        app_store.objects = objects
+        runner = run_scheduled if action == "scheduled-run" else resume_scheduled
+        return runner(env, target, objects, app_store, anchor, policy, artifact._github_token())
     if action == "initialize":
         require(env.get("BACKUP_COORDINATOR_APPROVAL_SHA256") == expected)
         from production_backup_manual_scope import ManualScope
@@ -1456,6 +1546,16 @@ def main(env=None):
     if action == "plan-run":
         require(pinned["state"] == "idle" and pinned["session"] != session + "-1")
         return {"status": "planned", "planSha256": digest(plan), "session": session, "mutationPerformed": False}
+    if action in {"plan-resume", "resume", "plan-reconcile", "reconcile", "plan-abort", "abort"}:
+        import production_backup_schedule as scheduled
+        scope = scheduled.logical_scope(target)
+        scope_anchor = ScheduleScopeAnchor(CoordinatorStore(objects, scope), scope,
+            env.get("SUBS_BOT_BACKUP_SCHEDULE_SCOPE_GENESIS_SHA256", ""), target.data["backupBucketName"],
+            target.data["backupBucketCreatedAt"])
+        scope_state, scope_raw, _ = scope_anchor.read()
+        require(scope_state["state"] == "active" and scope_state["controlRevision"] == revision,
+                "The original manual coordinator must still own the project scope.")
+        plan["scopePointerSha256"] = sha256(scope_raw).hexdigest()
     if action == "plan-resume":
         require(pinned["state"] == "active" and pinned["session"] == session + "-1" and pinned["controlRevision"] == revision)
         history = finished_controller(objects, target.digest, session, revision, source_checkpoint, source_sha, digest(policy))
@@ -1478,18 +1578,17 @@ def main(env=None):
         require(env.get("BACKUP_COORDINATOR_APPROVAL_SHA256") == digest(plan))
         from production_backup_manual_scope import ManualScope
         manual_scope = ManualScope(env, target, objects, revision, policy=policy, app_store=app_store)
-        manual_scope.acquire_coordinator("abort", plan)
         artifact.require_current_main(revision)
         require(finished_controller(objects, target.digest, session, revision, source_checkpoint, source_sha, digest(policy)) == history
                 and abort_observation(objects, app_store, target, session, revision, source_checkpoint, source_sha,
                                       backup_cli.maximum_pause(policy), app_genesis) == observed)
-        manual_scope.guard()
-        claim_resume_writer(objects, target.digest, session, revision, history, env["GITHUB_RUN_ID"], action="abort")
+        manual_scope.continue_coordinator("abort", plan, history)
         require(abort_observation(objects, app_store, target, session, revision, source_checkpoint, source_sha,
                                   backup_cli.maximum_pause(policy), app_genesis) == observed)
         manual_scope.guard()
         anchor.release(session + "-1")
         result = {"status": "abandoned-after-confirmed-terminal", "terminal": observed["terminal"],
+                "abortObservationSha256": digest(observed), "applicationAnchorSha256": observed["applicationAnchorSha256"],
                 "productionMutation": False, "dispatchRetried": False}
         manual_scope.finish(result)
         return result
@@ -1524,20 +1623,17 @@ def main(env=None):
         from production_backup_manual_scope import ManualScope
         app_store = PrivateStore(metadata, target.data["backupBucketName"])
         manual_scope = ManualScope(env, target, objects, revision, policy=policy, app_store=app_store)
-        manual_scope.acquire_coordinator("reconcile", plan)
         artifact.require_current_main(revision)
         require(finished_controller(objects, target.digest, session, revision, source_checkpoint, source_sha, digest(policy)) == history)
-        manual_scope.guard()
-        claim_resume_writer(objects, target.digest, session, revision, history, env["GITHUB_RUN_ID"], action="reconcile")
+        manual_scope.continue_coordinator("reconcile", plan, history)
         again = discover_run(intent, workflow["id"], token)
         again_result, again_source, again_original = selected_result(str(again["id"]), revision, intent["action"], token)
         require(again == run and again_result == result and again_source == source and again_original == original,
                 "The approved reconciliation evidence changed.")
         manual_scope.guard()
         confirm_stage(objects, intent, run, workflow["id"], result, source, original)
-        result = {"status": "reconciled", "mutationPerformed": True, "dispatchRetried": False}
-        manual_scope.finish(result)
-        return result
+        return {"status": "reconciled", "mutationPerformed": True, "dispatchRetried": False,
+                "scopeRetainedForContinuation": True}
     if action == "resume":
         history = finished_controller(objects, target.digest, session, revision, source_checkpoint, source_sha, digest(policy))
         plan["writerHistorySha256"] = digest(history)
@@ -1577,10 +1673,7 @@ def main(env=None):
         require(action == "resume" and pinned["state"] == "active" and pinned["session"] == session + "-1"
                 and pinned["controlRevision"] == revision)
         require(finished_controller(objects, target.digest, session, revision, source_checkpoint, source_sha, digest(policy)) == history)
-        manual_scope.acquire_coordinator("resume", plan)
-        artifact.require_current_main(revision)
-        manual_scope.guard()
-        claim_resume_writer(objects, target.digest, session, revision, history, env["GITHUB_RUN_ID"])
+        manual_scope.continue_coordinator("resume", plan, history)
         again, _ = completed_results(objects, target.digest, session, revision, artifact._github_token(),
                                      source_checkpoint, source_sha, backup_cli.maximum_pause(policy))
         require(again == verified, "The approved continuation results changed.")
@@ -1598,7 +1691,9 @@ if __name__ == "__main__":
     from pathlib import Path
     try:
         os.umask(0o077)
-        result = main()
+        # Use the normal module identity also used by the claim and scope verifiers.
+        from production_backup_coordinator import main as run
+        result = run()
         root = Path(os.environ["RUNNER_TEMP"])
         require(root.is_absolute() and root.is_dir() and not root.is_symlink())
         path = root / "production-backup-coordinator-result.json"

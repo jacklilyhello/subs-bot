@@ -13,7 +13,7 @@ import production_backup_coordinator as core
 import production_backup_schedule as schedule
 import production_backup_schedule_terminal as terminal
 import production_backup_transaction as transaction
-from production_target import canonical, digest
+from production_target import canonical, digest, parsed
 
 
 def phase_jobs(run_id, revision, profile="production"):
@@ -181,6 +181,49 @@ class TerminalEvidenceTests(unittest.TestCase):
         evidence["stages"][0]["latest"]["conclusion"] = "failure"
         with self.assertRaises(ValueError):
             terminal.verify_phase_evidence(self.store, self.target, self.slot, evidence)
+
+    def test_continuation_can_only_own_phases_after_the_confirmed_prefix(self):
+        key = core.BASE + self.target.digest + "/123/writers/0001.json"
+        record = {"version": 1, "kind": "scheduled-backup-continuation", "slotSha256": digest(self.slot),
+                  "writerRunId": "124", "writerAttempt": "1", "firstSequence": 11, "planSha256": "1" * 64}
+        self.store.put_once(key, canonical(record))
+        sequence = len(core.STEPS)
+        intent_key = core.event_key(self.target.digest, "123", sequence)
+        receipt_key = core.receipt_key(self.target.digest, "123", sequence)
+        saved = parsed(self.store.values[receipt_key])
+        intent = {**parsed(self.store.values[intent_key]), "writerRunId": "124"}
+        self.store.values[intent_key] = canonical(intent)
+        self.store.values[core.child_claim_key(self.target.digest, "123", sequence)] = canonical(core.child_claim(intent, saved["runId"], "1"))
+        self.store.values[receipt_key] = canonical(core.receipt(intent, saved["runId"], saved["result"],
+                                                                saved["artifactId"], saved["artifactSha256"]))
+        evidence = self.collect()
+        self.assertEqual(terminal.verify_phase_evidence(self.store, self.target, self.slot, evidence), digest(evidence))
+        self.store.values[key] = canonical({**record, "firstSequence": 10})
+        with self.assertRaises(ValueError):
+            terminal.verify_phase_evidence(self.store, self.target, self.slot, evidence)
+
+    def test_unacknowledged_receipt_requires_a_successful_original_child(self):
+        import production_backup_schedule_resume as resume
+
+        sequence = len(core.STEPS)
+        saved = parsed(self.store.values.pop(core.receipt_key(self.target.digest, "123", sequence)))
+        run = self.responses["/actions/runs/" + saved["runId"]]
+        archived = self.store.values[core.result_archive_key(self.target.digest, "123", sequence)]
+        proof = {"artifactId": saved["artifactId"], "artifactSha256": saved["artifactSha256"]}
+        with patch.object(core.artifact, "_get_json", side_effect=lambda path, _token: self.responses[path]), \
+             patch.object(core, "discover_run", return_value=run) as discover, \
+             patch.object(core, "selected_result", return_value=(saved["result"], proof, archived)) as original, \
+             patch.object(core, "dispatch_once") as dispatch:
+            completed, pending, _ = resume._completed_parts(self.store, self.target, self.slot, "test-token")
+            self.assertEqual(len(completed), sequence)
+            self.assertEqual(pending[3], saved["result"])
+            original.assert_called_once()
+            discover.return_value = {**run, "conclusion": "cancelled"}
+            original.reset_mock()
+            with self.assertRaises(ValueError):
+                resume._completed_parts(self.store, self.target, self.slot, "test-token")
+            original.assert_not_called()
+            dispatch.assert_not_called()
 
     def test_rehearsal_chain_binds_dispatcher_candidate_and_validation(self):
         class Rehearsal(Target):

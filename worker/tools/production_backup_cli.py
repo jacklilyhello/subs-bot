@@ -196,6 +196,17 @@ def authorized(target, env, action, source_revision, predecessor, control_revisi
     return approve(target, env.get(key, ""), action, source_revision, predecessor, control_revision=control_revision)
 
 
+def scheduled_begin_state(state):
+    """Bind journal-only admission preparation to stable deployment state."""
+    require(not any(state["terminal"].get(k, 0) for k in
+                ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates")),
+            "An unresolved effect prevents preparing a recurring backup.")
+    # Admitted work may finish and new work may be accepted before pause.
+    # These counts remain visible and are independently checked at pause/drain.
+    fixed = {key: state[key] for key in ("targetSha256", "configurationSha256", "release", "control", "migrationCount")}
+    return {**state, "stateSha256": digest(fixed)}
+
+
 class ScheduledBackupController(Controller):
     """Use only the scoped, independently verified recurring backup authority."""
 
@@ -475,9 +486,9 @@ def verify_manual_parent_scope(env, target, objects, policy, intent):
         env["SUBS_BOT_BACKUP_SCHEDULE_SCOPE_GENESIS_SHA256"], target.data["backupBucketName"], target.data["backupBucketCreatedAt"])
     current, raw, _etag = anchor.read()
     writer = intent["writerRunId"]
-    require(current["state"] == "active" and current["session"] == writer + "-1"
-            and current["controlRevision"] == env["GITHUB_SHA"])
-    key = manual.start_key(scope, writer)
+    require(current["state"] == "active" and current["controlRevision"] == env["GITHUB_SHA"])
+    owner = current["session"].removesuffix("-1")
+    key = manual.start_key(scope, owner)
     original, _etag = objects.get(key)
     start = parsed(original)
     fields = {"version", "kind", "scopeSha256", "targetSha256", "configurationSha256", "targetDocument",
@@ -492,7 +503,7 @@ def verify_manual_parent_scope(env, target, objects, policy, intent):
             and start["policy"] == policy and start["policySha256"] == digest(policy)
             and start["targetCoordinatorGenesisSha256"] == env.get("SUBS_BOT_BACKUP_COORDINATOR_GENESIS_SHA256")
             and start["applicationGenesisSha256"] == env.get("SUBS_BOT_BACKUP_GENESIS_SHA256")
-            and start["writerRunId"] == writer and start["writerAttempt"] == "1"
+            and start["writerRunId"] == owner and start["writerAttempt"] == "1"
             and start["coordinatorSession"] == intent["session"] and start["action"] in {"run", "resume"}
             and start["workflowRef"] == artifact.REPOSITORY + "/.github/workflows/worker-production-backup-coordinator.yml@" + artifact.MAIN_REF
             and start["controlRevision"] == env["GITHUB_SHA"] and start["sourceRevision"] is None
@@ -504,7 +515,20 @@ def verify_manual_parent_scope(env, target, objects, policy, intent):
     require(isinstance(keys, list) and len(keys) < 10000 and len(keys) == len(set(keys)) and key in keys
             and digest(sorted(item for item in keys if item != key)) == start["priorScopeKeysSha256"],
             "The scope inventory changed while its manual coordinator was active.")
-    return start["action"]
+    if writer == owner:
+        return start["action"]
+    prefix = coordinator.BASE + target.digest + "/" + intent["session"] + "/writers/"
+    history = objects.list(prefix, maximum=128)
+    require(0 < len(history) < 128 and history == [prefix + str(n).zfill(4) + ".json" for n in range(1, len(history) + 1)])
+    raw_writer, _ = objects.get(history[-1])
+    continuation = parsed(raw_writer)
+    require(canonical(continuation) == raw_writer and continuation.get("action") == "resume"
+            and continuation.get("writerRunId") == writer and continuation.get("writerAttempt") == "1"
+            and continuation.get("targetSha256") == target.digest and continuation.get("profile") == "production"
+            and continuation.get("controlRevision") == continuation.get("candidateRevision") == env["GITHUB_SHA"]
+            and continuation.get("session") == intent["session"] and continuation.get("position") == len(history),
+            "The latest confirmed continuation does not own this child.")
+    return "resume"
 
 
 def coordinator_guard(env, target, store, policy, base_guard, *, scheduled_slot=None, scheduled_client=None, claim=True):
@@ -529,10 +553,11 @@ def coordinator_guard(env, target, store, policy, base_guard, *, scheduled_slot=
         from production_backup_fresh_github import FreshConditionalJSON
         require(type(scheduled_client) is FreshConditionalJSON)
         require(isinstance(scheduled_slot, dict) and scheduled_slot.get("targetSha256") == target.digest
-                and scheduled_slot.get("session") == session
-                and scheduled_slot.get("writerRunId") == intent["writerRunId"]
-                and scheduled_slot.get("writerAttempt") == "1",
+                and scheduled_slot.get("session") == session and scheduled_slot.get("writerAttempt") == "1")
+        continuation = coordinator.scheduled_continuation(store.objects, scheduled_slot)
+        require(coordinator.scheduled_writer_id(scheduled_slot, continuation, sequence) == intent["writerRunId"],
                 "The scheduled slot does not identify this coordinator dispatch.")
+        is_continuation = intent["writerRunId"] != scheduled_slot["writerRunId"]
     inputs = {"action": action, "source_checkpoint_id": env.get("BACKUP_SOURCE_CHECKPOINT_ID", ""),
               "source_manifest_sha256": env.get("BACKUP_SOURCE_MANIFEST_SHA256", ""),
               "dispatch_nonce": nonce, "coordinator_session": session, "dispatch_deadline": raw_deadline}
@@ -556,22 +581,27 @@ def coordinator_guard(env, target, store, policy, base_guard, *, scheduled_slot=
     def parent_guard():
         nonlocal parent_job_id
         base_guard()
-        manual_action = None if scheduled_slot is not None else verify_manual_parent_scope(env, target, store.objects, policy, intent)
+        if scheduled_slot is None:
+            manual_action = verify_manual_parent_scope(env, target, store.objects, policy, intent)
+        else:
+            require(coordinator.scheduled_continuation(store.objects, scheduled_slot) == continuation)
         if action in {"pause", "freeze", "capture"}:
             require(deadline > int(time.time()), "The coordinator deadline elapsed; this mutation cannot start.")
         path = ".github/workflows/worker-production-backup-coordinator.yml"
         if scheduled_slot is None or parent_job_id is None:
             run = artifact._get_json("/actions/runs/" + intent["writerRunId"], artifact._github_token())
-            require(str(run.get("id")) == intent["writerRunId"] and run.get("run_attempt") == 1
-                    and run.get("path") in (path, path + "@main", path + "@refs/heads/main")
-                    and run.get("head_sha") == env["GITHUB_SHA"] and run.get("head_branch") == "main"
-                    and run.get("event") == ("schedule" if scheduled_slot is not None else "workflow_dispatch")
-                    and run.get("status") == "in_progress"
-                    and run.get("display_title") == ("Production backup coordinator scheduled-run at " + env["GITHUB_SHA"]
-                        if scheduled_slot is not None else "Production backup coordinator " + manual_action + " at " + env["GITHUB_SHA"])
-                    and all(isinstance(run.get(k), dict) and run[k].get("id") == artifact.REPOSITORY_ID
-                            for k in ("repository", "head_repository")),
+            require(run.get("status") == "in_progress",
                     "The exact coordinator writer is no longer running; do not start this mutation.")
+            if scheduled_slot is not None:
+                coordinator.scheduled_run_identity(run, intent["writerRunId"], env["GITHUB_SHA"], continuation=is_continuation)
+            else:
+                require(str(run.get("id")) == intent["writerRunId"] and run.get("run_attempt") == 1
+                        and run.get("path") in (path, path + "@main", path + "@refs/heads/main")
+                        and run.get("head_sha") == env["GITHUB_SHA"] and run.get("head_branch") == "main"
+                        and run.get("event") == "workflow_dispatch"
+                        and run.get("display_title") == "Production backup coordinator " + manual_action + " at " + env["GITHUB_SHA"]
+                        and all(isinstance(run.get(k), dict) and run[k].get("id") == artifact.REPOSITORY_ID
+                                for k in ("repository", "head_repository")))
             response = artifact._get_json("/actions/runs/" + intent["writerRunId"] + "/attempts/1/jobs?per_page=100",
                                           artifact._github_token())
             jobs = response.get("jobs")
@@ -1044,6 +1074,9 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
             anchor.initialize()
             result = {"status": "initialized", "action": action}
     elif action in {"plan-begin", "begin"}:
+        before_begin = state
+        if type(runtime) is ScheduledBackupRuntime:
+            state = scheduled_begin_state(state)
         require(state["control"]["admission"] == "open" and state["control"]["workers"] == "run"
                 and not any(state["terminal"].get(key, 0) for key in ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates")))
         now = datetime.now(timezone.utc)
@@ -1077,13 +1110,16 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
             original = {"version": 1, "targetSha256": target.digest, "session": session, "day": day,
                 "controlRevision": revision, "dispatcherRevision": dispatcher_revision, "dispatcherWorkflow": dispatcher_workflow,
                 "writerRunId": env["GITHUB_RUN_ID"], "writerAttempt": env["GITHUB_RUN_ATTEMPT"],
-                "anchorPredecessorSha256": recovery.digest(anchor_raw), "stateSha256": state["stateSha256"],
+                "anchorPredecessorSha256": recovery.digest(anchor_raw), "stateSha256": before_begin["stateSha256"],
                 "sourceRevision": proof["revision"], "approvalSha256": (recovery.digest(phase_envelope(approval_action, predecessor).encode("utf-8"))
                     if runtime is None or target.environment != "production" else runtime.authority_sha256),
                 "timestamp": int(time.time()), "startedDetails": started}
             intent_sha = maintenance.write_begin(store, original)
             guard()
-            require(ctl.inspect()["stateSha256"] == predecessor, "The approved begin predecessor changed.")
+            current = ctl.inspect()
+            if type(runtime) is ScheduledBackupRuntime:
+                current = scheduled_begin_state(current)
+            require(current["stateSha256"] == predecessor, "The approved begin predecessor changed.")
             anchor._advance(pin, anchor_raw, anchor_etag, state="active", session=session, day=day, revision=revision)
             journal.append("started", {**started, "beginIntentSha256": intent_sha}, int(time.time()))
             result = {"status": "started", "action": action, "session": session, "day": day}
@@ -1134,6 +1170,8 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
             result = {"status": "observed", "action": action, "phase": events[-1]["stage"], "state": state}
         elif action == "preflight":
             last(events, "started")
+            if type(runtime) is ScheduledBackupRuntime:
+                state = scheduled_begin_state(state)
             predecessor = exact_predecessor(env, state)
             phase_authorized(target, env, "backup-preflight:" + digest(contract), proof["revision"], predecessor, revision)
             observed = capacity.observe(api, source, warning_percent=policy["warningPercent"])
@@ -1169,7 +1207,17 @@ def execute_phase(*, action, env, target, revision, policy, contract, proof, sta
             result = {"status": "paused", "action": action, "state": after}
         elif action == "drain":
             last(events, "paused")
-            require(state["control"]["admission"] == "closed" and not any(state["work"].values()))
+            while True:
+                require(state["control"] == events[-1]["details"]["control"]
+                        and state["control"]["admission"] == "closed"
+                        and state["release"] == events[0]["details"]["release"])
+                if not any(state["work"].values()):
+                    break
+                require(env.get("BACKUP_DISPATCH_NONCE"), "The source still has unsettled work.")
+                require_pause_window(events, policy)
+                bounded_guard()
+                time.sleep(5)
+                state = ctl.inspect()
             result = {"status": "drained", "action": action, "state": state}
         elif action == "freeze":
             last(events, "paused")

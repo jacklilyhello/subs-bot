@@ -265,6 +265,38 @@ def _provision_job(receipt, token):
         require(len(steps) == 1 and (steps[0].get("status"), steps[0].get("conclusion")) == ("completed", "success"))
 
 
+def _skipped_cron(run, revision, token):
+    """A completed, unrerun cron with every fixed job skipped cannot write."""
+    workflows = {
+        ".github/workflows/worker-production-backup-coordinator.yml": (
+            {"Production backup coordinator scheduled-run at " + revision, "Production backup coordinator inspect at " + revision},
+            {"coordinate", "inspect_or_reconcile", "monitor", "schedule_readback"}),
+        ".github/workflows/worker-production-backup.yml": ({"Production backup monitor at " + revision}, {"checkpoint"}),
+    }
+    raw_path = run.get("path", "")
+    path = raw_path.removesuffix("@refs/heads/main").removesuffix("@main")
+    if path not in workflows or run.get("event") != "schedule":
+        return False
+    titles, names = workflows[path]
+    run_id = str(run.get("id"))
+    require(DECIMAL.fullmatch(run_id) and run.get("display_title") in titles)
+    latest = _get_json("/actions/runs/" + run_id, token)
+    for item in (run, latest):
+        require(str(item.get("id")) == run_id and item.get("head_sha") == revision and item.get("head_branch") == "main"
+                and item.get("event") == "schedule" and item.get("run_attempt") == 1
+                and item.get("path") in {path, path + "@main", path + "@refs/heads/main"}
+                and item.get("display_title") == run["display_title"] and item.get("status") == "completed"
+                and all(isinstance(item.get(k), dict) and item[k].get("id") == github.REPOSITORY_ID
+                        for k in ("repository", "head_repository")))
+    jobs = _pages("/actions/runs/" + run_id + "/attempts/1/jobs", "jobs", token, maximum=100)
+    require(len(jobs) == len(names) and {job.get("name") for job in jobs} == names
+            and all(str(job.get("run_id")) == run_id and job.get("run_attempt") == 1
+                    and job.get("head_sha") == revision and job.get("status") == "completed"
+                    and job.get("conclusion") == "skipped" and job.get("steps") == [] for job in jobs),
+            "A scheduled job was not positively confirmed skipped.")
+    return True
+
+
 def verify_first_launch_writers(env, review_raw, review_pin, token):
     """Freshly recheck the reviewed window and all runs after it, without writes."""
     _protected_inputs(env, review_raw, review_pin)
@@ -306,9 +338,11 @@ def verify_first_launch_writers(env, review_raw, review_pin, token):
         run_id = str(run.get("id"))
         if run_id == current_id or run_id in reviewed:
             continue
-        require(run.get("display_title") == "Production backup coordinator plan-schedule-anchor at " + env["GITHUB_SHA"]
-                and run.get("head_sha") == env["GITHUB_SHA"]
-                and _bootstrap_run(run_id, env["GITHUB_SHA"], "plan-schedule-anchor", token, running=False),
+        require(safe_plans < 5, "Too many later runs require a fresh reviewed inventory.")
+        require(_skipped_cron(run, env["GITHUB_SHA"], token)
+                or (run.get("display_title") == "Production backup coordinator plan-schedule-anchor at " + env["GITHUB_SHA"]
+                    and run.get("head_sha") == env["GITHUB_SHA"]
+                    and _bootstrap_run(run_id, env["GITHUB_SHA"], "plan-schedule-anchor", token, running=False)),
                 "A new unreviewed writer appeared after the approved inventory.")
         safe_plans += 1
     require(safe_plans <= 5, "Too many prior bootstrap plans require a new reviewed inventory.")

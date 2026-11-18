@@ -111,7 +111,7 @@ class CoordinatorTests(unittest.TestCase):
         bodies = {scope_key: canonical(material["scopeStart"]), target_key: canonical(material["targetStart"]),
                   slot_key: canonical(slot)}
         objects.get.side_effect = lambda key: (bodies[key], '"etag"')
-        objects.list.return_value = [scope_key, slot_key]
+        objects.list.side_effect = lambda prefix, **_kw: [] if prefix.endswith("/writers/") else [scope_key, slot_key]
         env = {"GITHUB_REPOSITORY": coordinator.artifact.REPOSITORY,
                "GITHUB_REPOSITORY_ID": str(coordinator.artifact.REPOSITORY_ID), "GITHUB_REF": coordinator.artifact.MAIN_REF,
                "GITHUB_EVENT_NAME": "schedule", "RUNNER_ENVIRONMENT": "github-hosted", "GITHUB_RUN_ATTEMPT": "1",
@@ -167,6 +167,16 @@ class CoordinatorTests(unittest.TestCase):
             self.assertIs(first.kwargs["fresh_client"], runtime.fresh_client)
             self.assertIs(second.kwargs["fresh_client"], runtime.fresh_client)
             self.assertIsNot(runtime.fresh_client, other.fresh_client)
+
+    def test_scheduled_begin_rebinds_live_work_but_refuses_unknown_or_changed_control(self):
+        state = {"targetSha256": "a" * 64, "configurationSha256": "b" * 64,
+                 "release": {"revision": "c" * 40}, "control": {"epoch": 7, "admission": "open"},
+                 "migrationCount": 40, "work": {"invocations": 0}, "terminal": {"unknownInvocations": 0}}
+        first = cli.scheduled_begin_state(state)["stateSha256"]
+        self.assertEqual(cli.scheduled_begin_state({**state, "work": {"invocations": 2}})["stateSha256"], first)
+        self.assertNotEqual(cli.scheduled_begin_state({**state, "control": {"epoch": 8}})["stateSha256"], first)
+        with self.assertRaises(ContractError):
+            cli.scheduled_begin_state({**state, "terminal": {"unknownInvocations": 1}})
 
     def test_manual_report_does_not_claim_unobserved_schedule_is_disabled(self):
         import json

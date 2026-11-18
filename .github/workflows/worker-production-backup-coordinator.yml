@@ -11,7 +11,7 @@ on:
         description: One independently approved coordinator operation
         required: true
         type: choice
-        options: [inspect, plan-initialize, initialize, plan-schedule-anchor, initialize-schedule-anchor, plan-run, run, plan-resume, resume, plan-reconcile, reconcile, plan-abort, abort]
+        options: [inspect, plan-initialize, initialize, plan-schedule-anchor, initialize-schedule-anchor, plan-resume-scheduled, resume-scheduled, plan-run, run, plan-resume, resume, plan-reconcile, reconcile, plan-abort, abort]
       session:
         description: Original coordinator plan run ID for continuation
         type: string
@@ -38,7 +38,7 @@ concurrency:
 
 jobs:
   coordinate:
-    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && ((github.event_name == 'schedule' && github.event.schedule == '*/15 * * * *' && vars.SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_DISPATCH_ENABLED == 'true') || (github.event_name == 'workflow_dispatch' && (inputs.action == 'run' || inputs.action == 'resume')))
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && ((github.event_name == 'schedule' && github.event.schedule == '*/15 * * * *' && vars.SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_DISPATCH_ENABLED == 'true') || (github.event_name == 'workflow_dispatch' && (inputs.action == 'run' || inputs.action == 'resume' || inputs.action == 'resume-scheduled')))
     permissions:
       actions: write
       contents: read
@@ -89,10 +89,10 @@ jobs:
           SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
           SUBS_BOT_CF_BACKUP_MONITOR_READ_TOKEN: ${{ github.event_name == 'schedule' && secrets.SUBS_BOT_CF_BACKUP_MONITOR_READ_TOKEN || '' }}
           SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
-          SUBS_BOT_SCOPED_R2_WRITE_JSON: ${{ (github.event_name == 'schedule' || inputs.action == 'run' || inputs.action == 'resume') && secrets.SUBS_BOT_SCOPED_R2_WRITE_JSON || '' }}
+          SUBS_BOT_SCOPED_R2_WRITE_JSON: ${{ (github.event_name == 'schedule' || inputs.action == 'run' || inputs.action == 'resume' || inputs.action == 'resume-scheduled') && secrets.SUBS_BOT_SCOPED_R2_WRITE_JSON || '' }}
           SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_ENABLED: ${{ vars.SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_ENABLED }}
-          SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_AUTHORITY_JSON: ${{ github.event_name == 'schedule' && secrets.SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_AUTHORITY_JSON || '' }}
-          SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_AUTHORITY_SHA256: ${{ github.event_name == 'schedule' && secrets.SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_AUTHORITY_SHA256 || '' }}
+          SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_AUTHORITY_JSON: ${{ (github.event_name == 'schedule' || inputs.action == 'resume-scheduled') && secrets.SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_AUTHORITY_JSON || '' }}
+          SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_AUTHORITY_SHA256: ${{ (github.event_name == 'schedule' || inputs.action == 'resume-scheduled') && secrets.SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_AUTHORITY_SHA256 || '' }}
           BACKUP_COORDINATOR_ACTION: ${{ github.event_name == 'schedule' && 'scheduled-run' || inputs.action }}
           BACKUP_COORDINATOR_SESSION: ${{ inputs.session }}
           BACKUP_COORDINATOR_SEQUENCE: ${{ inputs.sequence }}
@@ -103,7 +103,7 @@ jobs:
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           umask 077
           python3 -B worker/tools/production_backup_coordinator.py
-          if [ "$GITHUB_EVENT_NAME" = schedule ]; then
+          if [ "$GITHUB_EVENT_NAME" = schedule ] || [ "$BACKUP_COORDINATOR_ACTION" = resume-scheduled ]; then
             python3 -c 'import json, os, pathlib, re; p=pathlib.Path(os.environ["RUNNER_TEMP"])/"production-backup-coordinator-result.json"; r=json.loads(p.read_text()); s=r.get("status"); assert s in {"completed", "not-due"}; d=r.get("slotDay", ""); assert s != "completed" or re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", d); open(os.environ["GITHUB_OUTPUT"], "a").write("scheduled_status=" + s + "\n" + ("scheduled_day=" + d + "\n" if s == "completed" else ""))'
           fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -115,7 +115,7 @@ jobs:
           retention-days: 7
   schedule_readback:
     needs: coordinate
-    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && github.event_name == 'schedule' && needs.coordinate.result == 'success' && needs.coordinate.outputs.scheduled_status == 'completed'
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || inputs.action == 'resume-scheduled') && needs.coordinate.result == 'success' && needs.coordinate.outputs.scheduled_status == 'completed'
     permissions:
       actions: read
       contents: read
@@ -152,7 +152,7 @@ jobs:
           umask 077
           python3 -B worker/tools/production_backup_schedule_readback.py
   inspect_or_reconcile:
-    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.action != 'run' && inputs.action != 'resume'
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.action != 'run' && inputs.action != 'resume' && inputs.action != 'resume-scheduled'
     environment: subs-bot-production-backup-coordinator
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -186,13 +186,16 @@ jobs:
           SUBS_BOT_BACKUP_SCOPE_BOOTSTRAP_REVIEW_SHA256: ${{ (inputs.action == 'plan-schedule-anchor' || inputs.action == 'initialize-schedule-anchor') && secrets.SUBS_BOT_BACKUP_SCOPE_BOOTSTRAP_REVIEW_SHA256 || '' }}
           SUBS_BOT_BACKUP_SCOPE_BOOTSTRAP_REGISTRATION_SHA256: ${{ (inputs.action == 'plan-schedule-anchor' || inputs.action == 'initialize-schedule-anchor') && secrets.SUBS_BOT_BACKUP_SCOPE_BOOTSTRAP_REGISTRATION_SHA256 || '' }}
           SUBS_BOT_BACKUP_SCOPE_BOOTSTRAP_PLAN_SHA256: ${{ inputs.action == 'initialize-schedule-anchor' && secrets.SUBS_BOT_BACKUP_SCOPE_BOOTSTRAP_PLAN_SHA256 || '' }}
+          SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_ENABLED: ${{ vars.SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_ENABLED }}
+          SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_AUTHORITY_JSON: ${{ inputs.action == 'plan-resume-scheduled' && secrets.SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_AUTHORITY_JSON || '' }}
+          SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_AUTHORITY_SHA256: ${{ inputs.action == 'plan-resume-scheduled' && secrets.SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_AUTHORITY_SHA256 || '' }}
           SUBS_BOT_SCOPED_R2_WRITE_JSON: ${{ (inputs.action == 'initialize' || inputs.action == 'initialize-schedule-anchor' || inputs.action == 'reconcile' || inputs.action == 'abort') && secrets.SUBS_BOT_SCOPED_R2_WRITE_JSON || '' }}
           BACKUP_COORDINATOR_ACTION: ${{ inputs.action }}
           BACKUP_COORDINATOR_SESSION: ${{ inputs.session }}
           BACKUP_COORDINATOR_SEQUENCE: ${{ inputs.sequence }}
           BACKUP_COORDINATOR_APPROVAL_SHA256: ${{ inputs.approval_sha256 }}
-          BACKUP_SOURCE_CHECKPOINT_ID: ${{ inputs.source_checkpoint_id }}
-          BACKUP_SOURCE_MANIFEST_SHA256: ${{ inputs.source_manifest_sha256 }}
+          BACKUP_SOURCE_CHECKPOINT_ID: ${{ inputs.source_checkpoint_id || vars.SUBS_BOT_PRODUCTION_BACKUP_SOURCE_CHECKPOINT_ID }}
+          BACKUP_SOURCE_MANIFEST_SHA256: ${{ inputs.source_manifest_sha256 || vars.SUBS_BOT_PRODUCTION_BACKUP_SOURCE_MANIFEST_SHA256 }}
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           umask 077

@@ -19,14 +19,22 @@ def write_witness(env, target, objects, app_store, scope_anchor, target_anchor, 
     require(target.environment == "production" and type(objects) is scoped_r2.ScopedR2
             and objects.bucket == target.data["backupBucketName"]
             and objects.host == target.account_id + ".r2.cloudflarestorage.com" and isinstance(slot, dict)
-            and slot.get("targetSha256") == target.digest and slot.get("session") == env.get("GITHUB_RUN_ID")
-            and slot.get("writerRunId") == env.get("GITHUB_RUN_ID") and slot.get("writerAttempt") == "1"
+            and slot.get("targetSha256") == target.digest and slot.get("session") == slot.get("writerRunId")
+            and slot.get("writerAttempt") == "1"
             and type(scope_anchor) is coordinator.ScheduleScopeAnchor and type(target_anchor) is maintenance.Anchor
             and scope_anchor.target_sha256 == schedule.logical_scope(target)
             and scope_anchor.store.objects is objects and target_anchor.store.objects is objects
             and scope_anchor.bucket_name == target.data["backupBucketName"]
             and scope_anchor.bucket_created_at == target.data["backupBucketCreatedAt"]
             and target_anchor.target_sha256 == target.digest and objects.write_credential is not None)
+    continuation = coordinator.scheduled_continuation(objects, slot)
+    writer_id = slot["writerRunId"] if continuation is None else continuation["writerRunId"]
+    require(writer_id == env.get("GITHUB_RUN_ID"))
+    def verify_parent():
+        if continuation is None:
+            return coordinator.verify_scheduled_parent(env, slot, mode="fresh-reader")
+        require(coordinator.scheduled_continuation(objects, slot) == continuation)
+        return coordinator.verify_scheduled_parent(env, slot, mode="fresh-reader", continuation=continuation)
     authority, pin = slot["authority"], slot["authoritySha256"]
     require(env.get("SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_AUTHORITY_SHA256") == pin
             and backup.settings(env.get("SUBS_BOT_BACKUP_POLICY_JSON", "")) == slot["policy"])
@@ -57,7 +65,7 @@ def write_witness(env, target, objects, app_store, scope_anchor, target_anchor, 
                     env["GITHUB_SHA"], slot["coordinatorAnchorSha256"]) == done["coordinatorIdleAnchorSha256"])
 
     verify_anchors()
-    parent = coordinator.verify_scheduled_parent(env, slot, mode="fresh-reader")
+    parent = verify_parent()
     review, review_pin = coordinator.scheduled_review_document(env)
     parent["sourceReview"] = coordinator.scheduled_source_review(env, env["GITHUB_SHA"])
     require(parent["sourceReview"].get("reviewSha256") == review_pin)
@@ -83,8 +91,7 @@ def write_witness(env, target, objects, app_store, scope_anchor, target_anchor, 
             and type(core.get("reset")) is int and core["reset"] > int(time.time()),
             "Insufficient GitHub read quota for independent witness creation.")
     verify_anchors()
-    require(coordinator.verify_scheduled_parent(env, slot, mode="fresh-reader") ==
-            {k: parent[k] for k in ("originalRun", "latestRun", "jobs", "coordinateJobId", "readerJobId")}
+    require(verify_parent() == {key: value for key, value in parent.items() if key != "sourceReview"}
             and terminal.collect_app_terminal(objects, app_store, target, slot, phase, authority["applicationGenesisSha256"]) == app,
             "The independently observed parent or transaction changed before witness creation.")
     terminal_again, _ = objects.get(schedule.terminal_key(slot["scopeSha256"], slot["slotDay"]), limit=terminal.MAX_RECORD)
@@ -100,7 +107,7 @@ def write_witness(env, target, objects, app_store, scope_anchor, target_anchor, 
 def main(env=None):
     env = os.environ if env is None else env
     revision = coordinator.verify_context(env)
-    require(env.get("GITHUB_EVENT_NAME") == "schedule" and env.get("SCHEDULE_READBACK_MODE") == "fresh")
+    require(env.get("GITHUB_EVENT_NAME") in {"schedule", "workflow_dispatch"} and env.get("SCHEDULE_READBACK_MODE") == "fresh")
     target = validate_target(env.get("SUBS_BOT_TARGET_JSON", ""))
     require(target.environment == "production")
     metadata = API(target, env.get("SUBS_BOT_CF_R2_METADATA_READ_TOKEN", ""))

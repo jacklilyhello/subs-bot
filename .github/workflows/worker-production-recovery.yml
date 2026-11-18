@@ -38,6 +38,12 @@ on:
       state_sha256:
         description: Exact source inspect predecessor for every mutation
         type: string
+      resume_scope_run_id:
+        description: Original production recovery run holding the project scope
+        type: string
+      resume_journal_sha256:
+        description: Independently read current recovery journal digest for a known bookmark
+        type: string
       resource:
         description: Resource to reconcile only after an unacknowledged create
         type: choice
@@ -123,6 +129,8 @@ jobs:
           RECOVERY_CURRENT_CI_RUN_ID: ${{ inputs.current_run_id }}
           RECOVERY_CURRENT_CI_RUN_ATTEMPT: ${{ inputs.current_run_attempt }}
           RECOVERY_STATE_SHA256: ${{ inputs.state_sha256 }}
+          RECOVERY_RESUME_SCOPE_RUN_ID: ${{ inputs.resume_scope_run_id }}
+          RECOVERY_RESUME_JOURNAL_SHA256: ${{ inputs.resume_journal_sha256 }}
           RECOVERY_RESOURCE: ${{ inputs.resource }}
           RECOVERY_IDENTITY_SHA256: ${{ inputs.identity_sha256 }}
           RECOVERY_WARNING_PERCENT: ${{ inputs.warning_percent }}

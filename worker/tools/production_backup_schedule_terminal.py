@@ -58,12 +58,29 @@ def verify_reader_log(job_id, token, expected_sha256):
     return _verify_job_marker(job_id, token, expected_sha256, "SCHEDULE_WITNESS_SHA256")
 
 
+def completion_writer(start, done):
+    """A coordinator may close the original scope from its claimed continuation."""
+    if "completionWriterRunId" not in done:
+        require("completionAction" not in done)
+        return start["writerRunId"], start["action"]
+    run_id, action = done["completionWriterRunId"], done.get("completionAction")
+    require(schedule.SESSION.fullmatch(run_id or "") and run_id != start["writerRunId"])
+    if start["workflowRef"].endswith("/worker-production-backup-coordinator.yml@" + artifact.MAIN_REF):
+        require(start["action"] == "run" and action in {"resume", "abort"})
+    else:
+        require(start["workflowRef"].endswith("/worker-production-recovery.yml@" + artifact.MAIN_REF)
+                and ((action == "poll-export" and start["action"] in {"capture", "poll-export"})
+                     or (action == "start-import" and start["action"] == "start-import")))
+    return run_id, action
+
+
 def verify_manual_job(record, token, env, now, *, allow_expiring=False):
     """Independently verify one immutable manual scope result and its GH writer."""
     import production_backup_manual_scope as manual_scope
 
     start, done, result = record["start"], record["complete"], record["result"]
-    revision, run_id, path = start["controlRevision"], start["writerRunId"], start["workflowRef"]
+    run_id, action = completion_writer(start, done)
+    revision, path = start["controlRevision"], start["workflowRef"]
     allowed = {artifact.REPOSITORY + "/" + value + "@" + artifact.MAIN_REF: value for value in manual_scope.WORKFLOWS}
     require(path in allowed)
     source_review = coordinator.historical_manual_source_review(env, revision)
@@ -78,7 +95,9 @@ def verify_manual_job(record, token, env, now, *, allow_expiring=False):
                 and (run.get("status"), run.get("conclusion")) == ("completed", "success")
                 and all(isinstance(run.get(key), dict) and run[key].get("id") == artifact.REPOSITORY_ID
                         for key in ("repository", "head_repository")),
-                "The original manual writer is not independently confirmed successful.")
+                "The manual completion writer is not independently confirmed successful.")
+        if run_id != start["writerRunId"] and expected_path == coordinator.PROFILES["production"]["parent"]:
+            require(run.get("display_title") == coordinator.parent_title("production", action, revision, revision))
     response = artifact._get_json("/actions/runs/" + run_id + "/attempts/1/jobs?per_page=100", token)
     jobs = response.get("jobs")
     require(isinstance(jobs, list) and type(response.get("total_count")) is int
@@ -88,7 +107,7 @@ def verify_manual_job(record, token, env, now, *, allow_expiring=False):
              ".github/workflows/worker-production-backup-coordinator.yml": ("coordinate", "Coordinate one explicitly approved operation"),
              ".github/workflows/worker-production-recovery.yml": ("recovery", "Verify identities and execute one production-aware checkpoint")}
     job_name, step_name = names[expected_path]
-    if expected_path == ".github/workflows/worker-production-backup-coordinator.yml" and start["action"] not in {"run", "resume"}:
+    if expected_path == ".github/workflows/worker-production-backup-coordinator.yml" and action not in {"run", "resume"}:
         job_name, step_name = "inspect_or_reconcile", "Inspect or reconcile without workflow dispatch"
     matching = [job for job in jobs if isinstance(job, dict) and job.get("name") == job_name]
     require(len(matching) == 1)
@@ -107,6 +126,10 @@ def verify_manual_job(record, token, env, now, *, allow_expiring=False):
             "A required manual log is near its configured retention limit; stop new scheduled backups.")
     require(_verify_job_marker(str(job["id"]), token, record["completeSha256"], "SCHEDULE_MANUAL_COMPLETE_SHA256"))
     require(isinstance(done, dict) and isinstance(result, dict))
+    if run_id != start["writerRunId"] and expected_path.endswith("/worker-production-recovery.yml"):
+        require(result.get("action") == action and result.get("runId") == run_id and result.get("runAttempt") == "1"
+                and result.get("controlRevision") == revision
+                and result.get("phase") == ("captured" if action == "poll-export" else "verified"))
     return deadline
 
 
@@ -257,6 +280,7 @@ def verify_phase_evidence(objects, target, slot, value):
     workflow, stages = value["workflow"], value["stages"]
     require(isinstance(workflow, dict) and workflow.get("path") == coordinator.PROFILES[profile]["child"]
             and type(workflow.get("id")) is int and isinstance(stages, list) and len(stages) == len(coordinator.STEPS))
+    continuation = coordinator.scheduled_continuation(objects, slot) if profile == "production" else None
     results, pause_until = [], None
     for sequence, entry in enumerate(stages, 1):
         require(isinstance(entry, dict) and set(entry) == {"sequence", "originals", "run", "latest", "jobs"}
@@ -269,7 +293,7 @@ def verify_phase_evidence(objects, target, slot, value):
                 and isinstance(result, dict) and result.get("sourceRevision") == authority["sourceRevision"]
                 and intent == coordinator.dispatch_intent(target=target.digest, session=slot["session"], sequence=sequence,
                     revision=dispatcher, nonce=intent.get("nonce"), input_sha256=intent.get("inputSha256"),
-                    created_at=intent.get("createdAt"), writer_run_id=slot["writerRunId"],
+                    created_at=intent.get("createdAt"), writer_run_id=coordinator.scheduled_writer_id(slot, continuation, sequence),
                     profile=profile, candidate_revision=candidate)
                 and originals["claim"] == canonical(coordinator.child_claim(intent, receipt.get("runId"), "1"))
                 and receipt == coordinator.receipt(intent, receipt.get("runId"), result, receipt.get("artifactId"),
@@ -438,21 +462,33 @@ def verify_prior_history(objects, app_store, target, scope_anchor, token, env, a
                 start = parsed(raw)
                 require(canonical(start) == raw and start.get("policySha256") == manual["policySha256"]
                         and start.get("controlRevision") == manual["controlRevision"])
-                coordinator.finished_controller(objects, old_target.digest, session, manual["controlRevision"],
+                history = coordinator.finished_controller(objects, old_target.digest, session, manual["controlRevision"],
                     start["sourceCheckpointId"], start["sourceManifestSha256"], manual["policySha256"])
-                results, _ = coordinator.completed_results(objects, old_target.digest, session, manual["controlRevision"], token,
-                    start["sourceCheckpointId"], start["sourceManifestSha256"], backup.maximum_pause(manual["policy"]))
-                require(len(results) == len(coordinator.STEPS) and results[-1].get("status") == "resumed"
-                        and results[-1].get("action") == "activate")
-                receipt = parsed(_read(objects, coordinator.receipt_key(old_target.digest, session, 1), MAX_RECORD))
-                source_revision = results[0].get("sourceRevision")
-                require(results[0].get("session") == receipt.get("runId", "") + "-1"
-                        and schedule.REV.fullmatch(source_revision or "")
-                        and all(result.get("sourceRevision") == source_revision for result in results))
-                app = _app_terminal(app_store, old_target, results[0], results[coordinator.STEPS.index("verify")],
-                                    manual["controlRevision"], manual["policySha256"], manual["configurationSha256"],
-                                    manual["applicationGenesisSha256"])
-                require(app["events"][0]["details"].get("release", {}).get("revision") == source_revision)
+                end_run, end_action = completion_writer(manual, record["complete"])
+                if end_run != manual["writerRunId"]:
+                    require(history["writers"] and history["writers"][-1]["writerRunId"] == end_run
+                            and history["writers"][-1]["action"] == end_action)
+                if end_action == "abort":
+                    result = record["result"]
+                    require(result.get("status") == "abandoned-after-confirmed-terminal" and result.get("dispatchRetried") is False
+                            and result.get("productionMutation") is False
+                            and result.get("terminal") in {"no-mutating-child", "resumed", "preserved-frozen", "failed"}
+                            and all(schedule.HEX.fullmatch(result.get(k, "")) for k in
+                                    ("abortObservationSha256", "applicationAnchorSha256")))
+                else:
+                    results, _ = coordinator.completed_results(objects, old_target.digest, session, manual["controlRevision"], token,
+                        start["sourceCheckpointId"], start["sourceManifestSha256"], backup.maximum_pause(manual["policy"]))
+                    require(len(results) == len(coordinator.STEPS) and results[-1].get("status") == "resumed"
+                            and results[-1].get("action") == "activate")
+                    receipt = parsed(_read(objects, coordinator.receipt_key(old_target.digest, session, 1), MAX_RECORD))
+                    source_revision = results[0].get("sourceRevision")
+                    require(results[0].get("session") == receipt.get("runId", "") + "-1"
+                            and schedule.REV.fullmatch(source_revision or "")
+                            and all(result.get("sourceRevision") == source_revision for result in results))
+                    app = _app_terminal(app_store, old_target, results[0], results[coordinator.STEPS.index("verify")],
+                                        manual["controlRevision"], manual["policySha256"], manual["configurationSha256"],
+                                        manual["applicationGenesisSha256"])
+                    require(app["events"][0]["details"].get("release", {}).get("revision") == source_revision)
                 target_items = coordinator.coordinator_anchor_history(record["targetAnchor"])
                 matches = [item for item in target_items if item["session"] == session + "-1"]
                 require(len(matches) == 1)
@@ -465,12 +501,22 @@ def verify_prior_history(objects, app_store, target, scope_anchor, token, env, a
         stored = read_witness_structure(objects, old_target, slot)
         witness, terminal = stored["witness"], stored["terminal"]
         parent = witness["parent"]
+        continuation = coordinator.scheduled_continuation(objects, slot)
         fields = {"originalRun", "latestRun", "jobs", "coordinateJobId", "readerJobId", "sourceReview"}
+        if continuation is not None:
+            fields |= {"continuation", "stoppedOriginalRun"}
         require(set(parent) == fields and isinstance(parent["originalRun"], dict)
                 and isinstance(parent["latestRun"], dict) and isinstance(parent["jobs"], dict))
         revision = slot["authority"]["controlRevision"]
         require(coordinator.historical_schedule_source_review(env, revision, witness["review"], parent["sourceReview"]) is True)
-        observed = coordinator.verify_scheduled_parent(env, slot, mode="finished")
+        if continuation is None:
+            observed = coordinator.verify_scheduled_parent(env, slot, mode="finished")
+            writer_id = slot["writerRunId"]
+        else:
+            observed = coordinator.verify_scheduled_parent(env, slot, mode="finished", continuation=continuation)
+            require(parent["continuation"] == observed["continuation"] == continuation
+                    and parent["stoppedOriginalRun"] == observed["stoppedOriginalRun"])
+            writer_id = continuation["writerRunId"]
         retention = reader_log_deadlines(observed["originalRun"].get("created_at"), slot["authority"], int(time.time()))
         require(authority_sha256 is None or not retention["stop"],
                 "A required reader log is near its configured retention limit; stop new scheduled backups.")
@@ -479,8 +525,8 @@ def verify_prior_history(objects, app_store, target, scope_anchor, token, env, a
         log_stop_at = retention["stopAt"] if log_stop_at is None else min(log_stop_at, retention["stopAt"])
         require(observed["coordinateJobId"] == parent["coordinateJobId"]
                 and observed["readerJobId"] == parent["readerJobId"]
-                and str(parent["originalRun"].get("id")) == slot["writerRunId"]
-                and str(parent["latestRun"].get("id")) == slot["writerRunId"]
+                and str(parent["originalRun"].get("id")) == writer_id
+                and str(parent["latestRun"].get("id")) == writer_id
                 and parent["originalRun"].get("head_sha") == revision
                 and parent["latestRun"].get("head_sha") == revision
                 and parent["originalRun"].get("run_attempt") == parent["latestRun"].get("run_attempt") == 1,
@@ -611,10 +657,30 @@ def scope_inventory(objects, target, scope_anchor, target_genesis_sha256, *, env
         result = backup.recovery.native.parsed(raw_result, 256 * 1024)
         raw_done = _read(objects, files["complete"], MAX_RECORD)
         done = parsed(raw_done)
-        require(canonical(result) == raw_result and canonical(done) == raw_done
-                and done == {"version": 1, "kind": "manual-backup-scope-complete", "scopeSha256": scope,
-                             "startSha256": _sha(raw_start), "idleAnchorSha256": done.get("idleAnchorSha256"),
-                             "resultSha256": _sha(raw_result), "writerRunId": session, "writerAttempt": "1"}
+        require(isinstance(done, dict))
+        end_run, end_action = completion_writer(manual, done)
+        expected_done = {"version": 1, "kind": "manual-backup-scope-complete", "scopeSha256": scope,
+                         "startSha256": _sha(raw_start), "idleAnchorSha256": done.get("idleAnchorSha256"),
+                         "resultSha256": _sha(raw_result), "writerRunId": session, "writerAttempt": "1"}
+        if end_run != session:
+            expected_done.update(completionWriterRunId=end_run, completionAction=end_action)
+            if end_action in {"poll-export", "start-import"}:
+                from production_backup_manual_scope import recovery_writers_prefix
+                prefix = recovery_writers_prefix(scope, session)
+                continuations = objects.list(prefix, maximum=16)
+                require(0 < len(continuations) < 16 and continuations ==
+                        [prefix + str(n).zfill(4) + ".json" for n in range(1, len(continuations) + 1)])
+                previous = _sha(raw_start)
+                for key in continuations:
+                    raw_writer = _read(objects, key, MAX_RECORD)
+                    writer = parsed(raw_writer)
+                    require(canonical(writer) == raw_writer and writer.get("kind") == "recovery-scope-continuation"
+                            and writer.get("previousSha256") == previous and writer.get("action") == end_action
+                            and schedule.SESSION.fullmatch(writer.get("writerRunId", ""))
+                            and all(schedule.HEX.fullmatch(writer.get(name, "")) for name in ("contractSha256", "journalSha256")))
+                    previous = _sha(raw_writer)
+                require(writer["writerRunId"] == end_run)
+        require(canonical(result) == raw_result and canonical(done) == raw_done and done == expected_done
                 and schedule.HEX.fullmatch(done.get("idleAnchorSha256", "")))
         if old_target.digest not in target_histories:
             old_store = coordinator.CoordinatorStore(objects, old_target.digest)
