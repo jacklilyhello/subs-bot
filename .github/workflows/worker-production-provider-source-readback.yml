@@ -1,0 +1,57 @@
+name: Independently read production Provider source
+run-name: Read sealed production Provider source at ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      archive_run_id:
+        description: Original source seal run ID
+        required: true
+        type: string
+      archive_run_attempt:
+        description: Original source seal attempt
+        required: true
+        type: string
+      manifest_sha256:
+        description: Independently recorded source manifest SHA256
+        required: true
+        type: string
+      target_sha256:
+        description: Independently recorded full target SHA256
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  readback:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
+    environment: subs-bot-production-provider-archive
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Independently verify the pinned original from R2
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBS_BOT_PROVIDER_SOURCE_ACTION: verify-production
+          SUBS_BOT_PROVIDER_ARCHIVE_RUN_ID: ${{ inputs.archive_run_id }}
+          SUBS_BOT_PROVIDER_ARCHIVE_RUN_ATTEMPT: ${{ inputs.archive_run_attempt }}
+          SUBS_BOT_PROVIDER_ARCHIVE_MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_SHA256: ${{ inputs.target_sha256 }}
+          SUBS_BOT_PROVIDER_ARCHIVE_BUCKET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_BUCKET_JSON }}
+          SUBS_BOT_PROVIDER_SOURCE_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_SOURCE_LEDGER_JSON }}
+          SUBS_BOT_PROVIDER_SOURCE_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_SOURCE_CONTROLLERS_JSON }}
+          SUBS_BOT_PROVIDER_SOURCE_RESOLUTIONS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_SOURCE_RESOLUTIONS_JSON }}
+          SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_PROVIDER_ARCHIVE_READ_TOKEN }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          umask 077
+          python3 -B worker/tools/provider_durable_source.py

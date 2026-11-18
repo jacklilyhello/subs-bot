@@ -741,11 +741,46 @@ def request_context(operation, config):
             and os.environ.get("GITHUB_WORKFLOW_SHA") == revision and match(provider.REVISION, revision)
             and os.environ.get("GITHUB_WORKFLOW_REF") in allowed_workflows)
     require(os.environ.get("SUBS_BOT_PROVIDER_CONTROL_ENVIRONMENT") == config["environment"])
+    if os.environ.get("SUBS_BOT_PROVIDER_SIMULATE_ARTIFACT_UNAVAILABLE") == "1":
+        require(config["environment"] == "rehearsal" and operation == "verify"
+                and os.environ.get("SUBS_BOT_PROVIDER_DURABLE_REQUIRED") == "1",
+                "Artifact-unavailability simulation is limited to archive-backed rehearsal verification.")
     require(match(provider.REVISION, config["build"]["revision"]))
     if operation != "verify":
         require(os.environ.get("GITHUB_RUN_ATTEMPT") == "1", "A mutation cannot be retried; dispatch verify to reconcile.")
         require(os.environ.get("SUBS_BOT_PROVIDER_CONTROL_APPROVAL") == digest({"operation": operation, "target": config}),
                 "The exact ProviderFetch operation and full target configuration were not approved.")
+
+
+def durable_builds():
+    """The handoff is untrusted until each build is matched to the target and reverified."""
+    root = Path(os.environ.get("RUNNER_TEMP", "")) / "provider-durable-sources"
+    if not root.is_dir():
+        require(os.environ.get("SUBS_BOT_PROVIDER_DURABLE_REQUIRED") != "1",
+                "The required private Provider source handoff is missing.")
+        return None
+    raw = provider.checked_file(root / "index.json", 9 * 65536 + 4096).read_bytes()
+    records = json.loads(raw, object_pairs_hook=github._unique_json_object)
+    require(isinstance(records, list) and 0 < len(records) <= 9)
+    require(all(isinstance(row, dict) and set(row) == {"build", "target"}
+                and validate_config(row["target"])["build"] == row["build"] for row in records))
+    require(len({row["build"]["archiveSha256"] for row in records}) == len(records))
+    return records
+
+
+def durable_archive(build):
+    records = durable_builds()
+    require(records is not None and any(row["build"] == build for row in records),
+            "A pinned Provider source is missing from the private handoff.")
+    require(match(provider.HEX, build["archiveSha256"]))
+    path = Path(os.environ["RUNNER_TEMP"]) / "provider-durable-sources" / (build["archiveSha256"] + ".zip")
+    provider.checked_file(path, provenance.MAX_ZIP)
+    hashed = sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(provenance.COPY_CHUNK):
+            hashed.update(chunk)
+    require(hashed.hexdigest() == build["archiveSha256"], "The private Provider original digest differs.")
+    return path
 
 
 def guard_sources(config):
@@ -754,7 +789,7 @@ def guard_sources(config):
     require(match(provider.REVISION, current))
     github.require_current_main(current)
     token = github._github_token()
-    for source in releases(config):
+    for index, source in enumerate(releases(config)):
         build = source["build"]
         revision = build["revision"]
         if revision != current:
@@ -764,9 +799,27 @@ def guard_sources(config):
                     and all(isinstance(comparison.get(key), dict) and comparison[key].get("sha") == revision
                             for key in ("base_commit", "merge_base_commit")),
                     "The frozen provider source is not an exact reviewed main ancestor.")
-        require(provenance._select_artifact(build["runId"], revision, token)
-                == (build["runAttempt"], build["artifactId"], build["archiveSha256"]),
-                "The frozen source CI attempt or archive digest changed.")
+        records = durable_builds()
+        live_current = (records is not None and index == 0
+                        and os.environ.get("SUBS_BOT_PROVIDER_REHEARSAL_LIVE_CURRENT") == "1"
+                        and config["environment"] == "rehearsal" and revision == current
+                        and not any(row["build"] == build for row in records))
+        if records is None or live_current:
+            require(provenance._select_artifact(build["runId"], revision, token, run_attempt=build["runAttempt"])
+                    == (build["runAttempt"], build["artifactId"], build["archiveSha256"]),
+                    "The frozen source CI attempt or archive digest changed.")
+        else:
+            matches = [row for row in records if row["build"] == build]
+            require(len(matches) == 1)
+            archived = matches[0]["target"]
+            require(all(archived[key] == source[key] for key in ("environment", "accountId", "service", "workersDevOrigin", "smoke"))
+                    and all(archived[key] is None or archived[key] == source[key]
+                            for key in ("worker", "versionId", "activation", "container", "workflow")),
+                    "The archived Provider target identity does not match the requested release.")
+            github.verify_main_run(build["runId"], revision, token, workflow_id=provenance.WORKFLOW_ID,
+                                   workflow_path=provenance.WORKFLOW_PATH, workflow_label="Provider Fetch CI",
+                                   run_attempt=build["runAttempt"])
+            durable_archive(build)
     github.require_current_main(current)
 
 
@@ -776,9 +829,26 @@ def prepare_input():
     require(operation in OPERATIONS)
     request_context(operation, config)
     guard_sources(config)
-    evidence = provenance.prepare(provider_revision=config["build"]["revision"])
+    evidence = prepare_durable(config["build"]) if durable_builds() is not None else provenance.prepare(
+        provider_revision=config["build"]["revision"], provider_attempt=config["build"]["runAttempt"])
     require(evidence == config["build"])
     print(json.dumps(evidence, sort_keys=True))
+
+
+def prepare_durable(build):
+    root = Path(os.environ["RUNNER_TEMP"])
+    require(os.environ.get("SUBS_BOT_PROVIDER_CI_RUN_ID") == build["runId"])
+    source = durable_archive(build)
+    staged = root / provenance.VERIFIED_DIRECTORY
+    require(not os.path.lexists(staged))
+    staged.mkdir(mode=0o700)
+    provenance._unpack(source, staged)
+    with provenance.source_requirements(build["revision"]) as requirements:
+        manifest = provider.verify_release(staged, build["revision"], ref=github.MAIN_REF,
+                                           run_id=build["runId"], run_attempt=build["runAttempt"], requirements=requirements)
+    require(all(manifest[key] == build[key] for key in publication.MANIFEST_FIELDS),
+            "The durable Provider release differs from its pinned source.")
+    return build
 
 
 def verify_previous_archives(config, scratch):
@@ -788,12 +858,16 @@ def verify_previous_archives(config, scratch):
         directory = scratch / f"source-{index}"
         directory.mkdir(mode=0o700)
         archive = directory / "artifact.zip"
-        provenance._download_zip(build["artifactId"], token, build["archiveSha256"], archive)
+        if durable_builds() is None:
+            provenance._download_zip(build["artifactId"], token, build["archiveSha256"], archive)
+        else:
+            archive = durable_archive(build)
         extracted = directory / "verified"
         extracted.mkdir(mode=0o700)
         provenance._unpack(archive, extracted)
-        manifest = provider.verify_release(extracted, build["revision"], ref=github.MAIN_REF,
-                                           run_id=build["runId"], run_attempt=build["runAttempt"])
+        with provenance.source_requirements(build["revision"]) as requirements:
+            manifest = provider.verify_release(extracted, build["revision"], ref=github.MAIN_REF,
+                                               run_id=build["runId"], run_attempt=build["runAttempt"], requirements=requirements)
         require(all(manifest[key] == build[key] for key in publication.MANIFEST_FIELDS),
                 "A frozen previous release differs from its verified source archive.")
 

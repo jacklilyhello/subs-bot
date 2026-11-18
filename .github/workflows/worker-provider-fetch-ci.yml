@@ -12,6 +12,12 @@ on:
       - 'worker/tools/activate_provider_api_status.py'
       - 'worker/tools/install_provider_skopeo.sh'
       - 'worker/tools/install_provider_age.sh'
+      - 'worker/tools/provider_private_handoff.py'
+      - 'worker/tools/production_provider_encrypted_publish.py'
+      - 'worker/tools/production_provider_reviewed_head_harness.py'
+      - 'worker/test/test_production_provider_reviewed_head_faults.py'
+      - 'worker/test/test_provider_private_handoff.py'
+      - 'worker/test/test_production_provider_encrypted_publish.py'
       - 'worker/tools/trusted_provider_head_gate.py'
       - 'worker/tools/reviewed_provider_candidate.py'
       - 'worker/tools/isolation_sealed_transfer.py'
@@ -40,13 +46,37 @@ on:
       - 'worker/tools/production_provider_terminal.py'
       - 'worker/tools/production_provider_forward.py'
       - 'worker/tools/archive_production_provider.py'
+      - 'worker/tools/provider_durable_source.py'
+      - 'worker/tools/provider_isolated_source.py'
+      - 'worker/tools/provider_source_transfer.py'
+      - 'worker/tools/provider_digest_publish.py'
+      - 'worker/tools/provider_digest_journal.py'
+      - 'worker/tools/provider_private_mutation.py'
+      - 'worker/tools/provider_private_mutation_journal.py'
+      - 'worker/tools/provider_private_mutation_reconcile.py'
+      - 'worker/test/test_production_provider_private_mutation.py'
+      - 'worker/test/test_production_provider_private_mutation_journal.py'
+      - 'worker/test/test_production_provider_private_mutation_reconcile.py'
+      - 'worker/test/test_production_provider_source_transfer.py'
+      - 'worker/test/test_production_provider_isolated_source.py'
+      - 'worker/test/test_production_provider_digest_publish.py'
+      - 'worker/test/test_production_provider_digest_journal.py'
+      - '.github/workflows/worker-provider-digest-rehearsal.yml'
+      - '.github/workflows/worker-provider-digest-reconcile.yml'
+      - '.github/workflows/worker-provider-isolated-source.yml'
+      - '.github/workflows/worker-provider-isolated-source-readback.yml'
       - 'worker/test/test_production_provider.py'
+      - 'worker/test/test_production_provider_durable.py'
       - 'worker/test/test_production_provider_rehearsal.py'
       - 'worker/test/test_production_provider_terminal.py'
       - 'worker/test/test_production_provider_forward.py'
       - 'worker/test/test_archive_production_provider.py'
       - '.github/workflows/worker-production-provider.yml'
       - '.github/workflows/worker-production-provider-rehearsal.yml'
+      - '.github/workflows/worker-production-provider-source-readback.yml'
+      - '.github/workflows/worker-production-provider-source-reconcile.yml'
+      - '.github/workflows/worker-production-provider-source.yml'
+      - '.github/workflows/worker-production-provider-encrypted-rehearsal.yml'
       - '.github/actions/provider-control-step/action.yml'
       - 'worker/tools/publish_provider_registry.py'
       - 'worker/tools/stage_provider_version.py'
@@ -55,6 +85,7 @@ on:
       - 'worker/test/test_bootstrap_provider_worker.py'
       - 'worker/test/test_activate_provider_isolation.py'
       - 'worker/test/test_prepare_provider_artifact.py'
+      - 'worker/test/hosted_provider_digest_registry.py'
       - 'worker/test/test_publish_provider_registry.py'
       - 'worker/test/test_stage_provider_version.py'
       - '.github/workflows/worker-provider-artifact-preflight.yml'
@@ -81,6 +112,12 @@ on:
       - 'worker/tools/activate_provider_api_status.py'
       - 'worker/tools/install_provider_skopeo.sh'
       - 'worker/tools/install_provider_age.sh'
+      - 'worker/tools/provider_private_handoff.py'
+      - 'worker/tools/production_provider_encrypted_publish.py'
+      - 'worker/tools/production_provider_reviewed_head_harness.py'
+      - 'worker/test/test_production_provider_reviewed_head_faults.py'
+      - 'worker/test/test_provider_private_handoff.py'
+      - 'worker/test/test_production_provider_encrypted_publish.py'
       - 'worker/tools/trusted_provider_head_gate.py'
       - 'worker/tools/reviewed_provider_candidate.py'
       - 'worker/tools/isolation_sealed_transfer.py'
@@ -109,13 +146,37 @@ on:
       - 'worker/tools/production_provider_terminal.py'
       - 'worker/tools/production_provider_forward.py'
       - 'worker/tools/archive_production_provider.py'
+      - 'worker/tools/provider_durable_source.py'
+      - 'worker/tools/provider_isolated_source.py'
+      - 'worker/tools/provider_source_transfer.py'
+      - 'worker/tools/provider_digest_publish.py'
+      - 'worker/tools/provider_digest_journal.py'
+      - 'worker/tools/provider_private_mutation.py'
+      - 'worker/tools/provider_private_mutation_journal.py'
+      - 'worker/tools/provider_private_mutation_reconcile.py'
+      - 'worker/test/test_production_provider_private_mutation.py'
+      - 'worker/test/test_production_provider_private_mutation_journal.py'
+      - 'worker/test/test_production_provider_private_mutation_reconcile.py'
+      - 'worker/test/test_production_provider_source_transfer.py'
+      - 'worker/test/test_production_provider_isolated_source.py'
+      - 'worker/test/test_production_provider_digest_publish.py'
+      - 'worker/test/test_production_provider_digest_journal.py'
+      - '.github/workflows/worker-provider-digest-rehearsal.yml'
+      - '.github/workflows/worker-provider-digest-reconcile.yml'
+      - '.github/workflows/worker-provider-isolated-source.yml'
+      - '.github/workflows/worker-provider-isolated-source-readback.yml'
       - 'worker/test/test_production_provider.py'
+      - 'worker/test/test_production_provider_durable.py'
       - 'worker/test/test_production_provider_rehearsal.py'
       - 'worker/test/test_production_provider_terminal.py'
       - 'worker/test/test_production_provider_forward.py'
       - 'worker/test/test_archive_production_provider.py'
       - '.github/workflows/worker-production-provider.yml'
       - '.github/workflows/worker-production-provider-rehearsal.yml'
+      - '.github/workflows/worker-production-provider-source-readback.yml'
+      - '.github/workflows/worker-production-provider-source-reconcile.yml'
+      - '.github/workflows/worker-production-provider-source.yml'
+      - '.github/workflows/worker-production-provider-encrypted-rehearsal.yml'
       - '.github/actions/provider-control-step/action.yml'
       - 'worker/tools/publish_provider_registry.py'
       - 'worker/tools/stage_provider_version.py'
@@ -124,6 +185,7 @@ on:
       - 'worker/test/test_bootstrap_provider_worker.py'
       - 'worker/test/test_activate_provider_isolation.py'
       - 'worker/test/test_prepare_provider_artifact.py'
+      - 'worker/test/hosted_provider_digest_registry.py'
       - 'worker/test/test_publish_provider_registry.py'
       - 'worker/test/test_stage_provider_version.py'
       - '.github/workflows/worker-provider-artifact-preflight.yml'
@@ -155,7 +217,7 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.13'
-      - name: Verify pinned age package for trusted source transfer
+      - name: Verify pinned age package for private source handoff
         run: bash worker/tools/install_provider_age.sh
       - name: Install only the pinned transport wheels
         run: |
@@ -170,6 +232,7 @@ jobs:
         run: |
           python -B -m unittest discover -s worker/test -p 'test_production_provider*.py'
           python -B -m unittest discover -s worker/test -p 'test_archive_production_provider.py'
+          python -B -m unittest discover -s worker/test -p 'test_provider_private_handoff.py'
           python -B -m unittest discover -s worker/test -p 'test_trusted_provider_head*.py'
           python -B -m unittest discover -s worker/test -p 'test_trusted_provider_inventory.py'
           python -B -m unittest discover -s worker/test -p 'test_reviewed_provider_candidate.py'
@@ -246,6 +309,18 @@ jobs:
           sudo unshare --net --setgid="$(id -g)" --setuid="$(id -u)" -- \
             /usr/bin/python3 -B worker/tools/verify_provider_skopeo.py \
               "$RUNNER_TEMP/subs-bot-provider" "$RUNNER_TEMP"
+      - name: Exercise digest publication against a disposable loopback registry
+        run: |
+          set -euo pipefail
+          fixture="$RUNNER_TEMP/provider-distribution-fixture"
+          mkdir -m 700 "$fixture"
+          curl --fail --location --silent --show-error --retry 2 \
+            https://github.com/distribution/distribution/releases/download/v3.1.2/registry_3.1.2_linux_amd64.tar.gz \
+            --output "$fixture/registry.tar.gz"
+          echo '40df2224d410f72ae425c3371873b078bbdbda3b8b612be9571f0e6751f3acc8  '"$fixture/registry.tar.gz" | sha256sum --check --status
+          tar -xzf "$fixture/registry.tar.gz" -C "$fixture" registry
+          python3 -B worker/test/hosted_provider_digest_registry.py \
+            "$fixture/registry" "$RUNNER_TEMP/subs-bot-provider" "$BUILD_REVISION"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: subs-bot-provider-${{ env.BUILD_REVISION }}-${{ github.run_attempt }}

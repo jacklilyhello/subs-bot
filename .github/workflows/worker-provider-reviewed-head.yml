@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       validation_json:
-        description: Exact reviewed PR head, original Provider CI, approval and private source pins
+        description: Exact reviewed PR head or current main, original Provider CI, approval and private source pins
         required: true
         type: string
       fault_scenario:
@@ -47,6 +47,7 @@ jobs:
         with:
           validation_json: ${{ inputs.validation_json }}
           reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          main_self_policy_json: ${{ vars.SUBS_BOT_PROVIDER_MAIN_SELF_POLICY_JSON }}
           phase: sources
           environment: subs-bot-provider-archive-head-isolation
           provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
@@ -97,6 +98,7 @@ jobs:
         with:
           validation_json: ${{ inputs.validation_json }}
           reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          main_self_policy_json: ${{ vars.SUBS_BOT_PROVIDER_MAIN_SELF_POLICY_JSON }}
           phase: sources
           environment: subs-bot-provider-archive-head-isolation
           provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
@@ -148,6 +150,7 @@ jobs:
         with:
           validation_json: ${{ inputs.validation_json }}
           reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          main_self_policy_json: ${{ vars.SUBS_BOT_PROVIDER_MAIN_SELF_POLICY_JSON }}
           phase: attest-r2
           environment: subs-bot-provider-archive-head-isolation
           provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
@@ -158,6 +161,7 @@ jobs:
         env:
           PROVIDER_HEAD_VALIDATION_JSON: ${{ inputs.validation_json }}
           PROVIDER_REVIEWED_HEAD_SHA: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          PROVIDER_MAIN_SELF_POLICY_JSON: ${{ vars.SUBS_BOT_PROVIDER_MAIN_SELF_POLICY_JSON }}
           PROVIDER_HEAD_PHASE: attest-r2
           PROVIDER_HEAD_ENVIRONMENT: subs-bot-provider-archive-head-isolation
           PROVIDER_HEAD_CHECK: ready
@@ -193,6 +197,7 @@ jobs:
         with:
           validation_json: ${{ inputs.validation_json }}
           reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          main_self_policy_json: ${{ vars.SUBS_BOT_PROVIDER_MAIN_SELF_POLICY_JSON }}
           phase: attest-provider
           environment: subs-bot-provider-head-isolation
           provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
@@ -202,6 +207,7 @@ jobs:
         env:
           PROVIDER_HEAD_VALIDATION_JSON: ${{ inputs.validation_json }}
           PROVIDER_REVIEWED_HEAD_SHA: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          PROVIDER_MAIN_SELF_POLICY_JSON: ${{ vars.SUBS_BOT_PROVIDER_MAIN_SELF_POLICY_JSON }}
           PROVIDER_HEAD_PHASE: attest-provider
           PROVIDER_HEAD_ENVIRONMENT: subs-bot-provider-head-isolation
           PROVIDER_HEAD_CHECK: ready

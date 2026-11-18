@@ -276,11 +276,13 @@ class LocalBoundaryTests(unittest.TestCase):
                 path = verified / name
                 path.write_text("synthetic")
                 path.chmod(0o600)
-            with patch.object(publication.provider, "verify_release", return_value=EVIDENCE) as verify:
+            with patch.dict(os.environ, {"GITHUB_SHA": REVISION}), \
+                    patch.object(publication.provider, "verify_release", return_value=EVIDENCE) as verify:
                 self.assertEqual(publication._verified_input(root, REVISION, "10"),
                                  (verified / publication.provider.IMAGE, EVIDENCE))
                 verify.assert_called_once_with(verified, REVISION, ref=publication.github.MAIN_REF,
-                                               run_id="10", run_attempt="2")
+                                               run_id="10", run_attempt="2",
+                                               requirements=Path(publication.provider.__file__).with_name("requirements.txt"))
                 path = verified / publication.provider.IMAGE
                 path.unlink()
                 path.symlink_to(evidence_file)

@@ -188,9 +188,9 @@ def release_manifest(directory, revision, requirements, *, ref, run_id, run_atte
     return manifest
 
 
-def verify_release(directory, revision, *, ref, run_id, run_attempt, profile=FETCH_PROFILE):
+def verify_release(directory, revision, *, ref, run_id, run_attempt, profile=FETCH_PROFILE, requirements=None):
     require(profile in PROFILE_SERVICES)
-    requirements = Path(__file__).with_name("requirements.txt")
+    requirements = requirements if requirements is not None else Path(__file__).with_name("requirements.txt")
     with checked_file(directory / MANIFEST, MAX_METADATA).open("rb") as file:
         recorded = json_object(file)
     require(type(recorded.get("version")) is int and recorded["version"] == (2 if profile == FETCH_PROFILE else 3)

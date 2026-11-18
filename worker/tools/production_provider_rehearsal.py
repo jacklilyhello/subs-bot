@@ -193,10 +193,33 @@ def prepare_source():
     _mode, old, revision = selection()
     if old is not None:
         approve(old, "verify")
-    evidence = control.provenance.prepare(provider_revision=revision)
+    builds = control.durable_builds()
+    live_source = builds is None
+    if builds is None:
+        attempt = old["build"]["runAttempt"] if old is not None and _mode == "registered" else None
+        evidence = control.provenance.prepare(provider_revision=revision, provider_attempt=attempt)
+    else:
+        selected = [row["build"] for row in builds if row["build"]["revision"] == revision
+                    and row["build"]["runId"] == os.environ.get("SUBS_BOT_PROVIDER_CI_RUN_ID")]
+        if not selected:
+            control.require(_mode in {"current", "forward"} and revision == os.environ["GITHUB_SHA"]
+                            and os.environ.get("SUBS_BOT_PROVIDER_REHEARSAL_LIVE_CURRENT") == "1")
+            evidence = control.provenance.prepare(provider_revision=revision)
+            live_source = True
+        else:
+            control.require(len(selected) == 1)
+            evidence = selected[0]
+            control.github.verify_main_run(evidence["runId"], revision, control.github._github_token(),
+                workflow_id=control.provenance.WORKFLOW_ID, workflow_path=control.provenance.WORKFLOW_PATH,
+                workflow_label="Provider Fetch CI", run_attempt=evidence["runAttempt"])
+            evidence = control.prepare_durable(evidence)
     root = Path(os.environ["RUNNER_TEMP"])
-    control.provenance._download_zip(evidence["artifactId"], control.github._github_token(), evidence["archiveSha256"],
-                                     root / "provider-source-archive.zip")
+    if live_source:
+        control.provenance._download_zip(evidence["artifactId"], control.github._github_token(), evidence["archiveSha256"],
+                                         root / "provider-source-archive.zip")
+    else:
+        with control.durable_archive(evidence).open("rb") as source, control.provenance._write_private(root / "provider-source-archive.zip") as output:
+            shutil.copyfileobj(source, output)
     print(json.dumps(evidence, sort_keys=True))
 
 

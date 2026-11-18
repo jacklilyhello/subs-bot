@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       validation_json:
-        description: Exact reviewed candidate, source and private archive pins
+        description: Exact reviewed PR head or current main, source and private archive pins
         required: true
         type: string
       reconcile_pin_json:
@@ -65,6 +65,7 @@ jobs:
         with:
           validation_json: ${{ inputs.validation_json }}
           reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          main_self_policy_json: ${{ vars.SUBS_BOT_PROVIDER_MAIN_SELF_POLICY_JSON }}
           phase: recovery-inspect
           environment: subs-bot-provider-head-isolation
           provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
@@ -139,6 +140,7 @@ jobs:
         with:
           validation_json: ${{ inputs.validation_json }}
           reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          main_self_policy_json: ${{ vars.SUBS_BOT_PROVIDER_MAIN_SELF_POLICY_JSON }}
           phase: recovery-archive
           environment: subs-bot-provider-archive-head-isolation
           provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
@@ -193,6 +195,7 @@ jobs:
         with:
           validation_json: ${{ inputs.validation_json }}
           reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          main_self_policy_json: ${{ vars.SUBS_BOT_PROVIDER_MAIN_SELF_POLICY_JSON }}
           phase: recovery-readback
           environment: subs-bot-provider-archive-head-isolation
           provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}

@@ -187,6 +187,20 @@ class PrepareProviderArtifactTests(unittest.TestCase):
         self.assertEqual(self.listed, 2)
         self.assertGreater(len(self.response.read_sizes), 2)
 
+    def test_explicit_original_attempt_survives_later_rerun(self):
+        calls = []
+        def original_attempt(path, token):
+            calls.append(path)
+            if path == f"/actions/runs/{RUN_ID}/attempts/{ATTEMPT}":
+                return self.run
+            if path == f"/actions/runs/{RUN_ID}":
+                raise AssertionError("Latest attempt must not replace the original pin")
+            return self.github_json(path, token)
+        with patch.object(github, "_get_json", side_effect=original_attempt):
+            evidence = release.prepare(provider_attempt=ATTEMPT)
+        self.assertEqual(evidence["runAttempt"], ATTEMPT)
+        self.assertEqual(calls.count(f"/actions/runs/{RUN_ID}/attempts/{ATTEMPT}"), 2)
+
     def test_refuses_untrusted_run_before_downloading(self):
         for key, value in (("event", "pull_request"), ("conclusion", "failure"), ("workflow_id", 1),
                            ("path", ".github/workflows/untrusted.yml"), ("head_branch", "other"),

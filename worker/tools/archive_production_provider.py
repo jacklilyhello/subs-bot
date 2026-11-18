@@ -14,7 +14,7 @@ from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import ProxyHandler, Request, build_opener
 
-from cloudflare_isolation import CloudflareClient, API_ORIGIN, _NoRedirect
+from cloudflare_isolation import CloudflareClient, CloudflareError, API_ORIGIN, _NoRedirect
 from evidence_archive import verify_lifecycle
 from native_restore_rehearsal import signed_put_headers
 import production_provider as provider
@@ -43,6 +43,19 @@ TERMINAL_KEYS = {"terminal-manifest.json", *("terminal/" + name for name in TERM
 
 def require(value):
     provider.require(value, ERROR)
+
+
+def verified_token_identity(api, account_id):
+    """Resolve the active account token first; allow user-token fallback only on explicit denial."""
+    require(provider.match(provider.publication.ACCOUNT, account_id))
+    try:
+        identity = api("GET", f"/accounts/{account_id}/tokens/verify")
+    except CloudflareError as error:
+        require(error.http_status in (400, 401, 403, 404))
+        identity = api("GET", "/user/tokens/verify")
+    require(isinstance(identity, dict) and identity.get("status") == "active"
+            and provider.match(provider.publication.ACCOUNT, identity.get("id")))
+    return identity
 
 
 class PrivateProofStore:
@@ -78,7 +91,7 @@ class PrivateProofStore:
         verify_lifecycle(self.metadata_api("GET", self.base + "/lifecycle"), self.prefix)
 
     def key(self, relative):
-        require(relative in {"manifest.json", "partial-manifest.json"} | TERMINAL_KEYS
+        require(relative in {"manifest.json", "partial-manifest.json", "source-manifest.json", "source-intent.json"} | TERMINAL_KEYS
                 or re.fullmatch(r"blobs/[0-9a-f]{64}", relative))
         return self.prefix + relative
 
@@ -114,8 +127,7 @@ class PrivateProofStore:
                 metadata={"cache-control": "no-store, private", "content-type": "application/octet-stream"})
             return
         if self.access_key is None:
-            identity = self.api("GET", "/user/tokens/verify")
-            require(isinstance(identity, dict) and identity.get("status") == "active" and provider.match(provider.publication.ACCOUNT, identity.get("id")))
+            identity = verified_token_identity(self.api, self.target["accountId"])
             self.access_key = identity["id"]
         host = self.target["accountId"] + ".r2.cloudflarestorage.com"
         path = "/" + self.bucket + "/" + quote(self.key(relative), safe="/-_.~")
@@ -505,8 +517,9 @@ def reconcile_partial(store, manifest_sha256, response_sha256, *, terminal=False
         verified = directory / "verified"
         verified.mkdir(mode=0o700)
         provider.provenance._unpack(archive, verified)
-        release = provider.provider.verify_release(verified, target["build"]["revision"], ref=provider.github.MAIN_REF,
-                                                   run_id=target["build"]["runId"], run_attempt=target["build"]["runAttempt"])
+        with provider.provenance.source_requirements(target["build"]["revision"]) as requirements:
+            release = provider.provider.verify_release(verified, target["build"]["revision"], ref=provider.github.MAIN_REF,
+                run_id=target["build"]["runId"], run_attempt=target["build"]["runAttempt"], requirements=requirements)
         require(all(release[key] == target["build"][key] for key in provider.publication.MANIFEST_FIELDS))
         if terminal or forward_stage:
             require(not (terminal and forward_stage) and target["caller"] is None and target["environment"] == "rehearsal")

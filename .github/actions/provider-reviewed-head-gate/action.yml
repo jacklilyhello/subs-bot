@@ -17,6 +17,8 @@ inputs:
     required: true
   recovery_policy_json:
     required: false
+  main_self_policy_json:
+    required: false
 runs:
   using: composite
   steps:
@@ -28,6 +30,7 @@ runs:
         PROVIDER_HEAD_PHASE: ${{ inputs.phase }}
         PROVIDER_HEAD_ENVIRONMENT: ${{ inputs.environment }}
         PROVIDER_HEAD_CHECK: before
+        PROVIDER_MAIN_SELF_POLICY_JSON: ${{ inputs.main_self_policy_json }}
         PROVIDER_RECOVERY_POLICY_JSON: ${{ inputs.recovery_policy_json }}
       run: python3 -B trusted/worker/tools/trusted_provider_head_gate.py
     - name: Check out the exact approved candidate
@@ -44,6 +47,7 @@ runs:
         PROVIDER_HEAD_PHASE: ${{ inputs.phase }}
         PROVIDER_HEAD_ENVIRONMENT: ${{ inputs.environment }}
         PROVIDER_HEAD_CHECK: ready
+        PROVIDER_MAIN_SELF_POLICY_JSON: ${{ inputs.main_self_policy_json }}
         PROVIDER_RECOVERY_POLICY_JSON: ${{ inputs.recovery_policy_json }}
       run: python3 -B trusted/worker/tools/trusted_provider_head_gate.py
     - name: Confirm only the exact isolated resource contracts
@@ -54,6 +58,7 @@ runs:
         PROVIDER_HEAD_PHASE: ${{ inputs.phase }}
         PROVIDER_HEAD_ENVIRONMENT: ${{ inputs.environment }}
         PROVIDER_HEAD_CHECK: credential
+        PROVIDER_MAIN_SELF_POLICY_JSON: ${{ inputs.main_self_policy_json }}
         PROVIDER_RECOVERY_POLICY_JSON: ${{ inputs.recovery_policy_json }}
         SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ inputs.provider_target_json }}
         SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ inputs.archive_target_json }}
