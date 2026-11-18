@@ -174,3 +174,11 @@ G0 之后发生任何新增、修改、删除、授权、领取、撤销、短�
 监控按每页 50 条完整盘点受限的 GitHub 工作流历史；生产查询覆盖最近七天及起始 UTC 日期的余量。若结果总数达到 1,000、分页期间总数变化、记录重复或无法读全，完整性无法证明，监控报告 unknown 并失败，不把截断结果当成健康。默认每 15 分钟的监控自身也计入该数量；接近该边界须先调整经审查的历史盘点方案，不能忽略失败的 run。
 
 容量采样只使用 D1 Read 与私有 R2 对象/metadata 只读凭据；代码也拒绝非只读 D1 SQL 与 R2 写操作。平台对 D1 Read 令牌的实际负向写入拒绝必须在独立专用 probe D1 实测，不能仅凭权限名称或本工具自身的 SQL 限制声称已验证；probe 未通过前应保留该权限边界的未验收状态。
+## Rehearsal webhook window
+
+The trusted rehearsal coordinator rejects `run` and `resume`, and the legacy
+reviewed-head gate rejects `open-backup`. Switching a Telegram webhook between
+independent D1 databases can redeliver an update whose original response was
+lost, even when the pending count is zero. Keep these actions disabled until
+the selected rehearsal approach establishes update safety. Read-only plans,
+diagnosis, and the separately approved recovery paths remain available.

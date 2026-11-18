@@ -12,6 +12,27 @@ from production_target import ContractError
 
 
 class WebhookRecoveryTests(unittest.TestCase):
+    def test_phase_source_is_bound_to_exact_dispatcher_title_and_candidate(self):
+        main, candidate = "d" * 40, "c" * 40
+        env = {"WEBHOOK_SOURCE_RUN_ID": "123", "WEBHOOK_SOURCE_ATTEMPT": "1", "GITHUB_RUN_ID": "123",
+               "GITHUB_RUN_ATTEMPT": "1", "WEBHOOK_SOURCE_MAIN_SHA": main,
+               "WEBHOOK_SOURCE_CANDIDATE_SHA": candidate, "WEBHOOK_REVIEWED_CANDIDATE_SHA": candidate,
+               "WEBHOOK_SOURCE_KIND": "phase-coordinator", "GITHUB_WORKFLOW_REF": recovery.github.REPOSITORY + "/" +
+               recovery.PHASE_DISPATCHER + "@" + recovery.github.MAIN_REF}
+        run = {"id": 123, "run_attempt": 1, "path": recovery.PHASE_DISPATCHER, "head_sha": main,
+               "head_branch": "main", "event": "workflow_dispatch", "status": "in_progress",
+               "display_title": "Rehearsal backup coordinator run at " + main + " candidate " + candidate,
+               "repository": {"id": recovery.github.REPOSITORY_ID}, "head_repository": {"id": recovery.github.REPOSITORY_ID}}
+        with patch.object(recovery.github, "_github_token", return_value="synthetic"), \
+             patch.object(recovery.github, "_get_json", return_value=run):
+            self.assertEqual(recovery.source_run(env, True), ("123", "1", candidate))
+            for change in ({"WEBHOOK_SOURCE_KIND": "reviewed-head"}, {"WEBHOOK_REVIEWED_CANDIDATE_SHA": "e" * 40},
+                           {"GITHUB_WORKFLOW_REF": env["GITHUB_WORKFLOW_REF"].replace("coordinator", "unrelated")}):
+                with self.subTest(change=change), self.assertRaises(ContractError):
+                    recovery.source_run({**env, **change}, True)
+            with self.assertRaises(ContractError):
+                recovery.source_run({**env, "WEBHOOK_SOURCE_RUN_ID": "124"}, True)
+
     def test_manual_history_accepts_other_source_at_old_main_but_rejects_prior_same_source(self):
         def row(run_id, title, head, attempt=1):
             return {"id": run_id, "display_title": title, "head_sha": head, "run_attempt": attempt,
@@ -43,6 +64,22 @@ class WebhookRecoveryTests(unittest.TestCase):
              patch.object(recovery.github, "_get_json", return_value={"total_count": 2, "workflow_runs": [current, unknown]}), \
              self.assertRaises(ContractError):
             recovery.manual_no_prior_dispatch(env, "123")
+
+    def test_manual_history_uses_bounded_fifty_item_pages(self):
+        current = {"id": 900, "display_title": "Backup webhook restore 123-1", "head_sha": "a" * 40,
+                   "run_attempt": 1, "path": recovery.RECOVERY, "head_branch": "main", "event": "workflow_dispatch",
+                   "repository": {"id": recovery.github.REPOSITORY_ID}, "head_repository": {"id": recovery.github.REPOSITORY_ID}}
+        rows = [{**current, "id": index + 1, "display_title": "Backup webhook inspect 456-1"} for index in range(50)] + [current]
+        def result(path, _token):
+            self.assertIn("per_page=50", path)
+            page = int(path.rsplit("=", 1)[1])
+            return {"total_count": 51, "workflow_runs": rows[(page - 1) * 50:page * 50]}
+        with patch.object(recovery.github, "_github_token", return_value="synthetic"), \
+             patch.object(recovery.github, "_get_json", side_effect=result):
+            recovery.manual_no_prior_dispatch({"GITHUB_SHA": "a" * 40, "GITHUB_RUN_ID": "900"}, "123")
+            rows[50] = rows[0]
+            with self.assertRaises(ContractError):
+                recovery.manual_no_prior_dispatch({"GITHUB_SHA": "a" * 40, "GITHUB_RUN_ID": "900"}, "123")
 
     def fixture(self):
         draft = Mock(digest="a" * 64, data={"workerName": "isolated"})
@@ -78,9 +115,10 @@ class WebhookRecoveryTests(unittest.TestCase):
         store = Mock()
         store.get.side_effect = lambda key, **_: data.get(key)
         store.put.side_effect = lambda key, value: data.update({key: value})
-        env = {"GITHUB_SHA": "d" * 40, "WEBHOOK_SOURCE_MAIN_SHA": "d" * 40,
+        env = {"GITHUB_SHA": "d" * 40, "GITHUB_RUN_ID": "900", "GITHUB_RUN_ATTEMPT": "1", "WEBHOOK_SOURCE_MAIN_SHA": "d" * 40,
                "WEBHOOK_FREEZE_CONFIRMATION_SHA256": sha256(freeze).hexdigest(), "WEBHOOK_SNAPSHOT_SHA256": sha256(raw).hexdigest(),
-               "WEBHOOK_REGISTRATION_SHA256": sha256(registration).hexdigest()}
+               "WEBHOOK_REGISTRATION_SHA256": sha256(registration).hexdigest(),
+               "SUBS_BOT_PHASE_WEBHOOK_ANCHOR_GENESIS_SHA256": "e" * 64}
         telegram = Mock()
         telegram.call.side_effect = lambda method, *_: {"getWebhookInfo": changed, "setWebhook": True}[method]
         return draft, target, previous, store, prefix, data, env, telegram, before, changed
@@ -95,6 +133,41 @@ class WebhookRecoveryTests(unittest.TestCase):
             with self.assertRaises(ContractError):
                 recovery.inspect(env, execute=True)
         store.put.assert_not_called()
+        self.assertNotIn("setWebhook", [call.args[0] for call in telegram.call.call_args_list])
+
+    def test_phase_setup_binds_original_and_new_webhook_separately(self):
+        draft, target, previous, store, prefix, data, env, telegram, before, changed = self.fixture()
+        env["WEBHOOK_SOURCE_KIND"] = "phase-coordinator"
+        prior = {"url": before["url"], "hasCustomCertificate": False,
+                 "maxConnections": before["max_connections"], "allowedUpdates": before["allowed_updates"]}
+        prior_sha = sha256(recovery.canonical(prior)).hexdigest()
+        configured_raw = data[prefix + "123-1-webhook-configured.json"]
+        intent = {"version": 1, "kind": "phase-webhook-setup-intent", "runId": "123", "runAttempt": "1",
+                  "controllerRevision": "c" * 40, "dispatcherRevision": "d" * 40,
+                  "targetSha256": target.digest, "configurationSha256": target.configuration_digest,
+                  "sourceCheckpointId": "1" * 32, "sourceManifestSha256": "2" * 64,
+                  "snapshotSha256": env["WEBHOOK_SNAPSHOT_SHA256"], "predecessorSha256": "3" * 64,
+                  "webhookSettingsSha256": prior_sha, "historySha256": "4" * 64}
+        setup_key = prefix + "phase-coordinator-webhook-setup-123-1-"
+        def set_intent(value):
+            raw = recovery.canonical(value)
+            data[setup_key + "intent.json"] = raw
+            data[setup_key + "confirmed.json"] = recovery.canonical({"version": 1, "kind": "phase-webhook-setup-confirmed",
+                "intentSha256": sha256(raw).hexdigest(), "snapshotSha256": env["WEBHOOK_SNAPSHOT_SHA256"],
+                "configuredSha256": sha256(configured_raw).hexdigest(), "targetSha256": target.digest})
+        set_intent(intent)
+        with patch.object(recovery, "context", return_value=False), patch.object(recovery, "source_run", return_value=("123", "1", "c" * 40)), \
+             patch.object(recovery, "open_store", return_value=(draft, {}, previous, store, prefix)), \
+             patch.object(recovery, "validate_target", return_value=target), patch.object(recovery, "Telegram", return_value=telegram):
+            self.assertEqual(recovery.inspect(env)["status"], "observed")
+            set_intent({**intent, "webhookSettingsSha256": recovery.parsed(configured_raw)["webhookSha256"]})
+            with self.assertRaises(ContractError):
+                recovery.inspect(env)
+            set_intent(intent)
+            done = recovery.parsed(data[setup_key + "confirmed.json"])
+            data[setup_key + "confirmed.json"] = recovery.canonical({**done, "version": True})
+            with self.assertRaises(ContractError):
+                recovery.inspect(env)
         self.assertNotIn("setWebhook", [call.args[0] for call in telegram.call.call_args_list])
 
     def test_existing_intent_blocks_retry(self):
@@ -119,9 +192,14 @@ class WebhookRecoveryTests(unittest.TestCase):
         cls.assert_not_called()
         store.put.assert_not_called()
 
-    def test_confirmed_change_restores_once_without_dropping_pending_updates(self):
+    @patch("trusted_backup_webhook_anchor.anchor")
+    def test_confirmed_change_restores_once_without_dropping_pending_updates(self, anchor):
+        idle = ({"state": "idle"}, b"pointer", '"etag"')
+        active = ({"state": "active", "session": "900-1", "controlRevision": "d" * 40}, b"pointer", '"etag"')
+        released = ({"state": "idle", "session": "900-1"}, b"pointer", '"etag"')
+        anchor.return_value.read.side_effect = [idle, active, active, released]
         draft, target, previous, store, prefix, data, env, telegram, before, changed = self.fixture()
-        telegram.call.side_effect = [changed, changed, True, before]
+        telegram.call.side_effect = [changed, changed, changed, True, before, before]
         jobs = {"total_count": 1, "jobs": [{"steps": [{"name": "Trusted restore original test webhook", "conclusion": "skipped"}]}]}
         with patch.object(recovery, "context", return_value=False), patch.object(recovery, "source_run", return_value=("123", "1", "c" * 40)), \
              patch.object(recovery, "open_store", return_value=(draft, {}, previous, store, prefix)), \
@@ -136,12 +214,17 @@ class WebhookRecoveryTests(unittest.TestCase):
         self.assertEqual(len(writes), 1)
         self.assertIs(writes[0].args[1]["drop_pending_updates"], False)
         self.assertEqual(result["status"], "settings-restored")
+        anchor.return_value.release.assert_called_once_with("900-1")
         self.assertIn(prefix + "webhook-recovery-123-1-intent.json", data)
         self.assertIn(prefix + "webhook-recovery-123-1-complete.json", data)
 
-    def test_lost_restore_response_retains_intent_and_never_retries(self):
+    @patch("trusted_backup_webhook_anchor.anchor")
+    def test_lost_restore_response_retains_intent_and_never_retries(self, anchor):
+        idle = ({"state": "idle"}, b"pointer", '"etag"')
+        active = ({"state": "active", "session": "900-1", "controlRevision": "d" * 40}, b"pointer", '"etag"')
+        anchor.return_value.read.side_effect = [idle, active, active]
         draft, target, previous, store, prefix, data, env, telegram, _before, changed = self.fixture()
-        telegram.call.side_effect = [changed, changed, RuntimeError("unknown")]
+        telegram.call.side_effect = [changed, changed, changed, RuntimeError("unknown")]
         jobs = {"total_count": 1, "jobs": [{"steps": [{"name": "Trusted restore original test webhook", "conclusion": "skipped"}]}]}
         with patch.object(recovery, "context", return_value=False), patch.object(recovery, "source_run", return_value=("123", "1", "c" * 40)), \
              patch.object(recovery, "open_store", return_value=(draft, {}, previous, store, prefix)), \
@@ -155,6 +238,18 @@ class WebhookRecoveryTests(unittest.TestCase):
         self.assertIn(prefix + "webhook-recovery-123-1-intent.json", data)
         self.assertNotIn(prefix + "webhook-recovery-123-1-complete.json", data)
         self.assertEqual(sum(call.args[0] == "setWebhook" for call in telegram.call.call_args_list), 1)
+        anchor.return_value.release.assert_not_called()
+
+    @patch("trusted_backup_webhook_anchor.anchor")
+    def test_active_phase_lock_blocks_legacy_webhook_restore(self, anchor):
+        draft, target, previous, store, prefix, data, env, telegram, *_ = self.fixture()
+        anchor.return_value.read.return_value = ({"state": "active", "session": "999-1"}, b"pointer", '"etag"')
+        with patch.object(recovery, "context", return_value=False), patch.object(recovery, "source_run", return_value=("123", "1", "c" * 40)), \
+             patch.object(recovery, "open_store", return_value=(draft, {}, previous, store, prefix)), \
+             patch.object(recovery, "validate_target", return_value=target), patch.object(recovery, "Telegram", return_value=telegram), \
+             self.assertRaises(ContractError):
+            recovery.inspect(env, execute=True)
+        self.assertNotIn("setWebhook", [call.args[0] for call in telegram.call.call_args_list])
 
     def test_conflicting_conditional_claim_never_authorizes_telegram(self):
         store = Mock()

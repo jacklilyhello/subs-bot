@@ -27,7 +27,7 @@ import prepare_isolation_artifact as artifact
 import prepare_control_artifact
 from cloudflare_isolation import ISOLATION_RELEASE_USER_AGENT
 from general_isolation_window import work_sql, terminal_card_sql
-from production_target import Target, ContractError, approve, canonical, digest, matches, parsed, require, validate_target, SHA, REV, UUID
+from production_target import Target, ContractError, approve, canonical, digest, matches, parsed, require, validate_target, SHA, REV, UUID, TEST_BOT_ID
 import scoped_r2
 
 API_ROOT = "https://api.cloudflare.com/client/v4"
@@ -1024,9 +1024,15 @@ def hosted_environment(environment):
             "Lifecycle actions require the project's protected main workflow on a GitHub-hosted runner.")
 
 
+def require_legacy_webhook_safe(action, target):
+    require(not (action == "webhook" and target.environment == "rehearsal" and target.data["botId"] == TEST_BOT_ID),
+            "The legacy test webhook writer is disabled until it uses the shared persistent webhook lock.")
+
+
 def main():
     action = os.environ.get("CONTROL_ACTION", "inspect")
     target = validate_target(os.environ.get("SUBS_BOT_TARGET_JSON", ""))
+    require_legacy_webhook_safe(action, target)
     hosted_environment(target.environment)
     revision = os.environ.get("GITHUB_SHA", "")
     artifact.require_current_main(revision)

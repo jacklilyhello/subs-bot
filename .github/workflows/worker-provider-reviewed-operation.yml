@@ -384,6 +384,12 @@ jobs:
       PROVIDER_HEAD_REVIEWED_SHA: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
     outputs:
       verification_json: ${{ steps.verify.outputs.verification_json }}
+      next_age_id: ${{ steps.next_age.outputs.artifact-id }}
+      next_age_zip_sha256: ${{ steps.next_age.outputs.artifact-digest }}
+      next_archive_id: ${{ steps.next_archive.outputs.artifact-id }}
+      next_archive_zip_sha256: ${{ steps.next_archive.outputs.artifact-digest }}
+      next_live_id: ${{ steps.next_live.outputs.artifact-id }}
+      next_live_zip_sha256: ${{ steps.next_live.outputs.artifact-digest }}
     steps:
       - name: Check out trusted current main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -441,7 +447,16 @@ jobs:
         run: |
           umask 077
           python3 -B worker/tools/provider_private_mutation_journal.py
+      - name: Upload encrypted next target for durable retention
+        id: next_age
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: provider-next-target-age-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/provider-mutation-next-target.age
+          if-no-files-found: error
+          retention-days: 1
       - name: Upload encrypted next target for archive environment
+        id: next_archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: provider-next-target-archive-${{ github.run_id }}-${{ github.run_attempt }}
@@ -449,6 +464,7 @@ jobs:
           if-no-files-found: error
           retention-days: 1
       - name: Upload encrypted next target for live environment
+        id: next_live
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: provider-next-target-live-${{ github.run_id }}-${{ github.run_attempt }}
@@ -504,6 +520,14 @@ jobs:
           SUBS_BOT_PROVIDER_MUTATION_TRUSTED_ARTIFACT_SHA256: ${{ needs.dispatch.outputs.artifact_sha256 }}
           SUBS_BOT_PROVIDER_MUTATION_TRUSTED_RESPONSE_SHA256: ${{ needs.dispatch.outputs.response_sha256 }}
           SUBS_BOT_PROVIDER_MUTATION_VERIFICATION_JSON: ${{ needs.verify.outputs.verification_json }}
+          SUBS_BOT_PROVIDER_NEXT_AGE_ARTIFACT_ID: ${{ needs.verify.outputs.next_age_id }}
+          SUBS_BOT_PROVIDER_NEXT_AGE_ARTIFACT_SHA256: ${{ needs.verify.outputs.next_age_zip_sha256 }}
+          SUBS_BOT_PROVIDER_NEXT_ARCHIVE_ARTIFACT_ID: ${{ needs.verify.outputs.next_archive_id }}
+          SUBS_BOT_PROVIDER_NEXT_ARCHIVE_ARTIFACT_SHA256: ${{ needs.verify.outputs.next_archive_zip_sha256 }}
+          SUBS_BOT_PROVIDER_NEXT_LIVE_ARTIFACT_ID: ${{ needs.verify.outputs.next_live_id }}
+          SUBS_BOT_PROVIDER_NEXT_LIVE_ARTIFACT_SHA256: ${{ needs.verify.outputs.next_live_zip_sha256 }}
+          SUBS_BOT_PROVIDER_NEXT_TARGET_KEYS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_NEXT_TARGET_KEYS_JSON }}
+          SUBS_BOT_PROVIDER_NEXT_TARGET_KEY_PINS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_NEXT_TARGET_KEY_PINS_JSON }}
           SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
           SUBS_BOT_PROVIDER_TRUSTED_ARCHIVE_REFS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
           SUBS_BOT_PROVIDER_DIGEST_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_APPROVAL }}
@@ -530,6 +554,8 @@ jobs:
     timeout-minutes: 30
     env:
       PROVIDER_HEAD_REVIEWED_SHA: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+    outputs:
+      keyed_receipt_sha256: ${{ steps.read.outputs.keyed_receipt_sha256 }}
     steps:
       - name: Check out trusted current main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -550,6 +576,7 @@ jobs:
           archive_target_json: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
           archive_refs_json: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
       - name: Independently read all exact journal evidence
+        id: read
         env:
           SUBS_BOT_PROVIDER_MUTATION_ACTION: independent-readback
           SUBS_BOT_PROVIDER_MUTATION_PRESTATE_JSON: ${{ needs.preflight.outputs.prestate_json }}
@@ -568,6 +595,8 @@ jobs:
           SUBS_BOT_PROVIDER_MUTATION_TRUSTED_ARTIFACT_SHA256: ${{ needs.dispatch.outputs.artifact_sha256 }}
           SUBS_BOT_PROVIDER_MUTATION_TRUSTED_RESPONSE_SHA256: ${{ needs.dispatch.outputs.response_sha256 }}
           SUBS_BOT_PROVIDER_MUTATION_VERIFICATION_JSON: ${{ needs.verify.outputs.verification_json }}
+          SUBS_BOT_PROVIDER_NEXT_TARGET_KEYS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_NEXT_TARGET_KEYS_JSON }}
+          SUBS_BOT_PROVIDER_NEXT_TARGET_KEY_PINS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_NEXT_TARGET_KEY_PINS_JSON }}
           SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
           SUBS_BOT_PROVIDER_TRUSTED_ARCHIVE_REFS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
           SUBS_BOT_PROVIDER_DIGEST_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_APPROVAL }}
@@ -586,12 +615,66 @@ jobs:
           umask 077
           python3 -B worker/tools/provider_private_mutation_journal.py
 
+  evidence_keyless_readback:
+    name: Provider mutation keyless evidence readback
+    needs: [preflight, intent_readback, verify, completion_write, evidence_readback]
+    environment: subs-bot-provider-archive-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PROVIDER_HEAD_REVIEWED_SHA: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+    steps:
+      - name: Check out trusted current main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Verify independently approved Provider head and isolation contracts
+        uses: ./trusted/.github/actions/provider-reviewed-head-gate
+        with:
+          validation_json: ${{ inputs.validation_json }}
+          reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          phase: operation-keyless-readback
+          environment: subs-bot-provider-archive-head-isolation
+          provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          archive_target_json: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          archive_refs_json: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+      - name: Independently reconstruct private originals without an age key
+        id: read
+        env:
+          SUBS_BOT_PROVIDER_MUTATION_ACTION: keyless-readback
+          SUBS_BOT_PROVIDER_MUTATION_PRESTATE_JSON: ${{ needs.preflight.outputs.prestate_json }}
+          SUBS_BOT_PROVIDER_MUTATION_INTENT_SHA256: ${{ needs.intent_readback.outputs.intent_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_COMPLETION_SHA256: ${{ needs.completion_write.outputs.completion_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_KEYED_RECEIPT_SHA256: ${{ needs.evidence_readback.outputs.keyed_receipt_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_VERIFICATION_JSON: ${{ needs.verify.outputs.verification_json }}
+          SUBS_BOT_PROVIDER_ARCHIVE_ENVIRONMENT: rehearsal
+          SUBS_BOT_PROVIDER_NEXT_TARGET_KEYS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_NEXT_TARGET_KEYS_JSON }}
+          SUBS_BOT_PROVIDER_NEXT_TARGET_KEY_PINS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_NEXT_TARGET_KEY_PINS_JSON }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_TRUSTED_ARCHIVE_REFS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+          SUBS_BOT_PROVIDER_ISOLATED_SOURCE_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ISOLATED_SOURCE_LEDGER_JSON }}
+          SUBS_BOT_PROVIDER_ISOLATED_SOURCE_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ISOLATED_SOURCE_CONTROLLERS_JSON }}
+          SUBS_BOT_PROVIDER_MUTATION_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_LEDGER_JSON }}
+          SUBS_BOT_PROVIDER_MUTATION_RECONCILED_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_RECONCILED_JSON }}
+          SUBS_BOT_PROVIDER_MUTATION_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_CONTROLLERS_JSON }}
+          SUBS_BOT_PROVIDER_MUTATION_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_APPROVAL }}
+          SUBS_BOT_PROVIDER_DIGEST_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_APPROVAL }}
+          SUBS_BOT_PROVIDER_IMAGE_PREPARATION_SHA256: ${{ secrets.SUBS_BOT_PROVIDER_IMAGE_PREPARATION_SHA256 }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+        working-directory: candidate
+        run: |
+          test "$(git rev-parse HEAD)" = "$PROVIDER_HEAD_REVIEWED_SHA"
+          umask 077
+          python3 -B worker/tools/provider_private_mutation_journal.py
+
   failure_write:
     name: Provider mutation failure evidence archive
-    needs: [preflight, intent_readback, dispatch, verify, completion_write, evidence_readback]
-    # Default off. An explicit isolated-environment policy must enable writes;
-    # Any unconfirmed Worker or image-preparation result leaves its intent unresolved.
-    if: ${{ always() && vars.SUBS_BOT_PROVIDER_OPERATION_WRITE_ENABLED == 'true' && needs.evidence_readback.result != 'success' && needs.dispatch.outputs.observation_artifact_id != '' && needs.dispatch.outputs.observation_sha256 != '' }}
+    needs: [preflight, intent_readback, dispatch, verify, completion_write, evidence_readback, evidence_keyless_readback]
+    # A committed intent authorizes preservation after the entry switch closes.
+    if: ${{ always() && needs.intent_readback.result == 'success' && needs.evidence_keyless_readback.result != 'success' && needs.dispatch.outputs.observation_artifact_id != '' && needs.dispatch.outputs.observation_sha256 != '' }}
     environment: subs-bot-provider-archive-head-isolation
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -624,6 +707,15 @@ jobs:
           SUBS_BOT_PROVIDER_MUTATION_ACTION: failure-write
           SUBS_BOT_PROVIDER_MUTATION_PRESTATE_JSON: ${{ needs.preflight.outputs.prestate_json }}
           SUBS_BOT_PROVIDER_MUTATION_INTENT_SHA256: ${{ needs.intent_readback.outputs.intent_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_VERIFICATION_JSON: ${{ needs.verify.outputs.verification_json }}
+          SUBS_BOT_PROVIDER_NEXT_AGE_ARTIFACT_ID: ${{ needs.verify.outputs.next_age_id }}
+          SUBS_BOT_PROVIDER_NEXT_AGE_ARTIFACT_SHA256: ${{ needs.verify.outputs.next_age_zip_sha256 }}
+          SUBS_BOT_PROVIDER_NEXT_ARCHIVE_ARTIFACT_ID: ${{ needs.verify.outputs.next_archive_id }}
+          SUBS_BOT_PROVIDER_NEXT_ARCHIVE_ARTIFACT_SHA256: ${{ needs.verify.outputs.next_archive_zip_sha256 }}
+          SUBS_BOT_PROVIDER_NEXT_LIVE_ARTIFACT_ID: ${{ needs.verify.outputs.next_live_id }}
+          SUBS_BOT_PROVIDER_NEXT_LIVE_ARTIFACT_SHA256: ${{ needs.verify.outputs.next_live_zip_sha256 }}
+          SUBS_BOT_PROVIDER_NEXT_TARGET_KEYS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_NEXT_TARGET_KEYS_JSON }}
+          SUBS_BOT_PROVIDER_NEXT_TARGET_KEY_PINS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_NEXT_TARGET_KEY_PINS_JSON }}
           SUBS_BOT_PROVIDER_MUTATION_RESPONSE_ARTIFACT_ID: ${{ needs.dispatch.outputs.artifact_id }}
           SUBS_BOT_PROVIDER_MUTATION_RESPONSE_ARTIFACT_SHA256: ${{ needs.dispatch.outputs.artifact_sha256 }}
           SUBS_BOT_PROVIDER_MUTATION_RESPONSE_SHA256: ${{ needs.dispatch.outputs.response_sha256 }}
@@ -657,13 +749,15 @@ jobs:
           python3 -B worker/tools/provider_private_mutation_journal.py
   failure_readback:
     name: Provider mutation failure evidence readback
-    needs: [preflight, intent_readback, dispatch, failure_write]
+    needs: [preflight, intent_readback, dispatch, verify, failure_write]
     if: ${{ always() && needs.failure_write.result == 'success' }}
     environment: subs-bot-provider-archive-head-isolation
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       PROVIDER_HEAD_REVIEWED_SHA: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+    outputs:
+      keyed_receipt_sha256: ${{ steps.read.outputs.keyed_receipt_sha256 }}
     steps:
       - name: Check out trusted current main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -701,6 +795,15 @@ jobs:
           SUBS_BOT_PROVIDER_MUTATION_TRUSTED_OBSERVATION_ARTIFACT_SHA256: ${{ needs.dispatch.outputs.observation_artifact_sha256 }}
           SUBS_BOT_PROVIDER_MUTATION_TRUSTED_OBSERVATION_SHA256: ${{ needs.dispatch.outputs.observation_sha256 }}
           SUBS_BOT_PROVIDER_MUTATION_INTENT_SHA256: ${{ needs.intent_readback.outputs.intent_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_VERIFICATION_JSON: ${{ needs.verify.outputs.verification_json }}
+          SUBS_BOT_PROVIDER_NEXT_AGE_ARTIFACT_ID: ${{ needs.verify.outputs.next_age_id }}
+          SUBS_BOT_PROVIDER_NEXT_AGE_ARTIFACT_SHA256: ${{ needs.verify.outputs.next_age_zip_sha256 }}
+          SUBS_BOT_PROVIDER_NEXT_ARCHIVE_ARTIFACT_ID: ${{ needs.verify.outputs.next_archive_id }}
+          SUBS_BOT_PROVIDER_NEXT_ARCHIVE_ARTIFACT_SHA256: ${{ needs.verify.outputs.next_archive_zip_sha256 }}
+          SUBS_BOT_PROVIDER_NEXT_LIVE_ARTIFACT_ID: ${{ needs.verify.outputs.next_live_id }}
+          SUBS_BOT_PROVIDER_NEXT_LIVE_ARTIFACT_SHA256: ${{ needs.verify.outputs.next_live_zip_sha256 }}
+          SUBS_BOT_PROVIDER_NEXT_TARGET_KEYS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_NEXT_TARGET_KEYS_JSON }}
+          SUBS_BOT_PROVIDER_NEXT_TARGET_KEY_PINS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_NEXT_TARGET_KEY_PINS_JSON }}
           SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
           SUBS_BOT_PROVIDER_TRUSTED_ARCHIVE_REFS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
           SUBS_BOT_PROVIDER_DIGEST_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_APPROVAL }}
@@ -711,6 +814,61 @@ jobs:
           SUBS_BOT_PROVIDER_MUTATION_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_LEDGER_JSON }}
           SUBS_BOT_PROVIDER_MUTATION_RECONCILED_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_RECONCILED_JSON }}
           SUBS_BOT_PROVIDER_MUTATION_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_CONTROLLERS_JSON }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+        working-directory: candidate
+        run: |
+          test "$(git rev-parse HEAD)" = "$PROVIDER_HEAD_REVIEWED_SHA"
+          umask 077
+          python3 -B worker/tools/provider_private_mutation_journal.py
+
+  failure_keyless_readback:
+    name: Provider mutation failure keyless evidence readback
+    needs: [preflight, intent_readback, dispatch, verify, failure_write, failure_readback]
+    if: ${{ always() && needs.failure_readback.result == 'success' }}
+    environment: subs-bot-provider-archive-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PROVIDER_HEAD_REVIEWED_SHA: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+    steps:
+      - name: Check out trusted current main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Verify independently approved Provider head and isolation contracts
+        uses: ./trusted/.github/actions/provider-reviewed-head-gate
+        with:
+          validation_json: ${{ inputs.validation_json }}
+          reviewed_head_sha: ${{ vars.SUBS_BOT_PROVIDER_REVIEWED_HEAD_SHA }}
+          phase: operation-failure-keyless-readback
+          environment: subs-bot-provider-archive-head-isolation
+          provider_target_json: ${{ secrets.SUBS_BOT_PROVIDER_CONTROL_TARGET_JSON }}
+          archive_target_json: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          archive_refs_json: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+      - name: Independently reconstruct available failure originals without an age key
+        id: read
+        env:
+          SUBS_BOT_PROVIDER_MUTATION_ACTION: failure-keyless-readback
+          SUBS_BOT_PROVIDER_MUTATION_PRESTATE_JSON: ${{ needs.preflight.outputs.prestate_json }}
+          SUBS_BOT_PROVIDER_MUTATION_INTENT_SHA256: ${{ needs.intent_readback.outputs.intent_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_KEYED_RECEIPT_SHA256: ${{ needs.failure_readback.outputs.keyed_receipt_sha256 }}
+          SUBS_BOT_PROVIDER_MUTATION_VERIFICATION_JSON: ${{ needs.verify.outputs.verification_json }}
+          SUBS_BOT_PROVIDER_ARCHIVE_ENVIRONMENT: rehearsal
+          SUBS_BOT_PROVIDER_NEXT_TARGET_KEYS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_NEXT_TARGET_KEYS_JSON }}
+          SUBS_BOT_PROVIDER_NEXT_TARGET_KEY_PINS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_NEXT_TARGET_KEY_PINS_JSON }}
+          SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ARCHIVE_TARGET_JSON }}
+          SUBS_BOT_PROVIDER_TRUSTED_ARCHIVE_REFS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_REVIEWED_ARCHIVE_REFS_JSON }}
+          SUBS_BOT_PROVIDER_ISOLATED_SOURCE_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ISOLATED_SOURCE_LEDGER_JSON }}
+          SUBS_BOT_PROVIDER_ISOLATED_SOURCE_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_ISOLATED_SOURCE_CONTROLLERS_JSON }}
+          SUBS_BOT_PROVIDER_MUTATION_LEDGER_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_LEDGER_JSON }}
+          SUBS_BOT_PROVIDER_MUTATION_RECONCILED_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_RECONCILED_JSON }}
+          SUBS_BOT_PROVIDER_MUTATION_CONTROLLERS_JSON: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_CONTROLLERS_JSON }}
+          SUBS_BOT_PROVIDER_MUTATION_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_MUTATION_APPROVAL }}
+          SUBS_BOT_PROVIDER_DIGEST_APPROVAL: ${{ secrets.SUBS_BOT_PROVIDER_DIGEST_APPROVAL }}
+          SUBS_BOT_PROVIDER_IMAGE_PREPARATION_SHA256: ${{ secrets.SUBS_BOT_PROVIDER_IMAGE_PREPARATION_SHA256 }}
           SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
           SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
         working-directory: candidate

@@ -38,6 +38,39 @@ REVIEWED_PRE_WEBHOOK = {
     "43865731376": ("7d068deae67fbf4183698434001cbb1e5f5d06a6", "exercise", [],
                     "HTTPS domain health did not confirm the exact revision; admission remains closed."),
 }
+# Only these two failed, frozen-backup runs have separately reviewed source
+# closure and immutable original logs. Their classification concerns webhook
+# writes alone; it says nothing about backup or export success.
+REVIEWED_FAILED_HEAD = {
+    "44164739374": {"main": "43ec8cc22c3f51eedde5569e8025e26f3244091a", "candidate": "7aa685990859cffb30d47c5a6e593d969f1d0452",
+                     "job": "134327660057", "fault": "readback-failure", "logSha256": "6bc155ec5a2dac24b96a036bb0b884fe98ecb07ff82092f3992ca8d6983c194a"},
+    "44160464601": {"main": "d6dfeef9c4e16b032c5529d1c3844e11c91e46dd", "candidate": "d6462891bddc9877f99bd9a2a11dfe96f075e958",
+                     "job": "134312572827", "fault": "capacity-over", "logSha256": "819dd9c78f6ff682f97a30a71e002c500b2c858f18dcb6fbe33b0e0c7b151547"},
+}
+FAILED_HEAD_PATHS = {"worker/tools/production_backup_head_harness.py", "worker/tools/production_lifecycle_drill.py",
+                     "worker/tools/production_recovery.py", "worker/tools/native_restore_rehearsal.py",
+                     "worker/tools/production_storage.py", "worker/tools/scoped_r2.py", "worker/tools/production_backup_transaction.py",
+                     "worker/tools/production_backup_capacity.py", "worker/tools/production_control.py",
+                     "worker/tools/production_target.py", "worker/tools/production_release_evidence.py"}
+FAILED_HEAD_CLOSURE_SHA256 = "91b651f56cb22508251849a025ec316b8a29683175255289a9706b7c88453470"
+FAILED_HEAD_DISPATCHER = {".github/workflows/worker-backup-reviewed-head.yml": "850d735d15e7177664e831c289a35044eabab553ef86c452fef62a02091945b5",
+                          "worker/tools/trusted_backup_head_gate.py": "84aee74ddb0f2404811f5b8609ac24886f3da5c30cefb78f0b36cd8798eb0e5d"}
+
+
+def verify_failed_head_source(run_id, token):
+    """Independently re-read the exact audited main and candidate source closure."""
+    fixed = REVIEWED_FAILED_HEAD[run_id]
+    def source_hash(revision, path):
+        entry = github._get_json("/contents/" + path + "?ref=" + revision, token)
+        require(entry.get("type") == "file" and entry.get("path") == path and entry.get("encoding") == "base64"
+                and isinstance(entry.get("content"), str))
+        body = base64.b64decode(entry["content"].replace("\n", ""), validate=True)
+        require(len(body) <= 512 * 1024)
+        return sha256(body).hexdigest()
+    require(all(source_hash(fixed["main"], path) == expected for path, expected in FAILED_HEAD_DISPATCHER.items()))
+    closure = {path: source_hash(fixed["candidate"], path) for path in sorted(FAILED_HEAD_PATHS)}
+    require(sha256(canonical(closure)).hexdigest() == FAILED_HEAD_CLOSURE_SHA256,
+            "The reviewed frozen-backup source closure changed.")
 
 
 def audited_paths(workflow, revision):
@@ -118,6 +151,25 @@ def classify(raw, workflow, run_id, *, main_sha="", candidates=()):
                 and value.get("inlineQuerySubscribed") is True)
         return "response-independently-confirmed"
     if workflow == HEAD:
+        fixed = REVIEWED_FAILED_HEAD.get(run_id)
+        if fixed is not None:
+            require(main_sha == fixed["main"] and fixed["candidate"] in candidates
+                    and sha256(raw).hexdigest() == fixed["logSha256"])
+            specifications = []
+            for line in text.splitlines():
+                if "HEAD_VALIDATION_JSON" not in line or "{" not in line:
+                    continue
+                try:
+                    value = json.loads(line[line.index("{"):])
+                except (TypeError, ValueError):
+                    require(False, "The reviewed frozen-backup validation is malformed.")
+                require(isinstance(value, dict))
+                specifications.append(value)
+            require(len(specifications) == 4 and all(value == specifications[0] for value in specifications)
+                    and type(specifications[0].get("version")) is int and specifications[0]["version"] == 1
+                    and specifications[0].get("headSha") == fixed["candidate"]
+                    and specifications[0].get("action") == "backup" and specifications[0].get("fault") == fixed["fault"])
+            return "no-write-independently-confirmed"
         result = [value for value in documents if value.get("runId") == run_id and value.get("runAttempt") == "1"
                   and value.get("dispatcherMainRevision") == main_sha and value.get("headRevision") in candidates
                   and value.get("environment") == "rehearsal" and value.get("productionMutated") is False
@@ -204,14 +256,21 @@ def source(env):
             and selected[0].get("run_attempt") == 1
             and selected[0].get("head_sha") == revision and selected[0].get("status") == "completed")
     if workflow == HEAD:
-        require((run.get("status"), run.get("conclusion")) == ("completed", "success")
-                and isinstance(selected[0].get("steps"), list))
+        fixed = REVIEWED_FAILED_HEAD.get(run_id)
+        require(isinstance(selected[0].get("steps"), list)
+                and ((fixed is None and (run.get("status"), run.get("conclusion")) == ("completed", "success"))
+                     or (fixed is not None and revision == fixed["main"] and job_id == fixed["job"]
+                         and (run.get("status"), run.get("conclusion")) == ("completed", "failure")
+                         and run.get("display_title") == "Reviewed backup head validation at " + revision)))
         for step_name in ("Verify the exact independently reviewed head before checkout",
                           "Independently recheck trusted main and candidate checkout",
                           "Confirm only the authorized isolated test identity",
                           "Run the reviewed candidate against only dedicated isolation"):
             steps = [step for step in selected[0]["steps"] if isinstance(step, dict) and step.get("name") == step_name]
-            require(len(steps) == 1 and (steps[0].get("status"), steps[0].get("conclusion")) == ("completed", "success"))
+            conclusion = "failure" if fixed is not None and step_name == "Run the reviewed candidate against only dedicated isolation" else "success"
+            require(len(steps) == 1 and (steps[0].get("status"), steps[0].get("conclusion")) == ("completed", conclusion))
+        if fixed is not None:
+            verify_failed_head_source(run_id, token)
     raw = download_log(job_id, token)
     candidates = json.loads(env.get("SUBS_BOT_PHASE_WEBHOOK_CANDIDATES_JSON", "[]"))
     require(isinstance(candidates, list) and all(isinstance(value, str) and REV.fullmatch(value) for value in candidates))

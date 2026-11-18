@@ -174,6 +174,10 @@ def verify_historical_config(scope, expected_digest):
             "The original isolated DNS webhook configuration could not be verified.")
 
 
+def require_legacy_mode_safe(mode):
+    require(mode != "append", "The legacy test webhook writer is disabled until it uses the shared persistent webhook lock.")
+
+
 def run():
     revision = os.environ.get("GITHUB_SHA", "")
     require(REVISION.fullmatch(revision) and os.environ.get("GITHUB_REPOSITORY") == REPOSITORY
@@ -182,6 +186,7 @@ def run():
             and os.environ.get("GITHUB_WORKFLOW_SHA") == revision,
             "The inline webhook operation requires the trusted manual main workflow.")
     mode = os.environ.get("SUBS_BOT_INLINE_WEBHOOK_MODE", "")
+    require_legacy_mode_safe(mode)
     confirmation = os.environ.get("SUBS_BOT_INLINE_WEBHOOK_CONFIRMATION", "")
     raw = telegram_release_config({"migrations": [{"name": "0002_telegram.sql"}]})
     policy = _parse_object(raw, "The isolated Telegram configuration is invalid.")
