@@ -59,7 +59,7 @@ concurrency:
 
 jobs:
   checkpoint:
-    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main'
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && (github.event_name != 'schedule' || vars.SUBS_BOT_PRODUCTION_BACKUP_MONITOR_DISPATCH_ENABLED == 'true')
     environment: subs-bot-production
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -89,6 +89,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+          fetch-depth: ${{ (github.event_name == 'schedule' || inputs.action == 'monitor') && 1 || 0 }}
       - name: Monitor without production write or Bot credentials
         id: monitor
         if: steps.gate.outputs.enabled == 'true' && (github.event_name == 'schedule' || inputs.action == 'monitor')
@@ -131,6 +132,15 @@ jobs:
           SUBS_BOT_BACKUP_CAPTURE_APPROVAL_JSON: ${{ secrets.SUBS_BOT_BACKUP_CAPTURE_APPROVAL_JSON }}
           SUBS_BOT_BACKUP_POLICY_JSON: ${{ secrets.SUBS_BOT_BACKUP_POLICY_JSON }}
           SUBS_BOT_BACKUP_GENESIS_SHA256: ${{ secrets.SUBS_BOT_BACKUP_GENESIS_SHA256 }}
+          SUBS_BOT_BACKUP_COORDINATOR_GENESIS_SHA256: ${{ secrets.SUBS_BOT_BACKUP_COORDINATOR_GENESIS_SHA256 }}
+          SUBS_BOT_BACKUP_SCHEDULE_SCOPE_GENESIS_SHA256: ${{ secrets.SUBS_BOT_BACKUP_SCHEDULE_SCOPE_GENESIS_SHA256 }}
+          SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_AUTHORITY_JSON: ${{ inputs.dispatch_nonce && secrets.SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_AUTHORITY_JSON || '' }}
+          SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_AUTHORITY_SHA256: ${{ inputs.dispatch_nonce && secrets.SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_AUTHORITY_SHA256 || '' }}
+          SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_ENABLED: ${{ inputs.dispatch_nonce && vars.SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_ENABLED || '' }}
+          SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_REVIEW_JSON: ${{ !contains(fromJSON('["inspect","plan-initialize-anchor","inspect-anchor-initialization","inspect-anchor-unknown","plan-abort-unstarted","plan-begin","plan-pause","drain","plan-activate","plan-reconcile-transition","plan-resume-failed","plan-anchor-reconcile"]'), inputs.action) && secrets.SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_REVIEW_JSON || '' }}
+          SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_REVIEW_SHA256: ${{ !contains(fromJSON('["inspect","plan-initialize-anchor","inspect-anchor-initialization","inspect-anchor-unknown","plan-abort-unstarted","plan-begin","plan-pause","drain","plan-activate","plan-reconcile-transition","plan-resume-failed","plan-anchor-reconcile"]'), inputs.action) && secrets.SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_REVIEW_SHA256 || '' }}
+          SUBS_BOT_BACKUP_READER_LOG_POLICY_JSON: ${{ !contains(fromJSON('["inspect","plan-initialize-anchor","inspect-anchor-initialization","inspect-anchor-unknown","plan-abort-unstarted","plan-begin","plan-pause","drain","plan-activate","plan-reconcile-transition","plan-resume-failed","plan-anchor-reconcile"]'), inputs.action) && secrets.SUBS_BOT_BACKUP_READER_LOG_POLICY_JSON || '' }}
+          SUBS_BOT_BACKUP_READER_LOG_POLICY_SHA256: ${{ !contains(fromJSON('["inspect","plan-initialize-anchor","inspect-anchor-initialization","inspect-anchor-unknown","plan-abort-unstarted","plan-begin","plan-pause","drain","plan-activate","plan-reconcile-transition","plan-resume-failed","plan-anchor-reconcile"]'), inputs.action) && secrets.SUBS_BOT_BACKUP_READER_LOG_POLICY_SHA256 || '' }}
           SUBS_BOT_PRODUCTION_BACKUP_WRITES_ENABLED: ${{ vars.SUBS_BOT_PRODUCTION_BACKUP_WRITES_ENABLED }}
           SUBS_BOT_CI_RUN_ID: ${{ inputs.source_run_id || vars.SUBS_BOT_PRODUCTION_BACKUP_SOURCE_RUN_ID }}
           SUBS_BOT_CI_RUN_ATTEMPT: ${{ inputs.source_run_attempt || vars.SUBS_BOT_PRODUCTION_BACKUP_SOURCE_RUN_ATTEMPT || '1' }}

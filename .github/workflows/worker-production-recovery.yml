@@ -70,6 +70,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+          fetch-depth: 0
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11.18'
@@ -102,6 +103,14 @@ jobs:
           SUBS_BOT_CF_DEPENDENCY_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPENDENCY_READ_TOKEN }}
           SUBS_BOT_APPROVAL_JSON: ${{ inputs.rehearsal_registration_sha256 == '' && secrets.SUBS_BOT_APPROVAL_JSON || '' }}
           SUBS_BOT_RECOVERY_JSON: ${{ secrets.SUBS_BOT_RECOVERY_JSON }}
+          SUBS_BOT_BACKUP_POLICY_JSON: ${{ inputs.environment == 'production' && !contains(fromJSON('["inspect","preflight-capacity","verify-backup"]'), inputs.action) && secrets.SUBS_BOT_BACKUP_POLICY_JSON || '' }}
+          SUBS_BOT_BACKUP_GENESIS_SHA256: ${{ inputs.environment == 'production' && !contains(fromJSON('["inspect","preflight-capacity","verify-backup"]'), inputs.action) && secrets.SUBS_BOT_BACKUP_GENESIS_SHA256 || '' }}
+          SUBS_BOT_BACKUP_COORDINATOR_GENESIS_SHA256: ${{ inputs.environment == 'production' && !contains(fromJSON('["inspect","preflight-capacity","verify-backup"]'), inputs.action) && secrets.SUBS_BOT_BACKUP_COORDINATOR_GENESIS_SHA256 || '' }}
+          SUBS_BOT_BACKUP_SCHEDULE_SCOPE_GENESIS_SHA256: ${{ inputs.environment == 'production' && !contains(fromJSON('["inspect","preflight-capacity","verify-backup"]'), inputs.action) && secrets.SUBS_BOT_BACKUP_SCHEDULE_SCOPE_GENESIS_SHA256 || '' }}
+          SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_REVIEW_JSON: ${{ inputs.environment == 'production' && !contains(fromJSON('["inspect","preflight-capacity","verify-backup"]'), inputs.action) && secrets.SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_REVIEW_JSON || '' }}
+          SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_REVIEW_SHA256: ${{ inputs.environment == 'production' && !contains(fromJSON('["inspect","preflight-capacity","verify-backup"]'), inputs.action) && secrets.SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_REVIEW_SHA256 || '' }}
+          SUBS_BOT_BACKUP_READER_LOG_POLICY_JSON: ${{ inputs.environment == 'production' && !contains(fromJSON('["inspect","preflight-capacity","verify-backup"]'), inputs.action) && secrets.SUBS_BOT_BACKUP_READER_LOG_POLICY_JSON || '' }}
+          SUBS_BOT_BACKUP_READER_LOG_POLICY_SHA256: ${{ inputs.environment == 'production' && !contains(fromJSON('["inspect","preflight-capacity","verify-backup"]'), inputs.action) && secrets.SUBS_BOT_BACKUP_READER_LOG_POLICY_SHA256 || '' }}
           RECOVERY_REHEARSAL_REGISTRATION_SHA256: ${{ inputs.rehearsal_registration_sha256 }}
           SUBS_BOT_REHEARSAL_REGISTRATION_SHA256: ${{ vars.SUBS_BOT_REHEARSAL_REGISTRATION_SHA256 }}
           SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ inputs.environment == 'rehearsal' && inputs.rehearsal_registration_sha256 != '' && secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON || '' }}

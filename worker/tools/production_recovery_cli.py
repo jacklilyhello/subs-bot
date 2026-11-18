@@ -147,6 +147,7 @@ def main(env=None):
                                 dependency_api=API(target, env["SUBS_BOT_CF_DEPENDENCY_READ_TOKEN"])
                                 if target.data["provider"] is not None and env.get("SUBS_BOT_CF_DEPENDENCY_READ_TOKEN") else None)
         before = controller.inspect()
+        manual_scope = None
         if action not in READ_ONLY:
             recovery.require(before["stateSha256"] == env.get("RECOVERY_STATE_SHA256"),
                              "The current source predecessor differs; no mutation is authorized.")
@@ -157,6 +158,19 @@ def main(env=None):
                 approved = approval(target, approved_action, proof["revision"], before["stateSha256"], control_revision=control_revision)
             approve(target, approved, approved_action, proof["revision"], before["stateSha256"],
                     control_revision=control_revision)
+            if target.environment == "production":
+                import production_backup_cli as backup_cli
+                from production_backup_manual_scope import ManualScope
+                from production_storage import PrivateStore
+                policy = backup_cli.settings(env.get("SUBS_BOT_BACKUP_POLICY_JSON", ""))
+                app_store = PrivateStore(data, target.data["backupBucketName"])
+                recovery.require(app_store.objects is not None, "The project scope requires its scoped private bucket.")
+                manual_scope = ManualScope(env, target, app_store.objects, control_revision, policy=policy, app_store=app_store)
+                manual_scope.acquire(action, approved_action, approved, before["stateSha256"], proof["revision"])
+                guard = manual_scope.guard
+                controller.guard = guard
+                recovery.require(controller.inspect()["stateSha256"] == before["stateSha256"],
+                                 "The approved recovery predecessor changed after scope acquisition.")
         source = recovery.RecoverySource(api, target.data, bundle, manifest, controller.inspect, guard)
         source.archive_body, source.code_proof = body, proof
         if action == "preflight-capacity":
@@ -197,6 +211,8 @@ def main(env=None):
         result.update(sourceStateSha256=controller.inspect()["stateSha256"],
                       controlRevision=control_revision, sourceCIProof=proof, currentCIProof=current_proof,
                       environment=target.environment, runId=env["GITHUB_RUN_ID"], runAttempt=env["GITHUB_RUN_ATTEMPT"])
+        if manual_scope is not None:
+            manual_scope.finish(result, journal=journal)
         output = root / "production-recovery-result.json"
         with recovery.native.private_file(output) as stream:
             stream.write(target_canonical(result))

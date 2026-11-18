@@ -12,6 +12,22 @@ from production_target import ContractError, canonical, digest
 
 
 class RehearsalPhaseTests(unittest.TestCase):
+    def test_public_result_uses_verified_source_revision_without_business_state(self):
+        target = SimpleNamespace(environment="rehearsal", digest="d" * 64)
+        result = {"action": "verify", "status": "verified", "state": {"stateSha256": "e" * 64,
+                  "privateValue": "not-for-output"}, "secret": "not-for-output"}
+        public = phase.public_phase_result(result, target, "b" * 40, "a" * 40, {"revision": "c" * 40})
+        self.assertEqual(public["sourceRevision"], "c" * 40)
+        self.assertEqual(public["controlRevision"], "b" * 40)
+        self.assertEqual(public["dispatcherRevision"], "a" * 40)
+        self.assertNotIn("secret", public)
+        self.assertNotIn("state", public)
+        with self.assertRaises(ContractError):
+            phase.public_phase_result(result, target, "b" * 40, "a" * 40, {"revision": "invalid"})
+        with self.assertRaises(ContractError):
+            phase.public_phase_result(result, SimpleNamespace(environment="production", digest="d" * 64),
+                                      "b" * 40, "a" * 40, {"revision": "c" * 40})
+
     def test_owned_webhook_window_requires_complete_one_shot_evidence_and_unchanged_lock(self):
         import production_lifecycle_drill as drill
         main, candidate, target_sha, config_sha = "a" * 40, "b" * 40, "c" * 64, "d" * 64

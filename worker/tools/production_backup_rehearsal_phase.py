@@ -22,6 +22,24 @@ STEPS = ("plan-begin", "begin", "preflight", "plan-pause", "pause", "drain", "fr
 BASE = "maintenance/production-control/evidence/backup-coordinator/"
 
 
+def public_phase_result(result, target, candidate_revision, dispatcher_revision, verified_proof):
+    """Project only safe fields and the previously verified source identity."""
+    require(isinstance(result, dict) and target.environment == "rehearsal"
+            and HEX64.fullmatch(target.digest or "") and HEX40.fullmatch(candidate_revision or "")
+            and HEX40.fullmatch(dispatcher_revision or "") and isinstance(verified_proof, dict)
+            and HEX40.fullmatch(verified_proof.get("revision", "")))
+    safe_keys = {"status", "action", "stateSha256", "session", "day", "pauseSeconds", "pauseLimitExceeded",
+                 "capacity", "checkpointId", "manifestSha256", "approvalAction"}
+    observed = result.get("state")
+    public = {key: value for key, value in result.items() if key in safe_keys}
+    if isinstance(observed, dict) and "stateSha256" in observed:
+        public["stateSha256"] = observed["stateSha256"]
+    public.update(targetSha256=target.digest, controlRevision=candidate_revision, dispatcherRevision=dispatcher_revision,
+                  sourceRevision=verified_proof["revision"], scheduleEnabled=False, automaticReplay=False,
+                  consumerSwitch="not-authorized")
+    return public
+
+
 def intent_key(target_sha, session, sequence):
     require(HEX64.fullmatch(target_sha or "") and DECIMAL.fullmatch(session or "")
             and type(sequence) is int and 1 <= sequence <= len(STEPS))
@@ -438,14 +456,7 @@ def run(env):
         ctl=ctl, source=source, api=api, directory=Path(env["RUNNER_TEMP"]), runtime=runtime)
     # This is the same public projection as production, without invoking its
     # production-only current-main check with the candidate SHA.
-    safe_keys = {"status", "action", "stateSha256", "session", "day", "pauseSeconds", "pauseLimitExceeded",
-                 "capacity", "checkpointId", "manifestSha256", "approvalAction"}
-    observed = result.get("state")
-    public = {key: value for key, value in result.items() if key in safe_keys}
-    if isinstance(observed, dict) and "stateSha256" in observed:
-        public["stateSha256"] = observed["stateSha256"]
-    public.update(targetSha256=target.digest, controlRevision=candidate_sha, dispatcherRevision=main_sha,
-                  scheduleEnabled=False, automaticReplay=False, consumerSwitch="not-authorized")
+    public = public_phase_result(result, target, candidate_sha, main_sha, proof)
     identity_guard()
     path = Path(env["RUNNER_TEMP"]) / "production-backup-result.json"
     with recovery.native.private_file(path) as output:
