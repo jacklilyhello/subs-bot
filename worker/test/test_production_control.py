@@ -143,6 +143,14 @@ class StatefulAPI:
 
 
 class ProductionControllerTests(unittest.TestCase):
+    def test_only_authorized_test_bot_legacy_webhook_writer_is_blocked(self):
+        target = Mock(environment="rehearsal", data={"botId": contract.TEST_BOT_ID})
+        with self.assertRaises(contract.ContractError):
+            control.require_legacy_webhook_safe("webhook", target)
+        control.require_legacy_webhook_safe("inspect", target)
+        control.require_legacy_webhook_safe("webhook", Mock(environment="production", data={"botId": contract.TEST_BOT_ID}))
+        control.require_legacy_webhook_safe("webhook", Mock(environment="rehearsal", data={"botId": "123"}))
+
     def setUp(self):
         self.directory = TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
