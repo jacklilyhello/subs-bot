@@ -136,12 +136,13 @@ class TrustedGateTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             self.check({**self.env, "HEAD_VALIDATION_JSON": json.dumps(bad)})
 
-    def test_open_backup_requires_genesis_and_rejects_injected_faults(self):
+    def test_legacy_open_backup_is_disabled_until_it_uses_shared_lock(self):
         missing = {**spec(), "action": "open-backup"}
         with self.assertRaises(ContractError):
             self.check({**self.env, "HEAD_VALIDATION_JSON": json.dumps(missing)})
         valid = {**missing, "genesisSha256": "f" * 64}
-        self.assertTrue(self.check({**self.env, "HEAD_VALIDATION_JSON": json.dumps(valid)})["checkoutVerified"])
+        with self.assertRaises(ContractError):
+            self.check({**self.env, "HEAD_VALIDATION_JSON": json.dumps(valid)})
         with self.assertRaises(ContractError):
             self.check({**self.env, "HEAD_VALIDATION_JSON": json.dumps({**valid, "fault": "process-kill"})})
 

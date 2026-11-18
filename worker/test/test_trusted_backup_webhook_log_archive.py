@@ -2,6 +2,8 @@
 from pathlib import Path
 import sys
 import unittest
+from hashlib import sha256
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import trusted_backup_webhook_log_archive as archive
@@ -66,3 +68,21 @@ class WebhookLogArchiveTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             archive.classify(self.log({**result, "webhookTouched": True}), archive.HEAD, "123", main_sha="a" * 40,
                              candidates=["b" * 40])
+
+    def test_only_fixed_failed_backup_log_and_exact_validation_can_be_classified(self):
+        run_id = "44164739374"
+        fixed = archive.REVIEWED_FAILED_HEAD[run_id]
+        spec = {"version": 1, "headSha": fixed["candidate"], "action": "backup", "fault": fixed["fault"]}
+        raw = b"\n".join(b"HEAD_VALIDATION_JSON: " + canonical(spec) for _ in range(4))
+        with patch.dict(archive.REVIEWED_FAILED_HEAD, {run_id: {**fixed, "logSha256": sha256(raw).hexdigest()}}):
+            self.assertEqual(archive.classify(raw, archive.HEAD, run_id, main_sha=fixed["main"],
+                                             candidates=[fixed["candidate"]]), "no-write-independently-confirmed")
+            for altered, main, candidates in ((raw + b"x", fixed["main"], [fixed["candidate"]]),
+                                               (raw, "a" * 40, [fixed["candidate"]]),
+                                               (raw, fixed["main"], ["b" * 40])):
+                with self.assertRaises(ContractError):
+                    archive.classify(altered, archive.HEAD, run_id, main_sha=main, candidates=candidates)
+        wrong = b"\n".join(b"HEAD_VALIDATION_JSON: " + canonical({**spec, "action": "open-backup"}) for _ in range(4))
+        with patch.dict(archive.REVIEWED_FAILED_HEAD, {run_id: {**fixed, "logSha256": sha256(wrong).hexdigest()}}), \
+                self.assertRaises(ContractError):
+            archive.classify(wrong, archive.HEAD, run_id, main_sha=fixed["main"], candidates=[fixed["candidate"]])

@@ -1,6 +1,7 @@
 """Hosted fail-closed tests for the one fixed no-export evidence gate."""
 from pathlib import Path
 import base64
+import json
 from hashlib import sha256
 import os
 import sys
@@ -14,6 +15,109 @@ from production_target import ContractError
 
 
 class NoExportGateTests(unittest.TestCase):
+    def test_pinned_private_cache_rehashes_without_replacing_changed_evidence(self):
+        body = b"synthetic private evidence"
+        with tempfile.TemporaryDirectory() as directory:
+            calls = []
+            def fetch():
+                calls.append(True)
+                return body
+            self.assertEqual(gate.cached_private_bytes(directory, "run-job", sha256(body).hexdigest(), 1024, fetch), body)
+            self.assertEqual(gate.cached_private_bytes(directory, "run-job", sha256(body).hexdigest(), 1024, fetch), body)
+            self.assertEqual(len(calls), 1)
+            cached = next((Path(directory) / "no-export-reviewed-evidence-cache").iterdir())
+            cached.write_bytes(b"changed")
+            with self.assertRaises(ContractError):
+                gate.cached_private_bytes(directory, "run-job", sha256(body).hexdigest(), 1024, fetch)
+            self.assertEqual(len(calls), 1)
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "no-export-reviewed-evidence-cache").symlink_to(Path(directory))
+            with self.assertRaises(ContractError):
+                gate.cached_private_bytes(directory, "run-job", sha256(body).hexdigest(), 1024, lambda: body)
+
+    def test_live_projection_preserves_fresh_status_without_changing_historic_shape(self):
+        repo = {"id": gate.github.REPOSITORY_ID}
+        row = {"id": 1, "path": "x", "event": "workflow_dispatch", "head_sha": "a" * 40,
+               "created_at": "2026-01-01T00:00:00Z", "run_attempt": 1, "status": "completed", "conclusion": "success",
+               "display_title": "safe", "workflow_id": 7, "head_branch": "main", "repository": repo, "head_repository": repo}
+        with patch.object(gate.github, "_get_json", return_value={"total_count": 1, "workflow_runs": [row]}):
+            historic = gate.workflow_runs("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", "x", maximum=150)
+            live = gate.workflow_runs("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", "x", maximum=400, live_metadata=True)
+        self.assertNotIn("status", historic[0])
+        self.assertEqual((live[0]["status"], live[0]["conclusion"], live[0]["repository"]), ("completed", "success", repo))
+
+    def test_pinned_legacy_archive_rejects_unreviewed_or_inflight_runs(self):
+        repo = {"id": gate.github.REPOSITORY_ID}
+        source = next(iter(gate.LEGACY_SOURCE_LOGS))
+        record = {"action": "plan", "sourceRunId": source, "archiveJobId": "10", "readbackJobId": "",
+                  "jobsSha256": "a" * 64, "archiveLogSha256": "b" * 64, "readbackLogSha256": "",
+                  "sourceLogSha256": gate.LEGACY_SOURCE_LOGS[source], "planSha256": "c" * 64, "completionSha256": ""}
+        row = {"id": 123, "path": gate.LEGACY_ARCHIVE_WORKFLOW, "event": "workflow_dispatch", "head_sha": gate.LATER_PROVIDER_MAIN,
+               "run_attempt": 1, "head_branch": "main", "status": "completed", "conclusion": "success",
+               "display_title": "Preserve isolated webhook evidence " + source, "repository": repo, "head_repository": repo}
+        ledger, rows = {}, []
+        for index, (source_id, source_sha) in enumerate(gate.LEGACY_SOURCE_LOGS.items()):
+            for offset, action in enumerate(("plan", "seal")):
+                run_id = str(1000 + 2 * index + offset)
+                ledger[run_id] = {**record, "action": action, "sourceRunId": source_id, "sourceLogSha256": source_sha}
+                rows.append({**row, "id": int(run_id), "display_title": "Preserve isolated webhook evidence " + source_id})
+        env = {"GITHUB_RUN_ID": "99", "GITHUB_SHA": "a" * 40, "NO_EXPORT_LEGACY_ARCHIVES_JSON": json.dumps(ledger)}
+        with patch.object(gate, "verify_legacy_archive") as checked:
+            self.assertEqual(gate.live_writer_boundary(rows, env, "x", "b" * 40), 14)
+            self.assertEqual(checked.call_count, 14)
+        with self.assertRaises(ContractError):
+            gate.live_writer_boundary([row], {**env, "NO_EXPORT_LEGACY_ARCHIVES_JSON": "{}"}, "x", "b" * 40)
+        with self.assertRaises(ContractError):
+            gate.verify_legacy_archive({**row, "status": "in_progress"}, record, env, "x")
+
+    def test_sealed_legacy_archive_requires_matching_independent_reader(self):
+        repo = {"id": gate.github.REPOSITORY_ID}
+        source = next(iter(gate.LEGACY_SOURCE_LOGS))
+        record = {"action": "seal", "sourceRunId": source, "archiveJobId": "10", "readbackJobId": "11",
+                  "jobsSha256": "a" * 64, "archiveLogSha256": "b" * 64, "readbackLogSha256": "c" * 64,
+                  "sourceLogSha256": gate.LEGACY_SOURCE_LOGS[source], "planSha256": "d" * 64, "completionSha256": "e" * 64}
+        row = {"id": 123, "path": gate.LEGACY_ARCHIVE_WORKFLOW, "event": "workflow_dispatch", "head_sha": gate.LATER_PROVIDER_MAIN,
+               "run_attempt": 1, "head_branch": "main", "status": "completed", "conclusion": "success",
+               "display_title": "Preserve isolated webhook evidence " + source, "repository": repo, "head_repository": repo}
+        jobs = [{"id": 10, "name": "archive", "run_id": 123, "run_attempt": 1, "head_sha": gate.LATER_PROVIDER_MAIN,
+                 "status": "completed", "conclusion": "success", "steps": [
+                     {"name": name, "status": "completed", "conclusion": "success"} for name in
+                     ("Require the protected evidence archive switch", "Plan or conditionally seal the exact original job log")]},
+                {"id": 11, "name": "readback", "run_id": 123, "run_attempt": 1, "head_sha": gate.LATER_PROVIDER_MAIN,
+                 "status": "completed", "conclusion": "success", "steps": [
+                     {"name": name, "status": "completed", "conclusion": "success"} for name in
+                     ("Require the protected evidence archive switch", "Independently compare the retained original log")]}]
+        sealed = {"status": "sealed-awaiting-independent-readback", "planSha256": record["planSha256"],
+                  "logSha256": record["sourceLogSha256"], "completionSha256": record["completionSha256"]}
+        readback = {**sealed, "status": "independently-read-back", "sourceRunId": source, "archiveRunId": "123",
+                    "archiveJobId": "10", "readbackJobId": "11"}
+        commit = gate.canonical({"sha": gate.LATER_PROVIDER_MAIN, "treeSha": gate.LEGACY_ARCHIVE_TREE})
+        data = [commit, gate.canonical(jobs), gate.canonical(sealed), gate.canonical(readback)]
+        with patch.object(gate, "reviewed_source"), patch.object(gate, "cached_private_bytes", side_effect=data):
+            gate.verify_legacy_archive(row, record, {"RUNNER_TEMP": "/synthetic"}, "x")
+        bad = {**readback, "completionSha256": "f" * 64}
+        with patch.object(gate, "reviewed_source"), \
+             patch.object(gate, "cached_private_bytes", side_effect=[commit, gate.canonical(jobs), gate.canonical(sealed), gate.canonical(bad)]), \
+             self.assertRaises(ContractError):
+            gate.verify_legacy_archive(row, record, {"RUNNER_TEMP": "/synthetic"}, "x")
+
+    def test_later_provider_read_is_fixed_to_observed_jobs_and_candidate(self):
+        repo = {"id": gate.github.REPOSITORY_ID}
+        row = {"id": int(gate.LATER_PROVIDER_READ_RUN), "path": gate.PROVIDER_READ_WORKFLOW,
+               "event": "workflow_dispatch", "head_sha": gate.LATER_PROVIDER_MAIN, "run_attempt": 1,
+               "head_branch": "main", "status": "completed", "conclusion": "failure", "repository": repo,
+               "head_repository": repo, "display_title": "Reviewed Provider source verification at " + gate.LATER_PROVIDER_MAIN}
+        expected = {"Reviewed Provider source verification": "success", "Reviewed Provider simulated source fault": "success",
+                    "Trusted Provider R2 attestation": "success", "Trusted Provider live attestation": "failure"}
+        jobs = [{"id": index + 1, "name": name, "run_id": int(gate.LATER_PROVIDER_READ_RUN), "run_attempt": 1,
+                 "head_sha": gate.LATER_PROVIDER_MAIN, "status": "completed", "conclusion": conclusion}
+                for index, (name, conclusion) in enumerate(expected.items())]
+        line = json.dumps({"status": "validated", "reviewedHeadSha": gate.LATER_PROVIDER_HEAD, "pr": "290"}).encode()
+        raw = b"\n".join([line] * 3)
+        with patch.object(gate, "reviewed_source"), patch.object(gate, "cached_private_bytes", side_effect=[gate.canonical(jobs), raw]):
+            gate.verify_later_provider_read(row, {"RUNNER_TEMP": "/synthetic"}, "x")
+        with self.assertRaises(ContractError):
+            gate.verify_later_provider_read({**row, "run_attempt": 2}, {"RUNNER_TEMP": "/synthetic"}, "x")
     def test_pinned_source_cache_rehashes_and_never_overwrites(self):
         body = b"synthetic pinned source"
         source = {"path": "safe.py", "type": "file", "encoding": "base64",
@@ -78,6 +182,11 @@ class NoExportGateTests(unittest.TestCase):
         with patch.object(gate.github, "_get_json", side_effect=full) as get:
             self.assertEqual(len(gate.workflow_runs(*env)), 400)
             self.assertEqual(get.call_count, 8)
+        with patch.object(gate.github, "_get_json", side_effect=full) as get:
+            live = gate.workflow_runs(*env, maximum=400, live_metadata=True)
+            self.assertEqual(len(live), 400)
+            self.assertEqual(get.call_count, 8)
+            self.assertTrue(all(row["status"] == "completed" for row in live))
         with patch.object(gate.github, "_get_json", return_value={"total_count": 401, "workflow_runs": [row(1)]}):
             with self.assertRaises(ContractError):
                 gate.workflow_runs(*env)
