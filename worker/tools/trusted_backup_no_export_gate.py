@@ -112,6 +112,21 @@ def gate_stage(value):
     GATE_STAGE = value
 
 
+def read_json(path, token):
+    """One bounded metadata GET; hidden retries would invalidate the quota bound."""
+    try:
+        with github._OPENER.open(github._api_request(path, token), timeout=20) as response:
+            return github._parse_object(github._bounded_read(response, 1024 * 1024),
+                                        "Could not confirm trusted incident metadata.")
+    except Exception:
+        require(False, "The single trusted incident metadata read was not confirmed.")
+
+
+def compare_metadata(base, head, token):
+    require(HEX40.fullmatch(base or "") and HEX40.fullmatch(head or ""))
+    return read_json("/compare/" + base + "..." + head + "?per_page=1&page=2", token)
+
+
 def checkout_sha(path):
     require(path.is_dir() and not path.is_symlink())
     value = subprocess.run(["git", "-C", str(path), "rev-parse", "--verify", "HEAD"],
@@ -126,7 +141,7 @@ def workflow_runs(start, end, token, *, maximum=400, live_metadata=False):
     rows, total = [], None
     for page in range(1, (maximum + 49) // 50 + 1):
         query = urlencode({"created": start + ".." + end, "per_page": 50, "page": page})
-        result = github._get_json("/actions/runs?" + query, token)
+        result = read_json("/actions/runs?" + query, token)
         batch, count = result.get("workflow_runs"), result.get("total_count")
         require(isinstance(batch, list) and len(batch) <= 50 and type(count) is int and 0 <= count <= maximum
                 and (total is None or total == count))
@@ -164,7 +179,7 @@ def reviewed_source(revision, path, expected, token, directory):
     try:
         descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
-        item = github._get_json("/contents/" + path + "?ref=" + revision, token)
+        item = read_json("/contents/" + path + "?ref=" + revision, token)
         require(item.get("path") == path and item.get("type") == "file" and item.get("encoding") == "base64"
                 and isinstance(item.get("content"), str))
         body = base64.b64decode(item["content"].replace("\n", ""), validate=True)
@@ -213,15 +228,15 @@ def cached_private_bytes(directory, key, expected, maximum, fetch):
 
 def original_source(review, token, main, directory):
     gate_stage("original-run")
-    source = github._get_json("/actions/runs/" + OLD_RUN + "/attempts/1", token)
-    latest = github._get_json("/actions/runs/" + OLD_RUN, token)
+    source = read_json("/actions/runs/" + OLD_RUN + "/attempts/1", token)
+    latest = read_json("/actions/runs/" + OLD_RUN, token)
     require(str(source.get("id")) == str(latest.get("id")) == OLD_RUN and source.get("run_attempt") == latest.get("run_attempt") == 1
             and source.get("path") in {OLD_WORKFLOW, OLD_WORKFLOW + "@main", OLD_WORKFLOW + "@refs/heads/main"}
             and source.get("head_sha") == OLD_MAIN and source.get("head_branch") == "main"
             and source.get("event") == "workflow_dispatch" and (source.get("status"), source.get("conclusion")) == ("completed", "failure")
             and latest.get("status") == "completed"
             and all(isinstance(source.get(key), dict) and source[key].get("id") == github.REPOSITORY_ID for key in ("repository", "head_repository")))
-    jobs = github._get_json("/actions/runs/" + OLD_RUN + "/attempts/1/jobs?per_page=100", token)
+    jobs = read_json("/actions/runs/" + OLD_RUN + "/attempts/1/jobs?per_page=100", token)
     require(isinstance(jobs.get("jobs"), list) and type(jobs.get("total_count")) is int and jobs["total_count"] == len(jobs["jobs"]) < 100)
     selected = [job for job in jobs["jobs"] if isinstance(job, dict) and str(job.get("id")) == OLD_JOB and job.get("name") == "validate"]
     require(len(selected) == 1 and str(selected[0].get("run_id")) == OLD_RUN and selected[0].get("run_attempt") == 1
@@ -234,7 +249,7 @@ def original_source(review, token, main, directory):
                 (("completed", "failure") if name == "Run the reviewed candidate against only dedicated isolation" else ("completed", "success")))
     if OLD_MAIN != main:
         gate_stage("original-parentage")
-        comparison = github.compare_commits_metadata(OLD_MAIN, main, token)
+        comparison = compare_metadata(OLD_MAIN, main, token)
         require(comparison.get("status") == "ahead" and comparison.get("behind_by") == 0
                 and comparison.get("base_commit", {}).get("sha") == OLD_MAIN and comparison.get("merge_base_commit", {}).get("sha") == OLD_MAIN)
     gate_stage("original-source")
@@ -254,8 +269,8 @@ def verify_failed_initial_plan(item, env, token):
     require(item["path"] == WORKFLOW
             and item["event"] == "workflow_dispatch" and item["head_sha"] == pin["main"]
             and item["run_attempt"] == 1)
-    original = github._get_json("/actions/runs/" + run_id + "/attempts/1", token)
-    latest = github._get_json("/actions/runs/" + run_id, token)
+    original = read_json("/actions/runs/" + run_id + "/attempts/1", token)
+    latest = read_json("/actions/runs/" + run_id, token)
     for run in (original, latest):
         require(str(run.get("id")) == run_id and run.get("run_attempt") == 1
                 and run.get("path") in {WORKFLOW, WORKFLOW + "@main", WORKFLOW + "@refs/heads/main"}
@@ -263,7 +278,7 @@ def verify_failed_initial_plan(item, env, token):
                 and run.get("event") == "workflow_dispatch" and (run.get("status"), run.get("conclusion")) == ("completed", "failure")
                 and run.get("display_title") == "No-export " + pin["action"] + " at " + pin["main"] + " candidate " + pin["head"]
                 and all(isinstance(run.get(k), dict) and run[k].get("id") == github.REPOSITORY_ID for k in ("repository", "head_repository")))
-    response = github._get_json("/actions/runs/" + run_id + "/attempts/1/jobs?per_page=100", token)
+    response = read_json("/actions/runs/" + run_id + "/attempts/1/jobs?per_page=100", token)
     jobs = response.get("jobs")
     require(isinstance(jobs, list) and response.get("total_count") == len(jobs) == 2
             and {job.get("name") for job in jobs} == {"resolution", "readback"})
@@ -295,39 +310,54 @@ def verify_failed_initial_plan(item, env, token):
 
 
 def verify_fixed_unstarted_push(item, env, token):
-    """Two exact completed failures with no jobs; no failure cause is inferred."""
+    """Two fixed failures with a fresh latest run and pinned terminal evidence.
+
+    The original attempt's lists are read once on each fresh runner. Their
+    reuse relies on GitHub retaining the completed attempt and no concurrent
+    rerun or metadata rewriting; latest identity/attempt is never cached.
+    Unrelated mutable fields, such as a linked PR's current head, are excluded
+    from these derived records. They are not the original full API responses.
+    """
     gate_stage("unstarted-push")
     run_id = str(item["id"])
     require(run_id in UNSTARTED_PUSHES)
     pin = UNSTARTED_PUSHES[run_id]
     require(item["path"] == UNSTARTED_WORKFLOW and item["event"] == "push"
             and item["head_sha"] == pin["head"] and item["run_attempt"] == 1)
-    original = github._get_json("/actions/runs/" + run_id + "/attempts/1", token)
-    latest = github._get_json("/actions/runs/" + run_id, token)
-    for run in (original, latest):
-        require(str(run.get("id")) == run_id and run.get("run_attempt") == 1
-                and run.get("path") == UNSTARTED_WORKFLOW and run.get("event") == "push"
-                and run.get("head_sha") == pin["head"] and run.get("head_branch") == "codex/backup-coordinator"
-                and run.get("created_at") == pin["createdAt"] and run.get("workflow_id") == 421656360
-                and str(run.get("check_suite_id")) == pin["suite"]
-                and (run.get("status"), run.get("conclusion")) == ("completed", "failure")
-                and all(isinstance(run.get(k), dict) and run[k].get("id") == github.REPOSITORY_ID
-                        for k in ("repository", "head_repository")))
-    jobs = github._get_json("/actions/runs/" + run_id + "/attempts/1/jobs?per_page=100", token)
-    require(isinstance(jobs, dict) and set(jobs) == {"total_count", "jobs"}
-            and type(jobs["total_count"]) is int and jobs["total_count"] == 0 and jobs["jobs"] == [],
-            "A fixed unstarted push now has jobs or incomplete metadata.")
-    suite = github._get_json("/check-suites/" + pin["suite"], token)
-    require(str(suite.get("id")) == pin["suite"] and suite.get("head_sha") == pin["head"]
-            and suite.get("head_branch") == "codex/backup-coordinator"
-            and (suite.get("status"), suite.get("conclusion")) == ("completed", "failure")
-            and type(suite.get("latest_check_runs_count")) is int and suite["latest_check_runs_count"] == 0
-            and suite.get("app", {}).get("id") == 15368 and suite.get("app", {}).get("slug") == "github-actions"
-            and suite.get("repository", {}).get("id") == github.REPOSITORY_ID)
-    checks = github._get_json("/check-suites/" + pin["suite"] + "/check-runs?per_page=100", token)
-    require(isinstance(checks, dict) and set(checks) == {"total_count", "check_runs"}
-            and type(checks["total_count"]) is int and checks["total_count"] == 0 and checks["check_runs"] == [],
-            "A fixed unstarted push now has check runs.")
+    def run_record(value):
+        require(isinstance(value, dict) and isinstance(value.get("repository"), dict)
+                and isinstance(value.get("head_repository"), dict))
+        fields = ("id", "run_attempt", "path", "event", "head_sha", "head_branch", "created_at", "workflow_id",
+                  "check_suite_id", "status", "conclusion")
+        return {**{key: value.get(key) for key in fields}, "repositoryId": value["repository"].get("id"),
+                "headRepositoryId": value["head_repository"].get("id")}
+    def pinned_record(kind, path, expected, projection=None):
+        expected_raw = canonical(expected)
+        def fetch():
+            value = read_json(path, token)
+            return canonical(projection(value) if projection else value)
+        raw = cached_private_bytes(env.get("RUNNER_TEMP", ""), "unstarted-" + run_id + "-" + kind,
+                                   sha256(expected_raw).hexdigest(), 65536, fetch)
+        require(raw == expected_raw)
+        return parsed(raw)
+    expected_run = {"id": int(run_id), "run_attempt": 1, "path": UNSTARTED_WORKFLOW, "event": "push",
+                    "head_sha": pin["head"], "head_branch": "codex/backup-coordinator", "created_at": pin["createdAt"],
+                    "workflow_id": 421656360, "check_suite_id": int(pin["suite"]), "status": "completed",
+                    "conclusion": "failure", "repositoryId": github.REPOSITORY_ID, "headRepositoryId": github.REPOSITORY_ID}
+    original = pinned_record("attempt", "/actions/runs/" + run_id + "/attempts/1", expected_run, run_record)
+    latest = read_json("/actions/runs/" + run_id, token)
+    require(canonical(original) == canonical(run_record(latest)) == canonical(expected_run))
+    pinned_record("jobs", "/actions/runs/" + run_id + "/attempts/1/jobs?per_page=100", {"total_count": 0, "jobs": []})
+    def suite_record(value):
+        require(isinstance(value, dict) and isinstance(value.get("app"), dict) and isinstance(value.get("repository"), dict))
+        fields = ("id", "head_sha", "head_branch", "status", "conclusion", "latest_check_runs_count")
+        return {**{key: value.get(key) for key in fields}, "appId": value["app"].get("id"),
+                "appSlug": value["app"].get("slug"), "repositoryId": value["repository"].get("id")}
+    expected_suite = {"id": int(pin["suite"]), "head_sha": pin["head"], "head_branch": "codex/backup-coordinator",
+                      "status": "completed", "conclusion": "failure", "latest_check_runs_count": 0,
+                      "appId": 15368, "appSlug": "github-actions", "repositoryId": github.REPOSITORY_ID}
+    pinned_record("suite", "/check-suites/" + pin["suite"], expected_suite, suite_record)
+    pinned_record("checks", "/check-suites/" + pin["suite"] + "/check-runs?per_page=100", {"total_count": 0, "check_runs": []})
     reviewed_source(pin["head"], UNSTARTED_WORKFLOW, UNSTARTED_WORKFLOW_SHA256, token, env.get("RUNNER_TEMP", ""))
 
 
@@ -337,14 +367,14 @@ def verify_fixed_provider_read(item, env, token):
     require(str(item["id"]) == PROVIDER_READ_RUN and item["path"] == PROVIDER_READ_WORKFLOW
             and item["event"] == "workflow_dispatch" and item["head_sha"] == FAILED_PLAN_MAIN
             and item["run_attempt"] == 1)
-    run = github._get_json("/actions/runs/" + PROVIDER_READ_RUN, token)
+    run = read_json("/actions/runs/" + PROVIDER_READ_RUN, token)
     require(str(run.get("id")) == PROVIDER_READ_RUN and run.get("run_attempt") == 1
             and run.get("head_sha") == FAILED_PLAN_MAIN and run.get("head_branch") == "main"
             and run.get("event") == "workflow_dispatch" and (run.get("status"), run.get("conclusion")) == ("completed", "failure")
             and run.get("path") in {PROVIDER_READ_WORKFLOW, PROVIDER_READ_WORKFLOW + "@main", PROVIDER_READ_WORKFLOW + "@refs/heads/main"}
             and run.get("display_title") == "Reviewed Provider source verification at " + FAILED_PLAN_MAIN
             and all(isinstance(run.get(k), dict) and run[k].get("id") == github.REPOSITORY_ID for k in ("repository", "head_repository")))
-    response = github._get_json("/actions/runs/" + PROVIDER_READ_RUN + "/attempts/1/jobs?per_page=100", token)
+    response = read_json("/actions/runs/" + PROVIDER_READ_RUN + "/attempts/1/jobs?per_page=100", token)
     jobs = response.get("jobs")
     expected = {"Reviewed Provider source verification": "success", "Trusted Provider R2 attestation": "success",
                 "Reviewed Provider simulated source fault": "skipped", "Trusted Provider live attestation": "failure"}
@@ -369,7 +399,7 @@ def verify_later_provider_read(item, env, token):
     reviewed_source(LATER_PROVIDER_MAIN, PROVIDER_READ_WORKFLOW, PROVIDER_READ_SOURCE_SHA256, token, env.get("RUNNER_TEMP", ""))
     fields = ("id", "name", "run_id", "run_attempt", "head_sha", "status", "conclusion")
     def fetch_jobs():
-        response = github._get_json("/actions/runs/" + LATER_PROVIDER_READ_RUN + "/attempts/1/jobs?per_page=100", token)
+        response = read_json("/actions/runs/" + LATER_PROVIDER_READ_RUN + "/attempts/1/jobs?per_page=100", token)
         jobs = response.get("jobs")
         require(isinstance(jobs, list) and type(response.get("total_count")) is int and response["total_count"] == len(jobs) == 4)
         return canonical([{key: job.get(key) for key in fields} for job in jobs])
@@ -425,7 +455,7 @@ def verify_legacy_archive(item, record, env, token):
     gate_stage("legacy-source")
     commit_pin = {"sha": LATER_PROVIDER_MAIN, "treeSha": LEGACY_ARCHIVE_TREE}
     def fetch_commit():
-        commit = github._get_json("/git/commits/" + LATER_PROVIDER_MAIN, token)
+        commit = read_json("/git/commits/" + LATER_PROVIDER_MAIN, token)
         require(commit.get("sha") == LATER_PROVIDER_MAIN and isinstance(commit.get("tree"), dict)
                 and commit["tree"].get("sha") == LEGACY_ARCHIVE_TREE)
         return canonical(commit_pin)
@@ -434,7 +464,7 @@ def verify_legacy_archive(item, record, env, token):
     for path, expected in LEGACY_ARCHIVE_SOURCE.items():
         reviewed_source(LATER_PROVIDER_MAIN, path, expected, token, env.get("RUNNER_TEMP", ""))
     def fetch_jobs():
-        response = github._get_json("/actions/runs/" + run_id + "/attempts/1/jobs?per_page=100", token)
+        response = read_json("/actions/runs/" + run_id + "/attempts/1/jobs?per_page=100", token)
         jobs = response.get("jobs")
         require(isinstance(jobs, list) and type(response.get("total_count")) is int and response["total_count"] == len(jobs) == 2)
         return canonical(jobs)
@@ -528,7 +558,7 @@ def live_writer_boundary(rows, env, token, candidate):
                 "An unreviewed run may have held a target-bucket writer.")
         if run_id == current_run:
             continue
-        run = github._get_json("/actions/runs/" + run_id, token)
+        run = read_json("/actions/runs/" + run_id, token)
         title = run.get("display_title", "")
         actions = ("audit-writers", "plan", "seal", "verify-seal", "release", "verify-release")
         require(str(run.get("id")) == run_id and run.get("run_attempt") == 1 and run.get("status") == "completed"
@@ -546,7 +576,7 @@ def live_writer_boundary(rows, env, token, candidate):
                         and run_id == env.get("SUBS_BOT_BACKUP_NO_EXPORT_SEAL_RUN_ID"),
                         "Only the exact protected interrupted seal can be independently inspected.")
                 continue
-            jobs = github._get_json("/actions/runs/" + run_id + "/attempts/1/jobs?per_page=100", token)
+            jobs = read_json("/actions/runs/" + run_id + "/attempts/1/jobs?per_page=100", token)
             require(isinstance(jobs.get("jobs"), list) and type(jobs.get("total_count")) is int
                     and jobs["total_count"] == len(jobs["jobs"]) < 100)
             readers = [job for job in jobs["jobs"] if isinstance(job, dict) and job.get("name") == "readback"]
@@ -560,8 +590,8 @@ def live_writer_boundary(rows, env, token, candidate):
 
 
 def reviewed_run(run_id, action, main, candidate, token, *, successful, jobs_required):
-    run = github._get_json("/actions/runs/" + run_id + "/attempts/1", token)
-    latest = github._get_json("/actions/runs/" + run_id, token)
+    run = read_json("/actions/runs/" + run_id + "/attempts/1", token)
+    latest = read_json("/actions/runs/" + run_id, token)
     require(str(run.get("id")) == str(latest.get("id")) == run_id and run.get("run_attempt") == latest.get("run_attempt") == 1
             and run.get("path") in {WORKFLOW, WORKFLOW + "@main", WORKFLOW + "@refs/heads/main"}
             and run.get("head_sha") == main and run.get("head_branch") == "main" and run.get("event") == "workflow_dispatch"
@@ -570,7 +600,7 @@ def reviewed_run(run_id, action, main, candidate, token, *, successful, jobs_req
             and run.get("conclusion") in {"success", "failure", "cancelled", "timed_out"}
             and (not successful or run.get("conclusion") == "success")
             and all(isinstance(run.get(k), dict) and run[k].get("id") == github.REPOSITORY_ID for k in ("repository", "head_repository")))
-    response = github._get_json("/actions/runs/" + run_id + "/attempts/1/jobs?per_page=100", token)
+    response = read_json("/actions/runs/" + run_id + "/attempts/1/jobs?per_page=100", token)
     require(isinstance(response.get("jobs"), list) and type(response.get("total_count")) is int
             and response["total_count"] == len(response["jobs"]) < 100)
     for name, final, final_success in jobs_required:
@@ -664,13 +694,13 @@ def validate(env):
         require(DECIMAL.fullmatch(env.get("NO_EXPORT_RELEASE_RUN_ID", ""))
                 and env.get("SUBS_BOT_BACKUP_NO_EXPORT_RELEASE_RUN_ID") == env["NO_EXPORT_RELEASE_RUN_ID"])
     gate_stage("current-main-and-head")
-    ref = github._get_json("/git/ref/heads/main", token)
+    ref = read_json("/git/ref/heads/main", token)
     require(ref.get("ref") == github.MAIN_REF and ref.get("object", {}).get("sha") == main)
-    pull = github._get_json("/pulls/291", token)
+    pull = read_json("/pulls/291", token)
     require(pull.get("number") == 291 and pull.get("state") == "open" and pull.get("base", {}).get("ref") == "main"
             and pull.get("head", {}).get("sha") == spec["headSha"] and pull["head"].get("ref") == "codex/backup-orchestration"
             and all(isinstance(pull.get(key, {}).get("repo"), dict) and pull[key]["repo"].get("id") == github.REPOSITORY_ID for key in ("head", "base")))
-    comparison = github.compare_commits_metadata(main, spec["headSha"], token)
+    comparison = compare_metadata(main, spec["headSha"], token)
     require(comparison.get("status") in {"ahead", "identical"} and comparison.get("behind_by") == 0
             and comparison.get("base_commit", {}).get("sha") == main and comparison.get("merge_base_commit", {}).get("sha") == main)
     gate_stage("checkout")

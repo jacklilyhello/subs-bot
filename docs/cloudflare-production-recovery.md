@@ -136,6 +136,10 @@ G0 之后发生任何新增、修改、删除、授权、领取、撤销、短�
 
 首次 gate 已拒绝、候选和凭据步骤均跳过的两次固定对账失败，另按准确 run、job、原源码和日志摘要核验。未分类的历史、重跑、未知写入或变更原件继续拒绝。工作流的 `checks: read` 仅用于独立检查 GitHub check suite；不授予任何写权限。对账入口、写开关、完整来源与目标批准相互独立；保留原冻结现场，不自动重试导出或恢复接收。
 
+这两次固定 push 的原 attempt、零 jobs／checks 和 suite 身份在每个新 runner 首次完整读取后，以明确字段的派生证明缓存；不固定 linked PR 的当前 head 等可变附带字段，不把派生记录称为完整原始 API 响应。缓存文件每次使用均核对摘要，latest run、完整运行盘点、当前批准和来源关系仍每次重新读取。复用依赖 GitHub 保留已结束 attempt 的列表，以及本次处置期间无并发重跑或元数据改写的受控操作假设；不是平台原子锁。下一独立 runner 会重新取得全部证明，未知或冲突继续停止。
+
+此 gate 的每个 GitHub metadata GET 只请求一次，保持现有响应大小、完整分页与来源限制；瞬时读取失败即停止，不以底层隐式重试突破写前请求预算。
+
 ## Rehearsal webhook window
 
 The trusted rehearsal coordinator rejects `run` and `resume`, and the legacy
