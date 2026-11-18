@@ -1,4 +1,6 @@
 import sys
+import io
+import json
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -49,6 +51,21 @@ class FixtureCreateTests(unittest.TestCase):
                     fixture.create(self.env)
                 client.assert_not_called()
                 self.objects.put_once.assert_not_called()
+
+    def test_inventory_requires_complete_well_formed_results(self):
+        info = {"count": 0, "page": 1, "per_page": 100, "total_count": 0}
+        valid = {"success": True, "result": [], "result_info": info}
+        invalid = [{**valid, "result_info": {**info, "total_count": 1}},
+                   {**valid, "result_info": {"page": 1}},
+                   {**valid, "result": [None], "result_info": {**info, "count": 1, "total_count": 1}}]
+        for result in (valid, *invalid):
+            with self.subTest(result=result), patch.object(fixture, "build_opener") as opener:
+                opener.return_value.open.return_value = io.BytesIO(json.dumps(result).encode())
+                if result is valid:
+                    self.assertEqual(fixture.inventory("synthetic", self.name), [])
+                else:
+                    with self.assertRaises(ContractError):
+                        fixture.inventory("synthetic", self.name)
 
     def test_unknown_post_is_once_and_intent_is_preserved(self):
         with patch.object(fixture, "guard", return_value=self.name), \

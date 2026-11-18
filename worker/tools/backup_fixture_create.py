@@ -64,7 +64,7 @@ def inventory(token, name):
     with build_opener(ProxyHandler({}), _NoRedirect()).open(request, timeout=30) as response:
         raw = response.read(1024 * 1024 + 1)
     require(len(raw) <= 1024 * 1024)
-    result = json.loads(raw)
+    result = github._parse_object(raw, "The D1 name inventory was not confirmed.")
     require(isinstance(result, dict) and result.get("success") is True and isinstance(result.get("result"), list)
             and len(result["result"]) < 100 and isinstance(result.get("result_info"), dict))
     info = result["result_info"]
@@ -74,7 +74,9 @@ def inventory(token, name):
             and info["page"] == 1 and info["per_page"] == 100
             and info.get("total_pages", 1) in (0, 1) and not info.get("cursor")
             and not info.get("next_page_token") and info.get("is_truncated") in (None, False))
-    rows = [row for row in result["result"] if isinstance(row, dict) and row.get("name") == name]
+    require(all(isinstance(row, dict) and isinstance(row.get("name"), str)
+                and UUID.fullmatch(row.get("uuid", "")) for row in result["result"]))
+    rows = [row for row in result["result"] if row["name"] == name]
     require(len(rows) <= 1)
     return rows
 
