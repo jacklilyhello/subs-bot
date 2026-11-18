@@ -142,6 +142,12 @@ G0 之后发生任何新增、修改、删除、授权、领取、撤销、短�
 
 ## Rehearsal webhook window
 
+### 专用 D1 容量测试资源创建
+
+`worker-backup-fixture-create.yml` 是默认关闭的隔离入口，仅接收已授权的两个固定测试名称。每个名称先核对项目私有备份桶、精确主线和名称缺失，再条件写入固定私有 intent，最多发送一次 D1 创建请求；任何未确认结果都保留原 intent 并停止，不得再次派发该名称。成功后由独立 runner 重新读取数据库与私有 receipt，并封存只读证明；Worker 绑定清单尚须另行独立核对。此入口不会启用正式生产或切换消费者。
+
+启用前，由操作员用 GitHub API 独立确认仓库不存在同名变量、隔离 Environment 的分支策略与 `SUBS_BOT_BACKUP_FIXTURE_CREATE_MAIN_SHA` 精确指向经审主线，且只有该 Environment 显式设置 `SUBS_BOT_BACKUP_FIXTURE_CREATE_ENABLED=true`。使用相同生命周期互斥组，等待旧备份对账完成；确保其他调用方不并发创建同名数据库。完成后关闭开关；按单独核对的清理计划移除仅本轮创建的测试资源并保留证据。
+
 The trusted rehearsal coordinator rejects `run` and `resume`, and the legacy
 reviewed-head gate rejects `open-backup`. Switching a Telegram webhook between
 independent D1 databases can redeliver an update whose original response was

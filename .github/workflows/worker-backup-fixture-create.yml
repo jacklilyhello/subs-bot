@@ -1,0 +1,79 @@
+name: Create one approved isolated backup fixture
+run-name: Create isolated D1 fixture ${{ inputs.name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        type: choice
+        required: true
+        options:
+          - subs-bot-cf-backup-capacity-20261118
+          - subs-bot-cf-backup-permission-20261118
+
+permissions:
+  contents: read
+
+concurrency:
+  group: subs-bot-lifecycle-rehearsal
+  cancel-in-progress: false
+
+jobs:
+  create:
+    if: github.repository == 'jacklilyhello/subs-bot' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    environment: subs-bot-backup-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      FIXTURE_ENVIRONMENT: subs-bot-backup-head-isolation
+      FIXTURE_NAME: ${{ inputs.name }}
+      FIXTURE_MAIN_SHA: ${{ vars.SUBS_BOT_BACKUP_FIXTURE_CREATE_MAIN_SHA }}
+      FIXTURE_CREATE_ENABLED: ${{ vars.SUBS_BOT_BACKUP_FIXTURE_CREATE_ENABLED }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify exact trusted main and enabled fixture
+        env:
+          FIXTURE_ACTION: guard
+        run: python3 -B worker/tools/backup_fixture_create.py
+      - name: Claim intent and create once
+        env:
+          FIXTURE_ACTION: create
+          FIXTURE_D1_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_REHEARSAL_DATA_READ_TOKEN }}
+          FIXTURE_D1_WRITE_TOKEN: ${{ secrets.SUBS_BOT_CF_REHEARSAL_DATA_TOKEN }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_SCOPED_R2_WRITE_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_WRITE_JSON }}
+        run: python3 -B worker/tools/backup_fixture_create.py
+  readback:
+    needs: create
+    if: needs.create.result == 'success'
+    environment: subs-bot-backup-head-isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      FIXTURE_ENVIRONMENT: subs-bot-backup-head-isolation
+      FIXTURE_NAME: ${{ inputs.name }}
+      FIXTURE_MAIN_SHA: ${{ vars.SUBS_BOT_BACKUP_FIXTURE_CREATE_MAIN_SHA }}
+      FIXTURE_CREATE_ENABLED: ${{ vars.SUBS_BOT_BACKUP_FIXTURE_CREATE_ENABLED }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify exact trusted main and enabled fixture
+        env:
+          FIXTURE_ACTION: guard
+        run: python3 -B worker/tools/backup_fixture_create.py
+      - name: Independently read back receipt and database
+        env:
+          FIXTURE_ACTION: readback
+          FIXTURE_D1_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_REHEARSAL_DATA_READ_TOKEN }}
+          SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
+          SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
+          SUBS_BOT_SCOPED_R2_WRITE_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_WRITE_JSON }}
+        run: python3 -B worker/tools/backup_fixture_create.py
