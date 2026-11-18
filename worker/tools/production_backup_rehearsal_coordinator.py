@@ -8,12 +8,13 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
-import re
 import subprocess
 import sys
 import time
 
 import prepare_isolation_artifact as github
+from backup_rehearsal_webhook import MODE
+from production_backup_rehearsal_window import run_with_simulated_webhook
 import production_backup_cli as backup
 import production_backup_coordinator as core
 import production_backup_rehearsal_phase as rehearsal
@@ -93,9 +94,15 @@ def main(env=None):
     options = {"profile": "rehearsal", "candidate_revision": candidate, "validation_json": raw_spec}
     history_options = {"profile": "rehearsal", "candidate_revision": candidate, "validation_sha": validation_sha}
     token = github._github_token()
+    if action in {"plan-run", "run"}:
+        require(env.get("HEAD_TRUSTED_WEBHOOK_PRECONDITION") == MODE
+                and not env.get("HEAD_TRUSTED_WEBHOOK_CLEANUP"),
+                "This rehearsal requires the trusted simulation of the webhook precondition.")
+        plan_sha = digest({"plan": plan, "webhookPrecondition": MODE})
     if action == "plan-run":
         require(pinned["state"] == "idle" and pinned["session"] != session + "-1")
-        return {"status": "planned", "planSha256": digest(plan), "session": session, "mutationPerformed": False}
+        return {"status": "planned", "planSha256": plan_sha, "session": session, "mutationPerformed": False,
+                "webhookPreconditionSimulated": True}
     if action in {"plan-resume", "resume", "plan-reconcile", "reconcile", "plan-abort", "abort"}:
         require(pinned["state"] == "active" and pinned["session"] == session + "-1"
                 and pinned["controlRevision"] == candidate)
@@ -165,8 +172,8 @@ def main(env=None):
                                        backup.maximum_pause(policy), spec["genesisSha256"], **options) == observed)
         anchor.release(session + "-1")
         return {"status": "abandoned-after-confirmed-terminal", "terminal": observed["terminal"], "dispatchRetried": False}
-    require(env.get("BACKUP_COORDINATOR_APPROVAL_SHA256") == digest(plan))
     if action == "run":
+        require(env.get("BACKUP_COORDINATOR_APPROVAL_SHA256") == plan_sha)
         require(pinned["state"] == "idle" and pinned["session"] != session + "-1"
                 and backup.in_window(policy, datetime.now(timezone.utc)))
         original = github._get_json("/actions/runs/" + session + "/attempts/1", token)
@@ -179,106 +186,9 @@ def main(env=None):
                 and (original.get("status"), original.get("conclusion")) == ("completed", "success")
                 and all(isinstance(original.get(k), dict) and original[k].get("id") == github.REPOSITORY_ID
                         for k in ("repository", "head_repository")))
-        require(env.get("HEAD_TRUSTED_WEBHOOK_CLEANUP") == "configured-v1")
-        tool = context["tool"]
-        from trusted_backup_webhook_anchor import anchor as webhook_anchor, genesis_sha
-        expected_webhook_genesis = genesis_sha(tool.store, target.digest)
-        require(env.get("SUBS_BOT_PHASE_WEBHOOK_ANCHOR_GENESIS_SHA256") == expected_webhook_genesis)
-        webhook_lock = webhook_anchor(tool.store, target.digest, expected_webhook_genesis)
-        prior_webhook, _, _ = webhook_lock.read()
-        require(prior_webhook["state"] == "idle" and prior_webhook["session"] != tool.run + "-1")
-        tool.backup_evidence_workflow = "worker-backup-reviewed-coordinator.yml"
-        tool.baseline_checkpoint, tool.baseline_manifest_sha = checkpoint, manifest
-        ctl = tool.bind(target, context["bundle"], context["manifest"])
-        from production_lifecycle_drill import rows
-        def authorization_state(controller):
-            return {"policy": rows(controller.data, controller.database, "SELECT * FROM telegram_general_policy ORDER BY bot_id"),
-                    "actors": rows(controller.data, controller.database, "SELECT * FROM telegram_general_actors ORDER BY actor_id"),
-                    "groups": rows(controller.data, controller.database, "SELECT * FROM telegram_general_groups ORDER BY chat_id")}
-        def run_backup(controller, _anchors, _base):
-            before_auth = authorization_state(controller)
-            start = {**plan, "writerRunId": env["GITHUB_RUN_ID"], "writerAttempt": "1"}
-            key = core.BASE + target.digest + "/" + session + "/start-intent.json"
-            existing, _ = objects.get(key, absent=True)
-            require(existing is None)
-            objects.put_once(key, canonical(start))
-            guard()
-            anchor.acquire(session + "-1", datetime.now(timezone.utc).strftime("%Y/%m/%d"), candidate)
-            completed = core.run_sequence(objects, anchor, target.digest, session, main_sha, checkpoint, manifest, token,
-                deadline=time.monotonic() + 5 * 3600, pause_limit=backup.maximum_pause(policy),
-                pause_alarm_seconds=policy["pauseLimitSeconds"], writer_run_id=env["GITHUB_RUN_ID"], **options)
-            values, _ = core.completed_results(objects, target.digest, session, main_sha, token, checkpoint, manifest,
-                                                backup.maximum_pause(policy), **options)
-            after = controller.inspect()
-            require(completed.get("status") == "completed" and len(values) == len(core.STEPS)
-                    and values[-1].get("status") == "resumed" and after["control"]["admission"] == "open"
-                    and after["control"]["workers"] == "run" and authorization_state(controller) == before_auth
-                    and not any(after["terminal"].get(k, 0) for k in
-                                ("uncertain", "terminalUnknown", "terminalEditFailure", "unknownInvocations", "unknownUpdates")))
-            tool.report["dailyBackupAcceptance"] = {"baseline": {"checkpointId": values[8]["checkpointId"],
-                "manifestSha256": values[8]["manifestSha256"]}, "planBeginSession": values[0]["session"],
-                "planBeginDay": values[0]["day"], "pauseSeconds": values[-1]["pauseSeconds"],
-                "pauseLimitExceeded": values[-1]["pauseLimitExceeded"], "admissionRestored": True, "authorizationUnchanged": True}
-        # The trusted-main history checker and the one-shot setup callbacks are
-        # deliberately required before exercise can change the test webhook.
-        history_checker = Path(env["GITHUB_WORKSPACE"]) / "trusted/worker/tools/trusted_backup_webhook_history.py"
-        require(history_checker.is_file() and not history_checker.is_symlink(), "The trusted webhook history gate is unavailable.")
-        history_output = subprocess.run([sys.executable, "-B", str(history_checker)], env=gate_env,
-                                       capture_output=True, check=True, timeout=180)
-        history = parsed(history_output.stdout)
-        require(isinstance(history, dict) and history.get("status") == "resolved" and re.fullmatch(r"[a-f0-9]{64}", history.get("historySha256", "")))
-        guard()
-        webhook_lock.acquire(tool.run + "-1", datetime.now(timezone.utc).strftime("%Y/%m/%d"), candidate)
-        history_again = subprocess.run([sys.executable, "-B", str(history_checker)], env=gate_env,
-                                       capture_output=True, check=True, timeout=180)
-        require(parsed(history_again.stdout) == history, "The observed webhook history changed after acquiring the lock.")
-        setup_key = tool.prefix + "phase-coordinator-webhook-setup-" + tool.run + "-" + tool.attempt + "-intent.json"
-        confirmed_key = tool.prefix + "phase-coordinator-webhook-setup-" + tool.run + "-" + tool.attempt + "-confirmed.json"
-        setup_intent = {}
-        def webhook_setup(controller, webhook_plan, snapshot_sha):
-            require(not setup_intent and re.fullmatch(r"[a-f0-9]{64}", snapshot_sha or ""))
-            lock, _, _ = webhook_lock.read()
-            require(lock["state"] == "active" and lock["session"] == tool.run + "-1"
-                    and lock["controlRevision"] == candidate)
-            value = {"version": 1, "kind": "phase-webhook-setup-intent", "runId": tool.run, "runAttempt": tool.attempt,
-                "controllerRevision": candidate, "dispatcherRevision": main_sha, "targetSha256": target.digest,
-                "configurationSha256": target.configuration_digest, "sourceCheckpointId": checkpoint,
-                "sourceManifestSha256": manifest, "snapshotSha256": snapshot_sha,
-                "predecessorSha256": webhook_plan["stateSha256"],
-                "webhookSettingsSha256": webhook_plan["webhook"]["settingsSha256"], "historySha256": history["historySha256"]}
-            guard()
-            tool.store.put_exclusive(setup_key, canonical(value))
-            require(tool.store.get(setup_key) == canonical(value))
-            fresh = controller.plan_webhook()
-            require(fresh["stateSha256"] == value["predecessorSha256"]
-                    and fresh["webhook"]["settingsSha256"] == value["webhookSettingsSha256"])
-            setup_intent.update(value)
-        def webhook_confirm(_controller, configured, snapshot_sha):
-            require(setup_intent and setup_intent["snapshotSha256"] == snapshot_sha)
-            value = {"version": 1, "kind": "phase-webhook-setup-confirmed", "intentSha256": digest(setup_intent),
-                     "snapshotSha256": snapshot_sha, "configuredSha256": digest(configured), "targetSha256": target.digest}
-            tool.store.put_exclusive(confirmed_key, canonical(value))
-            require(tool.store.get(confirmed_key) == canonical(value))
-        tool.exercise(provided_controller=ctl, verify_extra=run_backup, external_webhook_cleanup=True,
-                      external_webhook_setup=webhook_setup, external_webhook_confirm=webhook_confirm)
-        ready = [item for item in tool.report["stages"] if item.get("stage") == "open-backup-ready-for-cleanup"]
-        accepted = tool.report["dailyBackupAcceptance"]
-        require(len(ready) == 1 and accepted["admissionRestored"] is True and accepted["authorizationUnchanged"] is True)
-        receipt = {"version": 1, "status": "candidate-complete-before-trusted-cleanup", "runId": tool.run,
-            "runAttempt": tool.attempt, "controllerRevision": candidate, "dispatcherRevision": main_sha,
-            "targetSha256": target.digest, "readySha256": ready[0]["sha256"],
-            "snapshotSha256": tool.report["webhookSnapshotSha256"], "checkpointId": accepted["baseline"]["checkpointId"],
-            "manifestSha256": accepted["baseline"]["manifestSha256"], "pauseSeconds": accepted["pauseSeconds"],
-            "pauseLimitExceeded": accepted["pauseLimitExceeded"], "admissionRestored": True, "authorizationUnchanged": True,
-            "confirmedReceiptsNotRepeated": True, "coordinatorSession": session, "planBeginSession": accepted["planBeginSession"],
-            "planBeginDay": accepted["planBeginDay"], "sourceCheckpointId": checkpoint, "sourceManifestSha256": manifest}
-        receipt_key = tool.prefix + tool.run + "-" + tool.attempt + "-backup-head-acceptance.json"
-        tool.store.put_exclusive(receipt_key, canonical(receipt))
-        require(tool.store.get(receipt_key) == canonical(receipt))
-        return {"status": "awaiting-trusted-cleanup", "pauseSeconds": accepted["pauseSeconds"],
-                "pauseLimitExceeded": accepted["pauseLimitExceeded"], "consumerSwitch": "not-authorized"}
+        return run_with_simulated_webhook(context, anchor, app_store, plan, env, guard, token, options)
     else:
-        require(action == "resume")
+        require(action == "resume" and env.get("BACKUP_COORDINATOR_APPROVAL_SHA256") == digest(plan))
         guard()
         require(core.finished_controller(objects, target.digest, session, main_sha, checkpoint, manifest, digest(policy), **history_options) == history)
         require(rehearsal.verify_owned_webhook_window(context, original_start, main_sha, candidate) == webhook_observation)

@@ -22,6 +22,34 @@ STEPS = ("plan-begin", "begin", "preflight", "plan-pause", "pause", "drain", "fr
 BASE = "maintenance/production-control/evidence/backup-coordinator/"
 
 
+def simulated_window(controller, tool, start, env):
+    """Read the original one-shot rehearsal opening and bind only its webhook adapter."""
+    from backup_rehearsal_webhook import BackupRehearsalTelegram, MODE
+
+    require(env.get("HEAD_TRUSTED_WEBHOOK_PRECONDITION") == MODE
+            and not env.get("HEAD_TRUSTED_WEBHOOK_CLEANUP") and isinstance(start, dict)
+            and start.get("targetSha256") == controller.target.digest
+            and start.get("profile") == "rehearsal" and start.get("action") == "run"
+            and start.get("controlRevision") == env.get("GITHUB_SHA")
+            and start.get("candidateRevision") == env.get("HEAD_TRUSTED_REVIEWED_SHA")
+            and start.get("writerAttempt") == "1" and DECIMAL.fullmatch(start.get("writerRunId", "")))
+    key = tool.prefix + "backup-simulated-open-" + start["writerRunId"] + "-1-verified.json"
+    raw = tool.store.get(key)
+    value = parsed(raw)
+    require(canonical(value) == raw and set(value) == {"version", "mode", "startSha256", "targetSha256",
+            "configurationSha256", "originalWebhookSettingsSha256", "openedEpoch"}
+            and type(value["version"]) is int and value["version"] == 1 and value["mode"] == MODE
+            and value["startSha256"] == digest(start) and value["targetSha256"] == controller.target.digest
+            and value["configurationSha256"] == controller.target.configuration_digest
+            and HEX64.fullmatch(value["originalWebhookSettingsSha256"])
+            and type(value["openedEpoch"]) is int and value["openedEpoch"] > 0)
+    adapter = BackupRehearsalTelegram(controller.target, controller.secrets)
+    require(adapter.observe_original()["settingsSha256"] == value["originalWebhookSettingsSha256"],
+            "The original Telegram settings changed during the isolation rehearsal.")
+    controller.telegram = adapter
+    return value
+
+
 def public_phase_result(result, target, candidate_revision, dispatcher_revision, verified_proof):
     """Project only safe fields and the previously verified source identity."""
     require(isinstance(result, dict) and target.environment == "rehearsal"
@@ -418,6 +446,11 @@ def run(env):
     start_raw, _ = store.objects.get(start_key)
     start = parsed(start_raw)
     require(canonical(start) == start_raw and start.get("session") == session)
+    from backup_rehearsal_webhook import MODE
+    simulated = env.get("HEAD_TRUSTED_WEBHOOK_PRECONDITION") == MODE
+    if simulated:
+        require(intent["writerRunId"] == start.get("writerRunId"), "The simulated opening owns only its original run.")
+        window = simulated_window(ctl, tool, start, env)
     window_context = {"tool": tool, "target": target, "bundle": bundle, "manifest": manifest, "controller": ctl,
                       "sourceCheckpointId": spec["sourceCheckpointId"],
                       "sourceManifestSha256": spec["sourceManifestSha256"]}
@@ -428,7 +461,10 @@ def run(env):
         require_parent_running(intent, main_sha, candidate_sha, github._github_token())
         current_start, _ = store.objects.get(start_key)
         require(current_start == start_raw, "The original coordinator start intent changed.")
-        verify_owned_webhook_window(window_context, start, main_sha, candidate_sha)
+        if simulated:
+            require(simulated_window(ctl, tool, start, env) == window)
+        else:
+            verify_owned_webhook_window(window_context, start, main_sha, candidate_sha)
         require_parent_running(intent, main_sha, candidate_sha, github._github_token())
         if action in {"pause", "freeze", "capture"}:
             require(deadline > int(time.time()), "The isolated pause deadline elapsed before the write.")
@@ -457,6 +493,8 @@ def run(env):
     # This is the same public projection as production, without invoking its
     # production-only current-main check with the candidate SHA.
     public = public_phase_result(result, target, candidate_sha, main_sha, proof)
+    if simulated:
+        public["webhookPreconditionSimulated"] = True
     identity_guard()
     path = Path(env["RUNNER_TEMP"]) / "production-backup-result.json"
     with recovery.native.private_file(path) as output:

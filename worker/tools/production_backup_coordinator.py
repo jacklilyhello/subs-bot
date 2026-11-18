@@ -965,11 +965,12 @@ def checkpoint_wait_deadline(action, deadline, pause_until, *, now, monotonic_no
 
 def run_sequence(store, anchor, target, session, revision, source_checkpoint_id, source_manifest_sha256, token, *,
                  deadline, pause_limit, writer_run_id, pause_alarm_seconds=300, profile="production", candidate_revision=None, validation_json=None,
-                 scope_owner=None):
+                 scope_owner=None, rehearsal_complete=None):
     """Drive the fixed checkpoint sequence; unknown external writes are never replayed."""
     from secrets import token_hex
     import time
     profile_config(profile)
+    require(rehearsal_complete is None or profile == "rehearsal" and callable(rehearsal_complete))
     candidate_revision = revision if candidate_revision is None and profile == "production" else candidate_revision
     require(REVISION.fullmatch(candidate_revision or "") and (profile != "production" or candidate_revision == revision)
             and type(pause_alarm_seconds) is int and 1 <= pause_alarm_seconds <= pause_limit)
@@ -1010,6 +1011,8 @@ def run_sequence(store, anchor, target, session, revision, source_checkpoint_id,
     require(results[-1].get("status") == "resumed" and results[-1].get("action") == "activate")
     if scope_owner is not None:
         scope_owner.guard()
+    if rehearsal_complete is not None:
+        rehearsal_complete(results)
     anchor.release(session + "-1")
     return {"status": "completed", "verifiedCheckpoints": len(results), "productionApprovalSynthesized": False}
 
