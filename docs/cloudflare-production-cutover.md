@@ -19,7 +19,7 @@
 
 正式 Bot 和初始正式账号尚未确定。测试管理员 `8813701954`、成员 `8653767757`、群 `-5114255828` 不自动成为正式配置。正式库不复制测试订阅、授权覆盖、回执、短码、分享、临时节点、恢复演练数据或测试签名密钥。现有测试环境和原记录保持原样。
 
-生产操作使用 [生命周期控制](cloudflare-production-controls.md)、[ProviderFetch 控制](cloudflare-production-provider.md) 和 [备份／故障恢复控制](cloudflare-production-recovery.md)。`worker-isolation-*` 继续保护原隔离资源，不通过替换其资源名称来操作生产。正式身份、明确配置、必要凭据或本次操作批准缺失时，工具拒绝执行，保持接收关闭；不会回退到测试身份。所有安装、构建、自动化测试、恢复和运行验证仍只在 GitHub 托管 runner 或 Cloudflare 执行。
+生产操作使用 [生命周期控制](cloudflare-production-controls.md)、[ProviderFetch 控制](cloudflare-production-provider.md) 和 [备份／故障恢复控制](cloudflare-production-recovery.md)。GitHub Environment 的准确键名和填写时点见[生产配置清单](cloudflare-production-config.md)。`worker-isolation-*` 继续保护原隔离资源，不通过替换其资源名称来操作生产。正式身份、明确配置、必要凭据或本次操作批准缺失时，工具拒绝执行，保持接收关闭；不会回退到测试身份。所有安装、构建、自动化测试、恢复和运行验证仍只在 GitHub 托管 runner 或 Cloudflare 执行。
 
 ## 审批所需证据与局部限制
 
@@ -44,9 +44,9 @@
 1. **创建并确认正式 Bot。** 由维护者创建或另行明确授权代为创建；安全注入受保护生产配置，核对 `getMe` 和唯一消费者安排。不得复用测试 Bot、启动轮询探测或向未经批准的正式账号发消息。固定正式管理员、默认访问策略及群范围。
 2. **只读核对目标。** 固定账户/Zone、资源名称和域名状态。发现同名资源、未知 Webhook、意外消费者或其他项目资源时停止核对，不覆盖采用。
 3. **创建独立生产资源。** 在生命周期工作流先执行 `availability`，以草稿身份及准确前态批准 `provision`。创建前的每资源意图和实际 ID／时间写入已登记的私有 journal anchor；只创建批准清单中的 Worker、D1 和私有 R2。新资源不带业务模块或消费者。若结果不明，用 `provision-inspect` 独立读回，再以准确种类、身份摘要和意图时间窗执行 `provision-reconcile`；不能重复创建或采用未知同名资源。
-4. **初始化新 schema 和正式权限。** 固定所有实际资源 ID／时间后，执行 `preflight`，核对账户／Zone、Bot／群权限、私有性及准确初始化前态，再批准 `initialize`。应用候选的完整准确迁移，只写批准的正式权限白名单，业务表为空，持久控制为 `closed/frozen`。默认没有时区设置行即 UTC，管理员仍可在私聊持久修改。发现未经正式批准的测试身份、测试夹具或非白名单记录即停止；同一真人账号成为正式主体也须重新明确批准正式角色，不隐式继承测试权限。没有从隔离数据恢复目标复制业务数据的步骤。
+4. **先建立共享备份作用域，再初始化新 schema 和正式权限。** 固定所有实际资源 ID／时间后，在 D1 仍无表、Worker 仍未部署时，按[备份状态初始化顺序](cloudflare-production-recovery.md#首次建立备份状态)先初始化项目作用域和目标协调锚，保持周期关闭。随后执行生命周期 `preflight`，核对账户／Zone、Bot／群权限、私有性及准确初始化前态，再批准 `initialize`。应用候选的完整准确迁移，只写批准的正式权限白名单，业务表为空，持久控制为 `closed/frozen`。默认没有时区设置行即 UTC，管理员仍可在私聊持久修改。发现未经正式批准的测试身份、测试夹具或非白名单记录即停止；同一真人账号成为正式主体也须重新明确批准正式角色，不隐式继承测试权限。没有从隔离数据恢复目标复制业务数据的步骤。
 5. **部署准确候选，保持暂停。** 若启用 URL 导入／刷新，先按 ProviderFetch 说明完成正式专用依赖的原 OCI 发布、版本、Container／Workflow、真实 smoke 与独立 verify，并固定应用 caller；不能自动使用 dev 服务。生命周期 `deploy` 仅使用已审查的准确 CI 字节，读回 100% 版本、模块、完整绑定／配置和迁移，保持 `closed/frozen`。仅启用批准功能，`/ai` 首发关闭，未批准群范围关闭。后续配置／开关更新用 `plan-deploy` 固定当前线上产物和新配置前态，不沿用初次批准。
-6. **封存上线前基线。** 独立 `inspect` 核对实际配置、结构和分类状态，以恢复工作流 `prepare → capture → verify-backup` 保存初始化 G0。资料包含 D1、R2 引用闭包、完整配置及摘要、原始准确 CI ZIP 和来源证明；不包含原始 Secret。已有隔离恢复证据不等于允许覆盖生产 D1。
+6. **建立应用备份锚并封存上线前基线。** 独立 `inspect` 核对实际配置、结构和分类状态，以应用备份工作流 `plan-initialize-anchor → initialize-anchor` 固定冻结应用的事务锚，再以恢复工作流 `prepare → capture → verify-backup` 保存 G0。周期继续关闭。资料包含 D1、R2 引用闭包、完整配置及摘要、原始准确 CI ZIP 和来源证明；不包含原始 Secret。已有隔离恢复证据不等于允许覆盖生产 D1。
 7. **绑定正式域名。** 生命周期 `domain` 仅在准确 Zone、DNS／Custom Domain 无冲突时将 `subs-bot.lilyya.top` 绑定到唯一目标，读回 HTTPS、健康提交及响应安全策略。生产 workers.dev／预览保持关闭，Telegram 接收仍关闭。
 8. **设置唯一正式 Webhook。** 先执行 `plan-webhook`，批准其 `stateSha256`，并将 `webhook.settingsSha256` 填入 `webhook_sha256` 后再执行 `webhook`。前 URL 只允许空或准确正式目标，未知 URL／自定义证书拒绝；工具重新核对 `getMe`，设置准确 URL、Secret、allowed_updates 和 max_connections，显式 `drop_pending_updates: false`，并独立读回。没有旧消费者需要停止。若出现意外积压，先分类其来源、授权和有效期，不用清队列、高 offset 或 `cutoverAt=now` 隐去更新；首次批准策略与主体生效下界为 1，业务时效拒绝／忽略也须持久记录。结果不明只读核对，不启动第二消费者试探。
 9. **最终激活。** 先以 G0 的 `baseline_checkpoint_id`、`baseline_manifest_sha256` 执行 `plan-activate`；工具完整读回 SQL／R2／原始 CI 闭包并与当前 frozen 现场核对。以包含该基线的前态单独批准 `activate`，再次核对后直接从 frozen 原子开启，不先 thaw。任何新写入、epoch、版本或配置变化均需重新封存并批准。准确资源、身份／配置、Webhook、域名、分类排空及未知结果检查也必须通过。Webhook 是当前唯一可写公开 HTTP，其他公开路径仅 GET/HEAD，目前没有 queue handler；Cron 使用同一持久 invocation 与 D1 fence。持久受理／disposition 后才确认，重复 `(bot_id, update_id)` 核对载荷摘要并复用完成结果，处理中或外部结果不确定的更新不能重执行业务。封存首次 receipt／任务水位。

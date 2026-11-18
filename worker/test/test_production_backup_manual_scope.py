@@ -13,9 +13,10 @@ from production_target import ContractError
 class ManualScopeTests(unittest.TestCase):
     def scope(self):
         scope = manual.ManualScope.__new__(manual.ManualScope)
-        scope.start = {"action": "pause", "workflowRef": artifact.REPOSITORY +
+        scope.start = {"action": "pause", "writerRunId": "123", "workflowRef": artifact.REPOSITORY +
                        "/.github/workflows/worker-production-backup.yml@" + artifact.MAIN_REF}
         scope.env = {"GITHUB_RUN_ID": "123"}
+        scope.continuation = None
         scope.scope = "a" * 64
         scope.objects, scope.anchor, scope.guard = Mock(), Mock(), Mock()
         return scope

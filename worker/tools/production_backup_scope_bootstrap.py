@@ -360,6 +360,40 @@ def verify_first_launch_writers(env, review_raw, review_pin, token):
             "guardGithubUpperBound": 13 + 5 * len(reviewed) + 4 * 5}
 
 
+def propose_writer_review(env, target, objects, anchor_objects, registration_sha256, token):
+    """Export the evidence rows for a separate operator review; this is not approval."""
+    require(env.get("BACKUP_COORDINATOR_ACTION") == "plan-schedule-anchor"
+            and not env.get("SUBS_BOT_BACKUP_SCOPE_BOOTSTRAP_REVIEW_JSON")
+            and not env.get("SUBS_BOT_BACKUP_SCOPE_BOOTSTRAP_REVIEW_SHA256")
+            and HEX.fullmatch(registration_sha256 or ""))
+    original = provision_original(target, objects, anchor_objects, registration_sha256)
+    receipt = original["receipt"]
+    _provision_job(receipt, token)
+    _bootstrap_run(env["GITHUB_RUN_ID"], env["GITHUB_SHA"], "plan-schedule-anchor", token, running=True)
+    provision = _get_json("/actions/runs/" + receipt["runId"] + "/attempts/1", token)
+    start, now = provision.get("created_at"), datetime.now(timezone.utc)
+    require(timedelta(0) <= now - _stamp(start) <= timedelta(days=31))
+    end = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    path = "/actions/runs?" + urlencode({"created": start + ".." + end})
+    runs = [row for row in _pages(path, "workflow_runs", token, maximum=26)
+            if str(row.get("id")) != env["GITHUB_RUN_ID"]]
+    require(len(runs) <= 25 and sum(str(row.get("id")) == receipt["runId"] for row in runs) == 1,
+            "The provisioning run must be present in the bounded review inventory.")
+    evidence = []
+    for row in runs:
+        item = _run_evidence(row, token)
+        item["classification"] = ("provision-only" if item["runId"] == receipt["runId"]
+                                  else "reviewed-no-target-mutation")
+        evidence.append(item)
+    require([row for row in _pages(path, "workflow_runs", token, maximum=26)
+             if str(row.get("id")) != env["GITHUB_RUN_ID"]] == runs)
+    _require_current_main(env["GITHUB_SHA"], token)
+    return {"version": 1, "kind": "new-production-scope-bootstrap-review", "targetSha256": target.digest,
+            "configurationSha256": target.configuration_digest, "scopeSha256": schedule.logical_scope(target),
+            "registrationSha256": registration_sha256, "windowStart": start, "windowEnd": end,
+            "reviewedRuns": evidence, "custody": CUSTODY, "noPriorInFlightWriter": True}
+
+
 def plan_first_launch(env, target, objects, data_objects, anchor_objects, data_api, worker_api, metadata_api, scope_anchor,
                       review_raw, review_pin, registration_sha256, token):
     """Produce a bounded, independently reviewable plan. No mutation is performed."""

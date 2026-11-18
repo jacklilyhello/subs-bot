@@ -16,7 +16,7 @@
 
 ## 运行前配置
 
-受保护的环境需要 `SUBS_BOT_TARGET_JSON`、`SUBS_BOT_CONTROL_SECRETS`、`SUBS_BOT_CF_DATA_TOKEN`、`SUBS_BOT_CF_WORKER_TOKEN`，与生产生命周期控制相同。额外配置 `SUBS_BOT_RECOVERY_JSON`。每个变更还需准确的 `SUBS_BOT_APPROVAL_JSON`。
+按[生产配置清单](cloudflare-production-config.md)填写两个受保护 Environment 的准确目标、备份策略、共享锚和来源审核。恢复步骤需要 `SUBS_BOT_RECOVERY_JSON`，每个变更另需准确的 `SUBS_BOT_APPROVAL_JSON`。恢复自身使用独立 Worker 只读凭据。
 
 数据凭据只需本项目账户的 D1 创建/原生导出/原生导入及 R2 读写能力。代码对数据请求另设严格路径与只读源约束；不提供源业务 SQL 写入、DELETE、reset、Time Travel 恢复或 Worker 部署路径。消费者发现使用 Worker 只读能力，检查全账户脚本及服务环境绑定；不能完整读取时停止。R2 条件写入以现有受保护 Token 身份派生 S3 签名，不把凭据放入上传对象。
 
@@ -98,9 +98,9 @@ G0 之后发生任何新增、修改、删除、授权、领取、撤销、短�
 | --- | --- |
 | 创建资源丢响应 | 保留 `started/unknown` 意图；只读查候选，独立核对身份 SHA 和创建时间窗后用 `pin-resource`；不重复 create、不采用未知资源 |
 | 导出开始后丢书签 | 保留 unknown，等待平台取消并核对正常查询恢复；不自动重启导出 |
-| 已知导出书签超时 | 用原 checkpoint 和 `poll-export` 接续同一导出；有界轮询到期不会报告完成 |
+| 已知导出书签超时 | 用原 checkpoint 和 `poll-export` 接续同一导出；若原调用仍持有共享锁，先用 `inspect` 取 `recoveryJournalSha256`，批准下一步并传 `resume_scope_run_id` 与 `resume_journal_sha256`；有界轮询到期不会报告完成 |
 | 对象写入丢响应 | 重新读同一键的完整字节和元数据；相同才可确认，不同或未知即停止 |
-| init/ingest 丢响应 | 只用已知书签轮询或只读完整对账；不重复 init/ingest、不清库 |
+| init/ingest 丢响应 | 只用已知书签轮询或只读完整对账；已持久记录同一导入轮询书签时可用同一会话的 `start-import` 和上述两个精确续接参数，不重复 init/ingest、不清库 |
 | journal 写入不明 | 同一调用停止后续 mutation；下次独立读完整 hash chain，冲突、缺代或未确认值阻止继续 |
 | 重复已确认调用 | 从持久 pin、内容摘要和完整远端状态确认；不会重复产生未知的创建或导入操作 |
 | 恢复目标有 Worker 绑定或公开 R2 | 停止恢复，保留原数据和目标；不会修改其他 Worker 来消除阻塞 |
@@ -131,23 +131,41 @@ G0 之后发生任何新增、修改、删除、授权、领取、撤销、短�
 
 所有界限采用超限拒绝，不截断数据。工具备份完整 D1 与 D1 引用的 R2 闭包，不声称复制任意无引用孤儿对象或 Worker Secret。Secret 由受保护配置另行保管。任务超时可能留下已确认分片或独立目标；这些资料不会被自动删除。源码/配置/密钥不兼容、非支持 schema/元数据或无法完整读取资源时停止，不能用部分摘要宣布恢复成功。
 
-## 隔离日常备份控制草案（尚未启用）
+## 日常备份与中断接续
 
-仓库包含待验收的日常备份、私有事务锚、独立监控和中断检查实现，入口默认关闭；尚未完成精确提交的托管测试、隔离故障演练、独立读回、代码审查以及实际 R2 条件写和分页响应核对前，不应视为已经验收。隔离 Environment 的 `SUBS_BOT_REHEARSAL_BACKUP_WRITES_ENABLED` 只控制隔离备份写入及事务锚协调；独立的 `SUBS_BOT_REHEARSAL_BACKUP_WATCHDOG_ENABLED` 控制看护，使停止发起新备份不会同时关闭未决事务看护。日常定时触发还需单独设置 `SUBS_BOT_REHEARSAL_DAILY_BACKUP_ENABLED`，监控定时触发使用 `SUBS_BOT_REHEARSAL_BACKUP_MONITOR_ENABLED`。这些开关均须显式设置为 `true`，默认不启用。
+### 首次建立备份状态
 
-生产 Environment 的 `SUBS_BOT_PRODUCTION_BACKUP_WRITES_ENABLED` 默认关闭，仅允许在另行批准正式运维策略后启用。它只允许进入已选的单步受保护入口，不生成授权：每次仍须精确目标、动作、来源和前态的独立批准，且禁止重跑 mutation attempt。生产 schedule 仅可运行只读监控，不能自动启动生产备份。
+1. 完成生命周期 `provision`，独立读回正式目标的实际身份与私有登记。先保持 D1 无表、Worker 无业务部署、业务 R2 无对象。保持周期和监控的仓库开关关闭。
+2. 在 `worker-production-backup-coordinator.yml` 调用 `plan-controller-review`，审查固定控制提交及工作流来源。将审核后的 canonical JSON 及摘要分别写入两个 Environment。配置原 reader 日志保留策略，见[生产配置清单](cloudflare-production-config.md)。
+3. 在协调器工作流调用 `plan-schedule-anchor`。首次未填写审核项时返回从准确 provision run 开始的候选 writer 清单。逐个审查原 run、jobs、源码、实际调用权限及没有未结操作的保管事实，固定 JSON 与独立摘要后再调用 `plan-schedule-anchor` 取得 `planSha256` 和三个 genesis 摘要。候选清单中的分类需要维护者确认。出现新 writer、超出盘点上限、旧对象、已迁移或已部署时停止。
+4. 固定三个 genesis 和准确计划摘要。获准后用 `initialize-schedule-anchor` 与准确 `approval_sha256` 建立全项目共享作用域，再用 `initialize` 与 `approval_sha256=targetCoordinatorGenesisSha256` 建立目标协调锚。此阶段只开放经批准的 `SUBS_BOT_PRODUCTION_BACKUP_COORDINATOR_ENABLED`。部分写入或响应不明时保留对象及原运行，先读回；不得删除锚或重放引导。
+5. 按[上线顺序](cloudflare-production-cutover.md)迁移新 D1、初始化正式权限并部署准确 Worker，保持 closed/frozen。用 `worker-production-backup.yml` 的 `plan-initialize-anchor → initialize-anchor` 建立应用事务锚，核对同一 genesis 和准确前态；仅为该动作启用 `SUBS_BOT_PRODUCTION_BACKUP_WRITES_ENABLED`。随后用恢复工作流 `prepare → capture → verify-backup` 封存首次 G0。后续 G1 也使用恢复工作流和同一共享锁，周期授权和周期开关可以继续关闭。
 
-周期备份和人工恢复共享作用域的改造仍在开发，尚不能作为生产自动运行能力。计划中的人工备份、协调器和事故 G1 写操作都要求先按独立审批初始化并取得同一作用域锁；G1 不占每日周期槽。锁、事务或外部请求结果不明时保留原证据并停止，不删除意图或重发。周期启动前须确认已有维护事务已结束；实际启用仍需完成独立验收及正式策略批准。
+### 周期执行与告警
 
-普通单步报告的 `scheduleEnabled: null` 表示该运行没有独立观察周期授权状态；不能把它当作已关闭。只有经过实际周期授权核验的子阶段才报告 `true`。
+建议由运维批准后每天 01:00 UTC（新加坡 09:00）开始，窗口 60 分钟。每 15 分钟触发器检查是否在窗口内、是否已有本日独立读回的备份。在同一授权内有独立读回的每个日期各占一个槽，下一天可调用新的槽；前一槽悬挂、共享锁未决或读回证明不完整时停止。周期、人工备份和独立恢复共用项目作用域，从开始意图直到已确认的终态；并发或重复触发无法得到第二把锁。运行频率以 UTC 日计，支持按整日间隔配置。
 
-生产定时任务还有两道独立开关：仓库级 `SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_DISPATCH_ENABLED` 和 `SUBS_BOT_PRODUCTION_BACKUP_MONITOR_DISPATCH_ENABLED` 在选择 production Environment 前控制对应 job，默认缺省关闭；进入 Environment 后仍须分别通过受保护的周期或监控开关和授权校验。仓库开关关闭时 job 不运行，不能把跳过视为已执行监控。显式手动动作仍遵守各自的保护条件和批准。
+启动写入前检查批准范围、来源、上次终态、完整库及引用对象容量，暂停前再次预检。实际顺序包括暂停新增接收、排空、冻结、捕获完整 D1/R2、验证封存、恢复到本次暂停前已确认的接收状态以及终态独立读回。已受理的任务可完成，Telegram webhook 设置和待处理更新继续保留。不确定的外部操作须停留并告警。保留最后成功 checkpoint，只有独立读回完整封存及终态的运行才会标为成功。
 
-首次生产的作用域引导计划限定于已批准的新资源：资源创建与登记确认后、D1 迁移和 Worker 部署前执行。引导须交叉核对新备份桶中的登记原件、独立的 provision 日志链、实际资源 ID 与创建时刻，并完整盘点新备份桶、新业务对象桶及创建后的本项目潜在写入运行；有旧证据、运行中或结果不明时停止。审核依据和不发生未授权删除的 custody 假设须由独立受保护摘要固定。资源或桶迁移不属于该引导路径；初始化代码和验证完成前不得启用。
+建议阈值为 80% 容量、暂停开始后 300 秒告警、最长允许暂停 1,800 秒、48 小时没有成功备份告警。暂停上限可配置为 300–21,600 秒且不小于告警门限；超时后停止新的冻结或捕获，按已知现场选择受限恢复。在途请求、runner 中断和平台排队可能使实际暂停超过门限。恢复接收前必须确认同一事务的控制代、依赖以及外部结果；结果不明时保持现场并通知值班人。保留期建议至少 30 天，须另行批准。G0、事故 G1 与未结案证据按各自要求保全，当前没有自动删除。
+
+启用周期前需独立批准绑定精确目标、配置、控制提交和已读回来源的限期授权，最长 31 天且最多 31 次。在仓库与对应 Environment 显式设置开关，[配置清单](cloudflare-production-config.md)列出了准确位置。关闭周期入口后，只读监控可独立运行。普通单步报告的 `scheduleEnabled: null` 表示该运行未独立观察周期授权状态。随着策略、配置或控制提交改变，重新核对来源、已审控制版本及权限定期；不得拿另一版本的批准或执行日期继续。
+
+### 中断处置
+
+| 已观察现场 | 操作 |
+| --- | --- |
+| 暂停前容量已超限、来源或依赖未通过 | 停止发起暂停。记录失败和告警，核对上次已验证的备份与余量，安排处置。 |
+| 原周期 run 已结束；阶段结果已持久化，或唯一缺失回执的原子步骤可用原成功子 run、私有 claim 和完整结果证明 | 在协调器调用 `plan-resume-scheduled`，将原周期 run ID 传为 `session`。审核输出的阶段和计划摘要后，在原授权仍有效时调用 `resume-scheduled`，传同一 `session` 与 `approval_sha256`。只接续原日期槽，最多一次正式续接。暂停时间超限时禁止发起新的冻结或捕获。 |
+| 子进程取消、下一步前缺失确认、外部结果或 CAS 不明 | 关闭新周期入口并保持独立监控。用协调器 `inspect`、应用监控、原私有 intent、journal 和原 run 核对现场。保留已受理任务、原证据和最后有效备份，不重发 Telegram 或外部写入，不清除原锁。过期、无法证明的前态和第二次中断升级给维护者。 |
+| 人工协调已中断，原锁尚在 | 用 `plan-resume → resume` 接续已证实的阶段；结果待对账时用 `plan-reconcile → reconcile`，此步骤保留共享锁。仅在原前态及安全终态可证明时使用 `plan-abort → abort`。单步应用恢复仍需对应前态和准确批准。 |
+| 独立读回失败 | 保留原封存、失败证据和上一次已确认备份。读回结果仍为失败或未知，不把写入完成当作成功。只允许原证据支持的续接或受限恢复接收；现场新写入时先封存 G1，再向独立目标恢复及对账。 |
+
+隔离的原写入、看护、周期和监控开关分别为 `SUBS_BOT_REHEARSAL_BACKUP_WRITES_ENABLED`、`SUBS_BOT_REHEARSAL_BACKUP_WATCHDOG_ENABLED`、`SUBS_BOT_REHEARSAL_DAILY_BACKUP_ENABLED` 和 `SUBS_BOT_REHEARSAL_BACKUP_MONITOR_ENABLED`，均默认关闭。开放隔离接收使用受信演练边界，详见文末。
 
 历史核验依赖原 Actions job 日志：本轮只读查询得到仓库日志保留配置为 90 天，这只是查询时的配置，不保证未来可取。运维须独立核对实际配置，设置受保护的保留期、提前告警和停用余量；平台保留配置变更时须重新审查。日志接近停用线应告警并停止新周期，日志实际缺失或无法核验时保持 unknown。原 job 日志保留期不等于 workflow artifact 的保留期；本项目部分报告 artifact 仅保留 7 或 14 天，应分别核对。
 
-草案默认每日 01:00 UTC 备份，80% 容量预警、300 秒暂停告警门限；百分比和门限可配置。独立的 `maximumPauseSeconds` 默认 1,800 秒（可配置 300–21,600 秒，且不小于报警门限）；超时后不得启动新的冻结或捕获，按精确已知状态执行受限恢复。任何门限都不是对 Cloudflare 在途请求或 runner 中断的硬时限保证。预检统计迁移链中的所有表和数据库引用对象闭包；活跃现场的读数不是一致快照，SQL 导出大小须冻结后才能准确验证，行数超限时对象未检查会明确标记。最终仍须完整封存与独立读回，容量或读回未知均不能报告成功。30 天为待批准建议，不自动删除 G0、G1、未结案证据或任何备份。
+预检统计迁移链中的所有表和数据库引用对象闭包。活跃现场的读数不是一致快照，SQL 导出大小须冻结后才能准确验证，行数超限时对象未检查会明确标记。周期作用域最多核验 200 个历史运行，达到 160 个告警；达到上限前需审查历史锚和保管方案。日志留存和历史对象的上限各自适用。
 
 20,000 是全部受支持表的行数总和，不是用户数；例如 Telegram 收件/发件、生产更新处置、调用及 Provider 处理记录也占用容量，日常消息可使其增长。当前恢复链不适合无界增长：接近上限时必须在尚能完整备份的窗口内安排经审查的分片备份与恢复能力扩容，验证后才能提高运行边界；不能以删除处理记录、跳过表或截断对象代替扩容。预检超限时不应开始暂停，并应保留最后一次成功备份、发出告警和安排扩容；冻结后才发现 SQL 过大或其他无法预检的限制时，按事务状态核对是否可以安全恢复接收。现阶段没有已验证的自动扩容或数据清理方案。
 
@@ -157,7 +175,7 @@ G0 之后发生任何新增、修改、删除、授权、领取、撤销、短�
 
 生产 checkpoint 的 `plan-initialize-anchor` 会只读给出按目标身份计算的 genesis 摘要；首次初始化前须独立固定该摘要并逐动作批准。新 begin 在 acquire 前先独占封存实际 writer、来源、批准摘要、准确控制前态和 anchor 前驱。若原 writer 已结束、完整 journal 确认为空、该 intent 与当前源码和现场均精确匹配，`plan-abort-unstarted` 可生成只读计划，`abort-unstarted` 经独立批准与单次恢复 intent 后终结此会话；唯一可核对的 future acquire 候选也可按摘要显式协调。任何恢复 intent 响应不明或重试、缺失 intent 的旧现场、跨控制版本、日志分叉或在途写入均保持 unknown，不能凭对象暂时缺失重放。`plan-anchor-reconcile` / `anchor-reconcile` 仍只处理原 resume intent 所属 run 已完成、完整 journal 已确认 resumed 且终态精确匹配的 release，不把失败备份改称成功。生产 mutation 默认关闭，并要求上面所述的单步精确批准。
 
-在完整事务 journal 证明尚无 capture 或 poll intent、原 freeze run 已完成且该 checkpoint 的 recovery journal 不存在时，`plan-resume-failed` 可针对确认属于本次维护的 frozen 状态生成受限恢复计划；已完成 fingerprint 时还要重新核对完整冻结数据。恢复动作仍需精确审批，重验依赖和无未知外部结果后才执行一次 CAS。若 recovery journal 存在、导出状态未知、日志缺失或存在未确认写入，则停留并告警；该路径不替代新激活所需的完整基线。此草案不自动授权或保证暂停硬时限。
+在完整事务 journal 证明尚无 capture 或 poll intent、原 freeze run 已完成且该 checkpoint 的 recovery journal 不存在时，`plan-resume-failed` 可针对确认属于本次维护的 frozen 状态生成受限恢复计划；已完成 fingerprint 时还要重新核对完整冻结数据。恢复动作仍需精确审批，重验依赖和无未知外部结果后才执行一次 CAS。若 recovery journal 存在、导出状态未知、日志缺失或存在未确认写入，则停留并告警；该路径不替代新激活所需的完整基线。
 
 `capacity-near`、`capacity-over`、`readback-failure` 和 `process-kill` 仅是手动隔离 dispatch 的合成故障模式：它们分别模拟阈值、独立读回失败和 runner 进程中断，不表示真实数据达到阈值或真实 R2 对象被损坏。托管 fixture、Cloudflare 实际验收和生产配置是独立结论，不能以其中任何单项代替整体验收。
 

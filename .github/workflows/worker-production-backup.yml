@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: One reviewed checkpoint; scheduled production operation is disabled
+        description: One reviewed checkpoint; the separate coordinator controls scheduled dispatch
         required: true
         type: choice
         options: [monitor, plan-initialize-anchor, initialize-anchor, inspect-anchor-initialization, inspect-anchor-unknown, plan-abort-unstarted, abort-unstarted, plan-begin, begin, inspect, preflight, abort-preflight, plan-pause, pause, drain, freeze, fingerprint, capture, poll-export, verify, plan-activate, activate, plan-reconcile-transition, reconcile-transition, plan-resume-failed, resume-failed, plan-anchor-reconcile, anchor-reconcile]

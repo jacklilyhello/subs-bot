@@ -306,13 +306,12 @@ def historical_schedule_source_review(env, revision, recorded_review, source):
     return True
 
 
-def scheduled_source_review(env, revision, *, historical=False):
-    """Verify the protected exact commit, full tree and reviewed source set."""
+def source_review_material(env, revision, *, historical=False):
+    """Derive the source pins from the verified checkout without creating approval."""
     import subprocess
     from pathlib import Path
 
-    review, pin = scheduled_review_document(env)
-    require(REVISION.fullmatch(revision or "") and revision in review["controllers"])
+    require(REVISION.fullmatch(revision or ""))
     workspace = Path(env.get("GITHUB_WORKSPACE", ""))
     require(workspace.is_absolute() and workspace.is_dir() and not workspace.is_symlink())
     def git(*arguments):
@@ -325,8 +324,7 @@ def scheduled_source_review(env, revision, *, historical=False):
     else:
         require(head == revision)
     tree = git("rev-parse", "--verify", revision + "^{tree}").strip().decode("ascii")
-    expected = review["controllers"][revision]
-    require(tree == expected["treeSha"])
+    require(REVISION.fullmatch(tree or ""))
     listing = git("ls-tree", "-r", "--name-only", revision, "--", "worker/tools")
     require(len(listing) <= 1024 * 1024)
     paths = [path for path in listing.decode("utf-8").splitlines() if path.endswith(".py")]
@@ -341,10 +339,18 @@ def scheduled_source_review(env, revision, *, historical=False):
         content = git("show", revision + ":" + path)
         require(len(content) == int(size))
         sources[path] = sha256(content).hexdigest()
-    require(sha256(canonical(sources)).hexdigest() == expected["sourceClosureSha256"]
-            and sources[SCHEDULE_REVIEW_WORKFLOWS[0]] == expected["workflowSha256"]
-            and sources[SCHEDULE_REVIEW_WORKFLOWS[1]] == expected["childWorkflowSha256"])
-    return {"revision": revision, "treeSha": tree, "sources": sources, "reviewSha256": pin}
+    entry = {"treeSha": tree, "sourceClosureSha256": sha256(canonical(sources)).hexdigest(),
+             "workflowSha256": sources[SCHEDULE_REVIEW_WORKFLOWS[0]], "childWorkflowSha256": sources[SCHEDULE_REVIEW_WORKFLOWS[1]]}
+    return entry, sources
+
+
+def scheduled_source_review(env, revision, *, historical=False):
+    """Verify the protected exact commit, full tree and reviewed source set."""
+    review, pin = scheduled_review_document(env)
+    require(REVISION.fullmatch(revision or "") and revision in review["controllers"])
+    entry, sources = source_review_material(env, revision, historical=historical)
+    require(entry == review["controllers"][revision])
+    return {"revision": revision, "treeSha": entry["treeSha"], "sources": sources, "reviewSha256": pin}
 
 
 def historical_manual_source_review(env, revision):
@@ -1437,6 +1443,11 @@ def scope_initialization(env, action, target, objects, revision, target_anchor, 
     review_pin = env.get("SUBS_BOT_BACKUP_SCOPE_BOOTSTRAP_REVIEW_SHA256", "")
     registration_sha = env.get("SUBS_BOT_BACKUP_SCOPE_BOOTSTRAP_REGISTRATION_SHA256", "")
     token = artifact._github_token()
+    if action == "plan-schedule-anchor" and not review_raw and not review_pin:
+        from production_control import privacy
+        privacy(metadata_api, metadata_api.root, provision_reader.bucket, registration["bucketCreatedAt"])
+        review = bootstrap.propose_writer_review(env, target, target_reader, provision_reader, registration_sha, token)
+        return {"status": "review-required", "review": review, "reviewSha256": digest(review), "mutationPerformed": False}
     args = (env, target, target_reader, data_reader, provision_reader, data_api, worker_api, metadata_api, read_anchor,
             review_raw, review_pin, registration_sha, token)
     plan = bootstrap.plan_first_launch(*args)
@@ -1471,6 +1482,37 @@ def scope_initialization(env, action, target, objects, revision, target_anchor, 
     return {"status": "schedule-anchor-initialized", "scopeGenesisSha256": scope_genesis, "mutationPerformed": True}
 
 
+def inspect_project_scope(env, target, objects):
+    import production_backup_manual_scope as manual
+    import production_backup_schedule as schedule
+    import production_backup_schedule_terminal as terminal
+
+    scope = schedule.logical_scope(target)
+    anchor = ScheduleScopeAnchor(CoordinatorStore(objects, scope), scope,
+        env.get("SUBS_BOT_BACKUP_SCHEDULE_SCOPE_GENESIS_SHA256", ""), target.data["backupBucketName"],
+        target.data["backupBucketCreatedAt"])
+    value, raw, _ = anchor.read()
+    if value["state"] == "active" or value["generation"] == 1:
+        return value["state"], value["state"] == "active"
+    owner, day = value["session"].removesuffix("-1"), value["day"].replace("/", "-")
+    manual_start, _ = objects.get(manual.start_key(scope, owner), absent=True)
+    schedule_start, _ = objects.get(schedule.scope_start_key(scope, owner), absent=True)
+    if isinstance(manual_start, bytes) and schedule_start is None:
+        done, _ = objects.get(manual.complete_key(scope, owner), absent=True)
+        final = parsed(done) if done is not None else {}
+        complete = (final.get("startSha256") == sha256(manual_start).hexdigest()
+                    and final.get("idleAnchorSha256") == sha256(raw).hexdigest())
+    elif isinstance(schedule_start, bytes) and manual_start is None:
+        done, _ = objects.get(schedule.terminal_key(scope, day), absent=True)
+        witness, _ = objects.get(terminal.witness_key(scope, day), absent=True)
+        final = parsed(done) if done is not None else {}
+        complete = (isinstance(witness, bytes) and final.get("session") == owner
+                    and final.get("scopeIdleAnchorSha256") == sha256(raw).hexdigest())
+    else:
+        complete = False
+    return value["state"], not complete
+
+
 def main(env=None):
     import os
     import time
@@ -1485,13 +1527,17 @@ def main(env=None):
     env = os.environ if env is None else env
     revision = verify_context(env)
     action = env.get("BACKUP_COORDINATOR_ACTION", "inspect")
-    require(action in {"inspect", "plan-initialize", "initialize", "plan-schedule-anchor", "initialize-schedule-anchor",
+    require(action in {"inspect", "plan-controller-review", "plan-initialize", "initialize", "plan-schedule-anchor", "initialize-schedule-anchor",
                        "scheduled-run", "plan-resume-scheduled", "resume-scheduled", "plan-run", "run",
                        "plan-resume", "resume", "plan-reconcile", "reconcile", "plan-abort", "abort"})
     if env.get("GITHUB_EVENT_NAME") == "schedule":
         require(action in {"inspect", "scheduled-run"}, "The cron event cannot select a manual action.")
     else:
         require(action != "scheduled-run", "A scheduled start requires the fixed cron event.")
+    if action == "plan-controller-review":
+        entry, _ = source_review_material(env, revision)
+        review = {"version": 1, "controllers": {revision: entry}}
+        return {"status": "planned", "review": review, "reviewSha256": digest(review), "mutationPerformed": False}
     target = validate_target(env.get("SUBS_BOT_TARGET_JSON", ""))
     require(target.environment == "production")
     policy = backup_cli.settings(env.get("SUBS_BOT_BACKUP_POLICY_JSON", ""))
@@ -1531,8 +1577,9 @@ def main(env=None):
         return result
     pinned, raw, _etag = anchor.read()
     if action == "inspect":
-        return {"status": "attention" if pinned["state"] == "active" else "observed",
-                "phase": pinned["state"], "mutationPerformed": False,
+        scope_state, scope_attention = inspect_project_scope(env, target, objects)
+        return {"status": "attention" if pinned["state"] == "active" or scope_attention else "observed",
+                "phase": pinned["state"], "scopeState": scope_state, "mutationPerformed": False,
                 "notification": "github-check-only", "automaticReplay": False}
     source_checkpoint, source_sha = env.get("BACKUP_SOURCE_CHECKPOINT_ID", ""), env.get("BACKUP_SOURCE_MANIFEST_SHA256", "")
     require(re.fullmatch(r"[a-f0-9]{32}", source_checkpoint or "") and HEX.fullmatch(source_sha or ""))

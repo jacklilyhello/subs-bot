@@ -11,7 +11,7 @@ on:
         description: One independently approved coordinator operation
         required: true
         type: choice
-        options: [inspect, plan-initialize, initialize, plan-schedule-anchor, initialize-schedule-anchor, plan-resume-scheduled, resume-scheduled, plan-run, run, plan-resume, resume, plan-reconcile, reconcile, plan-abort, abort]
+        options: [inspect, plan-controller-review, plan-initialize, initialize, plan-schedule-anchor, initialize-schedule-anchor, plan-resume-scheduled, resume-scheduled, plan-run, run, plan-resume, resume, plan-reconcile, reconcile, plan-abort, abort]
       session:
         description: Original coordinator plan run ID for continuation
         type: string
@@ -242,6 +242,7 @@ jobs:
           SUBS_BOT_TARGET_JSON: ${{ secrets.SUBS_BOT_TARGET_JSON }}
           SUBS_BOT_BACKUP_POLICY_JSON: ${{ secrets.SUBS_BOT_BACKUP_POLICY_JSON }}
           SUBS_BOT_BACKUP_COORDINATOR_GENESIS_SHA256: ${{ secrets.SUBS_BOT_BACKUP_COORDINATOR_GENESIS_SHA256 }}
+          SUBS_BOT_BACKUP_SCHEDULE_SCOPE_GENESIS_SHA256: ${{ secrets.SUBS_BOT_BACKUP_SCHEDULE_SCOPE_GENESIS_SHA256 }}
           SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
           SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
           BACKUP_COORDINATOR_ACTION: inspect
