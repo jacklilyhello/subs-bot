@@ -6,7 +6,7 @@
 
 | Secret | 何时填写 | 用途 |
 | --- | --- | --- |
-| `SUBS_BOT_TARGET_JSON` | 首发 | 账户、Zone、正式 Bot ID/用户名、域名、资源、角色／群范围、功能开关、配置世代和密钥摘要。在创建阶段填写草稿；随后使用实际登记的 ID 和创建时间。参见[目标字段](cloudflare-production-controls.md)。 |
+| `SUBS_BOT_TARGET_JSON` | 首发 | 账户、Zone、正式 Bot ID/用户名、域名、资源、角色／群范围、功能开关、配置世代和密钥摘要。固定 `defaultAccess=deny` 和 `features.apiStatus=false`。在创建阶段填写草稿，随后使用实际登记的 ID 和创建时间。参见[目标字段](cloudflare-production-controls.md)。 |
 | `SUBS_BOT_CONTROL_SECRETS` | 首发 | JSON 字段 `botToken`、`webhookSecret`、`aggregateKey`、`privateShareKey`、`shortlinkToken`。维护者安全提供 Bot Token，生成独立的 Webhook、聚合和私密分享密钥。短链未启用时填写 JSON null。 |
 | `SUBS_BOT_APPROVAL_JSON` | 首发，每个写动作分别填写 | 依据准确计划、前态、目标及控制提交审查生成的批准。一次批准只准许该动作。 |
 | `SUBS_BOT_PROVISION_ANCHOR_JSON` | 创建前 | 已批准的私有 provision 日志桶身份，字段 `accountId`、`bucketName`、`bucketCreatedAt`。日志桶独立于本次创建的业务桶和备份桶。 |
