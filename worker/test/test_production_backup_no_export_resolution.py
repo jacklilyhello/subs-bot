@@ -235,13 +235,28 @@ class NoExportEvidenceTests(unittest.TestCase):
                 resolution.require_request_budget({"NO_EXPORT_ACTION": "seal"}, review, 20)
             response.read.return_value = json.dumps({"resources": {"core": {"remaining": 5000, "reset": 2000}}}).encode()
             result = resolution.require_request_budget({"NO_EXPORT_ACTION": "seal"}, review, 20)
-            self.assertEqual(result["required"], (40 + 2 * (2 + 2)) * 20 + 3 * 14 + 13 + 100)
+            self.assertEqual(result["required"], (26 + 2 * (2 + 2)) * 20 + 3 * 14 + 40 + 100)
             self.assertEqual(result["writerLimit"], 4)
         with patch.object(resolution, "checked_gate", return_value=(review, 4, 14)), \
                 patch.object(resolution, "verify_legacy_archives"):
             resolution.guarded_review({}, review, 4, {})
         with patch.object(resolution, "checked_gate", return_value=(review, 5, 14)), self.assertRaises(Exception):
             resolution.guarded_review({}, review, 4, {})
+
+    def test_release_requires_the_full_reserved_budget_under_primary_limit(self):
+        review = {"targetSha256": "a" * 64}
+        response = MagicMock()
+        response.__enter__.return_value = response
+        with patch.object(resolution, "checked_gate", return_value=(review, 5, 14)), \
+                patch.object(resolution.github, "_github_token", return_value="token"), \
+                patch.object(resolution.github._OPENER, "open", return_value=response), \
+                patch.object(resolution.time, "time", return_value=1000):
+            response.read.return_value = json.dumps({"resources": {"core": {"remaining": 1000, "reset": 2000}}}).encode()
+            result = resolution.require_request_budget({"NO_EXPORT_ACTION": "release"}, review, 15)
+            self.assertEqual(result["required"], 872)
+            response.read.return_value = json.dumps({"resources": {"core": {"remaining": 871, "reset": 2000}}}).encode()
+            with self.assertRaises(Exception):
+                resolution.require_request_budget({"NO_EXPORT_ACTION": "release"}, review, 15)
 
     def test_original_seal_and_fresh_reader_are_both_required(self):
         main, candidate, run_id = "c" * 40, "d" * 40, "123"
