@@ -106,10 +106,15 @@ def create(env):
     created = CloudflareClient(writer)("POST", "/accounts/" + ACCOUNT + "/d1/database",
                                         {"name": name, "read_replication": {"mode": "disabled"}})
     result = identity(created, name)
+    response = {"version": 1, "intentSha256": sha256(raw).hexdigest(), "resource": result}
+    response_raw = canonical(response)
+    objects.put_once(base + "response.json", response_raw)
+    require(objects.get(base + "response.json")[0] == response_raw)
     observed = CloudflareClient(reader)("GET", "/accounts/" + ACCOUNT + "/d1/database/" + result["id"])
     rows = inventory(reader, name)
     require(identity(observed, name) == result and len(rows) == 1 and rows[0].get("uuid") == result["id"])
-    receipt = {"version": 1, "intentSha256": sha256(raw).hexdigest(), "resource": result}
+    receipt = {"version": 1, "intentSha256": sha256(raw).hexdigest(),
+               "responseSha256": sha256(response_raw).hexdigest(), "resource": result}
     objects.put_once(base + "receipt.json", canonical(receipt))
     return {"status": "created-awaiting-independent-readback", "name": name}
 
@@ -118,13 +123,16 @@ def readback(env):
     name = guard(env)
     objects, base = store(), PREFIX + name + "/"
     raw, _ = objects.get(base + "intent.json")
+    response_raw, _ = objects.get(base + "response.json")
     saved, _ = objects.get(base + "receipt.json")
-    intent, receipt = parsed(raw), parsed(saved)
-    require(canonical(intent) == raw and canonical(receipt) == saved
+    intent, response, receipt = parsed(raw), parsed(response_raw), parsed(saved)
+    require(canonical(intent) == raw and canonical(response) == response_raw and canonical(receipt) == saved
             and intent == {"version": 1, "accountId": ACCOUNT, "name": name, "runId": env["GITHUB_RUN_ID"],
                            "runAttempt": "1", "controllerRevision": env["GITHUB_SHA"], "kind": "isolated-d1-create"}
-            and set(receipt) == {"version", "intentSha256", "resource"} and receipt["version"] == 1
-            and receipt["intentSha256"] == sha256(raw).hexdigest())
+            and set(receipt) == {"version", "intentSha256", "responseSha256", "resource"} and receipt["version"] == 1
+            and receipt["intentSha256"] == sha256(raw).hexdigest()
+            and receipt["responseSha256"] == sha256(response_raw).hexdigest()
+            and response == {"version": 1, "intentSha256": sha256(raw).hexdigest(), "resource": receipt["resource"]})
     resource = receipt["resource"]
     require(isinstance(resource, dict) and set(resource) == {"id", "name", "createdAt"}
             and UUID.fullmatch(resource.get("id", "")) and resource.get("name") == name

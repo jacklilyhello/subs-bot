@@ -80,6 +80,22 @@ class FixtureCreateTests(unittest.TestCase):
             self.assertEqual(self.objects.put_once.call_count, 1)
             self.assertTrue(self.objects.put_once.call_args.args[0].endswith("/intent.json"))
 
+    def test_response_identity_is_preserved_before_readback_failure(self):
+        returned = {"uuid": "11111111-1111-1111-1111-111111111111", "name": self.name,
+                    "created_at": "2026-11-18T00:00:00Z"}
+        writer = Mock(return_value=returned)
+        reader = Mock(side_effect=OSError("read failed"))
+        with patch.object(fixture, "guard", return_value=self.name), \
+             patch.object(fixture, "store", return_value=self.objects), \
+             patch.object(fixture, "inventory", return_value=[]), \
+             patch.object(fixture, "CloudflareClient", side_effect=lambda token: writer if token == "write" else reader):
+            with self.assertRaises(OSError):
+                fixture.create(self.env)
+        self.assertEqual(writer.call_count, 1)
+        self.assertEqual(self.objects.put_once.call_count, 2)
+        self.assertTrue(self.objects.put_once.call_args_list[1].args[0].endswith("/response.json"))
+        self.assertEqual(json.loads(self.objects.put_once.call_args_list[1].args[1])["resource"]["id"], returned["uuid"])
+
     def test_readback_requires_exact_receipt_and_independent_reader(self):
         resource = {"id": "11111111-1111-1111-1111-111111111111", "name": self.name,
                     "createdAt": "2026-11-18T00:00:00Z"}
