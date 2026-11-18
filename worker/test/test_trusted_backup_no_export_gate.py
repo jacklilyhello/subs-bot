@@ -15,6 +15,50 @@ from production_target import ContractError
 
 
 class NoExportGateTests(unittest.TestCase):
+    def test_failure_phase_never_accepts_or_emits_arbitrary_input(self):
+        gate.gate_stage("identity")
+        secret = "synthetic-sensitive-input"
+        with self.assertRaises(ContractError) as error:
+            gate.gate_stage(secret)
+        self.assertEqual(gate.GATE_STAGE, "identity")
+        self.assertNotIn(secret, str(error.exception))
+
+    def test_only_two_pinned_zero_job_pushes_are_classified(self):
+        repo = {"id": gate.github.REPOSITORY_ID}
+        for run_id, pin in gate.UNSTARTED_PUSHES.items():
+            with self.subTest(run=run_id):
+                item = {"id": int(run_id), "path": gate.UNSTARTED_WORKFLOW, "event": "push",
+                        "head_sha": pin["head"], "run_attempt": 1}
+                run = {**item, "head_branch": "codex/backup-coordinator", "created_at": pin["createdAt"],
+                       "workflow_id": 421656360, "check_suite_id": int(pin["suite"]),
+                       "status": "completed", "conclusion": "failure", "repository": repo, "head_repository": repo}
+                suite = {"id": int(pin["suite"]), "head_branch": run["head_branch"], "head_sha": pin["head"],
+                         "status": "completed", "conclusion": "failure", "latest_check_runs_count": 0,
+                         "app": {"id": 15368, "slug": "github-actions"}, "repository": repo}
+                empty_jobs, empty_checks = {"total_count": 0, "jobs": []}, {"total_count": 0, "check_runs": []}
+                responses = [run, run, empty_jobs, suite, empty_checks]
+                with patch.object(gate.github, "_get_json", side_effect=responses), patch.object(gate, "reviewed_source") as source:
+                    gate.verify_fixed_unstarted_push(item, {"RUNNER_TEMP": "/synthetic"}, "x")
+                    self.assertEqual(source.call_args.args[:3], (pin["head"], gate.UNSTARTED_WORKFLOW, gate.UNSTARTED_WORKFLOW_SHA256))
+                invalid = [
+                    [run, {**run, "run_attempt": 2}],
+                    [run, {**run, "head_sha": "f" * 40}],
+                    [run, run, {"total_count": 1, "jobs": [{"id": 1}]}],
+                    [run, run, {"total_count": False, "jobs": []}],
+                    [run, run, empty_jobs, {**suite, "conclusion": "success"}],
+                    [run, run, empty_jobs, suite, {"total_count": 1, "check_runs": [{"id": 1}]}],
+                    [run, run, empty_jobs, suite, {"total_count": False, "check_runs": []}],
+                ]
+                for data in invalid:
+                    with patch.object(gate.github, "_get_json", side_effect=data), \
+                         patch.object(gate, "reviewed_source") as source, self.assertRaises(ContractError):
+                        gate.verify_fixed_unstarted_push(item, {"RUNNER_TEMP": "/synthetic"}, "x")
+                    source.assert_not_called()
+                for changed in ({**item, "id": 123}, {**item, "run_attempt": 2}, {**item, "head_sha": "e" * 40}):
+                    with patch.object(gate.github, "_get_json") as read, self.assertRaises(ContractError):
+                        gate.verify_fixed_unstarted_push(changed, {"RUNNER_TEMP": "/synthetic"}, "x")
+                    read.assert_not_called()
+
     def test_pinned_private_cache_rehashes_without_replacing_changed_evidence(self):
         body = b"synthetic private evidence"
         with tempfile.TemporaryDirectory() as directory:
@@ -223,15 +267,44 @@ class NoExportGateTests(unittest.TestCase):
         jobs = {"total_count": 2, "jobs": [{**base, "id": int(gate.FAILED_PLAN_JOB), "name": "resolution", "conclusion": "failure", "steps": steps},
                                            {**base, "name": "readback", "conclusion": "skipped", "steps": []}]}
         env = {"RUNNER_TEMP": "/synthetic"}
-        with patch.object(gate.github, "_get_json", side_effect=[run, jobs]), patch.object(gate, "reviewed_source") as sources:
+        with patch.object(gate.github, "_get_json", side_effect=[run, run, jobs]), \
+             patch.object(gate, "cached_private_bytes"), patch.object(gate, "reviewed_source") as sources:
             gate.verify_failed_initial_plan(item, env, "synthetic")
             self.assertEqual(sources.call_count, 2)
         steps[2]["conclusion"] = "success"
-        with patch.object(gate.github, "_get_json", side_effect=[run, jobs]), patch.object(gate, "reviewed_source"), self.assertRaises(ContractError):
+        with patch.object(gate.github, "_get_json", side_effect=[run, run, jobs]), patch.object(gate, "reviewed_source"), self.assertRaises(ContractError):
             gate.verify_failed_initial_plan(item, env, "synthetic")
         steps[2]["conclusion"] = "skipped"
         with self.assertRaises(ContractError):
             gate.verify_failed_initial_plan({**item, "run_attempt": 2}, env, "synthetic")
+
+    def test_fixed_later_audit_failure_preserves_original_attempt_log_and_sources(self):
+        pin = gate.PRECHECKOUT_FAILURES[gate.FAILED_AUDIT_RUN]
+        repo = {"id": gate.github.REPOSITORY_ID}
+        item = {"id": int(gate.FAILED_AUDIT_RUN), "path": gate.WORKFLOW, "event": "workflow_dispatch",
+                "head_sha": pin["main"], "run_attempt": 1}
+        run = {**item, "head_branch": "main", "status": "completed", "conclusion": "failure",
+               "display_title": "No-export audit-writers at " + pin["main"] + " candidate " + pin["head"],
+               "repository": repo, "head_repository": repo}
+        checkout = "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+        states = [(1, "Set up job", "success"), (2, checkout, "success"),
+                  (3, "Verify no-export identity before candidate checkout", "failure"), (4, checkout, "skipped"),
+                  (5, "Verify exact reviewed no-export checkout", "skipped"),
+                  (6, "Verify no-export test Bot identity", "skipped"), (7, "Plan or apply the no-export resolution", "skipped")]
+        steps = [{"number": number, "name": name, "status": "completed", "conclusion": outcome} for number, name, outcome in states]
+        base = {"run_id": item["id"], "run_attempt": 1, "head_sha": pin["main"], "status": "completed"}
+        jobs = {"total_count": 2, "jobs": [{**base, "id": int(pin["job"]), "name": "resolution", "conclusion": "failure", "steps": steps},
+                                           {**base, "name": "readback", "conclusion": "skipped", "steps": []}]}
+        with patch.object(gate.github, "_get_json", side_effect=[run, run, jobs]), \
+             patch.object(gate, "reviewed_source") as source, patch.object(gate, "cached_private_bytes") as log:
+            gate.verify_failed_initial_plan(item, {"RUNNER_TEMP": "/synthetic"}, "x")
+            self.assertEqual(source.call_count, 2)
+            self.assertEqual(log.call_args.args[2], pin["logSha256"])
+        steps[-1]["conclusion"] = "success"
+        with patch.object(gate.github, "_get_json", side_effect=[run, run, jobs]), \
+             patch.object(gate, "reviewed_source") as source, self.assertRaises(ContractError):
+            gate.verify_failed_initial_plan(item, {"RUNNER_TEMP": "/synthetic"}, "x")
+        source.assert_not_called()
 
     def test_only_pinned_finished_provider_read_is_allowed_from_previous_main(self):
         item = {"id": int(gate.PROVIDER_READ_RUN), "path": gate.PROVIDER_READ_WORKFLOW,

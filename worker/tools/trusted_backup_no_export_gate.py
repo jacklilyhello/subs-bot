@@ -31,6 +31,27 @@ FAILED_PLAN_SOURCES = {
     ".github/workflows/worker-backup-no-export-resolution.yml": "8b46e11408866e5369013d2715b2339df9d37794753b6b61cdc067dade523355",
     "worker/tools/trusted_backup_no_export_gate.py": "dec99713970c4259161ed038b1e02fa96e620bfa1d739a794cdfd162d937ba3f",
 }
+FAILED_AUDIT_RUN = "44211462453"
+PRECHECKOUT_FAILURES = {
+    FAILED_PLAN_RUN: {"main": FAILED_PLAN_MAIN, "head": FAILED_PLAN_HEAD, "job": FAILED_PLAN_JOB,
+                      "action": "plan", "logSha256": "06b7dc59ad424d1862233aca9290914bb1c67863569f5ef6908b2f99b3068852",
+                      "sources": FAILED_PLAN_SOURCES},
+    FAILED_AUDIT_RUN: {"main": "2cf63df6b024f356ce20e7540e18e0fe551efa00",
+                       "head": "4dd43d8ffe5b232f8ec49e1bd68542a66e2167c0", "job": "134490616925",
+                       "action": "audit-writers", "logSha256": "0b36071ed1c0f9c3153e14ee6cb068ca00a510ee8f118ed5787697ec9d3b0031",
+                       "sources": {".github/workflows/worker-backup-no-export-resolution.yml":
+                                   "fd9bc30a9339ac23ea9e354494fb0b0baef946cbc9c6f8458aeae41d2af0fc94",
+                                   "worker/tools/trusted_backup_no_export_gate.py":
+                                   "6ac708aaf01e2bb7f880264b2e859a93292c59bd6d118efd6ffb83514e4d22c5"}},
+}
+UNSTARTED_PUSHES = {
+    "44184558493": {"head": "065c3365de786127dc5c547474961a88b77d0f0e", "suite": "119612100985",
+                     "createdAt": "2026-11-17T21:53:52Z"},
+    "44184809455": {"head": "7d8c324fd68fefdd2356c5d573a22d8f681859ba", "suite": "119612767443",
+                     "createdAt": "2026-11-17T21:55:20Z"},
+}
+UNSTARTED_WORKFLOW = ".github/workflows/worker-production-backup.yml"
+UNSTARTED_WORKFLOW_SHA256 = "39ae8c13690402336f3c54055be8c088949799fd602615446ba5407854c58b73"
 PROVIDER_READ_RUN = "44179992037"
 PROVIDER_READ_WORKFLOW = ".github/workflows/worker-provider-reviewed-head.yml"
 PROVIDER_READ_SOURCE_SHA256 = "4d46897f48702019d0f376a33f744998d1a0a5ea852058642f0034e50e4f1dbf"
@@ -65,6 +86,11 @@ LEGACY_ARCHIVE_SOURCE = {
 ENVIRONMENT = "subs-bot-backup-head-isolation"
 HEX32, HEX40, HEX64 = (re.compile(r"[a-f0-9]{32}"), re.compile(r"[a-f0-9]{40}"), re.compile(r"[a-f0-9]{64}"))
 DECIMAL = re.compile(r"[1-9][0-9]{0,19}")
+GATE_STAGES = {"identity", "review-contract", "current-main-and-head", "checkout", "original-run",
+               "original-steps", "original-parentage", "original-source", "prior-resolution", "historic-inventory",
+               "live-inventory", "writer-boundary", "legacy-identity", "legacy-source", "legacy-jobs",
+               "legacy-logs", "provider-identity", "provider-jobs", "provider-log", "unstarted-push", "inventory-output"}
+GATE_STAGE = "identity"
 SPEC_KEYS = {"version", "pr", "headSha", "registrationSha256", "sourceCheckpointId", "sourceManifestSha256", "genesisSha256"}
 REVIEW_KEYS = {"version", "targetSha256", "registrationSha256", "sourceCheckpointId", "sourceManifestSha256",
                "oldRunId", "oldAttempt", "oldDispatcherSha", "oldCandidateSha", "checkpointId", "sourceJobId",
@@ -77,6 +103,13 @@ CANDIDATE_PATHS = {"worker/tools/production_backup_head_harness.py", "worker/too
                    "worker/tools/production_target.py", "worker/tools/production_release_evidence.py"}
 DISPATCHER_PATHS = {".github/workflows/worker-backup-reviewed-head.yml", "worker/tools/trusted_backup_head_gate.py",
                     ".github/workflows/worker-provider-reviewed-head.yml"}
+
+
+def gate_stage(value):
+    """Expose only a fixed public phase, never an exception or input value."""
+    global GATE_STAGE
+    require(value in GATE_STAGES)
+    GATE_STAGE = value
 
 
 def checkout_sha(path):
@@ -179,6 +212,7 @@ def cached_private_bytes(directory, key, expected, maximum, fetch):
 
 
 def original_source(review, token, main, directory):
+    gate_stage("original-run")
     source = github._get_json("/actions/runs/" + OLD_RUN + "/attempts/1", token)
     latest = github._get_json("/actions/runs/" + OLD_RUN, token)
     require(str(source.get("id")) == str(latest.get("id")) == OLD_RUN and source.get("run_attempt") == latest.get("run_attempt") == 1
@@ -192,15 +226,18 @@ def original_source(review, token, main, directory):
     selected = [job for job in jobs["jobs"] if isinstance(job, dict) and str(job.get("id")) == OLD_JOB and job.get("name") == "validate"]
     require(len(selected) == 1 and str(selected[0].get("run_id")) == OLD_RUN and selected[0].get("run_attempt") == 1
             and selected[0].get("head_sha") == OLD_MAIN and (selected[0].get("status"), selected[0].get("conclusion")) == ("completed", "failure"))
+    gate_stage("original-steps")
     for name in ("Verify the exact independently reviewed head before checkout", "Independently recheck trusted main and candidate checkout",
                  "Confirm only the authorized isolated test identity", "Run the reviewed candidate against only dedicated isolation"):
         steps = [step for step in selected[0].get("steps", []) if isinstance(step, dict) and step.get("name") == name]
         require(len(steps) == 1 and (steps[0].get("status"), steps[0].get("conclusion")) ==
                 (("completed", "failure") if name == "Run the reviewed candidate against only dedicated isolation" else ("completed", "success")))
     if OLD_MAIN != main:
+        gate_stage("original-parentage")
         comparison = github.compare_commits_metadata(OLD_MAIN, main, token)
         require(comparison.get("status") == "ahead" and comparison.get("behind_by") == 0
                 and comparison.get("base_commit", {}).get("sha") == OLD_MAIN and comparison.get("merge_base_commit", {}).get("sha") == OLD_MAIN)
+    gate_stage("original-source")
     for revision, entries in ((OLD_CANDIDATE, review["candidateCodeSha256"]), (OLD_MAIN, review["dispatcherCodeSha256"])):
         for path, expected in sorted(entries.items()):
             reviewed_source(revision, path, expected, token, directory)
@@ -209,28 +246,34 @@ def original_source(review, token, main, directory):
 
 
 def verify_failed_initial_plan(item, env, token):
-    """The one proven failed pre-candidate plan never received cloud credentials."""
-    require(str(item["id"]) == FAILED_PLAN_RUN and item["path"] == WORKFLOW
-            and item["event"] == "workflow_dispatch" and item["head_sha"] == FAILED_PLAN_MAIN
+    """Only two pinned first-gate failures, never an arbitrary failed writer."""
+    gate_stage("prior-resolution")
+    run_id = str(item["id"])
+    require(run_id in PRECHECKOUT_FAILURES)
+    pin = PRECHECKOUT_FAILURES[run_id]
+    require(item["path"] == WORKFLOW
+            and item["event"] == "workflow_dispatch" and item["head_sha"] == pin["main"]
             and item["run_attempt"] == 1)
-    run = github._get_json("/actions/runs/" + FAILED_PLAN_RUN, token)
-    require(str(run.get("id")) == FAILED_PLAN_RUN and run.get("run_attempt") == 1
-            and run.get("path") in {WORKFLOW, WORKFLOW + "@main", WORKFLOW + "@refs/heads/main"}
-            and run.get("head_sha") == FAILED_PLAN_MAIN and run.get("head_branch") == "main"
-            and run.get("event") == "workflow_dispatch" and (run.get("status"), run.get("conclusion")) == ("completed", "failure")
-            and run.get("display_title") == "No-export plan at " + FAILED_PLAN_MAIN + " candidate " + FAILED_PLAN_HEAD
-            and all(isinstance(run.get(k), dict) and run[k].get("id") == github.REPOSITORY_ID for k in ("repository", "head_repository")))
-    response = github._get_json("/actions/runs/" + FAILED_PLAN_RUN + "/attempts/1/jobs?per_page=100", token)
+    original = github._get_json("/actions/runs/" + run_id + "/attempts/1", token)
+    latest = github._get_json("/actions/runs/" + run_id, token)
+    for run in (original, latest):
+        require(str(run.get("id")) == run_id and run.get("run_attempt") == 1
+                and run.get("path") in {WORKFLOW, WORKFLOW + "@main", WORKFLOW + "@refs/heads/main"}
+                and run.get("head_sha") == pin["main"] and run.get("head_branch") == "main"
+                and run.get("event") == "workflow_dispatch" and (run.get("status"), run.get("conclusion")) == ("completed", "failure")
+                and run.get("display_title") == "No-export " + pin["action"] + " at " + pin["main"] + " candidate " + pin["head"]
+                and all(isinstance(run.get(k), dict) and run[k].get("id") == github.REPOSITORY_ID for k in ("repository", "head_repository")))
+    response = github._get_json("/actions/runs/" + run_id + "/attempts/1/jobs?per_page=100", token)
     jobs = response.get("jobs")
     require(isinstance(jobs, list) and response.get("total_count") == len(jobs) == 2
             and {job.get("name") for job in jobs} == {"resolution", "readback"})
     resolution = next(job for job in jobs if job.get("name") == "resolution")
     reader = next(job for job in jobs if job.get("name") == "readback")
-    require(str(resolution.get("id")) == FAILED_PLAN_JOB and str(resolution.get("run_id")) == FAILED_PLAN_RUN and resolution.get("run_attempt") == 1
-            and resolution.get("head_sha") == FAILED_PLAN_MAIN
+    require(str(resolution.get("id")) == pin["job"] and str(resolution.get("run_id")) == run_id and resolution.get("run_attempt") == 1
+            and resolution.get("head_sha") == pin["main"]
             and (resolution.get("status"), resolution.get("conclusion")) == ("completed", "failure")
-            and str(reader.get("run_id")) == FAILED_PLAN_RUN and reader.get("run_attempt") == 1
-            and reader.get("head_sha") == FAILED_PLAN_MAIN
+            and str(reader.get("run_id")) == run_id and reader.get("run_attempt") == 1
+            and reader.get("head_sha") == pin["main"]
             and (reader.get("status"), reader.get("conclusion")) == ("completed", "skipped"))
     steps = resolution.get("steps")
     require(isinstance(steps, list) and len(steps) >= 7)
@@ -244,12 +287,53 @@ def verify_failed_initial_plan(item, env, token):
         matches = [step for step in steps if isinstance(step, dict) and step.get("number") == number]
         require(len(matches) == 1 and matches[0].get("name") == name
                 and (matches[0].get("status"), matches[0].get("conclusion")) == ("completed", conclusion))
-    for path, expected_sha in FAILED_PLAN_SOURCES.items():
-        reviewed_source(FAILED_PLAN_MAIN, path, expected_sha, token, env.get("RUNNER_TEMP", ""))
+    for path, expected_sha in pin["sources"].items():
+        reviewed_source(pin["main"], path, expected_sha, token, env.get("RUNNER_TEMP", ""))
+    from trusted_backup_webhook_log_archive import download_log
+    cached_private_bytes(env.get("RUNNER_TEMP", ""), "precheckout-log-" + pin["job"], pin["logSha256"],
+                         4 * 1024 * 1024, lambda: download_log(pin["job"], token))
+
+
+def verify_fixed_unstarted_push(item, env, token):
+    """Two exact completed failures with no jobs; no failure cause is inferred."""
+    gate_stage("unstarted-push")
+    run_id = str(item["id"])
+    require(run_id in UNSTARTED_PUSHES)
+    pin = UNSTARTED_PUSHES[run_id]
+    require(item["path"] == UNSTARTED_WORKFLOW and item["event"] == "push"
+            and item["head_sha"] == pin["head"] and item["run_attempt"] == 1)
+    original = github._get_json("/actions/runs/" + run_id + "/attempts/1", token)
+    latest = github._get_json("/actions/runs/" + run_id, token)
+    for run in (original, latest):
+        require(str(run.get("id")) == run_id and run.get("run_attempt") == 1
+                and run.get("path") == UNSTARTED_WORKFLOW and run.get("event") == "push"
+                and run.get("head_sha") == pin["head"] and run.get("head_branch") == "codex/backup-coordinator"
+                and run.get("created_at") == pin["createdAt"] and run.get("workflow_id") == 421656360
+                and str(run.get("check_suite_id")) == pin["suite"]
+                and (run.get("status"), run.get("conclusion")) == ("completed", "failure")
+                and all(isinstance(run.get(k), dict) and run[k].get("id") == github.REPOSITORY_ID
+                        for k in ("repository", "head_repository")))
+    jobs = github._get_json("/actions/runs/" + run_id + "/attempts/1/jobs?per_page=100", token)
+    require(isinstance(jobs, dict) and set(jobs) == {"total_count", "jobs"}
+            and type(jobs["total_count"]) is int and jobs["total_count"] == 0 and jobs["jobs"] == [],
+            "A fixed unstarted push now has jobs or incomplete metadata.")
+    suite = github._get_json("/check-suites/" + pin["suite"], token)
+    require(str(suite.get("id")) == pin["suite"] and suite.get("head_sha") == pin["head"]
+            and suite.get("head_branch") == "codex/backup-coordinator"
+            and (suite.get("status"), suite.get("conclusion")) == ("completed", "failure")
+            and type(suite.get("latest_check_runs_count")) is int and suite["latest_check_runs_count"] == 0
+            and suite.get("app", {}).get("id") == 15368 and suite.get("app", {}).get("slug") == "github-actions"
+            and suite.get("repository", {}).get("id") == github.REPOSITORY_ID)
+    checks = github._get_json("/check-suites/" + pin["suite"] + "/check-runs?per_page=100", token)
+    require(isinstance(checks, dict) and set(checks) == {"total_count", "check_runs"}
+            and type(checks["total_count"]) is int and checks["total_count"] == 0 and checks["check_runs"] == [],
+            "A fixed unstarted push now has check runs.")
+    reviewed_source(pin["head"], UNSTARTED_WORKFLOW, UNSTARTED_WORKFLOW_SHA256, token, env.get("RUNNER_TEMP", ""))
 
 
 def verify_fixed_provider_read(item, env, token):
     """Recognize only the completed, reviewed read-only Provider run at old main."""
+    gate_stage("provider-identity")
     require(str(item["id"]) == PROVIDER_READ_RUN and item["path"] == PROVIDER_READ_WORKFLOW
             and item["event"] == "workflow_dispatch" and item["head_sha"] == FAILED_PLAN_MAIN
             and item["run_attempt"] == 1)
@@ -275,6 +359,7 @@ def verify_fixed_provider_read(item, env, token):
 
 def verify_later_provider_read(item, env, token):
     """Recognize only the fixed later read-only run, not its failed live result."""
+    gate_stage("provider-identity")
     require(str(item["id"]) == LATER_PROVIDER_READ_RUN and item["path"] == PROVIDER_READ_WORKFLOW
             and item["event"] == "workflow_dispatch" and item["head_sha"] == LATER_PROVIDER_MAIN
             and item["run_attempt"] == 1 and item.get("head_branch") == "main"
@@ -288,6 +373,7 @@ def verify_later_provider_read(item, env, token):
         jobs = response.get("jobs")
         require(isinstance(jobs, list) and type(response.get("total_count")) is int and response["total_count"] == len(jobs) == 4)
         return canonical([{key: job.get(key) for key in fields} for job in jobs])
+    gate_stage("provider-jobs")
     raw = cached_private_bytes(env.get("RUNNER_TEMP", ""), "provider-jobs-" + LATER_PROVIDER_READ_RUN,
                                LATER_PROVIDER_JOBS_SHA256, 65536, fetch_jobs)
     jobs = json.loads(raw)
@@ -298,6 +384,7 @@ def verify_later_provider_read(item, env, token):
         require(str(job.get("run_id")) == LATER_PROVIDER_READ_RUN and job.get("run_attempt") == 1
                 and job.get("head_sha") == LATER_PROVIDER_MAIN and job.get("status") == "completed"
                 and job.get("conclusion") == expected[job["name"]])
+    gate_stage("provider-log")
     from trusted_backup_webhook_log_archive import download_log
     raw_log = cached_private_bytes(env.get("RUNNER_TEMP", ""), "provider-log-" + LATER_PROVIDER_SOURCE_JOB,
                                    LATER_PROVIDER_LOG_SHA256, 4 * 1024 * 1024,
@@ -317,6 +404,7 @@ def verify_later_provider_read(item, env, token):
 
 def verify_legacy_archive(item, record, env, token):
     """Check only an independently pinned completed archive run on reviewed main."""
+    gate_stage("legacy-identity")
     run_id = str(item["id"])
     fields = {"action", "sourceRunId", "archiveJobId", "readbackJobId", "jobsSha256", "archiveLogSha256",
               "readbackLogSha256", "sourceLogSha256", "planSha256", "completionSha256"}
@@ -334,6 +422,7 @@ def verify_legacy_archive(item, record, env, token):
             and item.get("display_title") == "Preserve isolated webhook evidence " + record["sourceRunId"]
             and all(isinstance(item.get(key), dict) and item[key].get("id") == github.REPOSITORY_ID
                     for key in ("repository", "head_repository")))
+    gate_stage("legacy-source")
     commit_pin = {"sha": LATER_PROVIDER_MAIN, "treeSha": LEGACY_ARCHIVE_TREE}
     def fetch_commit():
         commit = github._get_json("/git/commits/" + LATER_PROVIDER_MAIN, token)
@@ -349,6 +438,7 @@ def verify_legacy_archive(item, record, env, token):
         jobs = response.get("jobs")
         require(isinstance(jobs, list) and type(response.get("total_count")) is int and response["total_count"] == len(jobs) == 2)
         return canonical(jobs)
+    gate_stage("legacy-jobs")
     jobs = json.loads(cached_private_bytes(env.get("RUNNER_TEMP", ""), "legacy-jobs-" + run_id,
                                            record["jobsSha256"], 1024 * 1024, fetch_jobs))
     require(isinstance(jobs, list) and len(jobs) == 2 and {job.get("name") for job in jobs} == {"archive", "readback"})
@@ -368,6 +458,7 @@ def verify_legacy_archive(item, record, env, token):
         for name in names:
             steps = [step for step in job["steps"] if isinstance(step, dict) and step.get("name") == name]
             require(len(steps) == 1 and (steps[0].get("status"), steps[0].get("conclusion")) == ("completed", "success"))
+    gate_stage("legacy-logs")
     from trusted_backup_webhook_log_archive import download_log
     def report(job, expected, kind):
         raw = cached_private_bytes(env.get("RUNNER_TEMP", ""), "legacy-log-" + job, expected, 4 * 1024 * 1024,
@@ -410,6 +501,7 @@ def live_writer_boundary(rows, env, token, candidate):
                 "The complete seven-source archive ledger is required.")
     observed_legacy = set()
     for item in rows:
+        gate_stage("writer-boundary")
         path, event, run_id = item["path"], item["event"], str(item["id"])
         if path == LEGACY_ARCHIVE_WORKFLOW:
             require(run_id in legacy, "An unreviewed history archive run was observed.")
@@ -426,7 +518,10 @@ def live_writer_boundary(rows, env, token, candidate):
         if run_id == LATER_PROVIDER_READ_RUN:
             verify_later_provider_read(item, env, token)
             continue
-        if run_id == FAILED_PLAN_RUN:
+        if run_id in UNSTARTED_PUSHES:
+            verify_fixed_unstarted_push(item, env, token)
+            continue
+        if run_id in PRECHECKOUT_FAILURES:
             verify_failed_initial_plan(item, env, token)
             continue
         require(event == "workflow_dispatch" and path == WORKFLOW and item["head_sha"] == env["GITHUB_SHA"],
@@ -510,6 +605,7 @@ def save_inventory(directory, inventory):
 
 
 def validate(env):
+    gate_stage("identity")
     main, token, action = env.get("GITHUB_SHA", ""), env.get("GH_TOKEN", ""), env.get("NO_EXPORT_ACTION", "")
     require(env.get("GITHUB_REPOSITORY") == github.REPOSITORY and env.get("GITHUB_REPOSITORY_ID") == str(github.REPOSITORY_ID)
             and env.get("GITHUB_REF") == github.MAIN_REF and env.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
@@ -525,6 +621,7 @@ def validate(env):
             and HEX32.fullmatch(spec.get("sourceCheckpointId", ""))
             and all(HEX64.fullmatch(spec.get(key, "")) for key in ("registrationSha256", "sourceManifestSha256", "genesisSha256"))
             and canonical(spec).decode() == env["NO_EXPORT_VALIDATION_JSON"])
+    gate_stage("review-contract")
     review_raw = env.get("NO_EXPORT_REVIEW_JSON", "")
     review = parsed(review_raw)
     require(set(review) == REVIEW_KEYS and type(review["version"]) is int and review["version"] == 1
@@ -566,6 +663,7 @@ def validate(env):
     if action == "verify-release":
         require(DECIMAL.fullmatch(env.get("NO_EXPORT_RELEASE_RUN_ID", ""))
                 and env.get("SUBS_BOT_BACKUP_NO_EXPORT_RELEASE_RUN_ID") == env["NO_EXPORT_RELEASE_RUN_ID"])
+    gate_stage("current-main-and-head")
     ref = github._get_json("/git/ref/heads/main", token)
     require(ref.get("ref") == github.MAIN_REF and ref.get("object", {}).get("sha") == main)
     pull = github._get_json("/pulls/291", token)
@@ -575,6 +673,7 @@ def validate(env):
     comparison = github.compare_commits_metadata(main, spec["headSha"], token)
     require(comparison.get("status") in {"ahead", "identical"} and comparison.get("behind_by") == 0
             and comparison.get("base_commit", {}).get("sha") == main and comparison.get("merge_base_commit", {}).get("sha") == main)
+    gate_stage("checkout")
     workspace = Path(env.get("GITHUB_WORKSPACE", ""))
     require(workspace.is_absolute() and workspace.is_dir() and not workspace.is_symlink()
             and checkout_sha(workspace / "trusted") == main)
@@ -590,6 +689,7 @@ def validate(env):
                 and re.fullmatch(r"9293938370:[A-Za-z0-9_-]{20,128}", test["botToken"] or "")
                 and re.fullmatch(r"[A-Za-z0-9_-]{32,256}", test["webhookSecret"] or ""))
     original_source(review, token, main, env.get("RUNNER_TEMP", ""))
+    gate_stage("prior-resolution")
     if action in {"verify-seal", "release", "release-readback", "verify-release"}:
         reader = env.get("NO_EXPORT_SEAL_READER_RUN_ID", "") if action != "verify-seal" else ""
         independent = action == "verify-seal" or bool(reader)
@@ -604,6 +704,7 @@ def validate(env):
     if action == "verify-release":
         reviewed_run(env["NO_EXPORT_RELEASE_RUN_ID"], "release", main, spec["headSha"], token, successful=False,
                      jobs_required=[("resolution", "Plan or apply the no-export resolution", False)])
+    gate_stage("historic-inventory")
     historic = workflow_runs(review["auditWindowStart"], review["auditWindowEnd"], token, maximum=150)
     inventory = canonical(historic)
     inventory_sha = sha256(inventory).hexdigest()
@@ -612,10 +713,12 @@ def validate(env):
     require(now >= review["auditWindowEnd"])
     # This is one bounded incident-resolution window, not a production
     # monitoring retention limit. A full or larger inventory remains unknown.
+    gate_stage("live-inventory")
     live = workflow_runs(review["auditWindowEnd"], now, token, maximum=400, live_metadata=True)
     writers = sum(row["path"] == WORKFLOW and str(row["id"]) != env.get("GITHUB_RUN_ID") for row in live)
     require(writers <= 40, "The no-export history exceeds this one-time resolution's bounded audit.")
     legacy_count = live_writer_boundary(live, env, token, spec["headSha"])
+    gate_stage("inventory-output")
     if check == "credential":
         save_inventory(env.get("RUNNER_TEMP", ""), inventory)
     legacy = parsed(env.get("NO_EXPORT_LEGACY_ARCHIVES_JSON", "") or "{}")
@@ -634,5 +737,5 @@ if __name__ == "__main__":
                 stream.write("writer_inventory_sha256=" + result["writerInventorySha256"] + "\n")
         print(json.dumps(result, sort_keys=True))
     except Exception:
-        print("::error::The fixed isolated no-export identity or complete audit inventory did not verify.")
+        print("::error::The fixed isolated no-export identity or complete audit inventory did not verify. Phase: " + GATE_STAGE)
         raise SystemExit(1) from None
