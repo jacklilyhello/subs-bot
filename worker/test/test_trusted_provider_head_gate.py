@@ -40,6 +40,9 @@ class TrustedProviderGateTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         Path(self.temporary.name, "trusted").mkdir()
         Path(self.temporary.name, "candidate").mkdir()
+        tools = Path(self.temporary.name, "candidate/worker/tools")
+        tools.mkdir(parents=True)
+        (tools / "provider_private_mutation_journal.py").write_text("PROVIDER_KEYLESS_EVIDENCE_PROTOCOL = 2\n")
         self.env = {"GITHUB_REPOSITORY": gate.github.REPOSITORY, "GITHUB_REPOSITORY_ID": str(gate.github.REPOSITORY_ID),
                     "GITHUB_REF": gate.github.MAIN_REF, "GITHUB_EVENT_NAME": "workflow_dispatch",
                     "GITHUB_WORKFLOW_REF": gate.WORKFLOW, "GITHUB_WORKFLOW_SHA": MAIN, "RUNNER_ENVIRONMENT": "github-hosted",
@@ -163,6 +166,11 @@ class TrustedProviderGateTests(unittest.TestCase):
             self.check({**source, "PROVIDER_HEAD_VALIDATION_JSON": json.dumps(approved)})
         operation = {**env, "GITHUB_WORKFLOW_REF": gate.OPERATION_WORKFLOW, "PROVIDER_HEAD_PHASE": "operation-dispatch"}
         self.assertTrue(self.check(operation)["checkoutVerified"])
+        marker = Path(self.temporary.name, "candidate/worker/tools/provider_private_mutation_journal.py")
+        marker.unlink()
+        with self.assertRaises(ContractError):
+            self.check(operation)
+        marker.write_text("PROVIDER_KEYLESS_EVIDENCE_PROTOCOL = 2\n")
         with self.assertRaises(ContractError):
             self.check({**operation, "PROVIDER_HEAD_PHASE": "digest-publish"})
         recovery = {**env, "GITHUB_WORKFLOW_REF": gate.RECOVERY_WORKFLOW, "PROVIDER_HEAD_PHASE": "recovery-inspect",
@@ -225,7 +233,7 @@ class TrustedProviderGateTests(unittest.TestCase):
         workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/worker-provider-reviewed-operation.yml").read_text()
         self.assertIn("vars.SUBS_BOT_PROVIDER_REVIEWED_OPERATION_ENABLED == 'true'", workflow)
         self.assertIn("vars.SUBS_BOT_PROVIDER_OPERATION_WRITE_ENABLED == 'true'", workflow)
-        self.assertEqual(workflow.count("uses: ./trusted/.github/actions/provider-reviewed-head-gate"), 10)
+        self.assertEqual(workflow.count("uses: ./trusted/.github/actions/provider-reviewed-head-gate"), 12)
         section = workflow.split("\n  dispatch:\n", 1)[1].split("\n  verify:\n", 1)[0]
         self.assertIn("SUBS_BOT_CF_PROVIDER_WORKER_TOKEN", section)
         self.assertNotIn("SUBS_BOT_SCOPED_R2_WRITE_JSON", section)
@@ -240,7 +248,23 @@ class TrustedProviderGateTests(unittest.TestCase):
         self.assertNotIn("vars.SUBS_BOT_PROVIDER_OPERATION_WRITE_ENABLED", failure_readback)
         self.assertIn("SUBS_BOT_SCOPED_R2_READ_JSON", failure_readback)
         self.assertNotIn("SUBS_BOT_SCOPED_R2_WRITE_JSON", failure_readback)
-        self.assertIn("needs.evidence_readback.result != 'success'", workflow)
+        self.assertIn("needs.evidence_keyless_readback.result != 'success'", workflow)
+        self.assertIn("needs.intent_readback.result == 'success'", workflow)
+        self.assertNotIn("vars.SUBS_BOT_PROVIDER_OPERATION_WRITE_ENABLED == 'true' && needs.evidence_keyless_readback", workflow)
+        for stem in ("age", "archive", "live"):
+            self.assertIn(f"next_{stem}_id: ${{{{ steps.next_{stem}.outputs.artifact-id }}}}", workflow)
+            self.assertIn(f"${{{{ needs.verify.outputs.next_{stem}_id }}}}", workflow)
+            self.assertIn(f"${{{{ needs.verify.outputs.next_{stem}_zip_sha256 }}}}", workflow)
+        for name, next_name in (("evidence_keyless_readback", "failure_write"), ("failure_keyless_readback", None)):
+            part = workflow.split(f"\n  {name}:\n", 1)[1]
+            if next_name:
+                part = part.split(f"\n  {next_name}:\n", 1)[0]
+            self.assertIn("uses: ./trusted/.github/actions/provider-reviewed-head-gate", part)
+            self.assertIn("SUBS_BOT_SCOPED_R2_READ_JSON", part)
+            for forbidden in ("SUBS_BOT_PROVIDER_SOURCE_AGE_IDENTITY", "SUBS_BOT_SCOPED_R2_WRITE_JSON",
+                              "SUBS_BOT_CF_PROVIDER_WORKER_READ_TOKEN", "SUBS_BOT_CF_PROVIDER_WORKER_WRITE_TOKEN",
+                              "SUBS_BOT_CF_PROVIDER_CONTAINER_READ_TOKEN", "SUBS_BOT_CF_PROVIDER_CONTAINER_WRITE_TOKEN"):
+                self.assertNotIn(forbidden, part)
         self.assertIn("SUBS_BOT_PROVIDER_MUTATION_ACTION: failure-readback", workflow)
         self.assertIn("SUBS_BOT_PROVIDER_MUTATION_RESOLUTIONS_JSON", workflow)
         prepare = section.split("- name: Prepare the exact image once", 1)[1].split("- name: Dispatch the exact approved Worker operation once", 1)[0]
