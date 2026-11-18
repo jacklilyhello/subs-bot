@@ -130,7 +130,17 @@ G0 之后发生任何新增、修改、删除、授权、领取、撤销、短�
 
 所有界限采用超限拒绝，不截断数据。工具备份完整 D1 与 D1 引用的 R2 闭包，不声称复制任意无引用孤儿对象或 Worker Secret。Secret 由受保护配置另行保管。任务超时可能留下已确认分片或独立目标；这些资料不会被自动删除。源码/配置/密钥不兼容、非支持 schema/元数据或无法完整读取资源时停止，不能用部分摘要宣布恢复成功。
 
-# Rehearsal webhook window
+## 受限中断对账的来源错误
+
+`worker-backup-no-export-resolution.yml` 的可信 gate 失败时仅输出固定的 `Phase` 名称；不输出异常正文、凭据或私有输入。先检查该阶段对应的准确 GitHub run／attempt、原工作流、完整 jobs／checks 和已有私有原件。没有 job 的历史失败也不能按失败状态直接忽略：仅有源码中精确登记、原和最新 attempt 均已结束且 jobs／checks 均完整为空的两次 push 可按对应证据分类。它们仍是失败运行，不作为备份成功证明。
+
+首次 gate 已拒绝、候选和凭据步骤均跳过的两次固定对账失败，另按准确 run、job、原源码和日志摘要核验。未分类的历史、重跑、未知写入或变更原件继续拒绝。工作流的 `checks: read` 仅用于独立检查 GitHub check suite；不授予任何写权限。对账入口、写开关、完整来源与目标批准相互独立；保留原冻结现场，不自动重试导出或恢复接收。
+
+这两次固定 push 的原 attempt、零 jobs／checks 和 suite 身份在每个新 runner 首次完整读取后，以明确字段的派生证明缓存；不固定 linked PR 的当前 head 等可变附带字段，不把派生记录称为完整原始 API 响应。缓存文件每次使用均核对摘要，latest run、完整运行盘点、当前批准和来源关系仍每次重新读取。复用依赖 GitHub 保留已结束 attempt 的列表，以及本次处置期间无并发重跑或元数据改写的受控操作假设；不是平台原子锁。下一独立 runner 会重新取得全部证明，未知或冲突继续停止。
+
+此 gate 的每个 GitHub metadata GET 只请求一次，保持现有响应大小、完整分页与来源限制；瞬时读取失败即停止，不以底层隐式重试突破写前请求预算。
+
+## Rehearsal webhook window
 
 The trusted rehearsal coordinator rejects `run` and `resume`, and the legacy
 reviewed-head gate rejects `open-backup`. Switching a Telegram webhook between
