@@ -47,6 +47,11 @@ def telegram_fixture(*observations, bot=ME, write=True):
 
 
 class OperationTests(unittest.TestCase):
+    def test_legacy_entry_keeps_inspect_but_blocks_append(self):
+        webhook.require_legacy_mode_safe("inspect")
+        with self.assertRaises(webhook.InlineWebhookError):
+            webhook.require_legacy_mode_safe("append")
+
     def operation(self, telegram, *, mode="append", confirmation=webhook.CONFIRM_APPEND, before_write=None):
         return webhook.maintain(telegram, POLICY, mode, confirmation, Mock(return_value=VERSION),
                                 before_write if before_write is not None else Mock(), pause=Mock())

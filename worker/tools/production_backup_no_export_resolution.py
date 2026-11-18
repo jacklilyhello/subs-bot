@@ -78,7 +78,7 @@ def checked_gate(env, *, with_stats=False):
     ledger = parsed(env.get("NO_EXPORT_LEGACY_ARCHIVES_JSON", "{}"))
     require(type(writers) is int and 0 <= writers <= 40
             and type(legacy) is int and 0 <= legacy <= 14
-            and type(live) is int and 0 <= live < 150 and legacy <= live
+            and type(live) is int and 0 <= live <= 400 and legacy <= live
             and isinstance(ledger, dict) and len(ledger) == legacy
             and result.get("legacyArchiveSha256") == sha256(canonical(ledger)).hexdigest())
     if with_stats:
@@ -90,15 +90,18 @@ def require_request_budget(env, review, remaining_guards):
     """Fail before an intent if the remaining hosted core quota is insufficient."""
     checked, writers, legacy = checked_gate(env, with_stats=True)
     require(checked == review and type(remaining_guards) is int and 1 <= remaining_guards <= 100)
-    # Gate's bounded fixed work is at most 17 GETs, including the exact old
-    # Provider read and the fresh complete live inventory (<150 runs), including legacy
-    # archive run metadata; allow two per known or two extra same-workflow
+    # Reserve 26 steady GETs per single-attempt guard: current identities,
+    # complete live inventory (up to 400 runs), the fixed Provider read and
+    # the two unstarted pushes' fresh latest records. Their ended-attempt
+    # evidence uses the rehashed same-runner cache, never a cached latest.
+    # Allow two per known or two extra same-workflow
     # runs, six for release's seal provenance, and 100 spare. Preserve an
-    # additional cold-cache allowance for legacy jobs/logs and source closure.
+    # additional 3*legacy+40 cold allowance (82 at 14 records, exceeding the
+    # independently counted 79 reads) for all fixed evidence and source closure.
     # Concurrent rate use or secondary limits remain unknown.
     require(env.get("NO_EXPORT_ACTION") in {"seal", "release"})
-    per_guard = 17 + 2 * (writers + 2) + (6 if env["NO_EXPORT_ACTION"] == "release" else 0)
-    required = per_guard * remaining_guards + 3 * legacy + 13 + 100
+    per_guard = 26 + 2 * (writers + 2) + (6 if env["NO_EXPORT_ACTION"] == "release" else 0)
+    required = per_guard * remaining_guards + 3 * legacy + 40 + 100
     request = Request("https://api.github.com/rate_limit", headers={
         "Accept": "application/vnd.github+json", "Authorization": "Bearer " + github._github_token(),
         "Cache-Control": "no-cache", "X-GitHub-Api-Version": "2022-11-28"})
@@ -414,16 +417,22 @@ def inventory_original(env, review):
     return raw
 
 
-def evidence_layout(plan_sha, originals, seal):
-    """Canonical, bounded object names independent of untrusted paths."""
+def evidence_layout(plan_sha, originals, seal, *, version=2):
+    """Pack complete originals deterministically; retain the v1 read layout."""
     require(SHA.fullmatch(plan_sha or "") and isinstance(originals, dict) and originals
+            and len(originals) <= 64 and type(version) is int and version in {1, 2}
+            and all(isinstance(name, str) and name for name in originals)
             and isinstance(seal, dict) and set(seal) == {"runId", "runAttempt", "dispatcherRevision", "controlRevision"}
             and re.fullmatch(r"[1-9][0-9]{0,19}", seal["runId"] or "") and seal["runAttempt"] == "1"
             and all(re.fullmatch(r"[a-f0-9]{40}", seal[key] or "") for key in ("dispatcherRevision", "controlRevision")))
-    records, pieces = [], {}
+    records, pieces, packed = [], {}, bytearray()
     for index, name in enumerate(sorted(originals), 1):
         raw = originals[name]
         require(isinstance(name, str) and isinstance(raw, bytes) and 0 < len(raw) <= MAX_LOG)
+        if version == 2:
+            records.append({"name": name, "offset": len(packed), "bytes": len(raw), "sha256": sha256(raw).hexdigest()})
+            packed.extend(raw)
+            continue
         chunks = []
         for pos in range(0, len(raw), CHUNK):
             part = raw[pos:pos + CHUNK]
@@ -431,9 +440,17 @@ def evidence_layout(plan_sha, originals, seal):
             chunks.append({"key": key, "bytes": len(part), "sha256": sha256(part).hexdigest()})
             pieces[key] = part
         records.append({"name": name, "bytes": len(raw), "sha256": sha256(raw).hexdigest(), "chunks": chunks})
-    manifest = {"version": 1, "kind": "no-export-original-evidence", "planSha256": plan_sha,
+    manifest = {"version": version, "kind": "no-export-original-evidence", "planSha256": plan_sha,
                 "originalRunId": OLD_RUN, "originalAttempt": "1", "originalJobId": OLD_JOB,
                 "threatModel": "reviewed-writers-no-unapproved-deletion", "seal": seal, "originals": records}
+    if version == 2:
+        packs = []
+        for pos in range(0, len(packed), CHUNK):
+            raw = bytes(packed[pos:pos + CHUNK])
+            key = "packs/" + str(pos // CHUNK + 1).zfill(3)
+            packs.append({"key": key, "bytes": len(raw), "sha256": sha256(raw).hexdigest()})
+            pieces[key] = raw
+        manifest["packs"] = packs
     return manifest, pieces
 
 
@@ -461,13 +478,24 @@ def seal_originals(store, prefix, plan_sha, originals, seal, guard, stage_callba
 
 def read_originals(store, prefix, plan_sha, originals, seal, evidence_sha):
     """Fresh runner compares every private byte to a fresh GH source download."""
-    manifest, pieces = evidence_layout(plan_sha, originals, seal)
+    stored = store.get(prefix + "evidence-manifest.json")
+    observed = parsed(stored)
+    require(canonical(observed) == stored and type(observed.get("version")) is int and observed["version"] in {1, 2})
+    manifest, pieces = evidence_layout(plan_sha, originals, seal, version=observed["version"])
     body = canonical(manifest)
     require(SHA.fullmatch(evidence_sha or "") and sha256(body).hexdigest() == evidence_sha)
     expected_intent = canonical({"version": 1, "kind": "no-export-evidence-intent", "planSha256": plan_sha,
                                  "manifestSha256": evidence_sha})
     require(store.get(prefix + "evidence-intent.json") == expected_intent
-            and store.get(prefix + "evidence-manifest.json") == body)
+            and stored == body)
+    if observed["version"] == 2:
+        require(store.objects is not None)
+        keys = store.objects.list(prefix, maximum=516)
+        metadata = {prefix + name for name in ("evidence-intent.json", "evidence-manifest.json",
+                                               "release-intent.json", "release-complete.json")}
+        require(isinstance(keys, list) and len(keys) == len(set(keys))
+                and set(keys) - metadata == {prefix + key for key in pieces},
+                "The complete original pack inventory differs.")
     for key, raw in pieces.items():
         require(store.get(prefix + key) == raw)
     return evidence_sha

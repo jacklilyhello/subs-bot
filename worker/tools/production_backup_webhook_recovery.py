@@ -18,6 +18,7 @@ from production_storage import PrivateStore
 from production_target import TEST_BOT_ID, canonical, parsed, require, validate_target
 
 DISPATCHER = ".github/workflows/worker-backup-reviewed-head.yml"
+PHASE_DISPATCHER = ".github/workflows/worker-backup-reviewed-coordinator.yml"
 RECOVERY = ".github/workflows/worker-backup-webhook-recovery.yml"
 ADMISSION_RECOVERY = ".github/workflows/worker-backup-admission-recovery.yml"
 DECIMAL = re.compile(r"[1-9][0-9]{0,19}")
@@ -32,9 +33,9 @@ def context(env):
             and env.get("GITHUB_REF") == github.MAIN_REF and env.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
             and env.get("RUNNER_ENVIRONMENT") == "github-hosted" and env.get("GITHUB_WORKFLOW_SHA") == revision
             and REV.fullmatch(revision or "") and env.get("GITHUB_RUN_ATTEMPT") == "1"
-            and ref in {github.REPOSITORY + "/" + path + "@" + github.MAIN_REF for path in (DISPATCHER, RECOVERY, ADMISSION_RECOVERY)})
+            and ref in {github.REPOSITORY + "/" + path + "@" + github.MAIN_REF for path in (DISPATCHER, PHASE_DISPATCHER, RECOVERY, ADMISSION_RECOVERY)})
     github.require_current_main(revision)
-    return ref.endswith(DISPATCHER + "@" + github.MAIN_REF)
+    return any(ref.endswith(path + "@" + github.MAIN_REF) for path in (DISPATCHER, PHASE_DISPATCHER))
 
 
 def source_run(env, automatic):
@@ -46,11 +47,18 @@ def source_run(env, automatic):
     require(REV.fullmatch(expected_main or "") and REV.fullmatch(expected_head or "")
             and expected_head == env.get("WEBHOOK_REVIEWED_CANDIDATE_SHA"),
             "The source candidate differs from the independent protected pin.")
+    source_kind = env.get("WEBHOOK_SOURCE_KIND", "reviewed-head")
+    require(source_kind in {"reviewed-head", "phase-coordinator"})
+    workflow = PHASE_DISPATCHER if source_kind == "phase-coordinator" else DISPATCHER
+    if automatic:
+        require(env.get("GITHUB_WORKFLOW_REF") == github.REPOSITORY + "/" + workflow + "@" + github.MAIN_REF)
     run = github._get_json("/actions/runs/" + run_id + "/attempts/1", github._github_token())
     require(str(run.get("id")) == run_id and run.get("run_attempt") == 1
-            and run.get("path") in (DISPATCHER, DISPATCHER + "@main", DISPATCHER + "@refs/heads/main")
+            and run.get("path") in (workflow, workflow + "@main", workflow + "@refs/heads/main")
             and run.get("head_sha") == expected_main and run.get("head_branch") == "main"
             and run.get("event") == "workflow_dispatch"
+            and (source_kind != "phase-coordinator" or run.get("display_title") ==
+                 "Rehearsal backup coordinator run at " + expected_main + " candidate " + expected_head)
             and all(isinstance(run.get(key), dict) and run[key].get("id") == github.REPOSITORY_ID
                     for key in ("repository", "head_repository"))
             and (automatic or run.get("status") == "completed"))
@@ -61,14 +69,14 @@ def manual_no_prior_dispatch(env, run_id):
     """Reject any prior manual write attempt, including one with a lost response."""
     token = github._github_token()
     rows, count = [], None
-    for page in range(1, 11):
-        response = github._get_json("/actions/workflows/worker-backup-webhook-recovery.yml/runs?per_page=100&page=" + str(page), token)
+    for page in range(1, 21):
+        response = github._get_json("/actions/workflows/worker-backup-webhook-recovery.yml/runs?per_page=50&page=" + str(page), token)
         batch, total = response.get("workflow_runs"), response.get("total_count")
-        require(isinstance(batch, list) and len(batch) <= 100 and type(total) is int and 0 <= total < 1000)
+        require(isinstance(batch, list) and len(batch) <= 50 and type(total) is int and 0 <= total < 1000)
         require(count is None or count == total, "Recovery workflow history changed during inspection.")
         count = total
         rows.extend(batch)
-        if len(batch) < 100:
+        if len(batch) < 50:
             break
     else:
         require(False, "The recovery workflow history exceeds its safe bound.")
@@ -90,7 +98,7 @@ def manual_no_prior_dispatch(env, run_id):
         elif row.get("display_title") == title:
             require(False, "A prior manual restore may have been dispatched; reconcile without replay.")
         else:
-            require(re.fullmatch(r"Backup webhook (?:diagnose|inspect|restore) [1-9][0-9]{0,19}-1", row.get("display_title", "")))
+            require(re.fullmatch(r"Backup webhook (?:diagnose|inspect|restore|plan-phase-unstarted|release-phase-unstarted) [1-9][0-9]{0,19}-1", row.get("display_title", "")))
     require(current_seen, "The current recovery run is not visible in complete history.")
 
 
@@ -265,6 +273,28 @@ def inspect(env, *, execute=False):
                             "max_connections": candidate_settings["maxConnections"],
                             "allowed_updates": candidate_settings["allowedUpdates"]},
             "The preceding webhook confirmation is malformed.")
+    if env.get("WEBHOOK_SOURCE_KIND") == "phase-coordinator":
+        setup_prefix = prefix + "phase-coordinator-webhook-setup-" + suffix + "-"
+        setup_raw = store.get(setup_prefix + "intent.json")
+        setup_done_raw = store.get(setup_prefix + "confirmed.json")
+        setup, setup_done = parsed(setup_raw), parsed(setup_done_raw)
+        require(canonical(setup) == setup_raw and canonical(setup_done) == setup_done_raw
+                and set(setup) == {"version", "kind", "runId", "runAttempt", "controllerRevision", "dispatcherRevision",
+                    "targetSha256", "configurationSha256", "sourceCheckpointId", "sourceManifestSha256", "snapshotSha256",
+                    "predecessorSha256", "webhookSettingsSha256", "historySha256"}
+                and type(setup["version"]) is int and setup["version"] == 1 and setup["kind"] == "phase-webhook-setup-intent"
+                and setup["runId"] == run_id and setup["runAttempt"] == attempt and setup["controllerRevision"] == candidate
+                and setup["dispatcherRevision"] == env["WEBHOOK_SOURCE_MAIN_SHA"] and setup["targetSha256"] == target.digest
+                and setup["configurationSha256"] == target.configuration_digest and setup["snapshotSha256"] == pin
+                and all(SHA.fullmatch(setup.get(k, "")) for k in ("sourceManifestSha256", "predecessorSha256", "webhookSettingsSha256", "historySha256"))
+                and re.fullmatch(r"[a-f0-9]{32}", setup.get("sourceCheckpointId", ""))
+                and setup["webhookSettingsSha256"] == sha256(canonical({"url": before["url"],
+                    "hasCustomCertificate": before["has_custom_certificate"], "maxConnections": before["max_connections"],
+                    "allowedUpdates": before["allowed_updates"]})).hexdigest()
+                and type(setup_done.get("version")) is int and setup_done == {"version": 1, "kind": "phase-webhook-setup-confirmed",
+                    "intentSha256": sha256(setup_raw).hexdigest(), "snapshotSha256": pin,
+                    "configuredSha256": sha256(configured_raw).hexdigest(), "targetSha256": target.digest},
+                "The one-shot webhook setup intent and confirmation are not independently verified.")
     if not execute:
         if automatic:
             require(intent is None and completion is None,
@@ -273,6 +303,19 @@ def inspect(env, *, execute=False):
                 "completionPresent": completion is not None, "settingsMatchOriginal": current == before,
                 "telegramSecretReadback": "not-available", "restoreAuthorized": False}
     require(intent is None and completion is None, "An earlier restore is present or uncertain; do not retry.")
+    # A separate legacy recovery must never cross an unresolved phase window.
+    # A phase cleanup may restore only its own active lock; an old source may
+    # restore only after the complete shared lock history proves idle.
+    from trusted_backup_webhook_anchor import anchor as webhook_anchor
+    lock_pin = env.get("SUBS_BOT_PHASE_WEBHOOK_ANCHOR_GENESIS_SHA256", "")
+    require(SHA.fullmatch(lock_pin or ""), "The protected shared webhook lock is not configured.")
+    lock = webhook_anchor(store, target.digest, lock_pin)
+    lock_before, _, _ = lock.read()
+    if env.get("WEBHOOK_SOURCE_KIND") == "phase-coordinator":
+        require(lock_before["state"] == "active" and lock_before["session"] == suffix
+                and lock_before["controlRevision"] == candidate)
+    else:
+        require(lock_before["state"] == "idle", "An unresolved webhook window blocks legacy restoration.")
     freeze_sha = env.get("WEBHOOK_FREEZE_CONFIRMATION_SHA256", "")
     require(SHA.fullmatch(freeze_sha or ""))
     freeze_raw = store.get(prefix + "backup-admission-" + suffix + "-freeze-confirmed.json")
@@ -307,11 +350,24 @@ def inspect(env, *, execute=False):
                  if step.get("name") == "Trusted restore original test webhook"]
         require(len(steps) == 1 and steps[0].get("conclusion") == "skipped",
                 "The original cleanup may have run; do not repeat an unknown write.")
+    phase_source = env.get("WEBHOOK_SOURCE_KIND") == "phase-coordinator"
+    if not phase_source:
+        from datetime import datetime, timezone
+        owner = env.get("GITHUB_RUN_ID", "") + "-" + env.get("GITHUB_RUN_ATTEMPT", "")
+        require(re.fullmatch(r"[1-9][0-9]{0,19}-1", owner or "") and REV.fullmatch(env.get("GITHUB_SHA", "")))
+        lock.acquire(owner, datetime.now(timezone.utc).strftime("%Y/%m/%d"), env["GITHUB_SHA"])
+        lock_before, _, _ = lock.read()
+        require(lock_before["state"] == "active" and lock_before["session"] == owner
+                and lock_before["controlRevision"] == env["GITHUB_SHA"])
+        require(require_exact_freeze(target, secrets, env, freeze) == frozen
+                and webhook_settings(telegram.call("getWebhookInfo")) == current)
     planned = {"version": 1, "sourceRunId": run_id, "sourceAttempt": attempt, "candidateRevision": candidate,
                "snapshotSha256": pin, "beforeSha256": sha256(canonical(before)).hexdigest(),
                "predecessorSha256": sha256(canonical(current)).hexdigest()}
     github.require_current_main(env["GITHUB_SHA"])
     claim_intent_once(store, intent_key, canonical(planned))
+    lock_after, _, _ = lock.read()
+    require(lock_after == lock_before, "The shared webhook lock changed after the restore intent.")
     require(require_exact_freeze(target, secrets, env, freeze) == frozen,
             "The complete isolated predecessor changed after its restore intent.")
     require(webhook_settings(telegram.call("getWebhookInfo")) == current, "Webhook predecessor changed after intent.")
@@ -325,6 +381,13 @@ def inspect(env, *, execute=False):
             "telegramSecretReadback": "not-available"}
     store.put(completion_key, canonical(done))
     require(store.get(completion_key) == canonical(done))
+    if not phase_source:
+        require(require_exact_freeze(target, secrets, env, freeze) == frozen
+                and webhook_settings(telegram.call("getWebhookInfo")) == before
+                and probe_original_webhook(previous["webhookSecret"]) == 400)
+        lock.release(owner)
+        released, _, _ = lock.read()
+        require(released["state"] == "idle" and released["session"] == owner)
     return {"status": "settings-restored", "snapshotSha256": pin, "completionSha256": sha256(canonical(done)).hexdigest(),
             "dropPendingUpdates": False, "telegramSecretReadback": "not-available"}
 

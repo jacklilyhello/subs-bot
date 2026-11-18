@@ -159,7 +159,9 @@ for (const [lane, subjectRole] of [
         const result = await db.prepare("SELECT operation_id,target FROM fixture_rpc_maps WHERE slug=?").bind(slug)
           .first<{ operation_id: string; target: string }>();
         assert.ok(result);
-        assert.doesNotMatch(result.operation_id, /7532|7533|http|synthetic/u);
+        // A UUID can coincidentally contain digits from a fixture actor ID.
+        // Require the actual opaque identifier format instead of banning substrings.
+        assert.match(result.operation_id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
         assert.match(result.target, /^https:\/\/subs-bot-cf-dev-01\.lilyya\.workers\.dev\/s\/[A-Za-z0-9_-]{22}$/u);
         return result;
       }

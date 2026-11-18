@@ -15,6 +15,13 @@ SEAL = {"runId": "123", "runAttempt": "1", "dispatcherRevision": "c" * 40, "cont
 class MemoryStore:
     def __init__(self):
         self.items = {}
+        self.objects = self
+
+    def list(self, prefix, *, maximum):
+        keys = sorted(key for key in self.items if key.startswith(prefix))
+        if len(keys) > maximum:
+            raise ValueError("inventory exceeds its bound")
+        return keys
 
     def put_exclusive(self, key, raw):
         if key in self.items:
@@ -146,9 +153,58 @@ class NoExportEvidenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             resolution.seal_originals(store, "private/", "a" * 64, originals, SEAL, guard)
         self.assertEqual(len([key for key in store.items if key.endswith("evidence-intent.json")]), 1)
-        store.items["private/objects/002/001"] += b"corrupt"
+        store.items["private/packs/001"] += b"corrupt"
         with self.assertRaises(Exception):
             resolution.read_originals(store, "private/", "a" * 64, originals, SEAL, evidence)
+
+    def test_small_originals_share_a_pack_without_losing_any_original_byte(self):
+        store = MemoryStore()
+        originals = {"source/" + str(n).zfill(3): (str(n) + "-original").encode() for n in range(30)}
+        guard = Mock()
+        evidence = resolution.seal_originals(store, "private/", "a" * 64, originals, SEAL, guard)
+        self.assertEqual(guard.call_count, 3)
+        manifest = json.loads(store.get("private/evidence-manifest.json"))
+        self.assertEqual(manifest["version"], 2)
+        self.assertEqual(len(manifest["packs"]), 1)
+        packed = store.get("private/packs/001")
+        offset = 0
+        for record in manifest["originals"]:
+            self.assertEqual(record["offset"], offset)
+            self.assertEqual(packed[offset:offset + record["bytes"]], originals[record["name"]])
+            offset += record["bytes"]
+        self.assertEqual(offset, len(packed))
+        self.assertEqual(resolution.read_originals(store, "private/", "a" * 64, originals, SEAL, evidence), evidence)
+        store.items["private/packs/002"] = b"unregistered"
+        with self.assertRaises(Exception):
+            resolution.read_originals(store, "private/", "a" * 64, originals, SEAL, evidence)
+
+    def test_pack_interruption_keeps_original_intent_and_cannot_be_replayed(self):
+        store = MemoryStore()
+        originals = {"first": b"one", "second": b"two"}
+        guard = Mock(side_effect=[None, None, RuntimeError("interrupted before final manifest")])
+        with self.assertRaises(RuntimeError):
+            resolution.seal_originals(store, "private/", "a" * 64, originals, SEAL, guard)
+        before = dict(store.items)
+        self.assertIn("private/evidence-intent.json", before)
+        self.assertIn("private/packs/001", before)
+        self.assertNotIn("private/evidence-manifest.json", before)
+        with self.assertRaises(ValueError):
+            resolution.seal_originals(store, "private/", "a" * 64, originals, SEAL, lambda: None)
+        self.assertEqual(store.items, before)
+
+    def test_existing_v1_originals_are_read_without_rewriting_them(self):
+        store = MemoryStore()
+        originals = {"first": b"one", "second": b"two"}
+        manifest, pieces = resolution.evidence_layout("a" * 64, originals, SEAL, version=1)
+        raw = resolution.canonical(manifest)
+        evidence = hashlib.sha256(raw).hexdigest()
+        store.items.update({"private/" + key: value for key, value in pieces.items()})
+        store.items["private/evidence-manifest.json"] = raw
+        store.items["private/evidence-intent.json"] = resolution.canonical({"version": 1,
+            "kind": "no-export-evidence-intent", "planSha256": "a" * 64, "manifestSha256": evidence})
+        before = dict(store.items)
+        self.assertEqual(resolution.read_originals(store, "private/", "a" * 64, originals, SEAL, evidence), evidence)
+        self.assertEqual(store.items, before)
 
     def test_changed_plan_or_fresh_originals_rejected(self):
         store = MemoryStore()
@@ -179,13 +235,28 @@ class NoExportEvidenceTests(unittest.TestCase):
                 resolution.require_request_budget({"NO_EXPORT_ACTION": "seal"}, review, 20)
             response.read.return_value = json.dumps({"resources": {"core": {"remaining": 5000, "reset": 2000}}}).encode()
             result = resolution.require_request_budget({"NO_EXPORT_ACTION": "seal"}, review, 20)
-            self.assertEqual(result["required"], (17 + 2 * (2 + 2)) * 20 + 3 * 14 + 13 + 100)
+            self.assertEqual(result["required"], (26 + 2 * (2 + 2)) * 20 + 3 * 14 + 40 + 100)
             self.assertEqual(result["writerLimit"], 4)
         with patch.object(resolution, "checked_gate", return_value=(review, 4, 14)), \
                 patch.object(resolution, "verify_legacy_archives"):
             resolution.guarded_review({}, review, 4, {})
         with patch.object(resolution, "checked_gate", return_value=(review, 5, 14)), self.assertRaises(Exception):
             resolution.guarded_review({}, review, 4, {})
+
+    def test_release_requires_the_full_reserved_budget_under_primary_limit(self):
+        review = {"targetSha256": "a" * 64}
+        response = MagicMock()
+        response.__enter__.return_value = response
+        with patch.object(resolution, "checked_gate", return_value=(review, 5, 14)), \
+                patch.object(resolution.github, "_github_token", return_value="token"), \
+                patch.object(resolution.github._OPENER, "open", return_value=response), \
+                patch.object(resolution.time, "time", return_value=1000):
+            response.read.return_value = json.dumps({"resources": {"core": {"remaining": 1000, "reset": 2000}}}).encode()
+            result = resolution.require_request_budget({"NO_EXPORT_ACTION": "release"}, review, 15)
+            self.assertEqual(result["required"], 872)
+            response.read.return_value = json.dumps({"resources": {"core": {"remaining": 871, "reset": 2000}}}).encode()
+            with self.assertRaises(Exception):
+                resolution.require_request_budget({"NO_EXPORT_ACTION": "release"}, review, 15)
 
     def test_original_seal_and_fresh_reader_are_both_required(self):
         main, candidate, run_id = "c" * 40, "d" * 40, "123"
