@@ -90,14 +90,15 @@ def require_request_budget(env, review, remaining_guards):
     """Fail before an intent if the remaining hosted core quota is insufficient."""
     checked, writers, legacy = checked_gate(env, with_stats=True)
     require(checked == review and type(remaining_guards) is int and 1 <= remaining_guards <= 100)
-    # Gate's bounded fixed work is at most 22 GETs, including the exact old
-    # Provider read and the fresh complete live inventory (up to 400 runs), including legacy
-    # archive run metadata; allow two per known or two extra same-workflow
+    # Reserve 40 fixed GETs per guard, including the old Provider read,
+    # complete live inventory (up to 400 runs), the two fixed zero-job push
+    # proofs (five fresh metadata GETs each), and original/latest precheckout
+    # failure checks. Allow two per known or two extra same-workflow
     # runs, six for release's seal provenance, and 100 spare. Preserve an
     # additional cold-cache allowance for legacy jobs/logs and source closure.
     # Concurrent rate use or secondary limits remain unknown.
     require(env.get("NO_EXPORT_ACTION") in {"seal", "release"})
-    per_guard = 22 + 2 * (writers + 2) + (6 if env["NO_EXPORT_ACTION"] == "release" else 0)
+    per_guard = 40 + 2 * (writers + 2) + (6 if env["NO_EXPORT_ACTION"] == "release" else 0)
     required = per_guard * remaining_guards + 3 * legacy + 13 + 100
     request = Request("https://api.github.com/rate_limit", headers={
         "Accept": "application/vnd.github+json", "Authorization": "Bearer " + github._github_token(),

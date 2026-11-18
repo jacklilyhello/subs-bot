@@ -235,7 +235,7 @@ class NoExportEvidenceTests(unittest.TestCase):
                 resolution.require_request_budget({"NO_EXPORT_ACTION": "seal"}, review, 20)
             response.read.return_value = json.dumps({"resources": {"core": {"remaining": 5000, "reset": 2000}}}).encode()
             result = resolution.require_request_budget({"NO_EXPORT_ACTION": "seal"}, review, 20)
-            self.assertEqual(result["required"], (22 + 2 * (2 + 2)) * 20 + 3 * 14 + 13 + 100)
+            self.assertEqual(result["required"], (40 + 2 * (2 + 2)) * 20 + 3 * 14 + 13 + 100)
             self.assertEqual(result["writerLimit"], 4)
         with patch.object(resolution, "checked_gate", return_value=(review, 4, 14)), \
                 patch.object(resolution, "verify_legacy_archives"):
