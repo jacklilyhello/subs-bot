@@ -38,6 +38,12 @@ on:
       state_sha256:
         description: Exact source inspect predecessor for every mutation
         type: string
+      resume_scope_run_id:
+        description: Original production recovery run holding the project scope
+        type: string
+      resume_journal_sha256:
+        description: Independently read current recovery journal digest for a known bookmark
+        type: string
       resource:
         description: Resource to reconcile only after an unacknowledged create
         type: choice
@@ -70,6 +76,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+          fetch-depth: 0
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11.18'
@@ -102,6 +109,14 @@ jobs:
           SUBS_BOT_CF_DEPENDENCY_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_DEPENDENCY_READ_TOKEN }}
           SUBS_BOT_APPROVAL_JSON: ${{ inputs.rehearsal_registration_sha256 == '' && secrets.SUBS_BOT_APPROVAL_JSON || '' }}
           SUBS_BOT_RECOVERY_JSON: ${{ secrets.SUBS_BOT_RECOVERY_JSON }}
+          SUBS_BOT_BACKUP_POLICY_JSON: ${{ inputs.environment == 'production' && !contains(fromJSON('["inspect","preflight-capacity","verify-backup"]'), inputs.action) && secrets.SUBS_BOT_BACKUP_POLICY_JSON || '' }}
+          SUBS_BOT_BACKUP_GENESIS_SHA256: ${{ inputs.environment == 'production' && !contains(fromJSON('["inspect","preflight-capacity","verify-backup"]'), inputs.action) && secrets.SUBS_BOT_BACKUP_GENESIS_SHA256 || '' }}
+          SUBS_BOT_BACKUP_COORDINATOR_GENESIS_SHA256: ${{ inputs.environment == 'production' && !contains(fromJSON('["inspect","preflight-capacity","verify-backup"]'), inputs.action) && secrets.SUBS_BOT_BACKUP_COORDINATOR_GENESIS_SHA256 || '' }}
+          SUBS_BOT_BACKUP_SCHEDULE_SCOPE_GENESIS_SHA256: ${{ inputs.environment == 'production' && !contains(fromJSON('["inspect","preflight-capacity","verify-backup"]'), inputs.action) && secrets.SUBS_BOT_BACKUP_SCHEDULE_SCOPE_GENESIS_SHA256 || '' }}
+          SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_REVIEW_JSON: ${{ inputs.environment == 'production' && !contains(fromJSON('["inspect","preflight-capacity","verify-backup"]'), inputs.action) && secrets.SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_REVIEW_JSON || '' }}
+          SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_REVIEW_SHA256: ${{ inputs.environment == 'production' && !contains(fromJSON('["inspect","preflight-capacity","verify-backup"]'), inputs.action) && secrets.SUBS_BOT_PRODUCTION_BACKUP_SCHEDULE_REVIEW_SHA256 || '' }}
+          SUBS_BOT_BACKUP_READER_LOG_POLICY_JSON: ${{ inputs.environment == 'production' && !contains(fromJSON('["inspect","preflight-capacity","verify-backup"]'), inputs.action) && secrets.SUBS_BOT_BACKUP_READER_LOG_POLICY_JSON || '' }}
+          SUBS_BOT_BACKUP_READER_LOG_POLICY_SHA256: ${{ inputs.environment == 'production' && !contains(fromJSON('["inspect","preflight-capacity","verify-backup"]'), inputs.action) && secrets.SUBS_BOT_BACKUP_READER_LOG_POLICY_SHA256 || '' }}
           RECOVERY_REHEARSAL_REGISTRATION_SHA256: ${{ inputs.rehearsal_registration_sha256 }}
           SUBS_BOT_REHEARSAL_REGISTRATION_SHA256: ${{ vars.SUBS_BOT_REHEARSAL_REGISTRATION_SHA256 }}
           SUBS_BOT_CF_ISOLATION_TARGET_JSON: ${{ inputs.environment == 'rehearsal' && inputs.rehearsal_registration_sha256 != '' && secrets.SUBS_BOT_CF_ISOLATION_TARGET_JSON || '' }}
@@ -114,6 +129,8 @@ jobs:
           RECOVERY_CURRENT_CI_RUN_ID: ${{ inputs.current_run_id }}
           RECOVERY_CURRENT_CI_RUN_ATTEMPT: ${{ inputs.current_run_attempt }}
           RECOVERY_STATE_SHA256: ${{ inputs.state_sha256 }}
+          RECOVERY_RESUME_SCOPE_RUN_ID: ${{ inputs.resume_scope_run_id }}
+          RECOVERY_RESUME_JOURNAL_SHA256: ${{ inputs.resume_journal_sha256 }}
           RECOVERY_RESOURCE: ${{ inputs.resource }}
           RECOVERY_IDENTITY_SHA256: ${{ inputs.identity_sha256 }}
           RECOVERY_WARNING_PERCENT: ${{ inputs.warning_percent }}

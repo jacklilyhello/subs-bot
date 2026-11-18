@@ -25,9 +25,9 @@ def _control(api, target, revision):
     return row
 
 
-def sample(target, token, checkpoint_id, manifest_sha256, *, warning_percent, root, guard):
+def sample(target, token, checkpoint_id, manifest_sha256, *, warning_percent, root, guard, require_open=False):
     """Scan every D1 table and every recoverable referenced object without writes."""
-    require(target.environment in {"rehearsal", "production"} and callable(guard)
+    require(target.environment in {"rehearsal", "production"} and callable(guard) and type(require_open) is bool
             and re.fullmatch(r"[a-f0-9]{32}", checkpoint_id or "")
             and re.fullmatch(r"[a-f0-9]{64}", manifest_sha256 or "")
             and type(warning_percent) is int and 1 <= warning_percent <= 99)
@@ -48,6 +48,9 @@ def sample(target, token, checkpoint_id, manifest_sha256, *, warning_percent, ro
         api.verify_backup()
         api.verify_bucket(target.data["bucketName"], target.data["bucketCreatedAt"])
         before = _control(api, target, source["manifest"]["revision"])
+        if require_open:
+            require((before["admission"], before["workers"]) == ("open", "run"),
+                    "A scheduled backup cannot claim a slot while production is paused or frozen.")
         schema = recovery.RecoverySource(api, target.data, source["bundle"], source["manifest"], lambda: None, guard)
         observed = capacity.observe(api, schema, warning_percent=warning_percent)
         counts = observed.get("tableCounts")
