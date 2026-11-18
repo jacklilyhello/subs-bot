@@ -905,28 +905,12 @@ def failure_evidence(*, readback=False):
         # Preserve the authenticated ciphertext even if its plaintext is malformed
         # or the temporary identity cannot decrypt it. The intent remains unknown.
         reader.put_once("failure-observation.age", cipher)
-    observed, _ = response_plaintexts(target, value, cipher)
-    core = {"failure-observation.age": cipher, "failure-observation-plaintext.json": control.canonical(observed),
-            "failure-target.json": control.canonical(control.validate_config(target))}
-    if not readback:
-        for name, body in core.items():
-            if name != "failure-observation.age":
-                reader.put_once(name, body)
     confirmed = download_response(allow_failed=True) if os.environ.get("SUBS_BOT_PROVIDER_MUTATION_RESPONSE_ARTIFACT_ID", "") else None
-    if not readback:
-        if confirmed is not None:
-            # Preserve ciphertext before parsing: an unexpected secret-shaped
-            # response remains unknown and its untrusted plaintext is never stored.
-            reader.put_once("failure-confirmed.age", confirmed)
-    original = response_original(target, value, cipher, confirmed)
-    _observed, confirmed_value = response_plaintexts(target, value, cipher, confirmed)
-    core["failure-observation.json"] = control.canonical(original)
-    if confirmed is not None:
-        core["failure-confirmed.age"] = confirmed
-        core["failure-confirmed.json"] = control.canonical(confirmed_value)
+    if not readback and confirmed is not None:
+        reader.put_once("failure-confirmed.age", confirmed)
     raw_verification = os.environ.get("SUBS_BOT_PROVIDER_MUTATION_VERIFICATION_JSON", "")
     verification = control.github._parse_object(raw_verification, sealed.ERROR) if raw_verification else {}
-    next_ciphers = {}
+    next_ciphers, cipher_files = {}, {}
     for kind in ("age", "archive", "live"):
         artifact_id = os.environ.get(f"SUBS_BOT_PROVIDER_NEXT_{kind.upper()}_ARTIFACT_ID", "")
         artifact_sha = os.environ.get(f"SUBS_BOT_PROVIDER_NEXT_{kind.upper()}_ARTIFACT_SHA256", "")
@@ -934,9 +918,23 @@ def failure_evidence(*, readback=False):
         if artifact_id:
             next_ciphers[kind] = download_next_artifact(kind, verification, allow_failed=True)
             name = "failure-next-target.age" if kind == "age" else "failure-next-target-" + kind + ".json"
-            core[name] = next_ciphers[kind]
+            cipher_files[name] = next_ciphers[kind]
             if not readback:
                 reader.put_once(name, next_ciphers[kind])
+    observed, _ = response_plaintexts(target, value, cipher)
+    core = {"failure-observation.age": cipher, "failure-observation-plaintext.json": control.canonical(observed),
+            "failure-target.json": control.canonical(control.validate_config(target))}
+    if not readback:
+        for name, body in core.items():
+            if name != "failure-observation.age":
+                reader.put_once(name, body)
+    original = response_original(target, value, cipher, confirmed)
+    _observed, confirmed_value = response_plaintexts(target, value, cipher, confirmed)
+    core["failure-observation.json"] = control.canonical(original)
+    if confirmed is not None:
+        core["failure-confirmed.age"] = confirmed
+        core["failure-confirmed.json"] = control.canonical(confirmed_value)
+    core.update(cipher_files)
     if "age" in next_ciphers:
         control.require(confirmed_value is not None)
         core["failure-next-target.json"] = control.canonical(checked_next_plaintext(target, value, confirmed_value, next_ciphers["age"]))

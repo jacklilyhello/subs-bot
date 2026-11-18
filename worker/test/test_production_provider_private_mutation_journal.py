@@ -291,6 +291,27 @@ class ProviderMutationJournalTests(unittest.TestCase):
             journal.failure_evidence()
         reader.put_once.assert_called_once_with("failure-observation.age", b"authenticated cipher")
 
+    def test_unreadable_observation_does_not_discard_available_confirmed_cipher(self):
+        value = {"kind": "fixture-intent"}
+        raw = control.canonical(value)
+        env = {"GITHUB_RUN_ID": "101", "GITHUB_SHA": "d" * 40, "SUBS_BOT_PROVIDER_MUTATION_RESPONSE_ARTIFACT_ID": "400",
+               "SUBS_BOT_PROVIDER_MUTATION_INTENT_SHA256": sha256(raw).hexdigest(),
+               "SUBS_BOT_PROVIDER_NEXT_AGE_ARTIFACT_ID": "401", "SUBS_BOT_PROVIDER_NEXT_AGE_ARTIFACT_SHA256": "a" * 64}
+        reader = Mock()
+        reader.read.return_value = raw
+        def response(*, observation=False, allow_failed=False):
+            return b"observation cipher" if observation else b"confirmed cipher"
+        with patch.dict(os.environ, env, clear=True), patch.object(journal, "planned", return_value=(config(active=True), None, "stage", value)), \
+                patch.object(journal, "store", return_value=reader), patch.object(journal, "inventory", return_value={"101": {"intent.json"}}), \
+                patch.object(journal, "download_response", side_effect=response), \
+                patch.object(journal, "download_next_artifact", return_value=b"next target cipher"), \
+                patch.object(journal, "response_plaintexts", side_effect=control.ProviderError("fixture")), \
+                self.assertRaises(control.ProviderError):
+            journal.failure_evidence()
+        self.assertEqual([call.args for call in reader.put_once.call_args_list],
+                         [("failure-observation.age", b"observation cipher"), ("failure-confirmed.age", b"confirmed cipher"),
+                          ("failure-next-target.age", b"next target cipher")])
+
     def test_failure_can_preserve_confirmed_artifact_from_failed_dispatch_without_promoting_success(self):
         cipher = b"confirmed cipher"
         buffer = BytesIO()
