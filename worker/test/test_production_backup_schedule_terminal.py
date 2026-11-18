@@ -429,7 +429,13 @@ class TerminalEvidenceTests(unittest.TestCase):
                    "configurationSha256": self.target.configuration_digest,
                    "release": {"revision": "d" * 40},
                    "control": {"admission": "open", "workers": "run"}}
-        stages = (("started", started), ("preflight", {}), ("pause-intent", {}), ("paused", {}),
+        observed_capacity = {"version": 1, "consistency": "unfrozen-observation", "snapshot": False,
+            "rows": 1, "rowLimit": 20000, "rowStatus": "normal", "tableCounts": {"subs_bot_schema_migrations": 1},
+            "warningPercent": 80, "objectCount": 0, "objectLimit": 512, "objectBytes": 0,
+            "objectBytesLimit": 256 * 1024 * 1024, "objectStatus": "normal", "objectBytesStatus": "normal",
+            "objectClosureSha256": sha256(canonical([])).hexdigest(), "sqlBytes": None,
+            "sqlBytesStatus": "unknown-until-native-export", "backupVerified": False}
+        stages = (("started", started), ("preflight", {"capacity": observed_capacity}), ("pause-intent", {}), ("paused", {}),
                   ("freeze-intent", {}), ("frozen", {}), ("frozen-data", {}), ("capture-intent", {}),
                   ("verified", {"checkpointId": checkpoint, "manifestSha256": "8" * 64}),
                   ("resume-intent", {}), ("resumed", {"control": {"admission": "open", "workers": "run"}}))
