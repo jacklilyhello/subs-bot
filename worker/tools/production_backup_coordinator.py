@@ -1123,18 +1123,28 @@ def bootstrap_rate_limit(token):
 
 def require_bootstrap_budget(observation, token):
     """Reserve primary GH quota before any first-launch scope object is written."""
+    import production_backup_scope_bootstrap as bootstrap
+
     require(isinstance(observation, dict) and type(observation.get("reviewedRunCount")) is int
-            and 0 <= observation["reviewedRunCount"] <= 25
-            and type(observation.get("safePlanRunCount")) is int and 0 <= observation["safePlanRunCount"] <= 5
-            and observation.get("guardGithubUpperBound") == 37 + 5 * observation["reviewedRunCount"],
+            and 0 < observation["reviewedRunCount"] <= bootstrap.MAX_REVIEWED_RUNS
+            and type(observation.get("laterRunCount")) is int and 0 <= observation["laterRunCount"] <= bootstrap.MAX_LATER_RUNS,
             "The bounded bootstrap writer inventory is required before a write.")
+    reviewed = observation["reviewedRunCount"]
+    later_limit = min(observation["laterRunCount"] + 8, bootstrap.MAX_LATER_RUNS)
+    snapshot_pages = (reviewed + later_limit + bootstrap.RUN_PAGE_SIZE) // bootstrap.RUN_PAGE_SIZE
+    # Two full inventory reads, direct run and attempt jobs for every reviewed
+    # row, and up to three reads per later run. Sources for reviewed runs are
+    # already cached by immutable revision; reserve four reads for new isolation
+    # workflow pins, plus six for provision, current bootstrap and main.
+    guard_reads = 2 * snapshot_pages + 2 * reviewed + 3 * later_limit + 4 + 6
     import time
     rate = bootstrap_rate_limit(token)
     core = rate.get("resources", {}).get("core", {})
     require(type(core.get("remaining")) is int and type(core.get("reset")) is int
             and core["reset"] > int(time.time())
-            and core["remaining"] >= 3 * observation["guardGithubUpperBound"] + 100,
+            and core["remaining"] >= 3 * guard_reads + 100,
             "GitHub read quota is insufficient for the three guarded bootstrap writes.")
+    return later_limit
 
 
 def scheduled_start_material(target, policy, authority, authority_sha256, day, session,
@@ -1450,7 +1460,8 @@ def scope_initialization(env, action, target, objects, revision, target_anchor, 
         return {"status": "review-required", "review": review, "reviewSha256": digest(review), "mutationPerformed": False}
     args = (env, target, target_reader, data_reader, provision_reader, data_api, worker_api, metadata_api, read_anchor,
             review_raw, review_pin, registration_sha, token)
-    plan = bootstrap.plan_first_launch(*args)
+    identities = {}
+    plan = bootstrap.plan_first_launch(*args, identities=identities)
     require(plan.get("targetCoordinatorGenesisSha256") == target_genesis
             and plan.get("controlRevision") == revision)
     plan_sha = digest(plan)
@@ -1465,15 +1476,15 @@ def scope_initialization(env, action, target, objects, revision, target_anchor, 
             and env.get("BACKUP_COORDINATOR_APPROVAL_SHA256") == plan_sha
             and env.get("SUBS_BOT_BACKUP_SCOPE_BOOTSTRAP_PLAN_SHA256") == plan_sha,
             "The exact independently pinned first-launch plan and both genesis pins are required.")
-    first = bootstrap.verify_first_launch_guard(*args, plan, stage=0)
-    require_bootstrap_budget(first, token)
+    first = bootstrap.verify_first_launch_guard(*args, plan, stage=0, identities=identities)
+    later_limit = require_bootstrap_budget(first, token)
     stage = 0
     def guarded_write():
         nonlocal stage
         require(stage in {0, 1, 2})
-        current = bootstrap.verify_first_launch_guard(*args, plan, stage=stage)
+        current = bootstrap.verify_first_launch_guard(*args, plan, stage=stage, identities=identities, later_limit=later_limit)
         require(current.get("reviewedRunCount") == first["reviewedRunCount"]
-                and current.get("guardGithubUpperBound") == first["guardGithubUpperBound"])
+                and current.get("laterRunCount") <= later_limit)
         stage += 1
     writer_anchor = ScheduleScopeAnchor(CoordinatorStore(objects, scope), scope, scope_genesis,
                                         target.data["backupBucketName"], target.data["backupBucketCreatedAt"])

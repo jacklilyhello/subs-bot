@@ -1,9 +1,11 @@
 """Synthetic hosted checks for first-launch scope evidence; no cloud access."""
+from datetime import datetime, timezone
 from pathlib import Path
 import sys
 import unittest
 from hashlib import sha256
 from urllib.error import HTTPError
+from urllib.parse import parse_qs, urlsplit
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
@@ -41,6 +43,21 @@ class ReadAPI:
     def __init__(self, target, token):
         self.target, self.token, self.create = target.data, token, False
         self.root = "/accounts/" + target.account_id
+
+
+class ReviewTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 1, 1, 3, tzinfo=timezone.utc).astimezone(tz)
+
+
+def review_environment(action):
+    return {"GITHUB_REPOSITORY": bootstrap.github.REPOSITORY,
+            "GITHUB_REPOSITORY_ID": str(bootstrap.github.REPOSITORY_ID), "GITHUB_REF": bootstrap.github.MAIN_REF,
+            "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_RUN_ATTEMPT": "1", "RUNNER_ENVIRONMENT": "github-hosted",
+            "GITHUB_RUN_ID": "999", "GITHUB_SHA": "f" * 40, "BACKUP_COORDINATOR_ACTION": action,
+            "GITHUB_WORKFLOW_REF": bootstrap.github.REPOSITORY
+                + "/.github/workflows/worker-production-backup-coordinator.yml@" + bootstrap.github.MAIN_REF}
 
 
 class BootstrapTests(unittest.TestCase):
@@ -91,8 +108,7 @@ class BootstrapTests(unittest.TestCase):
         data_api, worker_api, meta_api = (ReadAPI(target, env[key]) for key in
             ("SUBS_BOT_CF_BACKUP_MONITOR_READ_TOKEN", "SUBS_BOT_CF_WORKER_READ_TOKEN", "SUBS_BOT_CF_R2_METADATA_READ_TOKEN"))
         observation = {"safe": True}
-        writers = {"inventorySha256": digest(review["reviewedRuns"]), "reviewedRunCount": 1,
-                   "safePlanRunCount": 0, "guardGithubUpperBound": 38}
+        writers = {"inventorySha256": digest(review["reviewedRuns"]), "reviewedRunCount": 1, "laterRunCount": 0}
         registration_key = "maintenance/production-control/registrations/" + target.digest + ".json"
         objects.values[registration_key] = b"fixture"
         args = (env, target, objects, data_objects, anchor_objects, data_api, worker_api, meta_api, anchor, raw, review_pin, reg, "gh-token")
@@ -160,6 +176,113 @@ class BootstrapTests(unittest.TestCase):
         changed = [pages[0], {"total_count": 52, "workflow_runs": [{"id": 51}, {"id": 52}]}]
         with patch.object(bootstrap, "_get_json", side_effect=changed), self.assertRaises(ValueError):
             bootstrap._pages("/actions/runs?created=x", "workflow_runs", "synthetic")
+
+    def test_bootstrap_proposes_and_rechecks_every_reviewed_run_across_pages(self):
+        target = BootstrapTarget()
+        env = review_environment("plan-schedule-anchor")
+        repo = {"id": bootstrap.github.REPOSITORY_ID}
+        start = "2026-01-01T00:00:00Z"
+        runs = [{"id": index, "created_at": start, "run_attempt": 1, "head_branch": "main", "head_sha": "e" * 40,
+                 "event": "schedule", "path": ".github/workflows/worker-backup-monitor.yml",
+                 "repository": repo, "head_repository": repo, "status": "completed", "conclusion": "success"}
+                for index in range(1, 57)]
+        runs[0].update({"path": ".github/workflows/worker-production-control.yml", "event": "workflow_dispatch"})
+        pages = []
+
+        def github_read(path, token):
+            url = urlsplit(path)
+            if url.path == "/actions/runs":
+                page = int(parse_qs(url.query)["page"][0])
+                self.assertEqual(parse_qs(url.query)["created"], [start + "..2026-01-01T03:00:00Z"])
+                pages.append(page)
+                current = {"id": 999, "created_at": "2026-01-01T02:00:00Z"}
+                ordered = [current, *reversed(runs)]
+                offset = (page - 1) * bootstrap.RUN_PAGE_SIZE
+                return {"total_count": len(ordered), "workflow_runs": ordered[offset:offset + bootstrap.RUN_PAGE_SIZE]}
+            if path == "/actions/runs/1/attempts/1":
+                return runs[0]
+            return runs[int(url.path.rsplit("/", 1)[-1]) - 1]
+
+        def jobs(run_id, token):
+            return [{"id": int(run_id) + 1000, "run_id": int(run_id), "run_attempt": 1, "head_sha": "e" * 40,
+                     "status": "completed", "conclusion": "success"}]
+
+        with patch.object(bootstrap, "datetime", ReviewTime), patch.object(bootstrap, "_get_json", side_effect=github_read), \
+             patch.object(bootstrap, "_attempt_jobs", side_effect=jobs) as job_reads, \
+             patch.object(bootstrap, "_workflow_identity", return_value=("c" * 64, "e" * 40)) as source_reads, \
+             patch.object(bootstrap, "_provision_job"), patch.object(bootstrap, "_bootstrap_run"), \
+             patch.object(bootstrap, "_require_current_main"), \
+             patch.object(bootstrap, "provision_original", return_value={"receipt": {"runId": "1"}}):
+            review = bootstrap.propose_writer_review(env, target, None, None, "a" * 64, "token")
+            self.assertEqual([row["runId"] for row in review["reviewedRuns"]], [str(run["id"]) for run in runs])
+            self.assertEqual(review["reviewedRuns"][0]["classification"], "provision-only")
+            self.assertEqual(pages, [1, 2, 1, 2])
+            self.assertEqual(job_reads.call_count, 56)
+            self.assertEqual(source_reads.call_count, 2)
+            raw = canonical(review).decode()
+            pin = digest(review)
+            env.update({"SUBS_BOT_BACKUP_SCOPE_BOOTSTRAP_REVIEW_JSON": raw,
+                        "SUBS_BOT_BACKUP_SCOPE_BOOTSTRAP_REVIEW_SHA256": pin})
+            observed = bootstrap.verify_first_launch_writers(env, raw, pin, "token")
+            self.assertEqual(observed["reviewedRunCount"], 56)
+            self.assertEqual(pages, [1, 2, 1, 2] * 2)
+            self.assertEqual(job_reads.call_count, 112)
+
+    def test_later_inventory_rechecks_more_than_five_and_stops_for_unknown_writer(self):
+        env = review_environment("initialize-schedule-anchor")
+        approved = {"runId": "1", "path": ".github/workflows/worker-production-control.yml",
+                    "revision": "b" * 40, "classification": "provision-only"}
+        review = {"version": 1, "kind": "new-production-scope-bootstrap-review", "custody": bootstrap.CUSTODY,
+                  "noPriorInFlightWriter": True, "reviewedRuns": [approved],
+                  "windowStart": "2026-01-01T00:00:00Z", "windowEnd": "2026-01-01T01:00:00Z"}
+        raw, pin = canonical(review).decode(), digest(review)
+        env.update({"SUBS_BOT_BACKUP_SCOPE_BOOTSTRAP_REVIEW_JSON": raw,
+                    "SUBS_BOT_BACKUP_SCOPE_BOOTSTRAP_REVIEW_SHA256": pin})
+        path = ".github/workflows/worker-backup-monitor.yml"
+        history = {"id": 1, "path": approved["path"], "head_sha": approved["revision"],
+                   "created_at": review["windowStart"]}
+        later = [{"id": index, "created_at": "2026-01-01T02:00:00Z", "event": "schedule", "path": path}
+                 for index in range(2, 12)]
+        evidence = {key: value for key, value in approved.items() if key != "classification"}
+        with patch.object(bootstrap, "datetime", ReviewTime), \
+             patch.object(bootstrap, "_writer_runs", return_value=[history, *later]) as inventory, \
+             patch.object(bootstrap, "_run_evidence", return_value=evidence), patch.object(bootstrap, "_bootstrap_run"), \
+             patch.object(bootstrap, "_require_current_main"), \
+             patch.object(bootstrap, "_isolated_cron_inert", return_value=True) as inert:
+            self.assertEqual(bootstrap.verify_first_launch_writers(env, raw, pin, "token")["laterRunCount"], 10)
+            self.assertEqual(inert.call_count, 10)
+            with self.assertRaisesRegex(ValueError, "reserved writer observation budget"):
+                bootstrap.verify_first_launch_writers(env, raw, pin, "token", later_limit=8)
+            changed = {**later[-1], "path": ".github/workflows/unknown.yml", "event": "workflow_dispatch"}
+            inventory.return_value = [history, *later[:-1], changed]
+            with self.assertRaisesRegex(ValueError, "unreviewed writer"):
+                bootstrap.verify_first_launch_writers(env, raw, pin, "token")
+            inventory.side_effect = [[history, *later], [history, *later, changed]]
+            with self.assertRaisesRegex(ValueError, "inventory changed"):
+                bootstrap.verify_first_launch_writers(env, raw, pin, "token")
+
+    def test_scheduled_isolation_requires_pinned_source_and_actual_skipped_steps(self):
+        path = ".github/workflows/worker-production-lifecycle-rehearsal.yml"
+        pin, titles, policy = bootstrap.ISOLATION_CRON[path]
+        revision = "f" * 40
+        repo = {"id": bootstrap.github.REPOSITORY_ID}
+        run = {"id": 123, "display_title": titles[1] + " at " + revision, "event": "schedule", "run_attempt": 1,
+               "status": "completed", "head_sha": revision, "head_branch": "main", "path": path,
+               "repository": repo, "head_repository": repo}
+        jobs = [{"name": name, "run_id": 123, "run_attempt": 1, "head_sha": revision, "status": "completed",
+                 "conclusion": "success" if steps else "skipped",
+                 "steps": [{"name": step, "status": "completed", "conclusion": "skipped"} for step in steps]}
+                for name, steps in policy.items()]
+        with patch.object(bootstrap, "_get_json", return_value=run), \
+             patch.object(bootstrap, "_attempt_jobs", return_value=jobs), \
+             patch.object(bootstrap, "_workflow_identity", return_value=(pin, "e" * 40)) as source:
+            self.assertTrue(bootstrap._isolated_cron_inert(run, path, revision, "token", {}))
+            jobs[1]["steps"][0]["conclusion"] = "success"
+            with self.assertRaisesRegex(ValueError, "used credentials"):
+                bootstrap._isolated_cron_inert(run, path, revision, "token", {})
+            source.return_value = ("a" * 64, "e" * 40)
+            with self.assertRaisesRegex(ValueError, "fresh source review"):
+                bootstrap._isolated_cron_inert(run, path, revision, "token", {})
 
     def test_new_registration_is_bound_to_full_separate_journal(self):
         target = BootstrapTarget()
