@@ -4,25 +4,25 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: Preserve exact historical originals or independently verify a private archive
+        description: Preserve originals, add a current candidate from a verified historical archive, or independently verify
         type: choice
-        options: [archive, verify]
+        options: [archive, archive-from-verified, verify]
         default: verify
       archive_run_id:
-        description: Verify only, original successful archive workflow run ID
+        description: Exact original archive run ID for verify or archive-from-verified
         type: string
       archive_run_attempt:
-        description: Verify only, exact archive attempt
+        description: Exact original archive attempt for verify or archive-from-verified
         type: string
         default: '1'
       manifest_sha256:
-        description: Verify only, independent manifest SHA-256 from the successful archive summary
+        description: Independent manifest SHA-256 for the original archive in verify or archive-from-verified
         type: string
       confirmation:
-        description: Archive only, preserve original subs-bot 5752 release evidence
+        description: Both archive modes require preserve original subs-bot 5752 release evidence
         type: string
       current_candidate_run_id:
-        description: Optional additional successful candidate run; original 5752 evidence is always preserved
+        description: Exact additional candidate run, required for archive-from-verified
         type: string
       current_candidate_run_attempt:
         description: Exact additional candidate attempt, archive only
@@ -66,7 +66,7 @@ jobs:
           SUBS_BOT_CF_BOOTSTRAP_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
           SUBS_BOT_CF_R2_METADATA_READ_TOKEN: ${{ secrets.SUBS_BOT_CF_R2_METADATA_READ_TOKEN }}
           SUBS_BOT_SCOPED_R2_READ_JSON: ${{ secrets.SUBS_BOT_SCOPED_R2_READ_JSON }}
-          SUBS_BOT_SCOPED_R2_WRITE_JSON: ${{ inputs.action == 'archive' && secrets.SUBS_BOT_SCOPED_R2_WRITE_JSON || '' }}
+          SUBS_BOT_SCOPED_R2_WRITE_JSON: ${{ contains(fromJSON('["archive","archive-from-verified"]'), inputs.action) && secrets.SUBS_BOT_SCOPED_R2_WRITE_JSON || '' }}
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           python3 -B worker/tools/evidence_archive.py
