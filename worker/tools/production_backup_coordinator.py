@@ -1127,16 +1127,19 @@ def require_bootstrap_budget(observation, token):
 
     require(isinstance(observation, dict) and type(observation.get("reviewedRunCount")) is int
             and 0 < observation["reviewedRunCount"] <= bootstrap.MAX_REVIEWED_RUNS
+            and type(observation.get("reviewedNoJobCount")) is int
+            and 0 <= observation["reviewedNoJobCount"] <= observation["reviewedRunCount"]
             and type(observation.get("laterRunCount")) is int and 0 <= observation["laterRunCount"] <= bootstrap.MAX_LATER_RUNS,
             "The bounded bootstrap writer inventory is required before a write.")
     reviewed = observation["reviewedRunCount"]
     later_limit = min(observation["laterRunCount"] + 8, bootstrap.MAX_LATER_RUNS)
     snapshot_pages = (reviewed + later_limit + bootstrap.RUN_PAGE_SIZE) // bootstrap.RUN_PAGE_SIZE
     # Two full inventory reads, direct run and attempt jobs for every reviewed
-    # row, and up to three reads per later run. Sources for reviewed runs are
+    # row, plus a complete-history read for each pre-job cancellation, and up
+    # to three reads per later run. Sources for reviewed runs are
     # already cached by immutable revision; reserve four reads for new isolation
     # workflow pins, plus six for provision, current bootstrap and main.
-    guard_reads = 2 * snapshot_pages + 2 * reviewed + 3 * later_limit + 4 + 6
+    guard_reads = 2 * snapshot_pages + 2 * reviewed + observation["reviewedNoJobCount"] + 3 * later_limit + 4 + 6
     import time
     rate = bootstrap_rate_limit(token)
     core = rate.get("resources", {}).get("core", {})
@@ -1484,6 +1487,7 @@ def scope_initialization(env, action, target, objects, revision, target_anchor, 
         require(stage in {0, 1, 2})
         current = bootstrap.verify_first_launch_guard(*args, plan, stage=stage, identities=identities, later_limit=later_limit)
         require(current.get("reviewedRunCount") == first["reviewedRunCount"]
+                and current.get("reviewedNoJobCount") == first["reviewedNoJobCount"]
                 and current.get("laterRunCount") <= later_limit)
         stage += 1
     writer_anchor = ScheduleScopeAnchor(CoordinatorStore(objects, scope), scope, scope_genesis,
