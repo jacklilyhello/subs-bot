@@ -29,6 +29,13 @@ MAX_REVIEWED_RUNS = 96
 MAX_LATER_RUNS = 100
 MAX_REVIEW_BYTES = 48 * 1024
 
+PRODUCTION_CRON = {
+    ".github/workflows/worker-production-backup-coordinator.yml": (
+        ("Production backup coordinator scheduled-run", "Production backup coordinator inspect"),
+        {"coordinate", "inspect_or_reconcile", "monitor", "schedule_readback"}),
+    ".github/workflows/worker-production-backup.yml": (("Production backup monitor",), {"checkpoint"}),
+}
+
 # Only the exact audited workflow originals can prove that these scheduled
 # isolation runs never entered a step with Cloudflare or Telegram credentials.
 ISOLATION_CRON = {
@@ -253,9 +260,11 @@ def _run_evidence(run, token, identities):
     require(str(latest.get("id")) == run_id and latest.get("run_attempt") == 1
             and latest.get("status") == "completed" and latest.get("head_sha") == run["head_sha"])
     jobs = _attempt_jobs(run_id, token)
-    require(jobs and all(str(job.get("run_id")) == run_id and job.get("run_attempt") == 1
-            and job.get("head_sha") == run["head_sha"] and job.get("status") == "completed"
-            and isinstance(job.get("conclusion"), str) for job in jobs))
+    require((jobs and all(str(job.get("run_id")) == run_id and job.get("run_attempt") == 1
+                         and job.get("head_sha") == run["head_sha"] and job.get("status") == "completed"
+                         and isinstance(job.get("conclusion"), str) for job in jobs))
+            or (not jobs and _cancelled_before_jobs(run, latest, path, token)),
+            "An empty attempt needs independent proof of cancellation before any job.")
     workflow_sha, tree = _cached_workflow_identity(path, run["head_sha"], token, identities)
     return {"runId": run_id, "revision": run["head_sha"], "headBranch": run["head_branch"], "path": path, "event": run.get("event"),
             "createdAt": run.get("created_at"), "conclusion": run["conclusion"], "jobsSha256": digest(jobs),
@@ -309,7 +318,29 @@ def _provision_job(receipt, token):
         require(len(steps) == 1 and (steps[0].get("status"), steps[0].get("conclusion")) == ("completed", "success"))
 
 
-def _scheduled_jobs(run, path, revision, titles, names, token):
+def _cancelled_before_jobs(run, latest, path, token):
+    """An empty attempt is accepted only when the complete run also has no jobs."""
+    if path not in PRODUCTION_CRON:
+        return False
+    run_id, revision = run["id"], run["head_sha"]
+    titles, _names = PRODUCTION_CRON[path]
+    require(type(run_id) is int and DECIMAL.fullmatch(str(run_id)) and REV.fullmatch(revision))
+    for item in (run, latest):
+        require((item.get("id"), item.get("head_sha"), item.get("head_branch"), item.get("event"),
+                 item.get("run_attempt"), item.get("status"), item.get("conclusion")) ==
+                (run_id, revision, "main", "schedule", 1, "completed", "cancelled")
+                and item.get("path") in {path, path + "@main", path + "@refs/heads/main"}
+                and item.get("display_title") in [title + " at " + revision for title in titles]
+                and item.get("created_at") == run["created_at"]
+                and item.get("run_started_at") == run["created_at"]
+                and all(isinstance(item.get(k), dict) and item[k].get("id") == github.REPOSITORY_ID
+                        for k in ("repository", "head_repository")))
+    jobs = _pages(f"/actions/runs/{run_id}/jobs?filter=all", "jobs", token, maximum=100, page_size=100)
+    require(not jobs, "The cancelled schedule has jobs in its complete run history.")
+    return True
+
+
+def _scheduled_jobs(run, path, revision, titles, names, token, *, allow_pre_job_cancellation=False):
     run_id = str(run.get("id"))
     require(DECIMAL.fullmatch(run_id) and run.get("display_title") in [title + " at " + revision for title in titles])
     latest = _get_json("/actions/runs/" + run_id, token)
@@ -321,6 +352,9 @@ def _scheduled_jobs(run, path, revision, titles, names, token):
                 and all(isinstance(item.get(k), dict) and item[k].get("id") == github.REPOSITORY_ID
                         for k in ("repository", "head_repository")))
     jobs = _attempt_jobs(run_id, token)
+    if not jobs and allow_pre_job_cancellation:
+        require(_cancelled_before_jobs(run, latest, path, token))
+        return jobs
     require(len(jobs) == len(names) and {job.get("name") for job in jobs} == names
             and all(str(job.get("run_id")) == run_id and job.get("run_attempt") == 1
                     and job.get("head_sha") == revision and job.get("status") == "completed"
@@ -334,17 +368,11 @@ def _job_skipped(job):
 
 
 def _skipped_cron(run, path, revision, token):
-    """A completed, unrerun production cron with every fixed job skipped cannot write."""
-    workflows = {
-        ".github/workflows/worker-production-backup-coordinator.yml": (
-            ("Production backup coordinator scheduled-run", "Production backup coordinator inspect"),
-            {"coordinate", "inspect_or_reconcile", "monitor", "schedule_readback"}),
-        ".github/workflows/worker-production-backup.yml": (("Production backup monitor",), {"checkpoint"}),
-    }
-    if path not in workflows:
+    """Prove all production cron jobs skipped or none created before cancellation."""
+    if path not in PRODUCTION_CRON:
         return False
-    titles, names = workflows[path]
-    jobs = _scheduled_jobs(run, path, revision, titles, names, token)
+    titles, names = PRODUCTION_CRON[path]
+    jobs = _scheduled_jobs(run, path, revision, titles, names, token, allow_pre_job_cancellation=True)
     require(all(_job_skipped(job) for job in jobs),
             "A scheduled job was not positively confirmed skipped.")
     return True
@@ -424,8 +452,10 @@ def verify_first_launch_writers(env, review_raw, review_pin, token, *, identitie
     require(_writer_runs(review["windowStart"], observed_end, current_id, token, maximum=maximum) == runs,
             "The first-launch writer inventory changed during observation.")
     _require_current_main(revision, token)
+    empty_jobs_sha = digest([])
     return {"reviewSha256": review_pin, "inventorySha256": digest(review["reviewedRuns"]),
-            "reviewedRunCount": len(reviewed), "laterRunCount": len(later)}
+            "reviewedRunCount": len(reviewed), "laterRunCount": len(later),
+            "reviewedNoJobCount": sum(row.get("jobsSha256") == empty_jobs_sha for row in reviewed.values())}
 
 
 def propose_writer_review(env, target, objects, anchor_objects, registration_sha256, token):

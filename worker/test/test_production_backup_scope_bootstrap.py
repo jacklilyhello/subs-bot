@@ -108,7 +108,8 @@ class BootstrapTests(unittest.TestCase):
         data_api, worker_api, meta_api = (ReadAPI(target, env[key]) for key in
             ("SUBS_BOT_CF_BACKUP_MONITOR_READ_TOKEN", "SUBS_BOT_CF_WORKER_READ_TOKEN", "SUBS_BOT_CF_R2_METADATA_READ_TOKEN"))
         observation = {"safe": True}
-        writers = {"inventorySha256": digest(review["reviewedRuns"]), "reviewedRunCount": 1, "laterRunCount": 0}
+        writers = {"inventorySha256": digest(review["reviewedRuns"]), "reviewedRunCount": 1,
+                   "reviewedNoJobCount": 0, "laterRunCount": 0}
         registration_key = "maintenance/production-control/registrations/" + target.digest + ".json"
         objects.values[registration_key] = b"fixture"
         args = (env, target, objects, data_objects, anchor_objects, data_api, worker_api, meta_api, anchor, raw, review_pin, reg, "gh-token")
@@ -283,6 +284,38 @@ class BootstrapTests(unittest.TestCase):
             source.return_value = ("a" * 64, "e" * 40)
             with self.assertRaisesRegex(ValueError, "fresh source review"):
                 bootstrap._isolated_cron_inert(run, path, revision, "token", {})
+
+    def test_no_job_cancellation_requires_exact_cron_and_complete_empty_job_history(self):
+        path = ".github/workflows/worker-production-backup-coordinator.yml"
+        revision = "f" * 40
+        repo = {"id": bootstrap.github.REPOSITORY_ID}
+        start = "2026-01-01T00:00:00Z"
+        run = {"id": 123, "path": path, "head_sha": revision, "head_branch": "main", "event": "schedule",
+               "run_attempt": 1, "status": "completed", "conclusion": "cancelled",
+               "display_title": "Production backup coordinator scheduled-run at " + revision,
+               "created_at": start, "run_started_at": start, "repository": repo, "head_repository": repo}
+        no_jobs = {"jobs": [], "total_count": 0}
+
+        def read(endpoint, _token):
+            if endpoint == "/actions/runs/123":
+                return run
+            self.assertEqual(endpoint, "/actions/runs/123/jobs?filter=all&per_page=100&page=1")
+            return no_jobs
+
+        with patch.object(bootstrap, "_get_json", side_effect=read), \
+             patch.object(bootstrap, "_attempt_jobs", return_value=[]) as attempt, \
+             patch.object(bootstrap, "_workflow_identity", return_value=("c" * 64, "e" * 40)):
+            evidence = bootstrap._run_evidence(run, "token", {})
+            self.assertEqual(evidence["jobsSha256"], digest([]))
+            self.assertTrue(bootstrap._skipped_cron(run, path, revision, "token"))
+            no_jobs.update(jobs=[{"id": 55}], total_count=1)
+            with self.assertRaisesRegex(ValueError, "complete run history"):
+                bootstrap._run_evidence(run, "token", {})
+            no_jobs.update(jobs=[], total_count=0)
+            run["event"] = "workflow_dispatch"
+            with self.assertRaises(ValueError):
+                bootstrap._run_evidence(run, "token", {})
+            self.assertEqual(attempt.call_count, 4)
 
     def test_new_registration_is_bound_to_full_separate_journal(self):
         target = BootstrapTarget()
