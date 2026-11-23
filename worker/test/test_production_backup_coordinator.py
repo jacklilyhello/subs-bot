@@ -132,17 +132,17 @@ class CoordinatorTests(unittest.TestCase):
                 owner.guard()
 
     def test_scope_bootstrap_reserves_three_guards_before_any_write(self):
-        evidence = {"reviewedRunCount": 4, "safePlanRunCount": 1, "guardGithubUpperBound": 57}
-        with patch.object(coordinator, "bootstrap_rate_limit", return_value={"resources": {"core": {"remaining": 271, "reset": 4102444800}}}):
-            coordinator.require_bootstrap_budget(evidence, "token")
-        with patch.object(coordinator, "bootstrap_rate_limit", return_value={"resources": {"core": {"remaining": 270, "reset": 4102444800}}}), \
+        evidence = {"reviewedRunCount": 4, "laterRunCount": 1}
+        with patch.object(coordinator, "bootstrap_rate_limit", return_value={"resources": {"core": {"remaining": 241, "reset": 4102444800}}}):
+            self.assertEqual(coordinator.require_bootstrap_budget(evidence, "token"), 9)
+        with patch.object(coordinator, "bootstrap_rate_limit", return_value={"resources": {"core": {"remaining": 240, "reset": 4102444800}}}), \
              self.assertRaises(ContractError):
             coordinator.require_bootstrap_budget(evidence, "token")
         with patch.object(coordinator, "bootstrap_rate_limit", return_value={"resources": {"core": {"remaining": 999, "reset": 1}}}), \
              self.assertRaises(ContractError):
             coordinator.require_bootstrap_budget(evidence, "token")
         with self.assertRaises(ContractError):
-            coordinator.require_bootstrap_budget({**evidence, "guardGithubUpperBound": 48}, "token")
+            coordinator.require_bootstrap_budget({**evidence, "laterRunCount": 101}, "token")
 
     def test_bootstrap_quota_reads_the_global_endpoint_once(self):
         from io import BytesIO

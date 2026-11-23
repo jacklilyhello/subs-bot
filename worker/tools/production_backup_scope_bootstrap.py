@@ -24,6 +24,29 @@ REV = re.compile(r"[a-f0-9]{40}")
 DECIMAL = re.compile(r"[1-9][0-9]{0,19}")
 WORKFLOW = re.compile(r"\.github/workflows/[A-Za-z0-9_-]+\.ya?ml")
 CUSTODY = "new-project-reviewed-writers-no-unapproved-deletion"
+RUN_PAGE_SIZE = 50
+MAX_REVIEWED_RUNS = 96
+MAX_LATER_RUNS = 100
+MAX_REVIEW_BYTES = 48 * 1024
+
+# Only the exact audited workflow originals can prove that these scheduled
+# isolation runs never entered a step with Cloudflare or Telegram credentials.
+ISOLATION_CRON = {
+    ".github/workflows/worker-backup-monitor.yml": (
+        "4751c90d61cca2d1985fddf539b09a4366e131bbf71e015f8223618fa1914c3d",
+        ("Observe rehearsal backup health",),
+        {"observe": ("Read registered backup journals and hosted run status",)},
+    ),
+    ".github/workflows/worker-production-lifecycle-rehearsal.yml": (
+        "d97a78f4a2e7b33344455057e13c138e54074c5cf0014277560686cece3d6a7f",
+        ("Production lifecycle rehearsal daily-backup", "Production lifecycle rehearsal daily-backup-watchdog"),
+        {"head-validation": (), "rehearse": (
+            "Execute the registered production lifecycle code path",
+            "Independently restore the original test webhook after the exercise",
+            "Finalize only both complete positive and revoked-link HTTP results",
+        )},
+    ),
+}
 
 
 def _stamp(raw):
@@ -158,14 +181,15 @@ def new_resource_observation(target, data_api, worker_api, metadata_api):
             "activeDeployments": 0, "schedules": 0, "bucketsSha256": digest(buckets)}
 
 
-def _pages(path, key, token, *, maximum=500):
+def _pages(path, key, token, *, maximum=500, page_size=RUN_PAGE_SIZE):
     rows, seen, total = [], set(), None
     for page in range(1, 12):
         separator = "&" if "?" in path else "?"
-        response = _get_json(path + separator + urlencode({"per_page": 50, "page": page}), token)
+        response = _get_json(path + separator + urlencode({"per_page": page_size, "page": page}), token)
         batch, count = response.get(key), response.get("total_count")
         require(type(count) is int and 0 <= count <= maximum and isinstance(batch, list)
-                and len(batch) == min(50, max(0, count - len(rows))))
+                and len(batch) == min(page_size, max(0, count - len(rows))),
+                "The GitHub inventory exceeds its bound or a page is incomplete.")
         require(total is None or total == count, "The GH inventory changed between pages.")
         total = count
         for item in batch:
@@ -175,6 +199,19 @@ def _pages(path, key, token, *, maximum=500):
         if len(rows) == total:
             return rows
     require(False, "The GH inventory exceeds its verified bound.")
+
+
+def _attempt_jobs(run_id, token):
+    return _pages("/actions/runs/" + run_id + "/attempts/1/jobs", "jobs", token, maximum=100, page_size=100)
+
+
+def _writer_runs(start, end, current_id, token, *, maximum):
+    runs = _pages("/actions/runs?" + urlencode({"created": start + ".." + end}),
+                  "workflow_runs", token, maximum=maximum)
+    lower, upper = _stamp(start), _stamp(end)
+    require(all(lower <= _stamp(run.get("created_at")) <= upper for run in runs),
+            "GitHub returned a run outside the requested inventory window.")
+    return sorted((run for run in runs if str(run["id"]) != current_id), key=lambda run: run["id"])
 
 
 def _workflow_identity(path, revision, token):
@@ -192,7 +229,14 @@ def _workflow_identity(path, revision, token):
     return _sha(raw), commit["tree"]["sha"]
 
 
-def _run_evidence(run, token):
+def _cached_workflow_identity(path, revision, token, identities):
+    key = path, revision
+    if key not in identities:
+        identities[key] = _workflow_identity(path, revision, token)
+    return identities[key]
+
+
+def _run_evidence(run, token, identities):
     require(isinstance(run, dict) and type(run.get("id")) is int and run["id"] > 0
             and type(run.get("run_attempt")) is int and run["run_attempt"] == 1
             and run.get("status") == "completed" and isinstance(run.get("conclusion"), str)
@@ -208,11 +252,11 @@ def _run_evidence(run, token):
     latest = _get_json("/actions/runs/" + run_id, token)
     require(str(latest.get("id")) == run_id and latest.get("run_attempt") == 1
             and latest.get("status") == "completed" and latest.get("head_sha") == run["head_sha"])
-    jobs = _pages("/actions/runs/" + run_id + "/attempts/1/jobs", "jobs", token, maximum=100)
+    jobs = _attempt_jobs(run_id, token)
     require(jobs and all(str(job.get("run_id")) == run_id and job.get("run_attempt") == 1
             and job.get("head_sha") == run["head_sha"] and job.get("status") == "completed"
             and isinstance(job.get("conclusion"), str) for job in jobs))
-    workflow_sha, tree = _workflow_identity(path, run["head_sha"], token)
+    workflow_sha, tree = _cached_workflow_identity(path, run["head_sha"], token, identities)
     return {"runId": run_id, "revision": run["head_sha"], "headBranch": run["head_branch"], "path": path, "event": run.get("event"),
             "createdAt": run.get("created_at"), "conclusion": run["conclusion"], "jobsSha256": digest(jobs),
             "workflowSha256": workflow_sha, "treeSha": tree}
@@ -234,7 +278,7 @@ def _bootstrap_run(run_id, revision, action, token, *, running):
                 and (running or item.get("conclusion") == "success")
                 and all(isinstance(item.get(k), dict) and item[k].get("id") == github.REPOSITORY_ID
                         for k in ("repository", "head_repository")))
-    jobs = _pages("/actions/runs/" + run_id + "/attempts/1/jobs", "jobs", token, maximum=100)
+    jobs = _attempt_jobs(run_id, token)
     matched = [job for job in jobs if job.get("name") == "inspect_or_reconcile"]
     require(len(matched) == 1)
     job = matched[0]
@@ -255,7 +299,7 @@ def _provision_job(receipt, token):
             and run.get("event") == "workflow_dispatch" and (run.get("status"), run.get("conclusion")) == ("completed", "success")
             and all(isinstance(run.get(k), dict) and run[k].get("id") == github.REPOSITORY_ID
                     for k in ("repository", "head_repository")))
-    jobs = _pages("/actions/runs/" + run_id + "/attempts/1/jobs", "jobs", token, maximum=100)
+    jobs = _attempt_jobs(run_id, token)
     matching = [job for job in jobs if job.get("name") == "control"]
     require(len(matching) == 1 and isinstance(matching[0].get("steps"), list)
             and str(matching[0].get("run_id")) == run_id and matching[0].get("run_attempt") == 1
@@ -265,21 +309,9 @@ def _provision_job(receipt, token):
         require(len(steps) == 1 and (steps[0].get("status"), steps[0].get("conclusion")) == ("completed", "success"))
 
 
-def _skipped_cron(run, revision, token):
-    """A completed, unrerun cron with every fixed job skipped cannot write."""
-    workflows = {
-        ".github/workflows/worker-production-backup-coordinator.yml": (
-            {"Production backup coordinator scheduled-run at " + revision, "Production backup coordinator inspect at " + revision},
-            {"coordinate", "inspect_or_reconcile", "monitor", "schedule_readback"}),
-        ".github/workflows/worker-production-backup.yml": ({"Production backup monitor at " + revision}, {"checkpoint"}),
-    }
-    raw_path = run.get("path", "")
-    path = raw_path.removesuffix("@refs/heads/main").removesuffix("@main")
-    if path not in workflows or run.get("event") != "schedule":
-        return False
-    titles, names = workflows[path]
+def _scheduled_jobs(run, path, revision, titles, names, token):
     run_id = str(run.get("id"))
-    require(DECIMAL.fullmatch(run_id) and run.get("display_title") in titles)
+    require(DECIMAL.fullmatch(run_id) and run.get("display_title") in [title + " at " + revision for title in titles])
     latest = _get_json("/actions/runs/" + run_id, token)
     for item in (run, latest):
         require(str(item.get("id")) == run_id and item.get("head_sha") == revision and item.get("head_branch") == "main"
@@ -288,25 +320,66 @@ def _skipped_cron(run, revision, token):
                 and item.get("display_title") == run["display_title"] and item.get("status") == "completed"
                 and all(isinstance(item.get(k), dict) and item[k].get("id") == github.REPOSITORY_ID
                         for k in ("repository", "head_repository")))
-    jobs = _pages("/actions/runs/" + run_id + "/attempts/1/jobs", "jobs", token, maximum=100)
+    jobs = _attempt_jobs(run_id, token)
     require(len(jobs) == len(names) and {job.get("name") for job in jobs} == names
             and all(str(job.get("run_id")) == run_id and job.get("run_attempt") == 1
                     and job.get("head_sha") == revision and job.get("status") == "completed"
-                    and job.get("conclusion") == "skipped" and job.get("steps") == [] for job in jobs),
+                    and isinstance(job.get("steps"), list) for job in jobs),
+            "The scheduled run's exact job inventory is unavailable.")
+    return jobs
+
+
+def _job_skipped(job):
+    return job.get("conclusion") == "skipped" and job.get("steps") == []
+
+
+def _skipped_cron(run, path, revision, token):
+    """A completed, unrerun production cron with every fixed job skipped cannot write."""
+    workflows = {
+        ".github/workflows/worker-production-backup-coordinator.yml": (
+            ("Production backup coordinator scheduled-run", "Production backup coordinator inspect"),
+            {"coordinate", "inspect_or_reconcile", "monitor", "schedule_readback"}),
+        ".github/workflows/worker-production-backup.yml": (("Production backup monitor",), {"checkpoint"}),
+    }
+    if path not in workflows:
+        return False
+    titles, names = workflows[path]
+    jobs = _scheduled_jobs(run, path, revision, titles, names, token)
+    require(all(_job_skipped(job) for job in jobs),
             "A scheduled job was not positively confirmed skipped.")
     return True
 
 
-def verify_first_launch_writers(env, review_raw, review_pin, token):
+def _isolated_cron_inert(run, path, revision, token, identities):
+    if path not in ISOLATION_CRON:
+        return False
+    pin, titles, policy = ISOLATION_CRON[path]
+    workflow_sha, _tree = _cached_workflow_identity(path, revision, token, identities)
+    require(workflow_sha == pin, "The scheduled isolation workflow needs a fresh source review.")
+    jobs = _scheduled_jobs(run, path, revision, titles, set(policy), token)
+    for job in jobs:
+        if _job_skipped(job):
+            continue
+        required_steps = policy[job["name"]]
+        observed = [step for step in job["steps"] if step.get("name") in required_steps]
+        require(required_steps and job.get("conclusion") == "success"
+                and len(observed) == len(required_steps) and {step["name"] for step in observed} == set(required_steps)
+                and all((step.get("status"), step.get("conclusion")) == ("completed", "skipped") for step in observed),
+                "A scheduled isolation run used credentials or did not prove its credentialed steps were skipped.")
+    return True
+
+
+def verify_first_launch_writers(env, review_raw, review_pin, token, *, identities=None, later_limit=MAX_LATER_RUNS):
     """Freshly recheck the reviewed window and all runs after it, without writes."""
     _protected_inputs(env, review_raw, review_pin)
     raw = review_raw.encode("utf-8") if isinstance(review_raw, str) else review_raw
     review = parsed(raw)
-    require(isinstance(raw, bytes) and canonical(review) == raw and HEX.fullmatch(review_pin or "") and _sha(raw) == review_pin
+    require(isinstance(raw, bytes) and len(raw) <= MAX_REVIEW_BYTES
+            and canonical(review) == raw and HEX.fullmatch(review_pin or "") and _sha(raw) == review_pin
             and review.get("version") == 1 and type(review.get("version")) is int
             and review.get("kind") == "new-production-scope-bootstrap-review" and review.get("custody") == CUSTODY
             and review.get("noPriorInFlightWriter") is True and isinstance(review.get("reviewedRuns"), list)
-            and len(review["reviewedRuns"]) <= 25 and DECIMAL.fullmatch(env.get("GITHUB_RUN_ID", ""))
+            and 0 < len(review["reviewedRuns"]) <= MAX_REVIEWED_RUNS and DECIMAL.fullmatch(env.get("GITHUB_RUN_ID", ""))
             and REV.fullmatch(env.get("GITHUB_SHA", ""))
             and env.get("GITHUB_REPOSITORY") == github.REPOSITORY and env.get("GITHUB_REPOSITORY_ID") == str(github.REPOSITORY_ID)
             and env.get("GITHUB_REF") == github.MAIN_REF and env.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
@@ -315,49 +388,44 @@ def verify_first_launch_writers(env, review_raw, review_pin, token):
             and env.get("BACKUP_COORDINATOR_ACTION") in {"plan-schedule-anchor", "initialize-schedule-anchor"})
     start, end = _stamp(review.get("windowStart")), _stamp(review.get("windowEnd"))
     now = datetime.now(timezone.utc)
-    require(start <= end <= now and end - start <= timedelta(days=31))
-    time_range = review["windowStart"] + ".." + review["windowEnd"]
-    runs = _pages("/actions/runs?" + urlencode({"created": time_range}), "workflow_runs", token, maximum=26)
+    require(start <= end <= now and now - start <= timedelta(days=31) and 0 <= later_limit <= MAX_LATER_RUNS)
+    identities = {} if identities is None else identities
     reviewed = {entry.get("runId"): entry for entry in review["reviewedRuns"] if isinstance(entry, dict)}
     require(len(reviewed) == len(review["reviewedRuns"]) and all(DECIMAL.fullmatch(key or "") for key in reviewed))
     current_id = env["GITHUB_RUN_ID"]
-    actual = [run for run in runs if str(run.get("id")) != current_id]
+    revision = env["GITHUB_SHA"]
+    observed_end = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    maximum = len(reviewed) + later_limit + 1
+    runs = _writer_runs(review["windowStart"], observed_end, current_id, token, maximum=maximum)
+    actual = [run for run in runs if _stamp(run["created_at"]) <= end]
+    later = [run for run in runs if _stamp(run["created_at"]) > end]
     require({str(run.get("id")) for run in actual} == set(reviewed), "The reviewed run inventory differs.")
+    require(len(later) <= later_limit, "Too many new runs for the reserved writer observation budget.")
     for run in actual:
-        item = _run_evidence(run, token)
-        approved = reviewed[item["runId"]]
+        approved = reviewed[str(run["id"])]
+        require(approved.get("revision") == run.get("head_sha")
+                and approved.get("path") == run.get("path", "").split("@", 1)[0])
+        item = _run_evidence(run, token, identities)
         require(isinstance(approved, dict) and set(approved) == set(item) | {"classification"}
                 and {k: approved[k] for k in item} == item
                 and approved["classification"] in {"reviewed-no-target-mutation", "provision-only"})
-    _bootstrap_run(current_id, env["GITHUB_SHA"], env["BACKUP_COORDINATOR_ACTION"], token, running=True)
-    after = _pages("/actions/runs?" + urlencode({"created": review["windowEnd"] + ".." + now.strftime("%Y-%m-%dT%H:%M:%SZ")}),
-                   "workflow_runs", token, maximum=31)
-    require(len(after) <= 31, "The bounded first-launch live writer inventory is too large.")
-    safe_plans = 0
-    for run in after:
-        run_id = str(run.get("id"))
-        if run_id == current_id or run_id in reviewed:
-            continue
-        require(safe_plans < 5, "Too many later runs require a fresh reviewed inventory.")
-        require(_skipped_cron(run, env["GITHUB_SHA"], token)
-                or (run.get("display_title") == "Production backup coordinator plan-schedule-anchor at " + env["GITHUB_SHA"]
-                    and run.get("head_sha") == env["GITHUB_SHA"]
-                    and _bootstrap_run(run_id, env["GITHUB_SHA"], "plan-schedule-anchor", token, running=False)),
+    _bootstrap_run(current_id, revision, env["BACKUP_COORDINATOR_ACTION"], token, running=True)
+    for run in later:
+        path = run.get("path", "").removesuffix("@refs/heads/main").removesuffix("@main")
+        if run.get("event") == "schedule":
+            safe = (_skipped_cron(run, path, revision, token)
+                    or _isolated_cron_inert(run, path, revision, token, identities))
+        else:
+            safe = (run.get("display_title") == "Production backup coordinator plan-schedule-anchor at " + revision
+                    and run.get("head_sha") == revision
+                    and _bootstrap_run(str(run["id"]), revision, "plan-schedule-anchor", token, running=False))
+        require(safe,
                 "A new unreviewed writer appeared after the approved inventory.")
-        safe_plans += 1
-    require(safe_plans <= 5, "Too many prior bootstrap plans require a new reviewed inventory.")
-    again = _pages("/actions/runs?" + urlencode({"created": time_range}), "workflow_runs", token, maximum=26)
-    require([run for run in again if str(run.get("id")) != current_id] == actual,
-            "The independently reviewed run inventory changed during observation.")
-    after_again = _pages("/actions/runs?" + urlencode({"created": review["windowEnd"] + ".." + now.strftime("%Y-%m-%dT%H:%M:%SZ")}),
-                         "workflow_runs", token, maximum=31)
-    require([run for run in after_again if str(run.get("id")) != current_id] ==
-            [run for run in after if str(run.get("id")) != current_id],
-            "The live writer inventory changed during observation.")
-    _require_current_main(env["GITHUB_SHA"], token)
+    require(_writer_runs(review["windowStart"], observed_end, current_id, token, maximum=maximum) == runs,
+            "The first-launch writer inventory changed during observation.")
+    _require_current_main(revision, token)
     return {"reviewSha256": review_pin, "inventorySha256": digest(review["reviewedRuns"]),
-            "reviewedRunCount": len(reviewed), "safePlanRunCount": safe_plans,
-            "guardGithubUpperBound": 13 + 5 * len(reviewed) + 4 * 5}
+            "reviewedRunCount": len(reviewed), "laterRunCount": len(later)}
 
 
 def propose_writer_review(env, target, objects, anchor_objects, registration_sha256, token):
@@ -374,28 +442,29 @@ def propose_writer_review(env, target, objects, anchor_objects, registration_sha
     start, now = provision.get("created_at"), datetime.now(timezone.utc)
     require(timedelta(0) <= now - _stamp(start) <= timedelta(days=31))
     end = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-    path = "/actions/runs?" + urlencode({"created": start + ".." + end})
-    runs = [row for row in _pages(path, "workflow_runs", token, maximum=26)
-            if str(row.get("id")) != env["GITHUB_RUN_ID"]]
-    require(len(runs) <= 25 and sum(str(row.get("id")) == receipt["runId"] for row in runs) == 1,
+    current_id = env["GITHUB_RUN_ID"]
+    maximum = MAX_REVIEWED_RUNS + 1
+    runs = _writer_runs(start, end, current_id, token, maximum=maximum)
+    require(len(runs) <= MAX_REVIEWED_RUNS and sum(str(row["id"]) == receipt["runId"] for row in runs) == 1,
             "The provisioning run must be present in the bounded review inventory.")
-    evidence = []
+    evidence, identities = [], {}
     for row in runs:
-        item = _run_evidence(row, token)
+        item = _run_evidence(row, token, identities)
         item["classification"] = ("provision-only" if item["runId"] == receipt["runId"]
                                   else "reviewed-no-target-mutation")
         evidence.append(item)
-    require([row for row in _pages(path, "workflow_runs", token, maximum=26)
-             if str(row.get("id")) != env["GITHUB_RUN_ID"]] == runs)
+    require(_writer_runs(start, end, current_id, token, maximum=maximum) == runs)
     _require_current_main(env["GITHUB_SHA"], token)
-    return {"version": 1, "kind": "new-production-scope-bootstrap-review", "targetSha256": target.digest,
+    review = {"version": 1, "kind": "new-production-scope-bootstrap-review", "targetSha256": target.digest,
             "configurationSha256": target.configuration_digest, "scopeSha256": schedule.logical_scope(target),
             "registrationSha256": registration_sha256, "windowStart": start, "windowEnd": end,
             "reviewedRuns": evidence, "custody": CUSTODY, "noPriorInFlightWriter": True}
+    require(len(canonical(review)) <= MAX_REVIEW_BYTES, "The complete reviewed inventory exceeds the protected input size.")
+    return review
 
 
 def plan_first_launch(env, target, objects, data_objects, anchor_objects, data_api, worker_api, metadata_api, scope_anchor,
-                      review_raw, review_pin, registration_sha256, token):
+                      review_raw, review_pin, registration_sha256, token, *, identities=None):
     """Produce a bounded, independently reviewable plan. No mutation is performed."""
     _protected_inputs(env, review_raw, review_pin, registration_sha256)
     require(env.get("GITHUB_REPOSITORY") == github.REPOSITORY and env.get("GITHUB_REPOSITORY_ID") == str(github.REPOSITORY_ID)
@@ -437,7 +506,8 @@ def plan_first_launch(env, target, objects, data_objects, anchor_objects, data_a
     observation = new_resource_observation(target, data_api, worker_api, metadata_api)
     raw = review_raw.encode("utf-8") if isinstance(review_raw, str) else review_raw
     review = parsed(raw)
-    require(isinstance(raw, bytes) and canonical(review) == raw and HEX.fullmatch(review_pin or "") and _sha(raw) == review_pin
+    require(isinstance(raw, bytes) and len(raw) <= MAX_REVIEW_BYTES
+            and canonical(review) == raw and HEX.fullmatch(review_pin or "") and _sha(raw) == review_pin
             and set(review) == {"version", "kind", "targetSha256", "configurationSha256", "scopeSha256",
                 "registrationSha256", "windowStart", "windowEnd", "reviewedRuns", "custody", "noPriorInFlightWriter"}
             and type(review["version"]) is int and review["version"] == 1
@@ -445,7 +515,7 @@ def plan_first_launch(env, target, objects, data_objects, anchor_objects, data_a
             and review["configurationSha256"] == target.configuration_digest and review["scopeSha256"] == schedule.logical_scope(target)
             and review["registrationSha256"] == registration_sha256 and review["custody"] == CUSTODY
             and review["noPriorInFlightWriter"] is True and isinstance(review["reviewedRuns"], list)
-            and len(review["reviewedRuns"]) <= 25)
+            and 0 < len(review["reviewedRuns"]) <= MAX_REVIEWED_RUNS)
     earliest = min(_stamp(target.data[key]) for key in ("d1CreatedAt", "workerCreatedOn", "bucketCreatedAt", "backupBucketCreatedAt"))
     start, end = _stamp(review["windowStart"]), _stamp(review["windowEnd"])
     now = datetime.now(timezone.utc)
@@ -459,7 +529,7 @@ def plan_first_launch(env, target, objects, data_objects, anchor_objects, data_a
             and reviewed[provision_id]["revision"] == original["receipt"]["revision"]
             and reviewed[provision_id]["path"] == ".github/workflows/worker-production-control.yml")
     _provision_job(original["receipt"], token)
-    verify_first_launch_writers(env, review_raw, review_pin, token)
+    verify_first_launch_writers(env, review_raw, review_pin, token, identities=identities)
     # Repeat the independently bounded source observations before any caller can write.
     require(provision_original(target, objects, anchor_objects, registration_sha256) == original
             and new_resource_observation(target, data_api, worker_api, metadata_api) == observation)
@@ -476,7 +546,8 @@ def plan_first_launch(env, target, objects, data_objects, anchor_objects, data_a
 
 
 def verify_first_launch_guard(env, target, objects, data_objects, anchor_objects, data_api, worker_api, metadata_api, scope_anchor,
-                              review_raw, review_pin, registration_sha256, token, plan, *, stage):
+                              review_raw, review_pin, registration_sha256, token, plan, *, stage, identities=None,
+                              later_limit=MAX_LATER_RUNS):
     """Recheck the fixed pristine/partial genesis state before one bounded write.
 
     stage 0 precedes genesis, 1 precedes the immutable initial history, and 2
@@ -533,6 +604,6 @@ def verify_first_launch_guard(env, target, objects, data_objects, anchor_objects
     require(original["provisionJournalSha256"] == plan.get("provisionJournalSha256")
             and digest(new_resource_observation(target, data_api, worker_api, metadata_api)) == plan.get("resourceObservationSha256"))
     _provision_job(original["receipt"], token)
-    writers = verify_first_launch_writers(env, review_raw, review_pin, token)
+    writers = verify_first_launch_writers(env, review_raw, review_pin, token, identities=identities, later_limit=later_limit)
     require(writers["inventorySha256"] == plan.get("inventorySha256"))
-    return {**writers, "guardGithubUpperBound": writers["guardGithubUpperBound"] + 4}
+    return writers
