@@ -26,7 +26,8 @@ from native_restore_rehearsal import ACCOUNT_SHA256, signed_put_headers
 import scoped_r2
 
 ERROR = "Private release evidence could not be verified; preserve existing objects and investigate."
-WORKFLOW = artifact.REPOSITORY + "/.github/workflows/worker-evidence-archive.yml@refs/heads/main"
+WORKFLOW_PATH = ".github/workflows/worker-evidence-archive.yml"
+WORKFLOW = artifact.REPOSITORY + "/" + WORKFLOW_PATH + "@refs/heads/main"
 REVISION = "5752d09d9d205fe9ebcae2eea0b1f4f700d9701e"
 BASE = "maintenance/release-evidence/" + REVISION + "/"
 DECIMAL = re.compile(r"[1-9][0-9]{0,19}")
@@ -356,6 +357,16 @@ def collect_additional(token, run, attempt, expected_json, add, blobs, get_json,
     return record
 
 
+def evidence_adder(entries, blobs):
+    def add(label, raw, **metadata):
+        require(isinstance(raw, bytes) and 0 < len(raw) <= MAX_BLOB)
+        key = digest(raw)
+        blobs[key] = raw
+        require(sum(map(len, blobs.values())) <= MAX_TOTAL)
+        entries.append({"label": label, "sha256": key, "bytes": len(raw), **metadata})
+    return add
+
+
 def collect(token, get_json=artifact._get_json, download=artifact._download, log=candidate.download_job_log,
             *, current_candidate_run_id="", current_candidate_run_attempt="1", candidate_json_sha256=""):
     """Download exact historical originals; only safe projections of API metadata/logs survive."""
@@ -365,14 +376,7 @@ def collect(token, get_json=artifact._get_json, download=artifact._download, log
             for value in (current_candidate_run_id, current_candidate_run_attempt))
             and isinstance(candidate_json_sha256, str) and DIGEST.fullmatch(candidate_json_sha256))
     blobs, entries, runs, original = {}, [], [], None
-
-    def add(label, raw, **metadata):
-        require(isinstance(raw, bytes) and 0 < len(raw) <= MAX_BLOB)
-        key = digest(raw)
-        blobs[key] = raw
-        require(sum(map(len, blobs.values())) <= MAX_TOTAL)
-        entries.append({"label": label, "sha256": key, "bytes": len(raw), **metadata})
-
+    add = evidence_adder(entries, blobs)
     for spec in SOURCES:
         run = spec[0]
         stage("collect-run")
@@ -560,7 +564,7 @@ def archive(store, manifest, blobs, guard=lambda: None):
     return verify_archive(store, digest(raw))
 
 
-def verify_archive(store, expected):
+def read_archive(store, expected):
     store.verify()
     stage("manifest")
     require(isinstance(expected, str) and DIGEST.fullmatch(expected))
@@ -587,11 +591,45 @@ def verify_archive(store, expected):
     additional = value.get("additionalCandidates", [])
     require(isinstance(additional, list) and len(additional) <= 1)
     summaries = [verify_additional(record, blobs) for record in additional]
+    return value, blobs, total, summaries
+
+
+def verify_archive(store, expected):
+    _manifest, blobs, total, summaries = read_archive(store, expected)
     stage("complete")
     return {"status": "Passed", "archivePrefix": store.prefix, "manifestSha256": expected,
-        "blobCount": len(seen), "bytes": total, "historicalRevision": REVISION,
+        "blobCount": len(blobs), "bytes": total, "historicalRevision": REVISION,
         "productionMutationPerformed": False, "historicalStatusesUnchanged": True, "rawLogsArchived": False,
         **({"additionalCandidates": summaries} if summaries else {})}
+
+
+def collect_from_archive(store, source_run, source_attempt, source_sha, revision, token,
+                         get_json=artifact._get_json, download=artifact._download, log=candidate.download_job_log,
+                         *, current_candidate_run_id, current_candidate_run_attempt, candidate_json_sha256):
+    """Keep the pinned historical original and append a separately proven current candidate."""
+    require(DECIMAL.fullmatch(source_run) and DECIMAL.fullmatch(source_attempt)
+        and store.prefix == BASE + source_run + "/" + source_attempt + "/"
+        and all(DECIMAL.fullmatch(value) for value in (current_candidate_run_id, current_candidate_run_attempt))
+        and DIGEST.fullmatch(candidate_json_sha256))
+    original, blobs, _total, _additional = read_archive(store, source_sha)
+    writer = original.get("archiveWriter")
+    require("historicalArchiveOrigin" not in original
+        and isinstance(writer, dict) and set(writer) == {"runId", "runAttempt", "revision"}
+        and (writer["runId"], writer["runAttempt"]) == (source_run, source_attempt)
+        and artifact._REVISION.fullmatch(writer.get("revision", "")))
+    run = get_json(f"/actions/runs/{source_run}/attempts/{source_attempt}", token)
+    projected = run_projection(run, (source_run, WORKFLOW_PATH, writer["revision"], "success", 0), source_attempt)
+    require(projected["event"] == "workflow_dispatch")
+    entries = list(original["entries"])
+    add = evidence_adder(entries, blobs)
+    source_manifest = canonical(original)
+    require(digest(source_manifest) == source_sha)
+    add(f"historical-archive-{source_run}-{source_attempt}-manifest.json", source_manifest)
+    record = collect_additional(token, current_candidate_run_id, current_candidate_run_attempt, candidate_json_sha256,
+        add, blobs, get_json, download, log)
+    require(record["candidateRun"]["revision"] == revision and len(entries) <= 100)
+    return {**original, "entries": entries, "historicalArchiveOrigin": {"runId": source_run, "runAttempt": source_attempt,
+        "manifestSha256": source_sha}, "additionalCandidates": [record]}, blobs
 
 
 def main():
@@ -601,19 +639,30 @@ def main():
         and env.get("GITHUB_REF") == artifact.MAIN_REF and env.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
         and env.get("GITHUB_REPOSITORY") == artifact.REPOSITORY)
     action = env.get("EVIDENCE_ACTION")
-    require(action in ("archive", "verify"))
-    run = env.get("GITHUB_RUN_ID", "") if action == "archive" else env.get("EVIDENCE_ARCHIVE_RUN_ID", "")
-    attempt = env.get("GITHUB_RUN_ATTEMPT", "") if action == "archive" else env.get("EVIDENCE_ARCHIVE_RUN_ATTEMPT", "")
+    require(action in ("archive", "archive-from-verified", "verify"))
+    writing = action != "verify"
+    original_run, original_attempt = env.get("EVIDENCE_ARCHIVE_RUN_ID", ""), env.get("EVIDENCE_ARCHIVE_RUN_ATTEMPT", "")
+    run = env.get("GITHUB_RUN_ID", "") if writing else original_run
+    attempt = env.get("GITHUB_RUN_ATTEMPT", "") if writing else original_attempt
     require(DECIMAL.fullmatch(run) and DECIMAL.fullmatch(attempt))
-    store = PrivateStore(json.loads(env["SUBS_BOT_CF_ISOLATION_TARGET_JSON"]), env["SUBS_BOT_CF_BOOTSTRAP_TOKEN"], BASE + run + "/" + attempt + "/")
-    if action == "archive":
+    target, metadata_token = json.loads(env["SUBS_BOT_CF_ISOLATION_TARGET_JSON"]), env["SUBS_BOT_CF_BOOTSTRAP_TOKEN"]
+    store = PrivateStore(target, metadata_token, BASE + run + "/" + attempt + "/")
+    if writing:
         require(env.get("EVIDENCE_CONFIRMATION") == "preserve original subs-bot 5752 release evidence")
         guard = lambda: artifact.require_current_main(env["GITHUB_SHA"])
         guard()
-        manifest, blobs = collect(artifact._github_token(),
-            current_candidate_run_id=env.get("EVIDENCE_CURRENT_CANDIDATE_RUN_ID", ""),
-            current_candidate_run_attempt=env.get("EVIDENCE_CURRENT_CANDIDATE_RUN_ATTEMPT", "1"),
-            candidate_json_sha256=env.get("EVIDENCE_CANDIDATE_JSON_SHA256", ""))
+        inputs = {"current_candidate_run_id": env.get("EVIDENCE_CURRENT_CANDIDATE_RUN_ID", ""),
+            "current_candidate_run_attempt": env.get("EVIDENCE_CURRENT_CANDIDATE_RUN_ATTEMPT", "1"),
+            "candidate_json_sha256": env.get("EVIDENCE_CANDIDATE_JSON_SHA256", "")}
+        token = artifact._github_token()
+        if action == "archive-from-verified":
+            require(DECIMAL.fullmatch(original_run) and DECIMAL.fullmatch(original_attempt)
+                and (original_run, original_attempt) != (run, attempt))
+            source = PrivateStore(target, metadata_token, BASE + original_run + "/" + original_attempt + "/")
+            manifest, blobs = collect_from_archive(source, original_run, original_attempt,
+                env.get("EVIDENCE_MANIFEST_SHA256", ""), env["GITHUB_SHA"], token, **inputs)
+        else:
+            manifest, blobs = collect(token, **inputs)
         manifest["archiveWriter"] = {"revision": env["GITHUB_SHA"], "runId": run, "runAttempt": attempt}
         result = archive(store, manifest, blobs, guard)
     else:

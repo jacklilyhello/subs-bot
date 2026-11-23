@@ -134,6 +134,52 @@ class LaterCandidateFixture:
 
 
 class EvidenceArchiveTests(TestCase):
+    def test_reuse_verifies_private_original_and_archives_exact_new_candidate(self):
+        fixture = LaterCandidateFixture()
+        historical = MemoryStore()
+        value, blobs = manifest()
+        writer_revision = "b" * 40
+        value["archiveWriter"] = {"runId": "100", "runAttempt": "1", "revision": writer_revision}
+        source_sha = archive.archive(historical, value, blobs)["manifestSha256"]
+        original_bytes = dict(historical.objects)
+        original_writes = list(historical.writes)
+        repo = {"id": artifact.REPOSITORY_ID}
+        fixture.runs["100"] = {"id": 100, "run_attempt": 1, "workflow_id": 101, "path": archive.WORKFLOW_PATH,
+            "head_branch": "main", "head_sha": writer_revision, "event": "workflow_dispatch",
+            "status": "completed", "conclusion": "success", "repository": repo, "head_repository": repo}
+
+        def collect(sha=source_sha, revision=fixture.revision):
+            return archive.collect_from_archive(historical, "100", "1", sha, revision, "synthetic",
+                fixture.get_json, fixture.download, lambda *_: fixture.raw_log,
+                current_candidate_run_id="500", current_candidate_run_attempt="2",
+                candidate_json_sha256=fixture.json_sha)
+
+        combined, contents = collect()
+        self.assertEqual(combined["historicalArchiveOrigin"],
+            {"runId": "100", "runAttempt": "1", "manifestSha256": source_sha})
+        self.assertEqual(contents[source_sha], original_bytes["manifest.json"])
+        self.assertEqual(combined["entries"][:len(value["entries"])], value["entries"])
+        self.assertEqual(fixture.downloads, ["501", "2345"])
+        self.assertEqual(historical.objects, original_bytes)
+        self.assertEqual(historical.writes, original_writes)
+        destination = MemoryStore()
+        destination.prefix = archive.BASE + "200/1/"
+        result = archive.archive(destination, combined, contents)
+        self.assertEqual(archive.verify_archive(destination, result["manifestSha256"]), result)
+        self.assertEqual(result["additionalCandidates"][0]["revision"], fixture.revision)
+
+        with self.assertRaises(archive.ArchiveError):
+            collect(sha="0" * 64)
+        with self.assertRaises(archive.ArchiveError):
+            collect(revision="d" * 40)
+        fixture.runs["100"]["conclusion"] = "cancelled"
+        with self.assertRaises(archive.ArchiveError):
+            collect()
+        fixture.runs["100"]["conclusion"] = "success"
+        historical.objects[next(key for key in original_bytes if key.startswith("blobs/"))] = b"tampered"
+        with self.assertRaises(archive.ArchiveError):
+            collect()
+
     def test_later_candidate_preserves_exact_attempts_closed_provenance_and_no_raw_log(self):
         fixture = LaterCandidateFixture()
         record = fixture.collect()

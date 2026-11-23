@@ -32,6 +32,8 @@
 
 ## 审查用候选清单
 
+历史 GitHub 原件超过保留期时，`worker-evidence-archive.yml` 可用 `archive-from-verified`。提供原始历史封存的 run、attempt 和独立核验的 manifest 摘要，以及当前准确 main 的候选 run、attempt 和候选 JSON 摘要。工具从原私有 R2 封存重新读回每份历史字节，并核对原封存运行；随后核对新候选来源，在本次运行专用前缀单次追加封存。之后用 `verify` 和此次新封存的 run、attempt、manifest 摘要独立读回。
+
 `worker-production-candidate.yml` 在 GitHub 托管 runner 生成只供审查的包。它只使用 `github.token` 的 `actions: read` 和 `contents: read`，不接收 Cloudflare 或 Telegram 凭据、不调用 Cloudflare、不改部署、数据、域名、Webhook 或旧消费者。
 
 填写当前 main 的成功 `source_run_id`、准确 `source_run_attempt`、使用同一 CI 归档的成功普通隔离 `deploy_run_id` 及 `deploy_run_attempt`。工具核对仓库、workflow、main SHA、成功状态、准确尝试、CI 归档 SHA-256、包内模块及完整迁移。它只从该部署 job 的有界日志中提取严格允许的 CI proof、版本/开关 JSON 和迁移计数，并确认 CI proof 与选定归档完全相同。原始日志及签名下载 URL 不进入产物或输出。缺失、重复、冲突或过期证据使生成失败，不能用其他提交或只看绿色运行来替代。
